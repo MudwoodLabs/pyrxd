@@ -1364,15 +1364,31 @@ class SwapCoordinator:
             # taker committed, in any configuration.
             mp = self.config.margin_policy
             flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
-            required_burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
+            burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
+            # The SUFFICIENT floor, not just the necessary one. `assess_claim_finality` grants SAFE
+            # on `blocks_left - counter_reserve >= burial`, where `blocks_left` is t_rxd MINUS the
+            # confirmations already elapsed. So `t_rxd >= burial` is merely necessary: it leaves the
+            # band [burial, burial + confirm + reserve) open, and a maker who picks t_rxd inside it
+            # passes this gate, reveals LATE, and hands the taker a swap that is SQUEEZED at claim
+            # time anyway — a narrower version of exactly what this gate exists to prevent.
+            #
+            # The counter-leg reserve is the same quantity the claim-time gate subtracts, so it is
+            # computed the same way (and via the fast-tail accessor, because it DIVIDES).
+            counter_reserve = 0
+            if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
+                counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
+            # One block for the claim itself to be mined. Radiant has no RBF and no CPFP, so a claim
+            # that does not make it into a block before maturity cannot be accelerated.
+            required_burial = burial + counter_reserve + 1
             if required_burial > 0:
                 t_rxd_blocks = int(terms.t_rxd.value)
                 if t_rxd_blocks < required_burial:
                     return PreBtcLockGate(
                         ok=False,
                         reason=(
-                            f"t_rxd is {t_rxd_blocks} blocks but the value-scaled claim burial needs "
-                            f"{required_burial} — this swap can NEVER reach a safe claim. The taker "
+                            f"t_rxd is {t_rxd_blocks} blocks but a safe claim needs {required_burial} "
+                            f"(burial {burial} + counter-leg reserve {counter_reserve} + 1 block to "
+                            "mine) — this swap can NEVER reach a safe claim. The taker "
                             "would reveal, find every claim SQUEEZED, and be left choosing between "
                             "a reorg-reversible claim and walking away from a funded counter leg. "
                             "Negotiate a longer t_rxd, or a lower value-at-risk."
@@ -2062,6 +2078,49 @@ class SwapCoordinator:
         self.record = rec
         return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
 
+    async def _assert_claim_reached_the_mempool(self) -> None:
+        """Confirm the claim actually landed before treating the swap as claimed.
+
+        `claim_asset` returns once the node ACCEPTED the transaction, which is not the same as the
+        covenant being spent. Advancing on a broadcast alone meant a claim that never entered — or
+        was immediately dropped — left the record saying the asset was claimed while the covenant
+        sat there waiting for the maker's CSV refund.
+
+        ABSTAIN is not failure: a source that cannot answer must not fail a claim that probably
+        succeeded, on a chain where there is no second chance to send it.
+        """
+        outpoint = self.record.radiant_covenant_outpoint
+        if outpoint is None:
+            return
+        probe = getattr(getattr(self.radiant_leg, "chain_io", None), "covenant_unspent_incl_mempool", None)
+        if probe is None:
+            return  # the leg cannot answer; absence of the capability is not evidence of failure
+        try:
+            unspent = await probe(outpoint)
+        except Exception as exc:
+            logger.warning("could not confirm the claim reached the mempool for %s: %s", outpoint, exc)
+            return
+        if unspent is True:
+            raise NetworkError(
+                f"the claim was broadcast but covenant {outpoint} is still unspent, so it did not "
+                "reach the mempool. Radiant has no RBF and no CPFP, and the maker's refund becomes "
+                "valid at CSV maturity — retry the claim now rather than treating this as done."
+            )
+
+    async def taker_rebroadcast_claim_if_evicted(self, p: bytes) -> str | None:
+        """Re-broadcast the taker's claim if it has fallen out of the mempool. Returns the new txid.
+
+        The production entry point for the eviction case. A claim only wins the race with the CSV
+        refund by BEING in the mempool when maturity arrives, and Radiant's mempool expiry is about
+        eight hours with no RBF to bump it back in. Drive this on whatever tick the operator or the
+        watchtower already runs, between the claim and the covenant's maturity.
+        """
+        if not isinstance(p, (bytes, bytearray)) or len(p) != 32:
+            raise ValidationError("preimage must be 32 bytes")
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("preimage does not hash to the negotiated H; refusing to re-broadcast")
+        return await self.radiant_leg.rebroadcast_claim_if_evicted(self.record, bytes(p))
+
     def _assert_claim_tx_spends_our_htlc(self, maker_claim_tx_bytes: bytes) -> None:
         """Provenance gate: the supplied claim tx MUST spend OUR BTC HTLC funding outpoint.
 
@@ -2225,6 +2284,7 @@ class SwapCoordinator:
 
         # SAFE: the BTC claim is reorg-deep and our own burial still fits the window.
         await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._assert_claim_reached_the_mempool()
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record

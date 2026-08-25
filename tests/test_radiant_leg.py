@@ -1265,3 +1265,68 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         terms = _ft_terms(amount=1000)
         leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
         _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+
+class TestAnEvictedClaimCanBeRebroadcast:
+    """A claim only beats the CSV refund by BEING in the mempool when maturity arrives — a
+    non-BIP68-final refund is rejected from the mempool, so the maker cannot pre-broadcast. Radiant
+    has no RBF and no CPFP and expires the mempool after about eight hours, so an evicted claim
+    cannot be bumped back in; re-broadcasting is the only way.
+
+    The coordinator broadcast and advanced straight to a completed state, so an eviction was
+    invisible: the refund became valid at maturity, confirmed, and took both legs while the record
+    said the swap had finished.
+    """
+
+    @staticmethod
+    def _leg_with(unspent):
+        class _C(FakeClient):
+            async def get_utxos(self, script_hash):
+                return [UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=100_000, height=100)]
+
+            # The chain-io wrapper reads `txout_unspent_incl_mempool` off the CLIENT — overriding
+            # the wrapper's own method name would stub the layer under test instead of feeding it.
+            async def txout_unspent_incl_mempool(self, _txid, _vout):
+                return unspent
+
+        return _leg(client=_C(confirmations=10))
+
+    def _record(self):
+        from pyrxd.gravity.swap_state import SwapRecord, SwapState
+
+        return SwapRecord(state=SwapState.SECRET_REVEALED, terms=_rxd_terms(amount=100_000)).with_radiant_lock(
+            "ab" * 32 + ":1", "00" * 25
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unspent_covenant_means_EVICTED_and_triggers_a_rebroadcast(self) -> None:
+        leg = self._leg_with(True)
+        sent: list = []
+
+        async def _claim(record, preimage):
+            sent.append(bytes(preimage))
+            return "re" * 32
+
+        leg.claim_asset = _claim
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) == "re" * 32
+        assert sent == [b"\x11" * 32], "the claim was not re-broadcast despite the covenant being unspent"
+
+    @pytest.mark.asyncio
+    async def test_a_SPENT_covenant_does_nothing(self) -> None:
+        """The claim is alive — in the mempool or mined. Re-broadcasting would be a pointless
+        duplicate, and on a chain with no RBF a duplicate is its own risk."""
+        leg = self._leg_with(False)
+        sent: list = []
+        leg.claim_asset = lambda *a, **k: sent.append(1)
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) is None
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_an_ABSTAIN_does_NOT_rebroadcast(self) -> None:
+        """An unknown answer is not an eviction. Treating None as "gone" would fire a duplicate
+        broadcast every time a source was merely unreachable."""
+        leg = self._leg_with(None)
+        sent: list = []
+        leg.claim_asset = lambda *a, **k: sent.append(1)
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) is None
+        assert sent == []

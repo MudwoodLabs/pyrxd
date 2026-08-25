@@ -736,6 +736,47 @@ class RadiantCovenantLeg:
             self._assert_affordable(tx, fee, blocks_to_deadline=blocks_to_deadline, kind="claim")
         return await self._broadcast(tx)
 
+    async def rebroadcast_claim_if_evicted(self, record: SwapRecord, preimage: bytes) -> str | None:
+        """Re-broadcast the taker's claim if it has fallen out of the mempool. Returns the new txid,
+        or None when nothing needed doing.
+
+        WHY THIS EXISTS. A non-BIP68-final refund is rejected from the mempool
+        (Radiant Core ``validation.cpp:724-728``), so the maker CANNOT pre-broadcast and a claim
+        already sitting in the mempool at CSV maturity wins the race. The whole safety of the claim
+        window therefore rests on the claim STAYING there — and Radiant has no RBF and no CPFP, so
+        a claim that is evicted cannot be bumped back in. Mempool expiry is about eight hours.
+
+        The coordinator broadcast the claim and advanced straight to a completed state, so an
+        eviction was invisible: the maker's refund became valid at maturity, confirmed, and took
+        both legs while the swap's own record said it had finished.
+
+        Single-shot on purpose — no loop, no clock. The caller drives it on whatever tick it
+        already has, which keeps this testable and keeps clock ownership where the rest of the
+        module puts it.
+
+        Returns None when the covenant is already spent (our claim is in the mempool or mined —
+        nothing to do) and when the source ABSTAINS, because an unknown answer must not be treated
+        as "evicted" and turned into a duplicate broadcast.
+        """
+        _cov, outpoint, _carrier, _confs = await self._resolve_covenant(record)
+        unspent = await self.chain_io.covenant_unspent_incl_mempool(outpoint)
+        if unspent is None:
+            _LOG.warning(
+                "could not determine whether the covenant %s is still unspent; NOT re-broadcasting "
+                "(an unknown answer is not an eviction, and a duplicate broadcast is its own risk)",
+                outpoint,
+            )
+            return None
+        if not unspent:
+            return None  # spent or in the mempool — the claim is alive
+        _LOG.warning(
+            "covenant %s is unspent again: the claim has been evicted or reorged out. Re-broadcasting "
+            "— with no RBF and no CPFP this is the ONLY way back into the mempool, and the maker's "
+            "refund becomes valid at CSV maturity.",
+            outpoint,
+        )
+        return await self.claim_asset(record, preimage)
+
     async def refund_asset(self, record: SwapRecord) -> str:
         """Build + broadcast the MAKER's CSV refund spend. Returns the txid.
 

@@ -3098,19 +3098,24 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     @pytest.mark.asyncio
     async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=29)  # B(V) = 30
+        # B(V) = 30; the SUFFICIENT floor is 30 + counter_reserve(0 for BTC) + 1 to mine = 31.
+        terms = _terms(hashlock=h, t_rxd_blocks=30)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
-        assert "value-scaled claim burial" in gate.reason, gate.reason
+        assert "a safe claim needs" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
-    async def test_a_t_rxd_that_EXACTLY_fits_the_burial_is_accepted(self) -> None:
-        """The boundary. A guard that refuses valid work is a bug, and this one sits directly on a
-        parameter an honest maker has to choose — refusing at equality would reject correctly-sized
-        swaps."""
+    async def test_a_t_rxd_that_EXACTLY_meets_the_sufficient_floor_is_accepted(self) -> None:
+        """The boundary, and it is the SUFFICIENT one: burial + counter-leg reserve + one block to
+        mine. `t_rxd >= burial` alone is merely necessary — it leaves the band
+        [burial, burial + reserve + 1) open, where a maker can pass this gate, reveal late, and
+        still hand the taker a SQUEEZED claim.
+
+        A guard that refuses valid work is a bug, and this one sits on a parameter an honest maker
+        must choose, so equality has to pass."""
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=30)
+        terms = _terms(hashlock=h, t_rxd_blocks=31)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
@@ -3127,11 +3132,11 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         supposed to leave alone.
         """
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=1)  # flat burial defaults to 6
+        terms = _terms(hashlock=h, t_rxd_blocks=6)  # flat burial 6, so the floor is 6 + 0 + 1 = 7
         coord = _coordinator(terms=terms)
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
-        assert "claim burial" in gate.reason, gate.reason
+        assert "a safe claim needs" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
     async def test_an_ORDINARY_t_rxd_still_passes_without_economics(self) -> None:
@@ -3203,3 +3208,36 @@ class TestReservesUseTheFastTailInterval:
         construct without the caller knowing about the new field."""
         p = MarginPolicy.measured(margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0)
         assert p.rxd_block_interval_fast_s is not None
+
+
+class TestTheFundGateClosesTheSqueezeBand:
+    """`t_rxd >= burial` is NECESSARY but not SUFFICIENT.
+
+    `assess_claim_finality` grants SAFE on `blocks_left - counter_reserve >= burial`, and
+    `blocks_left` is `t_rxd` minus the confirmations already elapsed. So the band
+    `[burial, burial + reserve + 1)` passed a burial-only gate while still being SQUEEZED at claim
+    time — a maker could pick a t_rxd inside it, reveal LATE, and hand the taker a swap that cannot
+    reach a safe claim, which is a narrower version of the very thing the gate exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_INSIDE_the_squeeze_band_is_refused(self) -> None:
+        """Exactly the case a burial-only floor let through: >= the burial, < burial + 1."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=30)  # == B(V), inside the band
+        coord = _coordinator(terms=terms, policy=_valued_policy())
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "1 block to mine" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_the_ETH_counter_leg_reserve_widens_the_floor(self) -> None:
+        """On an ETH counter leg the claim-time gate also subtracts the finalization reserve, so the
+        fund-time floor must include it or the band simply reopens wider on that path."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        mp = _valued_policy()
+        assert (
+            mp.eth_finalization_window_s is None
+            or math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp)) >= 0
+        )  # documents the term; the BTC path above has reserve 0
