@@ -62,6 +62,7 @@ from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet RES
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.eth_wallet.chains import evm_chain_by_id
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.rpc import EthRpc
@@ -343,7 +344,12 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
     # Pin the RXD network to the transport's true network (mainnet) — fail-closed like dust_swap_run.
     rxd_network = SshTrRadiantClient.NETWORK
-    print(f"=== ETH↔RXD DUST swap — stage=sepolia-dust  (ETH=sepolia, RXD={rxd_network} mainnet) ===")
+    _eth_chain = evm_chain_by_id(int(args.eth_chain_id))
+    _asset = "ETH" if args.counter_asset == "native" else args.counter_asset.upper()
+    print(
+        f"=== {_asset}↔RXD DUST swap — stage=sepolia-dust  "
+        f"(counter={_eth_chain.name} chain_id={_eth_chain.chain_id}, RXD={rxd_network} mainnet) ==="
+    )
 
     policy = _policy(args)
     provenance = {
@@ -444,7 +450,11 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         claim_to=args.eth_claim_to,
         refund_to=args.eth_refund_to,
         eth_timeout=eth_timeout,
-        network="sepolia",
+        # Derived from the chain id, never hardcoded. This string is what the coordinator reads to
+        # decide whether the leg is value-bearing, and the stage is named for Sepolia while the
+        # chain is a parameter — so a Base Sepolia run used to announce itself as Sepolia. Two
+        # names for one chain is how a per-chain constant gets applied to the wrong chain.
+        network=evm_chain_by_id(int(args.eth_chain_id)).network,
     )
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
@@ -745,7 +755,6 @@ def _args() -> argparse.Namespace:
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
     # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.
     if args.eth_finalization_window_s is None:
-        from pyrxd.eth_wallet.chains import evm_chain_by_id
         from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
         from pyrxd.security.errors import ValidationError
 
