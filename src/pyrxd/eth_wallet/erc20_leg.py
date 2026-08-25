@@ -1,12 +1,18 @@
 """ERC-20 (USDC) counter-chain leg — the token sibling of :class:`EthHtlcContractLeg`.
 
 **A subclass, not a fork, and not an edit.** The native leg has moved real value on mainnet, so
-this adds behaviour without changing a line of it: only ``fund`` and ``verify_funded`` are
-overridden. ``claim``, ``refund``, ``fetch_claim_artifacts``, ``assert_claim_provenance``,
-``is_final`` and ``claim_finality_verdict`` are inherited **unchanged**, which works because
-``Erc20Htlc.sol`` was deliberately given the same ``claim(bytes32)`` / ``refund()`` signatures and
-the same ``Claimed(bytes32)`` event with the preimage un-indexed. Secret recovery therefore needs
-no token-specific code at all.
+this adds behaviour without changing a line of it. ``refund``, ``fetch_claim_artifacts``,
+``assert_claim_provenance``, ``is_final`` and ``claim_finality_verdict`` are inherited
+**unchanged**, which works because ``Erc20Htlc.sol`` was deliberately given the same
+``claim(bytes32)`` / ``refund()`` signatures and the same ``Claimed(bytes32)`` event with the
+preimage un-indexed. Secret recovery therefore needs no token-specific code at all.
+
+``fund``, ``verify_funded`` AND ``claim`` are overridden. An earlier version of this paragraph said
+``claim`` was inherited unchanged; it is not, and the difference matters to anyone reading this to
+decide how much of the audited native reveal path applies. The override adds two PRE-REVEAL gates —
+a funded-balance re-read and the issuer-freeze check — both of which exist because broadcasting
+``claim(preimage)`` publishes the secret, and a token leg can be short or frozen in ways the native
+leg cannot. It delegates to ``super().claim`` for the broadcast itself.
 
 **What genuinely differs is funding.** A payable constructor holds ETH; it cannot pull a token,
 because ``transferFrom`` needs an allowance granted to an address that does not exist until the
