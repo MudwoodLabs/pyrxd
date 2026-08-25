@@ -62,8 +62,10 @@ from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet RES
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
@@ -79,6 +81,7 @@ from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
 _DEFAULT_ARTIFACT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "EthHtlc.json"
+_DEFAULT_ERC20_ARTIFACT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "Erc20Htlc.json"
 _SEPOLIA_CHAIN_ID = 11155111
 _ANVIL_KEY = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # anvil acct 0 (public devnet)
 _ANVIL_ADDR0 = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -201,18 +204,46 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
         btc_claim_pubkey_xonly=b"\x00" * 32,
         btc_refund_pubkey_xonly=b"\x00" * 32,
         counter_chain="eth",
-        value_amount=args.eth_amount_wei,
+        value_amount=_counter_value(args),
+        token_address=(_counter_token(args).address if _counter_token(args) else ""),
         eth_timeout_unix_s=eth_timeout,
     )
     return terms, cov, p_secret, h, (taker_rxd, maker_rxd, taker_pkh, maker_pkh)
 
 
+def _counter_token(args):
+    """The ERC-20 this run swaps against, or None for a native-ETH counter leg.
+
+    Resolved from the PINNED registry by (symbol, chain id) rather than from an address on the
+    command line. A mistyped address that happens to be a live contract is a token nobody priced,
+    and `USDC` on the wrong chain id is a different contract entirely — the registry makes both
+    unrepresentable instead of merely unlikely.
+    """
+    if args.counter_asset == "native":
+        return None
+    return token_for(args.counter_asset.upper(), int(args.eth_chain_id))
+
+
+def _counter_value(args):
+    """The counter-leg amount, in whatever units that leg denominates.
+
+    Native: wei. ERC-20: the token's BASE UNITS (USDC is 6-decimal, so 1_000_000 == 1.00 USDC).
+    The record is chain-tagged precisely so a later reader cannot mistake the second for the first.
+    """
+    return int(args.eth_amount_wei) if args.counter_asset == "native" else int(args.token_amount)
+
+
 def _eth_leg(args, *, rpc_url, chain_id, key_hex, claim_to, refund_to, eth_timeout, network):
     rpc = EthRpc(rpc_url, expected_chain_id=chain_id)
-    artifact = load_artifact(args.eth_artifact)
-    contract_leg = EthHtlcContractLeg(
-        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(key_hex)), chain_id=chain_id, artifact=artifact
-    )
+    token = _counter_token(args)
+    artifact = load_artifact(args.eth_artifact if token is None else args.erc20_artifact)
+    key = PrivateKeyMaterial(bytes.fromhex(key_hex))
+    if token is None:
+        contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=chain_id, artifact=artifact)
+    else:
+        # The ERC-20 fund is TWO transactions (deploy, then a plain transfer — no approve, so no
+        # allowance race). That is why the coordinator refuses to run one without a durable record.
+        contract_leg = Erc20HtlcLeg(token=token, rpc=rpc, signing_key=key, chain_id=chain_id, artifact=artifact)
     leg = EthLeg(
         contract_leg=contract_leg,
         network=network,
@@ -638,6 +669,19 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--eth-claim-to", default="")
     ap.add_argument("--eth-refund-to", default="")
     ap.add_argument("--eth-artifact", default=str(_DEFAULT_ARTIFACT))
+    ap.add_argument("--erc20-artifact", default=str(_DEFAULT_ERC20_ARTIFACT))
+    ap.add_argument(
+        "--counter-asset",
+        choices=("native", "usdc"),
+        default="native",
+        help="what the counter leg pays: native ETH, or an ERC-20 resolved from the pinned registry",
+    )
+    ap.add_argument(
+        "--token-amount",
+        type=int,
+        default=1_000_000,
+        help="ERC-20 amount in BASE UNITS (USDC is 6-decimal: 1_000_000 == 1.00 USDC). Not wei.",
+    )
     ap.add_argument("--eth-timeout-s", type=int, default=86_400)  # 1 day ETH refund deadline
     # RXD
     ap.add_argument("--rxd-photons", type=int, default=1000)
