@@ -1087,3 +1087,154 @@ async def test_the_SPEND_PATH_pins_the_recorded_outpoint_against_a_poisoned_set(
     )
     assert carrier == 100_000
     assert cov is not None
+
+
+class TestAnUnreadableConfirmationDepthFailsClosed:
+    """This guard replaced a bare `int(info.get("confirmations", 0) or 0)` after a real bug: a
+    string coerced silently into a depth, and a JSON `Infinity` raised `OverflowError` — not a
+    `NetworkError`, so it escaped every `except NetworkError` on a value-moving path as a bare
+    traceback. It had no test until now, which is how the fail-closed direction could regress
+    unnoticed.
+    """
+
+    @staticmethod
+    def _io(raw):
+        # Subclass the real fake so the client satisfies RadiantChainIO's full interface; only the
+        # one method under test is overridden.
+        class _C(FakeClient):
+            async def get_transaction_verbose(self, _txid):
+                return {"confirmations": raw}
+
+        return RadiantChainIO(_C())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("label", "raw"),
+        [
+            ("JSON Infinity", float("inf")),
+            ("negative infinity", float("-inf")),
+            ("NaN", float("nan")),
+            ("a non-numeric string", "deep"),
+            ("a dict", {"depth": 3}),
+        ],
+    )
+    async def test_an_unreadable_depth_raises_NetworkError(self, label: str, raw) -> None:
+        """NetworkError specifically — the callers on the value-moving path catch that and nothing
+        else, so any other exception type escapes as an unhandled traceback."""
+        with pytest.raises(NetworkError, match="unreadable confirmation depth"):
+            await self._io(raw).confirmations("ab" * 32)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("label", "raw", "want"), [("absent", None, 0), ("negative", -5, 0), ("zero", 0, 0)])
+    async def test_a_falsy_or_negative_depth_reads_as_ZERO_not_as_deep(self, label: str, raw, want: int) -> None:
+        """Fail-closed direction: unknown or nonsensical depth must read as UNCONFIRMED, never as
+        buried. Reading it as deep is what lets a spend proceed against a covenant a reorg can
+        still remove."""
+        assert await self._io(raw).confirmations("ab" * 32) == want
+
+    @pytest.mark.asyncio
+    async def test_an_HONEST_depth_still_passes_through(self) -> None:
+        """A guard that refuses valid work is a bug — an ordinary integer depth must survive."""
+        assert await self._io(7).confirmations("ab" * 32) == 7
+
+    @pytest.mark.asyncio
+    async def test_a_NUMERIC_STRING_does_not_silently_coerce(self) -> None:
+        """The original bug: `"999999"` became a depth of 999999 and a shallow covenant read as
+        buried. Whether it is refused or read as 0, it must NOT come back as a large depth."""
+        try:
+            got = await self._io("999999").confirmations("ab" * 32)
+        except NetworkError:
+            return  # refused outright — also correct
+        assert got == 0, f"a string depth coerced to {got}; a shallow covenant would read as buried"
+
+
+def _nft_terms(carrier: int = 1000, csv: int = 6) -> NegotiatedTerms:
+    """NFT terms. Note `radiant_amount == nft_carrier_value` here is CORRECT, not a fixture
+    shortcut: for the NFT variant the field genuinely IS the carrier dust value, and identity is
+    bound separately by the genesis ref welded into the scriptPubKey."""
+    from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft
+
+    cov = build_htlc_covenant_nft(
+        genesis_txid=_REF_TXID,
+        genesis_vout=0,
+        nft_carrier_value=carrier,
+        taker_pkh=_TAKER_PKH,
+        maker_pkh=_MAKER_PKH,
+        hashlock=_H,
+        refund_csv=csv,
+    )
+    return NegotiatedTerms(
+        hashlock=_H,
+        btc_sats=100_000,
+        radiant_amount=carrier,
+        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(csv, t.TimeUnit.BLOCKS),
+        asset_variant="nft",
+        genesis_ref=GlyphRef(txid=_REF_TXID, vout=0).to_bytes(),
+        taker_dest_hash=cov.expected_taker_hash,
+        maker_dest_hash=cov.expected_maker_hash,
+        btc_claim_pubkey_xonly=_xonly(),
+        btc_refund_pubkey_xonly=_xonly(),
+    )
+
+
+class TestTheFundingGateIsExercisedPerAssetVariant:
+    """`verify_maker_asset_funded` is the HZ-1 gate: the taker MUST NOT fund the counter leg until
+    this confirms the maker's asset is really locked, at the agreed value, buried deep enough.
+
+    It had NO per-variant coverage. Its only real-leg exercise hardcoded the RXD covenant, and the
+    coordinator tests use a duck-typed fake that records the call without running it. That is how
+    #505 — the FT gate comparing a carrier photon value against a token count — survived: no test
+    ever drove this method with an FT.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rxd_accepts_a_correctly_funded_covenant(self) -> None:
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=100_000, confirmations=6))
+        outpoint, value, confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 100_000 and confs == 6 and outpoint
+
+    @pytest.mark.asyncio
+    async def test_rxd_refuses_a_wrongly_valued_covenant(self) -> None:
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=99_999, confirmations=6))
+        with pytest.raises(NetworkError, match="expected carrier value"):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+    @pytest.mark.asyncio
+    async def test_rxd_refuses_a_covenant_that_is_too_shallow(self) -> None:
+        """The depth half of the gate — a covenant a reorg can still remove must not clear it."""
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=100_000, confirmations=1))
+        with pytest.raises(NetworkError):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=6)
+
+    @pytest.mark.asyncio
+    async def test_nft_accepts_a_covenant_funded_at_the_CARRIER_value(self) -> None:
+        """For NFT, `radiant_amount` genuinely IS the carrier dust value, so comparing it against
+        the UTXO's photon value is correct. Asserting that here is what makes the FT case below a
+        real contrast rather than an untested assumption."""
+        terms = _nft_terms(carrier=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
+
+    @pytest.mark.xfail(
+        reason="#505: the FT gate compares carrier PHOTONS against a TOKEN COUNT. An honest maker "
+        "funding 1000 tokens on ordinary dust is refused; a dishonest one funding 1000 photons "
+        "carrying 1 token is accepted. Unfixed — this test is the live record of it.",
+        strict=True,
+    )
+    @pytest.mark.asyncio
+    async def test_ft_accepts_a_covenant_whose_CARRIER_differs_from_the_token_count(self) -> None:
+        """The scenario the FT path must support and currently cannot: 1000 tokens held on 546
+        photons of ordinary dust. The covenant enforces `refValueSum(ref) == amount` — a TOKEN
+        count — while the gate compares the carrier photon value, so the honest case is refused.
+
+        Deliberately chosen so the two quantities DIFFER: every existing FT fixture sets carrier
+        equal to the token count, which is exactly why the conflation was invisible.
+        """
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
+        _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)

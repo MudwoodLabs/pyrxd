@@ -42,9 +42,22 @@ def _pkh(wif: str) -> bytes:
 
 
 def _load_vector(name: str) -> dict:
+    """Load a mainnet golden vector, or XFAIL rather than skip when it is absent.
+
+    These are the ONLY byte-for-byte mainnet-proven checks on the FT/NFT holder scripts and ref
+    binding. The files are gitignored (`.gitignore:217` matches `gravity-ref-spike/.*`), so on a
+    fresh clone and in CI they are absent — and a `skip` does not fail a build, so the coverage
+    silently evaporated everywhere except a machine that happened to still have them.
+
+    `xfail(raises=...)` keeps the build green while making the absence VISIBLE in the report, which
+    a skip does not. The real fix is to commit sanitized vectors; until then this at least stops
+    the gap reading as coverage.
+    """
     path = _SPIKE / name
     if not path.exists():
-        pytest.skip(f"mainnet golden vector {name} not present")
+        pytest.xfail(
+            f"mainnet golden vector {name} is absent (gitignored) — FT/NFT byte-level binding is UNVERIFIED here"
+        )
     return json.loads(path.read_text())
 
 
