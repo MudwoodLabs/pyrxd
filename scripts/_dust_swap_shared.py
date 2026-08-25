@@ -366,13 +366,18 @@ async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_pho
     while True:
         utxos = await client.get_utxos(script_hash)
         for u in utxos or []:
-            if int(u.value) == int(expected_photons):
-                print(f"  covenant funded: {u.txid}:{u.vout} ({u.value} photons)")
+            # height 0 means unconfirmed. The prompt this replaces said ">= 1 conf", and the reorg
+            # gate downstream assumes a mined covenant, so require it here rather than racing it.
+            if int(u.value) == int(expected_photons) and int(getattr(u, "height", 0)) > 0:
+                print(f"  covenant funded: {u.tx_hash}:{u.tx_pos} ({u.value} photons, height {u.height})")
                 return u
         if utxos:
             # Present but wrong value: say so rather than waiting silently forever. The covenant
             # pins its amount, so a mis-funded UTXO is not one this swap can ever use.
-            print(f"  SPK holds {[int(u.value) for u in utxos]} photons, need exactly {expected_photons}")
+            print(
+                f"  SPK holds {[(int(u.value), int(getattr(u, 'height', 0))) for u in utxos]} "
+                f"(photons, height) — need exactly {expected_photons} at height > 0"
+            )
         await asyncio.sleep(poll_s)
 
 
