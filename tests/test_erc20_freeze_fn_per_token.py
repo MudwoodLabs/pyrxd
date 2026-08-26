@@ -179,17 +179,31 @@ class TestTheRegistryOnlyPinsWhatWasVerified:
         with pytest.raises(ValidationError, match="USDT0"):
             token_by_address("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", 42161)
 
-    def test_usdt_is_pinned_on_ethereum_only(self):
-        """Optimism/Base/Linea answer NEITHER freeze spelling. That is not evidence they cannot
-        freeze, only that the two probed names are absent — and has_blacklist=False on a negative
-        probe would fail OPEN on the gate guarding an unrecoverable loss."""
+    def test_usdt_is_pinned_only_where_the_admin_surface_was_read(self):
+        """Ethereum (freezable, `isBlackListed`) plus the two OP-stack bridged tokens whose
+        IMMUTABILITY was positively established — not merely "no freeze function answered"."""
         from pyrxd.eth_wallet.tokens import KNOWN_TOKENS
 
         usdt_chains = sorted(cid for sym, cid in KNOWN_TOKENS if sym == "USDT")
-        assert usdt_chains == [1], (
-            f"USDT pinned on {usdt_chains}. Only Ethereum was verified to answer a freeze "
-            "predicate; pinning another chain needs its admin surface read first."
+        assert usdt_chains == [1, 10, 8453], (
+            f"USDT pinned on {usdt_chains}. Linea is deliberately absent: it is an EIP-1967 proxy "
+            "with a live admin, so it can be UPGRADED into a token that freezes."
         )
+
+    def test_the_bridged_tokens_are_pinned_as_non_freezable(self):
+        """Justified by disassembly (no DELEGATECALL/SELFDESTRUCT, not a proxy, no owner/pause),
+        not by a probe returning nothing."""
+        from pyrxd.eth_wallet.tokens import token_for
+
+        for cid in (10, 8453):
+            assert token_for("USDT", cid).has_blacklist is False
+        assert token_for("USDT", 1).has_blacklist is True, "L1 USDT can freeze and must stay pinned so"
+
+    def test_linea_usdt_is_not_pinned_because_it_is_upgradeable(self):
+        from pyrxd.eth_wallet.tokens import token_for
+
+        with pytest.raises(ValidationError, match="no pinned"):
+            token_for("USDT", 59144)
 
     def test_every_pinned_token_names_a_usable_freeze_predicate(self):
         from pyrxd.eth_wallet.tokens import KNOWN_TOKENS

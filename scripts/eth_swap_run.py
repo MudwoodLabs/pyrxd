@@ -67,7 +67,7 @@ from pyrxd.eth_wallet.chains import evm_chain_by_id
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.rpc import EthRpc
-from pyrxd.eth_wallet.tokens import token_for
+from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, token_for
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
@@ -698,7 +698,10 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--erc20-artifact", default=str(_DEFAULT_ERC20_ARTIFACT))
     ap.add_argument(
         "--counter-asset",
-        choices=("native", "usdc"),
+        # DERIVED from the registry, never hand-listed. A hardcoded ("native", "usdc") left USDT
+        # pinned-but-unreachable the moment it was added — the same reachability gap the ERC-20 leg
+        # itself had. A new pinned symbol is now selectable the day it lands.
+        choices=("native", *sorted({sym.lower() for sym, _ in KNOWN_TOKENS})),
         default="native",
         help="what the counter leg pays: native ETH, or an ERC-20 resolved from the pinned registry",
     )

@@ -153,6 +153,27 @@ KNOWN_TOKENS: dict[tuple[str, int], Erc20Token] = {
     #     fail OPEN on the one gate guarding an unrecoverable loss. They stay unpinned until
     #     someone reads their admin surface properly.
     ("USDT", 1): Erc20Token("USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7", 6, 1, blacklist_fn="isBlackListed"),
+    # OP-stack bridged USDT. has_blacklist=False is POSITIVELY established here, not inferred from
+    # a failed probe. Verified 2026-08-25 on both chains:
+    #   * `l1Token()` returns 0xdAC17F95…1ec7 — Tether's real L1 USDT, so this is the canonical
+    #     bridge representation and not a look-alike.
+    #   * NOT a proxy (EIP-1967 implementation slot empty, admin slot empty).
+    #   * Opcode-aware disassembly finds no DELEGATECALL, CALLCODE, SELFDESTRUCT or CREATE* — so
+    #     the contract cannot be upgraded or replaced. (A naive byte scan reports CALLCODE; that
+    #     is PUSH immediate data, ~3.6 KB of the 6774. Absence of a byte is conclusive, presence
+    #     is not, which is why the walk skips PUSH operands.)
+    #   * The only privileged entry points are bridge-gated mint/burn. No blacklist, no pause, no
+    #     owner, no freeze under any spelling.
+    #
+    # RESIDUAL, and NOT the same as "no counterparty risk": burn is bridge-callable against an
+    # arbitrary holder, and the L2 bridge is itself an upgradeable system contract. That is a
+    # different risk from Circle's freeze on native USDC — bridge-governance rather than issuer
+    # discretion — and it is not covered by the pre-reveal gate, which only knows about freezes.
+    ("USDT", 10): Erc20Token("USDT", "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58", 6, 10, has_blacklist=False),
+    ("USDT", 8453): Erc20Token("USDT", "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2", 6, 8453, has_blacklist=False),
+    # Linea USDT 0xA2194392…2B93 stays UNPINNED: it IS an EIP-1967 proxy with a populated admin
+    # slot, so the admin can swap in an implementation that freezes. "Cannot freeze today" is not
+    # the property worth pinning; "cannot be made to freeze" is, and this token does not have it.
 }
 
 

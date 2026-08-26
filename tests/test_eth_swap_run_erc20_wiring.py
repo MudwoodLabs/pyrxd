@@ -120,3 +120,41 @@ def test_usdc_on_a_chain_with_no_pinned_token_is_refused(runner):
     args = _parse(runner, "--counter-asset", "usdc", "--eth-chain-id", "999999")
     with pytest.raises(ValidationError, match="no pinned"):
         runner._counter_token(args)
+
+
+def test_every_pinned_symbol_is_selectable_from_the_cli(runner):
+    """Pinning a token and being able to USE it are different things.
+
+    --counter-asset was a hand-written ("native", "usdc"), so USDT landed in the registry
+    reachable by nothing — the same defect the ERC-20 leg itself shipped with, one layer up. The
+    choices are derived from the registry now, and this asserts they stay derived.
+    """
+    from pyrxd.eth_wallet.tokens import KNOWN_TOKENS
+
+    saved = sys.argv
+    try:
+        for symbol in sorted({sym.lower() for sym, _ in KNOWN_TOKENS}):
+            chain = next(cid for sym, cid in KNOWN_TOKENS if sym.lower() == symbol)
+            sys.argv = [
+                "eth_swap_run.py",
+                "--stage",
+                "dry-run",
+                "--counter-asset",
+                symbol,
+                "--eth-chain-id",
+                str(chain),
+            ]
+            args = runner._args()  # argparse REJECTS a value outside choices, so this is the check
+            assert runner._counter_token(args).symbol.upper() == symbol.upper()
+    finally:
+        sys.argv = saved
+
+
+def test_a_bridged_usdt_leg_builds_without_a_freeze_predicate(runner):
+    """has_blacklist=False must not break leg construction. The OP-stack bridged USDT has no freeze
+    function at all, and a leg that only works for freezable tokens would refuse honest work."""
+    args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "8453")
+    leg = _make_leg(runner, args)
+    assert isinstance(leg, Erc20HtlcLeg)
+    assert leg._token.has_blacklist is False
+    assert leg._token.chain_id == 8453
