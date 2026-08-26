@@ -76,6 +76,11 @@ pytestmark = pytest.mark.integration
 _RXD_IMAGE = "radiant-core:v3.1.1-amd64"
 _MAINNET = 1
 _USDC = token_for("USDC", _MAINNET)
+#: Both are run against the REAL mainnet contracts on a fork, because the USDT delta is runtime
+#: behaviour a fake cannot prove: Tether's `transfer` returns NO bool (it is not ERC-20 compliant),
+#: and its freeze predicate is `isBlackListed`, not `isBlacklisted`. Unit tests pin the name; only
+#: the real bytecode proves the leg survives the missing return value.
+_TOKENS = {"USDC": _USDC, "USDT": token_for("USDT", _MAINNET)}
 #: A large holder to impersonate — avoids deriving the balances storage slot, whose packed layout
 #: is exactly the sort of detail a test should not encode.
 _WHALE = "0x28C6c06298d514Db089934071355E5743bf21d60"
@@ -113,8 +118,8 @@ def _now(url: str) -> int:
     return int(_rpc(url, "eth_getBlockByNumber", ["latest", False])["result"]["timestamp"], 16)
 
 
-@pytest.fixture(scope="module")
-def env(tmp_path_factory):
+@pytest.fixture(scope="module", params=sorted(_TOKENS))
+def env(request, tmp_path_factory):
     """A Radiant regtest node + an anvil fork of mainnet, with the taker holding real USDC."""
     fork_rpc = os.environ.get("PYRXD_ETH_FORK_RPC", "")
     if not os.environ.get("XCHAIN_ERC20_E2E"):
@@ -169,9 +174,20 @@ def env(tmp_path_factory):
         _rpc(url, "anvil_setBalance", [_WHALE, hex(10**18)])
         for who in (_ADDR_TAKER, _ADDR_MAKER):
             _rpc(url, "anvil_setBalance", [who, hex(10**19)])
+        token = _TOKENS[request.param]
+        # Guard the PARAMETRIZATION itself, at the only place it can collapse. Asserting the
+        # token inside a test compares the record against the same variable that produced it —
+        # self-consistent whatever the fixture yielded, so it cannot notice both runs quietly
+        # exercising one token. Verified by planting exactly that collapse here.
+        assert token.symbol == request.param, (
+            f"fixture param {request.param!r} yielded {token.symbol!r}: the suite would run one "
+            "token twice and read as coverage for two"
+        )
         transfer = "0xa9059cbb" + _ADDR_TAKER[2:].rjust(64, "0") + hex(_AMOUNT * 10)[2:].rjust(64, "0")
-        _rpc(url, "eth_sendTransaction", [{"from": _WHALE, "to": _USDC.address, "data": transfer}])
-        yield node, url, tmp_path_factory.mktemp("erc20e2e")
+        # Deliberately NOT checking a return value here either: this seeding call goes through
+        # eth_sendTransaction, and Tether would return nothing to check.
+        _rpc(url, "eth_sendTransaction", [{"from": _WHALE, "to": token.address, "data": transfer}])
+        yield node, url, tmp_path_factory.mktemp("erc20e2e"), token
     finally:
         anvil.terminate()
         try:
@@ -248,7 +264,7 @@ def _policy():
     )
 
 
-def _build(node, url, workdir, *, t_rxd_blocks=60, seen=None, reuse=None):
+def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=None):
     """Covenant + BOTH real legs + the production coordinator, wired for RXD↔USDC.
 
     ``reuse`` carries a previous build's key material and deadline so a RESTARTED process rebuilds
@@ -290,13 +306,13 @@ def _build(node, url, workdir, *, t_rxd_blocks=60, seen=None, reuse=None):
         # THE token fields. `value_amount` is 6-decimal USDC base units, NOT wei — the whole reason
         # the record is chain-tagged, and the distinction a mock token cannot exercise.
         value_amount=_AMOUNT,
-        token_address=_USDC.address,
+        token_address=(token or _USDC).address,
     )
 
     rpc = EthRpc(url, expected_chain_id=_MAINNET)
     artifact = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
     contract_leg = Erc20HtlcLeg(
-        token=_USDC,
+        token=token or _USDC,
         rpc=rpc,
         signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)),
         chain_id=_MAINNET,
@@ -339,8 +355,8 @@ def _build(node, url, workdir, *, t_rxd_blocks=60, seen=None, reuse=None):
     return coord, cov, p_secret, eth_leg, rxd_leg, taker_rxd, maker_rxd
 
 
-def _usdc_balance(url: str, who: str) -> int:
-    call = {"to": _USDC.address, "data": "0x70a08231" + who[2:].rjust(64, "0")}
+def _usdc_balance(url: str, who: str, token=None) -> int:
+    call = {"to": (token or _USDC).address, "data": "0x70a08231" + who[2:].rjust(64, "0")}
     return int(_rpc(url, "eth_call", [call, "latest"])["result"], 16)
 
 
@@ -352,10 +368,10 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     amount surviving the record round trip, the chain-tagged locator reaching the claim path, the
     covenant and the token HTLC agreeing about the same preimage.
     """
-    node, url, workdir = env
-    coord, cov, p_secret, eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir)
+    node, url, workdir, token = env
+    coord, cov, p_secret, eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, token)
 
-    maker_before = _usdc_balance(url, _ADDR_MAKER)
+    maker_before = _usdc_balance(url, _ADDR_MAKER, token)
 
     # 1. MAKER locks the Radiant asset first, and it is mined. The taker will not fund until it has
     #    read this off the chain — HZ-1, enforced by pre_btc_lock_check step 5.
@@ -375,8 +391,18 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     tag = on_disk["counterchain_locator"]["chain"]
     assert tag == "eth-erc20", f"persisted tag is {tag!r} — a reader would take 6-decimal units for wei"
     assert on_disk["counterchain_locator"]["locator"]["amount_wei"] == _AMOUNT
+    # The parametrization must actually reach the chain. If the fixture param failed to propagate,
+    # BOTH runs would exercise USDC and both would pass — a parametrized suite that silently tests
+    # one thing twice is worse than an unparametrized one, because it reads as coverage.
+    assert on_disk["counterchain_locator"]["locator"]["token_address"].lower() == token.address.lower(), (
+        f"the record names {on_disk['counterchain_locator']['locator']['token_address']}, but this "
+        f"run is parametrized for {token.symbol} at {token.address}"
+    )
+    # USDT's transfer returns NO bool. Reaching this line at all is the proof the leg does not read
+    # one — a compliance-assuming implementation reverts here against the real Tether bytecode.
+    assert _usdc_balance(url, loc.contract_address, token) == _AMOUNT
     assert loc.amount_wei == _AMOUNT, "the 6-decimal amount did not survive into the locator"
-    assert _usdc_balance(url, loc.contract_address) == _AMOUNT, "the HTLC does not hold the USDC"
+    assert _usdc_balance(url, loc.contract_address, token) == _AMOUNT, "the HTLC does not hold the USDC"
 
     # 3. MAKER revalidates and the swap is BOTH_LOCKED.
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
@@ -391,7 +417,7 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     # 4. MAKER claims the USDC, revealing p on Ethereum.
     rec = await coord.maker_claims_btc(p_secret)
     assert rec.state is SwapState.SECRET_REVEALED
-    assert _usdc_balance(url, _ADDR_MAKER) - maker_before == _AMOUNT, "the maker was not paid the USDC"
+    assert _usdc_balance(url, _ADDR_MAKER, token) - maker_before == _AMOUNT, "the maker was not paid the USDC"
     _mine(url, 4)  # let the claim finalize so the reorg gate can return SAFE
 
     # 5. TAKER scrapes p from the maker's real claim and takes the Radiant asset.
@@ -441,12 +467,12 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     actually needs when a counterparty goes quiet. It also exercises `mutual_refund`'s repair from
     this session: the two refunds are independent, so a failure in one must not skip the other.
     """
-    node, url, workdir = env
-    coord, cov, _p_secret, _eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, t_rxd_blocks=8)
+    node, url, workdir, token = env
+    coord, cov, _p_secret, _eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, token, t_rxd_blocks=8)
     terms = coord.record.terms
 
-    taker_before = _usdc_balance(url, _ADDR_TAKER)
-    maker_before = _usdc_balance(url, _ADDR_MAKER)
+    taker_before = _usdc_balance(url, _ADDR_TAKER, token)
+    maker_before = _usdc_balance(url, _ADDR_MAKER, token)
 
     # Both legs funded, exactly as the happy path — a stalling maker still has to LOCK; "never locks
     # at all" is refused before any taker value moves.
@@ -455,7 +481,7 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     rec = await coord.taker_funds_btc(terms, now_unix_s=_now(url))
     assert rec.state is SwapState.BTC_LOCKED
     htlc = rec.counterchain_locator.contract_address
-    assert _usdc_balance(url, htlc) == _AMOUNT
+    assert _usdc_balance(url, htlc, token) == _AMOUNT
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
     assert rec.state is SwapState.BOTH_LOCKED
 
@@ -468,12 +494,12 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     assert rec.state is SwapState.MUTUAL_REFUND, f"mutual refund did not complete: {rec.state}"
 
     # The USDC is back with the TAKER, who funded it — and the maker gained nothing.
-    assert _usdc_balance(url, htlc) == 0, "the HTLC still holds USDC after the refund"
+    assert _usdc_balance(url, htlc, token) == 0, "the HTLC still holds USDC after the refund"
     # NET ZERO, not +_AMOUNT: `taker_before` is the balance BEFORE funding, so the taker paid the
     # USDC out and got it back. Being made WHOLE is the property — an earlier version of this line
     # expected a gain, which no refund path should ever produce.
-    assert _usdc_balance(url, _ADDR_TAKER) == taker_before, "the taker was not made whole by the refund"
-    assert _usdc_balance(url, _ADDR_MAKER) == maker_before, "the maker gained USDC on a refund path"
+    assert _usdc_balance(url, _ADDR_TAKER, token) == taker_before, "the taker was not made whole by the refund"
+    assert _usdc_balance(url, _ADDR_MAKER, token) == maker_before, "the maker gained USDC on a refund path"
 
     # And the Radiant covenant is spent — refunded to the maker via the CSV branch.
     assert _covenant_is_spent(node, coord.record.radiant_covenant_outpoint), "the Radiant covenant was not refunded"
@@ -491,15 +517,17 @@ async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_fundin
     and the resume entry point. The property that matters is stated as arithmetic — ONE contract,
     holding EXACTLY the negotiated amount, never two and never double.
     """
-    node, url, workdir = env
+    node, url, workdir, token = env
     seen = _InMemSeen()
-    coord, cov, p_secret, _eth_leg, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, t_rxd_blocks=60, seen=seen)
+    coord, cov, p_secret, _eth_leg, _rxd, taker_rxd, maker_rxd = _build(
+        node, url, workdir, token, t_rxd_blocks=60, seen=seen
+    )
     terms = coord.record.terms
     reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
 
     _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
     node.rxd_mine(3)
-    taker_before = _usdc_balance(url, _ADDR_TAKER)
+    taker_before = _usdc_balance(url, _ADDR_TAKER, token)
 
     # CRASH: let the deploy land and be persisted, then die before the token push completes.
     real_send = coord._token_leg._sign_and_send
@@ -529,11 +557,13 @@ async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_fundin
     assert on_disk["pending_push_nonce"] is not None, "no nonce pin: a retry would be ADDITIVE"
     code = _rpc(url, "eth_getCode", [htlc, "latest"])["result"]
     assert code not in ("0x", ""), "no contract at the recorded address"
-    assert _usdc_balance(url, htlc) == 0, "the push should NOT have landed"
+    assert _usdc_balance(url, htlc, token) == 0, "the push should NOT have landed"
 
     # RESUME in a fresh coordinator, as a restarted process would — loading the record from disk.
     sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
-    coord2, cov2, _p2, _leg2, _rxd2, _tk2, _mk2 = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    coord2, cov2, _p2, _leg2, _rxd2, _tk2, _mk2 = _build(
+        node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse
+    )
     assert cov2.funded_spk == cov.funded_spk, "the rebuilt covenant is not the funded one"
     rec = await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
 
@@ -542,13 +572,13 @@ async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_fundin
         "the resume DEPLOYED A SECOND CONTRACT instead of completing the recorded one"
     )
     # THE arithmetic: exactly the negotiated amount, in exactly one contract.
-    assert _usdc_balance(url, htlc) == _AMOUNT, (
-        f"the HTLC holds {_usdc_balance(url, htlc)}, not {_AMOUNT} — a resume that re-sent the full "
+    assert _usdc_balance(url, htlc, token) == _AMOUNT, (
+        f"the HTLC holds {_usdc_balance(url, htlc, token)}, not {_AMOUNT} — a resume that re-sent the full "
         "amount would leave double, and claim sweeps the whole balance to the counterparty"
     )
     # The other half of the same arithmetic, from the payer's side. The contract balance alone
     # cannot distinguish "funded once" from "funded twice into two contracts" — this can.
-    spent = taker_before - _usdc_balance(url, _ADDR_TAKER)
+    spent = taker_before - _usdc_balance(url, _ADDR_TAKER, token)
     assert spent == _AMOUNT, f"the taker paid {spent}, not {_AMOUNT}: the crash cost them a second HTLC"
 
 
@@ -564,15 +594,17 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
     Reproduced by turning anvil's automine off for the push, so the transfer sits pending exactly
     as it would behind a congested basefee.
     """
-    node, url, workdir = env
+    node, url, workdir, token = env
     seen = _InMemSeen()
-    coord, cov, p_secret, _eth, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, t_rxd_blocks=60, seen=seen)
+    coord, cov, p_secret, _eth, _rxd, taker_rxd, maker_rxd = _build(
+        node, url, workdir, token, t_rxd_blocks=60, seen=seen
+    )
     terms = coord.record.terms
     reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
 
     _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
     node.rxd_mine(3)
-    taker_before = _usdc_balance(url, _ADDR_TAKER)
+    taker_before = _usdc_balance(url, _ADDR_TAKER, token)
 
     leg = coord._token_leg
     real_send, real_wait = leg._sign_and_send, leg._rpc.wait_receipt
@@ -599,7 +631,7 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
     pinned = on_disk.get("pending_push_nonce")
     assert pinned is not None, "no durable nonce pin: the resume cannot replace its own pending push"
 
-    coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse)
     sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
 
     # WHILE THE PUSH IS PENDING the resume REFUSES, and does not reach the pinned re-send at all.
@@ -617,15 +649,15 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
     # Now the resume completes — and finds nothing left to do, because the push it was going to
     # retry is the one that just landed. THE property, end to end: crash mid-broadcast, resume,
     # and the value is delivered EXACTLY once.
-    rec = await coord3_resume(node, url, workdir, seen, reuse, terms, sink)
+    rec = await coord3_resume(node, url, workdir, token, seen, reuse, terms, sink)
     htlc = on_disk["pending_counter_contract"]
     assert rec.counterchain_locator.contract_address.lower() == htlc.lower()
-    assert _usdc_balance(url, htlc) == _AMOUNT, f"HTLC holds {_usdc_balance(url, htlc)}, not {_AMOUNT}"
-    spent = taker_before - _usdc_balance(url, _ADDR_TAKER)
+    assert _usdc_balance(url, htlc, token) == _AMOUNT, f"HTLC holds {_usdc_balance(url, htlc, token)}, not {_AMOUNT}"
+    spent = taker_before - _usdc_balance(url, _ADDR_TAKER, token)
     assert spent == _AMOUNT, f"the taker paid {spent}, not {_AMOUNT}: the crashed push and the resume BOTH delivered"
 
 
-async def coord3_resume(node, url, workdir, seen, reuse, terms, sink):
+async def coord3_resume(node, url, workdir, token, seen, reuse, terms, sink):
     """A third process, resuming after the pending push settled."""
-    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse)
     return await coord3.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
