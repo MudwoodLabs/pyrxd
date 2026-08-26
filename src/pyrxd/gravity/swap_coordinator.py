@@ -1533,7 +1533,15 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            rxd_block_interval_s=policy.rxd_block_interval_s,
+            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
+            # interval is "a no-op input" because the sizer divides by it and this multiplies by
+            # it — true ONLY while both use the same one. It was passed the NOMINAL while
+            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
+            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
+            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
+            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
+            # maker holds the refunded asset AND can still claim the counter leg with p.
+            rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=policy.max_covenant_confirm_wait_s,
         )
 
@@ -1741,7 +1749,15 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            rxd_block_interval_s=policy.rxd_block_interval_s,
+            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
+            # interval is "a no-op input" because the sizer divides by it and this multiplies by
+            # it — true ONLY while both use the same one. It was passed the NOMINAL while
+            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
+            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
+            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
+            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
+            # maker holds the refunded asset AND can still claim the counter leg with p.
+            rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
         )
 

@@ -245,14 +245,23 @@ def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> Non
     caught it AFTER the covenant had been funded, because nothing checked it at argument-parse
     time. This does, so the operator learns the valid RANGE before spending a fee.
     """
-    nominal = float(args.rxd_block_interval_s)
+    # THE SAME INTERVAL THE GATE MULTIPLIES BY. It used the nominal, matching a coordinator call
+    # site that was itself passing the wrong one; the two agreed with each other and disagreed with
+    # the sizer. With the gate corrected to the fast tail this bound divides by the fast tail too,
+    # so the canonical sizing is representable again instead of being forbidden by its own guard.
+    nominal = float(args.rxd_block_interval_fast_s or args.rxd_block_interval_s)
     # RESERVE the covenant-confirm window. The gate anchors the projection on the covenant's
     # CONFIRMATION time, not on the runner's start, so however long funding-and-mining takes comes
     # straight out of the budget. Sizing against `now` silently assumes instant funding: a run that
     # took ~740s to fund and mine overshot by 607s and was refused AFTER the covenant was paid for.
     # `max_covenant_confirm_wait_s` is precisely the allowance for that delay, so spend it here.
     budget_s = int(args.eth_timeout_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
-    hi = math.floor(budget_s / nominal)
+    # The gate refuses at `projected >= deadline`, so the largest ACCEPTED value is one short of
+    # the quotient when it divides exactly. Verified by binary-searching the real gate: for a 24h
+    # timeout it accepts 2186 and refuses 2187, while a bare floor() computes 2187. An upper bound
+    # that names a value the gate then rejects sends the operator to fix an error into an error —
+    # which is exactly how this run burned two funded covenants.
+    hi = math.ceil(budget_s / nominal) - 1
     have = int(args.t_rxd_blocks)
     if have <= hi:
         return
