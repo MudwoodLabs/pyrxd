@@ -63,10 +63,10 @@ from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet RES
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
-from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.eth_wallet.chains import evm_chain_by_id
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, token_for
 from pyrxd.glyph.types import GlyphRef
@@ -117,15 +117,20 @@ def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
 
 
 def _evm_is_value_bearing(chain_id: int) -> bool:
-    """Whether the EVM leg moves real value — decided by the CHAIN REGISTRY, never by the stage
-    name.
+    """Whether the EVM leg's coins are real — read from the chain registry, never from the stage
+    name and never from the audit tag.
 
-    `_leg_is_value_bearing` in the coordinator uses exactly this rule (a `network` tag outside
-    `AUDIT_CLEARED_NETWORKS`), so the runner and the coordinator cannot end up disagreeing about
-    which side of the line a run is on. Note Sepolia counts as value-bearing under it too: the
-    tag is about audit clearance, not about whether the coins are worth anything.
+    A first version asked whether the `network` tag was outside `AUDIT_CLEARED_NETWORKS`, matching
+    the coordinator's `_leg_is_value_bearing`. That is the right rule for the AUDIT gate and the
+    wrong one here: the cleared set holds Bitcoin-family tags, so every EVM chain reads as
+    value-bearing — Base Sepolia included. It forced measured margins and a two-endpoint quorum
+    onto a faucet-money rehearsal, which is a guard refusing honest work. The runner's own wiring
+    tests caught it.
+
+    `is_testnet` states it per registry entry instead. The two questions genuinely differ: nothing
+    here is audit-cleared, and only some of it is worth anything.
     """
-    return evm_chain_by_id(int(chain_id)).network not in AUDIT_CLEARED_NETWORKS
+    return not evm_chain_by_id(int(chain_id)).is_testnet
 
 
 def _policy(args: argparse.Namespace) -> MarginPolicy:
@@ -280,8 +285,39 @@ def _counter_value(args):
     return int(args.eth_amount_wei) if args.counter_asset == "native" else int(args.token_amount)
 
 
+def _eth_rpc(args, *, rpc_url: str, chain_id: int):
+    """One endpoint, or a QUORUM of them once the token leg carries real value.
+
+    `--eth-rpc-url` takes a comma-separated list. One URL keeps today's behaviour exactly; two or
+    more build a `MultiSourceEthRpc`, so the reads a swap cannot take back — is the counter leg
+    funded, is this address frozen, is the claim final — stop resting on one endpoint's word.
+
+    A real token leg REQUIRES at least two, and that is a deliberate constraint on the operator
+    rather than a default. The single-source read defends a failing provider, not a lying one, and
+    the lagging case is the common one: a load-balanced provider serving a stale node is already
+    recorded in this codebase as having refused a claim and nearly killed a secret.
+
+    Independence is the operator's job and this code cannot check it. Three URLs at one provider
+    share one operator and one outage, and would satisfy the count while providing nothing.
+    """
+    urls = [u.strip() for u in str(rpc_url).split(",") if u.strip()]
+    if not urls:
+        raise SystemExit("--eth-rpc-url is required")
+    if len(urls) == 1:
+        if _token_leg_is_real(args):
+            raise SystemExit(
+                "a real-value token counter leg requires at least TWO independent --eth-rpc-url "
+                "endpoints (comma-separated), so no irreversible step rests on one endpoint's "
+                "word. Working L1 endpoints measured 2026-08-26: ethereum-rpc.publicnode.com. "
+                "Use providers with DIFFERENT operators — several URLs from one provider share a "
+                "single failure and satisfy nothing."
+            )
+        return EthRpc(urls[0], expected_chain_id=chain_id)
+    return MultiSourceEthRpc([EthRpc(u, expected_chain_id=chain_id) for u in urls])
+
+
 def _eth_leg(args, *, rpc_url, chain_id, key_hex, claim_to, refund_to, eth_timeout, network):
-    rpc = EthRpc(rpc_url, expected_chain_id=chain_id)
+    rpc = _eth_rpc(args, rpc_url=rpc_url, chain_id=chain_id)
     token = _counter_token(args)
     artifact = load_artifact(args.eth_artifact if token is None else args.erc20_artifact)
     key = PrivateKeyMaterial(bytes.fromhex(key_hex))
@@ -307,6 +343,24 @@ def _eth_leg(args, *, rpc_url, chain_id, key_hex, claim_to, refund_to, eth_timeo
 
 async def run_dry(args: argparse.Namespace) -> None:
     print("=== ETH↔RXD swap runner — stage=dry-run (local anvil; NO real value) ===")
+    if args.counter_asset != "native":
+        # A plain anvil has no token contracts, and this stage runs one at chain 31337 rather than
+        # a fork of the chain the token is pinned on. Deploying a MOCK token to close that gap
+        # would test a fiction: the properties most likely to be wrong on this path are runtime
+        # behaviours of the real bytecode — Tether's `transfer` returns no bool, its freeze
+        # predicate is spelled `isBlackListed`, and USDC is 6-decimal — and a mock reproduces
+        # exactly the ones someone remembered to write down.
+        #
+        # Without this the failure is a confusing "no pinned USDT on chain id 11155111", which
+        # blames the registry for a stage limitation.
+        raise SystemExit(
+            f"stage=dry-run is native-ETH only; --counter-asset {args.counter_asset} needs a chain "
+            "that actually has the token on it. The token-path rehearsal is the fork lifecycle "
+            "suite, which drives the production SwapCoordinator against the REAL token contract:\n"
+            "  XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \\\n"
+            "      .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration\n"
+            "It covers USDC and USDT on a mainnet fork, including the freeze gates."
+        )
     if "anvil" not in _which("anvil"):
         raise SystemExit("anvil not found on PATH — install foundry (the dry-run deploys on a local anvil)")
     port = _free_port()
@@ -736,7 +790,15 @@ def _args() -> argparse.Namespace:
         ),
     )
     # ETH
-    ap.add_argument("--eth-rpc-url", default="")
+    ap.add_argument(
+        "--eth-rpc-url",
+        default="",
+        help=(
+            "EVM endpoint. Comma-separated for a QUORUM, which a real token counter leg requires: "
+            "safety-critical reads then need agreement instead of one endpoint's word. Use "
+            "independent providers — several URLs from one provider share a single failure."
+        ),
+    )
     ap.add_argument("--eth-key-hex", default="")
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument("--eth-amount-wei", type=int, default=10**14)  # 0.0001 ETH dust

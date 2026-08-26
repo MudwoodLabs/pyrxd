@@ -20,6 +20,8 @@ import pytest
 
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.security.errors import ValidationError
 
 _RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "eth_swap_run.py"
@@ -54,12 +56,16 @@ def _contract_leg(leg):
     return leg
 
 
-def _make_leg(runner, args):
+def _make_leg(runner, args, rpc_url="http://127.0.0.1:1"):
     # An unreachable URL on purpose: constructing the leg must not require a live node, and this
     # test is about which CLASS gets built, not about talking to a chain.
+    #
+    # `rpc_url` is a parameter because a real-value token leg REQUIRES two endpoints, so a
+    # mainnet-token case has to say so rather than quietly getting an exemption a real run
+    # would not get.
     _rpc, leg = runner._eth_leg(
         args,
-        rpc_url="http://127.0.0.1:1",
+        rpc_url=rpc_url,
         chain_id=int(args.eth_chain_id),
         key_hex="11" * 32,
         claim_to="0x" + "11" * 20,
@@ -154,7 +160,67 @@ def test_a_bridged_usdt_leg_builds_without_a_freeze_predicate(runner):
     """has_blacklist=False must not break leg construction. The OP-stack bridged USDT has no freeze
     function at all, and a leg that only works for freezable tokens would refuse honest work."""
     args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "8453")
-    leg = _make_leg(runner, args)
+    # Base mainnet USDT is real value, so two endpoints — the same requirement a real run carries.
+    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2")
     assert isinstance(leg, Erc20HtlcLeg)
     assert leg._token.has_blacklist is False
     assert leg._token.chain_id == 8453
+
+
+class TestTheQuorumIsREACHABLEFromTheRunner:
+    """`MultiSourceEthRpc` existed, was tested, and no run could reach it.
+
+    The runner built a single `EthRpc`, so every safety-critical read on a real run stayed
+    single-source no matter what the class did — built-but-unreachable, the same shape as the
+    ERC-20 leg before this file existed. These drive the runner's real factory for that reason.
+    """
+
+    def test_one_url_still_builds_a_plain_EthRpc(self, runner) -> None:
+        """Backwards compatibility, and the honest-path pair for the refusal below."""
+        args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
+        assert isinstance(rpc, EthRpc)
+
+    def test_TWO_urls_build_a_quorum(self, runner) -> None:
+        args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1, http://127.0.0.1:2", chain_id=1)
+        assert isinstance(rpc, MultiSourceEthRpc)
+        assert len(rpc.sources) == 2 and rpc.min_agreeing == 2
+
+    def test_a_REAL_token_leg_REFUSES_a_single_endpoint(self, runner) -> None:
+        """The constraint that makes the quorum matter. A value-bearing token leg on one endpoint
+        is the configuration where a lying or lagging provider costs the preimage."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        with pytest.raises(SystemExit, match="at least TWO independent"):
+            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
+
+    def test_a_real_token_leg_is_SATISFIED_by_two(self, runner) -> None:
+        """Paired with the refusal: a guard that refused every configuration would pass that test
+        too, and would make the run impossible rather than safe."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2", chain_id=1)
+        assert isinstance(rpc, MultiSourceEthRpc)
+
+    def test_a_TESTNET_token_leg_is_not_forced_into_a_quorum(self, runner) -> None:
+        """Base Sepolia USDC is faucet money. Requiring two endpoints there would refuse honest
+        rehearsal work for no safety gain — the constraint tracks value, not the token type."""
+        args = _parse(runner, "--counter-asset", "usdc", "--eth-chain-id", str(_BASE_SEPOLIA))
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=_BASE_SEPOLIA)
+        assert isinstance(rpc, EthRpc)
+
+    def test_the_leg_actually_RECEIVES_the_quorum(self, runner) -> None:
+        """The reachability assertion proper: not just that `_eth_rpc` can build one, but that the
+        leg the coordinator drives is holding it."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        rpc, leg = runner._eth_leg(
+            args,
+            rpc_url="http://127.0.0.1:1,http://127.0.0.1:2",
+            chain_id=1,
+            key_hex="11" * 32,
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout=2_000_000_000,
+            network="mainnet",
+        )
+        assert isinstance(rpc, MultiSourceEthRpc)
+        assert _contract_leg(leg)._rpc is rpc, "the leg must hold the quorum, not a fresh single rpc"
