@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -108,11 +109,21 @@ class _CapturingEthLeg:
 
 
 def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
+    """The cross-clock margin, including the ETH finality STALL budget.
+
+    `eth_finality_stall_tolerance_s` defaulted to 0 and the runner had no flag for it at all, so
+    a measured policy refused at setup: real-value mode requires >= 3600s, because the taker waits
+    for ETH FINALITY before claiming RXD and the RXD refund must not open until it has had a
+    stall-tolerant window. The May-2023 mainnet stall ran about an hour. Sizing this against
+    happy-path finality is precisely the bug a stall triggers, which is why it is an explicit
+    operator number rather than something derived from the finalization window.
+    """
     return CrossClockMargin(
         eth_reorg_finality_s=args.eth_finalization_window_s,
         rxd_claim_burial_s=args.rxd_claim_burial_s,
         rxd_confirm_slack_s=args.rxd_confirm_slack_s,
         rounding_slack_s=args.rounding_slack_s,
+        eth_finality_stall_tolerance_s=args.eth_finality_stall_tolerance_s,
     )
 
 
@@ -155,6 +166,14 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
     )
     if not _token_leg_is_real(args):
         return MarginPolicy(is_measured=False, **common)
+    if args.eth_finality_stall_tolerance_s < 3600:
+        raise SystemExit(
+            "a real-value token counter leg needs --eth-finality-stall-tolerance-s >= 3600. The "
+            "taker waits for ETH finality before claiming RXD, so the RXD refund must not open "
+            "until it has had a stall-tolerant window; the May-2023 mainnet stall ran about an "
+            "hour. Sizing this against happy-path finality is the bug a stall triggers."
+        )
+    _assert_t_rxd_covers_the_takers_wait(args)
     if not args.rxd_block_interval_fast_s:
         raise SystemExit(
             "a real-value token counter leg needs --rxd-block-interval-fast-s (the MEASURED p10 "
@@ -167,6 +186,47 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
         require_measured=True,
         rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
         **common,
+    )
+
+
+def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> None:
+    """The RXD refund must not open before the taker has finished waiting for ETH finality.
+
+    `--t-rxd-blocks` is an operator flag on this runner, not a derived value, and NOTHING on this
+    path checks it against the ETH deadline. The one gate that runs — `assert_covenant_confirms_
+    before_eth_deadline` — is a PUNCTUALITY check (does the covenant confirm when the sizing
+    assumed), and its own docstring says it is "not a slow-chain defence"; the interval cancels out
+    of its arithmetic entirely.
+
+    So the unsafe direction is unguarded, and the default is on the wrong side of it. t_rxd is a
+    RELATIVE CSV in blocks: measure it at the FAST tail, because fast Radiant blocks are what
+    SHRINK the taker's window. At the measured p10 of 36s the default 60 blocks matures in 36
+    minutes, while the cross-clock margin the taker must sit through — ETH finality, the stall
+    budget, claim burial, slack — is about two hours. The maker could refund the asset while the
+    taker was still, correctly, waiting.
+
+    A slow chain is the harmless direction: it only lengthens the maker's lock, which is a liveness
+    cost and gives the taker MORE time. `eth_rxd_timelock` states that split explicitly.
+
+    Only enforced for a real token leg. Sepolia keeps its existing defaults exactly.
+    """
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return  # the missing-measurement refusal below is the better error
+    margin_s = _cross_clock_margin(args).total_s()
+    need = math.ceil(margin_s / fast)
+    have = int(args.t_rxd_blocks)
+    if have >= need:
+        return
+    raise SystemExit(
+        f"--t-rxd-blocks {have} is too SHORT for a real-value run. At the measured fast tail of "
+        f"{fast:.0f}s/block it matures in {have * fast / 3600:.2f} h, but the taker must first sit "
+        f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
+        f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
+        f"was still waiting.\n"
+        f"  minimum: --t-rxd-blocks {need}\n"
+        f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
+        f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
 
 
@@ -880,6 +940,16 @@ def _args() -> argparse.Namespace:
     # known chain gets its VETTED finalization window (e.g. Base 900s, not Ethereum's 768s); an
     # operator value always overrides. Realizes the registry's fail-closed per-chain safety.
     ap.add_argument("--eth-finalization-window-s", type=int, default=None)
+    ap.add_argument(
+        "--eth-finality-stall-tolerance-s",
+        type=int,
+        default=0,
+        help=(
+            "ADDITIONAL budget for an ETH finality STALL, seconds. Real-value mode requires "
+            ">= 3600 (the May-2023 mainnet stall ran about an hour). 0 keeps the existing "
+            "testnet behaviour; a measured policy refuses it."
+        ),
+    )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)
     ap.add_argument("--rounding-slack-s", type=int, default=300)
