@@ -36,6 +36,7 @@ from .erc20 import (
 )
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy, normalise_tx_hash
+from .multi_rpc import read_contract
 from .tokens import Erc20Token
 
 #: Measured on a mainnet fork against the real USDC proxy (block 25,815,805): a `transfer` into a
@@ -212,7 +213,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
     async def _deploy(self, *, web3, hashlock, claimant, refundee, timeout, amount_wei, on_deploy):
         """Deploy a fresh HTLC and report it before any value moves. Returns (address, tx hash)."""
         checksum = web3.Web3.to_checksum_address
-        c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
+        c = self._rpc.write_w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
         ctor = c.constructor(
             bytes(hashlock),
             checksum(claimant),
@@ -324,7 +325,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 htlc_address=address,
             )
             # --- push the tokens in. No approve, no transferFrom. ---
-            token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
+            token_c = self._rpc.write_w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
             push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)
             # PIN THE NONCE, and reuse the pin on every retry. Measured on 2026-08-24: a second
             # transaction at an already-used nonce is rejected ("nonce too low" once mined,
@@ -522,10 +523,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         await assert_token_matches_chain(self._rpc, self._token, block_identifier)
 
         web3 = _require_web3()
-        on_chain_token = await (
-            self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-            .functions.token()
-            .call(block_identifier="latest" if block_identifier is None else block_identifier)
+        _bid = "latest" if block_identifier is None else block_identifier
+
+        def _htlc_immutable(name: str):
+            # Rebuilt per endpoint so a multi-source rpc gets a real quorum rather than one
+            # endpoint's word. Identity reads: which asset the contract holds, and how much it
+            # was constructed for, are not quantities to average.
+            def _call(r):
+                c = r.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+                return getattr(c.functions, name)().call(block_identifier=_bid)
+
+            return _call
+
+        on_chain_token = await read_contract(
+            self._rpc, _htlc_immutable("token"), label=f"{locator.contract_address}.token()"
         )
         if web3.Web3.to_checksum_address(on_chain_token) != web3.Web3.to_checksum_address(self._token.address):
             raise ValidationError(
@@ -539,9 +550,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # counterparty deploying a look-alike whose stored amount disagrees with the negotiation —
         # and it stops being merely defensive the moment the contract's payout stops being a sweep.
         on_chain_amount = int(
-            await self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-            .functions.amount()
-            .call(block_identifier="latest" if block_identifier is None else block_identifier)
+            await read_contract(self._rpc, _htlc_immutable("amount"), label=f"{locator.contract_address}.amount()")
         )
         if on_chain_amount != expected_amount_wei:
             raise ValidationError(

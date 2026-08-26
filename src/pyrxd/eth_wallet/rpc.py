@@ -52,6 +52,21 @@ class EthRpc:
     def w3(self) -> Any:
         return self._w3
 
+    @property
+    def write_w3(self) -> Any:
+        """The web3 used to BUILD transactions. Identical to ``w3`` here.
+
+        It exists so the legs can name the difference between building a transaction (which has to
+        happen against one endpoint) and reading state (which should not). ``MultiSourceEthRpc``
+        makes ``w3`` fatal precisely so an unconverted READ cannot quietly run single-source; the
+        write sites say ``write_w3`` and mean it.
+        """
+        return self.w3
+
+    async def latest_block_timestamp(self) -> int:
+        """Head timestamp, for the claim-deadline and refund-maturity guards."""
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
     async def assert_chain(self) -> None:
         """Fail-closed if the endpoint is not the chain this swap was negotiated for."""
         try:

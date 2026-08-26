@@ -73,6 +73,10 @@ class _FakeRpc:
             eth = _W3Eth()
 
         self.w3 = _W3()
+        self.write_w3 = self.w3
+
+    async def latest_block_timestamp(self):
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
     async def assert_chain(self):
         return None

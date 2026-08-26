@@ -33,6 +33,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator, normalise_tx_hash
+from pyrxd.eth_wallet.multi_rpc import read_contract
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
@@ -277,13 +278,27 @@ class EthHtlcContractLeg:
         if not self._runtime_code_matches(code):
             raise ValidationError("on-chain runtime logic != committed EthHtlc artifact (wrong/attacker contract)")
         # Read immutables back by value and bind them to the negotiated terms.
+        #
+        # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
+        # every one of these becomes a quorum read. They are IDENTITY reads — no `combine` — because
+        # an endpoint disagreeing about a contract's hashlock is describing a different contract,
+        # and these four binds are what stand between a maker and revealing the preimage to a
+        # look-alike. Single-source callers are unchanged: `read_contract` calls straight through.
         web3 = _require_web3()
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         _bid = "latest" if block_identifier is None else block_identifier
-        on_h = bytes(await c.functions.hashlock().call(block_identifier=_bid))
-        on_claimant = await c.functions.claimant().call(block_identifier=_bid)
-        on_refundee = await c.functions.refundee().call(block_identifier=_bid)
-        on_timeout = int(await c.functions.timeout().call(block_identifier=_bid))
+
+        def _immutable(name: str):
+            def _call(r):
+                c = r.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+                return getattr(c.functions, name)().call(block_identifier=_bid)
+
+            return _call
+
+        addr = locator.contract_address
+        on_h = bytes(await read_contract(self._rpc, _immutable("hashlock"), label=f"{addr}.hashlock()"))
+        on_claimant = await read_contract(self._rpc, _immutable("claimant"), label=f"{addr}.claimant()")
+        on_refundee = await read_contract(self._rpc, _immutable("refundee"), label=f"{addr}.refundee()")
+        on_timeout = int(await read_contract(self._rpc, _immutable("timeout"), label=f"{addr}.timeout()"))
         if on_h != locator.hashlock_bytes:
             raise ValidationError("on-chain hashlock != negotiated H")
         if web3.Web3.to_checksum_address(on_claimant) != web3.Web3.to_checksum_address(locator.claimant):
@@ -435,7 +450,7 @@ class EthHtlcContractLeg:
             # swap's funded HTLC and must not be reported as one.
             await self.verify_funded(locator, expected_amount_wei=int(amount_wei))
             return locator
-        c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
+        c = self._rpc.write_w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
         # constructor(bytes32 _hashlock, address _claimant, address _refundee, uint256 _timeout)
         ctor = c.constructor(
             bytes(hashlock),
@@ -523,8 +538,8 @@ class EthHtlcContractLeg:
             # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
             # p to the provider), so nothing downstream catches expiry either. This check is the
             # only thing standing between a stalling counterparty and a free option.
-            head = await self._rpc.w3.eth.get_block("latest")
-            chain_ts, local_ts = int(head["timestamp"]), int(time.time())
+            chain_ts = await self._rpc.latest_block_timestamp()
+            local_ts = int(time.time())
             # Take the LATER of chain head and local clock. A lagging or hostile provider can only
             # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
             # guard pass when it should refuse — round 5's finding: a provider 4 minutes behind, or
@@ -548,7 +563,7 @@ class EthHtlcContractLeg:
                     "publishes the preimage in its calldata while paying nothing, which hands the "
                     "counterparty both legs. Refund after the timeout instead."
                 )
-            c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+            c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
             built = await c.functions.claim(bytes(preimage)).build_transaction(
                 await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
             )
@@ -574,7 +589,7 @@ class EthHtlcContractLeg:
         of truth for the deadline.
         """
         await self._rpc.assert_chain()
-        now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
+        now_ts = await self._rpc.latest_block_timestamp()
         if now_ts < int(locator.timeout):
             # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition
             # (wait for the timeout, then refund), not a permanent input error — consistent with the
@@ -584,7 +599,7 @@ class EthHtlcContractLeg:
                 f"({int(locator.timeout) - now_ts}s to go) — refusing to submit a refund the contract "
                 "would revert (gas/clarity guard; the contract enforces the deadline regardless)."
             )
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+        c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = await c.functions.refund().build_transaction(await self._base_tx(gas=100_000))
         return await self._sign_and_send(built)
 

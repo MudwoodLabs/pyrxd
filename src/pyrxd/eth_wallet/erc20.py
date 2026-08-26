@@ -16,6 +16,7 @@ from typing import Any
 
 from ..security.errors import NetworkError, ValidationError
 from .htlc_leg import _require_web3
+from .multi_rpc import read_contract
 from .tokens import Erc20Token
 
 #: The reads this module performs, plus ``symbol()`` — which nothing calls today and is kept
@@ -84,7 +85,16 @@ async def balance_of(rpc: Any, token: Erc20Token, owner: str, block_identifier: 
     """
     bid = "latest" if block_identifier is None else block_identifier
     try:
-        return int(await _contract(rpc, token).functions.balanceOf(owner).call(block_identifier=bid))
+        # MIN across a quorum when `rpc` is multi-source: a lagging endpoint can then only
+        # UNDER-report and refuse a swap, never over-credit one into a reveal.
+        return int(
+            await read_contract(
+                rpc,
+                lambda r: _contract(r, token).functions.balanceOf(owner).call(block_identifier=bid),
+                label=f"{token.symbol}.balanceOf({owner})",
+                combine=min,
+            )
+        )
     except Exception as exc:  # transport failures are transient by nature
         raise NetworkError(f"could not read {token.symbol} balance of {owner}: {exc}") from exc
 
@@ -103,7 +113,15 @@ async def assert_token_matches_chain(rpc: Any, token: Erc20Token, block_identifi
     """
     bid = "latest" if block_identifier is None else block_identifier
     try:
-        on_chain = int(await _contract(rpc, token).functions.decimals().call(block_identifier=bid))
+        # IDENTITY read: endpoints that disagree about a token's decimals are reporting different
+        # contracts, and a majority vote on which is right would be guessing at a 10^N scale.
+        on_chain = int(
+            await read_contract(
+                rpc,
+                lambda r: _contract(r, token).functions.decimals().call(block_identifier=bid),
+                label=f"{token.symbol}.decimals()",
+            )
+        )
     except Exception as exc:
         raise NetworkError(f"could not read decimals() for {token.symbol} at {token.address}: {exc}") from exc
     if on_chain != token.decimals:
@@ -138,10 +156,19 @@ async def is_blacklisted(rpc: Any, token: Erc20Token, address: str) -> bool:
     if not token.has_blacklist:
         # Pinned capability, not a probe: a token that cannot freeze cannot freeze this swap.
         return False
+
+    def _read(r: Any) -> Any:
+        contract = _contract(r, token, abi=_freeze_abi(token))
+        return getattr(contract.functions, token.blacklist_fn)(address).call(block_identifier="latest")
+
     try:
-        contract = _contract(rpc, token, abi=_freeze_abi(token))
-        fn = getattr(contract.functions, token.blacklist_fn)
-        return bool(await fn(address).call(block_identifier="latest"))
+        # ANY across a quorum, not a majority: the dangerous answer is "not frozen", so one
+        # endpoint reporting a freeze is enough to refuse. A lying source can therefore cost a
+        # swap that was fine — recoverable, both legs refund — but cannot talk this stack into
+        # revealing into a freeze, which is not.
+        return bool(
+            await read_contract(rpc, _read, label=f"{token.symbol}.{token.blacklist_fn}({address})", combine=any)
+        )
     except Exception as exc:
         raise NetworkError(
             f"could not determine whether {address} is frozen by {token.symbol}: {exc}. Refusing to "

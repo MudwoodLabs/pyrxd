@@ -50,6 +50,10 @@ class _Broken:
             eth = _Eth()
 
         self.w3 = _W3()
+        self.write_w3 = self.w3
+
+    async def latest_block_timestamp(self):
+        return int(time.time())
 
 
 @pytest.mark.parametrize(
@@ -198,6 +202,11 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
         class _Rpc:
             w3 = _W3()
+
+            write_w3 = w3
+
+            async def latest_block_timestamp(self):
+                return int(time.time())
 
         import json
         import pathlib
@@ -385,6 +394,11 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
 
     class _Rpc:
         w3 = _W3()
+
+        write_w3 = w3
+
+        async def latest_block_timestamp(self):
+            return int(time.time())
 
         async def assert_chain(self):
             return None

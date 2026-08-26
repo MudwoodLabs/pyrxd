@@ -109,6 +109,11 @@ def _leg(
     class _Rpc:
         w3 = _W3()
 
+        write_w3 = w3  # the fake builds transactions against the same object it reads from
+
+        async def latest_block_timestamp(self):
+            return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
         async def assert_chain(self):
             return None
 
@@ -394,6 +399,11 @@ def _real_verify_leg(
     class _Rpc:
         w3 = _W3()
 
+        write_w3 = w3  # the fake builds transactions against the same object it reads from
+
+        async def latest_block_timestamp(self):
+            return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
         async def assert_chain(self):
             return None
 
@@ -563,6 +573,11 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
 
     class _Rpc:
         w3 = _W3()
+
+        write_w3 = w3  # the fake builds transactions against the same object it reads from
+
+        async def latest_block_timestamp(self):
+            return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
         async def assert_chain(self):
             return None
