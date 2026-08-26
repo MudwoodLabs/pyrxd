@@ -50,10 +50,18 @@ Three things, none of which is a fix:
    one swap. A shared multi-swap HTLC would be a single freeze-point for every swap at once — this
    is the security argument for the topology, and it is why the sibling repo's shared
    `HashedTimelock` was **not** adopted.
-2. **A pre-reveal gate, inside `claim`.** Blacklist status for the contract *and* both parties is
-   checked at the **tip** immediately before the reveal. It lives inside the dangerous operation
+2. **A pre-reveal gate, inside `claim`.** Blacklist status for the contract and the **claimant**
+   is checked at the **tip** immediately before the reveal. It lives inside the dangerous operation
    rather than beside it, because a gate a caller must remember to invoke eventually is not
    invoked — which is exactly what happened for a full review cycle.
+
+   The **refundee is deliberately not checked here**, and an earlier revision of this page said it
+   was. A `claim` sweeps the contract to the claimant; the refundee is touched only by `refund()`,
+   so a frozen refundee cannot make the claim revert. Refusing on it would be a guard refusing
+   valid work, and worse: it would hand the counterparty a free unilateral veto, since a taker who
+   becomes sanctioned after funding could kill the maker's only route to tokens it had already
+   earned. The refundee belongs in a pre-**fund** gate, where a freeze really would strand the
+   refund — and no such gate exists yet.
 3. **A short funded window.** Exposure is the time tokens sit in the contract, so a tighter timeout
    is a safety property here in a way it is not for native ETH. This cuts against the usual
    instinct to be generous with timelocks.

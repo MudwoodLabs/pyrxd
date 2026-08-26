@@ -26,7 +26,11 @@ enforced on-chain:
 - **Trustless cross-chain atomic swaps.** Trade a Radiant asset (RXD / FT / NFT) against
   BTC or ETH — and EVM L2s (Base, Optimism, Arbitrum, Linea) — with **no bridge and no
   custodian**: a hash-timelock swap driven by a chain-neutral coordinator. Proven
-  end-to-end on regtest and on small real-value mainnet / Sepolia runs.
+  end-to-end on regtest and on small real-value mainnet / Sepolia runs. The EVM leg can
+  settle in **USDC or USDT** instead of native ETH — pinned per chain, never resolved by
+  symbol — so a quote holds its value across the
+  timelock window — for a weaker trust model, since a stablecoin issuer can freeze the
+  asset and atomicity there is conditional on the issuer not intervening.
   → [build a cross-chain swap](https://mudwoodlabs.github.io/pyrxd/how-to/build-a-cross-chain-swap.html)
 - **Recursive covenants.** Bitcoin-style script + induction lets a coin constrain the coin
   that spends it — soulbound NFTs, swap covenants, PoW-mint contracts.
@@ -71,8 +75,9 @@ mainnet. If you find a bug that affects funds, report it via the
 - Cross-chain HTLC atomic swaps (`pyrxd.gravity`) — RXD covenant + BTC Taproot + ETH
   Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
-  Linea). This cross-chain swap stack is **unaudited — verify it yourself before moving
-  real value.**
+  Linea) — the EVM legs in native ETH, in USDC on any of those chains, or in USDT on the
+  three where it is pinned (Ethereum, Optimism, Base). This cross-chain swap stack is
+  **unaudited — verify it yourself before moving real value.**
 
 ## Upgrading
 

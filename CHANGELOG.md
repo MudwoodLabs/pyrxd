@@ -64,15 +64,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     "funded", which costs nothing: the coordinator already documents that an HTLC address commits
     to immutables, not to the funded balance.
   - Token addresses are **pinned per chain id** from the issuer's own list and never resolved by
-    symbol. Bridged `USDC.e` on Arbitrum and Optimism is refused **by address**, named for what it
-    is, because it shares the symbol and is a different asset with different liquidity.
+    symbol. Bridged `USDC.e` on Arbitrum and Optimism, Arbitrum's omnichain `USDT0`, and BNB Smart
+    Chain's Binance-Peg `USDC` are refused **by address**, each named for what it is, because they
+    share a symbol with a different asset carrying different liquidity. The BSC one is also 18
+    decimals where Circle's USDC is 6 everywhere, so resolving it by symbol would be a
+    wrong-issuer error and a 10^12 scale error at once.
   - Decimals are pinned **and** verified against the live contract at swap start; a 6-vs-18
     disagreement is a factor of 10^12 in every amount.
-  - `assert_not_frozen_before_reveal` is the pre-reveal blacklist gate and includes the **HTLC
-    contract address**, not just the two parties: measured against the real USDC contract on a
-    mainnet fork, freezing the contract strands the funds permanently — `claim` reverts *and*
-    `refund` reverts, with no timeout to rescue them. It narrows the window rather than closing
-    it; check-then-reveal is itself a race.
+  - `assert_not_frozen_before_reveal` is the pre-reveal blacklist gate. It checks the **HTLC
+    contract address** and the **claimant** — the two addresses a `claim` actually touches.
+    Including the contract matters because, measured against the real USDC contract on a mainnet
+    fork, freezing the contract strands the funds permanently: `claim` reverts *and* `refund`
+    reverts, with no timeout to rescue them. The **refundee is deliberately excluded** — a claim
+    never touches it, so refusing there would block honest work and hand the counterparty a free
+    unilateral veto. It narrows the window rather than closing it; check-then-reveal is itself a
+    race.
 
 ### Fixed
 
