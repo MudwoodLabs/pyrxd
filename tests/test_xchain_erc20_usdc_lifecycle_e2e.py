@@ -18,12 +18,26 @@ What is real here:
 * **The coordinator is the production one**, driven NEGOTIATED → COMPLETED, plus the refund path.
 
 Moves no real value: anvil is a local fork with public deterministic keys, Radiant is a
-self-managed regtest container, and the USDC is conjured by impersonating a holder ON THE FORK.
+self-managed regtest container, and the tokens are conjured ON THE FORK (see `_seed_token`).
 
 Run it::
 
     XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \\
         .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration -s
+
+Or against Base, which is the corridor a Base mainnet run would actually take — and the only one
+that exercises the `has_blacklist=False` branch of the pre-reveal gate, since Base USDT cannot
+freeze and L1 USDT can::
+
+    XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_CHAIN_ID=8453 \\
+        PYRXD_ETH_FORK_RPC=https://mainnet.base.org \\
+        .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration -s
+
+The Base endpoint must serve ARCHIVE reads; anvil fetches state behind the tip and a pruned node
+fails mid-swap with a Fork Error rather than at startup. Measured 2026-08-25:
+`mainnet.base.org`, `base.meowrpc.com`, `1rpc.io/base` and `base-mainnet.public.blastapi.io` serve
+them; `base-rpc.publicnode.com` answers ordinary calls but refuses archive ones ("Archive requests
+require a personal token"), so it looks healthy right up until the deploy receipt.
 
 No RPC key is needed — see `test_erc20_leg_fork_integration.py`'s header for the working endpoints
 and for why probing them from Python makes it look like one is.
@@ -74,15 +88,27 @@ from tests.test_xchain_swap_regtest_e2e import (
 pytestmark = pytest.mark.integration
 
 _RXD_IMAGE = "radiant-core:v3.1.1-amd64"
-_MAINNET = 1
-_USDC = token_for("USDC", _MAINNET)
+#: Which chain to fork. Defaults to Ethereum; set PYRXD_ETH_FORK_CHAIN_ID=8453 with a Base RPC in
+#: PYRXD_ETH_FORK_RPC to run the same lifecycle against Base's pinned tokens. That matters because
+#: Base USDT is the has_blacklist=False branch of the pre-reveal gate — a different path from L1
+#: USDT, and the one a Base mainnet run actually takes.
+_FORK_CHAIN_ID = int(os.environ.get("PYRXD_ETH_FORK_CHAIN_ID", "1"))
+_USDC = token_for("USDC", _FORK_CHAIN_ID)
 #: Both are run against the REAL mainnet contracts on a fork, because the USDT delta is runtime
 #: behaviour a fake cannot prove: Tether's `transfer` returns NO bool (it is not ERC-20 compliant),
 #: and its freeze predicate is `isBlackListed`, not `isBlacklisted`. Unit tests pin the name; only
 #: the real bytecode proves the leg survives the missing return value.
-_TOKENS = {"USDC": _USDC, "USDT": token_for("USDT", _MAINNET)}
-#: A large holder to impersonate — avoids deriving the balances storage slot, whose packed layout
-#: is exactly the sort of detail a test should not encode.
+_TOKENS = {"USDC": _USDC, "USDT": token_for("USDT", _FORK_CHAIN_ID)}
+
+#: Function selectors used only to seed the fork with tokens. See `_seed_token`.
+_SEL_L2_BRIDGE = "0xae1f6aaf"  # l2Bridge()
+_SEL_MASTER_MINTER = "0x35d99f35"  # masterMinter()
+_SEL_CONFIGURE_MINTER = "0x4e44d956"  # configureMinter(address,uint256)
+_SEL_MINT = "0x40c10f19"  # mint(address,uint256)
+_SEL_TRANSFER = "0xa9059cbb"  # transfer(address,uint256)
+#: A large L1 holder to impersonate, for the one token that can be seeded no other way (see
+#: `_seed_token`) — avoids deriving the balances storage slot, whose packed layout is exactly the
+#: sort of detail a test should not encode.
 _WHALE = "0x28C6c06298d514Db089934071355E5743bf21d60"
 #: Anvil's deterministic PUBLIC dev keys. Local fork only; no real value.
 _KEY_TAKER = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -106,7 +132,18 @@ def _rpc(url: str, method: str, params=None):
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+        body = json.loads(r.read())
+    # Raise on a JSON-RPC `error` rather than handing it back. `_getter_address` depends on it —
+    # it tells "this contract has no such function" from a reverted eth_call — and every anvil_*
+    # cheat discards its result, so a mistyped method would otherwise pass for a working one.
+    #
+    # MEASURED 2026-08-25, and it is precisely the limit of this check: anvil does NOT report a
+    # reverted `eth_sendTransaction` as an error. It mines the transaction and returns a hash; the
+    # revert appears only in the receipt. A failed seeding send is therefore invisible HERE, which
+    # is why `_seed_token` reads the balance back rather than trusting the send.
+    if "error" in body:
+        raise RuntimeError(f"{method} failed: {body['error']}")
+    return body
 
 
 def _mine(url: str, n: int = 1) -> None:
@@ -116,6 +153,67 @@ def _mine(url: str, n: int = 1) -> None:
 
 def _now(url: str) -> int:
     return int(_rpc(url, "eth_getBlockByNumber", ["latest", False])["result"]["timestamp"], 16)
+
+
+def _word(value) -> str:
+    """One 32-byte ABI word from an int, or from an address as its low 20 bytes."""
+    return hex(int(value, 16) if isinstance(value, str) else int(value))[2:].rjust(64, "0")
+
+
+def _send_as(url: str, sender: str, to: str, data: str) -> None:
+    """Send `data` to `to` as `sender`, impersonating it and funding its gas first."""
+    _rpc(url, "anvil_impersonateAccount", [sender])
+    _rpc(url, "anvil_setBalance", [sender, hex(10**18)])
+    # No return value is inspected: Tether's `transfer` returns nothing at all, so there is nothing
+    # to inspect. A revert arrives as a JSON-RPC error instead, and `_rpc` raises on those.
+    _rpc(url, "eth_sendTransaction", [{"from": sender, "to": to, "data": data}])
+
+
+def _getter_address(url: str, contract: str, selector: str) -> str | None:
+    """A zero-argument address getter's value, or None if this contract has no such function."""
+    try:
+        word = _rpc(url, "eth_call", [{"to": contract, "data": selector}, "latest"])["result"]
+    except RuntimeError:
+        return None
+    if len(word) < 66:  # a fallback function answering with empty data is not an address
+        return None
+    return "0x" + word[-40:] if int(word, 16) else None
+
+
+def _seed_token(url: str, token, holder: str, amount: int) -> None:
+    """Give `holder` at least `amount` of `token` on the fork, and PROVE it landed.
+
+    WHICH mechanism works is a property of the token, not of the chain, so this probes the token
+    instead of branching on a chain id. Measured against Base mainnet on 2026-08-25: the bridged
+    USDT at 0xfde4C96c… mints for the L2 standard bridge, while native Circle USDC at 0x833589fC…
+    answers that same caller `FiatToken: caller is not a minter`. A chain-keyed seeder is therefore
+    wrong for one of the two tokens this fixture parametrises over — and wrong silently.
+
+    The closing balance read is the load-bearing line, and nothing else does its job: anvil mines a
+    reverting send and returns a hash for it (see `_rpc`), so the wrong seeder reports success and
+    moves nothing. Verified by planting exactly that — an L2-bridge mint against native USDC, the
+    shape the previous revision of this fixture used — and watching the send pass while the balance
+    stayed 0. Seeding runs before any assertion, so without this line the shortfall would resurface
+    inside the swap as a transfer that moved less than it should have.
+    """
+    bridge = _getter_address(url, token.address, _SEL_L2_BRIDGE)
+    master_minter = _getter_address(url, token.address, _SEL_MASTER_MINTER)
+    if bridge is not None:
+        _send_as(url, bridge, token.address, _SEL_MINT + _word(holder) + _word(amount))
+    elif master_minter is not None:
+        # A FiatToken — every native Circle USDC. The masterMinter cannot mint, only appoint, so it
+        # appoints itself; that keeps the whole path to a single impersonated account.
+        _send_as(url, master_minter, token.address, _SEL_CONFIGURE_MINTER + _word(master_minter) + _word(amount))
+        _send_as(url, master_minter, token.address, _SEL_MINT + _word(holder) + _word(amount))
+    else:
+        # Tether on L1 is neither: no masterMinter, and `issue` credits only the owner. Impersonating
+        # a pinned large holder is what is left.
+        _send_as(url, _WHALE, token.address, _SEL_TRANSFER + _word(holder) + _word(amount))
+    got = _usdc_balance(url, holder, token)
+    assert got >= amount, (
+        f"seeding {token.symbol} on chain {token.chain_id} left {got} base units, wanted {amount}: "
+        "the swap would fail later for a reason that has nothing to do with the swap"
+    )
 
 
 @pytest.fixture(scope="module", params=sorted(_TOKENS))
@@ -149,7 +247,7 @@ def env(request, tmp_path_factory):
             "--port",
             str(port),
             "--chain-id",
-            str(_MAINNET),
+            str(_FORK_CHAIN_ID),
             "--slots-in-an-epoch",
             "1",
             "--silent",
@@ -166,12 +264,9 @@ def env(request, tmp_path_factory):
                 time.sleep(0.25)
         else:  # pragma: no cover
             pytest.fail("anvil fork did not become ready")
-        # Give the taker USDC by impersonating a holder — no storage-slot derivation.
         # The anvil dev addresses carry EIP-7702 delegation designators on a mainnet fork; they are
         # deliberately left in place, because the token leg's ERC-20 sweep calls the token and never
         # the recipient, so it must work WITH them present (#478).
-        _rpc(url, "anvil_impersonateAccount", [_WHALE])
-        _rpc(url, "anvil_setBalance", [_WHALE, hex(10**18)])
         for who in (_ADDR_TAKER, _ADDR_MAKER):
             _rpc(url, "anvil_setBalance", [who, hex(10**19)])
         token = _TOKENS[request.param]
@@ -183,10 +278,7 @@ def env(request, tmp_path_factory):
             f"fixture param {request.param!r} yielded {token.symbol!r}: the suite would run one "
             "token twice and read as coverage for two"
         )
-        transfer = "0xa9059cbb" + _ADDR_TAKER[2:].rjust(64, "0") + hex(_AMOUNT * 10)[2:].rjust(64, "0")
-        # Deliberately NOT checking a return value here either: this seeding call goes through
-        # eth_sendTransaction, and Tether would return nothing to check.
-        _rpc(url, "eth_sendTransaction", [{"from": _WHALE, "to": token.address, "data": transfer}])
+        _seed_token(url, token, _ADDR_TAKER, _AMOUNT * 10)
         yield node, url, tmp_path_factory.mktemp("erc20e2e"), token
     finally:
         anvil.terminate()
@@ -309,13 +401,13 @@ def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=
         token_address=(token or _USDC).address,
     )
 
-    rpc = EthRpc(url, expected_chain_id=_MAINNET)
+    rpc = EthRpc(url, expected_chain_id=_FORK_CHAIN_ID)
     artifact = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
     contract_leg = Erc20HtlcLeg(
         token=token or _USDC,
         rpc=rpc,
         signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)),
-        chain_id=_MAINNET,
+        chain_id=_FORK_CHAIN_ID,
         artifact=artifact,
     )
     eth_leg = _RecordingEthLeg(
