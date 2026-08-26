@@ -217,6 +217,27 @@ def _maker_leg(fork_url: str) -> Erc20HtlcLeg:
     )
 
 
+def _receipt(fork_url: str, tx_hash: str, *, tries: int = 50) -> dict:
+    """Poll for a receipt instead of reading once.
+
+    `claim()` returns as soon as the transaction is SENT — it does not await a receipt, because
+    waiting is the caller's business. A single `eth_getTransactionReceipt` straight afterwards
+    therefore races the node and intermittently returns null, which surfaced here as
+    `TypeError: 'NoneType' object is not subscriptable` on roughly 2 runs in 5.
+
+    That was a flake in the TEST, not in the leg: nothing about the claim was wrong, the test just
+    asked too early. Worth fixing rather than tolerating, because a suite that fails 40% of the
+    time stops being read as a signal — and this one guards the gas budget on the reveal path,
+    where a revert publishes the preimage for nothing.
+    """
+    for _ in range(tries):
+        got = _rpc_call(fork_url, "eth_getTransactionReceipt", [tx_hash])["result"]
+        if got is not None:
+            return got
+        time.sleep(0.1)
+    raise AssertionError(f"no receipt for {tx_hash} after {tries} polls — the claim never mined")
+
+
 def test_a_real_claim_pays_the_claimant_and_fits_the_gas_budget(fork_url: str) -> None:
     """The suite stopped at `verify_funded` and never broadcast a claim, so the gas budget was
     never exercised on the token path — the parent builds at 120,000, a limit sized for a native
@@ -248,7 +269,7 @@ def test_a_real_claim_pays_the_claimant_and_fits_the_gas_budget(fork_url: str) -
     tx_hash = asyncio.run(_maker_leg(fork_url).claim(locator, preimage))
     assert tx_hash
 
-    receipt = _rpc_call(fork_url, "eth_getTransactionReceipt", [tx_hash])["result"]
+    receipt = _receipt(fork_url, tx_hash)
     assert int(receipt["status"], 16) == 1, "the claim reverted — check the gas budget"
     used = int(receipt["gasUsed"], 16)
     assert used < 120_000, f"claim used {used} gas against the inherited 120,000 limit"
@@ -282,7 +303,7 @@ def test_the_preimage_is_recoverable_from_the_real_claim(fork_url: str) -> None:
     tx_hash = asyncio.run(_maker_leg(fork_url).claim(locator, preimage))
 
     tx = _rpc_call(fork_url, "eth_getTransactionByHash", [tx_hash])["result"]
-    receipt = _rpc_call(fork_url, "eth_getTransactionReceipt", [tx_hash])["result"]
+    receipt = _receipt(fork_url, tx_hash)
     rec = recover_preimage_from_eth_claim(
         hashlock=hashlock,
         contract_address=locator.contract_address,

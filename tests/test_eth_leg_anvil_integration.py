@@ -34,7 +34,7 @@ if shutil.which("anvil") is None:  # pragma: no cover - environment gate
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.rpc import EthRpc
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 pytestmark = pytest.mark.integration
@@ -214,8 +214,16 @@ async def test_refund_after_timeout_and_claim_blocked_when_expired(anvil_url):
             await taker.refund(locator)
         # Fast-forward past the timeout.
         await _advance_time(rpc, 200)
-        # A claim is now expired — the contract reverts; the leg's eth_call preflight catches it.
-        with pytest.raises(ValidationError):
+        # A claim is now expired. This used to expect ValidationError, on the reasoning that the
+        # contract reverts and the leg's eth_call preflight catches it. The claim-deadline guard
+        # made that stale and STRICTER: it refuses on the timestamp before building anything, so
+        # no preflight, no gas, and nothing reaches a provider. PreRevealAbort is the right type —
+        # it means the preimage is still secret and the swap is refundable — and it is
+        # deliberately not a ValidationError, so the old assertion could not see it.
+        #
+        # That distinction is the whole point on this path: a claim that mines late still publishes
+        # p in its calldata while paying nothing, handing the counterparty both legs.
+        with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
             await maker.claim(locator, p)
         # The taker's unilateral refund now succeeds (pays the refundee).
         refund_tx = await taker.refund(locator)
