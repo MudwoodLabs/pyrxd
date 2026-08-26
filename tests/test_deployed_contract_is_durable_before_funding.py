@@ -477,6 +477,74 @@ class TestTheRealVerifyFundedRunsOnResume:
             _fund(leg, None, resume_from=_PENDING)
         assert order == [], f"{label}: tokens were sent to a contract that is not this swap"
 
+    @pytest.mark.parametrize(
+        ("label", "override"),
+        [("a different token", {"token": "0x" + "99" * 20})],
+    )
+    def test_a_resume_REFUSES_a_contract_denominated_in_ANOTHER_TOKEN(self, label, override) -> None:
+        """The `token()` immutable bind — the one asset check that is not self-consistent.
+
+        `locator.token_address` is compared against `self._token` on the maker path by a locator the
+        maker itself built from `self._token`, so that check compares the leg against itself. The
+        contract's OWN `token()` is the only real bind, and nothing exercised it: the parametrised
+        immutable list covered hashlock/claimant/refundee/timeout/amount and not this. Planting
+        `if False and ...` on it left the whole suite green, so a hostile taker could deploy an HTLC
+        denominated in a worthless token and the maker would lock RXD against it.
+        """
+        order: list = []
+        leg = _real_verify_leg(on_chain=override, held=0, order=order)
+        with pytest.raises(ValidationError):
+            _fund(leg, None, resume_from=_PENDING)
+        assert order == [], f"{label}: tokens were sent to a contract holding another asset"
+
+    def test_the_balance_FLOOR_refuses_when_the_contract_is_genuinely_SHORT(self) -> None:
+        """The maker's only proof the HTLC actually HOLDS the negotiated amount.
+
+        Every fixture that drove `verify_funded` set balanceOf EQUAL to the expected amount, so the
+        comparison could never be false — planting `if False and held < expected` left 9,780 tests
+        green. The fork test that looks like it covers this passes `expected*2`, which trips the
+        `amount()` immutable bind FIRST, and its regex accepts either message.
+
+        So this one deliberately makes the balance the ONLY thing wrong: every immutable matches and
+        the contract is one base unit short.
+        """
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=_AMOUNT - 1, order=order)
+        with pytest.raises(ValidationError, match="under-funded"):
+            asyncio.run(
+                leg.verify_funded(
+                    leg._locator_for(
+                        address=_DEPLOYED,
+                        deploy_hash="0xdeploy",
+                        hashlock=b"\x33" * 32,
+                        claimant="0x" + "44" * 20,
+                        refundee="0x" + "55" * 20,
+                        timeout=_FUND_TIMEOUT,
+                        amount_wei=_AMOUNT,
+                    ),
+                    expected_amount_wei=_AMOUNT,
+                )
+            )
+
+    def test_the_balance_floor_ACCEPTS_an_exactly_funded_contract(self) -> None:
+        """The honest-path pair. A floor that refused everything would satisfy the test above."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=_AMOUNT, order=order)
+        asyncio.run(
+            leg.verify_funded(
+                leg._locator_for(
+                    address=_DEPLOYED,
+                    deploy_hash="0xdeploy",
+                    hashlock=b"\x33" * 32,
+                    claimant="0x" + "44" * 20,
+                    refundee="0x" + "55" * 20,
+                    timeout=_FUND_TIMEOUT,
+                    amount_wei=_AMOUNT,
+                ),
+                expected_amount_wei=_AMOUNT,
+            )
+        )
+
     def test_the_balance_floor_is_the_ONLY_thing_the_resume_waives(self) -> None:
         """A half-finished fund is legitimately short, so the balance must be waived — and nothing
         else may be. Holding zero must still resume; that is what `require_balance=False` buys."""

@@ -302,6 +302,31 @@ def _free_port() -> int:
     return port
 
 
+def _load_restore(args) -> dict | None:
+    """The recovery file for a resume, or None for a fresh run."""
+    if not args.resume:
+        return None
+    return json.loads(Path(args.keys_out).expanduser().read_text())
+
+
+def resolve_eth_timeout(restore: dict | None, *, now_unix_s: int, eth_timeout_s: int) -> int:
+    """The swap's ETH deadline: FROM THE RECORD on a resume, from the clock on a fresh run.
+
+    Extracted from `run_sepolia_dust` so it can be tested. It could not be before: the decision
+    lived inside a 140-statement function no test executes, and the test that claimed to cover it
+    passed the timeout in itself and asserted the same value came back — true by construction and
+    unable to fail. That is the exact defect this function exists to prevent, sitting in the file
+    whose purpose was to prevent it.
+
+    `eth_timeout_unix_s` is an IMMUTABLE of the deployed HTLC and it anchors every cross-clock
+    margin. Recomputing it on resume re-times the swap against a contract that cannot be re-timed:
+    the margins would be measured from a deadline the chain does not agree with.
+    """
+    if restore is None:
+        return int(now_unix_s) + int(eth_timeout_s)
+    return int(restore["eth_timeout_unix_s"])
+
+
 def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: dict | None = None):
     """Build the HTLC covenant + negotiated terms. ``minted`` (a MintedNft) is REQUIRED for the
     NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT``.
@@ -651,14 +676,8 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             )
         print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
-    restore = None
-    if args.resume:
-        restore = json.loads(Path(args.keys_out).expanduser().read_text())
-        # The eth_timeout is part of the SWAP'S IDENTITY — it is an immutable of the deployed HTLC
-        # and it anchors every margin. Recomputing it on resume would silently re-time the swap.
-        eth_timeout = int(restore["eth_timeout_unix_s"])
-    else:
-        eth_timeout = int(time.time()) + args.eth_timeout_s
+    restore = _load_restore(args)
+    eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
     terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
         args, eth_timeout=eth_timeout, minted=minted, restore=restore
     )

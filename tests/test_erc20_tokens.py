@@ -237,3 +237,54 @@ class TestTheRegistryValidatesAsStrictlyAsEveryOtherAddressField:
 
     def test_the_honest_path_is_untouched(self) -> None:
         assert token_for("USDC", 1).base_units("12.345678") == 12_345_678
+
+
+class TestTheDecimalsGuardIsLoadBearing:
+    """The 10^N guard. Every fake returned decimals()==6 against a 6-decimal pin — equal by
+    construction — so planting `if False` on the comparison left all 9,780 tests green. This is the
+    check whose own message says "at these scales the difference is a factor of 10^N in every
+    amount", and it runs on both fund and verify_funded."""
+
+    @staticmethod
+    def _rpc(on_chain_decimals: int):
+        class _Call:
+            async def call(self, *a, **k):
+                return on_chain_decimals
+
+        class _Fns:
+            def decimals(self):
+                return _Call()
+
+        class _Contract:
+            functions = _Fns()
+
+        class _Eth:
+            def contract(self, *a, **k):
+                return _Contract()
+
+        class _W3:
+            eth = _Eth()
+
+        class _Rpc:
+            w3 = _W3()
+
+        return _Rpc()
+
+    def test_a_chain_that_reports_18_against_a_6_decimal_pin_is_REFUSED(self) -> None:
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+
+        usdc = token_for("USDC", 1)
+        assert usdc.decimals == 6, "fixture premise"
+        with pytest.raises(ValidationError, match="decimals"):
+            asyncio.run(assert_token_matches_chain(self._rpc(18), usdc))
+
+    def test_the_matching_case_is_ACCEPTED(self) -> None:
+        """The honest-path pair — deliberately the ONLY place the two are equal, so the refusal
+        test above cannot be satisfied by a guard that refuses everything."""
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+
+        asyncio.run(assert_token_matches_chain(self._rpc(6), token_for("USDC", 1)))

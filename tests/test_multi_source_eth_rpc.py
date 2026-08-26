@@ -389,3 +389,66 @@ class TestItIsActuallyUSABLEByTheLegs:
         should refuse — so the latest any endpoint admits to is the conservative one."""
         rpc = MultiSourceEthRpc([_Source(head_ts=1_700_000_000), _Source(head_ts=1_700_000_600)])
         assert _run(rpc.latest_block_timestamp()) == 1_700_000_600
+
+
+class TestTheReadsNoTestDrove:
+    """Mutation testing found three quorum reads with no direction or identity test at all.
+
+    `test_a_balance_takes_the_MINIMUM` drives `balance_of` — the ERC-20 path — not `rpc.get_balance`,
+    which is the NATIVE leg's funded bind. `get_code` existed in the fake only to satisfy a shape
+    check. `get_transaction_receipt` had no test whatsoever. Flipping each survived all 9,780 tests.
+    """
+
+    def test_get_balance_takes_the_MINIMUM(self) -> None:
+        """The native leg's funded bind. Under `max`, one lying endpoint answers 'funded' for an
+        empty contract — the exact scenario this module's docstring opens with."""
+        rpc = MultiSourceEthRpc([_Source(balance=10**18), _Source(balance=0), _Source(balance=10**18)])
+        assert _run(rpc.get_balance(_HTLC)) == 0
+
+    def test_get_balance_honest_path_reports_the_real_amount(self) -> None:
+        rpc = MultiSourceEthRpc([_Source(balance=10**18), _Source(balance=10**18)])
+        assert _run(rpc.get_balance(_HTLC)) == 10**18
+
+    def test_get_code_is_an_IDENTITY_read(self) -> None:
+        """Runtime bytecode decides 'is this the contract we committed to'. A magnitude
+        aggregation there is meaningless — differing code must refuse, not pick one."""
+        a, b = _Source(), _Source()
+
+        async def _other(_addr, _blk=None):
+            return b"\x99" * 4
+
+        b.get_code = _other
+        rpc = MultiSourceEthRpc([a, b])
+        with pytest.raises(NetworkError, match="disagree"):
+            _run(rpc.get_code(_HTLC))
+
+    def test_get_code_agreement_passes(self) -> None:
+        rpc = MultiSourceEthRpc([_Source(), _Source()])
+        assert _run(rpc.get_code(_HTLC)) == b"\x60" * 4
+
+    def test_get_transaction_receipt_refuses_when_the_DECIDING_fields_disagree(self) -> None:
+        """status/blockNumber/blockHash are what a finality verdict turns on. A primary-only read
+        there makes the quorum decorative for the one decision it most needs to cover."""
+        a, b = _Source(), _Source()
+
+        async def _ok(_h):
+            return {"status": 1, "blockHash": b"\xaa" * 32, "blockNumber": 100}
+
+        async def _bad(_h):
+            return {"status": 0, "blockHash": b"\xbb" * 32, "blockNumber": 42}
+
+        a.get_transaction_receipt, b.get_transaction_receipt = _ok, _bad
+        rpc = MultiSourceEthRpc([a, b])
+        with pytest.raises(NetworkError, match="disagree"):
+            _run(rpc.get_transaction_receipt("0xdead"))
+
+    def test_get_transaction_receipt_agreement_returns_it(self) -> None:
+        a, b = _Source(), _Source()
+
+        async def _ok(_h):
+            return {"status": 1, "blockHash": b"\xaa" * 32, "blockNumber": 100}
+
+        a.get_transaction_receipt, b.get_transaction_receipt = _ok, _ok
+        rpc = MultiSourceEthRpc([a, b])
+        got = _run(rpc.get_transaction_receipt("0xdead"))
+        assert got is not None and int(got["status"]) == 1

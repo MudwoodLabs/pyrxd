@@ -105,11 +105,23 @@ class TestResumeRebuildsTheSameSwap:
         )
 
     def test_the_eth_timeout_is_taken_FROM_THE_RECORD(self, runner) -> None:
-        """It is an immutable of the deployed HTLC and it anchors every margin. Recomputing it on
-        resume silently re-times the swap against a contract that cannot be re-timed."""
-        args, first = _fresh(runner, eth_timeout=1_900_000_000)
-        rec = _recovery_from(first, eth_timeout=1_900_000_000)
-        terms2, _c2, _p2, _h2, _k2 = runner._build_terms_and_covenant(
-            args, eth_timeout=int(rec["eth_timeout_unix_s"]), restore=rec
-        )
-        assert terms2.eth_timeout_unix_s == 1_900_000_000
+        """It is an immutable of the deployed HTLC and it anchors every cross-clock margin.
+
+        The first version of this test was TAUTOLOGICAL: it passed `eth_timeout` in itself and
+        asserted the same value came back, while `_build_terms_and_covenant` never reads it from
+        `restore` at all — the caller does. Equal by construction, unable to fail, in the file
+        whose entire purpose is that defect. Found by mutation testing.
+
+        `resolve_eth_timeout` is the decision, extracted so there is something real to drive. Here
+        the record's value and the clock-derived one are deliberately FAR APART, so taking the
+        wrong one cannot look like taking the right one.
+        """
+        rec = {"eth_timeout_unix_s": 1_900_000_000}
+        got = runner.resolve_eth_timeout(rec, now_unix_s=1_000_000_000, eth_timeout_s=86_400)
+        assert got == 1_900_000_000, "resume must take the deadline from the record"
+        assert got != 1_000_000_000 + 86_400, "and must NOT recompute it from the clock"
+
+    def test_a_FRESH_run_computes_the_timeout_from_the_clock(self, runner) -> None:
+        """The honest-path pair. A function that always returned the record's value would satisfy
+        the test above and break every fresh run."""
+        assert runner.resolve_eth_timeout(None, now_unix_s=1_000_000_000, eth_timeout_s=86_400) == 1_000_086_400
