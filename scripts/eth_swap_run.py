@@ -63,6 +63,7 @@ from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet RES
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.eth_wallet.chains import evm_chain_by_id
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
@@ -115,11 +116,31 @@ def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
     )
 
 
+def _evm_is_value_bearing(chain_id: int) -> bool:
+    """Whether the EVM leg moves real value — decided by the CHAIN REGISTRY, never by the stage
+    name.
+
+    `_leg_is_value_bearing` in the coordinator uses exactly this rule (a `network` tag outside
+    `AUDIT_CLEARED_NETWORKS`), so the runner and the coordinator cannot end up disagreeing about
+    which side of the line a run is on. Note Sepolia counts as value-bearing under it too: the
+    tag is about audit clearance, not about whether the coins are worth anything.
+    """
+    return evm_chain_by_id(int(chain_id)).network not in AUDIT_CLEARED_NETWORKS
+
+
 def _policy(args: argparse.Namespace) -> MarginPolicy:
-    return MarginPolicy(
+    """Estimated margins for a throwaway EVM chain; MEASURED once the token leg is real.
+
+    is_measured=False disables two defences on the ETH path — the verify->lock `finalized` reorg
+    pin (it re-verifies at `latest` instead, which cannot catch a reorg re-deploying a different
+    contract at the same CREATE address in that window) and the proactive-refund N-floor. On a
+    Sepolia counter leg that is an accepted dust trade, because the ETH side is faucet money and
+    only the RXD side can be lost. With USDT on L1 BOTH legs are real, so the same opt-in would be
+    buying the weak mode of two defences with actual value behind them.
+    """
+    common: dict = dict(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),
         block_interval_s=args.btc_block_interval_s,
-        is_measured=False,
         rxd_block_interval_s=args.rxd_block_interval_s,
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_cross_clock_margin(args),
@@ -127,6 +148,30 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
         # Dust harness: value below the Radiant reorg cost → opt out of value-scaled burial.
         accept_flat_burial=True,
     )
+    if not _token_leg_is_real(args):
+        return MarginPolicy(is_measured=False, **common)
+    if not args.rxd_block_interval_fast_s:
+        raise SystemExit(
+            "a real-value token counter leg needs --rxd-block-interval-fast-s (the MEASURED p10 "
+            "Radiant inter-block, seconds). Reserves DIVIDE by it, so a stale-high value silently "
+            "under-counts blocks. Measure it against a mainnet node for THIS run — it was 43s on "
+            "2026-06-02 and 36s on 2026-08-26, and the drift is in the under-counting direction."
+        )
+    return MarginPolicy(
+        is_measured=True,
+        require_measured=True,
+        rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
+        **common,
+    )
+
+
+def _token_leg_is_real(args: argparse.Namespace) -> bool:
+    """A token counter leg on a value-bearing chain — the case where both legs carry value.
+
+    Native ETH on Sepolia is deliberately NOT this: the chain is value-bearing by tag, but the
+    asset is faucet money, which is the whole premise of the sepolia-dust stage.
+    """
+    return args.counter_asset != "native" and _evm_is_value_bearing(args.eth_chain_id)
 
 
 def _anvil_rpc(url, method, params=None):
@@ -488,7 +533,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
     cfg = CoordinatorConfig(
         margin_policy=policy,
-        accept_estimated_eth_margins=True,
+        # Only for a throwaway token leg. With a real one the policy above is MEASURED, so this
+        # opt-in is not merely unnecessary — passing it would re-disable the two defences the
+        # measured policy just switched on, and it would do so silently.
+        accept_estimated_eth_margins=not _token_leg_is_real(args),
         # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
         # path, and resuming an interrupted fund skips it.
         fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
@@ -756,6 +804,16 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--margin-blocks", type=int, default=36)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help=(
+            "MEASURED p10 Radiant inter-block (seconds). Required once the token counter leg is "
+            "real. Reserves DIVIDE by this, so a stale-high value under-counts blocks; measure it "
+            "per run rather than inheriting a number."
+        ),
+    )
     # Default (None) → resolved from the EVM chain registry by --eth-chain-id in _args() below, so a
     # known chain gets its VETTED finalization window (e.g. Base 900s, not Ethereum's 768s); an
     # operator value always overrides. Realizes the registry's fail-closed per-chain safety.

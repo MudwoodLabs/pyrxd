@@ -208,8 +208,15 @@ class MarginPolicy:
     # across an inverse pair is what made #484's filed fix refuse every configuration.
     #
     # Defaults to None = "use rxd_block_interval_s", preserving today's behaviour exactly. A
-    # REAL-VALUE policy must supply a measured one: at the measured p10 of 43s, a reserve computed
-    # with the 300s default covers about a sixth of the window it is meant to protect.
+    # REAL-VALUE policy must supply a measured one: at a measured p10 of 36s, a reserve computed
+    # with the 300s default covers about an eighth of the window it is meant to protect.
+    #
+    # MEASURE IT PER RUN — the figure drifts and it drifts in the unsafe direction. Radiant mainnet
+    # p10 was 43s on 2026-06-02 and 36s on 2026-08-26 (720 intervals over 58.6h, blocks read off a
+    # mainnet node). Reserves DIVIDE by this, so a stale-high value under-counts: sizing with 43s
+    # against a real 36s gives 16% fewer blocks than the window actually holds. The same sample:
+    # median 222s, mean 293s, p90 669s, p99 1199s, max 2325s — a single 39-minute gap inside two
+    # and a half days.
     # See docs/solutions/design-decisions/sizing-t-rxd-the-two-directions-rule.md.
     rxd_block_interval_fast_s: float | None = None
     # Reorg gate (plan 2026-05-26). The maker's BTC claim must reach this depth before
@@ -285,9 +292,10 @@ class MarginPolicy:
             raise ValidationError(
                 "real-value mode (require_measured=True) requires a MEASURED "
                 "rxd_block_interval_fast_s: a reserve computed by DIVIDING by the interval needs a "
-                "fast-tail percentile, and the nominal value under-counts it. At the measured p10 "
-                "of 43s, a reserve computed with a 300s interval covers about a sixth of the "
-                "window it protects."
+                "fast-tail percentile, and the nominal value under-counts it. At a measured p10 "
+                "of 36s (Radiant mainnet, 2026-08-26), a reserve computed with a 300s interval "
+                "covers about an eighth of the window it protects. Measure it for YOUR run rather "
+                "than copying this number: it was 43s in June and 36s in August."
             )
         if not isinstance(self.is_measured, bool):
             raise ValidationError("MarginPolicy.is_measured must be bool")
@@ -412,8 +420,10 @@ class MarginPolicy:
 
         ``rxd_block_interval_fast_s`` is the FAST-tail (p10) inter-block measurement, REQUIRED
         here: every reserve computed by dividing a time span by the interval needs it, and the
-        nominal value under-counts them. Measured Radiant mainnet 2026-06-02: p10 43s against a
-        mean of 330s — a reserve sized with the mean covers about a sixth of its window. When it is
+        nominal value under-counts them. Measured Radiant mainnet 2026-08-26: p10 36s against a
+        mean of 293s — a reserve sized with the mean covers about an eighth of its window. (It was
+        p10 43s on 2026-06-02; the drift is downward, which is the direction that under-counts, so
+        re-measure rather than inheriting either figure.) When it is
         genuinely unknown, pass the same value as ``rxd_block_interval_s`` and know that the
         reserves are then nominal rather than conservative.
 
