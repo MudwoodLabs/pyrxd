@@ -37,6 +37,9 @@ _ASCII_DIGITS = re.compile(r"[0-9]+")
 _BRIDGED_LOOKALIKES: dict[str, str] = {
     "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8": "Arbitrum One USDC.e (bridged, not Circle-issued)",
     "0x7f5c764cbc14f9669b88837ca1490cca17c31607": "Optimism USDC.e (bridged, not Circle-issued)",
+    # Reports symbol "USD\u20ae0", not "USDT" — an omnichain variant, not Tether's ERC-20. Listed
+    # here so pinning it later as USDT is refused by NAME instead of silently accepted.
+    "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": "Arbitrum One USDT0 (omnichain variant, not Tether's USDT)",
 }
 
 
@@ -59,12 +62,27 @@ class Erc20Token:
     #: fail, and a failed probe is indistinguishable from "not frozen" unless the caller is very
     #: careful — which is exactly the fail-open this field removes. USDC (FiatToken) can freeze.
     has_blacklist: bool = True
+    #: The NAME of that freeze predicate, because issuers do not agree on it and the two spellings
+    #: are mutually exclusive. Measured 2026-08-25 against the live contracts:
+    #:
+    #:   USDC 0xA0b8…eB48   isBlacklisted -> ok        isBlackListed -> reverts
+    #:   USDT 0xdAC1…1ec7   isBlacklisted -> reverts   isBlackListed -> ok
+    #:
+    #: A single hardcoded name in the shared ABI made the gate revert on the other token, which
+    #: `is_blacklisted` correctly turns into a refusal — so the swap was not unsafe, it was simply
+    #: impossible. Carrying the name per token is what makes a second issuer representable at all.
+    blacklist_fn: str = "isBlacklisted"
 
     def __post_init__(self) -> None:
         # ONE canonical validator for the package (`locator.check_hex_addr`), not a fourth copy.
         # Round 5 measured the previous round-trip check accepting "0x" + "ab"*19 + "  " as a
         # 42-char "address" that decodes to nineteen bytes — for the field that IS the identity
         # of the asset. Three modules had each rolled their own; now none do.
+        if not isinstance(self.blacklist_fn, str) or not self.blacklist_fn.isidentifier():
+            raise ValidationError(
+                f"blacklist_fn must be a solidity identifier, got {self.blacklist_fn!r}. It is "
+                "interpolated into an ABI, so it is never free-form text."
+            )
         check_hex_addr("Erc20Token.address", self.address)
         object.__setattr__(self, "address", self.address.lower())
         if not isinstance(self.decimals, int) or isinstance(self.decimals, bool) or not 0 <= self.decimals <= 36:
@@ -122,6 +140,19 @@ KNOWN_TOKENS: dict[tuple[str, int], Erc20Token] = {
     ("USDC", 42161): Erc20Token("USDC", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, 42161),
     ("USDC", 421614): Erc20Token("USDC", "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d", 6, 421614),
     ("USDC", 59144): Erc20Token("USDC", "0x176211869cA2b568f2A7D4EE941E073a821EE1ff", 6, 59144),
+    # Tether USDT. VERIFIED 2026-08-25 by reading symbol()/decimals() and probing BOTH freeze
+    # spellings directly: reports USDT / 6, answers `isBlackListed`, reverts `isBlacklisted`.
+    #
+    # ETHEREUM ONLY, deliberately. The L2 addresses commonly listed as "USDT" did not verify as the
+    # same asset under the same rules:
+    #   * Arbitrum One 0xFd086bC7…FCbb9 reports symbol "USD\u20ae0" — the omnichain USDT0 variant,
+    #     a DIFFERENT asset. It is in _BRIDGED_LOOKALIKES rather than here.
+    #   * Optimism / Base / Linea answer NEITHER freeze spelling. That is not evidence they cannot
+    #     freeze — it is evidence the two names probed are absent. Pinning has_blacklist=False on a
+    #     negative probe is precisely the inference has_blacklist exists to avoid, and it would
+    #     fail OPEN on the one gate guarding an unrecoverable loss. They stay unpinned until
+    #     someone reads their admin surface properly.
+    ("USDT", 1): Erc20Token("USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7", 6, 1, blacklist_fn="isBlackListed"),
 }
 
 

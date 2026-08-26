@@ -37,13 +37,6 @@ ERC20_READ_ABI: list[dict[str, Any]] = [
         "outputs": [{"name": "", "type": "uint8"}],
     },
     {
-        "name": "isBlacklisted",
-        "type": "function",
-        "stateMutability": "view",
-        "inputs": [{"name": "account", "type": "address"}],
-        "outputs": [{"name": "", "type": "bool"}],
-    },
-    {
         "name": "symbol",
         "type": "function",
         "stateMutability": "view",
@@ -53,9 +46,33 @@ ERC20_READ_ABI: list[dict[str, Any]] = [
 ]
 
 
-def _contract(rpc: Any, token: Erc20Token) -> Any:
+def _freeze_abi(token: Erc20Token) -> list[dict[str, Any]]:
+    """The freeze predicate, named as THIS issuer named it.
+
+    Not a shared constant, because issuers disagree and the spellings are mutually exclusive —
+    measured against the live contracts, USDC answers ``isBlacklisted`` and reverts
+    ``isBlackListed``, and USDT does the exact reverse. A single hardcoded name turned the gate
+    into a permanent refusal on whichever token it was not written for.
+
+    The name is validated as a Solidity identifier when the token is constructed, so nothing
+    free-form reaches the ABI.
+    """
+    return [
+        {
+            "name": token.blacklist_fn,
+            "type": "function",
+            "stateMutability": "view",
+            "inputs": [{"name": "account", "type": "address"}],
+            "outputs": [{"name": "", "type": "bool"}],
+        }
+    ]
+
+
+def _contract(rpc: Any, token: Erc20Token, *, abi: list[dict[str, Any]] | None = None) -> Any:
     web3 = _require_web3()
-    return rpc.w3.eth.contract(address=web3.Web3.to_checksum_address(token.address), abi=ERC20_READ_ABI)
+    return rpc.w3.eth.contract(
+        address=web3.Web3.to_checksum_address(token.address), abi=abi if abi is not None else ERC20_READ_ABI
+    )
 
 
 async def balance_of(rpc: Any, token: Erc20Token, owner: str, block_identifier: Any = None) -> int:
@@ -122,7 +139,9 @@ async def is_blacklisted(rpc: Any, token: Erc20Token, address: str) -> bool:
         # Pinned capability, not a probe: a token that cannot freeze cannot freeze this swap.
         return False
     try:
-        return bool(await _contract(rpc, token).functions.isBlacklisted(address).call(block_identifier="latest"))
+        contract = _contract(rpc, token, abi=_freeze_abi(token))
+        fn = getattr(contract.functions, token.blacklist_fn)
+        return bool(await fn(address).call(block_identifier="latest"))
     except Exception as exc:
         raise NetworkError(
             f"could not determine whether {address} is frozen by {token.symbol}: {exc}. Refusing to "
