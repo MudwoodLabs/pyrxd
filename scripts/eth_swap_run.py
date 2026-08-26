@@ -174,6 +174,7 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
             "hour. Sizing this against happy-path finality is the bug a stall triggers."
         )
     _assert_t_rxd_covers_the_takers_wait(args)
+    _assert_t_rxd_opens_before_the_eth_deadline(args)
     if not args.rxd_block_interval_fast_s:
         raise SystemExit(
             "a real-value token counter leg needs --rxd-block-interval-fast-s (the MEASURED p10 "
@@ -230,6 +231,45 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> None:
     )
 
 
+def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> None:
+    """The RXD refund must OPEN before the ETH deadline minus the margin — the upper bound.
+
+    Learned the expensive way. The lower bound above divides the margin by the FAST tail, because
+    fast blocks shrink the taker's window. The coordinator's punctuality gate then projects the
+    same t_rxd forward by MULTIPLYING by the NOMINAL interval. Those two only cancel when both use
+    the same interval — `assert_covenant_confirms_before_eth_deadline` says so in as many words —
+    and sizing with 36s while the gate multiplies by 300s inflates the projection by ~8x.
+
+    A t_rxd of 2203, correct against the lower bound, projected the RXD refund 7.6 DAYS out against
+    a 22h budget. The gate caught it and refused to lock, which is the system working — but it
+    caught it AFTER the covenant had been funded, because nothing checked it at argument-parse
+    time. This does, so the operator learns the valid RANGE before spending a fee.
+    """
+    nominal = float(args.rxd_block_interval_s)
+    # RESERVE the covenant-confirm window. The gate anchors the projection on the covenant's
+    # CONFIRMATION time, not on the runner's start, so however long funding-and-mining takes comes
+    # straight out of the budget. Sizing against `now` silently assumes instant funding: a run that
+    # took ~740s to fund and mine overshot by 607s and was refused AFTER the covenant was paid for.
+    # `max_covenant_confirm_wait_s` is precisely the allowance for that delay, so spend it here.
+    budget_s = int(args.eth_timeout_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
+    hi = math.floor(budget_s / nominal)
+    have = int(args.t_rxd_blocks)
+    if have <= hi:
+        return
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    lo = math.ceil(_cross_clock_margin(args).total_s() / fast) if fast > 0 else 1
+    raise SystemExit(
+        f"--t-rxd-blocks {have} is too LONG. The coordinator projects the RXD refund forward at the "
+        f"NOMINAL {nominal:.0f}s interval, giving {have * nominal / 86400:.1f} days against a "
+        f"{budget_s / 3600:.1f} h budget (--eth-timeout-s minus the {_cross_clock_margin(args).total_s()}s "
+        f"cross-clock margin AND the {args.max_covenant_confirm_wait_s}s covenant-confirm reserve). "
+        f"The maker could not refund before the ETH deadline.\n"
+        f"  valid range: --t-rxd-blocks {lo}..{hi}   (use {hi} — the largest gives the taker the most window)\n"
+        f"  the LOWER bound divides the margin by the FAST tail; this UPPER bound multiplies by the "
+        f"NOMINAL one. Both are real, and they are not the same number."
+    )
+
+
 def _token_leg_is_real(args: argparse.Namespace) -> bool:
     """A token counter leg on a value-bearing chain — the case where both legs carry value.
 
@@ -253,14 +293,30 @@ def _free_port() -> int:
     return port
 
 
-def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
+def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: dict | None = None):
     """Build the HTLC covenant + negotiated terms. ``minted`` (a MintedNft) is REQUIRED for the
-    NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT."""
-    p_secret = SecretBytes(os.urandom(32))
-    h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+    NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT``.
+
+    ``restore`` is the recovery file, and it makes ``--resume`` mean what it says. Without it,
+    resume MINTED A FRESH SWAP: a new preimage, new RXD keys and a new eth_timeout, which builds a
+    DIFFERENT covenant with a different hashlock and silently abandons the funded one. That was
+    only ever caught because the O_EXCL write of the recovery file failed afterwards — the
+    protection was accidental, and on a different --keys-out it would not have fired at all.
+    Nothing drives this script in tests, which is the same reason three runners sat broken from
+    HZ-1 until a real run found them.
+    """
+    if restore is not None:
+        p_secret = SecretBytes(bytes.fromhex(restore["preimage_p_hex"]))
+        h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+        if h.hex() != restore["hashlock_H"]:
+            raise SystemExit("recovery file is inconsistent: sha256(p) != recorded hashlock_H")
+        taker_rxd, maker_rxd = PrivateKey(restore["taker_rxd_wif"]), PrivateKey(restore["maker_rxd_wif"])
+    else:
+        p_secret = SecretBytes(os.urandom(32))
+        h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+        taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
     t_btc = bt.Timelock(args.t_rxd_blocks + args.margin_blocks + 4, bt.TimeUnit.BLOCKS)  # decorative for ETH
-    taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     if args.asset_variant == "nft":
@@ -560,47 +616,82 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             )
         print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
-    eth_timeout = int(time.time()) + args.eth_timeout_s
-    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout, minted=minted)
+    restore = None
+    if args.resume:
+        restore = json.loads(Path(args.keys_out).expanduser().read_text())
+        # The eth_timeout is part of the SWAP'S IDENTITY — it is an immutable of the deployed HTLC
+        # and it anchors every margin. Recomputing it on resume would silently re-time the swap.
+        eth_timeout = int(restore["eth_timeout_unix_s"])
+    else:
+        eth_timeout = int(time.time()) + args.eth_timeout_s
+    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
+        args, eth_timeout=eth_timeout, minted=minted, restore=restore
+    )
+    if restore is not None:
+        # THE load-bearing check. If any restored input is wrong the rebuilt covenant will not be
+        # the one that holds the money, and continuing would fund a second swap while the first
+        # stays stranded. Compare the actual script, not the inputs that produced it.
+        if cov.funded_spk.hex() != restore["rxd_covenant_spk"]:
+            raise SystemExit(
+                "resume rebuilt a DIFFERENT covenant than the funded one — refusing.\n"
+                f"  funded : {restore['rxd_covenant_spk']}\n"
+                f"  rebuilt: {cov.funded_spk.hex()}\n"
+                "  the run's parameters (t-rxd-blocks, asset, amounts) must match the original."
+            )
+        print(f"  RESUMED: rebuilt covenant matches the funded SPK, eth_timeout pinned at {eth_timeout}")
 
     # Persist ALL run state (mode 600) BEFORE any broadcast — recovery/sweep. Holds the preimage p
     # + the ETH signing key + the RXD keys + the covenant SPK; single point of total compromise.
     keys_path = Path(args.keys_out).expanduser()
-    atomic_write_mode_600(
-        keys_path,
-        json.dumps(
-            {
-                "created_unix": int(time.time()),
-                "stage": "sepolia-dust",
-                "eth_chain": "sepolia",
-                "rxd_network": rxd_network,
-                "hashlock_H": h.hex(),
-                "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
-                "eth_key_hex": args.eth_key_hex,
-                "eth_claim_to": args.eth_claim_to,
-                "eth_refund_to": args.eth_refund_to,
-                "eth_timeout_unix_s": eth_timeout,
-                "eth_amount_wei": args.eth_amount_wei,
-                "taker_rxd_wif": _rkeys[0].wif(),
-                "maker_rxd_wif": _rkeys[1].wif(),
-                "rxd_covenant_spk": cov.funded_spk.hex(),
-                "t_rxd_blocks": terms.t_rxd.value,
-                # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
-                # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
-                # need it to rebuild the covenant they spend. Nothing used to persist it.
-                "rxd_covenant_amount": terms.radiant_amount,
-                "asset_variant": args.asset_variant,
-                "asset_genesis_ref": minted.ref_str if minted else None,
-                "asset_owner_wif": minted.owner_key.wif() if minted else None,
-                # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
-                "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
-                "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
-                "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
-            },
-            indent=2,
-        ),
-    )
-    print(f"  run keys persisted -> {keys_path} (mode 600)")
+    if restore is None:
+        atomic_write_mode_600(
+            keys_path,
+            json.dumps(
+                {
+                    "created_unix": int(time.time()),
+                    "stage": "sepolia-dust",
+                    # The CHAIN and the AMOUNT, recorded as they actually are rather than as the stage
+                    # name assumes. Both were wrong for a token run on L1: "sepolia" was hardcoded, and
+                    # the amount logged `--eth-amount-wei` (the NATIVE flag, untouched at its 0.0001 ETH
+                    # default) instead of the token base units actually locked. The run itself was
+                    # unaffected — the coordinator takes `_counter_value(args)` — but this file is the
+                    # RECOVERY path, and a hand-recovery driven from it would have had the wrong chain,
+                    # an amount off by ~10^8, and no idea which token the HTLC even holds.
+                    "eth_chain": evm_chain_by_id(int(args.eth_chain_id)).name,
+                    "eth_chain_id": int(args.eth_chain_id),
+                    "counter_asset": args.counter_asset,
+                    "token_address": (None if _counter_token(args) is None else _counter_token(args).address),
+                    "token_decimals": (None if _counter_token(args) is None else _counter_token(args).decimals),
+                    "rxd_network": rxd_network,
+                    "hashlock_H": h.hex(),
+                    "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
+                    "eth_key_hex": args.eth_key_hex,
+                    "eth_claim_to": args.eth_claim_to,
+                    "eth_refund_to": args.eth_refund_to,
+                    "eth_timeout_unix_s": eth_timeout,
+                    # Base units for a token leg, wei for native — the same value the coordinator locks.
+                    "counter_amount": _counter_value(args),
+                    "eth_amount_wei": args.eth_amount_wei,  # the native flag, kept for older readers
+                    "taker_rxd_wif": _rkeys[0].wif(),
+                    "maker_rxd_wif": _rkeys[1].wif(),
+                    "rxd_covenant_spk": cov.funded_spk.hex(),
+                    "t_rxd_blocks": terms.t_rxd.value,
+                    # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
+                    # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
+                    # need it to rebuild the covenant they spend. Nothing used to persist it.
+                    "rxd_covenant_amount": terms.radiant_amount,
+                    "asset_variant": args.asset_variant,
+                    "asset_genesis_ref": minted.ref_str if minted else None,
+                    "asset_owner_wif": minted.owner_key.wif() if minted else None,
+                    # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
+                    "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
+                    "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
+                    "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
+                },
+                indent=2,
+            ),
+        )
+        print(f"  run keys persisted -> {keys_path} (mode 600)")
 
     rpc, eth_leg = _eth_leg(
         args,
@@ -646,6 +737,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
     # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
     cfg = CoordinatorConfig(
+        maker_stall_safety_window_blocks=args.maker_stall_safety_window_blocks,
         margin_policy=policy,
         # Only for a throwaway token leg. With a real one the policy above is MEASURED, so this
         # opt-in is not merely unnecessary — passing it would re-disable the two defences the
@@ -655,8 +747,22 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # path, and resuming an interrupted fund skips it.
         fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
     )
+    # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
+    # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
+    # believed the swap had not started while the durable record said otherwise. That is why
+    # `resume_interrupted_fund` was the ONLY resumable point — anything past the fund had a record
+    # the coordinator never read, and the run could not continue from it.
+    _sink = JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
+    _loaded = _sink.load_record() if args.resume else None
+    if _loaded is not None:
+        print(f"  RESUMED record: state={_loaded.state.value}")
+        if _loaded.terms.hashlock != terms.hashlock:
+            raise SystemExit(
+                "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
+                "drive it with these terms."
+            )
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        record=_loaded if _loaded is not None else SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
         indexer=indexer,
@@ -666,7 +772,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # An ETH contract address depends on the deployer's nonce and exists nowhere until the
         # deploy receipt returns, so this hook is the ONLY thing that makes a mid-fund crash
         # recoverable. The coordinator refuses an ETH counter-leg without it.
-        persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+        persist=_sink,
         config=cfg,
     )
 
@@ -721,7 +827,28 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             f"taker_funds_btc: deploy+fund the {_asset} HTLC on {_eth_chain.name} (taker pays gas)",
             auto_yes=args.yes,
         )
-        if args.resume:
+        _swaprec = Path(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
+        _already_funded = (
+            _loaded is not None
+            and _loaded.state != SwapState.NEGOTIATED
+            and (getattr(_loaded, "counterchain_locator", None) is not None)
+        )
+        if _already_funded:
+            # The counter leg is already funded and its locator is on the record. Neither fund path
+            # applies: the forward one would deploy a SECOND HTLC, and resume_interrupted_fund
+            # rightly refuses a record with no pending deploy. Continue from where the swap is.
+            rec = _loaded
+            print(f"  counter leg already funded ({rec.counterchain_locator.contract_address}) — skipping the fund")
+        elif args.resume and not _swaprec.exists():
+            # RESUME MEANS "continue from wherever this swap actually is", and that is not always
+            # mid-fund. The covenant can be funded while the ETH fund never started — which is
+            # exactly what happens when the pre-lock gate refuses a shallow covenant and you come
+            # back after it buries. There is no record to resume because nothing was deployed, so
+            # the forward path is correct; `resume_interrupted_fund` rightly refuses that state
+            # ("resuming into a fresh fund would deploy a second HTLC").
+            print("  --resume: covenant funded, ETH fund never started -> taking the FORWARD path")
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        elif args.resume and _swaprec.exists():
             # THE READ SIDE. Loads the record the interrupted run persisted and completes the fund
             # it describes — reusing the deployed contract and the pinned nonce, so a retry cannot
             # deploy a second HTLC or send a second transfer. Without this entry point the durable
@@ -779,7 +906,17 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
 
         # 3. Maker claims the ETH, revealing p on Ethereum.
-        confirm("maker_claims_btc: broadcast the ETH claim on SEPOLIA (reveals p)", auto_yes=args.yes)
+        # Say what is ACTUALLY being broadcast, on the actual chain, for the actual asset. This
+        # line read "maker_claims_btc: broadcast the ETH claim on SEPOLIA" during a real Ethereum
+        # MAINNET USDT swap — three misnomers in one sentence, at the single most irreversible
+        # moment in the protocol. `maker_claims_btc` is a legacy FSM name (the state machine was
+        # built for BTC<->RXD and the EVM legs reuse it), but an operator reading "SEPOLIA" while
+        # real value moves is being actively misled, not merely confused.
+        confirm(
+            f"maker claims the {_asset} on {_eth_chain.name} (chain {args.eth_chain_id}) — "
+            "THIS PUBLISHES THE PREIMAGE and commits the Radiant side",
+            auto_yes=args.yes,
+        )
         rec = await coord.maker_claims_btc(p_secret)
         claim_tx = eth_leg.last_claim_tx
         if not claim_tx:
@@ -948,6 +1085,17 @@ def _args() -> argparse.Namespace:
             "ADDITIONAL budget for an ETH finality STALL, seconds. Real-value mode requires "
             ">= 3600 (the May-2023 mainnet stall ran about an hour). 0 keeps the existing "
             "testnet behaviour; a measured policy refuses it."
+        ),
+    )
+    ap.add_argument(
+        "--maker-stall-safety-window-blocks",
+        type=int,
+        default=6,
+        help=(
+            "N: the squeeze window the taker must be able to act inside. The coordinator enforces "
+            "a floor of ceil(eth_finalization_window_s / FAST-tail interval) + burial - 1, which on "
+            "L1 with a measured 36s fast tail is 27 — well above this default of 6. Raise it for a "
+            "real ETH counter leg; the default suits a chain whose finality window is small."
         ),
     )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)

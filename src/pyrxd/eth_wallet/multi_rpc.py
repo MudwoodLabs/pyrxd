@@ -201,13 +201,31 @@ class MultiSourceEthRpc:
     # ------------------------------------------------------- quorum'd reads
 
     async def assert_chain(self) -> None:
-        """EVERY source must be on the expected chain.
+        """No source may be on the WRONG chain; an unreachable one is tolerated above quorum.
 
-        Not a quorum: a quorum across two different chains is not a weaker guarantee, it is a
-        meaningless one. This is the same reasoning `FailoverElectrumXClient` uses to make a chain
-        mismatch non-failover-able.
+        A chain mismatch is never failover-able — a quorum spanning two chains is not a weaker
+        guarantee, it is a meaningless one — so a `ValidationError` from any source propagates,
+        the same reasoning `FailoverElectrumXClient` uses.
+
+        But the first version awaited every source unconditionally, which conflated "this endpoint
+        is on the wrong chain" with "this endpoint returned 429". That is not a safety property, it
+        is a liveness bug, and it bit during a live mainnet swap: one rate-limited public endpoint
+        aborted `verify_funded` with real value already locked in the HTLC. A source that cannot be
+        reached also cannot lie — and if it returns later on a different chain, every identity read
+        refuses on the disagreement. So an unreachable source is tolerated as long as `min_agreeing`
+        sources positively CONFIRM the chain.
         """
-        await asyncio.gather(*(s.assert_chain() for s in self._sources))
+        results = await asyncio.gather(*(s.assert_chain() for s in self._sources), return_exceptions=True)
+        for r in results:
+            if isinstance(r, ValidationError):
+                raise r
+        confirmed = sum(1 for r in results if not isinstance(r, BaseException))
+        if confirmed < self._min:
+            unreachable = "; ".join(f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException))
+            raise NetworkError(
+                f"assert_chain: only {confirmed} of {len(self._sources)} endpoints confirmed chain, "
+                f"quorum is {self._min} [{unreachable}]"
+            )
 
     async def get_code(self, address: str, block_identifier: str | int | None = None) -> bytes:
         """Runtime code — an IDENTITY read, so any disagreement refuses."""

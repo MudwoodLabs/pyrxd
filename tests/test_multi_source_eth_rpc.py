@@ -248,6 +248,27 @@ class TestBelowQuorumIsAnError:
         rpc = MultiSourceEthRpc([_Source(balance=5), _Source(balance=5), _Source(down=True)])
         assert _run(balance_of(rpc, _USDT, _HTLC)) == 5
 
+    def test_an_UNREACHABLE_source_does_not_abort_a_swap_above_quorum(self) -> None:
+        """Liveness, learned mid-swap. The first version awaited every source unconditionally, so
+        one rate-limited public endpoint aborted `verify_funded` with real value already locked in
+        the HTLC. An endpoint that cannot be reached also cannot lie, and if it returns on a
+        different chain every identity read refuses on the disagreement."""
+        rpc = MultiSourceEthRpc([_Source(), _Source(), _Source(down=True)])
+        _run(rpc.assert_chain())
+
+    def test_a_WRONG_CHAIN_source_is_still_fatal_even_above_quorum(self) -> None:
+        """The safety half, and it must not be softened by the liveness fix: a quorum spanning two
+        chains is not a weaker guarantee, it is a meaningless one."""
+        good, bad = _Source(), _Source()
+
+        async def _wrong():
+            raise ValidationError("RPC chain_id 8453 != expected 1 (wrong network)")
+
+        bad.assert_chain = _wrong
+        rpc = MultiSourceEthRpc([good, _Source(), bad])
+        with pytest.raises(ValidationError, match="wrong network"):
+            _run(rpc.assert_chain())
+
     def test_assert_chain_requires_EVERY_source_not_a_quorum(self) -> None:
         """A quorum spanning two different chains is not a weaker guarantee, it is a meaningless
         one — the same reasoning the ElectrumX failover layer uses."""

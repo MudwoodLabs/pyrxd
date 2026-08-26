@@ -1248,7 +1248,7 @@ class SwapCoordinator:
                 raise ValidationError(
                     f"maker_stall_safety_window_blocks={config.maker_stall_safety_window_blocks} is below the "
                     f"ETH finality+burial reserve floor {min_n} (= ceil(eth_finalization_window_s "
-                    f"{mp.eth_finalization_window_s}/rxd_block_interval_s {mp.rxd_block_interval_s})={fin_reserve_blocks} "
+                    f"{mp.eth_finalization_window_s}/{_dividing_interval_s(mp)}s fast-tail interval)={fin_reserve_blocks} "
                     f"+ burial {burial_blocks} - 1); a maker could time its reveal into a "
                     "SQUEEZE window the taker cannot safely act in — raise N or shrink the window"
                 )

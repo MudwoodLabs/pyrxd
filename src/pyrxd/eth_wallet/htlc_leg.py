@@ -275,8 +275,23 @@ class EthHtlcContractLeg:
         """
         await self._rpc.assert_chain()
         code = await self._rpc.get_code(locator.contract_address, block_identifier)
+        if not code:
+            # EMPTY is not WRONG, and conflating them is a bad diagnosis on the worst day. Reading
+            # at the `finalized` checkpoint returns no code for a contract deployed after it — the
+            # ordinary state for the ~13 minutes between deploy and finality. The old message
+            # accused an attacker, which on a live mainnet run reads as "you have been robbed"
+            # when the truth is "wait". Both are refusals; only one is a reason to panic.
+            raise ValidationError(
+                f"no contract code at {locator.contract_address} as of block_identifier="
+                f"{block_identifier!r}. If that is 'finalized', the deploy is most likely simply "
+                "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
+                "at a checkpoint is not evidence of a wrong or attacker contract."
+            )
         if not self._runtime_code_matches(code):
-            raise ValidationError("on-chain runtime logic != committed EthHtlc artifact (wrong/attacker contract)")
+            raise ValidationError(
+                f"on-chain runtime logic at {locator.contract_address} does not match the committed "
+                f"EthHtlc artifact ({len(code)} bytes present, but different) — wrong/attacker contract"
+            )
         # Read immutables back by value and bind them to the negotiated terms.
         #
         # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
