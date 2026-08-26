@@ -75,7 +75,7 @@ def test_stall_tolerance_shrinks_the_rxd_budget():
         rounding_slack_s=300,
         eth_finality_stall_tolerance_s=3600,
     )
-    kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, rxd_block_interval_s=43.0)
+    kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, rxd_block_interval_s=36.0)
     t_base = eth_absolute_to_rxd_relative_blocks(margin=base, **kw)
     t_stall = eth_absolute_to_rxd_relative_blocks(margin=with_stall, **kw)
     assert t_stall.value < t_base.value  # stall budget strictly shrinks the RXD window
@@ -95,15 +95,15 @@ def test_stall_tolerance_can_force_failclosed():
             eth_timeout_unix_s=10_000,
             expected_rxd_lock_time_unix_s=0,
             margin=huge_stall,
-            rxd_block_interval_s=43.0,
+            rxd_block_interval_s=36.0,
         )
 
 
 def test_fast_interval_yields_more_blocks_than_mean():
-    # The fast-tail (p10=43s) interval yields MORE blocks than the mean (330s) for the same
+    # The fast-tail (p10=36s, measured 2026-08-26) interval yields MORE blocks than the mean (330s) for the same
     # budget — the refund opens LATER in the fast case, which is the safe direction.
     kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, margin=_margin())
-    t_fast = eth_absolute_to_rxd_relative_blocks(rxd_block_interval_s=43.0, **kw)
+    t_fast = eth_absolute_to_rxd_relative_blocks(rxd_block_interval_s=36.0, **kw)
     t_mean = eth_absolute_to_rxd_relative_blocks(rxd_block_interval_s=330.0, **kw)
     assert t_fast.value > t_mean.value
 
@@ -401,7 +401,7 @@ class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
         disagree, the gate has started measuring something new — check it is the thing you meant,
         and that it does not simply refuse everything."""
         verdicts = {
-            iv: self._verdict(iv, lock_delay=lock_delay, wait=wait) for iv in (9.0, 43.0, 229.0, 330.0, 600.0, 1_200.0)
+            iv: self._verdict(iv, lock_delay=lock_delay, wait=wait) for iv in (9.0, 36.0, 229.0, 330.0, 600.0, 1_200.0)
         }
         assert len(set(verdicts.values())) == 1, (
             f"the interval changed the verdict: {verdicts}. The gate is documented as punctuality-"

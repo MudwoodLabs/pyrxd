@@ -160,6 +160,11 @@ def eth_absolute_to_rxd_relative_blocks(
     the mean UNDERESTIMATES how fast the window can open. Measured RXD mainnet 2026-06-02 (150
     blocks): min 9 s, p10 43 s, median 229 s, mean 330 s — the p10/min, not the mean, is the
     load-bearing number. A slow RXD only lengthens the maker's lock (a liveness, not safety, cost).
+
+    RE-MEASURED 2026-08-26 (720 blocks): p10 36 s, median 221 s, mean 296 s, p90 671 s, max
+    2325 s. The p10 drifted DOWN from 43 s, which is the direction that under-counts a reserve —
+    sizing with the June figure against the August reality gives 16% fewer blocks than the window
+    holds. Measure per run; do not inherit either number.
     """
     _require_int(eth_timeout_unix_s, "eth_timeout_unix_s")
     _require_int(expected_rxd_lock_time_unix_s, "expected_rxd_lock_time_unix_s")

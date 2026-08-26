@@ -27,6 +27,10 @@ jobs:
         # / CodeQL PinnedDependenciesID alert. See ci/README.md.
         run: pip install -r ci/ruff-pin.txt --require-hashes
       - name: ruff check (lint)
-        run: ruff check src tests examples
+        # `scripts` included deliberately. It was outside every automated gate — not linted, not
+        # type-checked, not covered — while holding the production entry point for every mainnet
+        # swap. pre-commit reached it, so the guarantee depended on each contributor having the
+        # hook installed. The tree is already clean, so this costs nothing and closes that gap.
+        run: ruff check src tests examples scripts
       - name: ruff format (check only — no rewrites)
         run: ruff format --check src tests examples

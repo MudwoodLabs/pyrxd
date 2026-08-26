@@ -419,6 +419,21 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
     urls = [u.strip() for u in str(rpc_url).split(",") if u.strip()]
     if not urls:
         raise SystemExit("--eth-rpc-url is required")
+    if _token_leg_is_real(args) and len(urls) < 3:
+        # THREE, not two, and the reason is arithmetic rather than taste. `min_agreeing` defaults
+        # to a true majority — max(2, n//2+1) — so at n=2 it is 2, and `assert_chain`'s tolerance
+        # for an unreachable endpoint is INERT: both must still answer. That is precisely the
+        # configuration that aborted a live swap on one 429 with value already in the HTLC.
+        # Requiring two endpoints buys a cross-check; requiring three buys the cross-check AND
+        # survives one of them being rate-limited, which on free public endpoints is routine.
+        raise SystemExit(
+            f"a real-value token counter leg needs at least THREE independent --eth-rpc-url "
+            f"endpoints (got {len(urls)}), so a quorum survives one being unreachable. At two, "
+            "min_agreeing is 2 and a single 429 stalls the swap mid-flight. Working L1 endpoints "
+            "measured 2026-08-26: ethereum-rpc.publicnode.com, eth-mainnet.public.blastapi.io, "
+            "eth.api.onfinality.io/public, eth.drpc.org, rpc.mevblocker.io. Use DIFFERENT "
+            "operators — several URLs from one provider share a single failure."
+        )
     if len(urls) == 1:
         if _token_leg_is_real(args):
             raise SystemExit(
@@ -573,8 +588,19 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         "eth_finalization_window_s": args.eth_finalization_window_s,
         "cross_clock_margin_total_s": _cross_clock_margin(args).total_s(),
         "max_covenant_confirm_wait_s": args.max_covenant_confirm_wait_s,
-        "is_measured": False,
-        "NOTE": "ESTIMATED margins — pre-external-audit dust validation; operator accepts dust loss",
+        # READ FROM THE POLICY, never asserted. These were hardcoded False/"ESTIMATED", so a real
+        # token leg — which builds a MEASURED, require_measured policy — produced a run report
+        # claiming its own margins were estimated. The provenance record is the artifact that
+        # documents the run; a hardcoded field in it is not a note, it is a false statement about
+        # what protected the money. Found by review after the first L1 USDT run, whose report says
+        # ESTIMATED while its policy was MEASURED.
+        "is_measured": policy.is_measured,
+        "require_measured": policy.require_measured,
+        "NOTE": (
+            "MEASURED margins (real-value token counter leg)"
+            if policy.is_measured
+            else "ESTIMATED margins — pre-external-audit dust validation; operator accepts dust loss"
+        ),
     }
     report = StepReport("sepolia-dust", provenance)
 

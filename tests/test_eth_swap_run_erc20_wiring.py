@@ -161,7 +161,7 @@ def test_a_bridged_usdt_leg_builds_without_a_freeze_predicate(runner):
     function at all, and a leg that only works for freezable tokens would refuse honest work."""
     args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "8453")
     # Base mainnet USDT is real value, so two endpoints — the same requirement a real run carries.
-    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2")
+    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3")
     assert isinstance(leg, Erc20HtlcLeg)
     assert leg._token.has_blacklist is False
     assert leg._token.chain_id == 8453
@@ -191,15 +191,28 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         """The constraint that makes the quorum matter. A value-bearing token leg on one endpoint
         is the configuration where a lying or lagging provider costs the preimage."""
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        with pytest.raises(SystemExit, match="at least TWO independent"):
+        with pytest.raises(SystemExit, match="at least THREE independent"):
             runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
 
-    def test_a_real_token_leg_is_SATISFIED_by_two(self, runner) -> None:
-        """Paired with the refusal: a guard that refused every configuration would pass that test
-        too, and would make the run impossible rather than safe."""
+    def test_a_real_token_leg_REFUSES_TWO_because_the_tolerance_would_be_inert(self, runner) -> None:
+        """Two passes "is it a quorum" and fails the question that matters.
+
+        `min_agreeing` defaults to a true majority — max(2, n//2+1) — so at n=2 it is 2 and
+        `assert_chain`'s tolerance for an unreachable endpoint does not exist: both must still
+        answer. That is exactly the configuration where one 429 from a public endpoint stalled a
+        live swap with value already locked in the HTLC.
+        """
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2", chain_id=1)
+        with pytest.raises(SystemExit, match="at least THREE independent"):
+            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2", chain_id=1)
+
+    def test_a_real_token_leg_is_SATISFIED_by_three(self, runner) -> None:
+        """The honest-path pair. Three is where the tolerance becomes real: 2-of-3 survives one
+        endpoint being down, which is routine on free public RPCs."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3", chain_id=1)
         assert isinstance(rpc, MultiSourceEthRpc)
+        assert rpc.min_agreeing == 2 and len(rpc.sources) == 3, "2-of-3 tolerates one unreachable"
 
     def test_a_TESTNET_token_leg_is_not_forced_into_a_quorum(self, runner) -> None:
         """Base Sepolia USDC is faucet money. Requiring two endpoints there would refuse honest
@@ -214,7 +227,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
         rpc, leg = runner._eth_leg(
             args,
-            rpc_url="http://127.0.0.1:1,http://127.0.0.1:2",
+            rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3",
             chain_id=1,
             key_hex="11" * 32,
             claim_to="0x" + "44" * 20,
