@@ -41,7 +41,14 @@ _USDC = token_for("USDC", 1)
 _FUND_TIMEOUT = int(time.time()) + 86_400
 
 
-def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0, inflight: int = 0):
+def _leg(
+    *,
+    push_fails: bool = False,
+    order: list,
+    initial_held: int = 0,
+    inflight: int = 0,
+    frozen: tuple[str, ...] = (),
+):
     """A token leg whose deploy always succeeds; the push may fail.
 
     `initial_held` is what the HTLC already holds — 0 for a fresh deploy, non-zero to model a
@@ -76,6 +83,11 @@ def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0, inflig
 
         def balanceOf(self, *a, **k):
             return _Call(state["held"])
+
+        def isBlacklisted(self, addr, *a, **k):
+            # The pre-fund gate reads this. Default is "not frozen", so every pre-existing test
+            # exercises the HONEST path; a test that wants a refusal passes `frozen=(...)`.
+            return _Call(str(addr).lower() in {a.lower() for a in frozen})
 
     class _Ctor:
         async def build_transaction(self, tx):
@@ -297,7 +309,15 @@ _REFUNDEE = "0x" + "55" * 20
 _TIMEOUT = _FUND_TIMEOUT
 
 
-def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 0, settled: int = 0):
+def _real_verify_leg(
+    *,
+    on_chain: dict,
+    held: int,
+    order: list,
+    inflight: int = 0,
+    settled: int = 0,
+    frozen: tuple[str, ...] = (),
+):
     """A leg whose `verify_funded` is the PRODUCTION one, backed by a node fake serving the
     contract's immutables. `on_chain` overrides let a test deploy a contract that is NOT this
     swap's and watch the real check refuse it."""
@@ -355,6 +375,11 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 
 
         def decimals(self, *a, **k):
             return _Call(6)
+
+        def isBlacklisted(self, addr, *a, **k):
+            # The pre-fund gate reads this. Default is "not frozen", so every pre-existing test
+            # exercises the HONEST path; a test that wants a refusal passes `frozen=(...)`.
+            return _Call(str(addr).lower() in {a.lower() for a in frozen})
 
     class _Contract:
         functions = _Fns()

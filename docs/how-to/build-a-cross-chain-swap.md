@@ -215,7 +215,13 @@ What the code does about that — none of which is a fix:
   gate that eventually is not invoked. (The refundee is deliberately *not* checked here: a claim
   sweeps to the claimant and never touches the refundee, so a frozen refundee cannot make the claim
   revert, and refusing on it would hand the counterparty a free veto over value the claimant has
-  already earned.)
+  already earned. The refundee is checked at the other end instead — see the next bullet.)
+- **A pre-fund gate, before you pay in.** `refund()` pays the refundee, so funding a leg whose
+  refundee is already frozen buys a position with no exit: if the counterparty never claims, the
+  tokens stay in the contract for good. Before the deploy spends gas, and again inside the step
+  that actually moves the tokens, the leg reads freeze status for the claimant, the refundee and —
+  once it exists — the contract itself. It refuses only when something is about to be sent, so a
+  resume whose push already landed can still recover its locator.
 - **It narrows the window; it does not close it.** Check-then-reveal is itself a race. A freeze
   landing between the check and the broadcast — or at any point after the reveal — is unmitigated by
   construction. It is a seatbelt, not a fix.

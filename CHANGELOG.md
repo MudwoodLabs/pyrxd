@@ -79,6 +79,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     never touches it, so refusing there would block honest work and hand the counterparty a free
     unilateral veto. It narrows the window rather than closing it; check-then-reveal is itself a
     race.
+  - `assert_not_frozen_before_funding` is the pre-**fund** gate, and it is where the refundee is
+    checked. `refund()` pays the refundee, so funding a leg whose refundee is already frozen buys
+    a position with no exit: if the counterparty never claims, the tokens stay in the contract for
+    good. That case was previously checked in **no** code path, while the docs described a
+    pre-fund gate that had never been written. It runs from `Erc20HtlcLeg.fund` twice — before the
+    deploy spends gas, and again **inside** the branch that moves tokens, where the contract
+    address is known and its freeze is the unrecoverable one — and only when something is actually
+    about to be sent, so a resume whose push already landed can still recover its locator. A token
+    pinned `has_blacklist=False` costs no RPC call at all.
 
 ### Fixed
 

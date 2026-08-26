@@ -28,7 +28,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..security.errors import NetworkError, PreRevealAbort, ValidationError
-from .erc20 import assert_not_frozen_before_reveal, assert_token_matches_chain, balance_of
+from .erc20 import (
+    assert_not_frozen_before_funding,
+    assert_not_frozen_before_reveal,
+    assert_token_matches_chain,
+    balance_of,
+)
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy, normalise_tx_hash
 from .tokens import Erc20Token
@@ -161,6 +166,26 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 require_balance=False,
             )
         else:
+            # THE FRESH-FUND BRANCH ONLY, and that scoping is the whole subtlety. This is the CHEAP
+            # copy of the gate — it cannot name the contract, because on a fresh fund the contract
+            # does not exist until the deploy below — and it is here so a doomed swap costs nothing
+            # rather than a 412k-gas deploy. The load-bearing copy runs in `_push_and_bind`, inside
+            # the branch that actually moves tokens.
+            #
+            # A first version ran before this `if`, on RESUMES too, passing the known contract
+            # address. That refused honest work: a resume whose push already landed has nothing
+            # left to send and nothing left to risk — it is calling `fund` only to recover its
+            # locator. Refusing it because the refundee was frozen would leave a taker whose tokens
+            # ARE in the contract unable to record the fund that completed, while un-funding
+            # nothing. Same reasoning, and the same scoping, as the in-flight guard below: refuse
+            # only when something is about to be SENT.
+            await assert_not_frozen_before_funding(
+                self._rpc,
+                self._token,
+                claimant=checksum(claimant),
+                refundee=checksum(refundee),
+                htlc_address=None,
+            )
             address, deploy_hash = await self._deploy(
                 web3=web3,
                 hashlock=hashlock,
@@ -285,6 +310,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 "sending against this reading could fund the HTLC twice. Wait for them to mine."
             )
         if shortfall > 0:
+            # THE GUARD, and it sits INSIDE the branch that moves the value rather than beside it.
+            # `address` is known by now, which the pre-deploy check could not assume, and it is the
+            # address whose freeze has no recovery at all — a frozen HTLC reverts claim AND refund.
+            # Scoped to `shortfall > 0` deliberately: when there is nothing left to send there is
+            # nothing to protect, and refusing a resume whose push already landed would strand a
+            # taker whose fund actually completed.
+            await assert_not_frozen_before_funding(
+                self._rpc,
+                self._token,
+                claimant=checksum(claimant),
+                refundee=checksum(refundee),
+                htlc_address=address,
+            )
             # --- push the tokens in. No approve, no transferFrom. ---
             token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
             push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)

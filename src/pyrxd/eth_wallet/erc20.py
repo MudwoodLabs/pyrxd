@@ -145,9 +145,66 @@ async def is_blacklisted(rpc: Any, token: Erc20Token, address: str) -> bool:
     except Exception as exc:
         raise NetworkError(
             f"could not determine whether {address} is frozen by {token.symbol}: {exc}. Refusing to "
-            "treat an unanswerable question as a safe answer — publishing the preimage on this "
-            "assumption is unrecoverable if it is wrong."
+            "treat an unanswerable question as a safe answer: acting on a wrong 'not frozen' is "
+            "unrecoverable, whether that act is funding the contract or publishing the preimage."
         ) from exc
+
+
+async def assert_not_frozen_before_funding(
+    rpc: Any,
+    token: Erc20Token,
+    *,
+    claimant: str,
+    refundee: str,
+    htlc_address: str | None,
+) -> None:
+    """The pre-FUND gate. Refuse to pay into a position that cannot be exited.
+
+    :func:`assert_not_frozen_before_reveal` protects the moment the preimage becomes public. This
+    one protects the earlier moment nothing was watching at all: **paying in**. They check
+    different addresses on purpose, because a different transfer is at risk in each.
+
+    * The **refundee** is why this function exists, and why it is a required argument rather than
+      an entry in a dict. A ``claim`` never touches the refundee, so the reveal gate deliberately
+      ignores it — correctly, since refusing there would block honest work and hand the
+      counterparty a free unilateral veto. But ``refund()`` *pays* the refundee, and a frozen
+      refundee makes it revert. Funding a leg whose refundee is already frozen buys a position
+      with no exit: if the counterparty simply never claims, the tokens stay in the contract for
+      good. Until this gate existed that case was checked in **no** code path — the docs claimed
+      a "pre-fund gate" that had never been written.
+    * The **claimant**, if frozen, cannot receive a ``claim`` at all, so the swap can only end in
+      a refund. Nothing is lost, but a deploy, a transfer and a full timelock are spent on a swap
+      that could never have completed.
+    * The **HTLC contract**, once it exists, is the unrecoverable case — freezing it reverts
+      ``claim`` *and* ``refund``, with no timeout that rescues the tokens. ``htlc_address`` is
+      ``None`` only in the window before the contract is deployed. It is a REQUIRED keyword so
+      that omitting it is impossible and passing ``None`` is a decision someone made.
+
+    This is a **narrower** promise than the reveal gate makes. It reads the tip once; a freeze
+    landing between this check and the transfer is unmitigated, exactly as check-then-reveal is
+    itself a race. It removes the case where the freeze was already there and nobody looked.
+
+    Raises:
+        NetworkError: the freeze status could not be READ — never treated as "not frozen".
+        ValidationError: an address is frozen; do not fund.
+    """
+    for role, addr in (("claimant", claimant), ("refundee", refundee)):
+        if not isinstance(addr, str) or not addr:
+            raise ValidationError(f"{role} address is required by the pre-fund freeze gate")
+    # Ordered so the report names the unrecoverable address first when several are frozen.
+    checks = [] if htlc_address is None else [("htlc contract", htlc_address)]
+    checks += [("claimant", claimant), ("refundee", refundee)]
+    frozen = [f"{role} ({addr})" for role, addr in checks if await is_blacklisted(rpc, token, addr)]
+    if not frozen:
+        return
+    raise ValidationError(
+        f"refusing to fund: {', '.join(frozen)} is frozen by the {token.symbol} issuer. "
+        "A frozen refundee cannot be paid by refund(), and a frozen contract can be paid by "
+        "neither refund() nor claim() — so tokens sent now may never come back. NO TOKENS HAVE "
+        "MOVED; this gate always runs before the transfer. (On a fresh fund the deploy gas may "
+        "already be spent — that is the cost of finding out, and it is not the value at risk.) "
+        "Renegotiate with an unfrozen address, or use a token whose issuer cannot freeze."
+    )
 
 
 async def assert_not_frozen_before_reveal(
