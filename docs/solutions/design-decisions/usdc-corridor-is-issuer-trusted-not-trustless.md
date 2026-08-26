@@ -6,7 +6,7 @@ category: design-decisions
 related_files:
   - src/pyrxd/eth_wallet/erc20_leg.py (the pre-reveal freeze gate, inside claim)
   - src/pyrxd/eth_wallet/erc20.py (is_blacklisted, assert_not_frozen_before_reveal)
-  - pyrxd-eth-htlc contracts/src/Erc20Htlc.sol (the FREEZE note)
+  - Erc20Htlc.sol, in the separate counter-leg contracts repository (the FREEZE note)
 ---
 
 ## TL;DR
@@ -18,14 +18,18 @@ disclosed. **Do not market this corridor as trustless.**
 
 ## The measured facts
 
-Measured on a mainnet fork at block 25,815,805 against the real USDC proxy, impersonating the live
-blacklister `0x0a06be16…78f9` (`pyrxd-eth-htlc` `test/Erc20HtlcSpike.t.sol`):
+Executed on a mainnet fork at block 25,815,805 against the real USDC proxy, impersonating the live
+blacklister `0x0a06be16…78f9`, in `test/Erc20HtlcSpike.t.sol` — which lives in the separate
+counter-leg contracts repository, so it is **not reproducible from this repo**.
 
-| what is frozen | claim | refund | recoverable? |
-|---|---|---|---|
-| the claimant | reverts | works | yes — refund after timeout |
-| the refundee | works | reverts | yes — claim still pays |
-| **the HTLC contract** | **reverts** | **reverts** | **NO — funds stranded permanently** |
+Two of the six cells below were executed; the rest follows from the token's transfer rule and has
+not been run. The split is kept because only the executed cells are evidence.
+
+| what is frozen | claim | refund | recoverable? | source |
+|---|---|---|---|---|
+| the claimant | reverts | works | yes — refund after timeout | `claim` **executed**; `refund` inferred |
+| the refundee | works | reverts | yes — claim still pays | inferred, not run |
+| **the HTLC contract** | **reverts** | **reverts** | **NO — funds stranded permanently** | **both executed** |
 
 The third row is the one that matters. No timeout rescues it. The funds are simply gone.
 
@@ -61,7 +65,10 @@ Three things, none of which is a fix:
    valid work, and worse: it would hand the counterparty a free unilateral veto, since a taker who
    becomes sanctioned after funding could kill the maker's only route to tokens it had already
    earned. The refundee belongs in a pre-**fund** gate, where a freeze really would strand the
-   refund — and no such gate exists yet.
+   refund, and `assert_not_frozen_before_funding` is now that gate — called from
+   `Erc20HtlcLeg.fund` before the deploy spends gas, and again inside the branch that moves the
+   tokens, where the contract address is known. It refuses only when something is about to be
+   sent, so a resume whose push already landed can still recover its locator.
 3. **A short funded window.** Exposure is the time tokens sit in the contract, so a tighter timeout
    is a safety property here in a way it is not for native ETH. This cuts against the usual
    instinct to be generous with timelocks.
