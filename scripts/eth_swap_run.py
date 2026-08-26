@@ -1022,7 +1022,24 @@ def _args() -> argparse.Namespace:
             "independent providers — several URLs from one provider share a single failure."
         ),
     )
-    ap.add_argument("--eth-key-hex", default="")
+    ap.add_argument(
+        "--eth-key-hex",
+        default="",
+        help=(
+            "The signing key as raw hex. VISIBLE IN `ps` AND /proc/<pid>/cmdline to every local "
+            "user for the life of the process, and it lands in shell history. Prefer "
+            "--eth-key-file. Kept for compatibility and for throwaway keys."
+        ),
+    )
+    ap.add_argument(
+        "--eth-key-file",
+        default="",
+        help=(
+            "Path to a file containing the signing key as hex. Preferred over --eth-key-hex: a "
+            "path on the command line is not a secret, the key itself is. Mirrors the pattern "
+            "dust_swap_resume.py already uses (it reads keys from --keys-out, never from argv)."
+        ),
+    )
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument("--eth-amount-wei", type=int, default=10**14)  # 0.0001 ETH dust
     ap.add_argument("--eth-claim-to", default="")
@@ -1134,6 +1151,20 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--report-out", default="/tmp/eth_swap_report.json")  # noqa: S108 — operator-overridable
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
+    if args.eth_key_file:
+        # A secret on argv is readable by every local user for as long as the process runs, and it
+        # persists in shell history afterwards. A PATH on argv is not a secret. Resolved here, once,
+        # so every downstream consumer keeps taking `args.eth_key_hex` unchanged.
+        if args.eth_key_hex:
+            raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
+        _kf = Path(args.eth_key_file).expanduser()
+        _mode = _kf.stat().st_mode & 0o777
+        if _mode & 0o077:
+            raise SystemExit(
+                f"{_kf} is mode {oct(_mode)}: readable by other users. chmod 600 it — a key file "
+                "that anyone can read is not an improvement on a key on the command line."
+            )
+        args.eth_key_hex = _kf.read_text().strip()
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
     # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.

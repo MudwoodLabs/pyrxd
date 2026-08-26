@@ -122,14 +122,28 @@ def _p2pkh_spk(key: PrivateKey) -> bytes:
 
 
 def _save(d: dict) -> None:
-    # 0600 — the state holds the carve UTXOs' WIFs (dust, but real keys).
-    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """0600 — the state holds the carve UTXOs' WIFs (dust, but real keys).
+
+    O_NOFOLLOW is load-bearing, not decoration. `_STATE` is a FIXED, PREDICTABLE path in
+    world-writable /tmp, and the previous `O_CREAT|O_TRUNC` open followed a pre-placed symlink and
+    truncated whatever it pointed at — any local user could aim it at a file this UID can write and
+    have the next run silently clobber it. Reproduced: the write succeeded, the victim file was
+    overwritten, and the symlink survived so the attack repeated.
+
+    The sibling `_dust_swap_shared.atomic_write_mode_600` is immune because it is O_EXCL, but that
+    is create-only and this state is rewritten as the run progresses. O_NOFOLLOW is the primitive
+    that fits: it refuses a symlink (ELOOP) while still allowing an ordinary file to be truncated.
+    """
+    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(d, f, indent=2)
 
 
 def _load() -> dict:
-    with open(_STATE) as f:
+    # O_NOFOLLOW on the READ side too: a symlink here lets an attacker substitute the WIFs and
+    # outpoints this run then acts on, which is the more dangerous half of the same weakness.
+    fd = os.open(_STATE, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as f:
         return json.load(f)
 
 
