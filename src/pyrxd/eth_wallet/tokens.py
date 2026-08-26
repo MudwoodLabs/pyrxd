@@ -40,6 +40,18 @@ _BRIDGED_LOOKALIKES: dict[str, str] = {
     # Reports symbol "USD\u20ae0", not "USDT" — an omnichain variant, not Tether's ERC-20. Listed
     # here so pinning it later as USDT is refused by NAME instead of silently accepted.
     "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": "Arbitrum One USDT0 (omnichain variant, not Tether's USDT)",
+    # BNB Smart Chain's "USDC". MEASURED 2026-08-25: reports symbol "USDC" and name "USD Coin" —
+    # metadata identical to Circle's — but it has NO masterMinter(), so it is not a Circle
+    # FiatToken at all, and it IS an EIP-1967 proxy (implementation 0xba5fe23f…0b5c).
+    #
+    # It also breaks the assumption the entries above share: it reports decimals=18, not 6. Every
+    # other look-alike here matches Circle's 6, which is why the note above says metadata alone
+    # cannot discriminate. Here it could have — but only if something looked, and nothing
+    # resolving by symbol does. Pinning it as USDC would be two errors at once: the wrong issuer
+    # AND a 10^12 scale error in every amount.
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": (
+        "BNB Smart Chain Binance-Peg USDC (not Circle-issued, and 18 decimals not 6)"
+    ),
 }
 
 
@@ -150,8 +162,9 @@ KNOWN_TOKENS: dict[tuple[str, int], Erc20Token] = {
     #   * Optimism / Base / Linea answer NEITHER freeze spelling. That is not evidence they cannot
     #     freeze — it is evidence the two names probed are absent. Pinning has_blacklist=False on a
     #     negative probe is precisely the inference has_blacklist exists to avoid, and it would
-    #     fail OPEN on the one gate guarding an unrecoverable loss. They stay unpinned until
-    #     someone reads their admin surface properly.
+    #     fail OPEN on the one gate guarding an unrecoverable loss. They stayed unpinned until
+    #     someone read their admin surface properly. Optimism and Base since HAVE been read that
+    #     way and are pinned below on positive evidence; Linea has not, and is still refused.
     ("USDT", 1): Erc20Token("USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7", 6, 1, blacklist_fn="isBlackListed"),
     # OP-stack bridged USDT. has_blacklist=False is POSITIVELY established here, not inferred from
     # a failed probe. Verified 2026-08-25 on both chains:
@@ -174,6 +187,29 @@ KNOWN_TOKENS: dict[tuple[str, int], Erc20Token] = {
     # Linea USDT 0xA2194392…2B93 stays UNPINNED: it IS an EIP-1967 proxy with a populated admin
     # slot, so the admin can swap in an implementation that freezes. "Cannot freeze today" is not
     # the property worth pinning; "cannot be made to freeze" is, and this token does not have it.
+    #
+    # BNB Smart Chain USDT 0x55d39832…7955 stays UNPINNED, and NOT because the token failed — it
+    # is the best-behaved token audited so far. MEASURED 2026-08-25: symbol "USDT", name "Tether
+    # USD"; NOT a proxy (all four EIP-1967-family slots empty); an opcode-aware walk of all 4,413
+    # bytes finds no DELEGATECALL, CALLCODE, SELFDESTRUCT or CREATE* — and no CALL at all, so it
+    # cannot even reach another contract. Its complete public ABI, enumerated from the dispatcher's
+    # PUSH4 table rather than inferred from reverts, is plain BEP-20 plus mint(uint256) and
+    # burn(uint256) over the owner's OWN balance, plus transferOwnership / renounceOwnership. No
+    # blacklist under any spelling, no pause, no burnFrom, no seize. Unlike the OP-stack entries
+    # above there is no bridge-callable burn against an arbitrary holder: nobody can take another
+    # account's balance. The residual is owner MINT — unbounded inflation, a peg risk rather than a
+    # seizure risk — plus Binance-Peg redeemability, this being Binance-issued, not Tether-issued.
+    #
+    # The blocker is the CHAIN, not the token. BSC's `finalized` tag is its own validator set's,
+    # measured 0-2 s behind the tip, so it does not fit the Ethereum-anchored finality model the
+    # swap's reorg gate is built on. See the BSC note in `chains.py`; `evm_chain_by_id(56)` fails
+    # closed. Pin this the day that chain question is answered, not before.
+    #
+    # NOTE FOR WHOEVER DOES: it is 18 decimals, where every token pinned above is 6. It would be
+    # the first entry where the SYMBOL ALONE is ambiguous at a factor of 10^12 — "USDT" means 6
+    # decimals on Ethereum and 18 on BSC. The (symbol, chain_id) key and the runtime
+    # `assert_token_matches_chain` cross-check are what stand between that and a silent 10^12
+    # error, so neither is optional here.
 }
 
 
@@ -201,9 +237,9 @@ def token_by_address(address: str, chain_id: int) -> Erc20Token:
     key = address.lower()
     if key in _BRIDGED_LOOKALIKES:
         raise ValidationError(
-            f"{address} is {_BRIDGED_LOOKALIKES[key]} — a different contract from Circle's native "
-            "USDC, with its own liquidity. Locking it would hand the counterparty an asset they "
-            "did not price. Use the native address for this chain."
+            f"{address} is {_BRIDGED_LOOKALIKES[key]} — a different contract from the issuer's "
+            "own token, with its own liquidity. Locking it would hand the counterparty an asset "
+            "they did not price. Use the pinned address for this chain."
         )
     for token in KNOWN_TOKENS.values():
         if token.address == key and token.chain_id == chain_id:

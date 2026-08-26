@@ -54,6 +54,26 @@ Polygon's own security terms), not this Ethereum-anchored window. ``evm_chain_by
 closed. (A 2025-09-10 faulty-milestone incident delayed Polygon finality ~15 min-1 h, resolved
 only by an emergency hard fork — a validator-set liveness risk with no Ethereum analogue.)
 
+Deliberately NOT in the registry — **BNB Smart Chain** (chain_id 56), for the same reason as
+Polygon PoS and it is worth stating separately because the token side looks so inviting. BSC's
+``finalized`` tag is its OWN validator set's (Parlia + BEP-126 fast finality), not
+Ethereum-anchored. MEASURED 2026-08-25 against three independent endpoints
+(``bsc-dataseed.bnbchain.org``, ``bsc-mainnet.public.blastapi.io``, ``bsc-dataseed1.defibit.io``):
+the ``finalized`` tag sits **0-2 seconds / 1-2 blocks behind the tip**. An Ethereum-anchored
+chain cannot finalize in under the 768 s L1 checkpoint, so that measurement alone settles what
+kind of finality this is.
+
+The floor would force a 768 s window onto it, and — exactly as for Polygon — that number
+misrepresents BSC in both directions: it finalizes far faster, and the finality it does have is
+secured by BSC's stake, not Ethereum's. Note that inflating the window does NOT recover the
+difference. A longer wait buys more of BSC's own security, never Ethereum's, so the swap
+operator's trust model is silently substituted whatever number is chosen. BSC needs a reorg depth
+argued in its own validator-set terms before it can carry value here; ``evm_chain_by_id(56)``
+fails closed until someone writes that down.
+
+(The token side is genuinely clean — see the BSC note in ``tokens.py`` — which is precisely why
+this exclusion is recorded here rather than left to be rediscovered.)
+
 The ``network`` tag feeds the existing fail-closed gates unchanged: any tag not in
 ``AUDIT_CLEARED_NETWORKS`` (only isolated test chains are) is value-bearing and refuses to
 run without the explicit post-audit ``audit_cleared=True`` opt-in — so every chain here,

@@ -8,7 +8,14 @@ from __future__ import annotations
 
 import pytest
 
-from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, Erc20Token, token_by_address, token_for
+from pyrxd.eth_wallet.chains import evm_chain_by_id
+from pyrxd.eth_wallet.tokens import (
+    _BRIDGED_LOOKALIKES,
+    KNOWN_TOKENS,
+    Erc20Token,
+    token_by_address,
+    token_for,
+)
 from pyrxd.security.errors import ValidationError
 
 
@@ -39,6 +46,67 @@ class TestTheRegistryIsPinnedNotResolved:
         actually have."""
         with pytest.raises(ValidationError, match="bridged"):
             token_by_address(address, chain_id)
+
+    @pytest.mark.parametrize("address", sorted(_BRIDGED_LOOKALIKES))
+    def test_EVERY_lookalike_is_refused_and_named(self, address: str) -> None:
+        """Parametrised over the registry itself, not over a hand-copied list.
+
+        The hand-written list covered the two USDC.e entries and silently missed the others as
+        they were added — a refusal nobody tests is a refusal nobody notices losing. Driving the
+        parametrisation off `_BRIDGED_LOOKALIKES` means a new entry cannot be added without
+        arriving with this test already applied to it.
+
+        The assertion is that the message NAMES the thing, because a bare "unknown token" sends
+        an operator hunting for a typo when what they actually hold is a different asset.
+        """
+        with pytest.raises(ValidationError) as exc:
+            token_by_address(address, 1)
+        assert _BRIDGED_LOOKALIKES[address] in str(exc.value)
+
+    def test_the_lookalike_that_ALSO_differs_in_decimals(self) -> None:
+        """BNB Smart Chain's Binance-Peg "USDC" is 18 decimals where Circle's is 6 everywhere.
+
+        Every other look-alike matches Circle's metadata exactly, which is the stated reason the
+        address is the only discriminator. This one would be a wrong-issuer error AND a 10^12
+        scale error at once, so it is pinned as refused rather than left to a symbol lookup.
+        """
+        bsc_pegged = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+        assert bsc_pegged in _BRIDGED_LOOKALIKES
+        assert "18 decimals" in _BRIDGED_LOOKALIKES[bsc_pegged]
+        for (symbol, chain_id), token in KNOWN_TOKENS.items():
+            assert token.address != bsc_pegged, f"refused look-alike pinned as {symbol} on {chain_id}"
+
+    def test_BSC_fails_closed_on_BOTH_the_token_and_the_chain(self) -> None:
+        """BSC USDT audits clean but BSC's finality is its own validator set's, not Ethereum's.
+
+        Both refusals are asserted because they are independent: pinning the token later without
+        answering the chain question would produce a swap whose reorg gate silently means
+        something else. Measured 2026-08-25: BSC's `finalized` tag runs 0-2 s behind the tip,
+        where an Ethereum-anchored chain cannot beat the 768 s L1 checkpoint.
+        """
+        with pytest.raises(ValidationError, match="no pinned"):
+            token_for("USDT", 56)
+        with pytest.raises(ValidationError, match="unknown EVM chain id"):
+            evm_chain_by_id(56)
+
+    def test_the_chains_that_ARE_supported_still_resolve(self) -> None:
+        """The honest-path pair for the refusals above — a fail-closed registry that refused
+        everything would pass every test in this class."""
+        for (symbol, chain_id), token in KNOWN_TOKENS.items():
+            assert token_for(symbol, chain_id) is token
+            assert evm_chain_by_id(chain_id).chain_id == chain_id
+
+    def test_the_same_symbol_can_mean_different_decimals_per_chain(self) -> None:
+        """Guards the assumption a reader of this registry is most likely to carry in.
+
+        Every token pinned today is 6 decimals, which makes "USDT is 6 decimals" look like a
+        property of the symbol. It is a property of the (symbol, chain) PAIR — BSC's USDT is 18 —
+        so this asserts the lookup key, not the current values. If a non-6-decimal token is ever
+        pinned, this test keeps passing and the ones assuming 6 are the ones that break.
+        """
+        for (symbol, chain_id), token in KNOWN_TOKENS.items():
+            assert token is token_for(symbol, chain_id)
+            assert token.chain_id == chain_id, "a token must know the chain its decimals belong to"
 
     def test_the_same_address_on_the_wrong_chain_is_not_the_same_asset(self) -> None:
         """A token address means nothing without its chain id."""
