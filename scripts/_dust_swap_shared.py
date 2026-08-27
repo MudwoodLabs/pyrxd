@@ -26,9 +26,11 @@ import struct
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times
 from pyrxd.network.bitcoin import MempoolSpaceSource
+from pyrxd.security.units import ChainHeight
 
 _MAINNET_BTC_API = "https://mempool.space/api"
 
@@ -58,14 +60,14 @@ class CapturingBroadcaster:
     (review of cbd5fc0).
     """
 
-    def __init__(self, inner) -> None:
+    def __init__(self, inner: Any) -> None:
         self._inner = inner
         self.last_raw: bytes | None = None
 
     async def broadcast(self, raw_tx: bytes) -> str:
         txid = await self._inner.broadcast(raw_tx)
         self.last_raw = bytes(raw_tx)
-        return txid
+        return str(txid)
 
 
 class InMemSeen:
@@ -109,11 +111,11 @@ class SshTrFeeSource:
     sign / broadcast over ssh.
     """
 
-    def __init__(self, client, fee_amount_photons: int) -> None:
+    def __init__(self, client: Any, fee_amount_photons: int) -> None:
         self._client = client
         self._amount = fee_amount_photons
 
-    def next_fee_input(self):
+    def next_fee_input(self) -> Any:
         return self._client.carve_fee_input(self._amount)
 
 
@@ -252,7 +254,7 @@ def atomic_write_mode_600(path: Path, content: str) -> None:
         raise
 
 
-def merge_into_mode_600(path: Path, extra: dict) -> None:
+def merge_into_mode_600(path: Path, extra: dict[str, Any]) -> None:
     """Merge ``extra`` into an existing mode-0600 JSON file, atomically.
 
     :func:`atomic_write_mode_600` is ``O_EXCL`` (create-only) by design, so it cannot
@@ -328,7 +330,7 @@ def validated_resume_deadline_s(
     return operator_value
 
 
-def rxd_blockcount(client) -> int:
+def rxd_blockcount(client: Any) -> ChainHeight:
     """``getblockcount`` over the ssh-tr shim, normalised to ``int``.
 
     Replaces the prior ``int(json.loads(json.dumps(_run_sync("getblockcount"))))``
@@ -339,7 +341,10 @@ def rxd_blockcount(client) -> int:
     res = client._run_sync("getblockcount")
     if not isinstance(res, int):
         raise RuntimeError(f"getblockcount returned non-int: {res!r}")
-    return res
+    # getblockcount is the TIP HEIGHT, not a depth. Tagged here, at the one place the number
+    # enters the runner, so it can be compared against a covenant fund height and never
+    # against a confirmation count.
+    return ChainHeight(res)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +352,7 @@ def rxd_blockcount(client) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def measured_margin_from_mainnet(args: argparse.Namespace):
+async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
     """Read recent MAINNET BTC header timestamps and build a measured ``MarginPolicy``.
 
     Timing always comes from MAINNET BTC data regardless of stage — signet header
@@ -384,16 +389,16 @@ async def measured_margin_from_mainnet(args: argparse.Namespace):
 class StepReport:
     """Append-only provenance report -> JSON. NEVER records the preimage ``p``."""
 
-    def __init__(self, stage: str, margin_provenance: dict) -> None:
+    def __init__(self, stage: str, margin_provenance: dict[str, Any]) -> None:
         self._t0 = time.monotonic()
-        self.doc: dict = {
+        self.doc: dict[str, Any] = {
             "stage": stage,
             "started_unix": int(time.time()),
             "margin_provenance": margin_provenance,
             "steps": [],
         }
 
-    def step(self, *, name: str, chain: str, **fields) -> None:
+    def step(self, *, name: str, chain: str, **fields: Any) -> None:
         entry = {"step": name, "chain": chain, "wall_clock_s": round(time.monotonic() - self._t0, 1), **fields}
         self.doc["steps"].append(entry)
         print(f"  [report] {json.dumps(entry)}")
@@ -436,7 +441,9 @@ __all__ = [
 _ = asyncio
 
 
-async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 30.0):
+async def wait_for_covenant_funding(
+    client: Any, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 30.0
+) -> Any:
     """Block until the covenant SPK actually holds a confirmed UTXO of the pinned amount.
 
     This replaces an operator ATTESTATION that appeared in every runner — a confirm() reading
@@ -473,7 +480,7 @@ async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_pho
         await asyncio.sleep(poll_s)
 
 
-def covenant_fund_height(height: int) -> int:
+def covenant_fund_height(height: ChainHeight) -> ChainHeight:
     """THE one place a covenant funding output's on-chain height becomes the reorg gate's anchor.
 
     UNITS, stated once so no call site has to restate them: this takes a TRUE BLOCK HEIGHT — the
@@ -485,6 +492,11 @@ def covenant_fund_height(height: int) -> int:
     (``fund_height = tip - confs + 1``) is now the bug rather than the fix: a conf count is no
     longer representable here, so there is nothing left to compensate for, and a leftover
     compensation would put the anchor a full chain-length in the past.
+
+    That units contract is now the CHECKER's, not just the docstring's: the parameter is a
+    :data:`~pyrxd.security.units.ChainHeight`, so handing this a
+    :data:`~pyrxd.security.units.Confirmations` — or the ``tip - confs + 1`` compensation that
+    became an inversion once the producer was fixed — does not type-check.
 
     ``height == 0`` still means UNCONFIRMED, under both conventions — the one thing the change did
     not touch. Fail closed on it: an unconfirmed covenant has no fund height, and inventing one
@@ -501,7 +513,9 @@ def covenant_fund_height(height: int) -> int:
     return height
 
 
-async def scan_covenant_fund_height(client, *, covenant_spk: bytes, expected_photons: int) -> int:
+async def scan_covenant_fund_height(
+    client: Any, *, covenant_spk: bytes, expected_photons: int
+) -> ChainHeight:
     """The anchor for paths that locked the asset WITHOUT :func:`wait_for_covenant_funding` — the
     NFT and FT variants, which lock by SPENDING into the covenant rather than by waiting on an
     operator payment. Same conversion, same fail-closed rules, one scan.
@@ -520,10 +534,10 @@ async def scan_covenant_fund_height(client, *, covenant_spk: bytes, expected_pho
         register(bytes(covenant_spk))
     script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
     utxos = await client.get_utxos(script_hash)
-    return covenant_fund_height(int(getattr(_covenant_utxo(utxos, expected_photons), "height", 0)))
+    return covenant_fund_height(ChainHeight(int(getattr(_covenant_utxo(utxos, expected_photons), "height", 0))))
 
 
-def _covenant_utxo(utxos, expected_photons: int):
+def _covenant_utxo(utxos: Any, expected_photons: int) -> Any:
     """The covenant's funding UTXO — fail-closed on anything ambiguous.
 
     Matched on the PINNED amount, exactly as :func:`wait_for_covenant_funding` does: the covenant
@@ -546,8 +560,13 @@ def _covenant_utxo(utxos, expected_photons: int):
 
 
 async def resolve_asset_locked_at_height(
-    rxd_leg, *, covenant_spk: bytes, expected_photons: int, explicit: int, now_rxd_height: int
-) -> int:
+    rxd_leg: Any,
+    *,
+    covenant_spk: bytes,
+    expected_photons: int,
+    explicit: int,
+    now_rxd_height: ChainHeight,
+) -> ChainHeight:
     """The two-host taker's reorg-gate anchor: read off the chain unless the operator pinned it.
 
     ``--asset-locked-at-height`` was declared with ``default=0``, passed straight into
@@ -569,13 +588,15 @@ async def resolve_asset_locked_at_height(
             "to read the covenant's true fund height off the chain."
         )
     if int(explicit) > 0:
-        anchor = covenant_fund_height(int(explicit))
+        # The operator's pinned value is a raw CLI int; re-tagging it here is the claim that it
+        # is a height, and `covenant_fund_height` is the check that it is a usable one.
+        anchor = covenant_fund_height(ChainHeight(int(explicit)))
         source = "pinned by --asset-locked-at-height"
     else:
         _outpoint, _value, height = await rxd_leg.chain_io.find_covenant_utxo(
             bytes(covenant_spk), expected_value=int(expected_photons)
         )
-        anchor = covenant_fund_height(int(height))
+        anchor = covenant_fund_height(ChainHeight(int(height)))
         source = "read from the covenant's funding output on chain"
     if anchor > int(now_rxd_height):
         # The coordinator fails closed on now < locked_at (F-013) with a message about lying nodes.
@@ -588,7 +609,9 @@ async def resolve_asset_locked_at_height(
     return anchor
 
 
-async def wait_for_covenant_via_leg(leg, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 10.0):
+async def wait_for_covenant_via_leg(
+    leg: Any, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 10.0
+) -> Any:
     """Same contract as :func:`wait_for_covenant_funding`, driven through the RadiantCovenantLeg.
 
     The two-host scripts hold a leg rather than a raw client, and `find_covenant_utxo` is the

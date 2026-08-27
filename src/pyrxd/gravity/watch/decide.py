@@ -39,8 +39,9 @@ from pyrxd.gravity.swap_coordinator import (
     assess_claim_finality,
     taker_refund_window_open,
 )
-from pyrxd.gravity.swap_state import SwapRecord, SwapState, is_terminal
+from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState, is_terminal
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.units import BlockSpan, ChainHeight, Confirmations, PhotonValue, Seconds
 
 __all__ = ["Decision", "Intent", "Observations", "decide"]
 
@@ -88,15 +89,19 @@ class Observations:
     never a false broadcast.
     """
 
+    # UNITS. This struct holds both HEIGHTS and DEPTHS side by side, which is exactly how the
+    # two got swapped before: both are non-negative ints and 0 is meaningful under each
+    # reading. They are unit-tagged now, so putting a depth in a height slot (or the reverse)
+    # is a mypy error at the construction site — see `pyrxd.security.units`.
     maker_has_claimed_btc: bool
-    now_rxd_height: int
-    asset_locked_at_height: int | None = None
-    btc_claim_confirmations: int | None = None
+    now_rxd_height: ChainHeight
+    asset_locked_at_height: ChainHeight | None = None
+    btc_claim_confirmations: Confirmations | None = None
     # Quorum-agreed depth of the taker's BTC FUNDING outpoint (distinct from btc_claim_confirmations,
     # which is the maker's CLAIM-tx depth). Read only when heading toward a BTC refund (state
     # BTC_LOCKED / PARAMS_MISMATCH); gates the relative-CSV maturity (funding buried >= t_btc) for an
     # autonomous refund. ``None`` until/unless read — the refund branch fails closed on None.
-    btc_funding_confirmations: int | None = None
+    btc_funding_confirmations: Confirmations | None = None
     # ETH counter-leg (v3). ``eth_claim_detected`` = the maker's ETH claim tx was observed on-chain;
     # ``eth_claim_finality`` = its point-in-time finalized-checkpoint verdict STATE (FINAL /
     # NOT_YET_FINAL_LIVE / COUNTER_CHAIN_NOT_FINALIZING), ``None`` until/unless a claim is observed.
@@ -111,7 +116,7 @@ class Observations:
     # branch prove the taker's counter-leg refund is DUE. ``None`` (the default, and every
     # pre-existing caller) keeps that branch fail-closed to WATCH — exactly as the BTC branch
     # watches on an unread funding depth — so an absent clock can never manufacture a page.
-    now_unix_s: int | None = None
+    now_unix_s: Seconds | None = None
     low_corroboration: bool = False
 
     def __post_init__(self) -> None:
@@ -183,7 +188,7 @@ class Decision:
             raise ValidationError("autonomous_asset_claim is only valid on a PAGE_CLAIM decision")
 
 
-def _value_at_risk_photons(terms) -> int | None:
+def _value_at_risk_photons(terms: NegotiatedTerms) -> PhotonValue | None:
     """The per-record value-at-risk (photons) for the value-scaled burial — the watchtower's
     per-swap input so one tower policy judges many swaps correctly (audit follow-up).
 
@@ -192,24 +197,36 @@ def _value_at_risk_photons(terms) -> int | None:
     watchtower cannot see — so return None, and ``assess_claim_finality`` fails closed
     (SQUEEZED, never a value-blind SAFE) whenever value-scaling is configured on the policy.
     """
-    return terms.radiant_amount if terms.asset_variant == "rxd" else None
+    # The variant check IS the proof of unit, so the re-tag belongs right here and nowhere
+    # else: `radiant_amount` is `PhotonValue | TokenUnits`, and only the "rxd" branch has
+    # established which. An "ft" amount reaching a photons-typed slot is #505.
+    return PhotonValue(terms.radiant_amount) if terms.asset_variant == "rxd" else None
 
 
-def _required_btc_depth_blocks(policy: MarginPolicy) -> int:
+def _required_btc_depth_blocks(policy: MarginPolicy) -> BlockSpan:
     """The reorg depth the FINAL verdict requires, in blocks — identical to the
     coordinator's construction (swap_coordinator.py:1258-1260), so the verdict and
     the gate's internal reserve cannot diverge (assess_claim_finality fails closed
     on a mismatch)."""
-    return policy.btc_claim_reorg_depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+    # normalize_to(BLOCKS) is what makes this a BlockSpan rather than seconds; the tag records
+    # that the conversion happened, so a raw SECONDS timelock cannot reach a blocks slot.
+    return BlockSpan(
+        policy.btc_claim_reorg_depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+    )
 
 
-def _refund_opens_at(policy: MarginPolicy, terms, asset_locked_at_height: int) -> int:
-    """RXD height at which the maker's CSV refund opens (the claim deadline)."""
-    t_rxd_blocks = terms.t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-    return asset_locked_at_height + t_rxd_blocks
+def _refund_opens_at(policy: MarginPolicy, terms: NegotiatedTerms, asset_locked_at_height: ChainHeight) -> ChainHeight:
+    """RXD height at which the maker's CSV refund opens (the claim deadline).
+
+    UNITS: a ChainHeight plus a BlockSpan is a ChainHeight. The anchor must be the height the
+    covenant was MINED at — a confirmation depth here puts the deadline a whole chain-length
+    out of place, which is precisely the inversion the shim fix created downstream.
+    """
+    t_rxd_blocks = BlockSpan(terms.t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value)
+    return ChainHeight(int(asset_locked_at_height) + int(t_rxd_blocks))
 
 
-def _btc_refund_matured(terms, obs: Observations) -> bool:
+def _btc_refund_matured(terms: NegotiatedTerms, obs: Observations) -> bool:
     """True iff the taker's BTC CSV refund leaf has PROVABLY matured — the gate for an *autonomous*
     refund (an alert-only page still goes out regardless; this only decides ``autonomous_btc_refund``).
 

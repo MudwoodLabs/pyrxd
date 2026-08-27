@@ -41,7 +41,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Protocol, runtime_checkable
+from collections.abc import Iterator
+from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.btc_wallet.taproot import TimeUnit
@@ -62,7 +63,8 @@ from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
 from pyrxd.network._guards import finite_int
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
-from pyrxd.security.types import Hex20
+from pyrxd.security.types import Hex20, Txid
+from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
 
 _LOG = logging.getLogger(__name__)
 
@@ -152,7 +154,7 @@ class RadiantChainIO:
     ``get_utxos(script_hash)->list`` (records with ``tx_hash``/``tx_pos``/``value``).
     """
 
-    def __init__(self, client) -> None:
+    def __init__(self, client: Any) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
@@ -171,7 +173,7 @@ class RadiantChainIO:
                 raise _AlreadyKnown() from exc
             raise NetworkError(f"radiant broadcast failed: {exc}") from exc
 
-    async def confirmations(self, txid: str) -> int:
+    async def confirmations(self, txid: str) -> Confirmations:
         info = await self._client.get_transaction_verbose(txid)
         if not isinstance(info, dict):
             raise NetworkError("get_transaction_verbose did not return a dict")
@@ -185,11 +187,15 @@ class RadiantChainIO:
             depth = finite_int(raw)
         except ValueError as exc:
             raise NetworkError("node reported an unreadable confirmation depth; fail-closed") from exc
-        return depth if depth > 0 else 0
+        # A DEPTH, tagged as one. `Confirmations` and `ChainHeight` are both ints and both
+        # non-negative, and 0 means "unmined" under both readings — which is exactly why the
+        # shim's conflation survived review. They order OPPOSITELY, so the checker now keeps
+        # this return value out of every slot that wants a height.
+        return Confirmations(depth) if depth > 0 else Confirmations(0)
 
     async def find_covenant_utxo(
-        self, spk: bytes, *, expected_value: int | None = None, pin_outpoint: str | None = None
-    ) -> tuple[str, int, int]:
+        self, spk: bytes, *, expected_value: PhotonValue | None = None, pin_outpoint: str | None = None
+    ) -> tuple[str, PhotonValue, ChainHeight]:
         """Locate the funded covenant UTXO for ``spk`` -> ``(outpoint, value, height)``.
 
         Scans the UTXO set of the covenant scriptPubKey (ElectrumX script-hash =
@@ -197,6 +203,14 @@ class RadiantChainIO:
         is one matching UTXO; if ``expected_value`` is given, the match must equal it
         (a wrong value is a mis-funded covenant -> fail-closed). The returned value
         is the ON-CHAIN value, never a self-report.
+
+        UNITS. ``expected_value`` is a :data:`~pyrxd.security.units.PhotonValue` because it
+        is matched against the UTXO's NATIVE carrier value. It is NOT a Glyph FT token
+        count: a token covenant enforces ``refValueSum(ref) == amount`` and its carrier can
+        be dust of any size, so an FT amount passed here is a units error (#505). The third
+        element is a :data:`~pyrxd.security.units.ChainHeight` — the height the covenant was
+        MINED at, never a confirmation depth; the two sort in opposite directions and the
+        earliest-confirmed rule below inverts under the wrong one.
         """
         import hashlib
 
@@ -261,7 +275,7 @@ class RadiantChainIO:
                 utxos[0].height,
             )
         u = utxos[0]
-        return f"{u.tx_hash}:{u.tx_pos}", int(u.value), int(u.height)
+        return f"{u.tx_hash}:{u.tx_pos}", PhotonValue(int(u.value)), ChainHeight(int(u.height))
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to
@@ -313,7 +327,7 @@ class RxinDexerRefAdapter:
     track. This adapter is the single-indexer regtest backend.
     """
 
-    def __init__(self, indexer, chain_io: RadiantChainIO) -> None:
+    def __init__(self, indexer: Any, chain_io: RadiantChainIO) -> None:
         if not hasattr(indexer, "glyph_get_token"):
             raise ValidationError("indexer must provide glyph_get_token()")
         if not isinstance(chain_io, RadiantChainIO):
@@ -340,7 +354,7 @@ class RxinDexerRefAdapter:
         )
 
     @staticmethod
-    def _genesis_outpoint(token: dict, queried: GlyphRef) -> bytes:
+    def _genesis_outpoint(token: dict[str, Any], queried: GlyphRef) -> bytes:
         """Re-encode the token's reported genesis outpoint to the 36-byte wire ref.
 
         RXinDexer's ``glyph.get_token`` reports the genesis outpoint under
@@ -361,9 +375,9 @@ class RxinDexerRefAdapter:
         # RXinDexer native: glyph_id == "txid:vout" of the genesis reveal.
         glyph_id = token.get("glyph_id")
         if isinstance(glyph_id, str) and glyph_id.count(":") == 1:
-            txid, vout_s = glyph_id.split(":")
+            gid_txid, vout_s = glyph_id.split(":")
             try:
-                return GlyphRef(txid=txid, vout=int(vout_s)).to_bytes()
+                return GlyphRef(txid=Txid(gid_txid.lower()), vout=int(vout_s)).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
         # RXinDexer native: separate txid + vout fields.
@@ -371,29 +385,29 @@ class RxinDexerRefAdapter:
         vout = token.get("vout")
         if isinstance(txid, str) and isinstance(vout, int) and not isinstance(vout, bool):
             try:
-                return GlyphRef(txid=txid, vout=vout).to_bytes()
+                return GlyphRef(txid=Txid(txid.lower()), vout=vout).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
         # Legacy/alternate indexer field names.
         outpoint = token.get("ref_outpoint")
         if isinstance(outpoint, str) and outpoint.count(":") == 1:
-            txid, vout_s = outpoint.split(":")
+            op_txid, vout_s = outpoint.split(":")
             try:
-                return GlyphRef(txid=txid, vout=int(vout_s)).to_bytes()
+                return GlyphRef(txid=Txid(op_txid.lower()), vout=int(vout_s)).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
         rtxid = token.get("ref_txid")
         rvout = token.get("ref_vout")
         if isinstance(rtxid, str) and isinstance(rvout, int) and not isinstance(rvout, bool):
             try:
-                return GlyphRef(txid=rtxid, vout=rvout).to_bytes()
+                return GlyphRef(txid=Txid(rtxid.lower()), vout=rvout).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
         # No outpoint reported -> cannot confirm it equals the advertised ref.
         return b"\x00" * 36
 
     @staticmethod
-    def _payload_hash(token: dict) -> bytes:
+    def _payload_hash(token: dict[str, Any]) -> bytes:
         ph = token.get("payload_hash")
         if isinstance(ph, str):
             try:
@@ -543,7 +557,17 @@ class RadiantCovenantLeg:
         """
         cov = self._build_covenant(terms)
         outpoint, _value, _height = await self.chain_io.find_covenant_utxo(
-            cov.funded_spk, expected_value=terms.radiant_amount
+            cov.funded_spk,
+            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
+            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
+            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
+            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
+            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
+            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
+            # it is deliberately not a cast, it names the defect, and mypy's
+            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
+            # the two units — so the fix cannot land while leaving this comment lying.
+            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
         )
         return outpoint
 
@@ -586,7 +610,17 @@ class RadiantCovenantLeg:
         if not isinstance(required, int) or isinstance(required, bool) or required < 0:
             raise ValidationError("min_confirmations must be a non-negative int or None")
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
-            cov.funded_spk, expected_value=terms.radiant_amount
+            cov.funded_spk,
+            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
+            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
+            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
+            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
+            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
+            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
+            # it is deliberately not a cast, it names the defect, and mypy's
+            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
+            # the two units — so the fix cannot land while leaving this comment lying.
+            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
         )
         confs = await self.chain_io.confirmations(outpoint.split(":")[0])
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
@@ -615,7 +649,16 @@ class RadiantCovenantLeg:
         # would let anyone brick this spend by paying the covenant SPK a second time.
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            expected_value=record.terms.radiant_amount,
+            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
+            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
+            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
+            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
+            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
+            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
+            # it is deliberately not a cast, it names the defect, and mypy's
+            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
+            # the two units — so the fix cannot land while leaving this comment lying.
+            expected_value=record.terms.radiant_amount,  # type: ignore[arg-type]
             pin_outpoint=record.radiant_covenant_outpoint,
         )
         txid = outpoint.split(":")[0]
@@ -631,7 +674,7 @@ class RadiantCovenantLeg:
         return cov, outpoint, value, confs
 
     @contextlib.contextmanager
-    def _unspent_on_failure(self, fee: FeeInput):
+    def _unspent_on_failure(self, fee: FeeInput) -> Iterator[None]:
         """Report a dispensed fee input back to the source when the spend never gets built.
 
         The fee input must be dispensed BEFORE the transaction can be built (its value and
@@ -665,7 +708,7 @@ class RadiantCovenantLeg:
                     )
             raise
 
-    def _assert_affordable(self, tx, fee: FeeInput, *, blocks_to_deadline: int | None, kind: str) -> None:
+    def _assert_affordable(self, tx: Any, fee: FeeInput, *, blocks_to_deadline: int | None, kind: str) -> None:
         """PRE-BROADCAST affordability gate (gap-closure A1) — refuse, and PAGE, rather
         than emit a time-critical spend that cannot be repaired.
 
@@ -824,10 +867,10 @@ class RadiantCovenantLeg:
             self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
         return await self._broadcast(tx)
 
-    async def _broadcast(self, tx) -> str:
+    async def _broadcast(self, tx: Any) -> str:
         raw = tx.serialize()
         try:
             return await self.chain_io.broadcast(raw)
         except _AlreadyKnown:
             # Idempotent: the node already has this exact tx -> its txid is authoritative.
-            return tx.txid()
+            return str(tx.txid())

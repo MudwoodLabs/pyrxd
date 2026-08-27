@@ -23,6 +23,7 @@ the daemon shell so the brain stays unit-testable with fakes.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -32,6 +33,7 @@ from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.units import ChainHeight, Confirmations, Seconds
 
 __all__ = [
     "BtcClaimSource",
@@ -74,11 +76,11 @@ class BtcClaimSource(Protocol):
         """Has the HTLC funding outpoint been spent (the maker's claim)? If so, by what tx?"""
         ...
 
-    async def confirmations(self, claim_txid: str) -> int:
+    async def confirmations(self, claim_txid: str) -> Confirmations:
         """Quorum-agreed confirmation depth of the maker's claim tx."""
         ...
 
-    async def funding_confirmations(self, funding_txid: str) -> int | None:
+    async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
         """Quorum-agreed confirmation depth of the taker's BTC FUNDING tx — the relative-CSV refund
         maturity input — or ``None`` if unread/unmined. Same conservative-``min`` quorum as
         :meth:`confirmations` (a forged over-report still fails consensus BIP68; an under-report only
@@ -139,11 +141,11 @@ class EthChainSource(Protocol):
 class RxdChainSource(Protocol):
     """Radiant chain reads. Single-source in v1 (flagged low-corroboration)."""
 
-    async def tip_height(self) -> int:
-        """Current RXD tip height (``getblockcount``)."""
+    async def tip_height(self) -> ChainHeight:
+        """Current RXD tip height (``getblockcount``) — a HEIGHT, never a depth."""
         ...
 
-    async def covenant_confirmations(self, outpoint: str) -> int | None:
+    async def covenant_confirmations(self, outpoint: str) -> Confirmations | None:
         """Confirmations of the funded covenant UTXO, or ``None`` if not found/unmined.
 
         Used to derive ``asset_locked_at_height = tip - confirmations + 1`` (the height
@@ -181,7 +183,7 @@ class ChainObserver(Observer):
         btc: BtcClaimSource | None = None,
         eth: EthChainSource | None = None,
         rxd_corroborated: bool = False,
-        clock=None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
@@ -221,11 +223,15 @@ class ChainObserver(Observer):
         # Asset-lock height from the covenant's confirmation depth: tip - confs + 1. Shared by both
         # directions. Out-of-range (bogus/lying source) → None so the gate sees "un-assessable" and
         # decide() fails closed, rather than feeding a nonsensical height to the gate.
-        asset_locked: int | None = None
+        # THE depth->height conversion, and the only one on this path. It is written out rather
+        # than implied because the reverse mistake (storing the depth) is the defect this whole
+        # unit-tagging exists for: `Confirmations` in, `ChainHeight` out, with the arithmetic
+        # that justifies the re-tag visible on one line.
+        asset_locked: ChainHeight | None = None
         if record.radiant_covenant_outpoint is not None:
             cov_confs = await self._rxd.covenant_confirmations(record.radiant_covenant_outpoint)
             if cov_confs is not None and cov_confs >= 1:
-                candidate = tip - cov_confs + 1
+                candidate = ChainHeight(int(tip) - int(cov_confs) + 1)
                 if 0 <= candidate <= tip:
                     asset_locked = candidate
         low_corr = not self._rxd_corroborated
@@ -241,7 +247,7 @@ class ChainObserver(Observer):
                 # The ETH analogue of btc_funding_confirmations: what lets decide()'s
                 # maker-never-locks branch prove the taker's counter-leg refund is due. Read only
                 # on the ETH path; the BTC arm's deadline is a depth and needs no clock.
-                now_unix_s=int(self._clock()),
+                now_unix_s=Seconds(int(self._clock())),
                 low_corroboration=low_corr,
             )
 
@@ -249,8 +255,8 @@ class ChainObserver(Observer):
         if self._btc is None:
             raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
         maker_claimed = False
-        btc_confs: int | None = None
-        funding_confs: int | None = None
+        btc_confs: Confirmations | None = None
+        funding_confs: Confirmations | None = None
         locator = record.btc_locator
         if locator is not None:
             status = await self._btc.claim_status(locator.funding_outpoint.txid, locator.funding_outpoint.vout)
