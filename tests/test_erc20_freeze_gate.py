@@ -263,7 +263,7 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
         leg = self._leg(frozen=True)
         with pytest.raises(PreRevealAbort, match="refusing to reveal"):
-            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(self._locator(), _PREIMAGE))
 
     def test_an_underfunded_contract_makes_claim_RAISE_before_the_freeze_read(self) -> None:
         """The on-chain Underfunded revert does NOT keep the preimage secret — a reverted tx is
@@ -272,7 +272,7 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
         leg = self._leg(frozen=False, held=1)
         with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
-            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(self._locator(), _PREIMAGE))
 
     def test_the_balance_check_runs_BEFORE_the_freeze_read_even_when_both_would_fire(self) -> None:
         """The case above cannot actually pin the ordering: with `frozen=False` the freeze read
@@ -284,7 +284,7 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
         leg = self._leg(frozen=True, held=1)
         with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
-            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(self._locator(), _PREIMAGE))
 
     def test_the_underfunded_refusal_PRESERVES_the_preimage(self) -> None:
         """The sibling lane of #479. Round 2 made a transport failure keep the secret but left this
@@ -295,7 +295,7 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
         leg = self._leg(frozen=False, held=1)
         with pytest.raises(PreRevealAbort) as exc:
-            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(self._locator(), _PREIMAGE))
         assert not isinstance(exc.value, ValidationError), (
             "a ValidationError here would make the coordinator zeroize a preimage that never left the process"
         )
@@ -341,6 +341,12 @@ class TestTheContractAddressCannotBeDisplacedByACallerKey:
         assert frozen_addr in checked, "the real HTLC address must still be checked"
 
 
+#: A NON-ZERO preimage. `assert_claim_provenance` confirms a claim by substring-matching p over
+#: the log's topics+data, so a p of 32 zero bytes is satisfied by ANY zero-padded log word — a
+#: receipt carrying no Claimed event at all still "confirms". Demonstrated: 64 zero bytes confirm
+#: under an all-zero p and correctly refuse under this one. The honest-path assertion here is the
+#: only place the ERC-20 claim runs end to end offline, so it must be falsifiable.
+_PREIMAGE = bytes.fromhex("11" * 32)
 _HTLC = "0x" + "11" * 20
 _CLAIMANT = "0x" + "44" * 20
 _REFUNDEE = "0x" + "55" * 20
@@ -442,8 +448,7 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
             # "unconfirmed" — a reason that has nothing to do with the freeze gate it is about.
             return {
                 "status": 1,
-                # hex of the b"\x00" * 32 preimage these tests claim with
-                "logs": [{"address": _HTLC, "topics": [], "data": "0x" + "00" * 32}],
+                "logs": [{"address": _HTLC, "topics": [], "data": "0x" + _PREIMAGE.hex()}],
             }
 
         async def fee_fields(self):
@@ -474,7 +479,7 @@ class TestTheGateDoesNotVetoAClaimOnAnAddressThatCannotAffectIt:
 
     def test_a_frozen_REFUNDEE_does_not_block_the_makers_claim(self) -> None:
         leg = _leg_with_frozen(frozen_addrs={_REFUNDEE})
-        assert asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32)), (
+        assert asyncio.run(leg.claim(_freeze_locator(), _PREIMAGE)), (
             "a frozen refundee cannot make a claim revert, so refusing the claim forfeits "
             "USDC the maker has already earned"
         )
@@ -486,7 +491,7 @@ class TestTheGateDoesNotVetoAClaimOnAnAddressThatCannotAffectIt:
 
         leg = _leg_with_frozen(frozen_addrs={_CLAIMANT})
         with pytest.raises(PreRevealAbort, match="refusing to reveal"):
-            asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(_freeze_locator(), _PREIMAGE))
 
     def test_a_frozen_HTLC_CONTRACT_still_blocks_the_claim(self) -> None:
         """The measured worst case: freezing the contract strands the funds permanently — claim
@@ -495,4 +500,4 @@ class TestTheGateDoesNotVetoAClaimOnAnAddressThatCannotAffectIt:
 
         leg = _leg_with_frozen(frozen_addrs={_HTLC})
         with pytest.raises(PreRevealAbort, match="refusing to reveal"):
-            asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32))
+            asyncio.run(leg.claim(_freeze_locator(), _PREIMAGE))
