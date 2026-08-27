@@ -18,7 +18,7 @@ still runs (eth_timeout > rxd_refund_open + margin); we just size the margin for
 
 Example:
   python scripts/eth_swap_grief_run.py --i-accept-dust-loss \
-      --eth-rpc-url https://gateway.tenderly.co/public/sepolia --eth-key-hex <taker-key> \
+      --eth-rpc-url https://gateway.tenderly.co/public/sepolia --eth-key-file ~/.swap-taker-eth-key \
       --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet ''
 """
 
@@ -36,9 +36,11 @@ from _dust_swap_shared import (
     InMemSeen,
     SshTrFeeSource,
     StepReport,
+    add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
     merge_into_mode_600,
+    resolve_eth_key_file,
     wait_for_covenant_funding,
 )
 from eth_swap_run import _build_terms_and_covenant, _eth_leg
@@ -230,7 +232,7 @@ def _args():
     ap.add_argument("--i-accept-dust-loss", action="store_true")
     ap.add_argument("--yes", action="store_true", help="auto-confirm (UNATTENDED only)")
     ap.add_argument("--eth-rpc-url", default="")
-    ap.add_argument("--eth-key-hex", default="")
+    add_eth_key_arguments(ap)
     ap.add_argument("--eth-chain-id", type=int, default=11155111)
     ap.add_argument("--eth-amount-wei", type=int, default=10**14)
     ap.add_argument("--eth-claim-to", default="")
@@ -257,7 +259,9 @@ def _args():
     ap.add_argument("--report-out", default="/tmp/eth_grief_report.json")  # noqa: S108
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
-    return ap.parse_args()
+    args = ap.parse_args()
+    resolve_eth_key_file(args)
+    return args
 
 
 if __name__ == "__main__":

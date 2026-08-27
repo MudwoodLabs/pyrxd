@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import struct
 import tempfile
 import time
@@ -119,6 +120,78 @@ class SshTrFeeSource:
 # ---------------------------------------------------------------------------
 # I/O helpers (operator + chain state + atomic disk writes)
 # ---------------------------------------------------------------------------
+
+
+def read_own_private_file(path: Path, *, what: str, limit: int = 1 << 20) -> str:
+    """Read a file this user owns, following no symlink and trusting no other account.
+
+    OPEN FIRST, then fstat THAT descriptor. `path.stat()` followed by `path.read_text()` checks one
+    file and reads another: between the two calls the path can be replaced, so a permissive file
+    passes the check while a different one supplies the contents.
+
+    O_NOFOLLOW refuses a symlink standing in for the file. O_NONBLOCK stops a FIFO from HANGING the
+    open before fstat can reject it — an operator who mistypes a path should get a message, not an
+    indefinite wait — and is a no-op for the regular files this accepts. The uid check refuses a
+    file another account can rewrite, and the mode check refuses one other accounts can read.
+
+    ``what`` names the stake in the refusal, because "permission denied" does not tell an operator
+    mid-swap why the run stopped.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise SystemExit(f"cannot open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SystemExit(f"{path} is not a regular file; refusing to read {what} from it")
+        if st.st_uid != os.getuid():
+            raise SystemExit(
+                f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: it holds "
+                f"{what}, and a file another account can rewrite is not a file you control."
+            )
+        if st.st_mode & 0o077:
+            raise SystemExit(
+                f"{path} is mode {oct(st.st_mode & 0o777)}: readable by other users, and it holds {what}. chmod 600 it."
+            )
+        return os.read(fd, limit).decode()
+    finally:
+        os.close(fd)
+
+
+def resolve_eth_key_file(args: argparse.Namespace) -> None:
+    """Fold ``--eth-key-file`` into ``args.eth_key_hex`` so downstream code is unchanged.
+
+    A secret on argv is readable by every local user for as long as the process runs, and it
+    persists in shell history afterwards. A PATH on argv is not a secret.
+
+    Shared rather than reimplemented per runner: the file flag existed on exactly one script and
+    every document still showed `--eth-key-hex`, so the safer option had no callers and the whole
+    documented two-host flow — the two-party run — put a live key on the command line.
+    """
+    if not getattr(args, "eth_key_file", ""):
+        return
+    if getattr(args, "eth_key_hex", ""):
+        raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
+    args.eth_key_hex = read_own_private_file(
+        Path(args.eth_key_file).expanduser(), what="an ETH signing key", limit=4096
+    ).strip()
+
+
+def add_eth_key_arguments(ap: argparse.ArgumentParser) -> None:
+    """The key flags, defined once so every ETH runner offers the same safer option."""
+    ap.add_argument(
+        "--eth-key-hex",
+        default="",
+        help="Signing key as hex ON THE COMMAND LINE — visible in `ps` and in shell history. "
+        "Prefer --eth-key-file. Kept for compatibility and for throwaway keys.",
+    )
+    ap.add_argument(
+        "--eth-key-file",
+        default="",
+        help="Path to a mode-600 file containing the signing key as hex. Preferred over "
+        "--eth-key-hex: a path on argv is not a secret.",
+    )
 
 
 def confirm(prompt: str, *, auto_yes: bool) -> None:

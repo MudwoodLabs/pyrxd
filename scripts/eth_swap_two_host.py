@@ -73,7 +73,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dust_swap_shared import atomic_write_mode_600, confirm, wait_for_covenant_via_leg
+from _dust_swap_shared import (
+    add_eth_key_arguments,
+    atomic_write_mode_600,
+    confirm,
+    resolve_eth_key_file,
+    wait_for_covenant_via_leg,
+)
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
@@ -973,7 +979,7 @@ def _args() -> argparse.Namespace:
     )
     # ETH
     ap.add_argument("--eth-rpc-url", default="")
-    ap.add_argument("--eth-key-hex", default="", help="this role's ETH signing key (taker: funder; maker: claimer)")
+    add_eth_key_arguments(ap)
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument(
         "--eth-network", default="sepolia", help="ETH network tag (anvil|sepolia); auto-anvil when chain-id 31337"
@@ -1024,6 +1030,7 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--poll-interval-s", type=float, default=10.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
     args = ap.parse_args()
+    resolve_eth_key_file(args)
     # Resolve the ETH finalization window from the chain registry when not pinned (vetted per-chain).
     if args.eth_finalization_window_s is None:
         from pyrxd.eth_wallet.chains import evm_chain_by_id

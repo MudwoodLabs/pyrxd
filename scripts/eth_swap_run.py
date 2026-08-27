@@ -32,7 +32,6 @@ import json
 import math
 import os
 import socket
-import stat
 import subprocess
 import sys
 import time
@@ -46,9 +45,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
+    add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
     merge_into_mode_600,
+    read_own_private_file,
+    resolve_eth_key_file,
     rxd_blockcount,
     wait_for_covenant_funding,
 )
@@ -379,43 +381,16 @@ def _free_port() -> int:
     return port
 
 
-def _read_own_private_file(path: Path) -> str:
-    """Read a file this user owns, following no symlink and trusting no other account.
-
-    A recovery file names the preimage, both RXD keys and the ETH deadline — everything needed to
-    steer a resume. `read_text()` accepted whatever the path resolved to, so on a shared directory
-    another account could plant one and choose the covenant a resume rebuilt. Same fstat-the-open-
-    descriptor shape as the key-file loader, for the same reason: checking one file and reading
-    another is not a check.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as exc:
-        raise SystemExit(f"cannot open {path}: {exc}") from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise SystemExit(f"{path} is not a regular file; refusing to read swap state from it")
-        if st.st_uid != os.getuid():
-            raise SystemExit(
-                f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: this file "
-                "decides which covenant a resume rebuilds."
-            )
-        if st.st_mode & 0o077:
-            raise SystemExit(
-                f"{path} is mode {oct(st.st_mode & 0o777)}: readable by other users, and it holds "
-                "the preimage and both RXD keys. chmod 600 it."
-            )
-        return os.read(fd, 1 << 20).decode()
-    finally:
-        os.close(fd)
-
-
 def _load_restore(args) -> dict | None:
     """The recovery file for a resume, or None for a fresh run."""
     if not args.resume:
         return None
-    return json.loads(_read_own_private_file(Path(args.keys_out).expanduser()))
+    return json.loads(
+        read_own_private_file(
+            Path(args.keys_out).expanduser(),
+            what="the preimage, both RXD keys and the ETH deadline this resume rebuilds from",
+        )
+    )
 
 
 def resolve_eth_timeout(restore: dict | None, *, now_unix_s: int, eth_timeout_s: int) -> int:
@@ -1160,24 +1135,7 @@ def _args() -> argparse.Namespace:
             "independent providers — several URLs from one provider share a single failure."
         ),
     )
-    ap.add_argument(
-        "--eth-key-hex",
-        default="",
-        help=(
-            "The signing key as raw hex. VISIBLE IN `ps` AND /proc/<pid>/cmdline to every local "
-            "user for the life of the process, and it lands in shell history. Prefer "
-            "--eth-key-file. Kept for compatibility and for throwaway keys."
-        ),
-    )
-    ap.add_argument(
-        "--eth-key-file",
-        default="",
-        help=(
-            "Path to a file containing the signing key as hex. Preferred over --eth-key-hex: a "
-            "path on the command line is not a secret, the key itself is. Mirrors the pattern "
-            "dust_swap_resume.py already uses (it reads keys from --keys-out, never from argv)."
-        ),
-    )
+    add_eth_key_arguments(ap)
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument("--eth-amount-wei", type=int, default=10**14)  # 0.0001 ETH dust
     ap.add_argument("--eth-claim-to", default="")
@@ -1300,42 +1258,7 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--report-out", default="~/.eth_swap_report.json")
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
-    if args.eth_key_file:
-        # A secret on argv is readable by every local user for as long as the process runs, and it
-        # persists in shell history afterwards. A PATH on argv is not a secret. Resolved here, once,
-        # so every downstream consumer keeps taking `args.eth_key_hex` unchanged.
-        if args.eth_key_hex:
-            raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
-        _kf = Path(args.eth_key_file).expanduser()
-        # OPEN FIRST, then fstat THAT descriptor. `stat()` then `read_text()` checks one file and
-        # reads another: between the two calls the path can be replaced, so a permissive file
-        # passes the check and a different file supplies the key. O_NOFOLLOW additionally refuses
-        # a symlink standing in for the key file.
-        try:
-            # O_NONBLOCK so a FIFO does not HANG the open before fstat can reject it — an
-            # operator who mistypes a path should get a message, not an indefinite wait.
-            # It is a no-op for the regular files this actually accepts.
-            _fd = os.open(_kf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError as exc:
-            raise SystemExit(f"cannot open {_kf}: {exc}") from exc
-        try:
-            _st = os.fstat(_fd)
-            _mode = _st.st_mode & 0o777
-            if not stat.S_ISREG(_st.st_mode):
-                raise SystemExit(f"{_kf} is not a regular file; refusing to read a key from it")
-            if _st.st_uid != os.getuid():
-                raise SystemExit(
-                    f"{_kf} is owned by uid {_st.st_uid}, not you ({os.getuid()}). Refusing: a key "
-                    "file another account can rewrite is not a key file you control."
-                )
-            if _mode & 0o077:
-                raise SystemExit(
-                    f"{_kf} is mode {oct(_mode)}: readable by other users. chmod 600 it — a key "
-                    "file that anyone can read is not an improvement on a key on the command line."
-                )
-            args.eth_key_hex = os.read(_fd, 4096).decode().strip()
-        finally:
-            os.close(_fd)
+    resolve_eth_key_file(args)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
     # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.
