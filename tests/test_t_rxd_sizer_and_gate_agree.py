@@ -105,30 +105,42 @@ class TestTheIntervalActuallyCancels:
 
     def test_the_coordinator_passes_the_DIVIDING_interval(self) -> None:
         """Pins the call-site fix. `_dividing_interval_s` is the one function that decides this, and
-        the coordinator must route through it rather than reading the nominal field."""
+        the coordinator must route through it rather than reading the nominal field.
+
+        Checked against the AST. The previous version scanned text and hand-rolled paren matching,
+        which made it both brittle (a reformat that wrapped the call across lines broke it) and
+        DEFEATABLE: `_dividing_interval_s(policy) * 8.3` contains the substring it looked for and
+        reintroduces exactly the 8.3x mismatch this module exists to prevent. An AST check sees the
+        multiplication, because the argument is then a BinOp and not the call itself.
+        """
+        import ast
+        import pathlib
+
         pol = _policy(fast=36.0, nominal=300.0)
         assert _dividing_interval_s(pol) == 36.0
-        src = __import__("pathlib").Path("src/pyrxd/gravity/swap_coordinator.py").read_text()
-        block = src.split("assert_covenant_confirms_before_eth_deadline(")
-        assert len(block) >= 3, "expected at least two call sites"
-        for call in block[1:]:
-            # Scan to the call's OWN closing paren by depth, not to the first ")" — the argument
-            # `_dividing_interval_s(policy)` contains one, and truncating there cut the very token
-            # being looked for. A source-scanning test that mis-parses reports a defect that is not
-            # there, which is its own kind of false alarm.
-            depth, end = 1, len(call)
-            for i, ch in enumerate(call):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            head = call[:end]
-            assert "_dividing_interval_s(policy)" in head, (
-                "a call site passes something other than the dividing interval; that is the exact "
-                f"mismatch this module exists to prevent:\n{head}"
+
+        tree = ast.parse(pathlib.Path("src/pyrxd/gravity/swap_coordinator.py").read_text())
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "assert_covenant_confirms_before_eth_deadline"
+        ]
+        assert len(calls) >= 2, f"expected at least two call sites, found {len(calls)}"
+        for call in calls:
+            arg = next(
+                (k.value for k in call.keywords if k.arg == "rxd_block_interval_s"),
+                None,
+            )
+            assert arg is not None, "a call site does not name rxd_block_interval_s at all"
+            assert isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name), (
+                f"line {call.lineno}: the interval is {ast.dump(arg)[:80]}, not a bare "
+                "`_dividing_interval_s(...)` call — anything wrapping it (a factor, a fallback, a "
+                "different field) is the mismatch this module exists to prevent"
+            )
+            assert arg.func.id == "_dividing_interval_s", (
+                f"line {call.lineno}: passes {arg.func.id}(...), not _dividing_interval_s(...)"
             )
 
 

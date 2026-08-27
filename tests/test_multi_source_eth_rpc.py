@@ -496,59 +496,114 @@ class TestOneValueTwoDirections:
         assert _run(balance_of(rpc, _USDT, _HTLC, combine=max)) == 5_000_000
         assert _run(balance_of(rpc, _USDT, _HTLC)) == 0, "the default stays MIN for floor comparisons"
 
+    @staticmethod
+    def _balance_reads(scope=None):
+        """Every `<name> = await balance_of(...)` in the ERC-20 leg, as (name, lineno, combine).
+
+        AST, not text. The text version hand-matched a call across one line, so a reformat that
+        wrapped the arguments broke it and a comment mentioning the call satisfied it — and neither
+        failure mode has anything to do with the property being checked.
+        """
+        import ast
+
+        if scope is None:
+            scope = ast.parse(pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text())
+        out = []
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            value = node.value
+            if not isinstance(target, ast.Name) or not isinstance(value, ast.Await):
+                continue
+            call = value.value
+            if not isinstance(call, ast.Call) or getattr(call.func, "id", None) != "balance_of":
+                continue
+            combine = next((k.value for k in call.keywords if k.arg == "combine"), None)
+            out.append((target.id, node.lineno, combine))
+        return out
+
     def test_the_SUBTRACTION_CALL_SITE_actually_passes_max(self) -> None:
         """The test above proves `balance_of` CAN take max; it does not prove the shortfall site
         DOES. Reverting that one call site to the default passed every behavioural test I wrote —
         the same unasserted-call-site failure this whole review keeps finding.
 
-        A source check, because the alternative is standing up a multi-source leg mid-fund, and the
-        property is exactly "this one read asks for the other direction". The neighbouring reads
-        must NOT have been swept along: they compare against a floor, where min is conservative.
+        Located by the SUBTRACTION, not by the variable name. There are four `held = await
+        balance_of(...)` reads in this module and three of them are floor comparisons where the
+        conservative `min` default is correct; keying on the name flagged all four. What makes this
+        one different is that its result is subtracted (`shortfall = amount_wei - held`), which
+        inverts which direction is safe — so the test finds the function that does the subtracting
+        and checks the read inside it.
         """
-        src = pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text()
-        subtraction = [
-            ln for ln in src.splitlines() if "held = await balance_of(self._rpc, self._token, address)" in ln
+        import ast
+
+        tree = ast.parse(pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text())
+        subtracting = [
+            fn
+            for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                isinstance(n, ast.BinOp)
+                and isinstance(n.op, ast.Sub)
+                # Walk INTO each operand: the real site is `int(amount_wei) - int(held)`, so
+                # `held` sits inside a call rather than being a direct operand. Matching only
+                # direct operands found nothing and the test reported its own blind spot as
+                # "no function subtracts held any more".
+                and any(
+                    isinstance(o, ast.Name) and o.id == "held" for side in (n.left, n.right) for o in ast.walk(side)
+                )
+                for n in ast.walk(fn)
+            )
         ]
-        assert not subtraction, (
-            "the shortfall site reads balance_of with the default MIN; it SUBTRACTS the result, so "
-            "an under-report over-computes what to send and a lagging replica triggers a second "
-            "full transfer"
-        )
-        assert "held = await balance_of(self._rpc, self._token, address, combine=max)" in src
+        assert subtracting, "no function subtracts `held` any more; this test has lost its subject"
+        for fn in subtracting:
+            reads = [r for r in self._balance_reads(fn) if r[0] == "held"]
+            assert reads, f"{fn.name} subtracts `held` but never reads it from balance_of"
+            for _name, lineno, combine in reads:
+                assert combine is not None, (
+                    f"{fn.name} line {lineno}: reads balance_of with the DEFAULT, then SUBTRACTS "
+                    "the result — an under-report over-computes what to send, so a lagging replica "
+                    "triggers a second full transfer"
+                )
+                assert isinstance(combine, ast.Name) and combine.id == "max", (
+                    f"{fn.name} line {lineno}: combine is {ast.dump(combine)[:60]}, not `max`"
+                )
 
-        floors = [ln.strip() for ln in src.splitlines() if "balance_of(" in ln and "combine=max" not in ln]
-        assert floors, "expected the floor comparisons to still use the conservative default"
+    def test_the_FLOOR_reads_keep_the_conservative_default(self) -> None:
+        """The other side of the same coin, and the reason the check above must be scoped. A read
+        COMPARED against a required amount wants the lowest answer any endpoint admits to; sweeping
+        those to `max` alongside the subtraction site would let one endpoint wave through an HTLC
+        that is short."""
+        import ast
 
-    def test_the_two_directions_are_COMPLEMENTARY_not_contradictory(self) -> None:
-        """Two balance reads of the SAME contract, deliberately aggregated differently.
+        tree = ast.parse(pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text())
+        subtracting_lines = {
+            n.lineno
+            for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for n in ast.walk(fn)
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub)
+        }
+        floors = [r for r in self._balance_reads(tree) if not any(abs(r[1] - ln) < 40 for ln in subtracting_lines)]
+        assert floors, "expected floor reads to still exist"
+        for name, lineno, combine in floors:
+            assert not (isinstance(combine, ast.Name) and combine.id == "max"), (
+                f"{name} at line {lineno} was swept to `max`; it is compared against a floor, "
+                "where believing the highest answer passes an under-funded HTLC"
+            )
 
-        MAX decides HOW MUCH TO SEND — so a lagging replica cannot trigger a second full transfer.
-        The floor read decides WHETHER ENOUGH ARRIVED — so an over-reporting endpoint cannot pass
-        an under-funded HTLC. Each is conservative for its own question, and the obvious objection
-        to the MAX fix (an over-reporter skips the push) is answered by the floor that runs
-        immediately after, in the same function.
+    def test_the_FLOOR_call_site_asks_for_the_quorum_th(self) -> None:
+        """Its neighbour must NOT have been swept along to `max`: it compares against a required
+        amount, so believing the highest answer would wave through an HTLC holding nothing."""
+        import ast
 
-        The floor was MIN and is now the QUORUM-th. MIN answered the objection even against a
-        MAJORITY of over-reporting endpoints — but it also let ONE lagging replica declare a
-        correctly funded HTLC short and abort the taker's own swap, tokens stranded until the
-        timeout. The quorum-th still answers the objection under the assumption every other read
-        here already makes (honest majority), and stops paying for it with an abort that a single
-        slow endpoint can trigger.
-
-        Pinned because a future refactor "unifying" these two reads would silently remove one half
-        of a two-sided guard, and both halves would still look individually reasonable.
-        """
-        src = pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text()
-        push = src.index("held = await balance_of(self._rpc, self._token, address, combine=max)")
-        floor = src.index("landed = await balance_of(self._rpc, self._token, address, combine=quorum_combiner")
-        assert push < floor, (
-            "the MAX read must come first — it decides the amount; the floor read verifies the "
-            "result, and verifying before sending checks nothing"
-        )
-        assert "if landed < int(amount_wei):" in src, (
-            "the floor read must still be compared against the required amount — that comparison "
-            "is what catches an over-reporting endpoint skipping the push"
-        )
+        landed = [r for r in self._balance_reads() if r[0] == "landed"]
+        assert landed, "no `landed = await balance_of(...)` found; the floor read was removed"
+        for _name, lineno, combine in landed:
+            assert isinstance(combine, ast.Call) and getattr(combine.func, "id", None) == "quorum_combiner", (
+                f"line {lineno}: the floor read must use quorum_combiner — `max` lets one endpoint "
+                f"declare an empty HTLC funded, and `min` let one laggard abort an honest swap"
+            )
 
     def test_the_receipt_returned_is_ONE_THE_QUORUM_AGREED_ON(self) -> None:
         """It used to re-fetch from the primary after the quorum passed — a second call nothing had

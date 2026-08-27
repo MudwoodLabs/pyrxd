@@ -321,6 +321,22 @@ refusals and 0 cases leaving an accepted block unused.
   five are that same shape.
 - **A derivation with no caller is not a safeguard.** It is documentation that happens to compile,
   and it will drift from the gate that checks it — which is exactly what happened here.
+- **When a property really is about the source, check the AST, not the text.** Several guards here
+  are structural — "this call site passes THAT interval", "this read asks for the other direction"
+  — and standing up a live multi-source leg mid-fund to observe them is not practical. Text
+  scanning made them both brittle and defeatable, in both directions at once: one matched the
+  DOCSTRING explaining the race it was checking and failed on correct code, while another was
+  satisfied by `_dividing_interval_s(policy) * 8.3`, which contains the substring it looked for and
+  reintroduces the exact 8.3x mismatch it existed to prevent. Parsing costs three extra lines and
+  removes the whole class — a comment can no longer break it OR satisfy it.
+- **Scope a structural check by the property, not by the name.** The "this read must take MAX"
+  check keyed on the variable `held` and flagged all four of its reads; three are floor
+  comparisons where the conservative default is right. What distinguishes the one site is that its
+  result is SUBTRACTED, which is what inverts the safe direction — so the test finds the function
+  that subtracts and checks the read inside it. A name is a proxy; the arithmetic is the reason.
+- **A test that hangs is worse than a test that fails.** Removing `O_NONBLOCK` made the FIFO case
+  block forever rather than fail, which in CI reads as infrastructure trouble rather than a
+  defect. A `SIGALRM` guard turns it into a ten-second failure that names the missing flag.
 - **A boundary that only appears on exact division needs a test that lands on it.** Grids find
   these; hand-picked cases pick round numbers that avoid them.
 
