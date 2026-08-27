@@ -473,6 +473,121 @@ async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_pho
         await asyncio.sleep(poll_s)
 
 
+def covenant_fund_height(height: int) -> int:
+    """THE one place a covenant funding output's on-chain height becomes the reorg gate's anchor.
+
+    UNITS, stated once so no call site has to restate them: this takes a TRUE BLOCK HEIGHT — the
+    meaning ``UtxoRecord.height`` and ``find_covenant_utxo``'s third element have always promised
+    and, since the shim fix, actually carry. It was not always so. ``radiant_mainnet_chainio``'s
+    ``get_utxos`` used to read the real height out of ``scantxoutset`` and then overwrite it with
+    ``tip - height + 1``, a CONFIRMATION COUNT, so every ``scripts/`` caller on the mainnet shim
+    was handed a depth in a field named for a height. Code that compensated for that
+    (``fund_height = tip - confs + 1``) is now the bug rather than the fix: a conf count is no
+    longer representable here, so there is nothing left to compensate for, and a leftover
+    compensation would put the anchor a full chain-length in the past.
+
+    ``height == 0`` still means UNCONFIRMED, under both conventions — the one thing the change did
+    not touch. Fail closed on it: an unconfirmed covenant has no fund height, and inventing one
+    hands the coordinator's F-013 anchor check an impossible value much further downstream, where
+    it is far harder to read.
+    """
+    if not isinstance(height, int) or isinstance(height, bool):
+        raise RuntimeError(f"covenant fund height must be an int block height, got {height!r} (fail-closed)")
+    if height < 1:
+        raise RuntimeError(
+            f"covenant UTXO reports height {height} — unconfirmed, so it has no fund height for the "
+            "reorg gate to anchor on (fail-closed)"
+        )
+    return height
+
+
+async def scan_covenant_fund_height(client, *, covenant_spk: bytes, expected_photons: int) -> int:
+    """The anchor for paths that locked the asset WITHOUT :func:`wait_for_covenant_funding` — the
+    NFT and FT variants, which lock by SPENDING into the covenant rather than by waiting on an
+    operator payment. Same conversion, same fail-closed rules, one scan.
+
+    NOT the tip, and that is the bug this exists to close. Both runners read the tip BEFORE
+    blocking on the asset lock, so the anchor was low by however long the lock took — minutes to
+    hours. The comment defending it said a low value "can only make the reorg-gate squeeze MORE
+    cautious, never less". True of the gate, false of the runner:
+    ``blocks_left = asset_locked_at_height + t_rxd - now``, so a low anchor shortens the window and
+    returns SQUEEZED, whose handler is ``taker_claim_asset_from_vulnerable`` — winner-take-all by
+    design, with no ``assess_claim_finality`` call anywhere inside it, and unattended under
+    ``--yes``. A more cautious gate produces a LESS gated broadcast.
+    """
+    register = getattr(client, "register_spk", None)
+    if callable(register):
+        register(bytes(covenant_spk))
+    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
+    utxos = await client.get_utxos(script_hash)
+    return covenant_fund_height(int(getattr(_covenant_utxo(utxos, expected_photons), "height", 0)))
+
+
+def _covenant_utxo(utxos, expected_photons: int):
+    """The covenant's funding UTXO — fail-closed on anything ambiguous.
+
+    Matched on the PINNED amount, exactly as :func:`wait_for_covenant_funding` does: the covenant
+    SPK is a pure function of public terms, so anyone can pay it, and a wrong-value output is not
+    the one this swap locked.
+    """
+    matches = [u for u in utxos or [] if int(u.value) == int(expected_photons)]
+    confirmed = [u for u in matches if int(getattr(u, "height", 0)) > 0]
+    if not confirmed:
+        raise RuntimeError(
+            f"no CONFIRMED covenant UTXO of exactly {expected_photons} photons is on chain — cannot "
+            f"derive the reorg gate's anchor height (fail-closed); saw {len(matches)} matching output(s)"
+        )
+    # A second payment of the same value is possible (anyone can pay the SPK). Take the EARLIEST-
+    # mined, i.e. the LOWEST height: that is the one the maker's lock produced, and a decoy paid
+    # later cannot push the anchor forward and slacken the gate. (Under the old confs-in-height
+    # convention the same choice was `max`. Getting that flip wrong is exactly the unit bug the
+    # named conversion above exists to make visible.)
+    return min(confirmed, key=lambda u: int(getattr(u, "height", 0)))
+
+
+async def resolve_asset_locked_at_height(
+    rxd_leg, *, covenant_spk: bytes, expected_photons: int, explicit: int, now_rxd_height: int
+) -> int:
+    """The two-host taker's reorg-gate anchor: read off the chain unless the operator pinned it.
+
+    ``--asset-locked-at-height`` was declared with ``default=0``, passed straight into
+    ``taker_scrape_and_claim_asset``, and validated nowhere — while ``--taker-min-rxd-confs >= 1``
+    was validated on the adjacent line. With anchor 0 the gate computes
+    ``blocks_left = 0 + t_rxd - now``, hugely negative at any realistic tip, so it reads SQUEEZED
+    on the FIRST assessment: the two-party adversarial run — the project's stated hard gate before
+    real value — went SQUEEZED -> ASSET_VULNERABLE -> winner-take-all every time and never once
+    exercised the finality wait it exists to prove.
+
+    So 0 no longer means "height zero"; it means "ask the chain", and the honest value is what an
+    operator who passes nothing now gets. The read re-derives nothing from the maker: the caller
+    passes the SPK it derived from its OWN terms, and the value is pinned, so a covenant funded at
+    the wrong amount is refused rather than anchored on.
+    """
+    if int(explicit) < 0:
+        raise SystemExit(
+            f"--asset-locked-at-height {explicit} is negative; it is a Radiant block height. Omit it "
+            "to read the covenant's true fund height off the chain."
+        )
+    if int(explicit) > 0:
+        anchor = covenant_fund_height(int(explicit))
+        source = "pinned by --asset-locked-at-height"
+    else:
+        _outpoint, _value, height = await rxd_leg.chain_io.find_covenant_utxo(
+            bytes(covenant_spk), expected_value=int(expected_photons)
+        )
+        anchor = covenant_fund_height(int(height))
+        source = "read from the covenant's funding output on chain"
+    if anchor > int(now_rxd_height):
+        # The coordinator fails closed on now < locked_at (F-013) with a message about lying nodes.
+        # Catching it here says which INPUT is wrong, before a claim decision depends on it.
+        raise SystemExit(
+            f"asset_locked_at_height {anchor} is above the current RXD tip {now_rxd_height} — a "
+            f"covenant cannot have been mined in a block that does not exist yet ({source})."
+        )
+    print(f"  reorg-gate anchor: asset_locked_at_height = {anchor} ({source})")
+    return anchor
+
+
 async def wait_for_covenant_via_leg(leg, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 10.0):
     """Same contract as :func:`wait_for_covenant_funding`, driven through the RadiantCovenantLeg.
 

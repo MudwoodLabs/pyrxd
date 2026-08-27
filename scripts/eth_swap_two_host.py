@@ -77,6 +77,7 @@ from _dust_swap_shared import (
     add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
+    resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
 )
@@ -202,6 +203,12 @@ def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
         rxd_claim_burial_s=args.rxd_claim_burial_s,
         rxd_confirm_slack_s=args.rxd_confirm_slack_s,
         rounding_slack_s=args.rounding_slack_s,
+        # The field its own docstring calls "the single most important safety addition", and this
+        # harness had no flag for it at all — so it defaulted to 0 and the two-party run could not
+        # be driven in the parameterisation the project calls mandatory. eth_swap_run.py has the
+        # flag and REFUSES below 3600 for a real token leg; the two-host prep must be able to
+        # rehearse with the same number, or it rehearses a swap nobody would run.
+        eth_finality_stall_tolerance_s=args.eth_finality_stall_tolerance_s,
     )
 
 
@@ -525,6 +532,20 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
 
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
+    # Re-derive the covenant from the taker's OWN public terms — the same derivation the fund phase
+    # checked the maker's advertised SPK against. The claim phase needs it to read the covenant's
+    # true fund height off the chain, and re-deriving keeps that read bound to terms we agreed to
+    # rather than to a hex string the envelope carries.
+    _terms3, cov = _terms_from_public(
+        hashlock=terms.hashlock,
+        rxd_photons=terms.radiant_amount,
+        eth_amount_wei=terms.value_amount,
+        t_rxd_blocks=terms.t_rxd.value,
+        margin_blocks=args.margin_blocks,
+        eth_timeout_unix_s=int(terms.eth_timeout_unix_s),
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+    )
     rpc, eth_leg = _eth_leg(
         args,
         claim_to=env["eth_maker_claim_addr"],
@@ -549,6 +570,18 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
         # cross-swap "reveal" fails closed here rather than entering the claim flow.
         confirm("taker_observed_reveal: verify the maker's on-chain reveal before claiming", auto_yes=args.yes)
         await coord.taker_observed_reveal(eth_claim_tx)
+        # The reorg gate's anchor, resolved ONCE before the loop. It used to be
+        # `args.asset_locked_at_height`, declared `default=0` and validated nowhere: at anchor 0
+        # the gate reads SQUEEZED at any realistic tip, so this harness — the two-party adversarial
+        # run, the project's stated hard gate before real value — went straight to ASSET_VULNERABLE
+        # and winner-take-all on the first assessment, never once exercising the finality wait.
+        asset_locked_at = await resolve_asset_locked_at_height(
+            rxd_leg,
+            covenant_spk=cov.funded_spk,
+            expected_photons=terms.radiant_amount,
+            explicit=args.asset_locked_at_height,
+            now_rxd_height=await _rxd_height(args),
+        )
         deadline = time.monotonic() + args.resume_deadline_s
         print(
             f"  scraping p from the maker's ETH claim {eth_claim_tx} + reorg-gated RXD claim (deadline {args.resume_deadline_s:.0f}s)"
@@ -564,7 +597,7 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
             now_rxd = await _rxd_height(args)
             confirm("taker_scrape_and_claim_asset: claim the RXD covenant with the scraped p", auto_yes=args.yes)
             rec = await coord.taker_scrape_and_claim_asset(
-                eth_claim_tx, now_rxd_height=now_rxd, asset_locked_at_height=args.asset_locked_at_height
+                eth_claim_tx, now_rxd_height=now_rxd, asset_locked_at_height=asset_locked_at
             )
             if rec.state is SwapState.COMPLETED:
                 print(f"  -> {rec.state.value} — RXD covenant claimed; cross-chain swap COMPLETE")
@@ -1001,7 +1034,7 @@ def _args() -> argparse.Namespace:
         "--asset-locked-at-height",
         type=int,
         default=0,
-        help="RXD height the covenant was funded at (for the reorg gate)",
+        help="RXD height the covenant was funded at (the reorg gate's anchor). OMIT IT (0) and it is read off the chain from the covenant's own funding output — that is the honest value and the intended default. A pinned value is a rehearsal override; 0 no longer means 'height zero', which made the gate read SQUEEZED at any realistic tip.",
     )
     # the operator's OWN regtest fee UTXO (party-local; WIF never serialised into an exchange file)
     ap.add_argument("--fee-txid", default="")
@@ -1022,6 +1055,17 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
     ap.add_argument("--eth-finalization-window-s", type=int, default=None)
+    ap.add_argument(
+        "--eth-finality-stall-tolerance-s",
+        type=int,
+        default=0,
+        help="ADDITIONAL cross-clock budget for an ETH FINALITY STALL — the checkpoint freezing "
+        "while blocks keep coming (Sepolia 2026-06-01 ~20 min; the May-2023 MAINNET incident ~1 h; "
+        "an inactivity leak is unbounded). The taker waits for FINALITY before claiming RXD, so "
+        "the RXD refund must not open until it has had a stall-tolerant window. 0 is the "
+        "regtest/anvil default; a real-value parameterisation needs >= 3600, which is what "
+        "eth_swap_run.py enforces.",
+    )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)
     ap.add_argument("--rounding-slack-s", type=int, default=300)
@@ -1064,6 +1108,14 @@ def main() -> None:
     # (review LOW). The gate exists precisely so a 0-conf covenant is refused — never accept below 1-conf.
     if args.taker_min_rxd_confs < 1:
         raise SystemExit("--taker-min-rxd-confs must be >= 1 (a 0/negative floor silently disables the depth gate)")
+    # A NEGATIVE anchor is not a Radiant height and cannot be one. 0 is the documented "read it
+    # off the chain" sentinel (see resolve_asset_locked_at_height); anything below that is a typo
+    # that would otherwise reach the gate as an arithmetic input and be silently believed.
+    if args.asset_locked_at_height < 0:
+        raise SystemExit(
+            f"--asset-locked-at-height {args.asset_locked_at_height} is negative; it is a Radiant "
+            "block height. Omit it to read the covenant's true fund height off the chain."
+        )
     if not args.role or not args.phase:
         raise SystemExit("specify --self-check, or both --role and --phase (see --help)")
     fn = _DISPATCH.get((args.role, args.phase))
