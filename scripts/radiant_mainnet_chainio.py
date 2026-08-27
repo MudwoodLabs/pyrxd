@@ -181,14 +181,15 @@ class SshTrRadiantClient:
         from pyrxd.gravity.htlc_spend import FeeInput
         from pyrxd.keys import PrivateKey
         from pyrxd.script.script import Script
+
         # `encode_pushdata` lives in pyrxd.utils; pyrxd.script.type merely imports it. Under
         # mypy strict that implicit re-export is not an export, so take it from its real home.
         from pyrxd.script.type import to_unlock_script_template
-        from pyrxd.utils import encode_pushdata
         from pyrxd.security.types import Hex20
         from pyrxd.transaction.transaction import Transaction
         from pyrxd.transaction.transaction_input import TransactionInput
         from pyrxd.transaction.transaction_output import TransactionOutput
+        from pyrxd.utils import encode_pushdata
 
         utxos = self._run_sync("listunspent", "1", "9999999")
         if not isinstance(utxos, list) or not utxos:

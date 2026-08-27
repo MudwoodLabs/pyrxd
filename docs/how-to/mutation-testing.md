@@ -172,6 +172,34 @@ cosmic-ray mutant runs in a fresh subprocess against a freshly written file — 
 manual loop is, and a false SURVIVED reads as "my test is worthless" while a false KILLED
 reads as "my test works". Both are worse than no measurement.
 
+### And confirm the plant actually landed
+
+The cache trap above is an edit that applied and was then served stale. The other way to get
+a false SURVIVED is simpler and easier to miss: **the edit never applied at all.** A `sed`
+pattern that does not match, an insertion anchored to the wrong line, an indentation
+mismatch — each exits 0, changes nothing, and the suite then passes for the most boring
+reason available. It reads exactly like a surviving mutant.
+
+Observed in a sibling repo (FlipperHub, 2026-08): of five mutants recorded as SURVIVED in one
+session, **three had never been applied**. The tests were fine; the measurement was fiction.
+
+cosmic-ray cannot make this mistake — it rewrites the AST and writes the mutant file itself,
+which is why `scripts/mutation_test.sh` needs no such check. The by-hand loop has no such
+guarantee, so make the edit prove itself:
+
+```bash
+# before: capture the exact thing you intend to change
+before=$(grep -c 'if n <= 75:' src/pyrxd/glyph/payload.py)
+# ...plant the mutation...
+after=$(grep -c 'if n <= 75:' src/pyrxd/glyph/payload.py)
+[ "$before" -gt "$after" ] || { echo "MUTATION DID NOT APPLY — result is meaningless"; exit 1; }
+```
+
+`git diff --stat -- <file>` works just as well and is harder to get wrong. The rule is the
+same either way: **a SURVIVED verdict is only evidence if you have proof the source changed.**
+Check the restore too — a restore that silently fails leaves the mutant in your tree and
+poisons every run after it.
+
 ## Baseline results — mint and glyphscript (2026-08)
 
 Both groups were run twice. The first numbers are kept because the difference between

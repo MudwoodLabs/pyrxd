@@ -754,7 +754,7 @@ class ElectrumXClient:
         created: list[Any] = []  # every ws actually returned by websockets.connect
 
         async def _try(url: str) -> Any:
-            ws = await websockets.connect(url)  # type: ignore[attr-defined]
+            ws = await websockets.connect(url)
             # Append BEFORE the pin check so the `finally` block below still closes
             # this socket when the check rejects it.
             created.append(ws)
