@@ -109,6 +109,15 @@ group_files() {
     coordinator) echo "gravity/swap_coordinator" ;;
     network)     echo "network/bitcoin network/electrumx network/failover network/confirm network/_guards network/tls_pin network/registry network/rxindexer network/chaintracker" ;;
     keys)        echo "security/errors security/secrets base58 hd/bip32 hd/descriptor gravity/watch/cli_secrets" ;;
+    # The EVM counter leg. Added 2026-08-27 after a six-reviewer panel found that essentially every
+    # defect of that review lived in these 3,593 lines — and that they had ZERO mutation coverage,
+    # because the group list never grew when the ETH leg was added. Cosmic-ray does mechanically
+    # what that panel did by hand: plant a defect, see whether any test notices. Every "test that
+    # passes for the wrong reason" it found is a surviving mutant this group would have listed.
+    ethleg)      echo "eth_wallet/htlc_leg eth_wallet/erc20_leg eth_wallet/multi_rpc eth_wallet/erc20 eth_wallet/tokens eth_wallet/chains eth_wallet/rpc eth_wallet/locator eth_wallet/keys eth_wallet/private_submit eth_wallet/secret" ;;
+    # The cross-clock timelock arithmetic. Separate group because it is pure computation with a
+    # fast, dense test set, and because two off-by-ones shipped here inside one week.
+    ethtimelock) echo "gravity/eth_rxd_timelock" ;;
     *)           return 1 ;;
   esac
 }
@@ -153,6 +162,8 @@ group_tests() {
     glyphscript) echo "tests/test_mutation_hardening.py tests/test_glyph_v2.py tests/test_glyph_dmint.py tests/test_golden_vectors.py tests/test_glyph_red_team.py tests/test_glyph_security_red_team.py tests/test_glyph_v2_metadata.py tests/test_dmint_module.py tests/test_mut_container_wave_builders.py tests/test_glyph.py tests/test_glyph_scanner.py tests/test_script_encoder_consolidation.py tests/test_glyph_mint_facade.py tests/test_dmint_v1_mint.py tests/test_glyph_cbor_roundtrip.py tests/test_fuzz_parsers.py" ;;
     mint)        echo "tests/test_glyph_transfer.py tests/test_glyph_nft_transfer.py tests/test_ft_transfer_demo_example.py tests/test_glyph_client_transfer.py tests/test_ft_transfer.py tests/test_ft_airdrop.py tests/test_glyph_mint_facade.py tests/cli/test_glyph_cmds.py" ;;
     swap)        echo "tests/test_htlc_spend_productized.py tests/test_htlc_spend_fee_floor.py tests/test_rswp_orders.py tests/test_rswp_wire.py tests/test_rswp_book.py tests/test_rswp_quoting.py tests/test_rswp_tracker.py tests/test_swap_order.py tests/test_htlc_covenant.py tests/test_rswp_covenant.py $GAPS tests/test_rswp_conformance_vectors.py" ;;
+    ethleg)      echo "tests/test_eth_leg.py tests/test_erc20_leg.py tests/test_multi_source_eth_rpc.py tests/test_claim_deadline_guard.py tests/test_claim_is_confirmed_not_assumed.py tests/test_erc20_freeze_gate.py tests/test_erc20_prefund_freeze_gate.py tests/test_erc20_freeze_fn_per_token.py tests/test_erc20_tokens.py tests/test_eth_chains.py tests/test_deployed_contract_is_durable_before_funding.py tests/test_deploy_receipt_address_is_never_trusted.py tests/test_preimage_survives_pre_broadcast_failure.py tests/test_eoa_recipient_policy.py tests/test_eth_private_submit.py tests/test_finality_verdict.py" ;;
+    ethtimelock) echo "tests/test_eth_rxd_timelock.py tests/test_t_rxd_sizer_and_gate_agree.py tests/test_eth_swap_run_timelock_bounds.py" ;;
     coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py" ;;
     network)     echo "tests/network/test_guards.py tests/network/test_registry.py tests/network/test_bitcoin.py tests/network/test_confirm.py tests/network/test_tls_pin.py tests/network/test_chaintracker.py tests/test_mempool_adapters.py tests/test_endpoint_diversity.py tests/network/test_failover.py tests/test_network_bitcoin.py tests/security/test_hostile_server_responses.py $GAPS tests/network/test_electrumx.py" ;;
     keys)        echo "tests/security/ tests/test_keys.py tests/test_base58.py tests/test_hd_wallet.py tests/test_hd_descriptor.py tests/cli/test_swap_recovery.py tests/cli/test_swap_cmds.py tests/test_watch_secret_and_ack_hardening.py" ;;
@@ -174,6 +185,8 @@ group_timeout() {
     mint)        echo "20.0" ;;
     glyphscript) echo "60.0" ;;
     swap)        echo "30.0" ;;
+    ethleg)      echo "30.0" ;;
+    ethtimelock) echo "20.0" ;;
     coordinator) echo "30.0" ;;
     network)     echo "30.0" ;;
     *)           echo "45.0" ;;
@@ -194,7 +207,7 @@ group_marker() {
 }
 
 CONSENSUS_GROUPS="spv script transaction dmint"
-VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network"
+VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network ethleg ethtimelock"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in
