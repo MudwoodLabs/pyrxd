@@ -23,6 +23,18 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 
 
+def _load_dmint():
+    """A fresh module instance whose _STATE the caller sets directly."""
+    sys.path.insert(0, str(_SCRIPTS))
+    try:
+        spec = importlib.util.spec_from_file_location("dmint_state_x", _SCRIPTS / "dmint_v2_mainnet_run.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.path.remove(str(_SCRIPTS))
+
+
 @pytest.fixture(scope="module")
 def dmint():
     sys.path.insert(0, str(_SCRIPTS))
@@ -105,6 +117,46 @@ class TestWhatItRefuses:
         with pytest.raises(SystemExit, match="accessible to other users"):
             dmint._save({"stage": "deployed", "key": "ab" * 32})
         assert "ab" * 32 not in state.read_text(), "keys were written into a world-readable file"
+
+    def test_a_refused_file_is_NOT_TRUNCATED_on_the_way_to_the_refusal(self) -> None:
+        """Truncation happens inside open(), so O_TRUNC destroys the file BEFORE any check runs.
+
+        The private-descriptor check was added to stop a pre-created world-readable file receiving
+        the keys, and it does — `json.dump` is behind it. But the open that discovered the problem
+        had already emptied the file: measured, a 186-byte file went to 0 and then the run refused.
+        No key leaks, so this is not disclosure; it is a self-DoS on the operator's own file, and
+        with a pre-existing group-writable ~/.pyrxd a hardlink makes it a clobber primitive.
+
+        The file must survive a refusal intact.
+        """
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        victim = Path(d) / "state.json"
+        victim.write_text("IMPORTANT PRE-EXISTING CONTENT " * 6)
+        victim.chmod(0o644)
+        before = victim.stat().st_size
+
+        dmint = _load_dmint()
+        dmint._STATE = str(victim)
+        with pytest.raises(SystemExit, match="accessible to other users"):
+            dmint._save({"stage": "deployed", "key": "ab" * 32})
+        assert victim.stat().st_size == before, (
+            "the file was truncated on the way to the refusal — the check must run before "
+            "anything is destroyed, not after"
+        )
+        assert "ab" * 32 not in victim.read_text()
+
+    def test_the_honest_path_can_still_REWRITE_in_place(self) -> None:
+        """The paired honest case, and why O_EXCL is not the fix here: this state is rewritten at
+        each stage of the run, so 'create-only' would break the runner outright."""
+        dmint = _load_dmint()
+        import tempfile
+
+        dmint._STATE = str(Path(tempfile.mkdtemp()) / "state.json")
+        dmint._save({"stage": "one"})
+        dmint._save({"stage": "two"})
+        assert dmint._load()["stage"] == "two"
 
     def test_a_PRE_PLANTED_world_readable_file_is_not_READ_either(self, dmint, state) -> None:
         """The read side of the same precondition: state another user can rewrite chooses which
