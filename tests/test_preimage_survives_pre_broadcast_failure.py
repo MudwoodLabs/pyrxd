@@ -185,23 +185,59 @@ class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
         ("module", "method"),
         [
             ("pyrxd.eth_wallet.htlc_leg", "EthHtlcContractLeg.claim"),
+            # A merge dropped this entry while the sibling scan below kept its allowlist paragraph
+            # explaining that erc20_leg.py raises PreRevealAbort from four pre-reveal checks — so
+            # for a while this file DOCUMENTED that the ERC-20 leg was in scope and no longer
+            # ENFORCED it. Its send token (`super().claim(`) exists only in Erc20HtlcLeg.claim,
+            # i.e. the detector below was written for this entry and had nothing to detect.
+            ("pyrxd.eth_wallet.erc20_leg", "Erc20HtlcLeg.claim"),
         ],
     )
     def test_every_raise_precedes_the_submit(self, module: str, method: str) -> None:
+        """Checked against the AST, not the text. The previous version grepped source LINES for
+        `raise PreRevealAbort` / `_sign_and_send(` / `super().claim(`, so a COMMENT containing a
+        send token above a real raise would move `min(sends)` up and mask a post-send raise —
+        and erc20_leg.py's claim is exactly the kind of heavily-commented code where that
+        happens. AST nodes cannot come from comments or docstrings."""
+        import ast
         import importlib
         import inspect
+        import textwrap
 
         cls_name, fn_name = method.split(".")
         fn = getattr(getattr(importlib.import_module(module), cls_name), fn_name)
-        src = inspect.getsource(fn)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
 
-        raises = [i for i, line in enumerate(src.splitlines()) if "raise PreRevealAbort" in line]
-        sends = [i for i, line in enumerate(src.splitlines()) if "_sign_and_send(" in line or "super().claim(" in line]
+        raises = [
+            n.lineno
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Raise)
+            and isinstance(n.exc, ast.Call)
+            and isinstance(n.exc.func, ast.Name)
+            and n.exc.func.id == "PreRevealAbort"
+        ]
+
+        def _is_send(call: ast.Call) -> bool:
+            f = call.func
+            if not isinstance(f, ast.Attribute):
+                return False
+            if f.attr == "_sign_and_send":  # the native leg's broadcast
+                return True
+            # `super().claim(...)` — the ERC-20 leg delegates its broadcast to the parent.
+            return (
+                f.attr == "claim"
+                and isinstance(f.value, ast.Call)
+                and isinstance(f.value.func, ast.Name)
+                and f.value.func.id == "super"
+            )
+
+        sends = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_send(n)]
         if not raises:
             pytest.skip(f"{method} raises no PreRevealAbort directly")
         assert sends, f"{method}: no send found — the boundary this pins has moved"
         assert max(raises) < min(sends), (
-            f"{method}: a PreRevealAbort is raised at or after the send, so the caller would be told "
+            f"{method}: a PreRevealAbort is raised at or after the send (raise at line {max(raises)}, "
+            f"first send at line {min(sends)} of the method), so the caller would be told "
             "nothing was broadcast when something may have been"
         )
 
