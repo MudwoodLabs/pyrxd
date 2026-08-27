@@ -32,9 +32,11 @@ import hashlib
 import json
 import shlex
 import subprocess
+from typing import Any
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.network.electrumx import UtxoRecord
+from pyrxd.security.units import ChainHeight, PhotonValue
 
 
 class SshTrRadiantClient:
@@ -114,7 +116,7 @@ class SshTrRadiantClient:
     async def broadcast(self, raw_tx: bytes) -> str:
         return str(await self._run("sendrawtransaction", bytes(raw_tx).hex()))
 
-    async def get_transaction_verbose(self, txid: str) -> dict:
+    async def get_transaction_verbose(self, txid: str) -> dict[str, Any]:
         res = await self._run("getrawtransaction", str(txid), "true")
         if not isinstance(res, dict):
             raise RuntimeError("getrawtransaction did not return a verbose dict")
@@ -145,19 +147,21 @@ class SshTrRadiantClient:
             # transport real-value mainnet runs use, that anti-poisoning rule selected
             # the POISON. Pass the height through untouched; no confirmation count is
             # computed in this method at all, so none can be stored by mistake.
-            # Producer conformance is enforced by tests/test_utxo_record_units.py.
+            # Producer conformance is enforced by tests/test_utxo_record_units.py, and the
+            # UNIT is now enforced by the checker: `height` is a `ChainHeight`, so re-deriving
+            # `tip - height + 1` here and storing it is a mypy error, not a review catch.
             out.append(
                 UtxoRecord(
                     tx_hash=u["txid"],
                     tx_pos=int(u["vout"]),
-                    value=round(u["amount"] * 1e8),
-                    height=int(u.get("height", 0)),
+                    value=PhotonValue(round(u["amount"] * 1e8)),
+                    height=ChainHeight(int(u.get("height", 0))),
                 )
             )
         return out
 
     # -- fee-UTXO carving (the RXD covenant spend needs a separate plain fee input) ---
-    def carve_fee_input(self, amount_photons: int, fee_photons: int = 4_000_000):
+    def carve_fee_input(self, amount_photons: int, fee_photons: int = 4_000_000) -> Any:
         """Carve a plain-P2PKH fee UTXO from the wallet -> a gravity.htlc_spend.FeeInput.
 
         SYNCHRONOUS (called from FeeSource.next_fee_input, which the leg invokes inside
@@ -177,7 +181,10 @@ class SshTrRadiantClient:
         from pyrxd.gravity.htlc_spend import FeeInput
         from pyrxd.keys import PrivateKey
         from pyrxd.script.script import Script
-        from pyrxd.script.type import encode_pushdata, to_unlock_script_template
+        # `encode_pushdata` lives in pyrxd.utils; pyrxd.script.type merely imports it. Under
+        # mypy strict that implicit re-export is not an export, so take it from its real home.
+        from pyrxd.script.type import to_unlock_script_template
+        from pyrxd.utils import encode_pushdata
         from pyrxd.security.types import Hex20
         from pyrxd.transaction.transaction import Transaction
         from pyrxd.transaction.transaction_input import TransactionInput
@@ -196,14 +203,14 @@ class SshTrRadiantClient:
         if change <= DUST_THRESHOLD_PHOTONS:
             raise RuntimeError(f"selected UTXO too small to carve {amount_photons} + fee {fee_photons}")
 
-        def _src(txid, vout, s, v):
+        def _src(txid: str, vout: int, s: bytes, v: int) -> Any:
             outs = [TransactionOutput(Script(b"\x00"), 0) for _ in range(vout)]
             outs.append(TransactionOutput(Script(s), v))
             tx = Transaction(tx_inputs=[], tx_outputs=outs)
             tx.txid = lambda: txid  # type: ignore[method-assign]
             return tx
 
-        def _unlock(tx, idx):
+        def _unlock(tx: Any, idx: int) -> Any:
             inp = tx.inputs[idx]
             sig = key.sign(tx.preimage(idx))
             return Script(

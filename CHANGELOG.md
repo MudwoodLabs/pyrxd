@@ -8,6 +8,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unit conflations are now type errors, not review catches** — new `pyrxd.security.units`.
+  Three confirmed defects in this codebase were the same shape: two quantities that are both
+  non-negative `int`, semantically incompatible, meeting in a field or parameter that could hold
+  either. A block height vs a confirmation count (the mainnet shim stored a depth in
+  `UtxoRecord.height`, inverting `find_covenant_utxo`'s earliest-confirmed anti-poisoning rule into
+  a poison-*selecting* one); a photon value vs a Glyph FT token count (#505, still open); seconds
+  vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
+  `BlockSpan` and `Seconds` are `typing.NewType` tags — zero runtime cost, no validation, no
+  behaviour change — applied to the producers and the gates: `UtxoRecord`, `RadiantChainIO`'s
+  covenant lookup and depth read, `NegotiatedTerms.radiant_amount`, the watchtower's `Observations`
+  (which holds heights and depths side by side), the quorum layer's depth→height conversion, and
+  the dust runner's reorg-gate anchor. They complement rather than replace `pyrxd.security.types`:
+  those classes answer "is this number plausible?" at a trust boundary, these answer "is it the
+  right kind?". `tests/security/test_unit_types_reject_conflations.py` runs mypy over fixtures
+  reproducing each real defect and proves the checker rejects it — and that the corrected form
+  still passes.
+- **`task typecheck` actually gates now.** Its declared three-path scope reported 296 errors across
+  40 transitively-imported modules, so `task ci` had been failing at that step rather than checking
+  anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
+  pins resolution to this checkout, and the scope is widened to the modules where a number's unit
+  decides whether funds move — including the two `scripts/` files the height/confs bug lived in.
+
 - **The token leg no longer refuses EIP-7702 delegated accounts** (#478). `verify_funded` rejects
   any claimant/refundee with contract code, because a native ETH send *executes* the recipient's
   code and a recipient that reverts on receive would lock the funds. An **EIP-7702 delegated EOA**

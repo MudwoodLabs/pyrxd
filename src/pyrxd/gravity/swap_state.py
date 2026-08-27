@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
@@ -33,6 +34,7 @@ from pyrxd.btc_wallet.taproot import (
 )
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.units import PhotonValue, TokenUnits
 
 # SwapRecord wire schema version. v1 (absent) is the BTC-only form (bare ``btc_locator``);
 # v2 adds the chain-tagged ``counterchain_locator`` for an ETH counter leg. A BTC swap still
@@ -51,6 +53,7 @@ __all__ = [
     "allowed_targets",
     "can_transition",
     "is_terminal",
+    "tag_radiant_amount",
 ]
 
 
@@ -252,6 +255,22 @@ COUNTER_CHAINS: frozenset[str] = frozenset({"btc", "eth"})
 _ZERO32: bytes = b"\x00" * 32
 
 
+def tag_radiant_amount(asset_variant: str, amount: int) -> PhotonValue | TokenUnits:
+    """Tag a raw ``radiant_amount`` with the unit ``asset_variant`` selects.
+
+    THE one place a bare int becomes a unit-tagged ``radiant_amount``. ``"ft"`` means a
+    Glyph token COUNT — the quantity the covenant's ``refValueSum(ref) == amount`` check
+    enforces, which is independent of the photon value of the output carrying it. ``"rxd"``
+    and ``"nft"`` both mean a native PHOTON value (the amount locked, and the carrier's
+    dust, respectively), which is what a UTXO ``value`` comparison is entitled to match.
+
+    A re-tag is a claim about which unit a number is in, so it belongs where the claim is
+    proven. Here the proof is ``asset_variant`` itself, read from the same record as the
+    amount. Anywhere else, prove it the same way — a variant check — before re-tagging.
+    """
+    return TokenUnits(amount) if asset_variant == "ft" else PhotonValue(amount)
+
+
 @dataclass(frozen=True)
 class NegotiatedTerms:
     """Everything the two parties agree before any lock — chain-agnostic.
@@ -269,7 +288,13 @@ class NegotiatedTerms:
 
     hashlock: bytes  # H = SHA256(p), 32 bytes — NEVER p
     btc_sats: int  # BTC the taker locks (claim leaf pays the maker)
-    radiant_amount: int  # FT amount / NFT carrier sats / RXD photons
+    # THREE units in one field, selected by ``asset_variant``: an FT TOKEN COUNT ("ft"), an
+    # NFT carrier PHOTON value ("nft"), or an RXD PHOTON value ("rxd"). The union says so to
+    # the checker: nothing may consume this as photons without first proving the variant is
+    # not "ft", and the proof is an explicit ``PhotonValue(...)`` re-tag beside the variant
+    # check that establishes it. This is what makes #505 — the funding gate matching an FT
+    # token count against the carrier's photon value — a mypy error instead of a review catch.
+    radiant_amount: PhotonValue | TokenUnits
     t_btc: Timelock  # BTC refund timelock (the LONGER leg)
     t_rxd: Timelock  # Radiant refund timelock (the SHORTER leg)
     asset_variant: str  # "rxd" | "ft" | "nft"
@@ -397,7 +422,7 @@ class NegotiatedTerms:
                 f"(got t_btc={self.t_btc.value} <= t_rxd={self.t_rxd.value} {self.t_btc.unit.value})"
             )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Canonical JSON/hex wire form. NEVER contains the preimage ``p``."""
         d = {
             "hashlock": self.hashlock.hex(),
@@ -431,11 +456,11 @@ class NegotiatedTerms:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> NegotiatedTerms:
+    def from_dict(cls, d: dict[str, Any]) -> NegotiatedTerms:
         return cls(
             hashlock=bytes.fromhex(d["hashlock"]),
             btc_sats=int(d["btc_sats"]),
-            radiant_amount=int(d["radiant_amount"]),
+            radiant_amount=tag_radiant_amount(str(d["asset_variant"]), int(d["radiant_amount"])),
             t_btc=_timelock_from_dict(d["t_btc"]),
             t_rxd=_timelock_from_dict(d["t_rxd"]),
             asset_variant=str(d["asset_variant"]),
@@ -615,7 +640,7 @@ class SwapRecord:
     def with_radiant_lock(self, outpoint: str, spk_hex: str) -> SwapRecord:
         return dataclasses.replace(self, radiant_covenant_outpoint=outpoint, radiant_covenant_spk_hex=spk_hex)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form. The preimage ``p`` is NOT a field and is never written —
         serialising the record can never leak the secret to disk.
 
@@ -623,7 +648,7 @@ class SwapRecord:
         byte-for-byte identical to the pre-ETH schema; a swap whose counter-leg locator is an
         :class:`EthHtlcLocator` serialises the v2 chain-tagged ``counterchain_locator`` +
         ``schema_version``."""
-        d: dict = {
+        d: dict[str, Any] = {
             "state": self.state.value,
             "terms": self.terms.to_dict(),
             "radiant_covenant_outpoint": self.radiant_covenant_outpoint,
@@ -651,7 +676,7 @@ class SwapRecord:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> SwapRecord:
+    def from_dict(cls, d: dict[str, Any]) -> SwapRecord:
         if "counterchain_locator" in d:  # v2 chain-tagged form
             cc = d["counterchain_locator"]
             chain, locd = cc.get("chain"), cc.get("locator")
@@ -706,5 +731,5 @@ def _pos_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _timelock_from_dict(d: dict) -> Timelock:
+def _timelock_from_dict(d: dict[str, Any]) -> Timelock:
     return Timelock(value=int(d["value"]), unit=TimeUnit(d["unit"]))

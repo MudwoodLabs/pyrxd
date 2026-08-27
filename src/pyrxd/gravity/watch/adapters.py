@@ -33,6 +33,7 @@ from pyrxd.gravity.swap_state import SwapRecord, is_terminal
 from pyrxd.gravity.watch.alerts import Page, Severity
 from pyrxd.gravity.watch.quorum import BtcClaimStatus
 from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.units import ChainHeight, Confirmations
 
 logger = logging.getLogger(__name__)
 
@@ -117,12 +118,12 @@ class ElectrumRxdChainSource:
     def __init__(self, client) -> None:
         self._c = client
 
-    async def tip_height(self) -> int:
+    async def tip_height(self) -> ChainHeight:
         # A failure here propagates → the reconciler fails closed (PAGE_SQUEEZED), which is
         # correct: a down RXD node during a swap must alert, not silently watch.
-        return int(await self._c.get_tip_height())
+        return ChainHeight(int(await self._c.get_tip_height()))
 
-    async def covenant_confirmations(self, outpoint: str) -> int | None:
+    async def covenant_confirmations(self, outpoint: str) -> Confirmations | None:
         txid = outpoint.split(":", 1)[0]
         try:
             verbose = await self._c.get_transaction_verbose(txid)
@@ -135,7 +136,7 @@ class ElectrumRxdChainSource:
         confs = verbose.get("confirmations")
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 1:
             return None
-        return confs
+        return Confirmations(confs)
 
 
 class MultiSourceRxdChainSource:
@@ -203,16 +204,16 @@ class MultiSourceRxdChainSource:
         results = await asyncio.gather(*(coro_fn(s) for s in self._sources), return_exceptions=True)
         return [x for x in results if not isinstance(x, Exception)]
 
-    async def tip_height(self) -> int:
+    async def tip_height(self) -> ChainHeight:
         oks = [int(h) for h in await self._gather(lambda s: s.tip_height())]
         if len(oks) < self._quorum:
             raise NetworkError(
                 f"RXD tip height corroborated by only {len(oks)} source(s); require "
                 f"quorum={self._quorum} of {len(self._sources)}. Fail-closed."
             )
-        return min(oks)  # only as advanced as the most-pessimistic source
+        return ChainHeight(min(oks))  # only as advanced as the most-pessimistic source
 
-    async def _live_and_covenant(self, src, outpoint: str) -> tuple[bool, int | None]:
+    async def _live_and_covenant(self, src, outpoint: str) -> tuple[bool, Confirmations | None]:
         """``(reachable, covenant_depth_or_None)`` for one source. Reachability is proven by
         a successful ``tip_height``; ONLY a reachable source may later count as an "absent"
         vote (a down node's ``None`` must never read as "the asset is not locked")."""
@@ -226,9 +227,9 @@ class MultiSourceRxdChainSource:
             depth = None
         if depth is not None and (not isinstance(depth, int) or isinstance(depth, bool) or depth < 1):
             depth = None
-        return (True, depth)
+        return (True, None if depth is None else Confirmations(depth))
 
-    async def covenant_confirmations(self, outpoint: str) -> int | None:
+    async def covenant_confirmations(self, outpoint: str) -> Confirmations | None:
         results = await asyncio.gather(
             *(self._live_and_covenant(s, outpoint) for s in self._sources), return_exceptions=True
         )
@@ -239,7 +240,7 @@ class MultiSourceRxdChainSource:
             # LOCKED — believed on any sighting. MAX depth is the fail-closed direction for the CLAIM
             # gate (blocks_left = t_rxd − cov_confs + 1; a small cov_confs reads SAFE), so a single
             # under-reporting source cannot drag an autonomous claim into a closing window (HIGH-2).
-            return max(present)
+            return Confirmations(max(present))
         if reachable >= self._quorum:
             return None  # >= quorum reachable sources, none saw it → corroborated NOT locked
         raise NetworkError(
@@ -298,15 +299,15 @@ class OutspendBtcClaimSource:
             raise NetworkError(f"all {len(errors)} claim-detection source(s) failed: {errors[0]!r}")
         return BtcClaimStatus(claimed=False)
 
-    async def confirmations(self, claim_txid: str) -> int:
-        return int(await self._reader.confirmations(claim_txid))
+    async def confirmations(self, claim_txid: str) -> Confirmations:
+        return Confirmations(int(await self._reader.confirmations(claim_txid)))
 
-    async def funding_confirmations(self, funding_txid: str) -> int | None:
+    async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
         """Funding-tx depth via the SAME quorum reader (conservative min). Returns ``None`` if the read
         fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a
         genuine 0 (unconfirmed) is returned as 0 and the maturity gate keeps watching."""
         try:
-            return int(await self._reader.confirmations(funding_txid))
+            return Confirmations(int(await self._reader.confirmations(funding_txid)))
         except Exception:
             logger.debug("funding-depth read failed for %s", funding_txid, exc_info=True)
             return None
