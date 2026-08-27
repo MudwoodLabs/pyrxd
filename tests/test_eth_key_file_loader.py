@@ -130,14 +130,24 @@ class TestWhatItRefuses:
 
 class TestTheCheckIsOnTheDescriptorItReads:
     def test_the_mode_is_read_from_the_OPEN_descriptor(self, shared) -> None:
-        """`stat()` then `read_text()` checks one file and reads another: between the two calls the
-        path can be replaced, so a permissive file passes the check while a different one supplies
-        the key. Racing that reliably in a test is not practical, so this pins the property that
-        makes the race impossible — the mode compared is the one on the descriptor being read.
+        """Structural half: `stat()` then `read_text()` checks one file and reads another, so the
+        implementation must go through fd-based calls and never through the path-based ones.
 
         Checked against the AST, not the text. A first version of this scanned the source for
         `.stat()` and matched the DOCSTRING that explains the race, so it failed on a correct
         implementation. A test a comment can break is a test a comment can also satisfy.
+
+        WHAT CAN SATISFY THIS CHECK WITHOUT THE PROPERTY HOLDING — a token-presence scan sees
+        WHICH functions are called, not WHICH DESCRIPTOR each acts on:
+          1. fstat fd1, then `os.open` the path AGAIN and `os.read` fd2 — the exact TOCTOU this
+             loader exists to prevent, with every required token present and every banned token
+             absent. CLOSED by the race test below, which swaps the file at the path the instant
+             the first open returns: any second pathname resolution reads the planted decoy and
+             the content assertion fails.
+          2. fstat some OTHER descriptor entirely and read the real one — right tokens, check
+             inspects the wrong file. CLOSED by pairing: `TestWhatItRefuses` proves a 0644 key
+             file is REFUSED, which an implementation whose fstat looks at an unrelated
+             (well-permissioned) fd cannot do.
         """
         import ast
 
@@ -149,6 +159,46 @@ class TestTheCheckIsOnTheDescriptorItReads:
         assert "stat" not in calls, "a path-based stat() re-introduces the race"
         assert "read_text" not in calls, "read_text() opens the path a second time"
         assert "open" in calls, "the file must be opened by descriptor"
+
+    def test_a_swap_of_the_path_at_the_open_boundary_cannot_change_what_is_read(
+        self, shared, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Behavioral half: STAGE the race instead of hoping to lose it. The moment the loader's
+        first `os.open` of the key path returns, this test atomically renames a different
+        (equally well-permissioned, so nothing refuses) key file over that path. A correct
+        implementation holds a descriptor pinned to the ORIGINAL inode — fstat and read both act
+        on it, and the swap changes nothing. Any implementation that touches the PATHNAME a
+        second time after the check (a re-open, a `read_text`, a second `os.open` for the read)
+        gets the decoy, and the assertion on the returned key catches it.
+
+        This is the assertion the AST test above cannot make: not "the right functions appear"
+        but "the bytes returned came from the same descriptor that was permission-checked".
+        """
+        victim = tmp_path / "eth.key"
+        victim.write_text(_KEY)
+        victim.chmod(0o600)
+        decoy = tmp_path / "decoy.key"
+        decoy.write_text("cd" * 32)  # a VALID key, mode 600, same owner: a re-open succeeds quietly
+        decoy.chmod(0o600)
+
+        real_open = os.open
+        swaps = {"count": 0}
+
+        def racing_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if str(path) == str(victim) and swaps["count"] == 0:
+                swaps["count"] = 1
+                os.rename(decoy, victim)  # atomic: the path now names a different file
+            return fd
+
+        monkeypatch.setattr(os, "open", racing_open)
+        ns = _args(shared, eth_key_file=str(victim))
+        assert swaps["count"] == 1, "the loader never opened the key path — this test raced nothing"
+        assert ns.eth_key_hex == _KEY, (
+            "the loader returned the DECOY key: something re-resolved the pathname after the "
+            "descriptor was opened and checked, which is exactly the check-one-file-read-another "
+            "race the fd discipline exists to prevent"
+        )
 
 
 class TestEveryEthRunnerOffersIt:
