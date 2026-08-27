@@ -26,8 +26,10 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 import sys
 import time
+from pathlib import Path
 
 from radiant_mainnet_chainio import SshTrRadiantClient
 
@@ -63,7 +65,13 @@ _MINE_TIMEOUT_S = 2400.0
 # recreated target on-chain, exactly matching compute_next_target_linear.
 _MODE = os.environ.get("DMINT_RUN_MODE", "fixed").lower()
 _DAA_MODE = DaaMode.LWMA if _MODE == "lwma" else DaaMode.FIXED
-_STATE = f"/tmp/dmint_v2_mainnet_state_{_MODE}.json"  # noqa: S108 — ephemeral ops state (0600); holds throwaway WIFs
+#: NOT /tmp. O_NOFOLLOW closed the symlink half of this weakness and left the other half open: a
+#: FIXED, PREDICTABLE path in a world-writable directory can also be pre-created by another user as
+#: an ORDINARY file, which O_NOFOLLOW happily opens — and this file holds real (dust) WIFs, so the
+#: run would write keys into a file the attacker can read. A path only this user can create removes
+#: the precondition instead of defending against one exploitation of it. Same move as the swap
+#: runner's report, whose /tmp default cost a real run's provenance.
+_STATE = str(Path(f"~/.pyrxd/dmint_v2_mainnet_state_{_MODE}.json").expanduser())
 _DEPLOY_LAST_TIME = 1_700_000_000 if _MODE == "lwma" else 0  # past ts so the mint nLockTime is final
 _TARGET_TIME = 60
 _MINT_CURRENT_TIME = _DEPLOY_LAST_TIME + 30 if _MODE == "lwma" else 0  # fast block → LWMA lowers target
@@ -121,6 +129,28 @@ def _p2pkh_spk(key: PrivateKey) -> bytes:
     return b"\x76\xa9\x14" + bytes(Hex20(key.public_key().hash160())) + b"\x88\xac"
 
 
+def _assert_private_descriptor(fd: int, path: str) -> None:
+    """Refuse an already-open file that is not a private, regular file this user owns.
+
+    O_NOFOLLOW answers "is this a symlink". It does not answer "did somebody else create this",
+    and O_CREAT leaves an EXISTING file's mode alone — so a pre-placed world-readable file passes
+    the open and then receives the WIFs. Checked on the descriptor rather than the path, because
+    re-examining the path would be a different file.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"{path} is not a regular file; refusing to use it for run state")
+    if st.st_uid != os.getuid():
+        raise SystemExit(
+            f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: it holds the carve UTXOs' keys."
+        )
+    if st.st_mode & 0o077:
+        raise SystemExit(
+            f"{path} is mode {oct(st.st_mode & 0o777)}: accessible to other users, and it holds "
+            "real keys. Remove it and re-run."
+        )
+
+
 def _save(d: dict) -> None:
     """0600 — the state holds the carve UTXOs' WIFs (dust, but real keys).
 
@@ -134,17 +164,32 @@ def _save(d: dict) -> None:
     is create-only and this state is rewritten as the run progresses. O_NOFOLLOW is the primitive
     that fits: it refuses a symlink (ELOOP) while still allowing an ordinary file to be truncated.
     """
-    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(d, f, indent=2)
+    Path(_STATE).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # O_NONBLOCK so a FIFO at this path cannot HANG the open before the check below can
+    # reject it; a no-op for the regular files this accepts.
+    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        # O_CREAT does not apply the mode to a file that already EXISTS, so a pre-created
+        # world-readable file keeps its mode and quietly receives the keys. Check the descriptor.
+        _assert_private_descriptor(fd, _STATE)
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f, indent=2)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _load() -> dict:
     # O_NOFOLLOW on the READ side too: a symlink here lets an attacker substitute the WIFs and
     # outpoints this run then acts on, which is the more dangerous half of the same weakness.
-    fd = os.open(_STATE, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as f:
-        return json.load(f)
+    fd = os.open(_STATE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        _assert_private_descriptor(fd, _STATE)
+        with os.fdopen(fd) as f:
+            return json.load(f)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _key_of(g: dict) -> PrivateKey:
