@@ -81,10 +81,23 @@ _KNOWN_UNREACHED: dict[str, str] = {
     #    capability whose only callers are tests — the exact defect class this file exists to
     #    catch, found already present. They are allowlisted so the scan can land green, and left
     #    here deliberately loud; wiring them (or deleting them) removes the entry.
-    "src/pyrxd/cli/errors.py::is_debug": "FINDING 2026-08-27: no shipped caller — wire or remove",
-    "src/pyrxd/cli/errors.py::render_error": "FINDING 2026-08-27: no shipped caller — wire or remove",
-    "src/pyrxd/glyph/script.py::is_commit_script": "FINDING 2026-08-27: test-only callers — wire or remove",
-    "src/pyrxd/glyph/script.py::is_dmint_contract_script": "FINDING 2026-08-27: test-only callers — wire or remove",
+    "src/pyrxd/cli/errors.py::render_error": (
+        "FINDING 2026-08-27: a one-line wrapper over err.format_message() whose own docstring "
+        "says '(used by tests)'. A test helper living in shipped code. Tests can call "
+        "format_message() directly; move or delete."
+    ),
+    "src/pyrxd/glyph/script.py::is_commit_script": (
+        "FINDING 2026-08-27: neither documented nor fuzzed, and superseded by the specific "
+        "is_commit_nft_script / is_commit_ft_script, which have 2 shipped callers each. "
+        "The generic form appears to be leftover; confirm and delete."
+    ),
+    "src/pyrxd/glyph/script.py::is_dmint_contract_script": (
+        "Documented public classifier, not a finding. Named in three tracked docs, including "
+        "the fuzzing-strategy doc which states its contract ('never raises; always returns "
+        "bool') and the funding-utxo-DoS solution doc which relies on it being a full parser. "
+        "Its siblings is_nft_script / is_ft_script have 7 and 12 shipped callers; this one is "
+        "consumer surface for inspecting a script, so test-only internal use is expected."
+    ),
     "src/pyrxd/eth_wallet/tokens.py::token_by_address": (
         "FINDING 2026-08-27: new in feat/erc20-usdc-leg with test-only callers — wire or remove"
     ),
