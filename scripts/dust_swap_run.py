@@ -69,6 +69,7 @@ from _dust_swap_shared import (
     StepReport,
     atomic_write_mode_600,
     confirm,
+    covenant_fund_height,
     measured_margin_from_mainnet,
     merge_into_mode_600,
     rxd_blockcount,
@@ -303,16 +304,24 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         #    risked nothing. HZ-1 (#392) enforces it from the other side — taker_funds_btc refuses
         #    until the covenant is verified on chain, so the previous fund-then-lock order could
         #    not complete a swap at all.
-        #    Capture the RXD height at/just-before the asset lock — the t_rxd refund window is
-        #    measured from here, so a conservative (slightly-low) value is safe (it can only make
-        #    the reorg-gate squeeze MORE cautious, never less).
-        rxd_locked_at = rxd_blockcount(rxd_client)
-        await wait_for_covenant_funding(
+        funded = await wait_for_covenant_funding(
             rxd_client,
             covenant_spk=cov.funded_spk,
             expected_photons=terms.radiant_amount,
             poll_s=args.poll_interval_s,
         )
+        #    ANCHOR THE REORG GATE ON THE FUNDING BLOCK. This used to be `rxd_blockcount()` ABOVE
+        #    the wait: it snapshotted the tip and then blocked — for minutes or hours — on the
+        #    operator hand-funding the covenant, so the anchor was low by exactly the funding
+        #    latency. The comment defending it said a low value "can only make the reorg-gate
+        #    squeeze MORE cautious, never less". True of the gate, false of the runner: the
+        #    squeeze verdict is SQUEEZED, whose handler is taker_claim_asset_from_vulnerable,
+        #    which is winner-take-all and calls assess_claim_finality nowhere — so a MORE cautious
+        #    gate produces a LESS gated broadcast, unattended under --yes. 1-5 blocks of funding
+        #    latency flips the verdict in the realistic band.
+        #    The wait already found and returned the funded UTXO; its height was simply discarded.
+        rxd_locked_at = covenant_fund_height(int(funded.height))
+        print(f"  covenant fund height = {rxd_locked_at} (the reorg gate's anchor)")
 
         # 2. Taker funds the BTC HTLC, then re-validates the covenant pinned to finality.
         confirm(f"taker_funds_btc: broadcast the {btc_network} P2TR HTLC funding tx", auto_yes=args.yes)
