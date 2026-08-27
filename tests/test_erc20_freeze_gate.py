@@ -436,6 +436,16 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
         async def assert_chain(self):
             return None
 
+        async def wait_receipt(self, tx_hash, **_k):
+            # `claim` CONFIRMS before reporting success: status == 1 plus a Claimed(p) log from
+            # this swap's own contract. Without this the honest-path test below fails as
+            # "unconfirmed" — a reason that has nothing to do with the freeze gate it is about.
+            return {
+                "status": 1,
+                # hex of the b"\x00" * 32 preimage these tests claim with
+                "logs": [{"address": _HTLC, "topics": [], "data": "0x" + "00" * 32}],
+            }
+
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
 

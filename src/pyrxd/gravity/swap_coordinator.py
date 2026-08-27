@@ -2080,8 +2080,13 @@ class SwapCoordinator:
         try:
             await self.counter_leg.claim(self.record.counterchain_locator, raw)
         except PreRevealAbort:
+            # Nothing was broadcast and no eth_call carried the calldata to a provider, so `p` is
+            # STILL SECRET — keep it. A blanket `finally` here destroyed the only copy of a secret
+            # that was still safe, turning a transient RPC blip or a refused pre-flight check into
+            # a dead swap that a retry would have completed. See #479.
             raise
         except BaseException:
+            # Anything else may have reached the network with `p` in its calldata. Assume public.
             preimage.zeroize()
             raise
         else:

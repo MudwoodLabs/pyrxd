@@ -33,6 +33,8 @@ from pyrxd.security.errors import PreRevealAbort
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 _ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+_CONTRACT = "0x" + "11" * 20
+_PREIMAGE = b"\x11" * 32
 _TIMEOUT = 1_800_000_000
 
 
@@ -64,24 +66,31 @@ def _leg(now_ts: int, *, sent: list):
     class _Rpc:
         w3 = _W3()
 
-        write_w3 = w3  # the fake builds transactions against the same object it reads from
+        write_w3 = w3  # the fake builds transactions against the object it reads from
 
         async def latest_block_timestamp(self):
+            # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+            # reads the QUORUM-th. One source has one answer, so both coincide here. `claim` used
+            # to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
             return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
-        async def latest_block_timestamp_min(self):
-            # The multi-source class aggregates this the other way for the staleness and
-            # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        async def latest_block_timestamp_quorum(self):
             return await self.latest_block_timestamp()
 
-        async def latest_block_timestamp_quorum(self):
-            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
-            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
-            # source has one answer, so all three coincide here.
+        async def latest_block_timestamp_min(self):
             return await self.latest_block_timestamp()
 
         async def assert_chain(self):
             return None
+
+        async def wait_receipt(self, tx_hash, **_k):
+            # `claim` now CONFIRMS before reporting success: status == 1 plus a Claimed(p) log
+            # emitted by this swap's own contract. A fake that stops at submission would let a
+            # reverted claim look successful — which is the defect being fixed.
+            return {
+                "status": 1,
+                "logs": [{"address": _CONTRACT, "topics": [], "data": "0x" + _PREIMAGE.hex()}],
+            }
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)
 
@@ -271,20 +280,18 @@ def _fee_leg(now_ts: int, cap: list):
     class _Rpc:
         w3 = _W3()
 
-        write_w3 = w3  # the fake builds transactions against the same object it reads from
+        write_w3 = w3  # the fake builds transactions against the object it reads from
 
         async def latest_block_timestamp(self):
+            # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+            # reads the QUORUM-th. One source has one answer, so both coincide here. `claim` used
+            # to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
             return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
-        async def latest_block_timestamp_min(self):
-            # The multi-source class aggregates this the other way for the staleness and
-            # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        async def latest_block_timestamp_quorum(self):
             return await self.latest_block_timestamp()
 
-        async def latest_block_timestamp_quorum(self):
-            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
-            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
-            # source has one answer, so all three coincide here.
+        async def latest_block_timestamp_min(self):
             return await self.latest_block_timestamp()
 
         async def assert_chain(self):
@@ -293,8 +300,17 @@ def _fee_leg(now_ts: int, cap: list):
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": _TIP, "maxFeePerGas": _BASE * 2 + _TIP}
 
-        async def get_transaction_count(self, _addr, block="pending"):
+        async def get_transaction_count(self, _addr):
             return 0
+
+        async def wait_receipt(self, tx_hash, **_k):
+            # `claim` now CONFIRMS before reporting success: status == 1 plus a Claimed(p) log
+            # emitted by this swap's own contract. A fake that stops at submission would let a
+            # reverted claim look successful — which is the defect being fixed.
+            return {
+                "status": 1,
+                "logs": [{"address": _CONTRACT, "topics": [], "data": "0x" + _PREIMAGE.hex()}],
+            }
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)
 
@@ -348,5 +364,8 @@ class TestTheDeadlineGuardAndTheStalenessAbortReadDIFFERENTHeads:
         they do would strand every claim — the failure mode being traded away, not accepted."""
         sent: list = []
         leg = self._split(quorum_ts=_TIMEOUT - 200_000, late_ts=_TIMEOUT - 100_000, sent=sent)
-        asyncio.run(leg.claim(_locator(), os.urandom(32)))
+        # `_PREIMAGE`, not a random one: `claim` now confirms success by matching p against the
+        # Claimed log the fake emits, so an unrelated preimage cannot be confirmed and the honest
+        # path would fail for a reason that has nothing to do with the deadline guard.
+        asyncio.run(leg.claim(_locator(), _PREIMAGE))
         assert sent == [True], "an ordinary endpoint spread blocked an honest claim"

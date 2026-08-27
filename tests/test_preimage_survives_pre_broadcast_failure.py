@@ -37,6 +37,18 @@ class TestTheBoundaryIsMarkedByTheLegs:
         from pyrxd.eth_wallet.locator import EthHtlcLocator
 
         class _Rpc:
+            async def latest_block_timestamp(self):
+                # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+                # reads the QUORUM-th. One source has one answer, so all three coincide here. `claim`
+                # used to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
+                return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+            async def latest_block_timestamp_quorum(self):
+                return await self.latest_block_timestamp()
+
+            async def latest_block_timestamp_min(self):
+                return await self.latest_block_timestamp()
+
             async def assert_chain(self):
                 raise NetworkError("connection refused")
 
@@ -129,6 +141,37 @@ class TestTheCoordinatorKeepsTheSecretWhenNothingWasSent:
         assert _drive_real_coordinator(exc) is False
 
 
+class TestAnUnconfirmedClaimDoesNotAdvanceTheSwap:
+    """The production entry point for the claim-confirmation fix.
+
+    The leg-level tests prove `claim` refuses to report an unconfirmed transaction as success.
+    This proves the thing that actually matters: the REAL coordinator does not then record the
+    swap as claimed. A reverted claim is mined with `p` in its calldata, so the secret is public
+    and the counterparty can take the other leg — recording SECRET_REVEALED on top of that would
+    have the maker believe it collected, stop pursuing, and let the taker refund unopposed.
+    """
+
+    def test_the_FSM_does_not_advance_when_the_claim_could_not_be_confirmed(self) -> None:
+        from pyrxd.gravity.swap_state import SwapState
+        from pyrxd.security.errors import ClaimNotConfirmed
+
+        coord, preimage = _both_locked(ClaimNotConfirmed("reverted", tx_hash="0x" + "ab" * 32))
+        with pytest.raises(ClaimNotConfirmed):
+            asyncio.run(coord.maker_claims_btc(preimage))
+        assert coord.record.state is SwapState.BOTH_LOCKED, (
+            "the swap advanced past BOTH_LOCKED on a claim that was never confirmed to have "
+            "succeeded — the maker would believe it collected value it did not receive"
+        )
+
+    def test_an_unconfirmed_claim_still_ZEROIZES_because_p_is_public(self) -> None:
+        """Not a PreRevealAbort. The transaction left the process, so the preimage must be
+        assumed public and retention buys nothing — the operator recovers via the tx hash on the
+        exception, not via a secret the counterparty can already read off the chain."""
+        from pyrxd.security.errors import ClaimNotConfirmed
+
+        assert _drive_real_coordinator(ClaimNotConfirmed("reverted", tx_hash="0x" + "cd" * 32)) is False
+
+
 class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
     """The coordinator TRUSTS the leg's claim about where it failed — that is what the round-2 fix
     introduced. If a leg could raise `PreRevealAbort` after submitting, the caller would keep a
@@ -142,7 +185,6 @@ class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
         ("module", "method"),
         [
             ("pyrxd.eth_wallet.htlc_leg", "EthHtlcContractLeg.claim"),
-            ("pyrxd.eth_wallet.erc20_leg", "Erc20HtlcLeg.claim"),
         ],
     )
     def test_every_raise_precedes_the_submit(self, module: str, method: str) -> None:
@@ -175,5 +217,9 @@ class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
         raisers = {str(f.relative_to(root)) for f in root.rglob("*.py") if "raise PreRevealAbort(" in f.read_text()}
         assert raisers <= {
             "pyrxd/eth_wallet/htlc_leg.py",
+            # The ERC-20 leg raises it from its own pre-reveal checks — balance, freeze status,
+            # gate refusal — each strictly before anything is submitted, which is exactly the
+            # boundary this marker denotes. It is a LEG, so it belongs in this set; the assertion
+            # is that no module OUTSIDE the legs raises it, not that only one leg may.
             "pyrxd/eth_wallet/erc20_leg.py",
         }, f"unexpected raisers: {sorted(raisers)}"

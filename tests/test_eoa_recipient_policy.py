@@ -96,6 +96,23 @@ def _rpc(artifact: dict, recipient_code: bytes, *, token_balance: int = _AMOUNT)
     class _Rpc:
         w3 = _W3()
 
+        # The write path is a SEPARATE accessor: a multi-source RPC has no single `w3` to
+        # sign against, so `w3` raises there and `write_w3` returns the primary's. One
+        # source means they are the same object here.
+        write_w3 = w3
+
+        async def latest_block_timestamp(self):
+            # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+            # reads the QUORUM-th. One source has one answer, so all three coincide here. `claim`
+            # used to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
+            return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+        async def latest_block_timestamp_quorum(self):
+            return await self.latest_block_timestamp()
+
+        async def latest_block_timestamp_min(self):
+            return await self.latest_block_timestamp()
+
         async def assert_chain(self):
             return None
 

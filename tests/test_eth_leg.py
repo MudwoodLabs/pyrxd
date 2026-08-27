@@ -542,6 +542,18 @@ class _RecordingRpc:
 
         self.w3 = _W3()
 
+    async def latest_block_timestamp(self):
+        # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+        # reads the QUORUM-th. One source has one answer, so all three coincide here. `claim`
+        # used to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+    async def latest_block_timestamp_quorum(self):
+        return await self.latest_block_timestamp()
+
+    async def latest_block_timestamp_min(self):
+        return await self.latest_block_timestamp()
+
     async def assert_chain(self):
         return None
 
