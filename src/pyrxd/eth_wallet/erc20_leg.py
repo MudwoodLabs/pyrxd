@@ -58,6 +58,30 @@ _TRANSFER_ABI = [
 ]
 
 
+def _create_address(sender: str, nonce: int) -> str:
+    """The CREATE address for ``sender`` at ``nonce`` — keccak(rlp([sender, nonce]))[12:].
+
+    Derivable from two values the deployer already holds, which is why trusting an endpoint to
+    report it was never necessary. Minimal RLP: a 20-byte address is a 0x94-prefixed string, and
+    the nonce is either the empty string (0), a single byte below 0x80, or a length-prefixed
+    big-endian integer.
+    """
+    from eth_utils import keccak, to_checksum_address
+
+    addr = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
+    if len(addr) != 20:
+        raise ValidationError(f"sender must be a 20-byte address, got {len(addr)}")
+    if nonce == 0:
+        n = b"\x80"
+    elif nonce < 0x80:
+        n = bytes([nonce])
+    else:
+        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        n = bytes([0x80 + len(b)]) + b
+    payload = b"\x94" + addr + n
+    return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+
+
 class Erc20HtlcLeg(EthHtlcContractLeg):
     """Counter-chain leg holding an ERC-20 rather than native ETH.
 
@@ -229,7 +253,24 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         receipt = await self._rpc.wait_receipt(deploy_hash)
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"Erc20Htlc deploy reverted (status != 1): {deploy_hash}")
-        address = checksum(receipt["contractAddress"])
+        # DERIVE the address; do not accept the endpoint's word for it. A CREATE address is
+        # keccak(rlp([sender, nonce]))[12:] — both inputs are ours, so this needs no second
+        # endpoint and no trust at all.
+        #
+        # This is the one read that decides WHERE THE TOKENS GO, and it was the last single-source
+        # read on the funding path: `wait_receipt` is primary-only by design, and the quorum'd
+        # `get_transaction_receipt` is never called during a fund. A lying or MITM'd primary that
+        # altered only `contractAddress` redirected the entire counter leg — and every downstream
+        # check still passed, because the tokens really were at the address it named.
+        derived = _create_address(self._account_address(), int(built["nonce"]))
+        reported = checksum(receipt["contractAddress"])
+        if derived != reported:
+            raise ValidationError(
+                f"deploy receipt names contract {reported} but CREATE from {self._account_address()} "
+                f"at nonce {int(built['nonce'])} is {derived}. Refusing: this is the read that "
+                "decides where the tokens go, and it is derivable rather than trusted."
+            )
+        address = derived
 
         # Make the address durable BEFORE the tokens move. This is the only ordering that helps:
         # after the push, a crash leaves real value in a contract whose address was never written
@@ -358,7 +399,15 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
 
         # Confirm from chain state rather than trusting the receipt: a fee-on-transfer or otherwise
         # non-standard token can succeed while delivering less than it was asked to.
-        landed = await balance_of(self._rpc, self._token, address)
+        # QUORUM-th, not MIN. This asks "did enough actually arrive", and the threat it exists for
+        # is a fee-on-transfer token that under-delivers — which every endpoint reports alike. MIN
+        # instead let ONE lagging replica declare a correctly funded HTLC short and abort the
+        # taker's own swap, stranding the tokens until the timeout. The counterparty verifies this
+        # independently before locking, so erring toward refusal here buys nothing it does not
+        # already have.
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        landed = await balance_of(self._rpc, self._token, address, combine=quorum_combiner(self._rpc))
         if landed < int(amount_wei):
             raise ValidationError(
                 f"push landed {landed} base units of {self._token.symbol} but {amount_wei} was "

@@ -67,6 +67,11 @@ class EthRpc:
         """Head timestamp, for the claim-deadline guard (wants the LATEST any source admits to)."""
         return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
+    async def latest_block_timestamp_quorum(self) -> int:
+        """Same read; the multi-source class returns the quorum-th head instead. One endpoint has
+        one answer, so all three accessors coincide here."""
+        return await self.latest_block_timestamp()
+
     async def latest_block_timestamp_min(self) -> int:
         """Same read; the name exists so the multi-source class can aggregate it the OTHER way for
         the staleness and refund-maturity guards. Identical here — one endpoint has one answer."""

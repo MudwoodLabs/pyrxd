@@ -74,6 +74,12 @@ def _leg(now_ts: int, *, sent: list):
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
             return await self.latest_block_timestamp()
 
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
+            return await self.latest_block_timestamp()
+
         async def assert_chain(self):
             return None
 
@@ -275,6 +281,12 @@ def _fee_leg(now_ts: int, cap: list):
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
             return await self.latest_block_timestamp()
 
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
+            return await self.latest_block_timestamp()
+
         async def assert_chain(self):
             return None
 
@@ -291,3 +303,50 @@ def _fee_leg(now_ts: int, cap: list):
 
     leg._sign_and_send = _sign_and_send
     return leg
+
+
+class TestTheDeadlineGuardAndTheStalenessAbortReadDIFFERENTHeads:
+    """Two checks, opposite conservative directions, and for a while one shared value.
+
+    Routing both through the MIN accessor made the deadline guard read the most LAGGING endpoint —
+    the one whose answer makes a late claim look early. That is the direction that leaks the
+    preimage into a transaction that cannot be mined in time. The staleness abort wants the
+    opposite, so the two cannot share a number.
+
+    Driven through `claim()` rather than by scanning the source, so a reformat does not break it
+    and a comment cannot satisfy it.
+    """
+
+    @staticmethod
+    def _split(*, quorum_ts: int, late_ts: int, sent: list):
+        """A leg whose endpoints DISAGREE: `latest_block_timestamp` sees `late_ts`, the quorum-th
+        head is `quorum_ts`. Real spread, not an exotic attack — one lagging replica does this."""
+        leg = _leg(quorum_ts, sent=sent)
+
+        async def _late():
+            return late_ts
+
+        async def _quorum():
+            return quorum_ts
+
+        leg._rpc.latest_block_timestamp = _late
+        leg._rpc.latest_block_timestamp_quorum = _quorum
+        return leg
+
+    def test_a_LAGGING_endpoint_cannot_talk_the_guard_past_the_deadline(self) -> None:
+        """The regression. The freshest head is seconds from the timeout, so the claim cannot be
+        mined in time and must be refused. A guard reading the quorum-th (or minimum) head sees
+        hours of room and reveals the preimage for nothing."""
+        sent: list = []
+        leg = self._split(quorum_ts=_TIMEOUT - 100_000, late_ts=_TIMEOUT - 10, sent=sent)
+        with pytest.raises(PreRevealAbort):
+            asyncio.run(leg.claim(_locator(), os.urandom(32)))
+        assert sent == [], "the preimage was broadcast into a window that had already closed"
+
+    def test_the_same_spread_with_room_to_spare_still_CLAIMS(self) -> None:
+        """The honest-path pair. Endpoints disagreeing is normal, and a guard that refuses whenever
+        they do would strand every claim — the failure mode being traded away, not accepted."""
+        sent: list = []
+        leg = self._split(quorum_ts=_TIMEOUT - 200_000, late_ts=_TIMEOUT - 100_000, sent=sent)
+        asyncio.run(leg.claim(_locator(), os.urandom(32)))
+        assert sent == [True], "an ordinary endpoint spread blocked an honest claim"

@@ -19,7 +19,7 @@ Stages (--stage), each gating the next:
 Examples:
   python scripts/eth_swap_run.py --stage dry-run
   python scripts/eth_swap_run.py --stage sepolia-dust --i-accept-dust-loss \
-      --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-hex <funded-sepolia-key> \
+      --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-file ~/.swap-eth-key \
       --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity
 """
 
@@ -32,6 +32,7 @@ import json
 import math
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -72,7 +73,7 @@ from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, token_for
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd_relative_blocks
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
@@ -165,6 +166,8 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
         accept_flat_burial=True,
     )
     if not _token_leg_is_real(args):
+        if int(args.t_rxd_blocks) == 0:
+            args.t_rxd_blocks = _SEPOLIA_DEFAULT_T_RXD_BLOCKS
         return MarginPolicy(is_measured=False, **common)
     if args.eth_finality_stall_tolerance_s < 3600:
         raise SystemExit(
@@ -173,8 +176,10 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
             "until it has had a stall-tolerant window; the May-2023 mainnet stall ran about an "
             "hour. Sizing this against happy-path finality is the bug a stall triggers."
         )
-    _assert_t_rxd_covers_the_takers_wait(args)
-    _assert_t_rxd_opens_before_the_eth_deadline(args)
+    # ORDER MATTERS, and it was wrong. Both bounds divide by the fast tail; running them before the
+    # flag that REQUIRES it meant they fell back to the nominal and emitted the pre-fix, 8.3x-too-
+    # tight range — sending the operator to "fix" a correct value into an unsafe one. Demand the
+    # measurement first, then size against it.
     if not args.rxd_block_interval_fast_s:
         raise SystemExit(
             "a real-value token counter leg needs --rxd-block-interval-fast-s (the MEASURED p10 "
@@ -182,6 +187,14 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
             "under-counts blocks. Measure it against a mainnet node for THIS run — it was 43s on "
             "2026-06-02 and 36s on 2026-08-26, and the drift is in the under-counting direction."
         )
+    if int(args.t_rxd_blocks) == 0:
+        args.t_rxd_blocks = _derive_t_rxd_blocks(args)
+    # The three bounds now run against a value the library derived rather than one an operator
+    # typed. That is deliberate: they are the check on the derivation, not a substitute for it, and
+    # a derivation nothing verifies is how the exact-division off-by-one survived in the first place.
+    _assert_t_rxd_covers_the_takers_wait(args)
+    _assert_t_rxd_opens_before_the_eth_deadline(args)
+    _assert_t_rxd_bounds_the_vulnerable_window(args)
     return MarginPolicy(
         is_measured=True,
         require_measured=True,
@@ -225,7 +238,7 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> None:
         f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
         f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
         f"was still waiting.\n"
-        f"  minimum: --t-rxd-blocks {need}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
         f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
         f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
@@ -273,9 +286,73 @@ def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> Non
         f"{budget_s / 3600:.1f} h budget (--eth-timeout-s minus the {_cross_clock_margin(args).total_s()}s "
         f"cross-clock margin AND the {args.max_covenant_confirm_wait_s}s covenant-confirm reserve). "
         f"The maker could not refund before the ETH deadline.\n"
-        f"  valid range: --t-rxd-blocks {lo}..{hi}   (use {hi} — the largest gives the taker the most window)\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
+        f"  (the taker's-wait bound floors it at {lo} and this one caps it at {hi}, but the "
+        f"vulnerable-window bound closes that range to a single value — there is nothing to choose)\n"
         f"  the LOWER bound divides the margin by the FAST tail; this UPPER bound multiplies by the "
         f"NOMINAL one. Both are real, and they are not the same number."
+    )
+
+
+_SEPOLIA_DEFAULT_T_RXD_BLOCKS = 60
+
+
+def _derive_t_rxd_blocks(args: argparse.Namespace) -> int:
+    """DERIVE t_rxd from the ETH deadline instead of trusting a number an operator typed.
+
+    `eth_absolute_to_rxd_relative_blocks` has existed, correct and carefully documented, for the
+    whole life of this corridor — and had NO production caller. The runner took `--t-rxd-blocks` as
+    a flag with a default of 60, so every real run was sized by hand and the library's derivation
+    was exercised only by tests. That is the whole reason today's run needed six refusals to find a
+    safe value the library could have computed outright, and the reason the sizer's exact-division
+    off-by-one could sit in a shipped release without anyone meeting it.
+
+    Both bounds pin t_rxd to essentially ONE value, so there is nothing here for an operator to
+    choose. `--t-rxd-blocks` is kept as an explicit override for rehearsals, and it is still
+    checked against the same three bounds.
+    """
+    return eth_absolute_to_rxd_relative_blocks(
+        eth_timeout_unix_s=int(time.time()) + int(args.eth_timeout_s),
+        # The CSV clock starts at covenant MINING, not now, so reserve the confirm allowance.
+        expected_rxd_lock_time_unix_s=int(time.time()) + int(args.max_covenant_confirm_wait_s),
+        margin=_cross_clock_margin(args),
+        # The FAST tail. A slow chain only lengthens the maker's lock; a fast one shrinks the
+        # taker's claim window, so the fast tail is the direction that has to be safe.
+        rxd_block_interval_s=float(args.rxd_block_interval_fast_s),
+    ).value
+
+
+def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace) -> None:
+    """The bound that was missing entirely: t_rxd must be LARGE enough, not merely small enough.
+
+    ASSET_VULNERABLE is `eth_timeout - t_rxd * fast` — the span in which the maker's covenant refund
+    has matured AND the counter leg is still claimable with `p`, so the maker can hold both. The
+    two existing bounds constrain the taker's wait and the maker's deadline; neither looks at this,
+    so every value the runner accepted violated it. Today's run used 240 and carried a 21.6h window
+    where the design intends roughly the cross-clock margin.
+
+    Sized at the FAST tail because fast Radiant blocks are what mature the covenant sooner in
+    wall-clock — the direction that widens this window.
+    """
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return
+    margin_s = _cross_clock_margin(args).total_s()
+    # Measured from covenant MINING, exactly as the upper bound is. Anchoring this one on `now`
+    # instead made the two disagree by the confirm wait, and the first thing that disagreement did
+    # was refuse the value the library's own sizer derives — a guard rejecting honest work.
+    wait_s = int(args.max_covenant_confirm_wait_s)
+    window_s = int(args.eth_timeout_s) - wait_s - int(args.t_rxd_blocks) * fast
+    if window_s <= margin_s + fast:
+        return
+    raise SystemExit(
+        f"--t-rxd-blocks {args.t_rxd_blocks} leaves a {window_s / 3600:.2f} h ASSET_VULNERABLE "
+        f"window — the span where the maker's covenant refund has matured AND the counter leg is "
+        f"still claimable with the preimage, so the maker can end up holding both legs. It should "
+        f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
+        f"  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
+        f"the taker safety. Only one of those is recoverable."
     )
 
 
@@ -302,11 +379,43 @@ def _free_port() -> int:
     return port
 
 
+def _read_own_private_file(path: Path) -> str:
+    """Read a file this user owns, following no symlink and trusting no other account.
+
+    A recovery file names the preimage, both RXD keys and the ETH deadline — everything needed to
+    steer a resume. `read_text()` accepted whatever the path resolved to, so on a shared directory
+    another account could plant one and choose the covenant a resume rebuilt. Same fstat-the-open-
+    descriptor shape as the key-file loader, for the same reason: checking one file and reading
+    another is not a check.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise SystemExit(f"cannot open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SystemExit(f"{path} is not a regular file; refusing to read swap state from it")
+        if st.st_uid != os.getuid():
+            raise SystemExit(
+                f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: this file "
+                "decides which covenant a resume rebuilds."
+            )
+        if st.st_mode & 0o077:
+            raise SystemExit(
+                f"{path} is mode {oct(st.st_mode & 0o777)}: readable by other users, and it holds "
+                "the preimage and both RXD keys. chmod 600 it."
+            )
+        return os.read(fd, 1 << 20).decode()
+    finally:
+        os.close(fd)
+
+
 def _load_restore(args) -> dict | None:
     """The recovery file for a resume, or None for a fresh run."""
     if not args.resume:
         return None
-    return json.loads(Path(args.keys_out).expanduser().read_text())
+    return json.loads(_read_own_private_file(Path(args.keys_out).expanduser()))
 
 
 def resolve_eth_timeout(restore: dict | None, *, now_unix_s: int, eth_timeout_s: int) -> int:
@@ -1020,8 +1129,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 break
             raise SystemExit(f"unexpected state {rec.state.value} from the reorg-gated claim — operator must intervene")
     finally:
-        report.dump(args.report_out)
-        print(f"  report -> {args.report_out}")
+        _report_path = str(Path(args.report_out).expanduser())
+        report.dump(_report_path)
+        print(f"  report -> {_report_path}")
         await rpc.close()
 
 
@@ -1095,7 +1205,13 @@ def _args() -> argparse.Namespace:
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
-    ap.add_argument("--t-rxd-blocks", type=int, default=60)
+    ap.add_argument(
+        "--t-rxd-blocks",
+        type=int,
+        default=0,
+        help="0 (default) DERIVES it from --eth-timeout-s and the measured fast tail. Pass a "
+        "value only to override a rehearsal; it is checked against the same bounds either way.",
+    )
     # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).
     ap.add_argument("--asset-variant", choices=("rxd", "nft", "ft"), default="rxd")
     ap.add_argument("--ft-name", default="ETH-RXD-REAL-FT")
@@ -1176,7 +1292,12 @@ def _args() -> argparse.Namespace:
     # ops
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
-    ap.add_argument("--report-out", default="/tmp/eth_swap_report.json")  # noqa: S108 — operator-overridable
+    # NOT /tmp. It is world-writable and shared with every process on the box: the report from the
+    # first real-value RXD/USDT swap was deleted there by an unrelated cleanup the same day. The
+    # report is the run's only off-chain provenance — txids, timings, the margins actually used —
+    # and it cannot be regenerated once the run is over. Default it beside the key file, under the
+    # operator's own home, where the same ownership and mode rules apply.
+    ap.add_argument("--report-out", default="~/.eth_swap_report.json")
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
     if args.eth_key_file:
@@ -1186,13 +1307,35 @@ def _args() -> argparse.Namespace:
         if args.eth_key_hex:
             raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
         _kf = Path(args.eth_key_file).expanduser()
-        _mode = _kf.stat().st_mode & 0o777
-        if _mode & 0o077:
-            raise SystemExit(
-                f"{_kf} is mode {oct(_mode)}: readable by other users. chmod 600 it — a key file "
-                "that anyone can read is not an improvement on a key on the command line."
-            )
-        args.eth_key_hex = _kf.read_text().strip()
+        # OPEN FIRST, then fstat THAT descriptor. `stat()` then `read_text()` checks one file and
+        # reads another: between the two calls the path can be replaced, so a permissive file
+        # passes the check and a different file supplies the key. O_NOFOLLOW additionally refuses
+        # a symlink standing in for the key file.
+        try:
+            # O_NONBLOCK so a FIFO does not HANG the open before fstat can reject it — an
+            # operator who mistypes a path should get a message, not an indefinite wait.
+            # It is a no-op for the regular files this actually accepts.
+            _fd = os.open(_kf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            raise SystemExit(f"cannot open {_kf}: {exc}") from exc
+        try:
+            _st = os.fstat(_fd)
+            _mode = _st.st_mode & 0o777
+            if not stat.S_ISREG(_st.st_mode):
+                raise SystemExit(f"{_kf} is not a regular file; refusing to read a key from it")
+            if _st.st_uid != os.getuid():
+                raise SystemExit(
+                    f"{_kf} is owned by uid {_st.st_uid}, not you ({os.getuid()}). Refusing: a key "
+                    "file another account can rewrite is not a key file you control."
+                )
+            if _mode & 0o077:
+                raise SystemExit(
+                    f"{_kf} is mode {oct(_mode)}: readable by other users. chmod 600 it — a key "
+                    "file that anyone can read is not an improvement on a key on the command line."
+                )
+            args.eth_key_hex = os.read(_fd, 4096).decode().strip()
+        finally:
+            os.close(_fd)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
     # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.

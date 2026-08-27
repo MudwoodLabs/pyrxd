@@ -246,6 +246,84 @@ that break.
   go red on a calendar rather than a defect — better as a runner warning at setup, where it reaches
   the person who can act.
 
+## Follow-up round: what an adversarial review of the FIXES found
+
+A review round pointed at the fixes above — the discipline that every fix is itself a change —
+found three more, plus two the fixing work surfaced on its own. The pattern repeated: the defects
+were in the layer nothing drives.
+
+### The deploy receipt chose where the money went
+
+`fund()` reads the new HTLC's address out of the deploy receipt. `wait_receipt` is **primary-only
+by design** — a receipt is a single-node artifact — and the quorum'd `get_transaction_receipt` is
+called **zero times** during a fund. So one endpoint alone decided the destination of the entire
+counter-leg amount, and every downstream check still passed, because the tokens really were at the
+address it named. Verifying the code at that address does not help: an attacker deploys the same
+bytecode and owns the claim keys.
+
+The address was never something to be told. `keccak(rlp([sender, nonce]))[12:]` derives it from two
+values the deployer already holds, and the leg now derives and cross-checks it.
+
+### A fixture that modelled a chain which cannot exist
+
+The ERC-20 deploy fakes reported `contractAddress: 0x7777…` — an address **no sender and nonce can
+produce**. Seven tests passed for years against a scenario production never generates, which is why
+nothing noticed the address was being trusted rather than derived. The fakes now compute the
+address the way a chain does.
+
+The same class, one layer up: `test_the_push_is_gated_on_the_CONTRACT_being_unfrozen` froze a
+fixture constant rather than the address the leg actually deploys to. The fake reported that same
+constant as the contract, so the gate was handed its own answer. It is now given the real one.
+
+### One value, two opposite conservative directions — again
+
+The head timestamp serves a deadline guard (must not believe it is EARLIER than it is) and a
+staleness abort (must not believe the chain is FRESHER than it is). Routing both through the MIN
+accessor silently removed the deadline guard's local-clock backstop.
+
+And MIN was the wrong answer for the staleness question in its own right: it lets **one** lagging
+replica declare a healthy chain halted and refuse every claim — a denial whose base rate is far
+above the attack it defends. MAX inverts it, letting one liar hide a real halt. Neither extreme is
+the question being asked. `min_agreeing` already states how many endpoints must corroborate a read,
+and the **quorum-th** head is exactly that answer: with 2-of-3, two fresh heads outvote one
+laggard, two stale heads outvote one liar, and adding endpoints makes the read *more* robust rather
+than — as with MIN — strictly more fragile.
+
+### The canonical sizer had no production caller, and was off by one
+
+`eth_absolute_to_rxd_relative_blocks` has existed, correct and carefully documented, for the whole
+life of this corridor — with **no production caller**. The runner took a hand-typed
+`--t-rxd-blocks` defaulting to 60. That is the direct cause of §1 above: six refusals were spent
+hunting a value the library could have computed outright.
+
+Wiring it in exposed a second defect immediately. The sizer used `floor(budget / interval)`; the
+punctuality gate compares with a strict `<`, so a projection landing precisely ON the deadline is
+late. On an exactly-dividing budget the sizer therefore emitted a value **its own gate refuses**.
+Swept 1,480 parameter combinations (eth_timeout 12–48 h × 8 fast tails × 5 confirm waits): 111
+divided exactly, and the gate refused the sizer's output on **all 111 and on no others**. The real
+run's parameters land precisely there — `(86400 − 7068 − 600) / 36 = 2187.0` — so the canonical
+derivation produced 2187 and the gate accepted only 2186.
+
+It stayed invisible for two independent reasons, and it needed both: nothing called the function,
+and the test asserting sizer and gate agree sizes with a **zero** confirm wait, so its budget never
+divides evenly and it never reaches the boundary. `ceil(x) − 1` fixes it; the sweep now shows 0
+refusals and 0 cases leaving an accepted block unused.
+
+### Lessons that generalise
+
+- **"Primary-only by design" is a decision about trust, not just about plumbing.** It is defensible
+  for a receipt's *existence* and indefensible for a value the receipt *names* that decides where
+  funds go. Audit single-source reads by what the caller does with them.
+- **A test whose fixture cannot occur is not a weak test — it is a different test.** Mutation
+  testing will not find it: the assertion is load-bearing, and the setup is fiction. Check fixtures
+  against the domain (*could a real chain produce this receipt?*), not only against the code.
+- **When one accessor serves two guards, check whether they want opposite things.** Two of these
+  five are that same shape.
+- **A derivation with no caller is not a safeguard.** It is documentation that happens to compile,
+  and it will drift from the gate that checks it — which is exactly what happened here.
+- **A boundary that only appears on exact division needs a test that lands on it.** Grids find
+  these; hand-picked cases pick round numbers that avoid them.
+
 ## See also
 
 - [`sizing-t-rxd-the-two-directions-rule.md`](../design-decisions/sizing-t-rxd-the-two-directions-rule.md) — the rule; decision 3 is what was missing.

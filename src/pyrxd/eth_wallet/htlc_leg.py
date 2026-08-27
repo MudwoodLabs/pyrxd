@@ -558,7 +558,17 @@ class EthHtlcContractLeg:
             # would hide a halted chain from every honest one), while the deadline guard wants the
             # latest any source admits to. Read the conservative one here and take the max against
             # the local clock — which no endpoint can move — for the deadline.
-            chain_ts = await self._rpc.latest_block_timestamp_min()
+            # TWO reads, because the two checks below want opposite things and one value cannot
+            # serve both. The deadline guard must not be talked into thinking it is EARLIER than it
+            # is (that is what lets a claim broadcast too late and publish p for nothing); the
+            # staleness abort must not be talked into thinking the chain is FRESHER than it is.
+            #
+            # `max(chain_ts_late, local_ts)` restores the local clock as the backstop the comment
+            # below describes: switching this to a MIN read had quietly removed it, so a slow local
+            # clock plus an ordinary endpoint spread let the guard pass with 50s of real head-room
+            # against a 96s budget.
+            chain_ts_late = await self._rpc.latest_block_timestamp()
+            chain_ts = await self._rpc.latest_block_timestamp_quorum()
             local_ts = int(time.time())
             # Take the LATER of chain head and local clock. A lagging or hostile provider can only
             # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
@@ -566,7 +576,7 @@ class EthHtlcContractLeg:
             # any of the L2s in KNOWN_TOKENS during a sequencer halt, made the guard inert in the
             # precise case it was written for. Local time cannot be moved by the provider, and
             # forward skew only ever makes the guard stricter.
-            now_ts = max(chain_ts, local_ts)
+            now_ts = max(chain_ts_late, local_ts)
             if local_ts - chain_ts > CLAIM_INCLUSION_BUDGET_S:
                 raise _ClaimTooLate(
                     f"the chain head is {local_ts - chain_ts}s stale (limit "

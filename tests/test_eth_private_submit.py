@@ -83,6 +83,12 @@ class _FakeRpc:
         # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
         return await self.latest_block_timestamp()
 
+    async def latest_block_timestamp_quorum(self):
+        # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+        # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+        # source has one answer, so all three coincide here.
+        return await self.latest_block_timestamp()
+
     async def assert_chain(self):
         return None
 

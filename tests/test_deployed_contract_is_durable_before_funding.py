@@ -27,14 +27,21 @@ import pytest
 
 pytest.importorskip("web3", reason="needs the eth extra: pip install 'pyrxd[eth]'")
 
-from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg, _create_address
 from pyrxd.eth_wallet.locator import PendingDeploy
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 _ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+#: The RESUME fixture's address. A resume takes the address from the durable RECORD — the deploy
+#: already happened and no receipt is being trusted — so an arbitrary value is honest there.
 _DEPLOYED = "0x" + "77" * 20
+#: A FRESH deploy is different. A deploy receipt cannot name an arbitrary address: `contractAddress`
+#: IS `keccak(rlp([sender, nonce]))[12:]`, and the leg now derives it rather than trusting the
+#: endpoint that reports it. A fake returning `0x7777...` modelled a chain that cannot exist, so
+#: every test here passed against a scenario production never produces. Each leg now computes
+#: the address its own key and nonce really imply, and `lying_receipt=` opts into the forgery.
 _USDC = token_for("USDC", 1)
 #: Evaluated ONCE so the fake's on-chain immutable and the value `_fund` sends agree; computing
 #: `time.time()` at each call made them differ and the real immutable bind refused, correctly.
@@ -48,6 +55,8 @@ def _leg(
     initial_held: int = 0,
     inflight: int = 0,
     frozen: tuple[str, ...] = (),
+    lying_receipt: str | None = None,
+    key: PrivateKeyMaterial | None = None,
 ):
     """A token leg whose deploy always succeeds; the push may fail.
 
@@ -57,6 +66,10 @@ def _leg(
     exact distinction the resume path turns on.
     """
     state = {"held": int(initial_held), "sent": []}
+    _key = key or PrivateKeyMaterial(os.urandom(32))
+    from pyrxd.eth_wallet.keys import derive_address
+
+    _sender = derive_address(_key)
 
     class _Call:
         def __init__(self, v):
@@ -91,6 +104,7 @@ def _leg(
 
     class _Ctor:
         async def build_transaction(self, tx):
+            state["deploy_nonce"] = tx.get("nonce")
             return dict(tx)
 
     class _Contract:
@@ -119,6 +133,12 @@ def _leg(
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
             return await self.latest_block_timestamp()
 
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
+            return await self.latest_block_timestamp()
+
         async def assert_chain(self):
             return None
 
@@ -130,15 +150,15 @@ def _leg(
 
         async def wait_receipt(self, tx_hash, **_k):
             if tx_hash == "0xdeploy":
-                return {"status": 1, "contractAddress": _DEPLOYED, "logs": []}
+                real = _create_address(_sender, int(state["deploy_nonce"]))
+                state["deployed"] = real
+                return {"status": 1, "contractAddress": lying_receipt or real, "logs": []}
             if push_fails:
                 return {"status": 0, "logs": []}
             state["held"] += state.pop("pending_transfer", 0)
             return {"status": 1, "logs": []}
 
-    leg = Erc20HtlcLeg(
-        token=_USDC, rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART
-    )
+    leg = Erc20HtlcLeg(token=_USDC, rpc=_Rpc(), signing_key=_key, chain_id=1, artifact=_ART)
 
     sends = {"n": 0}
 
@@ -179,8 +199,9 @@ class TestTheAddressIsDurableBeforeTheTokensMove:
             order.append(f"persisted:{addr}")
             assert tx == "0xdeploy", "the deploy tx hash must ride along; a resume needs it"
 
-        _fund(_leg(push_fails=False, order=order), _remember)
-        assert order == [f"persisted:{_DEPLOYED}", "tokens-pushed"], order
+        leg = _leg(push_fails=False, order=order)
+        _fund(leg, _remember)
+        assert order == [f"persisted:{leg._test_state['deployed']}", "tokens-pushed"], order
 
     def test_a_FAILED_push_still_leaves_the_address_recorded(self) -> None:
         """The crash-consistency case. The push reverts, `fund` raises and returns no locator —
@@ -191,9 +212,10 @@ class TestTheAddressIsDurableBeforeTheTokensMove:
         async def _remember(addr: str, tx: str) -> None:
             seen.append(addr)
 
+        leg = _leg(push_fails=True, order=[])
         with pytest.raises(NetworkError):
-            _fund(_leg(push_fails=True, order=[]), _remember)
-        assert seen == [_DEPLOYED], "the deployed address was lost when the push failed"
+            _fund(leg, _remember)
+        assert seen == [leg._test_state["deployed"]], "the deployed address was lost when the push failed"
 
     def test_a_caller_that_cannot_PERSIST_stops_before_the_tokens_move(self) -> None:
         """If the record cannot be written, pushing would create precisely the untracked value
@@ -212,8 +234,9 @@ class TestTheAddressIsDurableBeforeTheTokensMove:
         """A guard that refuses valid work is a bug: `on_deploy` is optional, and a caller that
         passes nothing keeps the previous behaviour."""
         order: list = []
-        loc = _fund(_leg(push_fails=False, order=order), None)
-        assert loc.contract_address.lower() == _DEPLOYED.lower()
+        leg = _leg(push_fails=False, order=order)
+        loc = _fund(leg, None)
+        assert loc.contract_address.lower() == leg._test_state["deployed"].lower()
         assert order == ["tokens-pushed"]
 
 
@@ -412,6 +435,12 @@ def _real_verify_leg(
         async def latest_block_timestamp_min(self):
             # The multi-source class aggregates this the other way for the staleness and
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+            return await self.latest_block_timestamp()
+
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
             return await self.latest_block_timestamp()
 
         async def assert_chain(self):
@@ -662,6 +691,12 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
             return await self.latest_block_timestamp()
 
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
+            return await self.latest_block_timestamp()
+
         async def assert_chain(self):
             return None
 
@@ -760,7 +795,7 @@ class TestTheInFlightGuardDoesNotBlockAFreshFund:
         leg = _leg(order=order, inflight=3)
         loc = _fund(leg, None)
         assert order == ["tokens-pushed"], f"a fresh fund was blocked by unrelated pending txs: {order}"
-        assert loc.contract_address.lower() == _DEPLOYED.lower()
+        assert loc.contract_address.lower() == leg._test_state["deployed"].lower()
 
     def test_a_RESUME_is_still_blocked_by_the_same_pending_transactions(self) -> None:
         """The pairing: identical mempool state, opposite verdict, because only the resume can be
@@ -908,3 +943,85 @@ class TestAPersistFailureDoesNotDiscardACommittedNativeFund:
         with pytest.raises(NetworkError, match="read-only filesystem"):
             _fund(_leg(order=order), _broken)
         assert "tokens-pushed" not in order
+
+
+class TestALyingDeployReceiptCannotRedirectTheFunding:
+    """`contractAddress` is reported by ONE endpoint and was believed without question.
+
+    `wait_receipt` is primary-only by design — a receipt is a single-node artifact and the quorum'd
+    `get_transaction_receipt` is called zero times during a fund. So the primary alone chose where
+    the entire counter-leg amount went, and every downstream check still passed, because the tokens
+    really were at the address it named. Verifying the code at that address does not help either:
+    an attacker deploys the same bytecode and simply owns the claim keys.
+
+    The address was never something to be told. `keccak(rlp([sender, nonce]))[12:]` derives it from
+    two values the deployer already holds.
+    """
+
+    def test_a_receipt_naming_a_DIFFERENT_contract_is_refused(self) -> None:
+        order: list = []
+        leg = _leg(push_fails=False, order=order, lying_receipt="0x" + "ab" * 20)
+        with pytest.raises(ValidationError, match="CREATE"):
+            _fund(leg, None)
+        assert "tokens-pushed" not in order, "tokens were pushed to an address the endpoint invented"
+
+    def test_the_refusal_is_not_merely_a_CHECKSUM_disagreement(self) -> None:
+        """The honest-path pair for the guard above. A receipt reporting the RIGHT address in the
+        wrong case is honest, and refusing it would be a bug — endpoints differ on EIP-55 casing.
+        Nothing may be pushed on a forgery; everything must proceed on a case difference."""
+        order: list = []
+        # THE SAME KEY for both legs. Two random keys deploy to two different addresses, so the
+        # "honest lowercase" of one is a forgery to the other — the test would have passed by
+        # triggering the very refusal it claims to rule out.
+        shared = PrivateKeyMaterial(os.urandom(32))
+        probe = _leg(push_fails=False, order=[], key=shared)
+        _fund(probe, None)
+        honest_lowercase = probe._test_state["deployed"].lower()
+
+        leg = _leg(push_fails=False, order=order, lying_receipt=honest_lowercase, key=shared)
+        loc = _fund(leg, None)
+        assert order == ["tokens-pushed"], "a correct address in lowercase was refused"
+        assert loc.contract_address.lower() == honest_lowercase
+
+    @pytest.mark.parametrize("nonce", [0, 1, 127, 128, 255, 256, 65535, 1_000_000, 2**32])
+    def test_it_matches_an_INDEPENDENT_rlp_encoder(self, nonce: int) -> None:
+        """Differential check against a real RLP library, not against itself.
+
+        `_create_address` hand-rolls minimal RLP to avoid a dependency, and a derivation verified
+        only by a fake that calls the same function proves the two agree, not that either is right.
+        `rlp.encode` is an independent implementation of the encoding the yellow paper specifies,
+        so agreeing with it across every nonce branch is a real check on the arithmetic.
+
+        A wrong branch here does not raise — it names a valid-looking address that nobody controls,
+        and the tokens go there.
+        """
+        import rlp
+        from eth_utils import keccak, to_checksum_address
+
+        sender = "0x" + os.urandom(20).hex()
+        expected = to_checksum_address(keccak(rlp.encode([bytes.fromhex(sender[2:]), nonce]))[12:])
+        assert _create_address(sender, nonce) == expected
+
+    @pytest.mark.parametrize("nonce", [0, 1, 127, 128, 255, 256, 65535, 1_000_000])
+    def test_every_RLP_nonce_branch_yields_a_distinct_valid_address(self, nonce: int) -> None:
+        """Minimal RLP encodes the nonce three different ways (empty string, single byte, length-
+        prefixed). A bug in any branch silently sends funds somewhere real and unrecoverable, so
+        sweep the boundaries rather than the one value the tests happen to use."""
+        from eth_utils import is_checksum_address
+
+        sender = "0x" + os.urandom(20).hex()
+        addr = _create_address(sender, nonce)
+        assert is_checksum_address(addr), addr
+        assert addr != _create_address(sender, nonce + 1)
+
+
+def _fresh_deploy_address(key: PrivateKeyMaterial, nonce: int = 0) -> str:
+    """Where a leg holding `key` will deploy on its FIRST fund — CREATE(sender, nonce).
+
+    Exposed because a test that wants to act on the deployed contract (freeze it, blacklist it)
+    has to name the address the leg will really use. Naming a fixture constant instead let the
+    fake hand the gate its own answer, so the check passed without the gate doing anything.
+    """
+    from pyrxd.eth_wallet.keys import derive_address
+
+    return _create_address(derive_address(key), nonce)

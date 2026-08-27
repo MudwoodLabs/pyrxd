@@ -53,6 +53,23 @@ from ..security.errors import NetworkError, ValidationError
 __all__ = ["MultiSourceEthRpc", "read_contract"]
 
 
+def quorum_combiner(rpc: Any) -> Callable[[list[Any]], Any]:
+    """A ``combine`` that returns the value at least ``min_agreeing`` sources are at or above.
+
+    For a magnitude that answers "how much is really there", MIN and MAX are both wrong at the
+    edges: MIN lets one lagging replica veto a correct answer, MAX lets one liar manufacture one.
+    The quorum-th value is what ``min_agreeing`` already promises, applied to a number instead of
+    to an identity.
+
+    Falls back to ``min`` for a single-source RPC, where there is nothing to aggregate, and where
+    erring low stays the conservative direction.
+    """
+    n = getattr(rpc, "_min", None)
+    if not isinstance(n, int) or n < 1:
+        return min
+    return lambda answers: sorted(answers, reverse=True)[min(n, len(answers)) - 1]
+
+
 async def read_contract(
     rpc: Any,
     make_call: Callable[[Any], Awaitable[Any]],
@@ -145,6 +162,21 @@ class MultiSourceEthRpc:
         write", and a read that says it is lying.
         """
         return self.primary.w3
+
+    async def latest_block_timestamp_quorum(self) -> int:
+        """Head timestamp that AT LEAST ``min_agreeing`` endpoints stand at or above.
+
+        Neither extreme is right for "is the chain fresh". MIN lets one lagging replica declare a
+        healthy chain halted and refuse every claim — and stale endpoints are the common case, so
+        that trades a rare bypass for a frequent denial. MAX lets one lying endpoint hide a genuine
+        halt from every honest one, which is the leak the staleness abort exists to prevent.
+
+        The quorum-th value is the honest middle and it is exactly what `min_agreeing` means: with
+        2-of-3, two fresh heads outvote one laggard, and two stale heads outvote one liar. Adding
+        endpoints makes it more robust rather than, as with MIN, strictly more fragile.
+        """
+        answers = await self._gather(lambda s: s.latest_block_timestamp(), label="latest_block_timestamp_quorum")
+        return sorted(answers, reverse=True)[self._min - 1]
 
     async def latest_block_timestamp_min(self) -> int:
         """Head timestamp, quorum by MIN — for guards that must not be fooled into thinking the

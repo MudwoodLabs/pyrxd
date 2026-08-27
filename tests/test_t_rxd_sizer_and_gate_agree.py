@@ -163,3 +163,66 @@ class TestTheWindowThisProtects:
             "the nominal-derived cap is supposed to be much worse at the fast tail; if it is not, "
             "the intervals have converged and this test is obsolete"
         )
+
+
+class TestTheExactDivisionBoundary:
+    """The one input class where sizer and gate disagreed — and the one the real run landed on.
+
+    `TestTheIntervalActuallyCancels` sizes with a ZERO confirm wait, so its budget never divides
+    evenly by the interval and it never reaches this boundary. On an exact quotient the old
+    `floor(budget/interval)` returned the quotient itself, and the gate compares with a strict `<`,
+    so a projection landing precisely ON the deadline is late: the sizer emitted a value its own
+    gate refused.
+
+    Invisible in production for a different reason — `eth_absolute_to_rxd_relative_blocks` had no
+    production caller at all. The runner took a hand-typed `--t-rxd-blocks`. The first run to
+    derive the value would have met it immediately: (86400 - 7068 - 600) / 36 = 2187.0 exactly.
+    """
+
+    def test_the_gate_ACCEPTS_the_sizer_output_when_the_budget_divides_EXACTLY(self) -> None:
+        wait = 600
+        fast = _dividing_interval_s(_policy())
+        budget = _ETH_TIMEOUT_S - _margin().total_s() - wait
+        assert budget % fast == 0, (
+            f"this test is only meaningful on an exact quotient; budget/interval = {budget / fast}"
+        )
+        sized = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
+            expected_rxd_lock_time_unix_s=_NOW + wait,
+            margin=_margin(),
+            rxd_block_interval_s=fast,
+        ).value
+        assert _gate_accepts(sized, fast, wait=wait), (
+            f"the gate refused t_rxd={sized}, the sizer's own output at the same interval — the "
+            f"exact-division boundary is back"
+        )
+
+    def test_the_sized_value_is_still_the_LARGEST_the_gate_accepts(self) -> None:
+        """The paired honest-path check. Fixing a refusal by shrinking the answer would also pass
+        the test above while quietly handing the taker a shorter claim window every run."""
+        wait = 600
+        fast = _dividing_interval_s(_policy())
+        sized = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
+            expected_rxd_lock_time_unix_s=_NOW + wait,
+            margin=_margin(),
+            rxd_block_interval_s=fast,
+        ).value
+        assert not _gate_accepts(sized + 1, fast, wait=wait), (
+            f"t_rxd={sized + 1} is also accepted, so the sizer gave away a block of the taker's "
+            f"claim window for nothing"
+        )
+
+    @pytest.mark.parametrize("wait", [0, 300, 600, 900, 1200])
+    @pytest.mark.parametrize("fast", [20.0, 24.0, 30.0, 36.0, 45.0, 60.0])
+    def test_across_the_parameter_grid_the_sizer_is_exactly_the_gate_boundary(self, fast: float, wait: int) -> None:
+        """Both properties at once, over the grid the sweep that found this defect used. Two
+        one-off cases can be satisfied by a fudge that happens to fit them; a grid cannot."""
+        sized = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
+            expected_rxd_lock_time_unix_s=_NOW + wait,
+            margin=_margin(),
+            rxd_block_interval_s=fast,
+        ).value
+        assert _gate_accepts(sized, fast, wait=wait), f"gate refused sized t_rxd={sized}"
+        assert not _gate_accepts(sized + 1, fast, wait=wait), f"t_rxd={sized + 1} also accepted"

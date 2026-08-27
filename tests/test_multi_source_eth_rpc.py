@@ -520,26 +520,34 @@ class TestOneValueTwoDirections:
         assert floors, "expected the floor comparisons to still use the conservative default"
 
     def test_the_two_directions_are_COMPLEMENTARY_not_contradictory(self) -> None:
-        """Why opposite directions on the same quantity is correct, not a smell.
+        """Two balance reads of the SAME contract, deliberately aggregated differently.
 
         MAX decides HOW MUCH TO SEND — so a lagging replica cannot trigger a second full transfer.
-        MIN decides WHETHER ENOUGH ARRIVED — so an over-reporting endpoint cannot pass an
-        under-funded HTLC. Each is conservative for its own question, and the obvious objection to
-        the MAX fix (an over-reporter skips the push) is answered by the MIN floor that runs
+        The floor read decides WHETHER ENOUGH ARRIVED — so an over-reporting endpoint cannot pass
+        an under-funded HTLC. Each is conservative for its own question, and the obvious objection
+        to the MAX fix (an over-reporter skips the push) is answered by the floor that runs
         immediately after, in the same function.
+
+        The floor was MIN and is now the QUORUM-th. MIN answered the objection even against a
+        MAJORITY of over-reporting endpoints — but it also let ONE lagging replica declare a
+        correctly funded HTLC short and abort the taker's own swap, tokens stranded until the
+        timeout. The quorum-th still answers the objection under the assumption every other read
+        here already makes (honest majority), and stops paying for it with an abort that a single
+        slow endpoint can trigger.
 
         Pinned because a future refactor "unifying" these two reads would silently remove one half
         of a two-sided guard, and both halves would still look individually reasonable.
         """
         src = pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text()
         push = src.index("held = await balance_of(self._rpc, self._token, address, combine=max)")
-        floor = src.index("landed = await balance_of(self._rpc, self._token, address)")
-        assert push < floor, "the send-decision read must come before the arrived-check read"
-        between = src[push:floor]
-        assert "shortfall" in between, "the MAX read must be the one feeding the subtraction"
-        assert "landed < int(amount_wei)" in src[floor : floor + 400], (
-            "the MIN read must still be compared against the floor — that comparison is what "
-            "catches an over-reporting endpoint skipping the push"
+        floor = src.index("landed = await balance_of(self._rpc, self._token, address, combine=quorum_combiner")
+        assert push < floor, (
+            "the MAX read must come first — it decides the amount; the floor read verifies the "
+            "result, and verifying before sending checks nothing"
+        )
+        assert "if landed < int(amount_wei):" in src, (
+            "the floor read must still be compared against the required amount — that comparison "
+            "is what catches an over-reporting endpoint skipping the push"
         )
 
     def test_the_receipt_returned_is_ONE_THE_QUORUM_AGREED_ON(self) -> None:
@@ -560,3 +568,85 @@ class TestOneValueTwoDirections:
         got = _run(rpc.get_transaction_receipt("0xdead"))
         assert calls["n"] == 1, "the primary must be asked ONCE, not re-fetched after agreeing"
         assert got["call"] == 1
+
+
+class TestTheStalenessAbortNeedsTheQUORUM_head:
+    """MIN closed an attack and opened a denial; the quorum-th value closes both.
+
+    The staleness abort asks "is the chain moving". MIN answers it with the single most-lagging
+    endpoint, so ONE slow replica — the common case, not an attack — declares a healthy chain
+    halted and refuses every claim. MAX answers it with the single freshest, so one LYING endpoint
+    hides a real halt from every honest one, which is the leak the abort exists to prevent.
+
+    Neither extreme is the question being asked. `min_agreeing` already states how many endpoints
+    must corroborate a read, and the quorum-th head is exactly that answer for this one.
+    """
+
+    def test_one_LAGGING_endpoint_does_not_declare_a_healthy_chain_halted(self) -> None:
+        """The liveness half. Under MIN this refuses the claim, and refusing a claim near the
+        deadline is not a safe default — it is how the preimage gets published for nothing."""
+        rpc = MultiSourceEthRpc(
+            [_Source(head_ts=1_700_003_600), _Source(head_ts=1_700_003_600), _Source(head_ts=1_700_000_000)]
+        )
+        assert _run(rpc.latest_block_timestamp_quorum()) == 1_700_003_600
+        assert _run(rpc.latest_block_timestamp_min()) == 1_700_000_000, (
+            "MIN is still available; this test pins that the STALENESS check no longer uses it"
+        )
+
+    def test_one_LYING_endpoint_still_cannot_hide_a_halted_chain(self) -> None:
+        """The safety half, and the property MIN was adopted for. Keeping it is the whole point:
+        a fix that trades a leak for a denial has not fixed anything."""
+        rpc = MultiSourceEthRpc(
+            [_Source(head_ts=1_700_000_000), _Source(head_ts=1_700_000_000), _Source(head_ts=1_700_003_600)]
+        )
+        assert _run(rpc.latest_block_timestamp_quorum()) == 1_700_000_000
+        assert _run(rpc.latest_block_timestamp()) == 1_700_003_600, "MAX would have believed the liar"
+
+    def test_adding_endpoints_makes_the_read_more_robust_not_less(self) -> None:
+        """The structural argument for the quorum-th value. Under MIN, each endpoint added is
+        another single point of denial — a five-source setup is strictly more fragile than a
+        two-source one, which inverts the reason for running several."""
+        many = [_Source(head_ts=1_700_003_600) for _ in range(4)] + [_Source(head_ts=1_700_000_000)]
+        rpc = MultiSourceEthRpc(many)
+        assert _run(rpc.latest_block_timestamp_quorum()) == 1_700_003_600
+        assert _run(rpc.latest_block_timestamp_min()) == 1_700_000_000
+
+
+class TestTheLandedBalanceUsesTheQUORUM_th:
+    """`landed` confirms the push actually delivered. MIN made one laggard abort an honest swap.
+
+    The check exists for a fee-on-transfer or otherwise non-standard token that succeeds while
+    delivering less than asked — a condition every endpoint reports alike. Endpoint disagreement is
+    noise against that threat, but under MIN a single replica that had not yet seen the transfer
+    reported 0, the leg declared the HTLC under-funded, and the taker's own correctly-funded swap
+    aborted with the tokens locked until the timeout.
+    """
+
+    def test_one_lagging_replica_does_not_declare_a_funded_HTLC_short(self) -> None:
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        rpc = MultiSourceEthRpc([_Source(balance=5_000_000), _Source(balance=5_000_000), _Source(balance=0)])
+        assert quorum_combiner(rpc)([5_000_000, 5_000_000, 0]) == 5_000_000
+        assert _run(balance_of(rpc, _USDT, _HTLC, combine=quorum_combiner(rpc))) == 5_000_000
+
+    def test_one_LYING_replica_cannot_declare_an_empty_HTLC_funded(self) -> None:
+        """The paired safety check. A fix that stops the false abort by believing the highest
+        answer would let a single endpoint wave through an HTLC holding nothing."""
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        rpc = MultiSourceEthRpc([_Source(balance=0), _Source(balance=0), _Source(balance=5_000_000)])
+        assert _run(balance_of(rpc, _USDT, _HTLC, combine=quorum_combiner(rpc))) == 0
+
+    def test_a_genuinely_SHORT_delivery_is_still_caught(self) -> None:
+        """The threat the check was written for: every endpoint agrees, and it must still refuse.
+        A guard that only survives disagreement has stopped doing its job."""
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        rpc = MultiSourceEthRpc([_Source(balance=4_999_999) for _ in range(3)])
+        assert _run(balance_of(rpc, _USDT, _HTLC, combine=quorum_combiner(rpc))) == 4_999_999
+
+    def test_a_single_source_rpc_still_aggregates_with_min(self) -> None:
+        """Nothing to aggregate over one endpoint, and erring low stays the safe direction there."""
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        assert quorum_combiner(object()) is min

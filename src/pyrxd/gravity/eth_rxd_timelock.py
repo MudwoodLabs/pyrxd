@@ -152,7 +152,7 @@ def eth_absolute_to_rxd_relative_blocks(
 
     ``rxd_block_interval_s`` MUST be a conservative FAST-TAIL percentile of the RXD inter-block
     distribution (e.g. p10), NOT the mean. Rationale (the attacker-benefits-when-RXD-runs-fast
-    rule): ``t_rxd = floor(budget_s / interval)`` picks the block count whose EXPECTED wall-clock
+    rule): ``t_rxd = ceil(budget_s / interval) - 1`` picks the block count whose EXPECTED wall-clock
     is ``budget_s``; if RXD then mines FASTER than ``interval`` assumed, those ``t_rxd`` blocks
     elapse SOONER than ``budget_s`` and the refund opens EARLY — shrinking (in the worst case
     eliminating) the taker's claim window. A smaller (fast-tail) ``interval`` yields MORE blocks
@@ -182,7 +182,21 @@ def eth_absolute_to_rxd_relative_blocks(
             f"no RXD timelock budget: eth_timeout - margin - rxd_lock_time = {budget_s}s "
             "(ETH deadline too close / margin too large to safely lock RXD)"
         )
-    t_rxd_blocks = math.floor(budget_s / rxd_block_interval_s)
+    # `ceil(x) - 1`, NOT `floor(x)`. The two differ only when the budget divides EXACTLY by the
+    # interval, and on exactly those inputs `floor` emits a value this module's own punctuality
+    # gate then REFUSES: `assert_covenant_confirms_before_eth_deadline` compares with a strict `<`,
+    # so a projection landing precisely ON the deadline is late. Swept 1480 parameter combinations
+    # (eth_timeout 12-48h x 8 fast tails x 5 confirm waits): 111 divided exactly, and the gate
+    # refused the sizer's own output on all 111 and on no others.
+    #
+    # It stayed invisible because nothing in production calls this function — the runner takes a
+    # hand-typed `--t-rxd-blocks` — and because the test asserting sizer and gate agree sizes with
+    # a zero confirm wait, which never lands on the boundary. The real run's parameters do:
+    # (86400 - 7068 - 600) / 36 = 2187.0 exactly, so the canonical derivation produced 2187 and the
+    # gate accepted only 2186. Deriving one block SHORT is the safe direction anyway: it opens the
+    # maker's refund marginally earlier, costing the taker a block of claim window rather than
+    # letting the refund land past the deadline it is sized to precede.
+    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s) - 1
     if t_rxd_blocks < floor_blocks:
         raise ValidationError(
             f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} "

@@ -176,6 +176,17 @@ def test_converter_rejects_bad_interval_and_floor():
         )
 
 
+def _expected_blocks(budget: float, interval: float) -> int:
+    """The sizer's rule, restated independently of the sizer.
+
+    `ceil(x) - 1`, not `floor(x)`. They differ only on an exact quotient, and on exactly those
+    inputs `floor` emitted a value `assert_covenant_confirms_before_eth_deadline` then REFUSED —
+    it compares with a strict `<`, so a projection landing precisely ON the deadline is late.
+    This model previously encoded `floor`, so the property test asserted the defect was present.
+    """
+    return (math.ceil(budget / interval) - 1) if budget > 0 else 0
+
+
 @given(
     eth_timeout=st.integers(min_value=1, max_value=4_000_000_000),
     rxd_lock=st.integers(min_value=0, max_value=4_000_000_000),
@@ -200,14 +211,15 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
             floor_blocks=floor_blocks,
         )
     except ValidationError:
-        blocks = math.floor(budget / interval) if budget > 0 else 0
+        blocks = _expected_blocks(budget, interval)
         assert budget <= 0 or blocks < floor_blocks or blocks > _CAP
         return
     # success → invariants hold
     assert t.unit is TimeUnit.BLOCKS
-    assert t.value == math.floor(budget / interval)
+    assert t.value == _expected_blocks(budget, interval)
     assert floor_blocks <= t.value <= _CAP
-    # "floor is conservative — never overshoots the budget", to within floating-point noise.
+    # "the sized value is conservative — never overshoots the budget", to within floating-point
+    # noise. `ceil(x) - 1` is at most `floor(x)`, so it is conservative wherever floor was.
     #
     # The tolerance is not papering over a production bug; it is here because BOTH sides of
     # this comparison are IEEE 754 doubles and neither can represent the exact quantity:

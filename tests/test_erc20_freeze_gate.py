@@ -60,6 +60,12 @@ class _Broken:
         # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
         return await self.latest_block_timestamp()
 
+    async def latest_block_timestamp_quorum(self):
+        # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+        # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+        # source has one answer, so all three coincide here.
+        return await self.latest_block_timestamp()
+
 
 @pytest.mark.parametrize(
     "exc",
@@ -216,6 +222,12 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
             async def latest_block_timestamp_min(self):
                 # The multi-source class aggregates this the other way for the staleness and
                 # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+                return await self.latest_block_timestamp()
+
+            async def latest_block_timestamp_quorum(self):
+                # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+                # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+                # source has one answer, so all three coincide here.
                 return await self.latest_block_timestamp()
 
         import json
@@ -413,6 +425,12 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
         async def latest_block_timestamp_min(self):
             # The multi-source class aggregates this the other way for the staleness and
             # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+            return await self.latest_block_timestamp()
+
+        async def latest_block_timestamp_quorum(self):
+            # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+            # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+            # source has one answer, so all three coincide here.
             return await self.latest_block_timestamp()
 
         async def assert_chain(self):

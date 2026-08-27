@@ -17,18 +17,21 @@ counterparty has walked away.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
 from pyrxd.eth_wallet.erc20 import assert_not_frozen_before_funding
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.secrets import PrivateKeyMaterial
 
 pytest.importorskip("web3", reason="needs the eth extra: pip install 'pyrxd[eth]'")
 
 from tests.test_deployed_contract_is_durable_before_funding import (
     _DEPLOYED,
     _PENDING,
+    _fresh_deploy_address,
     _fund,
     _leg,
     _stub_verify,
@@ -202,7 +205,9 @@ class TestItIsReachedFromFundNotOnlyFromTests:
 
         leg = _leg(order=order)
         _fund(leg, on_deploy=_on_deploy)
-        assert deployed == [_DEPLOYED]
+        # The address a fresh deploy reports is CREATE(sender, nonce), not a fixture constant —
+        # the leg derives it now rather than believing the receipt.
+        assert deployed == [leg._test_state["deployed"]]
         assert "tokens-pushed" in order
 
     def test_a_RESUME_with_nothing_left_to_send_is_NOT_blocked(self) -> None:
@@ -237,7 +242,11 @@ class TestItIsReachedFromFundNotOnlyFromTests:
         exist yet, so this is the only thing standing between a fund and a permanently frozen
         HTLC — and on a resume the contract may have been frozen while we were away."""
         order: list[str] = []
-        leg = _leg(order=order, frozen=(_DEPLOYED,))
+        # Freeze the address this leg will ACTUALLY deploy to. Passing a fixture constant froze an
+        # address unrelated to the HTLC and the test still passed, because the fake reported that
+        # constant as the contract — the gate was being handed its own answer.
+        key = PrivateKeyMaterial(os.urandom(32))
+        leg = _leg(order=order, frozen=(_fresh_deploy_address(key),), key=key)
         with pytest.raises(ValidationError, match="htlc contract"):
             _fund(leg, on_deploy=None)
         assert "tokens-pushed" not in order, "no tokens moved into the frozen contract"
