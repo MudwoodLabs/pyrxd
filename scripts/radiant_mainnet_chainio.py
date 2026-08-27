@@ -133,13 +133,26 @@ class SshTrRadiantClient:
         res = await self._run("scantxoutset", "start", desc)
         if not isinstance(res, dict):
             raise RuntimeError("scantxoutset did not return a dict")
-        tip = int(await self._run("getblockcount"))
         out: list[UtxoRecord] = []
         for u in res.get("unspents", []):
-            height = int(u.get("height", 0))
-            confs = (tip - height + 1) if height else 0
+            # UtxoRecord.height is a BLOCK HEIGHT (0 = unconfirmed) — the documented
+            # ElectrumX meaning — and scantxoutset's `height` already IS one. An earlier
+            # version converted it to a CONFIRMATION COUNT (tip - height + 1) before
+            # storing it, and the two units order OPPOSITELY: ascending height = oldest
+            # first, ascending confs = NEWEST first. find_covenant_utxo resolves a
+            # multi-funded covenant SPK by "earliest-confirmed = min height" precisely
+            # because the honest funding precedes any poison — so on this shim, the one
+            # transport real-value mainnet runs use, that anti-poisoning rule selected
+            # the POISON. Pass the height through untouched; no confirmation count is
+            # computed in this method at all, so none can be stored by mistake.
+            # Producer conformance is enforced by tests/test_utxo_record_units.py.
             out.append(
-                UtxoRecord(tx_hash=u["txid"], tx_pos=int(u["vout"]), value=round(u["amount"] * 1e8), height=confs)
+                UtxoRecord(
+                    tx_hash=u["txid"],
+                    tx_pos=int(u["vout"]),
+                    value=round(u["amount"] * 1e8),
+                    height=int(u.get("height", 0)),
+                )
             )
         return out
 

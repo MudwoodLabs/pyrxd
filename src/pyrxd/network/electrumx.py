@@ -62,7 +62,15 @@ class UtxoRecord:
         Output value in **photons** (RXD's smallest unit) — this is a Radiant client.
         For a Glyph FT the same number is also the token's unit count.
     height:
-        Block height at which the output was confirmed (0 = unconfirmed).
+        Block height at which the output was confirmed (0 = unconfirmed). A HEIGHT,
+        never a confirmation count. Both are non-negative ints, so a producer that
+        stores confs here type-checks — and inverts every age ordering built on the
+        field, because ascending height is oldest-first while ascending confs is
+        NEWEST-first. The mainnet ssh-tr shim did exactly that, which flipped
+        ``find_covenant_utxo``'s earliest-confirmed anti-poisoning rule into a
+        poison-selecting rule on the real-value path. Every producer of this record
+        is held to the height meaning by ``tests/test_utxo_record_units.py`` —
+        register any new producer there with a behavioural units test.
     """
 
     tx_hash: str

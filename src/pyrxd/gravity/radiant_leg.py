@@ -244,6 +244,12 @@ class RadiantChainIO:
             # parties derive the same answer from the same chain, which a "deepest" or "first
             # returned" rule would not guarantee across differing UTXO orderings. Height 0 means
             # unconfirmed, which sorts last — a mempool output must never displace a mined one.
+            #
+            # "Earliest" is only earliest because u.height is a BLOCK HEIGHT. Ascending order on a
+            # CONFIRMATION COUNT is newest-first, so a producer that stores confs in the field turns
+            # this exact line into a poison-selector — the mainnet ssh-tr shim did, and every
+            # real-value run inherited the inversion. The producer contract (height, 0=unconfirmed)
+            # is enforced per producer by tests/test_utxo_record_units.py.
             utxos = sorted(utxos, key=lambda u: (int(u.height) if int(u.height) > 0 else 1 << 62, u.tx_hash, u.tx_pos))
             _LOG.warning(
                 "covenant scriptPubKey has %d matching UTXOs; selecting the earliest-confirmed "
