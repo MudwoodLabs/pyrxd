@@ -519,6 +519,29 @@ class TestOneValueTwoDirections:
         floors = [ln.strip() for ln in src.splitlines() if "balance_of(" in ln and "combine=max" not in ln]
         assert floors, "expected the floor comparisons to still use the conservative default"
 
+    def test_the_two_directions_are_COMPLEMENTARY_not_contradictory(self) -> None:
+        """Why opposite directions on the same quantity is correct, not a smell.
+
+        MAX decides HOW MUCH TO SEND — so a lagging replica cannot trigger a second full transfer.
+        MIN decides WHETHER ENOUGH ARRIVED — so an over-reporting endpoint cannot pass an
+        under-funded HTLC. Each is conservative for its own question, and the obvious objection to
+        the MAX fix (an over-reporter skips the push) is answered by the MIN floor that runs
+        immediately after, in the same function.
+
+        Pinned because a future refactor "unifying" these two reads would silently remove one half
+        of a two-sided guard, and both halves would still look individually reasonable.
+        """
+        src = pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text()
+        push = src.index("held = await balance_of(self._rpc, self._token, address, combine=max)")
+        floor = src.index("landed = await balance_of(self._rpc, self._token, address)")
+        assert push < floor, "the send-decision read must come before the arrived-check read"
+        between = src[push:floor]
+        assert "shortfall" in between, "the MAX read must be the one feeding the subtraction"
+        assert "landed < int(amount_wei)" in src[floor : floor + 400], (
+            "the MIN read must still be compared against the floor — that comparison is what "
+            "catches an over-reporting endpoint skipping the push"
+        )
+
     def test_the_receipt_returned_is_ONE_THE_QUORUM_AGREED_ON(self) -> None:
         """It used to re-fetch from the primary after the quorum passed — a second call nothing had
         checked, so a primary honest once and lying once returned unverified data."""
