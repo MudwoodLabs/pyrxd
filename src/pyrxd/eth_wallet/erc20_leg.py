@@ -259,7 +259,13 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # the shortfall is the whole amount, while on a resume it may be anything from 0 to the
         # full amount (a push whose receipt was lost). Sending `amount_wei` unconditionally would
         # double-fund exactly the case a resume exists to handle.
-        held = await balance_of(self._rpc, self._token, address)
+        # MAX here, and ONLY here. Everywhere else this balance is compared against a floor, where
+        # MIN is conservative. This site SUBTRACTS it (`shortfall = amount - held`), which inverts
+        # the direction: an under-reported balance OVER-computes what must be sent. One lagging
+        # replica reporting 0 against a fully-funded HTLC yields a shortfall of the whole amount and
+        # a second full transfer — which `claim` then sweeps entirely to the counterparty. The nonce
+        # pin catches it when one exists; the direction should not depend on that.
+        held = await balance_of(self._rpc, self._token, address, combine=max)
         # A balance read at `latest` CANNOT see a transfer still sitting in the mempool, while the
         # nonce used to build the next one comes from `pending` — so a resume inside the receipt
         # wait would read 0, compute the full shortfall, and send a SECOND transfer at the next

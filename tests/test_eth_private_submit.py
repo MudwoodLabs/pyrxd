@@ -78,6 +78,11 @@ class _FakeRpc:
     async def latest_block_timestamp(self):
         return int((await self.w3.eth.get_block("latest"))["timestamp"])
 
+    async def latest_block_timestamp_min(self):
+        # The multi-source class aggregates this the other way for the staleness and
+        # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        return await self.latest_block_timestamp()
+
     async def assert_chain(self):
         return None
 

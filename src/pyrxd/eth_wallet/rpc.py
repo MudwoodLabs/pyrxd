@@ -64,8 +64,13 @@ class EthRpc:
         return self.w3
 
     async def latest_block_timestamp(self) -> int:
-        """Head timestamp, for the claim-deadline and refund-maturity guards."""
+        """Head timestamp, for the claim-deadline guard (wants the LATEST any source admits to)."""
         return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+    async def latest_block_timestamp_min(self) -> int:
+        """Same read; the name exists so the multi-source class can aggregate it the OTHER way for
+        the staleness and refund-maturity guards. Identical here — one endpoint has one answer."""
+        return await self.latest_block_timestamp()
 
     async def assert_chain(self) -> None:
         """Fail-closed if the endpoint is not the chain this swap was negotiated for."""

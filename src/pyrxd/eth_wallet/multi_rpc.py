@@ -146,6 +146,21 @@ class MultiSourceEthRpc:
         """
         return self.primary.w3
 
+    async def latest_block_timestamp_min(self) -> int:
+        """Head timestamp, quorum by MIN — for guards that must not be fooled into thinking the
+        chain is FRESHER or LATER than it is.
+
+        The MAX accessor below is right for the claim deadline and wrong for two other checks that
+        read the same value: the staleness abort (`local - chain > budget`), where one
+        fresh-reporting endpoint hides a halted chain from every honest one, and the refund-maturity
+        check (`now < timeout`), where an over-reported head submits a refund the contract will
+        reject. Disabling the staleness abort took ONE endpoint; disabling the deadline guard takes
+        ALL of them. One aggregation cannot serve both directions, so there are two accessors.
+        """
+        return await self.eth_call_quorum(
+            lambda s: s.latest_block_timestamp(), label="latest_block_timestamp_min", combine=min
+        )
+
     async def latest_block_timestamp(self) -> int:
         """Head timestamp — quorum by MAX, which is the safe direction here and only here.
 
@@ -269,10 +284,16 @@ class MultiSourceEthRpc:
                 return None
             return (r.get("status"), r.get("blockHash"), r.get("blockNumber"))
 
-        agreed = await self.eth_call_quorum(_one, label=f"get_transaction_receipt({tx_hash})")
+        # Collect the FULL receipts, agree on the deciding fields, then return one of the receipts
+        # that actually agreed. The first version re-fetched from the primary after the quorum
+        # passed — a second call whose answer nothing had checked, so a primary honest on call one
+        # and lying on call two returned unverified data through a method advertising a quorum.
+        full = await self._gather(lambda s: s.get_transaction_receipt(tx_hash), label=f"receipt({tx_hash})")
+        keyed = [(None if r is None else (r.get("status"), r.get("blockHash"), r.get("blockNumber")), r) for r in full]
+        agreed = self._agree([k for k, _ in keyed], label=f"get_transaction_receipt({tx_hash})", combine=None)
         if agreed is None:
             return None
-        return await self.primary.get_transaction_receipt(tx_hash)
+        return next(r for k, r in keyed if k == agreed)
 
     # --------------------------------------------- deliberately single-source
 

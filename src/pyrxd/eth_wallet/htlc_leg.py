@@ -553,7 +553,12 @@ class EthHtlcContractLeg:
             # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
             # p to the provider), so nothing downstream catches expiry either. This check is the
             # only thing standing between a stalling counterparty and a free option.
-            chain_ts = await self._rpc.latest_block_timestamp()
+            # MIN. This value feeds TWO checks with opposite needs: the staleness abort just below
+            # must not be fooled into thinking the chain is fresher than it is (one lying endpoint
+            # would hide a halted chain from every honest one), while the deadline guard wants the
+            # latest any source admits to. Read the conservative one here and take the max against
+            # the local clock — which no endpoint can move — for the deadline.
+            chain_ts = await self._rpc.latest_block_timestamp_min()
             local_ts = int(time.time())
             # Take the LATER of chain head and local clock. A lagging or hostile provider can only
             # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
@@ -604,7 +609,9 @@ class EthHtlcContractLeg:
         of truth for the deadline.
         """
         await self._rpc.assert_chain()
-        now_ts = await self._rpc.latest_block_timestamp()
+        # MIN: an over-reported head makes this think the timelock has matured when it has not,
+        # and submits a refund the contract rejects. Under-reporting only delays a retry.
+        now_ts = await self._rpc.latest_block_timestamp_min()
         if now_ts < int(locator.timeout):
             # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition
             # (wait for the timeout, then refund), not a permanent input error — consistent with the

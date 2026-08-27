@@ -76,7 +76,9 @@ def _contract(rpc: Any, token: Erc20Token, *, abi: list[dict[str, Any]] | None =
     )
 
 
-async def balance_of(rpc: Any, token: Erc20Token, owner: str, block_identifier: Any = None) -> int:
+async def balance_of(
+    rpc: Any, token: Erc20Token, owner: str, block_identifier: Any = None, *, combine: Any = min
+) -> int:
     """Token balance of ``owner``, in the token's BASE UNITS.
 
     Pin ``block_identifier`` to the same checkpoint as the rest of a verification pass. Reading the
@@ -92,7 +94,7 @@ async def balance_of(rpc: Any, token: Erc20Token, owner: str, block_identifier: 
                 rpc,
                 lambda r: _contract(r, token).functions.balanceOf(owner).call(block_identifier=bid),
                 label=f"{token.symbol}.balanceOf({owner})",
-                combine=min,
+                combine=combine,
             )
         )
     except Exception as exc:  # transport failures are transient by nature

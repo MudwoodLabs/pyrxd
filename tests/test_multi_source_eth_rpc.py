@@ -123,6 +123,11 @@ class _Source:
         await self._guard()
         return self.head_ts
 
+    async def latest_block_timestamp_min(self):
+        # The multi-source class aggregates this the other way for the staleness and
+        # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        return await self.latest_block_timestamp()
+
     @property
     def write_w3(self):
         return self.w3
@@ -452,3 +457,83 @@ class TestTheReadsNoTestDrove:
         rpc = MultiSourceEthRpc([a, b])
         got = _run(rpc.get_transaction_receipt("0xdead"))
         assert got is not None and int(got["status"]) == 1
+
+
+class TestOneValueTwoDirections:
+    """Three fixes from the panel's fix-re-review, each an aggregation pointing the wrong way.
+
+    None of these is about a LYING endpoint doing something exotic. Each is a direction that is
+    conservative at one call site and inverted at another, which is why reviewing an aggregation
+    in isolation cannot settle it — you have to look at what the consumer does with the number.
+    """
+
+    def test_the_head_timestamp_has_BOTH_directions_available(self) -> None:
+        """One accessor served three checks and two needed the opposite. Disabling the staleness
+        abort took ONE endpoint; disabling the deadline guard takes ALL of them."""
+        rpc = MultiSourceEthRpc([_Source(head_ts=1_700_000_000), _Source(head_ts=1_700_003_600)])
+        assert _run(rpc.latest_block_timestamp()) == 1_700_003_600, "deadline guard wants the LATEST"
+        assert _run(rpc.latest_block_timestamp_min()) == 1_700_000_000, "staleness/maturity want the EARLIEST"
+
+    def test_one_endpoint_reporting_a_FRESH_head_cannot_hide_a_halted_chain(self) -> None:
+        """The concrete attack the min accessor closes: two honest endpoints on a stalled chain and
+        one reporting the current time. Under `max` the staleness abort never fires."""
+        halted, halted2, liar = (
+            _Source(head_ts=1_700_000_000),
+            _Source(head_ts=1_700_000_000),
+            _Source(head_ts=1_700_002_400),
+        )
+        rpc = MultiSourceEthRpc([halted, halted2, liar])
+        assert _run(rpc.latest_block_timestamp_min()) == 1_700_000_000
+        assert _run(rpc.latest_block_timestamp()) == 1_700_002_400, "max is still available and still wrong here"
+
+    def test_the_balance_used_for_SUBTRACTION_takes_the_MAXIMUM(self) -> None:
+        """`shortfall = amount - held` inverts the direction. Under `min`, one lagging replica
+        reporting 0 against a fully-funded HTLC computes a shortfall of the WHOLE amount — a second
+        full transfer, which `claim` then sweeps entirely to the counterparty."""
+        from pyrxd.eth_wallet.erc20 import balance_of
+
+        rpc = MultiSourceEthRpc([_Source(balance=5_000_000), _Source(balance=5_000_000), _Source(balance=0)])
+        assert _run(balance_of(rpc, _USDT, _HTLC, combine=max)) == 5_000_000
+        assert _run(balance_of(rpc, _USDT, _HTLC)) == 0, "the default stays MIN for floor comparisons"
+
+    def test_the_SUBTRACTION_CALL_SITE_actually_passes_max(self) -> None:
+        """The test above proves `balance_of` CAN take max; it does not prove the shortfall site
+        DOES. Reverting that one call site to the default passed every behavioural test I wrote —
+        the same unasserted-call-site failure this whole review keeps finding.
+
+        A source check, because the alternative is standing up a multi-source leg mid-fund, and the
+        property is exactly "this one read asks for the other direction". The neighbouring reads
+        must NOT have been swept along: they compare against a floor, where min is conservative.
+        """
+        src = pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text()
+        subtraction = [
+            ln for ln in src.splitlines() if "held = await balance_of(self._rpc, self._token, address)" in ln
+        ]
+        assert not subtraction, (
+            "the shortfall site reads balance_of with the default MIN; it SUBTRACTS the result, so "
+            "an under-report over-computes what to send and a lagging replica triggers a second "
+            "full transfer"
+        )
+        assert "held = await balance_of(self._rpc, self._token, address, combine=max)" in src
+
+        floors = [ln.strip() for ln in src.splitlines() if "balance_of(" in ln and "combine=max" not in ln]
+        assert floors, "expected the floor comparisons to still use the conservative default"
+
+    def test_the_receipt_returned_is_ONE_THE_QUORUM_AGREED_ON(self) -> None:
+        """It used to re-fetch from the primary after the quorum passed — a second call nothing had
+        checked, so a primary honest once and lying once returned unverified data."""
+        calls = {"n": 0}
+
+        async def _two_faced(_h):
+            calls["n"] += 1
+            return {"status": 1, "blockHash": b"\xaa" * 32, "blockNumber": 100, "call": calls["n"]}
+
+        async def _honest(_h):
+            return {"status": 1, "blockHash": b"\xaa" * 32, "blockNumber": 100, "call": 0}
+
+        a, b = _Source(), _Source()
+        a.get_transaction_receipt, b.get_transaction_receipt = _two_faced, _honest
+        rpc = MultiSourceEthRpc([a, b])
+        got = _run(rpc.get_transaction_receipt("0xdead"))
+        assert calls["n"] == 1, "the primary must be asked ONCE, not re-fetched after agreeing"
+        assert got["call"] == 1

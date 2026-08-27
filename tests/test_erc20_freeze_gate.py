@@ -55,6 +55,11 @@ class _Broken:
     async def latest_block_timestamp(self):
         return int(time.time())
 
+    async def latest_block_timestamp_min(self):
+        # The multi-source class aggregates this the other way for the staleness and
+        # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        return await self.latest_block_timestamp()
+
 
 @pytest.mark.parametrize(
     "exc",
@@ -207,6 +212,11 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
 
             async def latest_block_timestamp(self):
                 return int(time.time())
+
+            async def latest_block_timestamp_min(self):
+                # The multi-source class aggregates this the other way for the staleness and
+                # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+                return await self.latest_block_timestamp()
 
         import json
         import pathlib
@@ -399,6 +409,11 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
 
         async def latest_block_timestamp(self):
             return int(time.time())
+
+        async def latest_block_timestamp_min(self):
+            # The multi-source class aggregates this the other way for the staleness and
+            # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+            return await self.latest_block_timestamp()
 
         async def assert_chain(self):
             return None
