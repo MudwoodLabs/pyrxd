@@ -43,6 +43,10 @@ _HASHLOCK = "0x" + "33" * 32
 _TIMEOUT = 1_800_000_000
 _AMOUNT = 12_345_678
 
+#: The head timestamp the fake below reports — a real value, and a fixed one, so the accessors
+#: that read it can be asserted rather than merely defined.
+_HEAD_TS = 1_700_000_000
+
 DELEGATION = b"\xef\x01\x00" + b"\x11" * 20  # exactly 23 bytes — a 7702 EOA
 CONTRACT = b"\x60\x80\x60\x40" * 10  # ordinary bytecode
 
@@ -89,6 +93,12 @@ def _rpc(artifact: dict, recipient_code: bytes, *, token_balance: int = _AMOUNT)
     class _Eth:
         def contract(self, *a, **k):
             return _Contract()
+
+        async def get_block(self, _which):
+            # Not decoration. The three `latest_block_timestamp*` accessors below all read it, and
+            # without it they raise AttributeError the first time anything calls them —
+            # scaffolding that LOOKS like protocol coverage and is not.
+            return {"timestamp": _HEAD_TS}
 
     class _W3:
         eth = _Eth()
@@ -269,3 +279,20 @@ class TestTheFundGuardRefusesAnAssetMismatchBeforeAnyBroadcast:
     def test_a_token_leg_with_a_DIFFERENT_token_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="asset mismatch before funding"):
             asyncio.run(self._adapter(token_leg=True).fund(self._terms("0x" + "99" * 20)))
+
+
+class TestTheFakeCanActuallyServeTheProtocolItAdvertises:
+    """The `_rpc` fake was given three `latest_block_timestamp*` accessors whose bodies call
+    `self.w3.eth.get_block("latest")` — on an inner `_Eth` that defined only `contract()`. Every
+    one raised AttributeError the moment anything called it, so the fake advertised a protocol it
+    could not serve: a `claim` driven through it would have failed on the fake, not on the code.
+
+    A method nothing calls is covered by nothing. Executing them is the point.
+    """
+
+    def test_all_three_head_timestamp_accessors_return_the_head(self) -> None:
+        rpc = _rpc(_NATIVE_ART, b"")
+        # All three coincide for a single source, which is exactly what their comments claim.
+        assert asyncio.run(rpc.latest_block_timestamp()) == _HEAD_TS
+        assert asyncio.run(rpc.latest_block_timestamp_quorum()) == _HEAD_TS
+        assert asyncio.run(rpc.latest_block_timestamp_min()) == _HEAD_TS
