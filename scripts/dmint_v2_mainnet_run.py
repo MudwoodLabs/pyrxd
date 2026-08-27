@@ -165,13 +165,23 @@ def _save(d: dict) -> None:
     that fits: it refuses a symlink (ELOOP) while still allowing an ordinary file to be truncated.
     """
     Path(_STATE).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # O_NONBLOCK so a FIFO at this path cannot HANG the open before the check below can
-    # reject it; a no-op for the regular files this accepts.
-    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    # NO O_TRUNC ON THE OPEN. Truncation is part of the open() syscall, so an O_TRUNC open
+    # destroys the file's contents BEFORE any check can refuse it: a file that fails the private-
+    # descriptor test below was already emptied by the call that discovered it. Measured — a
+    # pre-existing 186-byte file went to 0 bytes and then the run refused. No key leaked (the
+    # json.dump is behind the check), but it is a self-DoS on the operator's own file, and with a
+    # pre-existing group-writable ~/.pyrxd a hardlink turns it into a clobber primitive.
+    #
+    # Open WITHOUT truncating, check the descriptor, and only then ftruncate — so nothing is
+    # destroyed until the file has been established as one this user owns privately.
+    # O_NONBLOCK so a FIFO at this path cannot HANG the open before the check can reject it;
+    # a no-op for the regular files this accepts.
+    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         # O_CREAT does not apply the mode to a file that already EXISTS, so a pre-created
         # world-readable file keeps its mode and quietly receives the keys. Check the descriptor.
         _assert_private_descriptor(fd, _STATE)
+        os.ftruncate(fd, 0)
         with os.fdopen(fd, "w") as f:
             json.dump(d, f, indent=2)
     except BaseException:

@@ -231,13 +231,24 @@ async def resume(args) -> None:
         # — silently neutralising the gate on every crash-recovery. Derive the true
         # fund height from the covenant UTXO's on-chain confirmation depth instead
         # (the shim reports confs in UtxoRecord.height): fund_height = tip - confs + 1.
-        _cov_op, _cov_val, cov_confs = await rxd_leg.chain_io.find_covenant_utxo(
+        _cov_op, _cov_val, cov_fund_height = await rxd_leg.chain_io.find_covenant_utxo(
             cov.funded_spk, expected_value=args.rxd_photons
         )
-        if cov_confs < 1:
-            raise SystemExit("covenant UTXO has 0 confirmations; cannot derive its fund height (fail-closed)")
-        rxd_locked_at = rxd_blockcount(rxd_client) - cov_confs + 1
-        print(f"  covenant fund height = {rxd_locked_at} (derived from {cov_confs} on-chain confs)")
+        if cov_fund_height < 1:
+            raise SystemExit("covenant UTXO is unconfirmed (height 0); cannot anchor the reorg gate (fail-closed)")
+        # USE THE HEIGHT DIRECTLY. This used to be `tip - confs + 1`, compensating for the mainnet
+        # shim storing a CONFIRMATION COUNT in a field documented as a block height. That producer
+        # has been fixed to pass the true height through, so the compensation now converts a good
+        # height INTO a conf count and uses it as a fund height — placing the anchor deep in the
+        # past.
+        #
+        # That is not a harmless stale value. An anchor in the past makes the reorg gate read the
+        # t_rxd window as long expired, which drives SQUEEZED -> ASSET_VULNERABLE, whose handler is
+        # `taker_claim_asset_from_vulnerable` — the winner-take-all claim that calls
+        # `assess_claim_finality` ZERO times, and which `--yes` makes unattended. Compensating for a
+        # unit that no longer exists would turn every resume into an immediate ungated broadcast.
+        rxd_locked_at = cov_fund_height
+        print(f"  covenant fund height = {rxd_locked_at} (block height, read from the covenant UTXO)")
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
         print(f"  post_asset_lock_revalidate -> {rec.state.value}")
         if rec.state is not SwapState.BOTH_LOCKED:

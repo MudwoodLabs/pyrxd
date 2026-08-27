@@ -783,7 +783,12 @@ def _identify_loser(asset: AssetLeg, counter: CounterLeg) -> str:
 
 
 def margin_grade(
-    m: RunManifest, asset: AssetLeg, counter: CounterLeg, asset_claim_height: int | None
+    m: RunManifest,
+    asset: AssetLeg,
+    counter: CounterLeg,
+    asset_claim_height: int | None,
+    *,
+    chain_funding_height: int | None = None,
 ) -> tuple[str, int | None, str]:
     """Lucky-pass detector (runbook §4, detector B). A PASS is not "clean" if the honest taker's asset claim
     only just beat the maker's CSV refund window — a few blocks of variance the other way would have flipped
@@ -792,9 +797,25 @@ def margin_grade(
     {CLEAN, MARGINAL, UNKNOWN, N/A}. MARGINAL does not flip PASS->FAIL but flags "re-run with tighter timing"."""
     if not (asset is AssetLeg.TAKER_CLAIMED and counter is CounterLeg.MAKER_CLAIMED):
         return "N/A", None, "margin grading applies to the both-complete (happy) case only"
-    if m.asset_locked_at_height is None or asset_claim_height is None:
+    locked_at = chain_funding_height if chain_funding_height is not None else m.asset_locked_at_height
+    if locked_at is None or asset_claim_height is None:
         return "UNKNOWN", None, "missing asset_locked_at_height or asset-claim confirm height to grade margin"
-    rxd_refund_open = m.asset_locked_at_height + m.refund_csv
+    if (
+        chain_funding_height is not None
+        and m.asset_locked_at_height is not None
+        and int(m.asset_locked_at_height) != int(chain_funding_height)
+    ):
+        # A manifest that disagrees with the chain is not a rounding difference — it is the one
+        # number an author could set to buy themselves a CLEAN grade. Say so loudly and grade from
+        # the chain regardless.
+        return (
+            "MARGINAL",
+            int(chain_funding_height) + m.refund_csv - asset_claim_height,
+            f"manifest asset_locked_at_height={m.asset_locked_at_height} disagrees with the chain "
+            f"({chain_funding_height}); graded from the chain. A manifest is hand-authored and this "
+            f"field decides the lucky-pass grade, so a mismatch is reported rather than trusted.",
+        )
+    rxd_refund_open = locked_at + m.refund_csv
     slack = rxd_refund_open - asset_claim_height
     if slack < m.min_margin_blocks:
         return (
@@ -1111,11 +1132,14 @@ async def _fetch_for_live(
     try:
         cov_fund = await rxd.raw_tx(m.covenant_funding.txid)
         spend_txid = cited.get("covenant_spend_txid")
+        # ALWAYS, not only when discovering. This is the chain's own answer for where the covenant
+        # confirmed, and the margin grade is computed from it below. Fetching it only inside the
+        # discovery branch meant the verifier HELD the truth and graded from the manifest anyway.
+        chain_funding_height = await rxd.confirm_height(m.covenant_funding.txid)
         if not spend_txid:
             # The spender confirms at/after the funding height — pass it so discovery drops pre-funding
             # padding and its cap/budget applies only to genuinely-plausible candidates.
-            funding_height = await rxd.confirm_height(m.covenant_funding.txid)
-            spend_txid = await rxd.spend_of(m.covenant_funding, funded_spk, funding_height=funding_height)
+            spend_txid = await rxd.spend_of(m.covenant_funding, funded_spk, funding_height=chain_funding_height)
             if spend_txid:
                 print(f"  discovered covenant spend {spend_txid} independently (was not cited)", file=sys.stderr)
         cov_spend = await rxd.raw_tx(spend_txid) if spend_txid else None
@@ -1174,7 +1198,7 @@ async def _fetch_for_live(
                 counter_funding = await eth.tx_and_receipt(m.eth_funding_tx)  # deploy tx: value == funded wei
         finally:
             await eth.close()
-    return cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height
+    return cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height, chain_funding_height
 
 
 def run_verify(
@@ -1184,6 +1208,10 @@ def run_verify(
     counter_obj,
     *,
     asset_claim_height: int | None = None,
+    #: The covenant funding height AS READ FROM THE CHAIN. The manifest carries its own
+    #: `asset_locked_at_height`, which is hand-authored and bound to nothing; when this is
+    #: present the margin grade uses it and a disagreement is reported rather than trusted.
+    chain_funding_height: int | None = None,
     counter_funding=None,
 ) -> VerifyResult:
     """The pure verification core — given re-fetched data, produce the verdict. counter_obj is raw bytes
@@ -1203,7 +1231,15 @@ def run_verify(
     # collision resistance — the asset_p_sha256 arg is a redundant belt-and-suspenders slot. Do NOT wire a
     # raw scraped preimage back in here (it re-introduces the CodeQL clear-text-secret taint of PR #273).
     res = atomicity_verdict(m, asset, counter, None, counter_p_sha256)
-    grade, slack, margin_note = margin_grade(m, asset, counter, asset_claim_height)
+    # Grade from the CHAIN's funding height, not the manifest's. `asset_locked_at_height` is the
+    # only input to the lucky-pass detector that was bound to nothing: no script in this repo emits
+    # a RunManifest, so it is hand-authored, and inflating it by five blocks turned MARGINAL into
+    # CLEAN while the verdict stayed PASS/exit 0. Omitting it entirely produced UNKNOWN with no
+    # reason appended. The detector is the only thing separating "the swap was safe" from "the
+    # honest party barely won a race", so its input has to come from the chain like everything else.
+    grade, slack, margin_note = margin_grade(
+        m, asset, counter, asset_claim_height, chain_funding_height=chain_funding_height
+    )
     # Counter-leg VALUE + RECIPIENT checks are OPT-IN (they need extra manifest fields). The asset leg's
     # value is always re-derived, so an omitted counter check is an ASYMMETRY the operator must see — a
     # silent PASS would be read as "value/recipient verified" when it was not (review MEDIUM/HIGH). Derive
@@ -1232,9 +1268,17 @@ def run_verify(
     # (review HIGH): the verifier cannot rule out a counter HTLC that pays the taker — the exact hole the H1
     # binding closes ONLY when its manifest fields are supplied. Downgrade to a DISTINCT verdict + exit so
     # automation keying on verdict==PASS / exit 0 cannot conflate it with a fully-checked PASS.
+    #
+    # The UNWIND path needs this too, and did not have it. `classify_counter_leg` returns
+    # TAKER_REFUNDED from its unconditional else-branch — "no p in the witness and it spends our
+    # outpoint" — WITHOUT ever checking who was paid. The asset leg does check (spent_to must equal
+    # the taker or maker holder, else ANOMALOUS), so the two legs were held to different standards
+    # and a both-unwind run whose counter refund paid a STRANGER scored PASS / exit 0. Same
+    # distinct verdict, so automation keying on PASS / exit 0 cannot conflate either case with a
+    # fully-checked one.
     if (
         res.verdict is Verdict.PASS
-        and counter is CounterLeg.MAKER_CLAIMED
+        and counter in (CounterLeg.MAKER_CLAIMED, CounterLeg.TAKER_REFUNDED)
         and not (value_verified and recipient_verified)
     ):
         res.verdict = Verdict.PASS_UNVERIFIED
@@ -1259,7 +1303,7 @@ def run_verify(
             )
         if res.verdict is Verdict.PASS_UNVERIFIED:
             res.reasons.append(
-                "DOWNGRADED PASS -> PASS_UNVERIFIED: the counter CLAIM's recipient/value was not verified "
+                "DOWNGRADED PASS -> PASS_UNVERIFIED: the counter leg's recipient/value was not verified "
                 "(see warnings) — supply the counter binding fields for a fully-verified PASS"
             )
     return res
@@ -1868,7 +1912,14 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     # 3) re-fetch from independent sources + verify.
     try:
-        cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height = await _fetch_for_live(
+        (
+            cov_fund,
+            cov_spend,
+            counter_obj,
+            counter_funding,
+            asset_claim_height,
+            chain_funding_height,
+        ) = await _fetch_for_live(
             m,
             cited,
             args.btc_esplora_url,
@@ -1889,6 +1940,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         counter_obj,
         asset_claim_height=asset_claim_height,
         counter_funding=counter_funding,
+        chain_funding_height=chain_funding_height,
     )
     _append_trust_advisories(res, m, eth_urls, args.min_confirmations)
     print(json.dumps(res.as_dict(), indent=2))

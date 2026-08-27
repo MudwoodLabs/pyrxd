@@ -24,6 +24,7 @@ Security gates enforced here (off-chain, per the security review):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -40,7 +41,7 @@ from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.security.errors import ClaimNotConfirmed, NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-__all__ = ["EthHtlcContractLeg", "load_artifact"]
+__all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
 
 _REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
 # Claim-artifact size caps (red-team LOW DoS): a legit claim(bytes32) calldata + Claimed(bytes32)
@@ -69,6 +70,98 @@ def _b(v: Any) -> bytes:
 def _addr(v: Any) -> str:
     """Normalise an address-ish value to a lowercase hex string for comparison."""
     return str(v or "").lower()
+
+
+def create_address(sender: str, nonce: int) -> str:
+    """The CREATE address for ``sender`` at ``nonce`` — ``keccak(rlp([sender, nonce]))[12:]``.
+
+    Both inputs belong to the deployer, so a deploy receipt's ``contractAddress`` was never
+    something to be *told*. Minimal RLP: a 20-byte address is a ``0x94``-prefixed string, and the
+    nonce is either the empty string (0), a single byte below ``0x80``, or a length-prefixed
+    big-endian integer.
+
+    DUPLICATED, deliberately and temporarily, with ``erc20_leg._create_address``: the token leg
+    imports FROM this module, so importing back would be circular, and collapsing the two means
+    editing that file. They are pinned to agree by a differential test rather than by a comment.
+    """
+    from eth_utils import keccak, to_checksum_address
+
+    addr = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
+    if len(addr) != 20:
+        raise ValidationError(f"sender must be a 20-byte address, got {len(addr)}")
+    if nonce == 0:
+        n = b"\x80"
+    elif nonce < 0x80:
+        n = bytes([nonce])
+    else:
+        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        n = bytes([0x80 + len(b)]) + b
+    payload = b"\x94" + addr + n
+    return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+
+
+def _int_or_none(v: Any) -> int | None:
+    """Normalise a receipt integer that may arrive as an int or as a '0x'-prefixed string."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return int(v, 16) if v.startswith("0x") else int(v)
+    return int(v)
+
+
+def _receipt_facts(receipt: Any) -> Any:
+    """The parts of a receipt a swap decision rests on, normalised so two HONEST endpoints that
+    format them differently still agree.
+
+    Included: status, blockHash, blockNumber — and the LOGS, which the generic
+    :meth:`MultiSourceEthRpc.get_transaction_receipt` deliberately leaves out. It is right to leave
+    them out there: a poller asking "did it succeed, and where" should not refuse over a field it
+    never reads. Here the logs ARE the evidence — the whole gate is "a ``Claimed(p)`` event from
+    this swap's own contract" — so a receipt whose status is corroborated and whose logs are taken
+    from whichever endpoint answered first would leave the deciding field single-source.
+
+    Normalised, not compared raw: addresses differ in EIP-55 casing between providers, topics and
+    data arrive as ``HexBytes`` or as ``'0x'`` strings, and log ORDER is a client artifact. Every
+    one of those is an honest difference and refusing on it would be a guard refusing valid work.
+    What cannot honestly differ is the SET of (emitter, topics, data) triples: they are consensus
+    data, committed to by the receipts trie of the block both endpoints claim the tx is in.
+    """
+    if receipt is None:
+        return None
+    logs = sorted(
+        (
+            _addr(log.get("address")),
+            tuple(_b(t) for t in (log.get("topics") or [])),
+            _b(log.get("data")),
+        )
+        for log in (receipt.get("logs") or [])
+    )
+    return (
+        _int_or_none(receipt.get("status")),
+        _b(receipt.get("blockHash")),
+        _int_or_none(receipt.get("blockNumber")),
+        tuple(logs),
+    )
+
+
+def _agree_receipt_facts(answers: list[Any]) -> Any:
+    """Quorum ``combine`` for a receipt read: every endpoint must tell the same story, or refuse.
+
+    An identity read, like ``get_code`` and ``canonical_block_hash``: a disagreement means one
+    endpoint is lying or lagging and there is no way to tell which from here, so this refuses
+    rather than taking a majority. ``None`` (not mined here yet) is one of the stories — a
+    unanimous ``None`` is a real answer and the caller retries.
+    """
+    facts = [_receipt_facts(r) for r in answers]
+    first = facts[0]
+    for other in facts[1:]:
+        if other != first:
+            raise NetworkError(
+                f"endpoints disagree about this transaction's receipt ({first!r} vs {other!r}). "
+                "One of them is lying or lagging and there is no way to tell which from here, so "
+                "this refuses rather than taking a majority."
+            )
+    return answers[0]
 
 
 def load_artifact(path: str | os.PathLike) -> dict:
@@ -129,6 +222,14 @@ _BLOCK_S: int = 12
 #: `p` in its calldata for anyone to scrape. Deriving the multiplier FROM the budget is what stops
 #: them drifting again: change the budget and the fee follows.
 CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
+
+#: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
+#: primary's view of a mined transaction, and how often it re-asks. Only a multi-source RPC waits
+#: at all. Independent providers on a healthy chain converge within a block or two, so this is
+#: sized for a slow endpoint rather than for a chain halt: past it, "we could not get a quorum" is
+#: the honest answer and the claim is reported UNCONFIRMED, not failed and not succeeded.
+CLAIM_RECEIPT_QUORUM_WAIT_S: float = 60.0
+CLAIM_RECEIPT_QUORUM_POLL_S: float = 2.0
 
 
 def is_eip7702_delegation(code: bytes) -> bool:
@@ -485,7 +586,24 @@ class EthHtlcContractLeg:
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"deploy tx reverted (status != 1): {tx_hash}")
-        addr = receipt["contractAddress"]
+        # DERIVE the address; do not accept the endpoint's word for it. Same fix, same reason, as
+        # the token leg's `_deploy` — applied here because this leg has carried real value and the
+        # earlier fix was made only where the bug had been demonstrated.
+        #
+        # `wait_receipt` is PRIMARY-ONLY by design, so ONE endpoint chose where the entire counter
+        # leg went, and every downstream check still passed because the ETH really was at the
+        # address it named. Verifying the code there does not help: an attacker deploys the same
+        # bytecode and owns the claim key. A CREATE address is keccak(rlp([sender, nonce]))[12:] —
+        # both inputs are ours, so this needs no second endpoint and no trust at all.
+        derived = create_address(self._account_address(), int(built["nonce"]))
+        reported = web3.Web3.to_checksum_address(receipt["contractAddress"])
+        if derived != reported:
+            raise ValidationError(
+                f"deploy receipt names contract {reported} but CREATE from {self._account_address()} "
+                f"at nonce {int(built['nonce'])} is {derived}. Refusing: this is the read that "
+                "decides where the ETH went, and it is derivable rather than trusted."
+            )
+        addr = derived
         # Report the deployed address so the caller can make it durable. The native constructor is
         # payable, so value is already IN the contract at this point — a crash between here and the
         # caller's `verify_funded` leaves real ETH in a contract whose address exists only in this
@@ -600,7 +718,31 @@ class EthHtlcContractLeg:
         # calldata, and on the private path the submit does. Failures beyond this line are NOT
         # PreRevealAbort — the caller must assume p is public.
         preflight = self._private_submitter is None
-        tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
+        # PAST THE BOUNDARY, and the taxonomy has to say so. This call sits outside every `try`
+        # above deliberately — a failure here is NOT a `PreRevealAbort` — but it also sat outside
+        # every `except` below, so the one failure most likely to happen here surfaced as a bare
+        # `ValidationError`: neither marker, and no guidance. A wrong preimage against a real
+        # funded HTLC does exactly that ("tx would revert (preflight eth_call)"), and by then the
+        # public path's `eth_call` has already carried `p` in the calldata to the provider while
+        # the private path has handed the signed transaction to a relay. Neither can promise the
+        # secret stayed in this process, so the honest report is the one `ClaimNotConfirmed` makes:
+        # assume `p` is public, do not record a claim, investigate before retrying.
+        #
+        # This moves nothing across the boundary — the failure was always on this side of it. It
+        # stops the caller having to infer that from an exception type that says the opposite.
+        try:
+            tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
+        except ClaimNotConfirmed:
+            raise
+        except Exception as exc:
+            raise ClaimNotConfirmed(
+                f"the claim could not be submitted: {exc}. The preimage must be assumed PUBLIC — "
+                "on the public path the preflight eth_call carried it to the provider, on the "
+                "private path the submit carried the signed transaction — so treat the "
+                "counterparty as able to take the other leg. Do NOT record this swap as claimed. "
+                "Check whether a transaction from this address landed before retrying or refunding.",
+                tx_hash=None,
+            ) from exc
         # CONFIRM, don't assume. `send_raw` and `submit_raw` both return on SUBMISSION — no receipt,
         # no status — so returning here reported success for a transaction that may have reverted.
         # Every revert cause still applies after the deadline guard above: a fee spike, a reorg, an
@@ -748,6 +890,61 @@ class EthHtlcContractLeg:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
 
+    async def _confirmed_receipt(self, tx_hash: str) -> dict:
+        """The receipt a swap may act on: WAITED for, then AGREED ACROSS ENDPOINTS.
+
+        Two different questions, answered by two different reads, and conflating them is what this
+        fixes. ``wait_receipt`` answers *when to look* — it blocks until the tx is mined — and it is
+        primary-only by design, which is fine for a liveness signal. It is not fine as the evidence
+        the claim gate rests on: a hostile or MITM'd primary fabricates ``status: 1`` and a
+        ``Claimed(p)`` log from our own contract address, and by the time this runs ``p`` is already
+        public in the calldata, so it costs the attacker nothing to compose. The maker then advances
+        to SECRET_REVEALED believing it collected, stops pursuing, and the counterparty takes the
+        other leg with the preimage.
+
+        So the receipt is re-read through the quorum and every endpoint must tell the same story.
+        A single-source :class:`~pyrxd.eth_wallet.rpc.EthRpc` has no second story to tell and is
+        returned unchanged — there is nothing to corroborate with, and pretending otherwise would
+        be worse than being single-source honestly.
+
+        Propagation is tolerated, not assumed away: the primary can legitimately see a tx a beat
+        before its peers, so a unanimous "not mined here" or a transient disagreement is retried
+        until :data:`CLAIM_RECEIPT_QUORUM_WAIT_S`. Past that this raises, and the caller turns that
+        into "broadcast but NOT confirmed" — which is the truth, and is what an operator needs to
+        hear before deciding to retry or refund.
+        """
+        waited = await self._rpc.wait_receipt(tx_hash)
+        if getattr(self._rpc, "eth_call_quorum", None) is None:
+            return waited
+        label = f"claim receipt {tx_hash}"
+        deadline = time.monotonic() + CLAIM_RECEIPT_QUORUM_WAIT_S
+        last: Exception | None = None
+        while True:
+            try:
+                agreed = await read_contract(
+                    self._rpc,
+                    lambda s: s.get_transaction_receipt(tx_hash),
+                    label=label,
+                    combine=_agree_receipt_facts,
+                )
+            except NetworkError as exc:
+                agreed, last = None, exc
+            else:
+                if agreed is not None:
+                    return agreed
+                last = NetworkError(
+                    f"{label}: the endpoints agree they have no receipt for this transaction, "
+                    "while the primary reports it mined"
+                )
+            if time.monotonic() >= deadline:
+                raise NetworkError(
+                    f"{label}: no quorum of endpoints corroborated the primary's receipt within "
+                    f"{CLAIM_RECEIPT_QUORUM_WAIT_S:.0f}s ({last}). The primary alone is not "
+                    "evidence that a claim succeeded — it is the one party that could have "
+                    "fabricated it — so this is reported as unconfirmed."
+                ) from last
+            await asyncio.sleep(CLAIM_RECEIPT_QUORUM_POLL_S)
+
     async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, preimage: bytes) -> None:
         """Provenance gate (R6): the maker's claim tx MUST target THIS swap's HTLC contract
         instance AND emit the revealed secret ``p`` from it — the ETH analogue of the BTC
@@ -794,7 +991,7 @@ class EthHtlcContractLeg:
         # Claimed(p) FROM our contract). The log-emitter==our-contract + p-in-log check is strictly
         # stronger and already pins the swap: a cross-swap claim (even one reusing H) emits from a
         # DIFFERENT contract address, so no log from `want` carries p and the gate fails closed.
-        receipt = await self._rpc.wait_receipt(tx_hash)
+        receipt = await self._confirmed_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise ValidationError("claim tx did not succeed (status != 1); refusing to treat it as a valid claim")
         for log in receipt.get("logs", []):
