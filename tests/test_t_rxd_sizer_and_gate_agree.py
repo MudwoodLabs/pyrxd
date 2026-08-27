@@ -58,6 +58,34 @@ def _policy(fast: float = 36.0, nominal: float = 300.0) -> MarginPolicy:
     )
 
 
+def _analytic_largest(budget: int, interval: float) -> int:
+    """The largest t the gate can accept, derived from its DOCUMENTED semantics — not by asking it.
+
+    The gate refuses when `now + wait + ceil(t * interval) >= eth_timeout - margin`, i.e. accepts
+    exactly when `ceil(t * interval) < budget`. With an integer budget that is `t*interval <=
+    budget - 1`, so the largest acceptable t is `floor((budget-1) / interval)` — computed here over
+    `Fraction`, exactly, with no floats and no call into either production function.
+
+    WHY THIS EXISTS: the sizer now defers to the gate (it steps down until the gate accepts), so
+    "the gate accepts what the sizer emitted" and even "one more block is refused" are true BY
+    CONSTRUCTION — they pin sizer↔gate agreement but would stay green if BOTH drifted together
+    (e.g. a gate arithmetic change silently shrinking every window; measured: a 30s drift in the
+    gate's deadline passes every agreement test in this file). This independent restatement of the
+    boundary is what catches joint drift.
+
+    Exactness caveat, and why it is safe HERE: the production gate computes `ceil(t*interval)` in
+    binary floating point, and at awkward fractional intervals float and rational can disagree by
+    one block (the reason the SIZER defers to the gate instead of trusting `ceil(x)-1`). This
+    file's grids use intervals whose products with block counts are exactly representable
+    (integer-valued floats, t < 2^53), where float and Fraction provably coincide — so an
+    inequality against this model is a real defect, not float noise. Do not lift this helper into
+    a fuzz over arbitrary floats; there, the gate itself is the only exact oracle.
+    """
+    from fractions import Fraction
+
+    return math.floor(Fraction(budget - 1) / Fraction(interval))
+
+
 def _gate_accepts(t_rxd: int, interval: float, wait: int = 0) -> bool:
     try:
         assert_covenant_confirms_before_eth_deadline(
@@ -112,14 +140,60 @@ class TestTheIntervalActuallyCancels:
         DEFEATABLE: `_dividing_interval_s(policy) * 8.3` contains the substring it looked for and
         reintroduces exactly the 8.3x mismatch this module exists to prevent. An AST check sees the
         multiplication, because the argument is then a BinOp and not the call itself.
+
+        What could still satisfy this structural check while the property fails — each hole named,
+        and where it is closed:
+          1. `_dividing_interval_s(<helper>(policy))`, a wrapper that hands the helper a DOCTORED
+             policy (e.g. one with the fast tail blanked so the `or` falls back to nominal). The
+             outer node is still a bare `_dividing_interval_s(...)` call. CLOSED BELOW: the
+             argument must itself be a plain Name, not a call or any other expression.
+          2. Rebinding the name — a second `def _dividing_interval_s` or an assignment shadowing
+             the import target inside swap_coordinator.py. CLOSED BELOW: exactly one binding of
+             that name may exist in the module.
+          3. Rebinding the POLICY variable before the call (`policy = _nominalized(policy)`), or
+             calling the gate under an import alias so the call-site scan never sees it. Beyond a
+             per-site structural check's reach — CLOSED by
+             `TestTheIntervalThatReachesTheGate`, which drives the real coordinator methods and
+             asserts on the value that actually ARRIVES at the gate.
         """
         import ast
         import pathlib
 
+        import pyrxd.gravity.swap_coordinator as sc
+
         pol = _policy(fast=36.0, nominal=300.0)
         assert _dividing_interval_s(pol) == 36.0
 
-        tree = ast.parse(pathlib.Path("src/pyrxd/gravity/swap_coordinator.py").read_text())
+        # The imported module's own file — not a cwd-relative guess at where its source lives.
+        tree = ast.parse(pathlib.Path(sc.__file__).read_text())
+
+        # Hole 2: the name must be bound exactly once (the one real helper). A shadowing def or
+        # assignment would let every call site "route through _dividing_interval_s" while calling
+        # something else.
+        bindings = [
+            n
+            for n in ast.walk(tree)
+            if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_dividing_interval_s")
+            or (
+                isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_dividing_interval_s" for t in n.targets)
+            )
+        ]
+        assert len(bindings) == 1, f"_dividing_interval_s is bound {len(bindings)} times; a shadow can swap the tail"
+
+        # Hole 3 (alias half): the gate must be imported under its own name, so the call-site scan
+        # below cannot be dodged by `import ... as _gate`.
+        gate_imports = [
+            alias
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom)
+            for alias in n.names
+            if alias.name == "assert_covenant_confirms_before_eth_deadline"
+        ]
+        assert gate_imports and all(a.asname is None for a in gate_imports), (
+            "the gate is imported under an alias, so a call-site scan by name proves nothing"
+        )
+
         calls = [
             n
             for n in ast.walk(tree)
@@ -142,6 +216,78 @@ class TestTheIntervalActuallyCancels:
             assert arg.func.id == "_dividing_interval_s", (
                 f"line {call.lineno}: passes {arg.func.id}(...), not _dividing_interval_s(...)"
             )
+            # Hole 1: the helper must be handed the policy ITSELF. A call or expression here can
+            # doctor the policy on the way in (`_dividing_interval_s(_nominal_view(policy))`
+            # reintroduces the 8.3x mismatch while keeping the outer call's shape intact).
+            assert len(arg.args) == 1 and not arg.keywords and isinstance(arg.args[0], ast.Name), (
+                f"line {call.lineno}: _dividing_interval_s is not passed a bare policy variable "
+                f"({ast.dump(arg)[:120]}) — whatever transforms it there can swap the tail"
+            )
+
+
+class TestTheIntervalThatReachesTheGate:
+    """The behavioral half of the call-site pin: drive the REAL coordinator methods and observe
+    the interval that actually arrives at the gate. This is what closes the holes a structural
+    scan cannot reach (a policy variable reassigned before the call, a dodging alias, a wrapper
+    the AST test did not anticipate): no matter how the source is arranged, the value handed to
+    `assert_covenant_confirms_before_eth_deadline` either is the policy's fast tail or is not."""
+
+    @staticmethod
+    def _drive(monkeypatch) -> list[float]:
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            from test_swap_coordinator import (
+                FakeEthLeg,
+                FakeIndexer,
+                FakeRadiantLeg,
+                FakeSeenStore,
+                _eth_terms,
+                _final,
+                generate_secret,
+            )
+        finally:
+            sys.path.pop(0)
+
+        import pyrxd.gravity.swap_coordinator as sc
+        from pyrxd.gravity.swap_coordinator import CoordinatorConfig, SwapCoordinator
+        from pyrxd.gravity.swap_state import SwapRecord, SwapState
+
+        captured: list[float] = []
+
+        def _spy(**kw):  # signature-compatible: the coordinator calls it with keywords only
+            captured.append(kw["rxd_block_interval_s"])
+
+        monkeypatch.setattr(sc, "assert_covenant_confirms_before_eth_deadline", _spy)
+
+        _, h = generate_secret()
+        terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40_000)
+        # Built like test_swap_coordinator's `_eth_coord_negotiated`, but with a stall window that
+        # clears the finality+burial reserve floor the FAST tail implies (ceil(768/36)+6-1 = 27;
+        # that helper hardcodes 6, sized for its nominal-only policies).
+        coord = SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            counter_leg=FakeEthLeg(preimage=b"\x01" * 32, verdict=_final()),
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(
+                margin_policy=_policy(fast=36.0, nominal=300.0), maker_stall_safety_window_blocks=27
+            ),
+        )
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # pre-fund ordering gate
+        coord._assert_eth_lock_timing_still_safe(now_unix_s=_NOW)  # post-confirm recheck
+        return captured
+
+    def test_both_coordinator_gate_calls_receive_the_fast_tail(self, monkeypatch) -> None:
+        captured = self._drive(monkeypatch)
+        assert captured == [36.0, 36.0], (
+            f"the interval that reached the gate was {captured}, not the policy's fast tail "
+            "(36.0) both times — whatever the call sites look like, the value arriving is wrong, "
+            "which is the 8.3x mismatch this file exists to prevent"
+        )
 
 
 class TestTheWindowThisProtects:
@@ -208,6 +354,11 @@ class TestTheExactDivisionBoundary:
             f"the gate refused t_rxd={sized}, the sizer's own output at the same interval — the "
             f"exact-division boundary is back"
         )
+        # The agreement check above is true BY CONSTRUCTION now that the sizer defers to the gate;
+        # this is the independent half: on an exact quotient q, the largest acceptable value is
+        # exactly q - 1, derived from the gate's documented semantics without calling either
+        # function. A joint sizer+gate drift keeps the line above green and fails this one.
+        assert sized == budget // int(fast) - 1 == _analytic_largest(budget, fast)
 
     def test_the_sized_value_is_still_the_LARGEST_the_gate_accepts(self) -> None:
         """The paired honest-path check. Fixing a refusal by shrinking the answer would also pass
@@ -228,8 +379,17 @@ class TestTheExactDivisionBoundary:
     @pytest.mark.parametrize("wait", [0, 300, 600, 900, 1200])
     @pytest.mark.parametrize("fast", [20.0, 24.0, 30.0, 36.0, 45.0, 60.0])
     def test_across_the_parameter_grid_the_sizer_is_exactly_the_gate_boundary(self, fast: float, wait: int) -> None:
-        """Both properties at once, over the grid the sweep that found this defect used. Two
-        one-off cases can be satisfied by a fudge that happens to fit them; a grid cannot."""
+        """The boundary property from BOTH sides, over the grid the sweep that found this defect
+        used — plus the value itself from a third, implementation-independent derivation.
+
+        The accept/refuse pair pins sizer↔gate AGREEMENT, but the sizer reaches its answer by
+        asking the gate, so agreement alone survives any change that moves both together — it is
+        sharp at whatever boundary the gate currently has, right or wrong. `_analytic_largest`
+        restates where that boundary is SUPPOSED to be (exact rational arithmetic, no production
+        code), so the three assertions jointly refuse: a sizer that overshoots (gate refuses it),
+        a sizer that undershoots (sized+1 also accepted), and a sizer and gate that drifted in
+        lockstep (analytic value disagrees)."""
+        budget = _ETH_TIMEOUT_S - _margin().total_s() - wait
         sized = eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
             expected_rxd_lock_time_unix_s=_NOW + wait,
@@ -238,3 +398,8 @@ class TestTheExactDivisionBoundary:
         ).value
         assert _gate_accepts(sized, fast, wait=wait), f"gate refused sized t_rxd={sized}"
         assert not _gate_accepts(sized + 1, fast, wait=wait), f"t_rxd={sized + 1} also accepted"
+        assert sized == _analytic_largest(budget, fast), (
+            f"sized {sized} != analytic largest-acceptable {_analytic_largest(budget, fast)} for "
+            f"budget {budget}s at {fast}s/block — the sizer and the gate agree with each other "
+            "but not with the documented boundary, i.e. they drifted together"
+        )
