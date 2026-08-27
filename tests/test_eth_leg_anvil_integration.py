@@ -278,9 +278,18 @@ async def test_finalized_pin_rejects_reorg_swapped_in_contract(anvil_url_fast_fi
 
         # (a) 'latest' accepts the swapped-in contract against the ORIGINAL locator — blind.
         await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI)
-        # (b) 'finalized' fails closed: empty code at the checkpoint → runtime-logic mismatch.
-        with pytest.raises(ValidationError, match="runtime logic"):
+        # (b) 'finalized' fails closed. It used to report this as a runtime-logic mismatch, which
+        # conflated two different states: EMPTY code at the checkpoint (the deploy simply has not
+        # finalized yet — wait) and DIFFERENT code (someone else's contract — you have been
+        # robbed). During a live mainnet run the empty case fired the second message, which reads
+        # as a theft alert when the truth was "retry in ~13 minutes". The refusal is the property
+        # under test and it is unchanged; only the diagnosis is now honest about which state it saw.
+        with pytest.raises(ValidationError, match="NOT YET FINALIZED") as exc:
             await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI, block_identifier="finalized")
+        assert "runtime logic" not in str(exc.value), (
+            "empty code at the checkpoint must not be reported as a wrong/attacker contract — "
+            "that is the conflation this diagnosis was split to remove"
+        )
         # (c) LOW-R1 residual: the balance read honours the pin (0 at the checkpoint, funded at tip).
         assert await rpc.get_balance(locator.contract_address, "finalized") == 0
         assert await rpc.get_balance(locator.contract_address) == _AMOUNT_WEI + 1

@@ -41,6 +41,26 @@ class ExpectedSkip(NamedTuple):
 
 
 EXPECTED_SKIPS: tuple[ExpectedSkip, ...] = (
+    # --- opt-in, needs an archive RPC CI does not have ---------------------------------
+    ExpectedSkip(
+        reason=r"XCHAIN_ERC20_E2E not set",
+        nodeid=r"^tests/test_xchain_erc20_usdc_lifecycle_e2e\.py::",
+        why=(
+            "The RXD<->USDC/USDT lifecycle e2e forks Ethereum mainnet at a pinned height and "
+            "drives the swap against the REAL deployed USDC and USDT contracts. That needs an "
+            "archive-node RPC and an Anvil fork, neither of which a public CI runner has, so it "
+            "is opt-in behind XCHAIN_ERC20_E2E=1 and runs on a developer machine.\n\n"
+            "STATE THE COST PLAINLY, because that is what this file is for: with these skipped, "
+            "NOTHING in CI executes the token counter leg end to end. The offline suite covers "
+            "each piece against fakes, and a fake is exactly where a wrong assumption about a "
+            "real token hides — this branch already shipped deploy fakes reporting a "
+            "contractAddress no sender and nonce can produce, and seven tests passed against a "
+            "chain that cannot exist. These eight are the only tests that would have caught it "
+            "by construction, and they are the ones that do not run here.\n\n"
+            "Node-id-scoped on purpose: the same reason arising in a NEW test is still reported "
+            "as unexpected rather than silently inheriting this exemption."
+        ),
+    ),
     # --- genuinely optional dependency -------------------------------------------------
     ExpectedSkip(
         reason=r"could not import 'web3'",
