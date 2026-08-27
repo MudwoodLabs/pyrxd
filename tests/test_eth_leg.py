@@ -497,6 +497,11 @@ async def test_fund_rejects_timeout_mismatch_with_terms(monkeypatch):
 # -- LOW-R1: verify_funded must pin the EOA get_code + balance reads to the SAME block ------
 
 
+#: The head timestamp `_RecordingRpc` reports. A real value, and a fixed one, so the accessors
+#: that read it can be asserted rather than merely called.
+_HEAD_TS = 1_800_000_000
+
+
 class _RecordingRpc:
     """Fake EthRpc recording the block_identifier each read is pinned to. Returns values that pass
     verify_funded (claimant/refundee EOAs => empty code; balance == expected; immutables match)."""
@@ -536,6 +541,14 @@ class _RecordingRpc:
                     functions = _Functions()
 
                 return _C()
+
+            async def get_block(self, _which):
+                # Not decoration. The three `latest_block_timestamp*` accessors below all read it,
+                # and without it they raise AttributeError the first time anything calls them —
+                # scaffolding that LOOKS like protocol coverage and is not. The value is the head
+                # timestamp a node would report: far enough ahead of nothing in particular, and
+                # pinned so a test can assert on it.
+                return {"timestamp": _HEAD_TS}
 
         class _W3:
             eth = _Eth()
@@ -591,6 +604,34 @@ async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
     assert rpc.code_block_ids[loc.refundee] == "finalized"
     assert rpc.balance_block_id == "finalized"
     assert rpc.code_block_ids[loc.contract_address] == "finalized"  # the core code read (already pinned)
+
+
+async def test_the_recording_fake_can_actually_answer_the_head_timestamp():
+    """`_RecordingRpc` was given three `latest_block_timestamp*` accessors whose bodies call
+    `self.w3.eth.get_block("latest")` — on an inner `_Eth` that defined only `contract()`. Every
+    one raised AttributeError the moment anything called it, so the fake advertised a protocol it
+    could not serve: a `claim` driven through it would have failed on the fake, not on the code.
+
+    Executing them is the whole point. A method nothing calls is not covered by anything.
+    """
+    pytest.importorskip("web3")
+    from web3 import Web3
+
+    loc = EthHtlcLocator(
+        chain_id=11155111,
+        contract_address=Web3.to_checksum_address("0x" + "33" * 20),
+        deploy_tx_hash="0x" + "de" * 32,
+        hashlock="0x" + "ab" * 32,
+        claimant=Web3.to_checksum_address("0x" + "11" * 20),
+        refundee=Web3.to_checksum_address("0x" + "22" * 20),
+        timeout=4_000_000_000,
+        amount_wei=10**15,
+    )
+    rpc = _RecordingRpc(loc, loc.amount_wei)
+    # All three coincide for a single source, which is exactly what the accessors' comment claims.
+    assert await rpc.latest_block_timestamp() == _HEAD_TS
+    assert await rpc.latest_block_timestamp_quorum() == _HEAD_TS
+    assert await rpc.latest_block_timestamp_min() == _HEAD_TS
 
 
 def test_runtime_code_mask_gap_documented_and_empty_code_fails_closed():

@@ -630,8 +630,25 @@ _NATIVE_ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.
 _NATIVE_WEI = 10**15
 
 
-def _native_leg(*, on_chain: dict, balance: int, deployed: list):
+def _native_leg(
+    *,
+    on_chain: dict,
+    balance: int,
+    deployed: list,
+    lying_receipt: str | None = None,
+    key: PrivateKeyMaterial | None = None,
+):
     from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+    from pyrxd.eth_wallet.keys import derive_address
+
+    # The same correction the TOKEN fake above already carries. A deploy receipt cannot name an
+    # arbitrary address — `contractAddress` IS `keccak(rlp([sender, nonce]))[12:]` — so a fake
+    # returning a fixed `0x7777...` modelled a chain that cannot exist, and the native tests were
+    # passing against it. This one derives the address its own key and nonce really imply;
+    # `lying_receipt=` opts into the forgery.
+    _key = key or PrivateKeyMaterial(os.urandom(32))
+    _sender = derive_address(_key)
+    state: dict = {}
 
     imm = {
         "hashlock": b"\x33" * 32,
@@ -663,6 +680,7 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
 
     class _Ctor:
         async def build_transaction(self, tx):
+            state["deploy_nonce"] = tx.get("nonce")
             return dict(tx)
 
     class _Contract:
@@ -717,17 +735,18 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
         async def wait_receipt(self, *a, **k):
             # The deploy confirms and the payable constructor now HOLDS the ETH — which is the
             # whole reason a persist failure after this point must not discard the fund.
-            return {"status": 1, "contractAddress": _DEPLOYED, "logs": []}
+            real = _create_address(_sender, int(state["deploy_nonce"]))
+            state["deployed"] = real
+            return {"status": 1, "contractAddress": lying_receipt or real, "logs": []}
 
-    leg = EthHtlcContractLeg(
-        rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_NATIVE_ART
-    )
+    leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=_key, chain_id=1, artifact=_NATIVE_ART)
 
     async def _sign_and_send(*a, **k):
         deployed.append("DEPLOYED")
         return "0x" + "ee" * 32
 
     leg._sign_and_send = _sign_and_send
+    leg._test_state = state
     return leg
 
 
@@ -776,7 +795,63 @@ class TestTheNativeLegResumesInsteadOfRedeploying:
         leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
         loc = _native_fund(leg, None)
         assert deployed == ["DEPLOYED"], "a fresh fund returned a locator without deploying anything"
-        assert loc.contract_address.lower() == _DEPLOYED.lower()
+        assert loc.contract_address.lower() == leg._test_state["deployed"].lower()
+
+
+class TestALyingNativeDeployReceiptCannotRedirectTheFunding:
+    """The same defect as the token leg's, in the leg that has already carried real value.
+
+    The token fix was applied only where the bug had been demonstrated, so the NATIVE `fund` went
+    on doing `addr = receipt["contractAddress"]`. It is the worse of the two: the constructor is
+    payable, so the ETH is inside the contract the instant the deploy confirms — there is no
+    second transaction to withhold once the address turns out to be someone else's.
+
+    `wait_receipt` is primary-only by design, so one endpoint alone named the address, and every
+    downstream check still passed because the ETH really was there. Deploying the same bytecode is
+    no obstacle to an attacker who owns the claim key.
+    """
+
+    def test_a_receipt_naming_a_DIFFERENT_contract_is_refused(self) -> None:
+        deployed: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed, lying_receipt="0x" + "ab" * 20)
+        with pytest.raises(ValidationError, match="CREATE"):
+            _native_fund(leg, None)
+
+    def test_the_refusal_names_BOTH_addresses(self) -> None:
+        """An operator holding a locator that does not match the chain needs the two values to
+        compare. A refusal that says only 'mismatch' cannot be acted on."""
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=[], lying_receipt="0x" + "ab" * 20)
+        with pytest.raises(ValidationError) as ei:
+            _native_fund(leg, None)
+        msg = str(ei.value).lower()
+        assert "0x" + "ab" * 20 in msg, "the address the endpoint named is missing from the refusal"
+        assert leg._test_state["deployed"].lower() in msg, "the derived address is missing from the refusal"
+
+    def test_the_refusal_is_not_merely_a_CHECKSUM_disagreement(self) -> None:
+        """The honest-path pair. Providers differ on EIP-55 casing, and a correct address in the
+        wrong case is an honest receipt — refusing it would strand a fund whose ETH is already in
+        the contract, which is strictly worse than the attack.
+
+        THE SAME KEY for both legs, because two random keys deploy to two different addresses and
+        the 'honest lowercase' of one is a forgery to the other: the test would then pass by
+        triggering the very refusal it claims to rule out.
+        """
+        shared = PrivateKeyMaterial(os.urandom(32))
+        probe = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=[], key=shared)
+        _native_fund(probe, None)
+        honest_lowercase = probe._test_state["deployed"].lower()
+
+        deployed: list = []
+        leg = _native_leg(
+            on_chain={},
+            balance=_NATIVE_WEI,
+            deployed=deployed,
+            lying_receipt=honest_lowercase,
+            key=shared,
+        )
+        loc = _native_fund(leg, None)
+        assert deployed == ["DEPLOYED"], "a correct address in lowercase was refused"
+        assert loc.contract_address.lower() == honest_lowercase
 
 
 class TestTheInFlightGuardDoesNotBlockAFreshFund:
@@ -928,7 +1003,7 @@ class TestAPersistFailureDoesNotDiscardACommittedNativeFund:
             )
         )
         assert deployed == ["DEPLOYED"], "the deploy never happened, so the hook was never reached"
-        assert loc.contract_address.lower() == _DEPLOYED.lower(), (
+        assert loc.contract_address.lower() == leg._test_state["deployed"].lower(), (
             "a persist failure discarded a fund whose ETH is already in the contract"
         )
 
