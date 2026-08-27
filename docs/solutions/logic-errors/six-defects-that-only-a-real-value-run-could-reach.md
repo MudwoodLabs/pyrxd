@@ -321,6 +321,17 @@ refusals and 0 cases leaving an accepted block unused.
   five are that same shape.
 - **A derivation with no caller is not a safeguard.** It is documentation that happens to compile,
   and it will drift from the gate that checks it — which is exactly what happened here.
+- **A test can assert the right property on inputs where the defect cannot occur.** The known
+  failure mode is a fixture that builds an impossible scenario. This is a quieter cousin: the
+  fixture is realistic, the assertion is load-bearing, and the PARAMETER RANGE excludes the bug.
+  The first test for the non-integer-interval defect swept fifteen intervals at a fixed 24 h
+  deadline and passed with the fix removed — because none of the 163 (interval, deadline, wait)
+  triples that actually reproduce it uses a 24 h deadline. It swept the one axis that had been
+  discussed and held constant the one that mattered. **Mutation-test with the fix removed, not
+  only with a defect planted in the code under test** — a green suite against a reverted fix is
+  the clearest possible signal that the test never reached the behaviour. Then pin concrete
+  reproducing rows alongside the grid, and assert in each that the row still reproduces, so a
+  parameter change turns them into failures rather than into vacuous passes.
 - **When a property really is about the source, check the AST, not the text.** Several guards here
   are structural — "this call site passes THAT interval", "this read asks for the other direction"
   — and standing up a live multi-source leg mid-fund to observe them is not practical. Text

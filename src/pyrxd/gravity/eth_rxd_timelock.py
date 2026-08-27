@@ -127,6 +127,12 @@ class CrossClockMargin:
         )
 
 
+#: How far the sizer may step down to reach a value the gate accepts. The analytic value is
+#: never more than one block out; the extra room is so a genuine divergence raises rather
+#: than silently shrinking the taker's claim window block by block.
+_SIZER_GATE_STEPS = 3
+
+
 def eth_absolute_to_rxd_relative_blocks(
     *,
     eth_timeout_unix_s: int,
@@ -197,6 +203,24 @@ def eth_absolute_to_rxd_relative_blocks(
     # maker's refund marginally earlier, costing the taker a block of claim window rather than
     # letting the refund land past the deadline it is sized to precede.
     t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s) - 1
+    # ...and then ASK THE GATE, rather than trusting that arithmetic to match it.
+    #
+    # `ceil(x) - 1` is algebraically the largest `t` with `t * I < budget`, and it is exact for an
+    # integer interval. It is NOT exact once `I` has a fractional part, because both sides round
+    # differently in binary floating point: brute-forced against the real gate over 365 parameter
+    # rows per interval, 0% of sized values were refused at 9/20/36/43/60/120/300 s and 0.27-2.74%
+    # were refused at 36.2/36.4/36.5/36.7/43.3/60.5/331.7 s. `--rxd-block-interval-fast-s` is a
+    # float and a MEASURED p10 almost never lands on an integer, so the failing set is the normal
+    # case and the passing set is the rounded one.
+    #
+    # Patching the formula would fix the intervals someone thought to test. Deferring to the gate
+    # makes the two agree by construction for every interval, which is the property actually
+    # wanted: this function's contract is "the largest window the gate will accept".
+    # RANGE FIRST, then the gate. Asking the gate about an absurd value gets an absurd answer:
+    # a far-future deadline sizes to ~10^9 blocks, the gate refuses it for its own reasons, and the
+    # step-down loop exhausted and reported "the sizer and the gate disagree" — burying the real
+    # and much clearer BIP68 refusal under a message about rounding. Establish the value is even in
+    # range before asking anything else about it.
     if t_rxd_blocks < floor_blocks:
         raise ValidationError(
             f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} "
@@ -207,6 +231,36 @@ def eth_absolute_to_rxd_relative_blocks(
             f"RXD timelock {t_rxd_blocks} blocks exceeds the BIP68 16-bit cap "
             f"{_MAX_RXD_CSV_BLOCKS} (ETH deadline too far in the future to map to a "
             "relative CSV window)"
+        )
+    for _ in range(_SIZER_GATE_STEPS):
+        try:
+            assert_covenant_confirms_before_eth_deadline(
+                now_unix_s=expected_rxd_lock_time_unix_s,
+                eth_timeout_unix_s=eth_timeout_unix_s,
+                margin=margin,
+                t_rxd=Timelock(t_rxd_blocks, TimeUnit.BLOCKS),
+                rxd_block_interval_s=rxd_block_interval_s,
+                # The gate anchors on `now + wait`; anchoring it on the expected lock time with a
+                # zero wait is the same instant, and keeps this function's own signature intact.
+                max_covenant_confirm_wait_s=0,
+            )
+            break
+        except ValidationError:
+            t_rxd_blocks -= 1
+    else:  # pragma: no cover — the analytic value is never more than one block out
+        raise ValidationError(
+            f"could not size a t_rxd the punctuality gate accepts within {_SIZER_GATE_STEPS} "
+            f"blocks of {math.ceil(budget_s / rxd_block_interval_s) - 1} (budget {budget_s}s at "
+            f"{rxd_block_interval_s}s/block). The sizer and the gate disagree by more than a "
+            "rounding step, which means one of them has changed meaning."
+        )
+    # The step-down can cross the safety floor by one, so re-check it. Not the cap: stepping down
+    # only ever decreases, and a value that was under the cap stays under it.
+    if t_rxd_blocks < floor_blocks:
+        raise ValidationError(
+            f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} after the "
+            f"punctuality gate required one block less than the {budget_s}s budget allows at "
+            f"{rxd_block_interval_s}s/block"
         )
     return Timelock(t_rxd_blocks, TimeUnit.BLOCKS)
 

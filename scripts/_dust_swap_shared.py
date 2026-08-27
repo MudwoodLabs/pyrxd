@@ -173,9 +173,28 @@ def resolve_eth_key_file(args: argparse.Namespace) -> None:
         return
     if getattr(args, "eth_key_hex", ""):
         raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
-    args.eth_key_hex = read_own_private_file(
-        Path(args.eth_key_file).expanduser(), what="an ETH signing key", limit=4096
-    ).strip()
+    raw = read_own_private_file(Path(args.eth_key_file).expanduser(), what="an ETH signing key", limit=4096).strip()
+    args.eth_key_hex = _validated_eth_key_hex(raw, source=args.eth_key_file)
+
+
+def _validated_eth_key_hex(raw: str, *, source: str) -> str:
+    """Normalise and check the key HERE, not several hundred lines into the run.
+
+    A `0x` prefix is how every EVM tool prints a key, so a file containing one is honest input and
+    accepting it is the point — refusing it would be a guard rejecting valid work. What must not
+    happen is discovering the problem late: the length check used to live deep inside the run, past
+    the point where an NFT variant has already MINTED on RXD mainnet, so a mistyped key cost a real
+    transaction before anything complained.
+
+    Deliberately says nothing about the contents of the file beyond its length and alphabet.
+    """
+    key = raw[2:] if raw[:2].lower() == "0x" else raw
+    if len(key) != 64 or any(c not in "0123456789abcdefABCDEF" for c in key):
+        raise SystemExit(
+            f"{source} does not contain a 32-byte hex key: got {len(key)} hex characters after "
+            f"stripping any 0x prefix, expected 64. Refusing now, before the run spends anything."
+        )
+    return key
 
 
 def add_eth_key_arguments(ap: argparse.ArgumentParser) -> None:

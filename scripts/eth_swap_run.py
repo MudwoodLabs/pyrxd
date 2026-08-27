@@ -147,7 +147,7 @@ def _evm_is_value_bearing(chain_id: int) -> bool:
     return not evm_chain_by_id(int(chain_id)).is_testnet
 
 
-def _policy(args: argparse.Namespace) -> MarginPolicy:
+def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> MarginPolicy:
     """Estimated margins for a throwaway EVM chain; MEASURED once the token leg is real.
 
     is_measured=False disables two defences on the ETH path — the verify->lock `finalized` reorg
@@ -189,14 +189,21 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
             "under-counts blocks. Measure it against a mainnet node for THIS run — it was 43s on "
             "2026-06-02 and 36s on 2026-08-26, and the drift is in the under-counting direction."
         )
+    # IS THERE A VALID VALUE AT ALL? The lower bound needs t*fast >= margin; the upper caps t at
+    # the deadline minus that same margin and the confirm reserve. When the deadline is too short
+    # to hold both, no t_rxd satisfies them and the per-bound messages start contradicting each
+    # other: a 3 h timeout refused t_rxd=86 as "too SHORT" while advising the operator to omit the
+    # flag and derive it — which derives 86. That sends someone to re-type the one argument that
+    # cannot help, during a run, with a covenant possibly already funded. Name the real constraint.
+    _assert_the_eth_deadline_can_hold_the_margins(args, remaining_s=remaining_s)
     if int(args.t_rxd_blocks) == 0:
-        args.t_rxd_blocks = _derive_t_rxd_blocks(args)
+        args.t_rxd_blocks = _derive_t_rxd_blocks(args, remaining_s=remaining_s)
     # The three bounds now run against a value the library derived rather than one an operator
     # typed. That is deliberate: they are the check on the derivation, not a substitute for it, and
     # a derivation nothing verifies is how the exact-division off-by-one survived in the first place.
-    _assert_t_rxd_covers_the_takers_wait(args)
-    _assert_t_rxd_opens_before_the_eth_deadline(args)
-    _assert_t_rxd_bounds_the_vulnerable_window(args)
+    _assert_t_rxd_covers_the_takers_wait(args, remaining_s=remaining_s)
+    _assert_t_rxd_opens_before_the_eth_deadline(args, remaining_s=remaining_s)
+    _assert_t_rxd_bounds_the_vulnerable_window(args, remaining_s=remaining_s)
     return MarginPolicy(
         is_measured=True,
         require_measured=True,
@@ -205,7 +212,56 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
     )
 
 
-def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> None:
+def _assert_the_eth_deadline_can_hold_the_margins(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """Refuse a deadline no t_rxd can satisfy, naming `--eth-timeout-s` rather than `--t-rxd-blocks`.
+
+    The RXD window has to be long enough that the taker can sit out the whole cross-clock margin
+    (ETH finality, the stall budget, claim burial, slack) AND short enough that the maker's refund
+    still opens before the ETH deadline minus that same margin, after reserving the covenant's
+    confirm time. Both are real, so the deadline must contain roughly TWO margins plus the reserve.
+    Below that the feasible range is empty and every individual bound reports a different symptom
+    of the same cause.
+    """
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return
+    margin_s = _cross_clock_margin(args).total_s()
+    wait_s = int(args.max_covenant_confirm_wait_s)
+    budget_s = _eth_budget_s(args, remaining_s)
+    need_s = 2 * margin_s + wait_s + math.ceil(fast)
+    if budget_s >= need_s:
+        return
+    resumed = "" if remaining_s is None else " remaining on the resumed swap's deadline"
+    raise SystemExit(
+        f"--eth-timeout-s gives {budget_s}s ({budget_s / 3600:.2f} h){resumed}, which cannot hold "
+        f"the timelock at all — no --t-rxd-blocks satisfies both bounds.\n"
+        f"  the RXD window must cover the {margin_s}s ({margin_s / 3600:.2f} h) cross-clock margin "
+        f"AND still open before the deadline minus that same margin, after the "
+        f"{wait_s}s covenant-confirm reserve.\n"
+        f"  minimum: --eth-timeout-s {need_s} ({need_s / 3600:.2f} h)\n"
+        f"  shrink the MARGIN instead only if you can justify each part: "
+        f"--eth-finality-stall-tolerance-s is usually the largest and the least defensible to cut."
+        + (
+            "\n  on a resume this cannot be fixed by argument: the deadline is an immutable of the "
+            "deployed HTLC. Wait for it and refund."
+            if remaining_s is not None
+            else ""
+        )
+    )
+
+
+def _eth_budget_s(args: argparse.Namespace, remaining_s: int | None) -> int:
+    """Seconds of ETH deadline the bounds may actually spend.
+
+    `--eth-timeout-s` is a DURATION from now, correct only on a fresh run. On a resume the deadline
+    is an immutable of the already-deployed HTLC, fixed hours ago, and what is left of it is the
+    only budget there is. Passing the original duration made every parse-time bound validate a
+    swap that no longer exists.
+    """
+    return int(args.eth_timeout_s) if remaining_s is None else int(remaining_s)
+
+
+def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
     """The RXD refund must not open before the taker has finished waiting for ETH finality.
 
     `--t-rxd-blocks` is an operator flag on this runner, not a derived value, and NOTHING on this
@@ -240,13 +296,13 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> None:
         f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
         f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
         f"was still waiting.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
         f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
         f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
 
 
-def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> None:
+def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
     """The RXD refund must OPEN before the ETH deadline minus the margin — the upper bound.
 
     Learned the expensive way. The lower bound above divides the margin by the FAST tail, because
@@ -270,7 +326,9 @@ def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> Non
     # straight out of the budget. Sizing against `now` silently assumes instant funding: a run that
     # took ~740s to fund and mine overshot by 607s and was refused AFTER the covenant was paid for.
     # `max_covenant_confirm_wait_s` is precisely the allowance for that delay, so spend it here.
-    budget_s = int(args.eth_timeout_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
+    budget_s = (
+        _eth_budget_s(args, remaining_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
+    )
     # The gate refuses at `projected >= deadline`, so the largest ACCEPTED value is one short of
     # the quotient when it divides exactly. Verified by binary-searching the real gate: for a 24h
     # timeout it accepts 2186 and refuses 2187, while a bare floor() computes 2187. An upper bound
@@ -288,7 +346,7 @@ def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> Non
         f"{budget_s / 3600:.1f} h budget (--eth-timeout-s minus the {_cross_clock_margin(args).total_s()}s "
         f"cross-clock margin AND the {args.max_covenant_confirm_wait_s}s covenant-confirm reserve). "
         f"The maker could not refund before the ETH deadline.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
         f"  (the taker's-wait bound floors it at {lo} and this one caps it at {hi}, but the "
         f"vulnerable-window bound closes that range to a single value — there is nothing to choose)\n"
         f"  the LOWER bound divides the margin by the FAST tail; this UPPER bound multiplies by the "
@@ -299,7 +357,7 @@ def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace) -> Non
 _SEPOLIA_DEFAULT_T_RXD_BLOCKS = 60
 
 
-def _derive_t_rxd_blocks(args: argparse.Namespace) -> int:
+def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
     """DERIVE t_rxd from the ETH deadline instead of trusting a number an operator typed.
 
     `eth_absolute_to_rxd_relative_blocks` has existed, correct and carefully documented, for the
@@ -314,7 +372,7 @@ def _derive_t_rxd_blocks(args: argparse.Namespace) -> int:
     checked against the same three bounds.
     """
     return eth_absolute_to_rxd_relative_blocks(
-        eth_timeout_unix_s=int(time.time()) + int(args.eth_timeout_s),
+        eth_timeout_unix_s=int(time.time()) + _eth_budget_s(args, remaining_s),
         # The CSV clock starts at covenant MINING, not now, so reserve the confirm allowance.
         expected_rxd_lock_time_unix_s=int(time.time()) + int(args.max_covenant_confirm_wait_s),
         margin=_cross_clock_margin(args),
@@ -324,7 +382,7 @@ def _derive_t_rxd_blocks(args: argparse.Namespace) -> int:
     ).value
 
 
-def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace) -> None:
+def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
     """The bound that was missing entirely: t_rxd must be LARGE enough, not merely small enough.
 
     ASSET_VULNERABLE is `eth_timeout - t_rxd * fast` — the span in which the maker's covenant refund
@@ -344,7 +402,7 @@ def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace) -> None
     # instead made the two disagree by the confirm wait, and the first thing that disagreement did
     # was refuse the value the library's own sizer derives — a guard rejecting honest work.
     wait_s = int(args.max_covenant_confirm_wait_s)
-    window_s = int(args.eth_timeout_s) - wait_s - int(args.t_rxd_blocks) * fast
+    window_s = _eth_budget_s(args, remaining_s) - wait_s - int(args.t_rxd_blocks) * fast
     if window_s <= margin_s + fast:
         return
     raise SystemExit(
@@ -352,7 +410,7 @@ def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace) -> None
         f"window — the span where the maker's covenant refund has matured AND the counter leg is "
         f"still claimable with the preimage, so the maker can end up holding both legs. It should "
         f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args)}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derive_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
         f"  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
         f"the taker safety. Only one of those is recoverable."
     )
@@ -700,7 +758,17 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         f"(counter={_eth_chain.name} chain_id={_eth_chain.chain_id}, RXD={rxd_network} mainnet) ==="
     )
 
-    policy = _policy(args)
+    # RESUME FIRST. The t_rxd bounds divide `--eth-timeout-s`, a DURATION measured from now, but on
+    # a resume the real deadline is an ABSOLUTE time fixed hours ago and the remaining budget is
+    # whatever is left of it. Validating the original duration accepted values the coordinator then
+    # refused mid-run — after funding — which is the same "checked the wrong quantity" shape as the
+    # confirm-wait reserve. Resolve the deadline, hand the bounds what is actually left, and the
+    # parse-time answer means something on a resume too.
+    restore = _load_restore(args)
+    eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
+    # Only a RESUME has a deadline that is not `now + --eth-timeout-s`. Passing the remaining time
+    # unconditionally made a fresh run's refusals talk about "the resumed swap's deadline".
+    policy = _policy(args, remaining_s=(eth_timeout - int(time.time())) if restore is not None else None)
     provenance = {
         "stage": "sepolia-dust",
         "eth_finalization_window_s": args.eth_finalization_window_s,
@@ -760,8 +828,6 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             )
         print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
-    restore = _load_restore(args)
-    eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
     terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
         args, eth_timeout=eth_timeout, minted=minted, restore=restore
     )
