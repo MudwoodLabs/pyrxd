@@ -497,8 +497,26 @@ omit = [
     #   test_finality_verdict.py, test_eth_private_submit.py; provenance / finality-verdict /
     #   locator-equality / Flashbots header-signing logic is covered, only the network calls are not.
     # counter_chain_leg.py (the pure ABC) is intentionally NOT omitted — it is 100% covered offline.
-    # Narrow this to rpc.py + the on-chain-call methods (via `# pragma: no cover`) when Anvil runs in CI.
-    "src/pyrxd/eth_wallet/*",
+    # NARROWED 2026-08-27. rpc.py is OUT of this list: it is now measured, at 100% statement and
+    # 100% branch, OFFLINE. The rationale above — "100% transport, exercised by the Anvil suite CI
+    # does not run" — was true when written and is now false for that one module. A first-ever
+    # mutation run scored it 30/303 (9%), the worst in the codebase; direct unit tests took it to
+    # 193/303, and to 100% of the KILLABLE set (the 110 that remain are `X | Y` rewrites of type
+    # annotations, never evaluated under `from __future__ import annotations`). Coverage followed.
+    #
+    # The others stay omitted on the original rationale and should be removed from this list the
+    # same way — by being tested, one module at a time — not when Anvil eventually runs in CI.
+    "src/pyrxd/eth_wallet/__init__.py",
+    "src/pyrxd/eth_wallet/chains.py",
+    "src/pyrxd/eth_wallet/erc20.py",
+    "src/pyrxd/eth_wallet/erc20_leg.py",
+    "src/pyrxd/eth_wallet/htlc_leg.py",
+    "src/pyrxd/eth_wallet/keys.py",
+    "src/pyrxd/eth_wallet/locator.py",
+    "src/pyrxd/eth_wallet/multi_rpc.py",
+    "src/pyrxd/eth_wallet/private_submit.py",
+    "src/pyrxd/eth_wallet/secret.py",
+    "src/pyrxd/eth_wallet/tokens.py",
 ]
 
 [tool.coverage.report]
