@@ -262,6 +262,12 @@ coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
 # link to gitignored paths. Catches leaks where a public doc references a
 # private design doc — broken links + leaked filenames in commit history.
 check-private-links = "python3 scripts/check-no-private-links.py"
+# An exemption is a CLAIM about the world, and claims go stale silently. rpc.py sat omitted
+# on "only the Anvil suite covers it" while reaching 100% offline; measuring found eight more
+# in the same block, including the HTLC leg, ERC-20 leg and quorum layer at 91% — the
+# fund-safety core, excluded from the gate meant to hold it. Costs a second coverage pass, so
+# it is a deliberate check rather than part of `task ci`.
+check-coverage-omissions = "python3 scripts/check_coverage_omissions.py"
 # `task check-vendor` asks GitHub whether the sha256-pinned Radiant Core consensus
 # sources under tests/vendor/radiant_core/ have moved upstream, and whether the pinned
 # tag still shares those files with the release the regtest image is built from.
@@ -497,26 +503,26 @@ omit = [
     #   test_finality_verdict.py, test_eth_private_submit.py; provenance / finality-verdict /
     #   locator-equality / Flashbots header-signing logic is covered, only the network calls are not.
     # counter_chain_leg.py (the pure ABC) is intentionally NOT omitted — it is 100% covered offline.
-    # NARROWED 2026-08-27. rpc.py is OUT of this list: it is now measured, at 100% statement and
-    # 100% branch, OFFLINE. The rationale above — "100% transport, exercised by the Anvil suite CI
-    # does not run" — was true when written and is now false for that one module. A first-ever
-    # mutation run scored it 30/303 (9%), the worst in the codebase; direct unit tests took it to
-    # 193/303, and to 100% of the KILLABLE set (the 110 that remain are `X | Y` rewrites of type
-    # annotations, never evaluated under `from __future__ import annotations`). Coverage followed.
+    # NARROWED AGAIN 2026-08-28, by MEASUREMENT rather than by reading the rationale.
     #
-    # The others stay omitted on the original rationale and should be removed from this list the
-    # same way — by being tested, one module at a time — not when Anvil eventually runs in CI.
-    "src/pyrxd/eth_wallet/__init__.py",
-    "src/pyrxd/eth_wallet/chains.py",
-    "src/pyrxd/eth_wallet/erc20.py",
-    "src/pyrxd/eth_wallet/erc20_leg.py",
-    "src/pyrxd/eth_wallet/htlc_leg.py",
-    "src/pyrxd/eth_wallet/keys.py",
-    "src/pyrxd/eth_wallet/locator.py",
-    "src/pyrxd/eth_wallet/multi_rpc.py",
-    "src/pyrxd/eth_wallet/private_submit.py",
-    "src/pyrxd/eth_wallet/secret.py",
-    "src/pyrxd/eth_wallet/tokens.py",
+    # The comment above said these files are "100% transport ... exercised by the Phase-4
+    # Anvil/Sepolia integration suite, which CI does not yet run". Measured with the omit disabled
+    # against the OFFLINE suite, nine of the eleven were at or above the 85% gate:
+    #
+    #   __init__ 100%  chains 100%  rpc 100%  erc20 97%  erc20_leg 91%  htlc_leg 91%
+    #   multi_rpc 91%  secret 88%  tokens 88%
+    #
+    # So the exemption had been excluding the HTLC leg, the ERC-20 leg and the quorum layer — the
+    # fund-safety core of this branch — from the coverage gate. A regression in any of them could
+    # not move the number. Nobody read the list wrong; the rationale was true when written and
+    # quietly stopped being true as the tests arrived, and nothing was watching for that.
+    #
+    # Only the three genuinely below the gate remain. They leave the same way: by being tested.
+    # `scripts/check_coverage_omissions.py` now fails when an entry here rises above the gate, so
+    # the next one cannot go stale unnoticed.
+    "src/pyrxd/eth_wallet/keys.py",          # 83% — provenance/verdict logic covered, network calls not
+    "src/pyrxd/eth_wallet/locator.py",       # 81% — equality/normalisation covered, on-chain reads not
+    "src/pyrxd/eth_wallet/private_submit.py",  # 53% — Flashbots header signing covered, submission not
 ]
 
 [tool.coverage.report]
