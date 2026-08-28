@@ -207,7 +207,9 @@ group_marker() {
 }
 
 CONSENSUS_GROUPS="spv script transaction dmint"
-VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network ethleg ethtimelock"
+# `keys` was in NEITHER meta-group, so `task mutate all` silently skipped the module set that
+# holds secrets, base58 and BIP32 derivation. Reachable only by exact name until now.
+VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network keys ethleg ethtimelock"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in

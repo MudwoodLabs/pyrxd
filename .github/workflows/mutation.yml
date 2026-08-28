@@ -34,6 +34,16 @@ name: Mutation (scheduled)
 # tests/test_mutation_hardening.py. Set a threshold per group only once its equivalent-mutant
 # classes have been triaged out.
 #
+# UPDATE 2026-08-27: `ethleg` and `ethtimelock` now carry one, because their equivalent classes
+# HAVE been triaged — annotation rewrites under `from __future__ import annotations`, `*,` -> `/,`
+# keyword-only markers, and error-message f-strings in `# pragma: no cover` branches. Their floors
+# are measured, not aspirational, and exist so the number can only go up.
+#
+# Both groups were also missing from the matrix below when they were added to the script, so
+# nothing ran them. That is the same defect this branch kept finding elsewhere — a capability with
+# no caller — committed here while documenting it. If you add a group to
+# scripts/mutation_test.sh, add it to the matrix in the same change.
+#
 # Manual runs: gh workflow run "Mutation (scheduled)" -f groups=fee
 
 on:
@@ -42,7 +52,7 @@ on:
   workflow_dispatch:
     inputs:
       groups:
-        description: "Space-separated groups to run (default: all six value groups)"
+        description: "Space-separated groups to run (default: every VALUE group in the matrix below)"
         required: false
         default: ""
 
@@ -54,7 +64,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # DERIVE the matrix instead of restating it. The list below used to be a hand-typed copy of
+  # VALUE_GROUPS in scripts/mutation_test.sh, and the two drifted: `mint` and `glyphscript` were
+  # never run weekly, `keys` was reachable from neither meta-group, and `ethleg`/`ethtimelock`
+  # were added to the script in a change that forgot this file. A consistency test detects that
+  # after the fact; deriving it means the fact cannot be stated twice, so it cannot rot.
+  discover:
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.groups.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: groups
+        run: echo "matrix=$(python3 scripts/mutation_groups.py)" >> "$GITHUB_OUTPUT"
+
   mutate:
+    needs: discover
     # Don't burn scheduled minutes on forks; manual dispatch still works anywhere.
     if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
     name: mutate (${{ matrix.group }})
@@ -65,8 +92,7 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
-      matrix:
-        group: [fee, wallet, hdwallet, glyph, swap, coordinator, network]
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -93,7 +119,8 @@ jobs:
           MUTATION_REPORT_DIR: ${{ github.workspace }}/.mutation-reports
         run: |
           mkdir -p "$MUTATION_SESSION_DIR" "$MUTATION_REPORT_DIR"
-          poetry run bash scripts/mutation_test.sh "${{ matrix.group }}" | tee mutation-${{ matrix.group }}.log
+          MUTATION_MIN_KILL_PCT="${{ matrix.min_kill }}" \
+            poetry run bash scripts/mutation_test.sh "${{ matrix.group }}" | tee mutation-${{ matrix.group }}.log
       - name: Upload survivor list and session databases
         # `always()`: a timed-out or failed group still produced partial sessions, and the
         # survivors found before it stopped are still real.
