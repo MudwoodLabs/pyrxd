@@ -625,6 +625,56 @@ class TestOneValueTwoDirections:
         assert got["call"] == 1
 
 
+class TestTheQuorumCombinerSortsDESCENDING:
+    """A surviving mutant: `sorted(answers, reverse=True)` -> `reverse=False`.
+
+    `quorum_combiner` promises "the value at least `min_agreeing` sources are at or ABOVE", which
+    is the n-th LARGEST. Flipping the sort returns the n-th SMALLEST — the opposite guarantee.
+
+    It survived the whole suite because `min_agreeing` DEFAULTS to a true majority, and at the
+    majority position the n-th largest and the n-th smallest are the same element: the median.
+    Every test used a default (2-of-3, 3-of-5), so the flag was never exercised. `min_agreeing` is
+    an explicit constructor parameter, so a non-median quorum is reachable, and there the two
+    disagree completely — with five endpoints at 2-of-5 the correct answer is 700 and the mutant
+    returns 300.
+
+    Found by `task mutate ethleg`, the first mutation run this module ever had.
+    """
+
+    @staticmethod
+    def _answers() -> list[int]:
+        return [900, 700, 500, 300, 100]
+
+    def test_a_NON_median_quorum_takes_the_nth_LARGEST(self) -> None:
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        rpc = MultiSourceEthRpc([_Source() for _ in range(5)], min_agreeing=2)
+        got = quorum_combiner(rpc)(self._answers())
+        assert got == 700, (
+            f"expected the 2nd LARGEST (700) — the value at least 2 of 5 sources are at or above — "
+            f"got {got}. The 2nd smallest is 300, which is what a reversed sort returns and which "
+            f"inverts the guarantee the combiner exists to make."
+        )
+
+    def test_the_median_case_that_HID_it_still_works(self) -> None:
+        """The paired case, kept explicitly to document why the gap existed: at the default
+        majority the two orderings coincide, so this assertion can never catch the inversion."""
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        rpc = MultiSourceEthRpc([_Source() for _ in range(5)])
+        assert quorum_combiner(rpc)(self._answers()) == 500
+
+    def test_the_direction_is_the_SAFE_one_for_a_staleness_read(self) -> None:
+        """Why largest and not smallest: the consumer asks "is the chain fresh". Taking the n-th
+        SMALLEST head would let a minority of lagging endpoints drag the answer down, which is the
+        denial the quorum-th was introduced to remove."""
+        from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+        fresh, lagging = 1_700_003_600, 1_700_000_000
+        rpc = MultiSourceEthRpc([_Source() for _ in range(5)], min_agreeing=2)
+        assert quorum_combiner(rpc)([fresh, fresh, fresh, lagging, lagging]) == fresh
+
+
 class TestTheStalenessAbortNeedsTheQUORUM_head:
     """MIN closed an attack and opened a denial; the quorum-th value closes both.
 

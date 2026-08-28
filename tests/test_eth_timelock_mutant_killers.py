@@ -134,6 +134,45 @@ class TestTheFloorBlocksTypeGuard:
         assert _size(eth_timeout_s=86_400, interval=36.0, floor_blocks=12).value > 12
 
 
+class TestTheAnalyticValueNeedsAtMostOneStepDown:
+    """Four mutants on the sizer's arithmetic line survive, and I first called them equivalent.
+
+    `t_rxd_blocks = ceil(budget/interval) - 1` mutates to `- 0`, `// 1`, `* 1`, `** 1` — all of
+    which are `ceil(budget/interval)` — and the step-down loop then walks the value down until the
+    punctuality gate accepts it, so the final answer is the same. "Equivalent", I said.
+
+    That is only true because `_SIZER_GATE_STEPS` is 3, giving the loop room to absorb a wrong
+    starting point. The code's own comment claims the analytic value is "never more than one block
+    out", and that claim IS testable — it is the difference between a loop that corrects a rounding
+    edge and a loop quietly repairing arithmetic nobody checks.
+
+    Pinning it kills all four, and it pins a real invariant rather than an implementation detail:
+    if the analytic value ever needs two steps, the arithmetic has drifted from the gate and the
+    loop is hiding it.
+    """
+
+    @staticmethod
+    def _steps_needed(*, eth_timeout_s: int, interval: float, lock_delay: int = 600) -> int:
+        """How far the loop must walk from the analytic value to reach one the gate accepts."""
+        import math
+
+        margin = _margin()
+        budget = eth_timeout_s - margin.total_s() - lock_delay
+        analytic = math.ceil(budget / interval) - 1
+        emitted = _size(eth_timeout_s=eth_timeout_s, interval=interval, lock_delay=lock_delay).value
+        return analytic - emitted
+
+    @pytest.mark.parametrize("interval", [36.0, 36.2, 36.4, 43.3, 41.618, 60.0, 22.7])
+    @pytest.mark.parametrize("eth_timeout_s", [43_200, 61_200, 86_400, 111_600])
+    def test_the_loop_never_walks_more_than_one_block(self, interval: float, eth_timeout_s: int) -> None:
+        steps = self._steps_needed(eth_timeout_s=eth_timeout_s, interval=interval)
+        assert 0 <= steps <= 1, (
+            f"the analytic value needed {steps} step-downs at interval={interval}, "
+            f"eth_timeout_s={eth_timeout_s}. The code documents at most one; more means the "
+            f"arithmetic has drifted from the gate and the step-down loop is concealing it."
+        )
+
+
 def test_the_cross_clock_margin_is_immutable() -> None:
     """Killed mutant: `@dataclass(frozen=True)` -> `frozen=False`.
 
