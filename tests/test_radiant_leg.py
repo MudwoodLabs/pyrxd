@@ -1248,9 +1248,11 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         assert value == 1000
 
     @pytest.mark.xfail(
-        reason="#505: the FT gate compares carrier PHOTONS against a TOKEN COUNT. An honest maker "
-        "funding 1000 tokens on ordinary dust is refused; a dishonest one funding 1000 photons "
-        "carrying 1 token is accepted. Unfixed — this test is the live record of it.",
+        reason="#505 PARTIALLY fixed: the theft half is closed (FT now fails CLOSED at the gate "
+        "rather than accepting a covenant funded with 1000 photons carrying 1 token), but the "
+        "honest half still does not work — supporting it needs a refValueSum read for the token "
+        "ref, which no client exposes. This test stays the live record of the unsupported honest "
+        "case and will pass the day that read exists.",
         strict=True,
     )
     @pytest.mark.asyncio
@@ -1265,6 +1267,65 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         terms = _ft_terms(amount=1000)
         leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
         _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+
+class TestTheFtGateFailsClosedRatherThanComparingWrongUnits:
+    """#505's theft half. The covenant enforces ``OP_REFVALUESUM_OUTPUTS == amount`` on the TOKEN;
+    the funding gate can only read the carrier's native photon value. Comparing them let a maker
+    fund 1000 photons carrying ONE token and pass the gate — the taker then locked its counter
+    leg, the maker claimed it, and the taker's own claim could never satisfy refValueSum. One-sided
+    loss.
+
+    The gate now refuses FT outright. That does not make FT swaps work; it stops them being
+    exploitable while they do not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_HOSTILE_funding_is_no_longer_accepted(self) -> None:
+        """1000 photons carrying 1 token: the exact shape that used to pass. The photon value
+        matches `radiant_amount` by construction, which is why the old comparison could not tell
+        this from an honest funding."""
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        with pytest.raises(ValidationError, match="#505"):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_what_it_cannot_check(self) -> None:
+        """A gate that refuses without saying why sends an operator hunting a funding bug that is
+        not there. The message has to name the missing capability, not the symptom."""
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
+        with pytest.raises(ValidationError, match="refValueSum"):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+
+class TestTheFtRefusalDoesNotTouchRxdOrNft:
+    """The honest-path pair. A fix that removes a theft path by refusing everything is not a fix —
+    RXD and NFT compare photons against photons and must be completely unaffected."""
+
+    @pytest.mark.asyncio
+    async def test_an_RXD_covenant_still_verifies(self) -> None:
+        terms = _rxd_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
+
+    @pytest.mark.asyncio
+    async def test_an_NFT_covenant_still_verifies(self) -> None:
+        terms = _nft_terms(carrier=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
+
+    @pytest.mark.asyncio
+    async def test_an_RXD_covenant_funded_WRONG_is_still_refused(self) -> None:
+        """And the pre-existing fail-closed behaviour for a mis-funded RXD covenant is intact —
+        the FT refusal must not have short-circuited the value check for everyone else."""
+        terms = _rxd_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=999, confirmations=6))
+        with pytest.raises((NetworkError, ValidationError)):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
 
 
 class TestAnEvictedClaimCanBeRebroadcast:

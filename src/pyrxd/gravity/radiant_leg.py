@@ -142,6 +142,42 @@ class RadiantBroadcaster(Protocol):
         ...
 
 
+def expected_carrier_photons(terms: NegotiatedTerms) -> PhotonValue:
+    """The NATIVE photon value the covenant's carrier must hold — or refuse, for FT.
+
+    #505. ``terms.radiant_amount`` holds THREE units selected by ``asset_variant``: RXD photons,
+    an NFT carrier value, or an FT TOKEN COUNT. ``find_covenant_utxo`` matches its argument against
+    the UTXO's native ``value``, so passing the FT case compares a token count against carrier
+    photons. Both directions are wrong:
+
+    * honest maker funds 1000 tokens on 546 photons of dust -> REFUSED, which is why FT swaps do
+      not work today;
+    * hostile maker funds 1000 photons carrying 1 token -> ACCEPTED. The taker sees "funded",
+      locks its counter leg, and the maker claims it. The taker's own claim then cannot succeed,
+      because the FT covenant enforces ``OP_REFVALUESUM_OUTPUTS == amount`` on the TOKEN and the
+      input carries one. One-sided loss.
+
+    An FT swap can therefore only complete when the carrier's photon count HAPPENS to equal the
+    token count — the coincidence that hides the conflation, and the same coincidence that makes
+    the gate unable to tell an honest funding from a hostile one.
+
+    A correct FT gate must read the covenant UTXO's ``refValueSum`` for the token ref. No client
+    exposes that today (``get_utxos`` returns the native value only; RXinDexer's balance reads are
+    keyed by address, not outpoint), so this fails CLOSED rather than comparing the wrong number.
+    That removes the theft path and makes the existing breakage explicit; it does not make FT
+    swaps work, and is not claimed to.
+    """
+    if terms.asset_variant == "ft":
+        raise ValidationError(
+            "FT swaps are refused at the funding gate (#505): the covenant enforces "
+            "refValueSum(ref) == amount on the TOKEN, while this gate can only read the carrier's "
+            "native photon value, so it cannot tell an honestly-funded covenant from an "
+            "under-funded one. Refusing rather than comparing a token count against photons. "
+            "RXD and NFT swaps are unaffected."
+        )
+    return PhotonValue(int(terms.radiant_amount))
+
+
 class RadiantChainIO:
     """Thin chain helper over an ``ElectrumXClient``-like object.
 
@@ -558,16 +594,9 @@ class RadiantCovenantLeg:
         cov = self._build_covenant(terms)
         outpoint, _value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
+            # #505 FIXED at the gate: FT refuses rather than comparing a token
+            # count against the carrier's photons. See expected_carrier_photons.
+            expected_value=expected_carrier_photons(terms),
         )
         return outpoint
 
@@ -611,16 +640,9 @@ class RadiantCovenantLeg:
             raise ValidationError("min_confirmations must be a non-negative int or None")
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
+            # #505 FIXED at the gate: FT refuses rather than comparing a token
+            # count against the carrier's photons. See expected_carrier_photons.
+            expected_value=expected_carrier_photons(terms),
         )
         confs = await self.chain_io.confirmations(outpoint.split(":")[0])
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
@@ -649,16 +671,9 @@ class RadiantCovenantLeg:
         # would let anyone brick this spend by paying the covenant SPK a second time.
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=record.terms.radiant_amount,  # type: ignore[arg-type]
+            # #505 FIXED at the gate: FT refuses rather than comparing a token
+            # count against the carrier's photons. See expected_carrier_photons.
+            expected_value=expected_carrier_photons(record.terms),
             pin_outpoint=record.radiant_covenant_outpoint,
         )
         txid = outpoint.split(":")[0]
