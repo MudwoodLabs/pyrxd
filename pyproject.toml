@@ -518,8 +518,12 @@ omit = [
     # quietly stopped being true as the tests arrived, and nothing was watching for that.
     #
     # Only the three genuinely below the gate remain. They leave the same way: by being tested.
-    # `scripts/check_coverage_omissions.py` now fails when an entry here rises above the gate, so
-    # the next one cannot go stale unnoticed.
+    # `scripts/check_coverage_omissions.py` fails when an entry here rises above the gate, and the
+    # weekly `coverage-exemptions` job in .github/workflows/mutation.yml RUNS it. That second half
+    # was missing for a day: the script existed as a taskipy task nothing invoked, while this
+    # comment already claimed "the next one cannot go stale unnoticed" — a mechanism built to catch
+    # decayed claims whose own claim decayed on arrival. Caught by a verification pass, not by
+    # reading it.
     "src/pyrxd/eth_wallet/keys.py",          # 83% — provenance/verdict logic covered, network calls not
     "src/pyrxd/eth_wallet/locator.py",       # 81% — equality/normalisation covered, on-chain reads not
     "src/pyrxd/eth_wallet/private_submit.py",  # 53% — Flashbots header signing covered, submission not

@@ -17,6 +17,7 @@ that no longer exists is silently no-op, and the group looks gated while running
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -43,14 +44,38 @@ def _value_groups() -> list[str]:
 
 
 def main() -> int:
-    groups = _value_groups()
-    unknown = sorted(set(_MIN_KILL) - set(groups))
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--only",
+        default="",
+        help="space-separated subset to emit; empty means every VALUE group. The workflow's "
+        "`groups` dispatch input feeds this — it used to be declared and read nowhere.",
+    )
+    args = ap.parse_args()
+
+    all_groups = _value_groups()
+
+    # Validate thresholds against the FULL set, never the filtered one. A floor for a group that
+    # exists is correct even when this particular run filters it out; checking against the subset
+    # made `--only fee` fail with "threshold set for a group not in VALUE_GROUPS: ['ethtimelock']",
+    # which is both wrong and alarming. Validate what is DECLARED, emit what is SELECTED.
+    unknown = sorted(set(_MIN_KILL) - set(all_groups))
     if unknown:
-        # Fail loudly rather than emit a threshold that can never apply.
         raise SystemExit(f"threshold set for group(s) not in VALUE_GROUPS: {unknown}")
+
+    groups = all_groups
+    wanted = args.only.split()
+    if wanted:
+        bad = sorted(set(wanted) - set(all_groups))
+        if bad:
+            raise SystemExit(f"unknown group(s): {bad}; known: {all_groups}")
+        groups = [g for g in all_groups if g in wanted]
+
     matrix = {
         "group": groups,
-        "include": [{"group": g, "min_kill": str(v)} for g, v in _MIN_KILL.items()],
+        # Only floors for groups actually being run — an include entry for an absent group is
+        # inert, but emitting it invites the same "looks gated, runs report-only" confusion.
+        "include": [{"group": g, "min_kill": str(v)} for g, v in _MIN_KILL.items() if g in groups],
     }
     json.dump(matrix, sys.stdout, separators=(",", ":"))
     return 0

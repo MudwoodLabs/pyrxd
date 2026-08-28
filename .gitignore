@@ -220,3 +220,7 @@ docs/brainstorms/gravity-ref-spike/.*
 # private downstream project; must NOT be committed to public pyrxd.
 docs/brainstorms/2026-05-29-eth-rxd-htlc-reuse-aware-reaudit.md
 docs/plans/2026-05-29-feat-eth-rxd-htlc-tier1-reuse-refactor-plan.md
+
+# Local list of private project names for scripts/check-no-private-links.py.
+# Never committed: a list of names that must not appear in a public repo cannot live in one.
+.private-names

@@ -180,7 +180,7 @@ pattern that does not match, an insertion anchored to the wrong line, an indenta
 mismatch — each exits 0, changes nothing, and the suite then passes for the most boring
 reason available. It reads exactly like a surviving mutant.
 
-Observed in a sibling repo (FlipperHub, 2026-08): of five mutants recorded as SURVIVED in one
+Observed in another project (2026-08): of five mutants recorded as SURVIVED in one
 session, **three had never been applied**. The tests were fine; the measurement was fiction.
 
 cosmic-ray cannot make this mistake — it rewrites the AST and writes the mutant file itself,

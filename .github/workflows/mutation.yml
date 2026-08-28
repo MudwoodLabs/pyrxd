@@ -64,6 +64,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The coverage-exemption staleness check. It lived as a taskipy task and NOTHING invoked it —
+  # while pyproject's own comment claimed "the next one cannot go stale unnoticed". A mechanism
+  # built to catch decayed claims, whose own claim decayed on arrival. It runs here rather than in
+  # `task ci` because it costs a full extra coverage pass; weekly is the right cadence for a check
+  # on whether an exemption is still earned.
+  coverage-exemptions:
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r ci/poetry-pin.txt --require-hashes
+      - run: poetry install --sync --no-interaction
+      - run: poetry run python scripts/check_coverage_omissions.py
+
   # DERIVE the matrix instead of restating it. The list below used to be a hand-typed copy of
   # VALUE_GROUPS in scripts/mutation_test.sh, and the two drifted: `mint` and `glyphscript` were
   # never run weekly, `keys` was reachable from neither meta-group, and `ethleg`/`ethtimelock`
@@ -78,7 +96,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: groups
-        run: echo "matrix=$(python3 scripts/mutation_groups.py)" >> "$GITHUB_OUTPUT"
+        # The `groups` dispatch input was DECLARED and read nowhere: `-f groups=fee` was
+        # silently ignored and the operator got the whole matrix. Same class as a CLI flag
+        # with no caller, in YAML, where no scan reaches. Now it filters.
+        run: |
+          echo "matrix=$(python3 scripts/mutation_groups.py --only '${{ inputs.groups }}')" >> "$GITHUB_OUTPUT"
 
   mutate:
     needs: discover
