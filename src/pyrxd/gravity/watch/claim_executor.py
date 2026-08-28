@@ -438,8 +438,15 @@ class ClaimExecutor:
         # 7. FRESH covenant read (idempotency + asset-lock height) and FRESH finality re-assess.
         try:
             spk = await leg.expected_covenant_scriptpubkey(record.terms)
+            # PIN, like the coordinator's spend path. Without this the executor re-discovers by
+            # SPK scan, so a second payment to the covenant address makes the scan ambiguous, the
+            # refusal is classified below as a transient read fault, and this retries every tick
+            # until t_rxd expires while looking healthy — verbatim the behaviour the pin exists to
+            # stop. The pin was added to `_resolve_covenant` and this second reader was missed.
             outpoint, _value, funded_h = await leg.chain_io.find_covenant_utxo(
-                spk, expected_value=record.terms.radiant_amount
+                spk,
+                expected_value=record.terms.radiant_amount,
+                pin_outpoint=record.radiant_covenant_outpoint,
             )
         except NetworkError as exc:
             # The covenant UTXO is gone → already claimed (by us on a prior tick, the taker, or any

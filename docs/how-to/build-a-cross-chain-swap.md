@@ -3,7 +3,10 @@
 pyrxd ships a **trustless cross-chain atomic swap**: trade a Radiant asset (RXD, a
 Glyph FT, or a Glyph NFT) against BTC or ETH with no custodian and no trusted third
 party. It's a hash-timelock (HTLC) swap driven by a chain-neutral coordinator, proven
-end-to-end on regtest and on small real-value mainnet/Sepolia runs.
+end-to-end on regtest and on small real-value mainnet/Sepolia runs. The EVM counter-leg can
+also settle in **USDC or USDT** rather than native ETH — the same HTLC, but a weaker trust
+model, because a stablecoin issuer can freeze the asset; see *Settling the counter-leg in a
+stablecoin* below before you use it.
 
 > **New to this?** Start with the guided tutorial —
 > [Trustless cross-chain swap: RXD ↔ ETH](../tutorials/cross-chain-swap.md) — which walks a full
@@ -111,6 +114,7 @@ maintained harnesses:
 |---|---|
 | BTC ↔ RXD full swap on regtest (happy / mutual-refund / maker-stall / reorg-gate) | `tests/test_xchain_swap_regtest_e2e.py` |
 | ETH ↔ RXD full swap on Anvil + regtest | `tests/test_xchain_eth_swap_regtest_e2e.py` |
+| RXD ↔ USDC/USDT full swap (Radiant regtest + a forked-mainnet token) | `tests/test_xchain_erc20_usdc_lifecycle_e2e.py` |
 | Two-party adversarial scenarios (hostile maker/taker, races) | `tests/test_xchain_eth_adversarial_e2e.py` |
 | Operational driver (Sepolia + RXD, at-keyboard, dust) | `scripts/eth_swap_run.py` |
 
@@ -122,6 +126,143 @@ binary (ETH) or a `bitcoin-core` regtest image (BTC):
 $ RADIANT_REGTEST=1 XCHAIN_REGTEST=1 pytest tests/test_xchain_swap_regtest_e2e.py -m integration
 $ XCHAIN_ETH_REGTEST=1 pytest tests/test_xchain_eth_swap_regtest_e2e.py -m integration
 ```
+
+## Settling the counter-leg in a stablecoin (USDC / USDT)
+
+The EVM counter-leg can hold **USDC or USDT** instead of native ETH. The reason is pricing: a swap
+is negotiated now and settles hours later, so an ETH-denominated counter-leg carries ETH/RXD
+volatility across the entire timelock window, and whatever the pair does in between lands on one of
+the two parties. A stablecoin leg removes that — the amount agreed is the amount that settles.
+
+The protocol is unchanged. `Erc20Htlc.sol` was deliberately given the same `claim(bytes32)` /
+`refund()` signatures and the same **un-indexed** `Claimed(bytes32)` event as the native contract,
+so `Erc20HtlcLeg` subclasses `EthHtlcContractLeg` and inherits secret recovery, finality and the
+refund path unchanged. Wiring it is one substitution:
+
+```python
+from pyrxd import EthLeg, KNOWN_EVM_CHAINS
+from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.eth_wallet.tokens import token_for
+
+base = KNOWN_EVM_CHAINS["base-sepolia"]              # or "base" (mainnet; opt-in required)
+usdc = token_for("USDC", base.chain_id)              # (symbol, chain id) → a PINNED address
+
+rpc = EthRpc(url, expected_chain_id=base.chain_id)
+contract_leg = Erc20HtlcLeg(token=usdc, rpc=rpc, signing_key=key, chain_id=base.chain_id,
+                            artifact=ERC20_ARTIFACT)  # the Erc20Htlc artifact, not the native one
+eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)
+```
+
+`scripts/eth_swap_run.py` exposes the same choice as `--counter-asset` (derived from the registry,
+so a newly pinned symbol is selectable the day it lands) with `--token-amount` in base units.
+
+Four things differ from the native leg, and each is a place to get it wrong:
+
+- **The asset is an address, never a symbol.** `token_for(symbol, chain_id)` resolves from a pinned
+  registry and refuses anything else. Several chains carry both Circle's native USDC and a bridged
+  `USDC.e` that reports the identical `symbol()` and `decimals()` — verified by reading them off the
+  chains on 2026-08-23 — so nothing in a token's self-description tells them apart. The bridged
+  contracts are refused **by address**, named for what they are. USDC is pinned on Ethereum, Base,
+  Optimism, Arbitrum One and Linea (and on the Sepolia testnet of all but Linea); USDT on Ethereum,
+  Optimism and Base.
+- **Amounts are base units, not wei.** USDC and USDT are 6-decimal; a 6-vs-18 mixup is a factor of
+  10^12 in every amount. The decimals are pinned *and* cross-checked against the live contract at
+  swap start, and the durable record carries its own `"eth-erc20"` chain tag so no reader can take
+  base units for wei.
+- **Funding is two transactions** — deploy, then a plain `transfer`. A payable constructor cannot
+  pull a token, and there is no `approve` anywhere, so no allowance is ever created. "Deployed" no
+  longer implies "funded"; the coordinator persists the deployed address the instant it confirms and
+  strictly before the tokens move, so a crash mid-fund never leaves value at an address nobody
+  recorded.
+- **The terms name the token.** `NegotiatedTerms.token_address` binds the asset, and the leg refuses
+  to fund or to build a locator if the terms and the leg disagree in either direction — before
+  anything is broadcast.
+
+### What you give up: the issuer
+
+Native ETH is held by the EVM, and nobody can stop a transfer of it. USDC and USDT are held by
+contracts whose issuer can **freeze an address**, which puts a third party inside a two-party
+protocol.
+
+It bites exactly where an HTLC is most exposed. Claiming one leg publishes the preimage, and from
+that instant the counterparty can take the other. A freeze landing in that window means the
+counterparty sweeps while the frozen party can neither claim nor refund — a one-sided loss.
+**Atomicity on this corridor is conditional on the issuer not intervening.** On the native ETH leg
+there is no such party, and the refund right is unconditional.
+
+Two of these were executed on a mainnet fork against the real USDC contract with the live
+blacklister impersonated; the rest follows from the token's own transfer rule and has not been
+run. The distinction is kept because only the measured cells are evidence:
+
+| what is frozen | `claim` | `refund` | recoverable? | source |
+|---|---|---|---|---|
+| the claimant | reverts | works | yes — refund after the timeout | `claim` **measured**; `refund` inferred |
+| the refundee | works | reverts | yes — the claim still pays | inferred, not run |
+| **the HTLC contract itself** | **reverts** | **reverts** | **NO — the funds are stranded permanently** | **both measured** |
+
+The third row is the one that matters, and it is the one that was actually executed: no timeout
+rescues it. The inferred cells follow because a blacklisted address cannot be a party to a USDC
+transfer in either direction — sound reasoning, but reasoning.
+
+What the code does about that — none of which is a fix:
+
+- **A pre-reveal gate, inside `claim`.** Before it will build a claim, the leg reads freeze status
+  **at the tip** for the HTLC contract address and the claimant — the two addresses a claim actually
+  touches — and refuses if either is frozen. Nothing has been broadcast at that point, so the
+  preimage is still secret and abandoning the swap costs only fees. The gate lives inside the
+  dangerous operation rather than beside it, because a gate the caller must remember to invoke is a
+  gate that eventually is not invoked. (The refundee is deliberately *not* checked here: a claim
+  sweeps to the claimant and never touches the refundee, so a frozen refundee cannot make the claim
+  revert, and refusing on it would hand the counterparty a free veto over value the claimant has
+  already earned. The refundee is checked at the other end instead — see the next bullet.)
+- **A pre-fund gate, before you pay in.** `refund()` pays the refundee, so funding a leg whose
+  refundee is already frozen buys a position with no exit: if the counterparty never claims, the
+  tokens stay in the contract for good. Before the deploy spends gas, and again inside the step
+  that actually moves the tokens, the leg reads freeze status for the claimant, the refundee and —
+  once it exists — the contract itself. It refuses only when something is about to be sent, so a
+  resume whose push already landed can still recover its locator.
+- **It narrows the window; it does not close it.** Check-then-reveal is itself a race. A freeze
+  landing between the check and the broadcast — or at any point after the reveal — is unmitigated by
+  construction. It is a seatbelt, not a fix.
+- **An unreadable answer is a refusal, not a "no".** The freeze read raises rather than reporting
+  "not frozen" when the RPC is down, throttled or returning garbage. It defends a *failing* provider,
+  not a *lying* one: the read is single-source, so a hostile node claiming "not frozen" is uncaught.
+- **One contract per swap.** Each swap gets a fresh `CREATE` address, so a contract freeze costs one
+  swap rather than every open swap at once.
+- **A short funded window is a safety property here** in a way it is not for native ETH — exposure is
+  the time the tokens sit in the contract. That cuts against the usual instinct to be generous with
+  timelocks.
+
+**Two pinned tokens cannot freeze — and that is still not "no counterparty risk".** OP-stack bridged
+USDT on Optimism (`0x94b008aA…`) and Base (`0xfde4C96c…`) has no blacklist under any spelling, and
+that is established positively rather than inferred from a probe that found nothing: verified
+2026-08-25, `l1Token()` returns Tether's real L1 USDT, neither contract is a proxy (both EIP-1967
+slots empty), and an opcode-aware disassembly finds no `DELEGATECALL`, `CALLCODE`, `SELFDESTRUCT` or
+`CREATE*` — so the code cannot be swapped out. The only privileged entry points are bridge-gated mint
+and burn, and that is the residual: **burn is bridge-callable against an arbitrary holder, and the L2
+bridge is itself an upgradeable system contract.** That is a different risk — bridge governance
+rather than issuer discretion — not an absent one, and the pre-reveal gate does not cover it, because
+it only knows about freezes. A token whose freeze surface could not be established that way stays
+unpinned and `token_for` refuses it (Linea USDT is an upgradeable proxy with a populated admin slot;
+"cannot freeze today" is not the property worth pinning).
+
+The full analysis lives in the [threat model](../threat-model.md), and
+[the design decision](../solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.md)
+records the residual as accepted. **Do not describe this corridor as trustless.**
+
+### What has actually been proven
+
+`tests/test_xchain_erc20_usdc_lifecycle_e2e.py` drives the production `SwapCoordinator` from
+NEGOTIATED to COMPLETED — plus the refund path — with the Radiant leg on a regtest node and the token
+leg on an **anvil mainnet fork**: the real token contract, its real blacklist, real 6-decimal
+arithmetic. It re-runs against Base, which is what exercises the cannot-freeze branch of the
+pre-reveal gate. `tests/test_erc20_leg_fork_integration.py` covers the leg itself the same way,
+including a real claim inside the inherited gas budget.
+
+Both need a fork RPC (`PYRXD_ETH_FORK_RPC`) and skip cleanly without one, so they are local/manual
+gates rather than per-push CI. And **no real value has moved on a stablecoin mainnet**: the one dust
+run so far paired a mainnet Radiant leg with **Base Sepolia testnet** USDC.
 
 ## Adding another counter-chain
 

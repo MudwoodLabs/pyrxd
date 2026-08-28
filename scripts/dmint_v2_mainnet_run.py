@@ -26,8 +26,10 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 import sys
 import time
+from pathlib import Path
 
 from radiant_mainnet_chainio import SshTrRadiantClient
 
@@ -63,7 +65,13 @@ _MINE_TIMEOUT_S = 2400.0
 # recreated target on-chain, exactly matching compute_next_target_linear.
 _MODE = os.environ.get("DMINT_RUN_MODE", "fixed").lower()
 _DAA_MODE = DaaMode.LWMA if _MODE == "lwma" else DaaMode.FIXED
-_STATE = f"/tmp/dmint_v2_mainnet_state_{_MODE}.json"  # noqa: S108 — ephemeral ops state (0600); holds throwaway WIFs
+#: NOT /tmp. O_NOFOLLOW closed the symlink half of this weakness and left the other half open: a
+#: FIXED, PREDICTABLE path in a world-writable directory can also be pre-created by another user as
+#: an ORDINARY file, which O_NOFOLLOW happily opens — and this file holds real (dust) WIFs, so the
+#: run would write keys into a file the attacker can read. A path only this user can create removes
+#: the precondition instead of defending against one exploitation of it. Same move as the swap
+#: runner's report, whose /tmp default cost a real run's provenance.
+_STATE = str(Path(f"~/.pyrxd/dmint_v2_mainnet_state_{_MODE}.json").expanduser())
 _DEPLOY_LAST_TIME = 1_700_000_000 if _MODE == "lwma" else 0  # past ts so the mint nLockTime is final
 _TARGET_TIME = 60
 _MINT_CURRENT_TIME = _DEPLOY_LAST_TIME + 30 if _MODE == "lwma" else 0  # fast block → LWMA lowers target
@@ -121,16 +129,77 @@ def _p2pkh_spk(key: PrivateKey) -> bytes:
     return b"\x76\xa9\x14" + bytes(Hex20(key.public_key().hash160())) + b"\x88\xac"
 
 
+def _assert_private_descriptor(fd: int, path: str) -> None:
+    """Refuse an already-open file that is not a private, regular file this user owns.
+
+    O_NOFOLLOW answers "is this a symlink". It does not answer "did somebody else create this",
+    and O_CREAT leaves an EXISTING file's mode alone — so a pre-placed world-readable file passes
+    the open and then receives the WIFs. Checked on the descriptor rather than the path, because
+    re-examining the path would be a different file.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"{path} is not a regular file; refusing to use it for run state")
+    if st.st_uid != os.getuid():
+        raise SystemExit(
+            f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: it holds the carve UTXOs' keys."
+        )
+    if st.st_mode & 0o077:
+        raise SystemExit(
+            f"{path} is mode {oct(st.st_mode & 0o777)}: accessible to other users, and it holds "
+            "real keys. Remove it and re-run."
+        )
+
+
 def _save(d: dict) -> None:
-    # 0600 — the state holds the carve UTXOs' WIFs (dust, but real keys).
-    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(d, f, indent=2)
+    """0600 — the state holds the carve UTXOs' WIFs (dust, but real keys).
+
+    O_NOFOLLOW is load-bearing, not decoration. `_STATE` is a FIXED, PREDICTABLE path in
+    world-writable /tmp, and the previous `O_CREAT|O_TRUNC` open followed a pre-placed symlink and
+    truncated whatever it pointed at — any local user could aim it at a file this UID can write and
+    have the next run silently clobber it. Reproduced: the write succeeded, the victim file was
+    overwritten, and the symlink survived so the attack repeated.
+
+    The sibling `_dust_swap_shared.atomic_write_mode_600` is immune because it is O_EXCL, but that
+    is create-only and this state is rewritten as the run progresses. O_NOFOLLOW is the primitive
+    that fits: it refuses a symlink (ELOOP) while still allowing an ordinary file to be truncated.
+    """
+    Path(_STATE).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # NO O_TRUNC ON THE OPEN. Truncation is part of the open() syscall, so an O_TRUNC open
+    # destroys the file's contents BEFORE any check can refuse it: a file that fails the private-
+    # descriptor test below was already emptied by the call that discovered it. Measured — a
+    # pre-existing 186-byte file went to 0 bytes and then the run refused. No key leaked (the
+    # json.dump is behind the check), but it is a self-DoS on the operator's own file, and with a
+    # pre-existing group-writable ~/.pyrxd a hardlink turns it into a clobber primitive.
+    #
+    # Open WITHOUT truncating, check the descriptor, and only then ftruncate — so nothing is
+    # destroyed until the file has been established as one this user owns privately.
+    # O_NONBLOCK so a FIFO at this path cannot HANG the open before the check can reject it;
+    # a no-op for the regular files this accepts.
+    fd = os.open(_STATE, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        # O_CREAT does not apply the mode to a file that already EXISTS, so a pre-created
+        # world-readable file keeps its mode and quietly receives the keys. Check the descriptor.
+        _assert_private_descriptor(fd, _STATE)
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f, indent=2)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _load() -> dict:
-    with open(_STATE) as f:
-        return json.load(f)
+    # O_NOFOLLOW on the READ side too: a symlink here lets an attacker substitute the WIFs and
+    # outpoints this run then acts on, which is the more dangerous half of the same weakness.
+    fd = os.open(_STATE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        _assert_private_descriptor(fd, _STATE)
+        with os.fdopen(fd) as f:
+            return json.load(f)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _key_of(g: dict) -> PrivateKey:

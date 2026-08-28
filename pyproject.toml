@@ -231,13 +231,43 @@ lint = "ruff check src tests examples && bandit -r src/ -c pyproject.toml --quie
 format = "ruff format src tests examples"
 format-check = "ruff format --check src tests examples"
 test = "pytest"
-typecheck = "mypy src/pyrxd/security/ src/pyrxd/glyph/transfer.py src/pyrxd/glyph/client.py"
+# `task typecheck` runs mypy --strict over the UNIT-CRITICAL surface: every module where a
+# number's UNIT decides whether funds move. Three confirmed defects came from unit conflation
+# (block height vs confirmation count, photon value vs FT token count, seconds vs blocks), and
+# `pyrxd.security.units` turns each pair into a distinct NewType so the conflation is a check
+# error rather than a review catch. See that module's docstring.
+#
+# The scope is deliberately NOT `src/` — it is exactly the files that have been typed and are
+# green. A gate that fails on hundreds of pre-existing errors gets switched off. To widen it,
+# clear a module's errors FIRST, then add its path here.
+#
+# scripts/ is in scope on purpose: `radiant_mainnet_chainio.py` is the mainnet transport that
+# produced the height/confs conflation, and `_dust_swap_shared.py` holds the reorg-gate anchor
+# that consumed it. Excluding them would leave the type-checked boundary short of where the bug
+# actually lived.
+typecheck = """mypy \
+  src/pyrxd/security/ \
+  src/pyrxd/glyph/transfer.py \
+  src/pyrxd/glyph/client.py \
+  src/pyrxd/network/electrumx.py \
+  src/pyrxd/gravity/radiant_leg.py \
+  src/pyrxd/gravity/swap_state.py \
+  src/pyrxd/gravity/watch/decide.py \
+  src/pyrxd/gravity/watch/quorum.py \
+  scripts/radiant_mainnet_chainio.py \
+  scripts/_dust_swap_shared.py"""
 coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
 coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
 # `task check-private-links` ensures tracked docs (and staged additions) don't
 # link to gitignored paths. Catches leaks where a public doc references a
 # private design doc — broken links + leaked filenames in commit history.
 check-private-links = "python3 scripts/check-no-private-links.py"
+# An exemption is a CLAIM about the world, and claims go stale silently. rpc.py sat omitted
+# on "only the Anvil suite covers it" while reaching 100% offline; measuring found eight more
+# in the same block, including the HTLC leg, ERC-20 leg and quorum layer at 91% — the
+# fund-safety core, excluded from the gate meant to hold it. Costs a second coverage pass, so
+# it is a deliberate check rather than part of `task ci`.
+check-coverage-omissions = "python3 scripts/check_coverage_omissions.py"
 # `task check-vendor` asks GitHub whether the sha256-pinned Radiant Core consensus
 # sources under tests/vendor/radiant_core/ have moved upstream, and whether the pinned
 # tag still shares those files with the release the regtest image is built from.
@@ -361,6 +391,16 @@ skips = []
 strict = true
 python_version = "3.10"
 exclude = ["tests/"]
+# Resolve `pyrxd` from THIS checkout's src/, never from whatever is installed in the venv.
+# Without it, `mypy scripts/foo.py` on its own resolved the package out of site-packages and
+# reported a brand-new module as missing.
+mypy_path = "src"
+# Report errors ONLY for the files named on the command line; still READ everything they import
+# so inference is real. Without this, `task typecheck`'s declared 3-path scope actually reported
+# 296 errors across 40 transitively-imported modules and had been failing (and so failing
+# `task ci`) rather than gating anything. A gate that is red on arrival is not a gate — this is
+# what lets the scope below be both meaningful and honestly green.
+follow_imports = "silent"
 
 [tool.ruff]
 target-version = "py310"
@@ -463,8 +503,30 @@ omit = [
     #   test_finality_verdict.py, test_eth_private_submit.py; provenance / finality-verdict /
     #   locator-equality / Flashbots header-signing logic is covered, only the network calls are not.
     # counter_chain_leg.py (the pure ABC) is intentionally NOT omitted — it is 100% covered offline.
-    # Narrow this to rpc.py + the on-chain-call methods (via `# pragma: no cover`) when Anvil runs in CI.
-    "src/pyrxd/eth_wallet/*",
+    # NARROWED AGAIN 2026-08-28, by MEASUREMENT rather than by reading the rationale.
+    #
+    # The comment above said these files are "100% transport ... exercised by the Phase-4
+    # Anvil/Sepolia integration suite, which CI does not yet run". Measured with the omit disabled
+    # against the OFFLINE suite, nine of the eleven were at or above the 85% gate:
+    #
+    #   __init__ 100%  chains 100%  rpc 100%  erc20 97%  erc20_leg 91%  htlc_leg 91%
+    #   multi_rpc 91%  secret 88%  tokens 88%
+    #
+    # So the exemption had been excluding the HTLC leg, the ERC-20 leg and the quorum layer — the
+    # fund-safety core of this branch — from the coverage gate. A regression in any of them could
+    # not move the number. Nobody read the list wrong; the rationale was true when written and
+    # quietly stopped being true as the tests arrived, and nothing was watching for that.
+    #
+    # Only the three genuinely below the gate remain. They leave the same way: by being tested.
+    # `scripts/check_coverage_omissions.py` fails when an entry here rises above the gate, and the
+    # weekly `coverage-exemptions` job in .github/workflows/mutation.yml RUNS it. That second half
+    # was missing for a day: the script existed as a taskipy task nothing invoked, while this
+    # comment already claimed "the next one cannot go stale unnoticed" — a mechanism built to catch
+    # decayed claims whose own claim decayed on arrival. Caught by a verification pass, not by
+    # reading it.
+    "src/pyrxd/eth_wallet/keys.py",          # 83% — provenance/verdict logic covered, network calls not
+    "src/pyrxd/eth_wallet/locator.py",       # 81% — equality/normalisation covered, on-chain reads not
+    "src/pyrxd/eth_wallet/private_submit.py",  # 53% — Flashbots header signing covered, submission not
 ]
 
 [tool.coverage.report]

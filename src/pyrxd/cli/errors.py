@@ -88,7 +88,13 @@ class CliError(click.ClickException):
     # exception traceback (standard format — no captured locals).
     def show(self, file=None) -> None:  # type: ignore[override]
         click.echo(self.format_message(), file=file, err=True)
-        if _DEBUG and self.__cause__ is not None:
+        # Through the accessor, not the global. `docs/cli-security-backlog.md` records the
+        # --debug traceback as "wired up via errors.set_debug / is_debug", and it was half true:
+        # set_debug IS called from main.run(), but the read went straight to the module global, so
+        # is_debug() had no caller at all and the documented design was not the implemented one.
+        # A reachability scan surfaced it. Reading through the accessor makes the doc accurate and
+        # keeps the global's single reader in one place.
+        if is_debug() and self.__cause__ is not None:
             tb_lines = traceback.format_exception(
                 type(self.__cause__),
                 self.__cause__,

@@ -243,15 +243,34 @@ async def test_covenant_outpoint_fail_closed_when_unfunded():
         await leg.covenant_outpoint(terms)
 
 
-async def test_covenant_outpoint_ambiguous_utxo_fail_closed():
+async def test_covenant_outpoint_selects_the_earliest_confirmed_of_several():
+    """Was `..._ambiguous_utxo_fail_closed`, asserting a refusal.
+
+    That refusal was the attack one step earlier than the one it appeared to prevent: this is the
+    path that WRITES the outpoint later spends pin to, so anyone paying the covenant address before
+    it ran stopped the pin from ever being recorded, and every subsequent spend went back to
+    re-discovering — and refusing. Selecting the earliest-confirmed match is deterministic for both
+    parties and picks the honest funding, which necessarily precedes any poison.
+    """
     terms = _rxd_terms(amount=100_000)
     dupes = [
-        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=100),
-        UtxoRecord(tx_hash="ce" * 32, tx_pos=1, value=100_000, height=101),
+        UtxoRecord(tx_hash="ce" * 32, tx_pos=1, value=100_000, height=101),  # later — the poison
+        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=100),  # earlier — the real one
     ]
     leg = _leg(client=FakeClient(utxos=dupes))
-    with pytest.raises(NetworkError, match="ambiguous"):
-        await leg.covenant_outpoint(terms)
+    assert await leg.covenant_outpoint(terms) == "cd" * 32 + ":0"
+
+
+async def test_covenant_outpoint_prefers_a_CONFIRMED_output_over_a_mempool_one():
+    """Height 0 means unconfirmed. A mempool output must never displace a mined one, or an attacker
+    could steer the selection for free by broadcasting rather than paying."""
+    terms = _rxd_terms(amount=100_000)
+    dupes = [
+        UtxoRecord(tx_hash="ff" * 32, tx_pos=0, value=100_000, height=0),  # unconfirmed
+        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=900),  # mined, but later-looking
+    ]
+    leg = _leg(client=FakeClient(utxos=dupes))
+    assert await leg.covenant_outpoint(terms) == "cd" * 32 + ":0"
 
 
 async def test_find_covenant_utxo_registers_spk_for_registry_client():
@@ -999,3 +1018,315 @@ async def test_a_fee_source_without_release_unspent_still_works():
     with pytest.raises(InsufficientFundsError):
         await leg.claim_asset(rec, _P)
     assert client.broadcast_raw == []
+
+
+class TestASecondPaymentToTheCovenantCannotBlockTheSpend:
+    """The covenant scriptPubKey is a pure function of PUBLIC negotiated terms, so anyone can
+    construct it and anyone can pay it.
+
+    That made a discovery-time refusal into an attack: after revealing `p`, a maker sends a second
+    ordinary output of exactly `radiant_amount` to the same address, `find_covenant_utxo` refuses
+    with "ambiguous covenant UTXO set", and the taker's claim fails on every retry until `t_rxd`
+    expires — while the autonomous executor classifies the refusal as a transient read fault and
+    keeps retrying, looking healthy. The maker then CSV-refunds both outputs.
+
+    Once the funded outpoint is known there is nothing to discover, so the spend pins to it.
+    """
+
+    @staticmethod
+    def _two_utxos(value: int):
+        return [
+            UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=value, height=100),  # the real one
+            UtxoRecord(tx_hash="99" * 32, tx_pos=0, value=value, height=140),  # the poison
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_outpoint_is_selected_out_of_a_poisoned_set(self) -> None:
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        outpoint, value, _h = await io.find_covenant_utxo(
+            b"\x00" * 25, expected_value=100_000, pin_outpoint="ab" * 32 + ":1"
+        )
+        assert outpoint == "ab" * 32 + ":1", "the poison output was selected, or the spend refused"
+        assert value == 100_000
+
+    @pytest.mark.asyncio
+    async def test_WITHOUT_a_pin_the_EARLIEST_CONFIRMED_match_is_selected(self) -> None:
+        """The discovery path must SELECT, not refuse — and this test previously asserted the
+        opposite, on the reasoning that "nothing has been committed yet, so there is nothing for a
+        refusal to deny". That was wrong: the pin's only WRITER comes through this path, so
+        poisoning the address before the outpoint is recorded stopped the pin from ever being
+        written, and every later spend ran unpinned. The refusal WAS the attack, one step earlier.
+
+        The honest funding necessarily precedes any poison, so earliest-confirmed picks it — and it
+        is deterministic across both parties, which "first returned" would not be.
+        """
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        outpoint, value, height = await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000)
+        assert outpoint == "ab" * 32 + ":1", "the later (poison) output was selected"
+        assert value == 100_000 and height == 100
+
+    @pytest.mark.asyncio
+    async def test_a_pin_that_is_NOT_in_the_live_set_is_refused(self) -> None:
+        """Pinning must not become a way to spend something that is gone: a recorded outpoint that
+        has been spent or reorged out must fail closed, not fall back to whatever else is there."""
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        with pytest.raises(NetworkError, match="not in this scriptPubKey"):
+            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000, pin_outpoint="ee" * 32 + ":0")
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_outpoint_still_has_to_match_the_expected_value(self) -> None:
+        """The value filter runs BEFORE the pin, so a record pointing at a wrong-value output at
+        the right address is still refused — the pin narrows, it does not waive."""
+        client = FakeClient()
+        client._utxos = [UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=42, height=100)]
+        io = RadiantChainIO(client)
+        with pytest.raises(NetworkError, match="expected carrier value"):
+            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000, pin_outpoint="ab" * 32 + ":1")
+
+
+@pytest.mark.asyncio
+async def test_the_SPEND_PATH_pins_the_recorded_outpoint_against_a_poisoned_set():
+    """The production entry point for the pin.
+
+    Selecting the right UTXO is useless if `_resolve_covenant` never passes the recorded outpoint
+    down — the poisoning attack works through the SPEND path (`claim_asset` / `refund_asset`), not
+    through a direct call to the scanner. This drives the real leg with a record that carries the
+    outpoint and a UTXO set containing a second, identically-valued payment to the same address.
+    """
+    from pyrxd.gravity.swap_state import SwapRecord, SwapState
+
+    terms = _rxd_terms(amount=100_000)
+    real = UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=100_000, height=100)
+    poison = UtxoRecord(tx_hash="99" * 32, tx_pos=0, value=100_000, height=140)
+    leg = _leg(client=FakeClient(utxos=[real, poison]))
+    record = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms).with_radiant_lock("ab" * 32 + ":1", "00" * 25)
+
+    cov, outpoint, carrier, _confs = await leg._resolve_covenant(record)
+    assert outpoint == "ab" * 32 + ":1", (
+        "the spend path re-discovered by scan instead of using the recorded outpoint, so a second "
+        "payment to the covenant address blocks it"
+    )
+    assert carrier == 100_000
+    assert cov is not None
+
+
+class TestAnUnreadableConfirmationDepthFailsClosed:
+    """This guard replaced a bare `int(info.get("confirmations", 0) or 0)` after a real bug: a
+    string coerced silently into a depth, and a JSON `Infinity` raised `OverflowError` — not a
+    `NetworkError`, so it escaped every `except NetworkError` on a value-moving path as a bare
+    traceback. It had no test until now, which is how the fail-closed direction could regress
+    unnoticed.
+    """
+
+    @staticmethod
+    def _io(raw):
+        # Subclass the real fake so the client satisfies RadiantChainIO's full interface; only the
+        # one method under test is overridden.
+        class _C(FakeClient):
+            async def get_transaction_verbose(self, _txid):
+                return {"confirmations": raw}
+
+        return RadiantChainIO(_C())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("label", "raw"),
+        [
+            ("JSON Infinity", float("inf")),
+            ("negative infinity", float("-inf")),
+            ("NaN", float("nan")),
+            ("a non-numeric string", "deep"),
+            ("a dict", {"depth": 3}),
+        ],
+    )
+    async def test_an_unreadable_depth_raises_NetworkError(self, label: str, raw) -> None:
+        """NetworkError specifically — the callers on the value-moving path catch that and nothing
+        else, so any other exception type escapes as an unhandled traceback."""
+        with pytest.raises(NetworkError, match="unreadable confirmation depth"):
+            await self._io(raw).confirmations("ab" * 32)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("label", "raw", "want"), [("absent", None, 0), ("negative", -5, 0), ("zero", 0, 0)])
+    async def test_a_falsy_or_negative_depth_reads_as_ZERO_not_as_deep(self, label: str, raw, want: int) -> None:
+        """Fail-closed direction: unknown or nonsensical depth must read as UNCONFIRMED, never as
+        buried. Reading it as deep is what lets a spend proceed against a covenant a reorg can
+        still remove."""
+        assert await self._io(raw).confirmations("ab" * 32) == want
+
+    @pytest.mark.asyncio
+    async def test_an_HONEST_depth_still_passes_through(self) -> None:
+        """A guard that refuses valid work is a bug — an ordinary integer depth must survive."""
+        assert await self._io(7).confirmations("ab" * 32) == 7
+
+    @pytest.mark.asyncio
+    async def test_a_NUMERIC_STRING_does_not_silently_coerce(self) -> None:
+        """The original bug: `"999999"` became a depth of 999999 and a shallow covenant read as
+        buried. Whether it is refused or read as 0, it must NOT come back as a large depth."""
+        try:
+            got = await self._io("999999").confirmations("ab" * 32)
+        except NetworkError:
+            return  # refused outright — also correct
+        assert got == 0, f"a string depth coerced to {got}; a shallow covenant would read as buried"
+
+
+def _nft_terms(carrier: int = 1000, csv: int = 6) -> NegotiatedTerms:
+    """NFT terms. Note `radiant_amount == nft_carrier_value` here is CORRECT, not a fixture
+    shortcut: for the NFT variant the field genuinely IS the carrier dust value, and identity is
+    bound separately by the genesis ref welded into the scriptPubKey."""
+    from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft
+
+    cov = build_htlc_covenant_nft(
+        genesis_txid=_REF_TXID,
+        genesis_vout=0,
+        nft_carrier_value=carrier,
+        taker_pkh=_TAKER_PKH,
+        maker_pkh=_MAKER_PKH,
+        hashlock=_H,
+        refund_csv=csv,
+    )
+    return NegotiatedTerms(
+        hashlock=_H,
+        btc_sats=100_000,
+        radiant_amount=carrier,
+        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(csv, t.TimeUnit.BLOCKS),
+        asset_variant="nft",
+        genesis_ref=GlyphRef(txid=_REF_TXID, vout=0).to_bytes(),
+        taker_dest_hash=cov.expected_taker_hash,
+        maker_dest_hash=cov.expected_maker_hash,
+        btc_claim_pubkey_xonly=_xonly(),
+        btc_refund_pubkey_xonly=_xonly(),
+    )
+
+
+class TestTheFundingGateIsExercisedPerAssetVariant:
+    """`verify_maker_asset_funded` is the HZ-1 gate: the taker MUST NOT fund the counter leg until
+    this confirms the maker's asset is really locked, at the agreed value, buried deep enough.
+
+    It had NO per-variant coverage. Its only real-leg exercise hardcoded the RXD covenant, and the
+    coordinator tests use a duck-typed fake that records the call without running it. That is how
+    #505 — the FT gate comparing a carrier photon value against a token count — survived: no test
+    ever drove this method with an FT.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rxd_accepts_a_correctly_funded_covenant(self) -> None:
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=100_000, confirmations=6))
+        outpoint, value, confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 100_000 and confs == 6 and outpoint
+
+    @pytest.mark.asyncio
+    async def test_rxd_refuses_a_wrongly_valued_covenant(self) -> None:
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=99_999, confirmations=6))
+        with pytest.raises(NetworkError, match="expected carrier value"):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+    @pytest.mark.asyncio
+    async def test_rxd_refuses_a_covenant_that_is_too_shallow(self) -> None:
+        """The depth half of the gate — a covenant a reorg can still remove must not clear it."""
+        terms = _rxd_terms(amount=100_000)
+        leg = _leg(client=FakeClient(utxo_value=100_000, confirmations=1))
+        with pytest.raises(NetworkError):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=6)
+
+    @pytest.mark.asyncio
+    async def test_nft_accepts_a_covenant_funded_at_the_CARRIER_value(self) -> None:
+        """For NFT, `radiant_amount` genuinely IS the carrier dust value, so comparing it against
+        the UTXO's photon value is correct. Asserting that here is what makes the FT case below a
+        real contrast rather than an untested assumption."""
+        terms = _nft_terms(carrier=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
+
+    @pytest.mark.xfail(
+        reason="#505: the FT gate compares carrier PHOTONS against a TOKEN COUNT. An honest maker "
+        "funding 1000 tokens on ordinary dust is refused; a dishonest one funding 1000 photons "
+        "carrying 1 token is accepted. Unfixed — this test is the live record of it.",
+        strict=True,
+    )
+    @pytest.mark.asyncio
+    async def test_ft_accepts_a_covenant_whose_CARRIER_differs_from_the_token_count(self) -> None:
+        """The scenario the FT path must support and currently cannot: 1000 tokens held on 546
+        photons of ordinary dust. The covenant enforces `refValueSum(ref) == amount` — a TOKEN
+        count — while the gate compares the carrier photon value, so the honest case is refused.
+
+        Deliberately chosen so the two quantities DIFFER: every existing FT fixture sets carrier
+        equal to the token count, which is exactly why the conflation was invisible.
+        """
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
+        _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+
+class TestAnEvictedClaimCanBeRebroadcast:
+    """A claim only beats the CSV refund by BEING in the mempool when maturity arrives — a
+    non-BIP68-final refund is rejected from the mempool, so the maker cannot pre-broadcast. Radiant
+    has no RBF and no CPFP and expires the mempool after about eight hours, so an evicted claim
+    cannot be bumped back in; re-broadcasting is the only way.
+
+    The coordinator broadcast and advanced straight to a completed state, so an eviction was
+    invisible: the refund became valid at maturity, confirmed, and took both legs while the record
+    said the swap had finished.
+    """
+
+    @staticmethod
+    def _leg_with(unspent):
+        class _C(FakeClient):
+            async def get_utxos(self, script_hash):
+                return [UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=100_000, height=100)]
+
+            # The chain-io wrapper reads `txout_unspent_incl_mempool` off the CLIENT — overriding
+            # the wrapper's own method name would stub the layer under test instead of feeding it.
+            async def txout_unspent_incl_mempool(self, _txid, _vout):
+                return unspent
+
+        return _leg(client=_C(confirmations=10))
+
+    def _record(self):
+        from pyrxd.gravity.swap_state import SwapRecord, SwapState
+
+        return SwapRecord(state=SwapState.SECRET_REVEALED, terms=_rxd_terms(amount=100_000)).with_radiant_lock(
+            "ab" * 32 + ":1", "00" * 25
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unspent_covenant_means_EVICTED_and_triggers_a_rebroadcast(self) -> None:
+        leg = self._leg_with(True)
+        sent: list = []
+
+        async def _claim(record, preimage):
+            sent.append(bytes(preimage))
+            return "re" * 32
+
+        leg.claim_asset = _claim
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) == "re" * 32
+        assert sent == [b"\x11" * 32], "the claim was not re-broadcast despite the covenant being unspent"
+
+    @pytest.mark.asyncio
+    async def test_a_SPENT_covenant_does_nothing(self) -> None:
+        """The claim is alive — in the mempool or mined. Re-broadcasting would be a pointless
+        duplicate, and on a chain with no RBF a duplicate is its own risk."""
+        leg = self._leg_with(False)
+        sent: list = []
+        leg.claim_asset = lambda *a, **k: sent.append(1)
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) is None
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_an_ABSTAIN_does_NOT_rebroadcast(self) -> None:
+        """An unknown answer is not an eviction. Treating None as "gone" would fire a duplicate
+        broadcast every time a source was merely unreachable."""
+        leg = self._leg_with(None)
+        sent: list = []
+        leg.claim_asset = lambda *a, **k: sent.append(1)
+        assert await leg.rebroadcast_claim_if_evicted(self._record(), b"\x11" * 32) is None
+        assert sent == []

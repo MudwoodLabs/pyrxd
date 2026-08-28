@@ -234,6 +234,34 @@ def find_repo_root() -> Path:
         sys.exit(2)
 
 
+#: Local-only list of private project names, one per line, ``#`` for comments.
+#: GITIGNORED ON PURPOSE — the whole point is that these names must not appear in a public
+#: repo, so a list of them cannot live in one either. Absent file = check skipped.
+_PRIVATE_NAMES_FILE = ".private-names"
+
+
+def load_private_names(repo_root: Path) -> list[str]:
+    """Names that must never appear in a tracked doc, read from a gitignored local file."""
+    path = repo_root / _PRIVATE_NAMES_FILE
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def find_private_names(content: str, names: list[str]) -> list[str]:
+    """Case-insensitive whole-word matches for any private project name."""
+    hits = []
+    for name in names:
+        if re.search(rf"\b{re.escape(name)}\b", content, re.IGNORECASE):
+            hits.append(name)
+    return hits
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check that tracked docs don't link to gitignored paths.",
@@ -312,6 +340,35 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    private_names = load_private_names(repo_root)
+    name_leaks: list[tuple[Path, str]] = []
+    for doc in docs:
+        try:
+            content = (repo_root / doc).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for hit in find_private_names(content, private_names):
+            name_leaks.append((doc, hit))
+
+    if name_leaks:
+        failed = True
+        if leaks or home_path_leaks:
+            print("", file=sys.stderr)
+        print("error: tracked docs name a private project:", file=sys.stderr)
+        print("", file=sys.stderr)
+        for source, matched in name_leaks:
+            print(f"  {source}", file=sys.stderr)
+            print(f"    name: {matched}", file=sys.stderr)
+            print("", file=sys.stderr)
+        print(
+            "A private project's NAME in a public doc leaks its existence just as a\n"
+            "link to it would. This check exists because the link and home-path checks\n"
+            "did not catch one: a prose aside crediting a sibling repo for a technique\n"
+            "was written, committed and pushed before anyone noticed. Drop the name or\n"
+            'genericise it ("another project"). See docs/CONTRIBUTING.md.',
+            file=sys.stderr,
+        )
+
     if home_path_leaks:
         failed = True
         if leaks:
@@ -338,7 +395,8 @@ def main() -> int:
         return 1
 
     if args.verbose:
-        print(f"OK — {len(docs)} tracked doc files, no private-path links and no bare home-directory paths.")
+        skipped = "" if private_names else " (private-name check skipped: no .private-names file)"
+        print(f"OK — {len(docs)} tracked doc files, no private-path links, no bare home-directory paths{skipped}.")
     return 0
 
 

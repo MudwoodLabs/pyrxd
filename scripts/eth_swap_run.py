@@ -19,7 +19,7 @@ Stages (--stage), each gating the next:
 Examples:
   python scripts/eth_swap_run.py --stage dry-run
   python scripts/eth_swap_run.py --stage sepolia-dust --i-accept-dust-loss \
-      --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-hex <funded-sepolia-key> \
+      --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-file ~/.swap-eth-key \
       --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity
 """
 
@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -44,10 +45,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
+    add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
     merge_into_mode_600,
+    read_own_private_file,
+    resolve_eth_key_file,
     rxd_blockcount,
+    scan_covenant_fund_height,
+    wait_for_covenant_funding,
 )
 from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
     load_minted_ft,
@@ -62,13 +68,18 @@ from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet RES
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.eth_wallet.chains import evm_chain_by_id
+from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, token_for
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd_relative_blocks
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
+from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
@@ -78,6 +89,7 @@ from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
 _DEFAULT_ARTIFACT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "EthHtlc.json"
+_DEFAULT_ERC20_ARTIFACT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "Erc20Htlc.json"
 _SEPOLIA_CHAIN_ID = 11155111
 _ANVIL_KEY = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # anvil acct 0 (public devnet)
 _ANVIL_ADDR0 = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -101,19 +113,54 @@ class _CapturingEthLeg:
 
 
 def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
+    """The cross-clock margin, including the ETH finality STALL budget.
+
+    `eth_finality_stall_tolerance_s` defaulted to 0 and the runner had no flag for it at all, so
+    a measured policy refused at setup: real-value mode requires >= 3600s, because the taker waits
+    for ETH FINALITY before claiming RXD and the RXD refund must not open until it has had a
+    stall-tolerant window. The May-2023 mainnet stall ran about an hour. Sizing this against
+    happy-path finality is precisely the bug a stall triggers, which is why it is an explicit
+    operator number rather than something derived from the finalization window.
+    """
     return CrossClockMargin(
         eth_reorg_finality_s=args.eth_finalization_window_s,
         rxd_claim_burial_s=args.rxd_claim_burial_s,
         rxd_confirm_slack_s=args.rxd_confirm_slack_s,
         rounding_slack_s=args.rounding_slack_s,
+        eth_finality_stall_tolerance_s=args.eth_finality_stall_tolerance_s,
     )
 
 
-def _policy(args: argparse.Namespace) -> MarginPolicy:
-    return MarginPolicy(
+def _evm_is_value_bearing(chain_id: int) -> bool:
+    """Whether the EVM leg's coins are real — read from the chain registry, never from the stage
+    name and never from the audit tag.
+
+    A first version asked whether the `network` tag was outside `AUDIT_CLEARED_NETWORKS`, matching
+    the coordinator's `_leg_is_value_bearing`. That is the right rule for the AUDIT gate and the
+    wrong one here: the cleared set holds Bitcoin-family tags, so every EVM chain reads as
+    value-bearing — Base Sepolia included. It forced measured margins and a two-endpoint quorum
+    onto a faucet-money rehearsal, which is a guard refusing honest work. The runner's own wiring
+    tests caught it.
+
+    `is_testnet` states it per registry entry instead. The two questions genuinely differ: nothing
+    here is audit-cleared, and only some of it is worth anything.
+    """
+    return not evm_chain_by_id(int(chain_id)).is_testnet
+
+
+def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> MarginPolicy:
+    """Estimated margins for a throwaway EVM chain; MEASURED once the token leg is real.
+
+    is_measured=False disables two defences on the ETH path — the verify->lock `finalized` reorg
+    pin (it re-verifies at `latest` instead, which cannot catch a reorg re-deploying a different
+    contract at the same CREATE address in that window) and the proactive-refund N-floor. On a
+    Sepolia counter leg that is an accepted dust trade, because the ETH side is faucet money and
+    only the RXD side can be lost. With USDT on L1 BOTH legs are real, so the same opt-in would be
+    buying the weak mode of two defences with actual value behind them.
+    """
+    common: dict = dict(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),
         block_interval_s=args.btc_block_interval_s,
-        is_measured=False,
         rxd_block_interval_s=args.rxd_block_interval_s,
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_cross_clock_margin(args),
@@ -121,6 +168,470 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
         # Dust harness: value below the Radiant reorg cost → opt out of value-scaled burial.
         accept_flat_burial=True,
     )
+    if not _token_leg_is_real(args):
+        if int(args.t_rxd_blocks) == 0:
+            args.t_rxd_blocks = _SEPOLIA_DEFAULT_T_RXD_BLOCKS
+        return MarginPolicy(is_measured=False, **common)
+    if args.eth_finality_stall_tolerance_s < 3600:
+        raise SystemExit(
+            "a real-value token counter leg needs --eth-finality-stall-tolerance-s >= 3600. The "
+            "taker waits for ETH finality before claiming RXD, so the RXD refund must not open "
+            "until it has had a stall-tolerant window; the May-2023 mainnet stall ran about an "
+            "hour. Sizing this against happy-path finality is the bug a stall triggers."
+        )
+    # ORDER MATTERS, and it was wrong. Both bounds divide by the fast tail; running them before the
+    # flag that REQUIRES it meant they fell back to the nominal and emitted the pre-fix, 8.3x-too-
+    # tight range — sending the operator to "fix" a correct value into an unsafe one. Demand the
+    # measurement first, then size against it.
+    if not args.rxd_block_interval_fast_s:
+        raise SystemExit(
+            "a real-value token counter leg needs --rxd-block-interval-fast-s (the MEASURED p10 "
+            "Radiant inter-block, seconds). Reserves DIVIDE by it, so a stale-high value silently "
+            "under-counts blocks. Measure it against a mainnet node for THIS run — it was 43s on "
+            "2026-06-02 and 36s on 2026-08-26, and the drift is in the under-counting direction."
+        )
+    # IS THERE A VALID VALUE AT ALL? The lower bound needs t*fast >= margin; the upper caps t at
+    # the deadline minus that same margin and the confirm reserve. When the deadline is too short
+    # to hold both, no t_rxd satisfies them and the per-bound messages start contradicting each
+    # other: a 3 h timeout refused t_rxd=86 as "too SHORT" while advising the operator to omit the
+    # flag and derive it — which derives 86. That sends someone to re-type the one argument that
+    # cannot help, during a run, with a covenant possibly already funded. Name the real constraint.
+    _assert_the_eth_deadline_can_hold_the_margins(args, remaining_s=remaining_s)
+    if int(args.t_rxd_blocks) == 0:
+        args.t_rxd_blocks = _recommended_t_rxd_blocks(args, remaining_s=remaining_s)
+    # The three bounds now run against a value the library derived rather than one an operator
+    # typed. That is deliberate: they are the check on the derivation, not a substitute for it, and
+    # a derivation nothing verifies is how the exact-division off-by-one survived in the first place.
+    _assert_t_rxd_covers_the_takers_wait(args, remaining_s=remaining_s)
+    _assert_t_rxd_opens_before_the_eth_deadline(args, remaining_s=remaining_s)
+    _assert_t_rxd_bounds_the_vulnerable_window(args, remaining_s=remaining_s)
+    return MarginPolicy(
+        is_measured=True,
+        require_measured=True,
+        rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
+        **common,
+    )
+
+
+#: BIP68's relative-lock cap in blocks. The search space for `--t-rxd-blocks`; the converter
+#: refuses anything past it, so nothing beyond is a candidate.
+_T_RXD_BIP68_MAX_BLOCKS = 0xFFFF
+
+#: How far above the first conceivable deadline the minimum-search will look. The A-and-B
+#: necessary condition below is exact, so the coarse start is at most a second or two under the
+#: true answer, and the fractional-interval holes measured at 4000 random rows were all exactly
+#: 1 s wide. 64 is two orders of magnitude of headroom on a parse-time error path.
+_MINIMUM_SEARCH_STEPS = 64
+
+
+def _t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> bool:
+    """Lower bound A as a PREDICATE, so the feasibility scan and the refusal cannot drift apart.
+
+    They already did once — see `_assert_the_eth_deadline_can_hold_the_margins`, which modelled
+    this bound and bound C with a closed-form sum and got a different answer from the bounds
+    themselves. Anything that needs to know whether a t_rxd passes now asks the same function the
+    refusal asks.
+    """
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return True  # the missing-measurement refusal is the better error
+    return int(args.t_rxd_blocks) >= math.ceil(_cross_clock_margin(args).total_s() / fast)
+
+
+def _highest_t_rxd_the_deadline_accepts(args: argparse.Namespace, remaining_s: int | None) -> int:
+    """Upper bound B as a VALUE — the largest t_rxd whose projected refund precedes the deadline."""
+    # THE SAME INTERVAL THE GATE MULTIPLIES BY. It used the nominal, matching a coordinator call
+    # site that was itself passing the wrong one; the two agreed with each other and disagreed with
+    # the sizer. With the gate corrected to the fast tail this bound divides by the fast tail too,
+    # so the canonical sizing is representable again instead of being forbidden by its own guard.
+    nominal = float(args.rxd_block_interval_fast_s or args.rxd_block_interval_s)
+    # RESERVE the covenant-confirm window. The gate anchors the projection on the covenant's
+    # CONFIRMATION time, not on the runner's start, so however long funding-and-mining takes comes
+    # straight out of the budget. Sizing against `now` silently assumes instant funding: a run that
+    # took ~740s to fund and mine overshot by 607s and was refused AFTER the covenant was paid for.
+    # `max_covenant_confirm_wait_s` is precisely the allowance for that delay, so spend it here.
+    budget_s = (
+        _eth_budget_s(args, remaining_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
+    )
+    # The gate refuses at `projected >= deadline`, so the largest ACCEPTED value is one short of
+    # the quotient when it divides exactly. Verified by binary-searching the real gate: for a 24h
+    # timeout it accepts 2186 and refuses 2187, while a bare floor() computes 2187. An upper bound
+    # that names a value the gate then rejects sends the operator to fix an error into an error —
+    # which is exactly how this run burned two funded covenants.
+    return math.ceil(budget_s / nominal) - 1
+
+
+def _asset_vulnerable_window_s(args: argparse.Namespace, remaining_s: int | None) -> float:
+    """The ASSET_VULNERABLE span: covenant refund matured, counter leg still claimable with `p`."""
+    # Measured from covenant MINING, exactly as the upper bound is. Anchoring this one on `now`
+    # instead made the two disagree by the confirm wait, and the first thing that disagreement did
+    # was refuse the value the library's own sizer derives — a guard rejecting honest work.
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    return _eth_budget_s(args, remaining_s) - int(args.max_covenant_confirm_wait_s) - int(args.t_rxd_blocks) * fast
+
+
+def _t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, remaining_s: int | None) -> bool:
+    """Lower bound C as a PREDICATE. See `_t_rxd_covers_the_takers_wait` for why it is split out."""
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return True
+    return _asset_vulnerable_window_s(args, remaining_s) <= _cross_clock_margin(args).total_s() + fast
+
+
+def _with_t_rxd(args: argparse.Namespace, t_rxd_blocks: int) -> argparse.Namespace:
+    """A probe copy — the predicates read `args.t_rxd_blocks`, and a scan must not mutate it."""
+    probe = argparse.Namespace(**vars(args))
+    probe.t_rxd_blocks = int(t_rxd_blocks)
+    return probe
+
+
+def _lowest_t_rxd_meeting_the_floors(args: argparse.Namespace, remaining_s: int | None) -> int | None:
+    """The smallest t_rxd satisfying BOTH floors — by binary search, deliberately not a formula.
+
+    Both floors are monotone in t_rxd (a longer RXD window only ever helps the taker's wait and
+    only ever shrinks the vulnerable window), so a binary search over the predicates is exact.
+    A closed form is not: bound C's condition is `budget - wait - t*fast <= margin + fast`, which
+    rearranges to the same integer as bound B's `ceil((budget - margin - wait)/fast) - 1` in exact
+    arithmetic and NOT in binary floating point, because the two expressions round at different
+    places. That one-block disagreement is what emptied the feasible set while the closed-form
+    guard said the deadline was fine.
+    """
+
+    def meets(t: int) -> bool:
+        probe = _with_t_rxd(args, t)
+        return _t_rxd_covers_the_takers_wait(probe) and _t_rxd_bounds_the_vulnerable_window(probe, remaining_s)
+
+    if not meets(_T_RXD_BIP68_MAX_BLOCKS):
+        return None
+    lo, hi = 1, _T_RXD_BIP68_MAX_BLOCKS
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if meets(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def _t_rxd_feasible_range(args: argparse.Namespace, *, remaining_s: int | None = None) -> tuple[int, int] | None:
+    """The EXACT integer values of `--t-rxd-blocks` that satisfy all three enforced bounds.
+
+    None when that set is empty. Computed from the same predicates the three `_assert_` functions
+    call, so "the guard passed but a bound then refused" is not representable.
+    """
+    hi = min(_highest_t_rxd_the_deadline_accepts(args, remaining_s), _T_RXD_BIP68_MAX_BLOCKS)
+    if hi < 1:
+        return None
+    lo = _lowest_t_rxd_meeting_the_floors(args, remaining_s)
+    if lo is None or lo > hi:
+        return None
+    return (lo, hi)
+
+
+def _derivable_t_rxd(args: argparse.Namespace, remaining_s: int | None) -> int | None:
+    """The derived t_rxd, or None if the converter refuses these parameters outright."""
+    from pyrxd.security.errors import ValidationError
+
+    try:
+        return _derive_t_rxd_blocks(args, remaining_s=remaining_s)
+    except (ValidationError, SystemExit):
+        return None
+
+
+def _a_workable_t_rxd_exists(args: argparse.Namespace, *, remaining_s: int | None = None) -> bool:
+    """Is there ANY `--t-rxd-blocks` the three bounds accept at these parameters?"""
+    return _t_rxd_feasible_range(args, remaining_s=remaining_s) is not None
+
+
+def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
+    """The value this run should USE, and the only value any message here should ADVISE.
+
+    The library's derivation when it satisfies every enforced bound; the top of the feasible range
+    when it does not. Those differ, and an earlier version of this fix got the consequence wrong in
+    both directions at once. It folded "the derivation lands inside the range" into the DEADLINE
+    guard, so on a fractional fast tail it refused 254 of 950 measured parameter rows whose feasible
+    set was NON-empty — telling the operator "no --t-rxd-blocks satisfies all three bounds" when one
+    plainly did, and refusing an explicit in-range value that would have been fine. A guard that
+    refuses honest work is a defect, not a safe default.
+
+    The real problem was never the deadline; it was the ADVICE. `eth_absolute_to_rxd_relative_blocks`
+    asks the punctuality gate, so it always satisfies bound B, but nothing makes it satisfy the two
+    FLOORS, and where float rounding puts it one block under them the runner derived a value its own
+    bounds then refused — while every refusal message said "OMIT --t-rxd-blocks entirely and it is
+    derived: <that same value>". Sourcing the recommendation from the feasible SET instead makes the
+    contradiction unrepresentable: a value that is advised is, by construction, a value that passes.
+
+    Clamping UP is the safe direction, not merely the convenient one. The derivation can only be at
+    or below `hi` (it asks the gate, which IS bound B), so the fix-up only ever LENGTHENS the RXD
+    window: a longer maker lock, which is a liveness cost, and a longer taker claim window, which is
+    the safety-relevant one. `eth_rxd_timelock` states that split explicitly.
+    """
+    window = _t_rxd_feasible_range(args, remaining_s=remaining_s)
+    if window is None:
+        # Unreachable through _policy, which runs the deadline guard first. Refuse rather than
+        # invent a value, in case some future caller reaches it directly.
+        _assert_the_eth_deadline_can_hold_the_margins(args, remaining_s=remaining_s)
+        raise SystemExit("no --t-rxd-blocks satisfies all three bounds at these parameters")
+    lo, hi = window
+    derived = _derivable_t_rxd(args, remaining_s)
+    if derived is not None and lo <= derived <= hi:
+        return derived
+    return hi
+
+
+def _first_conceivable_eth_timeout_s(args: argparse.Namespace) -> int:
+    """The smallest `--eth-timeout-s` that bounds A and B alone could ever both accept.
+
+    Exact, and derived rather than fudged. Bound A floors t_rxd at `ceil(margin/fast)`; bound B
+    caps it at `ceil((budget - margin - wait)/fast) - 1`. The cap reaches the floor only once
+    `budget - margin - wait > fast * ceil(margin/fast)`. Used ONLY as the starting point of the
+    search below — it is a necessary condition, never a sufficient one, and the loop is what makes
+    the printed number true.
+    """
+    margin_s = _cross_clock_margin(args).total_s()
+    wait_s = int(args.max_covenant_confirm_wait_s)
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return margin_s + wait_s + 1
+    return math.floor(margin_s + wait_s + fast * math.ceil(margin_s / fast)) + 1
+
+
+def _smallest_workable_eth_timeout_s(args: argparse.Namespace) -> int | None:
+    """The smallest `--eth-timeout-s` at or above the requested one that actually yields a t_rxd.
+
+    CHECKED, not computed. Every candidate is fed back through `_a_workable_t_rxd_exists` — the
+    same test the refusal uses — so the number printed in the message cannot be one the next parse
+    turns around and rejects. Measured over 4000 refused fractional rows, the search never ran past
+    its step budget. The previous version printed `2*margin + wait + ceil(fast)`, a
+    closed form that models the bounds instead of asking them, and at a fractional fast tail it
+    both cleared deadlines with an empty feasible set and could name a minimum nothing verified.
+    """
+    candidate = max(_first_conceivable_eth_timeout_s(args), int(args.eth_timeout_s) + 1)
+    for _ in range(_MINIMUM_SEARCH_STEPS):
+        probe = argparse.Namespace(**vars(args))
+        probe.eth_timeout_s = candidate
+        if _a_workable_t_rxd_exists(probe):
+            return candidate
+        candidate += 1
+    return None
+
+
+def _assert_the_eth_deadline_can_hold_the_margins(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """Refuse a deadline no t_rxd can satisfy, naming `--eth-timeout-s` rather than `--t-rxd-blocks`.
+
+    The RXD window has to be long enough that the taker can sit out the whole cross-clock margin
+    (ETH finality, the stall budget, claim burial, slack) AND short enough that the maker's refund
+    still opens before the ETH deadline minus that same margin, after reserving the covenant's
+    confirm time. Both are real, so the deadline must contain roughly TWO margins plus the reserve.
+    Below that the feasible range is empty and every individual bound reports a different symptom
+    of the same cause.
+
+    "Roughly" was the bug. The first version encoded that sentence literally, as
+    `2 * margin + wait + ceil(fast)`, and a loose SUM is not the feasible set. The set is the
+    intersection of three integer bounds, and at a FRACTIONAL fast tail — a measured p10, i.e. the
+    normal case — bound B's cap and bound C's floor, algebraically the same integer, round to
+    values one apart. The set is then empty while the sum says the deadline is roomy, and the
+    operator is handed the exact contradiction this guard exists to prevent: `--t-rxd-blocks 2324`
+    refused, with "omit it and it is derived: 2324" as the remedy. Measured on the current
+    defaults: 0 of 4000 random integer-interval rows, 3 of 4000 fractional ones — which is why an
+    integer-only sweep could not see it and it shipped.
+
+    So the check is now the set ITSELF, computed by asking the same predicates the bounds enforce —
+    and NOTHING else. A first attempt at this fix also demanded that the library's derivation land
+    inside the set, which refused 254 of 950 measured fractional rows whose set was non-empty: a
+    guard refusing honest work, and a message that lied about why. That condition belongs to the
+    ADVICE, not to the deadline; `_recommended_t_rxd_blocks` carries it.
+    """
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    if fast <= 0:
+        return
+    if _a_workable_t_rxd_exists(args, remaining_s=remaining_s):
+        return
+    margin_s = _cross_clock_margin(args).total_s()
+    wait_s = int(args.max_covenant_confirm_wait_s)
+    budget_s = _eth_budget_s(args, remaining_s)
+    floor_t = _lowest_t_rxd_meeting_the_floors(args, remaining_s)
+    cap_t = _highest_t_rxd_the_deadline_accepts(args, remaining_s)
+    resumed = "" if remaining_s is None else " remaining on the resumed swap's deadline"
+    where = (
+        f"the floors put it at >= {floor_t} and the deadline caps it at <= {cap_t}"
+        if floor_t is not None
+        else f"no value up to the BIP68 cap of {_T_RXD_BIP68_MAX_BLOCKS} meets the floors, which cap at <= {cap_t}"
+    )
+    if remaining_s is None:
+        minimum = _smallest_workable_eth_timeout_s(args)
+        remedy = (
+            f"  minimum: --eth-timeout-s {minimum} ({minimum / 3600:.2f} h) — verified, not "
+            f"estimated: it is fed back through this same feasibility test.\n"
+            if minimum is not None
+            else "  no nearby --eth-timeout-s clears it; the margin itself is the thing to change.\n"
+        )
+    else:
+        remedy = (
+            "  on a resume this cannot be fixed by argument: the deadline is an immutable of the "
+            "deployed HTLC. Wait for it and refund.\n"
+        )
+    raise SystemExit(
+        f"--eth-timeout-s gives {budget_s}s ({budget_s / 3600:.2f} h){resumed}, which cannot hold "
+        f"the timelock at all — no --t-rxd-blocks satisfies all three bounds.\n"
+        f"  the RXD window must cover the {margin_s}s ({margin_s / 3600:.2f} h) cross-clock margin "
+        f"AND bound the ASSET_VULNERABLE span by it AND still open before the deadline minus that "
+        f"same margin, after the {wait_s}s covenant-confirm reserve: {where}.\n"
+        + remedy
+        + "  shrink the MARGIN instead only if you can justify each part: "
+        "--eth-finality-stall-tolerance-s is usually the largest and the least defensible to cut."
+    )
+
+
+def _eth_budget_s(args: argparse.Namespace, remaining_s: int | None) -> int:
+    """Seconds of ETH deadline the bounds may actually spend.
+
+    `--eth-timeout-s` is a DURATION from now, correct only on a fresh run. On a resume the deadline
+    is an immutable of the already-deployed HTLC, fixed hours ago, and what is left of it is the
+    only budget there is. Passing the original duration made every parse-time bound validate a
+    swap that no longer exists.
+    """
+    return int(args.eth_timeout_s) if remaining_s is None else int(remaining_s)
+
+
+def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """The RXD refund must not open before the taker has finished waiting for ETH finality.
+
+    `--t-rxd-blocks` is an operator flag on this runner, not a derived value, and NOTHING on this
+    path checks it against the ETH deadline. The one gate that runs — `assert_covenant_confirms_
+    before_eth_deadline` — is a PUNCTUALITY check (does the covenant confirm when the sizing
+    assumed), and its own docstring says it is "not a slow-chain defence"; the interval cancels out
+    of its arithmetic entirely.
+
+    So the unsafe direction is unguarded, and the default is on the wrong side of it. t_rxd is a
+    RELATIVE CSV in blocks: measure it at the FAST tail, because fast Radiant blocks are what
+    SHRINK the taker's window. At the measured p10 of 36s the default 60 blocks matures in 36
+    minutes, while the cross-clock margin the taker must sit through — ETH finality, the stall
+    budget, claim burial, slack — is about two hours. The maker could refund the asset while the
+    taker was still, correctly, waiting.
+
+    A slow chain is the harmless direction: it only lengthens the maker's lock, which is a liveness
+    cost and gives the taker MORE time. `eth_rxd_timelock` states that split explicitly.
+
+    Only enforced for a real token leg. Sepolia keeps its existing defaults exactly.
+    """
+    if _t_rxd_covers_the_takers_wait(args):
+        return
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    margin_s = _cross_clock_margin(args).total_s()
+    have = int(args.t_rxd_blocks)
+    raise SystemExit(
+        f"--t-rxd-blocks {have} is too SHORT for a real-value run. At the measured fast tail of "
+        f"{fast:.0f}s/block it matures in {have * fast / 3600:.2f} h, but the taker must first sit "
+        f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
+        f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
+        f"was still waiting.\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
+        f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
+    )
+
+
+def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """The RXD refund must OPEN before the ETH deadline minus the margin — the upper bound.
+
+    Learned the expensive way. The lower bound above divides the margin by the FAST tail, because
+    fast blocks shrink the taker's window. The coordinator's punctuality gate then projects the
+    same t_rxd forward by MULTIPLYING by the NOMINAL interval. Those two only cancel when both use
+    the same interval — `assert_covenant_confirms_before_eth_deadline` says so in as many words —
+    and sizing with 36s while the gate multiplies by 300s inflates the projection by ~8x.
+
+    A t_rxd of 2203, correct against the lower bound, projected the RXD refund 7.6 DAYS out against
+    a 22h budget. The gate caught it and refused to lock, which is the system working — but it
+    caught it AFTER the covenant had been funded, because nothing checked it at argument-parse
+    time. This does, so the operator learns the valid RANGE before spending a fee.
+    """
+    hi = _highest_t_rxd_the_deadline_accepts(args, remaining_s)
+    have = int(args.t_rxd_blocks)
+    if have <= hi:
+        return
+    nominal = float(args.rxd_block_interval_fast_s or args.rxd_block_interval_s)
+    budget_s = (
+        _eth_budget_s(args, remaining_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
+    )
+    fast = float(args.rxd_block_interval_fast_s or 0)
+    lo = math.ceil(_cross_clock_margin(args).total_s() / fast) if fast > 0 else 1
+    raise SystemExit(
+        f"--t-rxd-blocks {have} is too LONG. The coordinator projects the RXD refund forward at the "
+        f"NOMINAL {nominal:.0f}s interval, giving {have * nominal / 86400:.1f} days against a "
+        f"{budget_s / 3600:.1f} h budget (--eth-timeout-s minus the {_cross_clock_margin(args).total_s()}s "
+        f"cross-clock margin AND the {args.max_covenant_confirm_wait_s}s covenant-confirm reserve). "
+        f"The maker could not refund before the ETH deadline.\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  (the taker's-wait bound floors it at {lo} and this one caps it at {hi}, but the "
+        f"vulnerable-window bound closes that range to a single value — there is nothing to choose)\n"
+        f"  the LOWER bound divides the margin by the FAST tail; this UPPER bound multiplies by the "
+        f"NOMINAL one. Both are real, and they are not the same number."
+    )
+
+
+_SEPOLIA_DEFAULT_T_RXD_BLOCKS = 60
+
+
+def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
+    """DERIVE t_rxd from the ETH deadline instead of trusting a number an operator typed.
+
+    `eth_absolute_to_rxd_relative_blocks` has existed, correct and carefully documented, for the
+    whole life of this corridor — and had NO production caller. The runner took `--t-rxd-blocks` as
+    a flag with a default of 60, so every real run was sized by hand and the library's derivation
+    was exercised only by tests. That is the whole reason today's run needed six refusals to find a
+    safe value the library could have computed outright, and the reason the sizer's exact-division
+    off-by-one could sit in a shipped release without anyone meeting it.
+
+    Both bounds pin t_rxd to essentially ONE value, so there is nothing here for an operator to
+    choose. `--t-rxd-blocks` is kept as an explicit override for rehearsals, and it is still
+    checked against the same three bounds.
+    """
+    return eth_absolute_to_rxd_relative_blocks(
+        eth_timeout_unix_s=int(time.time()) + _eth_budget_s(args, remaining_s),
+        # The CSV clock starts at covenant MINING, not now, so reserve the confirm allowance.
+        expected_rxd_lock_time_unix_s=int(time.time()) + int(args.max_covenant_confirm_wait_s),
+        margin=_cross_clock_margin(args),
+        # The FAST tail. A slow chain only lengthens the maker's lock; a fast one shrinks the
+        # taker's claim window, so the fast tail is the direction that has to be safe.
+        rxd_block_interval_s=float(args.rxd_block_interval_fast_s),
+    ).value
+
+
+def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """The bound that was missing entirely: t_rxd must be LARGE enough, not merely small enough.
+
+    ASSET_VULNERABLE is `eth_timeout - t_rxd * fast` — the span in which the maker's covenant refund
+    has matured AND the counter leg is still claimable with `p`, so the maker can hold both. The
+    two existing bounds constrain the taker's wait and the maker's deadline; neither looks at this,
+    so every value the runner accepted violated it. Today's run used 240 and carried a 21.6h window
+    where the design intends roughly the cross-clock margin.
+
+    Sized at the FAST tail because fast Radiant blocks are what mature the covenant sooner in
+    wall-clock — the direction that widens this window.
+    """
+    if _t_rxd_bounds_the_vulnerable_window(args, remaining_s):
+        return
+    margin_s = _cross_clock_margin(args).total_s()
+    window_s = _asset_vulnerable_window_s(args, remaining_s)
+    raise SystemExit(
+        f"--t-rxd-blocks {args.t_rxd_blocks} leaves a {window_s / 3600:.2f} h ASSET_VULNERABLE "
+        f"window — the span where the maker's covenant refund has matured AND the counter leg is "
+        f"still claimable with the preimage, so the maker can end up holding both legs. It should "
+        f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
+        f"the taker safety. Only one of those is recoverable."
+    )
+
+
+def _token_leg_is_real(args: argparse.Namespace) -> bool:
+    """A token counter leg on a value-bearing chain — the case where both legs carry value.
+
+    Native ETH on Sepolia is deliberately NOT this: the chain is value-bearing by tag, but the
+    asset is faucet money, which is the whole premise of the sepolia-dust stage.
+    """
+    return args.counter_asset != "native" and _evm_is_value_bearing(args.eth_chain_id)
 
 
 def _anvil_rpc(url, method, params=None):
@@ -137,14 +648,60 @@ def _free_port() -> int:
     return port
 
 
-def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
+def _load_restore(args) -> dict | None:
+    """The recovery file for a resume, or None for a fresh run."""
+    if not args.resume:
+        return None
+    return json.loads(
+        read_own_private_file(
+            Path(args.keys_out).expanduser(),
+            what="the preimage, both RXD keys and the ETH deadline this resume rebuilds from",
+        )
+    )
+
+
+def resolve_eth_timeout(restore: dict | None, *, now_unix_s: int, eth_timeout_s: int) -> int:
+    """The swap's ETH deadline: FROM THE RECORD on a resume, from the clock on a fresh run.
+
+    Extracted from `run_sepolia_dust` so it can be tested. It could not be before: the decision
+    lived inside a 140-statement function no test executes, and the test that claimed to cover it
+    passed the timeout in itself and asserted the same value came back — true by construction and
+    unable to fail. That is the exact defect this function exists to prevent, sitting in the file
+    whose purpose was to prevent it.
+
+    `eth_timeout_unix_s` is an IMMUTABLE of the deployed HTLC and it anchors every cross-clock
+    margin. Recomputing it on resume re-times the swap against a contract that cannot be re-timed:
+    the margins would be measured from a deadline the chain does not agree with.
+    """
+    if restore is None:
+        return int(now_unix_s) + int(eth_timeout_s)
+    return int(restore["eth_timeout_unix_s"])
+
+
+def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: dict | None = None):
     """Build the HTLC covenant + negotiated terms. ``minted`` (a MintedNft) is REQUIRED for the
-    NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT."""
-    p_secret = SecretBytes(os.urandom(32))
-    h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+    NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT``.
+
+    ``restore`` is the recovery file, and it makes ``--resume`` mean what it says. Without it,
+    resume MINTED A FRESH SWAP: a new preimage, new RXD keys and a new eth_timeout, which builds a
+    DIFFERENT covenant with a different hashlock and silently abandons the funded one. That was
+    only ever caught because the O_EXCL write of the recovery file failed afterwards — the
+    protection was accidental, and on a different --keys-out it would not have fired at all.
+    Nothing drives this script in tests, which is the same reason three runners sat broken from
+    HZ-1 until a real run found them.
+    """
+    if restore is not None:
+        p_secret = SecretBytes(bytes.fromhex(restore["preimage_p_hex"]))
+        h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+        if h.hex() != restore["hashlock_H"]:
+            raise SystemExit("recovery file is inconsistent: sha256(p) != recorded hashlock_H")
+        taker_rxd, maker_rxd = PrivateKey(restore["taker_rxd_wif"]), PrivateKey(restore["maker_rxd_wif"])
+    else:
+        p_secret = SecretBytes(os.urandom(32))
+        h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+        taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
     t_btc = bt.Timelock(args.t_rxd_blocks + args.margin_blocks + 4, bt.TimeUnit.BLOCKS)  # decorative for ETH
-    taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     if args.asset_variant == "nft":
@@ -200,18 +757,92 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
         btc_claim_pubkey_xonly=b"\x00" * 32,
         btc_refund_pubkey_xonly=b"\x00" * 32,
         counter_chain="eth",
-        value_amount=args.eth_amount_wei,
+        value_amount=_counter_value(args),
+        token_address=(_counter_token(args).address if _counter_token(args) else ""),
         eth_timeout_unix_s=eth_timeout,
     )
     return terms, cov, p_secret, h, (taker_rxd, maker_rxd, taker_pkh, maker_pkh)
 
 
+def _counter_token(args):
+    """The ERC-20 this run swaps against, or None for a native-ETH counter leg.
+
+    Resolved from the PINNED registry by (symbol, chain id) rather than from an address on the
+    command line. A mistyped address that happens to be a live contract is a token nobody priced,
+    and `USDC` on the wrong chain id is a different contract entirely — the registry makes both
+    unrepresentable instead of merely unlikely.
+    """
+    if args.counter_asset == "native":
+        return None
+    return token_for(args.counter_asset.upper(), int(args.eth_chain_id))
+
+
+def _counter_value(args):
+    """The counter-leg amount, in whatever units that leg denominates.
+
+    Native: wei. ERC-20: the token's BASE UNITS (USDC is 6-decimal, so 1_000_000 == 1.00 USDC).
+    The record is chain-tagged precisely so a later reader cannot mistake the second for the first.
+    """
+    return int(args.eth_amount_wei) if args.counter_asset == "native" else int(args.token_amount)
+
+
+def _eth_rpc(args, *, rpc_url: str, chain_id: int):
+    """One endpoint, or a QUORUM of them once the token leg carries real value.
+
+    `--eth-rpc-url` takes a comma-separated list. One URL keeps today's behaviour exactly; two or
+    more build a `MultiSourceEthRpc`, so the reads a swap cannot take back — is the counter leg
+    funded, is this address frozen, is the claim final — stop resting on one endpoint's word.
+
+    A real token leg REQUIRES at least two, and that is a deliberate constraint on the operator
+    rather than a default. The single-source read defends a failing provider, not a lying one, and
+    the lagging case is the common one: a load-balanced provider serving a stale node is already
+    recorded in this codebase as having refused a claim and nearly killed a secret.
+
+    Independence is the operator's job and this code cannot check it. Three URLs at one provider
+    share one operator and one outage, and would satisfy the count while providing nothing.
+    """
+    urls = [u.strip() for u in str(rpc_url).split(",") if u.strip()]
+    if not urls:
+        raise SystemExit("--eth-rpc-url is required")
+    if _token_leg_is_real(args) and len(urls) < 3:
+        # THREE, not two, and the reason is arithmetic rather than taste. `min_agreeing` defaults
+        # to a true majority — max(2, n//2+1) — so at n=2 it is 2, and `assert_chain`'s tolerance
+        # for an unreachable endpoint is INERT: both must still answer. That is precisely the
+        # configuration that aborted a live swap on one 429 with value already in the HTLC.
+        # Requiring two endpoints buys a cross-check; requiring three buys the cross-check AND
+        # survives one of them being rate-limited, which on free public endpoints is routine.
+        raise SystemExit(
+            f"a real-value token counter leg needs at least THREE independent --eth-rpc-url "
+            f"endpoints (got {len(urls)}), so a quorum survives one being unreachable. At two, "
+            "min_agreeing is 2 and a single 429 stalls the swap mid-flight. Working L1 endpoints "
+            "measured 2026-08-26: ethereum-rpc.publicnode.com, eth-mainnet.public.blastapi.io, "
+            "eth.api.onfinality.io/public, eth.drpc.org, rpc.mevblocker.io. Use DIFFERENT "
+            "operators — several URLs from one provider share a single failure."
+        )
+    if len(urls) == 1:
+        if _token_leg_is_real(args):
+            raise SystemExit(
+                "a real-value token counter leg requires at least TWO independent --eth-rpc-url "
+                "endpoints (comma-separated), so no irreversible step rests on one endpoint's "
+                "word. Working L1 endpoints measured 2026-08-26: ethereum-rpc.publicnode.com. "
+                "Use providers with DIFFERENT operators — several URLs from one provider share a "
+                "single failure and satisfy nothing."
+            )
+        return EthRpc(urls[0], expected_chain_id=chain_id)
+    return MultiSourceEthRpc([EthRpc(u, expected_chain_id=chain_id) for u in urls])
+
+
 def _eth_leg(args, *, rpc_url, chain_id, key_hex, claim_to, refund_to, eth_timeout, network):
-    rpc = EthRpc(rpc_url, expected_chain_id=chain_id)
-    artifact = load_artifact(args.eth_artifact)
-    contract_leg = EthHtlcContractLeg(
-        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(key_hex)), chain_id=chain_id, artifact=artifact
-    )
+    rpc = _eth_rpc(args, rpc_url=rpc_url, chain_id=chain_id)
+    token = _counter_token(args)
+    artifact = load_artifact(args.eth_artifact if token is None else args.erc20_artifact)
+    key = PrivateKeyMaterial(bytes.fromhex(key_hex))
+    if token is None:
+        contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=chain_id, artifact=artifact)
+    else:
+        # The ERC-20 fund is TWO transactions (deploy, then a plain transfer — no approve, so no
+        # allowance race). That is why the coordinator refuses to run one without a durable record.
+        contract_leg = Erc20HtlcLeg(token=token, rpc=rpc, signing_key=key, chain_id=chain_id, artifact=artifact)
     leg = EthLeg(
         contract_leg=contract_leg,
         network=network,
@@ -228,6 +859,24 @@ def _eth_leg(args, *, rpc_url, chain_id, key_hex, claim_to, refund_to, eth_timeo
 
 async def run_dry(args: argparse.Namespace) -> None:
     print("=== ETH↔RXD swap runner — stage=dry-run (local anvil; NO real value) ===")
+    if args.counter_asset != "native":
+        # A plain anvil has no token contracts, and this stage runs one at chain 31337 rather than
+        # a fork of the chain the token is pinned on. Deploying a MOCK token to close that gap
+        # would test a fiction: the properties most likely to be wrong on this path are runtime
+        # behaviours of the real bytecode — Tether's `transfer` returns no bool, its freeze
+        # predicate is spelled `isBlackListed`, and USDC is 6-decimal — and a mock reproduces
+        # exactly the ones someone remembered to write down.
+        #
+        # Without this the failure is a confusing "no pinned USDT on chain id 11155111", which
+        # blames the registry for a stage limitation.
+        raise SystemExit(
+            f"stage=dry-run is native-ETH only; --counter-asset {args.counter_asset} needs a chain "
+            "that actually has the token on it. The token-path rehearsal is the fork lifecycle "
+            "suite, which drives the production SwapCoordinator against the REAL token contract:\n"
+            "  XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \\\n"
+            "      .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration\n"
+            "It covers USDC and USDT on a mainnet fork, including the freeze gates."
+        )
     if "anvil" not in _which("anvil"):
         raise SystemExit("anvil not found on PATH — install foundry (the dry-run deploys on a local anvil)")
     port = _free_port()
@@ -295,23 +944,58 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # Pre-flight: refuse BEFORE minting if the recovery file already exists (atomic_write_mode_600 is
     # O_EXCL). A leftover file from a prior/aborted run would otherwise crash the keys-persist step
     # AFTER the (real-value) mint — wasting the mint. Fail cheap, up front.
-    if Path(args.keys_out).expanduser().exists():
+    if args.resume:
+        # A resume REQUIRES the recovery file a fresh run refuses to overwrite: it holds the keys
+        # the interrupted run minted, and the swap record sits beside it.
+        if not Path(args.keys_out).expanduser().exists():
+            raise SystemExit(
+                f"--resume needs the recovery file from the interrupted run, and "
+                f"{Path(args.keys_out).expanduser()} does not exist. Without it the keys are gone "
+                "and the deployed contract can only be refunded by hand after its timeout."
+            )
+    elif Path(args.keys_out).expanduser().exists():
         raise SystemExit(
             f"recovery file already exists: {Path(args.keys_out).expanduser()} — move/delete it or pass a "
             f"fresh --keys-out before a new run (refusing to mint over a stale recovery file)"
         )
     # Pin the RXD network to the transport's true network (mainnet) — fail-closed like dust_swap_run.
     rxd_network = SshTrRadiantClient.NETWORK
-    print(f"=== ETH↔RXD DUST swap — stage=sepolia-dust  (ETH=sepolia, RXD={rxd_network} mainnet) ===")
+    _eth_chain = evm_chain_by_id(int(args.eth_chain_id))
+    _asset = "ETH" if args.counter_asset == "native" else args.counter_asset.upper()
+    print(
+        f"=== {_asset}↔RXD DUST swap — stage=sepolia-dust  "
+        f"(counter={_eth_chain.name} chain_id={_eth_chain.chain_id}, RXD={rxd_network} mainnet) ==="
+    )
 
-    policy = _policy(args)
+    # RESUME FIRST. The t_rxd bounds divide `--eth-timeout-s`, a DURATION measured from now, but on
+    # a resume the real deadline is an ABSOLUTE time fixed hours ago and the remaining budget is
+    # whatever is left of it. Validating the original duration accepted values the coordinator then
+    # refused mid-run — after funding — which is the same "checked the wrong quantity" shape as the
+    # confirm-wait reserve. Resolve the deadline, hand the bounds what is actually left, and the
+    # parse-time answer means something on a resume too.
+    restore = _load_restore(args)
+    eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
+    # Only a RESUME has a deadline that is not `now + --eth-timeout-s`. Passing the remaining time
+    # unconditionally made a fresh run's refusals talk about "the resumed swap's deadline".
+    policy = _policy(args, remaining_s=(eth_timeout - int(time.time())) if restore is not None else None)
     provenance = {
         "stage": "sepolia-dust",
         "eth_finalization_window_s": args.eth_finalization_window_s,
         "cross_clock_margin_total_s": _cross_clock_margin(args).total_s(),
         "max_covenant_confirm_wait_s": args.max_covenant_confirm_wait_s,
-        "is_measured": False,
-        "NOTE": "ESTIMATED margins — pre-external-audit dust validation; operator accepts dust loss",
+        # READ FROM THE POLICY, never asserted. These were hardcoded False/"ESTIMATED", so a real
+        # token leg — which builds a MEASURED, require_measured policy — produced a run report
+        # claiming its own margins were estimated. The provenance record is the artifact that
+        # documents the run; a hardcoded field in it is not a note, it is a false statement about
+        # what protected the money. Found by review after the first L1 USDT run, whose report says
+        # ESTIMATED while its policy was MEASURED.
+        "is_measured": policy.is_measured,
+        "require_measured": policy.require_measured,
+        "NOTE": (
+            "MEASURED margins (real-value token counter leg)"
+            if policy.is_measured
+            else "ESTIMATED margins — pre-external-audit dust validation; operator accepts dust loss"
+        ),
     }
     report = StepReport("sepolia-dust", provenance)
 
@@ -353,47 +1037,74 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             )
         print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
-    eth_timeout = int(time.time()) + args.eth_timeout_s
-    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout, minted=minted)
+    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
+        args, eth_timeout=eth_timeout, minted=minted, restore=restore
+    )
+    if restore is not None:
+        # THE load-bearing check. If any restored input is wrong the rebuilt covenant will not be
+        # the one that holds the money, and continuing would fund a second swap while the first
+        # stays stranded. Compare the actual script, not the inputs that produced it.
+        if cov.funded_spk.hex() != restore["rxd_covenant_spk"]:
+            raise SystemExit(
+                "resume rebuilt a DIFFERENT covenant than the funded one — refusing.\n"
+                f"  funded : {restore['rxd_covenant_spk']}\n"
+                f"  rebuilt: {cov.funded_spk.hex()}\n"
+                "  the run's parameters (t-rxd-blocks, asset, amounts) must match the original."
+            )
+        print(f"  RESUMED: rebuilt covenant matches the funded SPK, eth_timeout pinned at {eth_timeout}")
 
     # Persist ALL run state (mode 600) BEFORE any broadcast — recovery/sweep. Holds the preimage p
     # + the ETH signing key + the RXD keys + the covenant SPK; single point of total compromise.
     keys_path = Path(args.keys_out).expanduser()
-    atomic_write_mode_600(
-        keys_path,
-        json.dumps(
-            {
-                "created_unix": int(time.time()),
-                "stage": "sepolia-dust",
-                "eth_chain": "sepolia",
-                "rxd_network": rxd_network,
-                "hashlock_H": h.hex(),
-                "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
-                "eth_key_hex": args.eth_key_hex,
-                "eth_claim_to": args.eth_claim_to,
-                "eth_refund_to": args.eth_refund_to,
-                "eth_timeout_unix_s": eth_timeout,
-                "eth_amount_wei": args.eth_amount_wei,
-                "taker_rxd_wif": _rkeys[0].wif(),
-                "maker_rxd_wif": _rkeys[1].wif(),
-                "rxd_covenant_spk": cov.funded_spk.hex(),
-                "t_rxd_blocks": terms.t_rxd.value,
-                # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
-                # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
-                # need it to rebuild the covenant they spend. Nothing used to persist it.
-                "rxd_covenant_amount": terms.radiant_amount,
-                "asset_variant": args.asset_variant,
-                "asset_genesis_ref": minted.ref_str if minted else None,
-                "asset_owner_wif": minted.owner_key.wif() if minted else None,
-                # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
-                "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
-                "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
-                "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
-            },
-            indent=2,
-        ),
-    )
-    print(f"  run keys persisted -> {keys_path} (mode 600)")
+    if restore is None:
+        atomic_write_mode_600(
+            keys_path,
+            json.dumps(
+                {
+                    "created_unix": int(time.time()),
+                    "stage": "sepolia-dust",
+                    # The CHAIN and the AMOUNT, recorded as they actually are rather than as the stage
+                    # name assumes. Both were wrong for a token run on L1: "sepolia" was hardcoded, and
+                    # the amount logged `--eth-amount-wei` (the NATIVE flag, untouched at its 0.0001 ETH
+                    # default) instead of the token base units actually locked. The run itself was
+                    # unaffected — the coordinator takes `_counter_value(args)` — but this file is the
+                    # RECOVERY path, and a hand-recovery driven from it would have had the wrong chain,
+                    # an amount off by ~10^8, and no idea which token the HTLC even holds.
+                    "eth_chain": evm_chain_by_id(int(args.eth_chain_id)).name,
+                    "eth_chain_id": int(args.eth_chain_id),
+                    "counter_asset": args.counter_asset,
+                    "token_address": (None if _counter_token(args) is None else _counter_token(args).address),
+                    "token_decimals": (None if _counter_token(args) is None else _counter_token(args).decimals),
+                    "rxd_network": rxd_network,
+                    "hashlock_H": h.hex(),
+                    "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
+                    "eth_key_hex": args.eth_key_hex,
+                    "eth_claim_to": args.eth_claim_to,
+                    "eth_refund_to": args.eth_refund_to,
+                    "eth_timeout_unix_s": eth_timeout,
+                    # Base units for a token leg, wei for native — the same value the coordinator locks.
+                    "counter_amount": _counter_value(args),
+                    "eth_amount_wei": args.eth_amount_wei,  # the native flag, kept for older readers
+                    "taker_rxd_wif": _rkeys[0].wif(),
+                    "maker_rxd_wif": _rkeys[1].wif(),
+                    "rxd_covenant_spk": cov.funded_spk.hex(),
+                    "t_rxd_blocks": terms.t_rxd.value,
+                    # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
+                    # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
+                    # need it to rebuild the covenant they spend. Nothing used to persist it.
+                    "rxd_covenant_amount": terms.radiant_amount,
+                    "asset_variant": args.asset_variant,
+                    "asset_genesis_ref": minted.ref_str if minted else None,
+                    "asset_owner_wif": minted.owner_key.wif() if minted else None,
+                    # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
+                    "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
+                    "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
+                    "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
+                },
+                indent=2,
+            ),
+        )
+        print(f"  run keys persisted -> {keys_path} (mode 600)")
 
     rpc, eth_leg = _eth_leg(
         args,
@@ -403,7 +1114,11 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         claim_to=args.eth_claim_to,
         refund_to=args.eth_refund_to,
         eth_timeout=eth_timeout,
-        network="sepolia",
+        # Derived from the chain id, never hardcoded. This string is what the coordinator reads to
+        # decide whether the leg is value-bearing, and the stage is named for Sepolia while the
+        # chain is a parameter — so a Base Sepolia run used to announce itself as Sepolia. Two
+        # names for one chain is how a per-chain constant gets applied to the wrong chain.
+        network=evm_chain_by_id(int(args.eth_chain_id)).network,
     )
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
@@ -434,15 +1149,43 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
     # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
     # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
-    cfg = CoordinatorConfig(margin_policy=policy, accept_estimated_eth_margins=True)
+    cfg = CoordinatorConfig(
+        maker_stall_safety_window_blocks=args.maker_stall_safety_window_blocks,
+        margin_policy=policy,
+        # Only for a throwaway token leg. With a real one the policy above is MEASURED, so this
+        # opt-in is not merely unnecessary — passing it would re-disable the two defences the
+        # measured policy just switched on, and it would do so silently.
+        accept_estimated_eth_margins=not _token_leg_is_real(args),
+        # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
+        # path, and resuming an interrupted fund skips it.
+        fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+    )
+    # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
+    # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
+    # believed the swap had not started while the durable record said otherwise. That is why
+    # `resume_interrupted_fund` was the ONLY resumable point — anything past the fund had a record
+    # the coordinator never read, and the run could not continue from it.
+    _sink = JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
+    _loaded = _sink.load_record() if args.resume else None
+    if _loaded is not None:
+        print(f"  RESUMED record: state={_loaded.state.value}")
+        if _loaded.terms.hashlock != terms.hashlock:
+            raise SystemExit(
+                "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
+                "drive it with these terms."
+            )
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        record=_loaded if _loaded is not None else SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
         indexer=indexer,
         # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
         # so the SEEN-1 reservation survives a restart / second process (was InMemSeen).
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+        # An ETH contract address depends on the deployer's nonce and exists nowhere until the
+        # deploy receipt returns, so this hook is the ONLY thing that makes a mid-fund crash
+        # recoverable. The coordinator refuses an ETH counter-leg without it.
+        persist=_sink,
         config=cfg,
     )
 
@@ -454,37 +1197,15 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
 
     try:
-        # 1. Taker deploys + funds the ETH HTLC on Sepolia.
-        confirm("taker_funds_btc: deploy+fund the ETH HTLC on SEPOLIA (taker pays sepolia gas)", auto_yes=args.yes)
-        rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
-        report.step(
-            name="taker_funds_eth",
-            chain="eth",
-            state=rec.state.value,
-            contract=rec.counterchain_locator.contract_address,
-        )
-        print(f"  -> {rec.state.value} (ETH HTLC: {rec.counterchain_locator.contract_address})")
-        # PERSIST the per-swap contract address now that it exists. It is the ETH-side
-        # provenance anchor (`pyrxd swap recover-preimage --eth-contract`): only artifacts
-        # bound to THIS address may be scraped for p. Previously only eth_swap_two_host.py
-        # wrote it, so a crash here left the address on the console alone.
-        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
-
-        # 1b. MAKER verifies the taker-deployed ETH HTLC binds to terms BEFORE locking RXD
-        #     (red-team CRITICAL/HIGH). In a real TWO-PARTY flow this is the maker's go/no-go gate —
-        #     it fails closed if the taker deployed claimant=self / underfunded / bad timeout, so the
-        #     maker never locks RXD for nothing. (Here, single-operator, taker_funds_btc already set
-        #     the locator and post_asset_lock_revalidate re-verifies pinned to finality as a backstop;
-        #     we still run it explicitly to exercise the gate and document the two-party step.)
-        confirm("maker_verify_counter_funding: verify the on-chain ETH HTLC pays the maker", auto_yes=args.yes)
-        rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
-        report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
-        print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
-
-        # 2. Maker locks the ASSET on MAINNET, then the taker re-validates (incl. the genesis-ref
-        #    authenticity gate for an NFT). NFT: spend the minted singleton INTO the covenant SPK
-        #    (harness-driven, confirm-each). RXD: the operator funds the SPK out-of-band.
-        rxd_locked_at = rxd_blockcount(rxd_client)
+        # 1. MAKER LOCKS THE RADIANT ASSET FIRST. This ordering is the protocol, not a preference:
+        #    the maker is the party that knows p, so a maker who locks SECOND holds a free option —
+        #    it can watch the taker fund and walk away having risked nothing. HZ-1 enforces it from
+        #    the other side, refusing `taker_funds_btc` until the covenant is verified ON CHAIN.
+        #
+        #    This runner used to do the reverse: fund the counter leg at step 1 and print "fund the
+        #    RXD covenant" at step 2. That order predates HZ-1 (#392) and the gate has refused it
+        #    ever since — the runner has been unable to complete a swap, and nothing reported it
+        #    because exercising it costs real mainnet value.
         if args.asset_variant == "nft":
             lock_singleton_into_covenant(
                 rxd_client,
@@ -505,8 +1226,83 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 poll_s=args.confirm_poll_s,
             )
         else:
-            print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker (>= 1 conf):\n    {cov.funded_spk.hex()}")
-            confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
+            await wait_for_covenant_funding(
+                rxd_client,
+                covenant_spk=cov.funded_spk,
+                expected_photons=args.rxd_photons,
+                poll_s=args.confirm_poll_s,
+            )
+        #    ANCHOR THE REORG GATE ON THE FUNDING BLOCK, read AFTER the lock. This used to be
+        #    `rxd_blockcount()` ABOVE the lock: it snapshotted the tip and then blocked — for
+        #    minutes or hours — on the mint/lock and on the operator hand-funding the covenant, so
+        #    the anchor was low by exactly that latency. The comment defending it said a low value
+        #    "can only make the reorg-gate squeeze MORE cautious, never less". True of the gate,
+        #    false of the runner: the squeeze verdict is SQUEEZED, whose handler is
+        #    taker_claim_asset_from_vulnerable — winner-take-all, with no assess_claim_finality
+        #    call anywhere inside it, and unattended under --yes. A more cautious gate produces a
+        #    LESS gated broadcast.
+        #    One scan covers all three variants rather than three code paths: the NFT and FT legs
+        #    lock by SPENDING into the covenant and never touch wait_for_covenant_funding, so the
+        #    covenant's own funding output is the only thing all three share.
+        #    terms.radiant_amount is the pinned carrier value for rxd, nft and ft alike.
+        rxd_locked_at = await scan_covenant_fund_height(
+            rxd_client, covenant_spk=cov.funded_spk, expected_photons=terms.radiant_amount
+        )
+        print(f"  covenant fund height = {rxd_locked_at} (the reorg gate's anchor)")
+
+        # 2. TAKER funds the counter leg. The pre-lock gate re-reads the covenant off the chain
+        #    itself; the wait above only means we do not ask it to check something not there yet.
+        confirm(
+            f"taker_funds_btc: deploy+fund the {_asset} HTLC on {_eth_chain.name} (taker pays gas)",
+            auto_yes=args.yes,
+        )
+        _swaprec = Path(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
+        _already_funded = (
+            _loaded is not None
+            and _loaded.state != SwapState.NEGOTIATED
+            and (getattr(_loaded, "counterchain_locator", None) is not None)
+        )
+        if _already_funded:
+            # The counter leg is already funded and its locator is on the record. Neither fund path
+            # applies: the forward one would deploy a SECOND HTLC, and resume_interrupted_fund
+            # rightly refuses a record with no pending deploy. Continue from where the swap is.
+            rec = _loaded
+            print(f"  counter leg already funded ({rec.counterchain_locator.contract_address}) — skipping the fund")
+        elif args.resume and not _swaprec.exists():
+            # RESUME MEANS "continue from wherever this swap actually is", and that is not always
+            # mid-fund. The covenant can be funded while the ETH fund never started — which is
+            # exactly what happens when the pre-lock gate refuses a shallow covenant and you come
+            # back after it buries. There is no record to resume because nothing was deployed, so
+            # the forward path is correct; `resume_interrupted_fund` rightly refuses that state
+            # ("resuming into a fresh fund would deploy a second HTLC").
+            print("  --resume: covenant funded, ETH fund never started -> taking the FORWARD path")
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        elif args.resume and _swaprec.exists():
+            # THE READ SIDE. Loads the record the interrupted run persisted and completes the fund
+            # it describes — reusing the deployed contract and the pinned nonce, so a retry cannot
+            # deploy a second HTLC or send a second transfer. Without this entry point the durable
+            # record was written and never read, and every guard on the resume path was unreachable.
+            rec = await coord.resume_interrupted_fund(
+                terms,
+                sink=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+                now_unix_s=int(time.time()),
+            )
+        else:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        report.step(
+            name="taker_funds_eth",
+            chain="eth",
+            state=rec.state.value,
+            contract=rec.counterchain_locator.contract_address,
+        )
+        print(f"  -> {rec.state.value} ({_asset} HTLC: {rec.counterchain_locator.contract_address})")
+        # PERSIST the per-swap contract address now that it exists. It is the ETH-side
+        # provenance anchor (`pyrxd swap recover-preimage --eth-contract`): only artifacts
+        # bound to THIS address may be scraped for p. Previously only eth_swap_two_host.py
+        # wrote it, so a crash here left the address on the console alone.
+        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
+
+        # 3. Taker re-validates the covenant pinned to finality -> BOTH_LOCKED.
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=int(time.time()))
         report.step(
             name="post_asset_lock_revalidate",
@@ -517,6 +1313,16 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         print(f"  -> {rec.state.value}")
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after the timeout")
+
+        # 4. MAKER verifies the counter leg binds to terms BEFORE revealing p (red-team CRITICAL).
+        #    It used to sit before the RXD lock, as the maker's go/no-go on whether to lock at all.
+        #    Under maker-locks-first that placement is impossible — the contract does not exist yet —
+        #    so the gate moves to the other irreversible moment it protects: publishing the preimage.
+        #    Fails closed on claimant=self / underfunded / wrong timeout, before p is public.
+        confirm("maker_verify_counter_funding: verify the on-chain HTLC pays the maker", auto_yes=args.yes)
+        rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
+        report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
+        print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
         print(
             "\n  *** MONITORING WINDOW (BOTH_LOCKED): a maker stall (maker never claims the ETH, so p "
@@ -529,7 +1335,17 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
 
         # 3. Maker claims the ETH, revealing p on Ethereum.
-        confirm("maker_claims_btc: broadcast the ETH claim on SEPOLIA (reveals p)", auto_yes=args.yes)
+        # Say what is ACTUALLY being broadcast, on the actual chain, for the actual asset. This
+        # line read "maker_claims_btc: broadcast the ETH claim on SEPOLIA" during a real Ethereum
+        # MAINNET USDT swap — three misnomers in one sentence, at the single most irreversible
+        # moment in the protocol. `maker_claims_btc` is a legacy FSM name (the state machine was
+        # built for BTC<->RXD and the EVM legs reuse it), but an operator reading "SEPOLIA" while
+        # real value moves is being actively misled, not merely confused.
+        confirm(
+            f"maker claims the {_asset} on {_eth_chain.name} (chain {args.eth_chain_id}) — "
+            "THIS PUBLISHES THE PREIMAGE and commits the Radiant side",
+            auto_yes=args.yes,
+        )
         rec = await coord.maker_claims_btc(p_secret)
         claim_tx = eth_leg.last_claim_tx
         if not claim_tx:
@@ -579,8 +1395,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 break
             raise SystemExit(f"unexpected state {rec.state.value} from the reorg-gated claim — operator must intervene")
     finally:
-        report.dump(args.report_out)
-        print(f"  report -> {args.report_out}")
+        _report_path = str(Path(args.report_out).expanduser())
+        report.dump(_report_path)
+        print(f"  report -> {_report_path}")
         await rpc.close()
 
 
@@ -589,21 +1406,61 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--stage", choices=["dry-run", "sepolia-dust"], required=True)
     ap.add_argument("--i-accept-dust-loss", action="store_true")
     ap.add_argument("--yes", action="store_true", help="auto-confirm broadcasts (dry-run / unattended only)")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "COMPLETE an interrupted fund instead of starting a fresh one. Loads the persisted "
+            "swap record written beside --keys-out and finishes the counter-leg funding it "
+            "describes, reusing the deployed contract and the pinned push nonce rather than "
+            "deploying a second HTLC. Requires the existing --keys-out (which a fresh run refuses)."
+        ),
+    )
     # ETH
-    ap.add_argument("--eth-rpc-url", default="")
-    ap.add_argument("--eth-key-hex", default="")
+    ap.add_argument(
+        "--eth-rpc-url",
+        default="",
+        help=(
+            "EVM endpoint. Comma-separated for a QUORUM, which a real token counter leg requires: "
+            "safety-critical reads then need agreement instead of one endpoint's word. Use "
+            "independent providers — several URLs from one provider share a single failure."
+        ),
+    )
+    add_eth_key_arguments(ap)
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument("--eth-amount-wei", type=int, default=10**14)  # 0.0001 ETH dust
     ap.add_argument("--eth-claim-to", default="")
     ap.add_argument("--eth-refund-to", default="")
     ap.add_argument("--eth-artifact", default=str(_DEFAULT_ARTIFACT))
+    ap.add_argument("--erc20-artifact", default=str(_DEFAULT_ERC20_ARTIFACT))
+    ap.add_argument(
+        "--counter-asset",
+        # DERIVED from the registry, never hand-listed. A hardcoded ("native", "usdc") left USDT
+        # pinned-but-unreachable the moment it was added — the same reachability gap the ERC-20 leg
+        # itself had. A new pinned symbol is now selectable the day it lands.
+        choices=("native", *sorted({sym.lower() for sym, _ in KNOWN_TOKENS})),
+        default="native",
+        help="what the counter leg pays: native ETH, or an ERC-20 resolved from the pinned registry",
+    )
+    ap.add_argument(
+        "--token-amount",
+        type=int,
+        default=1_000_000,
+        help="ERC-20 amount in BASE UNITS (USDC is 6-decimal: 1_000_000 == 1.00 USDC). Not wei.",
+    )
     ap.add_argument("--eth-timeout-s", type=int, default=86_400)  # 1 day ETH refund deadline
     # RXD
     ap.add_argument("--rxd-photons", type=int, default=1000)
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
-    ap.add_argument("--t-rxd-blocks", type=int, default=60)
+    ap.add_argument(
+        "--t-rxd-blocks",
+        type=int,
+        default=0,
+        help="0 (default) DERIVES it from --eth-timeout-s and the measured fast tail. Pass a "
+        "value only to override a rehearsal; it is checked against the same bounds either way.",
+    )
     # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).
     ap.add_argument("--asset-variant", choices=("rxd", "nft", "ft"), default="rxd")
     ap.add_argument("--ft-name", default="ETH-RXD-REAL-FT")
@@ -642,10 +1499,41 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--margin-blocks", type=int, default=36)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help=(
+            "MEASURED p10 Radiant inter-block (seconds). Required once the token counter leg is "
+            "real. Reserves DIVIDE by this, so a stale-high value under-counts blocks; measure it "
+            "per run rather than inheriting a number."
+        ),
+    )
     # Default (None) → resolved from the EVM chain registry by --eth-chain-id in _args() below, so a
     # known chain gets its VETTED finalization window (e.g. Base 900s, not Ethereum's 768s); an
     # operator value always overrides. Realizes the registry's fail-closed per-chain safety.
     ap.add_argument("--eth-finalization-window-s", type=int, default=None)
+    ap.add_argument(
+        "--eth-finality-stall-tolerance-s",
+        type=int,
+        default=0,
+        help=(
+            "ADDITIONAL budget for an ETH finality STALL, seconds. Real-value mode requires "
+            ">= 3600 (the May-2023 mainnet stall ran about an hour). 0 keeps the existing "
+            "testnet behaviour; a measured policy refuses it."
+        ),
+    )
+    ap.add_argument(
+        "--maker-stall-safety-window-blocks",
+        type=int,
+        default=6,
+        help=(
+            "N: the squeeze window the taker must be able to act inside. The coordinator enforces "
+            "a floor of ceil(eth_finalization_window_s / FAST-tail interval) + burial - 1, which on "
+            "L1 with a measured 36s fast tail is 27 — well above this default of 6. Raise it for a "
+            "real ETH counter leg; the default suits a chain whose finality window is small."
+        ),
+    )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)
     ap.add_argument("--rounding-slack-s", type=int, default=300)
@@ -653,14 +1541,19 @@ def _args() -> argparse.Namespace:
     # ops
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
-    ap.add_argument("--report-out", default="/tmp/eth_swap_report.json")  # noqa: S108 — operator-overridable
+    # NOT /tmp. It is world-writable and shared with every process on the box: the report from the
+    # first real-value RXD/USDT swap was deleted there by an unrelated cleanup the same day. The
+    # report is the run's only off-chain provenance — txids, timings, the margins actually used —
+    # and it cannot be regenerated once the run is over. Default it beside the key file, under the
+    # operator's own home, where the same ownership and mode rules apply.
+    ap.add_argument("--report-out", default="~/.eth_swap_report.json")
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
+    resolve_eth_key_file(args)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
     # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.
     if args.eth_finalization_window_s is None:
-        from pyrxd.eth_wallet.chains import evm_chain_by_id
         from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
         from pyrxd.security.errors import ValidationError
 

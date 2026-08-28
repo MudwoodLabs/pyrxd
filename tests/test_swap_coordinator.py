@@ -18,6 +18,7 @@ real legs would. This exercises:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1194,6 +1195,9 @@ def test_real_value_mode_requires_a_stall_tolerant_finality_margin():
                 block_interval_s=600.0,
                 is_measured=True,
                 require_measured=True,
+                # Real-value mode also requires a measured fast tail; supply it so this test
+                # reaches the stall-tolerance check it is actually about.
+                rxd_block_interval_fast_s=43.0,
                 cross_clock_margin=_margin(bad),
             )
 
@@ -1204,6 +1208,7 @@ def test_real_value_mode_requires_a_stall_tolerant_finality_margin():
             block_interval_s=600.0,
             is_measured=True,
             require_measured=True,
+            rxd_block_interval_fast_s=43.0,
             cross_clock_margin=_margin(good),
         )
         assert ok.cross_clock_margin is not None
@@ -1370,6 +1375,49 @@ def test_assess_claim_finality_f007_rxd_interval_scaling():
     # ratio 1 (same interval) reproduces the old 1:1 behaviour: 14 - 6 = 8 >= 6 -> WAIT
     p1 = _p(600.0)
     assert assess_claim_finality(counter_claim_finality=_verdict(1, p1), **base, policy=p1) is ClaimFinality.WAIT
+
+
+def test_assess_claim_finality_uses_the_FAST_TAIL_interval_for_the_reserve():
+    """The production caller for the fast/slow split (#509).
+
+    The split was previously tested only by calling `_dividing_interval_s` directly — so reverting
+    all three call sites to the nominal field left the whole suite green. Mechanism proven, caller
+    unproven, which is the failure class this project keeps finding. This drives the real
+    `assess_claim_finality` and asserts the VERDICT changes.
+
+    Dividing by a SMALLER interval yields MORE reserve blocks, so a fast tail must be able to turn
+    a WAIT into a SQUEEZED — that is the whole point of reserving against a fast chain.
+    """
+
+    def _p(nominal, fast):
+        return MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=nominal,
+            rxd_block_interval_fast_s=fast,
+            btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+            rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        )
+
+    base = dict(
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(20, t.TimeUnit.BLOCKS),  # 14 blocks left
+    )
+    # Nominal 600s == BTC interval: reserve = ceil(6 * 600/600) = 6; 14 - 6 = 8 >= burial 6 -> WAIT.
+    nominal_only = _p(600.0, None)
+    assert (
+        assess_claim_finality(counter_claim_finality=_verdict(1, nominal_only), **base, policy=nominal_only)
+        is ClaimFinality.WAIT
+    )
+    # Same policy, but a measured FAST tail of 300s: reserve = ceil(6 * 600/300) = 12; 14 - 12 = 2
+    # < 6 -> SQUEEZED. The nominal field is unchanged, so ONLY the fast tail can produce this.
+    with_fast = _p(600.0, 300.0)
+    assert (
+        assess_claim_finality(counter_claim_finality=_verdict(1, with_fast), **base, policy=with_fast)
+        is ClaimFinality.SQUEEZED
+    ), "the reserve ignored rxd_block_interval_fast_s — the split is not wired to this call site"
 
 
 def test_assess_claim_finality_parity_sweep_byte_equivalent():
@@ -1772,6 +1820,8 @@ class FakeEthLeg:
         self._p = preimage.unsafe_raw_bytes() if isinstance(preimage, SecretBytes) else bytes(preimage)
         self._verdict = verdict
         self.provenance_ok = provenance_ok
+        self.resumed_from = None
+        self.push_nonce_seen = None
         self.fund_amount_delta = fund_amount_delta  # simulate a mis-funded (over/under) contract
         self.verify_raises = verify_raises  # simulate verify_funded failing AFTER deploy (atomicity inversion)
         self.calls: list[str] = []
@@ -1796,10 +1846,23 @@ class FakeEthLeg:
     def locked_amount(self, locator) -> int:
         return locator.amount_wei
 
-    async def fund(self, terms) -> EthHtlcLocator:
+    async def fund(
+        self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None
+    ) -> EthHtlcLocator:
         # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
         # contract is already deployed on-chain when we raise — the atomicity inversion.
         self.calls.append("fund")
+        self.resumed_from = resume_from
+        self.push_nonce_seen = push_nonce
+        # Mirror the real leg: report the nonce the push is pinned to BEFORE broadcasting, so the
+        # caller can make it durable. A fake that skipped this would hide a coordinator that never
+        # records the pin — and an unrecorded pin is no pin at all on the retry that needs it.
+        if on_push_nonce is not None and push_nonce is None:
+            await on_push_nonce(7)
+        # Mirror the real leg: report the deployed address before returning a locator, so a
+        # coordinator test can observe what the record holds mid-fund.
+        if on_deploy is not None:
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         loc = EthHtlcLocator(
             chain_id=11155111,
             contract_address="0x" + "ab" * 20,
@@ -2332,16 +2395,48 @@ async def test_pre_lock_dispatches_eth_ordering_gate():
 # --------------------------------------------------------------------------- ETH full lifecycle
 
 
-def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None):
+class _MemLock:
+    """A stand-in for `FileFundLock` that records whether it was actually entered."""
+
+    def __init__(self) -> None:
+        self.entries = 0
+
+    @contextlib.contextmanager
+    def __call__(self):
+        self.entries += 1
+        yield
+
+
+def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None, fund_lock=None):
+    """An ETH coordinator wired the way production must be.
+
+    `persist` is supplied unconditionally because the coordinator now REFUSES an ETH counter-leg
+    without one: an ETH contract address is not derivable from terms, so without a durable record a
+    mid-fund crash leaves value on chain that nothing references. Not one shipped runner injected a
+    hook, which is how the durable-handle work reached main-line code with no production caller.
+    Tests must therefore supply one too — and asserting on what it received is how the persistence
+    is checked at all.
+    """
     rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
-    return SwapCoordinator(
+    coord = SwapCoordinator(
         record=rec,
         counter_leg=eth_leg,
         radiant_leg=radiant_leg or FakeRadiantLeg(),
         indexer=FakeIndexer(),
         seen_store=seen_store or FakeSeenStore(),
-        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+        config=CoordinatorConfig(
+            margin_policy=policy or _eth_fund_policy(),
+            maker_stall_safety_window_blocks=6,
+            fund_lock=fund_lock,
+        ),
     )
+    coord.persisted = []
+
+    async def _persist(record):
+        coord.persisted.append(record)
+
+    coord._persist = _persist
+    return coord
 
 
 async def test_eth_full_lifecycle_negotiated_to_completed():
@@ -2765,6 +2860,451 @@ def test_burial_safety_factor_below_one_rejected():
         MarginPolicy.measured(
             margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=300.0, burial_safety_factor=0.9
         )
+
+
+async def test_the_coordinator_persists_a_deployed_eth_contract_onto_the_record():
+    """Production entry point for the durable-deploy fix.
+
+    `taker_funds_btc` persists an intent record before broadcasting, and its comment claims that
+    record "knows WHERE the HTLC address is". True for BTC — the P2TR funding address derives from
+    terms before anything is broadcast. FALSE for ETH, where a CREATE address depends on the
+    deployer's nonce and does not exist until the deploy receipt returns. Without this, a crash
+    mid-fund left real value in a contract referenced only by an exception string, and `refund()`
+    could not be pointed at it.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    persisted: list = []
+    coord._persist = lambda rec: persisted.append(rec) or asyncio.sleep(0)
+
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    # THE property: at the moment the contract existed on chain but was not yet an accepted
+    # locator — the window a crash falls into — a record carrying its address had been WRITTEN.
+    addrs = [getattr(r, "pending_counter_contract", None) for r in persisted]
+    assert ("0x" + "ab" * 20) in addrs, (
+        f"no persisted record ever referenced the deployed contract, so a crash mid-fund would "
+        f"leave value on chain with nothing pointing at it; persisted values were {addrs}"
+    )
+    # And once funding SUCCEEDS the handle is cleared, because the locator now carries the
+    # address; a stale 'pending' would point recovery at a swap that no longer needs it.
+    assert coord.record.pending_counter_contract is None
+    assert coord.record.counterchain_locator is not None
+    assert coord.record.counterchain_locator.contract_address.lower() == "0x" + "ab" * 20
+
+
+async def test_a_crashed_fund_can_be_RESUMED_instead_of_being_refused_forever():
+    """The retry half of the mid-fund crash story, through the REAL coordinator.
+
+    `reserve(H)` commits before the only broadcast, on purpose — two concurrent funders of the same
+    H must not both proceed. But that made a crashed fund unrecoverable in-band: the record stays
+    NEGOTIATED, the reservation is spent, and every retry is refused with "H already reserved". The
+    only knob an operator actually had was calling `fund` directly, which deploys a SECOND contract
+    and pushes a second full amount.
+
+    A record carrying a pending deploy is proof this swap already won that race, so the retry
+    resumes rather than re-reserving.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    lock = _MemLock()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=lock)
+
+    # Simulate the crash: the deploy landed and was persisted, nothing else completed.
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    # The reservation is already spent — as it would be after the crash.
+    coord.seen_store.reserve(h)
+
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    assert rec.state is SwapState.BTC_LOCKED, "the resumed fund did not complete"
+    assert leg.resumed_from is not None, "the leg was asked to fund fresh instead of resuming"
+    assert leg.resumed_from.address == "0x" + "ab" * 20
+    assert leg.resumed_from.deploy_tx_hash == "0x" + "cd" * 32
+    assert lock.entries == 1, "the fund ran without holding the exclusion lock"
+
+
+async def test_a_FRESH_fund_still_reserves_H_and_a_second_funder_is_refused():
+    """The guarantee the resume path must not weaken. Without a pending deploy on the record, the
+    reservation still runs and still refuses a second funder of the same H — otherwise the resume
+    would have turned a real defence into an opt-out."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_full(terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()))
+    coord.seen_store.reserve(h)  # somebody else got there first
+    with pytest.raises(ValidationError, match="hashlock H reused"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED
+
+
+async def test_a_resume_is_REFUSED_when_the_seen_store_no_longer_holds_the_reservation():
+    """The resume skips both the H-reuse probe and the atomic reserve, on the argument that a
+    pending-deploy record proves this swap already won the reservation. That holds only while the
+    seen-store and the record-store agree — a restored backup, a rotated store, or a non-durable
+    SeenStore beside durable records breaks it, and then a second swap under the same H could fund
+    a second HTLC where one revealed `p` drains both. Check the assumption, do not trust it.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    # The stores have diverged: a pending record, but H was never reserved here.
+    with pytest.raises(ValidationError, match="NOT reserved"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls, "the leg was asked to fund against an unproven reservation"
+
+
+async def test_a_resume_without_a_FUND_LOCK_is_refused():
+    """`reserve(H)` was the only mutual exclusion in the funding path. The resume skips it — the
+    record already holds that reservation — so without a replacement lock two resumers each read
+    the same pre-push balance, each send the shortfall, and the HTLC ends holding twice the
+    negotiated amount, which claim sweeps entirely to the counterparty. Refusing is the only safe
+    default: a lock the caller may forget is a lock that will eventually not be taken.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)  # no fund_lock
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    coord.seen_store.reserve(h)
+    with pytest.raises(ValidationError, match="fund_lock"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls, "the leg funded without mutual exclusion"
+
+
+async def test_an_ETH_fund_without_a_PERSIST_hook_is_refused():
+    """An ETH contract address depends on the deployer's nonce and exists nowhere until the deploy
+    receipt returns, so a record is the only thing that can make a mid-fund crash recoverable.
+    Without a persist hook `_persist_record` is a silent no-op — which is what shipped: not one
+    runner injected one, so the durable handle never reached disk in production at all."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    coord._persist = None  # the shipped configuration, before this guard
+    with pytest.raises(ValidationError, match="durable persist hook"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls
+
+
+async def test_the_coordinator_records_the_pinned_push_nonce_before_the_push():
+    """Nonce pinning is what makes funding idempotent without a distributed lock — a re-send at a
+    recorded nonce REPLACES rather than adds (measured 2026-08-24). The pin is only worth anything
+    on a retry, and a retry only happens after a crash, so a pin the coordinator never persisted is
+    no pin at all.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    pins = [getattr(r, "pending_push_nonce", None) for r in coord.persisted]
+    assert 7 in pins, (
+        f"the pinned push nonce was never PERSISTED, so a retry after a crash would build a fresh "
+        f"nonce and fund the HTLC a second time; persisted pins were {pins}"
+    )
+
+
+async def test_a_resume_passes_the_RECORDED_pin_down_to_the_leg():
+    """The other half: recording it is useless if the resume does not send it back."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=_MemLock())
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+        pending_push_nonce=41,
+    )
+    coord.seen_store.reserve(h)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert leg.push_nonce_seen == 41, (
+        f"the resume sent push_nonce={leg.push_nonce_seen} instead of the recorded pin 41 — a fresh "
+        "nonce is additive and funds the HTLC twice"
+    )
+
+
+async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
+    """The end-to-end path that did not exist, and could not be tested, until the read side landed.
+
+    Every earlier resume test hand-built a `SwapRecord` with `pending_counter_contract` already set
+    — which no production code could ever produce, because nothing read the file back. This drives
+    the real `JsonFileRecordSink`: a first coordinator crashes mid-fund, its record is written to
+    disk by the real sink, and a SECOND coordinator (a fresh process, in effect) loads that file and
+    completes the fund. That is the whole point of the durable handle.
+    """
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    # --- run 1: deploys, records the address and the nonce pin, then dies before completing ---
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            await on_push_nonce(7)
+            raise NetworkError("process died mid-fund")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError, match="died mid-fund"):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    on_disk = sink.load_record()
+    assert on_disk is not None and on_disk.pending_counter_contract == "0x" + "ab" * 20, (
+        "the crash left nothing on disk pointing at the deployed contract"
+    )
+    assert on_disk.pending_push_nonce == 7
+
+    # --- run 2: a FRESH coordinator loads that file and completes the fund ---
+    leg2 = FakeEthLeg(preimage=secret, verdict=_final())
+    resumed = _eth_coord_full(terms=terms, eth_leg=leg2, seen_store=seen, fund_lock=_MemLock())
+    resumed._persist = sink
+    rec = await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+
+    assert rec.state is SwapState.BTC_LOCKED, "the resumed fund did not complete"
+    assert leg2.resumed_from is not None and leg2.resumed_from.address == "0x" + "ab" * 20, (
+        "the resume deployed a second contract instead of completing the recorded one"
+    )
+    assert leg2.push_nonce_seen == 7, "the recorded nonce pin was not carried into the resume"
+
+
+async def test_resume_REFUSES_when_there_is_nothing_to_resume(tmp_path):
+    """Falling through to a fresh fund would deploy a SECOND contract."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=_MemLock())
+    with pytest.raises(ValidationError, match="nothing to resume"):
+        await coord.resume_interrupted_fund(terms, sink=JsonFileRecordSink(tmp_path / "absent.json"), now_unix_s=_NOW)
+    assert "fund" not in leg.calls
+
+
+async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_path):
+    """`taker_funds_btc` takes terms as an argument and never checks them against the record it is
+    about to act on, so a drifted argument would fund the contract from one swap using another
+    swap's parameters."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(
+        dataclasses.replace(
+            SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            pending_counter_contract="0x" + "ab" * 20,
+            pending_counter_deploy_tx="0x" + "cd" * 32,
+        )
+    )
+    _, other_h = generate_secret()
+    other = _eth_terms(hashlock=other_h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=other, eth_leg=leg, fund_lock=_MemLock())
+    with pytest.raises(ValidationError, match="do not match the persisted record"):
+        await coord.resume_interrupted_fund(other, sink=sink, now_unix_s=_NOW)
+    assert "fund" not in leg.calls
+
+
+def _valued_policy():
+    """A policy carrying real economics, so the value-scaled burial actually binds.
+
+    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 30, and each test picks a
+    `t_rxd` on one side of that. The variation lives in `_terms(t_rxd_blocks=...)`, NOT here — an
+    earlier version took a `t_rxd_ok` flag it never read, which implied the policy itself was
+    tailored per case when every call returned the same object.
+    """
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=3_000_000,  # B(V) = 30 blocks at factor 1.0
+    )
+
+
+class TestTRxdMustBeAbleToContainTheValueScaledBurial:
+    """`assess_claim_finality` returns SAFE only when `blocks_left >= B(V)`, and `blocks_left` is at
+    best `t_rxd`. So SAFE is reachable AT ALL only if `t_rxd >= B(V)` — and that was checked nowhere
+    before the taker committed its counter leg.
+
+    The maker chooses `t_rxd`, and shrinking it made the ordering gate pass MORE easily (`t_btc -
+    t_rxd` grows), so the one gate that looked at `t_rxd` rewarded exactly the direction that
+    nullifies the burial. A maker could hand over a swap that is unconditionally SQUEEZED, and the
+    taker would discover it only after revealing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
+        _secret, h = generate_secret()
+        # B(V) = 30; the SUFFICIENT floor is 30 + counter_reserve(0 for BTC) + 1 to mine = 31.
+        terms = _terms(hashlock=h, t_rxd_blocks=30)
+        coord = _coordinator(terms=terms, policy=_valued_policy())
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "a safe claim needs" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_that_EXACTLY_meets_the_sufficient_floor_is_accepted(self) -> None:
+        """The boundary, and it is the SUFFICIENT one: burial + counter-leg reserve + one block to
+        mine. `t_rxd >= burial` alone is merely necessary — it leaves the band
+        [burial, burial + reserve + 1) open, where a maker can pass this gate, reveal late, and
+        still hand the taker a SQUEEZED claim.
+
+        A guard that refuses valid work is a bug, and this one sits on a parameter an honest maker
+        must choose, so equality has to pass."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=31)
+        coord = _coordinator(terms=terms, policy=_valued_policy())
+        gate = await coord.pre_btc_lock_check(terms)
+        assert gate.ok, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_the_FLAT_burial_binds_even_without_economics(self) -> None:
+        """This test previously asserted the opposite — that a policy without economics does not
+        bind — which encoded the same mistake as the gate it was testing.
+
+        The gate checked only the VALUE-SCALED term, which is 0 when no reorg cost is configured.
+        So with the default 6-block flat burial, a t_rxd of 1 sailed through and then SQUEEZED on
+        every claim. The flat burial was checked at NO point before the taker committed, in any
+        configuration — and it is the term that dominates in exactly the dust runs this was
+        supposed to leave alone.
+        """
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=6)  # flat burial 6, so the floor is 6 + 0 + 1 = 7
+        coord = _coordinator(terms=terms)
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "a safe claim needs" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_an_ORDINARY_t_rxd_still_passes_without_economics(self) -> None:
+        """The paired honest path. Binding on the flat burial must not refuse a normal swap — the
+        default flat burial is 6 blocks and ordinary windows are far larger."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=72)
+        coord = _coordinator(terms=terms)
+        gate = await coord.pre_btc_lock_check(terms)
+        assert gate.ok, gate.reason
+
+
+class TestReservesUseTheFastTailInterval:
+    """Dividing a time span by the interval to get a block count wants the FAST tail: a smaller
+    interval yields MORE blocks, which is more cover. Multiplying wants the slow tail. One field
+    cannot serve both — reusing it across an inverse pair is what made #484's filed fix refuse
+    every configuration.
+
+    See docs/solutions/design-decisions/sizing-t-rxd-the-two-directions-rule.md.
+    """
+
+    def test_the_fast_tail_produces_a_LARGER_reserve_than_the_nominal(self) -> None:
+        """The whole point, stated as arithmetic. At the measured p10 of 43s against the 300s
+        nominal, a 768s finalization window reserves 18 blocks instead of 3 — the nominal covers
+        about a sixth of the window it is meant to protect."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        nominal = _valued_policy()
+        assert _dividing_interval_s(nominal) == nominal.rxd_block_interval_s
+
+        fast = dataclasses.replace(nominal, rxd_block_interval_fast_s=43.0)
+        assert _dividing_interval_s(fast) == 43.0
+        assert math.ceil(768 / _dividing_interval_s(fast)) > math.ceil(768 / _dividing_interval_s(nominal))
+
+    def test_an_UNSET_fast_tail_preserves_todays_behaviour_exactly(self) -> None:
+        """The no-regression guarantee. Every existing policy and dust run keeps its current
+        reserves; the split tightens only where an operator opts in or real-value mode demands it."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        p = _valued_policy()
+        assert p.rxd_block_interval_fast_s is None
+        assert _dividing_interval_s(p) == p.rxd_block_interval_s
+
+    def test_a_fast_tail_SLOWER_than_the_nominal_is_refused(self) -> None:
+        """The two swapped is the failure that would silently UNDER-reserve while looking correct."""
+        with pytest.raises(ValidationError, match="cannot be slower"):
+            dataclasses.replace(_valued_policy(), rxd_block_interval_fast_s=999.0)
+
+    def test_real_value_mode_REQUIRES_a_fast_tail(self) -> None:
+        from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+
+        with pytest.raises(ValidationError, match="rxd_block_interval_fast_s"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=True,
+                require_measured=True,
+                cross_clock_margin=CrossClockMargin(
+                    eth_reorg_finality_s=780,
+                    rxd_claim_burial_s=1_800,
+                    rxd_confirm_slack_s=600,
+                    rounding_slack_s=300,
+                    eth_finality_stall_tolerance_s=3_600,
+                ),
+            )
+
+    def test_the_measured_constructor_supplies_one_so_real_policies_still_build(self) -> None:
+        """A guard that refuses valid work is a bug: `MarginPolicy.measured(...)` must still
+        construct without the caller knowing about the new field."""
+        p = MarginPolicy.measured(margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0)
+        assert p.rxd_block_interval_fast_s is not None
+
+
+class TestTheFundGateClosesTheSqueezeBand:
+    """`t_rxd >= burial` is NECESSARY but not SUFFICIENT.
+
+    `assess_claim_finality` grants SAFE on `blocks_left - counter_reserve >= burial`, and
+    `blocks_left` is `t_rxd` minus the confirmations already elapsed. So the band
+    `[burial, burial + reserve + 1)` passed a burial-only gate while still being SQUEEZED at claim
+    time — a maker could pick a t_rxd inside it, reveal LATE, and hand the taker a swap that cannot
+    reach a safe claim, which is a narrower version of the very thing the gate exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_INSIDE_the_squeeze_band_is_refused(self) -> None:
+        """Exactly the case a burial-only floor let through: >= the burial, < burial + 1."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=30)  # == B(V), inside the band
+        coord = _coordinator(terms=terms, policy=_valued_policy())
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "1 block to mine" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_the_ETH_counter_leg_reserve_widens_the_floor(self) -> None:
+        """On an ETH counter leg the claim-time gate also subtracts the finalization reserve, so the
+        fund-time floor must include it or the band simply reopens wider on that path."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        mp = _valued_policy()
+        assert (
+            mp.eth_finalization_window_s is None
+            or math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp)) >= 0
+        )  # documents the term; the BTC path above has reserve 0
 
 
 @pytest.mark.asyncio

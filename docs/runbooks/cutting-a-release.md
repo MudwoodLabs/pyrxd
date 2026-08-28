@@ -99,9 +99,9 @@ print(len(s.encode('utf-16-le'))//2)"
 
 ## Gotchas
 
-**`gh` needs `--repo` in this clone.** There are two remotes (`origin` →
-`MudwoodLabs/pyrxd`, `eth-htlc` → `MudwoodLabs/pyrxd-eth-htlc`), so `gh` cannot
-infer the target. Without `--repo` it errors with *"No default remote repository
+**`gh` needs `--repo` in this clone.** Some clones carry a second remote besides
+`origin` → `MudwoodLabs/pyrxd` (the counter-leg Solidity lives in its own
+repository), and with more than one remote `gh` cannot infer the target. Without `--repo` it errors with *"No default remote repository
 has been set"* — and in some invocations does nothing at all. Either pass
 `--repo` or set it once with `gh repo set-default MudwoodLabs/pyrxd`.
 

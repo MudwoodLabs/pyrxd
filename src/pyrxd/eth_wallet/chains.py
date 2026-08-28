@@ -54,6 +54,26 @@ Polygon's own security terms), not this Ethereum-anchored window. ``evm_chain_by
 closed. (A 2025-09-10 faulty-milestone incident delayed Polygon finality ~15 min-1 h, resolved
 only by an emergency hard fork — a validator-set liveness risk with no Ethereum analogue.)
 
+Deliberately NOT in the registry — **BNB Smart Chain** (chain_id 56), for the same reason as
+Polygon PoS and it is worth stating separately because the token side looks so inviting. BSC's
+``finalized`` tag is its OWN validator set's (Parlia + BEP-126 fast finality), not
+Ethereum-anchored. MEASURED 2026-08-25 against three independent endpoints
+(``bsc-dataseed.bnbchain.org``, ``bsc-mainnet.public.blastapi.io``, ``bsc-dataseed1.defibit.io``):
+the ``finalized`` tag sits **0-2 seconds / 1-2 blocks behind the tip**. An Ethereum-anchored
+chain cannot finalize in under the 768 s L1 checkpoint, so that measurement alone settles what
+kind of finality this is.
+
+The floor would force a 768 s window onto it, and — exactly as for Polygon — that number
+misrepresents BSC in both directions: it finalizes far faster, and the finality it does have is
+secured by BSC's stake, not Ethereum's. Note that inflating the window does NOT recover the
+difference. A longer wait buys more of BSC's own security, never Ethereum's, so the swap
+operator's trust model is silently substituted whatever number is chosen. BSC needs a reorg depth
+argued in its own validator-set terms before it can carry value here; ``evm_chain_by_id(56)``
+fails closed until someone writes that down.
+
+(The token side is genuinely clean — see the BSC note in ``tokens.py`` — which is precisely why
+this exclusion is recorded here rather than left to be rediscovered.)
+
 The ``network`` tag feeds the existing fail-closed gates unchanged: any tag not in
 ``AUDIT_CLEARED_NETWORKS`` (only isolated test chains are) is value-bearing and refuses to
 run without the explicit post-audit ``audit_cleared=True`` opt-in — so every chain here,
@@ -103,6 +123,19 @@ class EvmChain:
     chain_id: int
     network: str
     finalization_window_s: int
+    #: Whether this chain's coins are FAUCET money. Stated per entry, never inferred.
+    #:
+    #: `network` cannot answer this. It feeds the audit gate, whose cleared set holds Bitcoin-family
+    #: tags only — so every EVM chain here, testnets included, reads as "not audit-cleared". That is
+    #: correct for what that gate does (nothing here is audit-cleared) and useless for deciding
+    #: whether real value is at stake. Reading it as the latter forced measured margins and a
+    #: multi-endpoint quorum onto a Base Sepolia rehearsal: a guard refusing honest work, caught by
+    #: the runner's own wiring tests.
+    #:
+    #: Not derived from the name either. "ends in -sepolia" is true of every testnet in this
+    #: registry today and is a naming convention, not a property; the next testnet that breaks it
+    #: would be silently promoted to real-value.
+    is_testnet: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.chain_id, int) or isinstance(self.chain_id, bool) or self.chain_id <= 0:
@@ -123,18 +156,26 @@ class EvmChain:
 KNOWN_EVM_CHAINS: dict[str, EvmChain] = {
     # Ethereum L1 — finality = 2 epochs (Casper FFG), 768 s steady-state.
     "ethereum": EvmChain(name="ethereum", chain_id=1, network="mainnet", finalization_window_s=768),
-    "sepolia": EvmChain(name="sepolia", chain_id=11155111, network="sepolia", finalization_window_s=768),
+    "sepolia": EvmChain(
+        name="sepolia", chain_id=11155111, network="sepolia", finalization_window_s=768, is_testnet=True
+    ),
     # Base (OP-stack L2) — finalized = batch in a finalized L1 block. 900 s CHOSEN/ESTIMATED
     # steady-state (batch cadence + L1 inclusion + 768 s L1 finality); see module docstring
     # for the 12 h sequencing-window worst case and where to budget it.
     "base": EvmChain(name="base", chain_id=8453, network="base", finalization_window_s=900),
-    "base-sepolia": EvmChain(name="base-sepolia", chain_id=84532, network="base-sepolia", finalization_window_s=900),
+    "base-sepolia": EvmChain(
+        name="base-sepolia", chain_id=84532, network="base-sepolia", finalization_window_s=900, is_testnet=True
+    ),
     # Optimism (OP-stack L2) — the SAME stack as Base, identical finalized-tag semantics
     # (finalized = batch in a finalized L1 block). 900 s matches Base's CHOSEN steady-state;
     # observed steady lag ~15-20 min, the 12 h sequencing-window worst case budgeted separately.
     "optimism": EvmChain(name="optimism", chain_id=10, network="optimism", finalization_window_s=900),
     "optimism-sepolia": EvmChain(
-        name="optimism-sepolia", chain_id=11155420, network="optimism-sepolia", finalization_window_s=900
+        name="optimism-sepolia",
+        chain_id=11155420,
+        network="optimism-sepolia",
+        finalization_window_s=900,
+        is_testnet=True,
     ),
     # Arbitrum One (Nitro optimistic rollup) — finalized = L2 block whose Sequencer batch sits in
     # a FINALIZED L1 block (Ethereum-anchored "hard finality"). Steady-state ~10-20 min -> 1200 s
@@ -142,14 +183,18 @@ KNOWN_EVM_CHAINS: dict[str, EvmChain] = {
     # case is a liveness stall, budgeted separately. NOT the ~6.4 d withdrawal dispute window.
     "arbitrum-one": EvmChain(name="arbitrum-one", chain_id=42161, network="arbitrum-one", finalization_window_s=1200),
     "arbitrum-sepolia": EvmChain(
-        name="arbitrum-sepolia", chain_id=421614, network="arbitrum-sepolia", finalization_window_s=1200
+        name="arbitrum-sepolia",
+        chain_id=421614,
+        network="arbitrum-sepolia",
+        finalization_window_s=1200,
+        is_testnet=True,
     ),
     # Linea (zk / validity rollup) — finalized = L2 block whose validity PROOF is verified in a
     # finalized L1 block (Ethereum-anchored). Proof-cadence-dominated: 6000 s ~= the official
     # MEDIAN hard finality (~1 h 40); the documented up-to-16 h tail is budgeted separately.
     "linea": EvmChain(name="linea", chain_id=59144, network="linea", finalization_window_s=6000),
     "linea-sepolia": EvmChain(
-        name="linea-sepolia", chain_id=59141, network="linea-sepolia", finalization_window_s=6000
+        name="linea-sepolia", chain_id=59141, network="linea-sepolia", finalization_window_s=6000, is_testnet=True
     ),
 }
 

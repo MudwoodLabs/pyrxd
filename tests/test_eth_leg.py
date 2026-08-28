@@ -135,14 +135,62 @@ async def test_fund_derives_kwargs_and_runs_verify(monkeypatch):
 
     out = await leg.fund(_Terms(h, 10**15))
     assert out is loc
-    assert calls["fund"] == {
+    kw = calls["fund"]
+    assert {k: kw[k] for k in ("hashlock", "claimant", "refundee", "timeout", "amount_wei")} == {
         "hashlock": h,
         "claimant": _MAKER,
         "refundee": _TAKER,
         "timeout": _TIMEOUT,
         "amount_wei": 10**15,
     }
+    # The adapter WRAPS on_deploy (to stash the address before the caller's persist can fail), so
+    # it is a callable here rather than the None that was passed in. Asserting the literal dict
+    # only ever proved the defaults propagate — a regression hardcoding `on_deploy=None` in the
+    # forward would have passed unchanged, dropping the coordinator's hook silently.
+    assert callable(kw["on_deploy"])
     assert calls["verify"] == (loc, 10**15)  # post-deploy binding gate ran
+
+
+async def test_fund_forwards_the_REAL_hooks_not_just_their_defaults(monkeypatch):
+    """The gap the round-7 test audit named: nothing checked that a real `resume_from`, `push_nonce`
+    or `on_deploy` actually REACHES the inner leg. A forward that hardcoded the defaults would have
+    passed every existing assertion while silently discarding the coordinator's hooks — which is
+    how the durable handle and the nonce pin both become inert."""
+    from pyrxd.eth_wallet.locator import PendingDeploy
+
+    cl = _contract_leg()
+    loc = _locator(10**15)
+    calls = {}
+    seen: list = []
+
+    async def fake_fund(**kw):
+        calls["fund"] = kw
+        if kw.get("on_deploy") is not None:
+            await kw["on_deploy"]("0x" + "77" * 20, "0x" + "de" * 32)
+        return loc
+
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
+        return None
+
+    monkeypatch.setattr(cl, "fund", fake_fund)
+    monkeypatch.setattr(cl, "verify_funded", fake_verify)
+    leg = _eth_leg(cl)
+    h = hashlib.sha256(os.urandom(32)).digest()
+    pending = PendingDeploy(address="0x" + "77" * 20, deploy_tx_hash="0x" + "de" * 32)
+
+    async def _hook(addr: str, tx: str) -> None:
+        seen.append((addr, tx))
+
+    await leg.fund(_Terms(h, 10**15), on_deploy=_hook, resume_from=pending, push_nonce=41)
+
+    assert calls["fund"]["resume_from"] is pending, "the resume handle never reached the leg"
+    assert calls["fund"]["push_nonce"] == 41, "the nonce pin never reached the leg"
+    assert seen == [("0x" + "77" * 20, "0x" + "de" * 32)], (
+        "the caller's on_deploy hook was not invoked through the adapter's wrapper"
+    )
+    assert leg.last_deployed_address == "0x" + "77" * 20, (
+        "the adapter did not stash the address before running the caller's persist"
+    )
 
 
 def test_expected_locator_built_from_own_config():
@@ -449,6 +497,11 @@ async def test_fund_rejects_timeout_mismatch_with_terms(monkeypatch):
 # -- LOW-R1: verify_funded must pin the EOA get_code + balance reads to the SAME block ------
 
 
+#: The head timestamp `_RecordingRpc` reports. A real value, and a fixed one, so the accessors
+#: that read it can be asserted rather than merely called.
+_HEAD_TS = 1_800_000_000
+
+
 class _RecordingRpc:
     """Fake EthRpc recording the block_identifier each read is pinned to. Returns values that pass
     verify_funded (claimant/refundee EOAs => empty code; balance == expected; immutables match)."""
@@ -489,10 +542,30 @@ class _RecordingRpc:
 
                 return _C()
 
+            async def get_block(self, _which):
+                # Not decoration. The three `latest_block_timestamp*` accessors below all read it,
+                # and without it they raise AttributeError the first time anything calls them —
+                # scaffolding that LOOKS like protocol coverage and is not. The value is the head
+                # timestamp a node would report: far enough ahead of nothing in particular, and
+                # pinned so a test can assert on it.
+                return {"timestamp": _HEAD_TS}
+
         class _W3:
             eth = _Eth()
 
         self.w3 = _W3()
+
+    async def latest_block_timestamp(self):
+        # The deadline guard reads the LATEST head any endpoint admits to; the staleness abort
+        # reads the QUORUM-th. One source has one answer, so all three coincide here. `claim`
+        # used to reach through `w3.eth.get_block` directly, which a multi-source RPC cannot serve.
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+    async def latest_block_timestamp_quorum(self):
+        return await self.latest_block_timestamp()
+
+    async def latest_block_timestamp_min(self):
+        return await self.latest_block_timestamp()
 
     async def assert_chain(self):
         return None
@@ -531,6 +604,34 @@ async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
     assert rpc.code_block_ids[loc.refundee] == "finalized"
     assert rpc.balance_block_id == "finalized"
     assert rpc.code_block_ids[loc.contract_address] == "finalized"  # the core code read (already pinned)
+
+
+async def test_the_recording_fake_can_actually_answer_the_head_timestamp():
+    """`_RecordingRpc` was given three `latest_block_timestamp*` accessors whose bodies call
+    `self.w3.eth.get_block("latest")` — on an inner `_Eth` that defined only `contract()`. Every
+    one raised AttributeError the moment anything called it, so the fake advertised a protocol it
+    could not serve: a `claim` driven through it would have failed on the fake, not on the code.
+
+    Executing them is the whole point. A method nothing calls is not covered by anything.
+    """
+    pytest.importorskip("web3")
+    from web3 import Web3
+
+    loc = EthHtlcLocator(
+        chain_id=11155111,
+        contract_address=Web3.to_checksum_address("0x" + "33" * 20),
+        deploy_tx_hash="0x" + "de" * 32,
+        hashlock="0x" + "ab" * 32,
+        claimant=Web3.to_checksum_address("0x" + "11" * 20),
+        refundee=Web3.to_checksum_address("0x" + "22" * 20),
+        timeout=4_000_000_000,
+        amount_wei=10**15,
+    )
+    rpc = _RecordingRpc(loc, loc.amount_wei)
+    # All three coincide for a single source, which is exactly what the accessors' comment claims.
+    assert await rpc.latest_block_timestamp() == _HEAD_TS
+    assert await rpc.latest_block_timestamp_quorum() == _HEAD_TS
+    assert await rpc.latest_block_timestamp_min() == _HEAD_TS
 
 
 def test_runtime_code_mask_gap_documented_and_empty_code_fails_closed():

@@ -52,6 +52,31 @@ class EthRpc:
     def w3(self) -> Any:
         return self._w3
 
+    @property
+    def write_w3(self) -> Any:
+        """The web3 used to BUILD transactions. Identical to ``w3`` here.
+
+        It exists so the legs can name the difference between building a transaction (which has to
+        happen against one endpoint) and reading state (which should not). ``MultiSourceEthRpc``
+        makes ``w3`` fatal precisely so an unconverted READ cannot quietly run single-source; the
+        write sites say ``write_w3`` and mean it.
+        """
+        return self.w3
+
+    async def latest_block_timestamp(self) -> int:
+        """Head timestamp, for the claim-deadline guard (wants the LATEST any source admits to)."""
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+    async def latest_block_timestamp_quorum(self) -> int:
+        """Same read; the multi-source class returns the quorum-th head instead. One endpoint has
+        one answer, so all three accessors coincide here."""
+        return await self.latest_block_timestamp()
+
+    async def latest_block_timestamp_min(self) -> int:
+        """Same read; the name exists so the multi-source class can aggregate it the OTHER way for
+        the staleness and refund-maturity guards. Identical here — one endpoint has one answer."""
+        return await self.latest_block_timestamp()
+
     async def assert_chain(self) -> None:
         """Fail-closed if the endpoint is not the chain this swap was negotiated for."""
         try:
@@ -88,10 +113,17 @@ class EthRpc:
         except Exception as exc:
             raise NetworkError(f"eth_getBalance failed: {exc}") from exc
 
-    async def get_transaction_count(self, address: str) -> int:
-        """Pending nonce for the sender."""
+    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+        """Nonce for the sender. Defaults to ``pending`` so a freshly built tx does not collide
+        with one still in the mempool.
+
+        The ``block`` parameter exists so a caller can compare the two: ``pending != latest`` means
+        this sender has transactions in flight. That is the difference between "the HTLC holds
+        nothing" and "the HTLC holds nothing YET", which a balance read alone cannot tell apart —
+        see the resume guard in :meth:`Erc20HtlcLeg._push_and_bind`.
+        """
         try:
-            return int(await self._w3.eth.get_transaction_count(address, "pending"))
+            return int(await self._w3.eth.get_transaction_count(address, block))
         except Exception as exc:
             raise NetworkError(f"eth_getTransactionCount failed: {exc}") from exc
 

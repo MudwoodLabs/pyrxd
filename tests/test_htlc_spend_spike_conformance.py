@@ -1,4 +1,13 @@
 """Phase-3 Gravity Taproot-HTLC: Radiant-side claim/refund tx-builder structural
+NOT A TEST OF THE PRODUCTION SPEND BUILDERS. This file `importlib`-loads the FROZEN PROTOTYPE
+scripts from `docs/brainstorms/gravity-ref-spike/` and never imports `pyrxd.gravity.htlc_spend`.
+It was named `test_htlc_spend.py`, so anyone auditing coverage of the spend layer found it and
+stopped looking — while a regression in the real `build_htlc_claim_tx` / `build_htlc_refund_tx`
+left it fully green. Renamed so the name stops making a claim the contents do not support.
+
+Kept because conformance between the shipped builders and the spike they were derived from is
+worth pinning. Production coverage lives in `test_htlc_spend_productized.py`.
+
 tests (NO on-chain spend — the parent runs the mainnet proof).
 
 Covers all 3 covenant variants (ft|nft|rxd). Asserts the SETTLED scriptSig layout

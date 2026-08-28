@@ -47,11 +47,11 @@ class _FakeRpc:
 
         class _W3Eth:
             async def get_block(self_inner, _which):
-                # `claim` now reads the clock to refuse a claim too close to the HTLC timeout — a
-                # late claim still mines with the preimage in its calldata — and cross-checks the
-                # head against LOCAL time, because a lagging provider under-reports "now", which is
-                # the direction that makes the guard pass when it should refuse. So this must
-                # report a REALISTIC head rather than a synthetic epoch. These tests are about
+                # The claim path reads the clock to refuse a claim too close to the HTLC timeout —
+                # a late claim still mines with the preimage in its calldata. Round 5 additionally
+                # cross-checks the head against LOCAL time (a lagging provider under-reports "now",
+                # which is the direction that makes the guard pass when it should refuse), so this
+                # must return a REALISTIC head rather than a synthetic epoch. These tests are about
                 # private-submit ROUTING, so report now and let the locator sit a day out.
                 return {"timestamp": int(time.time())}
 
@@ -73,6 +73,21 @@ class _FakeRpc:
             eth = _W3Eth()
 
         self.w3 = _W3()
+        self.write_w3 = self.w3
+
+    async def latest_block_timestamp(self):
+        return int((await self.w3.eth.get_block("latest"))["timestamp"])
+
+    async def latest_block_timestamp_min(self):
+        # The multi-source class aggregates this the other way for the staleness and
+        # refund-maturity guards; one endpoint has one answer, so the fake mirrors it.
+        return await self.latest_block_timestamp()
+
+    async def latest_block_timestamp_quorum(self):
+        # The staleness abort reads the QUORUM-th head: MIN lets one lagging endpoint
+        # declare a healthy chain halted, MAX lets one liar hide a real halt. A single
+        # source has one answer, so all three coincide here.
+        return await self.latest_block_timestamp()
 
     async def wait_receipt(self, tx_hash, **_k):
         # `claim` CONFIRMS before reporting success (status == 1 + a Claimed(p) log from this
@@ -92,7 +107,7 @@ class _FakeRpc:
     async def fee_fields(self):
         return {"maxFeePerGas": 1, "maxPriorityFeePerGas": 1}
 
-    async def get_transaction_count(self, addr):
+    async def get_transaction_count(self, addr, block="pending"):
         return 0
 
     async def send_raw(self, raw_tx):

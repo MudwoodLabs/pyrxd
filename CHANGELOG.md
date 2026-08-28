@@ -6,6 +6,111 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Unit conflations are now type errors, not review catches** — new `pyrxd.security.units`.
+  Three confirmed defects in this codebase were the same shape: two quantities that are both
+  non-negative `int`, semantically incompatible, meeting in a field or parameter that could hold
+  either. A block height vs a confirmation count (the mainnet shim stored a depth in
+  `UtxoRecord.height`, inverting `find_covenant_utxo`'s earliest-confirmed anti-poisoning rule into
+  a poison-*selecting* one); a photon value vs a Glyph FT token count (#505, still open); seconds
+  vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
+  `BlockSpan` and `Seconds` are `typing.NewType` tags — zero runtime cost, no validation, no
+  behaviour change — applied to the producers and the gates: `UtxoRecord`, `RadiantChainIO`'s
+  covenant lookup and depth read, `NegotiatedTerms.radiant_amount`, the watchtower's `Observations`
+  (which holds heights and depths side by side), the quorum layer's depth→height conversion, and
+  the dust runner's reorg-gate anchor. They complement rather than replace `pyrxd.security.types`:
+  those classes answer "is this number plausible?" at a trust boundary, these answer "is it the
+  right kind?". `tests/security/test_unit_types_reject_conflations.py` runs mypy over fixtures
+  reproducing each real defect and proves the checker rejects it — and that the corrected form
+  still passes.
+- **`task typecheck` actually gates now.** Its declared three-path scope reported 296 errors across
+  40 transitively-imported modules, so `task ci` had been failing at that step rather than checking
+  anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
+  pins resolution to this checkout, and the scope is widened to the modules where a number's unit
+  decides whether funds move — including the two `scripts/` files the height/confs bug lived in.
+
+- **The token leg no longer refuses EIP-7702 delegated accounts** (#478). `verify_funded` rejects
+  any claimant/refundee with contract code, because a native ETH send *executes* the recipient's
+  code and a recipient that reverts on receive would lock the funds. An **EIP-7702 delegated EOA**
+  carries 23 bytes of code (`0xef0100` + delegate) and is an ordinary EOA the user holds the key
+  to — both anvil dev addresses carry one on mainnet today, so this is a live population. The
+  restriction is meaningless for the token leg, whose payout calls the **token** contract and never
+  the recipient, so it now opts out; the native default is unchanged. The native refusal message
+  also names EIP-7702 when that is what it found, instead of claiming "not an EOA" about an address
+  that is one.
+- **A transient RPC failure no longer destroys the preimage and strands a swap** (#479).
+  `maker_claims_btc` zeroized `p` in a `finally`, on **every** exit — including failures where
+  nothing had been broadcast, such as the chain-id assertion or a fee read. That destroyed the only
+  copy of a still-secret preimage and left both parties waiting out their timelocks, over a blip a
+  retry would have survived. Pre-existing on the native leg; the ERC-20 leg's extra pre-reveal
+  reads made it far likelier to fire. The legs now mark the submit boundary with a new
+  `PreRevealAbort` — a promise about *where* a failure happened, not why — and the coordinator
+  zeroizes on everything else, since past that boundary `p` may already be public and a genuine
+  freeze refusal means the swap cannot complete anyway.
+- **The USDC corridor is documented as issuer-trusted, not trustless**
+  (`docs/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.md`). RXD/Glyph ↔
+  USDC uses the same HTLC protocol as RXD ↔ ETH but **not the same guarantee**: native ETH is held
+  by the EVM, USDC by a contract whose issuer can freeze addresses. Measured on a mainnet fork
+  against the real contract — freezing the **HTLC itself** makes `claim` *and* `refund` revert
+  **permanently**, with no timeout to rescue the funds. Mitigations are per-swap contracts (a
+  freeze loses one swap, not all), a pre-reveal blacklist gate inside `claim`, and a deliberately
+  short funded window. None is a fix; the residual is accepted and must travel with any
+  user-facing description of the corridor, alongside the existing "swaps are unaudited" line.
+- **ERC-20 / USDC durable-record support** — `Erc20HtlcLocator` and `NegotiatedTerms.token_address`.
+  An older binary cannot misread a token record: the locator serialises under its own
+  `"eth-erc20"` chain tag, and a reader that predates the tag lands in `from_dict`'s existing
+  fail-closed branch and **refuses**. That dispatch is the entire backward-compatibility defence —
+  `schema_version` is written but **never read back**, so bumping it would have protected nothing
+  while changing the bytes under existing swaps.
+  The tag is read **off the locator** (`CHAIN_TAG`) rather than chosen by an isinstance branch.
+  That matters: `Erc20HtlcLocator` subclasses `EthHtlcLocator`, so a branch would have written
+  `chain: "eth"` for a token swap and an older reader would have taken its 6-decimal amount for
+  wei — a 10^12 error arriving through the mechanism meant to prevent it.
+  **`swap_coordinator.py` is unchanged** — zero lines. Six of its seven `EthHtlcLocator`
+  isinstance sites are settlement and finality paths that genuinely apply to a token swap, so
+  subclassing lets them stand; each of those decisions is pinned by a test rather than left to
+  look like an oversight.
+- **ERC-20 / USDC counter-leg groundwork** (`pyrxd.eth_wallet.tokens`, `.erc20`, `.erc20_leg`).
+  Not yet reachable from the coordinator — the terms, locator and durable-record wiring is a
+  separate change, deliberately, because it touches the mainnet-proven swap path.
+  - `Erc20HtlcLeg` is a **subclass** of `EthHtlcContractLeg`, not a fork and not an edit: **zero
+    lines change in the native leg**. Only `fund` and `verify_funded` are overridden; `claim`,
+    `refund`, `fetch_claim_artifacts`, `assert_claim_provenance`, `is_final` and
+    `claim_finality_verdict` are inherited unchanged, which works because `Erc20Htlc.sol` was
+    given the same `claim(bytes32)`/`refund()` signatures and the same **un-indexed**
+    `Claimed(bytes32)` event. Secret recovery therefore needs no token-specific code at all.
+  - Funding is a **push, not a pull**: deploy, then a plain `transfer`. A payable constructor
+    cannot pull a token, so no allowance is ever created — removing the approve race, the
+    dangling allowance and the reset-to-zero dance in one go. "Deployed" no longer implies
+    "funded", which costs nothing: the coordinator already documents that an HTLC address commits
+    to immutables, not to the funded balance.
+  - Token addresses are **pinned per chain id** from the issuer's own list and never resolved by
+    symbol. Bridged `USDC.e` on Arbitrum and Optimism, Arbitrum's omnichain `USDT0`, and BNB Smart
+    Chain's Binance-Peg `USDC` are refused **by address**, each named for what it is, because they
+    share a symbol with a different asset carrying different liquidity. The BSC one is also 18
+    decimals where Circle's USDC is 6 everywhere, so resolving it by symbol would be a
+    wrong-issuer error and a 10^12 scale error at once.
+  - Decimals are pinned **and** verified against the live contract at swap start; a 6-vs-18
+    disagreement is a factor of 10^12 in every amount.
+  - `assert_not_frozen_before_reveal` is the pre-reveal blacklist gate. It checks the **HTLC
+    contract address** and the **claimant** — the two addresses a `claim` actually touches.
+    Including the contract matters because, measured against the real USDC contract on a mainnet
+    fork, freezing the contract strands the funds permanently: `claim` reverts *and* `refund`
+    reverts, with no timeout to rescue them. The **refundee is deliberately excluded** — a claim
+    never touches it, so refusing there would block honest work and hand the counterparty a free
+    unilateral veto. It narrows the window rather than closing it; check-then-reveal is itself a
+    race.
+  - `assert_not_frozen_before_funding` is the pre-**fund** gate, and it is where the refundee is
+    checked. `refund()` pays the refundee, so funding a leg whose refundee is already frozen buys
+    a position with no exit: if the counterparty never claims, the tokens stay in the contract for
+    good. That case was previously checked in **no** code path, while the docs described a
+    pre-fund gate that had never been written. It runs from `Erc20HtlcLeg.fund` twice — before the
+    deploy spends gas, and again **inside** the branch that moves tokens, where the contract
+    address is known and its freeze is the unrecoverable one — and only when something is actually
+    about to be sent, so a resume whose push already landed can still recover its locator. A token
+    pinned `has_blacklist=False` costs no RPC call at all.
+
 ### Fixed
 
 - **`pip install 'pyrxd[eth]'` now works.** It never did: five runtime errors instructed users to

@@ -117,8 +117,13 @@ class _FakeChainIO:
         self._value, self._funded_h, self._confs = value, funded_h, confs
         self._missing, self._error = missing, error
         self._mempool_unspent = mempool_unspent  # None → mempool re-check abstains (fall back to SeenStore)
+        self.pin_seen: str | None = "<never called>"
 
-    async def find_covenant_utxo(self, spk, *, expected_value=None):
+    async def find_covenant_utxo(self, spk, *, expected_value=None, pin_outpoint=None):
+        # Record what the executor asked for. The pin is the difference between reading the funded
+        # outpoint and re-DISCOVERING it by SPK scan — and a scan can be made ambiguous by anyone
+        # paying the covenant address, which is the brick this exists to stop.
+        self.pin_seen = pin_outpoint
         if self._error is not None:
             raise self._error
         if self._missing:
@@ -841,3 +846,22 @@ async def test_fee_shortfall_is_not_reported_as_a_transient_failure(caplog):
     with caplog.at_level("ERROR"):
         assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
     assert any("CANNOT COVER" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+
+async def test_the_executor_PINS_the_recorded_covenant_outpoint():
+    """The autonomous claim path is a SECOND reader of the covenant UTXO set, and it was missed when
+    the pin was added to the coordinator's spend path.
+
+    Without the pin it re-discovers by scriptPubKey scan — and that scan is made ambiguous by anyone
+    paying the covenant address, which is a public function of the negotiated terms. The refusal is
+    then classified by `_is_missing_utxo` as a transient read fault, so this retries every tick,
+    reporting healthy until `t_rxd` expires and the maker CSV-refunds. Reading the outpoint the record
+    already holds removes the discovery step the attack depends on.
+    """
+    ex, leg, rec, _p = await _armed_executor()
+    rec = rec.with_radiant_lock("ab" * 32 + ":1", "00" * 25)
+    await ex.execute("s1", rec, _claim_decision())
+    assert leg.chain_io.pin_seen == "ab" * 32 + ":1", (
+        f"the executor passed pin_outpoint={leg.chain_io.pin_seen!r} — it is re-discovering by scan, "
+        "so a second payment to the covenant address still bricks the autonomous claim"
+    )

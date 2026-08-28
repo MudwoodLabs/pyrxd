@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod
+from typing import Any
 
 from ..constants import PUBLIC_KEY_BYTE_LENGTH_LIST, PUBLIC_KEY_HASH_BYTE_LENGTH, SIGHASH, OpCode
 from ..hash import hash256
@@ -11,7 +12,11 @@ from .script import Script
 from .unlocking_template import UnlockingScriptTemplate
 
 
-def to_unlock_script_template(sign, estimated_unlocking_byte_length):
+def to_unlock_script_template(sign: Any, estimated_unlocking_byte_length: Any) -> Any:
+    # Returns the dynamically built CLASS, not an instance: callers pass it wherever an
+    # UnlockingScriptTemplate is expected and `sign` / `estimated_unlocking_byte_length` are
+    # read as plain class attributes. `Any` states that duck-typing honestly rather than
+    # asserting a class/instance relationship that does not hold.
     class_attrs = {"sign": sign, "estimated_unlocking_byte_length": estimated_unlocking_byte_length}
 
     dynamic_class = type("UnlockScriptTemplateImpl", (UnlockingScriptTemplate,), class_attrs)

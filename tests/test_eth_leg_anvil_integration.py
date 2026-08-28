@@ -34,7 +34,7 @@ if shutil.which("anvil") is None:  # pragma: no cover - environment gate
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.rpc import EthRpc
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 pytestmark = pytest.mark.integration
@@ -214,8 +214,16 @@ async def test_refund_after_timeout_and_claim_blocked_when_expired(anvil_url):
             await taker.refund(locator)
         # Fast-forward past the timeout.
         await _advance_time(rpc, 200)
-        # A claim is now expired — the contract reverts; the leg's eth_call preflight catches it.
-        with pytest.raises(ValidationError):
+        # A claim is now expired. This used to expect ValidationError, on the reasoning that the
+        # contract reverts and the leg's eth_call preflight catches it. The claim-deadline guard
+        # made that stale and STRICTER: it refuses on the timestamp before building anything, so
+        # no preflight, no gas, and nothing reaches a provider. PreRevealAbort is the right type —
+        # it means the preimage is still secret and the swap is refundable — and it is
+        # deliberately not a ValidationError, so the old assertion could not see it.
+        #
+        # That distinction is the whole point on this path: a claim that mines late still publishes
+        # p in its calldata while paying nothing, handing the counterparty both legs.
+        with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
             await maker.claim(locator, p)
         # The taker's unilateral refund now succeeds (pays the refundee).
         refund_tx = await taker.refund(locator)
@@ -270,9 +278,18 @@ async def test_finalized_pin_rejects_reorg_swapped_in_contract(anvil_url_fast_fi
 
         # (a) 'latest' accepts the swapped-in contract against the ORIGINAL locator — blind.
         await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI)
-        # (b) 'finalized' fails closed: empty code at the checkpoint → runtime-logic mismatch.
-        with pytest.raises(ValidationError, match="runtime logic"):
+        # (b) 'finalized' fails closed. It used to report this as a runtime-logic mismatch, which
+        # conflated two different states: EMPTY code at the checkpoint (the deploy simply has not
+        # finalized yet — wait) and DIFFERENT code (someone else's contract — you have been
+        # robbed). During a live mainnet run the empty case fired the second message, which reads
+        # as a theft alert when the truth was "retry in ~13 minutes". The refusal is the property
+        # under test and it is unchanged; only the diagnosis is now honest about which state it saw.
+        with pytest.raises(ValidationError, match="NOT YET FINALIZED") as exc:
             await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI, block_identifier="finalized")
+        assert "runtime logic" not in str(exc.value), (
+            "empty code at the checkpoint must not be reported as a wrong/attacker contract — "
+            "that is the conflation this diagnosis was split to remove"
+        )
         # (c) LOW-R1 residual: the balance read honours the pin (0 at the checkpoint, funded at tip).
         assert await rpc.get_balance(locator.contract_address, "finalized") == 0
         assert await rpc.get_balance(locator.contract_address) == _AMOUNT_WEI + 1

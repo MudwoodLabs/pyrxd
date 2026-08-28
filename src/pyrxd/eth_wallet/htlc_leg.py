@@ -24,20 +24,24 @@ Security gates enforced here (off-chain, per the security review):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator, normalise_tx_hash
+from pyrxd.eth_wallet.multi_rpc import read_contract
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.security.errors import ClaimNotConfirmed, NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-__all__ = ["EthHtlcContractLeg", "load_artifact"]
+__all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
 
 _REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
 # Claim-artifact size caps (red-team LOW DoS): a legit claim(bytes32) calldata + Claimed(bytes32)
@@ -66,6 +70,98 @@ def _b(v: Any) -> bytes:
 def _addr(v: Any) -> str:
     """Normalise an address-ish value to a lowercase hex string for comparison."""
     return str(v or "").lower()
+
+
+def create_address(sender: str, nonce: int) -> str:
+    """The CREATE address for ``sender`` at ``nonce`` — ``keccak(rlp([sender, nonce]))[12:]``.
+
+    Both inputs belong to the deployer, so a deploy receipt's ``contractAddress`` was never
+    something to be *told*. Minimal RLP: a 20-byte address is a ``0x94``-prefixed string, and the
+    nonce is either the empty string (0), a single byte below ``0x80``, or a length-prefixed
+    big-endian integer.
+
+    DUPLICATED, deliberately and temporarily, with ``erc20_leg._create_address``: the token leg
+    imports FROM this module, so importing back would be circular, and collapsing the two means
+    editing that file. They are pinned to agree by a differential test rather than by a comment.
+    """
+    from eth_utils import keccak, to_checksum_address
+
+    addr = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
+    if len(addr) != 20:
+        raise ValidationError(f"sender must be a 20-byte address, got {len(addr)}")
+    if nonce == 0:
+        n = b"\x80"
+    elif nonce < 0x80:
+        n = bytes([nonce])
+    else:
+        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        n = bytes([0x80 + len(b)]) + b
+    payload = b"\x94" + addr + n
+    return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+
+
+def _int_or_none(v: Any) -> int | None:
+    """Normalise a receipt integer that may arrive as an int or as a '0x'-prefixed string."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return int(v, 16) if v.startswith("0x") else int(v)
+    return int(v)
+
+
+def _receipt_facts(receipt: Any) -> Any:
+    """The parts of a receipt a swap decision rests on, normalised so two HONEST endpoints that
+    format them differently still agree.
+
+    Included: status, blockHash, blockNumber — and the LOGS, which the generic
+    :meth:`MultiSourceEthRpc.get_transaction_receipt` deliberately leaves out. It is right to leave
+    them out there: a poller asking "did it succeed, and where" should not refuse over a field it
+    never reads. Here the logs ARE the evidence — the whole gate is "a ``Claimed(p)`` event from
+    this swap's own contract" — so a receipt whose status is corroborated and whose logs are taken
+    from whichever endpoint answered first would leave the deciding field single-source.
+
+    Normalised, not compared raw: addresses differ in EIP-55 casing between providers, topics and
+    data arrive as ``HexBytes`` or as ``'0x'`` strings, and log ORDER is a client artifact. Every
+    one of those is an honest difference and refusing on it would be a guard refusing valid work.
+    What cannot honestly differ is the SET of (emitter, topics, data) triples: they are consensus
+    data, committed to by the receipts trie of the block both endpoints claim the tx is in.
+    """
+    if receipt is None:
+        return None
+    logs = sorted(
+        (
+            _addr(log.get("address")),
+            tuple(_b(t) for t in (log.get("topics") or [])),
+            _b(log.get("data")),
+        )
+        for log in (receipt.get("logs") or [])
+    )
+    return (
+        _int_or_none(receipt.get("status")),
+        _b(receipt.get("blockHash")),
+        _int_or_none(receipt.get("blockNumber")),
+        tuple(logs),
+    )
+
+
+def _agree_receipt_facts(answers: list[Any]) -> Any:
+    """Quorum ``combine`` for a receipt read: every endpoint must tell the same story, or refuse.
+
+    An identity read, like ``get_code`` and ``canonical_block_hash``: a disagreement means one
+    endpoint is lying or lagging and there is no way to tell which from here, so this refuses
+    rather than taking a majority. ``None`` (not mined here yet) is one of the stories — a
+    unanimous ``None`` is a real answer and the caller retries.
+    """
+    facts = [_receipt_facts(r) for r in answers]
+    first = facts[0]
+    for other in facts[1:]:
+        if other != first:
+            raise NetworkError(
+                f"endpoints disagree about this transaction's receipt ({first!r} vs {other!r}). "
+                "One of them is lying or lagging and there is no way to tell which from here, so "
+                "this refuses rather than taking a majority."
+            )
+    return answers[0]
 
 
 def load_artifact(path: str | os.PathLike) -> dict:
@@ -100,11 +196,17 @@ def _require_web3() -> Any:
     return web3
 
 
+class _ClaimTooLate(Exception):
+    """Internal: too close to the deadline to broadcast. Surfaced as PreRevealAbort."""
+
+
 #: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting.
 #: ~8 Ethereum blocks at 12s. Sized to cover ordinary inclusion latency and a fee spike, not to be
 #: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
 #: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
 #: that does not is the preimage published for nothing.
+_LOG = logging.getLogger(__name__)
+
 CLAIM_INCLUSION_BUDGET_S: int = 96
 
 #: Seconds per L1 block, used ONLY to convert the budget above into a fee multiplier.
@@ -121,9 +223,34 @@ _BLOCK_S: int = 12
 #: them drifting again: change the budget and the fee follows.
 CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
 
+#: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
+#: primary's view of a mined transaction, and how often it re-asks. Only a multi-source RPC waits
+#: at all. Independent providers on a healthy chain converge within a block or two, so this is
+#: sized for a slow endpoint rather than for a chain halt: past it, "we could not get a quorum" is
+#: the honest answer and the claim is reported UNCONFIRMED, not failed and not succeeded.
+CLAIM_RECEIPT_QUORUM_WAIT_S: float = 60.0
+CLAIM_RECEIPT_QUORUM_POLL_S: float = 2.0
 
-class _ClaimTooLate(Exception):
-    """Internal: too close to the deadline to broadcast. Surfaced as PreRevealAbort."""
+
+def is_eip7702_delegation(code: bytes) -> bool:
+    """Whether ``code`` is an EIP-7702 delegation designator rather than a contract.
+
+    The designator is exactly ``0xef0100`` followed by the delegate's 20-byte address — 23 bytes
+    total. EIP-3541 forbids deploying a contract whose code begins ``0xEF``, so a CONTRACT cannot
+    wear this shape; that is the property being tested, and it is the only one.
+
+    **It does NOT prove anyone holds the key.** A 7702 authorization is ``ecrecover``-derived, so a
+    signature can be picked Nick's-method style to install a delegation on an address nobody
+    controls. That is harmless where this is used — claimant and refundee are each party's own
+    address, and an ERC-20 sweep never executes recipient code — but the justification must not be
+    reused if this predicate is ever asked about a counterparty-supplied address.
+
+    **The length check is not decoration.** A prefix-only test would admit any contract that
+    happens to start with those bytes, and an earlier version of this branch shipped exactly that.
+    It lives here as a named predicate so a test can execute it: a test that re-derives the rule
+    inline is testing itself, which is how the prefix-only version passed review.
+    """
+    return len(code) == 23 and code[:3] == b"\xef\x01\x00"
 
 
 class EthHtlcContractLeg:
@@ -217,7 +344,12 @@ class EthHtlcContractLeg:
         return all(e == o for e, o in zip(expected, on_chain) if e != 0)
 
     async def verify_funded(
-        self, locator: EthHtlcLocator, *, expected_amount_wei: int, block_identifier: str | int | None = None
+        self,
+        locator: EthHtlcLocator,
+        *,
+        expected_amount_wei: int,
+        block_identifier: str | int | None = None,
+        allow_delegated_eoa_recipients: bool = False,
     ) -> None:
         """Pre-RXD-lock gate: the on-chain contract matches the negotiated terms.
 
@@ -234,7 +366,7 @@ class EthHtlcContractLeg:
         4. claimant and refundee are EOAs (empty code) — a contract recipient that
            reverts on ``receive`` would brick claim/refund via the contract's
            ``require(ok)``;
-        5. funded balance == expected amount (no underfunded contract).
+        5. funded balance >= expected amount (a LOWER bound — see the comment at the check) (no underfunded contract).
 
         ``block_identifier`` (red-team HIGH TOCTOU): pin EVERY read to one block. The taker's
         fund-time self-verify reads 'latest' (None). The MAKER's pre-lock re-verify passes
@@ -244,16 +376,45 @@ class EthHtlcContractLeg:
         """
         await self._rpc.assert_chain()
         code = await self._rpc.get_code(locator.contract_address, block_identifier)
+        if not code:
+            # EMPTY is not WRONG, and conflating them is a bad diagnosis on the worst day. Reading
+            # at the `finalized` checkpoint returns no code for a contract deployed after it — the
+            # ordinary state for the ~13 minutes between deploy and finality. The old message
+            # accused an attacker, which on a live mainnet run reads as "you have been robbed"
+            # when the truth is "wait". Both are refusals; only one is a reason to panic.
+            raise ValidationError(
+                f"no contract code at {locator.contract_address} as of block_identifier="
+                f"{block_identifier!r}. If that is 'finalized', the deploy is most likely simply "
+                "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
+                "at a checkpoint is not evidence of a wrong or attacker contract."
+            )
         if not self._runtime_code_matches(code):
-            raise ValidationError("on-chain runtime logic != committed EthHtlc artifact (wrong/attacker contract)")
+            raise ValidationError(
+                f"on-chain runtime logic at {locator.contract_address} does not match the committed "
+                f"EthHtlc artifact ({len(code)} bytes present, but different) — wrong/attacker contract"
+            )
         # Read immutables back by value and bind them to the negotiated terms.
+        #
+        # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
+        # every one of these becomes a quorum read. They are IDENTITY reads — no `combine` — because
+        # an endpoint disagreeing about a contract's hashlock is describing a different contract,
+        # and these four binds are what stand between a maker and revealing the preimage to a
+        # look-alike. Single-source callers are unchanged: `read_contract` calls straight through.
         web3 = _require_web3()
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         _bid = "latest" if block_identifier is None else block_identifier
-        on_h = bytes(await c.functions.hashlock().call(block_identifier=_bid))
-        on_claimant = await c.functions.claimant().call(block_identifier=_bid)
-        on_refundee = await c.functions.refundee().call(block_identifier=_bid)
-        on_timeout = int(await c.functions.timeout().call(block_identifier=_bid))
+
+        def _immutable(name: str):
+            def _call(r):
+                c = r.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+                return getattr(c.functions, name)().call(block_identifier=_bid)
+
+            return _call
+
+        addr = locator.contract_address
+        on_h = bytes(await read_contract(self._rpc, _immutable("hashlock"), label=f"{addr}.hashlock()"))
+        on_claimant = await read_contract(self._rpc, _immutable("claimant"), label=f"{addr}.claimant()")
+        on_refundee = await read_contract(self._rpc, _immutable("refundee"), label=f"{addr}.refundee()")
+        on_timeout = int(await read_contract(self._rpc, _immutable("timeout"), label=f"{addr}.timeout()"))
         if on_h != locator.hashlock_bytes:
             raise ValidationError("on-chain hashlock != negotiated H")
         if web3.Web3.to_checksum_address(on_claimant) != web3.Web3.to_checksum_address(locator.claimant):
@@ -268,10 +429,36 @@ class EthHtlcContractLeg:
         # 'finalized' the EOA-ness of claimant/refundee and the funded balance must be read at the
         # non-reorgable checkpoint too, not the reorg-able tip — else a reorg could flip an EOA to a
         # reverting contract, or show a balance the finalized state does not have.
-        if await self._rpc.get_code(locator.claimant, block_identifier):
-            raise ValidationError("claimant has contract code (not an EOA); a reverting recipient could lock funds")
-        if await self._rpc.get_code(locator.refundee, block_identifier):
-            raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
+        # An EIP-7702 delegated EOA carries EXACTLY 23 bytes: 0xef0100 followed by the delegate's
+        # address. It is an ordinary EOA whose key the user still holds — both anvil dev addresses
+        # carry one on mainnet today, so this is a live population rather than a hypothesis.
+        #
+        # `allow_delegated_eoa_recipients` admits that shape and NOTHING else. A leg whose payout
+        # cannot execute recipient code sets it — an ERC-20 sweep calls the TOKEN, never the
+        # recipient, so a delegate that would revert on receive has nothing to revert (#478).
+        #
+        # Deliberately narrow. The first cut of this fix disabled the whole check for such a leg,
+        # which also admitted ARBITRARY contract recipients — far more than the finding warranted.
+        # A contract that cannot move ERC-20 would strand the payout, and while each party picks
+        # its own payout address (so that is self-inflicted), widening a guard past the bug it was
+        # fixing is how the next one gets in.
+        for role, addr in (("claimant", locator.claimant), ("refundee", locator.refundee)):
+            code = bytes(await self._rpc.get_code(addr, block_identifier) or b"")
+            if not code:
+                continue
+            delegated = is_eip7702_delegation(code)
+            if delegated and allow_delegated_eoa_recipients:
+                continue
+            raise ValidationError(
+                f"{role} {addr} "
+                + (
+                    "is an EIP-7702 DELEGATED EOA; this leg pays with a native ETH send, which "
+                    "executes the delegate's code, and a delegate that reverts on receive would "
+                    "lock the funds"
+                    if delegated
+                    else "has contract code (not an EOA); a reverting recipient could lock funds"
+                )
+            )
         bal = await self._rpc.get_balance(locator.contract_address, block_identifier)
         # Lower bound, not exact-equal (red-team LOW): an attacker can force-send 1 wei (selfdestruct
         # / coinbase) to a contract, so an `== expected` check is griefable into a permanent verify
@@ -332,7 +519,17 @@ class EthHtlcContractLeg:
         }
 
     async def fund(
-        self, *, hashlock: bytes, claimant: str, refundee: str, timeout: int, amount_wei: int
+        self,
+        *,
+        hashlock: bytes,
+        claimant: str,
+        refundee: str,
+        timeout: int,
+        amount_wei: int,
+        on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
+        resume_from: Any = None,
+        push_nonce: Any = None,
+        on_push_nonce: Any = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
@@ -343,7 +540,33 @@ class EthHtlcContractLeg:
             raise ValidationError("amount_wei must be > 0")
         web3 = _require_web3()
         await self._rpc.assert_chain()
-        c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
+        if resume_from is not None:
+            # RESUME, not refuse. Funding here is a single payable constructor, so the ETH is in
+            # the contract the instant the deploy confirms and there is no push to complete — but
+            # that is a reason to RE-VERIFY and hand back the locator, not to fail. Refusing made a
+            # native fund unrecoverable: a transient error after the deploy leaves a pending handle
+            # on the record, every retry takes the resume branch, and the leg rejected it forever
+            # while H was already consumed and the ETH sat in the contract.
+            #
+            # Deploying again is the one thing that must not happen — it would put a SECOND full
+            # amount into a SECOND contract while the first still holds the original — so this
+            # path never reaches the constructor below.
+            locator = EthHtlcLocator(
+                chain_id=self._chain_id,
+                contract_address=web3.Web3.to_checksum_address(resume_from.address),
+                deploy_tx_hash=resume_from.deploy_tx_hash,
+                hashlock="0x" + bytes(hashlock).hex(),
+                claimant=web3.Web3.to_checksum_address(claimant),
+                refundee=web3.Web3.to_checksum_address(refundee),
+                timeout=int(timeout),
+                amount_wei=int(amount_wei),
+            )
+            # Full binding INCLUDING the balance: unlike the token leg there is no half-funded
+            # state to tolerate, so a contract that does not already hold the amount is not this
+            # swap's funded HTLC and must not be reported as one.
+            await self.verify_funded(locator, expected_amount_wei=int(amount_wei))
+            return locator
+        c = self._rpc.write_w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
         # constructor(bytes32 _hashlock, address _claimant, address _refundee, uint256 _timeout)
         ctor = c.constructor(
             bytes(hashlock),
@@ -363,7 +586,46 @@ class EthHtlcContractLeg:
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"deploy tx reverted (status != 1): {tx_hash}")
-        addr = receipt["contractAddress"]
+        # DERIVE the address; do not accept the endpoint's word for it. Same fix, same reason, as
+        # the token leg's `_deploy` — applied here because this leg has carried real value and the
+        # earlier fix was made only where the bug had been demonstrated.
+        #
+        # `wait_receipt` is PRIMARY-ONLY by design, so ONE endpoint chose where the entire counter
+        # leg went, and every downstream check still passed because the ETH really was at the
+        # address it named. Verifying the code there does not help: an attacker deploys the same
+        # bytecode and owns the claim key. A CREATE address is keccak(rlp([sender, nonce]))[12:] —
+        # both inputs are ours, so this needs no second endpoint and no trust at all.
+        derived = create_address(self._account_address(), int(built["nonce"]))
+        reported = web3.Web3.to_checksum_address(receipt["contractAddress"])
+        if derived != reported:
+            raise ValidationError(
+                f"deploy receipt names contract {reported} but CREATE from {self._account_address()} "
+                f"at nonce {int(built['nonce'])} is {derived}. Refusing: this is the read that "
+                "decides where the ETH went, and it is derivable rather than trusted."
+            )
+        addr = derived
+        # Report the deployed address so the caller can make it durable. The native constructor is
+        # payable, so value is already IN the contract at this point — a crash between here and the
+        # caller's `verify_funded` leaves real ETH in a contract whose address exists only in this
+        # frame. `refund()` recovers it after the timeout, but only for an operator who knows where
+        # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
+        if on_deploy is not None:
+            try:
+                await on_deploy(web3.Web3.to_checksum_address(addr), normalise_tx_hash(tx_hash))
+            except Exception as exc:
+                # LOG AND CONTINUE, unlike the token leg. Here the value moved as part of the deploy
+                # itself — the constructor is payable — so aborting cannot un-move it and only
+                # discards the address. The token leg aborts because nothing has moved yet there and
+                # stopping genuinely prevents untracked value; the same rule inverted here made a
+                # persist failure destroy a fund that would otherwise have completed.
+                _LOG.error(
+                    "could not persist the deployed HTLC address %s (tx %s): %s. The ETH is ALREADY "
+                    "in that contract — record this address by hand; refund() pays the refundee "
+                    "after the timeout.",
+                    addr,
+                    tx_hash,
+                    exc,
+                )
         return EthHtlcLocator(
             chain_id=self._chain_id,
             contract_address=web3.Web3.to_checksum_address(addr),
@@ -409,15 +671,25 @@ class EthHtlcContractLeg:
             # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
             # p to the provider), so nothing downstream catches expiry either. This check is the
             # only thing standing between a stalling counterparty and a free option.
-            head = await self._rpc.w3.eth.get_block("latest")
-            chain_ts, local_ts = int(head["timestamp"]), int(time.time())
+            # TWO reads, because the two checks below want opposite things and one value cannot
+            # serve both. The deadline guard must not be talked into thinking it is EARLIER than it
+            # is (that is what lets a claim broadcast too late and publish p for nothing); the
+            # staleness abort must not be talked into thinking the chain is FRESHER than it is.
+            #
+            # `max(chain_ts_late, local_ts)` restores the local clock as the backstop the comment
+            # below describes: switching this to a MIN read had quietly removed it, so a slow local
+            # clock plus an ordinary endpoint spread let the guard pass with 50s of real head-room
+            # against a 96s budget.
+            chain_ts_late = await self._rpc.latest_block_timestamp()
+            chain_ts = await self._rpc.latest_block_timestamp_quorum()
+            local_ts = int(time.time())
             # Take the LATER of chain head and local clock. A lagging or hostile provider can only
             # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
             # guard pass when it should refuse — round 5's finding: a provider 4 minutes behind, or
             # any of the L2s in KNOWN_TOKENS during a sequencer halt, made the guard inert in the
             # precise case it was written for. Local time cannot be moved by the provider, and
             # forward skew only ever makes the guard stricter.
-            now_ts = max(chain_ts, local_ts)
+            now_ts = max(chain_ts_late, local_ts)
             if local_ts - chain_ts > CLAIM_INCLUSION_BUDGET_S:
                 raise _ClaimTooLate(
                     f"the chain head is {local_ts - chain_ts}s stale (limit "
@@ -434,7 +706,7 @@ class EthHtlcContractLeg:
                     "publishes the preimage in its calldata while paying nothing, which hands the "
                     "counterparty both legs. Refund after the timeout instead."
                 )
-            c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+            c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
             built = await c.functions.claim(bytes(preimage)).build_transaction(
                 await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
             )
@@ -446,7 +718,31 @@ class EthHtlcContractLeg:
         # calldata, and on the private path the submit does. Failures beyond this line are NOT
         # PreRevealAbort — the caller must assume p is public.
         preflight = self._private_submitter is None
-        tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
+        # PAST THE BOUNDARY, and the taxonomy has to say so. This call sits outside every `try`
+        # above deliberately — a failure here is NOT a `PreRevealAbort` — but it also sat outside
+        # every `except` below, so the one failure most likely to happen here surfaced as a bare
+        # `ValidationError`: neither marker, and no guidance. A wrong preimage against a real
+        # funded HTLC does exactly that ("tx would revert (preflight eth_call)"), and by then the
+        # public path's `eth_call` has already carried `p` in the calldata to the provider while
+        # the private path has handed the signed transaction to a relay. Neither can promise the
+        # secret stayed in this process, so the honest report is the one `ClaimNotConfirmed` makes:
+        # assume `p` is public, do not record a claim, investigate before retrying.
+        #
+        # This moves nothing across the boundary — the failure was always on this side of it. It
+        # stops the caller having to infer that from an exception type that says the opposite.
+        try:
+            tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
+        except ClaimNotConfirmed:
+            raise
+        except Exception as exc:
+            raise ClaimNotConfirmed(
+                f"the claim could not be submitted: {exc}. The preimage must be assumed PUBLIC — "
+                "on the public path the preflight eth_call carried it to the provider, on the "
+                "private path the submit carried the signed transaction — so treat the "
+                "counterparty as able to take the other leg. Do NOT record this swap as claimed. "
+                "Check whether a transaction from this address landed before retrying or refunding.",
+                tx_hash=None,
+            ) from exc
         # CONFIRM, don't assume. `send_raw` and `submit_raw` both return on SUBMISSION — no receipt,
         # no status — so returning here reported success for a transaction that may have reverted.
         # Every revert cause still applies after the deadline guard above: a fee spike, a reorg, an
@@ -484,7 +780,9 @@ class EthHtlcContractLeg:
         of truth for the deadline.
         """
         await self._rpc.assert_chain()
-        now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
+        # MIN: an over-reported head makes this think the timelock has matured when it has not,
+        # and submits a refund the contract rejects. Under-reporting only delays a retry.
+        now_ts = await self._rpc.latest_block_timestamp_min()
         if now_ts < int(locator.timeout):
             # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition
             # (wait for the timeout, then refund), not a permanent input error — consistent with the
@@ -494,7 +792,7 @@ class EthHtlcContractLeg:
                 f"({int(locator.timeout) - now_ts}s to go) — refusing to submit a refund the contract "
                 "would revert (gas/clarity guard; the contract enforces the deadline regardless)."
             )
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+        c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = await c.functions.refund().build_transaction(await self._base_tx(gas=100_000))
         return await self._sign_and_send(built)
 
@@ -592,6 +890,61 @@ class EthHtlcContractLeg:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
 
+    async def _confirmed_receipt(self, tx_hash: str) -> dict:
+        """The receipt a swap may act on: WAITED for, then AGREED ACROSS ENDPOINTS.
+
+        Two different questions, answered by two different reads, and conflating them is what this
+        fixes. ``wait_receipt`` answers *when to look* — it blocks until the tx is mined — and it is
+        primary-only by design, which is fine for a liveness signal. It is not fine as the evidence
+        the claim gate rests on: a hostile or MITM'd primary fabricates ``status: 1`` and a
+        ``Claimed(p)`` log from our own contract address, and by the time this runs ``p`` is already
+        public in the calldata, so it costs the attacker nothing to compose. The maker then advances
+        to SECRET_REVEALED believing it collected, stops pursuing, and the counterparty takes the
+        other leg with the preimage.
+
+        So the receipt is re-read through the quorum and every endpoint must tell the same story.
+        A single-source :class:`~pyrxd.eth_wallet.rpc.EthRpc` has no second story to tell and is
+        returned unchanged — there is nothing to corroborate with, and pretending otherwise would
+        be worse than being single-source honestly.
+
+        Propagation is tolerated, not assumed away: the primary can legitimately see a tx a beat
+        before its peers, so a unanimous "not mined here" or a transient disagreement is retried
+        until :data:`CLAIM_RECEIPT_QUORUM_WAIT_S`. Past that this raises, and the caller turns that
+        into "broadcast but NOT confirmed" — which is the truth, and is what an operator needs to
+        hear before deciding to retry or refund.
+        """
+        waited = await self._rpc.wait_receipt(tx_hash)
+        if getattr(self._rpc, "eth_call_quorum", None) is None:
+            return waited
+        label = f"claim receipt {tx_hash}"
+        deadline = time.monotonic() + CLAIM_RECEIPT_QUORUM_WAIT_S
+        last: Exception | None = None
+        while True:
+            try:
+                agreed = await read_contract(
+                    self._rpc,
+                    lambda s: s.get_transaction_receipt(tx_hash),
+                    label=label,
+                    combine=_agree_receipt_facts,
+                )
+            except NetworkError as exc:
+                agreed, last = None, exc
+            else:
+                if agreed is not None:
+                    return agreed
+                last = NetworkError(
+                    f"{label}: the endpoints agree they have no receipt for this transaction, "
+                    "while the primary reports it mined"
+                )
+            if time.monotonic() >= deadline:
+                raise NetworkError(
+                    f"{label}: no quorum of endpoints corroborated the primary's receipt within "
+                    f"{CLAIM_RECEIPT_QUORUM_WAIT_S:.0f}s ({last}). The primary alone is not "
+                    "evidence that a claim succeeded — it is the one party that could have "
+                    "fabricated it — so this is reported as unconfirmed."
+                ) from last
+            await asyncio.sleep(CLAIM_RECEIPT_QUORUM_POLL_S)
+
     async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, preimage: bytes) -> None:
         """Provenance gate (R6): the maker's claim tx MUST target THIS swap's HTLC contract
         instance AND emit the revealed secret ``p`` from it — the ETH analogue of the BTC
@@ -638,7 +991,7 @@ class EthHtlcContractLeg:
         # Claimed(p) FROM our contract). The log-emitter==our-contract + p-in-log check is strictly
         # stronger and already pins the swap: a cross-swap claim (even one reusing H) emits from a
         # DIFFERENT contract address, so no log from `want` carries p and the gate fails closed.
-        receipt = await self._rpc.wait_receipt(tx_hash)
+        receipt = await self._confirmed_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise ValidationError("claim tx did not succeed (status != 1); refusing to treat it as a valid claim")
         for log in receipt.get("logs", []):

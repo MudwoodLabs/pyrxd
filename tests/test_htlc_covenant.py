@@ -42,9 +42,22 @@ def _pkh(wif: str) -> bytes:
 
 
 def _load_vector(name: str) -> dict:
+    """Load a mainnet golden vector, or XFAIL rather than skip when it is absent.
+
+    These are the ONLY byte-for-byte mainnet-proven checks on the FT/NFT holder scripts and ref
+    binding. The files are gitignored (`.gitignore:217` matches `gravity-ref-spike/.*`), so on a
+    fresh clone and in CI they are absent — and a `skip` does not fail a build, so the coverage
+    silently evaporated everywhere except a machine that happened to still have them.
+
+    `xfail(raises=...)` keeps the build green while making the absence VISIBLE in the report, which
+    a skip does not. The real fix is to commit sanitized vectors; until then this at least stops
+    the gap reading as coverage.
+    """
     path = _SPIKE / name
     if not path.exists():
-        pytest.skip(f"mainnet golden vector {name} not present")
+        pytest.xfail(
+            f"mainnet golden vector {name} is absent (gitignored) — FT/NFT byte-level binding is UNVERIFIED here"
+        )
     return json.loads(path.read_text())
 
 
@@ -437,3 +450,57 @@ def test_nft_and_ft_bind_exactly_the_genesis_ref():
     ref = GlyphRef(txid=txid, vout=int(vout)).to_bytes()
     assert set(count_input_refs(cov.funded_spk).keys()) == {ref}
     assert cov.genesis_ref == ref
+
+
+class TestNumberMinimalityIsCheckedSeparatelyFromPushMinimality:
+    """Push minimality and NUMBER minimality are two different consensus rules.
+
+    `CheckMinimalPush` governs the push opcode — a 1-byte `0x05` where `OP_5` belongs. A body is
+    SEPARATELY re-checked by `CScriptNum::IsMinimallyEncoded` wherever it is consumed numerically,
+    under SCRIPT_VERIFY_MINIMALDATA, which is a BLOCK flag — so a violation is not miner-recoverable
+    and the asset is stranded permanently on BOTH branches.
+
+    GUARD 3 audits the first rule, and cannot audit the second once the script is assembled: by then
+    it can no longer tell a numeric operand from a 32-byte hash. This checks at substitution time,
+    where the type is known.
+    """
+
+    def test_every_operand_the_covenant_consumes_numerically_encodes_minimally(self) -> None:
+        """The ranges that actually differ in encoding: the OP_N shortcut, the sign-padding
+        boundary at 128, and the 4-byte boundary."""
+        from pyrxd.gravity.htlc_covenant import _minimal_num_push
+        from pyrxd.utils import decode_script_num, encode_script_num
+
+        for n in (0, 1, 5, 16, 17, 127, 128, 255, 256, 2**31, 2**63 - 1):
+            body = encode_script_num(n)
+            assert body == encode_script_num(decode_script_num(body)), f"{n} is not round-trip minimal"
+            assert _minimal_num_push(n) is not None
+
+    def test_a_value_beyond_the_8_byte_CScriptNum_range_is_REFUSED(self) -> None:
+        """`maxIntegerSize` is 8. A 9-byte body raises INVALID_NUMBER_RANGE_64_BIT on both branches
+        — the same permanent-strand class as a non-minimal push, reachable by any direct caller
+        with a units slip."""
+        from pyrxd.gravity.htlc_covenant import _minimal_num_push
+
+        with pytest.raises(ValidationError, match="8-byte CScriptNum range"):
+            _minimal_num_push(2**63)
+
+    def test_the_boundary_value_itself_is_ACCEPTED(self) -> None:
+        """A guard that refuses valid work is a bug: 2**63 - 1 encodes in exactly 8 bytes and is
+        legal, so it must build."""
+        from pyrxd.gravity.htlc_covenant import _minimal_num_push
+
+        assert len(_minimal_num_push(2**63 - 1)) == 9  # 1 length byte + 8 body bytes
+
+    def test_an_honest_covenant_still_builds_across_the_interesting_ranges(self) -> None:
+        """The paired honest path — the encoder is on the build path for refundCsv and amount, so
+        an over-strict check here would refuse ordinary swaps rather than just bad ones."""
+        for csv in (1, 6, 16, 17, 144, 65_535):
+            cov = build_htlc_covenant_rxd(
+                amount=100_000,
+                taker_pkh=b"\x11" * 20,
+                maker_pkh=b"\x22" * 20,
+                hashlock=b"\x33" * 32,
+                refund_csv=csv,
+            )
+            assert cov.funded_spk

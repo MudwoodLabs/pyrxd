@@ -1,0 +1,239 @@
+"""The ERC-20 counter leg has a PRODUCTION caller, and it carries the right token.
+
+Until this wiring existed, `Erc20HtlcLeg` was constructed by nothing outside the test suite: the
+swap runner and the CLI could only fund a native-ETH counter leg, so a USDC swap was unreachable
+except from pytest. Every ERC-20 test passed while the corridor could not actually be executed.
+
+These drive the runner's REAL argument parser and its real leg factory rather than calling the
+token registry directly, because the defect this guards against is not "the registry is wrong" —
+it is "nothing asks the registry". A test that imports `token_for` itself would keep passing with
+the runner wired back to native.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.security.errors import ValidationError
+
+_RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "eth_swap_run.py"
+
+_BASE_SEPOLIA = 84532
+#: Circle's published Base Sepolia USDC. Pinned here as an INDEPENDENT copy: if this and the
+#: registry ever disagree, one of them is wrong, and a silent agreement is what we are testing for.
+_USDC_BASE_SEPOLIA = "0x036cbd53842c5426634e7929541ec2318f3dcf7e"
+
+
+@pytest.fixture(scope="module")
+def runner():
+    spec = importlib.util.spec_from_file_location("eth_swap_run_under_test", _RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _parse(runner, *argv):
+    saved = sys.argv
+    try:
+        sys.argv = ["eth_swap_run.py", "--stage", "dry-run", *argv]
+        return runner._args()
+    finally:
+        sys.argv = saved
+
+
+def _contract_leg(leg):
+    """Unwrap EthLeg (and the runner's capturing wrapper) down to the contract leg."""
+    while hasattr(leg, "_leg"):
+        leg = leg._leg
+    return leg
+
+
+def _make_leg(runner, args, rpc_url="http://127.0.0.1:1"):
+    # An unreachable URL on purpose: constructing the leg must not require a live node, and this
+    # test is about which CLASS gets built, not about talking to a chain.
+    #
+    # `rpc_url` is a parameter because a real-value token leg REQUIRES two endpoints, so a
+    # mainnet-token case has to say so rather than quietly getting an exemption a real run
+    # would not get.
+    _rpc, leg = runner._eth_leg(
+        args,
+        rpc_url=rpc_url,
+        chain_id=int(args.eth_chain_id),
+        key_hex="11" * 32,
+        claim_to="0x" + "11" * 20,
+        refund_to="0x" + "22" * 20,
+        eth_timeout=2**31,
+        network="base-sepolia",
+    )
+    return _contract_leg(leg)
+
+
+def test_counter_asset_usdc_builds_an_erc20_leg_bound_to_the_pinned_token(runner):
+    args = _parse(runner, "--counter-asset", "usdc", "--eth-chain-id", str(_BASE_SEPOLIA))
+    leg = _make_leg(runner, args)
+
+    assert isinstance(leg, Erc20HtlcLeg), (
+        f"the runner built {type(leg).__name__}: selecting --counter-asset usdc still funds a "
+        "NATIVE leg, so the swap would pay ETH while the record says USDC"
+    )
+    assert leg._token.address.lower() == _USDC_BASE_SEPOLIA, (
+        f"bound to {leg._token.address}, not Circle's Base Sepolia USDC"
+    )
+    assert leg._token.decimals == 6
+    assert leg._token.chain_id == _BASE_SEPOLIA
+
+
+def test_native_still_builds_a_native_leg(runner):
+    """The honest-path pair. A wiring change that routed EVERYTHING through the token leg would
+    satisfy the test above and break every native swap that already works."""
+    args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", str(_BASE_SEPOLIA))
+    leg = _make_leg(runner, args)
+    assert isinstance(leg, EthHtlcContractLeg)
+    assert not isinstance(leg, Erc20HtlcLeg), "a native run must not deploy a token HTLC"
+
+
+def test_the_amount_is_read_from_the_right_flag_for_each_asset(runner):
+    """--token-amount is BASE UNITS, --eth-amount-wei is wei. Reading the wrong one is the
+    10^12 error the chain tag exists to prevent, arriving through the front door."""
+    args = _parse(
+        runner,
+        "--counter-asset",
+        "usdc",
+        "--eth-chain-id",
+        str(_BASE_SEPOLIA),
+        "--token-amount",
+        "1000000",
+        "--eth-amount-wei",
+        "100000000000000",
+    )
+    assert runner._counter_value(args) == 1_000_000, "a USDC run must not size itself in wei"
+
+    native = _parse(runner, "--counter-asset", "native", "--eth-amount-wei", "100000000000000")
+    assert runner._counter_value(native) == 100_000_000_000_000
+
+
+def test_usdc_on_a_chain_with_no_pinned_token_is_refused(runner):
+    """Fail closed rather than falling back to an address from somewhere else. USDC on the wrong
+    chain id is a different contract, and on most chain ids it is nothing at all."""
+    args = _parse(runner, "--counter-asset", "usdc", "--eth-chain-id", "999999")
+    with pytest.raises(ValidationError, match="no pinned"):
+        runner._counter_token(args)
+
+
+def test_every_pinned_symbol_is_selectable_from_the_cli(runner):
+    """Pinning a token and being able to USE it are different things.
+
+    --counter-asset was a hand-written ("native", "usdc"), so USDT landed in the registry
+    reachable by nothing — the same defect the ERC-20 leg itself shipped with, one layer up. The
+    choices are derived from the registry now, and this asserts they stay derived.
+    """
+    from pyrxd.eth_wallet.tokens import KNOWN_TOKENS
+
+    saved = sys.argv
+    try:
+        for symbol in sorted({sym.lower() for sym, _ in KNOWN_TOKENS}):
+            chain = next(cid for sym, cid in KNOWN_TOKENS if sym.lower() == symbol)
+            sys.argv = [
+                "eth_swap_run.py",
+                "--stage",
+                "dry-run",
+                "--counter-asset",
+                symbol,
+                "--eth-chain-id",
+                str(chain),
+            ]
+            args = runner._args()  # argparse REJECTS a value outside choices, so this is the check
+            assert runner._counter_token(args).symbol.upper() == symbol.upper()
+    finally:
+        sys.argv = saved
+
+
+def test_a_bridged_usdt_leg_builds_without_a_freeze_predicate(runner):
+    """has_blacklist=False must not break leg construction. The OP-stack bridged USDT has no freeze
+    function at all, and a leg that only works for freezable tokens would refuse honest work."""
+    args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "8453")
+    # Base mainnet USDT is real value, so two endpoints — the same requirement a real run carries.
+    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3")
+    assert isinstance(leg, Erc20HtlcLeg)
+    assert leg._token.has_blacklist is False
+    assert leg._token.chain_id == 8453
+
+
+class TestTheQuorumIsREACHABLEFromTheRunner:
+    """`MultiSourceEthRpc` existed, was tested, and no run could reach it.
+
+    The runner built a single `EthRpc`, so every safety-critical read on a real run stayed
+    single-source no matter what the class did — built-but-unreachable, the same shape as the
+    ERC-20 leg before this file existed. These drive the runner's real factory for that reason.
+    """
+
+    def test_one_url_still_builds_a_plain_EthRpc(self, runner) -> None:
+        """Backwards compatibility, and the honest-path pair for the refusal below."""
+        args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
+        assert isinstance(rpc, EthRpc)
+
+    def test_TWO_urls_build_a_quorum(self, runner) -> None:
+        args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1, http://127.0.0.1:2", chain_id=1)
+        assert isinstance(rpc, MultiSourceEthRpc)
+        assert len(rpc.sources) == 2 and rpc.min_agreeing == 2
+
+    def test_a_REAL_token_leg_REFUSES_a_single_endpoint(self, runner) -> None:
+        """The constraint that makes the quorum matter. A value-bearing token leg on one endpoint
+        is the configuration where a lying or lagging provider costs the preimage."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        with pytest.raises(SystemExit, match="at least THREE independent"):
+            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
+
+    def test_a_real_token_leg_REFUSES_TWO_because_the_tolerance_would_be_inert(self, runner) -> None:
+        """Two passes "is it a quorum" and fails the question that matters.
+
+        `min_agreeing` defaults to a true majority — max(2, n//2+1) — so at n=2 it is 2 and
+        `assert_chain`'s tolerance for an unreachable endpoint does not exist: both must still
+        answer. That is exactly the configuration where one 429 from a public endpoint stalled a
+        live swap with value already locked in the HTLC.
+        """
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        with pytest.raises(SystemExit, match="at least THREE independent"):
+            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2", chain_id=1)
+
+    def test_a_real_token_leg_is_SATISFIED_by_three(self, runner) -> None:
+        """The honest-path pair. Three is where the tolerance becomes real: 2-of-3 survives one
+        endpoint being down, which is routine on free public RPCs."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3", chain_id=1)
+        assert isinstance(rpc, MultiSourceEthRpc)
+        assert rpc.min_agreeing == 2 and len(rpc.sources) == 3, "2-of-3 tolerates one unreachable"
+
+    def test_a_TESTNET_token_leg_is_not_forced_into_a_quorum(self, runner) -> None:
+        """Base Sepolia USDC is faucet money. Requiring two endpoints there would refuse honest
+        rehearsal work for no safety gain — the constraint tracks value, not the token type."""
+        args = _parse(runner, "--counter-asset", "usdc", "--eth-chain-id", str(_BASE_SEPOLIA))
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=_BASE_SEPOLIA)
+        assert isinstance(rpc, EthRpc)
+
+    def test_the_leg_actually_RECEIVES_the_quorum(self, runner) -> None:
+        """The reachability assertion proper: not just that `_eth_rpc` can build one, but that the
+        leg the coordinator drives is holding it."""
+        args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
+        rpc, leg = runner._eth_leg(
+            args,
+            rpc_url="http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3",
+            chain_id=1,
+            key_hex="11" * 32,
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout=2_000_000_000,
+            network="mainnet",
+        )
+        assert isinstance(rpc, MultiSourceEthRpc)
+        assert _contract_leg(leg)._rpc is rpc, "the leg must hold the quorum, not a fresh single rpc"

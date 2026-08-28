@@ -17,16 +17,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
+import stat
 import struct
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times
 from pyrxd.network.bitcoin import MempoolSpaceSource
+from pyrxd.security.units import ChainHeight
 
 _MAINNET_BTC_API = "https://mempool.space/api"
 
@@ -56,14 +60,14 @@ class CapturingBroadcaster:
     (review of cbd5fc0).
     """
 
-    def __init__(self, inner) -> None:
+    def __init__(self, inner: Any) -> None:
         self._inner = inner
         self.last_raw: bytes | None = None
 
     async def broadcast(self, raw_tx: bytes) -> str:
         txid = await self._inner.broadcast(raw_tx)
         self.last_raw = bytes(raw_tx)
-        return txid
+        return str(txid)
 
 
 class InMemSeen:
@@ -107,17 +111,108 @@ class SshTrFeeSource:
     sign / broadcast over ssh.
     """
 
-    def __init__(self, client, fee_amount_photons: int) -> None:
+    def __init__(self, client: Any, fee_amount_photons: int) -> None:
         self._client = client
         self._amount = fee_amount_photons
 
-    def next_fee_input(self):
+    def next_fee_input(self) -> Any:
         return self._client.carve_fee_input(self._amount)
 
 
 # ---------------------------------------------------------------------------
 # I/O helpers (operator + chain state + atomic disk writes)
 # ---------------------------------------------------------------------------
+
+
+def read_own_private_file(path: Path, *, what: str, limit: int = 1 << 20) -> str:
+    """Read a file this user owns, following no symlink and trusting no other account.
+
+    OPEN FIRST, then fstat THAT descriptor. `path.stat()` followed by `path.read_text()` checks one
+    file and reads another: between the two calls the path can be replaced, so a permissive file
+    passes the check while a different one supplies the contents.
+
+    O_NOFOLLOW refuses a symlink standing in for the file. O_NONBLOCK stops a FIFO from HANGING the
+    open before fstat can reject it — an operator who mistypes a path should get a message, not an
+    indefinite wait — and is a no-op for the regular files this accepts. The uid check refuses a
+    file another account can rewrite, and the mode check refuses one other accounts can read.
+
+    ``what`` names the stake in the refusal, because "permission denied" does not tell an operator
+    mid-swap why the run stopped.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise SystemExit(f"cannot open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SystemExit(f"{path} is not a regular file; refusing to read {what} from it")
+        if st.st_uid != os.getuid():
+            raise SystemExit(
+                f"{path} is owned by uid {st.st_uid}, not you ({os.getuid()}). Refusing: it holds "
+                f"{what}, and a file another account can rewrite is not a file you control."
+            )
+        if st.st_mode & 0o077:
+            raise SystemExit(
+                f"{path} is mode {oct(st.st_mode & 0o777)}: readable by other users, and it holds {what}. chmod 600 it."
+            )
+        return os.read(fd, limit).decode()
+    finally:
+        os.close(fd)
+
+
+def resolve_eth_key_file(args: argparse.Namespace) -> None:
+    """Fold ``--eth-key-file`` into ``args.eth_key_hex`` so downstream code is unchanged.
+
+    A secret on argv is readable by every local user for as long as the process runs, and it
+    persists in shell history afterwards. A PATH on argv is not a secret.
+
+    Shared rather than reimplemented per runner: the file flag existed on exactly one script and
+    every document still showed `--eth-key-hex`, so the safer option had no callers and the whole
+    documented two-host flow — the two-party run — put a live key on the command line.
+    """
+    if not getattr(args, "eth_key_file", ""):
+        return
+    if getattr(args, "eth_key_hex", ""):
+        raise SystemExit("pass --eth-key-file OR --eth-key-hex, not both")
+    raw = read_own_private_file(Path(args.eth_key_file).expanduser(), what="an ETH signing key", limit=4096).strip()
+    args.eth_key_hex = _validated_eth_key_hex(raw, source=args.eth_key_file)
+
+
+def _validated_eth_key_hex(raw: str, *, source: str) -> str:
+    """Normalise and check the key HERE, not several hundred lines into the run.
+
+    A `0x` prefix is how every EVM tool prints a key, so a file containing one is honest input and
+    accepting it is the point — refusing it would be a guard rejecting valid work. What must not
+    happen is discovering the problem late: the length check used to live deep inside the run, past
+    the point where an NFT variant has already MINTED on RXD mainnet, so a mistyped key cost a real
+    transaction before anything complained.
+
+    Deliberately says nothing about the contents of the file beyond its length and alphabet.
+    """
+    key = raw[2:] if raw[:2].lower() == "0x" else raw
+    if len(key) != 64 or any(c not in "0123456789abcdefABCDEF" for c in key):
+        raise SystemExit(
+            f"{source} does not contain a 32-byte hex key: got {len(key)} hex characters after "
+            f"stripping any 0x prefix, expected 64. Refusing now, before the run spends anything."
+        )
+    return key
+
+
+def add_eth_key_arguments(ap: argparse.ArgumentParser) -> None:
+    """The key flags, defined once so every ETH runner offers the same safer option."""
+    ap.add_argument(
+        "--eth-key-hex",
+        default="",
+        help="Signing key as hex ON THE COMMAND LINE — visible in `ps` and in shell history. "
+        "Prefer --eth-key-file. Kept for compatibility and for throwaway keys.",
+    )
+    ap.add_argument(
+        "--eth-key-file",
+        default="",
+        help="Path to a mode-600 file containing the signing key as hex. Preferred over "
+        "--eth-key-hex: a path on argv is not a secret.",
+    )
 
 
 def confirm(prompt: str, *, auto_yes: bool) -> None:
@@ -159,7 +254,7 @@ def atomic_write_mode_600(path: Path, content: str) -> None:
         raise
 
 
-def merge_into_mode_600(path: Path, extra: dict) -> None:
+def merge_into_mode_600(path: Path, extra: dict[str, Any]) -> None:
     """Merge ``extra`` into an existing mode-0600 JSON file, atomically.
 
     :func:`atomic_write_mode_600` is ``O_EXCL`` (create-only) by design, so it cannot
@@ -235,7 +330,7 @@ def validated_resume_deadline_s(
     return operator_value
 
 
-def rxd_blockcount(client) -> int:
+def rxd_blockcount(client: Any) -> ChainHeight:
     """``getblockcount`` over the ssh-tr shim, normalised to ``int``.
 
     Replaces the prior ``int(json.loads(json.dumps(_run_sync("getblockcount"))))``
@@ -246,7 +341,10 @@ def rxd_blockcount(client) -> int:
     res = client._run_sync("getblockcount")
     if not isinstance(res, int):
         raise RuntimeError(f"getblockcount returned non-int: {res!r}")
-    return res
+    # getblockcount is the TIP HEIGHT, not a depth. Tagged here, at the one place the number
+    # enters the runner, so it can be compared against a covenant fund height and never
+    # against a confirmation count.
+    return ChainHeight(res)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +352,7 @@ def rxd_blockcount(client) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def measured_margin_from_mainnet(args: argparse.Namespace):
+async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
     """Read recent MAINNET BTC header timestamps and build a measured ``MarginPolicy``.
 
     Timing always comes from MAINNET BTC data regardless of stage — signet header
@@ -291,16 +389,16 @@ async def measured_margin_from_mainnet(args: argparse.Namespace):
 class StepReport:
     """Append-only provenance report -> JSON. NEVER records the preimage ``p``."""
 
-    def __init__(self, stage: str, margin_provenance: dict) -> None:
+    def __init__(self, stage: str, margin_provenance: dict[str, Any]) -> None:
         self._t0 = time.monotonic()
-        self.doc: dict = {
+        self.doc: dict[str, Any] = {
             "stage": stage,
             "started_unix": int(time.time()),
             "margin_provenance": margin_provenance,
             "steps": [],
         }
 
-    def step(self, *, name: str, chain: str, **fields) -> None:
+    def step(self, *, name: str, chain: str, **fields: Any) -> None:
         entry = {"step": name, "chain": chain, "wall_clock_s": round(time.monotonic() - self._t0, 1), **fields}
         self.doc["steps"].append(entry)
         print(f"  [report] {json.dumps(entry)}")
@@ -341,3 +439,195 @@ __all__ = [
 # Pre-emptive asyncio guard — silence the noisy import-time warning on Python 3.13+
 # when this module is imported but never await'd. Cheap, removes nothing.
 _ = asyncio
+
+
+async def wait_for_covenant_funding(
+    client: Any, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 30.0
+) -> Any:
+    """Block until the covenant SPK actually holds a confirmed UTXO of the pinned amount.
+
+    This replaces an operator ATTESTATION that appeared in every runner — a confirm() reading
+    "you have funded the RXD covenant SPK on mainnet and it has >= 1 conf".
+
+    There are two kinds of prompt in these scripts and they were sharing one flag. An
+    AUTHORISATION ("I am about to broadcast X, proceed?") is exactly what --yes is for: the
+    operator pre-authorised an unattended run. An ATTESTATION asks the operator to certify an
+    external fact, and under --yes it does not skip the question, it FABRICATES the answer — the
+    run then proceeds asserting something nobody checked.
+
+    A question whose answer is on the chain should be asked of the chain.
+    """
+    client.register_spk(covenant_spk)
+    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
+    print(f"\n  Fund the RXD covenant SPK as the maker ({expected_photons} photons):")
+    print(f"    {covenant_spk.hex()}")
+    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
+    while True:
+        utxos = await client.get_utxos(script_hash)
+        for u in utxos or []:
+            # height 0 means unconfirmed. The prompt this replaces said ">= 1 conf", and the reorg
+            # gate downstream assumes a mined covenant, so require it here rather than racing it.
+            if int(u.value) == int(expected_photons) and int(getattr(u, "height", 0)) > 0:
+                print(f"  covenant funded: {u.tx_hash}:{u.tx_pos} ({u.value} photons, height {u.height})")
+                return u
+        if utxos:
+            # Present but wrong value: say so rather than waiting silently forever. The covenant
+            # pins its amount, so a mis-funded UTXO is not one this swap can ever use.
+            print(
+                f"  SPK holds {[(int(u.value), int(getattr(u, 'height', 0))) for u in utxos]} "
+                f"(photons, height) — need exactly {expected_photons} at height > 0"
+            )
+        await asyncio.sleep(poll_s)
+
+
+def covenant_fund_height(height: ChainHeight) -> ChainHeight:
+    """THE one place a covenant funding output's on-chain height becomes the reorg gate's anchor.
+
+    UNITS, stated once so no call site has to restate them: this takes a TRUE BLOCK HEIGHT — the
+    meaning ``UtxoRecord.height`` and ``find_covenant_utxo``'s third element have always promised
+    and, since the shim fix, actually carry. It was not always so. ``radiant_mainnet_chainio``'s
+    ``get_utxos`` used to read the real height out of ``scantxoutset`` and then overwrite it with
+    ``tip - height + 1``, a CONFIRMATION COUNT, so every ``scripts/`` caller on the mainnet shim
+    was handed a depth in a field named for a height. Code that compensated for that
+    (``fund_height = tip - confs + 1``) is now the bug rather than the fix: a conf count is no
+    longer representable here, so there is nothing left to compensate for, and a leftover
+    compensation would put the anchor a full chain-length in the past.
+
+    That units contract is now the CHECKER's, not just the docstring's: the parameter is a
+    :data:`~pyrxd.security.units.ChainHeight`, so handing this a
+    :data:`~pyrxd.security.units.Confirmations` — or the ``tip - confs + 1`` compensation that
+    became an inversion once the producer was fixed — does not type-check.
+
+    ``height == 0`` still means UNCONFIRMED, under both conventions — the one thing the change did
+    not touch. Fail closed on it: an unconfirmed covenant has no fund height, and inventing one
+    hands the coordinator's F-013 anchor check an impossible value much further downstream, where
+    it is far harder to read.
+    """
+    if not isinstance(height, int) or isinstance(height, bool):
+        raise RuntimeError(f"covenant fund height must be an int block height, got {height!r} (fail-closed)")
+    if height < 1:
+        raise RuntimeError(
+            f"covenant UTXO reports height {height} — unconfirmed, so it has no fund height for the "
+            "reorg gate to anchor on (fail-closed)"
+        )
+    return height
+
+
+async def scan_covenant_fund_height(
+    client: Any, *, covenant_spk: bytes, expected_photons: int
+) -> ChainHeight:
+    """The anchor for paths that locked the asset WITHOUT :func:`wait_for_covenant_funding` — the
+    NFT and FT variants, which lock by SPENDING into the covenant rather than by waiting on an
+    operator payment. Same conversion, same fail-closed rules, one scan.
+
+    NOT the tip, and that is the bug this exists to close. Both runners read the tip BEFORE
+    blocking on the asset lock, so the anchor was low by however long the lock took — minutes to
+    hours. The comment defending it said a low value "can only make the reorg-gate squeeze MORE
+    cautious, never less". True of the gate, false of the runner:
+    ``blocks_left = asset_locked_at_height + t_rxd - now``, so a low anchor shortens the window and
+    returns SQUEEZED, whose handler is ``taker_claim_asset_from_vulnerable`` — winner-take-all by
+    design, with no ``assess_claim_finality`` call anywhere inside it, and unattended under
+    ``--yes``. A more cautious gate produces a LESS gated broadcast.
+    """
+    register = getattr(client, "register_spk", None)
+    if callable(register):
+        register(bytes(covenant_spk))
+    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
+    utxos = await client.get_utxos(script_hash)
+    return covenant_fund_height(ChainHeight(int(getattr(_covenant_utxo(utxos, expected_photons), "height", 0))))
+
+
+def _covenant_utxo(utxos: Any, expected_photons: int) -> Any:
+    """The covenant's funding UTXO — fail-closed on anything ambiguous.
+
+    Matched on the PINNED amount, exactly as :func:`wait_for_covenant_funding` does: the covenant
+    SPK is a pure function of public terms, so anyone can pay it, and a wrong-value output is not
+    the one this swap locked.
+    """
+    matches = [u for u in utxos or [] if int(u.value) == int(expected_photons)]
+    confirmed = [u for u in matches if int(getattr(u, "height", 0)) > 0]
+    if not confirmed:
+        raise RuntimeError(
+            f"no CONFIRMED covenant UTXO of exactly {expected_photons} photons is on chain — cannot "
+            f"derive the reorg gate's anchor height (fail-closed); saw {len(matches)} matching output(s)"
+        )
+    # A second payment of the same value is possible (anyone can pay the SPK). Take the EARLIEST-
+    # mined, i.e. the LOWEST height: that is the one the maker's lock produced, and a decoy paid
+    # later cannot push the anchor forward and slacken the gate. (Under the old confs-in-height
+    # convention the same choice was `max`. Getting that flip wrong is exactly the unit bug the
+    # named conversion above exists to make visible.)
+    return min(confirmed, key=lambda u: int(getattr(u, "height", 0)))
+
+
+async def resolve_asset_locked_at_height(
+    rxd_leg: Any,
+    *,
+    covenant_spk: bytes,
+    expected_photons: int,
+    explicit: int,
+    now_rxd_height: ChainHeight,
+) -> ChainHeight:
+    """The two-host taker's reorg-gate anchor: read off the chain unless the operator pinned it.
+
+    ``--asset-locked-at-height`` was declared with ``default=0``, passed straight into
+    ``taker_scrape_and_claim_asset``, and validated nowhere — while ``--taker-min-rxd-confs >= 1``
+    was validated on the adjacent line. With anchor 0 the gate computes
+    ``blocks_left = 0 + t_rxd - now``, hugely negative at any realistic tip, so it reads SQUEEZED
+    on the FIRST assessment: the two-party adversarial run — the project's stated hard gate before
+    real value — went SQUEEZED -> ASSET_VULNERABLE -> winner-take-all every time and never once
+    exercised the finality wait it exists to prove.
+
+    So 0 no longer means "height zero"; it means "ask the chain", and the honest value is what an
+    operator who passes nothing now gets. The read re-derives nothing from the maker: the caller
+    passes the SPK it derived from its OWN terms, and the value is pinned, so a covenant funded at
+    the wrong amount is refused rather than anchored on.
+    """
+    if int(explicit) < 0:
+        raise SystemExit(
+            f"--asset-locked-at-height {explicit} is negative; it is a Radiant block height. Omit it "
+            "to read the covenant's true fund height off the chain."
+        )
+    if int(explicit) > 0:
+        # The operator's pinned value is a raw CLI int; re-tagging it here is the claim that it
+        # is a height, and `covenant_fund_height` is the check that it is a usable one.
+        anchor = covenant_fund_height(ChainHeight(int(explicit)))
+        source = "pinned by --asset-locked-at-height"
+    else:
+        _outpoint, _value, height = await rxd_leg.chain_io.find_covenant_utxo(
+            bytes(covenant_spk), expected_value=int(expected_photons)
+        )
+        anchor = covenant_fund_height(ChainHeight(int(height)))
+        source = "read from the covenant's funding output on chain"
+    if anchor > int(now_rxd_height):
+        # The coordinator fails closed on now < locked_at (F-013) with a message about lying nodes.
+        # Catching it here says which INPUT is wrong, before a claim decision depends on it.
+        raise SystemExit(
+            f"asset_locked_at_height {anchor} is above the current RXD tip {now_rxd_height} — a "
+            f"covenant cannot have been mined in a block that does not exist yet ({source})."
+        )
+    print(f"  reorg-gate anchor: asset_locked_at_height = {anchor} ({source})")
+    return anchor
+
+
+async def wait_for_covenant_via_leg(
+    leg: Any, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 10.0
+) -> Any:
+    """Same contract as :func:`wait_for_covenant_funding`, driven through the RadiantCovenantLeg.
+
+    The two-host scripts hold a leg rather than a raw client, and `find_covenant_utxo` is the
+    PRODUCTION lookup the coordinator itself uses — including its fail-closed value match, so a
+    mis-funded covenant is rejected here instead of surfacing later as a confusing gate refusal.
+    """
+    print(f"\n  Fund the RXD covenant SPK as the maker ({expected_photons} photons):")
+    print(f"    {bytes(covenant_spk).hex()}")
+    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
+    while True:
+        try:
+            outpoint, value, _height = await leg.find_covenant_utxo(
+                bytes(covenant_spk), expected_value=int(expected_photons)
+            )
+            print(f"  covenant funded: {outpoint} ({value} photons)")
+            return outpoint, value
+        except Exception as exc:  # not funded yet, or funded with the wrong amount
+            print(f"  not yet: {str(exc)[:110]}")
+        await asyncio.sleep(poll_s)

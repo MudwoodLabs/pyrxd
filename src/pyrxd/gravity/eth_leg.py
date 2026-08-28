@@ -28,7 +28,7 @@ import hashlib
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.security.errors import ValidationError
 
@@ -104,12 +104,20 @@ class EthLeg:
         ).digest()
 
     def locked_amount(self, locator: EthHtlcLocator) -> int:
-        """The funded amount the coordinator binds to ``terms.value_amount`` — wei for ETH."""
+        """The funded amount the coordinator binds to ``terms.value_amount``.
+
+        Wei for a native-ETH leg; the TOKEN's base units for an ``Erc20HtlcLocator`` (USDC has 6
+        decimals, not 18). The comparison stays correct across both because the same locator field
+        supplies this number and ``terms.value_amount`` was negotiated in the same unit — the unit
+        is carried by the locator TYPE and ``terms.token_address``, not by this method.
+        """
         return locator.amount_wei
 
     # -- fund / claim / refund -----------------------------------------------------------
 
-    async def fund(self, terms) -> EthHtlcLocator:
+    async def fund(
+        self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None
+    ) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
         maker to lock RXD against a wrong/attacker/under-funded contract.
@@ -123,7 +131,13 @@ class EthLeg:
         taker) via ``refund()`` after ``timeout``. To make the stranded deploy recoverable
         WITHOUT a chain rescan, we stash the deployed locator on ``self.last_funded_locator``
         BEFORE verify — so a caller that sees ``fund`` raise still has the contract address to
-        drive the timelock refund. (A full coordinator-record-level recovery is a Phase-4 item.)
+        drive the timelock refund.
+
+        That stash is MEMORY-ONLY and dies with the process, which is why ``on_deploy`` now exists
+        alongside it: the leg awaits it with the deployed address as soon as the deploy confirms
+        (and, for the token leg, strictly before the tokens are pushed), so the coordinator can
+        write the address to the durable record first. This is the coordinator-record-level
+        recovery previously deferred as a Phase-4 item.
         """
         # Consistency (audit HIGH-1): the leg's absolute deadline MUST equal the negotiated
         # term the coordinator's cross-clock ordering gate validated — otherwise the leg could
@@ -134,7 +148,39 @@ class EthLeg:
                 f"terms.eth_timeout_unix_s ({terms_timeout}) != this leg's eth_timeout_unix_s "
                 f"({self._eth_timeout_unix_s}); the validated deadline and the deployed deadline must agree"
             )
+        # Cross-check the ASSET before anything is broadcast. Without this a token leg driven by
+        # native terms deploys and pushes real USDC — `verify_funded` passes (self-consistent) and
+        # the amount bind passes (the integers match, the units do not) — and the disagreement is
+        # caught only by SwapRecord.__post_init__, i.e. AFTER the tokens sit in an HTLC the
+        # counterparty can already claim. A post-mortem is not a gate.
+        leg_token = getattr(self._leg, "token", None)
+        terms_token = getattr(terms, "token_address", "") or ""
+        if bool(leg_token) != bool(terms_token) or (leg_token and terms_token != leg_token.address):
+            raise ValidationError(
+                f"asset mismatch before funding: leg holds "
+                f"{leg_token.address if leg_token else 'native ETH'} but the terms name "
+                f"{terms_token or 'native ETH'}"
+            )
+        # Record the address the INSTANT the leg reports it, before the caller's hook runs. The
+        # hook persists, and a persist failure (ENOSPC, read-only mount) raises out of `fund` — so
+        # a stash set only after `fund` RETURNS is exactly the one a persist failure destroys,
+        # leaving the address in an exception string. Making the persist mandatory turned that from
+        # theoretical into reachable, which is a regression this restores.
+        self.last_deployed_address: str | None = None
+
+        async def _stash_then_persist(address: str, deploy_tx_hash: str) -> None:
+            self.last_deployed_address = address
+            if on_deploy is not None:
+                await on_deploy(address, deploy_tx_hash)
+
         locator = await self._leg.fund(
+            on_deploy=_stash_then_persist,
+            resume_from=resume_from,
+            **(
+                {}
+                if push_nonce is None and on_push_nonce is None
+                else {"push_nonce": push_nonce, "on_push_nonce": on_push_nonce}
+            ),
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
             refundee=self._refund_to,
@@ -156,16 +202,47 @@ class EthLeg:
         the on-chain contract at ``contract_address`` matches THIS expected locator, which is what
         binds the taker-deployed contract to 'pays the maker on claim, refunds the taker, on the
         agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain)."""
-        return EthHtlcLocator(
-            chain_id=self._leg.chain_id,
-            contract_address=contract_address,
-            deploy_tx_hash=deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32,
-            hashlock="0x" + bytes(terms.hashlock).hex(),
-            claimant=self._claim_to,
-            refundee=self._refund_to,
-            timeout=self._eth_timeout_unix_s,
-            amount_wei=int(terms.value_amount),
-        )
+        common = {
+            "chain_id": self._leg.chain_id,
+            "contract_address": contract_address,
+            "deploy_tx_hash": (
+                deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32
+            ),
+            "hashlock": "0x" + bytes(terms.hashlock).hex(),
+            "claimant": self._claim_to,
+            "refundee": self._refund_to,
+            "timeout": self._eth_timeout_unix_s,
+            "amount_wei": int(terms.value_amount),
+        }
+        # A token leg must produce a TOKEN locator, or the maker's expected record would say
+        # `chain: "eth"` while `amount_wei` held 6-decimal base units. The asset comes from the
+        # NEGOTIATED terms and is cross-checked against the leg's own pinned token, so the two
+        # sides cannot silently disagree about what is being paid.
+        token = getattr(self._leg, "token", None)
+        # `terms` is duck-typed here, and callers predating the token field pass objects without
+        # it — the existing suite caught exactly that. Absent means native, which is the correct
+        # reading of a terms object that has no concept of a token.
+        terms_token = getattr(terms, "token_address", "") or ""
+        if token is None:
+            if terms_token:
+                raise ValidationError(
+                    f"terms name token {terms_token} but this leg is a native-ETH leg; "
+                    "refusing to build a locator that would misdescribe the asset"
+                )
+            return EthHtlcLocator(**common)
+        # Both directions, and BEFORE anything is built. An empty terms_token against a token leg
+        # used to fall through silently and produce a token locator, leaving the disagreement to be
+        # caught by SwapRecord.__post_init__ — which on the fund path runs only AFTER the tokens are
+        # already in a deployed HTLC the counterparty can claim. A post-mortem is not a gate.
+        if not terms_token:
+            raise ValidationError(
+                f"this leg is pinned to {token.symbol} at {token.address} but the terms name no "
+                "token, so they describe a native-ETH swap; refusing rather than funding an asset "
+                "the counterparty did not agree to"
+            )
+        if terms_token != token.address:
+            raise ValidationError(f"terms name token {terms_token} but the leg is pinned to {token.address}")
+        return Erc20HtlcLocator(**common, token_address=token.address)
 
     async def verify_counterparty_funded(
         self, contract_address: str, terms, *, block_identifier: str | int | None = None

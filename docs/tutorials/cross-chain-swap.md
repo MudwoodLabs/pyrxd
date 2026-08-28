@@ -144,6 +144,19 @@ rules the coordinator enforces fail-closed:
 - **No counterparty inputs trusted.** Every step re-derives the covenant, re-checks the Glyph ref,
   and reads values from on-chain truth — never from what the other party asserts.
 
+**The one exception — a stablecoin counter-leg.** The same machinery can settle in **USDC or USDT**
+instead of native ETH, which is often what you want: a stablecoin quote does not drift against either
+party while the timelocks run. It costs you the guarantee above. Native ETH is held by the EVM, while
+a stablecoin is held by a contract whose issuer can freeze an address — and a freeze landing in the
+window between revealing `p` and claiming lets the counterparty take their leg while you can neither
+claim nor refund. Freezing the HTLC contract itself is worse, and is measured: `claim` *and* `refund`
+both revert, permanently, with no timeout to rescue the funds. pyrxd re-reads freeze status at the
+chain tip immediately before it will build a claim, so abandoning the swap there costs only fees —
+but check-then-reveal is itself a race, and a freeze after the reveal is unmitigated. On that
+corridor, atomicity is conditional on the issuer not intervening. The trade-off in full is in
+[build a cross-chain swap](../how-to/build-a-cross-chain-swap.md); the analysis is in the
+[threat model](../threat-model.md).
+
 If the maker stalls (locks the asset but never reveals `p`), nobody is stuck: after the timelocks
 mature, `mutual_refund` returns both legs to their owners.
 
@@ -154,6 +167,9 @@ mature, `mutual_refund` returns both legs to their owners.
 - **Other chains, no new code:** the same machinery runs against **BTC** (Taproot-HTLC) and the
   **EVM family** — Base, Optimism, Arbitrum, Linea (`pyrxd.eth_wallet.chains`). Only the per-chain
   finality window changes.
+- **Stablecoin instead of ETH:** the EVM counter-leg can hold **USDC or USDT** — same HTLC, weaker
+  trust model, since the issuer can freeze the asset. See
+  [settling the counter-leg in a stablecoin](../how-to/build-a-cross-chain-swap.md).
 - **Two operators, for real adversarial testing:**
   [run a two-host swap dry-run](../how-to/run-a-two-host-swap-dry-run.md) splits the swap across two
   separate operators exchanging only the public envelope — the genuine adversarial exercise.

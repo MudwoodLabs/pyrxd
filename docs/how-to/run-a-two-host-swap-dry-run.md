@@ -113,6 +113,22 @@ The harness `confirm`s before **every** irreversible broadcast (type `broadcast`
 proceed; anything else aborts). `--yes` bypasses confirmation for an unattended run — use
 it only when you know exactly what you are signing up for.
 
+### Put the signing key in a file, not on the command line
+
+Every `--eth-key-file` below expects a mode-600 file holding the key as hex. A secret passed as
+`--eth-key-hex` is readable by every local user for as long as the process runs (`ps` shows the
+full argument vector) and stays in shell history afterwards; a *path* on the command line is not a
+secret. The runners still accept `--eth-key-hex` for throwaway keys.
+
+```console
+$ (umask 077; printf '%s' "<your-hex-key>" > ~/.swap-taker-eth-key)
+$ ls -l ~/.swap-taker-eth-key        # must be -rw-------
+```
+
+The runners refuse a key file that is group- or world-readable, owned by another account, a
+symlink, or not a regular file — checked on the descriptor they actually read, so replacing the
+path between the check and the read does not work.
+
 **1. Taker — publish intro.** The taker generates its own RXD + ETH keys, persists them
 locally (mode 600), and publishes only the *public* half.
 
@@ -120,7 +136,7 @@ locally (mode 600), and publishes only the *public* half.
 taker$ python scripts/eth_swap_two_host.py --role taker --phase intro \
     --io ./swapdir \
     --eth-taker-addr 0x<taker-eth-addr> --eth-maker-addr 0x<maker-eth-addr> \
-    --eth-key-hex <taker-eth-key>
+    --eth-key-file ~/.swap-taker-eth-key
 # → writes taker_intro.json   (copy it to the maker's host)
 ```
 
@@ -131,7 +147,7 @@ and publishes `envelope.json`. The maker prints the **covenant SPK to fund**.
 ```console
 maker$ python scripts/eth_swap_two_host.py --role maker --phase envelope \
     --io ./swapdir \
-    --eth-maker-addr 0x<maker-eth-addr> --eth-key-hex <maker-eth-key> \
+    --eth-maker-addr 0x<maker-eth-addr> --eth-key-file ~/.swap-maker-eth-key \
     --rxd-photons 100000 --t-rxd-blocks 60 --margin-blocks 36
 # → writes envelope.json   (copy it to the taker's host)
 ```
@@ -145,7 +161,7 @@ funding locator.
 ```console
 taker$ python scripts/eth_swap_two_host.py --role taker --phase fund \
     --io ./swapdir \
-    --eth-rpc-url <sepolia-or-anvil> --eth-key-hex <taker-eth-key> --audit-cleared \
+    --eth-rpc-url <sepolia-or-anvil> --eth-key-file ~/.swap-taker-eth-key --audit-cleared \
     --rxd-electrumx-url ws://<regtest-electrumx> \
     --fee-txid <…> --fee-vout <…> --fee-value <…> --fee-spk-hex <…> --fee-wif <…>
 # → writes taker_funding.json   (copy it to the maker's host)
@@ -161,7 +177,7 @@ on-chain**. The claim tx hash is published.
 ```console
 maker$ python scripts/eth_swap_two_host.py --role maker --phase lock-claim \
     --io ./swapdir \
-    --eth-rpc-url <sepolia-or-anvil> --eth-key-hex <maker-eth-key> --audit-cleared \
+    --eth-rpc-url <sepolia-or-anvil> --eth-key-file ~/.swap-maker-eth-key --audit-cleared \
     --rxd-electrumx-url ws://<regtest-electrumx>
 # → writes maker_claim.json   (copy it to the taker's host)
 ```
@@ -173,7 +189,7 @@ gate, and claims the RXD covenant before its CSV refund window opens.
 ```console
 taker$ python scripts/eth_swap_two_host.py --role taker --phase claim \
     --io ./swapdir \
-    --eth-rpc-url <sepolia-or-anvil> --eth-key-hex <taker-eth-key> --audit-cleared \
+    --eth-rpc-url <sepolia-or-anvil> --eth-key-file ~/.swap-taker-eth-key --audit-cleared \
     --rxd-electrumx-url ws://<regtest-electrumx> --asset-locked-at-height <rxd-height> \
     --fee-txid <…> --fee-vout <…> --fee-value <…> --fee-spk-hex <…> --fee-wif <…>
 # → on SAFE: claims the covenant → COMPLETED (the swap is done)

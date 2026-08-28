@@ -11,9 +11,15 @@ For the narrative versions of the same material, see
 ```{toctree}
 :maxdepth: 1
 
+counter-chain-support
 glyph-token-protocol-spec
 mutation-survivors/index
 ```
+
+[Counter-chain and asset support](counter-chain-support.md) is the lookup table for the
+swap stack: which counter chains and which assets it can trade a Radiant asset against,
+which tokens are deliberately refused and why, and — stated separately from support —
+the level of proof behind each corridor.
 
 ## Machine-readable companions
 

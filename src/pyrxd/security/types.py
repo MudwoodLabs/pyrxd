@@ -20,7 +20,7 @@ material -- the error message uses a bounded summary (length, redacted tag).
 from __future__ import annotations
 
 import re
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 from .errors import ValidationError
 
@@ -62,6 +62,12 @@ class Txid(str):
 # --------------------------------------------------------------------------- Hex32 / Hex20
 
 
+#: Binds ``from_hex`` to the SUBCLASS it is called on, so ``Hex32.from_hex(...)`` is a
+#: ``Hex32`` rather than a bare ``_FixedBytes`` — without it every hex-string boundary
+#: silently widened back to the untyped base.
+_FB = TypeVar("_FB", bound="_FixedBytes")
+
+
 class _FixedBytes(bytes):
     """Base for fixed-length byte types.
 
@@ -81,7 +87,7 @@ class _FixedBytes(bytes):
         return bytes.__new__(cls, bytes(value))
 
     @classmethod
-    def from_hex(cls, value: str) -> _FixedBytes:
+    def from_hex(cls: type[_FB], value: str) -> _FB:
         """Construct from a hex string. Strict: rejects 0x prefix, whitespace,
         and wrong length. Use when inputs are human-readable (config, CLI)."""
         if not isinstance(value, str):

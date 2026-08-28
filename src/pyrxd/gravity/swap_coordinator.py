@@ -32,6 +32,8 @@ Design rules (house style)
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import functools
 import hashlib
 import logging
@@ -41,6 +43,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
+from typing import Any
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import (
@@ -50,7 +53,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
@@ -200,6 +203,22 @@ class MarginPolicy:
     # because BTC and RXD block rates differ — treating BTC blocks 1:1 as RXD blocks
     # under-counts the RXD window the BTC burial consumes. Defaults to ~300s (Radiant).
     rxd_block_interval_s: float = 300.0
+    # The FAST-tail counterpart, for conversions that DIVIDE by the interval. Dividing wants a
+    # SMALL interval (more blocks = more cover); multiplying wants a large one. Reusing one value
+    # across an inverse pair is what made #484's filed fix refuse every configuration.
+    #
+    # Defaults to None = "use rxd_block_interval_s", preserving today's behaviour exactly. A
+    # REAL-VALUE policy must supply a measured one: at a measured p10 of 36s, a reserve computed
+    # with the 300s default covers about an eighth of the window it is meant to protect.
+    #
+    # MEASURE IT PER RUN — the figure drifts and it drifts in the unsafe direction. Radiant mainnet
+    # p10 was 43s on 2026-06-02 and 36s on 2026-08-26 (720 intervals over 58.6h, blocks read off a
+    # mainnet node). Reserves DIVIDE by this, so a stale-high value under-counts: sizing with 43s
+    # against a real 36s gives 16% fewer blocks than the window actually holds. The same sample:
+    # median 222s, mean 293s, p90 669s, p99 1199s, max 2325s — a single 39-minute gap inside two
+    # and a half days.
+    # See docs/solutions/design-decisions/sizing-t-rxd-the-two-directions-rule.md.
+    rxd_block_interval_fast_s: float | None = None
     # Reorg gate (plan 2026-05-26). The maker's BTC claim must reach this depth before
     # the taker relies on the revealed p; the taker's own Radiant claim must then bury
     # ``rxd_claim_burial`` deep — both BEFORE t_rxd opens. Unit-tagged so the squeeze
@@ -259,6 +278,25 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.block_interval_s must be > 0")
         if not isinstance(self.rxd_block_interval_s, (int, float)) or self.rxd_block_interval_s <= 0:
             raise ValidationError("MarginPolicy.rxd_block_interval_s must be > 0")
+        fast = self.rxd_block_interval_fast_s
+        if fast is not None:
+            if not isinstance(fast, (int, float)) or fast <= 0:
+                raise ValidationError("MarginPolicy.rxd_block_interval_fast_s must be > 0")
+            if fast > self.rxd_block_interval_s:
+                raise ValidationError(
+                    f"MarginPolicy.rxd_block_interval_fast_s ({fast}s) exceeds rxd_block_interval_s "
+                    f"({self.rxd_block_interval_s}s) — a fast-tail percentile cannot be slower than "
+                    "the nominal one; the two are swapped"
+                )
+        if self.require_measured and fast is None:
+            raise ValidationError(
+                "real-value mode (require_measured=True) requires a MEASURED "
+                "rxd_block_interval_fast_s: a reserve computed by DIVIDING by the interval needs a "
+                "fast-tail percentile, and the nominal value under-counts it. At a measured p10 "
+                "of 36s (Radiant mainnet, 2026-08-26), a reserve computed with a 300s interval "
+                "covers about an eighth of the window it protects. Measure it for YOUR run rather "
+                "than copying this number: it was 43s in June and 36s in August."
+            )
         if not isinstance(self.is_measured, bool):
             raise ValidationError("MarginPolicy.is_measured must be bool")
         if not isinstance(self.require_measured, bool):
@@ -367,6 +405,7 @@ class MarginPolicy:
         btc_claim_reorg_depth: Timelock | None = None,
         rxd_claim_burial: Timelock | None = None,
         rxd_block_interval_s: float | None = None,
+        rxd_block_interval_fast_s: float | None = None,
         rxd_reorg_cost_per_block: int | None = None,
         value_at_risk_photons: int | None = None,
         burial_safety_factor: float = 1.0,
@@ -378,6 +417,15 @@ class MarginPolicy:
         inputs; if omitted they fall back to the ESTIMATED defaults (acceptable only
         because a measured policy still carries the estimated reorg depths — supply
         measured values for a real mainnet swap).
+
+        ``rxd_block_interval_fast_s`` is the FAST-tail (p10) inter-block measurement, REQUIRED
+        here: every reserve computed by dividing a time span by the interval needs it, and the
+        nominal value under-counts them. Measured Radiant mainnet 2026-08-26: p10 36s against a
+        mean of 293s — a reserve sized with the mean covers about an eighth of its window. (It was
+        p10 43s on 2026-06-02; the drift is downward, which is the direction that under-counts, so
+        re-measure rather than inheriting either figure.) When it is
+        genuinely unknown, pass the same value as ``rxd_block_interval_s`` and know that the
+        reserves are then nominal rather than conservative.
 
         ``rxd_reorg_cost_per_block`` (measured, photons/block) + ``value_at_risk_photons``
         (the assessed economic value) drive the VALUE-SCALED claim burial (red-team HIGH):
@@ -392,6 +440,12 @@ class MarginPolicy:
             "burial_safety_factor": burial_safety_factor,
             "accept_flat_burial": accept_flat_burial,
         }
+        # Default the fast tail to the nominal so an existing measured policy keeps working with
+        # today's numbers rather than failing to construct; the __post_init__ requirement then
+        # surfaces as an explicit choice at the call site instead of a hidden under-count.
+        kwargs["rxd_block_interval_fast_s"] = (
+            rxd_block_interval_fast_s if rxd_block_interval_fast_s is not None else (rxd_block_interval_s or 300.0)
+        )
         if btc_claim_reorg_depth is not None:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
@@ -638,6 +692,17 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
+def _dividing_interval_s(policy: MarginPolicy) -> float:
+    """The interval to use when CONVERTING A TIME SPAN INTO A BLOCK COUNT.
+
+    Dividing by a small interval yields MORE blocks, which is more cover — so a reserve wants the
+    fast tail. Every `ceil(seconds / interval)` in this module goes through here so a site cannot
+    quietly pick the nominal value; the projections that MULTIPLY by an interval deliberately do
+    not, and want the slow tail instead.
+    """
+    return float(policy.rxd_block_interval_fast_s or policy.rxd_block_interval_s)
+
+
 def _value_scaled_burial_blocks(policy: MarginPolicy, value_at_risk_photons: int | None) -> int:
     """Required claim-burial depth (Radiant blocks) so a reorg of the taker's claim costs at
     least the value at stake — 0 when value-scaling is not configured (then the flat burial
@@ -849,7 +914,7 @@ def assess_claim_finality(
             )
         # F-007: the reorg depth is in counter-chain blocks; convert the wall-clock it
         # represents into RXD blocks before subtracting (the rates differ; round UP).
-        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / _dividing_interval_s(policy))
     else:
         # Finalized-checkpoint (ETH) leg: finality is a TIME window, not a block depth (§9 #3).
         if policy.eth_finalization_window_s is None:
@@ -860,7 +925,7 @@ def assess_claim_finality(
         # Convert the finalization TIME window into RXD blocks; round UP (ceil) — this is a RESERVE,
         # so flooring would under-count it and let the gate say WAIT with too little margin. Same
         # direction as the depth branch above and reserve_to_blocks(); never floor a reserve.
-        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / policy.rxd_block_interval_s)
+        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / _dividing_interval_s(policy))
     if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
@@ -933,6 +998,14 @@ class CoordinatorConfig:
     # runbook (the dust harness); a long-lived / multi-process deployment needs a
     # durable store (audit track), not this flag.
     accept_nondurable_seen: bool = False
+    # A zero-argument callable returning a context manager that holds EXCLUSIVE, host-local
+    # mutual exclusion over funding this swap (see `record_sink.FileFundLock`). REQUIRED to
+    # resume an interrupted ETH fund: `reserve(H)` is what stopped two funders proceeding, the
+    # resume deliberately skips it because the record already holds that reservation, and without
+    # a replacement two resumers each read the same pre-push balance and each send the shortfall —
+    # leaving twice the negotiated amount in an HTLC whose claim sweeps the whole balance to the
+    # counterparty. A fresh fund is still covered by the reserve itself.
+    fund_lock: Any = None
     # Explicit opt-in to run a VALUE-BEARING ETH (finalized-checkpoint) counter-leg swap
     # with an ESTIMATED (is_measured=False) margin policy. is_measured gates TWO ETH
     # defenses — the verify->lock 'finalized' reorg pin (a 'latest' re-verify cannot catch
@@ -1164,7 +1237,7 @@ class SwapCoordinator:
         # itself), so the floor is advisory there — a real-value swap MUST be is_measured=True.
         if record.terms.counter_chain != "btc" and config.margin_policy.is_measured:
             mp = config.margin_policy
-            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / mp.rxd_block_interval_s)
+            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
             # Use the SAME burial reserve the reorg gate uses (assess_claim_finality:
             # _reserve_to_blocks(policy.rxd_claim_burial, ...)) — NOT the hardcoded estimate (red-team
             # LOW): an operator who measures a burial != 6 would otherwise get a floor that blesses an
@@ -1175,7 +1248,7 @@ class SwapCoordinator:
                 raise ValidationError(
                     f"maker_stall_safety_window_blocks={config.maker_stall_safety_window_blocks} is below the "
                     f"ETH finality+burial reserve floor {min_n} (= ceil(eth_finalization_window_s "
-                    f"{mp.eth_finalization_window_s}/rxd_block_interval_s {mp.rxd_block_interval_s})={fin_reserve_blocks} "
+                    f"{mp.eth_finalization_window_s}/{_dividing_interval_s(mp)}s fast-tail interval)={fin_reserve_blocks} "
                     f"+ burial {burial_blocks} - 1); a maker could time its reveal into a "
                     "SQUEEZE window the taker cannot safely act in — raise N or shrink the window"
                 )
@@ -1279,7 +1352,13 @@ class SwapCoordinator:
         # 2. H freshness — advisory read-only probe for a clean early reject; the
         #    authoritative atomic reserve is in taker_funds_btc, pre-broadcast.
         try:
-            if self.seen_store.has_seen(terms.hashlock):
+            # A record carrying a pending deploy means THIS swap already reserved H and put a
+            # contract on chain before being interrupted, so seeing H here is expected rather than
+            # suspicious — refusing would make a crashed fund permanently unresumable, which is the
+            # state this whole handle exists to escape. The authoritative atomic reserve below is
+            # skipped on that same evidence; a resume completes the existing contract rather than
+            # creating a second one, so the property this probe defends is untouched.
+            if not self.record.pending_counter_contract and self.seen_store.has_seen(terms.hashlock):
                 return PreBtcLockGate(ok=False, reason="hashlock H reused (free-option / preimage-replay risk)")
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"seen-store unavailable; fail-closed ({exc})")
@@ -1293,6 +1372,66 @@ class SwapCoordinator:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
+
+        # 3b. t_rxd must be able to CONTAIN the value-scaled claim burial.
+        #
+        # `assess_claim_finality` returns SAFE only when `blocks_left >= B(V)`, and `blocks_left` is
+        # at best `t_rxd` — at the instant the covenant is mined. So SAFE is reachable at all only
+        # if `t_rxd >= B(V)`. That was checked nowhere before the taker committed: the burial was
+        # verified at CLAIM time, when the value is already locked and the only remaining choices
+        # are to accept the reorg risk or walk away.
+        #
+        # The MAKER chooses t_rxd. And shrinking it makes the ordering check above pass MORE
+        # easily, because `t_btc - t_rxd` grows — so the one gate that did look at t_rxd rewarded
+        # exactly the direction that nullifies the burial. A maker could hand a taker a swap that
+        # is unconditionally SQUEEZED and the taker would only find out after revealing.
+        #
+        # Binds only when the policy actually carries the economics (a measured policy). Without
+        # `rxd_reorg_cost_per_block` and a value-at-risk there is no basis to scale, the flat
+        # burial stands, and there is nothing to check — see `_value_scaled_burial_blocks`.
+        try:
+            # max(flat, value-scaled) — the SAME term `assess_claim_finality` uses at claim time
+            # (see the `rxd_burial = max(flat_burial, ...)` line there). Checking the value-scaled
+            # component alone let the FLAT burial dominate unnoticed: with the default 6-block flat
+            # burial and economics yielding a value-scaled 1, a t_rxd of 3 passed this gate and
+            # then SQUEEZED on every claim — precisely the state this exists to prevent. It also
+            # made the gate inert whenever `rxd_reorg_cost_per_block` was unset, since the
+            # value-scaled term is 0 there, so the flat burial was checked at NO point before the
+            # taker committed, in any configuration.
+            mp = self.config.margin_policy
+            flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
+            # The SUFFICIENT floor, not just the necessary one. `assess_claim_finality` grants SAFE
+            # on `blocks_left - counter_reserve >= burial`, where `blocks_left` is t_rxd MINUS the
+            # confirmations already elapsed. So `t_rxd >= burial` is merely necessary: it leaves the
+            # band [burial, burial + confirm + reserve) open, and a maker who picks t_rxd inside it
+            # passes this gate, reveals LATE, and hands the taker a swap that is SQUEEZED at claim
+            # time anyway — a narrower version of exactly what this gate exists to prevent.
+            #
+            # The counter-leg reserve is the same quantity the claim-time gate subtracts, so it is
+            # computed the same way (and via the fast-tail accessor, because it DIVIDES).
+            counter_reserve = 0
+            if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
+                counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
+            # One block for the claim itself to be mined. Radiant has no RBF and no CPFP, so a claim
+            # that does not make it into a block before maturity cannot be accelerated.
+            required_burial = burial + counter_reserve + 1
+            if required_burial > 0:
+                t_rxd_blocks = int(terms.t_rxd.value)
+                if t_rxd_blocks < required_burial:
+                    return PreBtcLockGate(
+                        ok=False,
+                        reason=(
+                            f"t_rxd is {t_rxd_blocks} blocks but a safe claim needs {required_burial} "
+                            f"(burial {burial} + counter-leg reserve {counter_reserve} + 1 block to "
+                            "mine) — this swap can NEVER reach a safe claim. The taker "
+                            "would reveal, find every claim SQUEEZED, and be left choosing between "
+                            "a reorg-reversible claim and walking away from a funded counter leg. "
+                            "Negotiate a longer t_rxd, or a lower value-at-risk."
+                        ),
+                    )
+        except ValidationError as exc:
+            return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
 
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
@@ -1394,7 +1533,15 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            rxd_block_interval_s=policy.rxd_block_interval_s,
+            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
+            # interval is "a no-op input" because the sizer divides by it and this multiplies by
+            # it — true ONLY while both use the same one. It was passed the NOMINAL while
+            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
+            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
+            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
+            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
+            # maker holds the refunded asset AND can still claim the counter leg with p.
+            rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=policy.max_covenant_confirm_wait_s,
         )
 
@@ -1450,14 +1597,104 @@ class SwapCoordinator:
         # (refuse to fund), never open. H is consumed at this COMMIT point, not after
         # fund() succeeds: an on-chain-locked HTLC has used its H, and a transient
         # post-fund failure must not re-open the free-option / preimage-replay window.
-        try:
-            reserved = self.seen_store.reserve(terms.hashlock)
-        except Exception as exc:
-            raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
-        if not reserved:
-            raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
+        # RESUME, or reserve. A record carrying a pending deploy is proof that THIS swap already
+        # won the reservation race and got as far as putting a contract on chain — so re-reserving
+        # would refuse us our own H, permanently, which is exactly the state a mid-fund crash used
+        # to leave behind. Skipping the reserve here does not weaken the guarantee it provides:
+        # the resume completes the EXISTING contract rather than creating a second one, the leg
+        # verifies that contract carries this swap's immutables before sending anything to it, and
+        # it re-reads the balance so a lost receipt cannot double-fund.
+        # An ETH counter-leg address is not derivable from terms, so the ONLY thing that can make
+        # a mid-fund crash recoverable is a record written to durable storage. Without a persist
+        # hook `_persist_record` is a silent no-op and every guarantee below is a lie — which is
+        # exactly what shipped: not one runner injected one, so the durable handle never reached
+        # disk and the resume it enables could never trigger. Refuse rather than document it.
+        if terms.counter_chain == "eth" and self._persist is None:
+            raise ValidationError(
+                "an ETH counter-leg requires a durable persist hook: its contract address depends "
+                "on the deployer's nonce and exists nowhere until the deploy receipt returns, so "
+                "without one a crash between deploy and funding leaves real value on chain that "
+                "nothing references. Pass persist= (see gravity.record_sink.JsonFileRecordSink)."
+            )
 
-        locator = await self.counter_leg.fund(terms)
+        resume_from = None
+        if self.record.pending_counter_contract:
+            # CHECK the assumption instead of trusting it. "A pending deploy proves this swap won
+            # the reservation" holds only while the seen-store and the record-store agree. They can
+            # diverge — a restored backup, a rotated or deleted store, or a non-durable SeenStore
+            # configured alongside durable records — and then a pending record survives with NO live
+            # reservation. Skipping both the probe and the reserve on that record would let a second
+            # swap under the same H fund a second HTLC, where one revealed p drains both.
+            try:
+                still_reserved = self.seen_store.has_seen(terms.hashlock)
+            except Exception as exc:
+                raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+            if not still_reserved:
+                raise ValidationError(
+                    "record carries a pending counter-leg deploy but its hashlock is NOT reserved "
+                    "in the seen-store: the two stores have diverged, so this record cannot prove "
+                    "it won the reservation. Refusing to resume — resolve the divergence (or "
+                    "refund the deployed contract after the timeout) rather than funding against "
+                    "an H another swap may also be using."
+                )
+            if self.config.fund_lock is None:
+                raise ValidationError(
+                    "resuming an interrupted fund requires CoordinatorConfig.fund_lock: this path "
+                    "skips the seen-store reserve (the record already holds that reservation), and "
+                    "the reserve was also the only mutual exclusion in the funding path. Two "
+                    "resumers without a lock each read the same pre-push balance and each send the "
+                    "shortfall, leaving twice the negotiated amount in an HTLC whose claim sweeps "
+                    "the whole balance to the counterparty. See gravity.record_sink.FileFundLock."
+                )
+            resume_from = PendingDeploy(
+                address=self.record.pending_counter_contract,
+                deploy_tx_hash=str(self.record.pending_counter_deploy_tx),
+            )
+        else:
+            try:
+                reserved = self.seen_store.reserve(terms.hashlock)
+            except Exception as exc:
+                raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+            if not reserved:
+                raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
+
+        # An ETH-side contract address is not derivable from terms — it depends on the deployer's
+        # nonce — so unlike the BTC path there is nothing to persist BEFORE the broadcast. The next
+        # best thing is to persist it the instant the deploy confirms and, for the token leg,
+        # strictly before the tokens are pushed into it. Without this the intent record above knows
+        # the swap exists but not WHERE its value went, and a crash mid-fund leaves real value in a
+        # contract referenced only by an exception string.
+        async def _remember_push_nonce(nonce: int) -> None:
+            # Durable BEFORE the push is broadcast. The pin is only worth anything on a retry, and a
+            # retry only happens after a crash — so a pin recorded after the send is the one thing
+            # that crash destroys. Measured 2026-08-24: a re-send at a recorded nonce REPLACES
+            # rather than adds, which is what makes funding idempotent without a distributed lock,
+            # and unlike `flock` that property holds across hosts.
+            self.record = dataclasses.replace(self.record, pending_push_nonce=int(nonce))
+            await self._persist_record(self.record, shield=True)
+
+        async def _remember_deploy(address: str, deploy_tx_hash: str) -> None:
+            self.record = dataclasses.replace(
+                self.record,
+                pending_counter_contract=address,
+                pending_counter_deploy_tx=deploy_tx_hash,
+            )
+            await self._persist_record(self.record, shield=True)
+
+        if terms.counter_chain == "eth":
+            lock = self.config.fund_lock
+            # Held across deploy AND push: the window the lock exists to close is between reading
+            # the balance and sending the shortfall, which spans both.
+            with lock() if lock is not None else contextlib.nullcontext():
+                locator = await self.counter_leg.fund(
+                    terms,
+                    on_deploy=_remember_deploy,
+                    resume_from=resume_from,
+                    push_nonce=self.record.pending_push_nonce,
+                    on_push_nonce=_remember_push_nonce,
+                )
+        else:
+            locator = await self.counter_leg.fund(terms)
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):
             raise ValidationError("counter_leg.fund must return a Btc/Eth HtlcLocator (full durable retained state)")
         # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits to
@@ -1512,7 +1749,15 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            rxd_block_interval_s=policy.rxd_block_interval_s,
+            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
+            # interval is "a no-op input" because the sizer divides by it and this multiplies by
+            # it — true ONLY while both use the same one. It was passed the NOMINAL while
+            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
+            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
+            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
+            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
+            # maker holds the refunded asset AND can still claim the counter leg with p.
+            rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
         )
 
@@ -1821,6 +2066,17 @@ class SwapCoordinator:
         raw = preimage.unsafe_raw_bytes()
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
+        # Zeroize once a claim has been ATTEMPTED, not on every exit. Past the submit boundary p
+        # may be public — on the public path the preflight eth_call carries the calldata, on the
+        # private path the submit does — so holding a copy buys nothing and discarding it is right.
+        #
+        # Before that boundary nothing has left this process, and destroying the only copy of a
+        # still-secret p strands a swap that a retry would have completed: a transient RPC blip
+        # becoming a dead swap (#479). The legs mark that boundary by raising PreRevealAbort, which
+        # is a promise about WHERE the failure happened, not why.
+        #
+        # A gate refusal that is NOT a PreRevealAbort — an address really is frozen — still
+        # zeroizes: that swap cannot complete, and a dead secret should not linger in memory.
         try:
             await self.counter_leg.claim(self.record.counterchain_locator, raw)
         except PreRevealAbort:
@@ -1838,6 +2094,90 @@ class SwapCoordinator:
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    async def resume_interrupted_fund(self, terms: NegotiatedTerms, *, sink: Any, now_unix_s: int) -> SwapRecord:
+        """Reload a crashed fund from durable storage and complete it.
+
+        THE READ SIDE. Without this the durable record was written and never read: every guard the
+        resume path carries — the nonce pin, the fund lock, the seen-store divergence check, the
+        immutable re-bind — was unreachable in production because `pending_counter_contract` could
+        only ever be set by a test that hand-built a record. A mechanism with no reader is half a
+        mechanism, and this is the missing half.
+
+        Fails closed on every disagreement, because the alternative to refusing here is funding a
+        second HTLC while the first holds real value:
+
+        * No record on disk → refuse. A resume with nothing to resume from is a fresh fund, and a
+          fresh fund is `taker_funds_btc`'s job; silently falling through to it would deploy again.
+        * A record with no pending handle → refuse. Either the fund completed (the locator is on
+          the record) or it never started; neither is a resume.
+        * Terms that disagree with the record's → refuse. `taker_funds_btc` takes `terms` as an
+          argument and never checks them against the record it is about to act on, so a drifted
+          argument would fund one thing while the record describes another.
+        """
+        rec = sink.load_record()
+        if rec is None:
+            raise ValidationError(
+                "no swap record found: there is nothing to resume. If the fund never started, run "
+                "the forward path instead — resuming into a fresh fund would deploy a second HTLC."
+            )
+        if not rec.pending_counter_contract:
+            state = rec.state.value if isinstance(rec.state, SwapState) else rec.state
+            raise ValidationError(
+                f"the swap record carries no pending counter-leg deploy (state {state}), so there "
+                "is no interrupted fund to complete. If the counter leg is already funded its "
+                "locator is on the record and the swap should continue from there."
+            )
+        if rec.terms.hashlock != terms.hashlock:
+            raise ValidationError(
+                "the supplied terms do not match the persisted record (different hashlock): "
+                "resuming would fund the contract from one swap using the parameters of another."
+            )
+        self.record = rec
+        return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
+
+    async def _assert_claim_reached_the_mempool(self) -> None:
+        """Confirm the claim actually landed before treating the swap as claimed.
+
+        `claim_asset` returns once the node ACCEPTED the transaction, which is not the same as the
+        covenant being spent. Advancing on a broadcast alone meant a claim that never entered — or
+        was immediately dropped — left the record saying the asset was claimed while the covenant
+        sat there waiting for the maker's CSV refund.
+
+        ABSTAIN is not failure: a source that cannot answer must not fail a claim that probably
+        succeeded, on a chain where there is no second chance to send it.
+        """
+        outpoint = self.record.radiant_covenant_outpoint
+        if outpoint is None:
+            return
+        probe = getattr(getattr(self.radiant_leg, "chain_io", None), "covenant_unspent_incl_mempool", None)
+        if probe is None:
+            return  # the leg cannot answer; absence of the capability is not evidence of failure
+        try:
+            unspent = await probe(outpoint)
+        except Exception as exc:
+            logger.warning("could not confirm the claim reached the mempool for %s: %s", outpoint, exc)
+            return
+        if unspent is True:
+            raise NetworkError(
+                f"the claim was broadcast but covenant {outpoint} is still unspent, so it did not "
+                "reach the mempool. Radiant has no RBF and no CPFP, and the maker's refund becomes "
+                "valid at CSV maturity — retry the claim now rather than treating this as done."
+            )
+
+    async def taker_rebroadcast_claim_if_evicted(self, p: bytes) -> str | None:
+        """Re-broadcast the taker's claim if it has fallen out of the mempool. Returns the new txid.
+
+        The production entry point for the eviction case. A claim only wins the race with the CSV
+        refund by BEING in the mempool when maturity arrives, and Radiant's mempool expiry is about
+        eight hours with no RBF to bump it back in. Drive this on whatever tick the operator or the
+        watchtower already runs, between the claim and the covenant's maturity.
+        """
+        if not isinstance(p, (bytes, bytearray)) or len(p) != 32:
+            raise ValidationError("preimage must be 32 bytes")
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("preimage does not hash to the negotiated H; refusing to re-broadcast")
+        return await self.radiant_leg.rebroadcast_claim_if_evicted(self.record, bytes(p))
 
     def _assert_claim_tx_spends_our_htlc(self, maker_claim_tx_bytes: bytes) -> None:
         """Provenance gate: the supplied claim tx MUST spend OUR BTC HTLC funding outpoint.
@@ -2002,6 +2342,7 @@ class SwapCoordinator:
 
         # SAFE: the BTC claim is reorg-deep and our own burial still fits the window.
         await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._assert_claim_reached_the_mempool()
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record

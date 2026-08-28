@@ -91,4 +91,6 @@ class SshTrHttpRefAdapter:
         try:
             return body, int(code_s)
         except ValueError as exc:
-            raise NetworkError(f"RXinDexer REST query failed (ssh/curl): {err.decode(errors='replace')[:160] or text[:160]!r}") from exc
+            raise NetworkError(
+                f"RXinDexer REST query failed (ssh/curl): {err.decode(errors='replace')[:160] or text[:160]!r}"
+            ) from exc

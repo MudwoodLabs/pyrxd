@@ -15,6 +15,15 @@ covenant building-block docs land with this change. Tier 3: 3.2/#158 and 3.3/#10
 watchtower v2 + alert-only ETH shipped (see `src/pyrxd/gravity/watch/README.md`). Tier 0.2 and
 issue #8 remain open; Tier 4 (audit, real value, bridged assets) stays deliberately deferred.
 
+**Status delta (refreshed 2026-08-25):** Tier 2.3's counter-leg breadth now includes an **ERC-20
+leg** — a pinned USDC/USDT registry, the token HTLC leg, and a pre-reveal issuer-freeze gate — so
+RXD/Glyph↔USDC is buildable. The per-chain, per-asset picture, with the level of proof behind each
+corridor stated separately from "supported", is now a reference page:
+`docs/reference/counter-chain-support.md`. Read it before quoting any corridor as proven: the first
+RXD↔USDC run had the Radiant leg on **mainnet** and the USDC leg on **Base Sepolia testnet**, which
+is not a both-sides-mainnet proof, and a token corridor is a **weaker trust model** than native ETH
+because the issuer can freeze. Tier 4.1 is unchanged — the swap stack remains **UNAUDITED**.
+
 ## Framing (what this project actually is)
 
 pyrxd is a **low-mcap, community-driven** project. The near-term goal is **to attract developers to build

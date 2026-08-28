@@ -73,7 +73,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dust_swap_shared import atomic_write_mode_600, confirm
+from _dust_swap_shared import (
+    add_eth_key_arguments,
+    atomic_write_mode_600,
+    confirm,
+    resolve_asset_locked_at_height,
+    resolve_eth_key_file,
+    wait_for_covenant_via_leg,
+)
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
@@ -81,9 +88,10 @@ from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, assert_t_rxd_fits_the_eth_deadline
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
@@ -195,6 +203,12 @@ def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
         rxd_claim_burial_s=args.rxd_claim_burial_s,
         rxd_confirm_slack_s=args.rxd_confirm_slack_s,
         rounding_slack_s=args.rounding_slack_s,
+        # The field its own docstring calls "the single most important safety addition", and this
+        # harness had no flag for it at all — so it defaulted to 0 and the two-party run could not
+        # be driven in the parameterisation the project calls mandatory. eth_swap_run.py has the
+        # flag and REFUSES below 3600 for a real token leg; the two-host prep must be able to
+        # rehearse with the same number, or it rehearses a swap nobody would run.
+        eth_finality_stall_tolerance_s=args.eth_finality_stall_tolerance_s,
     )
 
 
@@ -405,11 +419,25 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
 
-    # --- THE safety gate: verify t_counterchain - t_rxd >= margin from the envelope ALONE. ---
-    # The taker uses its OWN margin policy (not a maker-supplied one) and REFUSES to fund on failure.
+    # --- THE safety gate: check t_rxd against the COUNTER-CHAIN DEADLINE, from the envelope alone.
+    #
+    # This used to call `assert_timelock_margin(terms.t_btc, terms.t_rxd, policy)` — which cannot
+    # fail here. On the ETH path `t_btc` is built as `t_rxd + margin_blocks + 4` (see
+    # `_build_terms_and_covenant`, where the comment already calls it "decorative for ETH"), so the
+    # difference it inspects is `margin_blocks + 4` by construction and the assertion passed for
+    # every possible input. It was labelled the safety gate and validated nothing.
+    #
+    # The real question is whether `t_rxd` fits inside the window the ETH deadline actually allows,
+    # which needs `eth_timeout_unix_s` — the quantity the old check never looked at.
     policy = _margin_policy(args)
     try:
-        assert_timelock_margin(terms.t_btc, terms.t_rxd, policy)
+        assert_t_rxd_fits_the_eth_deadline(
+            t_rxd=terms.t_rxd,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            expected_rxd_lock_time_unix_s=int(time.time()),
+            margin=policy.cross_clock_margin,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+        )
     except Exception as exc:
         raise SystemExit(
             f"REFUSING to fund: independent timelock-margin check FAILED ({exc}). "
@@ -504,6 +532,20 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
 
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
+    # Re-derive the covenant from the taker's OWN public terms — the same derivation the fund phase
+    # checked the maker's advertised SPK against. The claim phase needs it to read the covenant's
+    # true fund height off the chain, and re-deriving keeps that read bound to terms we agreed to
+    # rather than to a hex string the envelope carries.
+    _terms3, cov = _terms_from_public(
+        hashlock=terms.hashlock,
+        rxd_photons=terms.radiant_amount,
+        eth_amount_wei=terms.value_amount,
+        t_rxd_blocks=terms.t_rxd.value,
+        margin_blocks=args.margin_blocks,
+        eth_timeout_unix_s=int(terms.eth_timeout_unix_s),
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+    )
     rpc, eth_leg = _eth_leg(
         args,
         claim_to=env["eth_maker_claim_addr"],
@@ -528,6 +570,18 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
         # cross-swap "reveal" fails closed here rather than entering the claim flow.
         confirm("taker_observed_reveal: verify the maker's on-chain reveal before claiming", auto_yes=args.yes)
         await coord.taker_observed_reveal(eth_claim_tx)
+        # The reorg gate's anchor, resolved ONCE before the loop. It used to be
+        # `args.asset_locked_at_height`, declared `default=0` and validated nowhere: at anchor 0
+        # the gate reads SQUEEZED at any realistic tip, so this harness — the two-party adversarial
+        # run, the project's stated hard gate before real value — went straight to ASSET_VULNERABLE
+        # and winner-take-all on the first assessment, never once exercising the finality wait.
+        asset_locked_at = await resolve_asset_locked_at_height(
+            rxd_leg,
+            covenant_spk=cov.funded_spk,
+            expected_photons=terms.radiant_amount,
+            explicit=args.asset_locked_at_height,
+            now_rxd_height=await _rxd_height(args),
+        )
         deadline = time.monotonic() + args.resume_deadline_s
         print(
             f"  scraping p from the maker's ETH claim {eth_claim_tx} + reorg-gated RXD claim (deadline {args.resume_deadline_s:.0f}s)"
@@ -543,7 +597,7 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
             now_rxd = await _rxd_height(args)
             confirm("taker_scrape_and_claim_asset: claim the RXD covenant with the scraped p", auto_yes=args.yes)
             rec = await coord.taker_scrape_and_claim_asset(
-                eth_claim_tx, now_rxd_height=now_rxd, asset_locked_at_height=args.asset_locked_at_height
+                eth_claim_tx, now_rxd_height=now_rxd, asset_locked_at_height=asset_locked_at
             )
             if rec.state is SwapState.COMPLETED:
                 print(f"  -> {rec.state.value} — RXD covenant claimed; cross-chain swap COMPLETE")
@@ -683,8 +737,14 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
         print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
         # 2. Lock the RXD covenant: the operator funds the SPK out-of-band, then we re-validate.
-        print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")
-        confirm("you have funded the RXD covenant SPK on regtest and it has >= 1 conf", auto_yes=args.yes)
+        # Poll the chain instead of asking the operator to certify it. The prompt this replaces
+        # auto-answered itself under --yes, so the run asserted a fact nobody had checked.
+        await wait_for_covenant_via_leg(
+            rxd_leg,
+            covenant_spk=bytes.fromhex(covenant_spk_hex),
+            expected_photons=terms.radiant_amount,
+            poll_s=args.poll_interval_s,
+        )
         rec = await coord.post_asset_lock_revalidate(bytes.fromhex(covenant_spk_hex), now_unix_s=int(time.time()))
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after its timeout")
@@ -749,7 +809,20 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         radiant_leg=rxd_leg,
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=_margin_policy(args), accept_estimated_eth_margins=True, role=role),
+        persist=JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json"),
+        config=CoordinatorConfig(
+            margin_policy=_margin_policy(args),
+            accept_estimated_eth_margins=True,
+            role=role,
+            # NO fund_lock, deliberately. `FileFundLock` is `flock` — advisory and HOST-LOCAL —
+            # and this runner exists to split a swap across two operators on two hosts. Two hosts
+            # get two independent lock files, so it would provide zero exclusion in exactly the
+            # deployment it appears to protect: a guard that is not one. Without it the coordinator
+            # REFUSES to resume an interrupted fund here, which is the honest outcome — cross-host
+            # resume is unshipped. Fresh funding is unaffected: its exclusion comes from the atomic
+            # `reserve(H)`, which is durable and stronger. Same-host resume is refused too; that is
+            # a deliberate over-restriction rather than a lock that lies about its scope.
+        ),
     )
 
 
@@ -939,7 +1012,7 @@ def _args() -> argparse.Namespace:
     )
     # ETH
     ap.add_argument("--eth-rpc-url", default="")
-    ap.add_argument("--eth-key-hex", default="", help="this role's ETH signing key (taker: funder; maker: claimer)")
+    add_eth_key_arguments(ap)
     ap.add_argument("--eth-chain-id", type=int, default=_SEPOLIA_CHAIN_ID)
     ap.add_argument(
         "--eth-network", default="sepolia", help="ETH network tag (anvil|sepolia); auto-anvil when chain-id 31337"
@@ -961,7 +1034,7 @@ def _args() -> argparse.Namespace:
         "--asset-locked-at-height",
         type=int,
         default=0,
-        help="RXD height the covenant was funded at (for the reorg gate)",
+        help="RXD height the covenant was funded at (the reorg gate's anchor). OMIT IT (0) and it is read off the chain from the covenant's own funding output — that is the honest value and the intended default. A pinned value is a rehearsal override; 0 no longer means 'height zero', which made the gate read SQUEEZED at any realistic tip.",
     )
     # the operator's OWN regtest fee UTXO (party-local; WIF never serialised into an exchange file)
     ap.add_argument("--fee-txid", default="")
@@ -982,6 +1055,17 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
     ap.add_argument("--eth-finalization-window-s", type=int, default=None)
+    ap.add_argument(
+        "--eth-finality-stall-tolerance-s",
+        type=int,
+        default=0,
+        help="ADDITIONAL cross-clock budget for an ETH FINALITY STALL — the checkpoint freezing "
+        "while blocks keep coming (Sepolia 2026-06-01 ~20 min; the May-2023 MAINNET incident ~1 h; "
+        "an inactivity leak is unbounded). The taker waits for FINALITY before claiming RXD, so "
+        "the RXD refund must not open until it has had a stall-tolerant window. 0 is the "
+        "regtest/anvil default; a real-value parameterisation needs >= 3600, which is what "
+        "eth_swap_run.py enforces.",
+    )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)
     ap.add_argument("--rounding-slack-s", type=int, default=300)
@@ -990,6 +1074,7 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--poll-interval-s", type=float, default=10.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
     args = ap.parse_args()
+    resolve_eth_key_file(args)
     # Resolve the ETH finalization window from the chain registry when not pinned (vetted per-chain).
     if args.eth_finalization_window_s is None:
         from pyrxd.eth_wallet.chains import evm_chain_by_id
@@ -1023,6 +1108,14 @@ def main() -> None:
     # (review LOW). The gate exists precisely so a 0-conf covenant is refused — never accept below 1-conf.
     if args.taker_min_rxd_confs < 1:
         raise SystemExit("--taker-min-rxd-confs must be >= 1 (a 0/negative floor silently disables the depth gate)")
+    # A NEGATIVE anchor is not a Radiant height and cannot be one. 0 is the documented "read it
+    # off the chain" sentinel (see resolve_asset_locked_at_height); anything below that is a typo
+    # that would otherwise reach the gate as an arithmetic input and be silently believed.
+    if args.asset_locked_at_height < 0:
+        raise SystemExit(
+            f"--asset-locked-at-height {args.asset_locked_at_height} is negative; it is a Radiant "
+            "block height. Omit it to read the covenant's true fund height off the chain."
+        )
     if not args.role or not args.phase:
         raise SystemExit("specify --self-check, or both --role and --phase (see --help)")
     fn = _DISPATCH.get((args.role, args.phase))

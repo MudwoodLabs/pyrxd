@@ -59,6 +59,7 @@ from pyrxd.security.errors import ValidationError
 __all__ = [
     "CrossClockMargin",
     "assert_covenant_confirms_before_eth_deadline",
+    "assert_t_rxd_fits_the_eth_deadline",
     "eth_absolute_to_rxd_relative_blocks",
 ]
 
@@ -126,6 +127,12 @@ class CrossClockMargin:
         )
 
 
+#: How far the sizer may step down to reach a value the gate accepts. The analytic value is
+#: never more than one block out; the extra room is so a genuine divergence raises rather
+#: than silently shrinking the taker's claim window block by block.
+_SIZER_GATE_STEPS = 3
+
+
 def eth_absolute_to_rxd_relative_blocks(
     *,
     eth_timeout_unix_s: int,
@@ -151,7 +158,7 @@ def eth_absolute_to_rxd_relative_blocks(
 
     ``rxd_block_interval_s`` MUST be a conservative FAST-TAIL percentile of the RXD inter-block
     distribution (e.g. p10), NOT the mean. Rationale (the attacker-benefits-when-RXD-runs-fast
-    rule): ``t_rxd = floor(budget_s / interval)`` picks the block count whose EXPECTED wall-clock
+    rule): ``t_rxd = ceil(budget_s / interval) - 1`` picks the block count whose EXPECTED wall-clock
     is ``budget_s``; if RXD then mines FASTER than ``interval`` assumed, those ``t_rxd`` blocks
     elapse SOONER than ``budget_s`` and the refund opens EARLY — shrinking (in the worst case
     eliminating) the taker's claim window. A smaller (fast-tail) ``interval`` yields MORE blocks
@@ -159,6 +166,11 @@ def eth_absolute_to_rxd_relative_blocks(
     the mean UNDERESTIMATES how fast the window can open. Measured RXD mainnet 2026-06-02 (150
     blocks): min 9 s, p10 43 s, median 229 s, mean 330 s — the p10/min, not the mean, is the
     load-bearing number. A slow RXD only lengthens the maker's lock (a liveness, not safety, cost).
+
+    RE-MEASURED 2026-08-26 (720 blocks): p10 36 s, median 221 s, mean 296 s, p90 671 s, max
+    2325 s. The p10 drifted DOWN from 43 s, which is the direction that under-counts a reserve —
+    sizing with the June figure against the August reality gives 16% fewer blocks than the window
+    holds. Measure per run; do not inherit either number.
     """
     _require_int(eth_timeout_unix_s, "eth_timeout_unix_s")
     _require_int(expected_rxd_lock_time_unix_s, "expected_rxd_lock_time_unix_s")
@@ -176,7 +188,39 @@ def eth_absolute_to_rxd_relative_blocks(
             f"no RXD timelock budget: eth_timeout - margin - rxd_lock_time = {budget_s}s "
             "(ETH deadline too close / margin too large to safely lock RXD)"
         )
-    t_rxd_blocks = math.floor(budget_s / rxd_block_interval_s)
+    # `ceil(x) - 1`, NOT `floor(x)`. The two differ only when the budget divides EXACTLY by the
+    # interval, and on exactly those inputs `floor` emits a value this module's own punctuality
+    # gate then REFUSES: `assert_covenant_confirms_before_eth_deadline` compares with a strict `<`,
+    # so a projection landing precisely ON the deadline is late. Swept 1480 parameter combinations
+    # (eth_timeout 12-48h x 8 fast tails x 5 confirm waits): 111 divided exactly, and the gate
+    # refused the sizer's own output on all 111 and on no others.
+    #
+    # It stayed invisible because nothing in production calls this function — the runner takes a
+    # hand-typed `--t-rxd-blocks` — and because the test asserting sizer and gate agree sizes with
+    # a zero confirm wait, which never lands on the boundary. The real run's parameters do:
+    # (86400 - 7068 - 600) / 36 = 2187.0 exactly, so the canonical derivation produced 2187 and the
+    # gate accepted only 2186. Deriving one block SHORT is the safe direction anyway: it opens the
+    # maker's refund marginally earlier, costing the taker a block of claim window rather than
+    # letting the refund land past the deadline it is sized to precede.
+    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s) - 1
+    # ...and then ASK THE GATE, rather than trusting that arithmetic to match it.
+    #
+    # `ceil(x) - 1` is algebraically the largest `t` with `t * I < budget`, and it is exact for an
+    # integer interval. It is NOT exact once `I` has a fractional part, because both sides round
+    # differently in binary floating point: brute-forced against the real gate over 365 parameter
+    # rows per interval, 0% of sized values were refused at 9/20/36/43/60/120/300 s and 0.27-2.74%
+    # were refused at 36.2/36.4/36.5/36.7/43.3/60.5/331.7 s. `--rxd-block-interval-fast-s` is a
+    # float and a MEASURED p10 almost never lands on an integer, so the failing set is the normal
+    # case and the passing set is the rounded one.
+    #
+    # Patching the formula would fix the intervals someone thought to test. Deferring to the gate
+    # makes the two agree by construction for every interval, which is the property actually
+    # wanted: this function's contract is "the largest window the gate will accept".
+    # RANGE FIRST, then the gate. Asking the gate about an absurd value gets an absurd answer:
+    # a far-future deadline sizes to ~10^9 blocks, the gate refuses it for its own reasons, and the
+    # step-down loop exhausted and reported "the sizer and the gate disagree" — burying the real
+    # and much clearer BIP68 refusal under a message about rounding. Establish the value is even in
+    # range before asking anything else about it.
     if t_rxd_blocks < floor_blocks:
         raise ValidationError(
             f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} "
@@ -187,6 +231,36 @@ def eth_absolute_to_rxd_relative_blocks(
             f"RXD timelock {t_rxd_blocks} blocks exceeds the BIP68 16-bit cap "
             f"{_MAX_RXD_CSV_BLOCKS} (ETH deadline too far in the future to map to a "
             "relative CSV window)"
+        )
+    for _ in range(_SIZER_GATE_STEPS):
+        try:
+            assert_covenant_confirms_before_eth_deadline(
+                now_unix_s=expected_rxd_lock_time_unix_s,
+                eth_timeout_unix_s=eth_timeout_unix_s,
+                margin=margin,
+                t_rxd=Timelock(t_rxd_blocks, TimeUnit.BLOCKS),
+                rxd_block_interval_s=rxd_block_interval_s,
+                # The gate anchors on `now + wait`; anchoring it on the expected lock time with a
+                # zero wait is the same instant, and keeps this function's own signature intact.
+                max_covenant_confirm_wait_s=0,
+            )
+            break
+        except ValidationError:
+            t_rxd_blocks -= 1
+    else:  # pragma: no cover — the analytic value is never more than one block out
+        raise ValidationError(
+            f"could not size a t_rxd the punctuality gate accepts within {_SIZER_GATE_STEPS} "
+            f"blocks of {math.ceil(budget_s / rxd_block_interval_s) - 1} (budget {budget_s}s at "
+            f"{rxd_block_interval_s}s/block). The sizer and the gate disagree by more than a "
+            "rounding step, which means one of them has changed meaning."
+        )
+    # The step-down can cross the safety floor by one, so re-check it. Not the cap: stepping down
+    # only ever decreases, and a value that was under the cap stays under it.
+    if t_rxd_blocks < floor_blocks:
+        raise ValidationError(
+            f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} after the "
+            f"punctuality gate required one block less than the {budget_s}s budget allows at "
+            f"{rxd_block_interval_s}s/block"
         )
     return Timelock(t_rxd_blocks, TimeUnit.BLOCKS)
 
@@ -256,6 +330,47 @@ def assert_covenant_confirms_before_eth_deadline(
             "whole RXD refund window right — refusing to lock RXD (SC-3/TLK-1). This is a "
             "PUNCTUALITY failure, not a slow-chain one: see this function's docstring before "
             "changing the block interval in response to it."
+        )
+
+
+def assert_t_rxd_fits_the_eth_deadline(
+    *,
+    t_rxd: Timelock,
+    eth_timeout_unix_s: int,
+    expected_rxd_lock_time_unix_s: int,
+    margin: CrossClockMargin,
+    rxd_block_interval_s: float,
+    floor_blocks: int = 12,
+) -> None:
+    """Check a SUPPLIED ``t_rxd`` against the counter-chain deadline. Fail-closed.
+
+    :func:`eth_absolute_to_rxd_relative_blocks` DERIVES the largest safe window; this checks that an
+    independently-chosen one fits inside it. Both are needed because operators supply ``t_rxd`` as a
+    raw integer and the runners had no way to tell them it was wrong: the script-level check they
+    ran compared ``t_btc - t_rxd >= margin`` against a ``t_btc`` constructed as
+    ``t_rxd + margin + 4``, so it passed for every possible input while being labelled the safety
+    gate.
+
+    A ``t_rxd`` LARGER than the derived maximum pushes the Radiant refund past the counter-chain
+    deadline, which inverts the leg ordering the whole protocol rests on. Smaller is safe here and
+    deliberately permitted — a shorter window is the maker's own liveness cost, and #507 is the gate
+    that stops it being made TOO short.
+    """
+    if not isinstance(t_rxd, Timelock) or t_rxd.unit is not TimeUnit.BLOCKS:
+        raise ValidationError("t_rxd must be a BLOCKS Timelock")
+    largest = eth_absolute_to_rxd_relative_blocks(
+        eth_timeout_unix_s=eth_timeout_unix_s,
+        expected_rxd_lock_time_unix_s=expected_rxd_lock_time_unix_s,
+        margin=margin,
+        rxd_block_interval_s=rxd_block_interval_s,
+        floor_blocks=floor_blocks,
+    )
+    if int(t_rxd.value) > int(largest.value):
+        raise ValidationError(
+            f"t_rxd of {t_rxd.value} blocks exceeds the largest window the counter-chain deadline "
+            f"allows ({largest.value} blocks): the Radiant refund would open at or after the ETH "
+            "deadline minus margin, inverting the leg ordering. Shorten t_rxd or extend the ETH "
+            "timeout."
         )
 
 

@@ -39,6 +39,7 @@ from ..merkle_path import MerklePath
 from ..script.type import P2PKH
 from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError, redact
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
+from ..security.units import ChainHeight, PhotonValue
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
 from .tls_pin import normalize_pin, verify_connection_pin
@@ -60,15 +61,31 @@ class UtxoRecord:
         Output index within the transaction.
     value:
         Output value in **photons** (RXD's smallest unit) — this is a Radiant client.
-        For a Glyph FT the same number is also the token's unit count.
+        This is the CARRIER's native value. It is NOT a Glyph FT token count: a token
+        covenant enforces ``refValueSum(ref) == amount``, and 1000 tokens can sit on
+        546 photons of ordinary dust. See :data:`pyrxd.security.units.TokenUnits`.
     height:
-        Block height at which the output was confirmed (0 = unconfirmed).
+        Block height at which the output was confirmed (0 = unconfirmed). A HEIGHT,
+        never a confirmation count. Both are non-negative ints, so a producer that
+        stores confs here type-checks — and inverts every age ordering built on the
+        field, because ascending height is oldest-first while ascending confs is
+        NEWEST-first. The mainnet ssh-tr shim did exactly that, which flipped
+        ``find_covenant_utxo``'s earliest-confirmed anti-poisoning rule into a
+        poison-selecting rule on the real-value path.
+
+    Both fields are unit-TAGGED (:mod:`pyrxd.security.units`), so a producer that
+    stores a confirmation count in ``height`` — or a token count in ``value`` — is now
+    a mypy error at the construction site rather than a code review that has to notice.
+    The tags are :func:`typing.NewType` aliases: zero runtime cost, no validation, no
+    behaviour change. The behavioural half of the contract stays where it was: every
+    producer is driven through its real code path by ``tests/test_utxo_record_units.py``
+    — register any new producer there with a units test as well as tagging it here.
     """
 
     tx_hash: str
     tx_pos: int
-    value: int
-    height: int
+    value: PhotonValue
+    height: ChainHeight
 
 
 _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
@@ -365,7 +382,7 @@ class ElectrumXClient:
 
     # ---------------------------------------------------------------------- public API
 
-    async def call_extension(self, method: str, params: list | None = None) -> Any:
+    async def call_extension(self, method: str, params: list[Any] | None = None) -> Any:
         """Call an arbitrary JSON-RPC method on the connected server.
 
         Use this for indexer-extension RPCs that aren't part of the base
@@ -483,7 +500,7 @@ class ElectrumXClient:
         # Build a MerklePath from the ElectrumX branch format.
         # ElectrumX returns hashes in display (reversed) order; we pass the
         # txid as the leaf and build a linear proof path.
-        path: list = [[{"offset": pos, "hash_str": str(txid), "txid": True}]]
+        path: list[list[Any]] = [[{"offset": pos, "hash_str": str(txid), "txid": True}]]
         current_pos = pos
         for _h, sibling_hex in enumerate(merkle_hashes):
             sibling_offset = current_pos ^ 1
@@ -570,15 +587,20 @@ class ElectrumXClient:
                 UtxoRecord(
                     tx_hash=hex_str(item["tx_hash"], nbytes=32),
                     tx_pos=nonneg_int(item["tx_pos"]),
-                    value=int(Photons(nonneg_int(item["value"]))),
-                    height=nonneg_int(item["height"]),
+                    # `Photons` range-checks against Radiant MAX_MONEY; `PhotonValue` tags the
+                    # UNIT so a token count cannot be stored here. The tag is free — see
+                    # `pyrxd.security.units` on why a unit tag must not also validate.
+                    value=PhotonValue(int(Photons(nonneg_int(item["value"])))),
+                    # A HEIGHT. The server's `height` field already is one; nothing in this
+                    # method computes a depth, and `ChainHeight` now stops one being stored.
+                    height=ChainHeight(nonneg_int(item["height"])),
                 )
                 for item in result
             ]
         except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed UTXO entry in server response")
 
-    async def get_history(self, script_hash: Hex32 | bytes | str) -> list[dict]:
+    async def get_history(self, script_hash: Hex32 | bytes | str) -> list[dict[str, Any]]:
         """Return the transaction history for *script_hash*.
 
         Returns a list of ``{"tx_hash": str, "height": int}`` dicts.
@@ -732,7 +754,7 @@ class ElectrumXClient:
         created: list[Any] = []  # every ws actually returned by websockets.connect
 
         async def _try(url: str) -> Any:
-            ws = await websockets.connect(url)  # type: ignore[attr-defined]
+            ws = await websockets.connect(url)
             # Append BEFORE the pin check so the `finally` block below still closes
             # this socket when the check rejects it.
             created.append(ws)
@@ -899,7 +921,7 @@ class ElectrumXClient:
             self._id_counter += 1
             return self._id_counter
 
-    async def _call(self, method: str, params: list) -> Any:
+    async def _call(self, method: str, params: list[Any]) -> Any:
         """Send a JSON-RPC request and return the ``result`` field.
 
         Concurrency model
