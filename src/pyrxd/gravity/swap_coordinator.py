@@ -250,6 +250,15 @@ class MarginPolicy:
     # (the honest reward + work an attacker must out-spend per block). Operator-supplied/refreshed
     # (it tracks hashrate + RXD price); never hardcoded — an estimate masquerading as a measurement
     # would size the whole defence wrong. None disables value-scaling (then accept_flat_burial gates).
+    #
+    # STALENESS HAS A DANGEROUS DIRECTION, and it is the one a falling hashrate produces. The burial
+    # formula DIVIDES by this, so a value carried over from a period of HIGHER hashrate yields FEWER
+    # required blocks than the chain now warrants — under-burial, silently, in the unsafe direction.
+    # A too-LOW figure merely over-buries, which costs time and not funds. So when in doubt, round
+    # DOWN. Measured 2026-08-29 off the mainnet node: difficulty 25,892,399 at the 300 s target is
+    # ~371 TH/s, roughly 5x below a figure recorded a few months earlier — this is not hypothetical
+    # drift. `rxd_block_interval_s` carries the identical divide-by-a-stale-measurement trap and
+    # says so; this parameter had the refresh instruction without the direction.
     rxd_reorg_cost_per_block: int | None = None
     # value_at_risk_photons: the swap's ECONOMIC value to protect, in PHOTONS. For an RXD swap this
     # equals ``terms.radiant_amount``; for FT/NFT the on-chain amount (token units / NFT carrier
