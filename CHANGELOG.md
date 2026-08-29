@@ -122,6 +122,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The native ETH leg no longer trusts a deploy receipt for the address holding the swap's
+  value** — the same defect as the token leg's, fixed there only where it had been demonstrated,
+  and this is the leg that has carried real value. `deploy` took the HTLC contract's address from
+  `receipt["contractAddress"]`, and `wait_receipt` is primary-endpoint-only by design, so **one
+  RPC endpoint chose where the entire counter leg went**. Every downstream check still passed,
+  because the ETH really was at the address it named — verifying the code there does not help
+  either, since an attacker deploys the same bytecode and holds the claim key. A CREATE address is
+  `keccak(rlp([sender, nonce]))[12:]` and both inputs are the deployer's own, so it is derivable
+  with no second endpoint and no trust: `create_address()` now derives it, cross-checks the
+  reported value, and refuses on any disagreement. **This defect is present in v0.20.0 and
+  earlier.** Reaching it requires the primary endpoint to be malicious or compromised, which is
+  also the threat model a multi-source quorum layer exists to address.
+
 - **`pip install 'pyrxd[eth]'` now works.** It never did: five runtime errors instructed users to
   "install the eth extra" (`eth_wallet/rpc.py`, `htlc_leg.py`, `keys.py`, `private_submit.py` ×2)
   while `pyproject.toml` had **no `[project.optional-dependencies]` section at all**. The command
