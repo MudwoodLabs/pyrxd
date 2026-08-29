@@ -268,7 +268,11 @@ def tag_radiant_amount(asset_variant: str, amount: int) -> PhotonValue | TokenUn
     proven. Here the proof is ``asset_variant`` itself, read from the same record as the
     amount. Anywhere else, prove it the same way — a variant check — before re-tagging.
     """
-    return TokenUnits(amount) if asset_variant == "ft" else PhotonValue(amount)
+    # `TokenUnits` is a NewType OVER `PhotonValue`, not beside it, because on Radiant an FT's
+    # quantity IS its output's photon value (1 photon = 1 token unit). So the FT tag layers on
+    # top of the photon tag rather than replacing it, and an FT amount still flows anywhere a
+    # photon value is wanted — because it is one.
+    return TokenUnits(PhotonValue(amount)) if asset_variant == "ft" else PhotonValue(amount)
 
 
 @dataclass(frozen=True)

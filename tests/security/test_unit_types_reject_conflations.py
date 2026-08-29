@@ -17,8 +17,14 @@ The fixtures reproduce the real defects, not toy ones:
   earliest-confirmed anti-poisoning rule into a poison-SELECTING rule.
 * ``anchor_bug`` is the downstream compensation for it, feeding a depth to the reorg
   gate's ``asset_locked_at_height`` anchor.
-* ``photon_token_bug`` is issue #505, still OPEN: the FT funding gate matching a TOKEN
-  COUNT against the covenant carrier's PHOTON value.
+* ``photon_token_ok`` was ``photon_token_bug``. It asserted that mypy REJECTS an FT amount
+  reaching the funding gate, on the strength of issue #505. That premise is wrong: on Radiant
+  an FT's quantity IS its output's photon value (1 photon = 1 token unit;
+  ``OP_REFVALUESUM_OUTPUTS`` sums ref-bearing outputs' native nValue, and ``FtUtxo`` raises on
+  ``value != ft_amount`` because such an output cannot exist). ``TokenUnits`` is now a NewType
+  OVER ``PhotonValue``, so the call is well-typed and this fixture asserts it is ACCEPTED.
+  Recorded rather than deleted: a type model that encodes a distinction the chain does not make
+  produces real-looking errors on correct code, and those errors were read as confirmation.
 * ``seconds_blocks_bug`` is the third pair — a block-count duration reaching a field that
   holds wall-clock seconds, the shape behind two off-by-ones shipped in one week.
 """
@@ -95,8 +101,8 @@ def observe(tip: ChainHeight, cov_confs: Confirmations) -> Observations:
     return Observations(maker_has_claimed_btc=False, now_rxd_height=tip, asset_locked_at_height=mined_at)
 '''
 
-_PHOTON_TOKEN_BUG = '''\
-"""Issue #505: the FT funding gate matching a token count against a carrier photon value."""
+_PHOTON_TOKEN_FT_OK = '''\
+"""An FT amount reaching the funding gate is CORRECT on Radiant: 1 photon = 1 token unit."""
 from __future__ import annotations
 
 from pyrxd.gravity.radiant_leg import RadiantChainIO
@@ -157,10 +163,8 @@ _FIXTURES: dict[str, tuple[str, tuple[str, ...]]] = {
         ('Argument "asset_locked_at_height"', '"Confirmations"', 'expected "ChainHeight | None"'),
     ),
     "anchor_ok": (_ANCHOR_OK, ()),
-    "photon_token_bug": (
-        _PHOTON_TOKEN_BUG,
-        ('Argument "expected_value"', '"TokenUnits"', 'expected "PhotonValue | None"'),
-    ),
+    # No expected diagnostics: a TokenUnits IS a PhotonValue on Radiant, so this must COMPILE.
+    "photon_token_ft_ok": (_PHOTON_TOKEN_FT_OK, ()),
     "photon_token_ok": (_PHOTON_TOKEN_OK, ()),
     "seconds_blocks_bug": (
         _SECONDS_BLOCKS_BUG,

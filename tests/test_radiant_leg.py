@@ -1247,85 +1247,32 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
         assert value == 1000
 
-    @pytest.mark.xfail(
-        reason="#505 PARTIALLY fixed: the theft half is closed (FT now fails CLOSED at the gate "
-        "rather than accepting a covenant funded with 1000 photons carrying 1 token), but the "
-        "honest half still does not work — supporting it needs a refValueSum read for the token "
-        "ref, which no client exposes. This test stays the live record of the unsupported honest "
-        "case and will pass the day that read exists.",
-        strict=True,
-    )
     @pytest.mark.asyncio
-    async def test_ft_accepts_a_covenant_whose_CARRIER_differs_from_the_token_count(self) -> None:
-        """The scenario the FT path must support and currently cannot: 1000 tokens held on 546
-        photons of ordinary dust. The covenant enforces `refValueSum(ref) == amount` — a TOKEN
-        count — while the gate compares the carrier photon value, so the honest case is refused.
+    async def test_ft_refuses_a_covenant_funded_BELOW_the_token_amount(self) -> None:
+        """The scenario #505 called a defect, corrected against the chain.
 
-        Deliberately chosen so the two quantities DIFFER: every existing FT fixture sets carrier
-        equal to the token count, which is exactly why the conflation was invisible.
+        #505 asserted that 1000 tokens on 546 photons of dust is an honest funding the gate
+        wrongly refuses. On Radiant that output cannot exist: an FT's quantity IS its output value,
+        1 photon = 1 token unit (``docs/concepts/radiant-fts-are-on-chain.md``;
+        ``OP_REFVALUESUM_OUTPUTS`` sums ref-bearing outputs' native nValue; ``FtUtxo`` raises on
+        ``value != ft_amount`` because such a UTXO cannot exist on chain).
+
+        So 546 photons IS 546 tokens — a covenant funded 454 short of the negotiated 1000, and
+        refusing it is the gate working. This test replaces a strict xfail that encoded the
+        colored-coin model Radiant does not use.
         """
         terms = _ft_terms(amount=1000)
         leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
-        _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
-
-
-class TestTheFtGateFailsClosedRatherThanComparingWrongUnits:
-    """#505's theft half. The covenant enforces ``OP_REFVALUESUM_OUTPUTS == amount`` on the TOKEN;
-    the funding gate can only read the carrier's native photon value. Comparing them let a maker
-    fund 1000 photons carrying ONE token and pass the gate — the taker then locked its counter
-    leg, the maker claimed it, and the taker's own claim could never satisfy refValueSum. One-sided
-    loss.
-
-    The gate now refuses FT outright. That does not make FT swaps work; it stops them being
-    exploitable while they do not.
-    """
-
-    @pytest.mark.asyncio
-    async def test_the_HOSTILE_funding_is_no_longer_accepted(self) -> None:
-        """1000 photons carrying 1 token: the exact shape that used to pass. The photon value
-        matches `radiant_amount` by construction, which is why the old comparison could not tell
-        this from an honest funding."""
-        terms = _ft_terms(amount=1000)
-        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
-        with pytest.raises(ValidationError, match="#505"):
-            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
-
-    @pytest.mark.asyncio
-    async def test_the_refusal_names_what_it_cannot_check(self) -> None:
-        """A gate that refuses without saying why sends an operator hunting a funding bug that is
-        not there. The message has to name the missing capability, not the symptom."""
-        terms = _ft_terms(amount=1000)
-        leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
-        with pytest.raises(ValidationError, match="refValueSum"):
-            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
-
-
-class TestTheFtRefusalDoesNotTouchRxdOrNft:
-    """The honest-path pair. A fix that removes a theft path by refusing everything is not a fix —
-    RXD and NFT compare photons against photons and must be completely unaffected."""
-
-    @pytest.mark.asyncio
-    async def test_an_RXD_covenant_still_verifies(self) -> None:
-        terms = _rxd_terms(amount=1000)
-        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
-        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
-        assert value == 1000
-
-    @pytest.mark.asyncio
-    async def test_an_NFT_covenant_still_verifies(self) -> None:
-        terms = _nft_terms(carrier=1000)
-        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
-        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
-        assert value == 1000
-
-    @pytest.mark.asyncio
-    async def test_an_RXD_covenant_funded_WRONG_is_still_refused(self) -> None:
-        """And the pre-existing fail-closed behaviour for a mis-funded RXD covenant is intact —
-        the FT refusal must not have short-circuited the value check for everyone else."""
-        terms = _rxd_terms(amount=1000)
-        leg = _leg(client=FakeClient(utxo_value=999, confirmations=6))
         with pytest.raises((NetworkError, ValidationError)):
             await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+    @pytest.mark.asyncio
+    async def test_ft_ACCEPTS_a_covenant_funded_with_the_token_amount(self) -> None:
+        """The honest path, which works and always did: 1000 tokens funded as 1000 photons."""
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
 
 
 class TestAnEvictedClaimCanBeRebroadcast:
