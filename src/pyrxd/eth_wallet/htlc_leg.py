@@ -17,7 +17,8 @@ fed to the signer at the call site and never persisted as an ``eth_account`` obj
 Security gates enforced here (off-chain, per the security review):
   * pre-fund: ``eth_getCode`` runtime-bytecode == the committed artifact's, the
     contract immutables (hashlock/claimant/refundee/timeout) == negotiated, and the
-    funded balance == negotiated amount — BEFORE the maker is told to lock RXD.
+    funded balance == negotiated amount. Run inside the funder's own ``fund()``, and again
+    on the maker's side before the maker reveals p (the maker's RXD lock precedes both).
   * EOA-only claimant/refundee (a recipient contract that reverts on receive would lock
     funds via the contract's ``require(ok)``).
 """

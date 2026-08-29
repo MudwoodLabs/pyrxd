@@ -14,7 +14,7 @@ Two ETH-specific realities the adapter encodes (re-audit §9 + B1):
   pre-fund. ``derive``/``promised`` return the same deterministic terms commitment (the gate
   passes trivially) and the REAL binding is :meth:`EthHtlcContractLeg.verify_funded`, run
   inside :meth:`fund` POST-deploy (eth_getCode logic + immutables-by-getter == terms + balance
-  == amount) before the maker is told to lock RXD.
+  == amount), and again on the maker's side before the maker reveals p.
 * **Absolute timeout, wei amount.** The ETH refund deadline is an absolute unix timestamp (a
   per-swap negotiation input carried by this leg), not a relative timelock; the funded amount
   is wei. ``locked_amount`` returns wei (the coordinator binds it to ``terms.value_amount``);
@@ -248,12 +248,16 @@ class EthLeg:
         self, contract_address: str, terms, *, block_identifier: str | int | None = None
     ) -> EthHtlcLocator:
         """MAKER-side fail-closed gate (red-team CRITICAL fix): verify the TAKER-deployed ETH HTLC
-        at ``contract_address`` binds to the maker's EXPECTED terms BEFORE the maker locks the asset.
+        at ``contract_address`` binds to the maker's EXPECTED terms BEFORE the maker reveals p.
 
-        The taker deploys the ETH HTLC FIRST and the maker locks RXD SECOND, so the maker MUST
-        independently verify the on-chain contract (claimant==maker, refundee==taker, hashlock==H,
-        timeout, funded balance==amount) — otherwise a hostile taker deploys ``claimant=self`` or
-        underfunds and the honest maker locks the asset for nothing (one-sided maker loss). We build
+        ORDERING — this ran the other way before HZ-1 (#392) and the docstring did not follow.
+        The MAKER locks RXD FIRST; ``taker_funds_btc`` refuses until ``pre_btc_lock_check`` step 5
+        has read the covenant off the Radiant chain. So by the time this runs the asset is ALREADY
+        committed, and what this gate protects is the REVEAL, not the lock: a hostile taker who
+        deploys ``claimant=self``, underfunds, or sets a bad timeout is caught here, before p goes
+        public. Refusing leaves the maker at BTC_LOCKED with its CSV refund open — a lost swap, not
+        a lost asset. (Do not restore the old wording: a reviewer reading it filed a MEDIUM against
+        a gate placement that the protocol had already moved.) We build
         the EXPECTED locator from the maker's own config (NOT a taker-supplied one) and run
         :meth:`EthHtlcContractLeg.verify_funded` against the contract at ``contract_address`` — any
         mismatch raises. Returns the verified locator (for the maker's subsequent claim).

@@ -104,13 +104,18 @@ MAKER_SECRET_TAKER_LOCKS_BTC_FIRST = (  # nosec B105 — a role-invariant doc st
     "MAKER_SECRET_TAKER_LOCKS_BTC_FIRST: "
     "the maker holds the Glyph asset and wants BTC; the taker holds BTC and wants "
     "the asset. (1) The MAKER generates the secret p (32 bytes CSPRNG, fresh per "
-    "swap) and publishes H = SHA256(p). (2) The TAKER locks BTC FIRST (funds the "
-    "P2TR HTLC). (3) The MAKER locks the asset SECOND (Radiant covenant). (4) The "
+    "swap) and publishes H = SHA256(p). (2) The MAKER locks the asset FIRST "
+    "(Radiant covenant). (3) The TAKER locks BTC SECOND (funds the P2TR HTLC) — "
+    "`taker_funds_btc` will not proceed until `pre_btc_lock_check` step 5 has read "
+    "the covenant off the Radiant chain (HZ-1, #392). (4) The "
     "MAKER claims the BTC FIRST, revealing p in the Bitcoin witness. (5) The TAKER "
     "scrapes p from Bitcoin and claims the Radiant asset before its refund opens. "
     "Invariant: t_BTC > t_RXD + margin — the leg claimed second (Radiant) has the "
     "SHORTER refund window; the first-claimed leg (BTC) holds the LONGER refund. "
-    "The taker's client MUST verify t_BTC - t_RXD >= margin before funding, or refuse."
+    "The taker's client MUST verify t_BTC - t_RXD >= margin before funding, or refuse. "
+    "NB the NAME predates HZ-1 (#392), which inverted the lock order in (2)/(3); it is "
+    "kept because it is exported, asserted in tests and quoted in a ValidationError, and "
+    "because the half of it that names the timelock invariant is still exactly right."
 )
 
 
@@ -1909,7 +1914,7 @@ class SwapCoordinator:
         return verify
 
     def _btc_counter_funding_depth(self) -> int | None:
-        """How deep the taker's BTC HTLC funding must be buried before the maker locks the asset.
+        """How deep the taker's BTC HTLC funding must be buried before the maker reveals p.
 
         BTC's "finalized" is a confirmation DEPTH, not a checkpoint (see
         :class:`pyrxd.gravity.finality.CounterClaimFinality.from_btc_depth`), so this is the BTC
@@ -1998,9 +2003,10 @@ class SwapCoordinator:
     async def maker_verify_counter_funding(self, counter_funding_ref) -> SwapRecord:
         """MAKER-side fail-closed gate (red-team CRITICAL fix): the maker MUST verify the
         TAKER-funded counter-leg HTLC binds to the negotiated terms + the maker's own payout
-        config BEFORE the maker locks the asset (funds the RXD covenant). Returns on success
+        config AFTER the maker has locked the asset and BEFORE the maker reveals p. Returns on success
         (recording the verified locator on the record so :meth:`maker_claims_btc` can claim it);
-        RAISES on any mismatch — the maker MUST NOT lock the asset if this raises.
+        RAISES on any mismatch — the maker MUST NOT reveal p if this raises, and recovers the
+        already-locked covenant through its CSV refund. Refusing here costs a swap, never an asset.
 
         WHY THIS EXISTS: the maker commits its own value against a leg the COUNTERPARTY built. The
         runbook is MAKER-locks-asset-FIRST (the taker will not fund until `pre_btc_lock_check`

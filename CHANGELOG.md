@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Nine places in shipped source described the lock order that HZ-1 (#392) inverted.** The maker
+  locks the Radiant asset FIRST — `taker_funds_btc` refuses until `pre_btc_lock_check` step 5 has
+  read the covenant off the Radiant chain — but the prose still said taker-locks-first, including
+  the module-level role invariant and one docstring that contradicted itself two paragraphs apart.
+  A reviewer read it and filed a MEDIUM (#486) against a gate placement the protocol had already
+  moved: `verify_counterparty_funded` runs from `post_asset_lock_revalidate`, which requires
+  `BTC_LOCKED`, so it guards the *reveal*, not the lock. The stale wording had also been **pinned by
+  a passing test**, which turned red when the constant was corrected and named no reason — so the
+  natural response to that red was to revert the fix. No logic changed; the exported
+  `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST` string has new **text** (its name is unchanged, and nothing
+  parses its value). `tests/test_protocol_lock_ordering_docs_are_current.py` scans for the old
+  phrasings.
+
+
 ## [0.21.0] — 2026-08-29
 
 ### Added

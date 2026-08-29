@@ -108,7 +108,7 @@ class EthHtlcLocator:
     timeout:
         Absolute unix deadline (matches the contract immutable).
     amount_wei:
-        The funded value (verified == negotiated before the maker locks RXD).
+        The funded value (verified == negotiated before the maker reveals p).
     """
 
     #: The wire tag this locator serialises under inside ``counterchain_locator``.
