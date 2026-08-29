@@ -249,6 +249,51 @@ These are **ratchets, not proofs**, and the write-up would be dishonest without 
   4 of its 11 entries are unscoped by node id, so the same reason arising in a new test passes
   silently.
 
+## A mechanism can be worse than no mechanism
+
+The section above says these are ratchets rather than proofs. That understates the risk, and the
+understatement was corrected the hard way, hours after this document was first drafted.
+
+`TokenUnits` and `PhotonValue` were introduced as INDEPENDENT `NewType`s, on the strength of issue
+#505's claim that a Glyph FT's token count is orthogonal to its carrier's photon value. mypy then
+produced a genuine-looking `arg-type` error at three call sites — on **correct code**. Those errors
+were read as confirmation that #505 was real. A fix was written to make FT swaps fail closed,
+tested, reviewed, and reverted only because someone asked the plain question "is there actually a
+security issue here?"
+
+There was not. On Radiant **1 photon = 1 token unit**: `OP_REFVALUESUM_OUTPUTS` sums each
+ref-bearing output's native `nValue` (Radiant-Core `src/script/interpreter.cpp`), and
+`glyph/ft.py` RAISES on `value != ft_amount` because such an output cannot exist on chain — citing
+the interpreter line. `docs/concepts/radiant-fts-are-on-chain.md` says the same in a table.
+
+The full loop:
+
+1. The issue asserted the conflation.
+2. A branch wrote the assertion verbatim into a `UtxoRecord.value` docstring.
+3. The type work encoded it as incompatible types.
+4. mypy emitted real errors on correct code.
+5. Reviewers cited the docstring and the errors as corroboration.
+
+Three reviewers agreeing meant three reviewers reading the same wrong sentence, one of which the
+review process had itself written. **A type system taught a distinction the chain does not make
+will manufacture evidence for the bug you told it to expect** — and that evidence is more
+persuasive than prose, because it is generated, specific, and reproducible.
+
+This does not argue against the technique. The height-versus-confirmations pair, mechanised the
+same way, is a genuine win with an observable on-chain consequence behind it. The difference is
+whether the distinction **exists on the chain**, and that is a question about the consensus
+implementation, not about the codebase:
+
+> Before encoding a distinction in the type system, verify it against the layer that enforces it.
+> A wrong invariant does not fail loudly. It gets enforced.
+
+Two details worth keeping. The correct model was already in the repository, in `glyph/ft.py`, with
+a citation to the exact interpreter line — in a module that nine review rounds, a six-reviewer
+panel and the author never opened; the most reliable source available was in-tree the entire time.
+And when the type model was corrected, `warn_unused_ignores` deleted all three `# type: ignore`
+markers automatically. The self-invalidating rule worked — it simply cannot tell the difference
+between "the code was fixed" and "the belief was wrong".
+
 ## What this does not cover
 
 `#505` — an FT funding gate comparing a token count against a carrier photon value — is a
