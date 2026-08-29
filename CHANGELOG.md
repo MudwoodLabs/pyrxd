@@ -9,12 +9,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Unit conflations are now type errors, not review catches** — new `pyrxd.security.units`.
-  Three confirmed defects in this codebase were the same shape: two quantities that are both
+  Two confirmed defects in this codebase were the same shape: two quantities that are both
   non-negative `int`, semantically incompatible, meeting in a field or parameter that could hold
-  either. A block height vs a confirmation count (the mainnet shim stored a depth in
+  either. A block height vs a confirmation count — the mainnet shim stored a depth in
   `UtxoRecord.height`, inverting `find_covenant_utxo`'s earliest-confirmed anti-poisoning rule into
-  a poison-*selecting* one); seconds
-  vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
+  a poison-*selecting* one — and seconds vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
   `BlockSpan` and `Seconds` are `typing.NewType` tags — zero runtime cost, no validation, no
   behaviour change — applied to the producers and the gates: `UtxoRecord`, `RadiantChainIO`'s
   covenant lookup and depth read, `NegotiatedTerms.radiant_amount`, the watchtower's `Observations`
