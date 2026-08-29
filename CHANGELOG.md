@@ -13,7 +13,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-negative `int`, semantically incompatible, meeting in a field or parameter that could hold
   either. A block height vs a confirmation count (the mainnet shim stored a depth in
   `UtxoRecord.height`, inverting `find_covenant_utxo`'s earliest-confirmed anti-poisoning rule into
-  a poison-*selecting* one); a photon value vs a Glyph FT token count (#505, still open); seconds
+  a poison-*selecting* one); seconds
   vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
   `BlockSpan` and `Seconds` are `typing.NewType` tags — zero runtime cost, no validation, no
   behaviour change — applied to the producers and the gates: `UtxoRecord`, `RadiantChainIO`'s
@@ -24,6 +24,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   right kind?". `tests/security/test_unit_types_reject_conflations.py` runs mypy over fixtures
   reproducing each real defect and proves the checker rejects it — and that the corrected form
   still passes.
+
+  **Read this before adding a unit tag.** A third pair — photon value vs Glyph FT token count
+  (#505) — was tagged here too, as *incompatible* types, and it was wrong: on Radiant an FT's
+  quantity **is** its output's photon value (1 photon = 1 token unit, enforced by
+  `OP_REFVALUESUM_OUTPUTS` summing `nValue`). mypy then produced real-looking `arg-type` errors on
+  **correct** code, and those errors were read as confirming the defect. `TokenUnits` is now
+  `NewType("TokenUnits", PhotonValue)` — a subtype, so the intent survives while an FT amount flows
+  into a photon slot, because it is one. A wrong invariant does not fail loudly; it gets enforced.
+  Verify a distinction against the layer that enforces it before encoding it.
 - **`task typecheck` actually gates now.** Its declared three-path scope reported 296 errors across
   40 transitively-imported modules, so `task ci` had been failing at that step rather than checking
   anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
