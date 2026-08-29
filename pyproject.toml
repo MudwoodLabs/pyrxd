@@ -76,7 +76,7 @@ dependencies = [
 # aiohttp is deliberately absent: it is already a runtime dependency, not an eth-only one.
 eth = [
     "web3>=7.16.0,<8.0.0",
-    "eth-account>=0.13.6,<1.0.0",
+    "eth-account>=0.14.0,<1.0.0",
     "eth-keys>=0.8.0,<1.0.0",
 ]
 
