@@ -40,7 +40,7 @@ dependencies = [
     # Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
     # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
     # transitive dep in most environments.
-    "cryptography>=50.0.0",
+    "cryptography>=50.0.1",
     "pycryptodomex>=3.23.0,<4.0.0",
     # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
     # pyrxd.cli.config falls back to this when running on 3.10.
@@ -76,7 +76,7 @@ dependencies = [
 # aiohttp is deliberately absent: it is already a runtime dependency, not an eth-only one.
 eth = [
     "web3>=7.16.0,<8.0.0",
-    "eth-account>=0.13.6,<1.0.0",
+    "eth-account>=0.14.0,<1.0.0",
     "eth-keys>=0.8.0,<1.0.0",
 ]
 
@@ -338,10 +338,10 @@ dev = [
     "cosmic-ray>=8.7.0,<9.0.0",
     "detect-secrets>=1.5.0,<2.0.0",
     "hypothesis>=6.165.10,<7.0.0",
-    "mypy>=2.3.0,<3.0.0",
+    "mypy>=2.3.1,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.3,<0.17.0",
+    "ruff>=0.16.4,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
