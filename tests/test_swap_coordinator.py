@@ -345,11 +345,29 @@ def _real_maker_claim_tx(locator: t.BtcHtlcLocator, preimage: bytes) -> bytes:
 
 
 def test_role_invariant_constant_spelled_out():
+    """The constant must spell out the order the code ENFORCES.
+
+    This test used to assert "locks BTC FIRST" and "locks the asset SECOND" — the order
+    HZ-1 (#392) inverted. So the stale description was not merely un-updated, it was PINNED:
+    correcting the constant would have failed this test, and the test named no reason, so the
+    reasonable move on seeing it fail was to revert the correction. A reviewer later read that
+    protected sentence and filed a MEDIUM (#486) against a gate placement the protocol had
+    already moved.
+
+    A test that pins prose keeps that prose true only if it is updated when the behaviour
+    changes; when it is not, it actively defends the wrong answer. Hence the reference to the
+    enforcing code below, so the next person to see this fail knows which side to fix.
+    """
     inv = MAKER_SECRET_TAKER_LOCKS_BTC_FIRST
     assert inv.startswith("MAKER_SECRET_TAKER_LOCKS_BTC_FIRST")
-    for phrase in ("generates the secret", "locks BTC FIRST", "locks the asset SECOND", "claims the BTC FIRST"):
-        assert phrase in inv
+    # The MAKER locks first: `taker_funds_btc` -> `pre_btc_lock_check` step 5 reads the
+    # covenant off the Radiant chain and fails closed, so the taker CANNOT fund first.
+    for phrase in ("generates the secret", "locks the asset FIRST", "locks BTC SECOND", "claims the BTC FIRST"):
+        assert phrase in inv, f"missing {phrase!r} — see pre_btc_lock_check step 5 for the enforced order"
     assert "t_BTC > t_RXD" in inv
+    # The NAME still says TAKER_LOCKS_BTC_FIRST; it is exported and quoted in a
+    # ValidationError, so it stays. The body must say why, or the name re-teaches the old order.
+    assert "predates HZ-1" in inv
 
 
 # ---------------------------------------------------------------------------
