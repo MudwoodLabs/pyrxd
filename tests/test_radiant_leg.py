@@ -1247,24 +1247,32 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
         assert value == 1000
 
-    @pytest.mark.xfail(
-        reason="#505: the FT gate compares carrier PHOTONS against a TOKEN COUNT. An honest maker "
-        "funding 1000 tokens on ordinary dust is refused; a dishonest one funding 1000 photons "
-        "carrying 1 token is accepted. Unfixed — this test is the live record of it.",
-        strict=True,
-    )
     @pytest.mark.asyncio
-    async def test_ft_accepts_a_covenant_whose_CARRIER_differs_from_the_token_count(self) -> None:
-        """The scenario the FT path must support and currently cannot: 1000 tokens held on 546
-        photons of ordinary dust. The covenant enforces `refValueSum(ref) == amount` — a TOKEN
-        count — while the gate compares the carrier photon value, so the honest case is refused.
+    async def test_ft_refuses_a_covenant_funded_BELOW_the_token_amount(self) -> None:
+        """The scenario #505 called a defect, corrected against the chain.
 
-        Deliberately chosen so the two quantities DIFFER: every existing FT fixture sets carrier
-        equal to the token count, which is exactly why the conflation was invisible.
+        #505 asserted that 1000 tokens on 546 photons of dust is an honest funding the gate
+        wrongly refuses. On Radiant that output cannot exist: an FT's quantity IS its output value,
+        1 photon = 1 token unit (``docs/concepts/radiant-fts-are-on-chain.md``;
+        ``OP_REFVALUESUM_OUTPUTS`` sums ref-bearing outputs' native nValue; ``FtUtxo`` raises on
+        ``value != ft_amount`` because such a UTXO cannot exist on chain).
+
+        So 546 photons IS 546 tokens — a covenant funded 454 short of the negotiated 1000, and
+        refusing it is the gate working. This test replaces a strict xfail that encoded the
+        colored-coin model Radiant does not use.
         """
         terms = _ft_terms(amount=1000)
         leg = _leg(client=FakeClient(utxo_value=546, confirmations=6))
-        _outpoint, _value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        with pytest.raises((NetworkError, ValidationError)):
+            await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+
+    @pytest.mark.asyncio
+    async def test_ft_ACCEPTS_a_covenant_funded_with_the_token_amount(self) -> None:
+        """The honest path, which works and always did: 1000 tokens funded as 1000 photons."""
+        terms = _ft_terms(amount=1000)
+        leg = _leg(client=FakeClient(utxo_value=1000, confirmations=6))
+        _outpoint, value, _confs = await leg.verify_maker_asset_funded(terms, min_confirmations=3)
+        assert value == 1000
 
 
 class TestAnEvictedClaimCanBeRebroadcast:

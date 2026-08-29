@@ -558,16 +558,12 @@ class RadiantCovenantLeg:
         cov = self._build_covenant(terms)
         outpoint, _value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
+            # Well-typed and correct for every variant. On Radiant an FT's quantity IS its
+            # output's photon value (1 photon = 1 token unit), so matching `radiant_amount`
+            # against the UTXO's native value is right for rxd, nft AND ft. #505 asserted
+            # otherwise; see security/units.py for why that was wrong and how the type model
+            # briefly manufactured evidence for it.
+            expected_value=terms.radiant_amount,
         )
         return outpoint
 
@@ -611,16 +607,12 @@ class RadiantCovenantLeg:
             raise ValidationError("min_confirmations must be a non-negative int or None")
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=terms.radiant_amount,  # type: ignore[arg-type]
+            # Well-typed and correct for every variant. On Radiant an FT's quantity IS its
+            # output's photon value (1 photon = 1 token unit), so matching `radiant_amount`
+            # against the UTXO's native value is right for rxd, nft AND ft. #505 asserted
+            # otherwise; see security/units.py for why that was wrong and how the type model
+            # briefly manufactured evidence for it.
+            expected_value=terms.radiant_amount,
         )
         confs = await self.chain_io.confirmations(outpoint.split(":")[0])
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
@@ -649,16 +641,9 @@ class RadiantCovenantLeg:
         # would let anyone brick this spend by paying the covenant SPK a second time.
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
             cov.funded_spk,
-            # OPEN DEFECT #505, held OPEN BY THE CHECKER. ``radiant_amount`` is
-            # ``PhotonValue | TokenUnits``; ``expected_value`` is ``PhotonValue``. For
-            # ``asset_variant == "ft"`` this matches a TOKEN COUNT against the carrier's
-            # PHOTON value, so an honest maker funding 1000 tokens on 546 photons of dust is
-            # REFUSED while a maker funding 1000 photons carrying 1 token is ACCEPTED. See
-            # tests/test_radiant_leg.py's strict xfail. This ignore is a MARKER, not a fix:
-            # it is deliberately not a cast, it names the defect, and mypy's
-            # warn_unused_ignores (strict) deletes it the day the signature stops conflating
-            # the two units — so the fix cannot land while leaving this comment lying.
-            expected_value=record.terms.radiant_amount,  # type: ignore[arg-type]
+            # Well-typed and correct for every variant — an FT amount IS a photon value on
+            # Radiant. See security/units.py; #505 asserted the opposite and was wrong.
+            expected_value=record.terms.radiant_amount,
             pin_outpoint=record.radiant_covenant_outpoint,
         )
         txid = outpoint.split(":")[0]

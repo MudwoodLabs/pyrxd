@@ -89,18 +89,29 @@ Confirmations = NewType("Confirmations", int)
 # --------------------------------------------------------------------------- value
 
 #: Native RXD value in photons (the chain's smallest unit) — what a UTXO's ``value``
-#: field holds and what a covenant's carrier output is funded with.
-#:
-#: For a plain-RXD or NFT swap this is the quantity the funding gate must match. For a
-#: Glyph FT it is NOT: the covenant enforces ``refValueSum(ref) == amount``, a
-#: :data:`TokenUnits` count, while the carrier can be ordinary dust of any size.
+#: field holds and what a covenant's carrier output is funded with. On Radiant this is
+#: ALSO the Glyph FT quantity when the output carries an FT ref; see :data:`TokenUnits`.
 PhotonValue = NewType("PhotonValue", int)
 
-#: A Glyph fungible-token COUNT — the quantity a token covenant's ``refValueSum``
-#: enforces. Independent of the photon value of the output carrying it: 1000 tokens can
-#: sit on 546 photons of dust. Fixtures that set the two equal are what hid #505 for as
-#: long as they did; prefer fixtures where they DIFFER.
-TokenUnits = NewType("TokenUnits", int)
+#: A Glyph fungible-token quantity — and on Radiant that IS a photon value, which is why
+#: this is a NewType OVER :data:`PhotonValue` rather than beside it.
+#:
+#: **1 photon = 1 token unit** (``docs/concepts/radiant-fts-are-on-chain.md``).
+#: ``OP_REFVALUESUM_OUTPUTS`` sums the native ``nValue`` of ref-bearing outputs
+#: (Radiant-Core ``src/script/interpreter.cpp``), and :class:`~pyrxd.glyph.ft.FtUtxo`
+#: RAISES on ``value != ft_amount`` because such an output cannot exist on chain.
+#:
+#: An earlier revision made this a NewType over ``int``, INDEPENDENT of ``PhotonValue``,
+#: on the belief that "1000 tokens can sit on 546 photons of dust". That is the Bitcoin
+#: colored-coin model (Atomicals/Runes) and Radiant does not use it. The consequence is
+#: worth remembering: the incompatible pair produced a mypy error on CORRECT code, that
+#: error was read as confirmation of issue #505, and a fix was written to refuse FT
+#: swaps outright. A type system taught a distinction the chain does not make will
+#: manufacture evidence for the bug you told it to expect.
+#:
+#: Kept as a subtype so the INTENT ("this number is a token quantity") is still
+#: expressible, while a token quantity flows into a photon slot — because it is one.
+TokenUnits = NewType("TokenUnits", PhotonValue)
 
 # --------------------------------------------------------------------------- duration
 

@@ -9,12 +9,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Unit conflations are now type errors, not review catches** — new `pyrxd.security.units`.
-  Three confirmed defects in this codebase were the same shape: two quantities that are both
+  Two confirmed defects in this codebase were the same shape: two quantities that are both
   non-negative `int`, semantically incompatible, meeting in a field or parameter that could hold
-  either. A block height vs a confirmation count (the mainnet shim stored a depth in
+  either. A block height vs a confirmation count — the mainnet shim stored a depth in
   `UtxoRecord.height`, inverting `find_covenant_utxo`'s earliest-confirmed anti-poisoning rule into
-  a poison-*selecting* one); a photon value vs a Glyph FT token count (#505, still open); seconds
-  vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
+  a poison-*selecting* one — and seconds vs blocks in the timelock arithmetic. `ChainHeight`, `Confirmations`, `PhotonValue`, `TokenUnits`,
   `BlockSpan` and `Seconds` are `typing.NewType` tags — zero runtime cost, no validation, no
   behaviour change — applied to the producers and the gates: `UtxoRecord`, `RadiantChainIO`'s
   covenant lookup and depth read, `NegotiatedTerms.radiant_amount`, the watchtower's `Observations`
@@ -24,9 +23,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   right kind?". `tests/security/test_unit_types_reject_conflations.py` runs mypy over fixtures
   reproducing each real defect and proves the checker rejects it — and that the corrected form
   still passes.
-- **`task typecheck` actually gates now.** Its declared three-path scope reported 296 errors across
-  40 transitively-imported modules, so `task ci` had been failing at that step rather than checking
-  anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
+
+  **Read this before adding a unit tag.** A third pair — photon value vs Glyph FT token count
+  (#505) — was tagged here too, as *incompatible* types, and it was wrong: on Radiant an FT's
+  quantity **is** its output's photon value (1 photon = 1 token unit, enforced by
+  `OP_REFVALUESUM_OUTPUTS` summing `nValue`). mypy then produced real-looking `arg-type` errors on
+  **correct** code, and those errors were read as confirming the defect. `TokenUnits` is now
+  `NewType("TokenUnits", PhotonValue)` — a subtype, so the intent survives while an FT amount flows
+  into a photon slot, because it is one. A wrong invariant does not fail loudly; it gets enforced.
+  Verify a distinction against the layer that enforces it before encoding it.
+- **`task typecheck` actually gates now.** Its declared three-path scope reported **295 errors
+  across 40 transitively-imported modules** (measured by running the pre-fix command against the
+  pre-fix tree), so `task ci` had been failing at that step rather than checking anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
   pins resolution to this checkout, and the scope is widened to the modules where a number's unit
   decides whether funds move — including the two `scripts/` files the height/confs bug lived in.
 
@@ -112,6 +120,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pinned `has_blacklist=False` costs no RPC call at all.
 
 ### Fixed
+
+- **The native ETH leg no longer trusts a deploy receipt for the address holding the swap's
+  value** — the same defect as the token leg's, fixed there only where it had been demonstrated,
+  and this is the leg that has carried real value. `deploy` took the HTLC contract's address from
+  `receipt["contractAddress"]`, and `wait_receipt` is primary-endpoint-only by design, so **one
+  RPC endpoint chose where the entire counter leg went**. Every downstream check still passed,
+  because the ETH really was at the address it named — verifying the code there does not help
+  either, since an attacker deploys the same bytecode and holds the claim key. A CREATE address is
+  `keccak(rlp([sender, nonce]))[12:]` and both inputs are the deployer's own, so it is derivable
+  with no second endpoint and no trust: `create_address()` now derives it, cross-checks the
+  reported value, and refuses on any disagreement. **This defect is present in v0.20.0 and
+  earlier.** Reaching it requires the primary endpoint to be malicious or compromised, which is
+  also the threat model a multi-source quorum layer exists to address.
 
 - **`pip install 'pyrxd[eth]'` now works.** It never did: five runtime errors instructed users to
   "install the eth extra" (`eth_wallet/rpc.py`, `htlc_leg.py`, `keys.py`, `private_submit.py` ×2)

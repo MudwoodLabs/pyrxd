@@ -61,9 +61,18 @@ class UtxoRecord:
         Output index within the transaction.
     value:
         Output value in **photons** (RXD's smallest unit) — this is a Radiant client.
-        This is the CARRIER's native value. It is NOT a Glyph FT token count: a token
-        covenant enforces ``refValueSum(ref) == amount``, and 1000 tokens can sit on
-        546 photons of ordinary dust. See :data:`pyrxd.security.units.TokenUnits`.
+
+        On Radiant this IS the Glyph FT token quantity when the output carries an FT
+        ref: **1 photon = 1 token unit** (``docs/concepts/radiant-fts-are-on-chain.md``).
+        ``OP_REFVALUESUM_OUTPUTS`` sums ref-bearing outputs' native ``nValue``
+        (Radiant-Core ``src/script/interpreter.cpp``), and :class:`~pyrxd.glyph.ft.FtUtxo`
+        REFUSES ``value != ft_amount`` because such an output cannot exist on chain.
+
+        An earlier revision of this docstring said the opposite — that "1000 tokens can
+        sit on 546 photons of ordinary dust". That is the Bitcoin colored-coin model
+        (Atomicals/Runes), and it is wrong here. The claim originated in issue #505, was
+        written into this docstring, and was then cited back as corroboration for #505 —
+        the issue and the doc confirming each other while the chain said otherwise.
     height:
         Block height at which the output was confirmed (0 = unconfirmed). A HEIGHT,
         never a confirmation count. Both are non-negative ints, so a producer that
