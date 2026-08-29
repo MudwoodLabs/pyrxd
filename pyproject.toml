@@ -232,10 +232,12 @@ format = "ruff format src tests examples"
 format-check = "ruff format --check src tests examples"
 test = "pytest"
 # `task typecheck` runs mypy --strict over the UNIT-CRITICAL surface: every module where a
-# number's UNIT decides whether funds move. Three confirmed defects came from unit conflation
-# (block height vs confirmation count, photon value vs FT token count, seconds vs blocks), and
-# `pyrxd.security.units` turns each pair into a distinct NewType so the conflation is a check
-# error rather than a review catch. See that module's docstring.
+# number's UNIT decides whether funds move. Two confirmed defects came from unit conflation
+# (block height vs confirmation count; seconds vs blocks), and `pyrxd.security.units` turns each
+# pair into a distinct NewType so the conflation is a check error rather than a review catch.
+# A third candidate — photon value vs FT token count — was tagged here and was WRONG: on Radiant
+# 1 photon = 1 token unit, so the types manufactured errors on correct code. See that module's
+# docstring before adding a tag.
 #
 # The scope is deliberately NOT `src/` — it is exactly the files that have been typed and are
 # green. A gate that fails on hundreds of pre-existing errors gets switched off. To widen it,
@@ -397,8 +399,12 @@ exclude = ["tests/"]
 mypy_path = "src"
 # Report errors ONLY for the files named on the command line; still READ everything they import
 # so inference is real. Without this, `task typecheck`'s declared 3-path scope actually reported
-# 296 errors across 40 transitively-imported modules and had been failing (and so failing
-# `task ci`) rather than gating anything. A gate that is red on arrival is not a gate — this is
+# 295 errors across 40 transitively-imported modules and had been failing (and so failing
+# `task ci`) rather than gating anything. Measured 2026-08-28 by running the pre-fix command
+# against the pre-fix tree: `mypy src/pyrxd/security/ src/pyrxd/glyph/transfer.py
+# src/pyrxd/glyph/client.py` at 69027a8~1 -> "Found 295 errors in 40 files (checked 7 source
+# files)". Running it against the FIXED tree reports success, which is how the figure first
+# failed to reproduce. A gate that is red on arrival is not a gate — this is
 # what lets the scope below be both meaningful and honestly green.
 follow_imports = "silent"
 

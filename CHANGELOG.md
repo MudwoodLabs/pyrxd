@@ -32,9 +32,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `NewType("TokenUnits", PhotonValue)` — a subtype, so the intent survives while an FT amount flows
   into a photon slot, because it is one. A wrong invariant does not fail loudly; it gets enforced.
   Verify a distinction against the layer that enforces it before encoding it.
-- **`task typecheck` actually gates now.** Its declared three-path scope reported 296 errors across
-  40 transitively-imported modules, so `task ci` had been failing at that step rather than checking
-  anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
+- **`task typecheck` actually gates now.** Its declared three-path scope reported **295 errors
+  across 40 transitively-imported modules** (measured by running the pre-fix command against the
+  pre-fix tree), so `task ci` had been failing at that step rather than checking anything. `follow_imports = "silent"` confines errors to the files named, `mypy_path = "src"`
   pins resolution to this checkout, and the scope is widened to the modules where a number's unit
   decides whether funds move — including the two `scripts/` files the height/confs bug lived in.
 
