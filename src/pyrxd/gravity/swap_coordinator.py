@@ -1387,66 +1387,6 @@ class SwapCoordinator:
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
 
-        # 3b. t_rxd must be able to CONTAIN the value-scaled claim burial.
-        #
-        # `assess_claim_finality` returns SAFE only when `blocks_left >= B(V)`, and `blocks_left` is
-        # at best `t_rxd` — at the instant the covenant is mined. So SAFE is reachable at all only
-        # if `t_rxd >= B(V)`. That was checked nowhere before the taker committed: the burial was
-        # verified at CLAIM time, when the value is already locked and the only remaining choices
-        # are to accept the reorg risk or walk away.
-        #
-        # The MAKER chooses t_rxd. And shrinking it makes the ordering check above pass MORE
-        # easily, because `t_btc - t_rxd` grows — so the one gate that did look at t_rxd rewarded
-        # exactly the direction that nullifies the burial. A maker could hand a taker a swap that
-        # is unconditionally SQUEEZED and the taker would only find out after revealing.
-        #
-        # Binds only when the policy actually carries the economics (a measured policy). Without
-        # `rxd_reorg_cost_per_block` and a value-at-risk there is no basis to scale, the flat
-        # burial stands, and there is nothing to check — see `_value_scaled_burial_blocks`.
-        try:
-            # max(flat, value-scaled) — the SAME term `assess_claim_finality` uses at claim time
-            # (see the `rxd_burial = max(flat_burial, ...)` line there). Checking the value-scaled
-            # component alone let the FLAT burial dominate unnoticed: with the default 6-block flat
-            # burial and economics yielding a value-scaled 1, a t_rxd of 3 passed this gate and
-            # then SQUEEZED on every claim — precisely the state this exists to prevent. It also
-            # made the gate inert whenever `rxd_reorg_cost_per_block` was unset, since the
-            # value-scaled term is 0 there, so the flat burial was checked at NO point before the
-            # taker committed, in any configuration.
-            mp = self.config.margin_policy
-            flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
-            burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
-            # The SUFFICIENT floor, not just the necessary one. `assess_claim_finality` grants SAFE
-            # on `blocks_left - counter_reserve >= burial`, where `blocks_left` is t_rxd MINUS the
-            # confirmations already elapsed. So `t_rxd >= burial` is merely necessary: it leaves the
-            # band [burial, burial + confirm + reserve) open, and a maker who picks t_rxd inside it
-            # passes this gate, reveals LATE, and hands the taker a swap that is SQUEEZED at claim
-            # time anyway — a narrower version of exactly what this gate exists to prevent.
-            #
-            # The counter-leg reserve is the same quantity the claim-time gate subtracts, so it is
-            # computed the same way (and via the fast-tail accessor, because it DIVIDES).
-            counter_reserve = 0
-            if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
-                counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
-            # One block for the claim itself to be mined. Radiant has no RBF and no CPFP, so a claim
-            # that does not make it into a block before maturity cannot be accelerated.
-            required_burial = burial + counter_reserve + 1
-            if required_burial > 0:
-                t_rxd_blocks = int(terms.t_rxd.value)
-                if t_rxd_blocks < required_burial:
-                    return PreBtcLockGate(
-                        ok=False,
-                        reason=(
-                            f"t_rxd is {t_rxd_blocks} blocks but a safe claim needs {required_burial} "
-                            f"(burial {burial} + counter-leg reserve {counter_reserve} + 1 block to "
-                            "mine) — this swap can NEVER reach a safe claim. The taker "
-                            "would reveal, find every claim SQUEEZED, and be left choosing between "
-                            "a reorg-reversible claim and walking away from a funded counter leg. "
-                            "Negotiate a longer t_rxd, or a lower value-at-risk."
-                        ),
-                    )
-        except ValidationError as exc:
-            return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
-
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
             expected_spk = self.counter_leg.derive_funding_scriptpubkey(terms)
@@ -1460,13 +1400,33 @@ class SwapCoordinator:
         #    the swap SHOULD look like; only this reads the Radiant chain. See
         #    :meth:`taker_verify_asset_funding`.
         try:
-            await self.taker_verify_asset_funding(terms)
+            _cov_outpoint, _cov_value, cov_confs = await self.taker_verify_asset_funding(terms)
         except (ValidationError, NetworkError) as exc:
             return PreBtcLockGate(ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})")
         except Exception as exc:
             return PreBtcLockGate(
                 ok=False, reason=f"could not verify the maker's Radiant covenant; fail-closed ({exc})"
             )
+
+        # 6. The burial-vs-t_rxd floor, using the window that ACTUALLY REMAINS.
+        #
+        # This ran as step 3b, before the chain read, against the NEGOTIATED t_rxd. But `t_rxd` is a
+        # RELATIVE CSV measured from the covenant's confirmation, so by the time the taker funds,
+        # `cov_confs` blocks of it are already spent. `assess_claim_finality` knows this — it grants
+        # SAFE on `blocks_left - counter_reserve >= burial` where `blocks_left = t_rxd - cov_confs`
+        # — and the old check's own comment said so two lines above comparing against the
+        # undecremented value.
+        #
+        # The shortfall is not incidental: step 5 REQUIRES the covenant be `_asset_funding_depth()`
+        # deep before the taker funds, which on a measured policy is exactly `rxd_claim_burial`. So
+        # `cov_confs >= burial` always holds on the real-value path and the old floor understated
+        # the requirement by at least a full burial, on every swap.
+        #
+        # It moved here rather than reading the chain earlier so the cheap local checks still fail
+        # fast; this is the first point where the elapsed depth is known.
+        gate = self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=cov_confs)
+        if gate is not None:
+            return gate
 
         return PreBtcLockGate(ok=True)
 
@@ -1485,6 +1445,51 @@ class SwapCoordinator:
         if not policy.is_measured:
             return None
         return _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+
+    def _assert_t_rxd_can_reach_a_safe_claim(self, terms: NegotiatedTerms, *, cov_confs: int) -> PreBtcLockGate | None:
+        """None when the swap can still reach a SAFE claim; a refusing gate otherwise.
+
+        `assess_claim_finality` returns SAFE only when `blocks_left - counter_reserve >= burial`,
+        and `blocks_left` is `t_rxd` MINUS the covenant confirmations already elapsed. Checking the
+        NEGOTIATED `t_rxd` instead — which this did until #531 — understates the floor by exactly
+        `cov_confs`, and step 5 forces `cov_confs >= burial` on a measured policy, so the gap was
+        never zero on the path that matters.
+
+        The MAKER chooses `t_rxd`, and shrinking it makes the ordering check pass MORE easily
+        (`t_btc - t_rxd` grows) — so the one gate that looked at `t_rxd` rewarded exactly the
+        direction that nullifies the burial.
+        """
+        mp = self.config.margin_policy
+        try:
+            flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
+            # max(flat, value-scaled) — the SAME term the claim-time gate uses. Checking only the
+            # value-scaled component let the FLAT burial dominate unnoticed, and made this inert
+            # whenever `rxd_reorg_cost_per_block` was unset, since that term is 0 there.
+            counter_reserve = 0
+            if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
+                counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
+            # One block for the claim itself to be mined. Radiant has no RBF and no CPFP, so a
+            # claim that misses maturity cannot be accelerated.
+            required = burial + counter_reserve + 1
+            elapsed = max(0, int(cov_confs))
+            remaining = int(terms.t_rxd.value) - elapsed
+            if remaining < required:
+                return PreBtcLockGate(
+                    ok=False,
+                    reason=(
+                        f"t_rxd is {int(terms.t_rxd.value)} blocks and the maker's covenant is already "
+                        f"{elapsed} deep, leaving {remaining} — but a safe claim needs {required} "
+                        f"(burial {burial} + counter-leg reserve {counter_reserve} + 1 block to mine). "
+                        "This swap can NEVER reach a safe claim: the taker would reveal, find every "
+                        "claim SQUEEZED, and be left choosing between a reorg-reversible claim and "
+                        "walking away from a funded counter leg. Negotiate a longer t_rxd, fund "
+                        "sooner after the covenant confirms, or lower the value-at-risk."
+                    ),
+                )
+        except ValidationError as exc:
+            return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
+        return None
 
     async def taker_verify_asset_funding(self, terms: NegotiatedTerms) -> tuple[str, int, int]:
         """Fail-closed: the MAKER's asset must be locked on chain before the taker locks anything.
