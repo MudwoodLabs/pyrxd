@@ -3188,19 +3188,48 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         assert "a safe claim needs" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
-    async def test_a_t_rxd_that_EXACTLY_meets_the_sufficient_floor_is_accepted(self) -> None:
+    async def test_a_REMAINING_window_that_EXACTLY_meets_the_sufficient_floor_is_accepted(self) -> None:
         """The boundary, and it is the SUFFICIENT one: burial + counter-leg reserve + one block to
         mine. `t_rxd >= burial` alone is merely necessary — it leaves the band
         [burial, burial + reserve + 1) open, where a maker can pass this gate, reveal late, and
         still hand the taker a SQUEEZED claim.
 
         A guard that refuses valid work is a bug, and this one sits on a parameter an honest maker
-        must choose, so equality has to pass."""
+        must choose, so equality has to pass.
+
+        THE EQUALITY IS ON THE REMAINING WINDOW, NOT THE NEGOTIATED ONE (#531). `t_rxd` is a
+        relative CSV from the covenant's confirmation, so the covenant's existing depth is already
+        spent when the taker funds. This asserted `t_rxd == 31` before, while the fixture's covenant
+        reports 1 confirmation — so the accepted swap actually had 30 blocks left against a floor of
+        31, which is the defect this class exists to prevent, encoded in its own honest-path test.
+        """
+        _secret, h = generate_secret()
+        # floor 31 + the 1 confirmation the fake covenant reports = exactly 31 remaining.
+        terms = _terms(hashlock=h, t_rxd_blocks=32)
+        coord = _coordinator(terms=terms, policy=_valued_policy())
+        gate = await coord.pre_btc_lock_check(terms)
+        assert gate.ok, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_that_clears_the_floor_only_by_IGNORING_elapsed_depth_is_REFUSED(self) -> None:
+        """The #531 regression, stated directly.
+
+        `t_rxd = 31` clears the floor if you compare the NEGOTIATED value, and fails it once the
+        covenant's elapsed confirmations are subtracted. Before the fix this swap was accepted and
+        then SQUEEZED at every claim — the taker would reveal and find no safe claim available,
+        which is precisely the state the gate was written to prevent.
+
+        Step 5 forces the covenant to be `_asset_funding_depth()` deep before the taker funds, so
+        the elapsed depth is never zero on the real-value path and the old floor understated the
+        requirement on every swap.
+        """
         _secret, h = generate_secret()
         terms = _terms(hashlock=h, t_rxd_blocks=31)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
-        assert gate.ok, gate.reason
+        assert not gate.ok
+        assert "already" in gate.reason and "deep" in gate.reason, gate.reason
+        assert "a safe claim needs" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
     async def test_the_FLAT_burial_binds_even_without_economics(self) -> None:
