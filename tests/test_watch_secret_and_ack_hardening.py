@@ -391,7 +391,13 @@ def test_watchtower_main_returns_1_on_a_config_error(capsys):
 
     code = run_mod.main(["--records-dir", str(Path(os.devnull).parent), "--measured"])
     assert code == 1
-    assert "must set --rxd-reorg-cost-per-block" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # Assert the CONTRACT — exit 1, and the message offers every way forward — rather than one
+    # exact phrase. This previously pinned "must set --rxd-reorg-cost-per-block" and broke when
+    # #533 added the provenanced --rxd-difficulty path in front of it, even though the behaviour
+    # and the named flag were both unchanged.
+    for offered in ("--rxd-difficulty", "--rxd-reorg-cost-per-block", "--accept-flat-burial"):
+        assert offered in err, f"the config error must still offer {offered}: {err}"
 
 
 def test_watchtower_config_error_is_catchable_by_an_embedder():

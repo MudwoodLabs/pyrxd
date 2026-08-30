@@ -56,6 +56,7 @@ from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
+from pyrxd.gravity.reorg_cost import ReorgCostMeasurement
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import SecretBytes
 
@@ -260,6 +261,13 @@ class MarginPolicy:
     # drift. `rxd_block_interval_s` carries the identical divide-by-a-stale-measurement trap and
     # says so; this parameter had the refresh instruction without the direction.
     rxd_reorg_cost_per_block: int | None = None
+    # reorg_cost: the same quantity WITH ITS PROVENANCE — the hashrate and price it assumed, and
+    # when it was taken (see `pyrxd.gravity.reorg_cost`). Prefer this over the bare int: an int
+    # cannot express "this assumed 1.88 PH/s in May", so nothing can notice when the chain moves,
+    # and Radiant's hashrate fell ~5x between measurements with no signal (#533). When supplied it
+    # POPULATES `rxd_reorg_cost_per_block` below, so every existing consumer is unchanged, and the
+    # coordinator refuses a swap whose measurement is past its `max_age_s`.
+    reorg_cost: ReorgCostMeasurement | None = None
     # value_at_risk_photons: the swap's ECONOMIC value to protect, in PHOTONS. For an RXD swap this
     # equals ``terms.radiant_amount``; for FT/NFT the on-chain amount (token units / NFT carrier
     # dust) is NOT the economic value, so the operator MUST assess and supply it explicitly.
@@ -288,6 +296,20 @@ class MarginPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.margin, Timelock):
             raise ValidationError("MarginPolicy.margin must be a Timelock")
+        # A measurement and a bare int are the SAME quantity from two sources. Refuse rather than
+        # pick a winner: silently preferring one would make the other look effective while doing
+        # nothing, which is how a stale figure survives in the first place.
+        if self.reorg_cost is not None:
+            if not isinstance(self.reorg_cost, ReorgCostMeasurement):
+                raise ValidationError("MarginPolicy.reorg_cost must be a ReorgCostMeasurement")
+            if self.rxd_reorg_cost_per_block is not None:
+                raise ValidationError(
+                    "MarginPolicy got BOTH reorg_cost and rxd_reorg_cost_per_block. They are the same "
+                    "quantity; supply the measurement alone so its provenance travels with it."
+                )
+            # Populate the plain field so every existing consumer (`_value_scaled_burial_blocks`,
+            # the setup gate, the watchtower) reads it unchanged.
+            object.__setattr__(self, "rxd_reorg_cost_per_block", self.reorg_cost.photons_per_block)
         if not isinstance(self.block_interval_s, (int, float)) or self.block_interval_s <= 0:
             raise ValidationError("MarginPolicy.block_interval_s must be > 0")
         if not isinstance(self.rxd_block_interval_s, (int, float)) or self.rxd_block_interval_s <= 0:
@@ -421,6 +443,7 @@ class MarginPolicy:
         rxd_block_interval_s: float | None = None,
         rxd_block_interval_fast_s: float | None = None,
         rxd_reorg_cost_per_block: int | None = None,
+        reorg_cost: ReorgCostMeasurement | None = None,
         value_at_risk_photons: int | None = None,
         burial_safety_factor: float = 1.0,
         accept_flat_burial: bool = False,
@@ -468,6 +491,8 @@ class MarginPolicy:
             kwargs["rxd_block_interval_s"] = rxd_block_interval_s
         if rxd_reorg_cost_per_block is not None:
             kwargs["rxd_reorg_cost_per_block"] = rxd_reorg_cost_per_block
+        if reorg_cost is not None:
+            kwargs["reorg_cost"] = reorg_cost
         if value_at_risk_photons is not None:
             kwargs["value_at_risk_photons"] = value_at_risk_photons
         return cls(**kwargs)
@@ -1341,6 +1366,28 @@ class SwapCoordinator:
         """
         if not isinstance(terms, NegotiatedTerms):
             raise ValidationError("pre_btc_lock_check requires NegotiatedTerms")
+
+        # 0. The reorg-cost measurement must still hold. Cheapest possible check and it gates a
+        #    number that DIVIDES into the burial depth, so a stale one under-buries silently
+        #    (#533). Only applies when the operator opted into provenance by supplying a
+        #    ReorgCostMeasurement; a bare `rxd_reorg_cost_per_block` has nothing to check, which
+        #    is the whole argument for the measurement.
+        measurement = self.config.margin_policy.reorg_cost
+        if measurement is not None:
+            if now_unix_s is None:
+                return PreBtcLockGate(
+                    ok=False,
+                    reason=(
+                        "the policy carries a reorg-cost measurement but no now_unix_s was supplied, "
+                        "so its freshness cannot be checked. Pass the caller's wall-clock (the "
+                        "coordinator never reads a clock itself), or drop to a bare "
+                        "rxd_reorg_cost_per_block and accept that nothing can tell when it went stale."
+                    ),
+                )
+            try:
+                measurement.assert_fresh(now_unix_s)
+            except ValidationError as exc:
+                return PreBtcLockGate(ok=False, reason=f"reorg-cost measurement is not usable: {exc}")
 
         # 1. REF authenticity bound to the ADVERTISED asset (FT/NFT carry a ref;
         #    rxd is a no-op inside the gate). verify_ref_authenticity RAISES on any

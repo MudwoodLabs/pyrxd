@@ -37,6 +37,7 @@ import contextlib
 import logging
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
@@ -44,6 +45,7 @@ import aiohttp
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+from pyrxd.gravity.reorg_cost import ReorgCostMeasurement, measure_rxd_reorg_cost
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.watch import (
     AckingAlerter,
@@ -292,17 +294,58 @@ async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     return RpcEthChainSource(rpc)
 
 
+def _reorg_cost_from_args(args: argparse.Namespace) -> ReorgCostMeasurement | None:
+    """Build a provenanced reorg cost from the measurement flags, or None if they were not used.
+
+    Preferred over the bare ``--rxd-reorg-cost-per-block``: the burial depth DIVIDES by this
+    number, so one carried over from a period of higher hashrate under-buries silently. Radiant's
+    hashrate fell ~5x between two measurements with nothing to signal it (#533). A measurement
+    carries the hashrate and price it assumed plus a timestamp, so the coordinator can refuse it
+    once it is past ``--reorg-cost-max-age-s``.
+
+    ``time.time()`` is read HERE, at the CLI edge, and never inside the coordinator or the policy —
+    both of which take clocks as parameters by house rule.
+    """
+    if args.rxd_difficulty is None:
+        return None
+    missing = [
+        name
+        for name, value in (
+            ("--rxd-usd-per-hash", args.rxd_usd_per_hash),
+            ("--rxd-price-usd", args.rxd_price_usd),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValidationError(
+            f"--rxd-difficulty needs {' and '.join(missing)} to convert work into photons; "
+            "supplying it alone would size the burial off an incomplete model"
+        )
+    return measure_rxd_reorg_cost(
+        difficulty=args.rxd_difficulty,
+        block_interval_s=args.rxd_block_interval_s,
+        usd_per_hash=args.rxd_usd_per_hash,
+        rxd_price_usd=args.rxd_price_usd,
+        measured_at_unix_s=int(time.time()),
+        max_age_s=args.reorg_cost_max_age_s,
+    )
+
+
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if args.measured:
         # Fail closed (mirrors the coordinator's setup gate): a measured tower signals real-value
         # intent, so it must either value-scale (set the per-block reorg cost; the per-record value
         # comes from each swap's terms in decide()) or consciously accept a flat burial for dust.
-        if args.rxd_reorg_cost_per_block is None and not args.accept_flat_burial:
+        measurement = _reorg_cost_from_args(args)
+        if measurement is None and args.rxd_reorg_cost_per_block is None and not args.accept_flat_burial:
             raise ValidationError(
-                "a --measured watchtower must set --rxd-reorg-cost-per-block (value-scale RXD claims) "
-                "or --accept-flat-burial (dust); refusing to silently flat-assess value-bearing swaps"
+                "a --measured watchtower must set --rxd-difficulty (with --rxd-usd-per-hash and "
+                "--rxd-price-usd, so the figure carries its provenance and can go stale), or the raw "
+                "--rxd-reorg-cost-per-block, or --accept-flat-burial (dust); refusing to silently "
+                "flat-assess value-bearing swaps"
             )
         return MarginPolicy.measured(
+            reorg_cost=measurement,
             margin=Timelock(args.margin_blocks, TimeUnit.BLOCKS),
             block_interval_s=args.block_interval_s,
             btc_claim_reorg_depth=Timelock(args.btc_reorg_depth, TimeUnit.BLOCKS),
@@ -384,6 +427,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="MEASURED marginal cost to reorg one Radiant block, in photons (enables value-scaled burial)",
+    )
+    p.add_argument(
+        "--rxd-difficulty",
+        type=float,
+        default=None,
+        help="Radiant network difficulty (radiant-cli getblockchaininfo). With --rxd-usd-per-hash "
+        "and --rxd-price-usd this derives the per-block reorg cost AND stamps its provenance, so a "
+        "stale figure fails closed instead of silently under-burying. Preferred over the raw flag.",
+    )
+    p.add_argument("--rxd-usd-per-hash", type=float, default=None, help="amortised USD cost of one SHA512/256 hash")
+    p.add_argument("--rxd-price-usd", type=float, default=None, help="RXD price in USD, for converting work to photons")
+    p.add_argument(
+        "--reorg-cost-max-age-s",
+        type=int,
+        default=86_400,
+        help="how long a reorg-cost measurement stays usable before the coordinator refuses it (default 1 day)",
     )
     p.add_argument(
         "--accept-flat-burial",
