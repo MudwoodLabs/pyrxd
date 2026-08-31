@@ -334,9 +334,19 @@ def _boundary(setup, make, label: str, policy: DeadlineFeePolicy = DEFAULT_RADIA
     (1/1500 trials, on each of the three cases that flaked), which is 0.27% per run of
     this file. Iterating leaves only ``under`` as an independent draw.
 
+    WHY 60 ATTEMPTS AND NOT 25 (#517). The residual flake is this loop EXHAUSTING, not the
+    equality assertion the issue diagnosed. Measured 2026-08-30: signing here is deterministic —
+    coincurve/libsecp256k1 use RFC 6979, and 200 signings of one message produced ONE signature —
+    so for a fixed ``state`` and fee the bytes, and therefore the size, are fixed. ``cand`` cannot
+    disagree with the converged ``settled``: 0 out of 12,000 draws did. What varies is which
+    ``state`` gets drawn, and the per-attempt reject rate measured about 0.67 (attempts to
+    converge ran 1..8 across sampled runs), so 25 attempts leave roughly 4e-5 per case and ~3e-4
+    across this file's cases. Rare, and exactly the once-observed rate. 60 attempts take that to
+    the 1e-11 range at no cost to the passing path, which redraws only when it must.
+
     :returns: ``(at_floor_raw, floor)``.
     """
-    for _ in range(25):
+    for _ in range(60):
         state = setup()
         size = len(make(state, policy.min_relay_fee(400), _PERMISSIVE))
         for _ in range(_SETTLE_STEPS):
