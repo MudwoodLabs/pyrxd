@@ -77,6 +77,41 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/utils.py::serialize_ecdsa_recoverable": "PRE-EXISTING utility surface, test-only callers",
     "src/pyrxd/utils.py::to_base58_check": "PRE-EXISTING utility surface, test-only callers",
     "src/pyrxd/utils.py::to_base64": "PRE-EXISTING utility surface, test-only callers",
+    # -- EXPOSED 2026-08-31 when `__all__` entries stopped counting as references. They were
+    #    never reachable; the scan simply could not see them, because an identifier-shaped
+    #    string in `__all__` satisfied the registry rule. Every one PRE-DATES that change, so
+    #    they are recorded as debt rather than fixed blind — several are plausibly intended
+    #    public API and want a deliberate `__init__` export instead of a caller.
+    "src/pyrxd/btc_wallet/chains.py::pow_chain_by_network": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/btc_wallet/taproot.py::nums_point_is_unspendable": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/crypto/aead.py::decrypt_chunked": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/crypto/aead.py::encrypt_chunked": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/crypto/kem.py::unwrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/crypto/kem.py::wrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/eth_wallet/keys.py::generate_eth_key": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/eth_wallet/private_submit.py::FlashbotsSubmitter": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/eth_wallet/private_submit.py::PrivateSubmitter": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/eth_wallet/replacement.py::bump_replacement_fees": (
+        "the replacement-pricing half of #515 / #504 item 1. The carve-out that calls it also "
+        "needs the push tx HASH to be durable; only pending_push_nonce is persisted today. "
+        "Deliberately loud rather than wired to nothing."
+    ),
+    "src/pyrxd/glyph/credential_binding.py::CredentialResolver": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/credential_binding.py::verify_credential_binding": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock.py::add_timelock_to_metadata": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock.py::get_unlock_remaining": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock.py::is_unlocked": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock.py::verify_cek_reveal": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock_reveal_tx.py::create_reveal_proof": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock_reveal_tx.py::parse_reveal_proof_script": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/glyph/timelock_reveal_tx.py::validate_reveal_proof": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/gravity/radiant_leg.py::RadiantBroadcaster": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/gravity/swap_state.py::allowed_targets": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/gravity/swap_state.py::can_transition": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/gravity/watch/claim_executor.py::sidecar_leg_resolver": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/script/consensus.py::is_valid_script_size": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/script/consensus.py::iter_script_ops": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    "src/pyrxd/security/errors.py::UnsupportedScriptError": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     # -- flagged and REPORTED as findings when this scan landed (2026-08-27). Each is a shipped
     #    capability whose only callers are tests — the exact defect class this file exists to
     #    catch, found already present. They are allowlisted so the scan can land green, and left
@@ -133,6 +168,18 @@ def _referenced_names() -> frozenset[str]:
     identifier-shaped string constants (registries name their targets as strings)."""
     names: set[str] = set()
     for _p, tree in _shipped_trees():
+        # `__all__` ENTRIES DO NOT COUNT. They are identifier-shaped strings, so the registry rule
+        # below swallowed them and any symbol could be made to look reachable by exporting it —
+        # which is a declaration of intent, not a caller. Found by walking through this hole with
+        # a new module whose two functions had no callers at all and were not flagged.
+        exported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+            ):
+                for elt in ast.walk(node.value):
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        exported.add(elt.value)
         for node in ast.walk(tree):
             if isinstance(node, ast.Name):
                 names.add(node.id)
@@ -140,7 +187,12 @@ def _referenced_names() -> frozenset[str]:
                 names.add(node.attr)
             elif isinstance(node, ast.ImportFrom):
                 names.update(a.name for a in node.names)
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.isidentifier()
+                and node.value not in exported
+            ):
                 names.add(node.value)
     return frozenset(names)
 
