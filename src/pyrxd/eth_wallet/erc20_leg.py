@@ -376,11 +376,27 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             token_c = self._rpc.write_w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
             push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)
             # PIN THE NONCE, and reuse the pin on every retry. Measured on 2026-08-24: a second
-            # transaction at an already-used nonce is rejected ("nonce too low" once mined,
-            # "transaction already imported" while pending) and a higher-priced one REPLACES rather
-            # than adds — so two resumers, or a resume racing its own still-pending push, deliver
-            # the value exactly once. That is a property of the chain, so unlike the `flock` it
-            # holds across hosts, filesystems and a copied keys directory.
+            # transaction at an already-used nonce is rejected — "nonce too low" once mined,
+            # "transaction already imported" while pending. That rejection is what delivers the
+            # value exactly once, and being a property of the chain it holds across hosts,
+            # filesystems and a copied keys directory, unlike the `flock`.
+            #
+            # WHAT THIS DOES NOT DO, corrected (#515). This used to add that a higher-priced
+            # transaction "REPLACES rather than adds — so ... a resume racing its own still-pending
+            # push, deliver[s] the value exactly once". The replacement half is never reached:
+            #
+            #   1. the in-flight guard above refuses whenever `pending > latest`, which IS the
+            #      racing-its-own-push case, so the resume stops before building anything; and
+            #   2. even reaching it, this rebuild would not be a valid replacement. EIP-1559 needs
+            #      BOTH `maxFeePerGas` and `maxPriorityFeePerGas` raised (geth: >= 10%), and
+            #      `_base_tx`'s `basefee_headroom` scales only the basefee share and explicitly
+            #      "never the tip". An equal-tip resend is what produced the measured
+            #      "transaction already imported".
+            #
+            # Exactly-once here is the chain REJECTING the duplicate, not this code replacing it.
+            # A real bumped-replacement path also needs the push tx HASH to be durable so the
+            # pending transaction's fees can be read back; only `pending_push_nonce` is persisted
+            # today. See #515 before claiming replacement anywhere.
             #
             # The pin must be DURABLE before the broadcast or a retry cannot reuse it, which is the
             # whole mechanism. See the design note under docs/solutions/design-decisions/.
