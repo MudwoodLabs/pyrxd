@@ -327,12 +327,52 @@ class MultiSourceEthRpc:
             return None
         return next(r for k, r in keyed if k == agreed)
 
+    async def inflight_nonce_window(self, address: str) -> tuple[int, int]:
+        """``(pending, latest)`` for an IN-FLIGHT GUARD, read across every endpoint.
+
+        NOT for building a transaction — use :meth:`get_transaction_count` for that, and read its
+        docstring for why it must stay primary-only. The two uses want opposite things from the
+        same RPC, which is why they are separate methods (#504):
+
+        * BUILDING needs the broadcasting endpoint's own mempool view. Another endpoint's nonce
+          would produce a transaction against state that endpoint does not have.
+        * GUARDING asks "could something of ours still be in flight?" and must answer YES if ANY
+          endpoint thinks so. Where the advisory file lock is absent, this read is the only thing
+          between a resume and a double-fund, and a single lagging or load-balanced provider
+          defeats it: host B sees ``pending == latest``, computes the full shortfall, and sends an
+          additive transfer while host A's push is still pending.
+
+        Hence the aggregation, which is conservative TOWARD REFUSING rather than toward the
+        smaller number:
+
+        * ``pending`` takes **MAX** — the most in-flight any endpoint will admit to;
+        * ``latest`` takes **MIN** — the least settled any endpoint will vouch for.
+
+        The caller's ``pending > latest`` test therefore fires as readily as the fleet allows, and
+        a lagging endpoint can only over-refuse. Refusing a resume costs a swap; missing an
+        in-flight push costs the funded amount twice.
+        """
+        pending = await self.eth_call_quorum(
+            lambda s: s.get_transaction_count(address, "pending"),
+            label=f"inflight_nonce_window.pending({address})",
+            combine=max,
+        )
+        latest = await self.eth_call_quorum(
+            lambda s: s.get_transaction_count(address, "latest"),
+            label=f"inflight_nonce_window.latest({address})",
+            combine=min,
+        )
+        return int(pending), int(latest)
+
     # --------------------------------------------- deliberately single-source
 
     async def get_transaction_count(self, address: str, block: str = "pending") -> int:
         """PRIMARY only, and it must be. The nonce is the mempool view of the endpoint that will
         broadcast; taking another's would build a transaction against a state that endpoint does
-        not have."""
+        not have.
+
+        For an in-flight GUARD rather than a build, use :meth:`inflight_nonce_window` — a guard
+        needs every endpoint's view, not the broadcaster's (#504)."""
         return await self.primary.get_transaction_count(address, block)
 
     async def fee_fields(self) -> dict:
