@@ -341,13 +341,13 @@ dev = [
     "mypy>=2.3.1,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.4,<0.17.0",
+    "ruff>=0.16.5,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
     # (GHSA-6v7p-g79w-8964). cachecontrol allows < 2.0.0, so pin the patched floor. Dev-scope only —
     # msgpack is not a pyrxd runtime dependency and never ships in the published package.
-    "msgpack>=1.2.1",
+    "msgpack>=1.2.2",
     # Transitive security floor (dev-only): cosmic-ray pulls gitpython, which has drawn repeated
     # clusters of HIGH advisories — env-var exfiltration via Repo.clone_from() (GHSA-rwj8-pgh3-r573,
     # patched 3.1.52), command injection via Repo.archive()/git.ls_remote() and short/long-option gate
