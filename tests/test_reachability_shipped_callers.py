@@ -89,14 +89,11 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/crypto/kem.py::unwrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/crypto/kem.py::wrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/eth_wallet/keys.py::generate_eth_key": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
-    "src/pyrxd/eth_wallet/private_submit.py::FlashbotsSubmitter": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
-    "src/pyrxd/eth_wallet/private_submit.py::PrivateSubmitter": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/eth_wallet/replacement.py::bump_replacement_fees": (
         "the replacement-pricing half of #515 / #504 item 1. The carve-out that calls it also "
         "needs the push tx HASH to be durable; only pending_push_nonce is persisted today. "
         "Deliberately loud rather than wired to nothing."
     ),
-    "src/pyrxd/glyph/credential_binding.py::CredentialResolver": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/credential_binding.py::verify_credential_binding": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock.py::add_timelock_to_metadata": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock.py::get_unlock_remaining": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
@@ -105,7 +102,6 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/glyph/timelock_reveal_tx.py::create_reveal_proof": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock_reveal_tx.py::parse_reveal_proof_script": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock_reveal_tx.py::validate_reveal_proof": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
-    "src/pyrxd/gravity/radiant_leg.py::RadiantBroadcaster": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/gravity/swap_state.py::allowed_targets": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/gravity/swap_state.py::can_transition": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/gravity/watch/claim_executor.py::sidecar_leg_resolver": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
