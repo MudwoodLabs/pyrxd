@@ -56,7 +56,7 @@ from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
-from pyrxd.gravity.reorg_cost import ReorgCostMeasurement
+from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
@@ -594,6 +594,55 @@ def measure_margin_from_btc_block_times(
         ),
     }
     return policy, provenance
+
+
+def _stablecoin_value_floor_photons(terms: NegotiatedTerms, policy: MarginPolicy, counter_leg: Any) -> int | None:
+    """Photons implied by a stablecoin counter leg's declared value, or None when there is no basis.
+
+    Against BTC, a leg's economic value was never knowable in-protocol. Against a stablecoin it is:
+    ``terms.value_amount`` is a 6-decimal dollar figure sitting on the record, so the swap states
+    its own worth (#489).
+
+    That matters because the RXD floor beside this one is exempt for ``ft``/``nft`` — their
+    ``radiant_amount`` is a token count or carrier dust, not an economic value — so ANY nonzero
+    ``value_at_risk_photons`` satisfied the setup gate for those variants and the value-scaled
+    burial collapsed to the flat floor. Downstream is fail-closed for ft/nft today, which makes
+    this the setup gate lagging the runtime gate rather than an open hole; it becomes one the
+    moment someone passes the opt-out.
+
+    Returns None — no check — unless every input is present and pinned:
+
+    * a ``token_address`` on the terms, so the amount's unit is knowable;
+    * a token the leg actually holds, matching that address, whose ``decimals`` are PINNED (the
+      registry holds only USD-pegged USDC/USDT and refuses look-alikes by address, which is what
+      makes "base units -> dollars" sound here and not a guess);
+    * a **provenanced** ``rxd_price_usd`` from :class:`ReorgCostMeasurement`.
+
+    The last is deliberate. Converting dollars to photons needs an RXD/USD rate, and a rate with no
+    declared source and no expiry is exactly the stale-constant hazard of #533 in a new place — so
+    this reuses the measurement's price, which carries both, rather than inventing one. An operator
+    on the bare ``rxd_reorg_cost_per_block`` path gets no check, not a check built on a number
+    nobody can date.
+
+    Exact over ``Fraction`` and rounded UP: understating the floor is the unsafe direction.
+    """
+    if not getattr(terms, "token_address", ""):
+        return None
+    measurement = policy.reorg_cost
+    if measurement is None:
+        return None
+    token = getattr(counter_leg, "token", None)
+    if token is None:
+        token = getattr(getattr(counter_leg, "_leg", None), "token", None)
+    address = getattr(token, "address", None)
+    decimals = getattr(token, "decimals", None)
+    if not address or not isinstance(decimals, int) or address.lower() != terms.token_address.lower():
+        return None
+    if int(terms.value_amount) <= 0:
+        return None
+    usd = Fraction(int(terms.value_amount), 10**decimals)
+    photons = usd / Fraction(measurement.rxd_price_usd) * PHOTONS_PER_RXD
+    return -((-photons.numerator) // photons.denominator)
 
 
 def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy) -> None:
@@ -1235,6 +1284,20 @@ class SwapCoordinator:
                 "value-scaled claim burial below what this swap's own on-chain value demands. Set "
                 "value_at_risk_photons >= radiant_amount for an RXD swap."
             )
+        # The same floor, from the OTHER leg, and for EVERY asset variant. The RXD check above is
+        # exempt for ft/nft, so before this any nonzero value-at-risk satisfied the gate for them
+        # and the value-scaled burial fell back to the flat floor (#489).
+        if _leg_is_value_bearing(radiant_leg) and config.margin_policy.value_at_risk_photons is not None:
+            implied = _stablecoin_value_floor_photons(record.terms, config.margin_policy, leg)
+            if implied is not None and config.margin_policy.value_at_risk_photons < implied:
+                raise ValidationError(
+                    f"value_at_risk_photons ({config.margin_policy.value_at_risk_photons}) is below the "
+                    f"{implied} photons this swap's own counter leg declares it is worth "
+                    f"({record.terms.value_amount} base units of {record.terms.token_address} at "
+                    f"${config.margin_policy.reorg_cost.rxd_price_usd}/RXD). An under-stated "
+                    "value-at-risk shrinks the value-scaled claim burial below what the swap is worth. "
+                    "Raise value_at_risk_photons, or re-measure the reorg cost if the rate has moved."
+                )
         # MEDIUM-1 (whole-stack audit): a VALUE-BEARING ETH counter-leg swap on an ESTIMATED
         # policy silently runs in the weak mode of two defenses — the verify->lock 'finalized'
         # reorg pin (_assert_eth_counter_funding_verified re-verifies at 'latest' when
