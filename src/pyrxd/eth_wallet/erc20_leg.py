@@ -83,6 +83,23 @@ def _create_address(sender: str, nonce: int) -> str:
     return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
 
 
+async def _inflight_nonce_window(rpc: Any, sender: str) -> tuple[int, int]:
+    """``(pending, latest)`` from every endpoint when the rpc can, from one when it cannot.
+
+    Duck-typed rather than isinstance-checked so a single-source rpc, and every test fake, keeps
+    working — this is a guard being STRENGTHENED where the fleet allows, not a new requirement. A
+    fake that only implements `get_transaction_count` behaves exactly as before.
+    """
+    window = getattr(rpc, "inflight_nonce_window", None)
+    if callable(window):
+        pending, latest = await window(sender)
+        return int(pending), int(latest)
+    return (
+        int(await rpc.get_transaction_count(sender, "pending")),
+        int(await rpc.get_transaction_count(sender, "latest")),
+    )
+
+
 class Erc20HtlcLeg(EthHtlcContractLeg):
     """Counter-chain leg holding an ERC-20 rather than native ETH.
 
@@ -348,9 +365,16 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # in flight" — it means our view of the account is stale or the pinned slot was consumed by
         # something else, and reporting `pending - latest` there printed a NEGATIVE count while
         # masking the real diagnosis below.
+        # QUORUM'D, not single-source (#504). This read is the only thing between a resume and a
+        # double-fund wherever the advisory file lock is absent — two hosts, a shared mount, a
+        # container restart, a copied keys directory — and one lagging or load-balanced provider
+        # defeats it: this host sees `pending == latest` while the other's push is in flight,
+        # computes the full shortfall, and sends an ADDITIVE transfer.
+        #
+        # `inflight_nonce_window` takes MAX pending and MIN latest, so the test below fires as
+        # readily as the fleet allows. A single-source rpc falls back to its own reads unchanged.
         _check_inflight = resuming and shortfall > 0
-        pending_nonce = await self._rpc.get_transaction_count(sender, "pending") if _check_inflight else 0
-        latest_nonce = await self._rpc.get_transaction_count(sender, "latest") if _check_inflight else 0
+        pending_nonce, latest_nonce = await _inflight_nonce_window(self._rpc, sender) if _check_inflight else (0, 0)
         if resuming and shortfall > 0 and pending_nonce > latest_nonce:
             raise NetworkError(
                 f"{pending_nonce - latest_nonce} transaction(s) from {sender} are still in flight "
