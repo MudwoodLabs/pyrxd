@@ -38,17 +38,25 @@ def test_basefee_headroom_cannot_form_a_valid_replacement() -> None:
     )
 
 
-def test_the_push_tx_hash_is_not_durable_so_its_fees_cannot_be_read_back() -> None:
-    """A bumped replacement must clear the PENDING transaction's fees by a margin, which means
-    reading it — and only the nonce is persisted. Recorded so the missing piece is visible to
-    whoever implements #515's carve-out."""
+def test_the_push_tx_hash_IS_now_durable_so_a_replacement_can_be_priced() -> None:
+    """This test previously asserted the OPPOSITE, and was written to fail when it stopped being
+    true — which is what happened.
+
+    It read: "a bumped replacement must clear the PENDING transaction's fees by a margin, which
+    means reading it — and only the nonce is persisted", with a failure message telling whoever
+    saw it red that the blocker on #515's carve-out was gone. It is: `pending_push_tx_hash` is
+    recorded before the broadcast, so `eth_getTransactionByHash` is available on resume, and
+    `pyrxd.eth_wallet.replacement` prices the bump.
+
+    WHAT REMAINS is the carve-out itself — relaxing the in-flight guard for the case
+    `pending == push_nonce + 1 and latest == push_nonce`, where the pending transaction provably
+    IS our own pinned push. Both ingredients now exist; nothing yet consumes them together.
+    """
     from pyrxd.gravity.swap_state import SwapRecord
 
     fields = set(getattr(SwapRecord, "__dataclass_fields__", {}))
     assert "pending_push_nonce" in fields
-    assert not [f for f in fields if "push" in f and "hash" in f], (
-        "a push hash is now durable — the blocker on #515's bumped-replacement carve-out is gone"
-    )
+    assert "pending_push_tx_hash" in fields, "the durable push hash went away; #515 is blocked again"
 
 
 def test_the_comment_no_longer_claims_replacement() -> None:
