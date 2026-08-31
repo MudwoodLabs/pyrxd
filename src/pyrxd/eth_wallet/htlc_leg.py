@@ -496,7 +496,14 @@ class EthHtlcContractLeg:
 
         return derive_address(self._key)
 
-    async def _sign_and_send(self, tx: dict, *, preflight: bool = True, private: bool = False) -> str:
+    async def _sign_and_send(
+        self,
+        tx: dict,
+        *,
+        preflight: bool = True,
+        private: bool = False,
+        on_signed: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
         """Sign ``tx`` with the held key's RAW bytes (call-site only) and broadcast.
 
         Preflights via ``eth_call`` first (unless ``preflight=False``, e.g. a contract
@@ -511,15 +518,44 @@ class EthHtlcContractLeg:
         """
         if preflight:
             await self._rpc.preflight(tx)
+        signed_raw, tx_hash = self._sign_tx(tx)
+        if on_signed is not None:
+            # BETWEEN signing and sending. The hash is known here and nothing has been broadcast,
+            # so a caller that must record a handle before value moves can do it and abort for
+            # free if it cannot (#502 item 2). Deliberately NOT swallowed: refusing to broadcast
+            # because the handle cannot be persisted is the whole point of the position.
+            await on_signed(tx_hash)
+        if private and self._private_submitter is not None:
+            return str(await self._private_submitter.submit_raw(signed_raw))
+        sent = await self._rpc.send_raw(signed_raw)
+        # The node echoing a DIFFERENT hash than the bytes we signed is the broadcast-echo distrust
+        # rule (0.19.0) in its simplest form: we know the answer, so we do not have to be told it.
+        if normalise_tx_hash(str(sent)).lower() != tx_hash.lower():
+            raise NetworkError(
+                f"node reported tx hash {sent} for bytes whose keccak is {tx_hash}. Refusing: the "
+                "hash is derivable from what we signed, so a disagreement means the node did not "
+                "broadcast what we gave it."
+            )
+        return tx_hash
+
+    def _sign_tx(self, tx: dict) -> tuple[bytes, str]:
+        """Sign ``tx`` locally and return ``(raw_bytes, tx_hash)``.
+
+        SPLIT OUT so the hash exists BEFORE the broadcast. It always did — a signed transaction's
+        hash is ``keccak`` of its own bytes — but it was only reachable as `_sign_and_send`'s
+        return value, i.e. after the send. That made the deploy-broadcast-to-persist gap look
+        forced when it is merely accepted (#502 item 2), and it is why a resume has no durable push
+        hash to re-price against (#515, #504 item 1).
+
+        Nothing here touches the network. The key's raw bytes live for one call and are dropped.
+        """
         web3 = _require_web3()
         raw = self._key.unsafe_raw_bytes()
         try:
             signed = web3.Account.sign_transaction(tx, raw)
         finally:
             del raw
-        if private and self._private_submitter is not None:
-            return str(await self._private_submitter.submit_raw(signed.raw_transaction))
-        return await self._rpc.send_raw(signed.raw_transaction)
+        return bytes(signed.raw_transaction), normalise_tx_hash(signed.hash.hex())
 
     async def _base_tx(self, *, gas: int, basefee_headroom: float = 1.0) -> dict:
         """Build the common tx fields. `basefee_headroom` scales the basefee share of
@@ -603,8 +639,27 @@ class EthHtlcContractLeg:
         tx = await self._base_tx(gas=800_000)
         tx["value"] = int(amount_wei)
         built = await ctor.build_transaction(tx)
+        # PERSIST BEFORE THE BROADCAST (#502 item 2). Both halves of the handle are derivable from
+        # what we already hold: the CREATE address is keccak(rlp([sender, nonce]))[12:] with the
+        # nonce sitting in `built`, and the tx hash is keccak of the bytes we are about to sign.
+        # Neither needs a receipt, so the deploy-broadcast-to-persist gap was ACCEPTED, not forced
+        # — and on this leg the constructor is payable, so that gap spans a value-moving
+        # transaction. A crash inside it left real ETH in a contract whose address existed only in
+        # this frame.
+        #
+        # Signing first is what makes it possible, and signing does not broadcast: if anything
+        # below fails, nothing was sent and the persisted handle simply describes a contract that
+        # never came to exist — harmless, and the resume path already tolerates a handle whose
+        # address holds nothing.
+        predicted_addr = web3.Web3.to_checksum_address(create_address(self._account_address(), int(built["nonce"])))
+        _persist = None
+        if on_deploy is not None:
+
+            async def _persist(h: str) -> None:
+                await on_deploy(predicted_addr, h)
+
         # No eth_call preflight for a deploy (no `to`); the status==1 check below is the gate.
-        tx_hash = await self._sign_and_send(built, preflight=False)
+        tx_hash = await self._sign_and_send(built, preflight=False, on_signed=_persist)
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"deploy tx reverted (status != 1): {tx_hash}")
@@ -626,28 +681,15 @@ class EthHtlcContractLeg:
                 "decides where the ETH went, and it is derivable rather than trusted."
             )
         addr = derived
-        # Report the deployed address so the caller can make it durable. The native constructor is
-        # payable, so value is already IN the contract at this point — a crash between here and the
-        # caller's `verify_funded` leaves real ETH in a contract whose address exists only in this
-        # frame. `refund()` recovers it after the timeout, but only for an operator who knows where
-        # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
-        if on_deploy is not None:
-            try:
-                await on_deploy(web3.Web3.to_checksum_address(addr), normalise_tx_hash(tx_hash))
-            except Exception as exc:
-                # LOG AND CONTINUE, unlike the token leg. Here the value moved as part of the deploy
-                # itself — the constructor is payable — so aborting cannot un-move it and only
-                # discards the address. The token leg aborts because nothing has moved yet there and
-                # stopping genuinely prevents untracked value; the same rule inverted here made a
-                # persist failure destroy a fund that would otherwise have completed.
-                _LOG.error(
-                    "could not persist the deployed HTLC address %s (tx %s): %s. The ETH is ALREADY "
-                    "in that contract — record this address by hand; refund() pays the refundee "
-                    "after the timeout.",
-                    addr,
-                    tx_hash,
-                    exc,
-                )
+        # The handle was already persisted BEFORE the broadcast, carrying this same derived
+        # address, so the window this comment used to describe — "a crash between here and the
+        # caller's verify_funded leaves real ETH in a contract whose address exists only in this
+        # frame" — no longer exists on this leg. See `Erc20HtlcLeg.fund`, where the same hazard
+        # spans two transactions and is handled differently.
+        # The handle was persisted before the broadcast, with the SAME derived address this check
+        # just re-confirmed against the receipt, so there is nothing left to record here.
+        # The handle was already persisted BEFORE the broadcast, with the same derived address
+        # this check just re-confirmed against the receipt — so there is nothing left to record.
         return EthHtlcLocator(
             chain_id=self._chain_id,
             contract_address=web3.Web3.to_checksum_address(addr),

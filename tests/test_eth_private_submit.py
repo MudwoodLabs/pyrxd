@@ -112,7 +112,12 @@ class _FakeRpc:
 
     async def send_raw(self, raw_tx):
         self.public_sends.append(bytes(raw_tx))
-        return "0x" + "cd" * 32
+        # A real node returns keccak OF THE BYTES IT WAS GIVEN. The canned "0xcdcd..." modelled a
+        # node echoing a hash unrelated to what it broadcast, which cannot happen — and the leg now
+        # checks it, because the hash is derivable from what we signed.
+        from eth_utils import keccak
+
+        return "0x" + keccak(bytes(raw_tx)).hex()
 
 
 def _locator():
@@ -154,7 +159,9 @@ async def test_claim_falls_back_to_public_when_no_submitter():
     rpc = _FakeRpc()
     leg = _leg(rpc, submitter=None)
     tx_hash = await leg.claim(_locator(), b"\x01" * 32)
-    assert tx_hash == "0x" + "cd" * 32  # public send_raw
+    from eth_utils import keccak
+
+    assert tx_hash == "0x" + keccak(rpc.public_sends[0]).hex()  # public send_raw, hash of our bytes
     assert len(rpc.public_sends) == 1
 
 
