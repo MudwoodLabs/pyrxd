@@ -149,7 +149,7 @@ def _leg(
             return inflight if block == "pending" else 0
 
         async def wait_receipt(self, tx_hash, **_k):
-            if tx_hash == "0xdeploy":
+            if tx_hash == _DEPLOY_TX:
                 real = _create_address(_sender, int(state["deploy_nonce"]))
                 state["deployed"] = real
                 return {"status": 1, "contractAddress": lying_receipt or real, "logs": []}
@@ -165,7 +165,7 @@ def _leg(
     async def _sign_and_send(*a, **k):
         sends["n"] += 1
         if sends["n"] == 1 and initial_held == 0 and "resumed" not in state:
-            return "0xdeploy"
+            return _DEPLOY_TX
         order.append("tokens-pushed")
         state["sent"].append(state.get("pending_transfer"))
         return "0xpush"
@@ -197,7 +197,7 @@ class TestTheAddressIsDurableBeforeTheTokensMove:
 
         async def _remember(addr: str, tx: str) -> None:
             order.append(f"persisted:{addr}")
-            assert tx == "0xdeploy", "the deploy tx hash must ride along; a resume needs it"
+            assert tx == _DEPLOY_TX, "the deploy tx hash must ride along; a resume needs it"
 
         leg = _leg(push_fails=False, order=order)
         _fund(leg, _remember)
@@ -241,7 +241,11 @@ class TestTheAddressIsDurableBeforeTheTokensMove:
 
 
 _AMOUNT = 12_345_678
-_PENDING = PendingDeploy(address=_DEPLOYED, deploy_tx_hash="0xdeploy")
+# A REAL-SHAPED hash. This was "0xdeploy" — readable, and a shape that cannot exist on chain, so
+# the durable record under test was one no node could ever produce (#502 item 7).
+_DEPLOY_TX = "0x" + "de" * 32
+
+_PENDING = PendingDeploy(address=_DEPLOYED, deploy_tx_hash=_DEPLOY_TX)
 
 
 def _stub_verify(leg, order: list):
@@ -554,7 +558,7 @@ class TestTheRealVerifyFundedRunsOnResume:
                 leg.verify_funded(
                     leg._locator_for(
                         address=_DEPLOYED,
-                        deploy_hash="0xdeploy",
+                        deploy_hash=_DEPLOY_TX,
                         hashlock=b"\x33" * 32,
                         claimant="0x" + "44" * 20,
                         refundee="0x" + "55" * 20,
@@ -573,7 +577,7 @@ class TestTheRealVerifyFundedRunsOnResume:
             leg.verify_funded(
                 leg._locator_for(
                     address=_DEPLOYED,
-                    deploy_hash="0xdeploy",
+                    deploy_hash=_DEPLOY_TX,
                     hashlock=b"\x33" * 32,
                     claimant="0x" + "44" * 20,
                     refundee="0x" + "55" * 20,

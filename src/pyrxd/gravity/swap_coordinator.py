@@ -1483,7 +1483,15 @@ class SwapCoordinator:
             # state this whole handle exists to escape. The authoritative atomic reserve below is
             # skipped on that same evidence; a resume completes the existing contract rather than
             # creating a second one, so the property this probe defends is untouched.
-            if not self.record.pending_counter_contract and self.seen_store.has_seen(terms.hashlock):
+            #
+            # SCOPED TO THIS RECORD'S OWN H (#502 item 3). The skip used to fire on a pending
+            # deploy for WHATEVER hashlock was passed, so one record left pending disabled the
+            # reuse probe for every unrelated H indefinitely — the evidence is "this swap already
+            # reserved THIS H", and it says nothing about another one.
+            resuming_this_h = bool(self.record.pending_counter_contract) and (
+                bytes(terms.hashlock) == bytes(self.record.terms.hashlock)
+            )
+            if not resuming_this_h and self.seen_store.has_seen(terms.hashlock):
                 return PreBtcLockGate(ok=False, reason="hashlock H reused (free-option / preimage-replay risk)")
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"seen-store unavailable; fail-closed ({exc})")
