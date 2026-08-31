@@ -5,4 +5,4 @@ poetry==2.4.1
 #   <50.0.0  PKCS#7 EnvelopedData decryption exposes a Bleichenbacher oracle
 #            (GHSA-g6cj-pr64-35w5). Not a path pyrxd itself uses, but this pin
 #            is what CI installs, so it must not resolve to a flagged version.
-cryptography>=50.0.0
+cryptography>=50.0.1
