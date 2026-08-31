@@ -374,8 +374,10 @@ class PreRevealAbort(RxdSdkError):
     That distinction is load-bearing for the caller. ``SwapCoordinator.maker_claims_btc`` zeroizes
     the preimage once a claim has been attempted, because from that point ``p`` may be public and
     keeping a copy in memory buys nothing. Doing the same on a pre-broadcast failure would destroy
-    the only copy of a secret that is still safe, stranding a swap that a retry would have
-    completed — a transient RPC blip turning into a dead swap (see #479).
+    the holder of a secret that is still safe, stranding a swap that a retry would have
+    completed — a transient RPC blip turning into a dead swap (see #479). ("The holder", not
+    "the only copy": a caller that pulled the raw bytes out has an immutable copy the zeroize
+    cannot reach. What it clears is the long-lived buffer — see ``SecretBytes.zeroize``.)
 
     Any new check added before the submit MUST raise this rather than a bare ``NetworkError``, or
     the caller will treat a recoverable failure as an irreversible one.

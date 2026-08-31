@@ -46,6 +46,7 @@ from pyrxd.security.errors import (
     PreRevealExpired,
     ValidationError,
 )
+from pyrxd.security.reveal import mark_reveal_crossed, watching_for_reveal
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
@@ -673,6 +674,7 @@ class EthHtlcContractLeg:
         (the whole point is that p must not touch the public RPC); the on-chain revert protection
         the preflight gave is traded for p-privacy, which is the correct trade for the reveal tx.
         On the public-fallback path (no submitter) p goes public anyway, so the preflight stays."""
+        watching_for_reveal()  # this leg reports its own reveal boundary (#480)
         if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
             raise ValidationError("preimage must be 32 bytes")
         # Everything up to `_sign_and_send` leaves nothing outside this process: `assert_chain` and
@@ -756,6 +758,10 @@ class EthHtlcContractLeg:
         #
         # This moves nothing across the boundary — the failure was always on this side of it. It
         # stops the caller having to infer that from an exception type that says the opposite.
+        # THE BOUNDARY. Marked here rather than inside `_sign_and_send`, because on the public
+        # path the preflight `eth_call` inside it already carries `p` in the calldata — the
+        # crossing is this call, not the broadcast within it.
+        mark_reveal_crossed()
         try:
             tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
         except ClaimNotConfirmed:

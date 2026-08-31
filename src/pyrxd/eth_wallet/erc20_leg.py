@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..security.errors import NetworkError, PreRevealAbort, ValidationError
+from ..security.reveal import watching_for_reveal
 from .erc20 import (
     assert_not_frozen_before_funding,
     assert_not_frozen_before_reveal,
@@ -469,6 +470,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         The claim itself is the parent's, unchanged — this adds a precondition, not a different
         settlement path.
         """
+        watching_for_reveal()  # this leg's extra pre-reveal reads run before super().claim (#480)
         # Re-read the funded balance at the TIP before building a claim. `verify_funded` ran
         # earlier and at a finalized checkpoint, which is the right place for the immutables — but
         # the contract's balance is what decides whether this claim pays, and the on-chain
