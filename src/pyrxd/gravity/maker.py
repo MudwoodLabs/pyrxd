@@ -28,7 +28,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pyrxd.network.bitcoin import BtcDataSource
@@ -253,6 +255,8 @@ class GravityMakerSession:
         self,
         offer: ActiveOffer,
         timeout_seconds: int = 3600,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ) -> str | None:
         """Poll for the Taker's claim transaction.
 
@@ -271,7 +275,11 @@ class GravityMakerSession:
         offer:
             The :class:`ActiveOffer` returned by ``create_offer``.
         timeout_seconds:
-            Maximum seconds to wait. Returns ``None`` on timeout.
+            Maximum seconds to wait, as WALL-CLOCK seconds. Returns ``None`` on timeout.
+        clock:
+            Monotonic-ish time source. Injectable so the timeout branch is reachable in a
+            test without sleeping — the same shape ``pyrxd.network.confirm`` uses, and for
+            the same reason: a fake ``sleep`` does not advance a real clock.
 
         Returns
         -------
@@ -280,8 +288,19 @@ class GravityMakerSession:
             on timeout.
         """
         script_hash = _p2sh_script_hash(offer.offer.offer_redeem_hex)
+        # A DEADLINE, not a poll count (#475). Deriving `max_polls = timeout // interval` and
+        # looping that many times measures polls, not time: every network round trip inside the
+        # loop is unbudgeted, so the real bound is `max_polls * (interval + latency)`. At the
+        # shipped defaults (interval 30 s, timeout 3600 s => 120 polls) a 1 s per-iteration
+        # latency overruns by 120 s, and 3 s by 360 s — 10%. This is the same defect the
+        # confirmation waits carried before 0.20.0, so it takes the same fix.
+        if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
+            raise ValidationError("timeout_seconds must be a number")
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValidationError(f"timeout_seconds must be finite and >= 0, got {timeout_seconds!r}")
         effective_interval = self._poll_interval if self._poll_interval > 0 else 1
-        max_polls = max(1, timeout_seconds // effective_interval)
+        started = clock()
+        deadline = started + float(timeout_seconds)
 
         logger.info(
             "Polling for claim on offer %s (timeout=%ds, interval=%ds)",
@@ -290,50 +309,65 @@ class GravityMakerSession:
             self._poll_interval,
         )
 
-        for attempt in range(max_polls):
+        attempt = 0
+        last_error: NetworkError | None = None
+        while True:
+            # Do not START a poll we cannot afford. The poll's own duration is unknowable in
+            # advance, so the honest bound is deadline + ONE poll — not the deadline exactly.
+            # What changed is that the overrun no longer ACCUMULATES: the old loop paid it 120
+            # times over at the shipped defaults.
+            if attempt and clock() >= deadline:
+                if last_error is not None:
+                    # A dead endpoint is NOT "no claim happened". Returning None here would tell
+                    # the maker the taker never claimed, when the truth is we could not see. The
+                    # pre-deadline `raise` in the retry lane below is unreachable once the sleep
+                    # lands exactly on the deadline, so the error is carried out to here.
+                    raise last_error
+                break
+            attempt += 1
             try:
                 utxos = await self._rxd.get_utxos(script_hash)
             except NetworkError as exc:
-                logger.warning(
-                    "get_utxos poll %d/%d failed: %s — retrying",
-                    attempt + 1,
-                    max_polls,
-                    exc,
-                )
-                if attempt + 1 < max_polls:
-                    await asyncio.sleep(self._poll_interval)
-                    continue
-                raise
+                logger.warning("get_utxos poll %d failed: %s — retrying", attempt, exc)
+                last_error = exc
+                # The poll happened BEFORE this sleep, so an unclamped sleep runs past the
+                # deadline rather than up to it. Re-read the clock: the failing read itself
+                # consumed time, which is the whole point of the change.
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(effective_interval, remaining))
+                continue
 
+            last_error = None  # a successful read clears it; only a FAILING tail should raise
             # Check if the specific offer UTXO is still unspent.
             offer_unspent = any(u.tx_hash == offer.offer_txid and u.tx_pos == offer.offer_vout for u in utxos)
 
-            if not offer_unspent and attempt > 0:
+            # `attempt > 1` (was `> 0`): an offer UTXO missing from the FIRST poll is ambiguous —
+            # not yet indexed reads identically to already spent — so the first observation is
+            # treated as "not visible yet" rather than as a claim. Renumbered with the loop, which
+            # now counts from 1; the guard is unchanged in meaning.
+            if not offer_unspent and attempt > 1:
                 # The UTXO has been spent — the Taker has claimed it.
                 logger.info("Offer %s claimed (UTXO spent)", offer.offer_txid[:16])
                 return offer.offer_txid
 
             if offer_unspent:
-                logger.debug(
-                    "Offer %s still open (poll %d/%d)",
-                    offer.offer_txid[:16],
-                    attempt + 1,
-                    max_polls,
-                )
+                logger.debug("Offer %s still open (poll %d)", offer.offer_txid[:16], attempt)
             else:
-                # attempt == 0 and UTXO not found — may not be confirmed yet
-                logger.debug(
-                    "Offer UTXO not visible yet on poll %d/%d — may be unconfirmed",
-                    attempt + 1,
-                    max_polls,
-                )
+                # First poll and the UTXO is not there — may simply not be indexed yet.
+                logger.debug("Offer UTXO not visible yet on poll %d — may be unconfirmed", attempt)
 
-            if attempt + 1 < max_polls:
-                await asyncio.sleep(self._poll_interval)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(effective_interval, remaining))
 
         logger.info(
-            "wait_for_claim timed out after %ds for offer %s",
+            "wait_for_claim timed out after %.1fs (budget %ss, %d polls) for offer %s",
+            clock() - started,
             timeout_seconds,
+            attempt,
             offer.offer_txid[:16],
         )
         return None
