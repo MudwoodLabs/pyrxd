@@ -58,6 +58,7 @@ from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbo
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import ReorgCostMeasurement
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
+from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
 
 from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
@@ -2130,6 +2131,14 @@ class SwapCoordinator:
             raise ValidationError("preimage must be SecretBytes (in-memory only; never persisted)")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot claim")
+        # `unsafe_raw_bytes()` returns a COPY, and `bytes` is immutable, so this local cannot be
+        # scrubbed and `preimage.zeroize()` below does not reach it (#480). What the zeroize
+        # actually buys is real but narrower than "the secret is gone": it clears the LONG-LIVED
+        # holder, the one that outlives this frame and could be persisted, logged or reused. This
+        # copy dies with the frame, and downstream callers copy it again regardless — web3 does,
+        # building the calldata. Describing the zeroize as erasing the secret from memory would be
+        # a promise CPython cannot keep; `SecretBytes.zeroize` is honest about this and the call
+        # sites should be too.
         raw = preimage.unsafe_raw_bytes()
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
@@ -2137,7 +2146,7 @@ class SwapCoordinator:
         # may be public — on the public path the preflight eth_call carries the calldata, on the
         # private path the submit does — so holding a copy buys nothing and discarding it is right.
         #
-        # Before that boundary nothing has left this process, and destroying the only copy of a
+        # Before that boundary nothing has left this process, and zeroizing the holder of a
         # still-secret p strands a swap that a retry would have completed: a transient RPC blip
         # becoming a dead swap (#479). The legs mark that boundary by raising PreRevealAbort, which
         # is a promise about WHERE the failure happened, not why.
@@ -2152,20 +2161,30 @@ class SwapCoordinator:
         # a provider, so it zeroizes. The pre-reveal gates are not in that set — including the
         # freeze refusal, where keeping `p` costs nothing because a genuinely frozen counterparty
         # means the swap cannot complete anyway and both sides refund.
-        try:
-            await self.counter_leg.claim(self.record.counterchain_locator, raw)
-        except PreRevealAbort:
-            # Nothing was broadcast and no eth_call carried the calldata to a provider, so `p` is
-            # STILL SECRET — keep it. A blanket `finally` here destroyed the only copy of a secret
-            # that was still safe, turning a transient RPC blip or a refused pre-flight check into
-            # a dead swap that a retry would have completed. See #479.
-            raise
-        except BaseException:
-            # Anything else may have reached the network with `p` in its calldata. Assume public.
-            preimage.zeroize()
-            raise
-        else:
-            preimage.zeroize()
+        # The leg RECORDS whether anything carrying `p` left the process; this no longer infers it
+        # from the exception class. `asyncio.CancelledError` is a BaseException, so a cancellation
+        # during the pre-broadcast reads used to land in the zeroize branch and destroy a secret
+        # that was still safe — #479 arriving through the cancel channel (#480). A boundary the leg
+        # sets cannot be got wrong by a future check landing on the wrong side of it.
+        with reveal_boundary() as boundary:
+            try:
+                await self.counter_leg.claim(self.record.counterchain_locator, raw)
+            except PreRevealAbort:
+                # Kept as its own branch even though the boundary would say the same: this is the
+                # leg's explicit promise that nothing was sent, and it must hold for a leg that
+                # does not report a boundary at all. "Keep it" means the holder above stays
+                # readable for a retry — see the note on `raw` for what zeroize does and does not
+                # reach.
+                raise
+            except BaseException:
+                # UNWATCHED (a leg that does not report) reads as may_be_public, so a
+                # non-participating leg keeps today's behaviour. Only an explicit "I got nowhere"
+                # keeps the preimage.
+                if boundary.may_be_public:
+                    preimage.zeroize()
+                raise
+            else:
+                preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
         await self._persist_record(self.record, shield=True)
         return self.record
