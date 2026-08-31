@@ -39,7 +39,13 @@ from pyrxd.eth_wallet.multi_rpc import read_contract
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
-from pyrxd.security.errors import ClaimNotConfirmed, NetworkError, PreRevealAbort, ValidationError
+from pyrxd.security.errors import (
+    ClaimNotConfirmed,
+    NetworkError,
+    PreRevealAbort,
+    PreRevealExpired,
+    ValidationError,
+)
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
@@ -198,7 +204,21 @@ def _require_web3() -> Any:
 
 
 class _ClaimTooLate(Exception):
-    """Internal: too close to the deadline to broadcast. Surfaced as PreRevealAbort."""
+    """Internal: the claim cannot be built for a TIMING reason. Surfaced as a pre-reveal abort.
+
+    ``permanent`` separates the two, because they call for opposite responses and both used to
+    surface identically (#485):
+
+    * a STALE HEAD is transient — the provider catches up, the operator fixes the clock, and the
+      next attempt works. Its own message says "then retry".
+    * TOO CLOSE TO THE TIMEOUT is not — the gap only shrinks. Its own message says "Refund after
+      the timeout instead", which a driver could not act on while the exception class promised
+      the failure was retryable.
+    """
+
+    def __init__(self, message: str, *, permanent: bool) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 #: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting.
@@ -697,7 +717,8 @@ class EthHtlcContractLeg:
                     f"{CLAIM_INCLUSION_BUDGET_S}s): with a head this old there is no way to reason "
                     "about whether a claim would be included before the timeout, and a claim that "
                     "mines late publishes the preimage for nothing. Check the provider, and check "
-                    "this machine's clock, then retry. Nothing was sent."
+                    "this machine's clock, then retry. Nothing was sent.",
+                    permanent=False,
                 )
             deadline = int(locator.timeout)
             if now_ts + CLAIM_INCLUSION_BUDGET_S >= deadline:
@@ -705,14 +726,18 @@ class EthHtlcContractLeg:
                     f"refusing to build a claim {deadline - now_ts}s before the HTLC timeout (needs "
                     f"{CLAIM_INCLUSION_BUDGET_S}s of head-room): a claim that mines late still "
                     "publishes the preimage in its calldata while paying nothing, which hands the "
-                    "counterparty both legs. Refund after the timeout instead."
+                    "counterparty both legs. Refund after the timeout instead.",
+                    permanent=True,
                 )
             c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
             built = await c.functions.claim(bytes(preimage)).build_transaction(
                 await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
             )
         except _ClaimTooLate as exc:
-            raise PreRevealAbort(str(exc)) from exc
+            # Permanent -> PreRevealExpired, so a driver stops and refunds rather than spinning
+            # until the deadline it is already too close to (#485). Both keep `p`: nothing was
+            # broadcast either way.
+            raise (PreRevealExpired if exc.permanent else PreRevealAbort)(str(exc)) from exc
         except Exception as exc:
             raise PreRevealAbort(f"claim abandoned before broadcast; the preimage is still secret: {exc}") from exc
         # From here p may reach a provider: on the public path the preflight eth_call carries the
