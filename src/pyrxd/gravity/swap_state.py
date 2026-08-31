@@ -32,7 +32,7 @@ from pyrxd.btc_wallet.taproot import (
     Timelock,
     TimeUnit,
 )
-from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr, check_tx_hash
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.units import PhotonValue, TokenUnits
 
@@ -527,13 +527,30 @@ class SwapRecord:
     #: this hash — the `"0x" + "00"*32` placeholder `expected_locator` uses for an unknown deploy
     #: would silently break it. Unrecoverable after the fact, like the address itself.
     pending_counter_deploy_tx: str | None = None
-    #: The sender nonce the token push is PINNED to. Measured (2026-08-24, anvil): re-sending at a
-    #: recorded nonce is a REPLACEMENT, never an addition — two resumers, or a resume racing its own
-    #: still-pending push, deliver the value once and only once. That is a property of the chain
-    #: rather than of a lock, so unlike `flock` it holds across hosts, filesystems, and a copied
-    #: keys directory. Persisting it before the broadcast is what makes it usable on a retry.
-    #: See docs/solutions/design-decisions/nonce-pinning-makes-erc20-funding-idempotent.md.
+    #: The sender nonce the token push is PINNED to. Measured (2026-08-24, anvil): a second
+    #: transaction at a recorded nonce is REJECTED — "nonce too low" once mined, "transaction
+    #: already imported" while pending — so two resumers, or a resume racing its own still-pending
+    #: push, deliver the value once and only once. That rejection is a property of the chain rather
+    #: than of a lock, so unlike `flock` it holds across hosts, filesystems, and a copied keys
+    #: directory. Persisting it before the broadcast is what makes it usable on a retry.
+    #:
+    #: THIS USED TO SAY "a REPLACEMENT, never an addition". Exactly-once here comes from the
+    #: rejection, not from replacing: replacing needs BOTH EIP-1559 fee fields raised past the
+    #: pending transaction's, which `_base_tx`'s basefee_headroom cannot do (it never touches the
+    #: tip). The same overclaim was corrected in `erc20_leg.py` for #515 and left here — the
+    #: fix-the-class rule, missed once. `pyrxd.eth_wallet.replacement` now prices a real one.
+    #: See docs/solutions/design-decisions/nonce-pinning-makes-erc20-funding-idempotent.md, whose
+    #: "What this does NOT solve" section was right about this all along.
     pending_push_nonce: int | None = None
+    #: The token push's transaction HASH, recorded BEFORE it is broadcast (the hash is keccak of
+    #: the bytes we signed, so it needs no receipt — see `EthHtlcContractLeg._sign_tx`).
+    #:
+    #: Without it a resume cannot READ the pending transaction back, and therefore cannot price a
+    #: replacement against its fees — `eth_getTransactionByHash` needs the hash, and
+    #: `txpool_content` is non-standard and absent from most public endpoints. That missing read
+    #: is what blocked the resume carve-out in #515 and the idempotent-funding direction in #504
+    #: item 1, not the pricing arithmetic.
+    pending_push_tx_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -593,6 +610,16 @@ class SwapRecord:
         pin = self.pending_push_nonce
         if pin is not None and (not isinstance(pin, int) or isinstance(pin, bool) or pin < 0):
             raise ValidationError("pending_push_nonce must be a non-negative int")
+        if self.pending_push_tx_hash is not None:
+            # The SAME shape check the deploy handle uses. A durable reference that round-trips
+            # garbage reads as a record and points nowhere (#502 item 7).
+            check_tx_hash(self.pending_push_tx_hash)
+        if self.pending_push_tx_hash is not None and self.pending_push_nonce is None:
+            raise ValidationError(
+                "pending_push_tx_hash without pending_push_nonce: the hash identifies a transaction "
+                "whose slot is unknown, so a resume could neither replace it nor rule out sending a "
+                "second push at a different nonce. Record both or neither."
+            )
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -635,6 +662,7 @@ class SwapRecord:
             pending_counter_contract=None,
             pending_counter_deploy_tx=None,
             pending_push_nonce=None,
+            pending_push_tx_hash=None,
         )
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
@@ -677,6 +705,8 @@ class SwapRecord:
             d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
             if self.pending_push_nonce is not None:
                 d["pending_push_nonce"] = self.pending_push_nonce
+            if self.pending_push_tx_hash is not None:
+                d["pending_push_tx_hash"] = self.pending_push_tx_hash
         return d
 
     @classmethod
@@ -708,6 +738,7 @@ class SwapRecord:
             pending_counter_contract=d.get("pending_counter_contract"),
             pending_counter_deploy_tx=d.get("pending_counter_deploy_tx"),
             pending_push_nonce=d.get("pending_push_nonce"),
+            pending_push_tx_hash=d.get("pending_push_tx_hash"),
         )
 
 

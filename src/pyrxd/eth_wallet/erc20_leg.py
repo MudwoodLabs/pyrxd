@@ -135,6 +135,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         resume_from: PendingDeploy | None = None,
         push_nonce: int | None = None,
         on_push_nonce: Callable[[int], Awaitable[None]] | None = None,
+        on_push_hash: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
         """Deploy the HTLC, push the tokens into it, and only then return a locator.
 
@@ -242,6 +243,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             resuming=resume_from is not None,
             push_nonce=push_nonce,
             on_push_nonce=on_push_nonce,
+            on_push_hash=on_push_hash,
             web3=web3,
             address=address,
             deploy_hash=deploy_hash,
@@ -303,6 +305,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         resuming,
         push_nonce,
         on_push_nonce,
+        on_push_hash,
         web3,
         address,
         deploy_hash,
@@ -429,7 +432,17 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             elif on_push_nonce is not None:
                 await on_push_nonce(int(push_tx["nonce"]))
             push_built = await token_c.functions.transfer(address, shortfall).build_transaction(push_tx)
-            push_hash = await self._sign_and_send(push_built)
+            # RECORD THE HASH BEFORE THE BROADCAST. The nonce pin alone identifies the SLOT; the
+            # hash identifies the TRANSACTION, which is what a resume needs to read its fees back
+            # and price a replacement against them (#515, #504 item 1). `on_signed` fires between
+            # signing and sending, so this is durable before anything can be pending.
+            _record_hash = None
+            if on_push_hash is not None:
+
+                async def _record_hash(h: str) -> None:
+                    await on_push_hash(int(push_tx["nonce"]), h)
+
+            push_hash = await self._sign_and_send(push_built, on_signed=_record_hash)
             push_receipt = await self._rpc.wait_receipt(push_hash)
             if int(push_receipt.get("status", 0)) != 1:
                 raise NetworkError(
