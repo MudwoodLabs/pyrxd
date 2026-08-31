@@ -19,7 +19,14 @@ from typing import ClassVar
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "PendingDeploy", "check_hex_addr", "normalise_tx_hash"]
+__all__ = [
+    "Erc20HtlcLocator",
+    "EthHtlcLocator",
+    "PendingDeploy",
+    "check_hex_addr",
+    "check_tx_hash",
+    "normalise_tx_hash",
+]
 
 
 #: The ONLY accepted spelling of an EVM address anywhere in this package. Anchored, ASCII-only.
@@ -43,7 +50,30 @@ def normalise_tx_hash(val: str) -> str:
     """
     if not isinstance(val, str) or not val:
         raise ValidationError("transaction hash must be a non-empty string")
-    return val if val.startswith("0x") else "0x" + val
+    return check_tx_hash(val if val.startswith("0x") else "0x" + val)
+
+
+def check_tx_hash(val: str) -> str:
+    """The one shape check for a transaction hash: ``0x`` + exactly 64 hex characters.
+
+    A prefix test alone accepted ``"0x"`` itself, and ``"0xzz"``, into a DURABLE record whose whole
+    purpose is to be the surviving reference to a funded contract (#502 item 7). A handle that
+    round-trips garbage is worse than none: it reads as a record and points nowhere.
+
+    Shape only. Nothing here can confirm this hash created that address — that needs a chain read,
+    and the caller does it by deriving the CREATE address and cross-checking.
+    """
+    if not isinstance(val, str):
+        raise ValidationError("transaction hash must be a string")
+    if len(val) != 66 or not val.startswith("0x"):
+        raise ValidationError(
+            f"transaction hash must be 0x + 64 hex characters (66 total), got {len(val)}: {val[:12]!r}"
+        )
+    try:
+        int(val[2:], 16)
+    except ValueError:
+        raise ValidationError(f"transaction hash is not hex: {val[:12]!r}") from None
+    return val
 
 
 def check_hex_addr(name: str, val: str) -> str:
@@ -79,8 +109,7 @@ class PendingDeploy:
 
     def __post_init__(self) -> None:
         check_hex_addr("PendingDeploy.address", self.address)
-        if not isinstance(self.deploy_tx_hash, str) or not self.deploy_tx_hash.startswith("0x"):
-            raise ValidationError("PendingDeploy.deploy_tx_hash must be a 0x-prefixed hex hash")
+        check_tx_hash(self.deploy_tx_hash)
         object.__setattr__(self, "address", self.address.lower())
 
 
