@@ -2142,8 +2142,16 @@ class SwapCoordinator:
         # becoming a dead swap (#479). The legs mark that boundary by raising PreRevealAbort, which
         # is a promise about WHERE the failure happened, not why.
         #
-        # A gate refusal that is NOT a PreRevealAbort — an address really is frozen — still
-        # zeroizes: that swap cannot complete, and a dead secret should not linger in memory.
+        # THE EXAMPLE THIS COMMENT USED TO GIVE IS NOW BACKWARDS, so it is corrected rather than
+        # trimmed. It read: "A gate refusal that is NOT a PreRevealAbort — an address really is
+        # frozen — still zeroizes." A frozen address is now exactly a PreRevealAbort (see
+        # `Erc20HtlcLeg.claim`), so that lane does NOT zeroize, and the sentence described the
+        # opposite of the code directly beneath it (#485).
+        #
+        # What survives is the rule: anything that is not a PreRevealAbort may have carried `p` to
+        # a provider, so it zeroizes. The pre-reveal gates are not in that set — including the
+        # freeze refusal, where keeping `p` costs nothing because a genuinely frozen counterparty
+        # means the swap cannot complete anyway and both sides refund.
         try:
             await self.counter_leg.claim(self.record.counterchain_locator, raw)
         except PreRevealAbort:

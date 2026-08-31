@@ -29,7 +29,7 @@ from pyrxd.eth_wallet.htlc_leg import (
     EthHtlcContractLeg,
 )
 from pyrxd.eth_wallet.locator import EthHtlcLocator
-from pyrxd.security.errors import PreRevealAbort
+from pyrxd.security.errors import PreRevealAbort, PreRevealExpired
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 _ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
@@ -369,3 +369,42 @@ class TestTheDeadlineGuardAndTheStalenessAbortReadDIFFERENTHeads:
         # path would fail for a reason that has nothing to do with the deadline guard.
         asyncio.run(leg.claim(_locator(), _PREIMAGE))
         assert sent == [True], "an ordinary endpoint spread blocked an honest claim"
+
+
+class TestRetryabilityIsDistinguishable:
+    """A driver must be able to tell "try again" from "stop and refund" (#485).
+
+    ``PreRevealAbort`` promises "a swap that a retry would have completed". The deadline guard
+    broke that promise: refusing for being too close to the timeout is a condition that strictly
+    WORSENS with time, so a driver honouring the contract would spin until the deadline instead
+    of pivoting to the refund path.
+
+    These drive ``leg.claim`` — the production entry point — rather than constructing the
+    exception, because the wiring from the internal ``_ClaimTooLate`` flag to the public class is
+    the part that can break.
+    """
+
+    def test_a_deadline_refusal_is_PERMANENT(self) -> None:
+        leg = _leg(_TIMEOUT - 1, sent=[])
+        with pytest.raises(PreRevealExpired) as caught:
+            asyncio.run(leg.claim(_locator(), b"\x11" * 32))
+        assert caught.value.retryable is False
+
+    def test_a_STALE_HEAD_refusal_stays_retryable(self) -> None:
+        """The honest-path half. This one really is transient — the provider catches up or the
+        clock is fixed — and its own message says "then retry". Marking it permanent would send a
+        driver to refund over a blip, which is the #479 failure wearing a different hat."""
+        leg = _leg(int(time.time()) - 3600, sent=[])
+        loc = _locator(timeout=int(time.time()) + 86_400)
+        with pytest.raises(PreRevealAbort, match="stale") as caught:
+            asyncio.run(leg.claim(loc, b"\x11" * 32))
+        assert not isinstance(caught.value, PreRevealExpired)
+        assert caught.value.retryable is True
+
+    def test_the_permanent_case_is_still_caught_by_existing_handlers(self) -> None:
+        """Back-compat: PreRevealExpired subclasses PreRevealAbort, so every `except
+        PreRevealAbort` — including the coordinator's keep-the-preimage branch — is unchanged.
+        The preimage handling must NOT differ; only the caller's next move does."""
+        leg = _leg(_TIMEOUT - 1, sent=[])
+        with pytest.raises(PreRevealAbort):
+            asyncio.run(leg.claim(_locator(), b"\x11" * 32))

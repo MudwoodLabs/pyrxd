@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 __all__ = [
     "Base58Error",
@@ -43,6 +43,7 @@ __all__ = [
     "PolicyRejection",
     "PoolTooSmallError",
     "PreRevealAbort",
+    "PreRevealExpired",
     "RxdSdkError",
     "SpvVerificationError",
     "TlsPinMismatchError",
@@ -378,7 +379,35 @@ class PreRevealAbort(RxdSdkError):
 
     Any new check added before the submit MUST raise this rather than a bare ``NetworkError``, or
     the caller will treat a recoverable failure as an irreversible one.
+
+    ``retryable`` says whether trying again can succeed. It is True here because every original
+    member was a transient read — an RPC blip, a stale balance — and the docstring above promises
+    "a swap that a retry would have completed". A later check broke that promise: refusing to
+    build a claim too close to the HTLC timeout is a condition that strictly WORSENS with time, so
+    a driver honouring the contract would spin until the deadline instead of pivoting to refund.
+    That case is :class:`PreRevealExpired` (#485). Check ``retryable`` — or catch the subclass
+    first — before retrying.
     """
+
+    #: Can trying again succeed? See :class:`PreRevealExpired` for the case where it cannot.
+    retryable: ClassVar[bool] = True
+
+
+class PreRevealExpired(PreRevealAbort):
+    """A pre-reveal abort that a retry can NEVER resolve, because time is the thing that failed.
+
+    Subclass of :class:`PreRevealAbort` so the preimage handling is unchanged — nothing was
+    broadcast, ``p`` is still secret, and the caller must not zeroize it. What differs is the
+    caller's NEXT move: retrying walks further past the deadline, so the driver must stop and take
+    the refund path.
+
+    Raised when a claim is refused for being too close to the HTLC timeout. A claim that mines
+    late still publishes the preimage in its calldata while paying nothing, which hands the
+    counterparty both legs — so refusing is right, and refusing again a second later is still
+    right, forever.
+    """
+
+    retryable: ClassVar[bool] = False
 
 
 class NetworkError(RxdSdkError):
