@@ -745,7 +745,13 @@ def _native_leg(
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=_key, chain_id=1, artifact=_NATIVE_ART)
 
-    async def _sign_and_send(*a, **k):
+    async def _sign_and_send(*a, on_signed=None, **k):
+        # HONOUR on_signed, and honour its ORDER. The fake used to swallow it in `**k`, so after
+        # the persist moved between signing and sending (#502 item 2) this stub exercised none of
+        # the changed path and the tests around it kept passing while testing a fake that no
+        # longer resembled production.
+        if on_signed is not None:
+            await on_signed("0x" + "ee" * 32)
         deployed.append("DEPLOYED")
         return "0x" + "ee" * 32
 
@@ -977,43 +983,102 @@ class TestThePushNonceIsPinnedAndReused:
         assert order == [], "value was sent against a pin that another transaction had consumed"
 
 
-class TestAPersistFailureDoesNotDiscardACommittedNativeFund:
-    """Making the persist hook mandatory created a regression on the NATIVE leg.
+class TestAPersistFailureNowStopsBeforeAnythingIsCommitted:
+    """The dilemma this class used to document has been dissolved rather than balanced.
 
-    Its constructor is payable, so the ETH is in the contract the instant the deploy confirms.
-    Aborting on a persist failure cannot un-move it — it only discards the address, leaving it in an
-    exception string. The rule "if the caller cannot persist it, we must not push" is right for the
-    TOKEN leg, where nothing has moved yet and stopping genuinely prevents untracked value, and
-    inverted here.
+    The native persist hook ran AFTER the deploy, and the constructor is payable — so the ETH was
+    already in the contract when the hook fired. That left only bad options: swallow the failure
+    and lose the address, or abort and lose a fund that had already completed. The old rule
+    (log-and-continue) was the better of the two, and this class asserted it.
+
+    #502 item 2 pointed out the premise was false: both halves of the handle are derivable BEFORE
+    the broadcast. Moving the persist between signing and sending means nothing has moved when it
+    fires, so aborting is free — and the native and token legs now follow the SAME rule instead of
+    opposite ones, which is a simpler thing to reason about than a documented asymmetry.
     """
 
-    def test_the_native_fund_survives_a_failing_persist_hook(self) -> None:
+    def test_a_failing_persist_hook_stops_BEFORE_the_deploy(self) -> None:
         deployed: list = []
         leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
 
         async def _broken(_addr: str, _tx: str) -> None:
             raise NetworkError("read-only filesystem")
 
-        # The DEPLOY path — the resume path never calls on_deploy at all, so testing through it
-        # would prove nothing about this fix.
-        loc = asyncio.run(
+        with pytest.raises(NetworkError, match="read-only filesystem"):
+            asyncio.run(
+                leg.fund(
+                    hashlock=b"\x33" * 32,
+                    claimant=_CLAIMANT,
+                    refundee=_REFUNDEE,
+                    timeout=_FUND_TIMEOUT,
+                    amount_wei=_NATIVE_WEI,
+                    on_deploy=_broken,
+                )
+            )
+        assert deployed == [], "the deploy went ahead despite the handle not being recorded"
+
+    def test_the_handle_carries_the_DERIVED_address_not_a_receipt_one(self) -> None:
+        """It has to: at persist time there is no receipt to read. The address comes from
+        keccak(rlp([sender, nonce]))[12:], which is also why it needs no endpoint to be trusted."""
+        deployed: list = []
+        seen: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
+
+        async def _record(addr: str, tx: str) -> None:
+            seen.append((addr, tx))
+
+        asyncio.run(
             leg.fund(
                 hashlock=b"\x33" * 32,
                 claimant=_CLAIMANT,
                 refundee=_REFUNDEE,
                 timeout=_FUND_TIMEOUT,
                 amount_wei=_NATIVE_WEI,
-                on_deploy=_broken,
+                on_deploy=_record,
             )
         )
-        assert deployed == ["DEPLOYED"], "the deploy never happened, so the hook was never reached"
-        assert loc.contract_address.lower() == leg._test_state["deployed"].lower(), (
-            "a persist failure discarded a fund whose ETH is already in the contract"
+        assert len(seen) == 1, "the handle was recorded more than once, or not at all"
+        addr, tx = seen[0]
+        assert addr.lower() == leg._test_state["deployed"].lower()
+        assert len(tx) == 66 and tx.startswith("0x")
+
+    def test_the_persist_happens_BEFORE_the_send(self) -> None:
+        """Ordering is the whole fix. Recording after the broadcast would leave the same window
+        this change exists to close, and an assertion on the values alone cannot see the
+        difference."""
+        order: list = []
+        deployed: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
+
+        async def _record(_addr: str, _tx: str) -> None:
+            order.append("persisted")
+
+        real_send = leg._sign_and_send
+
+        async def _tracking(*a, on_signed=None, **k):
+            async def _wrapped(h):
+                await on_signed(h)
+
+            out = await real_send(*a, on_signed=_wrapped if on_signed else None, **k)
+            order.append("sent")
+            return out
+
+        leg._sign_and_send = _tracking
+        asyncio.run(
+            leg.fund(
+                hashlock=b"\x33" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_FUND_TIMEOUT,
+                amount_wei=_NATIVE_WEI,
+                on_deploy=_record,
+            )
         )
+        assert order == ["persisted", "sent"], order
 
     def test_the_TOKEN_leg_still_refuses_to_push_when_it_cannot_persist(self) -> None:
-        """The pairing. Narrowing the native rule must not disarm the token one, where the abort is
-        the only thing preventing value from moving into a contract nothing references."""
+        """The pairing, kept. Both legs now refuse for the same reason — nothing has moved yet —
+        rather than for opposite ones."""
         order: list = []
 
         async def _broken(_addr: str, _tx: str) -> None:

@@ -441,7 +441,12 @@ def _leg_with_preflight(reverts: bool, *, sends: list):
 
         async def send_raw(self, raw):
             sends.append(bytes(raw))
-            return "0x" + "ab" * 32
+            # keccak OF THE BYTES GIVEN, as a real node does. A canned hash modelled a node
+            # echoing something unrelated to what it broadcast; the leg now refuses that, since
+            # the hash is derivable from the bytes we signed.
+            from eth_utils import keccak
+
+            return "0x" + keccak(bytes(raw)).hex()
 
         async def wait_receipt(self, tx_hash, **_k):
             return _good_receipt()
@@ -484,5 +489,10 @@ class TestAFailureAtTheSubmitIsReportedAsPastTheBoundary:
         turning the taxonomy fix into a refusal would cost the swap."""
         sends: list = []
         leg = _leg_with_preflight(False, sends=sends)
-        assert asyncio.run(leg.claim(_locator(), _P)) == "0x" + "ab" * 32
+        got = asyncio.run(leg.claim(_locator(), _P))
         assert len(sends) == 1, "the signed transaction never reached the node"
+        # DERIVED, not a canned constant. The leg now returns keccak of the bytes it signed rather
+        # than the node's echo, so the expected value has to come from the same place.
+        from eth_utils import keccak
+
+        assert got == "0x" + keccak(sends[0]).hex()
