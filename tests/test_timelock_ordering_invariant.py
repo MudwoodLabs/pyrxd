@@ -93,3 +93,62 @@ def test_the_theft_window_no_longer_exists() -> None:
     assert_timelock_margin(_blk(t_btc), _blk(t_rxd), _policy())
     assert t_btc < t_rxd, "the counter leg must expire FIRST"
     assert t_rxd - t_btc >= MARGIN, "and by at least Δ, so the taker has time after the reveal"
+
+
+class TestTheSizingAnchor:
+    """The anchor inverted with the relation, and the two runners disagreed about it (#482).
+
+    `t_rxd` is committed in the covenant script BEFORE broadcast, and the refund opens at
+    `actual_confirm + t_rxd`. The invariant is `actual_confirm + t_rxd >= counter_deadline +
+    margin`, so:
+
+        confirm LATER than assumed   -> refund opens later  -> MORE margin -> safe
+        confirm EARLIER than assumed -> refund opens sooner -> invariant BREAKS
+
+    The conservative anchor is therefore the EARLIEST plausible confirm — `now`. Reserving a
+    confirm allowance was correct under the OLD relation, where a LATE confirm pushed the refund
+    past the deadline, and is exactly wrong under this one.
+    """
+
+    def test_both_runners_anchor_on_now(self) -> None:
+        """They disagreed: `eth_swap_run` reserved `max_covenant_confirm_wait_s` while
+        `eth_swap_two_host` used `now`. Under the inversion that made one of them unsafe, and
+        nothing reconciled them — so the agreement is pinned rather than left to convention."""
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+        for name in ("eth_swap_run.py", "eth_swap_two_host.py"):
+            src = (root / name).read_text()
+            anchors = re.findall(r"expected_rxd_lock_time_unix_s=([^,\n]+)", src)
+            assert anchors, f"{name} no longer sizes a t_rxd — check this test still has a subject"
+            for anchor in anchors:
+                assert "max_covenant_confirm_wait" not in anchor, (
+                    f"{name} anchors the sizing on a LATE confirm ({anchor.strip()}). Under the "
+                    "inverted relation an early confirm is what breaks the invariant, so the "
+                    "anchor must be the earliest plausible confirm."
+                )
+                assert "time.time()" in anchor, f"{name} anchors on {anchor.strip()!r}, expected now"
+
+    def test_an_earlier_confirm_than_assumed_is_the_unsafe_direction(self) -> None:
+        """The property behind the rule, arithmetic only — no chain, no sizing call.
+
+        Anchoring on `now` makes every actual confirm at-or-after the anchor, so the refund can
+        only open LATER than planned. Anchoring on a late confirm admits actual < assumed, which
+        moves it earlier and eats the margin.
+        """
+        counter_deadline, margin, interval = 10_000, 1_000, 10
+        now = 0
+
+        # Anchored on `now`: t_rxd sized so the refund opens exactly at deadline + margin.
+        t_rxd_now = (counter_deadline + margin - now) // interval
+        for actual_confirm in (0, 50, 500):  # never earlier than the anchor
+            assert actual_confirm + t_rxd_now * interval >= counter_deadline + margin
+
+        # Anchored on a LATE confirm: a fast chain confirms sooner and the invariant fails.
+        assumed_late = 500
+        t_rxd_late = (counter_deadline + margin - assumed_late) // interval
+        assert 0 + t_rxd_late * interval < counter_deadline + margin, (
+            "a confirm earlier than the assumed one must break the invariant — if it does not, "
+            "this test is not exercising the direction it claims"
+        )

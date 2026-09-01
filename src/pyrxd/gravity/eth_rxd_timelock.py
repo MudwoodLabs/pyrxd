@@ -326,16 +326,30 @@ def assert_covenant_confirms_before_eth_deadline(
     if max_covenant_confirm_wait_s < 0:
         raise ValidationError("max_covenant_confirm_wait_s must be >= 0")
 
-    deadline_s = eth_timeout_unix_s - margin.total_s()
-    projected_rxd_open_s = now_unix_s + max_covenant_confirm_wait_s + math.ceil(t_rxd.value * rxd_block_interval_s)
-    if projected_rxd_open_s >= deadline_s:
+    # ASSERT THE INVARIANT ITSELF, not a proxy for it (#482 §5). This checked "does the covenant
+    # confirm by the time the sizing assumed" — the right question under the OLD relation, where
+    # the RXD refund had to open BEFORE the ETH deadline and a LATE confirm pushed it past.
+    #
+    # The relation is inverted now: the refund must open AFTER the deadline plus the margin, so a
+    # late confirm only adds margin (a liveness cost to the maker) and an EARLY one is what eats
+    # it. The floor is therefore taken at the EARLIEST plausible confirm — `now_unix_s`, with no
+    # allowance added — and the check is the property itself:
+    #
+    #     earliest_confirm + t_rxd  >=  eth_timeout + margin
+    #
+    # `max_covenant_confirm_wait_s` is still validated above and still meaningful to the caller as
+    # an operational bound, but it no longer belongs in THIS arithmetic: adding it here would
+    # assume a late confirm, which is the optimistic direction now.
+    required_open_s = eth_timeout_unix_s + margin.total_s()
+    earliest_rxd_open_s = now_unix_s + math.ceil(t_rxd.value * rxd_block_interval_s)
+    if earliest_rxd_open_s < required_open_s:
         raise ValidationError(
-            f"covenant would confirm too late: the RXD CSV clock starts at covenant MINING, and a "
-            f"confirmation at {now_unix_s + max_covenant_confirm_wait_s} is past the time the "
-            f"timelock sizing assumed ({projected_rxd_open_s} >= {deadline_s}), which shifts the "
-            "whole RXD refund window right — refusing to lock RXD (SC-3/TLK-1). This is a "
-            "PUNCTUALITY failure, not a slow-chain one: see this function's docstring before "
-            "changing the block interval in response to it."
+            f"the RXD refund could open too EARLY: the CSV clock starts at covenant MINING, so a "
+            f"confirmation at {now_unix_s} puts the refund at {earliest_rxd_open_s}, before the "
+            f"{required_open_s} this swap requires (eth_timeout {eth_timeout_unix_s} + margin "
+            f"{margin.total_s()}s). The maker LOCKS the Radiant leg, so it must outlast the leg "
+            "the maker CLAIMS — refusing to lock RXD (#482). A LATE confirmation is safe here and "
+            "costs the maker only lock time; an early one is what eats the taker's window."
         )
 
 

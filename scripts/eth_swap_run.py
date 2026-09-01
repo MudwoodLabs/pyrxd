@@ -589,8 +589,23 @@ def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = 
     """
     return eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=int(time.time()) + _eth_budget_s(args, remaining_s),
-        # The CSV clock starts at covenant MINING, not now, so reserve the confirm allowance.
-        expected_rxd_lock_time_unix_s=int(time.time()) + int(args.max_covenant_confirm_wait_s),
+        # The CSV clock starts at covenant MINING, so this anchor is an ASSUMPTION about when
+        # that happens — and the safe end of that assumption INVERTED with the timelock direction
+        # (#482).
+        #
+        # The refund opens at `actual_confirm + t_rxd`, and `t_rxd` is committed in the covenant
+        # script before broadcast. The invariant is now `actual_confirm + t_rxd >= eth_timeout +
+        # margin`, so:
+        #
+        #   confirm LATER than assumed  -> refund opens later  -> MORE margin -> safe (maker waits)
+        #   confirm EARLIER than assumed -> refund opens sooner -> invariant BREAKS
+        #
+        # So the conservative anchor is the EARLIEST plausible confirm, i.e. `now`. Reserving
+        # `max_covenant_confirm_wait_s` here was right under the OLD relation — where the refund had
+        # to open BEFORE the ETH deadline and a late confirm pushed it past — and is exactly wrong
+        # under the corrected one. `eth_swap_two_host.py` already anchors on `now`; the two runners
+        # disagreed, and this is the half that was unsafe.
+        expected_rxd_lock_time_unix_s=int(time.time()),
         margin=_cross_clock_margin(args),
         # The FAST tail. A slow chain only lengthens the maker's lock; a fast one shrinks the
         # taker's claim window, so the fast tail is the direction that has to be safe.

@@ -1970,10 +1970,20 @@ class FakeEthLeg:
         return self.last_locator
 
 
-def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 144, eth_timeout_unix_s: int = 1779710245):
-    # t_btc DERIVES from t_rxd, same as `_terms` — see the note there. For an ETH swap `t_btc` is
-    # only the BTC-shaped placeholder (the real deadline is `eth_timeout_unix_s`), but the
-    # construction guard still applies to it, so it has to respect the inverted relation.
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int | None = None, eth_timeout_unix_s: int = 1779710245):
+    # t_rxd DERIVES from the ETH deadline, the way production sizes it. Under the inverted relation
+    # (#482) the RXD refund must open AFTER `eth_timeout + margin`, so a fixed block count cannot
+    # be right for an arbitrary deadline — a fixture that hardcodes one is asserting against a
+    # deadline it does not span, and every ETH test built on it fails for a reason that has nothing
+    # to do with what it is testing.
+    if t_rxd_blocks is None:
+        # 300.0 is the interval the ETH coordinator fixtures below configure, NOT 600. Deriving
+        # against the wrong one halves the window and every ETH test fails on a margin it was
+        # never testing — which is what happened on the first attempt at this.
+        span_s = max(0, eth_timeout_unix_s - _NOW) + _ETH_TEST_MARGIN_S
+        t_rxd_blocks = math.ceil(span_s / 300.0) + 2  # +2 for the sizer's and the gate's rounding
+    # t_btc is only the BTC-shaped placeholder here (the real deadline is `eth_timeout_unix_s`),
+    # but the construction guard still applies to it, so it respects the inverted relation too.
     return NegotiatedTerms(
         hashlock=hashlock,
         btc_sats=100_000,
@@ -2340,6 +2350,9 @@ def test_reserve_to_blocks_rounds_up_for_seconds():
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 
 _NOW = 1_700_000_000
+# The cross-clock margin the ETH fixtures below build (780 + 1800 + 600 + 300, plus stall budget
+# where a test sets one). Kept beside _NOW because `_eth_terms` sizes t_rxd against it.
+_ETH_TEST_MARGIN_S = 780 + 1_800 + 600 + 300
 
 
 def _xmargin():
