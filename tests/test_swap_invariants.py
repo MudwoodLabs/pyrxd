@@ -165,16 +165,19 @@ def _terms(t_btc_v: int, t_rxd_v: int) -> NegotiatedTerms:
     t_btc=st.integers(min_value=1, max_value=65535),
     t_rxd=st.integers(min_value=1, max_value=65535),
 )
-def test_I5_terms_enforce_t_btc_strictly_greater_same_unit(t_btc, t_rxd):
-    if t_btc > t_rxd:
+def test_I5_terms_enforce_t_rxd_strictly_greater_same_unit(t_btc, t_rxd):
+    # INVERTED BY #482. The maker holds `p`, LOCKS the Radiant leg and CLAIMS the BTC leg, so the
+    # leg it LOCKS must carry the LONGER refund (Herlihy, arXiv:1801.09515 §1). Written the old way
+    # this property test asserted the exploitable ordering across its whole generated domain.
+    if t_rxd > t_btc:
         terms = _terms(t_btc, t_rxd)  # must succeed
-        assert terms.t_btc.value > terms.t_rxd.value
+        assert terms.t_rxd.value > terms.t_btc.value
     else:
-        # t_btc <= t_rxd in the same unit must be rejected (would let the BTC
-        # refund open before/at the Radiant refund — the taker could be griefed).
+        # t_rxd <= t_btc in the same unit must be rejected: the maker's own leg would refund while
+        # it can still claim the counter leg with p, so it could take both.
         try:
             _terms(t_btc, t_rxd)
             raised = False
         except ValidationError:
             raised = True
-        assert raised, f"terms accepted unsafe ordering t_btc={t_btc} <= t_rxd={t_rxd}"
+        assert raised, f"terms accepted unsafe ordering t_rxd={t_rxd} <= t_btc={t_btc}"

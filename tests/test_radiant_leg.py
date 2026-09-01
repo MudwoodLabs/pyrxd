@@ -54,7 +54,11 @@ def _rxd_terms(amount: int = 100_000, csv: int = 6) -> NegotiatedTerms:
         hashlock=_H,
         btc_sats=100_000,
         radiant_amount=amount,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        # t_btc DERIVES from the covenant's own CSV. Under the inverted relation (#482) the
+        # Radiant leg the maker LOCKS must outlast the leg it CLAIMS, and `csv` IS that
+        # Radiant timelock — so a fixed 72 is unconstructible the moment csv drops below it,
+        # which is the default here (6).
+        t_btc=t.Timelock(max(1, csv // 2), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(csv, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",
@@ -79,7 +83,11 @@ def _ft_terms(amount: int = 1000, csv: int = 6) -> NegotiatedTerms:
         hashlock=_H,
         btc_sats=100_000,
         radiant_amount=amount,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        # t_btc DERIVES from the covenant's own CSV. Under the inverted relation (#482) the
+        # Radiant leg the maker LOCKS must outlast the leg it CLAIMS, and `csv` IS that
+        # Radiant timelock — so a fixed 72 is unconstructible the moment csv drops below it,
+        # which is the default here (6).
+        t_btc=t.Timelock(max(1, csv // 2), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(csv, t.TimeUnit.BLOCKS),
         asset_variant="ft",
         genesis_ref=GlyphRef(txid=_REF_TXID, vout=0).to_bytes(),
@@ -600,7 +608,7 @@ async def test_nft_variant_builds_and_binds():
         hashlock=_H,
         btc_sats=100_000,
         radiant_amount=1000,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_btc=t.Timelock(3, t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(6, t.TimeUnit.BLOCKS),
         asset_variant="nft",
         genesis_ref=GlyphRef(txid=_REF_TXID, vout=0).to_bytes(),
@@ -1194,7 +1202,11 @@ def _nft_terms(carrier: int = 1000, csv: int = 6) -> NegotiatedTerms:
         hashlock=_H,
         btc_sats=100_000,
         radiant_amount=carrier,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        # t_btc DERIVES from the covenant's own CSV. Under the inverted relation (#482) the
+        # Radiant leg the maker LOCKS must outlast the leg it CLAIMS, and `csv` IS that
+        # Radiant timelock — so a fixed 72 is unconstructible the moment csv drops below it,
+        # which is the default here (6).
+        t_btc=t.Timelock(max(1, csv // 2), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(csv, t.TimeUnit.BLOCKS),
         asset_variant="nft",
         genesis_ref=GlyphRef(txid=_REF_TXID, vout=0).to_bytes(),

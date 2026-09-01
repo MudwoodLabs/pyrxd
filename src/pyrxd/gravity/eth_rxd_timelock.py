@@ -11,7 +11,7 @@ only starts counting once the covenant is MINED. This module bridges the two:
   (floor) rounding + a fail-closed safety floor, so the canonical HTLC ordering invariant
   holds across the unit + anchor boundary: the asset/RXD leg (claimed SECOND, by the taker)
   opens its refund strictly BEFORE the counter/ETH leg's deadline by at least the margin —
-  i.e. the counter/ETH leg, claimed FIRST by the maker, holds the LONGER deadline (the
+  i.e. the counter/ETH leg, claimed FIRST by the maker, holds the SHORTER deadline (the
   cross-clock analog of the BTC ``t_BTC > t_RXD`` invariant). The inherent risk this ordering
   creates (a maker withholding its claim until past the RXD refund, then claiming AND
   refunding) is mitigated by the proactive asset-refund + the cross-clock margin coupling, not
@@ -59,6 +59,7 @@ from pyrxd.security.errors import ValidationError
 __all__ = [
     "CrossClockMargin",
     "assert_covenant_confirms_before_eth_deadline",
+    "assert_eth_deadline_is_claimable",
     "assert_t_rxd_fits_the_eth_deadline",
     "eth_absolute_to_rxd_relative_blocks",
 ]
@@ -77,7 +78,7 @@ class CrossClockMargin:
     Each component is a deliberate, documented seconds budget; the converter subtracts
     their sum from the ETH deadline before sizing the RXD window, so the RXD refund opens
     strictly BEFORE the ETH deadline by at least this much wall-clock (the RXD/asset leg,
-    claimed second, holds the SHORTER deadline; the ETH/counter leg the longer).
+    LOCKED by the maker, holds the LONGER deadline; the ETH/counter leg the shorter).
 
     ``eth_reorg_finality_s`` is the post-Merge ETH finalized-checkpoint lag in the STEADY
     STATE (~2 epochs ≈ 768 s ≈ 12.8 min — formally specified, ethereum.org/eth2book).
@@ -144,12 +145,18 @@ def eth_absolute_to_rxd_relative_blocks(
     """Size the RXD covenant's RELATIVE CSV window (in BLOCKS) from the ETH ABSOLUTE deadline.
 
     The RXD refund — relative, anchored at covenant mining ≈ ``expected_rxd_lock_time_unix_s``
-    — must open strictly BEFORE the ETH deadline minus the full margin (the RXD/asset leg
-    holds the SHORTER deadline; the ETH/counter leg the longer). The window is sized as large
-    as that allows (rxd-refund pushed up to, but not past, ``eth_timeout - margin``, maximising
-    the taker's claim window). So the available wall-clock budget for the RXD window is::
+    — must open strictly AFTER the ETH deadline plus the full margin (the RXD/asset leg is the
+    one the MAKER LOCKED, so it holds the LONGER deadline; the ETH/counter leg the shorter).
+    INVERTED 2026-08-31, #482: this subtracted the margin, putting the RXD refund BEFORE the ETH
+    deadline and handing the maker a window in which to refund the covenant while ``p`` was still
+    secret and then claim the counter leg. See :func:`assert_timelock_margin` for the rule and the
+    Herlihy citation.
 
-        budget_s = eth_timeout_unix_s - margin.total_s() - expected_rxd_lock_time_unix_s
+    The margin's components were always the right budget for THIS direction — every one is time
+    the TAKER needs after the reveal (ETH finality, stall tolerance, claim burial, confirm slack,
+    rounding), and the maker may reveal as late as ``eth_timeout``. Only the sign was wrong::
+
+        budget_s = eth_timeout_unix_s + margin.total_s() - expected_rxd_lock_time_unix_s
 
     converted to blocks by FLOOR. Flooring can only SHORTEN the RXD window, which lets the
     maker reclaim the asset no later than computed (never longer); the sub-block remainder
@@ -182,7 +189,7 @@ def eth_absolute_to_rxd_relative_blocks(
             "on mainnet, e.g. p10 — NOT the mean; see docstring)"
         )
 
-    budget_s = eth_timeout_unix_s - margin.total_s() - expected_rxd_lock_time_unix_s
+    budget_s = eth_timeout_unix_s + margin.total_s() - expected_rxd_lock_time_unix_s
     if budget_s <= 0:
         raise ValidationError(
             f"no RXD timelock budget: eth_timeout - margin - rxd_lock_time = {budget_s}s "
@@ -200,9 +207,11 @@ def eth_absolute_to_rxd_relative_blocks(
     # a zero confirm wait, which never lands on the boundary. The real run's parameters do:
     # (86400 - 7068 - 600) / 36 = 2187.0 exactly, so the canonical derivation produced 2187 and the
     # gate accepted only 2186. Deriving one block SHORT is the safe direction anyway: it opens the
-    # maker's refund marginally earlier, costing the taker a block of claim window rather than
-    # letting the refund land past the deadline it is sized to precede.
-    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s) - 1
+    # maker's refund marginally LATER, costing the maker a block of lock time rather than letting
+    # the refund open before the deadline it is sized to outlast (#482 inverted this: the gate is
+    # now a LOWER bound on t_rxd, so `ceil` with no -1 is the smallest accepted value, where it was
+    # `ceil - 1` for the largest accepted one).
+    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s)
     # ...and then ASK THE GATE, rather than trusting that arithmetic to match it.
     #
     # `ceil(x) - 1` is algebraically the largest `t` with `t * I < budget`, and it is exact for an
@@ -232,6 +241,13 @@ def eth_absolute_to_rxd_relative_blocks(
             f"{_MAX_RXD_CSV_BLOCKS} (ETH deadline too far in the future to map to a "
             "relative CSV window)"
         )
+    # START ONE BELOW THE ANALYTIC VALUE, then step up. `ceil` is the exact minimum only in exact
+    # arithmetic; at fractional intervals the float division can round the quotient UP across an
+    # integer boundary, and starting AT it would then return a window one block longer than the
+    # gate actually requires, with no step able to find the shorter one (the search only goes up).
+    # This is the mirror of the pre-#482 note about `ceil(x) - 1` legitimately being one block low.
+    # The gate remains the authority: whatever this returns has been accepted by it.
+    t_rxd_blocks = max(floor_blocks, t_rxd_blocks - 1)
     for _ in range(_SIZER_GATE_STEPS):
         try:
             assert_covenant_confirms_before_eth_deadline(
@@ -246,21 +262,27 @@ def eth_absolute_to_rxd_relative_blocks(
             )
             break
         except ValidationError:
-            t_rxd_blocks -= 1
+            # UP, not down (#482). The gate bounds t_rxd from BELOW now, so a refusal means the
+            # window is too SHORT. Stepping down was the old direction and moves away from
+            # acceptance — the loop then always exhausts and reports the sizer and gate as
+            # disagreeing, which is how this was found.
+            t_rxd_blocks += 1
     else:  # pragma: no cover — the analytic value is never more than one block out
         raise ValidationError(
             f"could not size a t_rxd the punctuality gate accepts within {_SIZER_GATE_STEPS} "
-            f"blocks of {math.ceil(budget_s / rxd_block_interval_s) - 1} (budget {budget_s}s at "
+            f"blocks of {math.ceil(budget_s / rxd_block_interval_s)} (budget {budget_s}s at "
             f"{rxd_block_interval_s}s/block). The sizer and the gate disagree by more than a "
             "rounding step, which means one of them has changed meaning."
         )
-    # The step-down can cross the safety floor by one, so re-check it. Not the cap: stepping down
-    # only ever decreases, and a value that was under the cap stays under it.
-    if t_rxd_blocks < floor_blocks:
+    # The step-UP can cross the BIP68 cap by one, so re-check THAT. Not the floor: stepping up only
+    # ever increases, and a value already at or above the floor stays there. This pairing flipped
+    # with the search direction (#482) — re-checking the floor after an upward search is a check
+    # that can no longer fail, and would have left the cap unguarded.
+    if t_rxd_blocks > _MAX_RXD_CSV_BLOCKS:
         raise ValidationError(
-            f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} after the "
-            f"punctuality gate required one block less than the {budget_s}s budget allows at "
-            f"{rxd_block_interval_s}s/block"
+            f"RXD timelock {t_rxd_blocks} blocks exceeds the BIP68 16-bit cap {_MAX_RXD_CSV_BLOCKS} "
+            f"after the punctuality gate required one block more than the {budget_s}s budget allows "
+            f"at {rxd_block_interval_s}s/block"
         )
     return Timelock(t_rxd_blocks, TimeUnit.BLOCKS)
 
@@ -273,6 +295,7 @@ def assert_covenant_confirms_before_eth_deadline(
     t_rxd: Timelock,
     rxd_block_interval_s: float,
     max_covenant_confirm_wait_s: int,
+    elapsed_blocks: int = 0,
 ) -> None:
     """Covenant-punctuality gate (re-audit SC-3/TLK-1).
 
@@ -320,16 +343,85 @@ def assert_covenant_confirms_before_eth_deadline(
     if max_covenant_confirm_wait_s < 0:
         raise ValidationError("max_covenant_confirm_wait_s must be >= 0")
 
-    deadline_s = eth_timeout_unix_s - margin.total_s()
-    projected_rxd_open_s = now_unix_s + max_covenant_confirm_wait_s + math.ceil(t_rxd.value * rxd_block_interval_s)
-    if projected_rxd_open_s >= deadline_s:
+    # ASSERT THE INVARIANT ITSELF, not a proxy for it (#482 §5). This checked "does the covenant
+    # confirm by the time the sizing assumed" — the right question under the OLD relation, where
+    # the RXD refund had to open BEFORE the ETH deadline and a LATE confirm pushed it past.
+    #
+    # The relation is inverted now: the refund must open AFTER the deadline plus the margin, so a
+    # late confirm only adds margin (a liveness cost to the maker) and an EARLY one is what eats
+    # it. The floor is therefore taken at the EARLIEST plausible confirm — `now_unix_s`, with no
+    # allowance added — and the check is the property itself:
+    #
+    #     earliest_confirm + t_rxd  >=  eth_timeout + margin
+    #
+    # `max_covenant_confirm_wait_s` is still validated above and still meaningful to the caller as
+    # an operational bound, but it no longer belongs in THIS arithmetic: adding it here would
+    # assume a late confirm, which is the optimistic direction now.
+    # ELAPSED DEPTH IS SUBTRACTED (#482, the #531 class applied to this gate). `t_rxd` is a
+    # RELATIVE CSV counted from the covenant's MINING, so once the covenant has confirmations the
+    # refund opens that much sooner. Anchoring at `now` with the undecremented `t_rxd` overstates
+    # the window by exactly `elapsed_blocks * interval` — and the MAKER chooses that number, by
+    # locking its covenant early and presenting the swap late. Under the old relation an overstated
+    # window was the safe direction, which is why this went unnoticed; inverted, it is precisely
+    # the direction that lets a maker refund RXD while still holding `p` to claim the ETH leg.
+    _require_int(elapsed_blocks, "elapsed_blocks")
+    if elapsed_blocks < 0:
+        raise ValidationError("elapsed_blocks cannot be negative")
+    remaining_blocks = t_rxd.value - elapsed_blocks
+    required_open_s = eth_timeout_unix_s + margin.total_s()
+    earliest_rxd_open_s = now_unix_s + math.ceil(remaining_blocks * rxd_block_interval_s)
+    if earliest_rxd_open_s < required_open_s:
         raise ValidationError(
-            f"covenant would confirm too late: the RXD CSV clock starts at covenant MINING, and a "
-            f"confirmation at {now_unix_s + max_covenant_confirm_wait_s} is past the time the "
-            f"timelock sizing assumed ({projected_rxd_open_s} >= {deadline_s}), which shifts the "
-            "whole RXD refund window right — refusing to lock RXD (SC-3/TLK-1). This is a "
-            "PUNCTUALITY failure, not a slow-chain one: see this function's docstring before "
-            "changing the block interval in response to it."
+            f"the RXD refund could open too EARLY: the CSV clock starts at covenant MINING, so a "
+            f"confirmation at {now_unix_s} puts the refund at {earliest_rxd_open_s} ({remaining_blocks} blk left of {t_rxd.value}), before the "
+            f"{required_open_s} this swap requires (eth_timeout {eth_timeout_unix_s} + margin "
+            f"{margin.total_s()}s). The maker LOCKS the Radiant leg, so it must outlast the leg "
+            "the maker CLAIMS — refusing to lock RXD (#482). A LATE confirmation is safe here and "
+            "costs the maker only lock time; an early one is what eats the taker's window."
+        )
+
+
+def assert_eth_deadline_is_claimable(
+    *,
+    now_unix_s: int,
+    eth_timeout_unix_s: int,
+    margin: CrossClockMargin,
+) -> None:
+    """Refuse an ETH deadline that has already passed, or is too near for the swap to complete.
+
+    THIS EXISTS BECAUSE #482's INVERSION SILENTLY DROPPED IT. Under the old (wrong) relation the
+    gate demanded the projected RXD refund land BEFORE ``eth_timeout``, so an expired or near-expiry
+    deadline failed automatically — the refusal was a side effect of the arithmetic, and the two
+    tests covering it were the only thing recording that the requirement existed. Inverting the
+    relation turned a close deadline into the EASY case (the RXD refund clears it trivially), so
+    both tests went green-by-vacuity and the protection disappeared with nothing to show for it.
+    A requirement that only ever held as a side effect is one refactor away from gone.
+
+    THE REQUIREMENT ITSELF IS INDEPENDENT of the ordering invariant, which is why it needs its own
+    check. Ordering asks "if both parties act, can either be robbed?". This asks "can the party who
+    must act still act at all?". The maker claims the ETH leg, and will not do so until the taker's
+    funding is final — so the deadline must leave room for that finality plus a stall, or the taker
+    is funding a leg the maker provably cannot claim. Both parties then refund, which loses no
+    principal but burns fees, locks the taker's capital for the full ``t_rxd``, and hands the maker
+    a free option: it can watch the price and simply decline to reveal.
+
+    Fail-closed on a deadline in the past — that case is not a tight window, it is a dead swap.
+    """
+    _require_int(now_unix_s, "now_unix_s")
+    _require_int(eth_timeout_unix_s, "eth_timeout_unix_s")
+
+    # The maker acts only on FINAL funding, so that is the floor: finality, plus the stall budget
+    # the policy already carries for it, plus the rounding/skew allowance.
+    claim_reachable_s = margin.eth_reorg_finality_s + margin.eth_finality_stall_tolerance_s + margin.rounding_slack_s
+    remaining_s = eth_timeout_unix_s - now_unix_s
+    if remaining_s < claim_reachable_s:
+        expired = " (ALREADY EXPIRED)" if remaining_s < 0 else ""
+        raise ValidationError(
+            f"the ETH deadline leaves too little time to claim{expired}: eth_timeout is {remaining_s}s away "
+            f"but the maker cannot act until the counter leg is final, which needs {claim_reachable_s}s "
+            f"(finality {margin.eth_reorg_finality_s}s + stall {margin.eth_finality_stall_tolerance_s}s + "
+            f"rounding {margin.rounding_slack_s}s). Funding this would confirm too late to be claimed — "
+            "both legs would refund, and until then the maker holds a free option (#482)."
         )
 
 

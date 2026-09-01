@@ -143,7 +143,9 @@ class TestLoadingBackIsFailClosed:
 
         return SwapRecord(
             state=SwapState.NEGOTIATED,
-            terms=_eth_terms(hashlock=b"\x33" * 32, eth_timeout_unix_s=1_800_000_000),
+            # 1_800_000_000 was ~3 years past the shared fixture clock; `_eth_terms` now SIZES t_rxd
+            # from the deadline (#482), so that asks for ~333k blocks and trips the BIP68 16-bit cap.
+            terms=_eth_terms(hashlock=b"\x33" * 32, eth_timeout_unix_s=1_700_040_000),
             pending_counter_contract="0x" + "ab" * 20,
             pending_counter_deploy_tx="0x" + "cd" * 32,
             pending_push_nonce=41,

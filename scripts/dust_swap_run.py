@@ -129,7 +129,10 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     h = hashlib.sha256(p).digest()
     margin_blocks = policy.margin.normalize_to(bt.TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    t_btc = bt.Timelock(args.t_rxd_blocks + margin_blocks + 4, bt.TimeUnit.BLOCKS)  # > t_rxd + margin
+    # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd carries the LONGER
+    # timeout and the BTC leg it CLAIMS is the shorter one. This built t_rxd + margin + 4 — the
+    # layout where the maker can refund RXD and still claim BTC with p.
+    t_btc = bt.Timelock(args.t_rxd_blocks - margin_blocks - 4, bt.TimeUnit.BLOCKS)  # < t_rxd - margin
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
     taker_btc_kp = generate_keypair(btc_network)

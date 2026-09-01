@@ -32,7 +32,11 @@ def _xonly() -> bytes:
     return coincurve.PublicKeyXOnly.from_secret(os.urandom(32)).format()
 
 
-def _btc_terms(*, t_btc_blocks: int = 144, t_rxd_blocks: int = 72) -> NegotiatedTerms:
+# t_rxd KEEPS its 72 and t_btc drops to 36 (#482). Inverting the usual 72/144 pair the other
+# way would have moved REFUND_OPENS from 172 to 244 and invalidated every height constant in
+# this file — dozens of `now=` literals chosen relative to it. Shrinking t_btc satisfies the
+# inverted ordering while leaving the heights, which are what these tests are about, alone.
+def _btc_terms(*, t_btc_blocks: int = 36, t_rxd_blocks: int = 72) -> NegotiatedTerms:
     p = os.urandom(32)
     return NegotiatedTerms(
         hashlock=hashlib.sha256(p).digest(),
@@ -55,7 +59,9 @@ def _eth_terms() -> NegotiatedTerms:
         hashlock=hashlib.sha256(p).digest(),
         btc_sats=100_000,
         radiant_amount=1_000,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        # Same reasoning as `_btc_terms` above: t_rxd stays 72 so REFUND_OPENS stays 172, and
+        # t_btc drops to 36 to satisfy the inverted ordering (#482).
+        t_btc=t.Timelock(36, t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
         asset_variant="ft",
         genesis_ref=b"\xaa" * 36,

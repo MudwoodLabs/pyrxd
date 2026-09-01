@@ -851,8 +851,9 @@ def run_self_check() -> None:
     terms, cov = _terms_from_public(
         hashlock=h,
         btc_sats=100_000,
-        t_rxd_blocks=20,
-        t_btc_blocks=60,  # t_btc - t_rxd = 40 >= margin 36
+        # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd is the LONGER.
+        t_rxd_blocks=60,
+        t_btc_blocks=20,  # t_rxd - t_btc = 40 >= margin 36
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,
@@ -909,12 +910,14 @@ def run_self_check() -> None:
     assert_timelock_margin(terms2.t_btc, terms2.t_rxd, policy)
     print("  [ok] taker's INDEPENDENT timelock-margin check passes for honest terms")
 
-    # ...and REFUSES a hostile too-tight envelope (t_btc - t_rxd < margin).
+    # ...and REFUSES a hostile too-tight envelope (t_rxd - t_btc < margin).
+    # The pair inverted with #482: t_rxd=50/t_btc=60 no longer constructs at all, so this check
+    # would have passed on the ordering guard's exception rather than the margin check's.
     hostile, _ = _terms_from_public(
         hashlock=h,
         btc_sats=100_000,
-        t_rxd_blocks=50,
-        t_btc_blocks=60,  # gap 10 < margin 36
+        t_rxd_blocks=60,
+        t_btc_blocks=50,  # gap 10 < margin 36
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,
@@ -924,7 +927,7 @@ def run_self_check() -> None:
         assert_timelock_margin(hostile.t_btc, hostile.t_rxd, policy)
         raise AssertionError("FAIL: the margin check did not reject a too-tight hostile envelope")
     except ValidationError:
-        print("  [ok] taker REFUSES a hostile too-tight envelope (t_btc - t_rxd < margin)")
+        print("  [ok] taker REFUSES a hostile too-tight envelope (t_rxd - t_btc < margin)")
 
     # --- MAKER side: the expected HTLC SPK is deterministically re-derivable from public terms. ---
     htlc = bt.build_htlc(

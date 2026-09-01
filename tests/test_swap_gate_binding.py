@@ -413,9 +413,10 @@ async def test_claim_from_vulnerable_refuses_a_same_H_claim_tx_from_another_swap
     coord = await _to_both_locked(terms=terms, btc_leg=btc, radiant_leg=rxd, role=SwapRole.TAKER)
     ours = _real_maker_claim_tx(coord.record.btc_locator, secret.unsafe_raw_bytes())
     await coord.taker_observed_reveal(ours)
-    # Squeeze the window so the gate routes to ASSET_VULNERABLE (t_rxd=72, burial 6).
+    # Squeeze the window so the gate routes to ASSET_VULNERABLE (t_rxd=144 since #482, burial 6),
+    # so the height that squeezes moves with it — 1_070 leaves 74 blocks and is nowhere near.
     btc.claim_confs = 0
-    await coord.taker_scrape_and_claim_asset(ours, now_rxd_height=1_070, asset_locked_at_height=1_000)
+    await coord.taker_scrape_and_claim_asset(ours, now_rxd_height=1_142, asset_locked_at_height=1_000)
     assert coord.record.state is SwapState.ASSET_VULNERABLE
 
     foreign = _foreign_same_h_claim_tx(terms, secret.unsafe_raw_bytes())
@@ -490,7 +491,7 @@ async def test_measured_eth_policy_pins_the_lock_time_reverify_to_finalized():
     longer pays it.
     """
     secret, h = generate_secret()
-    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40_000)
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40_000, now_unix_s=_NOW)
     leg = FakeEthLeg(preimage=secret, verdict=_final())
     rxd = FakeRadiantLeg()
     coord = SwapCoordinator(
@@ -524,8 +525,8 @@ def _btc_terms_kwargs() -> dict:
         hashlock=hashlib.sha256(os.urandom(32)).digest(),
         btc_sats=100_000,
         radiant_amount=1_000,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
-        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        t_btc=t.Timelock(72, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(144, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",
         taker_dest_hash=b"\x11" * 32,

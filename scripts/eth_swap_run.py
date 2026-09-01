@@ -203,7 +203,7 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
     # typed. That is deliberate: they are the check on the derivation, not a substitute for it, and
     # a derivation nothing verifies is how the exact-division off-by-one survived in the first place.
     _assert_t_rxd_covers_the_takers_wait(args, remaining_s=remaining_s)
-    _assert_t_rxd_opens_before_the_eth_deadline(args, remaining_s=remaining_s)
+    _assert_t_rxd_outlasts_the_eth_deadline(args, remaining_s=remaining_s)
     _assert_t_rxd_bounds_the_vulnerable_window(args, remaining_s=remaining_s)
     return MarginPolicy(
         is_measured=True,
@@ -238,8 +238,28 @@ def _t_rxd_covers_the_takers_wait(args: argparse.Namespace) -> bool:
     return int(args.t_rxd_blocks) >= math.ceil(_cross_clock_margin(args).total_s() / fast)
 
 
-def _highest_t_rxd_the_deadline_accepts(args: argparse.Namespace, remaining_s: int | None) -> int:
-    """Upper bound B as a VALUE — the largest t_rxd whose projected refund precedes the deadline."""
+def _lowest_t_rxd_the_deadline_requires(args: argparse.Namespace, remaining_s: int | None) -> int:
+    """Bound B as a VALUE — the SMALLEST t_rxd whose projected refund OUTLASTS the deadline.
+
+    THIS BOUND CHANGED SIDES WITH #482, and that changes the shape of the whole feasible set.
+
+    It was an upper bound: the RXD refund had to open BEFORE the ETH deadline, so a longer window
+    was the thing to guard against, and the set was an interval squeezed between floors below and
+    this cap above. That squeeze is what produced the "the deadline must hold roughly TWO margins"
+    reasoning, the empty-set-at-a-fractional-tail bug, and the run that burned two funded covenants
+    being sent from one error into another.
+
+    Under the corrected relation the maker LOCKS the Radiant leg, so its refund must open AFTER the
+    deadline plus the margin. A LONGER t_rxd is then monotonically safer, and the deadline imposes
+    a FLOOR. Every bound in this file is now a floor and the only ceiling left is BIP68 — so the
+    feasible set is `[max(floors), 65535]` and cannot be empty by rounding disagreement between two
+    bounds that were algebraically equal. The class of bug that squeeze produced is gone, not
+    fixed.
+
+    The remedy for infeasibility inverts too: the floor RISES with the deadline, so a deadline too
+    FAR in the future is what no 16-bit CSV can cover. Asking for more time used to be the fix; it
+    is now the cause.
+    """
     # THE SAME INTERVAL THE GATE MULTIPLIES BY. It used the nominal, matching a coordinator call
     # site that was itself passing the wrong one; the two agreed with each other and disagreed with
     # the sizer. With the gate corrected to the fast tail this bound divides by the fast tail too,
@@ -250,15 +270,14 @@ def _highest_t_rxd_the_deadline_accepts(args: argparse.Namespace, remaining_s: i
     # straight out of the budget. Sizing against `now` silently assumes instant funding: a run that
     # took ~740s to fund and mine overshot by 607s and was refused AFTER the covenant was paid for.
     # `max_covenant_confirm_wait_s` is precisely the allowance for that delay, so spend it here.
-    budget_s = (
-        _eth_budget_s(args, remaining_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
-    )
-    # The gate refuses at `projected >= deadline`, so the largest ACCEPTED value is one short of
-    # the quotient when it divides exactly. Verified by binary-searching the real gate: for a 24h
-    # timeout it accepts 2186 and refuses 2187, while a bare floor() computes 2187. An upper bound
-    # that names a value the gate then rejects sends the operator to fix an error into an error —
-    # which is exactly how this run burned two funded covenants.
-    return math.ceil(budget_s / nominal) - 1
+    # NO confirm-wait reserve. It was subtracted here to model a LATE covenant confirmation pushing
+    # the refund past a deadline it had to precede. The refund must now OUTLAST the deadline, so a
+    # late confirm only adds margin and spending the wait here would assume the optimistic
+    # direction — the same term #482 removed from the library gate for the same reason.
+    budget_s = _eth_budget_s(args, remaining_s) + _cross_clock_margin(args).total_s()
+    # The gate accepts at `projected >= required`, so equality is ACCEPTED and the smallest such
+    # value is the plain ceiling — no `- 1`, which belonged to a strict `<` on the other side.
+    return math.ceil(budget_s / nominal)
 
 
 def _asset_vulnerable_window_s(args: argparse.Namespace, remaining_s: int | None) -> float:
@@ -319,11 +338,16 @@ def _t_rxd_feasible_range(args: argparse.Namespace, *, remaining_s: int | None =
     None when that set is empty. Computed from the same predicates the three `_assert_` functions
     call, so "the guard passed but a bound then refused" is not representable.
     """
-    hi = min(_highest_t_rxd_the_deadline_accepts(args, remaining_s), _T_RXD_BIP68_MAX_BLOCKS)
-    if hi < 1:
+    # ALL FLOORS, ONE CEILING (#482). Bound B moved from the `hi` side to the `lo` side, so the
+    # only ceiling left is the BIP68 field width.
+    hi = _T_RXD_BIP68_MAX_BLOCKS
+    floors = [_lowest_t_rxd_the_deadline_requires(args, remaining_s)]
+    from_predicates = _lowest_t_rxd_meeting_the_floors(args, remaining_s)
+    if from_predicates is None:
         return None
-    lo = _lowest_t_rxd_meeting_the_floors(args, remaining_s)
-    if lo is None or lo > hi:
+    floors.append(from_predicates)
+    lo = max(1, *floors)
+    if lo > hi:
         return None
     return (lo, hi)
 
@@ -379,40 +403,49 @@ def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | No
     return hi
 
 
-def _first_conceivable_eth_timeout_s(args: argparse.Namespace) -> int:
-    """The smallest `--eth-timeout-s` that bounds A and B alone could ever both accept.
+def _largest_workable_eth_timeout_s(args: argparse.Namespace) -> int | None:
+    """The largest `--eth-timeout-s` at or below the requested one that actually yields a t_rxd.
 
-    Exact, and derived rather than fudged. Bound A floors t_rxd at `ceil(margin/fast)`; bound B
-    caps it at `ceil((budget - margin - wait)/fast) - 1`. The cap reaches the floor only once
-    `budget - margin - wait > fast * ceil(margin/fast)`. Used ONLY as the starting point of the
-    search below — it is a necessary condition, never a sufficient one, and the loop is what makes
-    the printed number true.
+    THE SEARCH REVERSED WITH THE RELATION (#482), and so did the advice it produces.
+
+    Bound B used to CAP t_rxd, so a deadline too SHORT emptied the feasible set and the remedy was
+    to ask for more time — `_smallest_workable_eth_timeout_s`, searching upward from the requested
+    value. Bound B is a floor now: `t_rxd >= ceil((budget + margin) / fast)` rises with the
+    deadline, and the only ceiling left is the BIP68 field width. A short deadline is therefore
+    always satisfiable, and what cannot be satisfied is a deadline too FAR — no 16-bit relative CSV
+    reaches it.
+
+    Searching upward would have walked further from feasibility on every step and returned None,
+    turning a fixable situation into "the margin itself is the thing to change". Worse, had it ever
+    found something it would have advised an operator to LENGTHEN the deadline that was already too
+    long.
+
+    CHECKED, not computed, exactly as before: every candidate goes back through
+    `_a_workable_t_rxd_exists`, the same predicate the refusal uses, so the number printed cannot be
+    one the next parse turns around and rejects.
     """
-    margin_s = _cross_clock_margin(args).total_s()
-    wait_s = int(args.max_covenant_confirm_wait_s)
+    # START FROM THE ANALYTIC MAXIMUM, then step down to VERIFY it. A one-second walk down from the
+    # requested value cannot converge: the deadline is typically hundreds of thousands of seconds
+    # past the reach, and the step budget is a handful. The old upward search could start at the
+    # requested value because the feasible region began just above it; the infeasible region is now
+    # unbounded above, so the search has to begin at the boundary rather than walk to it.
+    #
+    # The boundary is exact: bound B needs `ceil((budget + margin) / fast) <= BIP68_MAX`, so
+    # `budget <= BIP68_MAX * fast - margin`. Derived, then fed back through the same predicate the
+    # refusal uses — the step-down loop is what makes the printed number true, as before.
     fast = float(args.rxd_block_interval_fast_s or 0)
     if fast <= 0:
-        return margin_s + wait_s + 1
-    return math.floor(margin_s + wait_s + fast * math.ceil(margin_s / fast)) + 1
-
-
-def _smallest_workable_eth_timeout_s(args: argparse.Namespace) -> int | None:
-    """The smallest `--eth-timeout-s` at or above the requested one that actually yields a t_rxd.
-
-    CHECKED, not computed. Every candidate is fed back through `_a_workable_t_rxd_exists` — the
-    same test the refusal uses — so the number printed in the message cannot be one the next parse
-    turns around and rejects. Measured over 4000 refused fractional rows, the search never ran past
-    its step budget. The previous version printed `2*margin + wait + ceil(fast)`, a
-    closed form that models the bounds instead of asking them, and at a fractional fast tail it
-    both cleared deadlines with an empty feasible set and could name a minimum nothing verified.
-    """
-    candidate = max(_first_conceivable_eth_timeout_s(args), int(args.eth_timeout_s) + 1)
+        return None
+    analytic = int(_T_RXD_BIP68_MAX_BLOCKS * fast) - _cross_clock_margin(args).total_s()
+    candidate = min(int(args.eth_timeout_s) - 1, analytic)
     for _ in range(_MINIMUM_SEARCH_STEPS):
+        if candidate < 1:
+            return None
         probe = argparse.Namespace(**vars(args))
         probe.eth_timeout_s = candidate
         if _a_workable_t_rxd_exists(probe):
             return candidate
-        candidate += 1
+        candidate -= 1
     return None
 
 
@@ -451,19 +484,22 @@ def _assert_the_eth_deadline_can_hold_the_margins(args: argparse.Namespace, *, r
     wait_s = int(args.max_covenant_confirm_wait_s)
     budget_s = _eth_budget_s(args, remaining_s)
     floor_t = _lowest_t_rxd_meeting_the_floors(args, remaining_s)
-    cap_t = _highest_t_rxd_the_deadline_accepts(args, remaining_s)
+    deadline_floor_t = _lowest_t_rxd_the_deadline_requires(args, remaining_s)
     resumed = "" if remaining_s is None else " remaining on the resumed swap's deadline"
     where = (
-        f"the floors put it at >= {floor_t} and the deadline caps it at <= {cap_t}"
+        f"the floors put it at >= {max(floor_t, deadline_floor_t)} (the deadline alone needs "
+        f">= {deadline_floor_t}), past the BIP68 cap of {_T_RXD_BIP68_MAX_BLOCKS}"
         if floor_t is not None
-        else f"no value up to the BIP68 cap of {_T_RXD_BIP68_MAX_BLOCKS} meets the floors, which cap at <= {cap_t}"
+        else f"no value up to the BIP68 cap of {_T_RXD_BIP68_MAX_BLOCKS} meets the floors; the "
+        f"deadline alone needs >= {deadline_floor_t}"
     )
     if remaining_s is None:
-        minimum = _smallest_workable_eth_timeout_s(args)
+        maximum = _largest_workable_eth_timeout_s(args)
         remedy = (
-            f"  minimum: --eth-timeout-s {minimum} ({minimum / 3600:.2f} h) — verified, not "
-            f"estimated: it is fed back through this same feasibility test.\n"
-            if minimum is not None
+            f"  maximum: --eth-timeout-s {maximum} ({maximum / 3600:.2f} h) — verified, not "
+            f"estimated: it is fed back through this same feasibility test. NOTE the direction: "
+            f"the deadline is too FAR for a 16-bit CSV to reach, so it must come DOWN (#482).\n"
+            if maximum is not None
             else "  no nearby --eth-timeout-s clears it; the margin itself is the thing to change.\n"
         )
     else:
@@ -532,41 +568,43 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_
     )
 
 
-def _assert_t_rxd_opens_before_the_eth_deadline(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
-    """The RXD refund must OPEN before the ETH deadline minus the margin — the upper bound.
+def _assert_t_rxd_outlasts_the_eth_deadline(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
+    """The RXD refund must OPEN AFTER the ETH deadline plus the margin — a FLOOR since #482.
 
-    Learned the expensive way. The lower bound above divides the margin by the FAST tail, because
-    fast blocks shrink the taker's window. The coordinator's punctuality gate then projects the
-    same t_rxd forward by MULTIPLYING by the NOMINAL interval. Those two only cancel when both use
-    the same interval — `assert_covenant_confirms_before_eth_deadline` says so in as many words —
-    and sizing with 36s while the gate multiplies by 300s inflates the projection by ~8x.
+    THIS ASSERTION USED TO REFUSE THE OPPOSITE VALUES. It was `_assert_t_rxd_opens_before_the_eth_
+    deadline`, an upper bound: a t_rxd "too LONG" meant the maker could not refund before the ETH
+    deadline. Under the corrected relation the maker's leg is SUPPOSED to outlast the counter leg,
+    and a t_rxd that is too SHORT is what lets the maker refund its Radiant leg while still holding
+    `p` to claim the ETH leg — taking both.
 
-    A t_rxd of 2203, correct against the lower bound, projected the RXD refund 7.6 DAYS out against
-    a 22h budget. The gate caught it and refused to lock, which is the system working — but it
-    caught it AFTER the covenant had been funded, because nothing checked it at argument-parse
-    time. This does, so the operator learns the valid RANGE before spending a fee.
+    So the refusal message is not a rewording of the old one. The old one told an operator to
+    SHORTEN a window that needed lengthening, which is the single worst thing a guard can do: it is
+    confidently wrong, it names the right flag, and following it walks the operator into the exact
+    layout the swap has to avoid.
+
+    The interval lesson survives intact and is still the reason this is checked at parse time
+    rather than at lock time: the taker's-wait floor divides the margin by the FAST tail while the
+    coordinator's gate multiplies by the same tail, and those cancel only while both use it. A
+    t_rxd correct against one bound and wrong against the gate was caught AFTER the covenant was
+    funded, which is what this refusal exists to prevent.
     """
-    hi = _highest_t_rxd_the_deadline_accepts(args, remaining_s)
+    lo = _lowest_t_rxd_the_deadline_requires(args, remaining_s)
     have = int(args.t_rxd_blocks)
-    if have <= hi:
+    if have >= lo:
         return
     nominal = float(args.rxd_block_interval_fast_s or args.rxd_block_interval_s)
-    budget_s = (
-        _eth_budget_s(args, remaining_s) - _cross_clock_margin(args).total_s() - int(args.max_covenant_confirm_wait_s)
-    )
-    fast = float(args.rxd_block_interval_fast_s or 0)
-    lo = math.ceil(_cross_clock_margin(args).total_s() / fast) if fast > 0 else 1
+    margin_s = _cross_clock_margin(args).total_s()
+    required_s = _eth_budget_s(args, remaining_s) + margin_s
     raise SystemExit(
-        f"--t-rxd-blocks {have} is too LONG. The coordinator projects the RXD refund forward at the "
-        f"NOMINAL {nominal:.0f}s interval, giving {have * nominal / 86400:.1f} days against a "
-        f"{budget_s / 3600:.1f} h budget (--eth-timeout-s minus the {_cross_clock_margin(args).total_s()}s "
-        f"cross-clock margin AND the {args.max_covenant_confirm_wait_s}s covenant-confirm reserve). "
-        f"The maker could not refund before the ETH deadline.\n"
+        f"--t-rxd-blocks {have} is too SHORT. The coordinator projects the RXD refund forward at "
+        f"the {nominal:.0f}s interval, giving {have * nominal / 3600:.1f} h against the "
+        f"{required_s / 3600:.1f} h this swap requires (--eth-timeout-s PLUS the {margin_s}s "
+        f"cross-clock margin). The maker's Radiant refund would open while it can still claim the "
+        f"ETH leg with p — it could take both legs.\n"
         f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
-        f"  (the taker's-wait bound floors it at {lo} and this one caps it at {hi}, but the "
-        f"vulnerable-window bound closes that range to a single value — there is nothing to choose)\n"
-        f"  the LOWER bound divides the margin by the FAST tail; this UPPER bound multiplies by the "
-        f"NOMINAL one. Both are real, and they are not the same number."
+        f"  minimum: --t-rxd-blocks {lo}\n"
+        f"  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
+        f"Lengthening t_rxd is the fix now; shortening it was never safe."
     )
 
 
@@ -589,8 +627,23 @@ def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = 
     """
     return eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=int(time.time()) + _eth_budget_s(args, remaining_s),
-        # The CSV clock starts at covenant MINING, not now, so reserve the confirm allowance.
-        expected_rxd_lock_time_unix_s=int(time.time()) + int(args.max_covenant_confirm_wait_s),
+        # The CSV clock starts at covenant MINING, so this anchor is an ASSUMPTION about when
+        # that happens — and the safe end of that assumption INVERTED with the timelock direction
+        # (#482).
+        #
+        # The refund opens at `actual_confirm + t_rxd`, and `t_rxd` is committed in the covenant
+        # script before broadcast. The invariant is now `actual_confirm + t_rxd >= eth_timeout +
+        # margin`, so:
+        #
+        #   confirm LATER than assumed  -> refund opens later  -> MORE margin -> safe (maker waits)
+        #   confirm EARLIER than assumed -> refund opens sooner -> invariant BREAKS
+        #
+        # So the conservative anchor is the EARLIEST plausible confirm, i.e. `now`. Reserving
+        # `max_covenant_confirm_wait_s` here was right under the OLD relation — where the refund had
+        # to open BEFORE the ETH deadline and a late confirm pushed it past — and is exactly wrong
+        # under the corrected one. `eth_swap_two_host.py` already anchors on `now`; the two runners
+        # disagreed, and this is the half that was unsafe.
+        expected_rxd_lock_time_unix_s=int(time.time()),
         margin=_cross_clock_margin(args),
         # The FAST tail. A slow chain only lengthens the maker's lock; a fast one shrinks the
         # taker's claim window, so the fast tail is the direction that has to be safe.
@@ -701,7 +754,9 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: d
         h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
         taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    t_btc = bt.Timelock(args.t_rxd_blocks + args.margin_blocks + 4, bt.TimeUnit.BLOCKS)  # decorative for ETH
+    # INVERTED (#482) — see dust_swap_run.py. Decorative for ETH (the real deadline is
+    # eth_timeout_unix_s) but it still passes through the same-unit ordering guard.
+    t_btc = bt.Timelock(args.t_rxd_blocks - args.margin_blocks - 4, bt.TimeUnit.BLOCKS)
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     if args.asset_variant == "nft":

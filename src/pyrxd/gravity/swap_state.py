@@ -284,10 +284,11 @@ class NegotiatedTerms:
     :meth:`to_dict`/:meth:`from_dict` (JSON, never pickle).
 
     Timelocks are unit-tagged :class:`Timelock` (BIP68/112). The cross-chain
-    ordering invariant ``t_btc - t_rxd >= margin`` is checked by the coordinator
+    ordering invariant ``t_rxd - t_btc >= margin`` is checked by the coordinator
     (see ``swap_coordinator.assert_timelock_margin``), not here — but the raw
-    ordering ``t_btc > t_rxd`` in the *same* unit is rejected at construction as a
-    cheap fail-closed guard.
+    ordering ``t_rxd > t_btc`` in the *same* unit is rejected at construction as a
+    cheap fail-closed guard. INVERTED 2026-08-31 (#482): the maker holds ``p`` and LOCKS
+    the Radiant leg, so that leg carries the LONGER timeout.
     """
 
     hashlock: bytes  # H = SHA256(p), 32 bytes — NEVER p
@@ -299,8 +300,8 @@ class NegotiatedTerms:
     # check that establishes it. This is what makes #505 — the funding gate matching an FT
     # token count against the carrier's photon value — a mypy error instead of a review catch.
     radiant_amount: PhotonValue | TokenUnits
-    t_btc: Timelock  # BTC refund timelock (the LONGER leg)
-    t_rxd: Timelock  # Radiant refund timelock (the SHORTER leg)
+    t_btc: Timelock  # BTC refund timelock (the SHORTER leg — the maker CLAIMS this one)
+    t_rxd: Timelock  # Radiant refund timelock (the LONGER leg — the maker LOCKED this one)
     asset_variant: str  # "rxd" | "ft" | "nft"
     # Radiant asset binding. genesis_ref is the GENESIS outpoint ref (FT/NFT);
     # empty for plain RXD. taker/maker dest hashes pin the claim/refund holder.
@@ -420,10 +421,10 @@ class NegotiatedTerms:
                 object.__setattr__(self, _name, _val)
         # Cheap same-unit ordering guard (the full margin check is fail-closed in
         # the coordinator and handles cross-unit normalisation).
-        if self.t_btc.unit is self.t_rxd.unit and self.t_btc.value <= self.t_rxd.value:
+        if self.t_btc.unit is self.t_rxd.unit and self.t_rxd.value <= self.t_btc.value:
             raise ValidationError(
-                "invariant MAKER_SECRET_TAKER_LOCKS_BTC_FIRST requires t_btc > t_rxd "
-                f"(got t_btc={self.t_btc.value} <= t_rxd={self.t_rxd.value} {self.t_btc.unit.value})"
+                "invariant MAKER_SECRET_TAKER_LOCKS_BTC_FIRST requires t_rxd > t_btc "
+                f"(got t_rxd={self.t_rxd.value} <= t_btc={self.t_btc.value} {self.t_btc.unit.value})"
             )
 
     def to_dict(self) -> dict[str, Any]:

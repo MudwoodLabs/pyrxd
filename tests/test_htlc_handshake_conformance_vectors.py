@@ -17,7 +17,7 @@ The suite covers four things the spec makes normative:
    ETH/credential keys are omitted exactly when they hold their BTC defaults;
 2. the 32-byte preimage rule — the fixed length is what the ``OP_SIZE <0x20>
    OP_EQUALVERIFY`` prefix consensus-pins on both legs' claim branches;
-3. the timelock-margin invariant ``t_btc - t_rxd >= margin``, including the cross-unit case
+3. the timelock-margin invariant ``t_rxd - t_btc >= margin`` (#482), including the cross-unit case
    that the cheap same-unit construction guard cannot see;
 4. the two re-derived commitments a counterparty actually checks — the BTC P2TR funding
    scriptPubKey and the Radiant covenant scriptPubKey.
@@ -194,10 +194,18 @@ def test_terms_hashlock_matches_the_published_preimage(vec: dict):
 def test_margin_verdicts(vec: dict):
     """``assert_timelock_margin`` must accept/reject exactly as published.
 
-    The invariant is ``t_btc - t_rxd >= margin`` with both legs normalised to blocks. The
-    direction is counterintuitive and load-bearing: the party who locks FIRST (the taker,
-    on the counter leg) holds the LONGER refund window, so the leg claimed second (Radiant)
-    always matures first.
+    The invariant is ``t_rxd - t_btc >= margin`` with both legs normalised to blocks. The
+    direction is load-bearing: the MAKER holds the preimage ``p``, LOCKS the Radiant leg and
+    CLAIMS the BTC leg, so the leg it LOCKS carries the LONGER refund (Herlihy,
+    arXiv:1801.09515 §1). Otherwise the maker can let its own leg mature, refund it, and still
+    claim the counter leg with ``p`` — taking both.
+
+    THE PUBLISHED VECTORS ASSERTED THE OPPOSITE and this docstring argued for it, calling the
+    wrong direction "counterintuitive and load-bearing". The suite accepted t_btc=60/t_rxd=20
+    and rejected t_btc=20/t_rxd=60, so a second implementation that got the direction RIGHT
+    would have failed conformance and been "corrected" into the exploitable layout. That is
+    the worst failure mode a conformance suite has: it does not merely miss a defect, it
+    propagates one, with the authority of a published spec behind it.
     """
     policy = MarginPolicy(
         margin=_timelock(vec["margin"]),
@@ -217,7 +225,7 @@ def test_cross_unit_inversion_passes_construction_but_fails_the_margin_check():
     """The construction guard is NOT the safety check — the normalising one is.
 
     ``NegotiatedTerms.__post_init__`` only compares t_btc/t_rxd when they share a unit, so a
-    SECONDS t_btc that is shorter than a BLOCKS t_rxd constructs happily. Only
+    SECONDS t_btc that is LONGER than a BLOCKS t_rxd constructs happily. Only
     ``assert_timelock_margin`` catches it. A second implementation that ports the cheap
     guard and skips the normalising one will fund inverted swaps.
     """
