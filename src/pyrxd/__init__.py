@@ -152,6 +152,31 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SpvProof": ("pyrxd.spv", "SpvProof"),
     "SpvProofBuilder": ("pyrxd.spv", "SpvProofBuilder"),
     "verify_tx_in_block": ("pyrxd.spv", "verify_tx_in_block"),
+    # Content encryption primitives — pyrxd.crypto (#556).
+    #
+    # These are BYTE-COMPATIBLE WITH PHOTONIC WALLET (`packages/lib/src/encryption.ts`), which is
+    # what makes them worth a public export rather than an internal detail: a caller encrypting
+    # Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the actual use
+    # case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1 vector.
+    #
+    # Exported rather than wired to a caller, deliberately. #556 found them unreachable along with
+    # the timelocked-content feature that is their only in-repo consumer, but they are GENERAL
+    # primitives whose reachability does not depend on that feature's fate — see the allowlist in
+    # tests/test_reachability_shipped_callers.py, where the timelock half stays recorded as debt.
+    #
+    # The set is chosen so the surface is USABLE, the same rule as GlyphMinter/JsonFilePendingStore
+    # above: `encrypt_chunked` returns a `ChunkedCiphertext` that `decrypt_chunked` consumes, and
+    # `wrap_cek_x25519` needs a recipient public key the caller can only derive with
+    # `x25519_public_key`. Exporting the functions without those leaves the entry point
+    # unreachable in practice, which is the defect class this whole export exists to answer.
+    "ChunkedCiphertext": ("pyrxd.crypto.aead", "ChunkedCiphertext"),
+    "EncryptedChunk": ("pyrxd.crypto.aead", "EncryptedChunk"),
+    "WrappedCEK": ("pyrxd.crypto.kem", "WrappedCEK"),
+    "decrypt_chunked": ("pyrxd.crypto.aead", "decrypt_chunked"),
+    "encrypt_chunked": ("pyrxd.crypto.aead", "encrypt_chunked"),
+    "unwrap_cek_x25519": ("pyrxd.crypto.kem", "unwrap_cek_x25519"),
+    "wrap_cek_x25519": ("pyrxd.crypto.kem", "wrap_cek_x25519"),
+    "x25519_public_key": ("pyrxd.crypto.kem", "x25519_public_key"),
     # Local regtest dev node (see `pyrxd regtest` / the quickstart tutorial)
     "RegtestNode": ("pyrxd.devnet", "RegtestNode"),
 }
