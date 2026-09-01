@@ -159,7 +159,7 @@ def _xonly(kp: BtcKeypair) -> bytes:
     return coincurve.PublicKeyXOnly.from_secret(kp._privkey.unsafe_raw_bytes()).format()
 
 
-def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 20) -> NegotiatedTerms:
+def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 80) -> NegotiatedTerms:
     """Terms whose dest hashes come from the REAL covenant, so the real leg binds to them."""
     hashlock = hashlib.sha256(os.urandom(32)).digest()
     cov = build_htlc_covenant_rxd(
@@ -173,7 +173,9 @@ def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 20
         hashlock=hashlock,
         btc_sats=_BTC_SATS,
         radiant_amount=_RXD_AMOUNT,
-        t_btc=t.Timelock(72, t.TimeUnit.BLOCKS),
+        # DERIVED from the covenant's own CSV (#482): t_rxd IS `refund_csv` here, and it defaults
+        # to 20, so a fixed t_btc of 72 makes the terms unconstructible under the inverted rule.
+        t_btc=t.Timelock(max(1, t_rxd_blocks // 2), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",

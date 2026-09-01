@@ -716,7 +716,9 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: d
         h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
         taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    t_btc = bt.Timelock(args.t_rxd_blocks + args.margin_blocks + 4, bt.TimeUnit.BLOCKS)  # decorative for ETH
+    # INVERTED (#482) — see dust_swap_run.py. Decorative for ETH (the real deadline is
+    # eth_timeout_unix_s) but it still passes through the same-unit ordering guard.
+    t_btc = bt.Timelock(args.t_rxd_blocks - args.margin_blocks - 4, bt.TimeUnit.BLOCKS)
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     if args.asset_variant == "nft":

@@ -38,6 +38,19 @@ def _margin(**kw) -> CrossClockMargin:
     return CrossClockMargin(**base)
 
 
+def _size_for_budget(budget_s: int, interval: float, *, lock_delay: int = 600, **kw):
+    """Size against an EXACT budget, which is what every boundary below is really about.
+
+    #482 flipped the budget from `eth_timeout - margin - lock` to `eth_timeout + margin - lock`, so
+    the old `eth_timeout_s = 7068 + N` idiom now means a budget 14136s larger than intended. Naming
+    the budget directly makes these constants say what they pin instead of encoding one particular
+    arrangement of the formula, and it survives the next change to the formula's shape.
+    """
+    return _size(
+        eth_timeout_s=budget_s - _margin().total_s() + lock_delay, interval=interval, lock_delay=lock_delay, **kw
+    )
+
+
 def _size(*, eth_timeout_s: int, interval: float, lock_delay: int = 0, **kw):
     return eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=_NOW + eth_timeout_s,
@@ -57,15 +70,17 @@ class TestTheSafetyFloorDefault:
     """
 
     def test_the_default_floor_is_exactly_twelve(self) -> None:
-        # Budgets are stated as (margin + lock_delay + N*interval); the sizer emits N-1 because it
-        # is `ceil(budget/interval) - 1`. Values below were MEASURED against the real sizer rather
-        # than derived by hand — deriving them by hand is what put an off-by-one in this test on
-        # the first attempt, which is the same error class the whole file exists to pin.
-        assert _size(eth_timeout_s=7068 + 600 + 13 * 60, interval=60.0, lock_delay=600).value == 12
+        # MEASURED against the real sizer, not derived by hand — deriving them by hand is what put
+        # an off-by-one in this test on the first attempt, which is the same error class the whole
+        # file exists to pin. Re-measured after #482: the sizer now emits the SMALLEST t with
+        # `ceil(t*interval) >= budget`, so a 661s budget at 60s/block is the first that reaches 12.
+        assert _size_for_budget(661, 60.0).value == 12
+        assert _size_for_budget(720, 60.0).value == 12  # ...and 720 is the last
+        assert _size_for_budget(721, 60.0).value == 13  # one second more buys the next block
 
     def test_one_block_below_the_default_floor_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="below safety floor 12"):
-            _size(eth_timeout_s=7068 + 600 + 12 * 60, interval=60.0, lock_delay=600)
+            _size_for_budget(660, 60.0)
 
 
 class TestTheBip68CapBoundary:
@@ -78,13 +93,14 @@ class TestTheBip68CapBoundary:
 
     def test_exactly_the_cap_is_ACCEPTED(self) -> None:
         cap = SEQUENCE_LOCKTIME_MASK
-        # cap + 1 seconds of budget, because the sizer subtracts one from the ceiling.
-        sized = _size(eth_timeout_s=7068 + cap + 1, interval=1.0)
+        # At 1s/block the budget IS the block count, so the cap is reached by a budget of exactly
+        # `cap` seconds. (It was `cap + 1` while the sizer subtracted one from the ceiling.)
+        sized = _size_for_budget(cap, 1.0, lock_delay=0)
         assert sized.value == cap, f"expected the cap {cap} to be representable, got {sized.value}"
 
     def test_one_block_ABOVE_the_cap_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="BIP68 16-bit cap"):
-            _size(eth_timeout_s=7068 + SEQUENCE_LOCKTIME_MASK + 2, interval=1.0)
+            _size_for_budget(SEQUENCE_LOCKTIME_MASK + 1, 1.0, lock_delay=0)
 
 
 class TestTheIntervalAndBudgetBoundaries:
@@ -107,13 +123,13 @@ class TestTheIntervalAndBudgetBoundaries:
     def test_a_budget_of_exactly_zero_is_refused(self) -> None:
         """`<= 0` vs `< 0`: a zero budget buys no blocks at all and must fail closed."""
         with pytest.raises(ValidationError):
-            _size(eth_timeout_s=_margin().total_s(), interval=1.0)
+            _size_for_budget(0, 1.0, lock_delay=0)
 
     def test_a_budget_of_exactly_one_second_is_refused_by_the_FLOOR_not_by_the_sign(self) -> None:
         """`<= 0` vs `<= 1`: one second is a positive budget, so it must pass the sign check and be
         refused by the safety floor instead — a different error, which is what distinguishes them."""
         with pytest.raises(ValidationError, match="below safety floor"):
-            _size(eth_timeout_s=_margin().total_s() + 1, interval=1.0)
+            _size_for_budget(1, 1.0, lock_delay=0)
 
 
 class TestTheFloorBlocksTypeGuard:
@@ -134,12 +150,14 @@ class TestTheFloorBlocksTypeGuard:
         assert _size(eth_timeout_s=86_400, interval=36.0, floor_blocks=12).value > 12
 
 
-class TestTheAnalyticValueNeedsAtMostOneStepDown:
+class TestTheAnalyticValueNeedsAtMostOneStep:
     """Four mutants on the sizer's arithmetic line survive, and I first called them equivalent.
 
-    `t_rxd_blocks = ceil(budget/interval) - 1` mutates to `- 0`, `// 1`, `* 1`, `** 1` — all of
-    which are `ceil(budget/interval)` — and the step-down loop then walks the value down until the
-    punctuality gate accepts it, so the final answer is the same. "Equivalent", I said.
+    `t_rxd_blocks = ceil(budget/interval)` mutates to `+ 1`, `// 1`, `* 1`, `** 1` — and the loop
+    then walks the value until the gate accepts it, so the final answer is the same. "Equivalent",
+    I said. (#482 inverted the search: it starts one BELOW the analytic value and steps UP, where
+    it used to start at `ceil - 1` and step down. The invariant this class pins — that the loop
+    corrects a rounding edge rather than repairing arithmetic nobody checks — is unchanged.)
 
     That is only true because `_SIZER_GATE_STEPS` is 3, giving the loop room to absorb a wrong
     starting point. The code's own comment claims the analytic value is "never more than one block
@@ -153,21 +171,26 @@ class TestTheAnalyticValueNeedsAtMostOneStepDown:
 
     @staticmethod
     def _steps_needed(*, eth_timeout_s: int, interval: float, lock_delay: int = 600) -> int:
-        """How far the loop must walk from the analytic value to reach one the gate accepts."""
+        """How far the loop must walk from its starting value to reach one the gate accepts.
+
+        UPWARD now (#482), so the subtraction is `emitted - analytic`. Left as `analytic - emitted`
+        this returns a negative number, `0 <= steps` fails, and the message blames the arithmetic
+        for drifting when the only thing that moved was the direction of the walk.
+        """
         import math
 
         margin = _margin()
-        budget = eth_timeout_s - margin.total_s() - lock_delay
-        analytic = math.ceil(budget / interval) - 1
+        budget = eth_timeout_s + margin.total_s() - lock_delay
+        analytic = math.ceil(budget / interval) - 1  # the sizer's own starting point
         emitted = _size(eth_timeout_s=eth_timeout_s, interval=interval, lock_delay=lock_delay).value
-        return analytic - emitted
+        return emitted - analytic
 
     @pytest.mark.parametrize("interval", [36.0, 36.2, 36.4, 43.3, 41.618, 60.0, 22.7])
     @pytest.mark.parametrize("eth_timeout_s", [43_200, 61_200, 86_400, 111_600])
     def test_the_loop_never_walks_more_than_one_block(self, interval: float, eth_timeout_s: int) -> None:
         steps = self._steps_needed(eth_timeout_s=eth_timeout_s, interval=interval)
         assert 0 <= steps <= 1, (
-            f"the analytic value needed {steps} step-downs at interval={interval}, "
+            f"the analytic value needed {steps} steps at interval={interval}, "
             f"eth_timeout_s={eth_timeout_s}. The code documents at most one; more means the "
             f"arithmetic has drifted from the gate and the step-down loop is concealing it."
         )

@@ -245,8 +245,9 @@ def _terms_from_public(
     identical covenant SPK + dest hashes — that mutual re-derivation is the trust anchor."""
     t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
     # t_btc is decorative for an ETH swap (the real ETH deadline is eth_timeout_unix_s), but it must
-    # stay > t_rxd so the same-unit ordering guard in NegotiatedTerms passes; keep it well clear.
-    t_btc = bt.Timelock(t_rxd_blocks + margin_blocks + 4, bt.TimeUnit.BLOCKS)
+    # stay BELOW t_rxd so the same-unit ordering guard in NegotiatedTerms passes; keep it well
+    # clear. It was t_rxd + margin + 4 before #482 inverted the relation.
+    t_btc = bt.Timelock(t_rxd_blocks - margin_blocks - 4, bt.TimeUnit.BLOCKS)
     cov = build_htlc_covenant_rxd(
         amount=rxd_photons,
         taker_pkh=bytes(Hex20(taker_pkh)),
@@ -957,13 +958,17 @@ def run_self_check() -> None:
     assert_timelock_margin(terms2.t_btc, terms2.t_rxd, policy)
     print("  [ok] taker's INDEPENDENT timelock-margin check passes for honest terms")
 
-    # ...and REFUSES a hostile too-tight envelope (t_btc - t_rxd < margin).
+    # ...and REFUSES a hostile too-tight envelope (t_rxd - t_btc < margin).
+    #
+    # The pair is the other way round since #482. Written as t_btc=61/t_rxd=60 it no longer even
+    # CONSTRUCTS — the ordering guard rejects it first — so `assert_timelock_margin` never runs and
+    # this check would pass on an exception raised by the wrong thing entirely.
     hostile = NegotiatedTerms(
         hashlock=h,
         btc_sats=1000,
         radiant_amount=1000,
-        t_btc=bt.Timelock(61, bt.TimeUnit.BLOCKS),  # only 1 block over t_rxd — far below margin 36
-        t_rxd=bt.Timelock(60, bt.TimeUnit.BLOCKS),
+        t_btc=bt.Timelock(60, bt.TimeUnit.BLOCKS),
+        t_rxd=bt.Timelock(61, bt.TimeUnit.BLOCKS),  # only 1 block over t_btc — far below margin 36
         asset_variant="rxd",
         genesis_ref=b"",
         taker_dest_hash=cov.expected_taker_hash,

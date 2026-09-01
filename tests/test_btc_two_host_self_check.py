@@ -64,8 +64,9 @@ def test_terms_from_public_is_deterministic_and_btc_counterchain():
     kw = dict(
         hashlock=h,
         btc_sats=100_000,
-        t_rxd_blocks=20,
-        t_btc_blocks=60,
+        # INVERTED (#482): the maker locks the Radiant leg, so it carries the LONGER timeout.
+        t_rxd_blocks=60,
+        t_btc_blocks=20,
         taker_pkh=b"\x11" * 20,
         maker_pkh=b"\x22" * 20,
         btc_claim_xonly=b"\x33" * 32,

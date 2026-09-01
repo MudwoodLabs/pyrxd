@@ -513,9 +513,7 @@ def covenant_fund_height(height: ChainHeight) -> ChainHeight:
     return height
 
 
-async def scan_covenant_fund_height(
-    client: Any, *, covenant_spk: bytes, expected_photons: int
-) -> ChainHeight:
+async def scan_covenant_fund_height(client: Any, *, covenant_spk: bytes, expected_photons: int) -> ChainHeight:
     """The anchor for paths that locked the asset WITHOUT :func:`wait_for_covenant_funding` — the
     NFT and FT variants, which lock by SPENDING into the covenant rather than by waiting on an
     operator payment. Same conversion, same fail-closed rules, one scan.
