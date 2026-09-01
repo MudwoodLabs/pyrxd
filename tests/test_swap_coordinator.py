@@ -182,7 +182,7 @@ class FakeRadiantLeg:
     on-chain-vs-expected match to drive PARAMS_MISMATCH.
     """
 
-    def __init__(self, *, asset_funded: bool = True) -> None:
+    def __init__(self, *, asset_funded: bool = True, report_confs: int | None = None) -> None:
         self.calls: list[str] = []
         self.claimed_with: bytes | None = None
         self.refunded = False
@@ -191,13 +191,20 @@ class FakeRadiantLeg:
         # tests/test_taker_asset_funding_gate_adversarial.py for the real-leg version).
         self.asset_funded = bool(asset_funded)
         self.verify_min_confirmations: list[int | None] = []
+        # A covenant DEEPER than the minimum the taker asks for. The default fake reports exactly
+        # the minimum, which quietly models the one case a maker would never choose: locking at the
+        # last possible moment. `t_rxd` counts from MINING, so every block of extra depth is a
+        # block the taker does not get, and the maker picks that number for free by locking early
+        # and presenting late (#482 step 7).
+        self.report_confs = report_confs
 
     async def verify_maker_asset_funded(self, terms: NegotiatedTerms, *, min_confirmations=None):
         self.calls.append("verify_maker_asset_funded")
         self.verify_min_confirmations.append(min_confirmations)
         if not self.asset_funded:
             raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
-        return ("ef" * 32 + ":0", terms.radiant_amount, max(int(min_confirmations or 1), 1))
+        confs = self.report_confs if self.report_confs is not None else max(int(min_confirmations or 1), 1)
+        return ("ef" * 32 + ":0", terms.radiant_amount, int(confs))
 
     async def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         # Deterministic stand-in for the fused covenant SPK.
@@ -1624,7 +1631,10 @@ async def test_scrape_rejects_claim_tx_for_foreign_funding_outpoint():
 
 async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=10, hashlock=h)
+    # t_rxd 50, not 10: under the inverted relation (#482) t_rxd must exceed t_btc by the 36-block
+    # margin, so a 10-block window is not a swap that can be constructed. The SQUEEZED state is
+    # reached by burning the window with elapsed height below, which is how it happens for real.
+    terms = _terms(variant="rxd", t_rxd_blocks=50, hashlock=h)
     btc = FakeBtcLeg(claim_confs=1)  # shallow
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1633,7 +1643,8 @@ async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     rec = await coord.maker_claims_btc(p_secret)
     claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
     # Window closing (now near t_rxd maturity) + shallow -> SQUEEZED -> ASSET_VULNERABLE.
-    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1006, asset_locked_at_height=1000)
+    # 45 of the 50 blocks spent -> 5 left, under the 6-block burial -> SQUEEZED.
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1045, asset_locked_at_height=1000)
     assert rec.state is SwapState.ASSET_VULNERABLE
     assert rxd.claimed_with is None  # not auto-claimed
     # The deliberate winner-take-all claim is a separate, explicit decision.
@@ -1970,7 +1981,13 @@ class FakeEthLeg:
         return self.last_locator
 
 
-def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int | None = None, eth_timeout_unix_s: int = 1779710245):
+_NOW = 1_700_000_000
+# The cross-clock margin the ETH fixtures below build (780 + 1800 + 600 + 300, plus stall budget
+# where a test sets one). Kept beside _NOW because `_eth_terms` sizes t_rxd against it.
+_ETH_TEST_MARGIN_S = 780 + 1_800 + 600 + 300
+
+
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int | None = None, eth_timeout_unix_s: int = _NOW + 40_000):
     # t_rxd DERIVES from the ETH deadline, the way production sizes it. Under the inverted relation
     # (#482) the RXD refund must open AFTER `eth_timeout + margin`, so a fixed block count cannot
     # be right for an arbitrary deadline — a fixture that hardcodes one is asserting against a
@@ -2349,11 +2366,6 @@ def test_reserve_to_blocks_rounds_up_for_seconds():
 
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 
-_NOW = 1_700_000_000
-# The cross-clock margin the ETH fixtures below build (780 + 1800 + 600 + 300, plus stall budget
-# where a test sets one). Kept beside _NOW because `_eth_terms` sizes t_rxd against it.
-_ETH_TEST_MARGIN_S = 780 + 1_800 + 600 + 300
-
 
 def _xmargin():
     # total = 768 + 1800 + 600 + 300 = 3468s
@@ -2374,21 +2386,22 @@ def _eth_fund_policy(**kw):
     )
 
 
-def _eth_coord_negotiated(*, terms, policy=None):
+def _eth_coord_negotiated(*, terms, policy=None, radiant_leg=None):
     rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
     p_dummy = b"\x01" * 32
     return SwapCoordinator(
         record=rec,
         counter_leg=FakeEthLeg(preimage=p_dummy, verdict=_final()),
-        radiant_leg=FakeRadiantLeg(),
+        radiant_leg=radiant_leg or FakeRadiantLeg(),
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
     )
 
 
-# projected_rxd_open = now + max_confirm_wait(3600) + t_rxd(72)*rxd_interval(300)=21600 = now+25200
-# deadline = eth_timeout - margin.total(3468). Need now+25200 < eth_timeout-3468 -> eth_timeout > now+28668.
+# INVERTED (#482): earliest_rxd_open = now + (t_rxd - elapsed) * rxd_interval(300), and it must land
+# AT OR AFTER eth_timeout + margin.total(3468). No confirm-wait term — that assumes a LATE confirm,
+# which is the optimistic direction now. So t_rxd >= ceil((eth_timeout - now + 3468) / 300) + elapsed.
 
 
 def test_eth_timelock_ordering_accepts_safe_deadline():
@@ -2398,14 +2411,40 @@ def test_eth_timelock_ordering_accepts_safe_deadline():
     coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # no raise (40000 > 28668)
 
 
-def test_eth_timelock_ordering_rejects_deadline_too_close():
-    # HIGH-1 core: an eth_timeout that does NOT clear the RXD window + margin is refused —
-    # a maker cannot set a deadline that lets it refund both legs.
+def test_eth_timelock_ordering_rejects_a_t_rxd_that_opens_before_the_eth_deadline():
+    """HIGH-1 core, in the direction that is actually dangerous (#482).
+
+    THIS TEST USED TO ASSERT THE OPPOSITE and passed for years. It refused a deadline that was
+    "too close" — `_NOW + 10000` against a 28668s budget — because the old gate demanded the RXD
+    refund open BEFORE the ETH deadline. Under the correct relation a nearer deadline is the SAFE
+    case: the maker locks the Radiant leg, so that leg must OUTLAST the ETH leg it claims. What
+    robs the taker is the reverse — an RXD refund that opens while the maker can still claim ETH
+    with `p`, letting the maker take both legs.
+
+    So the fixture states the real danger: a `t_rxd` too SMALL to outlast `eth_timeout + margin`.
+    The explicit block count matters — `_eth_terms` otherwise sizes `t_rxd` to fit whatever
+    deadline it is given, which would make this test green by construction while proving nothing.
+    """
     _, h = generate_secret()
-    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # 10000 < 28668
+    # margin totals 3468s, so the refund must open no earlier than _NOW + 43468 => t_rxd >= 145
+    # blocks at the 300s dividing interval. 100 leaves the maker a window it should not have.
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000, t_rxd_blocks=100)
     coord = _eth_coord_negotiated(terms=terms)
-    with pytest.raises(ValidationError, match="confirm too late"):
+    with pytest.raises(ValidationError, match="open too EARLY"):
         coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+def test_eth_timelock_ordering_accepts_the_nearer_deadline_that_the_old_gate_refused():
+    """The honest path the inversion restores, and the paired case for the test above.
+
+    `_NOW + 10000` is the exact deadline the old gate called "too close" and refused. It is
+    legitimate: the maker's Radiant leg outlasts it comfortably. A guard that refuses valid work is
+    a bug, and this one sat on a parameter an honest maker must choose.
+    """
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)
+    coord = _eth_coord_negotiated(terms=terms)
+    coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # no raise
 
 
 def test_eth_timelock_ordering_rejects_expired_deadline():
@@ -2438,7 +2477,9 @@ def test_eth_timelock_ordering_requires_now_and_margin():
 async def test_pre_lock_dispatches_eth_ordering_gate():
     # Integration: pre_btc_lock_check step 3 routes an ETH swap to the cross-clock gate.
     _, h = generate_secret()
-    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # too close
+    # A t_rxd too small to outlast the ETH deadline + margin — the direction that robs the taker
+    # (#482). Explicit, because `_eth_terms` otherwise sizes t_rxd to fit and nothing would fail.
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000, t_rxd_blocks=100)
     coord = _eth_coord_negotiated(terms=terms)
     gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
     assert not gate.ok and "margin check failed" in gate.reason
@@ -2573,21 +2614,31 @@ async def test_eth_post_confirm_recheck_accepts_on_time_lock():
     assert rec.state is SwapState.BOTH_LOCKED
 
 
-async def test_eth_post_confirm_recheck_refuses_stalled_maker_lock():
-    # THE re-verify HIGH: a maker who STALLS the covenant broadcast (locks late) collapses the
-    # cross-clock margin the pre-fund gate projected. The second run catches it and refuses to
-    # enter BOTH_LOCKED — the taker must refund the counter leg, not proceed.
+async def test_eth_post_confirm_recheck_ACCEPTS_a_stalled_maker_lock_now_that_late_is_safe():
+    """THE DIRECTION OF THIS TEST FLIPPED WITH #482, and that is the finding, not a fixture edit.
+
+    It asserted that a maker STALLING its covenant broadcast collapses the cross-clock margin, and
+    the recheck refused. That was correct under the old relation: the RXD refund had to open BEFORE
+    the ETH deadline, so pushing the covenant's mining later pushed the refund past it.
+
+    Inverted, the Radiant leg must OUTLAST the ETH leg. A late lock opens the refund LATER, which
+    is strictly safer — it costs the maker lock time and takes nothing from the taker. Refusing it
+    would be a guard refusing valid work, on a swap that has already had value committed to it,
+    where the taker's only alternative is an unnecessary refund and its fees.
+
+    WHAT REPLACES IT is step 7 of the pre-fund gate: the danger under this relation is a covenant
+    that mined EARLY, because `t_rxd` counts from mining and the maker chooses how much of it to
+    spend before presenting the swap. That is asserted directly in
+    `TestTheMakerCannotSpendTRxdBeforePresentingTheSwap` below, against the remaining window.
+    """
     secret, h = generate_secret()
     terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
     rxd = FakeRadiantLeg()
     coord = await _eth_to_btc_locked(
         leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
     )
-    # Maker delays the lock to _NOW+30000: actual rxd_open _NOW+30000+21600 > deadline _NOW+36532.
-    with pytest.raises(ValidationError, match="confirm too late"):
-        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW + 30000)
-    assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance to BOTH_LOCKED
-    assert rxd.claimed_with is None
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW + 30000)
+    assert coord.record.state is SwapState.BOTH_LOCKED
 
 
 async def test_eth_post_confirm_recheck_requires_now_unix_s():
@@ -3203,7 +3254,12 @@ def _valued_policy():
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
         rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
         rxd_reorg_cost_per_block=100_000,
-        value_at_risk_photons=3_000_000,  # B(V) = 30 blocks at factor 1.0
+        # B(V) = 60 blocks at factor 1.0. Sized ABOVE the 36-block margin on purpose: under the
+        # inverted relation (#482) t_rxd must exceed t_btc by the margin, so a t_rxd small enough
+        # to fail a 30-block burial floor is not a swap that can exist under this policy. Testing
+        # the burial gate there would be testing a fiction — the margin check refuses first, and
+        # the burial assertion never runs.
+        value_at_risk_photons=6_000_000,
     )
 
 
@@ -3221,8 +3277,8 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     @pytest.mark.asyncio
     async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
         _secret, h = generate_secret()
-        # B(V) = 30; the SUFFICIENT floor is 30 + counter_reserve(0 for BTC) + 1 to mine = 31.
-        terms = _terms(hashlock=h, t_rxd_blocks=30)
+        # B(V) = 60; the SUFFICIENT floor is 60 + counter_reserve(0 for BTC) + 1 to mine = 61.
+        terms = _terms(hashlock=h, t_rxd_blocks=60)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
@@ -3245,8 +3301,8 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         31, which is the defect this class exists to prevent, encoded in its own honest-path test.
         """
         _secret, h = generate_secret()
-        # floor 31 + the 1 confirmation the fake covenant reports = exactly 31 remaining.
-        terms = _terms(hashlock=h, t_rxd_blocks=32)
+        # floor 61 + the 1 confirmation the fake covenant reports = exactly 61 remaining.
+        terms = _terms(hashlock=h, t_rxd_blocks=62)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
@@ -3255,7 +3311,7 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     async def test_a_t_rxd_that_clears_the_floor_only_by_IGNORING_elapsed_depth_is_REFUSED(self) -> None:
         """The #531 regression, stated directly.
 
-        `t_rxd = 31` clears the floor if you compare the NEGOTIATED value, and fails it once the
+        `t_rxd = 61` clears the floor if you compare the NEGOTIATED value, and fails it once the
         covenant's elapsed confirmations are subtracted. Before the fix this swap was accepted and
         then SQUEEZED at every claim — the taker would reveal and find no safe claim available,
         which is precisely the state the gate was written to prevent.
@@ -3265,7 +3321,7 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         requirement on every swap.
         """
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=31)
+        terms = _terms(hashlock=h, t_rxd_blocks=61)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
@@ -3284,8 +3340,11 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         supposed to leave alone.
         """
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=6)  # flat burial 6, so the floor is 6 + 0 + 1 = 7
-        coord = _coordinator(terms=terms)
+        # Burial 60 for the same reason `_valued_policy` uses 60: the flat term has to sit ABOVE
+        # the margin to be reachable at all. The VALUE of the flat burial is incidental here — what
+        # this test pins is that a policy with NO economics configured still binds on it.
+        terms = _terms(hashlock=h, t_rxd_blocks=60)  # flat burial 60, so the floor is 60 + 0 + 1 = 61
+        coord = _coordinator(terms=terms, policy=_policy(rxd_burial=60))
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
         assert "a safe claim needs" in gate.reason, gate.reason
@@ -3376,7 +3435,7 @@ class TestTheFundGateClosesTheSqueezeBand:
     async def test_a_t_rxd_INSIDE_the_squeeze_band_is_refused(self) -> None:
         """Exactly the case a burial-only floor let through: >= the burial, < burial + 1."""
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=30)  # == B(V), inside the band
+        terms = _terms(hashlock=h, t_rxd_blocks=60)  # == B(V), inside the band
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
@@ -3466,3 +3525,46 @@ async def test_mutual_refund_HONEST_path_still_completes():
     await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
     rec = await coord.mutual_refund()
     assert rec.state is not SwapState.BOTH_LOCKED, "an all-successful mutual refund must advance"
+
+
+class TestTheMakerCannotSpendTRxdBeforePresentingTheSwap:
+    """Step 7 of the pre-fund gate: the cross-clock ordering check, re-run against the window that
+    ACTUALLY REMAINS.
+
+    `t_rxd` is a RELATIVE CSV counted from the covenant's MINING. Step 3 checks the ordering
+    invariant against the NEGOTIATED `t_rxd` anchored at `now`, which is correct only if the
+    covenant mines now. It does not: the maker locks it first, and the taker verifies it at step 5.
+    Every confirmation the covenant already has is a block of `t_rxd` already spent.
+
+    THE MAKER CHOOSES THAT NUMBER, which is what makes this an attack and not a rounding error. It
+    locks the covenant, waits, and presents the swap late. Step 3 sees a `t_rxd` that comfortably
+    outlasts `eth_timeout + margin`; the chain sees a refund that opens sooner by exactly the
+    elapsed depth. Under the OLD relation an overstated window was the conservative direction,
+    which is why this survived — inverting the relation (#482) turned the same arithmetic into the
+    direction that lets the maker refund its Radiant leg while still holding `p` for the ETH leg.
+
+    This is the #531 conflation, which fixed the identical mistake for the burial floor and left
+    the ordering gate comparing against the negotiated value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_covenant_that_ALREADY_SPENT_the_window_is_refused(self) -> None:
+        _, h = generate_secret()
+        # Sized to pass step 3 with 4 blocks to spare, then presented 40 blocks deep.
+        terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000, t_rxd_blocks=149)
+        coord = _eth_coord_negotiated(terms=terms, radiant_leg=FakeRadiantLeg(report_confs=40))
+        gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+        assert not gate.ok
+        assert "REMAINING window" in gate.reason, gate.reason
+        assert "open too EARLY" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_the_SAME_terms_pass_when_the_covenant_is_fresh(self) -> None:
+        """The paired honest path, and the reason the test above is about DEPTH and not about the
+        terms. Identical `t_rxd` and deadline; only the covenant's age differs. Without this, the
+        refusal above would be indistinguishable from a `t_rxd` that was simply too small."""
+        _, h = generate_secret()
+        terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000, t_rxd_blocks=149)
+        coord = _eth_coord_negotiated(terms=terms, radiant_leg=FakeRadiantLeg(report_confs=1))
+        gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+        assert "margin check failed" not in (gate.reason or ""), gate.reason

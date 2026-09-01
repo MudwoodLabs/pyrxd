@@ -61,7 +61,11 @@ from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
 
-from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
+from .eth_rxd_timelock import (
+    CrossClockMargin,
+    assert_covenant_confirms_before_eth_deadline,
+    assert_eth_deadline_is_claimable,
+)
 from .finality import CounterClaimFinality, CounterClaimState
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
@@ -1576,6 +1580,25 @@ class SwapCoordinator:
         if gate is not None:
             return gate
 
+        # 7. THE CROSS-CLOCK ORDERING GATE, RE-RUN AGAINST THE WINDOW THAT ACTUALLY REMAINS.
+        #
+        # Step 3 ran it against the NEGOTIATED t_rxd, anchored at `now`. But t_rxd is a relative
+        # CSV from the covenant's mining, so `cov_confs` blocks of it are already spent and the
+        # refund opens that much sooner than step 3 computed. Under the OLD relation an overstated
+        # window was the conservative direction; inverted (#482), it is the direction that lets the
+        # maker refund its Radiant leg while still holding `p` for the ETH leg.
+        #
+        # THE GAP IS MAKER-CONTROLLED, which is what makes it an attack rather than an inaccuracy:
+        # the maker locks its covenant, waits, and only then presents the swap. Step 3 cannot see
+        # that — `cov_confs` is not known until the chain read at step 5. Exactly the #531 shape,
+        # which fixed this same conflation for the burial floor and left the ordering gate on the
+        # negotiated value.
+        if terms.eth_timeout_unix_s is not None:
+            try:
+                self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s, elapsed_blocks=cov_confs)
+            except ValidationError as exc:
+                return PreBtcLockGate(ok=False, reason=f"margin check failed against the REMAINING window: {exc}")
+
         return PreBtcLockGate(ok=True)
 
     def _asset_funding_depth(self) -> int | None:
@@ -1671,19 +1694,33 @@ class SwapCoordinator:
             )
         return await verify(terms, min_confirmations=self._asset_funding_depth())
 
-    def _assert_eth_timelock_ordering(self, terms: NegotiatedTerms, *, now_unix_s: int | None) -> None:
+    def _assert_eth_timelock_ordering(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None, elapsed_blocks: int = 0
+    ) -> None:
         """ETH cross-clock ordering gate (audit HIGH-1) — wires the previously-orphaned
         :mod:`pyrxd.gravity.eth_rxd_timelock` bridge into the live pre-fund path.
 
-        The HTLC ordering invariant requires the counter-leg (ETH) refund to open strictly
-        AFTER the asset (RXD) refund, minus the cross-clock margin. For ETH the real deadline
-        is the ABSOLUTE ``terms.eth_timeout_unix_s`` (a contract immutable), NOT the relative
-        ``t_btc`` placeholder — so the BTC-shaped ``assert_timelock_margin(t_btc, t_rxd)`` is
-        the WRONG gate here. We instead project where the RXD CSV refund opens (covenant mines
-        ~``now + max_covenant_confirm_wait`` then counts ``t_rxd`` blocks) and refuse unless it
-        lands before ``eth_timeout - margin``. This also closes the now-vs-timeout grief: an
-        already-expired or near-expiry ``eth_timeout_unix_s`` makes the projected open exceed
-        the deadline, so the gate refuses to fund. Fail-closed on any missing input.
+        The HTLC ordering invariant requires the ASSET (RXD) refund to open strictly AFTER the
+        counter-leg (ETH) refund, plus the cross-clock margin. The maker holds ``p`` and LOCKS the
+        Radiant leg, so that leg carries the LONGER timeout and the maker claims the SHORTER one
+        (Herlihy 1801.09515 §1). For ETH the real deadline is the ABSOLUTE
+        ``terms.eth_timeout_unix_s`` (a contract immutable), NOT the relative ``t_btc``
+        placeholder — so the BTC-shaped ``assert_timelock_margin(t_btc, t_rxd)`` is the WRONG gate
+        here. We project where the RXD CSV refund opens and refuse unless it lands AFTER
+        ``eth_timeout + margin``.
+
+        THIS DOCSTRING DESCRIBED THE OPPOSITE RELATION until #482 — it said the gate refuses
+        "unless it lands before ``eth_timeout - margin``", the inverted rule stated with full
+        confidence one scroll above the code. Prose that asserts an invariant becomes evidence to
+        the next reader; when it is wrong it is manufactured corroboration, so it is corrected
+        here rather than left to be cited.
+
+        TWO SEPARATE CHECKS RUN, because ordering does not imply liveness.
+        :func:`assert_eth_deadline_is_claimable` asks whether the party who must act still can;
+        :func:`assert_covenant_confirms_before_eth_deadline` asks whether either party can be
+        robbed if both do. Under the old relation the first fell out of the second's arithmetic
+        and had no check of its own; under this one it does not follow, so it is asserted
+        directly. Fail-closed on any missing input.
         """
         policy = self.config.margin_policy
         if now_unix_s is None:
@@ -1695,6 +1732,16 @@ class SwapCoordinator:
                 "ETH swap requires MarginPolicy.cross_clock_margin and max_covenant_confirm_wait_s "
                 "for the cross-clock ordering gate"
             )
+        # LIVENESS FIRST, and ONLY HERE. A dead or near-dead deadline is refused on its own
+        # terms rather than as a by-product of the ordering arithmetic (#482). Deliberately NOT
+        # run in the post-confirm recheck: this floor asks "should the taker fund at all", and
+        # once it HAS funded the deadline is legitimately closer every second — applying it there
+        # would refuse honest swaps for the crime of being underway.
+        assert_eth_deadline_is_claimable(
+            now_unix_s=now_unix_s,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            margin=policy.cross_clock_margin,
+        )
         assert_covenant_confirms_before_eth_deadline(
             now_unix_s=now_unix_s,
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
@@ -1710,6 +1757,7 @@ class SwapCoordinator:
             # maker holds the refunded asset AND can still claim the counter leg with p.
             rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=policy.max_covenant_confirm_wait_s,
+            elapsed_blocks=elapsed_blocks,
         )
 
     # -- taker funds the counter leg first (the role invariant's step 2) ----------------
