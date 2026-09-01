@@ -367,13 +367,15 @@ def test_eth_detected_without_finality_fails_closed_regardless_of_state():
 
 
 def test_eth_not_yet_final_reserve_boundary():
-    # Locks the 3-block finalization reserve (ceil(768/300)) against an off-by-one regression:
-    # blocks_left 5 (now=167) still WAITs (5 - 3 >= burial 2); blocks_left 4 (now=168) SQUEEZES.
+    # Locks the 3-block finalization reserve (ceil(768/300)) against an off-by-one regression.
+    # The floor is burial 2 + reserve 3 + inclusion 2 (#511) = 7, so blocks_left 7 (now=165) WAITs
+    # and blocks_left 6 (now=166) SQUEEZES. It was 5/4 while the claim was assumed to bury from the
+    # current height; #511 reserves the blocks it needs to be MINED first.
     wait = _decide_e(
-        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=167)
+        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=165)
     )
     squeeze = _decide_e(
-        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=168)
+        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=166)
     )
     assert wait.intent is Intent.WATCH
     assert squeeze.intent is Intent.PAGE_SQUEEZED

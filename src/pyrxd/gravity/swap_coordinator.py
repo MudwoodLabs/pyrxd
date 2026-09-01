@@ -86,6 +86,7 @@ __all__ = [
     "ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS",
     "ESTIMATED_DEFAULT_MARGIN_BLOCKS",
     "ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS",
+    "ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS",
     "MAINNET_ETH_FINALITY_STALL_FLOOR_S",
     "MAKER_SECRET_TAKER_LOCKS_BTC_FIRST",
     "ClaimFinality",
@@ -159,6 +160,18 @@ ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS = 6
 # confirmations the taker's OWN asset claim must reach to be reorg-safe, and the slack
 # for it to get included — both consumed by the squeeze check below.
 ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
+
+#: Blocks reserved for the taker's own claim to be MINED, before its burial starts counting (#511).
+#:
+#: TWO blocks, and each one is a separate reason. The first is arithmetic and unavoidable: a claim
+#: broadcast at height H cannot be mined at H, so its burial can only start at H+1. The second is
+#: slack for a block that does not include it — Radiant has no RBF and no CPFP, so a claim that
+#: misses cannot be accelerated, and mempool eviction (~8h expiry) then hands the maker its refund.
+#:
+#: MEASURE IT for a real-value run. This is a BLOCK count, not a wall-clock budget, so the block
+#: interval does not enter it — what matters is how many blocks can pass without including a
+#: correctly-fee'd tx. 2 is an estimate, not a measurement.
+ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS = 2
 
 #: Minimum ``eth_finality_stall_tolerance_s`` a REAL-VALUE ETH-leg policy must carry, in seconds.
 #: Grounded in the May-2023 Ethereum mainnet finality incident (~9 epochs, roughly an hour) that
@@ -241,6 +254,12 @@ class MarginPolicy:
     )
     rxd_claim_burial: Timelock = field(
         default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS, TimeUnit.BLOCKS)
+    )
+    #: Blocks allowed for the taker's claim to be MINED before its burial starts counting (#511).
+    #: See :data:`ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS`. Kept a policy knob rather than a constant
+    #: because it is the one term here an operator can measure on their own node.
+    rxd_claim_inclusion: Timelock = field(
+        default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS, TimeUnit.BLOCKS)
     )
     # VALUE-SCALED claim burial (red-team 2026-06-12 HIGH). The flat ``rxd_claim_burial`` above
     # bounds reorg PROBABILITY, not reorg COST vs. value — a low-cap PoW chain like Radiant can be
@@ -446,6 +465,7 @@ class MarginPolicy:
         block_interval_s: float,
         btc_claim_reorg_depth: Timelock | None = None,
         rxd_claim_burial: Timelock | None = None,
+        rxd_claim_inclusion: Timelock | None = None,
         rxd_block_interval_s: float | None = None,
         rxd_block_interval_fast_s: float | None = None,
         rxd_reorg_cost_per_block: int | None = None,
@@ -493,6 +513,11 @@ class MarginPolicy:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
             kwargs["rxd_claim_burial"] = rxd_claim_burial
+        # #511: a REAL-VALUE policy should measure how many blocks a correctly-fee'd claim can
+        # wait for inclusion. Reachable here because `measured()` is the constructor such an
+        # operator is told to use — a knob only settable through the raw dataclass is not a knob.
+        if rxd_claim_inclusion is not None:
+            kwargs["rxd_claim_inclusion"] = rxd_claim_inclusion
         if rxd_block_interval_s is not None:
             kwargs["rxd_block_interval_s"] = rxd_block_interval_s
         if rxd_reorg_cost_per_block is not None:
@@ -921,6 +946,24 @@ def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
     return math.ceil(reserve.value / block_interval_s)
 
 
+def _claim_floor_blocks(policy: MarginPolicy, *, burial: int, counter_reserve: int) -> int:
+    """Blocks that must remain before the maker's refund opens for a claim started NOW to be buried
+    in time. THE SINGLE DEFINITION — both the fund-time gate and the claim-time assessor call it.
+
+    They disagreed before #511, by exactly one block and on the permissive side. The fund gate
+    required `burial + counter_reserve + 1`, its comment naming the extra block as "one block for
+    the claim itself to be mined"; `assess_claim_finality` required only `burial + counter_reserve`.
+    So a swap could be funded against the stricter floor and then certified SAFE by the looser one
+    at a height where the claim provably could not bury in time — measured at burial=6, t_rxd=72:
+    `blocks_left == 6` returned SAFE while a claim mined in the very NEXT block reaches depth 6
+    exactly AT the refund height, where the maker's refund is simultaneously valid.
+
+    Two gates computing the same quantity from separate expressions is the shape that produced
+    #531 and the runner's empty-feasible-set class. Derived once here instead.
+    """
+    return burial + counter_reserve + _reserve_to_blocks(policy.rxd_claim_inclusion, policy.block_interval_s)
+
+
 def assess_claim_finality(
     *,
     counter_claim_finality: CounterClaimFinality,
@@ -1018,8 +1061,10 @@ def assess_claim_finality(
         # RF-06: the counter chain is not advancing finalization — never WAIT on a stall.
         return ClaimFinality.SQUEEZED
     if state is CounterClaimState.FINAL:
-        # Counter-leg claim is final/reorg-safe. Claim iff our own burial still fits.
-        if blocks_left >= rxd_burial:
+        # Counter-leg claim is final/reorg-safe. Claim iff our own burial still fits — INCLUDING
+        # the blocks the claim needs to be mined (#511), which this compared without until it
+        # certified SAFE one block past the point a claim could bury in time.
+        if blocks_left >= _claim_floor_blocks(policy, burial=rxd_burial, counter_reserve=0):
             return ClaimFinality.SAFE
         return ClaimFinality.SQUEEZED
     # NOT_YET_FINAL_LIVE: the counter-leg claim is not yet final. We can WAIT only if, after
@@ -1048,7 +1093,10 @@ def assess_claim_finality(
         # so flooring would under-count it and let the gate say WAIT with too little margin. Same
         # direction as the depth branch above and reserve_to_blocks(); never floor a reserve.
         counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / _dividing_interval_s(policy))
-    if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
+    if (
+        blocks_left >= _claim_floor_blocks(policy, burial=rxd_burial, counter_reserve=counter_reserve_rxd)
+        and counter_claim_finality.remaining_positive
+    ):
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
 
@@ -1640,9 +1688,9 @@ class SwapCoordinator:
             counter_reserve = 0
             if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
                 counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
-            # One block for the claim itself to be mined. Radiant has no RBF and no CPFP, so a
-            # claim that misses maturity cannot be accelerated.
-            required = burial + counter_reserve + 1
+            # The SHARED floor (#511) — the claim-time assessor computes it from the same
+            # function, so this gate and that one cannot drift apart again.
+            required = _claim_floor_blocks(mp, burial=burial, counter_reserve=counter_reserve)
             elapsed = max(0, int(cov_confs))
             remaining = int(terms.t_rxd.value) - elapsed
             if remaining < required:
@@ -1651,7 +1699,8 @@ class SwapCoordinator:
                     reason=(
                         f"t_rxd is {int(terms.t_rxd.value)} blocks and the maker's covenant is already "
                         f"{elapsed} deep, leaving {remaining} — but a safe claim needs {required} "
-                        f"(burial {burial} + counter-leg reserve {counter_reserve} + 1 block to mine). "
+                        f"(burial {burial} + counter-leg reserve {counter_reserve} + "
+                        f"{_reserve_to_blocks(mp.rxd_claim_inclusion, mp.block_interval_s)} to be mined). "
                         "This swap can NEVER reach a safe claim: the taker would reveal, find every "
                         "claim SQUEEZED, and be left choosing between a reorg-reversible claim and "
                         "walking away from a funded counter leg. Negotiate a longer t_rxd, fund "
