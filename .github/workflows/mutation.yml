@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -94,7 +94,7 @@ jobs:
     outputs:
       matrix: ${{ steps.groups.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: groups
         # The `groups` dispatch input was DECLARED and read nowhere: `-f groups=fee` was
         # silently ignored and the operator got the whole matrix. Same class as a CLI flag
