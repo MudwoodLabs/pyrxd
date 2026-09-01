@@ -182,10 +182,28 @@ class TestAResumeIsBoundedByWhatIsLEFT:
             "bound is dividing the original duration, not what remains"
         )
 
-    def test_a_value_valid_at_the_start_is_refused_once_too_little_remains(self, runner) -> None:
+    def test_a_value_valid_at_the_start_STAYS_valid_as_the_deadline_approaches(self, runner) -> None:
+        """THE RESUME RISK REVERSED WITH #482, and asserting the old direction would now demand a
+        refusal that would be a bug.
+
+        The bound was a cap: as the deadline approached, less remained, the cap fell, and a t_rxd
+        chosen at the start could drift above it — so a resume had to re-check and refuse. It is a
+        floor now, and the floor FALLS as the deadline approaches (`remaining + margin` shrinks).
+        A window long enough at the start is therefore still long enough later, always, and
+        refusing it would strand a swap the check exists to save.
+
+        What a resume must still catch is a t_rxd too SHORT for what remains, asserted below.
+        """
         at_start = runner._derive_t_rxd_blocks(_ns())
-        with pytest.raises(SystemExit):
-            runner._assert_t_rxd_outlasts_the_eth_deadline(_ns(t_rxd_blocks=at_start), remaining_s=43_200)
+        runner._assert_t_rxd_outlasts_the_eth_deadline(_ns(t_rxd_blocks=at_start), remaining_s=43_200)
+
+    def test_a_value_too_SHORT_for_what_remains_is_still_refused_on_resume(self, runner) -> None:
+        """The paired refusal, so the test above cannot be satisfied by a bound that accepts
+        everything on a resume."""
+        remaining = 43_200
+        derived = runner._derive_t_rxd_blocks(_ns(), remaining_s=remaining)
+        with pytest.raises(SystemExit, match="too SHORT"):
+            runner._assert_t_rxd_outlasts_the_eth_deadline(_ns(t_rxd_blocks=derived - 1), remaining_s=remaining)
 
     def test_the_honest_resume_still_passes(self, runner) -> None:
         """Paired, because a bound that refuses every resume strands funds it was meant to save."""
@@ -313,7 +331,9 @@ def test_the_derivation_matches_what_the_bounds_demand(runner) -> None:
         runner._assert_t_rxd_covers_the_takers_wait(args)
         runner._assert_t_rxd_outlasts_the_eth_deadline(args)
         runner._assert_t_rxd_bounds_the_vulnerable_window(args)
-        assert args.t_rxd_blocks < math.ceil(eth_timeout_s / 36.0)
+        # The derived window now EXCEEDS the raw deadline in blocks — it has to cover the deadline
+        # PLUS the margin, where it used to have to fit inside the deadline MINUS it (#482).
+        assert args.t_rxd_blocks > math.ceil(eth_timeout_s / 36.0)
 
 
 #: (fast_interval_s, eth_timeout_s, stall_s, confirm_wait_s) rows on which the PRE-FIX deadline
@@ -428,36 +448,14 @@ class TestTheFeasibilityCheckIsTheSetAndNotASum:
         lo, hi = runner._t_rxd_feasible_range(args)
         assert lo <= args.t_rxd_blocks <= hi
 
-    @pytest.mark.parametrize("fast,eth_timeout_s,stall,wait", _EMPTY_FEASIBLE_SET_ROWS)
-    def test_the_minimum_it_names_is_reached_by_the_whole_pipeline(
-        self, runner, fast: float, eth_timeout_s: int, stall: int, wait: int
-    ) -> None:
-        """Honest path. A refusal that leaves the operator with no correct action IS the defect;
-        the remedy has to survive the derivation AND all three bounds."""
-        base = dict(
-            rxd_block_interval_fast_s=fast,
-            eth_finality_stall_tolerance_s=stall,
-            max_covenant_confirm_wait_s=wait,
-        )
-        with pytest.raises(SystemExit) as exc:
-            runner._assert_the_eth_deadline_can_hold_the_margins(_ns(eth_timeout_s=eth_timeout_s, **base))
-        minimum = int(str(exc.value).split("minimum: --eth-timeout-s ")[1].split()[0])
-        _run_the_whole_parse_time_pipeline(runner, _ns(eth_timeout_s=minimum, **base))
-
-    @pytest.mark.parametrize("fast,eth_timeout_s,stall,wait", _EMPTY_FEASIBLE_SET_ROWS)
-    def test_the_minimum_is_actually_minimAL(
-        self, runner, fast: float, eth_timeout_s: int, stall: int, wait: int
-    ) -> None:
-        base = dict(
-            rxd_block_interval_fast_s=fast,
-            eth_finality_stall_tolerance_s=stall,
-            max_covenant_confirm_wait_s=wait,
-        )
-        with pytest.raises(SystemExit) as exc:
-            runner._assert_the_eth_deadline_can_hold_the_margins(_ns(eth_timeout_s=eth_timeout_s, **base))
-        minimum = int(str(exc.value).split("minimum: --eth-timeout-s ")[1].split()[0])
-        with pytest.raises(SystemExit, match="cannot hold"):
-            runner._assert_the_eth_deadline_can_hold_the_margins(_ns(eth_timeout_s=minimum - 1, **base))
+    # REMOVED WITH #482, not silently: `test_the_minimum_it_names_is_reached_by_the_whole_pipeline`
+    # and `test_the_minimum_is_actually_minimAL`. Both drove `_assert_the_eth_deadline_can_hold_the
+    # _margins` over `_EMPTY_FEASIBLE_SET_ROWS` and parsed a "minimum: --eth-timeout-s" out of the
+    # refusal. Those rows no longer refuse — their sets are non-empty — so neither test could reach
+    # its assertion, and both would have had to be rewritten into something the two tests above
+    # already say about the same rows: the set exists, and the whole pipeline accepts the derived
+    # value on it. The minimum-vs-maximum boundary they were pinning is covered by
+    # `TestAnImpossibleDeadlineNamesTheRightArgument`, on parameters that genuinely refuse.
 
     @pytest.mark.parametrize("fast", [36.2, 36.4, 36.5, 36.7, 43.3, 55.9, 60.5, 22.7, 331.7, 41.618, 9.7, 128.3])
     def test_a_FRACTIONAL_sweep_never_clears_a_deadline_the_bounds_then_refuse(self, runner, fast: float) -> None:
@@ -490,7 +488,11 @@ class TestTheFeasibilityCheckIsTheSetAndNotASum:
             window = runner._t_rxd_feasible_range(args)
             assert window is not None
             lo, hi = window
-            for t in range(max(1, lo - 3), hi + 4):
+            # Probe the NEIGHBOURHOOD OF THE FLOOR, not of `hi`. `hi` is the BIP68 field width
+            # since #482, and `hi + 4` walks past it into values the predicates accept (they are
+            # all floors) but the range excludes for being unrepresentable — a disagreement about
+            # the field width, not about the bounds.
+            for t in range(max(1, lo - 3), min(lo + 4, hi + 1)):
                 probe = _ns(rxd_block_interval_fast_s=fast, eth_timeout_s=86_400, t_rxd_blocks=t)
                 accepted = True
                 try:
@@ -556,11 +558,26 @@ class TestTheTwoBoundsWhoseREFUSALHadNeverRun:
 
     def test_the_vulnerable_window_bound_is_a_FLOOR_and_refuses_one_block_under_it(self, runner) -> None:
         """Pins the DIRECTION. A bound that only refuses very small values would satisfy the 240
-        test above while still accepting everything near the boundary."""
-        derived = runner._derive_t_rxd_blocks(_ns())
-        runner._assert_t_rxd_bounds_the_vulnerable_window(_ns(t_rxd_blocks=derived))
+        test above while still accepting everything near the boundary.
+
+        PROBED AT THIS BOUND'S OWN FLOOR, not at the derived value. Since #482 the deadline floor
+        dominates and the derived value sits far above the vulnerable-window floor, so
+        `derived - 1` still satisfies this bound — the assertion would have been vacuous while
+        looking identical to a real one. The floor is located by scanning this predicate alone.
+        """
+
+        def ok(t: int) -> bool:
+            try:
+                runner._assert_t_rxd_bounds_the_vulnerable_window(_ns(t_rxd_blocks=t))
+                return True
+            except SystemExit:
+                return False
+
+        floor = next(t for t in range(1, 65_536) if ok(t))
+        assert floor > 1, "the vulnerable-window bound accepts t_rxd=1; it is not binding at all"
+        runner._assert_t_rxd_bounds_the_vulnerable_window(_ns(t_rxd_blocks=floor))
         with pytest.raises(SystemExit, match="ASSET_VULNERABLE"):
-            runner._assert_t_rxd_bounds_the_vulnerable_window(_ns(t_rxd_blocks=derived - 1))
+            runner._assert_t_rxd_bounds_the_vulnerable_window(_ns(t_rxd_blocks=floor - 1))
 
 
 #: (fast_interval_s, eth_timeout_s, stall_s, confirm_wait_s) rows where the feasible set is
@@ -594,10 +611,22 @@ class TestTheADVICEIsSourcedFromTheFeasibleSet:
     """
 
     @pytest.mark.parametrize("fast,eth_timeout_s,stall,wait", _DERIVATION_MISSES_THE_RANGE_ROWS)
-    def test_the_row_still_reproduces_the_derivation_gap(
+    def test_the_derivation_now_lands_exactly_ON_the_feasible_floor(
         self, runner, fast: float, eth_timeout_s: int, stall: int, wait: int
     ) -> None:
-        """Guards the guard: without an actual gap these rows prove nothing."""
+        """THE GAP IS CLOSED BY CONSTRUCTION SINCE #482, so this asserts the opposite of what its
+        name records — deliberately, and under the original name, because the rows are the evidence.
+
+        These are the measured parameter sets on which the library's derivation landed OUTSIDE the
+        runner's feasible set. That was possible because the set had a ceiling: the derivation
+        aimed at the largest window the gate accepts, the runner capped it a block lower, and the
+        two disagreed at a fractional tail. Inverted, both aim at the same floor — the derivation
+        returns the SMALLEST value the gate accepts and the runner's lower bound IS that value —
+        so `derived == window[0]` exactly, on every row.
+
+        That is a sharper property than "lands inside", and it is asserted rather than the weaker
+        containment because the equality is what makes the gap unrepresentable.
+        """
         args = _ns(
             rxd_block_interval_fast_s=fast,
             eth_timeout_s=eth_timeout_s,
@@ -605,11 +634,15 @@ class TestTheADVICEIsSourcedFromTheFeasibleSet:
             max_covenant_confirm_wait_s=wait,
         )
         window = runner._t_rxd_feasible_range(args)
-        assert window is not None, "this row's feasible set is empty; it belongs in the other class"
+        assert window is not None, "this row's feasible set is empty; the ceiling has come back"
         derived = runner._derive_t_rxd_blocks(args)
-        assert not (window[0] <= derived <= window[1]), (
-            f"the raw derivation {derived} now lands inside {window} at fast={fast} — this row no "
-            "longer demonstrates the gap; find a replacement rather than deleting it"
+        assert window[0] <= derived <= window[1], (
+            f"the derivation {derived} falls outside {window} at fast={fast} — the gap this row records has reopened"
+        )
+        assert derived == window[0], (
+            f"the derivation {derived} is not the feasible floor {window[0]} at fast={fast}. Both "
+            "should be 'the smallest t_rxd the gate accepts'; a difference means they have drifted "
+            "apart again, which is exactly how the gap arose."
         )
 
     @pytest.mark.parametrize("fast,eth_timeout_s,stall,wait", _DERIVATION_MISSES_THE_RANGE_ROWS)
