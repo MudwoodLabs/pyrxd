@@ -288,7 +288,11 @@ class FakeSeenStore:
 # ---------------------------------------------------------------------------
 
 
-def _terms(*, variant: str = "ft", t_btc_blocks: int = 144, t_rxd_blocks: int = 72, hashlock: bytes | None = None):
+# INVERTED 2026-08-31 (#482): t_rxd is now the LONGER leg. The maker holds p and LOCKS the
+# Radiant covenant, so that leg carries the longer timeout and the leg the maker CLAIMS (BTC)
+# the shorter — Herlihy 1801.09515 §1. These defaults were 144/72 the other way round, which
+# means every test built on them was exercising the relation that let the maker take both legs.
+def _terms(*, variant: str = "ft", t_btc_blocks: int = 72, t_rxd_blocks: int = 144, hashlock: bytes | None = None):
     if hashlock is None:
         hashlock = hashlib.sha256(os.urandom(32)).digest()
     return NegotiatedTerms(

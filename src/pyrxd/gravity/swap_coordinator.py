@@ -112,9 +112,10 @@ MAKER_SECRET_TAKER_LOCKS_BTC_FIRST = (  # nosec B105 — a role-invariant doc st
     "the covenant off the Radiant chain (HZ-1, #392). (4) The "
     "MAKER claims the BTC FIRST, revealing p in the Bitcoin witness. (5) The TAKER "
     "scrapes p from Bitcoin and claims the Radiant asset before its refund opens. "
-    "Invariant: t_BTC > t_RXD + margin — the leg claimed second (Radiant) has the "
-    "SHORTER refund window; the first-claimed leg (BTC) holds the LONGER refund. "
-    "The taker's client MUST verify t_BTC - t_RXD >= margin before funding, or refuse. "
+    "Invariant: t_RXD > t_BTC + margin — the maker holds p and LOCKS the Radiant leg, "
+    "so THAT leg carries the LONGER refund and the leg the maker CLAIMS (BTC) the shorter "
+    "(Herlihy 1801.09515 §1: the secret generator locks at 6-delta and claims a 4-delta leg). "
+    "The taker's client MUST verify t_RXD - t_BTC >= margin before funding, or refuse. "
     "NB the NAME predates HZ-1 (#392), which inverted the lock order in (2)/(3); it is "
     "kept because it is exported, asserted in tests and quoted in a ValidationError, and "
     "because the half of it that names the timelock invariant is still exactly right."
@@ -187,7 +188,7 @@ class MarginPolicy:
     Attributes
     ----------
     margin:
-        The required minimum ``t_btc - t_rxd``, as a unit-tagged
+        The required minimum ``t_rxd - t_btc``, as a unit-tagged
         :class:`Timelock`. If ``is_measured`` is False this is an ESTIMATE.
     block_interval_s:
         Seconds-per-block used to normalise across units. For BTC the canonical
@@ -646,7 +647,21 @@ def _stablecoin_value_floor_photons(terms: NegotiatedTerms, policy: MarginPolicy
 
 
 def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy) -> None:
-    """Assert ``t_btc - t_rxd >= margin`` — fail-closed, cross-unit normalised.
+    """Assert ``t_rxd - t_btc >= margin`` — fail-closed, cross-unit normalised.
+
+    INVERTED 2026-08-31 (#482 finding 1). This asserted ``t_btc - t_rxd >= margin``, which is the
+    wrong way round. Herlihy (arXiv:1801.09515) §1: Alice GENERATES the secret and locks at ``6∆``;
+    Bob locks at ``5∆``; Carol at ``4∆``; **Alice claims Carol's 4∆ leg**. The secret-holder's
+    LOCKED leg carries the LONGEST timeout and the leg they CLAIM the shortest, with Lemma 4.13
+    giving the gap: "the timeout on each arc (u, v) is later by at least ∆ than the timeout on each
+    arc (v, w)".
+
+    Our maker generates ``p``, LOCKS the Radiant covenant and CLAIMS the counter leg, so ``t_rxd``
+    must be the longer one. Under the old relation the window ``[rxd_refund_opens, counter_deadline]``
+    — at least ``margin`` wide BY CONSTRUCTION — let the maker refund the covenant while ``p`` was
+    still secret and then claim the counter leg. Both legs, deterministically, with the taker unable
+    to claim (no ``p``) or refund (its deadline is later). The safety buffer WAS the attack window.
+
 
     Both legs and the margin are normalised to BLOCKS using
     ``policy.block_interval_s``. If either input is not a :class:`Timelock`, or the
@@ -676,13 +691,16 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
         raise ValidationError(f"could not normalise timelocks to a common unit: {exc}") from exc
 
-    if btc_blocks <= rxd_blocks:
+    if rxd_blocks <= btc_blocks:
         raise ValidationError(
-            f"timelock ordering violated: t_btc ({btc_blocks} blk) must exceed t_rxd ({rxd_blocks} blk)"
+            f"timelock ordering violated: t_rxd ({rxd_blocks} blk) must exceed t_btc ({btc_blocks} blk) — "
+            "the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout "
+            "(Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is "
+            "still secret and then claim the counter leg."
         )
-    if (btc_blocks - rxd_blocks) < margin_blocks:
+    if (rxd_blocks - btc_blocks) < margin_blocks:
         raise ValidationError(
-            f"insufficient margin: t_btc - t_rxd = {btc_blocks - rxd_blocks} blk < required {margin_blocks} blk "
+            f"insufficient margin: t_rxd - t_btc = {rxd_blocks - btc_blocks} blk < required {margin_blocks} blk "
             f"({'measured' if policy.is_measured else 'ESTIMATED'})"
         )
 
@@ -723,10 +741,21 @@ def taker_refund_window_open(
     This is a TIMING PREDICATE only — "the maker has not claimed and ``t_RXD - N`` is
     approaching" — NOT a prescription of which refund to run. (Formerly named
     ``should_taker_refund_proactively``; renamed because the name described an action
-    while the predicate only describes this window — deferred from PR #189.) The dominant adversarial
-    risk it guards: because ``t_BTC > t_RXD``, a malicious maker can withhold the BTC
-    claim until after ``t_RXD`` opens, then claim BTC (revealing ``p``) AND CSV-refund
-    the asset, taking both. Treat the trigger as "stop waiting", never "keep waiting".
+    while the predicate only describes this window — deferred from PR #189.)
+
+    THE RISK THIS WAS WRITTEN FOR IS NOW CLOSED AT THE SOURCE, and it is worth recording that
+    this docstring DESCRIBED the defect for months while the ordering that enabled it stood. It
+    read: "because ``t_BTC > t_RXD``, a malicious maker can withhold the BTC claim until after
+    ``t_RXD`` opens, then claim BTC (revealing ``p``) AND CSV-refund the asset, taking both."
+
+    That is #482 finding 1, stated exactly, and mitigated with a timing predicate that asks the
+    taker to bail out early rather than by fixing the relation. With ``t_RXD > t_BTC + margin``
+    (see :func:`assert_timelock_margin`) the maker's own refund now opens LAST, so withholding
+    buys nothing: the counter leg expires first and the taker refunds it.
+
+    The predicate is KEPT because it still detects a stalled maker — a liveness signal, not a
+    theft one — and because a swap negotiated under the old relation is still out there. Treat the
+    trigger as "stop waiting", never "keep waiting".
 
     IMPORTANT — what the taker DOES when this fires is :meth:`mutual_refund` (both legs
     unwind once both timeouts elapse), NOT an asset-only refund. The asset CSV refund
