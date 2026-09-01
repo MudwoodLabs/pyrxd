@@ -51,12 +51,20 @@ def _xonly(sk: coincurve.PrivateKey) -> bytes:
 
 
 def _terms(*, btc_sats: int = 5_000, t_btc: t.Timelock | None = None) -> NegotiatedTerms:
+    _t_btc = t_btc or t.Timelock(72, t.TimeUnit.BLOCKS)
     return NegotiatedTerms(
         hashlock=_H,
         btc_sats=btc_sats,
         radiant_amount=1_000,
-        t_btc=t_btc or t.Timelock(144, t.TimeUnit.BLOCKS),
-        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        t_btc=_t_btc,
+        # DERIVED, not a literal (#482). t_rxd must strictly exceed t_btc, and callers pass t_btc
+        # freely (144, 200, a SECONDS value). A fixed t_rxd collides with whichever of those
+        # happens to match it — which is exactly what a hardcoded 144 did here.
+        t_rxd=(
+            t.Timelock(_t_btc.value + 72, t.TimeUnit.BLOCKS)
+            if _t_btc.unit is t.TimeUnit.BLOCKS
+            else t.Timelock(144, t.TimeUnit.BLOCKS)
+        ),
         asset_variant="ft",
         genesis_ref=b"\xaa" * 36,
         taker_dest_hash=b"\x11" * 32,
@@ -385,10 +393,13 @@ def _decide(rec, obs):
 
 
 def test_btc_locked_refunds_only_when_funding_matured():
-    rec = _btc_rec()  # t_btc = 144 blocks
+    # t_btc = 72 blocks. It was 144 before #482 inverted the pair; the confirmation counts here
+    # are RELATIVE to it, so they move with it — 100 confirmations used to be immature and is now
+    # well past maturity, which is what this test would otherwise assert the opposite of.
+    rec = _btc_rec()
     assert _decide(rec, _obs(btc_funding_confirmations=None)).intent is Intent.WATCH
-    assert _decide(rec, _obs(btc_funding_confirmations=100)).intent is Intent.WATCH
-    d = _decide(rec, _obs(btc_funding_confirmations=144))
+    assert _decide(rec, _obs(btc_funding_confirmations=71)).intent is Intent.WATCH
+    d = _decide(rec, _obs(btc_funding_confirmations=72))
     assert d.intent is Intent.PAGE_REFUND
     assert d.recommended_action == "taker_refund_btc" and d.autonomous_btc_refund is True
 

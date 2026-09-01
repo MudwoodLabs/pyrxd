@@ -43,7 +43,7 @@ def _xonly() -> bytes:
     return coincurve.PublicKeyXOnly.from_secret(os.urandom(32)).format()
 
 
-def _terms(*, variant: str = "ft", t_btc_blocks: int = 144, t_rxd_blocks: int = 72) -> NegotiatedTerms:
+def _terms(*, variant: str = "ft", t_btc_blocks: int = 72, t_rxd_blocks: int = 144) -> NegotiatedTerms:
     p = os.urandom(32)
     h = hashlib.sha256(p).digest()
     return NegotiatedTerms(
@@ -240,10 +240,24 @@ def test_terms_never_carries_preimage():
 
 
 def test_terms_rejects_same_unit_bad_ordering():
+    """The construction guard, in the direction #482 corrected it to.
+
+    The maker holds `p`, LOCKS the Radiant leg and CLAIMS the BTC leg, so `t_rxd` must strictly
+    exceed `t_btc`. The refused pairs are therefore t_rxd <= t_btc. The second case here used to
+    be `(t_btc=50, t_rxd=72)` — which is now the LEGITIMATE ordering, and is asserted as such in
+    the honest-path test below rather than deleted, since a refusal test whose input became valid
+    is exactly the kind that goes green by vacuity if it is merely renumbered.
+    """
     with pytest.raises(ValidationError):
-        _terms(t_btc_blocks=72, t_rxd_blocks=72)  # t_btc <= t_rxd
+        _terms(t_btc_blocks=72, t_rxd_blocks=72)  # equal is not "exceeds"
     with pytest.raises(ValidationError):
-        _terms(t_btc_blocks=50, t_rxd_blocks=72)
+        _terms(t_btc_blocks=72, t_rxd_blocks=50)  # t_rxd shorter than t_btc
+
+
+def test_terms_ACCEPTS_the_ordering_the_old_guard_refused():
+    """The paired honest path. `t_btc=50, t_rxd=72` is the safe layout and must construct."""
+    terms = _terms(t_btc_blocks=50, t_rxd_blocks=72)
+    assert terms.t_rxd.value > terms.t_btc.value
 
 
 def test_terms_rejects_seconds_t_rxd_f002():
