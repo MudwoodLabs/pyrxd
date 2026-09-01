@@ -35,7 +35,7 @@ dependencies = [
     "aiohttp>=3.14.3",
     "base58>=2.1.1,<3.0.0",
     "cbor2>=6.1.4,<7.0",
-    "click>=8.4.2,<9.0",
+    "click>=8.5.0,<9.0",
     "coincurve>=21.0.0,<22.0.0",
     # Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
     # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
@@ -341,13 +341,13 @@ dev = [
     "mypy>=2.3.1,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.4,<0.17.0",
+    "ruff>=0.16.5,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
     # (GHSA-6v7p-g79w-8964). cachecontrol allows < 2.0.0, so pin the patched floor. Dev-scope only —
     # msgpack is not a pyrxd runtime dependency and never ships in the published package.
-    "msgpack>=1.2.1",
+    "msgpack>=1.2.2",
     # Transitive security floor (dev-only): cosmic-ray pulls gitpython, which has drawn repeated
     # clusters of HIGH advisories — env-var exfiltration via Repo.clone_from() (GHSA-rwj8-pgh3-r573,
     # patched 3.1.52), command injection via Repo.archive()/git.ls_remote() and short/long-option gate
@@ -359,7 +359,7 @@ dev = [
     # IndexFile.from_tree (GHSA-9rj7-rf2p-w77r, GHSA-4gmw-gg2m-w46p), all patched 3.1.58. cosmic-ray
     # sets no upper cap, so floor at the highest patched version. Dev-scope only — gitpython is not a
     # pyrxd runtime dependency and never ships in the published package.
-    "gitpython>=3.1.59",
+    "gitpython>=3.1.60",
 ]
 test = [
     "bandit[toml]>=1.9.4,<2.0.0",
