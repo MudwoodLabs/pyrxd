@@ -502,13 +502,16 @@ async def test_refund_rejects_premature_csv():
     a clear "needs N, has M" message and NOT broadcast — the leg refuses a non-final refund rather than
     relying on node rejection under deadline pressure."""
     taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
-    terms = _terms(maker_kp=maker, taker_kp=taker)  # t_btc = 144 → mature at funding confs >= 144
+    # t_btc = 72 since #482 swapped the pair (the maker LOCKS the longer Radiant leg), so maturity
+    # is at 72 confirmations and the "one block short" case is 71. Left at 143 this test passes 143
+    # confirmations against a 72-block CSV — long mature — and asserts a refusal that cannot happen.
+    terms = _terms(maker_kp=maker, taker_kp=taker)
     bc = FakeBroadcaster()
-    leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc, reader=FakeFundingReader(claim_confs=143))
+    leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc, reader=FakeFundingReader(claim_confs=71))
     htlc = leg._htlc(terms)
     locator = htlc.with_funding(t.BtcOutpoint("cd" * 32, 0), terms.btc_sats)
     # NetworkError (transient/retryable), consistent with the covenant leg — not a fatal ValidationError.
-    with pytest.raises(NetworkError, match="not yet mature: needs 144 confirmations, has 143"):
+    with pytest.raises(NetworkError, match="not yet mature: needs 72 confirmations, has 71"):
         await leg.refund(locator, terms.t_btc)
     assert bc.raw_seen == [], "no non-final refund may be broadcast before CSV maturity"
 

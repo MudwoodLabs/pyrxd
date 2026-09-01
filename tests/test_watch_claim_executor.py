@@ -486,8 +486,10 @@ async def test_covenant_already_spent_is_idempotent_declined():
 async def test_fresh_reassess_squeezed_declines():
     # t_rxd window already closed at fresh read: funded_h far below now so blocks_left < burial.
     terms, _p, raw, claim_txid, locator, _btc_leg = await _build_real_claim()
-    # now_rxd = funded_h + confs - 1 = 100 + 100 - 1 = 199 > refund_opens (100 + 72 = 172) → SQUEEZED.
-    chain_io = _FakeChainIO(value=terms.radiant_amount, funded_h=100, confs=100)
+    # now_rxd = funded_h + confs - 1 = 100 + 172 - 1 = 271 > refund_opens (100 + 144 = 244) → SQUEEZED.
+    # The numbers moved with t_rxd, which #482 raised from 72 to 144; at the old confs=100 the
+    # window is still wide open and this test asserts a SQUEEZE that does not happen.
+    chain_io = _FakeChainIO(value=terms.radiant_amount, funded_h=100, confs=172)
     leg = _FakeRadiantLeg(chain_io)
     ex = ClaimExecutor(
         resolve_leg=_resolver(leg),
@@ -614,9 +616,11 @@ async def test_fire_once_marks_only_after_successful_broadcast():
 
 
 async def test_corroborated_deeper_depth_flips_safe_to_squeezed():
-    # Single node says confs=1 → now_rxd=100 → SAFE. A corroborator reporting a DEEPER depth (100) makes
-    # now_rxd=199 > refund_opens(172) → SQUEEZED → DECLINED. The deeper (MAX) read can't false-SAFE.
-    ex, leg, rec, _ = await _armed_executor(confs=1, rxd_depth_corroborator=_FakeDepthCorroborator(depth=100))
+    # Single node says confs=1 → now_rxd=100 → SAFE. A corroborator reporting a DEEPER depth (172)
+    # makes now_rxd=271 > refund_opens(244) → SQUEEZED → DECLINED. The deeper (MAX) read can't
+    # false-SAFE. The corroborated depth scales with t_rxd (72 → 144 at #482); at the old 100 the
+    # deeper read is still SAFE and this test proves nothing about the flip it is named for.
+    ex, leg, rec, _ = await _armed_executor(confs=1, rxd_depth_corroborator=_FakeDepthCorroborator(depth=172))
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
     assert leg.claimed_with is None
 

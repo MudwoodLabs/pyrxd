@@ -287,7 +287,14 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
     #   (b) one FEWER block is refused — the emitted value is the SMALLEST the gate accepts, so no
     #       fix for (a) may quietly lengthen the maker's lock instead (#482 flipped which side of
     #       the boundary is the give-away);
-    assert not accepts(t.value - 1), f"the gate also accepts t_rxd={t.value - 1}: the maker's lock is a block too long"
+    #       ...but ONLY where the GATE is the binding constraint. When the safety floor is what
+    #       stops the search, the emitted value is the floor and the gate legitimately accepts less
+    #       — asserting otherwise demands the sizer return a value below its own floor. Found by
+    #       hypothesis at floor_blocks=2, emitted 2, gate accepting 1.
+    if t.value > floor_blocks:
+        assert not accepts(t.value - 1), (
+            f"the gate also accepts t_rxd={t.value - 1}: the maker's lock is a block too long"
+        )
     #   (c) the step-UP never drifts: the answer stays within the sizer's documented reach of
     #       the analytic value (start, or up to 2 above it — the third refusal raises instead).
     assert start <= t.value <= start + 2, f"t.value={t.value} outside [{start}, {start + 2}]"

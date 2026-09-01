@@ -1985,9 +1985,18 @@ _NOW = 1_700_000_000
 # The cross-clock margin the ETH fixtures below build (780 + 1800 + 600 + 300, plus stall budget
 # where a test sets one). Kept beside _NOW because `_eth_terms` sizes t_rxd against it.
 _ETH_TEST_MARGIN_S = 780 + 1_800 + 600 + 300
+# Covenant depth already elapsed when the taker funds. Comfortably above the 6-block burial the
+# measured fixtures use, so the derived t_rxd clears step 7 rather than sitting on its boundary.
+_ELAPSED_DEPTH_ALLOWANCE = 24
 
 
-def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int | None = None, eth_timeout_unix_s: int = _NOW + 40_000):
+def _eth_terms(
+    *,
+    hashlock: bytes,
+    t_rxd_blocks: int | None = None,
+    eth_timeout_unix_s: int = _NOW + 40_000,
+    now_unix_s: int = _NOW,
+):
     # t_rxd DERIVES from the ETH deadline, the way production sizes it. Under the inverted relation
     # (#482) the RXD refund must open AFTER `eth_timeout + margin`, so a fixed block count cannot
     # be right for an arbitrary deadline — a fixture that hardcodes one is asserting against a
@@ -1997,8 +2006,17 @@ def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int | None = None, eth_timeout_
         # 300.0 is the interval the ETH coordinator fixtures below configure, NOT 600. Deriving
         # against the wrong one halves the window and every ETH test fails on a margin it was
         # never testing — which is what happened on the first attempt at this.
-        span_s = max(0, eth_timeout_unix_s - _NOW) + _ETH_TEST_MARGIN_S
-        t_rxd_blocks = math.ceil(span_s / 300.0) + 2  # +2 for the sizer's and the gate's rounding
+        # `now_unix_s` is the CALLER's clock, not this module's. Other test files import this
+        # fixture and freeze time somewhere else entirely — sizing against `_NOW` there produced
+        # a span of decades and a t_rxd past the BIP68 cap, from a deadline the caller had
+        # written as 40_000s out.
+        span_s = max(0, eth_timeout_unix_s - now_unix_s) + _ETH_TEST_MARGIN_S
+        # +2 for the sizer's and the gate's rounding, +_ELAPSED_DEPTH_ALLOWANCE for the covenant
+        # confirmations already spent by the time the taker funds. Step 7 of the pre-fund gate
+        # checks the REMAINING window (#482), and on a MEASURED policy the covenant is required
+        # to be burial-deep before funding — so a t_rxd sized to exactly meet the deadline is
+        # always short by that depth. Production has to carry the same headroom.
+        t_rxd_blocks = math.ceil(span_s / 300.0) + 2 + _ELAPSED_DEPTH_ALLOWANCE
     # t_btc is only the BTC-shaped placeholder here (the real deadline is `eth_timeout_unix_s`),
     # but the construction guard still applies to it, so it respects the inverted relation too.
     return NegotiatedTerms(

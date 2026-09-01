@@ -851,8 +851,9 @@ def run_self_check() -> None:
     terms, cov = _terms_from_public(
         hashlock=h,
         btc_sats=100_000,
-        t_rxd_blocks=20,
-        t_btc_blocks=60,  # t_btc - t_rxd = 40 >= margin 36
+        # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd is the LONGER.
+        t_rxd_blocks=60,
+        t_btc_blocks=20,  # t_rxd - t_btc = 40 >= margin 36
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,

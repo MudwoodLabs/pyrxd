@@ -234,8 +234,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "--refund-spk must be a standard spendable scriptPubKey (P2WPKH/P2TR/P2WSH/P2PKH/P2SH); "
             "derive it from your checksum-validated refund address"
         )
-    if args.t_btc <= args.t_rxd:
-        raise SystemExit(f"--t-btc ({args.t_btc}) must be > --t-rxd ({args.t_rxd}) (BTC is the longer leg)")
+    # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so the RADIANT leg carries the
+    # longer refund and the BTC leg it claims is the shorter one.
+    if args.t_rxd <= args.t_btc:
+        raise SystemExit(f"--t-rxd ({args.t_rxd}) must be > --t-btc ({args.t_btc}) (Radiant is the longer leg)")
 
     # Keys: taker refund key (generated, persisted 0600) + a maker claim PUBKEY (we never claim, so its
     # private half is discarded — only the x-only pubkey is needed to reconstruct the taptree).
@@ -408,8 +410,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     s.add_argument("--swap-id", default="dust1", help="swap id (== the SwapRecord/sidecar file stem)")
     s.add_argument("--network", default="bc", help="bc | bcrt | tb | signet")
     s.add_argument("--btc-sats", type=int, required=True, help="exact sats to fund the HTLC with")
-    s.add_argument("--t-btc", type=int, default=2, help="BTC refund CSV in blocks (the longer leg)")
-    s.add_argument("--t-rxd", type=int, default=1, help="RXD refund CSV in blocks (must be < --t-btc)")
+    s.add_argument("--t-btc", type=int, default=1, help="BTC refund CSV in blocks (the shorter leg)")
+    s.add_argument("--t-rxd", type=int, default=2, help="RXD refund CSV in blocks (must be > --t-btc)")
     s.add_argument("--refund-spk", required=True, help="hex scriptPubKey the refund must pay (YOUR address)")
     s.add_argument("--refund-address", help="the refund address, for display only")
     s.add_argument("--force", action="store_true", help="overwrite an existing state file")

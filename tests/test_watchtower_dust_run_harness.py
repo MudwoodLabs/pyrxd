@@ -31,10 +31,11 @@ if _SCRIPTS not in sys.path:
 
 import watchtower_dust_run as harness
 
-# A standard P2WPKH refund scriptPubKey for tests. The MAINNET run uses 2000 sats / t_btc=2 / t_rxd=1,
-# so the unit tests exercise that exact config.
+# A standard P2WPKH refund scriptPubKey for tests. The MAINNET run used 2000 sats with the BTC leg
+# as the LONGER one (t_btc=2 / t_rxd=1) — the ordering #482 corrected. The legs are swapped here to
+# the layout the tower now requires; the amounts and everything else stay as the run had them.
 _REFUND_SPK_HEX = "0014" + "11" * 20
-_RUN = dict(btc_sats=2000, t_btc=2, t_rxd=1, network="bcrt")
+_RUN = dict(btc_sats=2000, t_btc=1, t_rxd=2, network="bcrt")
 
 
 def _setup(tmp_path: Path, **overrides) -> Path:
@@ -119,9 +120,11 @@ def test_setup_refuses_a_nonstandard_refund_spk(tmp_path):
     assert not (tmp_path / "run.state.json").exists()
 
 
-def test_setup_refuses_when_t_btc_not_longer_than_t_rxd(tmp_path):
+def test_setup_refuses_when_t_rxd_not_longer_than_t_btc(tmp_path):
     with pytest.raises(SystemExit):
-        _setup(tmp_path, t_btc=2, t_rxd=2)
+        _setup(tmp_path, t_btc=2, t_rxd=2)  # equal is not 'exceeds'
+    with pytest.raises(SystemExit):
+        _setup(tmp_path, t_btc=2, t_rxd=1)  # the OLD ordering, now refused
 
 
 async def test_harness_artifacts_satisfy_every_executor_bind(tmp_path):
