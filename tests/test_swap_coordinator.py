@@ -288,11 +288,29 @@ class FakeSeenStore:
 # ---------------------------------------------------------------------------
 
 
-# INVERTED 2026-08-31 (#482): t_rxd is now the LONGER leg. The maker holds p and LOCKS the
-# Radiant covenant, so that leg carries the longer timeout and the leg the maker CLAIMS (BTC)
-# the shorter — Herlihy 1801.09515 §1. These defaults were 144/72 the other way round, which
-# means every test built on them was exercising the relation that let the maker take both legs.
-def _terms(*, variant: str = "ft", t_btc_blocks: int = 72, t_rxd_blocks: int = 144, hashlock: bytes | None = None):
+# INVERTED 2026-08-31 (#482): t_rxd is now the LONGER leg. The maker holds p and LOCKS the Radiant
+# covenant, so that leg carries the longer timeout and the leg the maker CLAIMS (BTC) the shorter —
+# Herlihy 1801.09515 §1. The defaults were 144/72 the other way round, so every test built on them
+# was exercising the relation that let the maker take both legs.
+#
+# `t_btc_blocks` now DERIVES from `t_rxd_blocks` when not given. Callers vary `t_rxd` to exercise
+# burial and squeeze bands; making each one also hand-maintain `t_btc` is how a relation drifts out
+# of a suite one call site at a time. `_BTC_GAP` is wide enough for the default estimated margin.
+_BTC_GAP = 40
+
+
+def _terms(
+    *,
+    variant: str = "ft",
+    t_btc_blocks: int | None = None,
+    t_rxd_blocks: int = 144,
+    hashlock: bytes | None = None,
+):
+    if t_btc_blocks is None:
+        # At least 1: a zero/negative BTC timelock is not a swap, and a t_rxd below the margin
+        # cannot satisfy the invariant at all — which is itself a real consequence of the
+        # inversion, and why the small-t_rxd cases below carry a smaller margin.
+        t_btc_blocks = max(1, t_rxd_blocks - _BTC_GAP)
     if hashlock is None:
         hashlock = hashlib.sha256(os.urandom(32)).digest()
     return NegotiatedTerms(
@@ -368,7 +386,9 @@ def test_role_invariant_constant_spelled_out():
     # covenant off the Radiant chain and fails closed, so the taker CANNOT fund first.
     for phrase in ("generates the secret", "locks the asset FIRST", "locks BTC SECOND", "claims the BTC FIRST"):
         assert phrase in inv, f"missing {phrase!r} — see pre_btc_lock_check step 5 for the enforced order"
-    assert "t_BTC > t_RXD" in inv
+    # INVERTED #482: the maker LOCKS the Radiant leg, so THAT leg carries the longer timeout.
+    assert "t_RXD > t_BTC" in inv
+    assert "t_BTC > t_RXD" not in inv, "the invariant states the direction that let the maker take both legs"
     # The NAME still says TAKER_LOCKS_BTC_FIRST; it is exported and quoted in a
     # ValidationError, so it stays. The body must say why, or the name re-teaches the old order.
     assert "predates HZ-1" in inv
@@ -414,8 +434,9 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     assert rec.state is SwapState.BTC_LOCKED
 
 
-def test_margin_rejects_btc_not_greater_than_rxd():
+def test_margin_rejects_rxd_not_greater_than_btc():
     # Construct via direct Timelocks (NegotiatedTerms would also reject same-unit).
+    # INVERTED #482: t_rxd is the leg the MAKER LOCKED and must be the LONGER one.
     policy = MarginPolicy.estimated()
     with pytest.raises(ValidationError):
         assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(72, t.TimeUnit.BLOCKS), policy)
@@ -423,22 +444,22 @@ def test_margin_rejects_btc_not_greater_than_rxd():
 
 def test_margin_rejects_insufficient_gap():
     policy = MarginPolicy.estimated()  # 36-block ESTIMATED margin
-    # gap = 10 blocks < 36 required
+    # gap = 10 blocks < 36 required (t_rxd - t_btc)
     with pytest.raises(ValidationError):
-        assert_timelock_margin(t.Timelock(82, t.TimeUnit.BLOCKS), t.Timelock(72, t.TimeUnit.BLOCKS), policy)
+        assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(82, t.TimeUnit.BLOCKS), policy)
 
 
 def test_margin_accepts_safe_gap():
     policy = MarginPolicy.estimated()
-    # gap = 100 blocks >= 36
-    assert_timelock_margin(t.Timelock(172, t.TimeUnit.BLOCKS), t.Timelock(72, t.TimeUnit.BLOCKS), policy)
+    # gap = 100 blocks >= 36 (t_rxd - t_btc)
+    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(172, t.TimeUnit.BLOCKS), policy)
 
 
 def test_margin_cross_unit_normalises():
-    # t_btc in seconds, t_rxd in blocks; 600s/block. 144*600=86400s vs 72 blk=43200s,
-    # gap = 72 blocks-equiv = enough for the 36-block margin.
+    # t_btc in seconds, t_rxd in blocks; 600s/block. 72 blk-equiv = 43200s vs 144 blk,
+    # gap = 72 blocks-equiv = enough for the 36-block margin. The LONGER leg is t_rxd.
     policy = MarginPolicy.estimated(block_interval_s=600.0)
-    assert_timelock_margin(t.Timelock(86_400, t.TimeUnit.SECONDS), t.Timelock(72, t.TimeUnit.BLOCKS), policy)
+    assert_timelock_margin(t.Timelock(43_200, t.TimeUnit.SECONDS), t.Timelock(144, t.TimeUnit.BLOCKS), policy)
 
 
 def test_margin_fail_closed_on_non_timelock():
@@ -454,7 +475,7 @@ def test_margin_real_value_mode_requires_measured():
     # A measured policy in real-value mode is accepted.
     measured = MarginPolicy.measured(margin=t.Timelock(50, t.TimeUnit.BLOCKS), block_interval_s=600.0)
     assert measured.is_measured and measured.require_measured
-    assert_timelock_margin(t.Timelock(200, t.TimeUnit.BLOCKS), t.Timelock(72, t.TimeUnit.BLOCKS), measured)
+    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(200, t.TimeUnit.BLOCKS), measured)
 
 
 def test_estimated_margin_is_labelled():
@@ -1949,12 +1970,15 @@ class FakeEthLeg:
         return self.last_locator
 
 
-def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72, eth_timeout_unix_s: int = 1779710245):
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 144, eth_timeout_unix_s: int = 1779710245):
+    # t_btc DERIVES from t_rxd, same as `_terms` — see the note there. For an ETH swap `t_btc` is
+    # only the BTC-shaped placeholder (the real deadline is `eth_timeout_unix_s`), but the
+    # construction guard still applies to it, so it has to respect the inverted relation.
     return NegotiatedTerms(
         hashlock=hashlock,
         btc_sats=100_000,
         radiant_amount=1_000,
-        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_btc=t.Timelock(max(1, t_rxd_blocks - _BTC_GAP), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",
