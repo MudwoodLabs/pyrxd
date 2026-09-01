@@ -55,6 +55,16 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without insta
 # attribute access. Order is alphabetical by name to make additions
 # easy to spot in diffs.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    # Injection points — the protocols a CONSUMER implements and hands to the SDK. They have no
+    # in-repo caller BY DESIGN: the SDK duck-types them and the implementation comes from outside,
+    # so "no caller" is the correct shape rather than dead code. Exporting them says that
+    # deliberately — and a package export is a real consumer surface, where a module's own
+    # `__all__` is only a declaration of intent (#553, where `__all__` stopped counting as a
+    # reference and surfaced these).
+    "CredentialResolver": ("pyrxd.glyph.credential_binding", "CredentialResolver"),
+    "FlashbotsSubmitter": ("pyrxd.eth_wallet.private_submit", "FlashbotsSubmitter"),
+    "PrivateSubmitter": ("pyrxd.eth_wallet.private_submit", "PrivateSubmitter"),
+    "RadiantBroadcaster": ("pyrxd.gravity.radiant_leg", "RadiantBroadcaster"),
     # Gravity
     "ActiveOffer": ("pyrxd.gravity", "ActiveOffer"),
     # HD wallet — BIP-44
