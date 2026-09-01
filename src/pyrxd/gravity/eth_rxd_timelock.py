@@ -207,9 +207,11 @@ def eth_absolute_to_rxd_relative_blocks(
     # a zero confirm wait, which never lands on the boundary. The real run's parameters do:
     # (86400 - 7068 - 600) / 36 = 2187.0 exactly, so the canonical derivation produced 2187 and the
     # gate accepted only 2186. Deriving one block SHORT is the safe direction anyway: it opens the
-    # maker's refund marginally earlier, costing the taker a block of claim window rather than
-    # letting the refund land past the deadline it is sized to precede.
-    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s) - 1
+    # maker's refund marginally LATER, costing the maker a block of lock time rather than letting
+    # the refund open before the deadline it is sized to outlast (#482 inverted this: the gate is
+    # now a LOWER bound on t_rxd, so `ceil` with no -1 is the smallest accepted value, where it was
+    # `ceil - 1` for the largest accepted one).
+    t_rxd_blocks = math.ceil(budget_s / rxd_block_interval_s)
     # ...and then ASK THE GATE, rather than trusting that arithmetic to match it.
     #
     # `ceil(x) - 1` is algebraically the largest `t` with `t * I < budget`, and it is exact for an
@@ -253,21 +255,27 @@ def eth_absolute_to_rxd_relative_blocks(
             )
             break
         except ValidationError:
-            t_rxd_blocks -= 1
+            # UP, not down (#482). The gate bounds t_rxd from BELOW now, so a refusal means the
+            # window is too SHORT. Stepping down was the old direction and moves away from
+            # acceptance — the loop then always exhausts and reports the sizer and gate as
+            # disagreeing, which is how this was found.
+            t_rxd_blocks += 1
     else:  # pragma: no cover — the analytic value is never more than one block out
         raise ValidationError(
             f"could not size a t_rxd the punctuality gate accepts within {_SIZER_GATE_STEPS} "
-            f"blocks of {math.ceil(budget_s / rxd_block_interval_s) - 1} (budget {budget_s}s at "
+            f"blocks of {math.ceil(budget_s / rxd_block_interval_s)} (budget {budget_s}s at "
             f"{rxd_block_interval_s}s/block). The sizer and the gate disagree by more than a "
             "rounding step, which means one of them has changed meaning."
         )
-    # The step-down can cross the safety floor by one, so re-check it. Not the cap: stepping down
-    # only ever decreases, and a value that was under the cap stays under it.
-    if t_rxd_blocks < floor_blocks:
+    # The step-UP can cross the BIP68 cap by one, so re-check THAT. Not the floor: stepping up only
+    # ever increases, and a value already at or above the floor stays there. This pairing flipped
+    # with the search direction (#482) — re-checking the floor after an upward search is a check
+    # that can no longer fail, and would have left the cap unguarded.
+    if t_rxd_blocks > _MAX_RXD_CSV_BLOCKS:
         raise ValidationError(
-            f"RXD timelock {t_rxd_blocks} blocks below safety floor {floor_blocks} after the "
-            f"punctuality gate required one block less than the {budget_s}s budget allows at "
-            f"{rxd_block_interval_s}s/block"
+            f"RXD timelock {t_rxd_blocks} blocks exceeds the BIP68 16-bit cap {_MAX_RXD_CSV_BLOCKS} "
+            f"after the punctuality gate required one block more than the {budget_s}s budget allows "
+            f"at {rxd_block_interval_s}s/block"
         )
     return Timelock(t_rxd_blocks, TimeUnit.BLOCKS)
 

@@ -58,7 +58,7 @@ def _policy(fast: float = 36.0, nominal: float = 300.0) -> MarginPolicy:
     )
 
 
-def _analytic_largest(budget: int, interval: float) -> int:
+def _analytic_smallest(budget: int, interval: float) -> int:
     """The largest t the gate can accept, derived from its DOCUMENTED semantics — not by asking it.
 
     The gate refuses when `now + wait + ceil(t * interval) >= eth_timeout - margin`, i.e. accepts
@@ -83,18 +83,27 @@ def _analytic_largest(budget: int, interval: float) -> int:
     """
     from fractions import Fraction
 
-    return math.floor(Fraction(budget - 1) / Fraction(interval))
+    # SMALLEST, not largest (#482). The gate bounds t_rxd from BELOW — the refund must open at or
+    # after `eth_timeout + margin` — so the boundary value is `ceil(budget / interval)`, the least
+    # t with `t * interval >= budget`. It was `floor((budget - 1) / interval)`, the greatest t
+    # with `t * interval < budget`, which is the boundary of the opposite inequality.
+    return math.ceil(Fraction(budget) / Fraction(interval))
 
 
 def _gate_accepts(t_rxd: int, interval: float, wait: int = 0) -> bool:
     try:
+        # ANCHOR AT THE LOCK TIME, with a zero wait. The gate used to ADD
+        # `max_covenant_confirm_wait_s` to `now`, so passing it here was the same instant as the
+        # sizer's `expected_rxd_lock_time_unix_s = _NOW + wait`. #482 removed that term from the
+        # arithmetic — adding it now would assume a LATE confirm, which is the optimistic
+        # direction — so the two anchors have to be written the same way to stay the same instant.
         assert_covenant_confirms_before_eth_deadline(
-            now_unix_s=_NOW,
+            now_unix_s=_NOW + wait,
             eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
             margin=_margin(),
             t_rxd=bt.Timelock(t_rxd, bt.TimeUnit.BLOCKS),
             rxd_block_interval_s=interval,
-            max_covenant_confirm_wait_s=wait,
+            max_covenant_confirm_wait_s=0,
         )
         return True
     except Exception:
@@ -119,14 +128,20 @@ class TestTheIntervalActuallyCancels:
     def test_the_MISMATCH_is_what_breaks_it(self) -> None:
         """The defect, as a test. Sizing at the fast tail and checking at the nominal refuses the
         sizer's own output — which is how a runner-side cap came to shorten the window ~8x."""
+        # THE DANGEROUS PAIRING SWAPPED ENDS WITH THE RELATION (#482). Sizing at the FAST tail and
+        # checking at the NOMINAL used to refuse, because a bigger interval overshot an upper
+        # bound. The gate bounds t_rxd from below now, so that pairing OVER-satisfies and passes.
+        # What refuses today is the reverse: size at the nominal, check at the fast tail, and the
+        # window is far too short. Same defect, opposite arrangement — a test left as it was would
+        # have gone quietly green while the mismatch it exists for was still reachable.
         fast, nominal = 36.0, 300.0
         sized = eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
             expected_rxd_lock_time_unix_s=_NOW,
             margin=_margin(),
-            rxd_block_interval_s=fast,
+            rxd_block_interval_s=nominal,
         ).value
-        assert not _gate_accepts(sized, nominal), (
+        assert not _gate_accepts(sized, fast), (
             "expected the mismatched pairing to refuse — if this passes, the two intervals have "
             "converged and this test no longer describes anything"
         )
@@ -338,9 +353,13 @@ class TestTheExactDivisionBoundary:
     """
 
     def test_the_gate_ACCEPTS_the_sizer_output_when_the_budget_divides_EXACTLY(self) -> None:
-        wait = 600
+        # 624, not 600: the budget gained `+ margin` instead of `- margin` when the relation was
+        # inverted (#482), which moved the exact quotient. The precondition assert below is what
+        # caught it — a test that needs an exact division has to re-derive the constant, not keep
+        # the one that used to produce one.
+        wait = 624
         fast = _dividing_interval_s(_policy())
-        budget = _ETH_TIMEOUT_S - _margin().total_s() - wait
+        budget = _ETH_TIMEOUT_S + _margin().total_s() - wait
         assert budget % fast == 0, (
             f"this test is only meaningful on an exact quotient; budget/interval = {budget / fast}"
         )
@@ -358,11 +377,14 @@ class TestTheExactDivisionBoundary:
         # this is the independent half: on an exact quotient q, the largest acceptable value is
         # exactly q - 1, derived from the gate's documented semantics without calling either
         # function. A joint sizer+gate drift keeps the line above green and fails this one.
-        assert sized == budget // int(fast) - 1 == _analytic_largest(budget, fast)
+        # On an exact quotient q the SMALLEST acceptable value is exactly q (not q - 1): q blocks
+        # reach the deadline precisely, and equality satisfies a `>=` bound.
+        assert sized == budget // int(fast) == _analytic_smallest(budget, fast)
 
-    def test_the_sized_value_is_still_the_LARGEST_the_gate_accepts(self) -> None:
-        """The paired honest-path check. Fixing a refusal by shrinking the answer would also pass
-        the test above while quietly handing the taker a shorter claim window every run."""
+    def test_the_sized_value_is_still_the_SMALLEST_the_gate_accepts(self) -> None:
+        """The paired honest-path check, inverted with the relation (#482). The give-away is now
+        upward: satisfying the gate by GROWING t_rxd would also pass the test above, while locking
+        the maker's asset longer than the swap needs on every run."""
         wait = 600
         fast = _dividing_interval_s(_policy())
         sized = eth_absolute_to_rxd_relative_blocks(
@@ -371,9 +393,9 @@ class TestTheExactDivisionBoundary:
             margin=_margin(),
             rxd_block_interval_s=fast,
         ).value
-        assert not _gate_accepts(sized + 1, fast, wait=wait), (
-            f"t_rxd={sized + 1} is also accepted, so the sizer gave away a block of the taker's "
-            f"claim window for nothing"
+        assert not _gate_accepts(sized - 1, fast, wait=wait), (
+            f"t_rxd={sized - 1} is also accepted, so the sizer locked the maker's asset a block "
+            f"longer than the deadline requires"
         )
 
     @pytest.mark.parametrize("wait", [0, 300, 600, 900, 1200])
@@ -384,12 +406,12 @@ class TestTheExactDivisionBoundary:
 
         The accept/refuse pair pins sizer↔gate AGREEMENT, but the sizer reaches its answer by
         asking the gate, so agreement alone survives any change that moves both together — it is
-        sharp at whatever boundary the gate currently has, right or wrong. `_analytic_largest`
+        sharp at whatever boundary the gate currently has, right or wrong. `_analytic_smallest`
         restates where that boundary is SUPPOSED to be (exact rational arithmetic, no production
-        code), so the three assertions jointly refuse: a sizer that overshoots (gate refuses it),
-        a sizer that undershoots (sized+1 also accepted), and a sizer and gate that drifted in
+        code), so the three assertions jointly refuse: a sizer that undershoots (gate refuses it),
+        a sizer that overshoots (sized-1 also accepted), and a sizer and gate that drifted in
         lockstep (analytic value disagrees)."""
-        budget = _ETH_TIMEOUT_S - _margin().total_s() - wait
+        budget = _ETH_TIMEOUT_S + _margin().total_s() - wait
         sized = eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
             expected_rxd_lock_time_unix_s=_NOW + wait,
@@ -397,9 +419,9 @@ class TestTheExactDivisionBoundary:
             rxd_block_interval_s=fast,
         ).value
         assert _gate_accepts(sized, fast, wait=wait), f"gate refused sized t_rxd={sized}"
-        assert not _gate_accepts(sized + 1, fast, wait=wait), f"t_rxd={sized + 1} also accepted"
-        assert sized == _analytic_largest(budget, fast), (
-            f"sized {sized} != analytic largest-acceptable {_analytic_largest(budget, fast)} for "
+        assert not _gate_accepts(sized - 1, fast, wait=wait), f"t_rxd={sized - 1} also accepted"
+        assert sized == _analytic_smallest(budget, fast), (
+            f"sized {sized} != analytic smallest-acceptable {_analytic_smallest(budget, fast)} for "
             f"budget {budget}s at {fast}s/block — the sizer and the gate agree with each other "
             "but not with the documented boundary, i.e. they drifted together"
         )
