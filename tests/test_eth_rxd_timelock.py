@@ -62,9 +62,11 @@ def test_stall_tolerance_defaults_zero_and_is_additive():
         )
 
 
-def test_stall_tolerance_shrinks_the_rxd_budget():
-    # Same inputs, but the stall tolerance eats into the RXD window: the refund must open
-    # EARLIER (fewer blocks) so the taker still has its stall-tolerant claim window.
+def test_stall_tolerance_GROWS_the_rxd_window():
+    # INVERTED WITH THE RELATION (#482). The margin used to be subtracted from the window: the RXD
+    # refund had to open before the ETH deadline, so every second of stall budget bought fewer
+    # blocks. It is added now — the refund must open AFTER the deadline PLUS the margin — so a
+    # stall tolerance makes the maker lock its asset LONGER, which is who should pay for it.
     base = CrossClockMargin(
         eth_reorg_finality_s=768, rxd_claim_burial_s=600, rxd_confirm_slack_s=300, rounding_slack_s=300
     )
@@ -78,19 +80,21 @@ def test_stall_tolerance_shrinks_the_rxd_budget():
     kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, rxd_block_interval_s=36.0)
     t_base = eth_absolute_to_rxd_relative_blocks(margin=base, **kw)
     t_stall = eth_absolute_to_rxd_relative_blocks(margin=with_stall, **kw)
-    assert t_stall.value < t_base.value  # stall budget strictly shrinks the RXD window
+    assert t_stall.value > t_base.value  # stall budget strictly LENGTHENS the maker's lock
 
 
 def test_stall_tolerance_can_force_failclosed():
-    # A stall tolerance larger than the remaining ETH→RXD gap leaves no budget → refuse to lock.
+    # Still fail-closed, at the OPPOSITE end (#482). A huge stall tolerance used to leave NO budget;
+    # it now demands a window past the BIP68 16-bit cap, which is equally unlockable. The refusal
+    # survived the inversion; the reason for it did not, so the match string has to move with it.
     huge_stall = CrossClockMargin(
         eth_reorg_finality_s=768,
         rxd_claim_burial_s=600,
         rxd_confirm_slack_s=300,
         rounding_slack_s=300,
-        eth_finality_stall_tolerance_s=100_000,
+        eth_finality_stall_tolerance_s=100_000_000,
     )
-    with pytest.raises(ValidationError, match="no RXD timelock budget"):
+    with pytest.raises(ValidationError, match="BIP68"):
         eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=10_000,
             expected_rxd_lock_time_unix_s=0,
@@ -112,7 +116,9 @@ def test_fast_interval_yields_more_blocks_than_mean():
 
 
 def test_converter_concrete_floor_and_unit():
-    # budget = 100000 - 1800(margin) - 0 = 98200s ; /600 = 163.66 -> floor 163 blocks
+    # budget = 100000 + 1800(margin) - 0 = 101800s ; /600 = 169.67 -> ceil 170 blocks. The margin
+    # is ADDED and the rounding is UP (#482): the window must COVER the budget, where it used to
+    # have to fit inside it.
     m = _margin()  # total 1800
     t = eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=100_000,
@@ -121,15 +127,18 @@ def test_converter_concrete_floor_and_unit():
         rxd_block_interval_s=600.0,
         floor_blocks=12,
     )
-    assert t == Timelock(163, TimeUnit.BLOCKS)
-    assert t.value * 600.0 <= (100_000 - 1800)  # floor never overshoots the budget
+    assert t == Timelock(170, TimeUnit.BLOCKS)
+    assert t.value * 600.0 >= (100_000 + 1800)  # the window never UNDERshoots the budget
 
 
 def test_converter_failclosed_no_budget():
-    with pytest.raises(ValidationError, match="no RXD timelock budget"):
+    # "No budget" now means the lock time is so far PAST the deadline+margin that the required
+    # window is non-positive — the swap is already over. Equal timestamps no longer produce it:
+    # with the margin added, lock-at-deadline still needs `margin` seconds of window (#482).
+    with pytest.raises(ValidationError, match="no RXD timelock budget|below safety floor"):
         eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=1000,
-            expected_rxd_lock_time_unix_s=1000,
+            expected_rxd_lock_time_unix_s=100_000,
             margin=_margin(),
             rxd_block_interval_s=600.0,
         )
@@ -191,11 +200,11 @@ def _analytic_start(budget: float, interval: float) -> int:
     counterexamples into the committed `tests/.hypothesis-corpus/`, the first CI run to find one
     would have turned the suite permanently red.
 
-    What remains true of this value: the sizer starts here and may step down at most
-    `_SIZER_GATE_STEPS` (3) times, so it bounds the answer from above and (minus 2 — the third
-    refusal raises instead of returning) from below.
+    What remains true of this value: the sizer starts here and may step UP at most
+    `_SIZER_GATE_STEPS` (3) times (#482 inverted the search), so it bounds the answer from below
+    and (plus 2 — the third refusal raises instead of returning) from above.
     """
-    return (math.ceil(budget / interval) - 1) if budget > 0 else 0
+    return max(0, math.ceil(budget / interval) - 1) if budget > 0 else 0
 
 
 def _gate_accepts_at_lock_time(t_blocks: int, *, eth_timeout: int, rxd_lock: int, margin, interval: float) -> bool:
@@ -241,7 +250,7 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
     margin = CrossClockMargin(
         eth_reorg_finality_s=m1, rxd_claim_burial_s=m2, rxd_confirm_slack_s=m3, rounding_slack_s=m4
     )
-    budget = eth_timeout - margin.total_s() - rxd_lock
+    budget = eth_timeout + margin.total_s() - rxd_lock
     start = _analytic_start(budget, interval)
 
     def accepts(t_blocks: int) -> bool:
@@ -265,7 +274,7 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
         # projection `ceil(t*I)` is non-decreasing), so "the gate refuses floor_blocks" is
         # equivalent to "every value the floor allows is refused". If NONE of these hold, the
         # refusal turned away honest work — the sizer/gate contract has genuinely diverged.
-        assert budget <= 0 or start < floor_blocks or start > _CAP or not accepts(floor_blocks)
+        assert budget <= 0 or start < floor_blocks or start > _CAP or not accepts(_CAP)
         return
     # success → invariants hold
     assert t.unit is TimeUnit.BLOCKS
@@ -275,12 +284,13 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
     # went stale both times the sizer changed; asking the gate cannot.
     #   (a) what it emitted, the gate accepts (honest path);
     assert accepts(t.value), f"the sizer emitted t_rxd={t.value} and its own gate refuses it"
-    #   (b) one more block is refused — the emitted value is the LARGEST the gate accepts, so no
-    #       fix for (a) may quietly shrink the taker's claim window instead;
-    assert not accepts(t.value + 1), f"the gate also accepts t_rxd={t.value + 1}: a block of claim window given away"
-    #   (c) the step-down never drifts: the answer stays within the sizer's documented reach of
-    #       the analytic value (start, or up to 2 below it — the third refusal raises instead).
-    assert start - 2 <= t.value <= start, f"t.value={t.value} outside [{start - 2}, {start}]"
+    #   (b) one FEWER block is refused — the emitted value is the SMALLEST the gate accepts, so no
+    #       fix for (a) may quietly lengthen the maker's lock instead (#482 flipped which side of
+    #       the boundary is the give-away);
+    assert not accepts(t.value - 1), f"the gate also accepts t_rxd={t.value - 1}: the maker's lock is a block too long"
+    #   (c) the step-UP never drifts: the answer stays within the sizer's documented reach of
+    #       the analytic value (start, or up to 2 above it — the third refusal raises instead).
+    assert start <= t.value <= start + 2, f"t.value={t.value} outside [{start}, {start + 2}]"
     # "the sized value is conservative — never overshoots the budget", to within floating-point
     # noise. `ceil(x) - 1` is at most `floor(x)`, so it is conservative wherever floor was.
     #
@@ -303,7 +313,17 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
     # so the invariant still fails loudly if the direction of the rounding ever flips.
     # Sub-block remainder is covered by `margin.rounding_slack_s` by design (see the
     # `eth_absolute_to_rxd_relative_blocks` docstring).
-    assert t.value * interval <= budget + 8 * math.ulp(float(budget))
+    # UNDERSHOOT is the direction to bound now (#482): the window must COVER the budget, where it
+    # used to have to fit inside it.
+    #
+    # AND THE CEIL IS LOAD-BEARING ON THIS SIDE. The gate compares `ceil(t * interval)`, not the
+    # raw product. Under the old inequality the un-rounded product was a conservative proxy — it is
+    # never larger — so dropping the ceil here was safe and this line did not have one. Reversed,
+    # the same omission understates the window by up to a second and the assertion fails on
+    # CORRECT output: at eth_timeout=44, interval=1.5 the sizer returns 29, whose 43.5s projects to
+    # ceil = 44 and exactly meets a 44s budget. That is the pinned @example above, and it is why
+    # the model has to mirror the gate's arithmetic rather than approximate it.
+    assert math.ceil(t.value * interval) >= budget - 8 * math.ulp(float(budget))
 
 
 # ─────────────────────────────────────────────────── funding-confirm gate (D2) ──
@@ -312,10 +332,10 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
 def test_gate_passes_with_margin_left():
     m = _margin(60, 60, 60, 60)  # total 240
     t = Timelock(10, TimeUnit.BLOCKS)
-    # projected = 1000 + 0 + ceil(10*600) = 7000 ; deadline = 7241 - 240 = 7001 > 7000 → OK
+    # earliest open = 1000 + ceil(10*600) = 7000 ; required = 6700 + 240 = 6940 <= 7000 → OK
     assert_covenant_confirms_before_eth_deadline(
         now_unix_s=1000,
-        eth_timeout_unix_s=7241,
+        eth_timeout_unix_s=6700,
         margin=m,
         t_rxd=t,
         rxd_block_interval_s=600.0,
@@ -323,14 +343,14 @@ def test_gate_passes_with_margin_left():
     )
 
 
-def test_gate_fails_when_covenant_confirms_too_late():
+def test_gate_fails_when_the_refund_would_open_before_the_deadline():
     m = _margin(60, 60, 60, 60)  # total 240
     t = Timelock(10, TimeUnit.BLOCKS)
-    # projected 7000 ; deadline = 7240 - 240 = 7000 ; 7000 >= 7000 → raise
-    with pytest.raises(ValidationError, match="confirm too late"):
+    # earliest open = 7000 ; required = 6761 + 240 = 7001 > 7000 → raise, by exactly one second
+    with pytest.raises(ValidationError, match="open too EARLY"):
         assert_covenant_confirms_before_eth_deadline(
             now_unix_s=1000,
-            eth_timeout_unix_s=7240,
+            eth_timeout_unix_s=6761,
             margin=m,
             t_rxd=t,
             rxd_block_interval_s=600.0,
@@ -338,19 +358,24 @@ def test_gate_fails_when_covenant_confirms_too_late():
         )
 
 
-def test_gate_failclosed_on_confirm_wait_squeeze():
+def test_the_confirm_wait_no_longer_moves_the_verdict():
+    """THIS TEST CHANGED PURPOSE, deliberately, and says so rather than being deleted (#482).
+
+    It asserted that a `max_covenant_confirm_wait_s` budget pushed the projected open past the
+    deadline and forced a refusal. That term is gone from the arithmetic: the floor is now taken at
+    the EARLIEST plausible confirm, and adding a wait would assume a LATE one, which is the
+    optimistic direction under this relation.
+
+    The parameter is still validated and still meaningful to callers as an operational bound, so
+    the thing worth pinning is that it is INERT here — otherwise a future change could quietly
+    reintroduce it into the arithmetic and reopen exactly the window it used to close.
+    """
     m = _margin(60, 60, 60, 60)
     t = Timelock(10, TimeUnit.BLOCKS)
-    # pre-lock projection with a confirm-wait budget pushes the open past the deadline
-    with pytest.raises(ValidationError, match="confirm too late"):
-        assert_covenant_confirms_before_eth_deadline(
-            now_unix_s=1000,
-            eth_timeout_unix_s=7241,
-            margin=m,
-            t_rxd=t,
-            rxd_block_interval_s=600.0,
-            max_covenant_confirm_wait_s=600,
-        )
+    kw = dict(now_unix_s=1000, eth_timeout_unix_s=6700, margin=m, t_rxd=t, rxd_block_interval_s=600.0)
+    assert_covenant_confirms_before_eth_deadline(max_covenant_confirm_wait_s=0, **kw)
+    assert_covenant_confirms_before_eth_deadline(max_covenant_confirm_wait_s=600, **kw)
+    assert_covenant_confirms_before_eth_deadline(max_covenant_confirm_wait_s=100_000, **kw)
 
 
 def test_gate_requires_blocks_timelock():
@@ -426,8 +451,10 @@ class TestASuppliedTRxdIsCheckedAgainstTheCounterChainDeadline:
 
 class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
     """The gate LOOKS like a wall-clock projection of the RXD refund and was documented as one.
-    It is not: `rxd_block_interval_s` cancels, because sizing computes `floor(budget/interval)`
-    and the gate computes `ceil(t_rxd * interval)` — inverse operations.
+    It is not: `rxd_block_interval_s` cancels, because sizing computes `ceil(budget/interval)`
+    and the gate computes `ceil(t_rxd * interval)` — inverse operations. (Sizing was
+    `floor(budget/interval)` before #482 inverted the bound; the cancellation survives, which is
+    why every test in this class except the direction of the refusal still holds.)
 
     These tests exist to stop the obvious "fix". Splitting the interval into fast and slow tails
     and passing the slow one here was attempted; it refuses every configuration at every budget,
@@ -484,10 +511,30 @@ class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
             "only precisely because it cannot see the block rate."
         )
 
-    def test_it_refuses_a_LATE_covenant_confirmation(self) -> None:
-        """The property it really has: confirm past the time the sizing assumed and it refuses."""
-        assert not self._verdict(229.0, lock_delay=3_600, wait=7_200)
+    def test_it_refuses_an_EARLY_covenant_confirmation(self) -> None:
+        """WHICH DIRECTION IS DANGEROUS FLIPPED WITH THE RELATION (#482), and this pair is the
+        clearest statement of it in the suite.
+
+        The gate used to refuse a confirmation LATER than sizing assumed, because a late mine
+        pushed the RXD refund past the ETH deadline it had to precede. The refund must now OUTLAST
+        that deadline, so lateness only costs the maker lock time. What robs the taker is an EARLY
+        confirmation: `t_rxd` counts from mining, so mining sooner opens the refund sooner, and the
+        maker can refund its Radiant leg while still holding `p` for the ETH leg.
+
+        `_verdict` checks the gate at `now` against a `t_rxd` sized for a lock at
+        `now + lock_delay`, so a positive `lock_delay` IS the early-confirmation case.
+        """
+        assert not self._verdict(229.0, lock_delay=3_600, wait=0)
 
     def test_it_accepts_a_PUNCTUAL_covenant_confirmation(self) -> None:
         """Paired honest path — the gate must not refuse a covenant that confirms on time."""
-        assert self._verdict(229.0, lock_delay=3_600, wait=300)
+        assert self._verdict(229.0, lock_delay=0, wait=0)
+
+    def test_it_accepts_a_LATE_covenant_confirmation_which_is_now_the_SAFE_direction(self) -> None:
+        """The refusal this class used to assert, now required to PASS.
+
+        A guard that refuses valid work is a bug, and this one would refuse the maker for being
+        slow — on the swap's most common non-adversarial deviation, where the cost falls on the
+        maker alone and the taker is strictly better off.
+        """
+        assert self._verdict(229.0, lock_delay=-3_600, wait=0)

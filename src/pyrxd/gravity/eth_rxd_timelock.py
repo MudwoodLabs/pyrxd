@@ -241,6 +241,13 @@ def eth_absolute_to_rxd_relative_blocks(
             f"{_MAX_RXD_CSV_BLOCKS} (ETH deadline too far in the future to map to a "
             "relative CSV window)"
         )
+    # START ONE BELOW THE ANALYTIC VALUE, then step up. `ceil` is the exact minimum only in exact
+    # arithmetic; at fractional intervals the float division can round the quotient UP across an
+    # integer boundary, and starting AT it would then return a window one block longer than the
+    # gate actually requires, with no step able to find the shorter one (the search only goes up).
+    # This is the mirror of the pre-#482 note about `ceil(x) - 1` legitimately being one block low.
+    # The gate remains the authority: whatever this returns has been accepted by it.
+    t_rxd_blocks = max(floor_blocks, t_rxd_blocks - 1)
     for _ in range(_SIZER_GATE_STEPS):
         try:
             assert_covenant_confirms_before_eth_deadline(
