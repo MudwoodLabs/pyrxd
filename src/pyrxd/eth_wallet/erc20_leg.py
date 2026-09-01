@@ -38,6 +38,7 @@ from .erc20 import (
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy, normalise_tx_hash
 from .multi_rpc import read_contract
+from .replacement import bump_replacement_fees
 from .tokens import Erc20Token
 
 #: Measured on a mainnet fork against the real USDC proxy (block 25,815,805): a `transfer` into a
@@ -81,6 +82,21 @@ def _create_address(sender: str, nonce: int) -> str:
         n = bytes([0x80 + len(b)]) + b
     payload = b"\x94" + addr + n
     return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+
+
+def _fee_fields_of(tx: dict) -> dict[str, int]:
+    """The EIP-1559 fee fields of a pending transaction, or a refusal naming what is missing.
+
+    A legacy `gasPrice`-only transaction has no tip to raise, so there is no valid 1559 replacement
+    for it — saying so beats bumping a field that does not exist.
+    """
+    missing = [k for k in ("maxFeePerGas", "maxPriorityFeePerGas") if tx.get(k) is None]
+    if missing:
+        raise NetworkError(
+            f"the pending push is missing {', '.join(missing)}, so its fees cannot be raised the "
+            "way EIP-1559 requires. Wait for it to mine rather than replacing it."
+        )
+    return {"maxFeePerGas": int(tx["maxFeePerGas"]), "maxPriorityFeePerGas": int(tx["maxPriorityFeePerGas"])}
 
 
 async def _inflight_nonce_window(rpc: Any, sender: str) -> tuple[int, int]:
@@ -134,6 +150,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
         resume_from: PendingDeploy | None = None,
         push_nonce: int | None = None,
+        push_tx_hash: str | None = None,
         on_push_nonce: Callable[[int], Awaitable[None]] | None = None,
         on_push_hash: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
@@ -242,6 +259,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         return await self._push_and_bind(
             resuming=resume_from is not None,
             push_nonce=push_nonce,
+            push_tx_hash=push_tx_hash,
             on_push_nonce=on_push_nonce,
             on_push_hash=on_push_hash,
             web3=web3,
@@ -304,6 +322,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         *,
         resuming,
         push_nonce,
+        push_tx_hash,
         on_push_nonce,
         on_push_hash,
         web3,
@@ -378,7 +397,29 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # readily as the fleet allows. A single-source rpc falls back to its own reads unchanged.
         _check_inflight = resuming and shortfall > 0
         pending_nonce, latest_nonce = await _inflight_nonce_window(self._rpc, sender) if _check_inflight else (0, 0)
-        if resuming and shortfall > 0 and pending_nonce > latest_nonce:
+        # THE ONE CASE THE GUARD CAN IDENTIFY EXACTLY (#515, #504 item 1). When `latest` sits at
+        # the pinned nonce and `pending` is one past it, there is exactly ONE transaction in
+        # flight and it occupies our own pinned slot — so it IS our push, not an unrelated
+        # transaction the guard was written to fear.
+        #
+        # Re-sending at that pinned nonce cannot double-fund: only one transaction per nonce can
+        # mine, so the replacement either supersedes the original or loses to it with "nonce too
+        # low". Either way the value moves once. That is the same chain property the pin has always
+        # relied on, used in the one direction it was never allowed to reach.
+        #
+        # It needs BOTH a durable nonce and a durable HASH: the nonce identifies the slot, and the
+        # hash is how the pending transaction's fees are read back so the replacement can clear
+        # them. Without the hash this branch would rebuild at the same price and be rejected as
+        # "transaction already imported" — a worse outcome than the refusal, because it looks like
+        # a node fault.
+        _replaces_own_push = (
+            resuming
+            and push_nonce is not None
+            and push_tx_hash is not None
+            and latest_nonce == int(push_nonce)
+            and pending_nonce == int(push_nonce) + 1
+        )
+        if resuming and shortfall > 0 and pending_nonce > latest_nonce and not _replaces_own_push:
             raise NetworkError(
                 f"{pending_nonce - latest_nonce} transaction(s) from {sender} are still in flight "
                 f"(nonce pending={pending_nonce}, latest={latest_nonce}), so the HTLC balance "
@@ -422,13 +463,21 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             #
             # Exactly-once here is the chain REJECTING the duplicate, not this code replacing it.
             # A real bumped-replacement path also needs the push tx HASH to be durable so the
-            # pending transaction's fees can be read back; only `pending_push_nonce` is persisted
-            # today. See #515 before claiming replacement anywhere.
+            # pending transaction's fees can be read back — which `pending_push_tx_hash` now
+            # provides, so the branch above CAN replace when it can prove the pending transaction
+            # is its own. Everywhere else, exactly-once is still the rejection.
             #
             # The pin must be DURABLE before the broadcast or a retry cannot reuse it, which is the
             # whole mechanism. See the design note under docs/solutions/design-decisions/.
             if push_nonce is not None:
                 push_tx = {**push_tx, "nonce": int(push_nonce)}
+                if _replaces_own_push:
+                    # Price it past the transaction ALREADY PENDING, read back by its durable hash
+                    # — not past a fresh estimate. When fees have fallen since, an estimate-based
+                    # bump comes out BELOW what is pending and the node rejects it while this code
+                    # believes it raised the price.
+                    pending_tx = await self._rpc.get_transaction(str(push_tx_hash))
+                    push_tx = {**push_tx, **bump_replacement_fees(_fee_fields_of(pending_tx))}
             elif on_push_nonce is not None:
                 await on_push_nonce(int(push_tx["nonce"]))
             push_built = await token_c.functions.transfer(address, shortfall).build_transaction(push_tx)

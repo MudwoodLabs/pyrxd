@@ -89,11 +89,6 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/crypto/kem.py::unwrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/crypto/kem.py::wrap_cek_x25519": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/eth_wallet/keys.py::generate_eth_key": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
-    "src/pyrxd/eth_wallet/replacement.py::bump_replacement_fees": (
-        "the replacement-pricing half of #515 / #504 item 1. The carve-out that calls it also "
-        "needs the push tx HASH to be durable; only pending_push_nonce is persisted today. "
-        "Deliberately loud rather than wired to nothing."
-    ),
     "src/pyrxd/glyph/credential_binding.py::verify_credential_binding": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock.py::add_timelock_to_metadata": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/glyph/timelock.py::get_unlock_remaining": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
