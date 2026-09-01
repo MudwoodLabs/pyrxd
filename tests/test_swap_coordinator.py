@@ -1471,9 +1471,14 @@ def test_assess_claim_finality_uses_the_FAST_TAIL_interval_for_the_reserve():
 
 
 def test_assess_claim_finality_parity_sweep_byte_equivalent():
-    """Auditor-grade regression: the verdict refactor reproduces the OLD int-based
-    SAFE/WAIT/SQUEEZED decision byte-for-byte. Sweeps confs in 0..2*depth across several
-    (now, t_rxd, policy) configs and asserts old-formula == new-verdict for every cell.
+    """Auditor-grade regression: an INDEPENDENT restatement of the SAFE/WAIT/SQUEEZED rule,
+    swept over confs in 0..2*depth across several (now, t_rxd, policy) configs, asserted equal to
+    the production verdict in every cell.
+
+    `_old` is a reference implementation, not a copy — its value is that it derives the answer from
+    the rule rather than from the code. It has been UPDATED for #511 rather than pinned to the old
+    behaviour: the floor now includes the blocks the claim needs to be MINED before its burial can
+    start, and a reference that kept the old floor would assert the defect back into place.
     """
 
     def _old(confs, now, locked, t_rxd, policy):
@@ -1481,12 +1486,16 @@ def test_assess_claim_finality_parity_sweep_byte_equivalent():
         rxd_blocks = t_rxd.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
         rxd_burial = policy.rxd_claim_burial.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
         depth = policy.btc_claim_reorg_depth.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+        # #511: a claim decided on at height `now` cannot be mined at `now`, so its burial starts
+        # at `now + 1` at the earliest and by `now + inclusion` with the reserve. Derived here from
+        # that sentence, independently of how the production floor is expressed.
+        inclusion = policy.rxd_claim_inclusion.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
         blocks_left = (locked + rxd_blocks) - now
         if confs >= depth:
-            return ClaimFinality.SAFE if blocks_left >= rxd_burial else ClaimFinality.SQUEEZED
+            return ClaimFinality.SAFE if blocks_left >= rxd_burial + inclusion else ClaimFinality.SQUEEZED
         depth_in_rxd = math.ceil(depth * bi / rbi)
         remaining = depth - confs
-        if blocks_left - depth_in_rxd >= rxd_burial and remaining > 0:
+        if blocks_left >= rxd_burial + inclusion + depth_in_rxd and remaining > 0:
             return ClaimFinality.WAIT
         return ClaimFinality.SQUEEZED
 
@@ -3319,8 +3328,10 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         31, which is the defect this class exists to prevent, encoded in its own honest-path test.
         """
         _secret, h = generate_secret()
-        # floor 61 + the 1 confirmation the fake covenant reports = exactly 61 remaining.
-        terms = _terms(hashlock=h, t_rxd_blocks=62)
+        # floor 62 (burial 60 + 0 counter reserve + 2 to be MINED, #511) + the 1 confirmation the
+        # fake covenant reports = exactly 62 remaining. Was 61 while the floor reserved a single
+        # block for inclusion; #511 showed one block is the arithmetic minimum, not a reserve.
+        terms = _terms(hashlock=h, t_rxd_blocks=63)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
@@ -3457,7 +3468,7 @@ class TestTheFundGateClosesTheSqueezeBand:
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
-        assert "1 block to mine" in gate.reason, gate.reason
+        assert "to be mined" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
     async def test_the_ETH_counter_leg_reserve_widens_the_floor(self) -> None:
