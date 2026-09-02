@@ -32,12 +32,21 @@ Revisit only on the trigger in §5.
 
 Verified against the shipped state machine, not inferred:
 
-- **The taker locks first.** `gravity/swap_state.py`: `NEGOTIATED --> BTC_LOCKED : taker funds
-  BTC P2TR HTLC (locks FIRST)`.
-- **The taker's own refund is the LONGER timelock.** `assert_timelock_margin` enforces
-  `t_btc - t_rxd >= margin` (`gravity/swap_coordinator.py:475`). This direction is correct and
-  deliberate — it is what prevents the far worse one-sided-loss race — but it means the party who
-  commits first is also the party who waits longest to get out.
+> **⚠ TWO PREMISES BELOW WERE CORRECTED IN SOURCE AND NOT HERE, and both point the asymmetry the
+> other way. The conclusion — griefing is a liveness residual, not a bond problem — is unaffected,
+> but the WHO and the HOW LONG are. Re-derive the cost asymmetry before quoting it.**
+
+- **The MAKER locks first**, not the taker: `pre_btc_lock_check` refuses to fund until step 5 has
+  read the maker's covenant off the Radiant chain (HZ-1, #392). This bullet said the taker locks
+  first, quoting a state-machine comment that has since been corrected.
+- **The taker's own refund is the SHORTER timelock**, not the longer. `assert_timelock_margin`
+  enforces `t_rxd - t_btc >= margin` since #482 — the maker holds `p` and LOCKS the Radiant leg, so
+  that leg carries the longer timeout. The old text called `t_btc - t_rxd >= margin` "correct and
+  deliberate"; it is the layout in which the maker refunds its own leg and still claims the
+  counter leg with `p`.
+
+  So the party immobilised longest is now the **maker**, on the leg it locked — which is the
+  opposite of the asymmetry this document built its griefing argument on.
 - **The recourse works, and is slow.** `taker_refund_btc` is "valid from BTC_LOCKED (maker never
   locked, `t_btc` elapsed)". The taker is made whole; they simply cannot leave early.
 

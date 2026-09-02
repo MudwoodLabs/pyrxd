@@ -61,7 +61,9 @@ So the requirement is
 
     t_rxd  ≥  claim_broadcast_and_confirm_blocks  +  B(V)
 
-and the counter-leg deadline must exceed `t_rxd` by the cross-clock margin on top. **Nothing
+and `t_rxd` must exceed the counter-leg deadline by the cross-clock margin on top (#482 inverted
+this sentence: it read "the counter-leg deadline must exceed `t_rxd`", which is the exploitable
+direction). **Nothing
 enforces the `B(V)` term today**, which is #507: the burial is checked at claim time, when the
 taker's value is already committed and the only remaining choice is to accept the risk or walk.
 
