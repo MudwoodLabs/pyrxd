@@ -1989,14 +1989,25 @@ class SwapCoordinator:
         """Post-confirm cross-clock recheck (audit re-verify HIGH) — the bridge's prescribed
         SECOND run (:func:`assert_covenant_confirms_before_eth_deadline` docstring).
 
-        The pre-fund ordering gate (:meth:`_assert_eth_timelock_ordering`) projects where the
-        RXD CSV refund opens from the TAKER's fund time. But the MAKER locks the covenant at a
-        maker-controlled time and can STALL the broadcast — pushing the ACTUAL rxd-refund-open
-        (covenant_mining_time + t_rxd) past that projection and collapsing the cross-clock
-        margin. We re-run the gate here at the ACTUAL lock time with
-        ``max_covenant_confirm_wait_s = 0`` (the covenant is confirmed now). If the margin no
-        longer holds we refuse to advance to BOTH_LOCKED — the taker must refund the counter
-        leg rather than proceed into the reopened one-sided-loss window. Fail-closed.
+        The pre-fund ordering gate (:meth:`_assert_eth_timelock_ordering`) projects where the RXD
+        CSV refund opens from the TAKER's fund time. We re-run it here at the ACTUAL lock time with
+        ``max_covenant_confirm_wait_s = 0`` (the covenant is confirmed now), and refuse to advance
+        to BOTH_LOCKED if the ordering no longer holds — the taker refunds the counter leg rather
+        than proceed into a reopened one-sided-loss window. Fail-closed.
+
+        THIS DOCSTRING DESCRIBED THE OPPOSITE HAZARD until now, and #482 corrected its sibling
+        while leaving this one. It said the danger was a maker who STALLS the broadcast, "pushing
+        the ACTUAL rxd-refund-open past that projection and collapsing the cross-clock margin".
+        Under the corrected relation the Radiant leg must OUTLAST the counter leg, so a late lock
+        opens the refund LATER and is strictly SAFER — it costs the maker lock time and takes
+        nothing from the taker. What robs the taker is a covenant that mined EARLY.
+
+        WHICH LEAVES THIS CHECK WEAKLY DISCRIMINATING, tracked separately: it is anchored on the
+        caller's revalidation clock rather than the covenant's actual mining time, and a later
+        anchor only makes the inverted invariant easier to satisfy. The pre-fund path covers the
+        early-mining case at step 7 of :meth:`pre_btc_lock_check`, which subtracts the covenant's
+        elapsed confirmations; this second run has no equivalent. Corrected here rather than left
+        to be cited — prose asserting an invariant becomes evidence for the next reader.
         """
         policy = self.config.margin_policy
         terms = self.record.terms
