@@ -180,7 +180,10 @@ def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 90
         radiant_amount=_RXD_AMOUNT,
         # DERIVED from the covenant's own CSV (#482): t_rxd IS `refund_csv` here, and it defaults
         # to 20, so a fixed t_btc of 72 makes the terms unconstructible under the inverted rule.
-        t_btc=t.Timelock(max(1, t_rxd_blocks // 2), t.TimeUnit.BLOCKS),
+        # t_btc = t_rxd//2 is EXACTLY the zero-margin boundary in wall clock (#567): at 600 s
+        # per BTC block against 300 s per Radiant block, half as many BTC blocks open at the
+        # same instant. So that derivation could never satisfy any margin — subtract it.
+        t_btc=t.Timelock(max(1, t_rxd_blocks // 2 - 36 - 4), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",

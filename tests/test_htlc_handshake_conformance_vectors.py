@@ -69,11 +69,17 @@ def _timelock(d: dict) -> bt.Timelock:
 
 
 def test_schema_marker():
-    """/2 since #482. The bump is not cosmetic: schema /1 published the INVERTED timelock rule —
-    it accepted t_btc=60/t_rxd=20 and rejected t_btc=20/t_rxd=60 — so a consumer pinned to /1
-    cannot tell the exploitable file from the corrected one by version alone. That is exactly what
-    a schema marker is for."""
-    assert _DOC["schema"] == "radiant-htlc-handshake/2"
+    """/3 since #567, and every bump so far has been semantically incompatible.
+
+    /1 published the ordering INVERTED — accepted t_btc=60/t_rxd=20 and rejected the correct
+    layout. /2 (#482) fixed the direction and left the UNITS conflated, so its only ACCEPT vector
+    was STILL unsafe: t_btc=20/t_rxd=60 is 3.33 h of Bitcoin against 5.0 h of Radiant with a 6.0 h
+    margin required. /3 is judged in wall clock and each margin vector carries
+    rxd_block_interval_s, because the verdict depends on it.
+
+    A consumer pinned to an older schema cannot tell these apart from the version alone. That is
+    what a schema marker is for, and it is why this file bumps rather than quietly changing."""
+    assert _DOC["schema"] == "radiant-htlc-handshake/3"
 
 
 @pytest.mark.parametrize("vec", _DOC["margin_vectors"], ids=lambda v: v["id"])
@@ -94,6 +100,10 @@ def test_every_reject_vectors_why_IS_the_real_refusal(vec: dict):
     policy = MarginPolicy(
         margin=_timelock(vec["margin"]),
         block_interval_s=vec["block_interval_s"],
+        # PER-VECTOR (#567): the verdict depends on the Radiant interval, so a vector that does not
+        # carry it is not reproducible. Defaulting it here would let the file publish a verdict the
+        # stated parameters do not produce.
+        rxd_block_interval_s=vec["rxd_block_interval_s"],
         is_measured=False,
     )
     with pytest.raises(ValidationError) as exc:
@@ -243,6 +253,11 @@ def test_margin_verdicts(vec: dict):
     policy = MarginPolicy(
         margin=_timelock(vec["margin"]),
         block_interval_s=float(vec["block_interval_s"]),
+        # READ FROM THE VECTOR, not defaulted (#567). The verdict depends on the Radiant interval,
+        # and `MarginPolicy`'s default is 300.0 — the same value these vectors happen to use, so a
+        # defaulted policy passes by COINCIDENCE. A vector stating any other interval would be
+        # judged against 300 while appearing to be judged against its own stated parameters.
+        rxd_block_interval_s=float(vec["rxd_block_interval_s"]),
         is_measured=False,
         accept_flat_burial=True,
     )

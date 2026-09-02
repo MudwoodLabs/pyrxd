@@ -27,8 +27,24 @@ from pyrxd.security.errors import ValidationError
 MARGIN = 36
 
 
-def _policy(margin: int = MARGIN) -> MarginPolicy:
-    return MarginPolicy(margin=t.Timelock(margin, t.TimeUnit.BLOCKS), block_interval_s=600.0, is_measured=False)
+def _policy(margin: int = MARGIN, *, rxd_interval_s: float = 600.0) -> MarginPolicy:
+    """HERLIHY'S MODEL IS SINGLE-CLOCK, so the default here makes both chains tick at the same rate.
+
+    The paper's 6∆/5∆/4∆ are timeouts in ONE time unit ∆. Mapping 6∆ onto Radiant blocks and 4∆
+    onto Bitcoin blocks and comparing the counts smuggles in a claim the paper does not make — that
+    a Radiant block and a Bitcoin block are the same duration. They are not (~300 s vs ~600 s), and
+    that conflation was live in the shipped gate until #567.
+
+    This file's job is to pin the DIRECTION and the ∆ GAP against the primary source. Making both
+    intervals equal isolates exactly that and nothing else. `TestTheTwoClockReality` below is the
+    bridge from the paper's single clock to the two chains this codebase actually runs on.
+    """
+    return MarginPolicy(
+        margin=t.Timelock(margin, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        rxd_block_interval_s=rxd_interval_s,
+        is_measured=False,
+    )
 
 
 def _blk(n: int) -> t.Timelock:
@@ -63,10 +79,15 @@ class TestTheRule:
 
 
 class TestTheHerlihyExample:
-    """The paper's own numbers, mapped onto two parties.
+    """The paper's own numbers, mapped onto two parties, ON A SINGLE CLOCK.
 
     Alice locks 6∆ and claims a 4∆ leg. Collapsing the three-party cycle to two, the secret
     holder's locked leg keeps the larger timeout and the claimed leg the smaller.
+
+    ∆ IS A DURATION, NOT A BLOCK COUNT. These tests run both chains at the same interval so that
+    "6∆ vs 4∆" means what the paper means. Written against the real two-clock rates, 6∆ of Radiant
+    blocks is SHORTER in wall-clock than 4∆ of Bitcoin blocks at every ∆ — which is #567, and is
+    the bridge tested separately below rather than tangled into the primary-source check.
     """
 
     @pytest.mark.parametrize("delta", [1, 6, 144])
@@ -152,3 +173,49 @@ class TestTheSizingAnchor:
             "a confirm earlier than the assumed one must break the invariant — if it does not, "
             "this test is not exercising the direction it claims"
         )
+
+
+class TestTheTwoClockReality:
+    """The bridge from Herlihy's single clock to the two chains this codebase runs on (#567).
+
+    The paper's ordering is stated in ∆, a duration. This codebase encodes each leg as a relative
+    CSV in ITS OWN chain's blocks — `t_btc` in Bitcoin blocks (~600 s), `t_rxd` in Radiant blocks
+    (~300 s nominal, 222 s measured median). The rule is unchanged; only the encoding differs, and
+    the encoding is where it went wrong: `assert_timelock_margin` compared the two counts
+    one-for-one, so a Radiant leg could "exceed" a Bitcoin leg by 36 raw blocks while being NINE
+    HOURS SHORTER in wall-clock.
+
+    THE CONFLATION WAS FAIL-SAFE UNTIL #482 AND FAIL-OPEN AFTER IT. Under the old `t_btc > t_rxd`
+    rule, requiring more Bitcoin blocks than Radiant blocks meant Bitcoin wall-clock exceeded
+    Radiant's by more than 2x — the bug made the check STRICTER than the protocol needed. The units
+    were only ever safe BECAUSE the direction was wrong, which is why inverting the direction
+    without touching the units reopened the theft window the inversion was closing.
+    """
+
+    def test_the_same_delta_ratio_that_PASSES_on_one_clock_FAILS_on_two(self) -> None:
+        """The defect in one assertion. Identical block counts and margin; only the Radiant
+        interval differs. This is what a primary-source check written in block counts cannot see."""
+        counts = dict(t_btc=_blk(4 * 6), t_rxd=_blk(6 * 6))  # Herlihy's 6∆/4∆ at ∆ = 6 blocks
+        assert_timelock_margin(counts["t_btc"], counts["t_rxd"], _policy(margin=2 * 6))
+        with pytest.raises(ValidationError, match="WALL CLOCK"):
+            assert_timelock_margin(counts["t_btc"], counts["t_rxd"], _policy(margin=2 * 6, rxd_interval_s=300.0))
+
+    def test_the_faster_chain_needs_PROPORTIONALLY_MORE_blocks(self) -> None:
+        """The correct encoding: the leg the maker LOCKS is on the faster chain, so it needs more
+        blocks to buy the same duration. At 600 s vs 300 s that is a factor of two, exactly."""
+        t_btc, margin = 24, 12  # the claimed leg: 24 blk x 600 s = 4.0 h; margin 12 blk = 2.0 h
+        need_s = t_btc * 600.0 + margin * 600.0  # 6.0 h
+        for rxd_interval_s in (600.0, 300.0, 222.0):
+            exact = need_s / rxd_interval_s
+            t_rxd = int(-(-exact // 1))  # ceil, without importing math for one line
+            pol = _policy(margin=margin, rxd_interval_s=rxd_interval_s)
+            assert_timelock_margin(_blk(t_btc), _blk(t_rxd), pol)
+            with pytest.raises(ValidationError):
+                assert_timelock_margin(_blk(t_btc), _blk(t_rxd - 1), pol)
+
+    def test_the_published_conformance_ACCEPT_vector_is_unsafe_on_two_clocks(self) -> None:
+        """`margin-ok-gap-40-margin-36` (t_btc=20 / t_rxd=60 / margin=36) is the ONLY accept case in
+        the published vectors. #482 corrected their DIRECTION and never checked the accept case
+        against the units: 5.0 h against 3.33 h + a 6.0 h margin. It must be regenerated."""
+        with pytest.raises(ValidationError, match="WALL CLOCK"):
+            assert_timelock_margin(_blk(20), _blk(60), _policy(margin=36, rxd_interval_s=300.0))

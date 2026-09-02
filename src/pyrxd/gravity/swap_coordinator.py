@@ -760,6 +760,36 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
         raise ValidationError("assert_timelock_margin elapsed_blocks must be a non-negative int (fail-closed)")
     rxd_blocks -= elapsed_blocks
 
+    # ── WALL CLOCK, NOT RAW BLOCK COUNTS (#567) ──────────────────────────────────────────────
+    #
+    # `t_btc` counts BITCOIN blocks (~600 s). `t_rxd` counts RADIANT blocks (~300 s nominal, 222 s
+    # measured median). Comparing the two counts one-for-one is a unit conflation, and
+    # `normalize_to(BLOCKS)` is the IDENTITY for a BLOCKS-tagged Timelock, so
+    # `policy.rxd_block_interval_s` never entered this function at all:
+    #
+    #     t_btc=144 blk (24.0 h)   t_rxd=180 blk (15.0 h)   raw gap 36  ->  the old gate ACCEPTED
+    #
+    # The Radiant refund opens NINE HOURS BEFORE the counter-leg deadline: the maker refunds the leg
+    # it locked while `p` is still secret, then claims the counter leg with `p`. Both legs.
+    #
+    # THE CONFLATION IS PRE-EXISTING AND WAS FAIL-SAFE UNTIL #482. Requiring `t_btc > t_rxd` in raw
+    # counts meant BTC wall-clock exceeded Radiant's by more than 2x, so the bug made this check
+    # STRICTER than the protocol needed. Inverting the direction turned it fail-open — the units
+    # were only ever safe BECAUSE of the direction, which is why neither the inversion nor the six
+    # rounds after it noticed.
+    #
+    # `margin` stays a BTC-block Timelock: its measured derivation (`ceil(tail_gap / median)`) is
+    # "one slow BTC block", a counter-chain quantity, and nothing persisted carries the policy.
+    maker_refund_opens_s = rxd_blocks * policy.rxd_block_interval_s
+    taker_refund_opens_s = btc_blocks * policy.block_interval_s
+    margin_s = margin_blocks * policy.block_interval_s
+
+    def _h(seconds: float) -> str:
+        return f"{seconds / 3600:.2f} h"
+
+    # The cheap ordering check stays as a NECESSARY condition with a clearer message. It is implied
+    # by the inequality below whenever the Radiant interval is the shorter one, so it never refuses
+    # anything the wall-clock check would accept — it just fails first, and more legibly.
     if rxd_blocks <= btc_blocks:
         raise ValidationError(
             f"timelock ordering violated: t_rxd ({rxd_blocks} blk"
@@ -769,12 +799,18 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
             "(Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is "
             "still secret and then claim the counter leg."
         )
-    if (rxd_blocks - btc_blocks) < margin_blocks:
+    if maker_refund_opens_s < taker_refund_opens_s + margin_s:
         raise ValidationError(
-            f"insufficient margin: t_rxd - t_btc = {rxd_blocks - btc_blocks} blk"
-            f"{f' (t_rxd {rxd_blocks} remaining of {rxd_blocks + elapsed_blocks}, {elapsed_blocks} already elapsed)' if elapsed_blocks else ''}"
-            f" < required {margin_blocks} blk "
-            f"({'measured' if policy.is_measured else 'ESTIMATED'})"
+            f"insufficient margin in WALL CLOCK: the maker's Radiant refund opens at "
+            f"{_h(maker_refund_opens_s)} ({rxd_blocks} blk"
+            f"{f' remaining of {rxd_blocks + elapsed_blocks}' if elapsed_blocks else ''} "
+            f"x {policy.rxd_block_interval_s:g}s), but the taker's counter-leg refund opens at "
+            f"{_h(taker_refund_opens_s)} ({btc_blocks} blk x {policy.block_interval_s:g}s) and the "
+            f"margin needs {_h(margin_s)} on top — a shortfall of "
+            f"{_h(taker_refund_opens_s + margin_s - maker_refund_opens_s)} "
+            f"({'measured' if policy.is_measured else 'ESTIMATED'}). "
+            "The two legs count DIFFERENT chains' blocks; a raw block-count comparison accepted "
+            "this (#567)."
         )
 
 
