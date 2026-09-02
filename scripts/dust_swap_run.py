@@ -64,13 +64,13 @@ from pyrxd.security.types import Hex20, Txid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     CapturingBroadcaster,
     SshTrFeeSource,
     StepReport,
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
-    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
     measured_margin_from_mainnet,
     merge_into_mode_600,

@@ -34,7 +34,7 @@ _MARGIN_NAMES = ("margin_blocks", "margin")
 
 #: The ONE place the two quantities are allowed to be reconciled — and it does so
 #: in seconds, so even here they do not meet inside a single expression.
-_ALLOWLIST = {"scripts/_dust_swap_shared.py"}
+_CANONICAL_DERIVATION = "scripts/_dust_swap_shared.py"
 
 
 def _offending_expressions(source: str) -> list[str]:
@@ -60,12 +60,16 @@ def test_the_scanner_actually_catches_the_shipped_defect():
 
 
 def test_the_scanner_does_not_flag_the_correct_derivation():
-    """Honest-path: converting through seconds must NOT trip the scanner."""
-    correct = (
-        "usable = int((t_rxd_blocks * rxd_block_interval_s) // btc_block_interval_s)\n"
-        "t_btc_blocks = usable - margin_blocks\n"
-    )
-    assert not _offending_expressions(correct)
+    """Honest-path, against the REAL file rather than a synthetic string.
+
+    ``derive_counter_timelock`` is the one place a Radiant block count and a Bitcoin margin are
+    reconciled, and it needs NO exemption: converting to seconds first puts the two identifiers in
+    different statements. Asserting that here is strictly better than an allowlist entry — an
+    exemption is an untested claim, and the skip it produced reported green while saying nothing.
+    """
+    src = (_ROOT / _CANONICAL_DERIVATION).read_text()
+    assert "def derive_counter_timelock" in src, f"{_CANONICAL_DERIVATION} no longer holds the derivation"
+    assert not _offending_expressions(src)
 
 
 @pytest.mark.parametrize(
@@ -75,8 +79,6 @@ def test_the_scanner_does_not_flag_the_correct_derivation():
 )
 def test_no_cross_chain_block_arithmetic(path):
     rel = str(path.relative_to(_ROOT))
-    if rel in _ALLOWLIST:
-        pytest.skip(f"{rel} is the single allowed derivation, and it works in seconds")
     offending = _offending_expressions(path.read_text())
     assert not offending, (
         f"{rel} mixes a RADIANT-block count with a BITCOIN-block margin in one expression: "

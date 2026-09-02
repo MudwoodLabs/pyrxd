@@ -74,10 +74,10 @@ import coincurve
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     CapturingBroadcaster,
     atomic_write_mode_600,
     confirm,
-    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
     resolve_asset_locked_at_height,
     wait_for_covenant_via_leg,
