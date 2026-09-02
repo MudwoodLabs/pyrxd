@@ -14,6 +14,11 @@ if TYPE_CHECKING:
     # create a cycle.
     from .dmint import DmintCborPayload
 
+    # .encrypted_content is a leaf today (it imports nothing from this package), so a runtime
+    # import would not cycle — but this file's convention is annotation-only for intra-package
+    # types, and a leaf can grow an import later.
+    from .encrypted_content import TimelockSpec
+
 
 class GlyphProtocol(IntEnum):
     FT = 1  # Fungible token
@@ -315,6 +320,17 @@ class GlyphMetadata:
     rights: GlyphRights | None = None  # V2 licensing and attribution
     created: str = ""  # V2 ISO8601 creation timestamp
     commit_outpoint: str = ""  # V2 txid:vout of the commit UTXO
+    # CBOR ``crypto.timelock`` — WHEN an encrypted payload becomes readable (#556).
+    #
+    # The decoder dropped this. pyrxd would classify a token as TIMELOCK and then discard the
+    # only field that says when it unlocks, so `glyph.timelock.is_unlocked` and
+    # `get_unlock_remaining` had nothing to be called WITH — which is why they had no caller.
+    # The unreachability was a parser gap, not a missing convenience method.
+    #
+    # Only the timelock spec is carried, not the whole `crypto` block: the wraps and the key
+    # format are mint-side concerns, and surfacing per-recipient key material through the
+    # inspect path is not something to do incidentally.
+    timelock: TimelockSpec | None = None
     # CBOR ``in`` — the CONTAINER(s) this token is a member of. Membership points
     # CHILD -> PARENT and lives here, in the envelope, because it cannot live in
     # the locking script: an output may not carry a ref that a *sibling* output

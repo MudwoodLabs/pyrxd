@@ -169,6 +169,20 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # `wrap_cek_x25519` needs a recipient public key the caller can only derive with
     # `x25519_public_key`. Exporting the functions without those leaves the entry point
     # unreachable in practice, which is the defect class this whole export exists to answer.
+    # Timelocked content — the READ side (#556). A holder of someone else's timelocked token asks
+    # exactly two things: can I read it yet, and how much longer. `verify_cek_reveal` is the third
+    # — checking a published CEK against the on-chain commitment before trusting it to decrypt.
+    #
+    # The MINT and REVEAL builders are deliberately NOT exported. They publish a CEK on-chain and
+    # have never had a production caller or a real-value run; exporting a workflow nothing reaches
+    # would restate #556 rather than close it.
+    #
+    # `TimelockSpec` comes with them because `is_unlocked` takes metadata carrying one, and
+    # `GlyphMetadata.timelock` is how a caller gets one — decoded from the CBOR since this change.
+    "TimelockSpec": ("pyrxd.glyph.encrypted_content", "TimelockSpec"),
+    "get_unlock_remaining": ("pyrxd.glyph.timelock", "get_unlock_remaining"),
+    "is_unlocked": ("pyrxd.glyph.timelock", "is_unlocked"),
+    "verify_cek_reveal": ("pyrxd.glyph.timelock", "verify_cek_reveal"),
     "ChunkedCiphertext": ("pyrxd.crypto.aead", "ChunkedCiphertext"),
     "EncryptedChunk": ("pyrxd.crypto.aead", "EncryptedChunk"),
     "WrappedCEK": ("pyrxd.crypto.kem", "WrappedCEK"),

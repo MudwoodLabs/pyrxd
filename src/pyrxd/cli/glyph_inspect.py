@@ -273,6 +273,19 @@ def _render_txid_human(payload: dict) -> str:
             lines.append(f"  decimals: {metadata['decimals']}")
         if metadata.get("main"):
             lines.append(f"  main:     {metadata['main']}")
+        tl = metadata.get("timelock")
+        if tl:
+            lines.append(f"  timelock: opens at {tl['unlock_at']} ({tl['mode']})")
+            if tl.get("hint"):
+                lines.append(f"            hint: {_truncate_for_human(tl['hint'])}")
+            lines.append(f"            cek commitment: {tl['cek_hash']}")
+            # NO "unlocked/locked" LINE. Deciding that needs the caller's view of the chain — a tip
+            # height for mode="block", a timestamp for mode="time" — and this renderer is handed a
+            # payload, not a node. `pyrxd.is_unlocked(...)` answers it for a caller who has one.
+            # Printing a verdict off this process's wall clock would be a guess dressed as a fact,
+            # and for mode="block" it would be meaningless.
+            lines.append("            (unlocked? pass this token's metadata and your chain tip to")
+            lines.append("             pyrxd.is_unlocked / pyrxd.get_unlock_remaining)")
     # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
     # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
     # V1 = 4-byte nonce / 72-byte scriptSig; V2 = 8-byte / 76-byte.
