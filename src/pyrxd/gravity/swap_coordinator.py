@@ -529,12 +529,23 @@ class MarginPolicy:
             "burial_safety_factor": burial_safety_factor,
             "accept_flat_burial": accept_flat_burial,
         }
-        # Default the fast tail to the nominal so an existing measured policy keeps working with
-        # today's numbers rather than failing to construct; the __post_init__ requirement then
-        # surfaces as an explicit choice at the call site instead of a hidden under-count.
-        kwargs["rxd_block_interval_fast_s"] = (
-            rxd_block_interval_fast_s if rxd_block_interval_fast_s is not None else (rxd_block_interval_s or 300.0)
-        )
+        # DO NOT default the fast tail. This used to fill it with `rxd_block_interval_s or 300.0`,
+        # reasoning that "the __post_init__ requirement then surfaces as an explicit choice at the
+        # call site" — but it cannot, because this line had already satisfied it. `measured()` sets
+        # `require_measured=True` unconditionally, so the guard at __post_init__ ("real-value mode
+        # requires a MEASURED rxd_block_interval_fast_s") was UNREACHABLE through the constructor
+        # operators are told to use.
+        #
+        # Reproduced on the shipped entry point before this change: `pyrxd-watchtower --measured`
+        # yielded require_measured=True with rxd_block_interval_fast_s=300.0, so the ETH 768s
+        # finality reserve was ceil(768/300)=3 RXD blocks where the repo's own measured p10 of 36s
+        # needs 22 — a 7x under-reserve on exactly the path the guard protects.
+        #
+        # Left None, the guard fires and the caller must choose. The docstring above already told
+        # them how: when the fast tail is genuinely unknown, pass the nominal value explicitly and
+        # accept that the reserves are nominal rather than conservative.
+        if rxd_block_interval_fast_s is not None:
+            kwargs["rxd_block_interval_fast_s"] = rxd_block_interval_fast_s
         if btc_claim_reorg_depth is not None:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
@@ -562,6 +573,7 @@ def measure_margin_from_btc_block_times(
     btc_claim_reorg_depth_blocks: int,
     rxd_claim_burial_blocks: int,
     rxd_block_interval_s: float,
+    rxd_block_interval_fast_s: float | None = None,
     accept_flat_burial: bool = False,
 ) -> tuple[MarginPolicy, dict]:
     """Build a MEASURED MarginPolicy from real mainnet BTC inter-block data (pure).
@@ -622,12 +634,17 @@ def measure_margin_from_btc_block_times(
         btc_claim_reorg_depth=Timelock(btc_claim_reorg_depth_blocks, TimeUnit.BLOCKS),
         rxd_claim_burial=Timelock(rxd_claim_burial_blocks, TimeUnit.BLOCKS),
         rxd_block_interval_s=float(rxd_block_interval_s),  # F-007: stored for the squeeze conversion
+        # REQUIRED by measured() since the silent nominal substitution was removed. This is the
+        # documented real-value policy builder, so it is exactly the path that must not quietly
+        # reserve at the nominal interval; omitting it now raises rather than under-reserving.
+        rxd_block_interval_fast_s=rxd_block_interval_fast_s,
         # Dust runs opt out of value-scaled burial (the value is below the Radiant reorg cost);
         # a real-value run leaves this False and supplies rxd_reorg_cost_per_block + value_at_risk.
         accept_flat_burial=accept_flat_burial,
     )
     provenance = {
         "measured": {
+            "rxd_block_interval_fast_s": rxd_block_interval_fast_s,
             "btc_block_interval_s_median": median_gap,
             "btc_tail_gap_s": tail_gap_s,
             "btc_tail_percentile": btc_tail_percentile,

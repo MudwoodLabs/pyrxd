@@ -136,12 +136,18 @@ def test_the_reserve_is_settable_through_the_constructor_a_REAL_VALUE_OPERATOR_U
 
     `ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS` tells an operator to measure this for a real-value run,
     and `MarginPolicy.measured()` is the constructor such an operator is told to use. A knob
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
     settable only by building the raw dataclass is not reachable from the documented path — the
     same gap #556 found at subsystem scale, one field wide.
     """
     from pyrxd.gravity.swap_coordinator import ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS
 
     measured = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=600.0,
         rxd_claim_inclusion=t.Timelock(4, t.TimeUnit.BLOCKS),
@@ -150,7 +156,11 @@ def test_the_reserve_is_settable_through_the_constructor_a_REAL_VALUE_OPERATOR_U
     # ...and omitting it keeps the documented default rather than silently dropping to zero.
     assert (
         MarginPolicy.measured(
-            margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0
+            # EXPLICIT since measured() stopped substituting it silently; same value the
+            # substitution used, so this test's arithmetic is unchanged.
+            rxd_block_interval_fast_s=300.0,
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
         ).rxd_claim_inclusion.value
         == ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS
     )

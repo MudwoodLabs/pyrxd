@@ -31,6 +31,7 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 from _dust_swap_shared import (
     PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
+    elapsed_reserve_blocks,
 )
 
 from pyrxd.btc_wallet import taproot as bt
@@ -124,4 +125,64 @@ def test_reserve_covers_every_runner_confirmation_floor():
         assert floor <= PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS, (
             f"{name} waits for {floor} confirmations but the derivation reserves only "
             f"{PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS} blocks"
+        )
+
+
+@pytest.mark.parametrize("burial", [0, 2, 6, 12, 13, 20, 40])
+def test_the_reserve_covers_the_depth_the_taker_is_MADE_to_wait(burial: int):
+    """A flat reserve refused any measured burial above it, and blamed the maker.
+
+    ``pre_btc_lock_check`` step 5 will not fund the counter leg until the covenant is
+    ``rxd_claim_burial`` deep, and step 7 then re-runs the margin gate with
+    ``elapsed_blocks=cov_confs``. So the elapsed depth the gate sees is AT LEAST the burial —
+    the two are coupled by the protocol, and the derivation has to know it.
+
+    Shipped briefly as a flat 12. Measured then (t_rxd=180, margin=2, derived t_btc=82): burial 12
+    passed; burial 13 and 20 were refused as "insufficient margin in WALL CLOCK", a message about
+    the MAKER'S TERMS when the real cause was the runner's own constant — pointing the operator at
+    a knob that could not fix it.
+
+    Nothing forbids a burial above 12: the floor is 2 and a real-value operator measures it.
+    """
+    t_rxd, margin = 180, 2
+    reserve = elapsed_reserve_blocks(rxd_claim_burial_blocks=burial)
+    assert reserve >= burial, "the reserve must cover the depth step 5 enforces"
+    t_btc = derive_counter_timelock(
+        t_rxd_blocks=t_rxd,
+        margin_blocks=margin,
+        rxd_block_interval_s=300.0,
+        btc_block_interval_s=600.0,
+        elapsed_reserve_blocks=reserve,
+    )
+    policy = _policy(margin, 600.0, 300.0)
+    # The taker funds at exactly the required depth, and at every depth up to the reserve.
+    for elapsed in range(burial, reserve + 1):
+        assert_timelock_margin(
+            bt.Timelock(t_btc, bt.TimeUnit.BLOCKS),
+            bt.Timelock(t_rxd, bt.TimeUnit.BLOCKS),
+            policy,
+            elapsed_blocks=elapsed,
+        )
+
+
+def test_the_flat_constant_alone_would_NOT_cover_a_measured_burial():
+    """The honest negative: proves the coupling above is load-bearing, not decorative.
+
+    Without it the suite would pass identically whether the reserve tracked the burial or not.
+    """
+    t_rxd, margin, burial = 180, 2, 20
+    assert burial > PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS
+    t_btc_flat = derive_counter_timelock(
+        t_rxd_blocks=t_rxd,
+        margin_blocks=margin,
+        rxd_block_interval_s=300.0,
+        btc_block_interval_s=600.0,
+        elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
+    )
+    with pytest.raises(Exception):
+        assert_timelock_margin(
+            bt.Timelock(t_btc_flat, bt.TimeUnit.BLOCKS),
+            bt.Timelock(t_rxd, bt.TimeUnit.BLOCKS),
+            _policy(margin, 600.0, 300.0),
+            elapsed_blocks=burial,
         )

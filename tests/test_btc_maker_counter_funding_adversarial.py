@@ -265,6 +265,9 @@ async def test_measured_policy_requires_the_btc_reorg_depth():
     the same ``btc_claim_reorg_depth`` the claim-finality gate uses — not the leg's shallow
     funding default. Mirrors the ETH gate's ``'finalized'``-when-measured discipline."""
     measured = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=600.0,
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),

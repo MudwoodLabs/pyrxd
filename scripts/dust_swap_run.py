@@ -64,7 +64,6 @@ from pyrxd.security.types import Hex20, Txid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
-    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     CapturingBroadcaster,
     SshTrFeeSource,
     StepReport,
@@ -72,6 +71,7 @@ from _dust_swap_shared import (
     confirm,
     covenant_fund_height,
     derive_counter_timelock,
+    elapsed_reserve_blocks,
     measured_margin_from_mainnet,
     merge_into_mode_600,
     rxd_blockcount,
@@ -140,7 +140,15 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             margin_blocks=margin_blocks,
             rxd_block_interval_s=policy.rxd_block_interval_s,
             btc_block_interval_s=policy.block_interval_s,
-            elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
+            # COUPLED to the depth the taker must wait (step 5) before the gate re-runs at
+            # step 7 with elapsed_blocks=cov_confs. A flat constant refused any measured
+            # burial above it, blaming the maker's terms. RADIANT interval: this is a
+            # Radiant-chain quantity, and policy.block_interval_s is the Bitcoin one.
+            elapsed_reserve_blocks=elapsed_reserve_blocks(
+                rxd_claim_burial_blocks=policy.rxd_claim_burial.normalize_to(
+                    bt.TimeUnit.BLOCKS, block_interval_s=policy.rxd_block_interval_s
+                ).value
+            ),
         ),
         bt.TimeUnit.BLOCKS,
     )

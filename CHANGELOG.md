@@ -8,6 +8,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`pyrxd-watchtower --measured` ran real-value mode with a NOMINAL Radiant interval, and the
+  guard forbidding exactly that could never fire.** `MarginPolicy.measured()` sets
+  `require_measured=True` unconditionally and then filled `rxd_block_interval_fast_s` with
+  `rxd_block_interval_s or 300.0`, so the `__post_init__` check ("real-value mode requires a
+  MEASURED rxd_block_interval_fast_s") was unreachable through the constructor operators are told
+  to use. The shipped watchtower had no flag to supply the value at all.
+
+  Reproduced on the shipped entry point: `--measured` yielded `require_measured=True` with a 300 s
+  fast tail, so the ETH finality reserve was `ceil(768/300) = 3` Radiant blocks where the repo's
+  own measured p10 of 36 s needs **22** — a 7x under-reserve on the path the guard protects. An
+  under-reserved floor returns WAIT where there is no room left to wait.
+
+  `measured()` no longer substitutes; `--rxd-block-interval-fast-s` is now a watchtower flag, and
+  `measure_margin_from_btc_block_times` threads and records it in its provenance. A caller who has
+  not measured the p10 passes the nominal value **explicitly**, which the docstring already
+  prescribed. The test asserting the substitution as a feature — "a guard that refuses valid work
+  is a bug: `measured(...)` must still construct" — now asserts the refusal, paired with an
+  honest-path test and a reachability test through the real CLI parser. The pre-existing guard test
+  passed only because it built `MarginPolicy(...)` directly, bypassing the production constructor.
+
+- **The pre-BTC-lock elapsed reserve was uncoupled from the depth the taker is made to wait.**
+  `pre_btc_lock_check` step 5 refuses to fund until the covenant is `rxd_claim_burial` deep, and
+  step 7 re-runs the margin gate with `elapsed_blocks=cov_confs` — so the elapsed depth is at least
+  the burial. The reserve shipped as a flat 12, so any measured burial above that had the runner
+  refuse its own derived terms with "insufficient margin in WALL CLOCK", a message about the
+  *maker's* terms when the cause was the runner's constant. Measured at t_rxd=180, margin=2: burial
+  12 passed, 13 and 20 were refused. `elapsed_reserve_blocks()` now derives it from the burial plus
+  operational slack, wired into all four runners; nothing forbids a burial above 12, since the
+  floor is 2 and a real-value operator measures it.
+
 - **Four published, user-facing documents still taught the pre-#482 timelock direction**, and one
   of them taught the pre-HZ-1 lock order as well. `docs/how-to/build-a-cross-chain-swap.md`,
   `docs/tutorials/cross-chain-swap.md`, `docs/how-to/run-a-two-host-swap-dry-run.md` and

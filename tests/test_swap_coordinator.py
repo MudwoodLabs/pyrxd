@@ -500,7 +500,13 @@ def test_margin_real_value_mode_requires_measured():
     with pytest.raises(ValidationError):
         MarginPolicy.estimated(require_measured=True)
     # A measured policy in real-value mode is accepted.
-    measured = MarginPolicy.measured(margin=t.Timelock(50, t.TimeUnit.BLOCKS), block_interval_s=600.0)
+    # EXPLICIT since measured() stopped substituting it silently; same value the substitution
+    # used, so this test's arithmetic is unchanged.
+    measured = MarginPolicy.measured(
+        margin=t.Timelock(50, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        rxd_block_interval_fast_s=300.0,
+    )
     assert measured.is_measured and measured.require_measured
     # 244, not 200: in WALL CLOCK (#567) a 72-block BTC leg (12.0 h) plus a 50-block margin (8.3 h)
     # needs 244 Radiant blocks at 300 s. 200 is 16.7 h against the 20.3 h required.
@@ -1726,6 +1732,8 @@ def test_measure_margin_from_btc_block_times_basic():
     for gap in (600, 600, 600, 600, 1200, 600, 1800, 600, 600, 600):
         ts.append(ts[-1] + gap)
     policy, prov = measure_margin_from_btc_block_times(
+        # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+        rxd_block_interval_fast_s=300.0,
         btc_block_timestamps=ts,
         btc_tail_percentile=99.9,  # nearest-rank over 10 gaps -> the max
         btc_claim_reorg_depth_blocks=3,
@@ -1746,6 +1754,8 @@ def test_measure_margin_handles_unordered_and_equal_timestamps():
     base = 1_700_000_000
     ts = [base + 1200, base, base + 600, base + 600, base + 1800]  # unordered + a duplicate
     policy, prov = measure_margin_from_btc_block_times(
+        # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+        rxd_block_interval_fast_s=300.0,
         btc_block_timestamps=ts,
         btc_tail_percentile=75.0,
         btc_claim_reorg_depth_blocks=2,
@@ -1759,6 +1769,8 @@ def test_measure_margin_handles_unordered_and_equal_timestamps():
 def test_measure_margin_rejects_thin_or_bad_inputs():
     with pytest.raises(ValidationError, match=">= 3 BTC block timestamps"):
         measure_margin_from_btc_block_times(
+            # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+            rxd_block_interval_fast_s=300.0,
             btc_block_timestamps=[1, 2],
             btc_tail_percentile=90.0,
             btc_claim_reorg_depth_blocks=3,
@@ -1767,6 +1779,8 @@ def test_measure_margin_rejects_thin_or_bad_inputs():
         )
     with pytest.raises(ValidationError, match="btc_tail_percentile"):
         measure_margin_from_btc_block_times(
+            # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+            rxd_block_interval_fast_s=300.0,
             btc_block_timestamps=[1, 2, 3, 4],
             btc_tail_percentile=10.0,
             btc_claim_reorg_depth_blocks=3,
@@ -1775,6 +1789,8 @@ def test_measure_margin_rejects_thin_or_bad_inputs():
         )
     with pytest.raises(ValidationError, match="must all be ints"):
         measure_margin_from_btc_block_times(
+            # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+            rxd_block_interval_fast_s=300.0,
             btc_block_timestamps=[1, 2.5, 3],
             btc_tail_percentile=90.0,  # type: ignore[list-item]
             btc_claim_reorg_depth_blocks=3,
@@ -1788,6 +1804,8 @@ def test_measure_margin_inherits_reorg_depth_floor():
     ts = [1_700_000_000 + i * 600 for i in range(6)]
     with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
         measure_margin_from_btc_block_times(
+            # EXPLICIT: the real-value builder no longer substitutes a nominal fast tail.
+            rxd_block_interval_fast_s=300.0,
             btc_block_timestamps=ts,
             btc_tail_percentile=90.0,
             btc_claim_reorg_depth_blocks=1,
@@ -2203,6 +2221,9 @@ async def test_btc_counter_funding_depth_pins_to_reorg_depth_only_when_measured(
     assert leg.last_verify_min_confirmations is None  # is_measured=False -> leg default
 
     measured = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=600.0,
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
@@ -2851,6 +2872,9 @@ def test_value_scaled_burial_math_and_floor():
 
     # value 1,000,000 / cost 100,000 / factor 1.0 -> 10 blocks; ceil rounds up.
     p = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=100_000,
@@ -2859,6 +2883,9 @@ def test_value_scaled_burial_math_and_floor():
     assert _value_scaled_burial_blocks(p, p.value_at_risk_photons) == 11  # ceil(1,050,000 / 100,000)
     # factor scales linearly.
     p2 = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=100_000,
@@ -2877,6 +2904,9 @@ def test_value_scaled_burial_exact_integer_no_float_undercount():
 
     value, cost = 100_000_000_000_000_003, 3  # > 2**53; not divisible by 3
     p = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=cost,
@@ -2895,6 +2925,9 @@ def test_assess_per_record_value_override_and_fail_closed_without_value():
     locked, now = 1000, 1001
     t_rxd = t.Timelock(20, t.TimeUnit.BLOCKS)
     p = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_block_interval_s=300.0,
@@ -2913,6 +2946,9 @@ def test_assess_per_record_value_override_and_fail_closed_without_value():
 def test_setup_gate_rejects_understated_value_for_rxd():
     # An RXD swap whose value_at_risk_photons is below its own on-chain radiant_amount (1000) is refused.
     under = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=100_000,
@@ -2929,6 +2965,9 @@ def test_setup_gate_rejects_understated_value_for_rxd():
         )
     # value >= radiant_amount constructs; and FT (different unit) is exempt from the check.
     ok = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=100_000,
@@ -2953,6 +2992,9 @@ def test_high_value_squeezes_where_flat_would_be_safe():
     locked_at, now = 1000, 1001
     t_rxd = t.Timelock(20, t.TimeUnit.BLOCKS)  # window ~19 blocks left
     flat_safe = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_block_interval_s=300.0,
@@ -2971,6 +3013,9 @@ def test_high_value_squeezes_where_flat_would_be_safe():
     )
     # Same window, but value demands burial 50 (5,000,000 / 100,000) >> 19 left -> SQUEEZED.
     value_scaled = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_block_interval_s=300.0,
@@ -3001,6 +3046,9 @@ def test_setup_gate_accepts_dust_optout():
 
 def test_setup_gate_accepts_value_scaled_inputs():
     p = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=300.0,
         rxd_reorg_cost_per_block=100_000,
@@ -3025,7 +3073,12 @@ def test_setup_gate_does_not_fire_on_non_value_bearing_radiant():
 def test_burial_safety_factor_below_one_rejected():
     with pytest.raises(ValidationError, match="burial_safety_factor"):
         MarginPolicy.measured(
-            margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=300.0, burial_safety_factor=0.9
+            # EXPLICIT since measured() stopped substituting it silently; same value the
+            # substitution used, so this test's arithmetic is unchanged.
+            rxd_block_interval_fast_s=300.0,
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=300.0,
+            burial_safety_factor=0.9,
         )
 
 
@@ -3483,11 +3536,59 @@ class TestReservesUseTheFastTailInterval:
                 ),
             )
 
-    def test_the_measured_constructor_supplies_one_so_real_policies_still_build(self) -> None:
-        """A guard that refuses valid work is a bug: `MarginPolicy.measured(...)` must still
-        construct without the caller knowing about the new field."""
-        p = MarginPolicy.measured(margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0)
-        assert p.rxd_block_interval_fast_s is not None
+    def test_the_measured_constructor_REFUSES_without_a_fast_tail(self) -> None:
+        """This asserted the opposite until 2026-09-02, and that is what made the guard dead.
+
+        It read: "A guard that refuses valid work is a bug: `MarginPolicy.measured(...)` must still
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
+        construct without the caller knowing about the new field" — and `measured()` obliged by
+        filling the fast tail with `rxd_block_interval_s or 300.0`. Since `measured()` also sets
+        `require_measured=True` unconditionally, the __post_init__ guard right above could never
+        fire through it. `test_real_value_mode_REQUIRES_a_fast_tail` passed only because it builds
+        `MarginPolicy(...)` DIRECTLY, bypassing the production constructor.
+
+        Measured on the shipped entry point: `pyrxd-watchtower --measured` produced
+        require_measured=True with a 300s fast tail, reserving ceil(768/300)=3 RXD blocks for the
+        ETH finality window where the repo's own measured p10 of 36s needs 22.
+
+        The principle in the old docstring is right and is served by the test below: the valid work
+        is passing the nominal value EXPLICITLY, which is what the constructor's docstring already
+        told callers to do when the tail is genuinely unknown.
+        """
+        with pytest.raises(ValidationError, match="rxd_block_interval_fast_s"):
+            MarginPolicy.measured(margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0)
+
+    def test_an_EXPLICIT_nominal_fast_tail_still_builds(self) -> None:
+        """The honest path, paired with the refusal above so the guard cannot creep into refusing
+        legitimate work. An operator who has not measured the p10 says so out loud and gets nominal
+        reserves knowingly, rather than silently."""
+        p = MarginPolicy.measured(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            rxd_block_interval_s=300.0,
+            rxd_block_interval_fast_s=300.0,
+        )
+        assert p.rxd_block_interval_fast_s == 300.0
+
+    def test_the_shipped_watchtower_can_supply_it(self) -> None:
+        """Reachability: a required field with no way to pass it is just a broken entry point.
+
+        `pyrxd-watchtower` had no `--rxd-block-interval-fast-s` flag at all, which is why the
+        silent substitution looked necessary.
+        """
+        from pyrxd.gravity.watch import run as watch_run
+
+        args = watch_run._parse_args(
+            ["--records-dir", "/tmp/x", "--measured", "--accept-flat-burial", "--rxd-block-interval-fast-s", "36"]
+        )
+        policy = watch_run._policy_from_args(args)
+        assert policy.require_measured is True
+        assert policy.rxd_block_interval_fast_s == 36.0
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        assert _dividing_interval_s(policy) == 36.0
 
 
 class TestTheFundGateClosesTheSqueezeBand:

@@ -74,11 +74,11 @@ import coincurve
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
-    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     CapturingBroadcaster,
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
+    elapsed_reserve_blocks,
     resolve_asset_locked_at_height,
     wait_for_covenant_via_leg,
 )
@@ -96,6 +96,7 @@ from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
+    ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS,
     CoordinatorConfig,
     MarginPolicy,
     SwapCoordinator,
@@ -692,7 +693,10 @@ async def maker_phase_envelope(args) -> None:
             margin_blocks=args.margin_blocks,
             rxd_block_interval_s=args.rxd_block_interval_s,
             btc_block_interval_s=args.btc_block_interval_s,
-            elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
+            # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
+            elapsed_reserve_blocks=elapsed_reserve_blocks(
+                rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS
+            ),
         ),
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,

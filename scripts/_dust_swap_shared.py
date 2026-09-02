@@ -648,6 +648,33 @@ async def wait_for_covenant_via_leg(
 PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS = 12
 
 
+def elapsed_reserve_blocks(*, rxd_claim_burial_blocks: int) -> int:
+    """The Radiant blocks to reserve, COUPLED to the depth the taker is made to wait.
+
+    The flat constant above is not sufficient on its own, and shipping it alone was a defect in
+    the fix that introduced it. ``pre_btc_lock_check`` step 5 refuses to fund the counter leg
+    until the covenant is ``rxd_claim_burial`` deep, and step 7 then re-runs the margin gate with
+    ``elapsed_blocks=cov_confs``. So the elapsed depth the gate sees is AT LEAST the burial. With
+    a flat 12, any operator who measured a burial above 12 got their own runner refused at step 7,
+    with a message about the maker's terms — pointing at the wrong knob entirely.
+
+    Measured before this fix (t_rxd=180, margin=2, derived t_btc=82): burial 12 passed, burial 13
+    and burial 20 were both refused as "insufficient margin in WALL CLOCK".
+
+    The slack on top covers the operational gap between reaching the depth and the gate running.
+    """
+    if not isinstance(rxd_claim_burial_blocks, int) or isinstance(rxd_claim_burial_blocks, bool):
+        raise SystemExit("rxd_claim_burial_blocks must be an int")
+    if rxd_claim_burial_blocks < 0:
+        raise SystemExit("rxd_claim_burial_blocks must be >= 0")
+    return max(PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS, rxd_claim_burial_blocks + _OPERATIONAL_SLACK_BLOCKS)
+
+
+#: Radiant blocks between the covenant reaching its required depth and the gate actually running:
+#: the taker noticing, building and broadcasting the counter leg.
+_OPERATIONAL_SLACK_BLOCKS = 4
+
+
 def derive_counter_timelock(
     *,
     t_rxd_blocks: int,
