@@ -8,6 +8,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Four published, user-facing documents still taught the pre-#482 timelock direction**, and one
+  of them taught the pre-HZ-1 lock order as well. `docs/how-to/build-a-cross-chain-swap.md`,
+  `docs/tutorials/cross-chain-swap.md`, `docs/how-to/run-a-two-host-swap-dry-run.md` and
+  `docs/security-audit-scope.md` all stated `t_counterchain > t_rxd + margin` — the layout in which
+  the maker refunds its own leg while `p` is secret and still claims the counter leg, taking both.
+  The how-to carried it as a **MUST** directive for implementers; the audit-scope row told an
+  external auditor that the inverted rule was the invariant being enforced.
+
+  #568 corrected the handshake spec and missed all four, because they spell the counter leg
+  `t_counterchain` / `t_counter` and the sweep looked for `t_btc`. Same rule, different letter.
+
+  Also corrected: the exported `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST` invariant text and the
+  `pre_btc_lock_check` docstring, which stated the relation in raw blocks and in the reversed
+  direction respectively — the safety gate describing its own rule backwards; the `TimeUnit`
+  docstring in `taproot.py`, which called `t_BTC - t_RXD >= margin` "the whole cross-chain safety
+  invariant"; and the wire-format spec, which still flagged the units defect as OPEN after #567
+  closed it and named the wrong conformance schema version.
+
+  `tests/test_protocol_lock_ordering_docs_are_current.py` now scans `src/`, `scripts/`,
+  `conformance/` and the published docs rather than `src/` alone, for the timelock direction as
+  well as the lock order, in **both** variable namings and both hyphen spellings. Its non-vacuity
+  cases are the ten sentences that actually shipped.
+
+- **`eth_swap_two_host.py`'s self-check had no test**, which its BTC sibling's docstring recorded
+  in writing. Its hardcoded `t_rxd_blocks` was not raised alongside the runner's argparse default,
+  so the self-check raised `SystemExit` at startup and nothing noticed. Now covered by
+  `tests/test_eth_two_host_self_check.py`.
+
 - **The derived counter-leg timelock was refused by the gate it was derived from.**
   `derive_counter_timelock` solved the margin inequality to equality — the largest `t_btc` the
   gate accepts **at `elapsed_blocks=0`**. But `pre_btc_lock_check` calls

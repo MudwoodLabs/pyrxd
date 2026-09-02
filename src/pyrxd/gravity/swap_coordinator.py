@@ -117,10 +117,13 @@ MAKER_SECRET_TAKER_LOCKS_BTC_FIRST = (  # nosec B105 — a role-invariant doc st
     "the covenant off the Radiant chain (HZ-1, #392). (4) The "
     "MAKER claims the BTC FIRST, revealing p in the Bitcoin witness. (5) The TAKER "
     "scrapes p from Bitcoin and claims the Radiant asset before its refund opens. "
-    "Invariant: t_RXD > t_BTC + margin — the maker holds p and LOCKS the Radiant leg, "
-    "so THAT leg carries the LONGER refund and the leg the maker CLAIMS (BTC) the shorter "
-    "(Herlihy 1801.09515 §1: the secret generator locks at 6-delta and claims a 4-delta leg). "
-    "The taker's client MUST verify t_RXD - t_BTC >= margin before funding, or refuse. "
+    "Invariant, IN WALL CLOCK (#567): t_RXD * i_RXD >= t_BTC * i_BTC + margin * i_BTC — the "
+    "maker holds p and LOCKS the Radiant leg, so THAT leg carries the LONGER refund and the "
+    "leg the maker CLAIMS (BTC) the shorter (Herlihy 1801.09515 §1: the secret generator "
+    "locks at 6-delta and claims a 4-delta leg). The raw-block form t_RXD > t_BTC + margin "
+    "is NOT sufficient: a Radiant block is ~300 s against Bitcoin's ~600 s, so it passes "
+    "layouts whose real margin is negative. The taker's client MUST verify the wall-clock "
+    "relation before funding, or refuse. "
     "NB the NAME predates HZ-1 (#392), which inverted the lock order in (2)/(3); it is "
     "kept because it is exported, asserted in tests and quoted in a ValidationError, and "
     "because the half of it that names the timelock invariant is still exactly right."
@@ -1572,8 +1575,10 @@ class SwapCoordinator:
           2. H freshness — a read-only advisory probe of the seen-store (reused H
              => reject early). The authoritative atomic reserve happens later, in
              :meth:`taker_funds_btc`, immediately before the broadcast.
-          3. The cross-chain timelock ordering. BTC: the same-clock margin
-             ``t_btc - t_rxd >= margin``. ETH: the cross-clock gate that validates the
+          3. The cross-chain timelock ordering. BTC: the WALL-CLOCK margin
+             ``t_rxd * i_rxd >= t_btc * i_btc + margin * i_btc`` (this docstring said
+             ``t_btc - t_rxd >= margin`` until 2026-09-02 — the pre-#482 direction, in the
+             pre-#567 units, in the gate's own description of itself). ETH: the cross-clock gate that validates the
              ABSOLUTE ``eth_timeout_unix_s`` leaves room for the RELATIVE ``t_rxd`` window
              (needs ``now_unix_s``; audit HIGH-1). The orphaned bridge is wired here.
           4. Maker-*promised* params match the locally re-derived BTC funding SPK

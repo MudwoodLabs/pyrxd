@@ -927,7 +927,10 @@ def run_self_check() -> None:
         hashlock=h,
         rxd_photons=1000,
         eth_amount_wei=10**14,
-        t_rxd_blocks=60,
+        # 120: the counter leg is DERIVED from this in wall clock with an elapsed
+        # reserve, and 60 no longer yields a positive t_btc. The argparse default was
+        # raised and this hardcoded twin was not — same file, one place and not the other.
+        t_rxd_blocks=120,
         margin_blocks=36,
         eth_timeout_unix_s=eth_timeout,
         taker_pkh=taker_pkh,
@@ -978,7 +981,7 @@ def run_self_check() -> None:
     assert cov2.funded_spk.hex() == env2["covenant_spk_hex"], "FAIL: taker re-derived a different covenant SPK"
     print("  [ok] taker re-derives the SAME covenant SPK from the envelope's public terms")
 
-    # The independent margin check passes for honest terms (t_btc - t_rxd = 40 >= margin 36)...
+    # The independent margin check passes for honest terms (t_rxd 120 - t_btc 18 = 102 >= margin 36)...
     policy = MarginPolicy(
         margin=bt.Timelock(36, bt.TimeUnit.BLOCKS),
         block_interval_s=600.0,

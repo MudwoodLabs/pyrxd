@@ -23,7 +23,8 @@ run itself.
 > validation exercise.
 
 For the model behind the steps — the maker/taker roles, the `H = SHA256(p)` hashlock, and
-the `t_counterchain > t_rxd + margin` safety invariant — read
+the wall-clock `t_rxd · i_rxd ≥ t_counterchain · i_counterchain + margin · i_counterchain`
+safety invariant — read
 [Build a cross-chain atomic swap](build-a-cross-chain-swap.md) first. This page is the
 operational *how*; that page is the *why*.
 

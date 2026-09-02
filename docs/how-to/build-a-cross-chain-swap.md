@@ -48,15 +48,26 @@ print(SwapCoordinator.__module__)  # the role invariant lives in swap_coordinato
 `pyrxd.gravity.swap_coordinator`) is the safety hinge — read it before you wire anything:
 
 1. The **maker** generates `p`, publishes `H`.
-2. The **taker** locks the counter-chain (BTC/ETH HTLC) **first**.
-3. The **maker** locks the Radiant covenant **second**.
+2. The **maker** locks the Radiant covenant **first**.
+3. The **taker** locks the counter-chain (BTC/ETH HTLC) **second** — `taker_funds_btc`
+   refuses until `pre_btc_lock_check` has read that covenant off the Radiant chain.
 4. The **maker** claims the counter-chain **first**, revealing `p`.
 5. The **taker** scrapes `p` and claims the Radiant asset **before its refund opens**.
 
-The timelocks must satisfy **`t_counterchain > t_rxd + margin`**: the leg claimed
-*second* (Radiant) carries the *shorter* refund window. The taker's client MUST verify
-`t_counterchain − t_rxd ≥ margin` before funding, or refuse. The coordinator enforces
-this fail-closed (`assert_timelock_margin`) — don't route around it.
+The timelocks must satisfy, **in wall clock**:
+
+**`t_rxd · i_rxd ≥ t_counterchain · i_counterchain + margin · i_counterchain`**
+
+The maker holds `p`, **locks** the Radiant leg and **claims** the counter leg, so the leg it
+*locks* carries the **longer** refund window and the leg it *claims* the shorter. The taker's
+client MUST verify this before funding, or refuse. The coordinator enforces it fail-closed
+(`assert_timelock_margin`) — don't route around it.
+
+> **⚠ This page taught the opposite until 2026-09-02.** It gave the lock order as taker-first
+> (superseded by HZ-1/#392) and the invariant as `t_counterchain > t_rxd + margin` in raw blocks
+> — the layout in which the maker refunds its own leg while `p` is still secret and *then* claims
+> the counter leg, taking both. **If you built against this page, re-derive your lock order and
+> your timelock ordering.**
 
 ## The pieces (all importable from the top level)
 

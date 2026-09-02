@@ -304,7 +304,7 @@ these would otherwise be missed).
 | `SWAP-R1` | critical | mitigated (gate) | Consensus enforces ref **uniqueness**, not **provenance** — a fake-singleton covenant is consensus-valid; `verify_ref_authenticity` is the *only* defense | `gravity/ref_authenticity.py` · R1 |
 | `SWAP-COVENANT-BUGS` | critical | open | Gravity covenant variants "still being hardened" — the most concentrated risk in the codebase | TM S10 / gap #12 |
 | `SWAP-FREEOPT` | high | accepted | Taker offline/censored across `[reveal, t_rxd]` → one-sided loss (HTLC free option). Bounded by margin + reorg gate + value-scaled burial; **not** eliminated | TM S20 / R1 |
-| `SWAP-TIMELOCK-INVARIANT` | high | mitigated | `t_counter > t_rxd + margin` is client-enforced (`assert_timelock_margin`); a wrong client could route around it | `swap_coordinator.py` |
+| `SWAP-TIMELOCK-INVARIANT` | high | mitigated | `t_rxd · i_rxd ≥ t_counter · i_counter + margin · i_counter` (WALL CLOCK, #567) is client-enforced (`assert_timelock_margin`); a wrong client could route around it. This row stated the inverted, raw-block form `t_counter > t_rxd + margin` until 2026-09-02 | `swap_coordinator.py` |
 | `SWAP-MAKER-STALL` | high | mitigated | A stalling maker can take both legs unless the taker stops waiting / refunds proactively (C1) | `swap_coordinator.py` |
 | `SWAP-BURIAL` | high | mitigated | Flat claim-burial bounds reorg *probability*, not reorg *cost vs value* (low-cap PoW); value-scaled burial now enforced | `swap_coordinator.py` · red-team 2026-06-12 HIGH |
 | `SWAP-MARGIN-MEASURED` | high | gate | Default cross-chain margin is **estimated**; a real-value swap must use `MarginPolicy.measured(...)` | `swap_coordinator.py` |

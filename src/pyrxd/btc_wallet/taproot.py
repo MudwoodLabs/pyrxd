@@ -215,9 +215,18 @@ _OP_DROP = b"\x75"
 class TimeUnit(Enum):
     """The unit a :class:`Timelock` is measured in.
 
-    The whole cross-chain safety invariant (``t_BTC - t_RXD >= margin``) rides on
-    comparing like units; mixing blocks and seconds without conversion is a
-    fail-closed error, not a silent coercion.
+    The whole cross-chain safety invariant rides on comparing like units, and
+    since #567 that comparison is in SECONDS, not raw block counts::
+
+        t_rxd * i_rxd >= t_btc * i_btc + margin * i_btc
+
+    The maker holds ``p``, LOCKS the Radiant leg and CLAIMS the counter leg, so
+    the Radiant leg carries the LONGER timeout (#482). Until 2026-09-02 this
+    docstring stated the reverse — ``t_BTC - t_RXD >= margin`` — and called it
+    "the whole safety invariant"; that is the layout in which the maker takes
+    both legs, deterministically. Mixing
+    blocks and seconds without conversion is a fail-closed error, not a silent
+    coercion.
     """
 
     BLOCKS = "blocks"

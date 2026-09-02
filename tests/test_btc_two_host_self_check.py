@@ -3,7 +3,8 @@
 The two-host harness's ``--self-check`` is its validatable deliverable (no chain): it round-trips the
 security-critical seam — the maker serialises the envelope, the taker re-derives the covenant + runs
 the INDEPENDENT margin check, the maker re-derives the expected BTC HTLC SPK — and asserts ``p`` never
-appears in any serialised artifact. This test wires that into CI (the ETH sibling has no such test).
+appears in any serialised artifact. This test wires that into CI; the ETH sibling is covered by
+``tests/test_eth_two_host_self_check.py``.
 """
 
 from __future__ import annotations

@@ -339,11 +339,22 @@ broadcast (`swap_coordinator.py:1363-1375`).
 ### Timelock deltas — the maker's own leg must outlast the one it claims
 
 ```
-t_rxd − t_btc ≥ margin
+t_rxd · i_rxd  ≥  t_btc · i_btc  +  margin · i_btc
 ```
 
+where `i_rxd` and `i_btc` are the two chains' block intervals in seconds. **The relation is in WALL
+CLOCK, not in raw block counts** — `t_btc` counts Bitcoin blocks (~600 s) and `t_rxd` counts Radiant
+blocks (~300 s), so a Radiant block buys roughly half of what a Bitcoin block does. At the nominal
+600/300 the relation reduces to `t_rxd ≥ 2·t_btc + 2·margin`.
+
 Enforced by `assert_timelock_margin` (`pyrxd/gravity/swap_coordinator.py`), in two steps: a strict
-ordering check (`t_rxd` must exceed `t_btc`) and then the margin.
+ordering check (`t_rxd` must exceed `t_btc`) and then the margin, both after converting to seconds.
+
+The gate also subtracts the Radiant blocks already elapsed when it is called
+(`elapsed_blocks=cov_confs` from `pre_btc_lock_check`), because the maker's leg starts ticking at
+its funding confirmation. A conforming implementation deriving `t_btc` from `t_rxd` MUST reserve
+headroom for that elapsed depth, or the terms it derives will be refused by this same check once the
+covenant confirms.
 
 **The invariant in words.** The maker holds the preimage `p`. It **LOCKS** the Radiant leg and
 **CLAIMS** the counter leg, so the leg it locks carries the **LONGER** refund window and the leg it
@@ -366,16 +377,14 @@ the attack window.
 >
 > **If you implemented against any published pyrxd handshake material before 2026-09-01, re-derive
 > your timelock ordering.** The vectors are corrected and their schema is bumped to
-> `radiant-htlc-handshake/2` so the two files can be told apart by version.
+> `radiant-htlc-handshake/3` so the files can be told apart by version.
 
-**⚠ OPEN DEFECT — THE UNITS.** The relation above is stated in *blocks*, and `t_btc` counts
-**Bitcoin** blocks (~600 s) while `t_rxd` counts **Radiant** blocks (~300 s). They are not the same
-unit, and the shipped check compares them one-for-one: `t_rxd=180` "exceeds" `t_btc=144` by 36 raw
-blocks while being 15 h against 24 h in wall-clock — the Radiant refund opening *nine hours before*
-the counter-leg deadline. Under the pre-#482 direction this conflation was fail-safe and it is now
-fail-open. **Do not treat the block-denominated form as sufficient.** Tracked as
-[issue #567](https://github.com/MudwoodLabs/pyrxd/issues/567); this section will be restated in
-seconds when that lands.
+**⚠ THIS RELATION WAS PUBLISHED IN RAW BLOCKS UNTIL #567**, comparing `t_btc` and `t_rxd`
+one-for-one although they count different chains' blocks. `t_rxd=180` "exceeds" `t_btc=144` by 36
+raw blocks while being 15 h against 24 h in wall clock — the Radiant refund opening *nine hours
+before* the counter-leg deadline. Under the pre-#482 direction that conflation was fail-safe; after
+the inversion it was fail-open. Fixed in #567 and restated above in seconds. **If you implemented
+the block-denominated form, re-derive against the wall-clock relation.**
 
 **Margin floor.** There is no protocol-mandated minimum. `margin` is **each party's own policy**,
 not a negotiated field — the taker checks the maker's `terms` against the *taker's* margin and

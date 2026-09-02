@@ -133,10 +133,13 @@ right action at the right moment (and never pages a claim against a not-yet-fina
 The swap never asks you to trust the counterparty — it leans on each chain's consensus plus three
 rules the coordinator enforces fail-closed:
 
-- **Ordering + timelock margin.** The taker locks ETH *first*, the maker locks the asset *second*,
-  and the maker reveals `p` *first*. The leg claimed second (Radiant) carries the **shorter**
-  refund window, so the taker always has time to scrape `p` and claim before its own refund opens.
-  The coordinator refuses to proceed unless `t_counter > t_rxd + margin`.
+- **Ordering + timelock margin.** The maker locks the asset *first*, the taker locks ETH *second*,
+  and the maker reveals `p` *first*. The leg the maker **locks** (Radiant) carries the **longer**
+  refund window and the leg it **claims** the shorter, so the taker always has time to scrape `p`
+  and claim before its own refund opens. The coordinator refuses to proceed unless
+  `t_rxd · i_rxd ≥ t_counter · i_counter + margin · i_counter` — a wall-clock comparison, because a
+  Radiant block is ~300 s against Ethereum's and Bitcoin's much longer targets. (This bullet gave
+  the lock order and the inequality backwards until 2026-09-02.)
 - **The reorg-finality gate.** The taker doesn't claim the asset the instant `p` appears — it waits
   until the ETH claim is **reorg-safe** (post-Merge `finalized`-checkpoint final, *and* the
   Radiant claim buried deep enough that reversing it would cost more than the value at stake). A
