@@ -153,11 +153,24 @@ class TestBuildP2pkhWithCsvScript:
         with pytest.raises(ValidationError, match="sequence out of range"):
             build_p2pkh_with_csv_script(_PKH, sequence=-1)
 
-    def test_zero_sequence_op_0(self):
-        """A sequence of 0 (relative lock of 0 — i.e. spendable in the
-        next block) encodes as OP_0."""
-        script = build_p2pkh_with_csv_script(_PKH, sequence=0)
-        assert script[0] == 0x00  # OP_0
+    def test_zero_unit_count_refused_in_both_spellings(self):
+        """A relative lock of ZERO is a no-op — the output is spendable in its
+        own funding block — so this builder refuses it.
+
+        Both spellings, because they are the same lock: a bare ``0``, and
+        ``build_csv_sequence(0, TIME_512_SECONDS)`` which is ``0x400000``,
+        non-zero and still zero units. A ``sequence < 1`` guard would pass the
+        second one, which is how the disable-bit spelling came to be refused
+        here for years while this one was not.
+        """
+        for sequence in (0, build_csv_sequence(0, CsvKind.BLOCKS), build_csv_sequence(0, CsvKind.TIME_512_SECONDS)):
+            with pytest.raises(ValidationError, match="unit count of 0"):
+                build_p2pkh_with_csv_script(_PKH, sequence=sequence)
+
+    def test_one_unit_is_accepted(self):
+        """The honest floor still builds — the guard refuses zero, not small."""
+        script = build_p2pkh_with_csv_script(_PKH, sequence=1)
+        assert script[0] == 0x51  # OP_1
         assert script[1] == 0xB2
         assert script[2] == 0x75
         assert script[3:] == _P2PKH_TAIL

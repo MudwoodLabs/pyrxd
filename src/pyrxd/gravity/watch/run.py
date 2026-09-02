@@ -351,6 +351,7 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
             btc_claim_reorg_depth=Timelock(args.btc_reorg_depth, TimeUnit.BLOCKS),
             rxd_claim_burial=Timelock(args.rxd_claim_burial, TimeUnit.BLOCKS),
             rxd_block_interval_s=args.rxd_block_interval_s,
+            rxd_block_interval_fast_s=args.rxd_block_interval_fast_s,
             rxd_reorg_cost_per_block=args.rxd_reorg_cost_per_block,
             accept_flat_burial=args.accept_flat_burial,
         )
@@ -416,6 +417,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
     p.add_argument("--block-interval-s", type=float, default=600.0)
     p.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    # The FAST-TAIL (p10) Radiant interval. Required by --measured, and there was no way to
+    # supply it: `MarginPolicy.measured()` silently substituted the NOMINAL value, so
+    # `--measured` ran real-value mode with a 300s tail. At the repo's own measured p10 of
+    # 36s that under-reserves the ETH finality window 7x (3 blocks where 22 are needed).
+    # Reserves DIVIDE by this, so a stale-HIGH value under-counts. Measure it per run:
+    # Radiant mainnet p10 was 43s on 2026-06-02 and 36s on 2026-08-26.
+    p.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=None,
+        help="(required with --measured) the MEASURED p10 Radiant inter-block time, in "
+        "seconds. Pass --rxd-block-interval-s's value to accept nominal reserves knowingly.",
+    )
     p.add_argument("--btc-reorg-depth", type=int, default=6)
     p.add_argument("--rxd-claim-burial", type=int, default=2)
     p.add_argument("--margin-blocks", type=int, default=72)

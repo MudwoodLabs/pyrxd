@@ -8,6 +8,101 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`pyrxd-watchtower --measured` ran real-value mode with a NOMINAL Radiant interval, and the
+  guard forbidding exactly that could never fire.** `MarginPolicy.measured()` sets
+  `require_measured=True` unconditionally and then filled `rxd_block_interval_fast_s` with
+  `rxd_block_interval_s or 300.0`, so the `__post_init__` check ("real-value mode requires a
+  MEASURED rxd_block_interval_fast_s") was unreachable through the constructor operators are told
+  to use. The shipped watchtower had no flag to supply the value at all.
+
+  Reproduced on the shipped entry point: `--measured` yielded `require_measured=True` with a 300 s
+  fast tail, so the ETH finality reserve was `ceil(768/300) = 3` Radiant blocks where the repo's
+  own measured p10 of 36 s needs **22** — a 7x under-reserve on the path the guard protects. An
+  under-reserved floor returns WAIT where there is no room left to wait.
+
+  `measured()` no longer substitutes; `--rxd-block-interval-fast-s` is now a watchtower flag, and
+  `measure_margin_from_btc_block_times` threads and records it in its provenance. A caller who has
+  not measured the p10 passes the nominal value **explicitly**, which the docstring already
+  prescribed. The test asserting the substitution as a feature — "a guard that refuses valid work
+  is a bug: `measured(...)` must still construct" — now asserts the refusal, paired with an
+  honest-path test and a reachability test through the real CLI parser. The pre-existing guard test
+  passed only because it built `MarginPolicy(...)` directly, bypassing the production constructor.
+
+- **The pre-BTC-lock elapsed reserve was uncoupled from the depth the taker is made to wait.**
+  `pre_btc_lock_check` step 5 refuses to fund until the covenant is `rxd_claim_burial` deep, and
+  step 7 re-runs the margin gate with `elapsed_blocks=cov_confs` — so the elapsed depth is at least
+  the burial. The reserve shipped as a flat 12, so any measured burial above that had the runner
+  refuse its own derived terms with "insufficient margin in WALL CLOCK", a message about the
+  *maker's* terms when the cause was the runner's constant. Measured at t_rxd=180, margin=2: burial
+  12 passed, 13 and 20 were refused. `elapsed_reserve_blocks()` now derives it from the burial plus
+  operational slack, wired into all four runners; nothing forbids a burial above 12, since the
+  floor is 2 and a real-value operator measures it.
+
+- **Four published, user-facing documents still taught the pre-#482 timelock direction**, and one
+  of them taught the pre-HZ-1 lock order as well. `docs/how-to/build-a-cross-chain-swap.md`,
+  `docs/tutorials/cross-chain-swap.md`, `docs/how-to/run-a-two-host-swap-dry-run.md` and
+  `docs/security-audit-scope.md` all stated `t_counterchain > t_rxd + margin` — the layout in which
+  the maker refunds its own leg while `p` is secret and still claims the counter leg, taking both.
+  The how-to carried it as a **MUST** directive for implementers; the audit-scope row told an
+  external auditor that the inverted rule was the invariant being enforced.
+
+  #568 corrected the handshake spec and missed all four, because they spell the counter leg
+  `t_counterchain` / `t_counter` and the sweep looked for `t_btc`. Same rule, different letter.
+
+  Also corrected: the exported `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST` invariant text and the
+  `pre_btc_lock_check` docstring, which stated the relation in raw blocks and in the reversed
+  direction respectively — the safety gate describing its own rule backwards; the `TimeUnit`
+  docstring in `taproot.py`, which called `t_BTC - t_RXD >= margin` "the whole cross-chain safety
+  invariant"; and the wire-format spec, which still flagged the units defect as OPEN after #567
+  closed it and named the wrong conformance schema version.
+
+  `tests/test_protocol_lock_ordering_docs_are_current.py` now scans `src/`, `scripts/`,
+  `conformance/` and the published docs rather than `src/` alone, for the timelock direction as
+  well as the lock order, in **both** variable namings and both hyphen spellings. Its non-vacuity
+  cases are the ten sentences that actually shipped.
+
+- **`eth_swap_two_host.py`'s self-check had no test**, which its BTC sibling's docstring recorded
+  in writing. Its hardcoded `t_rxd_blocks` was not raised alongside the runner's argparse default,
+  so the self-check raised `SystemExit` at startup and nothing noticed. Now covered by
+  `tests/test_eth_two_host_self_check.py`.
+
+- **The derived counter-leg timelock was refused by the gate it was derived from.**
+  `derive_counter_timelock` solved the margin inequality to equality — the largest `t_btc` the
+  gate accepts **at `elapsed_blocks=0`**. But `pre_btc_lock_check` calls
+  `assert_timelock_margin(..., elapsed_blocks=cov_confs)`, the covenant's confirmation count, and
+  the gate does `rxd_blocks -= elapsed_blocks` before judging. The taker refuses to fund BTC until
+  the covenant has confirmed, so `cov_confs` is never 0 on a real run.
+
+  Measured: the derived terms passed at `elapsed=0` and **at no other value**, for every `t_rxd`
+  tried. The maker would lock the Radiant leg, the pre-BTC-lock gate would then refuse its own
+  derived terms, and the swap would stall to the CSV refund with funds committed.
+
+  The derivation now reserves `PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS` (12 Radiant blocks, ~1 h
+  nominal) so the produced `t_btc` survives `elapsed` anywhere in `[0, reserve]`, and
+  `elapsed_reserve_blocks` is a **required** keyword — omitting it is a `TypeError`, not a silently
+  unsafe default. A test asserts the reserve covers every runner's `--taker-min-rxd-confs` floor,
+  derived from the runners rather than copied from them.
+
+  Every unit test around this built terms by hand and called the gate with the default
+  `elapsed_blocks=0`. The assertions were load-bearing and the fixture was internally consistent;
+  the situation it set up simply could not occur in production.
+
+- **`build_p2pkh_with_csv_script` accepted a relative time-lock of ZERO.** It refused the
+  disable-bit spelling of a no-op lock with an explicit error, and accepted a zero unit count —
+  the same no-op — emitting `OP_0 OP_CSV OP_DROP` for a caller that asked to be time-locked. The
+  output is spendable in its own funding block. The floor now lives in the builder, and it MASKS
+  rather than comparing: `build_csv_sequence(0, TIME_512_SECONDS)` is `0x400000`, non-zero and
+  still a lock of zero, so a `< 1` guard would pass it. **Behaviour change to exported API** —
+  a zero unit count now raises `ValidationError`. `pyrxd.inspect` still classifies such scripts,
+  because they can exist on-chain regardless of what this library will build.
+
+- **`scripts/btc_swap_two_host.py` shipped the PRE-#482 timelock ordering in its defaults**
+  (`t_rxd=20 / t_btc=60`) and taught it in `--help` ("must exceed t_rxd + margin"). Three sibling
+  runners moved to the shared wall-clock derivation (#567); this one was missed and kept `t_btc` as
+  a flag. The safety gate refused those defaults, so the runner was unusable as shipped rather than
+  unsafe — but the help text was advising operators toward the layout in which the maker takes both
+  legs. `t_btc` is now DERIVED, and `--t-btc-blocks` is gone.
+
 - **The HTLC timelock ordering was INVERTED, in shipped source and in the published conformance
   vectors (#482).** `t_rxd` must EXCEED `t_btc`, not the reverse. The maker holds the preimage `p`,
   LOCKS the Radiant leg and CLAIMS the counter leg, so the leg it locks carries the LONGER timeout

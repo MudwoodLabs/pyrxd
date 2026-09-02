@@ -362,7 +362,7 @@ class TestWallClockCltvIsReachable:
         assert len(bytes(broken).hex()) == 64
         assert _classify_input(bytes(broken).hex())[0] == "txid"
 
-    @pytest.mark.parametrize("blocks", [0, 1, 16, 144, 65535])
+    @pytest.mark.parametrize("blocks", [1, 16, 144, 65535])
     def test_csv_blocks(self, blocks):
         seq = build_csv_sequence(blocks, CsvKind.BLOCKS)
         row = _classify(build_p2pkh_with_csv_script(_PKH, seq))
@@ -382,6 +382,20 @@ class TestWallClockCltvIsReachable:
         assert row["locktime_units"] == units
         # The raw value keeps the type flag; the decoded count does not.
         assert row["locktime_value"] != units
+
+    def test_csv_with_zero_units_is_still_classified(self):
+        """``build_p2pkh_with_csv_script`` refuses to emit a zero-unit lock, but
+        one can exist on-chain — anyone can write the bytes — and the inspector's
+        job is to READ what is there, not only what this library will build.
+
+        So the builder's floor must not become a blind spot in the reader. Hand-
+        constructed for exactly that reason, following the disable-bit case below.
+        """
+        script = bytes([0x00, _OP_CSV, _OP_DROP]) + b"\x76\xa9\x14" + _PKH + b"\x88\xac"
+        row = _classify(script)
+        assert row["type"] == "p2pkh-csv"
+        assert row["locktime_units"] == 0
+        assert row["relative_lock_disabled"] is False
 
     def test_csv_with_disable_bit_is_reported_as_a_no_op(self):
         """``build_p2pkh_with_csv_script`` refuses to emit this, but it can

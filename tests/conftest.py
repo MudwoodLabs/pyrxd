@@ -43,8 +43,12 @@ try:
     # COMMITTED example database (tests/.hypothesis-corpus/) so a shrunk counterexample found by any
     # fuzz test PERSISTS and is replayed on every future run until fixed. The default .hypothesis/ dir is
     # gitignored and ephemeral on CI runners, so found failures were silently discarded (audit follow-up).
-    # A developer who reproduces a failure commits the corpus entry; it then regresses forever. NOT
-    # gitignored (the ignore is `.hypothesis/`, a different name).
+    # A developer who reproduces a failure commits the corpus entry; it then regresses until the
+    # test is RENAMED. Entries are keyed by `_hash(function_digest(test))` and function_digest
+    # includes the name, so a rename orphans them silently while the files remain (measured: a
+    # body edit does NOT orphan; a rename does). Six orphaned directories were found this way.
+    # `tests/test_hypothesis_corpus_is_live.py` fails on any orphan. NOT gitignored (the ignore
+    # is `.hypothesis/`, a different name).
     _corpus = DirectoryBasedExampleDatabase(os.path.join(os.path.dirname(__file__), ".hypothesis-corpus"))
 
     # ci: keep random exploration but replay the committed corpus first, so a previously-found

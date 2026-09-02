@@ -313,6 +313,9 @@ async def test_measured_policy_pins_the_covenant_depth_to_the_reorg_policy():
     """A real-value (``is_measured``) swap requires the policy's RXD burial depth, not the leg's
     shallow default — the same ``is_measured`` discipline as the maker-side BTC gate."""
     measured = MarginPolicy.measured(
+        # EXPLICIT since measured() stopped substituting it silently; same value the
+        # substitution used, so this test's arithmetic is unchanged.
+        rxd_block_interval_fast_s=300.0,
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=600.0,
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),

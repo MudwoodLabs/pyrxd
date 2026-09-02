@@ -227,7 +227,11 @@ ignore = [
 # `task lint` runs the same set CI runs: ruff (style + safety) and
 # bandit (security smell detection on src/). Catch failures locally
 # before pushing.
-lint = "ruff check src tests examples && bandit -r src/ -c pyproject.toml --quiet"
+# `scripts` matches .github/workflows/lint.yml:34 — it was added there deliberately (scripts
+# holds the production entry point for every mainnet swap) and NOT added here, so the
+# pre-push hook and `task ci-fast` structurally could not catch a scripts/ lint error. They
+# reported clean while CI failed.
+lint = "ruff check src tests examples scripts && bandit -r src/ -c pyproject.toml --quiet"
 format = "ruff format src tests examples"
 format-check = "ruff format --check src tests examples"
 test = "pytest"

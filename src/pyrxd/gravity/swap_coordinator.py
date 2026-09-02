@@ -117,10 +117,13 @@ MAKER_SECRET_TAKER_LOCKS_BTC_FIRST = (  # nosec B105 — a role-invariant doc st
     "the covenant off the Radiant chain (HZ-1, #392). (4) The "
     "MAKER claims the BTC FIRST, revealing p in the Bitcoin witness. (5) The TAKER "
     "scrapes p from Bitcoin and claims the Radiant asset before its refund opens. "
-    "Invariant: t_RXD > t_BTC + margin — the maker holds p and LOCKS the Radiant leg, "
-    "so THAT leg carries the LONGER refund and the leg the maker CLAIMS (BTC) the shorter "
-    "(Herlihy 1801.09515 §1: the secret generator locks at 6-delta and claims a 4-delta leg). "
-    "The taker's client MUST verify t_RXD - t_BTC >= margin before funding, or refuse. "
+    "Invariant, IN WALL CLOCK (#567): t_RXD * i_RXD >= t_BTC * i_BTC + margin * i_BTC — the "
+    "maker holds p and LOCKS the Radiant leg, so THAT leg carries the LONGER refund and the "
+    "leg the maker CLAIMS (BTC) the shorter (Herlihy 1801.09515 §1: the secret generator "
+    "locks at 6-delta and claims a 4-delta leg). The raw-block form t_RXD > t_BTC + margin "
+    "is NOT sufficient: a Radiant block is ~300 s against Bitcoin's ~600 s, so it passes "
+    "layouts whose real margin is negative. The taker's client MUST verify the wall-clock "
+    "relation before funding, or refuse. "
     "NB the NAME predates HZ-1 (#392), which inverted the lock order in (2)/(3); it is "
     "kept because it is exported, asserted in tests and quoted in a ValidationError, and "
     "because the half of it that names the timelock invariant is still exactly right."
@@ -526,12 +529,23 @@ class MarginPolicy:
             "burial_safety_factor": burial_safety_factor,
             "accept_flat_burial": accept_flat_burial,
         }
-        # Default the fast tail to the nominal so an existing measured policy keeps working with
-        # today's numbers rather than failing to construct; the __post_init__ requirement then
-        # surfaces as an explicit choice at the call site instead of a hidden under-count.
-        kwargs["rxd_block_interval_fast_s"] = (
-            rxd_block_interval_fast_s if rxd_block_interval_fast_s is not None else (rxd_block_interval_s or 300.0)
-        )
+        # DO NOT default the fast tail. This used to fill it with `rxd_block_interval_s or 300.0`,
+        # reasoning that "the __post_init__ requirement then surfaces as an explicit choice at the
+        # call site" — but it cannot, because this line had already satisfied it. `measured()` sets
+        # `require_measured=True` unconditionally, so the guard at __post_init__ ("real-value mode
+        # requires a MEASURED rxd_block_interval_fast_s") was UNREACHABLE through the constructor
+        # operators are told to use.
+        #
+        # Reproduced on the shipped entry point before this change: `pyrxd-watchtower --measured`
+        # yielded require_measured=True with rxd_block_interval_fast_s=300.0, so the ETH 768s
+        # finality reserve was ceil(768/300)=3 RXD blocks where the repo's own measured p10 of 36s
+        # needs 22 — a 7x under-reserve on exactly the path the guard protects.
+        #
+        # Left None, the guard fires and the caller must choose. The docstring above already told
+        # them how: when the fast tail is genuinely unknown, pass the nominal value explicitly and
+        # accept that the reserves are nominal rather than conservative.
+        if rxd_block_interval_fast_s is not None:
+            kwargs["rxd_block_interval_fast_s"] = rxd_block_interval_fast_s
         if btc_claim_reorg_depth is not None:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
@@ -559,6 +573,7 @@ def measure_margin_from_btc_block_times(
     btc_claim_reorg_depth_blocks: int,
     rxd_claim_burial_blocks: int,
     rxd_block_interval_s: float,
+    rxd_block_interval_fast_s: float | None = None,
     accept_flat_burial: bool = False,
 ) -> tuple[MarginPolicy, dict]:
     """Build a MEASURED MarginPolicy from real mainnet BTC inter-block data (pure).
@@ -619,12 +634,17 @@ def measure_margin_from_btc_block_times(
         btc_claim_reorg_depth=Timelock(btc_claim_reorg_depth_blocks, TimeUnit.BLOCKS),
         rxd_claim_burial=Timelock(rxd_claim_burial_blocks, TimeUnit.BLOCKS),
         rxd_block_interval_s=float(rxd_block_interval_s),  # F-007: stored for the squeeze conversion
+        # REQUIRED by measured() since the silent nominal substitution was removed. This is the
+        # documented real-value policy builder, so it is exactly the path that must not quietly
+        # reserve at the nominal interval; omitting it now raises rather than under-reserving.
+        rxd_block_interval_fast_s=rxd_block_interval_fast_s,
         # Dust runs opt out of value-scaled burial (the value is below the Radiant reorg cost);
         # a real-value run leaves this False and supplies rxd_reorg_cost_per_block + value_at_risk.
         accept_flat_burial=accept_flat_burial,
     )
     provenance = {
         "measured": {
+            "rxd_block_interval_fast_s": rxd_block_interval_fast_s,
             "btc_block_interval_s_median": median_gap,
             "btc_tail_gap_s": tail_gap_s,
             "btc_tail_percentile": btc_tail_percentile,
@@ -1572,8 +1592,10 @@ class SwapCoordinator:
           2. H freshness — a read-only advisory probe of the seen-store (reused H
              => reject early). The authoritative atomic reserve happens later, in
              :meth:`taker_funds_btc`, immediately before the broadcast.
-          3. The cross-chain timelock ordering. BTC: the same-clock margin
-             ``t_btc - t_rxd >= margin``. ETH: the cross-clock gate that validates the
+          3. The cross-chain timelock ordering. BTC: the WALL-CLOCK margin
+             ``t_rxd * i_rxd >= t_btc * i_btc + margin * i_btc`` (this docstring said
+             ``t_btc - t_rxd >= margin`` until 2026-09-02 — the pre-#482 direction, in the
+             pre-#567 units, in the gate's own description of itself). ETH: the cross-clock gate that validates the
              ABSOLUTE ``eth_timeout_unix_s`` leaves room for the RELATIVE ``t_rxd`` window
              (needs ``now_unix_s``; audit HIGH-1). The orphaned bridge is wired here.
           4. Maker-*promised* params match the locally re-derived BTC funding SPK

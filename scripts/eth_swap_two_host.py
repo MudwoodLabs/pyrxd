@@ -78,6 +78,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
+    elapsed_reserve_blocks,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -95,6 +96,7 @@ from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
+    ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS,
     CoordinatorConfig,
     MarginPolicy,
     SwapCoordinator,
@@ -279,6 +281,10 @@ def _terms_from_public(
             margin_blocks=margin_blocks,
             rxd_block_interval_s=rxd_block_interval_s,
             btc_block_interval_s=btc_block_interval_s,
+            # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
+            elapsed_reserve_blocks=elapsed_reserve_blocks(
+                rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS
+            ),
         ),
         bt.TimeUnit.BLOCKS,
     )
@@ -925,7 +931,10 @@ def run_self_check() -> None:
         hashlock=h,
         rxd_photons=1000,
         eth_amount_wei=10**14,
-        t_rxd_blocks=60,
+        # 120: the counter leg is DERIVED from this in wall clock with an elapsed
+        # reserve, and 60 no longer yields a positive t_btc. The argparse default was
+        # raised and this hardcoded twin was not — same file, one place and not the other.
+        t_rxd_blocks=120,
         margin_blocks=36,
         eth_timeout_unix_s=eth_timeout,
         taker_pkh=taker_pkh,
@@ -976,7 +985,7 @@ def run_self_check() -> None:
     assert cov2.funded_spk.hex() == env2["covenant_spk_hex"], "FAIL: taker re-derived a different covenant SPK"
     print("  [ok] taker re-derives the SAME covenant SPK from the envelope's public terms")
 
-    # The independent margin check passes for honest terms (t_btc - t_rxd = 40 >= margin 36)...
+    # The independent margin check passes for honest terms (t_rxd 120 - t_btc 18 = 102 >= margin 36)...
     policy = MarginPolicy(
         margin=bt.Timelock(36, bt.TimeUnit.BLOCKS),
         block_interval_s=600.0,
@@ -1068,7 +1077,11 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--rxd-electrumx-url", default="", help="regtest Radiant ElectrumX/Fulcrum ws/wss URL")
     ap.add_argument("--rxd-electrumx-insecure", action="store_true")
     ap.add_argument("--rxd-photons", type=int, default=100_000)
-    ap.add_argument("--t-rxd-blocks", type=int, default=60)
+    # 120, not 60: the shared wall-clock derivation (#567) needs t_rxd * 300 s to cover the
+    # 36-block margin * 600 s AND leave a counter leg, so the old 60 — valid under the
+    # superseded `t_rxd - margin - 4` — now exits at startup. Changing the formula and
+    # leaving the inputs that feed it is how the fix broke its own runner.
+    ap.add_argument("--t-rxd-blocks", type=int, default=120)
     ap.add_argument(
         "--asset-locked-at-height",
         type=int,

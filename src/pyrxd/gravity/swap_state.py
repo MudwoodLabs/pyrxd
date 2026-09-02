@@ -434,7 +434,8 @@ class NegotiatedTerms:
             raise ValidationError(
                 f"t_btc is {self.t_btc.value} blocks — a counter leg that matures in its own funding "
                 "block is refundable before the swap can complete. Raise t_rxd (t_btc derives from it "
-                "as t_rxd - margin - 4) or lower the margin."
+                "IN SECONDS, as floor(t_rxd * rxd_block_interval_s / btc_block_interval_s) - margin) "
+                "or lower the margin."
             )
         if self.t_btc.unit is self.t_rxd.unit and self.t_rxd.value <= self.t_btc.value:
             raise ValidationError(

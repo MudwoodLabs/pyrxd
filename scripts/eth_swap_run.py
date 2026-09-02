@@ -49,6 +49,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
+    elapsed_reserve_blocks,
     merge_into_mode_600,
     read_own_private_file,
     resolve_eth_key_file,
@@ -81,7 +82,12 @@ from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import (
+    ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS,
+    CoordinatorConfig,
+    MarginPolicy,
+    SwapCoordinator,
+)
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
@@ -766,6 +772,10 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: d
             margin_blocks=args.margin_blocks,
             rxd_block_interval_s=args.rxd_block_interval_s,
             btc_block_interval_s=args.btc_block_interval_s,
+            # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
+            elapsed_reserve_blocks=elapsed_reserve_blocks(
+                rxd_claim_burial_blocks=getattr(args, "rxd_claim_burial", ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS)
+            ),
         ),
         bt.TimeUnit.BLOCKS,
     )

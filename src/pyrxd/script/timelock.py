@@ -154,6 +154,18 @@ def build_p2pkh_with_csv_script(owner_pkh: Hex20, sequence: int) -> bytes:
         raise ValidationError(
             f"sequence has disable bit (1<<31) set ({sequence:#x}); this would make the relative time-lock a no-op"
         )
+    # The SAME no-op, the other spelling. The disable bit above was refused from the start;
+    # a zero UNIT COUNT was not, so this builder emitted `OP_0 OP_CSV OP_DROP` — a lock of
+    # zero, spendable in its own funding block — for a caller that asked for a time-lock.
+    # Masked, not `< 1`: `build_csv_sequence(0, TIME_512_SECONDS)` is 0x400000, which is
+    # non-zero and still a lock of zero. `build_csv_sequence` itself stays permissive by
+    # DECISION, not oversight — it encodes an integer; this is where the integer becomes
+    # bytes that hold funds, so this is where the floor belongs.
+    if sequence & SEQUENCE_LOCKTIME_MASK == 0:
+        raise ValidationError(
+            f"sequence {sequence:#x} has a unit count of 0 — a relative lock of zero is a no-op; "
+            "the output would be spendable in its own funding block. Pass at least 1 unit."
+        )
     return encode_int(sequence) + OpCode.OP_CHECKSEQUENCEVERIFY + OpCode.OP_DROP + _p2pkh_tail(bytes(owner_pkh))
 
 
