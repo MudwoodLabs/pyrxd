@@ -385,7 +385,10 @@ class TestTheExactDivisionBoundary:
         """The paired honest-path check, inverted with the relation (#482). The give-away is now
         upward: satisfying the gate by GROWING t_rxd would also pass the test above, while locking
         the maker's asset longer than the swap needs on every run."""
-        wait = 600
+        # 624, matching its sibling. The exact quotient moved when #482 flipped the budget's
+        # sign; at 600 this sits at budget/interval = 2579.67 — off the boundary the whole
+        # class exists for, so the refuse-below half proves nothing.
+        wait = 624
         fast = _dividing_interval_s(_policy())
         sized = eth_absolute_to_rxd_relative_blocks(
             eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,

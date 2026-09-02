@@ -121,8 +121,18 @@ class TestTheIntervalAndBudgetBoundaries:
             _size(eth_timeout_s=86_400, interval=0.0)
 
     def test_a_budget_of_exactly_zero_is_refused(self) -> None:
-        """`<= 0` vs `< 0`: a zero budget buys no blocks at all and must fail closed."""
-        with pytest.raises(ValidationError):
+        """`<= 0` vs `< 0`: a zero budget buys no blocks at all and must fail closed.
+
+        THE `match=` IS THE WHOLE TEST, and it was missing — so this class's named mutant was ALIVE.
+        Mutating `budget_s <= 0` to `< 0` lets a zero budget through the sign check; it then falls
+        to the safety floor and raises a DIFFERENT ValidationError, which a bare `pytest.raises`
+        accepts. Measured: with that mutant planted, 262 tests across all four timelock files passed
+        while this class's docstring claimed to kill it.
+
+        A refusal test without `match=` asserts only "something went wrong", which on a fail-closed
+        path is nearly always true and is why it caught nothing.
+        """
+        with pytest.raises(ValidationError, match="no RXD timelock budget"):
             _size_for_budget(0, 1.0, lock_delay=0)
 
     def test_a_budget_of_exactly_one_second_is_refused_by_the_FLOOR_not_by_the_sign(self) -> None:
