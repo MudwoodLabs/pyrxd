@@ -38,6 +38,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "counterintuitive and load-bearing". Prose asserting an invariant becomes evidence for the next
   reader; wrong, it is manufactured corroboration.
 
+- **The timelock margin was judged in RAW BLOCK COUNTS across two chains (#567).** `t_btc` counts
+  BITCOIN blocks (~600 s); `t_rxd` counts RADIANT blocks (~300 s nominal, 222 s measured median).
+  `assert_timelock_margin` compared the two counts one-for-one, because `normalize_to(BLOCKS)` is
+  the identity for a BLOCKS-tagged `Timelock` and `rxd_block_interval_s` never entered:
+
+      t_btc=144 blk (24.0 h)   t_rxd=180 blk (15.0 h)   raw gap 36   ->   ACCEPTED
+
+  The Radiant refund opens NINE HOURS BEFORE the counter-leg deadline — the maker refunds the leg it
+  locked while `p` is secret, then claims the counter leg with `p`. Both legs.
+
+  **THE CONFLATION IS PRE-EXISTING AND WAS FAIL-SAFE.** Under the old `t_btc > t_rxd` rule, requiring
+  more Bitcoin blocks than Radiant blocks meant Bitcoin wall-clock exceeded Radiant's by more than
+  2x — the bug made the check STRICTER than the protocol needed. Inverting the direction turned it
+  fail-open. The units were only ever safe BECAUSE the direction was wrong, which is why neither the
+  inversion nor the reviews after it noticed. **The 0.21.0 timelock inversion did not fix the
+  BTC<->RXD corridor; this does.**
+
+  **THE SHIPPED DUST DEFAULTS WERE EXPLOITABLE WITH NO ATTACK.** `--t-rxd-blocks 20` at a typical
+  measured margin of 3 gives `t_btc=13`: the maker's refund opens 40 minutes before the taker's at
+  the MEAN block rate, while the raw-count check reported a 4-block SURPLUS. A maker who simply
+  waits takes both legs.
+
+- **The elapsed-depth correction was ETH-only, leaving the BTC corridor on the negotiated window
+  (#482 follow-up).** `t_rxd` is a relative CSV from covenant MINING and the maker chooses when to
+  lock and when to present, so the gap is maker-controlled. Demonstrated at t_rxd=80/t_btc=40/
+  margin=36: a covenant 44 blocks deep left an effective gap of -4 and the gate ACCEPTED it.
+
+- **`t_btc` could underflow to zero.** `t_btc = t_rxd - margin - 4` became a subtraction when the
+  relation inverted; the old `+ margin + 4` could not underflow. `Timelock(0)` constructs and
+  `refund_leaf_script` emits `OP_0 OP_CSV OP_DROP` — a counter leg refundable in its own funding
+  block. Reachable on the dust defaults at a measured margin of 16. Now unrepresentable.
+
+- **`MarginPolicy.rxd_claim_inclusion` escaped validation** — a fail-OPEN omission. `Timelock(0)`
+  was accepted and silently restored the pre-#511 floor the field exists to raise.
+
 - **`assess_claim_finality` certified a claim SAFE that could not bury in time (#511).** It
   compared `blocks_left >= burial` — the condition for a claim that is ALREADY CONFIRMED. A claim
   being decided on has not been broadcast, so it cannot be mined at the current height and its
@@ -58,6 +93,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CPFP) hands the maker its refund.
 
 ### Added
+
+- **The timelocked-content READ side is reachable (#556)** — `is_unlocked`, `get_unlock_remaining`,
+  `verify_cek_reveal` and `TimelockSpec` are exported, and `glyph inspect` now reports WHEN a token
+  opens. The helpers had no caller because they had no POSSIBLE caller: `decode_payload` never read
+  `crypto.timelock` from the CBOR, so pyrxd would classify a token as TIMELOCK and then discard the
+  only field saying when it unlocks. `GlyphMetadata.timelock` carries it now. The MINT and REVEAL
+  builders stay unwired — they publish a CEK on-chain and have never had a production caller.
 
 - **The content-encryption primitives are exported from the top level (#556)** — `encrypt_chunked`,
   `decrypt_chunked`, `wrap_cek_x25519`, `unwrap_cek_x25519`, `x25519_public_key`, and the
@@ -102,12 +144,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which is now the cause rather than the fix. `_assert_t_rxd_opens_before_the_eth_deadline` is
   `_assert_t_rxd_outlasts_the_eth_deadline`, refusing "too SHORT" where it refused "too LONG".
 
+- **THE TIMELOCK MARGIN IS NOW JUDGED IN WALL CLOCK (#567), and honest swaps need a LONGER
+  `t_rxd`.** The requirement is `t_rxd * rxd_interval >= t_btc * btc_interval + margin *
+  btc_interval`. At 600 s vs 300 s that means roughly `t_rxd >= 2 * t_btc + 2 * margin` — a 24 h
+  Bitcoin leg with a 6 h margin now needs 360 Radiant blocks (30 h), where 180 was accepted before.
+  **Every previously-accepted configuration in this repo was inverted in wall-clock**, so re-derive
+  your parameters rather than adjusting them.
+
+- **The conformance vectors are at schema `radiant-htlc-handshake/3`.** `/1` published the ordering
+  INVERTED; `/2` fixed the direction and left the units conflated, so its only ACCEPT vector was
+  STILL unsafe. Each margin vector now carries `rxd_block_interval_s`, because the verdict depends
+  on it. A consumer pinned to an older schema cannot tell these apart from the version alone.
+
 - **The SAFE/SQUEEZED boundary moved by two blocks** (#511). Swaps that previously reported SAFE
   within two blocks of the floor now report SQUEEZED, which routes to `ASSET_VULNERABLE` — an
   explicit operator decision, not a forfeit. Being conservative here is cheap; the old boundary
   certified claims that could not bury before the maker's refund opened.
 
 ### Internal
+
+- **A live mutant and three vacuous assertions closed.** `test_a_budget_of_exactly_zero_is_refused`
+  used a bare `pytest.raises` with no `match=`, so mutating `budget_s <= 0` to `< 0` left 262 tests
+  passing while the class docstring named that mutant as killed. A parametrized interval test was
+  satisfied by uniform REFUSAL — the exact failure its own docstring warned about. An honest-path
+  test never asserted `gate.ok`. And `test_margin_verdicts` built its policy without the Radiant
+  interval, passing by coincidence off a default that matched.
+
+- **Five public documents were still teaching the exploitable timelock rule**, including
+  `docs/htlc-handshake-wire-format.md`, whose "What breaks if it is inverted" section described the
+  CORRECT layout as the breakage.
 
 - **Every GitHub Actions reference is pinned to a full commit SHA**, and a test keeps it that way.
   Three floating refs remained in `mutation.yml` — a movable tag means whoever controls it controls
