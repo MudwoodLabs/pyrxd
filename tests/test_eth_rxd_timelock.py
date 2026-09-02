@@ -504,8 +504,25 @@ class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
         except ValidationError:
             return False
 
-    @pytest.mark.parametrize(("lock_delay", "wait"), [(600, 0), (3_600, 300), (7_200, 1_800), (20_000, 19_000)])
-    def test_the_verdict_does_not_depend_on_the_block_interval_at_all(self, lock_delay: int, wait: int) -> None:
+    @pytest.mark.parametrize(
+        ("lock_delay", "wait", "expected"),
+        [
+            # EVERY ROW CARRIES ITS EXPECTED VERDICT, and both verdicts appear. The four rows here
+            # were all positive `lock_delay` and, post-#482, ALL FOUR REFUSE — so the old assertion
+            # (`len(set(verdicts)) == 1`) was satisfied by uniform REFUSAL, which is precisely the
+            # failure this test's own docstring warns about ("does not simply refuse everything").
+            # Measured before the fix: {False} on all four rows, at all six intervals.
+            (600, 0, False),  # early confirmation -> refuse (the dangerous direction post-#482)
+            (3_600, 300, False),
+            (7_200, 1_800, False),
+            (20_000, 19_000, False),
+            (0, 0, True),  # punctual -> accept
+            (-3_600, 0, True),  # LATE confirmation -> accept; safe under the inverted relation
+        ],
+    )
+    def test_the_verdict_does_not_depend_on_the_block_interval_at_all(
+        self, lock_delay: int, wait: int, expected: bool
+    ) -> None:
         """9s to 1200s is a 133x range straddling the entire observed RXD distribution (measured
         mainnet: min 9s, p10 43s, median 229s, mean 330s). If a change ever makes one of these
         disagree, the gate has started measuring something new — check it is the thing you meant,
@@ -516,6 +533,10 @@ class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
         assert len(set(verdicts.values())) == 1, (
             f"the interval changed the verdict: {verdicts}. The gate is documented as punctuality-"
             "only precisely because it cannot see the block rate."
+        )
+        assert next(iter(verdicts.values())) is expected, (
+            f"interval-independence holds but the verdict is wrong: got {verdicts}, expected "
+            f"{expected}. Uniformity alone is satisfied by a gate that refuses everything."
         )
 
     def test_it_refuses_an_EARLY_covenant_confirmation(self) -> None:

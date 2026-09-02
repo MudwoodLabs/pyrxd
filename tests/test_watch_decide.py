@@ -188,7 +188,9 @@ def test_asset_refunded_terminal_retires_while_btc_still_locked():
     # BTC funding shallow + maker has NOT claimed: the BTC leg is unambiguously still locked.
     obs = Observations(
         maker_has_claimed_btc=False,
-        now_rxd_height=180,  # past t_rxd maturity (172) but t_btc (LOCK+144=244) is far off
+        now_rxd_height=180,  # past t_rxd maturity (172); t_btc is 36 blk and its own maturity is
+        # judged on btc_funding_confirmations (1 here), not on this RXD height. The comment said
+        # "t_btc (LOCK+144=244)" — a leftover from when t_btc was the longer leg (#482).
         asset_locked_at_height=LOCK,
         btc_funding_confirmations=1,
     )

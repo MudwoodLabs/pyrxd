@@ -3269,7 +3269,9 @@ async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_
 def _valued_policy():
     """A policy carrying real economics, so the value-scaled burial actually binds.
 
-    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 30, and each test picks a
+    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 60 (it was 30 until #482's migration scaled
+    these scenarios above the margin — a t_rxd below the margin is not a swap that can exist), and
+    each test picks a
     `t_rxd` on one side of that. The variation lives in `_terms(t_rxd_blocks=...)`, NOT here — an
     earlier version took a `t_rxd_ok` flag it never read, which implied the policy itself was
     tailored per case when every call returned the same object.
@@ -3596,4 +3598,6 @@ class TestTheMakerCannotSpendTRxdBeforePresentingTheSwap:
         terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000, t_rxd_blocks=149)
         coord = _eth_coord_negotiated(terms=terms, radiant_leg=FakeRadiantLeg(report_confs=1))
         gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
-        assert "margin check failed" not in (gate.reason or ""), gate.reason
+        # `ok`, not merely "no margin complaint". The weaker form stays green when the gate
+        # refuses for any OTHER reason, which is how an honest-path test stops being one.
+        assert gate.ok, gate.reason

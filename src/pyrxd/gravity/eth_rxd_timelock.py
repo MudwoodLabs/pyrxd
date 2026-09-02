@@ -128,9 +128,10 @@ class CrossClockMargin:
         )
 
 
-#: How far the sizer may step down to reach a value the gate accepts. The analytic value is
-#: never more than one block out; the extra room is so a genuine divergence raises rather
-#: than silently shrinking the taker's claim window block by block.
+#: How far the sizer may step UP to reach a value the gate accepts (it stepped DOWN until #482
+#: made the gate a LOWER bound). The analytic value is never more than one block out; the extra
+#: room is so a genuine divergence raises rather than silently lengthening the maker's lock block
+#: by block.
 _SIZER_GATE_STEPS = 3
 
 
@@ -192,10 +193,12 @@ def eth_absolute_to_rxd_relative_blocks(
     budget_s = eth_timeout_unix_s + margin.total_s() - expected_rxd_lock_time_unix_s
     if budget_s <= 0:
         raise ValidationError(
-            f"no RXD timelock budget: eth_timeout - margin - rxd_lock_time = {budget_s}s "
-            "(ETH deadline too close / margin too large to safely lock RXD)"
+            f"no RXD timelock budget: eth_timeout + margin - rxd_lock_time = {budget_s}s "
+            "(the RXD lock time is already past the ETH deadline plus the margin, so no window "
+            "remains to lock into)"
         )
-    # `ceil(x) - 1`, NOT `floor(x)`. The two differ only when the budget divides EXACTLY by the
+    # `ceil(x)`, NOT `floor(x)` (it was `ceil(x) - 1` until #482 made the gate a LOWER bound).
+    # The two differ only when the budget divides EXACTLY by the
     # interval, and on exactly those inputs `floor` emits a value this module's own punctuality
     # gate then REFUSES: `assert_covenant_confirms_before_eth_deadline` compares with a strict `<`,
     # so a projection landing precisely ON the deadline is late. Swept 1480 parameter combinations
