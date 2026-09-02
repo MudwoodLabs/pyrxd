@@ -53,8 +53,14 @@ def _rxd_terms(*, taker_pkh: bytes, credential_ref: bytes = b""):
         hashlock=hashlib.sha256(os.urandom(32)).digest(),
         btc_sats=100_000,
         radiant_amount=1_000,
+        # 72 / 216, not 72 / 144. In WALL CLOCK (#567) a 72-block BTC leg is 12.0 h and the
+        # estimated 36-block margin is 6.0 h, so the Radiant leg needs 216 blocks at 300 s.
+        # 144 is 12.0 h against the 18.0 h required — the credential tests were all built on
+        # a configuration in which the maker takes both legs. 224 rather than exactly 216: step
+        # 7 judges the REMAINING window, and the fake covenant reports a confirmation already
+        # spent, so an exact fit is one block short.
         t_btc=t.Timelock(72, t.TimeUnit.BLOCKS),
-        t_rxd=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(224, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",
         taker_dest_hash=holder_hash(taker_pkh, variant="rxd"),

@@ -212,10 +212,28 @@ def _cross_clock_margin(args: argparse.Namespace) -> CrossClockMargin:
     )
 
 
+#: Below this, an ETH finality stall outlives the taker's claim window. `eth_swap_run.py` REFUSES
+#: under it in measured mode; this script only warns (see the flag's help for why).
+_REAL_VALUE_STALL_TOLERANCE_FLOOR_S = 3600
+
+
 def _margin_policy(args: argparse.Namespace) -> MarginPolicy:
     """The ESTIMATED margin policy (is_measured=False). A real-value run MUST use
     ``MarginPolicy.measured(...)``; this is a regtest/testnet PREP, so flat burial + estimated
     margins are the documented dust-grade hatch — the audit gate still blocks real value."""
+    # SAY IT OUT LOUD. This script is what the two-party adversarial run drives, and its
+    # stall-tolerance flag defaulted to 0 while its own help text credited a guard that lives in
+    # another program. An unenforced floor that a reader believes is enforced is worse than no
+    # floor: it stops them checking.
+    if args.eth_finality_stall_tolerance_s < _REAL_VALUE_STALL_TOLERANCE_FLOOR_S:
+        print(
+            f"  [WARN] --eth-finality-stall-tolerance-s is {args.eth_finality_stall_tolerance_s}s, "
+            f"below the {_REAL_VALUE_STALL_TOLERANCE_FLOOR_S}s a REAL-VALUE run needs. Fine for "
+            "regtest/anvil. NOT fine for anything carrying value: the taker waits for ETH finality "
+            "before claiming RXD, and the May-2023 mainnet stall ran about an hour, so the RXD "
+            "refund can open before the taker ever gets a stall-tolerant window.",
+            file=sys.stderr,
+        )
     return MarginPolicy(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),
         block_interval_s=args.btc_block_interval_s,
@@ -1080,8 +1098,12 @@ def _args() -> argparse.Namespace:
         "while blocks keep coming (Sepolia 2026-06-01 ~20 min; the May-2023 MAINNET incident ~1 h; "
         "an inactivity leak is unbounded). The taker waits for FINALITY before claiming RXD, so "
         "the RXD refund must not open until it has had a stall-tolerant window. 0 is the "
-        "regtest/anvil default; a real-value parameterisation needs >= 3600, which is what "
-        "eth_swap_run.py enforces.",
+        "regtest/anvil default; a real-value parameterisation needs >= 3600. THIS SCRIPT DOES NOT "
+        "ENFORCE THAT — it prints a loud warning below 3600 and continues, because regtest runs "
+        "legitimately use 0 and refusing them would be a guard refusing valid work. The help text "
+        "used to say '>= 3600, which is what eth_swap_run.py enforces', pointing at a DIFFERENT "
+        "program's guard as though it protected this one; that guard is in eth_swap_run.py's "
+        "MEASURED branch and this script never takes it.",
     )
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)

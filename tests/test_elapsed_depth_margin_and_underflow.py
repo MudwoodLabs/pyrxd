@@ -41,37 +41,41 @@ class TestTheMarginIsJudgedOnTheWindowThatREMAINS:
     def test_an_aged_covenant_that_erodes_the_margin_is_REFUSED(self) -> None:
         """The exploit, at the numbers it was demonstrated on.
 
-        t_rxd 80 / t_btc 40 clears a 36-block margin on the negotiated terms. A covenant 30 blocks
-        deep leaves 50, so the REAL gap is 10 — well under the margin — and before this the gate
-        accepted it. At 44 deep the real gap is NEGATIVE: the Radiant refund opens BEFORE the BTC
-        deadline, which is the exact ordering #482 exists to prevent.
+        t_rxd 120 / t_btc 20 clears the margin in WALL CLOCK on the negotiated terms: 10.0 h of
+        Radiant against 3.33 h of Bitcoin plus a 6.0 h margin, so 112 Radiant blocks must remain.
+        A covenant 9 blocks deep leaves 111 and the swap is already unsafe; at 44 deep it leaves 76.
+
+        The numbers moved with #567 — they were t_rxd 80 / t_btc 40, which reads as a comfortable
+        40-block gap and is 6.67 h against 12.67 h required. The fixture was itself an inverted
+        configuration in wall-clock, so it could not have distinguished an elapsed-depth failure
+        from a units failure.
         """
-        for elapsed, real_gap in ((20, 20), (30, 10), (44, -4)):
+        for elapsed, remaining in ((9, 111), (20, 100), (44, 76)):
             with pytest.raises(ValidationError) as exc:
-                assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=elapsed)
-            assert str(real_gap) in str(exc.value) or "must exceed" in str(exc.value), str(exc.value)
+                assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=elapsed)
+            assert str(remaining) in str(exc.value) or "WALL CLOCK" in str(exc.value), str(exc.value)
 
     def test_a_FRESH_covenant_with_the_same_terms_still_passes(self) -> None:
         """The paired honest path, and the reason this is about DEPTH and not about the terms.
         Identical t_rxd/t_btc; only the covenant's age differs. Without this, the refusal above
         would be indistinguishable from a margin that was simply too tight."""
-        assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=1)  # 39 >= 36
-        assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=4)  # 36 >= 36, the boundary
+        assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=1)  # 119 blk left
+        assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=8)  # 112 left = the floor exactly
 
     def test_the_boundary_is_exact(self) -> None:
-        assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=4)
+        assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=8)
         with pytest.raises(ValidationError):
-            assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=5)
+            assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=9)
 
     def test_the_default_is_the_NEGOTIATED_check_and_is_unchanged(self) -> None:
         """Callers that have not read the chain pass nothing and get the old behaviour, which is
         still correct for what it is — a check on the terms, not on the live window."""
-        assert_timelock_margin(_blk(40), _blk(80), _policy())
+        assert_timelock_margin(_blk(20), _blk(120), _policy())
 
     @pytest.mark.parametrize("bad", [-1, True, 2.0, "2", None])
     def test_a_bad_elapsed_value_fails_CLOSED(self, bad: object) -> None:
         with pytest.raises(ValidationError):
-            assert_timelock_margin(_blk(40), _blk(80), _policy(), elapsed_blocks=bad)  # type: ignore[arg-type]
+            assert_timelock_margin(_blk(20), _blk(120), _policy(), elapsed_blocks=bad)  # type: ignore[arg-type]
 
 
 class TestACounterLegCannotMatureInItsOwnFundingBlock:
@@ -127,12 +131,13 @@ class TestTheCoordinatorACTUALLYPassesElapsedDepthOnTheBtcPath:
         from tests.test_swap_coordinator import FakeRadiantLeg, _coordinator, _policy, _terms
 
         _secret, h = generate_secret()
-        # t_rxd 80 / t_btc 40 clears the 36-block margin on the NEGOTIATED terms.
-        terms = _terms(hashlock=h, t_rxd_blocks=80, t_btc_blocks=40)
-        for confs, real_gap in ((20, 20), (30, 10), (44, -4)):
+        # t_rxd 120 / t_btc 20 clears the margin in WALL CLOCK on the NEGOTIATED terms (10.0 h
+        # of Radiant vs 3.33 h + a 6.0 h margin), so 112 Radiant blocks must remain.
+        terms = _terms(hashlock=h, t_rxd_blocks=120, t_btc_blocks=20)
+        for confs, remaining in ((9, 111), (20, 100), (44, 76)):
             coord = _coordinator(terms=terms, radiant_leg=FakeRadiantLeg(report_confs=confs), policy=_policy())
             gate = await coord.pre_btc_lock_check(terms)
-            assert not gate.ok, f"covenant {confs} deep leaves a real gap of {real_gap}; the gate must refuse"
+            assert not gate.ok, f"covenant {confs} deep leaves {remaining} blk; the gate must refuse"
             assert "REMAINING window" in gate.reason, gate.reason
 
     @pytest.mark.asyncio
@@ -143,7 +148,7 @@ class TestTheCoordinatorACTUALLYPassesElapsedDepthOnTheBtcPath:
         from tests.test_swap_coordinator import FakeRadiantLeg, _coordinator, _policy, _terms
 
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=80, t_btc_blocks=40)
+        terms = _terms(hashlock=h, t_rxd_blocks=120, t_btc_blocks=20)
         coord = _coordinator(terms=terms, radiant_leg=FakeRadiantLeg(report_confs=1), policy=_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason

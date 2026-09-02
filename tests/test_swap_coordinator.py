@@ -302,8 +302,22 @@ class FakeSeenStore:
 #
 # `t_btc_blocks` now DERIVES from `t_rxd_blocks` when not given. Callers vary `t_rxd` to exercise
 # burial and squeeze bands; making each one also hand-maintain `t_btc` is how a relation drifts out
-# of a suite one call site at a time. `_BTC_GAP` is wide enough for the default estimated margin.
-_BTC_GAP = 40
+# of a suite one call site at a time.
+#
+# THE DERIVATION IS IN WALL CLOCK (#567). It was `t_rxd - 40`, a raw-block gap — but `t_btc` counts
+# BITCOIN blocks (600 s) and `t_rxd` counts RADIANT blocks (300 s), so subtracting one count from
+# the other compares different units. At the default 144/104 that is 12.0 h of Radiant against
+# 17.3 h of Bitcoin: a NEGATIVE margin, i.e. every swap built from this helper was the exploitable
+# layout in wall-clock while reading as a comfortable 40-block surplus.
+#
+# The gate requires `t_rxd * I_rxd >= t_btc * I_btc + margin * I_btc`. Solving for t_btc at the
+# estimated policy (I_btc 600, I_rxd 300, margin 36) gives `t_btc <= t_rxd/2 - 36`. The helper
+# leaves slack under that for TWO things: a test that nudges t_rxd by one, and the covenant depth
+# already elapsed when the taker funds — step 7 judges the margin on the REMAINING window, and a
+# measured policy requires the covenant be burial-deep BEFORE funding, so `elapsed` is never zero
+# on the real-value path. 12 BTC blocks of slack covers ~24 Radiant blocks of elapsed depth.
+_BTC_SLACK_BLOCKS = 12
+_ESTIMATED_MARGIN_BLOCKS = 36
 
 
 def _terms(
@@ -314,10 +328,11 @@ def _terms(
     hashlock: bytes | None = None,
 ):
     if t_btc_blocks is None:
-        # At least 1: a zero/negative BTC timelock is not a swap, and a t_rxd below the margin
-        # cannot satisfy the invariant at all — which is itself a real consequence of the
-        # inversion, and why the small-t_rxd cases below carry a smaller margin.
-        t_btc_blocks = max(1, t_rxd_blocks - _BTC_GAP)
+        # At least 1: a zero/negative BTC timelock is not a swap (it is refundable in its own
+        # funding block). A t_rxd too small to buy the margin in WALL CLOCK cannot satisfy the
+        # invariant at any t_btc — a real consequence of #482 + #567, and why the small-t_rxd cases
+        # below carry a smaller margin or a larger t_rxd.
+        t_btc_blocks = max(1, t_rxd_blocks // 2 - _ESTIMATED_MARGIN_BLOCKS - _BTC_SLACK_BLOCKS)
     if hashlock is None:
         hashlock = hashlib.sha256(os.urandom(32)).digest()
     return NegotiatedTerms(
@@ -458,15 +473,20 @@ def test_margin_rejects_insufficient_gap():
 
 def test_margin_accepts_safe_gap():
     policy = MarginPolicy.estimated()
-    # gap = 100 blocks >= 36 (t_rxd - t_btc)
-    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(172, t.TimeUnit.BLOCKS), policy)
+    # IN WALL CLOCK (#567), not in raw blocks. t_btc counts BITCOIN blocks (600 s) and t_rxd counts
+    # RADIANT blocks (300 s), so 72/172 was 12.0 h of Bitcoin against 14.3 h of Radiant with a 6.0 h
+    # margin required — a shortfall of 3.7 h that a 100-block "gap" concealed.
+    # Need: t_rxd * 300 >= t_btc * 600 + 36 * 600  ->  t_rxd >= 2 * t_btc + 72.
+    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(216, t.TimeUnit.BLOCKS), policy)
 
 
 def test_margin_cross_unit_normalises():
-    # t_btc in seconds, t_rxd in blocks; 600s/block. 72 blk-equiv = 43200s vs 144 blk,
-    # gap = 72 blocks-equiv = enough for the 36-block margin. The LONGER leg is t_rxd.
+    # t_btc in SECONDS, t_rxd in BLOCKS — the cross-unit case the same-unit construction guard
+    # cannot see. 43200 s normalises to 72 BTC blocks at 600 s; the Radiant leg must then cover
+    # 72*600 + 36*600 = 64800 s, i.e. >= 216 Radiant blocks at 300 s. It was 144, which is 12.0 h
+    # against the 18.0 h required (#567).
     policy = MarginPolicy.estimated(block_interval_s=600.0)
-    assert_timelock_margin(t.Timelock(43_200, t.TimeUnit.SECONDS), t.Timelock(144, t.TimeUnit.BLOCKS), policy)
+    assert_timelock_margin(t.Timelock(43_200, t.TimeUnit.SECONDS), t.Timelock(216, t.TimeUnit.BLOCKS), policy)
 
 
 def test_margin_fail_closed_on_non_timelock():
@@ -482,7 +502,9 @@ def test_margin_real_value_mode_requires_measured():
     # A measured policy in real-value mode is accepted.
     measured = MarginPolicy.measured(margin=t.Timelock(50, t.TimeUnit.BLOCKS), block_interval_s=600.0)
     assert measured.is_measured and measured.require_measured
-    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(200, t.TimeUnit.BLOCKS), measured)
+    # 244, not 200: in WALL CLOCK (#567) a 72-block BTC leg (12.0 h) plus a 50-block margin (8.3 h)
+    # needs 244 Radiant blocks at 300 s. 200 is 16.7 h against the 20.3 h required.
+    assert_timelock_margin(t.Timelock(72, t.TimeUnit.BLOCKS), t.Timelock(244, t.TimeUnit.BLOCKS), measured)
 
 
 def test_estimated_margin_is_labelled():
@@ -944,7 +966,7 @@ async def test_e2e_params_mismatch_taker_refunds_btc():
 
 async def test_e2e_maker_stalls_taker_refunds_asset():
     _p, h = generate_secret()
-    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    terms = _terms(hashlock=h, t_rxd_blocks=80)
     btc = FakeBtcLeg()
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd, window=6)
@@ -954,11 +976,11 @@ async def test_e2e_maker_stalls_taker_refunds_asset():
     assert coord.record.state is SwapState.BOTH_LOCKED
 
     # Maker stalls: hasn't claimed and the covenant's CSV refund is now MATURE.
-    # locked at 1000; maturity = 1072; the CSV refund can only be MINED at >= 1072
+    # locked at 1000; maturity = 1080 (t_rxd moved 72 -> 80 with #567); MINED at >= 1080
     # (the trigger fires N earlier at 1066, but the P3 maturity pre-check refuses to
     # broadcast a non-final refund — see test_maker_stall_refuses_premature_refund).
     rec = await coord.maybe_refund_asset_on_maker_stall(
-        now_block_height=1072, asset_locked_at_height=1000, maker_has_claimed_btc=False
+        now_block_height=1080, asset_locked_at_height=1000, maker_has_claimed_btc=False
     )
     assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
     assert rxd.refunded  # the covenant CSV refund was broadcast — it pays the MAKER, not the taker.
@@ -973,20 +995,20 @@ async def test_maker_stall_refuses_premature_refund():
     non-final refund (rather than emit a tx a real node rejects), with an exact "matures at N, now M"
     message a block-based poller can act on — and it must NOT broadcast or advance the FSM."""
     _p, h = generate_secret()
-    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    terms = _terms(hashlock=h, t_rxd_blocks=80)
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, radiant_leg=rxd, window=6)
     await coord.taker_funds_btc(terms)
     await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
     assert coord.record.state is SwapState.BOTH_LOCKED
 
-    # locked at 1000; maturity = 1072; trigger fires at 1066 but the covenant is 6 blocks short of
-    # CSV maturity — refuse to broadcast.
+    # locked at 1000; maturity = 1080 (t_rxd moved 72 -> 80 with #567); trigger fires at 1074 but
+    # the covenant is 6 blocks short of CSV maturity — refuse to broadcast.
     # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT/retryable condition, the same
     # convention the RadiantLeg/BtcLeg refund maturity self-checks use — a block poller keys on it to retry.
-    with pytest.raises(NetworkError, match="not yet mature.*matures at height 1072, now 1066"):
+    with pytest.raises(NetworkError, match="not yet mature.*matures at height 1080, now 1074"):
         await coord.maybe_refund_asset_on_maker_stall(
-            now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
+            now_block_height=1074, asset_locked_at_height=1000, maker_has_claimed_btc=False
         )
     assert not rxd.refunded, "no non-final refund may be broadcast before CSV maturity"
     assert coord.record.state is SwapState.BOTH_LOCKED, "the FSM must stay BOTH_LOCKED (retryable)"
@@ -997,7 +1019,7 @@ async def test_maker_stall_forbidden_for_taker_role():
     A TAKER-role coordinator must be PHYSICALLY unable to call it (fail closed in code, not merely in a
     docstring) — even at a mature height where a role-less coordinator would broadcast."""
     _p, h = generate_secret()
-    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    terms = _terms(hashlock=h, t_rxd_blocks=80)
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, radiant_leg=rxd, window=6, role=SwapRole.TAKER)
     await coord.taker_funds_btc(terms)
@@ -1007,7 +1029,7 @@ async def test_maker_stall_forbidden_for_taker_role():
     # Mature height (1072) — a role-less coordinator would broadcast here; the taker role must not.
     with pytest.raises(ValidationError, match="forbidden for a TAKER-role coordinator"):
         await coord.maybe_refund_asset_on_maker_stall(
-            now_block_height=1072, asset_locked_at_height=1000, maker_has_claimed_btc=False
+            now_block_height=1080, asset_locked_at_height=1000, maker_has_claimed_btc=False
         )
     assert not rxd.refunded, "a taker-role coordinator must never broadcast the asset-only refund"
     assert coord.record.state is SwapState.BOTH_LOCKED
@@ -1015,7 +1037,7 @@ async def test_maker_stall_forbidden_for_taker_role():
 
 async def test_maker_stall_noop_before_window():
     _p, h = generate_secret()
-    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    terms = _terms(hashlock=h, t_rxd_blocks=80)
     coord = _coordinator(terms=terms)
     await coord.taker_funds_btc(terms)
     await coord.post_asset_lock_revalidate(await coord.radiant_leg.expected_covenant_scriptpubkey(terms))
@@ -1547,7 +1569,7 @@ def test_assess_claim_finality_eth_stall_squeezes():
 
 async def test_gate_safe_claims_asset():
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = FakeBtcLeg(claim_confs=10)
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1562,7 +1584,7 @@ async def test_gate_safe_claims_asset():
 
 async def test_gate_wait_does_not_claim_and_stays_secret_revealed():
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = FakeBtcLeg(claim_confs=1)  # shallow
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1590,7 +1612,7 @@ async def test_serialized_step_concurrent_duplicate_step_acts_once():
             return await super().claim_asset(record, preimage)
 
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = FakeBtcLeg(claim_confs=10)
     rxd = SlowClaimRxd()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1616,7 +1638,7 @@ async def test_scrape_rejects_claim_tx_for_foreign_funding_outpoint():
     funding outpoint (a wrong / cross-swap claim tx) is refused before any asset claim.
     """
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = FakeBtcLeg(claim_confs=10)
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1640,10 +1662,12 @@ async def test_scrape_rejects_claim_tx_for_foreign_funding_outpoint():
 
 async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     p_secret, h = generate_secret()
-    # t_rxd 50, not 10: under the inverted relation (#482) t_rxd must exceed t_btc by the 36-block
+    # t_rxd 80, not 50: in WALL CLOCK (#567) the derived t_btc of 1 block plus the 36-block margin
+    # needs 74 Radiant blocks, so 50 was refused by the margin before the squeeze could be reached.
+    # Originally 10: under the inverted relation (#482) t_rxd must exceed t_btc by the 36-block
     # margin, so a 10-block window is not a swap that can be constructed. The SQUEEZED state is
     # reached by burning the window with elapsed height below, which is how it happens for real.
-    terms = _terms(variant="rxd", t_rxd_blocks=50, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = FakeBtcLeg(claim_confs=1)  # shallow
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -1652,8 +1676,8 @@ async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     rec = await coord.maker_claims_btc(p_secret)
     claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
     # Window closing (now near t_rxd maturity) + shallow -> SQUEEZED -> ASSET_VULNERABLE.
-    # 45 of the 50 blocks spent -> 5 left, under the 6-block burial -> SQUEEZED.
-    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1045, asset_locked_at_height=1000)
+    # 75 of the 80 blocks spent -> 5 left, under the 6-block burial -> SQUEEZED.
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1075, asset_locked_at_height=1000)
     assert rec.state is SwapState.ASSET_VULNERABLE
     assert rxd.claimed_with is None  # not auto-claimed
     # The deliberate winner-take-all claim is a separate, explicit decision.
@@ -1668,7 +1692,7 @@ async def test_gate_fail_closed_on_confs_read_error():
             raise RuntimeError("node unreachable")
 
     p_secret, h = generate_secret()
-    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
     btc = ErrLeg()
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
@@ -2032,7 +2056,10 @@ def _eth_terms(
         hashlock=hashlock,
         btc_sats=100_000,
         radiant_amount=1_000,
-        t_btc=t.Timelock(max(1, t_rxd_blocks - _BTC_GAP), t.TimeUnit.BLOCKS),
+        # Same wall-clock derivation as `_terms` (#567). For an ETH swap t_btc is only the
+        # BTC-shaped placeholder — the real deadline is eth_timeout_unix_s — but it still
+        # passes through the same margin gate, so it obeys the same units.
+        t_btc=t.Timelock(max(1, t_rxd_blocks // 2 - _ESTIMATED_MARGIN_BLOCKS - _BTC_SLACK_BLOCKS), t.TimeUnit.BLOCKS),
         t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
         asset_variant="rxd",
         genesis_ref=b"",
@@ -2267,7 +2294,7 @@ async def test_eth_claim_rejects_failed_provenance_no_claim():
 
 async def test_eth_claim_wait_stays_secret_revealed():
     p, h = generate_secret()
-    terms = _eth_terms(hashlock=h, t_rxd_blocks=72)  # roomy
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=80)  # roomy
     leg = FakeEthLeg(preimage=p, verdict=_eth_not_final_verdict())
     rxd = FakeRadiantLeg()
     coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
@@ -2308,7 +2335,7 @@ async def test_eth_late_reveal_races_csv_taker_squeezed_then_cannot_claim_spent_
     inherent HTLC property, surfaced loudly, not a false success. (See eth_rxd_timelock.py: this is
     why the cross-clock margin couples N to the finality+burial reserve, and why it is audit-gated.)"""
     p, h = generate_secret()
-    terms = _eth_terms(hashlock=h, t_rxd_blocks=72)
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=80)
     leg = FakeEthLeg(preimage=p, verdict=_final())  # the ETH claim IS final — maker revealed at t_eth-epsilon
 
     # Maker already CSV-refunded the covenant to itself: the taker's Radiant claim must fail closed
@@ -2323,7 +2350,10 @@ async def test_eth_late_reveal_races_csv_taker_squeezed_then_cannot_claim_spent_
     # refund opens @ 1000+72=1072; the maker revealed only as it closed: now=1070 -> 2 blocks left <
     # rxd_burial(6). FINAL verdict + a window that no longer fits our own burial -> SQUEEZED, NOT an
     # automatic claim (the gate refuses to claim off a window it cannot safely bury in).
-    rec = await coord.taker_scrape_and_claim_asset("0xlateclaim", now_rxd_height=1070, asset_locked_at_height=1000)
+    # 1075, not 1070: t_rxd moved 72 -> 80 with the #567 migration, so the height that leaves the
+    # taker inside the squeeze band (blocks_left < burial 2 + counter reserve 3 + inclusion 2)
+    # moved with it. At 1070 the taker still has 10 blocks and is not squeezed at all.
+    rec = await coord.taker_scrape_and_claim_asset("0xlateclaim", now_rxd_height=1075, asset_locked_at_height=1000)
     assert rec.state is SwapState.ASSET_VULNERABLE, (
         f"a FINAL but too-late reveal must SQUEEZE to ASSET_VULNERABLE, got {rec.state.value}"
     )
@@ -3269,7 +3299,8 @@ async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_
 def _valued_policy():
     """A policy carrying real economics, so the value-scaled burial actually binds.
 
-    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 60 (it was 30 until #482's migration scaled
+    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 90 (30 until #482, then 60, and now above the
+    wall-clock margin requirement so the burial is what binds —
     these scenarios above the margin — a t_rxd below the margin is not a swap that can exist), and
     each test picks a
     `t_rxd` on one side of that. The variation lives in `_terms(t_rxd_blocks=...)`, NOT here — an
@@ -3288,7 +3319,10 @@ def _valued_policy():
         # to fail a 30-block burial floor is not a swap that can exist under this policy. Testing
         # the burial gate there would be testing a fiction — the margin check refuses first, and
         # the burial assertion never runs.
-        value_at_risk_photons=6_000_000,
+        # B(V) = 90 blocks. Sized ABOVE the WALL-CLOCK margin requirement (#567), not just above
+        # the raw block margin: with t_btc=1 and a 36 BTC-block margin, the gate needs 74 Radiant
+        # blocks, so a B(V) of 60 left the MARGIN binding and these burial tests proved nothing.
+        value_at_risk_photons=9_000_000,
     )
 
 
@@ -3306,8 +3340,8 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     @pytest.mark.asyncio
     async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
         _secret, h = generate_secret()
-        # B(V) = 60; the SUFFICIENT floor is 60 + counter_reserve(0 for BTC) + 1 to mine = 61.
-        terms = _terms(hashlock=h, t_rxd_blocks=60)
+        # B(V) = 90; the SUFFICIENT floor is 90 + counter_reserve(0 for BTC) + 1 to mine = 91.
+        terms = _terms(hashlock=h, t_rxd_blocks=90)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
@@ -3330,10 +3364,10 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         31, which is the defect this class exists to prevent, encoded in its own honest-path test.
         """
         _secret, h = generate_secret()
-        # floor 62 (burial 60 + 0 counter reserve + 2 to be MINED, #511) + the 1 confirmation the
+        # floor 92 (burial 90 + 0 counter reserve + 2 to be MINED, #511) + the 1 confirmation the
         # fake covenant reports = exactly 62 remaining. Was 61 while the floor reserved a single
         # block for inclusion; #511 showed one block is the arithmetic minimum, not a reserve.
-        terms = _terms(hashlock=h, t_rxd_blocks=63)
+        terms = _terms(hashlock=h, t_rxd_blocks=93)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
@@ -3342,7 +3376,7 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     async def test_a_t_rxd_that_clears_the_floor_only_by_IGNORING_elapsed_depth_is_REFUSED(self) -> None:
         """The #531 regression, stated directly.
 
-        `t_rxd = 61` clears the floor if you compare the NEGOTIATED value, and fails it once the
+        `t_rxd = 91` clears the floor if you compare the NEGOTIATED value, and fails it once the
         covenant's elapsed confirmations are subtracted. Before the fix this swap was accepted and
         then SQUEEZED at every claim — the taker would reveal and find no safe claim available,
         which is precisely the state the gate was written to prevent.
@@ -3352,7 +3386,7 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         requirement on every swap.
         """
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=61)
+        terms = _terms(hashlock=h, t_rxd_blocks=91)
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
@@ -3374,8 +3408,8 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         # Burial 60 for the same reason `_valued_policy` uses 60: the flat term has to sit ABOVE
         # the margin to be reachable at all. The VALUE of the flat burial is incidental here — what
         # this test pins is that a policy with NO economics configured still binds on it.
-        terms = _terms(hashlock=h, t_rxd_blocks=60)  # flat burial 60, so the floor is 60 + 0 + 1 = 61
-        coord = _coordinator(terms=terms, policy=_policy(rxd_burial=60))
+        terms = _terms(hashlock=h, t_rxd_blocks=90)  # flat burial 90, so the floor is 90 + 0 + 1 = 91
+        coord = _coordinator(terms=terms, policy=_policy(rxd_burial=90))
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
         assert "a safe claim needs" in gate.reason, gate.reason
@@ -3383,9 +3417,13 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     @pytest.mark.asyncio
     async def test_an_ORDINARY_t_rxd_still_passes_without_economics(self) -> None:
         """The paired honest path. Binding on the flat burial must not refuse a normal swap — the
-        default flat burial is 6 blocks and ordinary windows are far larger."""
+        default flat burial is 6 blocks and ordinary windows are far larger.
+
+        80, not 72: with t_btc=1 and the estimated 36 BTC-block margin, the WALL-CLOCK gate needs
+        74 Radiant blocks (#567), so 72 was refused by the margin and this honest-path test would
+        have been passing or failing for a reason unrelated to the burial it is named for."""
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=72)
+        terms = _terms(hashlock=h, t_rxd_blocks=80)
         coord = _coordinator(terms=terms)
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
@@ -3466,7 +3504,7 @@ class TestTheFundGateClosesTheSqueezeBand:
     async def test_a_t_rxd_INSIDE_the_squeeze_band_is_refused(self) -> None:
         """Exactly the case a burial-only floor let through: >= the burial, < burial + 1."""
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=60)  # == B(V), inside the band
+        terms = _terms(hashlock=h, t_rxd_blocks=90)  # == B(V), inside the band
         coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok

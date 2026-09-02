@@ -852,8 +852,12 @@ def run_self_check() -> None:
         hashlock=h,
         btc_sats=100_000,
         # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd is the LONGER.
-        t_rxd_blocks=60,
-        t_btc_blocks=20,  # t_rxd - t_btc = 40 >= margin 36
+        # IN WALL CLOCK (#567): t_btc 20 blk x 600 s = 3.33 h, margin 36 blk = 6.0 h, so the
+        # Radiant leg needs (20*600 + 36*600)/300 = 112 blocks. It was 60 — 5.0 h against the
+        # 9.33 h required, i.e. the honest-terms case in this self-check was itself the layout
+        # where the maker takes both legs, while reading as a 40-block surplus.
+        t_rxd_blocks=120,
+        t_btc_blocks=20,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,
@@ -916,8 +920,10 @@ def run_self_check() -> None:
     hostile, _ = _terms_from_public(
         hashlock=h,
         btc_sats=100_000,
-        t_rxd_blocks=60,
-        t_btc_blocks=50,  # gap 10 < margin 36
+        # Still a REJECT, now for the wall-clock reason: 120 blk x 300 s = 10.0 h against
+        # 50 blk x 600 s + 6.0 h = 14.33 h.
+        t_rxd_blocks=120,
+        t_btc_blocks=50,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,

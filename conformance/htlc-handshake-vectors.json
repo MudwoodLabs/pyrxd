@@ -1,17 +1,17 @@
 {
-  "schema": "radiant-htlc-handshake/2",
+  "schema": "radiant-htlc-handshake/3",
   "builder": "pyrxd.gravity.swap_state: NegotiatedTerms.to_dict / from_dict; pyrxd.gravity.htlc_covenant: build_htlc_covenant_{rxd,ft,nft} / holder_hash; pyrxd.btc_wallet.taproot: build_htlc / claim_leaf_script / refund_leaf_script; pyrxd.gravity.swap_coordinator: assert_timelock_margin",
   "provenance": "REFERENCE vectors produced by pyrxd from its own builders — pyrxd is the reference PRODUCER here, so this suite is a regression lock against silent drift, not an independent cross-check. NO mainnet-anchored vector (tracked follow-up). The swap stack these vectors describe is UNAUDITED: passing this suite means a second implementation agrees with pyrxd's bytes, NOT that the protocol is safe. The 32-byte preimage below is a fixed ASCII string, deliberately not CSPRNG output, so that no conformance file ever carries a value that could open a funded HTLC. Guarded by tests/test_htlc_handshake_conformance_vectors.py.",
   "notes": {
     "hashlock": "H = SHA256(p), SINGLE sha256, exactly 32 bytes. p itself is exactly 32 bytes and NEVER crosses the wire.",
     "dest_hashes": "taker_dest_hash / maker_dest_hash are hash256 (double-SHA256) of the holder script, NOT of a pkh.",
-    "timelock_ordering": "t_rxd MUST exceed t_btc by at least the verifier's own margin. The MAKER holds the preimage p, LOCKS the Radiant leg, and CLAIMS the BTC leg — so the leg it locks carries the LONGER refund (Herlihy, Atomic Cross-Chain Swaps, arXiv:1801.09515 §1). THESE VECTORS PREVIOUSLY PUBLISHED THE OPPOSITE and are corrected here: they accepted t_btc=60/t_rxd=20 and REJECTED t_btc=20/t_rxd=60, so an implementation that agreed with them was forced into the layout where the party holding p can refund the leg it locked and still claim the other. See issue #482.",
+    "timelock_ordering": "t_rxd must exceed t_btc by the verifier's margin IN WALL CLOCK — each leg multiplied by ITS OWN chain's block interval. The maker holds the preimage p, LOCKS the Radiant leg and CLAIMS the BTC leg, so the leg it locks carries the LONGER refund (Herlihy, arXiv:1801.09515 §1). t_btc counts BITCOIN blocks (~600 s) and t_rxd counts RADIANT blocks (~300 s): comparing the raw counts is a unit conflation, and it is why schema /2 still published an unsafe ACCEPT vector (t_btc=20 / t_rxd=60 = 3.33 h against 5.0 h with a 6.0 h margin required). Schema /1 published the ordering INVERTED as well. See issues #482 and #567.",
     "t_rxd_unit": "t_rxd MUST be BLOCKS. The Radiant covenant CSV has no SECONDS encoding.",
     "omitted_defaults": "counter_chain/value_amount/eth_timeout_unix_s/credential_ref are emitted only when they differ from the BTC defaults; a reader MUST apply the defaults for absent keys.",
     "credential_ref_is_off_chain": "credential_ref is NOT substituted into the covenant bytecode. btc-rxd-credential-gated and btc-rxd differ only by credential_ref and their covenant_scriptpubkey_hex is byte-IDENTICAL -- that equality is the EXPECTED result, asserted by test_credential_gating_does_not_change_the_covenant_spk, not an accident of the comparison. The gate is off-chain pre-fund policy (swap_coordinator.pre_btc_lock_gate); the covenant pays whoever produces the pinned holder script with p, credentialed or not. Do NOT treat the section-4 SPK byte-compare as binding this gate.",
     "genesis_ref_enforcement": "ft/nft: only NON-EMPTINESS is checked at NegotiatedTerms construction (swap_state.py:339-341); the 36-byte length is enforced later, fail-closed, at holder_hash (htlc_covenant.py:194-195). rxd: a non-empty genesis_ref is accepted and silently ignored -- it round-trips through the wire form and changes no derived value.",
     "hex": "bare lowercase, no 0x prefix; genesis_txid in derivation_params is DISPLAY byte order, the 36-byte wire ref is reversed-txid || vout LE32.",
-    "schema_revision": "Bumped 1 -> 2 for the #482 timelock-ordering correction. Schema /1 published the INVERTED rule: it accepted t_btc=60/t_rxd=20 and rejected t_btc=20/t_rxd=60. The change is semantically incompatible and a consumer pinned to /1 cannot tell the two apart from the version alone, which is exactly why this field moved."
+    "schema_revision": "/1 published the INVERTED ordering (accepted t_btc=60/t_rxd=20). /2 corrected the direction and left the UNITS conflated, so its only ACCEPT vector was still unsafe. /3 is judged in wall clock and each margin vector now carries rxd_block_interval_s, because the verdict depends on it. Every version bump here is semantically incompatible; a consumer pinned to an older schema cannot tell them apart from the version alone."
   },
   "hashlock_vectors": [
     {
@@ -43,14 +43,14 @@
   ],
   "margin_vectors": [
     {
-      "id": "margin-ok-gap-40-margin-36",
+      "id": "margin-ok-wall-clock-10h-vs-3h20m-plus-6h",
       "source": "reference",
       "t_btc": {
         "value": 20,
         "unit": "blocks"
       },
       "t_rxd": {
-        "value": 60,
+        "value": 120,
         "unit": "blocks"
       },
       "margin": {
@@ -58,17 +58,18 @@
         "unit": "blocks"
       },
       "block_interval_s": 600.0,
+      "rxd_block_interval_s": 300.0,
       "verdict": "accept"
     },
     {
-      "id": "margin-too-tight-gap-10-margin-36",
+      "id": "margin-too-tight-by-one-radiant-block",
       "source": "reference",
       "t_btc": {
-        "value": 50,
+        "value": 20,
         "unit": "blocks"
       },
       "t_rxd": {
-        "value": 60,
+        "value": 111,
         "unit": "blocks"
       },
       "margin": {
@@ -76,8 +77,29 @@
         "unit": "blocks"
       },
       "block_interval_s": 600.0,
+      "rxd_block_interval_s": 300.0,
       "verdict": "reject",
-      "why": "insufficient margin: t_rxd - t_btc = 10 blk < required 36 blk (ESTIMATED)"
+      "why": "insufficient margin in WALL CLOCK: the maker's Radiant refund opens at 9.25 h (111 blk x 300s), but the taker's counter-leg refund opens at 3.33 h (20 blk x 600s) and the margin needs 6.00 h on top — a shortfall of 0.08 h (ESTIMATED). The two legs count DIFFERENT chains' blocks; a raw block-count comparison accepted this (#567)."
+    },
+    {
+      "id": "margin-raw-count-surplus-that-is-a-wall-clock-deficit",
+      "source": "reference",
+      "t_btc": {
+        "value": 144,
+        "unit": "blocks"
+      },
+      "t_rxd": {
+        "value": 180,
+        "unit": "blocks"
+      },
+      "margin": {
+        "value": 36,
+        "unit": "blocks"
+      },
+      "block_interval_s": 600.0,
+      "rxd_block_interval_s": 300.0,
+      "verdict": "reject",
+      "why": "insufficient margin in WALL CLOCK: the maker's Radiant refund opens at 15.00 h (180 blk x 300s), but the taker's counter-leg refund opens at 24.00 h (144 blk x 600s) and the margin needs 6.00 h on top — a shortfall of 15.00 h (ESTIMATED). The two legs count DIFFERENT chains' blocks; a raw block-count comparison accepted this (#567)."
     },
     {
       "id": "margin-inverted-ordering",
@@ -95,6 +117,7 @@
         "unit": "blocks"
       },
       "block_interval_s": 600.0,
+      "rxd_block_interval_s": 300.0,
       "verdict": "reject",
       "why": "timelock ordering violated: t_rxd (20 blk) must exceed t_btc (60 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg."
     },
@@ -114,8 +137,9 @@
         "unit": "blocks"
       },
       "block_interval_s": 600.0,
+      "rxd_block_interval_s": 300.0,
       "verdict": "reject",
-      "why": "timelock ordering violated: t_rxd (12 blk) must exceed t_btc (72 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg. NOTE: NegotiatedTerms' cheap same-unit construction guard does NOT fire on this pair — it only compares t_btc and t_rxd when they share a unit. Only the normalising margin check catches it, so a conforming implementation MUST run the normalising check and not just the construction guard."
+      "why": "timelock ordering violated: t_rxd (12 blk) must exceed t_btc (72 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg. NOTE: NegotiatedTerms' cheap same-unit construction guard does NOT fire on this pair — it only compares t_btc and t_rxd when they share a unit. A conforming implementation MUST run the normalising check and not just the construction guard."
     }
   ],
   "terms_vectors": [
@@ -140,7 +164,7 @@
           "unit": "blocks"
         },
         "t_rxd": {
-          "value": 60,
+          "value": 120,
           "unit": "blocks"
         },
         "asset_variant": "rxd",
@@ -150,7 +174,7 @@
         "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
         "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
       },
-      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d013cb27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0178b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
     },
     {
       "id": "btc-ft",
@@ -173,7 +197,7 @@
           "unit": "blocks"
         },
         "t_rxd": {
-          "value": 60,
+          "value": 120,
           "unit": "blocks"
         },
         "asset_variant": "ft",
@@ -183,7 +207,7 @@
         "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
         "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
       },
-      "covenant_scriptpubkey_hex": "d001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519d76de519ddc0288139d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20a831b57d2fb14c06dd8d58b41b5c7daace489126392da8c25ac9d51b26caf227877767519d013cb27500cdaa206d51abe99d4ed3381a56f43f4da2cb2c383f4801a4bc7ad0ed5479f3046cc25c8768bdd001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000dec0e9aa76e378e4a269e69d"
+      "covenant_scriptpubkey_hex": "d001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519d76de519ddc0288139d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20a831b57d2fb14c06dd8d58b41b5c7daace489126392da8c25ac9d51b26caf227877767519d0178b27500cdaa206d51abe99d4ed3381a56f43f4da2cb2c383f4801a4bc7ad0ed5479f3046cc25c8768bdd001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000dec0e9aa76e378e4a269e69d"
     },
     {
       "id": "btc-nft",
@@ -206,7 +230,7 @@
           "unit": "blocks"
         },
         "t_rxd": {
-          "value": 60,
+          "value": 120,
           "unit": "blocks"
         },
         "asset_variant": "nft",
@@ -216,7 +240,7 @@
         "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
         "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
       },
-      "covenant_scriptpubkey_hex": "d801e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519dde519d00cc0222029d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20ab4f06cc51c6e3d31ee445240882c70aa3c9c3dd4bc6222b6c994340d8833859877767519d013cb27500cdaa204f9e31140f311d888dd2acab3df2915f0e76f978d90b2a965999493f1577de608768"
+      "covenant_scriptpubkey_hex": "d801e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519dde519d00cc0222029d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20ab4f06cc51c6e3d31ee445240882c70aa3c9c3dd4bc6222b6c994340d8833859877767519d0178b27500cdaa204f9e31140f311d888dd2acab3df2915f0e76f978d90b2a965999493f1577de608768"
     },
     {
       "id": "eth-rxd",
@@ -234,7 +258,7 @@
           "unit": "blocks"
         },
         "t_rxd": {
-          "value": 60,
+          "value": 120,
           "unit": "blocks"
         },
         "asset_variant": "rxd",
@@ -247,7 +271,7 @@
         "value_amount": 1000000000000000,
         "eth_timeout_unix_s": 1800000000
       },
-      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d013cb27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0178b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
     },
     {
       "id": "btc-rxd-credential-gated",
@@ -270,7 +294,7 @@
           "unit": "blocks"
         },
         "t_rxd": {
-          "value": 60,
+          "value": 120,
           "unit": "blocks"
         },
         "asset_variant": "rxd",
@@ -281,7 +305,7 @@
         "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444",
         "credential_ref": "01e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000"
       },
-      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d013cb27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0178b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
     }
   ]
 }
