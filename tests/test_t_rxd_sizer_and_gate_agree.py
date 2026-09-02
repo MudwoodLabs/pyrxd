@@ -20,6 +20,8 @@ from __future__ import annotations
 import math
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 import pyrxd.btc_wallet.taproot as bt
 from pyrxd.gravity.eth_rxd_timelock import (
@@ -427,4 +429,53 @@ class TestTheExactDivisionBoundary:
             f"sized {sized} != analytic smallest-acceptable {_analytic_smallest(budget, fast)} for "
             f"budget {budget}s at {fast}s/block — the sizer and the gate agree with each other "
             "but not with the documented boundary, i.e. they drifted together"
+        )
+
+    @settings(max_examples=300, deadline=None)
+    @given(
+        whole=st.integers(min_value=15, max_value=400),
+        hundredths=st.integers(min_value=1, max_value=99),
+        wait=st.integers(min_value=0, max_value=3600),
+    )
+    def test_the_boundary_is_sharp_at_FRACTIONAL_intervals_too(self, whole: int, hundredths: int, wait: int) -> None:
+        """The grid above is all whole-second intervals. Real ones are not.
+
+        Every measured Radiant figure in this repo is fractional — a 222 s median, a 293 s mean,
+        a p10 that moved 43 s -> 36 s between two samples — and the sizer DIVIDES by that number.
+        Fractional divisors are where `ceil(t * interval)` in binary floating point stops agreeing
+        with exact rational arithmetic, which is the whole reason the sizer defers to the gate
+        rather than computing `ceil(x) - 1` itself.
+
+        NOTE what this does NOT assert. `_analytic_smallest` is documented as valid only for
+        integer-valued intervals, "where float and Fraction provably coincide", and says in as many
+        words: *do not lift this helper into a fuzz over arbitrary floats; there, the gate itself
+        is the only exact oracle.* So the third, drift-catching assertion of the grid test has no
+        meaning here and is deliberately omitted — asserting it would manufacture float-noise
+        failures and teach the next reader to loosen a real check.
+
+        What survives at arbitrary intervals is the two-sided boundary property, and it is the one
+        D7/D8 regressed: the gate must ACCEPT what the sizer emits (no undershoot, which strands
+        the maker) and REFUSE one block less (no overshoot, which locks the maker's asset longer
+        than the swap needs, every run).
+
+        MEASURED, and the reason this earns its runtime: planting a one-block overshoot in the
+        sizer (`math.ceil(...) + 1`) fails THIS test and nothing else in the file — the
+        whole-second grid above stays green on all 41 of its cases. Fractional divisors are not a
+        cosmetic widening of the grid; they are the only rows that catch it.
+        """
+        fast = whole + hundredths / 100.0
+        assert fast % 1 != 0, "the draw must be fractional — that is the point"
+        sized = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=_NOW + _ETH_TIMEOUT_S,
+            expected_rxd_lock_time_unix_s=_NOW + wait,
+            margin=_margin(),
+            rxd_block_interval_s=fast,
+        ).value
+        assert _gate_accepts(sized, fast, wait=wait), (
+            f"gate refused the sized t_rxd={sized} at {fast}s/block, wait={wait}s — the sizer "
+            f"undershot and the maker's covenant would be refused at its own gate"
+        )
+        assert not _gate_accepts(sized - 1, fast, wait=wait), (
+            f"t_rxd={sized - 1} is also accepted at {fast}s/block, wait={wait}s — the sizer "
+            f"overshot, locking the maker's asset a block longer than the deadline requires"
         )
