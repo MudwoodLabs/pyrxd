@@ -762,6 +762,23 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",
             "decimals": metadata.decimals,
         }
+        # TIMELOCK: say WHEN it opens, not just that it is one (#556). `classification` already
+        # reported "timelock"; the field that answers the holder's actual question — can I read
+        # this yet — was decoded nowhere until now.
+        #
+        # NO UNLOCKED/LOCKED VERDICT IS EMITTED HERE. `is_unlocked` needs the caller's view of the
+        # chain (a tip height for mode="block", a timestamp for mode="time"), and this function is
+        # given neither. Printing a verdict computed from a clock this process happens to have
+        # would be a guess presented as a fact — the CLI supplies the tip and renders the verdict.
+        # `hint` is operator-supplied CBOR text and is sanitised like every other display string.
+        if metadata.timelock is not None:
+            tl = metadata.timelock
+            metadata_payload["timelock"] = {
+                "mode": _sanitize_display_string(str(tl.mode)),
+                "unlock_at": tl.unlock_at,
+                "cek_hash": _sanitize_display_string(tl.cek_hash),
+                "hint": _sanitize_display_string(tl.hint) if tl.hint else "",
+            }
         if metadata.main is not None:
             from ..hash import sha256
 

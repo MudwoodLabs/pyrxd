@@ -206,8 +206,26 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         except (ValidationError, KeyError, ValueError) as e:
             _log.warning("decode_payload: malformed 'rights' field ignored: %s", e)
 
+    # CBOR ``crypto.timelock`` (#556). Defensive in the same shape as creator/royalty/policy/rights
+    # above: a malformed block is logged and dropped, never raised — an unparseable optional field
+    # must not make an otherwise-valid token undecodable.
+    #
+    # THIS IS THE GAP THAT MADE THE TIMELOCK HELPERS UNREACHABLE. `is_unlocked` and
+    # `get_unlock_remaining` take the spec, and nothing in the parse path produced one, so the
+    # inspect surface could classify a token as TIMELOCK and then have nothing to say about WHEN it
+    # unlocks. The helpers had no caller because they had no possible caller.
+    timelock = None
+    if isinstance(d.get("crypto"), dict) and d["crypto"].get("timelock") is not None:
+        from .encrypted_content import TimelockSpec
+
+        try:
+            timelock = TimelockSpec.from_dict(d["crypto"]["timelock"])
+        except (ValidationError, KeyError, ValueError, TypeError) as e:
+            _log.warning("decode_payload: malformed 'crypto.timelock' field ignored: %s", e)
+
     return GlyphMetadata(
         protocol=d["p"],
+        timelock=timelock,
         container_refs=_decode_rel_refs(d.get("in"), "in"),
         author_refs=_decode_rel_refs(d.get("by"), "by"),
         name=_cbor_str(d, "name", 64),
