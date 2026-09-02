@@ -336,30 +336,46 @@ reuse is separately rejected: the coordinator atomically reserves `H` in a seen-
 **before** the funding broadcast, and a second funder of the same `H` is refused with nothing
 broadcast (`swap_coordinator.py:1363-1375`).
 
-### Timelock deltas — the direction is counterintuitive and inverting it loses funds
+### Timelock deltas — the maker's own leg must outlast the one it claims
 
 ```
-t_btc − t_rxd ≥ margin        (both normalised to blocks)
+t_rxd − t_btc ≥ margin
 ```
 
-Enforced by `assert_timelock_margin` (`swap_coordinator.py:475`), in two steps:
+Enforced by `assert_timelock_margin` (`pyrxd/gravity/swap_coordinator.py`), in two steps: a strict
+ordering check (`t_rxd` must exceed `t_btc`) and then the margin.
 
-- `swap_coordinator.py:506` — `if btc_blocks <= rxd_blocks: raise` (strict ordering)
-- `swap_coordinator.py:510` — `if (btc_blocks - rxd_blocks) < margin_blocks: raise` (the margin)
+**The invariant in words.** The maker holds the preimage `p`. It **LOCKS** the Radiant leg and
+**CLAIMS** the counter leg, so the leg it locks carries the **LONGER** refund window and the leg it
+claims the **SHORTER** one — Herlihy, *Atomic Cross-Chain Swaps*
+([arXiv:1801.09515](https://arxiv.org/abs/1801.09515) §1), where timeouts decrease along the
+propagation path and consecutive ones differ by at least ∆.
 
-**The invariant in words** (`swap_coordinator.py:106-108`): the leg claimed *second* (Radiant) has
-the **SHORTER** refund window; the leg claimed *first* (the counter leg) holds the **LONGER** one.
-The party who commits capital first therefore also waits longest to get it back — that asymmetry is
-deliberate, and it is the direct cause of the accepted griefing residual (see
-**Known residuals**).
+**What breaks if it is inverted.** If `t_rxd ≤ t_btc`, the maker's own leg refunds while the counter
+leg is still claimable. The maker waits out its own CSV, refunds the Radiant asset while `p` is
+still secret, and *then* claims the counter leg with `p` — taking both legs, deterministically, with
+no recourse for the taker. The margin is not a safety buffer in that arrangement; it is the width of
+the attack window.
 
-**What breaks if it is inverted.** If `t_rxd ≥ t_btc`, the Radiant refund does not mature before the
-counter-leg refund. The taker, who must claim the asset *after* the maker reveals `p`, can be left
-with no window in which both "the maker has revealed" and "the maker's CSV refund has not yet
-opened" hold — the maker refunds the asset out from under the pending claim while still holding a
-claimable counter leg. The margin is the buffer that keeps that window open; it must cover the
-counter-chain confirmation tail, the Radiant reorg depth, and the seconds↔blocks conversion slack
-(`swap_coordinator.py:116-123`).
+> **⚠ THIS SECTION PUBLISHED THE OPPOSITE RULE UNTIL #482**, and said so with confidence: it gave
+> `t_btc − t_rxd ≥ margin`, called the direction "counterintuitive", and titled the paragraph above
+> "What breaks if it is inverted" while describing the **correct** layout as the breakage. The
+> conformance vectors matched it — they accepted `t_btc=60/t_rxd=20` and rejected
+> `t_btc=20/t_rxd=60`. An implementation built to this document and checked against those vectors
+> was assembled into the layout in which the party holding `p` takes both legs.
+>
+> **If you implemented against any published pyrxd handshake material before 2026-09-01, re-derive
+> your timelock ordering.** The vectors are corrected and their schema is bumped to
+> `radiant-htlc-handshake/2` so the two files can be told apart by version.
+
+**⚠ OPEN DEFECT — THE UNITS.** The relation above is stated in *blocks*, and `t_btc` counts
+**Bitcoin** blocks (~600 s) while `t_rxd` counts **Radiant** blocks (~300 s). They are not the same
+unit, and the shipped check compares them one-for-one: `t_rxd=180` "exceeds" `t_btc=144` by 36 raw
+blocks while being 15 h against 24 h in wall-clock — the Radiant refund opening *nine hours before*
+the counter-leg deadline. Under the pre-#482 direction this conflation was fail-safe and it is now
+fail-open. **Do not treat the block-denominated form as sufficient.** Tracked as
+[issue #567](https://github.com/MudwoodLabs/pyrxd/issues/567); this section will be restated in
+seconds when that lands.
 
 **Margin floor.** There is no protocol-mandated minimum. `margin` is **each party's own policy**,
 not a negotiated field — the taker checks the maker's `terms` against the *taker's* margin and

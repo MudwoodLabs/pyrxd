@@ -433,8 +433,10 @@ those for depth; use this page to look something up mid-task.
 
 - **`t_btc` / `t_rxd`** — the two legs' timelocks in a cross-chain HTLC
   swap. `assert_timelock_margin(t_btc, t_rxd, policy)` enforces
-  `t_btc - t_rxd >= margin` (both normalized to blocks) **before the taker
-  funds anything**
+  `t_rxd - t_btc >= margin` **before the taker funds anything** (#482 —
+  this said `t_btc - t_rxd` until 2026-09-01, which is the layout in which the
+  party holding `p` takes both legs; and see #567, the two legs' blocks are not
+  the same unit)
   ([`src/pyrxd/gravity/swap_coordinator.py:475`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/gravity/swap_coordinator.py)).
   The direction matters: it's what stops a maker from setting too-tight a
   BTC refund (or too-loose an RXD refund) and creates the race window a
