@@ -247,7 +247,19 @@ def _terms_from_public(
     # t_btc is decorative for an ETH swap (the real ETH deadline is eth_timeout_unix_s), but it must
     # stay BELOW t_rxd so the same-unit ordering guard in NegotiatedTerms passes; keep it well
     # clear. It was t_rxd + margin + 4 before #482 inverted the relation.
-    t_btc = bt.Timelock(t_rxd_blocks - margin_blocks - 4, bt.TimeUnit.BLOCKS)
+    # UNDERFLOW GUARD (#482 follow-up). This became a SUBTRACTION when the relation inverted, and a
+    # subtraction can go to zero or negative where the old addition could not. t_btc = 0 emits
+    # `OP_0 OP_CSV OP_DROP` — a counter leg refundable in its own funding block; negative dies
+    # inside Timelock with a message that names neither flag the operator can act on.
+    _t_btc_blocks = t_rxd_blocks - margin_blocks - 4
+    if _t_btc_blocks < 1:
+        raise SystemExit(
+            f"--t-rxd-blocks {t_rxd_blocks} leaves t_btc = {_t_btc_blocks} (t_rxd - margin {margin_blocks} - 4). "
+            "The counter leg would mature in its own funding block or earlier, so it is refundable "
+            "before the swap can complete. Raise --t-rxd-blocks to at least "
+            f"{margin_blocks + 5}, or lower the margin."
+        )
+    t_btc = bt.Timelock(_t_btc_blocks, bt.TimeUnit.BLOCKS)
     cov = build_htlc_covenant_rxd(
         amount=rxd_photons,
         taker_pkh=bytes(Hex20(taker_pkh)),

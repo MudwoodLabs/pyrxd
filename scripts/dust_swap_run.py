@@ -132,7 +132,19 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd carries the LONGER
     # timeout and the BTC leg it CLAIMS is the shorter one. This built t_rxd + margin + 4 — the
     # layout where the maker can refund RXD and still claim BTC with p.
-    t_btc = bt.Timelock(args.t_rxd_blocks - margin_blocks - 4, bt.TimeUnit.BLOCKS)  # < t_rxd - margin
+    # UNDERFLOW GUARD (#482 follow-up). This became a SUBTRACTION when the relation inverted, and a
+    # subtraction can go to zero or negative where the old addition could not. t_btc = 0 emits
+    # `OP_0 OP_CSV OP_DROP` — a counter leg refundable in its own funding block; negative dies
+    # inside Timelock with a message that names neither flag the operator can act on.
+    _t_btc_blocks = args.t_rxd_blocks - margin_blocks - 4
+    if _t_btc_blocks < 1:
+        raise SystemExit(
+            f"--t-rxd-blocks {args.t_rxd_blocks} leaves t_btc = {_t_btc_blocks} (t_rxd - margin {margin_blocks} - 4). "
+            "The counter leg would mature in its own funding block or earlier, so it is refundable "
+            "before the swap can complete. Raise --t-rxd-blocks to at least "
+            f"{margin_blocks + 5}, or lower the margin."
+        )
+    t_btc = bt.Timelock(_t_btc_blocks, bt.TimeUnit.BLOCKS)
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
     taker_btc_kp = generate_keypair(btc_network)

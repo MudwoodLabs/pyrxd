@@ -159,7 +159,12 @@ def _xonly(kp: BtcKeypair) -> bytes:
     return coincurve.PublicKeyXOnly.from_secret(kp._privkey.unsafe_raw_bytes()).format()
 
 
-def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 80) -> NegotiatedTerms:
+# t_rxd 90, not 80. t_btc derives as t_rxd//2 = 45, and a MEASURED policy requires the covenant to
+# be burial-deep (6) BEFORE the taker funds — so the margin is judged on the REMAINING window
+# (#482 follow-up): 90 - 6 - 45 = 39 >= the 36-block margin. At 80 the remaining gap is 34 and
+# the gate correctly refuses. Production must carry the same headroom; a fixture sized to the
+# negotiated terms alone models a swap that cannot be funded.
+def _terms(*, maker_kp: BtcKeypair, taker_kp: BtcKeypair, t_rxd_blocks: int = 90) -> NegotiatedTerms:
     """Terms whose dest hashes come from the REAL covenant, so the real leg binds to them."""
     hashlock = hashlib.sha256(os.urandom(32)).digest()
     cov = build_htlc_covenant_rxd(

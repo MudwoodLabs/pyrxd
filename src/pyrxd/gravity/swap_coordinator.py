@@ -380,6 +380,27 @@ class MarginPolicy:
                     f"MarginPolicy.{label} = {depth_blocks} blk < safety floor {_MIN_REORG_DEPTH_BLOCKS}; "
                     "a 0/1-block reorg depth defeats the gate (single-block reorgs occur on real chains)"
                 )
+
+        # rxd_claim_inclusion is validated SEPARATELY because its floor is different: 1, not
+        # _MIN_REORG_DEPTH_BLOCKS. It is not a reorg depth — it is the blocks a claim needs to be
+        # MINED before its burial can start, and one is the arithmetic minimum (a claim broadcast
+        # at height H cannot be mined at H).
+        #
+        # It was omitted from the loop above when #511 added it, which is a fail-OPEN omission:
+        # `rxd_claim_inclusion=Timelock(0)` was accepted and silently restored the pre-#511 floor
+        # this field exists to raise, and a bare `int` was accepted at construction and failed much
+        # later with an AttributeError instead of a fail-closed ValidationError.
+        if not isinstance(self.rxd_claim_inclusion, Timelock):
+            raise ValidationError("MarginPolicy.rxd_claim_inclusion must be a Timelock")
+        inclusion_blocks = self.rxd_claim_inclusion.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=self.block_interval_s
+        ).value
+        if inclusion_blocks < 1:
+            raise ValidationError(
+                f"MarginPolicy.rxd_claim_inclusion = {inclusion_blocks} blk < 1; a claim cannot be "
+                "mined in the block it is broadcast in, so zero reserves nothing and restores the "
+                "floor #511 raised"
+            )
         if self.require_measured and not self.is_measured:
             raise ValidationError(
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
@@ -675,7 +696,7 @@ def _stablecoin_value_floor_photons(terms: NegotiatedTerms, policy: MarginPolicy
     return -((-photons.numerator) // photons.denominator)
 
 
-def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy) -> None:
+def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy, *, elapsed_blocks: int = 0) -> None:
     """Assert ``t_rxd - t_btc >= margin`` — fail-closed, cross-unit normalised.
 
     INVERTED 2026-08-31 (#482 finding 1). This asserted ``t_btc - t_rxd >= margin``, which is the
@@ -720,16 +741,39 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
         raise ValidationError(f"could not normalise timelocks to a common unit: {exc}") from exc
 
+    # ELAPSED COVENANT DEPTH IS SUBTRACTED FROM t_rxd. `t_rxd` is a RELATIVE CSV counted from the
+    # covenant's MINING, so once the covenant has confirmations the Radiant refund opens that much
+    # sooner and the REAL gap is `(t_rxd - elapsed) - t_btc`. Comparing the negotiated `t_rxd`
+    # overstates the gap by exactly `elapsed_blocks`.
+    #
+    # THE MAKER CHOOSES THAT NUMBER: it locks its covenant, waits, and only then presents the swap.
+    # Left uncorrected this is the #482 theft resurrected — negotiated terms that clear the margin,
+    # a real gap that does not, and a maker that can refund the Radiant leg while `p` is still
+    # secret and then claim the counter leg. Demonstrated at t_rxd=80/t_btc=40/margin=36: a covenant
+    # 44 blocks deep left an effective gap of -4 and the pre-fund gate accepted it.
+    #
+    # The ETH path got this at #482 (the cross-clock gate takes the same parameter) and the BURIAL
+    # floor got it at #531; this gate — the one the BTC path relies on — was the third instance of
+    # the same conflation and the only one left. Callers that have not read the chain pass 0, which
+    # is the negotiated-terms check and still correct for what it is.
+    if not isinstance(elapsed_blocks, int) or isinstance(elapsed_blocks, bool) or elapsed_blocks < 0:
+        raise ValidationError("assert_timelock_margin elapsed_blocks must be a non-negative int (fail-closed)")
+    rxd_blocks -= elapsed_blocks
+
     if rxd_blocks <= btc_blocks:
         raise ValidationError(
-            f"timelock ordering violated: t_rxd ({rxd_blocks} blk) must exceed t_btc ({btc_blocks} blk) — "
+            f"timelock ordering violated: t_rxd ({rxd_blocks} blk"
+            f"{f' remaining of {rxd_blocks + elapsed_blocks} after {elapsed_blocks} elapsed' if elapsed_blocks else ''}) "
+            f"must exceed t_btc ({btc_blocks} blk) — "
             "the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout "
             "(Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is "
             "still secret and then claim the counter leg."
         )
     if (rxd_blocks - btc_blocks) < margin_blocks:
         raise ValidationError(
-            f"insufficient margin: t_rxd - t_btc = {rxd_blocks - btc_blocks} blk < required {margin_blocks} blk "
+            f"insufficient margin: t_rxd - t_btc = {rxd_blocks - btc_blocks} blk"
+            f"{f' (t_rxd {rxd_blocks} remaining of {rxd_blocks + elapsed_blocks}, {elapsed_blocks} already elapsed)' if elapsed_blocks else ''}"
+            f" < required {margin_blocks} blk "
             f"({'measured' if policy.is_measured else 'ESTIMATED'})"
         )
 
@@ -1641,11 +1685,21 @@ class SwapCoordinator:
         # that — `cov_confs` is not known until the chain read at step 5. Exactly the #531 shape,
         # which fixed this same conflation for the burial floor and left the ordering gate on the
         # negotiated value.
-        if terms.eth_timeout_unix_s is not None:
-            try:
+        #
+        # BOTH COUNTER CHAINS, mirroring step 3's own branch. This ran for ETH only when it landed,
+        # and the BTC path — the flagship BTC<->RXD corridor — was left comparing the NEGOTIATED
+        # t_rxd at step 3 and nothing else. Its only elapsed-aware check was step 6's claim floor
+        # (burial + reserve + inclusion, ~8 blocks), which is far below a 36-block margin, so a
+        # maker could age its covenant and walk the real gap to zero and past it. Fixing the ETH
+        # instance and not the class is the failure this codebase keeps repeating; a security panel
+        # found it here within an hour of the ETH fix merging.
+        try:
+            if terms.counter_chain == "btc":
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, self.config.margin_policy, elapsed_blocks=cov_confs)
+            else:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s, elapsed_blocks=cov_confs)
-            except ValidationError as exc:
-                return PreBtcLockGate(ok=False, reason=f"margin check failed against the REMAINING window: {exc}")
+        except ValidationError as exc:
+            return PreBtcLockGate(ok=False, reason=f"margin check failed against the REMAINING window: {exc}")
 
         return PreBtcLockGate(ok=True)
 

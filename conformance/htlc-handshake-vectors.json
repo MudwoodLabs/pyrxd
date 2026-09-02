@@ -1,5 +1,5 @@
 {
-  "schema": "radiant-htlc-handshake/1",
+  "schema": "radiant-htlc-handshake/2",
   "builder": "pyrxd.gravity.swap_state: NegotiatedTerms.to_dict / from_dict; pyrxd.gravity.htlc_covenant: build_htlc_covenant_{rxd,ft,nft} / holder_hash; pyrxd.btc_wallet.taproot: build_htlc / claim_leaf_script / refund_leaf_script; pyrxd.gravity.swap_coordinator: assert_timelock_margin",
   "provenance": "REFERENCE vectors produced by pyrxd from its own builders — pyrxd is the reference PRODUCER here, so this suite is a regression lock against silent drift, not an independent cross-check. NO mainnet-anchored vector (tracked follow-up). The swap stack these vectors describe is UNAUDITED: passing this suite means a second implementation agrees with pyrxd's bytes, NOT that the protocol is safe. The 32-byte preimage below is a fixed ASCII string, deliberately not CSPRNG output, so that no conformance file ever carries a value that could open a funded HTLC. Guarded by tests/test_htlc_handshake_conformance_vectors.py.",
   "notes": {
@@ -10,7 +10,8 @@
     "omitted_defaults": "counter_chain/value_amount/eth_timeout_unix_s/credential_ref are emitted only when they differ from the BTC defaults; a reader MUST apply the defaults for absent keys.",
     "credential_ref_is_off_chain": "credential_ref is NOT substituted into the covenant bytecode. btc-rxd-credential-gated and btc-rxd differ only by credential_ref and their covenant_scriptpubkey_hex is byte-IDENTICAL -- that equality is the EXPECTED result, asserted by test_credential_gating_does_not_change_the_covenant_spk, not an accident of the comparison. The gate is off-chain pre-fund policy (swap_coordinator.pre_btc_lock_gate); the covenant pays whoever produces the pinned holder script with p, credentialed or not. Do NOT treat the section-4 SPK byte-compare as binding this gate.",
     "genesis_ref_enforcement": "ft/nft: only NON-EMPTINESS is checked at NegotiatedTerms construction (swap_state.py:339-341); the 36-byte length is enforced later, fail-closed, at holder_hash (htlc_covenant.py:194-195). rxd: a non-empty genesis_ref is accepted and silently ignored -- it round-trips through the wire form and changes no derived value.",
-    "hex": "bare lowercase, no 0x prefix; genesis_txid in derivation_params is DISPLAY byte order, the 36-byte wire ref is reversed-txid || vout LE32."
+    "hex": "bare lowercase, no 0x prefix; genesis_txid in derivation_params is DISPLAY byte order, the 36-byte wire ref is reversed-txid || vout LE32.",
+    "schema_revision": "Bumped 1 -> 2 for the #482 timelock-ordering correction. Schema /1 published the INVERTED rule: it accepted t_btc=60/t_rxd=20 and rejected t_btc=20/t_rxd=60. The change is semantically incompatible and a consumer pinned to /1 cannot tell the two apart from the version alone, which is exactly why this field moved."
   },
   "hashlock_vectors": [
     {
@@ -76,7 +77,7 @@
       },
       "block_interval_s": 600.0,
       "verdict": "reject",
-      "why": "insufficient margin: t_btc - t_rxd = 10 blk < required 36 blk"
+      "why": "insufficient margin: t_rxd - t_btc = 10 blk < required 36 blk (ESTIMATED)"
     },
     {
       "id": "margin-inverted-ordering",
@@ -95,7 +96,7 @@
       },
       "block_interval_s": 600.0,
       "verdict": "reject",
-      "why": "t_btc must EXCEED t_rxd. Inverting the order lets the first-locking party's refund open first — the maker can then claim the counter leg AND refund the asset."
+      "why": "timelock ordering violated: t_rxd (20 blk) must exceed t_btc (60 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg."
     },
     {
       "id": "margin-cross-unit-inversion",
@@ -114,7 +115,7 @@
       },
       "block_interval_s": 600.0,
       "verdict": "reject",
-      "why": "600 s normalises to 1 block at a 600 s interval, which is BELOW t_rxd. NegotiatedTerms' cheap same-unit construction guard does NOT fire here — only the normalising margin check catches it. A conforming implementation MUST run the normalising check."
+      "why": "timelock ordering violated: t_rxd (12 blk) must exceed t_btc (72 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg. NOTE: NegotiatedTerms' cheap same-unit construction guard does NOT fire on this pair — it only compares t_btc and t_rxd when they share a unit. Only the normalising margin check catches it, so a conforming implementation MUST run the normalising check and not just the construction guard."
     }
   ],
   "terms_vectors": [
