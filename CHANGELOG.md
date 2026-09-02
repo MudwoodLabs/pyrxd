@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **The HTLC timelock ordering was INVERTED, in shipped source and in the published conformance
+  vectors (#482).** `t_rxd` must EXCEED `t_btc`, not the reverse. The maker holds the preimage `p`,
+  LOCKS the Radiant leg and CLAIMS the counter leg, so the leg it locks carries the LONGER timeout
+  (Herlihy, *Atomic Cross-Chain Swaps*, [arXiv:1801.09515](https://arxiv.org/abs/1801.09515) §1).
+  Built the other way, a maker can let its own leg mature, refund it, and still claim the counter
+  leg with `p` — taking both. The margin between the two deadlines was the attack window, not a
+  safety buffer.
+
+  **Five production runners built the exploitable ordering**: `dust_swap_run.py`,
+  `eth_swap_run.py` and `eth_swap_two_host.py` each computed `t_btc = t_rxd + margin + 4`;
+  `btc_swap_two_host.py`'s self-check used it; and `watchtower_dust_run.py` **enforced it at the
+  command line**, refusing honest input with "(BTC is the longer leg)" in the message. An operator
+  following that refusal built the vulnerable layout.
+
+  **`conformance/htlc-handshake-vectors.json` taught it too, and that ships in the sdist.** The
+  vectors ACCEPTED `t_btc 60 / t_rxd 20` and REJECTED `t_btc 20 / t_rxd 60` — the correct ordering,
+  published under the name `margin-inverted-ordering`. Their `notes.timelock_ordering` stated the
+  rule backwards in prose. A second implementation that got the direction RIGHT would have failed
+  conformance and been told, with a spec and a green run behind it, to swap to the layout where the
+  party holding `p` takes both legs. Every vector is REGENERATED from the builders, not hand-edited:
+  the covenant SPK commits to `refund_csv = t_rxd` and the BTC taptree to `t_btc`, so both sets of
+  bytes move with the correction.
+
+  **If you have implemented against these vectors, re-derive your timelock ordering.** That is the
+  part of this defect that propagates outside pyrxd.
+
+  Also corrected: the docstrings that argued FOR the wrong direction, including one calling it
+  "counterintuitive and load-bearing". Prose asserting an invariant becomes evidence for the next
+  reader; wrong, it is manufactured corroboration.
+
+- **`assess_claim_finality` certified a claim SAFE that could not bury in time (#511).** It
+  compared `blocks_left >= burial` — the condition for a claim that is ALREADY CONFIRMED. A claim
+  being decided on has not been broadcast, so it cannot be mined at the current height and its
+  burial can only start at the next one. Measured at `burial=6, t_rxd=72`: `blocks_left == 6`
+  returned SAFE, and a claim mined in the very next block reaches burial depth exactly AT the
+  refund height, where the maker's refund is simultaneously valid.
+
+  The fund-time gate already reserved that block ("one block for the claim itself to be mined") and
+  the claim-time gate did not, so a swap could be funded against the stricter floor and then
+  certified SAFE by the looser one. Both now derive the floor from one function. New
+  `MarginPolicy.rxd_claim_inclusion` (default 2 blocks — an ESTIMATE, settable via
+  `MarginPolicy.measured()`; measure it for a real-value run).
+
+  NOTE: the issue's own body describes a mempool-race attack that does **not** work — Radiant Core
+  `validation.cpp:718-728` admits a BIP68-locked transaction only if it "can be mined in the next
+  block", so the maker cannot pre-broadcast and a claim already in the mempool wins. The real
+  exposure is an UNCONFIRMED claim sitting through maturity, where eviction (~8h expiry, no RBF, no
+  CPFP) hands the maker its refund.
+
+### Added
+
+- **The content-encryption primitives are exported from the top level (#556)** — `encrypt_chunked`,
+  `decrypt_chunked`, `wrap_cek_x25519`, `unwrap_cek_x25519`, `x25519_public_key`, and the
+  `ChunkedCiphertext` / `EncryptedChunk` / `WrappedCEK` types. They are byte-compatible with
+  Photonic Wallet's `packages/lib/src/encryption.ts` and verified against the
+  draft-irtf-cfrg-xchacha-03 Appendix A.3.1 vector, so encrypting Glyph content in pyrxd and
+  decrypting it in Photonic (or the reverse) works across implementations. Nothing in `src/`
+  imported them before — they were reachable only from tests. The exported set is the closure
+  needed to actually use them; exporting the functions without the types and `x25519_public_key`
+  would have left the entry point unreachable in practice.
+
 ### Fixed
 
 - **Nine places in shipped source described the lock order that HZ-1 (#392) inverted.** The maker
@@ -21,6 +84,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   parses its value). `tests/test_protocol_lock_ordering_docs_are_current.py` scans for the old
   phrasings.
 
+
+### Upgrade notes
+
+- **`NegotiatedTerms` now REFUSES the old ordering at construction.** If you build terms directly,
+  swap the pair: `t_rxd` must strictly exceed `t_btc`. Code that passed `t_btc=144, t_rxd=72` now
+  raises `ValidationError` naming `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`. This is the point — the old
+  pair is the layout in which the party holding `p` can take both legs.
+
+- **`watchtower_dust_run.py`'s `--t-btc` / `--t-rxd` semantics inverted**, and so did its defaults
+  (`--t-btc 1`, `--t-rxd 2`). It previously refused `--t-rxd >= --t-btc` with "(BTC is the longer
+  leg)"; it now refuses `--t-btc >= --t-rxd`.
+
+- **`eth_swap_run.py`'s deadline advice changed direction.** A deadline too FAR is now what cannot
+  be satisfied — past roughly 23 days no 16-bit relative CSV reaches it — and the refusal names a
+  MAXIMUM `--eth-timeout-s`. It previously named a minimum and told operators to ask for more time,
+  which is now the cause rather than the fix. `_assert_t_rxd_opens_before_the_eth_deadline` is
+  `_assert_t_rxd_outlasts_the_eth_deadline`, refusing "too SHORT" where it refused "too LONG".
+
+- **The SAFE/SQUEEZED boundary moved by two blocks** (#511). Swaps that previously reported SAFE
+  within two blocks of the floor now report SQUEEZED, which routes to `ASSET_VULNERABLE` — an
+  explicit operator decision, not a forfeit. Being conservative here is cheap; the old boundary
+  certified claims that could not bury before the maker's refund opened.
+
+### Internal
+
+- **Every GitHub Actions reference is pinned to a full commit SHA**, and a test keeps it that way.
+  Three floating refs remained in `mutation.yml` — a movable tag means whoever controls it controls
+  what runs in CI with the repository checked out. The check is a test rather than a script because
+  this repo has twice shipped a checker nothing invoked.
 
 ## [0.21.0] — 2026-08-29
 
