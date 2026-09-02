@@ -82,7 +82,57 @@ If you are deploying pyrxd in a production system handling real funds:
   any mainnet broadcast
 - Hold private keys outside the web tier — see the architectural
   pattern in our README under "Production Architecture"
-- Subscribe to GitHub Security Advisories for this repository
+- Watch this repository's **Releases** — security-relevant defects are
+  disclosed in the release notes and recorded under "Known security-relevant
+  defects in published releases" below, not as GitHub Security Advisories
+
+## Known security-relevant defects in published releases
+
+Recorded here rather than as a GitHub Security Advisory, because the affected
+population is reachable through this repository and the release notes rather
+than through dependency scanners.
+
+### The published handshake spec and conformance vectors taught the timelock ordering backwards
+
+**Affected: every release through 0.22.0.** **Fixed in 0.22.0.**
+
+`conformance/htlc-handshake-vectors.json`, shipped in the sdist at schema
+`radiant-htlc-handshake/1`, **accepted `t_btc=60 / t_rxd=20`** and **rejected
+`t_btc=20 / t_rxd=60`** — the correct ordering, published under the name
+`margin-inverted-ordering`. `docs/htlc-handshake-wire-format.md` and four
+user-facing guides stated the same relation the same way round.
+
+The accepted layout is the one in which the maker refunds its own leg while the
+preimage `p` is still secret and *then* claims the counter leg with `p`, taking
+both, with no recourse for the counterparty. The maker holds `p`; it **locks**
+the Radiant leg and **claims** the counter leg, so the leg it locks must carry
+the **longer** refund window (Herlihy, *Atomic Cross-Chain Swaps*,
+[arXiv:1801.09515](https://arxiv.org/abs/1801.09515) §1).
+
+**Scope, stated precisely in both directions.** pyrxd's own gate was *fail-safe*
+under the superseded rule: this library refused to build the layout its own
+specification described. The exposure was to **a second implementation built
+from the published material** — one that derived the ordering correctly would
+have run these vectors, failed, and been told by a specification with a passing
+test suite behind it to invert into the vulnerable arrangement.
+
+**If you implemented a Radiant HTLC against any pyrxd handshake material
+published before 2026-09-02, re-derive your timelock ordering.** The vectors are
+regenerated from the builders and the schema is bumped to
+`radiant-htlc-handshake/3`, so a consumer pinned to `/1` can tell the two apart
+by version.
+
+A second defect sat underneath it and is also fixed in 0.22.0: the margin was
+compared in **raw block counts across two chains**. A Radiant block is ~300 s
+against Bitcoin's ~600 s, so `t_rxd=180` "exceeded" `t_btc=144` by 36 blocks
+while being 15 h against 24 h in wall clock. The relation is now evaluated in
+seconds, which means **honest swaps need a longer Radiant leg than before** —
+re-check your parameters rather than only bumping the version.
+
+**Not affected:** the Glyph stack — minting, commit/reveal, Wave names, key
+derivation, transfers and resolution. `pyrxd.glyph` does not import
+`pyrxd.gravity`; a mint never loads the swap code. Deployments using pyrxd only
+for Glyph/Wave operations are untouched by the above.
 
 ## Supported Versions
 
