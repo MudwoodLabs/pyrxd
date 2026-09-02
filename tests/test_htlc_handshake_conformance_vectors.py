@@ -69,7 +69,40 @@ def _timelock(d: dict) -> bt.Timelock:
 
 
 def test_schema_marker():
-    assert _DOC["schema"] == "radiant-htlc-handshake/1"
+    """/2 since #482. The bump is not cosmetic: schema /1 published the INVERTED timelock rule —
+    it accepted t_btc=60/t_rxd=20 and rejected t_btc=20/t_rxd=60 — so a consumer pinned to /1
+    cannot tell the exploitable file from the corrected one by version alone. That is exactly what
+    a schema marker is for."""
+    assert _DOC["schema"] == "radiant-htlc-handshake/2"
+
+
+@pytest.mark.parametrize("vec", _DOC["margin_vectors"], ids=lambda v: v["id"])
+def test_every_reject_vectors_why_IS_the_real_refusal(vec: dict):
+    """The prose is DERIVED, not authored — and this is the check that was missing.
+
+    Nothing asserted the `why` strings, so when #482 swapped the vector VALUES the explanations
+    stayed behind: `margin-inverted-ordering.why` still read "t_btc must EXCEED t_rxd" — the
+    exploitable rule, in the published artifact, four lines below a corrected `notes` field
+    saying the opposite. Two independent reviewers found it; no test could have.
+
+    Asserting the `why` equals the exception the production gate actually raises makes the prose
+    incapable of drifting from the code, rather than merely checked against it.
+    """
+    if vec["verdict"] != "reject":
+        assert "why" not in vec, "an accepted vector should not carry a refusal explanation"
+        return
+    policy = MarginPolicy(
+        margin=_timelock(vec["margin"]),
+        block_interval_s=vec["block_interval_s"],
+        is_measured=False,
+    )
+    with pytest.raises(ValidationError) as exc:
+        assert_timelock_margin(_timelock(vec["t_btc"]), _timelock(vec["t_rxd"]), policy)
+    produced = " ".join(str(exc.value).split())
+    assert vec["why"].startswith(produced), (
+        f"{vec['id']}'s published `why` is not what the gate raises.\n"
+        f"  published: {vec['why']}\n  produced : {produced}"
+    )
 
 
 def test_suite_covers_every_asset_variant_and_both_counter_chains():

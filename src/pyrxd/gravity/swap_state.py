@@ -421,6 +421,21 @@ class NegotiatedTerms:
                 object.__setattr__(self, _name, _val)
         # Cheap same-unit ordering guard (the full margin check is fail-closed in
         # the coordinator and handles cross-unit normalisation).
+        # A COUNTER LEG THAT MATURES IN ITS OWN FUNDING BLOCK IS NOT A TIMELOCK (#482 follow-up).
+        # `t_btc` became a SUBTRACTION when the relation inverted (`t_rxd - margin - 4`), and a
+        # subtraction can underflow where the old addition could not. `Timelock(0)` constructs, and
+        # `refund_leaf_script` then emits `OP_0 OP_CSV OP_DROP` — a BTC HTLC the taker can refund
+        # immediately while the maker's Radiant leg is still locked, and still claim the asset once
+        # `p` is public. Reachable on the dust defaults (t_rxd=20) at a measured margin of 16.
+        #
+        # Refused here rather than clamped at each builder: clamping silently hands back a swap
+        # nobody asked for, and this is the layer that makes it unrepresentable for every caller.
+        if self.t_btc.unit is TimeUnit.BLOCKS and self.t_btc.value < 1:
+            raise ValidationError(
+                f"t_btc is {self.t_btc.value} blocks — a counter leg that matures in its own funding "
+                "block is refundable before the swap can complete. Raise t_rxd (t_btc derives from it "
+                "as t_rxd - margin - 4) or lower the margin."
+            )
         if self.t_btc.unit is self.t_rxd.unit and self.t_rxd.value <= self.t_btc.value:
             raise ValidationError(
                 "invariant MAKER_SECRET_TAKER_LOCKS_BTC_FIRST requires t_rxd > t_btc "
