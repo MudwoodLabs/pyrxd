@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.22.0] — 2026-09-02
+
 ### Security
 
 - **`pyrxd-watchtower --measured` ran real-value mode with a NOMINAL Radiant interval, and the
