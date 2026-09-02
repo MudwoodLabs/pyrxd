@@ -1068,7 +1068,11 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--rxd-electrumx-url", default="", help="regtest Radiant ElectrumX/Fulcrum ws/wss URL")
     ap.add_argument("--rxd-electrumx-insecure", action="store_true")
     ap.add_argument("--rxd-photons", type=int, default=100_000)
-    ap.add_argument("--t-rxd-blocks", type=int, default=60)
+    # 120, not 60: the shared wall-clock derivation (#567) needs t_rxd * 300 s to cover the
+    # 36-block margin * 600 s AND leave a counter leg, so the old 60 — valid under the
+    # superseded `t_rxd - margin - 4` — now exits at startup. Changing the formula and
+    # leaving the inputs that feed it is how the fix broke its own runner.
+    ap.add_argument("--t-rxd-blocks", type=int, default=120)
     ap.add_argument(
         "--asset-locked-at-height",
         type=int,

@@ -8,6 +8,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`build_p2pkh_with_csv_script` accepted a relative time-lock of ZERO.** It refused the
+  disable-bit spelling of a no-op lock with an explicit error, and accepted a zero unit count —
+  the same no-op — emitting `OP_0 OP_CSV OP_DROP` for a caller that asked to be time-locked. The
+  output is spendable in its own funding block. The floor now lives in the builder, and it MASKS
+  rather than comparing: `build_csv_sequence(0, TIME_512_SECONDS)` is `0x400000`, non-zero and
+  still a lock of zero, so a `< 1` guard would pass it. **Behaviour change to exported API** —
+  a zero unit count now raises `ValidationError`. `pyrxd.inspect` still classifies such scripts,
+  because they can exist on-chain regardless of what this library will build.
+
+- **`scripts/btc_swap_two_host.py` shipped the PRE-#482 timelock ordering in its defaults**
+  (`t_rxd=20 / t_btc=60`) and taught it in `--help` ("must exceed t_rxd + margin"). Three sibling
+  runners moved to the shared wall-clock derivation (#567); this one was missed and kept `t_btc` as
+  a flag. The safety gate refused those defaults, so the runner was unusable as shipped rather than
+  unsafe — but the help text was advising operators toward the layout in which the maker takes both
+  legs. `t_btc` is now DERIVED, and `--t-btc-blocks` is gone.
+
 - **The HTLC timelock ordering was INVERTED, in shipped source and in the published conformance
   vectors (#482).** `t_rxd` must EXCEED `t_btc`, not the reverse. The maker holds the preimage `p`,
   LOCKS the Radiant leg and CLAIMS the counter leg, so the leg it locks carries the LONGER timeout

@@ -1,7 +1,7 @@
 ---
 title: "Fifteen bypasses of rules that were already written down — the rules were right, they just were not executable"
 category: test-failures
-component: "engineering process; `tests/test_reachability_shipped_callers.py`, `scripts/check_coverage_omissions.py`, `scripts/mutation_groups.py`, `src/pyrxd/security/units.py`"
+component: "engineering process; `tests/test_reachability_shipped_callers.py`, `scripts/check_coverage_omissions.py`, `scripts/mutation_groups.py`, `src/pyrxd/security/units.py`, `tests/test_no_cross_chain_block_arithmetic.py`, `tests/test_runner_defaults_survive_the_gate.py`"
 tags:
   - process
   - test-integrity
@@ -12,7 +12,10 @@ tags:
   - type-safety
   - ci
   - decay
+  - recurrence
+  - units
 date: 2026-08-28
+updated: 2026-09-02
 severity: high
 status: solved
 symptom: >
@@ -82,6 +85,9 @@ Three fixes were applied only where the bug had been demonstrated:
 | CREATE-address derivation | token leg | **native leg**, which had carried real value |
 | token-count vs photon-value gate | RXD, NFT | **FT** (still open, #505) |
 | reorg-anchor derivation | resume runner | **both forward runners** |
+| zero-CSV floor (2026-09-01, #573) | three runner scripts | **the producer**, reachable from 8 call sites |
+| `MarginPolicy` field validation (2026-09-01, #573) | three fields typed by hand | **the fourth**, added by #511 |
+| counter-timelock derivation (2026-09-01, #573) | three runners | **the fourth runner**, and the defaults of a fifth |
 
 ### 3. Hand-planted mutations only test the mutation you thought of
 
@@ -293,6 +299,125 @@ panel and the author never opened; the most reliable source available was in-tre
 And when the type model was corrected, `warn_unused_ignores` deleted all three `# type: ignore`
 markers automatically. The self-invalidating rule worked — it simply cannot tell the difference
 between "the code was fixed" and "the belief was wrong".
+
+## Recurrence, 2026-09-02: the rule was quoted in the commit that broke it
+
+Everything above was written on 2026-08-28. Five days later the same class recurred three times in
+one session, and the circumstances remove the last comfortable explanation for it.
+
+**The rule was not forgotten. It was being typed at the moment it was bypassed.** Commit `7edc335`
+(#566) says, in its own message:
+
+> The ETH instance was fixed and the class was not. This is the **third** time this conflation has
+> been fixed one site at a time: #531 (burial floor), #482 (ETH gate), now this.
+
+The same diff introduced three fresh instance-level fixes. A security panel caught all three, and
+the corrections landed in #573. So the failure is not ignorance of the rule, not disagreement with
+it, and not inattention — the author was actively narrating the rule while violating it. Naming a
+class does not fix it; only a mechanism that derives the set does.
+
+### The recursion, which is the sharpest evidence available
+
+`src/pyrxd/security/units.py` was built by the session that documented "findings give coordinates."
+It is the level-1 mechanism for unit conflations, and it distinguishes exactly the conflations that
+had been *demonstrated* by then: `ChainHeight` vs `Confirmations`, `PhotonValue` vs `TokenUnits`,
+`BlockSpan` vs `Seconds`.
+
+`BlockSpan` is one `NewType` for **all chains**. A Radiant block count and a Bitcoin block count are
+the same type to it. So #567 — subtracting a Bitcoin-block margin from a Radiant-block count — was
+invisible to the very mechanism built to prevent unit conflations.
+
+**The prevention mechanism was itself built at the instance.** It generalised over the demonstrated
+axis (blocks vs seconds) and not over the undemonstrated one (whose blocks). That is the documented
+failure mode, applied to the tool written to stop it, by the session that wrote the documentation.
+
+### What a plant does and does not prove
+
+The correction that matters most to future work is about verification, not about types.
+
+Planting a defect proves the **assertion** is load-bearing. It does not prove the **scope** is
+right — because a site-fix and a class-fix behave *identically* on the demonstrated input. Both
+refuse it. #566 did plant, watched the failure, and still shipped three site-fixes.
+
+> **The plant must be an instance the site-fix does NOT cover.**
+
+For a hand-kept validator table, that means simulating *a fifth field being added* — deleting an
+entry and asserting the cross-check fails — not passing the bad value the fix already refuses.
+Verified that way here: the `MarginPolicy` cross-check was proved by recreating the exact #511
+omission, not by passing `Timelock(0)`.
+
+### Applying this section's own test found three more, in the commit being documented
+
+Before writing this, the fix commit (`5239a17`) was checked against the rule it claims to apply.
+It missed three siblings:
+
+1. **`src/pyrxd/script/timelock.py`** — a third OP_CSV producer, `build_p2pkh_with_csv_script`,
+   refused the *disable-bit* spelling of a no-op lock with an explicit error and **accepted a zero
+   unit count**, which is the same no-op. Its docstring warns about no-op locks. Zero production
+   callers, so it was never on a fund path — but it is exported public API.
+
+   The guard needs a mask, not `< 1`: `build_csv_sequence(0, TIME_512_SECONDS)` is `0x400000` —
+   non-zero, and still a lock of zero. A naive floor passes the second spelling, which is precisely
+   how the first spelling came to be refused for years while the other was not.
+
+2. **`scripts/btc_swap_two_host.py`** — the *fourth* runner. Three moved to the shared derivation;
+   this one kept `t_btc` as a flag, so its shipped defaults (`t_rxd=20, t_btc=60`) still encoded the
+   **pre-#482 ordering**, and `--help` still taught `must exceed t_rxd + margin`, the relation #482
+   inverted away from. The gate refuses those defaults, so the runner was unusable as shipped — the
+   safety layer held, and the operator-facing prose was teaching the unsafe layout.
+
+   The same file had been fixed correctly 125 lines earlier: its self-check carries a careful #567
+   comment and correct values. **One file, fixed in one place and not the other.**
+
+3. **`src/pyrxd/gravity/swap_state.py`** — the operator-facing error message still instructed
+   `t_btc derives from it as t_rxd - margin - 4`, the formula #573 replaced. Every other surviving
+   copy of that string is a historical comment explaining why it was wrong; this one was advice.
+
+### And one the fix actively broke
+
+`scripts/eth_swap_two_host.py` defaulted `--t-rxd-blocks 60`. Under the superseded
+`t_rxd - margin - 4` that yielded `20` — valid. Under the wall-clock derivation that replaced it,
+`floor(60 * 300 / 600) - 36 = -6`, and the runner **exits at startup**.
+
+`5239a17` changed the formula and did not re-check the inputs feeding it. This is the eighth
+consecutive round in this corridor to find a defect created by the previous round's fix.
+
+Why no test caught it: every unit test constructs terms by hand, so **nothing ever ran the defaults
+an operator gets by typing the command with no flags.** A runner can be unusable as shipped while
+its suite is entirely green.
+
+### Mechanisms added
+
+| level | mechanism | catches |
+|---|---|---|
+| 3 (detect) | `tests/test_no_cross_chain_block_arithmetic.py` | a Radiant block count and a Bitcoin margin meeting in one expression — the #567 shape, across 233 files |
+| 3 (detect) | `tests/test_runner_defaults_survive_the_gate.py` | shipped argparse defaults that the real gate refuses — both of today's runner misses |
+| 1 (derive) | the zero-unit floor moved inside `build_p2pkh_with_csv_script` | every caller, present and future |
+
+Honest limits, stated because the section above is about overstated claims:
+
+- The arithmetic scanner encodes the *fix's* shape — converting through seconds structurally
+  separates the two identifiers — so it is not a heuristic. But it would **not** have caught
+  finding 2, which was stale defaults, not arithmetic. Two different checks were needed for what
+  felt like one defect.
+- The defaults test statically reaches only runners exposing both flags; `eth_swap_run` derives at
+  runtime (`t_rxd=0` sentinel) and `dust_swap_run` takes its margin from a measured policy. Two
+  runners are actually checked. Both were the two that broke.
+- **A correction to #573's own commit message**, which claimed the `MarginPolicy` floors were
+  "DERIVED FROM THE DATACLASS". They are not. Floor *values* are policy and cannot be derived from
+  a type; only the table's *completeness* is derived. That mechanism sits at levels 2–3, not
+  level 1. The ceiling is set by what the type can express — which is the same limit that made
+  `units.py` blind to #567.
+
+### If you arrived here searching
+
+This class is what you are looking for if you are thinking any of:
+
+> "I fixed this in one place and missed the others" · "the same bug in three files" · "the fix
+> broke a different caller" · "the test passed but the script won't run" · "we already have a rule
+> about this" · "I wrote the rule down and did it anyway"
+
+The rule is not the fix. Derive the set, or accept that you will fix it again.
 
 ## What this does not cover
 

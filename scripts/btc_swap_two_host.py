@@ -77,6 +77,7 @@ from _dust_swap_shared import (
     CapturingBroadcaster,
     atomic_write_mode_600,
     confirm,
+    derive_counter_timelock,
     resolve_asset_locked_at_height,
     wait_for_covenant_via_leg,
 )
@@ -682,7 +683,15 @@ async def maker_phase_envelope(args) -> None:
         hashlock=h,
         btc_sats=args.btc_sats,
         t_rxd_blocks=args.t_rxd_blocks,
-        t_btc_blocks=args.t_btc_blocks,
+        # DERIVED, not a flag (#567). This runner kept `t_btc = --t-btc-blocks` after the
+        # other three moved to the shared derivation, so its defaults still encoded the
+        # PRE-#482 ordering (t_btc > t_rxd) and its --help still taught it.
+        t_btc_blocks=derive_counter_timelock(
+            t_rxd_blocks=args.t_rxd_blocks,
+            margin_blocks=args.margin_blocks,
+            rxd_block_interval_s=args.rxd_block_interval_s,
+            btc_block_interval_s=args.btc_block_interval_s,
+        ),
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         btc_claim_xonly=claim_xonly,
@@ -977,8 +986,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--btc-block-interval-s", type=float, default=600.0)
     p.add_argument("--btc-fee-sats", type=int, default=2_000)
     p.add_argument("--btc-sats", type=int, default=100_000, help="(maker) the BTC HTLC amount")
-    p.add_argument("--t-rxd-blocks", type=int, default=20, help="(maker) the RXD covenant CSV")
-    p.add_argument("--t-btc-blocks", type=int, default=60, help="(maker) the BTC HTLC CSV (must exceed t_rxd + margin)")
+    p.add_argument(
+        "--t-rxd-blocks",
+        type=int,
+        default=120,
+        help="(maker) the RXD covenant CSV — the LONGER leg (#482). t_btc is DERIVED from it.",
+    )
     p.add_argument("--margin-blocks", type=int, default=36)
     p.add_argument(
         "--taker-min-rxd-confs",
