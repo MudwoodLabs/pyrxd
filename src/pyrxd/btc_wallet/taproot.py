@@ -335,6 +335,24 @@ def refund_leaf_script(refund_pubkey_xonly: bytes, timeout: Timelock) -> bytes:
     pk = _as_bytes(refund_pubkey_xonly, name="refund_pubkey_xonly", length=32)
     if not isinstance(timeout, Timelock):
         raise ValidationError("timeout must be a Timelock")
+    # A ZERO TIMELOCK IS NOT A TIMELOCK, and this belongs HERE — in the producer of the bytes —
+    # rather than in each caller. `Timelock(0)` emits `OP_0 OP_CSV OP_DROP`, a relative lock
+    # satisfied in the funding block itself: the refund branch is spendable immediately, so the
+    # counter leg can be refunded while the other leg is still locked.
+    #
+    # It became reachable when #482 made `t_btc` a SUBTRACTION (`t_rxd - margin - 4`); the old
+    # addition could not underflow. The first fix put a `< 1` refusal in three RUNNER scripts —
+    # fix-at-the-demonstrated-site, which is the shape this codebase keeps repeating. Any caller
+    # that builds a leaf, now or later, gets the floor by construction.
+    #
+    # `build_htlc_covenant_*` has enforced the same floor on the Radiant side all along
+    # (`htlc_covenant.py`, "a 0 CSV is a no-op timelock"). This is the BTC-side twin it was missing.
+    if timeout.unit is TimeUnit.BLOCKS and timeout.value < 1:
+        raise ValidationError(
+            f"refund timeout is {timeout.value} blocks — a 0-block CSV is a no-op: the refund leaf "
+            "would be spendable in the funding block, so the counter leg is refundable before the "
+            "swap can complete"
+        )
     return _push_minimal_int(timeout.csv_script_operand()) + _OP_CSV + _OP_DROP + _push_data(pk) + _OP_CHECKSIG
 
 

@@ -70,6 +70,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
+    derive_counter_timelock,
     measured_margin_from_mainnet,
     merge_into_mode_600,
     rxd_blockcount,
@@ -129,22 +130,18 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     h = hashlib.sha256(p).digest()
     margin_blocks = policy.margin.normalize_to(bt.TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    # INVERTED (#482): the maker holds p and LOCKS the Radiant leg, so t_rxd carries the LONGER
-    # timeout and the BTC leg it CLAIMS is the shorter one. This built t_rxd + margin + 4 — the
-    # layout where the maker can refund RXD and still claim BTC with p.
-    # UNDERFLOW GUARD (#482 follow-up). This became a SUBTRACTION when the relation inverted, and a
-    # subtraction can go to zero or negative where the old addition could not. t_btc = 0 emits
-    # `OP_0 OP_CSV OP_DROP` — a counter leg refundable in its own funding block; negative dies
-    # inside Timelock with a message that names neither flag the operator can act on.
-    _t_btc_blocks = args.t_rxd_blocks - margin_blocks - 4
-    if _t_btc_blocks < 1:
-        raise SystemExit(
-            f"--t-rxd-blocks {args.t_rxd_blocks} leaves t_btc = {_t_btc_blocks} (t_rxd - margin {margin_blocks} - 4). "
-            "The counter leg would mature in its own funding block or earlier, so it is refundable "
-            "before the swap can complete. Raise --t-rxd-blocks to at least "
-            f"{margin_blocks + 5}, or lower the margin."
-        )
-    t_btc = bt.Timelock(_t_btc_blocks, bt.TimeUnit.BLOCKS)
+    # DERIVED IN WALL CLOCK by the one shared definition (#567). Three runners each computed
+    # `t_rxd - margin - 4`, subtracting BITCOIN blocks from a RADIANT-block count as though the two
+    # were the same unit — a negative real margin at every realistic parameter.
+    t_btc = bt.Timelock(
+        derive_counter_timelock(
+            t_rxd_blocks=args.t_rxd_blocks,
+            margin_blocks=margin_blocks,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            btc_block_interval_s=policy.block_interval_s,
+        ),
+        bt.TimeUnit.BLOCKS,
+    )
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
     taker_btc_kp = generate_keypair(btc_network)

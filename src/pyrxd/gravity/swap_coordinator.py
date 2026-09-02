@@ -187,6 +187,21 @@ MAINNET_ETH_FINALITY_STALL_FLOOR_S = 3600
 # even a dust run must use >= 2. NOT a configurable knob — it is the fail-closed floor.
 _MIN_REORG_DEPTH_BLOCKS = 2
 
+#: Every ``Timelock`` field on :class:`MarginPolicy` and its minimum, in BLOCKS. Iterated by
+#: ``__post_init__``; cross-checked against the dataclass's real field set, both directions, by
+#: ``tests/test_margin_policy_validates_every_timelock_field.py``.
+#:
+#: The floors differ ON PURPOSE. A reorg depth of 0 or 1 defeats the gate it guards, so those sit at
+#: ``_MIN_REORG_DEPTH_BLOCKS``. ``rxd_claim_inclusion`` is not a reorg depth — it is the blocks a
+#: claim needs to be MINED before its burial can start, and 1 is the arithmetic minimum.
+#: ``margin`` is deliberately absent: it is a policy quantity with no protocol-imposed floor (a
+#: dust run legitimately uses 3), and the wall-clock gate is what bounds it.
+_TIMELOCK_FLOORS: dict[str, int] = {
+    "btc_claim_reorg_depth": _MIN_REORG_DEPTH_BLOCKS,
+    "rxd_claim_burial": _MIN_REORG_DEPTH_BLOCKS,
+    "rxd_claim_inclusion": 1,
+}
+
 # Hard safety floor (SECONDS) for the ETH/PoS finalization window. A smaller window collapses
 # the reorg-gate's finalization reserve toward zero. Enforced at MarginPolicy construction
 # whenever eth_finalization_window_s is set (the ETH-swap PRESENCE of the field is enforced
@@ -362,45 +377,32 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.is_measured must be bool")
         if not isinstance(self.require_measured, bool):
             raise ValidationError("MarginPolicy.require_measured must be bool")
-        for label, depth in (
-            ("btc_claim_reorg_depth", self.btc_claim_reorg_depth),
-            ("rxd_claim_burial", self.rxd_claim_burial),
-        ):
-            if not isinstance(depth, Timelock):
-                raise ValidationError(f"MarginPolicy.{label} must be a Timelock")
-            # Floor in BLOCK terms (normalise so a seconds-tagged depth is floored too).
-            # A 1-block reorg depth is materially unsafe on a real chain — natural
-            # single-block reorgs happen, and "dust" bounds the LOSS, not the reorg
-            # PROBABILITY. Require >= 2 (reorg-gate plan, security review). The
-            # conventional value is 6; a chosen dust value of 2-3 is defensible if
-            # recorded as below-conventional. 0/1 are rejected fail-closed.
-            depth_blocks = depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=self.block_interval_s).value
-            if depth_blocks < _MIN_REORG_DEPTH_BLOCKS:
-                raise ValidationError(
-                    f"MarginPolicy.{label} = {depth_blocks} blk < safety floor {_MIN_REORG_DEPTH_BLOCKS}; "
-                    "a 0/1-block reorg depth defeats the gate (single-block reorgs occur on real chains)"
-                )
-
-        # rxd_claim_inclusion is validated SEPARATELY because its floor is different: 1, not
-        # _MIN_REORG_DEPTH_BLOCKS. It is not a reorg depth — it is the blocks a claim needs to be
-        # MINED before its burial can start, and one is the arithmetic minimum (a claim broadcast
-        # at height H cannot be mined at H).
+        # EVERY Timelock FIELD IS CHECKED, DERIVED FROM THE DATACLASS — not from a hand-kept list.
         #
-        # It was omitted from the loop above when #511 added it, which is a fail-OPEN omission:
-        # `rxd_claim_inclusion=Timelock(0)` was accepted and silently restored the pre-#511 floor
-        # this field exists to raise, and a bare `int` was accepted at construction and failed much
-        # later with an AttributeError instead of a fail-closed ValidationError.
-        if not isinstance(self.rxd_claim_inclusion, Timelock):
-            raise ValidationError("MarginPolicy.rxd_claim_inclusion must be a Timelock")
-        inclusion_blocks = self.rxd_claim_inclusion.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=self.block_interval_s
-        ).value
-        if inclusion_blocks < 1:
-            raise ValidationError(
-                f"MarginPolicy.rxd_claim_inclusion = {inclusion_blocks} blk < 1; a claim cannot be "
-                "mined in the block it is broadcast in, so zero reserves nothing and restores the "
-                "floor #511 raised"
-            )
+        # The list was hand-kept, and `rxd_claim_inclusion` was simply left off it when #511 added
+        # the field: `Timelock(0)` was accepted and silently restored the pre-#511 floor the field
+        # exists to raise, and a bare `int` was accepted at construction to fail much later with an
+        # AttributeError instead of a fail-closed ValidationError. The first fix hand-typed a
+        # fourth check beside the other three — the same shape, one instance later.
+        #
+        # `_TIMELOCK_FLOORS` is checked against the dataclass's own fields in both directions by
+        # `tests/test_margin_policy_validates_every_timelock_field.py`, so a field added without a
+        # floor, or a floor naming a field that no longer exists, is a failing test rather than a
+        # gap nobody notices.
+        for label, floor in _TIMELOCK_FLOORS.items():
+            value = getattr(self, label)
+            if not isinstance(value, Timelock):
+                raise ValidationError(f"MarginPolicy.{label} must be a Timelock")
+            blocks = value.normalize_to(TimeUnit.BLOCKS, block_interval_s=self.block_interval_s).value
+            if blocks < floor:
+                raise ValidationError(
+                    f"MarginPolicy.{label} = {blocks} blk < safety floor {floor}. "
+                    + (
+                        "A 0/1-block reorg depth defeats the gate (single-block reorgs occur on real chains)."
+                        if floor >= _MIN_REORG_DEPTH_BLOCKS
+                        else "A claim cannot be mined in the block it is broadcast in, so zero reserves nothing."
+                    )
+                )
         if self.require_measured and not self.is_measured:
             raise ValidationError(
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
