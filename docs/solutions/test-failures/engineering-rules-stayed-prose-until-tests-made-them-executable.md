@@ -386,6 +386,38 @@ Why no test caught it: every unit test constructs terms by hand, so **nothing ev
 an operator gets by typing the command with no flags.** A runner can be unusable as shipped while
 its suite is entirely green.
 
+### The one the whole sweep was still wrong about
+
+Continuing the audit past the four above found a defect larger than any of them, in the shared
+derivation the sweep had just introduced.
+
+`derive_counter_timelock` solves the margin inequality to **equality** — the largest `t_btc` the
+gate accepts. But it accepts it only at `elapsed_blocks=0`, and the coordinator never calls it that
+way: `pre_btc_lock_check` passes `elapsed_blocks=cov_confs`, the covenant's confirmation count, and
+the gate does `rxd_blocks -= elapsed_blocks` before judging. The taker refuses to fund BTC until the
+covenant has confirmed, so `cov_confs` is never 0 on a real run.
+
+Measured across `t_rxd` of 120, 200 and 400: the derived terms passed at `elapsed=0` and **at no
+other value**. The maker locks the Radiant leg, the pre-lock gate then refuses the terms the same
+module derived, and the swap stalls to the CSV refund with funds committed.
+
+**Every test around this constructed terms by hand and called the gate with the default
+`elapsed_blocks=0`.** The assertions were load-bearing. The fixtures were internally consistent.
+They would survive mutation testing. And the scenario they set up cannot occur in production, so
+the defect lived exactly in the gap between the fixture and the real call — the failure mode this
+repository already had a name for, reached this time not by a bad value but by an *omitted
+argument's default*.
+
+> **A default parameter value is a fixture.** `elapsed_blocks: int = 0` put a production-impossible
+> scenario in every test that did not think about it, and reading those tests gives no hint,
+> because the wrong value is the one you did not type.
+
+The fix makes the omission impossible rather than merely fixed: `elapsed_reserve_blocks` is a
+**required** keyword — leaving it out is a `TypeError` — and the derivation reserves headroom so
+the produced `t_btc` survives `elapsed` anywhere in `[0, reserve]`. That range is the test, and it
+is a derived relation rather than a copied number: a companion case asserts the reserve covers
+every runner's `--taker-min-rxd-confs` floor, read out of the runners themselves.
+
 ### Mechanisms added
 
 | level | mechanism | catches |

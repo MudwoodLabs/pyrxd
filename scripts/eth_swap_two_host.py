@@ -77,6 +77,7 @@ from _dust_swap_shared import (
     add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
+    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
@@ -279,6 +280,7 @@ def _terms_from_public(
             margin_blocks=margin_blocks,
             rxd_block_interval_s=rxd_block_interval_s,
             btc_block_interval_s=btc_block_interval_s,
+            elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
         ),
         bt.TimeUnit.BLOCKS,
     )

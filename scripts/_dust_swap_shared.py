@@ -631,12 +631,30 @@ async def wait_for_covenant_via_leg(
         await asyncio.sleep(poll_s)
 
 
+#: RADIANT blocks of headroom the derived counter leg must survive.
+#:
+#: ``assert_timelock_margin`` is called from ``pre_btc_lock_check`` as
+#: ``elapsed_blocks=cov_confs`` — the covenant's CONFIRMATION COUNT — and it does
+#: ``rxd_blocks -= elapsed_blocks`` before judging. The taker refuses to fund BTC until the
+#: covenant has confirmed, so ``cov_confs`` is NEVER 0 on a real run.
+#:
+#: A derivation that solves the gate's inequality to equality therefore produces terms the
+#: production gate ALWAYS refuses — it passes only at ``elapsed=0``, which never occurs. That
+#: shipped, and it was found by testing the derivation against the call the coordinator really
+#: makes rather than against the one the unit tests make.
+#:
+#: 12 blocks is ~1 h at the 300 s nominal and ~44 min at the 222 s measured median: the covenant
+#: confirming, the taker's depth floor, and the operational gap before it funds.
+PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS = 12
+
+
 def derive_counter_timelock(
     *,
     t_rxd_blocks: int,
     margin_blocks: int,
     rxd_block_interval_s: float,
     btc_block_interval_s: float,
+    elapsed_reserve_blocks: int,
     rxd_flag: str = "--t-rxd-blocks",
 ) -> int:
     """Derive ``t_btc`` (BITCOIN blocks) from ``t_rxd`` (RADIANT blocks), IN SECONDS.
@@ -650,7 +668,7 @@ def derive_counter_timelock(
     The gate this must satisfy is ``t_rxd * i_rxd >= t_btc * i_btc + margin * i_btc``. Solving for
     the largest safe ``t_btc``::
 
-        t_btc = floor((t_rxd * i_rxd) / i_btc) - margin
+        t_btc = floor(((t_rxd - elapsed_reserve) * i_rxd) / i_btc) - margin
 
     At 600/300 that is ``t_rxd/2 - margin``, so a Radiant leg buys HALF as many Bitcoin blocks —
     which is the whole point the raw subtraction obscured.
@@ -662,11 +680,21 @@ def derive_counter_timelock(
     """
     if rxd_block_interval_s <= 0 or btc_block_interval_s <= 0:
         raise SystemExit("block intervals must be positive to derive a counter-leg timelock")
-    usable_btc_blocks = int((t_rxd_blocks * rxd_block_interval_s) // btc_block_interval_s)
+    if not isinstance(elapsed_reserve_blocks, int) or isinstance(elapsed_reserve_blocks, bool):
+        raise SystemExit("elapsed_reserve_blocks must be an int")
+    if elapsed_reserve_blocks < 0:
+        raise SystemExit("elapsed_reserve_blocks must be >= 0")
+    # Derive against the WORST case the gate will judge, not the best. The gate subtracts the
+    # covenant's confirmations from t_rxd, so reserving them here is what makes the produced
+    # t_btc survive `elapsed` anywhere in [0, elapsed_reserve_blocks].
+    budget_rxd_blocks = t_rxd_blocks - elapsed_reserve_blocks
+    usable_btc_blocks = int((budget_rxd_blocks * rxd_block_interval_s) // btc_block_interval_s)
     t_btc_blocks = usable_btc_blocks - margin_blocks
     if t_btc_blocks < 1:
         # The smallest t_rxd that yields t_btc >= 1, inverted from the relation above.
-        need = int(-(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s))
+        need = elapsed_reserve_blocks + int(
+            -(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s)
+        )
         raise SystemExit(
             f"{rxd_flag} {t_rxd_blocks} leaves no room for a counter leg: {t_rxd_blocks} Radiant "
             f"blocks is {t_rxd_blocks * rxd_block_interval_s / 3600:.2f} h, and the "

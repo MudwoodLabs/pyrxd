@@ -70,6 +70,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
+    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
     measured_margin_from_mainnet,
     merge_into_mode_600,
@@ -139,6 +140,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             margin_blocks=margin_blocks,
             rxd_block_interval_s=policy.rxd_block_interval_s,
             btc_block_interval_s=policy.block_interval_s,
+            elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
         ),
         bt.TimeUnit.BLOCKS,
     )

@@ -8,6 +8,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The derived counter-leg timelock was refused by the gate it was derived from.**
+  `derive_counter_timelock` solved the margin inequality to equality — the largest `t_btc` the
+  gate accepts **at `elapsed_blocks=0`**. But `pre_btc_lock_check` calls
+  `assert_timelock_margin(..., elapsed_blocks=cov_confs)`, the covenant's confirmation count, and
+  the gate does `rxd_blocks -= elapsed_blocks` before judging. The taker refuses to fund BTC until
+  the covenant has confirmed, so `cov_confs` is never 0 on a real run.
+
+  Measured: the derived terms passed at `elapsed=0` and **at no other value**, for every `t_rxd`
+  tried. The maker would lock the Radiant leg, the pre-BTC-lock gate would then refuse its own
+  derived terms, and the swap would stall to the CSV refund with funds committed.
+
+  The derivation now reserves `PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS` (12 Radiant blocks, ~1 h
+  nominal) so the produced `t_btc` survives `elapsed` anywhere in `[0, reserve]`, and
+  `elapsed_reserve_blocks` is a **required** keyword — omitting it is a `TypeError`, not a silently
+  unsafe default. A test asserts the reserve covers every runner's `--taker-min-rxd-confs` floor,
+  derived from the runners rather than copied from them.
+
+  Every unit test around this built terms by hand and called the gate with the default
+  `elapsed_blocks=0`. The assertions were load-bearing and the fixture was internally consistent;
+  the situation it set up simply could not occur in production.
+
 - **`build_p2pkh_with_csv_script` accepted a relative time-lock of ZERO.** It refused the
   disable-bit spelling of a no-op lock with an explicit error, and accepted a zero unit count —
   the same no-op — emitting `OP_0 OP_CSV OP_DROP` for a caller that asked to be time-locked. The

@@ -28,7 +28,7 @@ import pytest
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "scripts"))
 
-from _dust_swap_shared import derive_counter_timelock
+from _dust_swap_shared import PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS, derive_counter_timelock
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.gravity.swap_coordinator import MarginPolicy, assert_timelock_margin
@@ -82,6 +82,7 @@ def test_shipped_defaults_survive_the_gate(path):
         margin_blocks=margin,
         rxd_block_interval_s=i_rxd,
         btc_block_interval_s=i_btc,
+        elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     )
     policy = MarginPolicy(
         margin=bt.Timelock(margin, bt.TimeUnit.BLOCKS),
@@ -90,4 +91,13 @@ def test_shipped_defaults_survive_the_gate(path):
         rxd_block_interval_s=i_rxd,
         accept_flat_burial=True,
     )
-    assert_timelock_margin(bt.Timelock(t_btc, bt.TimeUnit.BLOCKS), bt.Timelock(t_rxd, bt.TimeUnit.BLOCKS), policy)
+    # Across the whole reserved range, NOT just elapsed=0. The coordinator passes
+    # `elapsed_blocks=cov_confs` and the taker never funds BTC at 0 confirmations, so a check
+    # at 0 alone exercises a call production never makes.
+    for elapsed in range(PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS + 1):
+        assert_timelock_margin(
+            bt.Timelock(t_btc, bt.TimeUnit.BLOCKS),
+            bt.Timelock(t_rxd, bt.TimeUnit.BLOCKS),
+            policy,
+            elapsed_blocks=elapsed,
+        )

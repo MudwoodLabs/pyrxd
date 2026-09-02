@@ -48,6 +48,7 @@ from _dust_swap_shared import (
     add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
+    PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
     derive_counter_timelock,
     merge_into_mode_600,
     read_own_private_file,
@@ -766,6 +767,7 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: d
             margin_blocks=args.margin_blocks,
             rxd_block_interval_s=args.rxd_block_interval_s,
             btc_block_interval_s=args.btc_block_interval_s,
+            elapsed_reserve_blocks=PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS,
         ),
         bt.TimeUnit.BLOCKS,
     )
