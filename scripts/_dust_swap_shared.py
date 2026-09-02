@@ -629,3 +629,52 @@ async def wait_for_covenant_via_leg(
         except Exception as exc:  # not funded yet, or funded with the wrong amount
             print(f"  not yet: {str(exc)[:110]}")
         await asyncio.sleep(poll_s)
+
+
+def derive_counter_timelock(
+    *,
+    t_rxd_blocks: int,
+    margin_blocks: int,
+    rxd_block_interval_s: float,
+    btc_block_interval_s: float,
+    rxd_flag: str = "--t-rxd-blocks",
+) -> int:
+    """Derive ``t_btc`` (BITCOIN blocks) from ``t_rxd`` (RADIANT blocks), IN SECONDS.
+
+    ONE DEFINITION, because there were three and they were all wrong the same way. Each runner
+    computed ``t_btc = t_rxd - margin - 4``, subtracting a BITCOIN-block margin from a RADIANT-block
+    count as though the two were the same unit. At the real rates (~600 s vs ~300 s) that yields a
+    NEGATIVE wall-clock margin at every realistic parameter — the layout in which the maker refunds
+    the leg it locked and still claims the other with ``p`` (#567).
+
+    The gate this must satisfy is ``t_rxd * i_rxd >= t_btc * i_btc + margin * i_btc``. Solving for
+    the largest safe ``t_btc``::
+
+        t_btc = floor((t_rxd * i_rxd) / i_btc) - margin
+
+    At 600/300 that is ``t_rxd/2 - margin``, so a Radiant leg buys HALF as many Bitcoin blocks —
+    which is the whole point the raw subtraction obscured.
+
+    Raises ``SystemExit`` (an operator-facing message naming the flag) when no positive ``t_btc``
+    exists. ``refund_leaf_script`` also refuses a zero-block leaf by construction, so this cannot be
+    bypassed by a caller that forgets to check — but a message about "0 blocks" from deep inside a
+    script builder does not tell an operator WHICH flag to change, and this does.
+    """
+    if rxd_block_interval_s <= 0 or btc_block_interval_s <= 0:
+        raise SystemExit("block intervals must be positive to derive a counter-leg timelock")
+    usable_btc_blocks = int((t_rxd_blocks * rxd_block_interval_s) // btc_block_interval_s)
+    t_btc_blocks = usable_btc_blocks - margin_blocks
+    if t_btc_blocks < 1:
+        # The smallest t_rxd that yields t_btc >= 1, inverted from the relation above.
+        need = int(-(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s))
+        raise SystemExit(
+            f"{rxd_flag} {t_rxd_blocks} leaves no room for a counter leg: {t_rxd_blocks} Radiant "
+            f"blocks is {t_rxd_blocks * rxd_block_interval_s / 3600:.2f} h, and the "
+            f"{margin_blocks}-block margin alone is "
+            f"{margin_blocks * btc_block_interval_s / 3600:.2f} h.\n"
+            f"  raise {rxd_flag} to at least {need}, or lower --margin-blocks.\n"
+            "  (t_btc is derived in WALL CLOCK since #567: a Radiant block is worth about half a "
+            "Bitcoin block, so a Radiant leg buys half as many counter-leg blocks as its raw count "
+            "suggests.)"
+        )
+    return t_btc_blocks

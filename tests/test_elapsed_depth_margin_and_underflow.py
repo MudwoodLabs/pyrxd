@@ -100,18 +100,31 @@ class TestACounterLegCannotMatureInItsOwnFundingBlock:
         terms = _terms(hashlock=h, t_rxd_blocks=80, t_btc_blocks=1)
         assert terms.t_btc.value == 1
 
-    def test_the_zero_script_this_prevents_really_is_immediately_spendable(self) -> None:
-        """Why the refusal exists, stated in the bytes rather than asserted in prose.
+    def test_the_PRODUCER_refuses_a_zero_leaf_so_no_caller_can_build_one(self) -> None:
+        """Why the refusal exists, and where it now lives.
 
-        `OP_0 OP_CSV OP_DROP` is a relative timelock of zero — satisfied in the funding block
-        itself. This is what the guard above stops being constructible.
+        `OP_0 OP_CSV OP_DROP` — the `00b275` prefix — is a relative timelock of ZERO, satisfied in
+        the funding block itself. The refund branch would be spendable immediately.
+
+        THIS TEST USED TO BUILD THAT SCRIPT to show the danger. It can no longer build it, which is
+        the point: the floor moved from three runner scripts into `refund_leaf_script` itself, so
+        the bad bytes are unrepresentable rather than merely unreached. A guard beside the dangerous
+        operation has to be remembered by every caller; a guard inside it does not.
+
+        The `00b275` shape is still pinned — via the raw encoder, so the demonstration survives
+        without the producer being willing to emit it.
         """
         import coincurve
 
-        from pyrxd.btc_wallet.taproot import refund_leaf_script
+        from pyrxd.btc_wallet.taproot import _OP_CSV, _OP_DROP, _push_minimal_int, refund_leaf_script
+
+        # what a zero CSV encodes to, straight from the primitives
+        assert (_push_minimal_int(0) + _OP_CSV + _OP_DROP).hex().startswith("00b275")
 
         xonly = coincurve.PublicKeyXOnly.from_secret(bytes(range(1, 33))).format()
-        assert refund_leaf_script(xonly, _blk(0)).hex().startswith("00b275")
+        with pytest.raises(ValidationError, match="no-op"):
+            refund_leaf_script(xonly, _blk(0))
+        # ...and the honest neighbour still builds, and is not the zero shape.
         assert not refund_leaf_script(xonly, _blk(1)).hex().startswith("00b275")
 
 
