@@ -99,15 +99,15 @@ def _inspect_outpoint(s: str) -> dict:
         raise UserError("outpoint failed to parse", cause=msg) from exc
 
 
-def _inspect_script(script_hex: str) -> dict:
+def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError``."""
     try:
-        return _inspect_script_core(script_hex)
+        return _inspect_script_core(script_hex, network=network)
     except ValidationError as exc:
         raise UserError(str(exc)) from exc
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
+def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
 
@@ -116,7 +116,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     CLI's three-line ``error / cause / fix`` formatting so existing
     test assertions (e.g. on ``"--electrumx"``) keep matching."""
     try:
-        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout)
+        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network)
     except ValidationError as exc:
         msg = str(exc)
         if "raw bytes too short" in msg:
@@ -166,7 +166,9 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         raise UserError(msg) from exc
 
 
-async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None) -> dict:
+async def _inspect_txid_inner(
+    client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None, network: str = "mainnet"
+) -> dict:
     """Fetch *txid_hex* via *client* and classify every output.
 
     Thin async wrapper around :func:`_classify_raw_tx`. The split is so
@@ -186,7 +188,7 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
         raise UserError("invalid txid", cause=str(exc)) from exc
 
     raw = await client.get_transaction(txid)
-    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout)
+    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
 
 
 def _render_txid_human(payload: dict) -> str:
@@ -773,7 +775,7 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool,
     elif form == "outpoint":
         payload = _inspect_outpoint(value)
     elif form == "script":
-        payload = _inspect_script(value)
+        payload = _inspect_script(value, network=ctx.network)
     else:  # pragma: no cover — _classify_input never returns other values
         raise UserError(f"internal: unknown form {form!r}")
 
@@ -807,7 +809,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
         client = ctx.make_client()
         async with client:
             if form == "txid":
-                return await _inspect_txid_inner(client, value)
+                return await _inspect_txid_inner(client, value, network=ctx.network)
             # form == "outpoint" + resolve: parse, fetch the source, classify
             # only the named vout.
             outpoint_payload = _inspect_outpoint(value)
@@ -815,6 +817,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
                 client,
                 outpoint_payload["txid"],
                 only_vout=outpoint_payload["vout"],
+                network=ctx.network,
             )
 
     try:

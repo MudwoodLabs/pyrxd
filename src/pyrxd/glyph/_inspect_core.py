@@ -326,7 +326,7 @@ def _ref_summary(script: bytes) -> dict:
     return {"token_bearing": bool(carried), "input_refs": carried, "referenced_refs": named}  # nosec B105
 
 
-def _inspect_script(script_hex: str) -> dict:
+def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
     from ..script.timelock import parse_p2pkh_timelock_script
     from .dmint import DmintState
@@ -425,16 +425,34 @@ def _inspect_script(script_hex: str) -> dict:
             }
             if mark.ok:
                 out["type"] = f"op_return-hashmark-v{mark.version}"
-                # ATTEST, now that we can. The signed statement includes the
-                # chain's genesis hash — the verified context the tx was found
-                # in — and a pasted script carries no such context, so mainnet is
-                # ASSUMED and the assumption is reported rather than hidden. The
-                # same bytes on another chain are a different statement.
-                att = verify_attestation(mark, network_genesis=RADIANT_MAINNET_GENESIS)
+                # ATTEST, now that we can. The signed statement includes the chain's
+                # genesis hash, so THE SAME BYTES ON ANOTHER CHAIN ARE A DIFFERENT
+                # STATEMENT and verify against a different key.
+                #
+                # §6.3 step 2 says to use the genesis of the chain the transaction was
+                # actually found on. Mainnet was hardcoded, so `--network testnet
+                # glyph inspect` attested against mainnet and announced
+                # "assuming radiant-mainnet" — an answer to a question the user had
+                # explicitly not asked.
+                #
+                # Mainnet remains the DEFAULT rather than an error, because a pasted
+                # script genuinely carries no context and refusing to attest it would
+                # be worse than assuming and saying so. The --fetch path knows the
+                # chain it read from and now passes it.
+                from ..network.registry import genesis_hash_for
+
+                # An unknown network falls back to mainnet AND SAYS MAINNET. Reporting
+                # the requested name beside a mainnet genesis would state an assumption
+                # the code did not make, which is worse than the hardcoding this
+                # replaces: the reader could not tell the verdict was against a
+                # different chain.
+                genesis = genesis_hash_for(network)
+                assumed = network if genesis else "mainnet"
+                att = verify_attestation(mark, network_genesis=genesis or RADIANT_MAINNET_GENESIS)
                 out["hashmark"]["attestation"] = {
                     "outcome": att.outcome.value,
                     "recovered_hash160": att.recovered_hash160_hex,
-                    "assumed_network": "radiant-mainnet",
+                    "assumed_network": f"radiant-{assumed}",
                     "detail": att.detail,
                 }
         return out
@@ -729,7 +747,7 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
+def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
     Synchronous, network-free core. The CLI's ``--fetch`` path wraps this
@@ -803,7 +821,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     for idx, out in enumerated:
         try:
             script_bytes = out.locking_script.serialize()
-            row = _inspect_script(script_bytes.hex())
+            row = _inspect_script(script_bytes.hex(), network=network)
             row.pop("form", None)  # always "script" — redundant inside a tx listing
             row["vout"] = idx
             row["satoshis"] = out.satoshis

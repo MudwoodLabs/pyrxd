@@ -359,3 +359,72 @@ class TestWaveIdentityNamesAreSanitized:
         stored = record["wave_identity"]["names"]
         assert "\x1b" not in stored[0], "the escape reached the stored record"
         assert stored[1] == "honest.rxd", "an ordinary name must survive untouched"
+
+
+class TestTheAttestationUsesTheChainItWasFoundOn:
+    """§6.3 step 2: rebuild the statement with the genesis of the chain the
+    transaction was ACTUALLY found on.
+
+    The genesis hash is inside the signed statement, so the same bytes on another
+    chain are a different statement and verify against a different key. Mainnet was
+    hardcoded, so `pyrxd --network testnet glyph inspect ...` attested against
+    mainnet and announced "assuming radiant-mainnet" — an answer to a question the
+    user had explicitly not asked.
+
+    Mainnet stays the DEFAULT rather than becoming an error: a pasted script
+    genuinely carries no context, and refusing to attest it would be worse than
+    assuming and saying so.
+    """
+
+    SCRIPT = (
+        b"\x6a\x08HASHMARK\x02"
+        + bytes([2, 1])
+        + b"\x20"
+        + bytes(32)
+        + b"\x14"
+        + bytes(20)
+        + b"\x41"
+        + bytes([31])
+        + bytes(64)
+    ).hex()
+
+    def _assumed(self, network: str) -> str:
+        from pyrxd.glyph._inspect_core import _inspect_script
+
+        return _inspect_script(self.SCRIPT, network=network)["hashmark"]["attestation"]["assumed_network"]
+
+    @pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+    def test_each_known_network_is_used_and_reported(self, network: str) -> None:
+        assert self._assumed(network) == f"radiant-{network}"
+
+    def test_the_default_is_still_mainnet(self) -> None:
+        from pyrxd.glyph._inspect_core import _inspect_script
+
+        assert _inspect_script(self.SCRIPT)["hashmark"]["attestation"]["assumed_network"] == "radiant-mainnet"
+
+    def test_the_genesis_used_actually_DIFFERS_per_network(self) -> None:
+        """Guards the tests above. If these ever coincided, reporting the right name
+        beside the wrong genesis would look identical to correct behaviour."""
+        from pyrxd.network.registry import genesis_hash_for
+
+        hashes = {genesis_hash_for(n) for n in ("mainnet", "testnet", "regtest")}
+        assert len(hashes) == 3 and None not in hashes
+
+    def test_an_unknown_network_falls_back_to_mainnet_AND_SAYS_SO(self) -> None:
+        """The label must never disagree with the genesis actually used. Reporting
+        the requested name beside a mainnet genesis would state an assumption the
+        code did not make — worse than the hardcoding this replaced, because the
+        reader could not tell the verdict was against a different chain."""
+        assert self._assumed("nonesuch") == "radiant-mainnet"
+
+    def test_the_CLI_passes_its_network_at_every_entry_point(self) -> None:
+        """Reachability: the parameter exists and is threaded, but a call site that
+        forgets it silently reverts to the hardcoded behaviour."""
+        import inspect as _i
+
+        from pyrxd.cli import glyph_inspect
+
+        source = _i.getsource(glyph_inspect)
+        for call in ("_inspect_script(value", "_inspect_txid_inner(client, value"):
+            index = source.index(call)
+            assert "network=ctx.network" in source[index : index + 200], call
