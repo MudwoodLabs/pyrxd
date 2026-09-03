@@ -168,3 +168,59 @@ class TestGuardsThatMustNotRefuseValidWork:
         )
         result = verify_attestation(record)  # must not raise
         assert result.outcome.value == "invalid_signature" and expected in (result.detail or "")
+
+
+class TestLoweringTheScriptFloorDidNotSwALLOWOtherForms:
+    """`_MIN_SCRIPT_HEX_LEN` went 46 -> 12 so short `msg` outputs stop being refused.
+
+    Loosening a guard is the change most worth re-attacking: the floor was also,
+    incidentally, what stopped very short input from being treated as a script at
+    all. These pin what must still hold — a dispatcher that started swallowing
+    txids would be a far worse bug than the one being fixed.
+
+    One behaviour DID change and it is a deliberate trade: a truncated txid now
+    renders as an unrecognised script rather than "could not classify input". The
+    rescued case (a real on-chain `msg` as small as 6 bytes) is worth more than the
+    sharper error message for a typo, and nothing about it is unsafe.
+    """
+
+    @pytest.mark.parametrize(
+        "value,expected_form",
+        [
+            ("ab" * 32, "txid"),
+            ("ab" * 32 + ":0", "outpoint"),
+            ((b"\x6a\x03msg\x02hi").hex(), "script"),
+        ],
+        ids=["txid", "outpoint", "short msg"],
+    )
+    def test_each_form_still_dispatches_to_itself(self, value: str, expected_form: str) -> None:
+        from pyrxd.glyph._inspect_core import _classify_input
+
+        assert _classify_input(value)[0] == expected_form
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            # Refused BY THE FLOOR: valid, even-length hex that is simply too short to
+            # be any script. Without one of these the class below is a fiction — every
+            # other case here is refused by a different check, so dropping the floor to
+            # zero passed the whole class and I nearly shipped a test that pinned
+            # nothing.
+            "6a03",
+            "ab",
+            # Refused by the other checks, kept so the dispatcher's whole contract is
+            # pinned in one place.
+            "abc",
+            "hello world!",
+            "",
+            "6a" * 20_000,
+        ],
+        ids=["too short (floor)", "2 chars (floor)", "odd-length hex", "not hex", "empty", "oversize"],
+    )
+    def test_junk_is_still_refused(self, value: str) -> None:
+        """The floor is lower, not gone. A guard that refuses nothing is not a guard."""
+        from pyrxd.glyph._inspect_core import _classify_input
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError):
+            _classify_input(value)

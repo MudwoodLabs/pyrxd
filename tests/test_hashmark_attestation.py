@@ -428,3 +428,89 @@ class TestTheAttestationUsesTheChainItWasFoundOn:
         for call in ("_inspect_script(value", "_inspect_txid_inner(client, value"):
             index = source.index(call)
             assert "network=ctx.network" in source[index : index + 200], call
+
+
+class TestTheLabelTableMatchesTheSPEC:
+    """Every codepoint §5.4's table names, enumerated — not one per row.
+
+    The implementation stores ranges (`0x00-0x1F`, `0x202A-0x202E`) and the tests
+    above sample one member of each. That is a hand-kept set checked by a hand-kept
+    set: an off-by-one at a range edge, or a row transcribed with the wrong endpoint,
+    passes both. The spec's table is small enough to write out in full, so it is.
+
+    Both directions, because a table that over-rejects is also wrong: U+200C and
+    U+200D are explicitly exempted as joiners that "cannot reorder anything and are
+    load-bearing in Devanagari and emoji sequences", and refusing them would refuse
+    honest labels in several scripts.
+    """
+
+    #: §5.4, every codepoint named, expanded from the ranges the spec writes.
+    SPEC_REJECTED = (
+        *range(0x00, 0x20),  # C0
+        0x7F,  # DEL
+        *range(0x80, 0xA0),  # C1
+        0x2028,  # line separator
+        0x2029,  # paragraph separator
+        0x061C,  # ALM
+        0x200B,  # ZWSP
+        0x200E,  # LRM
+        0x200F,  # RLM
+        *range(0x202A, 0x202F),  # embeddings and overrides
+        *range(0x2066, 0x206A),  # isolates
+        0xFEFF,  # BOM / ZWNBSP
+    )
+    #: Explicitly NOT rejected by the same section.
+    SPEC_ALLOWED = (0x200C, 0x200D)
+
+    def test_every_codepoint_the_spec_rejects_is_rejected(self) -> None:
+        from pyrxd.script.hashmark import _label_defect
+
+        accepted = [f"U+{c:04X}" for c in self.SPEC_REJECTED if _label_defect(f"a{chr(c)}b") is None]
+        assert not accepted, f"§5.4 names these as rejected and the decoder accepts them: {accepted}"
+
+    def test_no_codepoint_the_spec_allows_is_rejected(self) -> None:
+        from pyrxd.script.hashmark import _label_defect
+
+        refused = [f"U+{c:04X}" for c in self.SPEC_ALLOWED if _label_defect(f"a{chr(c)}b") is not None]
+        assert not refused, f"§5.4 exempts these joiners and the decoder refuses them: {refused}"
+
+    def test_the_edges_of_each_range_are_covered(self) -> None:
+        """A range written one short at either end still passes a one-per-row sample."""
+        from pyrxd.script.hashmark import _label_defect
+
+        for lo, hi in ((0x00, 0x1F), (0x80, 0x9F), (0x202A, 0x202E), (0x2066, 0x2069)):
+            assert _label_defect(f"a{chr(lo)}b") is not None, f"low edge U+{lo:04X}"
+            assert _label_defect(f"a{chr(hi)}b") is not None, f"high edge U+{hi:04X}"
+
+    def test_the_characters_just_OUTSIDE_each_range_are_allowed(self) -> None:
+        """The other half — a range written one too WIDE refuses honest text. U+0020
+        is a space and U+00A0 a non-breaking space; both are ordinary label content."""
+        from pyrxd.script.hashmark import _label_defect
+
+        # NB U+2029 is NOT a valid "just outside" probe for the U+202A range: the
+        # spec rejects it separately as a paragraph separator. Writing it here as
+        # `0x202A - 1` is the mistake this list exists to avoid making in the code.
+        for cp in (0x20, 0xA0, 0x202F, 0x2030, 0x206A, 0x2027, 0x2065, 0x0619):
+            assert _label_defect(f"a{chr(cp)}b") is None, f"U+{cp:04X} is outside every rejected range"
+
+    def test_a_decoder_NEVER_substitutes_U_FFFD(self) -> None:
+        """§5.4: "Malformed sequences are a malformed record, not text with odd
+        characters in it — a decoder must not substitute U+FFFD"."""
+        from pyrxd.script.hashmark import HashMarkOutcome, decode_hashmark
+
+        raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + _push(b"\xff\xfe bad")
+        record = decode_hashmark(raw)
+        assert record.outcome is HashMarkOutcome.INVALID
+        assert "�" not in (record.label or ""), "a substituted replacement character IS the defect"
+
+    def test_a_zero_length_label_push_is_NOT_HASHMARK(self) -> None:
+        """§5.4 says an empty label is not representable, and §6.1 step 2 says a
+        non-minimal push fails BEFORE the magic is read — "no magic seen yet, so no
+        HashMark claim". A zero-length push is `OP_0`, which §4.1 rejects, so the
+        outcome is NOT_HASHMARK rather than INVALID. Pinned because the plausible
+        wrong answer (INVALID, since the magic is right there in the bytes) reads
+        more helpful and is what a reasonable person would implement."""
+        from pyrxd.script.hashmark import HashMarkOutcome, decode_hashmark
+
+        raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + b"\x00"
+        assert decode_hashmark(raw).outcome is HashMarkOutcome.NOT_HASHMARK
