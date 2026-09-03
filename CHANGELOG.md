@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd inspect` decodes the Photonic `msg` data carrier.** `OP_RETURN PUSH3 "msg"
+  <push> <message>` — the only OP_RETURN format with real volume on Radiant: measured
+  across 20 consecutive mainnet blocks, **73 of 73** data outputs carried this marker and
+  nothing else did. pyrxd already WROTE these and could not read one back, so the
+  commonest data output on the chain rendered as opaque hex. Non-UTF-8 bytes are reported
+  rather than refused — they are already on chain — and display sanitisation happens at
+  the render boundary so the raw bytes stay recoverable for a caller verifying them.
+
 ### Fixed
 
 - **Containers classified as `nft`/`mut` — the container branch was dead code (#578).**

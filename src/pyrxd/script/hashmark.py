@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from ..constants import OpCode
-from .script import Script
+from .script import data_pushes_after_op_return
 
 __all__ = [
     "HASHMARK_MAGIC",
@@ -100,30 +100,6 @@ class HashMarkRecord:
         return self.outcome is HashMarkOutcome.OK
 
 
-def _pushes(script: bytes) -> list[bytes] | None:
-    """Every push after the leading ``OP_RETURN``, or None if the script is not
-    cleanly push-only from offset 1.
-
-    Returns None rather than raising: at this point no magic has been seen, so
-    the output has not yet claimed to be a HashMark and a parse failure means
-    "some other protocol", not "a broken HashMark".
-    """
-    # allow_malformed: a truncated push must set truncated_at rather than raise.
-    # The spec is explicit that a bad push BEFORE the magic is NOT_HASHMARK — no
-    # HashMark claim has been made yet — and the inspector's contract allows only
-    # ValidationError to escape. Raising here did both wrong; the fuzzer caught it.
-    parsed = Script(script[1:], allow_malformed=True)
-    if parsed.truncated_at is not None:
-        return None
-    out: list[bytes] = []
-    for chunk in parsed.chunks:
-        op = chunk.op[0] if isinstance(chunk.op, bytes) else chunk.op
-        if op > 0x4B:  # not a direct/PUSHDATA data push
-            return None
-        out.append(chunk.data or b"")
-    return out
-
-
 def decode_hashmark(script: bytes) -> HashMarkRecord:
     """Decode a ``scriptPubKey`` as a HashMark record.
 
@@ -133,7 +109,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
     if not script or script[0] != _OP_RETURN:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 
-    pushes = _pushes(script)
+    pushes = data_pushes_after_op_return(script)
     if pushes is None or not pushes or pushes[0] != HASHMARK_MAGIC:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 

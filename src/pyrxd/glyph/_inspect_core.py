@@ -37,6 +37,7 @@ import unicodedata
 
 from ..hash import hash256
 from ..script.hashmark import HashMarkOutcome, decode_hashmark
+from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
@@ -369,6 +370,27 @@ def _inspect_script(script_hex: str) -> dict:
         # additive: anything that is not one stays plain `op_return`, because a
         # scanner meets thousands of other protocols' data outputs and treating
         # them as errors buries the real ones.
+        # The Photonic `msg` convention: OP_RETURN PUSH3 "msg" <push> <message>.
+        # Measured on 20 consecutive mainnet blocks, 73 of 73 OP_RETURN outputs
+        # carried this marker and nothing else did — it is the whole observed
+        # population, and pyrxd already WRITES it. Reading it back turns the
+        # commonest data output on the chain from an opaque blob into its text.
+        msg = decode_message(script)
+        if msg.outcome is not MessageOutcome.NOT_MESSAGE:
+            out["message"] = {
+                "outcome": msg.outcome.value,
+                # SANITISED here, at the display boundary. The message is arbitrary
+                # operator bytes and `repr` does not escape U+202E and friends; the
+                # decoder deliberately returns it unmangled so the raw bytes stay
+                # recoverable, and mangling belongs where it is shown.
+                "text": _sanitize_display_string(msg.text) if msg.text else None,
+                "is_utf8": msg.is_utf8,
+                "byte_length": len(msg.raw) if msg.raw else 0,
+                "detail": msg.detail,
+            }
+            if msg.ok:
+                out["type"] = "op_return-msg"
+
         mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
             out["hashmark"] = {

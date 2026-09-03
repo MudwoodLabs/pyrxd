@@ -365,6 +365,18 @@ def _render_script_human(payload: dict) -> str:
     type_ = payload.get("type", "?")
     head = f"type: {type_}    length: {payload['length']} bytes"
     body: list[str] = []
+    msg = payload.get("message")
+    if msg:
+        if msg["outcome"] == "ok":
+            if msg["is_utf8"]:
+                body.append(f"  message ({msg['byte_length']} bytes): {_truncate_for_human(msg['text'])}")
+            else:
+                # Say WHY there is no text rather than printing nothing, or a caller
+                # assumes the field is empty when the bytes simply are not text.
+                body.append(f"  message: {msg['byte_length']} bytes, not valid UTF-8 (see data_hex)")
+        else:
+            body.append(f"  message: {msg['outcome']}" + (f" — {msg['detail']}" if msg.get("detail") else ""))
+
     hm = payload.get("hashmark")
     if hm:
         # HashMark is a third-party OP_RETURN format (MIT, github.com/cdonnachie/hashmark.rxd).
