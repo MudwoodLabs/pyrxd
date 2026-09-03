@@ -839,6 +839,12 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     try:
         names = asyncio.run(_do())
     except Exception as exc:
-        hm["wave_identity"] = {"resolved": False, "reason": f"lookup failed: {exc}"}
+        # The exception text can contain a server-controlled response body.
+        hm["wave_identity"] = {"resolved": False, "reason": _sanitize_display_string(f"lookup failed: {exc}")}
         return
-    hm["wave_identity"] = {"resolved": True, "names": names}
+    # SANITIZED AT THE BOUNDARY, like every other name the indexer hands back. A
+    # WAVE name is registration text an attacker chooses, and it lands directly
+    # under "signature VERIFIED" — the one line in this output that states an
+    # independently checked cryptographic fact. Raw, it can carry the ANSI to
+    # scroll that line off the screen and reprint it saying something else.
+    hm["wave_identity"] = {"resolved": True, "names": [_sanitize_display_string(n) for n in names]}

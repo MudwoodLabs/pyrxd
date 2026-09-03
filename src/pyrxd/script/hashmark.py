@@ -148,6 +148,46 @@ class HashMarkRecord:
         return self.outcome is HashMarkOutcome.OK
 
 
+#: v1's label cap is a flat number in the spec (§5.4).
+_V1_LABEL_CAP = 128
+
+#: The whole-record ceiling both versions share, in bytes (§5.4, §7).
+_MAX_RECORD_BYTES = 223
+
+
+def _encoded_push_size(n: int) -> int:
+    """Bytes a push of *n* payload bytes occupies, minimally encoded (§4.1)."""
+    return 1 + n if n <= 75 else 2 + n if n <= 255 else 3 + n
+
+
+def _max_label_bytes(digest_len: int) -> int:
+    """The v2 label cap for a given digest length — DERIVED, per §5.4.
+
+    v2 spends 87 bytes on the signer and signature, so the label gets whatever is
+    left of the 223-byte record ceiling. For sha256 that is 88.
+
+    This was hardcoded to 223 — the whole-RECORD ceiling, mistaken for the label's
+    share of it. It was unreachable only because the push walker refused every
+    ``OP_PUSHDATA1``, so no label above 75 bytes could arrive at all; fixing the
+    walker in the same commit is what makes getting this right load-bearing.
+
+    Computed rather than tabulated so that registering a longer digest shrinks the
+    label automatically, instead of silently producing records that stop relaying.
+    """
+    fixed = (
+        1  # OP_RETURN
+        + _encoded_push_size(8)  # magic
+        + _encoded_push_size(2)  # header
+        + _encoded_push_size(digest_len)
+        + _encoded_push_size(20)  # signer hash160
+        + _encoded_push_size(65)  # recoverable signature
+    )
+    # Largest L whose own push still fits. Solved directly rather than by search:
+    # the label push costs 1 + L up to 75, then 2 + L.
+    room = _MAX_RECORD_BYTES - fixed
+    return room - 1 if room - 1 <= 75 else room - 2
+
+
 def decode_hashmark(script: bytes) -> HashMarkRecord:
     """Decode a ``scriptPubKey`` as a HashMark record.
 
@@ -157,7 +197,9 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
     if not script or script[0] != _OP_RETURN:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 
-    pushes = data_pushes_after_op_return(script)
+    # HashMark 4.1: every record has exactly one valid serialization, so a
+    # non-minimal push makes this not-a-HashMark rather than a HashMark to repair.
+    pushes = data_pushes_after_op_return(script, require_minimal=True)
     if pushes is None or not pushes or pushes[0] != HASHMARK_MAGIC:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 
@@ -215,7 +257,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
     label_withheld: str | None = None
     if len(pushes) == expected[1]:
         raw = pushes[-1]
-        cap = 128 if version == 1 else 223
+        cap = _V1_LABEL_CAP if version == 1 else _max_label_bytes(len(digest))
         if not raw or len(raw) > cap:
             return HashMarkRecord(
                 HashMarkOutcome.INVALID, version=version, detail=f"label is {len(raw)} bytes, expected 1..{cap}"
@@ -231,9 +273,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
             if version == 2:
                 # The label is INSIDE the signed statement, so a non-canonical label
                 # is not the label that was signed. The record is invalid.
-                return HashMarkRecord(
-                    HashMarkOutcome.INVALID, version=version, detail=f"label {defect} (spec 5.4)"
-                )
+                return HashMarkRecord(HashMarkOutcome.INVALID, version=version, detail=f"label {defect} (spec 5.4)")
             # v1: the label is not signed and forms no part of any claim, so a
             # dangerous one can misrepresent itself on screen but not a statement.
             # Withhold it and keep the record — invalidating would throw away

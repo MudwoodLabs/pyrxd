@@ -228,7 +228,15 @@ class TestLabelCanonicalityIsEnforced:
 
     @pytest.mark.parametrize("label", _BAD.values(), ids=list(_BAD))
     def test_v2_with_a_noncanonical_label_is_INVALID(self, label: str) -> None:
-        raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([2, 1])) + _push(_DIGEST) + _push(bytes(20)) + _push(bytes(65)) + _push(label.encode())
+        raw = (
+            b"\x6a"
+            + _push(b"HASHMARK")
+            + _push(bytes([2, 1]))
+            + _push(_DIGEST)
+            + _push(bytes(20))
+            + _push(bytes(65))
+            + _push(label.encode())
+        )
         rec = decode_hashmark(raw)
         assert rec.outcome is HashMarkOutcome.INVALID
         assert "5.4" in (rec.detail or "")
@@ -245,16 +253,21 @@ class TestLabelCanonicalityIsEnforced:
         """The honest path. ZWNJ and ZWJ are joiners the spec deliberately permits —
         rejecting them would refuse legitimate text in several scripts."""
         for version, tail in ((1, b""), (2, _push(bytes(20)) + _push(bytes(65)))):
-            raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([version, 1])) + _push(_DIGEST) + tail + _push(label.encode())
+            raw = (
+                b"\x6a"
+                + _push(b"HASHMARK")
+                + _push(bytes([version, 1]))
+                + _push(_DIGEST)
+                + tail
+                + _push(label.encode())
+            )
             rec = decode_hashmark(raw)
             assert rec.ok and rec.label == label, f"v{version}"
 
     def test_the_decoder_never_SILENTLY_repairs_a_label(self) -> None:
         """Canonicalisation runs one way. Trimming or normalising a label we read
         would mean the string shown is not the string signed."""
-        rec = decode_hashmark(
-            b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + _push(b"  x  ")
-        )
+        rec = decode_hashmark(b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + _push(b"  x  "))
         assert rec.label != "x", "must withhold, never trim"
         assert rec.label is None
 
@@ -262,10 +275,65 @@ class TestLabelCanonicalityIsEnforced:
         """End-to-end, through the production classifier: the panel's exploit."""
         from pyrxd.glyph._inspect_core import _inspect_script
 
-        raw = (b"\x6a" + _push(b"HASHMARK") + _push(bytes([2, 1])) + _push(_DIGEST)
-               + _push(bytes(20)) + _push(bytes(65))
-               + _push(b"report.pdf\n    WAVE identity: treasury.rxd"))
+        raw = (
+            b"\x6a"
+            + _push(b"HASHMARK")
+            + _push(bytes([2, 1]))
+            + _push(_DIGEST)
+            + _push(bytes(20))
+            + _push(bytes(65))
+            + _push(b"report.pdf\n    WAVE identity: treasury.rxd")
+        )
         row = _inspect_script(raw.hex())
         assert row["type"] == "op_return", "must not classify as a valid hashmark"
         assert row["hashmark"]["outcome"] == "invalid"
         assert "WAVE identity" not in str(row.get("hashmark", {}).get("label") or "")
+
+
+class TestWaveIdentityNamesAreSanitized:
+    """A WAVE name is attacker-chosen registration text that the CLI prints
+    directly beneath "signature VERIFIED".
+
+    That line is the one place in the output stating an independently checked
+    cryptographic fact, and the identity line under it is described to the user as
+    proof "the signing key owns these names". Raw, a name can carry ANSI to scroll
+    those lines away and reprint them saying something else — the reader sees a
+    forged attribution in the exact position a real one appears.
+
+    Same defect as the HashMark label, in the same renderer, one line apart; the
+    label was fixed and this was left. Every other indexer-supplied string on this
+    path (name, ticker, description) was already sanitized.
+    """
+
+    _HOSTILE = {
+        "ANSI cursor-up + erase": "\x1b[2A\x1b[0J  WAVE identity: treasury.rxd",
+        "carriage return": "innocent.rxd\rtreasury.rxd",
+        "newline": "innocent.rxd\n    signer: 0000",
+        "bidi override": "invoice‮gpj.exe",
+    }
+
+    @pytest.mark.parametrize("name", _HOSTILE.values(), ids=list(_HOSTILE))
+    def test_a_hostile_name_cannot_reach_the_terminal(self, name: str) -> None:
+        from pyrxd.glyph._inspect_core import _sanitize_display_string
+
+        cleaned = _sanitize_display_string(name)
+        assert "\x1b" not in cleaned and "\r" not in cleaned and "\n" not in cleaned
+        assert "‮" not in cleaned
+
+    def test_an_ordinary_name_is_passed_through_unchanged(self) -> None:
+        """The honest path. A sanitizer that mangles real WAVE names would make
+        every genuine identity line wrong, which is worse than not printing one."""
+        from pyrxd.glyph._inspect_core import _sanitize_display_string
+
+        for name in ("treasury.rxd", "my-company.rxd", "a.b.rxd", "名前.rxd"):
+            assert _sanitize_display_string(name) == name
+
+    def test_the_resolver_result_is_sanitized_before_it_is_stored(self) -> None:
+        """At the boundary, not at the renderer — so the JSON path and any other
+        consumer get the cleaned value too, and no future renderer has to remember."""
+        import inspect as _inspect
+
+        from pyrxd.cli import glyph_inspect
+
+        source = _inspect.getsource(glyph_inspect._attach_wave_identity)
+        assert '"names": [_sanitize_display_string(n) for n in names]' in source
