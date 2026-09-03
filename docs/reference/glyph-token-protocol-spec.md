@@ -304,16 +304,23 @@ Notes on individual fields:
 | CBOR body | 262,144 bytes (256 KiB) | `src/pyrxd/glyph/payload.py:51` |
 | `attrs` entries | 64 | `src/pyrxd/glyph/payload.py:58` |
 | `main.t` (MIME type) | 256 characters | `src/pyrxd/glyph/payload.py:67` |
-| `main.b` (media) | 100,000 bytes | `src/pyrxd/glyph/types.py:116-117` |
+| `main.b` (media) | bounded only by the CBOR body cap | — |
 
 The 256 KiB body cap is a DoS bound chosen above the largest known real payload
 (the 65,569-byte mainnet body); it is a pyrxd policy limit, not a consensus one.
 
-Both caps are enforced on decode. `decode_payload` constructs a `GlyphMedia`
-(`src/pyrxd/glyph/payload.py:122`), so the 100,000-byte `main.b` ceiling checked
-in `GlyphMedia.__post_init__` (`src/pyrxd/glyph/types.py:116-117`) rejects an
-oversize blob even though the enclosing body is still under 256 KiB. Measured:
-100,000 bytes decodes; 100,001 raises `ValidationError`.
+**Reading is not writing.** The body cap is the only size bound applied on
+decode. There is no separate `main.b` ceiling: media is whatever the enclosing
+body can hold.
+
+An earlier revision of this section said pyrxd "decodes media it would refuse to
+construct" — which was correct — and it was then changed to match a 100,000-byte
+cap in `GlyphMedia.__post_init__`. That cap was a write-side policy that fired
+only on decode, because the decoder is the only code that constructs a
+`GlyphMedia`; it refused real mainnet tokens (webp payloads of 153,650 / 178,608
+/ 236,726 bytes, measured), and it made the 256 KiB body budget unreachable for
+any media-bearing token. **The spec was right and the code was made authoritative
+over it.** The cap is gone; this sentence is restored.
 
 ### 4.5 What a decoder MUST reject
 
@@ -323,11 +330,16 @@ oversize blob even though the enclosing body is still under 256 KiB. Measured:
 - Bytes that are not decodable CBOR.
 - A top-level value that is not a map.
 - A map with no `p` key, or whose `p` is not an array.
-- Any text field exceeding its length cap in §4.3.
-- A `main.t` longer than 256 characters.
-- A `main.b` longer than 100,000 bytes (`src/pyrxd/glyph/types.py:116-117`,
-  reached through the `GlyphMedia` construction at
-  `src/pyrxd/glyph/payload.py:122`).
+- A `main.t` that is not a text string, or longer than 256 characters.
+
+A decoder MUST NOT reject the whole payload for an unusable OPTIONAL field. A
+text field that is the wrong type, or longer than its §4.3 cap, is **dropped**
+(the decoder logs it and returns the empty string) so that the rest of the token
+still decodes. Dropping preserves both properties the caps exist for — nothing is
+coerced (`42` never becomes `"42"`), and nothing oversized reaches a caller —
+while a rejection additionally discarded every other field. Measured on live
+mainnet: 6 of 25 sampled payloads were rejected outright by the previous
+behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 - An `attrs` map with more than 64 entries.
 - A `decimals` that is a float or boolean.
 

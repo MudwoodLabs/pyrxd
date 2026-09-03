@@ -118,8 +118,22 @@ class GlyphMedia:
             raise ValidationError("Invalid MIME type")
         if len(self.mime_type) > self._MAX_MIME_TYPE_CHARS:
             raise ValidationError(f"MIME type too long: {len(self.mime_type)} > {self._MAX_MIME_TYPE_CHARS}")
-        if len(self.data) > 100_000:  # 100KB limit for on-chain media
-            raise ValidationError("On-chain media too large (max 100KB)")
+        # NO SIZE CAP HERE. This used to refuse data over 100 KB, and the only
+        # code that ever constructs a GlyphMedia is the DECODER (payload.py) —
+        # so a write-side policy limit fired exclusively when reading somebody
+        # else's token off the chain, and took the whole payload down with it:
+        # `GlyphInspector.extract_reveal_metadata` catches Exception and returns
+        # None, so the user saw "metadata: NONE" rather than a size refusal.
+        #
+        # Measured on live mainnet: 6 of 25 sampled `gly` payloads were refused
+        # by pyrxd and decoded fine by an independent verifier; four of the six
+        # were webp images of 153,650 / 178,608 / 236,726 bytes.
+        #
+        # It also contradicted the real bound. `_MAX_CBOR_PAYLOAD_BYTES` (256 KB)
+        # was deliberately raised to admit a genuine 65,569-byte payload, and this
+        # inner cap made that headroom unreachable for any media-bearing token.
+        # The 256 KB payload cap is the DoS bound, and it is on the encode path
+        # where a policy limit belongs.
 
 
 _VALID_PROTOCOL_VALUES = frozenset(p.value for p in GlyphProtocol)

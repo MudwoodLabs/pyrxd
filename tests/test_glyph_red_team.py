@@ -374,49 +374,64 @@ class TestCborInjection:
 
 
 class TestDecodePayloadSecurityAudit2026:
-    """Regression tests for MEDIUM-5: decode_payload field-type and length limits."""
+    """MEDIUM-5: decode_payload field-type and length limits.
 
-    def test_non_string_name_field_raises(self):
-        """MEDIUM-5: CBOR 'name' as integer must raise, not silently become str(42)='42'."""
-        cbor_bytes = cbor2.dumps({"p": [2], "name": 42})
-        with pytest.raises(ValidationError, match="must be a text string"):
-            decode_payload(cbor_bytes)
+    The FAILURE MODE changed on 2026-09-02; the security property did not.
 
-    def test_non_string_ticker_field_raises(self):
-        """MEDIUM-5: CBOR 'ticker' as list must raise."""
-        cbor_bytes = cbor2.dumps({"p": [1], "ticker": [1, 2, 3]})
-        with pytest.raises(ValidationError, match="must be a text string"):
-            decode_payload(cbor_bytes)
+    These cases originally asserted that an unusable field RAISES. The threat
+    MEDIUM-5 named is type confusion — "must raise, not silently become
+    str(42)='42'" — and the bound exists to stop an oversized on-chain string
+    reaching a display path. Both are still enforced: the field is DROPPED, so
+    nothing is coerced and nothing oversized propagates.
 
-    def test_non_string_description_raises(self):
-        """MEDIUM-5: CBOR 'desc' as dict must raise."""
-        cbor_bytes = cbor2.dumps({"p": [2], "desc": {"nested": "dict"}})
-        with pytest.raises(ValidationError, match="must be a text string"):
-            decode_payload(cbor_bytes)
+    What raising cost was availability, and it cost it on somebody else's data.
+    One bad field discarded the ENTIRE token, and `extract_reveal_metadata`
+    catches Exception and returns None, so a user saw "metadata: NONE" — not a
+    refusal they could act on. Measured on live mainnet: 6 of 25 sampled `gly`
+    payloads were refused by pyrxd and decoded fine by an independent verifier,
+    including Photonic-minted glyphs carrying `loc` as an INTEGER.
 
-    def test_name_too_long_raises(self):
-        """MEDIUM-5: name > 64 chars must raise — prevents memory exhaustion from on-chain payloads."""
-        cbor_bytes = cbor2.dumps({"p": [2], "name": "x" * 65})
-        with pytest.raises(ValidationError, match="too long"):
-            decode_payload(cbor_bytes)
+    Reading third-party chain data is exactly where a guard that refuses honest
+    input is a defect. The bound belongs on what we WRITE.
+    """
 
-    def test_description_too_long_raises(self):
-        """MEDIUM-5: desc > 1000 chars must raise."""
-        cbor_bytes = cbor2.dumps({"p": [2], "desc": "x" * 1001})
-        with pytest.raises(ValidationError, match="too long"):
-            decode_payload(cbor_bytes)
+    @pytest.mark.parametrize(
+        ("field", "bad_value", "protocol"),
+        [
+            ("name", 42, [2]),
+            ("ticker", [1, 2, 3], [1]),
+            ("desc", {"nested": "dict"}, [2]),
+        ],
+    )
+    def test_a_non_string_field_is_dropped_and_NEVER_coerced(self, field, bad_value, protocol):
+        """The type-confusion half. `str(42)` must not appear anywhere."""
+        meta = decode_payload(cbor2.dumps({"p": protocol, field: bad_value}))
+        attr = {"desc": "description"}.get(field, field)
+        assert getattr(meta, attr) == "", f"{field} should be dropped, not coerced"
+        assert str(bad_value) not in (getattr(meta, attr) or "")
 
-    def test_ticker_too_long_raises(self):
-        """MEDIUM-5: ticker > 16 chars must raise."""
-        cbor_bytes = cbor2.dumps({"p": [1], "ticker": "x" * 17})
-        with pytest.raises(ValidationError, match="too long"):
-            decode_payload(cbor_bytes)
+    @pytest.mark.parametrize(
+        ("field", "value", "protocol"),
+        [
+            ("name", "x" * 65, [2]),
+            ("desc", "x" * 1001, [2]),
+            ("ticker", "x" * 17, [1]),
+            ("image", "https://example.com/" + "x" * 500, [2]),
+        ],
+    )
+    def test_an_oversized_field_is_dropped_so_nothing_oversized_PROPAGATES(self, field, value, protocol):
+        """The memory-exhaustion half. The bound is on what reaches a caller, and
+        an empty string satisfies it exactly as a refusal did."""
+        meta = decode_payload(cbor2.dumps({"p": protocol, field: value}))
+        attr = {"desc": "description", "image": "image_url"}.get(field, field)
+        assert getattr(meta, attr) == ""
 
-    def test_image_url_too_long_raises(self):
-        """MEDIUM-5: image URL > 512 chars must raise."""
-        cbor_bytes = cbor2.dumps({"p": [2], "image": "https://example.com/" + "x" * 500})
-        with pytest.raises(ValidationError, match="too long"):
-            decode_payload(cbor_bytes)
+    def test_one_bad_field_no_longer_discards_the_WHOLE_token(self):
+        """The regression this change exists for: a token with one unusable field
+        must still yield everything else it carries."""
+        meta = decode_payload(cbor2.dumps({"v": 2, "p": [2], "loc": 0, "name": "Craig", "ticker": "CRG"}))
+        assert meta.name == "Craig" and meta.ticker == "CRG"
+        assert meta.loc == ""  # the offending field, and only it
 
     def test_valid_fields_at_limits_accepted(self):
         """Boundary: fields exactly at their limits must be accepted."""
@@ -848,9 +863,28 @@ class TestMiscHardening:
         with pytest.raises(ValidationError, match="20 bytes"):
             Hex20(bytes(21))
 
-    def test_glyph_media_over_limit_rejected(self):
-        with pytest.raises(ValidationError, match="too large"):
-            GlyphMedia(mime_type="image/png", data=bytes(100_001))
+    def test_glyph_media_carries_chain_sized_data(self):
+        """GlyphMedia is only ever constructed by the DECODER, so a size cap here
+        refused real on-chain tokens and nothing else. Live mainnet carries webp
+        payloads of 153,650 / 178,608 / 236,726 bytes.
+
+        The DoS bound lives on the encode path, at `_MAX_CBOR_PAYLOAD_BYTES`
+        (256 KB) — see `test_the_payload_cap_is_where_the_dos_bound_lives`. The
+        100 KB cap this replaced also made that headroom unreachable for any
+        media-bearing token, so the two limits contradicted each other."""
+        m = GlyphMedia(mime_type="image/png", data=bytes(153_650))
+        assert len(m.data) == 153_650
+
+    def test_the_payload_cap_is_where_the_dos_bound_lives(self):
+        """Paired with the case above so removing one cap cannot quietly remove
+        the protection: media beyond the payload budget is still refused."""
+        import cbor2
+
+        from pyrxd.glyph.payload import decode_payload
+
+        blob = cbor2.dumps({"v": 1, "p": [2], "main": {"t": "image/webp", "b": bytes(500_000)}})
+        with pytest.raises(ValidationError, match="payload too large"):
+            decode_payload(blob)
 
     def test_glyph_media_blank_mime_rejected(self):
         with pytest.raises(ValidationError, match="Invalid MIME type"):

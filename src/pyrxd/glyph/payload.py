@@ -37,14 +37,31 @@ def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
 
 
 def _cbor_str(d: dict, key: str, max_len: int) -> str:
-    """Extract a string field from a CBOR dict, enforcing type and length."""
+    """Extract a string field from a CBOR dict, dropping it if it is unusable.
+
+    DROPS rather than raises, because this is the READ path for third-party
+    on-chain data and one bad field used to discard the entire token. `creator`,
+    `royalty`, `policy`, `rights`, `crypto.timelock`, `in`, `by` and `attrs` were
+    already defensive; only the string fields and the media raised, and one raise
+    killed everything.
+
+    Measured on live mainnet: Photonic-minted relationship glyphs carry
+    ``{'v':2,'p':[2],'loc':0,...}`` — `loc` as an INTEGER. Our spec
+    (docs/reference/glyph-token-protocol-spec.md:257) says text; the chain
+    disagrees, and the chain is what we are reading. Refusing those tokens
+    surfaced as "metadata: NONE", which tells the user nothing they can act on.
+
+    Writers stay strict: nothing on the encode path calls this.
+    """
     v = d.get(key, "")
     if v == "":
         return ""
     if not isinstance(v, str):
-        raise ValidationError(f"CBOR field {key!r} must be a text string, got {type(v).__name__!r}")
+        _log.warning("decode_payload: CBOR field %r is %s, not a text string; dropped", key, type(v).__name__)
+        return ""
     if len(v) > max_len:
-        raise ValidationError(f"CBOR field {key!r} too long: {len(v)} > {max_len}")
+        _log.warning("decode_payload: CBOR field %r is %d chars > %d; dropped", key, len(v), max_len)
+        return ""
     return v
 
 

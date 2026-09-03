@@ -6,6 +6,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **pyrxd silently refused about a quarter of live mainnet glyph payloads (#576).**
+  Two write-side limits fired on the READ path and each discarded the entire token:
+  a 100,000-byte cap in `GlyphMedia.__post_init__`, and `_cbor_str` raising on a
+  wrong-typed or over-long field. `GlyphInspector.extract_reveal_metadata` catches
+  `Exception` and returns `None`, so a user saw `metadata: NONE` rather than a
+  refusal they could act on.
+
+  Measured against an independent verifier on live mainnet: **6 of 25 sampled `gly`
+  payloads** were refused by pyrxd and decoded fine — four were webp images of
+  153,650 / 178,608 / 236,726 bytes, and two were Photonic-minted relationship
+  glyphs carrying `loc` as an **integer** where our spec says text.
+
+  The media cap guarded nothing pyrxd writes: the decoder is the only code that
+  constructs a `GlyphMedia`. It also contradicted `_MAX_CBOR_PAYLOAD_BYTES`, which
+  had been deliberately raised to 256 KB to admit a real 65,569-byte payload — the
+  inner cap made that headroom unreachable for any media-bearing token.
+
+  Both security properties are unchanged and still asserted: nothing is coerced
+  (`42` never becomes `"42"`), and nothing oversized reaches a caller. The DoS bound
+  is the 256 KB payload cap, on the encode path where a policy limit belongs.
+
+  `docs/reference/glyph-token-protocol-spec.md` §4.4–4.5 are corrected. An earlier
+  revision said pyrxd "decodes media it would refuse to construct" — which was
+  right — and it had been changed to match the code instead. The spec was made to
+  follow the defect; it now leads again.
+
 ### Added
 
 - **`pyrxd inspect` classifies HashMark records.** HashMark is a THIRD-PARTY
