@@ -389,10 +389,16 @@ def _render_script_human(payload: dict) -> str:
                 body.append(f"    label:   {_truncate_for_human(hm['label'])}")
             if hm.get("signer_hash160"):
                 body.append(f"    signer:  {hm['signer_hash160']}")
-                # NOT verified here, and the label must say so: checking it needs
-                # secp256k1 and the chain the tx was found on. Decoding is not
-                # attestation — a record that decodes is well-formed, not believed.
-                body.append("    signature present but NOT VERIFIED by inspect")
+                att = hm.get("attestation") or {}
+                if att.get("outcome") == "valid":
+                    body.append("    signature VERIFIED — recovers to the committed signer")
+                    body.append(f"      (assuming {att.get('assumed_network')}; the chain is part of")
+                    body.append("       the signed statement and a pasted script carries no context)")
+                elif att.get("outcome") == "invalid_signature":
+                    # The bytes decoded; the CLAIM does not hold. Saying "malformed"
+                    # here would send whoever is debugging it after the wrong problem.
+                    body.append(f"    signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
+                    body.append("      (the record is well-formed; its claim is not supported)")
             body.append("    (proves someone knew this digest no later than the confirming")
             body.append("     block — not authorship, ownership, originality or contents)")
         else:

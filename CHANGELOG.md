@@ -8,6 +8,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HashMark v2 signatures are VERIFIED, not just reported.** `verify_attestation`
+  rebuilds the canonical signed statement (fixed key order, label omitted when absent,
+  raw UTF-8 rather than `\uXXXX` escapes), recovers the public key, and requires
+  `hash160(recovered) == signer`. The commitment is what makes recovery non-circular:
+  without a value fixed in advance, an attacker writes whatever hash their chosen
+  signature recovers to. Low-S is mandatory and the header is range-checked (27..34).
+
+  Attestation is kept SEPARATE from decoding, as the spec requires — an invalid
+  signature means the bytes were fine and the claim does not hold, which is a different
+  problem from a malformed record. v1 reports `not_attested` rather than a failure,
+  because v1 never claimed to say who.
+
+  The chain's genesis hash is part of the signed statement and is NOT carried by the
+  record, so the same bytes do not verify on another chain. `inspect` assumes Radiant
+  mainnet for a pasted script and says so.
+
 - **`pyrxd inspect` decodes the Photonic `msg` data carrier.** `OP_RETURN PUSH3 "msg"
   <push> <message>` — the only OP_RETURN format with real volume on Radiant: measured
   across 20 consecutive mainnet blocks, **73 of 73** data outputs carried this marker and

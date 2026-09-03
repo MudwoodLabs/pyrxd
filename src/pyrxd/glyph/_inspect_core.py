@@ -36,7 +36,12 @@ from __future__ import annotations
 import unicodedata
 
 from ..hash import hash256
-from ..script.hashmark import HashMarkOutcome, decode_hashmark
+from ..script.hashmark import (
+    RADIANT_MAINNET_GENESIS,
+    HashMarkOutcome,
+    decode_hashmark,
+    verify_attestation,
+)
 from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
@@ -407,6 +412,18 @@ def _inspect_script(script_hex: str) -> dict:
             }
             if mark.ok:
                 out["type"] = f"op_return-hashmark-v{mark.version}"
+                # ATTEST, now that we can. The signed statement includes the
+                # chain's genesis hash — the verified context the tx was found
+                # in — and a pasted script carries no such context, so mainnet is
+                # ASSUMED and the assumption is reported rather than hidden. The
+                # same bytes on another chain are a different statement.
+                att = verify_attestation(mark, network_genesis=RADIANT_MAINNET_GENESIS)
+                out["hashmark"]["attestation"] = {
+                    "outcome": att.outcome.value,
+                    "recovered_hash160": att.recovered_hash160_hex,
+                    "assumed_network": "radiant-mainnet",
+                    "detail": att.detail,
+                }
         return out
 
     if is_nft_script(script_hex):
