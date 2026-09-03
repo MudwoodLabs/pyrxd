@@ -847,8 +847,11 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         # operator-supplied CBOR — anyone can name any collection — so the claim is
         # never surfaced without whether the transaction was authorised to carry it.
         # Consensus's subset rule makes that checkable from this transaction alone:
-        # a ref in an OUTPUT must be backed by an input ref, so a claimed parent
-        # appearing here means the transaction spent it.
+        # a ref in an output carried by one of the THREE subset-checked opcodes
+        # (`INPUT_BACKED_REF_OPCODES`) must be backed by an input ref, so a claimed
+        # parent appearing under one of those means the transaction spent it. The
+        # other two operand-carrying opcodes prove nothing and are discarded — see
+        # `output_ref_operands`.
         rel = verify_relationship_claims(metadata, [bytes(o.locking_script.serialize()) for o in tx.outputs])
         if rel:
             metadata_payload["relationships"] = [

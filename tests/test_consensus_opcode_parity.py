@@ -43,6 +43,7 @@ from pyrxd.constants import (
     OpCode,
 )
 from tests.consensus_oracle import (
+    VENDOR_DIR,
     manifest,
     max_opcode,
     opcode_table,
@@ -94,7 +95,7 @@ class TestOracleIntegrity:
     """Guard the oracle. Each of these failing means the differentials below
     are meaningless, so they must fail loudly rather than degrade."""
 
-    @pytest.mark.parametrize("name", ["script.h", "script.cpp"])
+    @pytest.mark.parametrize("name", sorted(manifest()["files"]))
     def test_vendored_sources_match_manifest_digest(self, name):
         expected = manifest()["files"][name]["sha256"]
         assert vendored_digest(name) == expected, (
@@ -102,6 +103,22 @@ class TestOracleIntegrity:
             f"MANIFEST.json. The vendored Radiant Core sources are verbatim upstream "
             f"copies and must never be hand-edited — re-run "
             f"scripts/refresh_radiant_core_vendor.py to update them and the manifest together."
+        )
+
+    def test_every_vendored_file_is_covered_in_BOTH_directions(self):
+        """The digest check above was a hand-typed list of two while eight files were
+        vendored, so six consensus sources — including the one holding the ref-backing
+        rule — could be edited with the suite still green. Verified by tampering: an
+        appended line to validation.h changed nothing until this was derived.
+
+        Both directions matter. A file on disk with no manifest entry is unpinned; a
+        manifest entry with no file is a check that silently stopped running."""
+        on_disk = {p.name for p in VENDOR_DIR.iterdir() if p.suffix in {".h", ".cpp"}}
+        in_manifest = set(manifest()["files"])
+        assert on_disk == in_manifest, (
+            f"vendored-source coverage has drifted: on disk only {sorted(on_disk - in_manifest)}, "
+            f"in manifest only {sorted(in_manifest - on_disk)}. Re-run "
+            f"scripts/refresh_radiant_core_vendor.py rather than editing either by hand."
         )
 
     def test_opcode_table_parsed_plausibly(self):

@@ -9,9 +9,16 @@ WHY THE CHECK IS LOCAL. Radiant's induction rules
 (`ReferenceParser::validateTransactionReferenceOperations`, called from
 `validation.cpp:742`) enforce a SUBSET RULE: every ref in an output must be backed
 by an input ref, where the input set includes the spent outpoints themselves.
-Verified against upstream Radiant-Core at the commit this repo vendors (v3.1.2,
-`45e0aa4`). So a claimed parent appearing among a transaction's OUTPUT refs proves
-the transaction spent it — no parent fetch required.
+
+THAT RULE COVERS THREE OF THE FIVE operand-carrying opcodes, not all five, and this
+docstring originally said "every ref" and claimed the claim was verified against
+upstream — while `validation.h`, the file the rule lives in, was not among the
+vendored sources and could not have been checked. `OP_DISALLOWPUSHINPUTREF` reaches
+no out-parameter at all and `OP_DISALLOWPUSHINPUTREFSIBLING` is compared only
+against other OUTPUTS, so either can name any ref without holding it. It is now
+vendored, and `tests/test_ref_backing_matches_consensus.py` derives the covered set
+from it. So a claimed parent appearing among a transaction's output refs under one
+of the three PROVES the transaction spent it — no parent fetch required.
 
 Reasoning from the opcode handler alone gives the opposite answer:
 `interpreter.cpp:1957` says outright that it performs NO membership check.

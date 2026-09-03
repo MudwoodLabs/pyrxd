@@ -72,6 +72,13 @@ FILES = {
     # which is the only authority on "consensus vs policy". Also the file where
     # `fRequireStandard = false` is hardcoded, so the policy layer is absent here.
     "validation.cpp": "src/validation.cpp",
+    # ReferenceParser::validateTransactionReferenceOperations — the ONLY place the
+    # push-ref backing rule ("every output ref must be backed by an input ref") is
+    # applied, and therefore the only authority on WHICH ref opcodes it covers.
+    # Vendored because pyrxd shipped a verifier that assumed all five operand-carrying
+    # opcodes were backed; two of them are not, and no test could have caught that
+    # while the rule's source lived outside the oracle.
+    "validation.h": "src/validation.h",
 }
 
 

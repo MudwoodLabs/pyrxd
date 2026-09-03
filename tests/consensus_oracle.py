@@ -618,3 +618,148 @@ def low_s_gate_flag_name() -> str:
     if not match:
         raise OracleParseError("could not locate the low-S gate in sigencoding.cpp")
     return match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Fact 12 — WHICH ref opcodes the backing-subset rule actually covers
+#           (script.cpp GetPushRefs -> validation.h validateTransactionReferenceOperations)
+# ---------------------------------------------------------------------------
+#
+# "Carries a 36-byte ref operand" and "consensus guarantees the transaction spent
+# that ref" are DIFFERENT QUESTIONS WITH DIFFERENT ANSWERS, and pyrxd shipped a
+# verifier that conflated them: it read all five operand-carrying opcodes as proof
+# of backing and stamped the result "VERIFIED — spent in this tx". Two of the five
+# are never checked against the inputs at all, so anyone could name a collection
+# they had never touched and be believed.
+#
+# The rule lives in ``validation.h``, which was NOT vendored when that verifier was
+# written — so no differential could have caught it, and reasoning from the code
+# under review could only ever confirm the code was self-consistent. That absence
+# is the actual root cause, which is why the fix is an extractor here rather than a
+# corrected constant in ``constants.py``.
+#
+# The chain this follows, in three hops:
+#
+#   1. ``GetPushRefs`` files each opcode's operand into a FUNCTION-LOCAL set
+#      (``foundPushRefs``, ``foundRequiredRefs``, ``foundDisallowedRefs``, ...).
+#   2. At the end, only SOME of those locals are merged into the caller's
+#      out-parameters. ``foundDisallowedRefs`` (0xd2) is merged into NOTHING — it
+#      is intersected against this script's own pushes and then discarded.
+#   3. ``validateTransactionReferenceOperations`` passes only SOME of the
+#      out-parameters to ``validatePushRefRule``, which is the actual
+#      output-must-be-a-subset-of-input check. The disallow-sibling set (0xd3)
+#      instead reaches ``validateDisallowedSiblingsRefRule``, which compares
+#      outputs against OTHER OUTPUTS and never reads the inputs.
+#
+# An opcode is backed only if its operand survives all three hops.
+
+#: ``pushRefSet.insert(foundPushRefs.begin(), ...)`` — hop 2, local set to out-param.
+_MERGE = re.compile(r"(\w+)\s*\.insert\s*\(\s*(\w+)\s*\.begin\s*\(\s*\)")
+
+#: ``validatePushRefRule(inputPushRefSet, outputRequireRefSet)`` — hop 3. The SECOND
+#: argument is the output-side set being required to be a subset of the inputs.
+_SUBSET_CHECK = re.compile(r"validatePushRefRule\s*\(\s*\w+\s*,\s*(\w+)\s*\)")
+
+
+def _validate_tx_refs_body() -> str:
+    src = _strip_comments(vendored_source("validation.h"))
+    start = src.find("static bool validateTransactionReferenceOperations(")
+    if start < 0:
+        raise OracleParseError("could not locate validateTransactionReferenceOperations in vendored validation.h")
+    end = src.find("\n    static ", start + 1)
+    return src[start : end if end > 0 else len(src)]
+
+
+@lru_cache(maxsize=1)
+def _get_push_refs_out_params() -> list[str]:
+    """The out-parameter names of ``GetPushRefs``, IN ORDER.
+
+    Order is load-bearing: the caller passes its own variables positionally, so
+    mapping caller name to consensus role is a positional join. Getting this
+    backwards would silently swap "require" and "disallow-sibling", which is the
+    exact confusion being guarded against.
+    """
+    src = _strip_comments(vendored_source("script.cpp"))
+    sig = re.search(
+        r"bool\s+CScript::GetPushRefs\s*\(\s*const_iterator\s+pc\s*,(.*?)\)\s*const\s*\{",
+        src,
+        re.DOTALL,
+    )
+    if not sig:
+        raise OracleParseError("could not parse the GetPushRefs signature")
+    params = [re.sub(r".*[\s&*]", "", p).strip() for p in sig.group(1).split(",") if p.strip()]
+    if "pushRefSet" not in params:
+        raise OracleParseError(f"GetPushRefs signature parsed to an unexpected parameter list: {params}")
+    return params
+
+
+@lru_cache(maxsize=1)
+def input_backed_ref_opcode_names() -> frozenset[str]:
+    """Opcode names whose output operand consensus REQUIRES an input to back.
+
+    This is the set a reader may treat as authorisation. Its complement within
+    :func:`ref_operand_opcode_names` — currently ``OP_DISALLOWPUSHINPUTREF`` and
+    ``OP_DISALLOWPUSHINPUTREFSIBLING`` — may be written by anyone about anything,
+    at the cost of one output, and means only what the script says locally.
+    """
+    script_src = _strip_comments(vendored_source("script.cpp"))
+    body = _get_push_refs_body(script_src)
+
+    # Hop 1: opcode -> the function-local sets its branch inserts into.
+    branches = list(_BRANCH.finditer(body))
+    if not branches:
+        raise OracleParseError("no `if (opcode == OP_x) {` dispatch chain found in GetPushRefs")
+    filed: dict[str, set[str]] = {}
+    for i, match in enumerate(branches):
+        end = branches[i + 1].start() if i + 1 < len(branches) else len(body)
+        filed[match.group(1)] = {m.group(1) for m in re.finditer(r"(\w+)\s*\.insert\s*\(", body[match.end() : end])}
+    if not any(filed.values()):
+        raise OracleParseError("GetPushRefs dispatch parsed to no set insertions at all")
+
+    # Hop 2: function-local set -> out-parameter. Only merges whose TARGET is an
+    # out-param count; `foundDisallowedRefs` is consumed by a set_intersection into
+    # a local and never merged, which is precisely why 0xd2 is unbacked.
+    out_params = set(_get_push_refs_out_params())
+    local_to_out: dict[str, str] = {m.group(2): m.group(1) for m in _MERGE.finditer(body) if m.group(1) in out_params}
+    if not local_to_out:
+        raise OracleParseError("no local-set -> out-parameter merges found at the end of GetPushRefs")
+
+    # Hop 3: out-parameter role -> is it subset-checked against the inputs?
+    validate_body = _validate_tx_refs_body()
+    checked_caller_vars = {m.group(1) for m in _SUBSET_CHECK.finditer(validate_body)}
+    if not checked_caller_vars:
+        raise OracleParseError("no validatePushRefRule calls found in validateTransactionReferenceOperations")
+
+    # The caller's variables are bound to consensus roles positionally, at its
+    # buildRefSetFromScript call over the OUTPUTS. The input-side call is skipped:
+    # what the inputs contribute is the thing being checked AGAINST, not checked.
+    call = re.search(r"buildRefSetFromScript\s*\(\s*tx\.vout\[\w+\]\.scriptPubKey\s*,(.*?)\)", validate_body, re.DOTALL)
+    if not call:
+        raise OracleParseError("could not locate the per-output buildRefSetFromScript call")
+    caller_args = [a.strip() for a in call.group(1).split(",") if a.strip()]
+    roles = _get_push_refs_out_params()[: len(caller_args)]
+    if len(caller_args) != len(roles):
+        raise OracleParseError(f"arity mismatch: {len(caller_args)} args vs {len(roles)} out-params")
+    arg_for_role = dict(zip(roles, caller_args, strict=True))
+
+    # A caller variable may be accumulated into another before the check
+    # (`outputPushRefSet.insert(outputPushRefSetLocal.begin(), ...)`), so follow one
+    # hop of aliasing rather than requiring the checked name to appear verbatim.
+    aliases: dict[str, str] = {m.group(2): m.group(1) for m in _MERGE.finditer(validate_body)}
+    backed_roles = {
+        role
+        for role, var in arg_for_role.items()
+        if var in checked_caller_vars or aliases.get(var) in checked_caller_vars
+    }
+    if not backed_roles:
+        raise OracleParseError("no output ref set reached validatePushRefRule — parse is wrong")
+
+    backed = {op for op, locals_ in filed.items() if {local_to_out.get(s) for s in locals_} & backed_roles}
+    if not backed:
+        raise OracleParseError("backing chain parsed to an empty opcode set")
+    return frozenset(backed)
+
+
+def input_backed_ref_opcodes() -> frozenset[int]:
+    table = opcode_table()
+    return frozenset(table[n] for n in input_backed_ref_opcode_names())

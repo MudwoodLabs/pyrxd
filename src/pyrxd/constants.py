@@ -569,6 +569,37 @@ LOCKTIME_THRESHOLD: int = 500_000_000
 # *disallow-sibling* sets instead, so they must be WALKED but not COLLECTED.
 PUSH_REF_OPCODES: frozenset[int] = frozenset({0xD0, 0xD8})
 
+# The subset whose presence in an OUTPUT is evidence the transaction SPENT that ref
+# — the only ref opcodes a reader may treat as authorisation.
+#
+# ``ReferenceParser::validateTransactionReferenceOperations`` (``src/validation.h``)
+# passes exactly three output sets to ``validatePushRefRule``, the
+# every-output-ref-must-appear-among-the-input-refs check: the push set (0xd0, and
+# 0xd8 which files into it), the require set (0xd1), and the singleton set (0xd8).
+#
+# The other two operand-carrying opcodes are NOT checked against the inputs:
+#   * 0xd2 OP_DISALLOWPUSHINPUTREF — ``GetPushRefs`` files it into a function-LOCAL
+#     ``foundDisallowedRefs``, intersects it against this script's own pushes, and
+#     then discards it. It reaches no out-parameter at all.
+#   * 0xd3 OP_DISALLOWPUSHINPUTREFSIBLING — reaches only
+#     ``validateDisallowedSiblingsRefRule``, which compares outputs against OTHER
+#     OUTPUTS. It never reads the inputs.
+# A transaction whose outputs carry only those two returns true from the whole rule
+# before the input loop even runs. So ANYONE can name ANY ref via 0xd2/0xd3, for the
+# price of one output, without ever holding the thing they named.
+#
+# This distinction is why the set is separate from :data:`REF_OPERAND_OPCODES`
+# (which must be WALKED, to stay in step with the opcode stream) and from
+# :data:`PUSH_REF_OPCODES` (which is about the sighash's ``hashOutputHashes``, a
+# third question again). Three overlapping sets, three different answers; the
+# verifier in :mod:`pyrxd.glyph.relationships` originally used the widest one and
+# reported forged collection membership as VERIFIED.
+#
+# Derived, not trusted: ``consensus_oracle.input_backed_ref_opcodes()`` recovers
+# this set by following the C++ chain and ``tests/test_ref_backing_matches_consensus.py``
+# asserts the two agree.
+INPUT_BACKED_REF_OPCODES: frozenset[int] = frozenset({0xD0, 0xD1, 0xD8})
+
 # The same two opcodes as plain ints, for the FIXED-LAYOUT readers that expect one
 # specific opcode at one specific offset rather than testing set membership
 # (``glyph/dmint/chain.py`` parses ``0xd8 <ref> 0xd0 <ref>`` positionally). Derived from

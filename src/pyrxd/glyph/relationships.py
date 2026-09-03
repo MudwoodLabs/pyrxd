@@ -28,7 +28,10 @@ alone would conclude the opposite.
 
 WHAT THIS DOES NOT PROVE. That the parent's owner *approved* the membership in any
 social sense, only that the transaction was authorised to carry the parent's ref —
-which requires having spent it. Delegated authorization (a delegate token consumed
+which requires having spent it. And it proves that only for refs carried by the
+three opcodes consensus subset-checks: ``OP_DISALLOWPUSHINPUTREF`` and
+``OP_DISALLOWPUSHINPUTREFSIBLING`` operands are local assertions anyone may write
+about any ref, and reading them as backing forges the verdict outright. Delegated authorization (a delegate token consumed
 by the commit and burned by the reveal) is a separate mechanism pyrxd does not
 implement at all, so a legitimately delegated claim will read UNBACKED here.
 """
@@ -39,6 +42,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
+from ..constants import INPUT_BACKED_REF_OPCODES
 from ..security.errors import ValidationError
 from .script import iter_input_refs
 from .types import GlyphRef
@@ -60,8 +64,10 @@ class RelationshipKind(Enum):
 
 
 class RelationshipOutcome(Enum):
-    #: The claimed ref appears among the transaction's output refs, so consensus
-    #: required the transaction to have spent it. The claim is authorised.
+    #: The claimed ref appears in an output under an opcode consensus subset-checks
+    #: against the inputs, so the transaction provably spent it. The claim is
+    #: authorised. A ref named only by ``OP_DISALLOWPUSHINPUTREF``/``...SIBLING`` does
+    #: NOT qualify — see :func:`output_ref_operands`.
     BACKED = "backed"
     #: The glyph claims a parent that appears nowhere in the transaction's outputs.
     #: Nothing authorised it — display it as a claim, never as a fact.
@@ -80,12 +86,24 @@ class RelationshipVerdict:
 
 
 def output_ref_operands(output_scripts: list[bytes]) -> set[bytes]:
-    """Every 36-byte ref operand carried by these output scripts.
+    """The ref operands in these outputs that consensus REQUIRED an input to back.
 
-    Uses :func:`iter_input_refs`, which walks the script as an opcode stream the way
-    consensus does — so a ref-range byte sitting inside push data is not mistaken for
-    an opcode, and the operand-less REFHASH opcodes (``0xd4``-``0xd7``) advance by one
-    byte instead of swallowing 36.
+    Not every ref operand qualifies, and the difference is the whole point of this
+    function. ``ReferenceParser::validateTransactionReferenceOperations`` subset-checks
+    only three of the five operand-carrying opcodes against the transaction's inputs
+    (:data:`~pyrxd.constants.INPUT_BACKED_REF_OPCODES`). The other two —
+    ``OP_DISALLOWPUSHINPUTREF`` and ``OP_DISALLOWPUSHINPUTREFSIBLING`` — are local
+    assertions about this transaction's own outputs; consensus never asks whether an
+    input carried them. Anyone can name any ref with them, for the price of one
+    output, without ever holding it. Collecting those as backing is a complete
+    forgery of the authorisation verdict, so they are walked and discarded.
+
+    Walking still uses :func:`iter_input_refs`, which consumes the operand of ALL five
+    the way consensus does — so a ref-range byte sitting inside push data is not
+    mistaken for an opcode, and the operand-less REFHASH opcodes (``0xd4``-``0xd7``)
+    advance by one byte instead of swallowing 36. Filtering happens after the walk,
+    never by narrowing the walk: skipping an opcode's 36 bytes would desynchronise the
+    parse and hand back refs that are not there.
 
     A script that cannot be walked is SKIPPED rather than failing the whole check: a
     transaction may carry outputs from other protocols, and one unparseable output
@@ -94,7 +112,9 @@ def output_ref_operands(output_scripts: list[bytes]) -> set[bytes]:
     operands: set[bytes] = set()
     for script in output_scripts:
         try:
-            for _op, operand in iter_input_refs(script):
+            for op, operand in iter_input_refs(script):
+                if op not in INPUT_BACKED_REF_OPCODES:
+                    continue
                 operands.add(bytes(operand))
         except Exception as exc:
             # Logged, not swallowed: if a claim reads UNBACKED because an output could
