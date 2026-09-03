@@ -345,6 +345,19 @@ class GlyphMetadata:
     # format are mint-side concerns, and surfacing per-recipient key material through the
     # inspect path is not something to do incidentally.
     timelock: TimelockSpec | None = None
+    # The EXACT CBOR these fields were decoded from, when they came off a chain.
+    #
+    # Carried because decoding is LOSSY and creator-signature verification is not
+    # allowed to be. `_cbor_str` drops a wrong-typed field to "" rather than raising,
+    # which is right for display — Photonic mints `loc` as an INTEGER on mainnet and
+    # refusing those tokens showed the user "metadata: NONE". But re-encoding the
+    # decoded object and checking a signature over THAT reports an honest,
+    # correctly-signed token as a forgery, because the bytes the creator signed are
+    # not the bytes we rebuilt. Verification reads these instead.
+    #
+    # compare=False: two tokens with identical fields are the same token regardless of
+    # which one arrived over a wire, and every existing equality assertion stays true.
+    source_cbor: bytes | None = field(default=None, compare=False, repr=False)
     # CBOR ``in`` — the CONTAINER(s) this token is a member of. Membership points
     # CHILD -> PARENT and lives here, in the envelope, because it cannot live in
     # the locking script: an output may not carry a ref that a *sibling* output
