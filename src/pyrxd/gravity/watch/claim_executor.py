@@ -639,8 +639,12 @@ class ClaimExecutor:
             return f"value-bearing {variant} autonomous claim has no in-record value bound; refusing (set accept_unbounded_reorg_risk for dust)"
         if self._reorg_cost_per_block is None:
             return "no reorg_cost_per_block configured; cannot bound the value-vs-reorg risk (refusing)"
+        # RADIANT's interval for a RADIANT reserve (#579). This read
+        # `policy.block_interval_s` — Bitcoin's — and fed the result to
+        # `max_protected_value`, so a seconds-tagged burial would have halved the
+        # value ceiling this gate exists to enforce.
         burial_blocks = self._policy.rxd_claim_burial.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=self._policy.block_interval_s
+            TimeUnit.BLOCKS, block_interval_s=self._policy.rxd_block_interval_s
         ).value
         ceiling = max_protected_value(
             rxd_claim_burial_blocks=burial_blocks,

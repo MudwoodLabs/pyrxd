@@ -1511,13 +1511,22 @@ def test_assess_claim_finality_parity_sweep_byte_equivalent():
 
     def _old(confs, now, locked, t_rxd, policy):
         bi, rbi = policy.block_interval_s, policy.rxd_block_interval_s
-        rxd_blocks = t_rxd.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
-        rxd_burial = policy.rxd_claim_burial.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
-        depth = policy.btc_claim_reorg_depth.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+
+        def _reserve(tl, interval):
+            """A RESERVE rounds UP — flooring under-counts it, the unsafe direction.
+            Restated here from the rule rather than copied from `_reserve_to_blocks`."""
+            return tl.value if tl.unit is t.TimeUnit.BLOCKS else math.ceil(tl.value / interval)
+
+        rxd_blocks = t_rxd.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=rbi).value
+        # RADIANT quantities convert at RADIANT's interval (#579). This reference used
+        # `bi` for both, which is the production conflation restated — so the two agreed
+        # by sharing a defect, and no swept policy was seconds-tagged to expose it.
+        rxd_burial = _reserve(policy.rxd_claim_burial, rbi)
+        depth = _reserve(policy.btc_claim_reorg_depth, bi)  # a BITCOIN quantity
         # #511: a claim decided on at height `now` cannot be mined at `now`, so its burial starts
         # at `now + 1` at the earliest and by `now + inclusion` with the reserve. Derived here from
         # that sentence, independently of how the production floor is expressed.
-        inclusion = policy.rxd_claim_inclusion.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+        inclusion = _reserve(policy.rxd_claim_inclusion, rbi)
         blocks_left = (locked + rxd_blocks) - now
         if confs >= depth:
             return ClaimFinality.SAFE if blocks_left >= rxd_burial + inclusion else ClaimFinality.SQUEEZED
@@ -1536,6 +1545,20 @@ def test_assess_claim_finality_parity_sweep_byte_equivalent():
             rxd_block_interval_s=300.0,  # ratio 2 exercises the F-007 scaling
             btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
             rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        ),
+        # A SECONDS-TAGGED policy. Every policy above is BLOCKS-tagged, which makes
+        # every conversion the identity — so the sweep exercised no unit arithmetic
+        # at all, and could not have failed on #579 however wrong the intervals were.
+        # 1800 s of Radiant burial is 6 Radiant blocks; read at the Bitcoin interval
+        # it is 3, half the intended depth. This row is the difference between a
+        # sweep that looks exhaustive and one that is.
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=300.0,
+            btc_claim_reorg_depth=t.Timelock(3600, t.TimeUnit.SECONDS),  # 6 BTC blocks
+            rxd_claim_burial=t.Timelock(1800, t.TimeUnit.SECONDS),  # 6 RXD blocks
         ),
     ]
     locked = 1000
