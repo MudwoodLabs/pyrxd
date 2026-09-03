@@ -31,6 +31,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
+if TYPE_CHECKING:
+    from ..constants import Network
+
 from ..security.errors import ValidationError
 from .types import GlyphMetadata, GlyphProtocol
 
@@ -301,6 +304,31 @@ class WaveRecord:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WaveResolverError(f"could not parse indexer response: {exc}") from exc
+
+
+async def wave_names_for_hash160(client, pubkey_hash160: bytes, *, network: Network | None = None) -> list[str]:
+    """WAVE names owned by the address a public-key hash encodes.
+
+    The bridge between a KEY and a NAME: a hash160 is what a P2PKH address
+    encodes, and WAVE resolves names to addresses, so the reverse lookup answers
+    "which names does the holder of this key own".
+
+    Written for HashMark v2 attestation — a verified signer is a hash160, and the
+    question a recipient actually has is "was this recorded by company.rxd?" — but
+    nothing here is HashMark-specific.
+
+    CALLERS MUST ONLY PASS A KEY THEY HAVE VERIFIED. Resolving an unproven signer
+    would dress a claim up as an identity, which is precisely the failure the
+    signature check exists to prevent. See
+    :func:`pyrxd.script.hashmark.verify_attestation`.
+    """
+    from ..base58 import base58check_encode
+    from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+
+    if len(pubkey_hash160) != 20:
+        raise ValidationError(f"pubkey_hash160 must be 20 bytes, got {len(pubkey_hash160)}")
+    address = base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[network or Network.MAINNET] + pubkey_hash160)
+    return await WaveResolver(client).reverse_lookup(address)
 
 
 def classify_glyph_metadata(metadata: GlyphMetadata) -> str:

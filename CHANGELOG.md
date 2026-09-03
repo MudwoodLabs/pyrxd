@@ -8,6 +8,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd glyph inspect --verify-wave` names the signer.** For a VERIFIED v2
+  signature, resolves the WAVE names the signing key owns: hash160 -> address ->
+  `wave.reverse_lookup`. A recipient can then confirm both that a file matches the
+  recorded digest AND that it was recorded by the holder of `company.rxd`.
+  `pyrxd.glyph.wave.wave_names_for_hash160` is the reusable half and is not
+  HashMark-specific.
+
+  **Gated on verification.** An unverified or absent signature resolves nothing and
+  says why — presenting a name for an unproven signer would dress a claim up as an
+  identity, which is the failure the signature check exists to prevent.
+
 - **HashMark v2 signatures are VERIFIED, not just reported.** `verify_attestation`
   rebuilds the canonical signed statement (fixed key order, label omitted when absent,
   raw UTF-8 rather than `\uXXXX` escapes), recovers the public key, and requires

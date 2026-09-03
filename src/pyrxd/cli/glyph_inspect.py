@@ -394,6 +394,17 @@ def _render_script_human(payload: dict) -> str:
                     body.append("    signature VERIFIED — recovers to the committed signer")
                     body.append(f"      (assuming {att.get('assumed_network')}; the chain is part of")
                     body.append("       the signed statement and a pasted script carries no context)")
+                    wi = hm.get("wave_identity")
+                    if wi and wi.get("resolved"):
+                        names = wi.get("names") or []
+                        if names:
+                            body.append(f"    WAVE identity: {', '.join(names)}")
+                            body.append("      (the signing key owns these names — file matches the")
+                            body.append("       digest AND was recorded by that name's holder)")
+                        else:
+                            body.append("    WAVE identity: none — the signing key owns no WAVE name")
+                    elif wi:
+                        body.append(f"    WAVE identity: not resolved ({wi.get('reason')})")
                 elif att.get("outcome") == "invalid_signature":
                     # The bytes decoded; the CLAIM does not hold. Saying "malformed"
                     # here would send whoever is debugging it after the wrong problem.
@@ -600,8 +611,18 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     default=False,
     help="For an outpoint, fetch its source tx and classify the named vout.",
 )
+@click.option(
+    "--verify-wave",
+    "verify_wave",
+    is_flag=True,
+    default=False,
+    help=(
+        "For a VERIFIED HashMark v2 signature, look up the WAVE names the signing "
+        "key owns. Needs the network. Never runs on an unverified signature."
+    ),
+)
 @click.pass_obj
-def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool) -> None:
+def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool, verify_wave: bool) -> None:
     """Classify a Glyph input.
 
     INPUT can be:
@@ -728,6 +749,9 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
     else:  # pragma: no cover — _classify_input never returns other values
         raise UserError(f"internal: unknown form {form!r}")
 
+    if verify_wave:
+        _attach_wave_identity(ctx, payload)
+
     mode = ctx.output_mode
     if mode == "json":
         click.echo(emit(payload, mode="json"))
@@ -773,3 +797,44 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
             cause=str(exc),
             fix=f"check that {ctx.electrumx_url} is reachable",
         ) from exc
+
+
+def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
+    """Resolve the WAVE names a VERIFIED HashMark signer owns, and attach them.
+
+    ONLY runs on a signature that actually verified. Resolving an unverified
+    signer would dress a claim up as an identity — the exact failure the
+    signature check exists to prevent — so an unverified or absent attestation
+    attaches nothing and says why.
+
+    Errors are attached rather than raised: a name lookup failing is not a reason
+    to lose the classification the user asked for.
+    """
+    hm = payload.get("hashmark")
+    if not hm:
+        return
+    att = hm.get("attestation") or {}
+    if att.get("outcome") != "valid":
+        hm["wave_identity"] = {
+            "resolved": False,
+            "reason": (
+                "signature did not verify; refusing to resolve an unproven signer"
+                if att.get("outcome") == "invalid_signature"
+                else "no verified v2 signature on this record"
+            ),
+        }
+        return
+
+    from ..glyph.wave import wave_names_for_hash160
+
+    async def _do() -> list[str]:
+        client = ctx.make_client()
+        async with client:
+            return await wave_names_for_hash160(client, bytes.fromhex(att["recovered_hash160"]))
+
+    try:
+        names = asyncio.run(_do())
+    except Exception as exc:
+        hm["wave_identity"] = {"resolved": False, "reason": f"lookup failed: {exc}"}
+        return
+    hm["wave_identity"] = {"resolved": True, "names": names}
