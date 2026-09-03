@@ -55,12 +55,19 @@ from .types import GlyphProtocol
 # here so a single change updates both surfaces.
 _TXID_HEX_LEN = 64
 _CONTRACT_HEX_LEN = 72
-# The smallest script we classify is P2SH — ``OP_HASH160 <20> OP_EQUAL``, 23
-# bytes / 46 hex. It used to be plain P2PKH (25 bytes / 50 hex), which meant a
-# pasted P2SH scriptPubKey was rejected by the input dispatcher before any
-# classifier saw it. Lowering the floor only widens what reaches
-# ``_inspect_script``; anything it cannot name still comes back ``unknown``.
-_MIN_SCRIPT_HEX_LEN = 46
+# The smallest script we classify. It was 46 hex (23 bytes), calibrated to P2SH —
+# ``OP_HASH160 <20> OP_EQUAL`` — which was the smallest shape that existed before the
+# OP_RETURN payload decoders. It is now an OP_RETURN data carrier: ``OP_RETURN`` plus
+# a 3-byte marker plus a one-byte payload is 6 bytes / 12 hex, and a real short ``msg``
+# is smaller than P2SH.
+#
+# The floor sits in ``_classify_input`` and runs BEFORE dispatch, so a short but
+# perfectly valid pasted `msg` was refused with "could not classify input" even though
+# ``_inspect_script`` decodes it correctly — a guard refusing valid work, and only on
+# the pasted-script form, since ``--fetch`` calls the classifier per output with no
+# floor. Lowering it only widens what reaches ``_inspect_script``; anything it cannot
+# name still comes back ``unknown``.
+_MIN_SCRIPT_HEX_LEN = 12
 # Cap accidental "paste a whole tx" before running every classifier on it.
 _MAX_SCRIPT_HEX_LEN = 20_000
 

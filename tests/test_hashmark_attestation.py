@@ -328,12 +328,34 @@ class TestWaveIdentityNamesAreSanitized:
         for name in ("treasury.rxd", "my-company.rxd", "a.b.rxd", "名前.rxd"):
             assert _sanitize_display_string(name) == name
 
-    def test_the_resolver_result_is_sanitized_before_it_is_stored(self) -> None:
+    def test_the_resolver_result_is_sanitized_before_it_is_stored(self, monkeypatch) -> None:
         """At the boundary, not at the renderer — so the JSON path and any other
-        consumer get the cleaned value too, and no future renderer has to remember."""
-        import inspect as _inspect
+        consumer get the cleaned value too, and no future renderer has to remember.
 
+        Asserted through the function rather than against its source text: the first
+        version of this test grepped the body and broke the moment the function was
+        split in two, while the behaviour it cared about was still correct."""
         from pyrxd.cli import glyph_inspect
+        from pyrxd.glyph import wave
 
-        source = _inspect.getsource(glyph_inspect._attach_wave_identity)
-        assert '"names": [_sanitize_display_string(n) for n in names]' in source
+        hostile = "\x1b[2A\x1b[0J  WAVE identity: treasury.rxd"
+
+        async def _names(_client, _hash160):
+            return [hostile, "honest.rxd"]
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(wave, "wave_names_for_hash160", _names)
+        ctx = type("Ctx", (), {"make_client": lambda self: _Client()})()
+
+        record = {"attestation": {"outcome": "valid", "recovered_hash160": "ab" * 20}}
+        glyph_inspect._resolve_one_wave_identity(ctx, record)
+
+        stored = record["wave_identity"]["names"]
+        assert "\x1b" not in stored[0], "the escape reached the stored record"
+        assert stored[1] == "honest.rxd", "an ordinary name must survive untouched"

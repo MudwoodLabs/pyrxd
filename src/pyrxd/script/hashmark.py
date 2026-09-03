@@ -390,7 +390,20 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     if record.version != 2 or not record.signature_hex or not record.signer_hash160_hex:
         return AttestationResult(AttestationOutcome.NOT_ATTESTED, detail="v1 record carries no signer")
 
-    sig = bytes.fromhex(record.signature_hex)
+    # §6.3 step 3 makes "65 bytes" part of VERIFYING, not only of decoding, and this
+    # function is public API: `decode_hashmark` enforces the length, but a caller doing
+    # offline verification builds a `HashMarkRecord` from stored fields and reaches here
+    # directly. Without the check a 33-byte value slices to an EMPTY s, which is int 0 —
+    # a wrong-but-typed answer rather than a refusal — and malformed hex escaped as an
+    # uncaught ValueError instead of one of this function's own outcomes.
+    try:
+        sig = bytes.fromhex(record.signature_hex)
+    except ValueError:
+        return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="signature is not valid hex")
+    if len(sig) != 65:
+        return AttestationResult(
+            AttestationOutcome.INVALID_SIGNATURE, detail=f"signature is {len(sig)} bytes, expected 65"
+        )
     header, r_bytes, s_bytes = sig[0], sig[1:33], sig[33:65]
 
     # §5.6: header is 27 + recoveryId, +4 when the key is compressed; 27..34.

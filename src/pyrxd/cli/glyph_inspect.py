@@ -208,6 +208,11 @@ def _render_txid_human(payload: dict) -> str:
             type_ = row.get("type", "?")
             head = f"  vout {row['vout']:>3}  type={type_:<10}  sats={sats}"
             lines.append(head)
+            # An OP_RETURN payload's verdict must reach the terminal HERE too, not
+            # only in the pasted-script view. This is the path that reaches a record
+            # actually on chain, and without it a v2 whose signature DOES NOT VERIFY
+            # rendered identically to a genuine one.
+            lines.extend(_op_return_payload_lines(row, indent="            "))
             if type_ in ("nft", "ft"):
                 lines.append(f"            ref={row.get('ref_outpoint', '')}")
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
@@ -360,22 +365,31 @@ def _render_inspect_human(payload: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in payload.items())
 
 
-def _render_script_human(payload: dict) -> str:
-    """Pretty-print a classified script result."""
-    type_ = payload.get("type", "?")
-    head = f"type: {type_}    length: {payload['length']} bytes"
-    body: list[str] = []
+def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
+    """The `msg` and HashMark rendering, for EVERY human surface that shows one.
+
+    Factored out because there are two such surfaces and there was one renderer. The
+    pasted-script view printed the digest, the signer and the attestation verdict; the
+    txid view — the DEFAULT path, and the only one that reaches a record actually on
+    chain — printed the type label alone. So a v2 whose signature DOES NOT VERIFY and
+    a genuine one rendered byte-identically, with the affirmative-sounding
+    `op_return-hashmark-v2` label surviving and the verdict discarded.
+
+    A computed verdict that no human sees is not a feature. Two copies of a renderer
+    is how one of them ends up missing the line that matters, so there is one.
+    """
+    out: list[str] = []
     msg = payload.get("message")
     if msg:
         if msg["outcome"] == "ok":
             if msg["is_utf8"]:
-                body.append(f"  message ({msg['byte_length']} bytes): {_truncate_for_human(msg['text'])}")
+                out.append(f"{indent}message ({msg['byte_length']} bytes): {_truncate_for_human(msg['text'])}")
             else:
                 # Say WHY there is no text rather than printing nothing, or a caller
                 # assumes the field is empty when the bytes simply are not text.
-                body.append(f"  message: {msg['byte_length']} bytes, not valid UTF-8 (see data_hex)")
+                out.append(f"{indent}message: {msg['byte_length']} bytes, not valid UTF-8 (see data_hex)")
         else:
-            body.append(f"  message: {msg['outcome']}" + (f" — {msg['detail']}" if msg.get("detail") else ""))
+            out.append(f"{indent}message: {msg['outcome']}" + (f" — {msg['detail']}" if msg.get("detail") else ""))
 
     hm = payload.get("hashmark")
     if hm:
@@ -383,41 +397,51 @@ def _render_script_human(payload: dict) -> str:
         # Classifying it in JSON and not printing it here would leave the feature
         # invisible to the person actually reading a terminal.
         if hm["outcome"] == "ok":
-            body.append(f"  HashMark v{hm['version']} ({hm['algorithm']})")
-            body.append(f"    digest:  {hm['digest']}")
+            out.append(f"{indent}HashMark v{hm['version']} ({hm['algorithm']})")
+            out.append(f"{indent}  digest:  {hm['digest']}")
             if hm.get("label"):
-                body.append(f"    label:   {_truncate_for_human(hm['label'])}")
+                out.append(f"{indent}  label:   {_truncate_for_human(hm['label'])}")
             elif hm.get("label_withheld"):
                 # v1 keeps its timestamp evidence; the label is withheld WITH a reason,
                 # because silently showing nothing looks like a record that had no label.
-                body.append(f"    label:   [withheld — {hm['label_withheld']}]")
+                out.append(f"{indent}  label:   [withheld — {hm['label_withheld']}]")
             if hm.get("signer_hash160"):
-                body.append(f"    signer:  {hm['signer_hash160']}")
+                out.append(f"{indent}  signer:  {hm['signer_hash160']}")
                 att = hm.get("attestation") or {}
                 if att.get("outcome") == "valid":
-                    body.append("    signature VERIFIED — recovers to the committed signer")
-                    body.append(f"      (assuming {att.get('assumed_network')}; the chain is part of")
-                    body.append("       the signed statement and a pasted script carries no context)")
+                    out.append(f"{indent}  signature VERIFIED — recovers to the committed signer")
+                    out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
+                    out.append(f"{indent}     the signed statement and a pasted script carries no context)")
                     wi = hm.get("wave_identity")
                     if wi and wi.get("resolved"):
                         names = wi.get("names") or []
                         if names:
-                            body.append(f"    WAVE identity: {', '.join(names)}")
-                            body.append("      (the signing key owns these names — file matches the")
-                            body.append("       digest AND was recorded by that name's holder)")
+                            out.append(f"{indent}  WAVE identity: {', '.join(names)}")
+                            out.append(f"{indent}    (the signing key owns these names — file matches the")
+                            out.append(f"{indent}     digest AND was recorded by that name's holder)")
                         else:
-                            body.append("    WAVE identity: none — the signing key owns no WAVE name")
+                            out.append(f"{indent}  WAVE identity: none — the signing key owns no WAVE name")
                     elif wi:
-                        body.append(f"    WAVE identity: not resolved ({wi.get('reason')})")
+                        out.append(f"{indent}  WAVE identity: not resolved ({wi.get('reason')})")
                 elif att.get("outcome") == "invalid_signature":
                     # The bytes decoded; the CLAIM does not hold. Saying "malformed"
                     # here would send whoever is debugging it after the wrong problem.
-                    body.append(f"    signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
-                    body.append("      (the record is well-formed; its claim is not supported)")
-            body.append("    (proves someone knew this digest no later than the confirming")
-            body.append("     block — not authorship, ownership, originality or contents)")
+                    out.append(f"{indent}  signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
+                    out.append(f"{indent}    (the record is well-formed; its claim is not supported)")
+            out.append(f"{indent}  (proves someone knew this digest no later than the confirming")
+            out.append(f"{indent}   block — not authorship, ownership, originality or contents)")
         else:
-            body.append(f"  HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+            out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+
+    return out
+
+
+def _render_script_human(payload: dict) -> str:
+    """Pretty-print a classified script result."""
+    type_ = payload.get("type", "?")
+    head = f"type: {type_}    length: {payload['length']} bytes"
+    body: list[str] = []
+    body.extend(_op_return_payload_lines(payload))
 
     if type_ == "p2pkh":
         body.append(f"  owner_pkh: {payload['owner_pkh']}")
@@ -814,7 +838,20 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     Errors are attached rather than raised: a name lookup failing is not a reason
     to lose the classification the user asked for.
     """
-    hm = payload.get("hashmark")
+    # BOTH shapes. A pasted script puts the record at the top level; a txid puts one
+    # per output. Reading only the first meant `--verify-wave <txid> --fetch` attached
+    # nothing and never said why — a flag that silently does nothing on the form most
+    # people use it with.
+    records = (
+        [payload["hashmark"]]
+        if payload.get("hashmark")
+        else [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]
+    )
+    for hm in records:
+        _resolve_one_wave_identity(ctx, hm)
+
+
+def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
     if not hm:
         return
     att = hm.get("attestation") or {}
