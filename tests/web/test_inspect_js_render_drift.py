@@ -700,3 +700,41 @@ class TestTheCorpusCoversEveryShapeTheClassifierCanEmit:
                 f"corpus shape {name!r} classifies as {produced!r}, which the classifier "
                 f"source no longer emits — this shape is guarding nothing"
             )
+
+
+class TestTheNestedRequirementIsNotVACUOUS:
+    """A nested block must demand SOMETHING on screen.
+
+    `_required_evidence` recurses into `hashmark` / `message` / `attestation` and
+    skips leaves listed in `_OMITTED_NESTED_KEYS`. If a block's every leaf ended up
+    listed there, it would return no requirements at all and the block would count
+    as "rendered" while the card showed nothing — the same shape as the corpus gap
+    that let these fields go unrendered in the first place, one level down.
+
+    The omission table is the right mechanism; it just needs a floor under it.
+    """
+
+    _NESTED = {"hashmark": ("op_return-hashmark-v2", 3), "message": ("op_return-msg", 1)}
+
+    @pytest.mark.parametrize("key", sorted(_NESTED))
+    def test_the_block_demands_evidence(self, key, payloads) -> None:
+        shape, minimum = self._NESTED[key]
+        block = payloads[shape]["row"][key]
+        evidence = _required_evidence(key, block)
+        assert len(evidence) >= minimum, (
+            f"{key!r} on shape {shape!r} requires only {len(evidence)} evidence strings "
+            f"({evidence}). Every leaf that matters has been omitted, so this block now "
+            f"passes whether or not the renderer shows it."
+        )
+
+    def test_the_digest_specifically_must_be_shown(self, payloads) -> None:
+        """The one field that identifies WHICH file was marked. A HashMark card
+        without it is decoration."""
+        block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert block["digest"] in _required_evidence("hashmark", block)
+
+    def test_the_attestation_detail_must_be_shown(self, payloads) -> None:
+        """The verdict's reason. Dropping it is how "does not verify" becomes a bare
+        badge again."""
+        block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert block["attestation"]["detail"] in _required_evidence("hashmark", block)
