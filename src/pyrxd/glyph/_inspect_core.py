@@ -46,6 +46,7 @@ from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
+from .relationships import verify_relationship_claims
 from .types import GlyphProtocol
 
 # --- Length / shape constants ----------------------------------------------
@@ -842,6 +843,23 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",
             "decimals": metadata.decimals,
         }
+        # RELATIONSHIP CLAIMS, WITH THEIR VERDICT (#591). `in` and `by` are
+        # operator-supplied CBOR — anyone can name any collection — so the claim is
+        # never surfaced without whether the transaction was authorised to carry it.
+        # Consensus's subset rule makes that checkable from this transaction alone:
+        # a ref in an OUTPUT must be backed by an input ref, so a claimed parent
+        # appearing here means the transaction spent it.
+        rel = verify_relationship_claims(metadata, [bytes(o.locking_script.serialize()) for o in tx.outputs])
+        if rel:
+            metadata_payload["relationships"] = [
+                {
+                    "kind": v.kind.value,
+                    "ref": f"{v.ref.txid}:{v.ref.vout}",
+                    "outcome": v.outcome.value,
+                }
+                for v in rel
+            ]
+
         # TIMELOCK: say WHEN it opens, not just that it is one (#556). `classification` already
         # reported "timelock"; the field that answers the holder's actual question — can I read
         # this yet — was decoded nowhere until now.

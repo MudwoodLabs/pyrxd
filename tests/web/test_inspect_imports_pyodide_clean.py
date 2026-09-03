@@ -43,7 +43,12 @@ _HEAVY_DEP_ROOTS = frozenset({"coincurve", "aiohttp", "websockets", "Cryptodome"
 # allow some growth headroom but a sudden jump means a re-eagered
 # import somewhere upstream. Adjust deliberately when the count
 # legitimately changes (and document why in the commit).
-_PYRXD_MODULE_BUDGET = 35
+# 36 since #591 added `pyrxd.glyph.relationships` — ONE deliberate module the
+# inspect path genuinely needs, not an accidental re-export. Raise this only for a
+# module you meant to add, and say which: the number exists to catch an `__init__.py`
+# re-eagering a top-level import, and a budget nudged up without a reason stops
+# catching that.
+_PYRXD_MODULE_BUDGET = 36
 
 
 def _clear_relevant_modules() -> None:

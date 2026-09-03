@@ -282,6 +282,17 @@ def _render_txid_human(payload: dict) -> str:
             lines.append(f"  desc:     {_truncate_for_human(metadata['description'])}")
         if metadata.get("decimals"):
             lines.append(f"  decimals: {metadata['decimals']}")
+        # The claim AND the verdict, never the claim alone (#591). Rendering
+        # "in collection X" without saying whether anything authorised it is the
+        # defect this exists to fix — the same shape as showing a WAVE name for
+        # an unverified HashMark signer.
+        for rel in metadata.get("relationships") or []:
+            label = "collection" if rel["kind"] == "container" else "creator"
+            if rel["outcome"] == "backed":
+                lines.append(f"  {label}: {rel['ref']}  [VERIFIED — spent in this tx]")
+            else:
+                lines.append(f"  {label}: {rel['ref']}  [CLAIMED ONLY — nothing authorised it]")
+
         if metadata.get("main"):
             lines.append(f"  main:     {metadata['main']}")
         tl = metadata.get("timelock")
