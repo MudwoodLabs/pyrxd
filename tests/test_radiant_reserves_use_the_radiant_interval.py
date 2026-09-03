@@ -50,6 +50,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 _SRC = _ROOT / "src"
 
@@ -185,3 +187,39 @@ def test_the_derivation_still_finds_the_fields_this_guards() -> None:
     rule, the scan would pass forever by covering nothing."""
     tagged = _chain_tagged_reserves()
     assert {"rxd_claim_burial", "rxd_claim_inclusion", "btc_claim_reorg_depth"} <= set(tagged)
+
+
+# --- the scan must prove it actually scanned -------------------------------
+#
+# `_offenders()` returning [] is the PASS condition, and it also returns [] when it
+# walked nothing at all: a repointed `_SRC`, a changed glob, or the source moving
+# under it all read as "clean". A guard whose success and whose vacuity produce the
+# same output is not a guard — the same defect this file's own subject had, and the
+# same one that let the browser render-drift suite pass over unrendered fields.
+
+
+def _calls_mentioning(field: str) -> int:
+    """How many Call nodes in the scanned tree mention *field* at all."""
+    total = 0
+    for path in sorted(_SRC.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            if isinstance(node, ast.Call) and field in _identifiers(node):
+                total += 1
+    return total
+
+
+def test_the_scan_reaches_a_plausible_amount_of_source() -> None:
+    files = list(_SRC.rglob("*.py"))
+    assert len(files) > 50, f"only {len(files)} source files found — is _SRC still the package root?"
+
+
+@pytest.mark.parametrize("field", sorted(_chain_tagged_reserves()))
+def test_each_guarded_field_is_actually_REACHED_by_the_scan(field: str) -> None:
+    """The sharper check. A field nobody converts anywhere is a field this scanner
+    cannot be protecting, however many files it walks — and it would pass forever."""
+    count = _calls_mentioning(field)
+    assert count > 0, (
+        f"{field!r} is derived as a chain-tagged reserve but appears in NO call in the "
+        f"scanned source, so the scan covers it vacuously. Either the field is dead "
+        f"(remove it) or the scan is no longer reading the right tree."
+    )
