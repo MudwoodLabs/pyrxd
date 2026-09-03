@@ -36,7 +36,13 @@ from __future__ import annotations
 import unicodedata
 
 from ..hash import hash256
-from ..script.hashmark import HashMarkOutcome, decode_hashmark
+from ..script.hashmark import (
+    RADIANT_MAINNET_GENESIS,
+    HashMarkOutcome,
+    decode_hashmark,
+    verify_attestation,
+)
+from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
@@ -369,6 +375,27 @@ def _inspect_script(script_hex: str) -> dict:
         # additive: anything that is not one stays plain `op_return`, because a
         # scanner meets thousands of other protocols' data outputs and treating
         # them as errors buries the real ones.
+        # The Photonic `msg` convention: OP_RETURN PUSH3 "msg" <push> <message>.
+        # Measured on 20 consecutive mainnet blocks, 73 of 73 OP_RETURN outputs
+        # carried this marker and nothing else did — it is the whole observed
+        # population, and pyrxd already WRITES it. Reading it back turns the
+        # commonest data output on the chain from an opaque blob into its text.
+        msg = decode_message(script)
+        if msg.outcome is not MessageOutcome.NOT_MESSAGE:
+            out["message"] = {
+                "outcome": msg.outcome.value,
+                # SANITISED here, at the display boundary. The message is arbitrary
+                # operator bytes and `repr` does not escape U+202E and friends; the
+                # decoder deliberately returns it unmangled so the raw bytes stay
+                # recoverable, and mangling belongs where it is shown.
+                "text": _sanitize_display_string(msg.text) if msg.text else None,
+                "is_utf8": msg.is_utf8,
+                "byte_length": len(msg.raw) if msg.raw else 0,
+                "detail": msg.detail,
+            }
+            if msg.ok:
+                out["type"] = "op_return-msg"
+
         mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
             out["hashmark"] = {
@@ -385,6 +412,18 @@ def _inspect_script(script_hex: str) -> dict:
             }
             if mark.ok:
                 out["type"] = f"op_return-hashmark-v{mark.version}"
+                # ATTEST, now that we can. The signed statement includes the
+                # chain's genesis hash — the verified context the tx was found
+                # in — and a pasted script carries no such context, so mainnet is
+                # ASSUMED and the assumption is reported rather than hidden. The
+                # same bytes on another chain are a different statement.
+                att = verify_attestation(mark, network_genesis=RADIANT_MAINNET_GENESIS)
+                out["hashmark"]["attestation"] = {
+                    "outcome": att.outcome.value,
+                    "recovered_hash160": att.recovered_hash160_hex,
+                    "assumed_network": "radiant-mainnet",
+                    "detail": att.detail,
+                }
         return out
 
     if is_nft_script(script_hex):
@@ -639,6 +678,24 @@ def _classify_metadata_protocol(metadata) -> str:
     if GlyphProtocol.WAVE in p and has_wave_name:
         return "wave"
     if GlyphProtocol.CONTAINER in p:
+        return "container"
+    # ...OR the `type` STRING, which is what the chain actually carries (#578).
+    #
+    # GlyphProtocol.CONTAINER (7) is the spec'd form and no mainnet token uses it.
+    # All four containers on Radiant mainnet declare themselves with `type:
+    # "container"` on an ordinary NFT/MUT protocol set, so the branch above was
+    # dead code and every container classified as "nft" or "mut".
+    #
+    # Verified against the chain, not inferred: the "BTC" container
+    # (ref 5558395540...c2ab:0, reveal 57c4d660...dfb1) decodes to `p = (2,)` with
+    # `type = 'container'`. The indexer agrees — it reports token_type CONTAINER
+    # for exactly these four and exposes no protocol field, so its label is derived
+    # from the same string.
+    #
+    # This is a DECLARATION, like the protocol array itself: `type` is operator CBOR
+    # and nothing on chain enforces it. Both forms are claims about what a token is;
+    # neither is a proof, and the ecosystem treats this one as the classification.
+    if (metadata.token_type or "").strip().lower() == "container":
         return "container"
     if GlyphProtocol.AUTHORITY in p:
         return "authority"

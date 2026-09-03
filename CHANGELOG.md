@@ -6,7 +6,52 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd glyph inspect --verify-wave` names the signer.** For a VERIFIED v2
+  signature, resolves the WAVE names the signing key owns: hash160 -> address ->
+  `wave.reverse_lookup`. A recipient can then confirm both that a file matches the
+  recorded digest AND that it was recorded by the holder of `company.rxd`.
+  `pyrxd.glyph.wave.wave_names_for_hash160` is the reusable half and is not
+  HashMark-specific.
+
+  **Gated on verification.** An unverified or absent signature resolves nothing and
+  says why — presenting a name for an unproven signer would dress a claim up as an
+  identity, which is the failure the signature check exists to prevent.
+
+- **HashMark v2 signatures are VERIFIED, not just reported.** `verify_attestation`
+  rebuilds the canonical signed statement (fixed key order, label omitted when absent,
+  raw UTF-8 rather than `\uXXXX` escapes), recovers the public key, and requires
+  `hash160(recovered) == signer`. The commitment is what makes recovery non-circular:
+  without a value fixed in advance, an attacker writes whatever hash their chosen
+  signature recovers to. Low-S is mandatory and the header is range-checked (27..34).
+
+  Attestation is kept SEPARATE from decoding, as the spec requires — an invalid
+  signature means the bytes were fine and the claim does not hold, which is a different
+  problem from a malformed record. v1 reports `not_attested` rather than a failure,
+  because v1 never claimed to say who.
+
+  The chain's genesis hash is part of the signed statement and is NOT carried by the
+  record, so the same bytes do not verify on another chain. `inspect` assumes Radiant
+  mainnet for a pasted script and says so.
+
+- **`pyrxd inspect` decodes the Photonic `msg` data carrier.** `OP_RETURN PUSH3 "msg"
+  <push> <message>` — the only OP_RETURN format with real volume on Radiant: measured
+  across 20 consecutive mainnet blocks, **73 of 73** data outputs carried this marker and
+  nothing else did. pyrxd already WROTE these and could not read one back, so the
+  commonest data output on the chain rendered as opaque hex. Non-UTF-8 bytes are reported
+  rather than refused — they are already on chain — and display sanitisation happens at
+  the render boundary so the raw bytes stay recoverable for a caller verifying them.
+
 ### Fixed
+
+- **Containers classified as `nft`/`mut` — the container branch was dead code (#578).**
+  `GlyphProtocol.CONTAINER` (7) is the spec'd marker and no mainnet token uses it: all
+  four containers on Radiant mainnet declare `type: "container"` on an ordinary NFT/MUT
+  protocol set. Verified on chain — the "BTC" container (reveal `57c4d660…dfb1`) decodes
+  to `p = (2,)` with `type = 'container'`. Three sites recognised only the protocol form:
+  `GlyphMetadata.is_container`, the inspect classifier, and its deliberate mirror in
+  `wave.py`. Both declarations now count at all three.
 
 - **A multi-glyph reveal reported one glyph's metadata as the transaction's (#577).**
   `find_reveal_metadata` returns the FIRST input carrying a decodable `gly` payload,

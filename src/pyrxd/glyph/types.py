@@ -358,8 +358,20 @@ class GlyphMetadata:
 
     @property
     def is_container(self) -> bool:
-        """True when this envelope marks the token itself as a CONTAINER."""
-        return GlyphProtocol.CONTAINER in self.protocol
+        """True when this envelope marks the token itself as a CONTAINER.
+
+        Either declaration counts. `GlyphProtocol.CONTAINER` (7) is the spec'd
+        form and NO mainnet token uses it — all four containers on Radiant
+        mainnet declare `type: "container"` on an ordinary NFT/MUT protocol set,
+        so a protocol-only test was False for every real container (#578).
+
+        Verified on chain: the "BTC" container (reveal 57c4d660...dfb1) decodes
+        to `p = (2,)` with `type = 'container'`.
+
+        Both are DECLARATIONS — `type` is operator CBOR and nothing on chain
+        enforces it, exactly as nothing enforces the protocol array.
+        """
+        return GlyphProtocol.CONTAINER in self.protocol or (self.token_type or "").strip().lower() == "container"
 
     def __post_init__(self) -> None:
         import re

@@ -305,3 +305,27 @@ class Script:
     @classmethod
     def write_bin(cls, octets: bytes) -> Script:
         return Script(encode_pushdata(octets))
+
+
+def data_pushes_after_op_return(script: bytes) -> list[bytes] | None:
+    """Every data push following a leading ``OP_RETURN``, or None if not push-only.
+
+    Shared by the ``OP_RETURN`` payload decoders (HashMark, the Photonic ``msg``
+    convention) so the walk exists once. Returns None rather than raising: at the
+    point a caller uses this, no protocol marker has been seen yet, so a parse
+    failure means "some other protocol", not "a broken record". Radiant Core
+    classifies a data carrier as ``TX_NULL_DATA`` only when the remainder after
+    ``OP_RETURN`` is push-only, so a non-push chunk means this is not one.
+    """
+    if not script or script[0] != 0x6A:
+        return None
+    parsed = Script(script[1:], allow_malformed=True)
+    if parsed.truncated_at is not None:
+        return None
+    out: list[bytes] = []
+    for chunk in parsed.chunks:
+        op = chunk.op[0] if isinstance(chunk.op, bytes) else chunk.op
+        if op > 0x4B:  # not a direct or OP_PUSHDATA data push
+            return None
+        out.append(chunk.data or b"")
+    return out
