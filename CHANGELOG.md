@@ -8,6 +8,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Containers classified as `nft`/`mut` — the container branch was dead code (#578).**
+  `GlyphProtocol.CONTAINER` (7) is the spec'd marker and no mainnet token uses it: all
+  four containers on Radiant mainnet declare `type: "container"` on an ordinary NFT/MUT
+  protocol set. Verified on chain — the "BTC" container (reveal `57c4d660…dfb1`) decodes
+  to `p = (2,)` with `type = 'container'`. Three sites recognised only the protocol form:
+  `GlyphMetadata.is_container`, the inspect classifier, and its deliberate mirror in
+  `wave.py`. Both declarations now count at all three.
+
 - **A multi-glyph reveal reported one glyph's metadata as the transaction's (#577).**
   `find_reveal_metadata` returns the FIRST input carrying a decodable `gly` payload,
   and that single payload was surfaced as the whole transaction's metadata. Multi-glyph

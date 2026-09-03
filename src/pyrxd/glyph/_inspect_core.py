@@ -640,6 +640,24 @@ def _classify_metadata_protocol(metadata) -> str:
         return "wave"
     if GlyphProtocol.CONTAINER in p:
         return "container"
+    # ...OR the `type` STRING, which is what the chain actually carries (#578).
+    #
+    # GlyphProtocol.CONTAINER (7) is the spec'd form and no mainnet token uses it.
+    # All four containers on Radiant mainnet declare themselves with `type:
+    # "container"` on an ordinary NFT/MUT protocol set, so the branch above was
+    # dead code and every container classified as "nft" or "mut".
+    #
+    # Verified against the chain, not inferred: the "BTC" container
+    # (ref 5558395540...c2ab:0, reveal 57c4d660...dfb1) decodes to `p = (2,)` with
+    # `type = 'container'`. The indexer agrees — it reports token_type CONTAINER
+    # for exactly these four and exposes no protocol field, so its label is derived
+    # from the same string.
+    #
+    # This is a DECLARATION, like the protocol array itself: `type` is operator CBOR
+    # and nothing on chain enforces it. Both forms are claims about what a token is;
+    # neither is a proof, and the ecosystem treats this one as the classification.
+    if (metadata.token_type or "").strip().lower() == "container":
+        return "container"
     if GlyphProtocol.AUTHORITY in p:
         return "authority"
     if GlyphProtocol.TIMELOCK in p:

@@ -333,6 +333,11 @@ def classify_glyph_metadata(metadata: GlyphMetadata) -> str:
         return "wave"
     if GlyphProtocol.CONTAINER in p:
         return "container"
+    # ...or the `type` STRING, which is the form the chain actually carries (#578).
+    # Kept in step with the deliberate mirror of this function in
+    # `_inspect_core._classify_metadata_protocol`; see the note there.
+    if (metadata.token_type or "").strip().lower() == "container":
+        return "container"
     if GlyphProtocol.AUTHORITY in p:
         return "authority"
     if GlyphProtocol.TIMELOCK in p:
