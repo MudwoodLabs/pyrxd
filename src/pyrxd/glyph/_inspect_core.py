@@ -811,6 +811,36 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
                 f"sha256={sha256(metadata.main.data).hex()}>"
             )
 
+    # EVERY input's payload, not just the first (#577).
+    #
+    # `find_reveal_metadata` returns the FIRST decodable scriptSig and that single
+    # payload was reported as the transaction's metadata. Multi-glyph reveals are
+    # real and not rare on mainnet — one observed reveal mints 35 refs from 36
+    # inputs — so 34 of those refs were being shown another token's name,
+    # description and media.
+    #
+    # The full per-input payload is not duplicated here; each entry carries enough
+    # to see WHICH input a name belongs to, and `metadata.input_index` already says
+    # which one the headline payload came from. What was missing was any signal
+    # that other payloads existed at all.
+    metadata_inputs: list[dict] = []
+    for idx, ss in enumerate(scriptsigs):
+        m = inspector.extract_reveal_metadata(ss)
+        if m is None:
+            continue
+        metadata_inputs.append(
+            {
+                "input_index": idx,
+                "classification": _classify_metadata_protocol(m),
+                "name": _sanitize_display_string(m.name) if m.name else "",
+                "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
+            }
+        )
+    if metadata_payload is not None and len(metadata_inputs) > 1:
+        # Say it on the headline payload too. A caller reading only `metadata` must
+        # not be able to mistake one glyph's fields for the transaction's.
+        metadata_payload["of_n_payloads"] = len(metadata_inputs)
+
     return {
         "form": "txid",
         "txid": str(txid),
@@ -819,5 +849,6 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         "output_count": len(tx.outputs),
         "outputs": output_rows,
         "metadata": metadata_payload,
+        "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }

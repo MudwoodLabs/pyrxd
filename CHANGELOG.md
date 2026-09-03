@@ -8,6 +8,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A multi-glyph reveal reported one glyph's metadata as the transaction's (#577).**
+  `find_reveal_metadata` returns the FIRST input carrying a decodable `gly` payload,
+  and that single payload was surfaced as the whole transaction's metadata. Multi-glyph
+  reveals are real on mainnet — one observed reveal mints **35 refs from 36 inputs** —
+  so thirty-four refs were shown another token's name, description and media.
+
+  Additive, because `inspect --json` has consumers: `metadata` still carries the first
+  payload and its `input_index`, and now also `of_n_payloads` when there is more than
+  one. A new `metadata_inputs` lists every input that carries a payload. The CLI says
+  "1 of N glyphs minted here" instead of a bare "Reveal metadata", and prints the
+  others — a JSON key nobody renders does not reach the person reading a terminal.
+
 - **pyrxd silently refused about a quarter of live mainnet glyph payloads (#576).**
   Two write-side limits fired on the READ path and each discarded the entire token:
   a 100,000-byte cap in `GlyphMedia.__post_init__`, and `_cbor_str` raising on a

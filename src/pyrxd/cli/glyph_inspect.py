@@ -261,7 +261,18 @@ def _render_txid_human(payload: dict) -> str:
     metadata = payload.get("metadata")
     if metadata is not None:
         lines.append("")
-        lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        # SAY WHEN IT IS ONE OF SEVERAL (#577). A multi-glyph reveal carries a
+        # payload per minted glyph; printing one under a bare "Reveal metadata"
+        # heading told the reader it described the transaction. One observed
+        # mainnet reveal mints 35 refs from 36 inputs.
+        n_payloads = metadata.get("of_n_payloads")
+        if n_payloads:
+            lines.append(
+                f"Reveal metadata (from input {metadata['input_index']} — "
+                f"1 of {n_payloads} glyphs minted here; see metadata_inputs for the rest):"
+            )
+        else:
+            lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
         lines.append(f"  protocol: {metadata['protocol']}")
         if metadata.get("name"):
             lines.append(f"  name:     {_truncate_for_human(metadata['name'])}")
@@ -286,6 +297,20 @@ def _render_txid_human(payload: dict) -> str:
             # and for mode="block" it would be meaningless.
             lines.append("            (unlocked? pass this token's metadata and your chain tip to")
             lines.append("             pyrxd.is_unlocked / pyrxd.get_unlock_remaining)")
+    # THE OTHER GLYPHS IN A MULTI-GLYPH REVEAL (#577). Pointing at a JSON key is
+    # no use to someone reading the terminal, which is where this renderer is read.
+    others = [
+        row
+        for row in (payload.get("metadata_inputs") or [])
+        if row["input_index"] != (metadata or {}).get("input_index")
+    ]
+    if others:
+        lines.append("")
+        lines.append(f"Other glyphs minted in this transaction ({len(others)}):")
+        for row in others:
+            label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
+            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
+
     # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
     # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
     # V1 = 4-byte nonce / 72-byte scriptSig; V2 = 8-byte / 76-byte.
