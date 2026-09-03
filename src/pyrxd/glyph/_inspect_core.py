@@ -36,6 +36,7 @@ from __future__ import annotations
 import unicodedata
 
 from ..hash import hash256
+from ..script.hashmark import HashMarkOutcome, decode_hashmark
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
@@ -358,11 +359,33 @@ def _inspect_script(script_hex: str) -> dict:
     # re-strip the OP_RETURN byte. Length cap is the script's max
     # (already enforced upstream via _MAX_SCRIPT_HEX_LEN).
     if len(script) >= 1 and script[0] == 0x6A:
-        return {
+        out = {
             **base,
             "type": "op_return",
             "data_hex": script[1:].hex(),
         }
+        # HashMark is a THIRD-PARTY OP_RETURN format on Radiant (MIT, spec at
+        # github.com/cdonnachie/hashmark.rxd). Decoding it here is read-only and
+        # additive: anything that is not one stays plain `op_return`, because a
+        # scanner meets thousands of other protocols' data outputs and treating
+        # them as errors buries the real ones.
+        mark = decode_hashmark(script)
+        if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
+            out["hashmark"] = {
+                "outcome": mark.outcome.value,
+                "version": mark.version,
+                "algorithm": mark.algorithm,
+                "digest": mark.digest_hex,
+                "label": mark.label,
+                # v2 only, and NOT verified here — verifying needs secp256k1 and
+                # the chain the tx was found on. Well-formed is not believed.
+                "signer_hash160": mark.signer_hash160_hex,
+                "signature_unverified": mark.signature_hex,
+                "detail": mark.detail,
+            }
+            if mark.ok:
+                out["type"] = f"op_return-hashmark-v{mark.version}"
+        return out
 
     if is_nft_script(script_hex):
         ref = extract_ref_from_nft_script(script)

@@ -801,11 +801,19 @@ class TestScriptTemplates:
     def test_op_return_lock_uses_non_minimal_push(self):
         """0x01 as OP_RETURN data must stay a literal `01 01` push — the
         minimal-push form (OP_1) would CHANGE the pushed byte semantics for
-        data carriers that read raw pushdata."""
+        data carriers that read raw pushdata.
+
+        The leading byte changed on 2026-09-02: this builder emitted
+        `OP_FALSE OP_RETURN` (`00 6a`), which Radiant Core classifies as
+        TX_NONSTANDARD and does not relay. It is a bare `6a` now. The
+        non-minimal-push property this test exists for is unchanged.
+        """
         from pyrxd.script.type import OpReturn
 
-        assert OpReturn().lock([b"\x01"]).serialize() == b"\x00\x6a\x01\x01"
-        assert OpReturn().lock(["hi"]).serialize() == b"\x00\x6a\x02hi"
+        assert OpReturn().lock([b"\x01"]).serialize() == b"\x6a\x01\x01"
+        assert OpReturn().lock(["hi"]).serialize() == b"\x6a\x02hi"
+        # the opt-in prefixed form keeps the same non-minimal push
+        assert OpReturn().lock([b"\x01"], provably_unspendable=True).serialize() == b"\x00\x6a\x01\x01"
 
     def test_p2pk_lock_bytes_and_length_guard(self):
         from pyrxd.keys import PrivateKey

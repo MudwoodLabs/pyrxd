@@ -91,7 +91,30 @@ class TestOpReturn:
 
     def test_empty_pushdatas(self):
         s = OpReturn().lock([])
-        assert s.byte_length() == 2  # OP_FALSE OP_RETURN only
+        assert s.serialize() == b"\x6a"  # a bare OP_RETURN, nothing else
+
+    def test_the_leading_byte_is_a_BARE_op_return(self):
+        """The form Radiant Core will actually relay, asserted on the byte.
+
+        Radiant Core classifies a data carrier as TX_NULL_DATA — standard, and
+        dust-exempt so a 0-photon output is legal — only when scriptPubKey[0] is
+        OP_RETURN (src/script/standard.cpp, Solver()). This builder emitted
+        `OP_FALSE OP_RETURN` until 2026-09-02, which falls through to
+        TX_NONSTANDARD and is not relayed.
+
+        The tests above could not catch it: they asserted `byte_length() > 2`
+        and `b"pyrxd" in raw`, both true of either spelling. Measured on mainnet
+        across 20 consecutive blocks: 232 bare OP_RETURN data outputs, zero of
+        the prefixed form.
+        """
+        assert OpReturn().lock([b"hello"]).serialize()[0] == 0x6A
+
+    def test_the_prefixed_form_is_still_reachable_deliberately(self):
+        """The honest-path half. Core's IsUnspendable() detects only this
+        spelling, so a caller who wants a pruning helper to recognise the output
+        can still ask for it — explicitly, knowing it will not relay."""
+        raw = OpReturn().lock([b"hello"], provably_unspendable=True).serialize()
+        assert raw[:2] == b"\x00\x6a"
 
 
 # ---------------------------------------------------------------------------
