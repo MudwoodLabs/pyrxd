@@ -365,6 +365,27 @@ def _render_script_human(payload: dict) -> str:
     type_ = payload.get("type", "?")
     head = f"type: {type_}    length: {payload['length']} bytes"
     body: list[str] = []
+    hm = payload.get("hashmark")
+    if hm:
+        # HashMark is a third-party OP_RETURN format (MIT, github.com/cdonnachie/hashmark.rxd).
+        # Classifying it in JSON and not printing it here would leave the feature
+        # invisible to the person actually reading a terminal.
+        if hm["outcome"] == "ok":
+            body.append(f"  HashMark v{hm['version']} ({hm['algorithm']})")
+            body.append(f"    digest:  {hm['digest']}")
+            if hm.get("label"):
+                body.append(f"    label:   {_truncate_for_human(hm['label'])}")
+            if hm.get("signer_hash160"):
+                body.append(f"    signer:  {hm['signer_hash160']}")
+                # NOT verified here, and the label must say so: checking it needs
+                # secp256k1 and the chain the tx was found on. Decoding is not
+                # attestation — a record that decodes is well-formed, not believed.
+                body.append("    signature present but NOT VERIFIED by inspect")
+            body.append("    (proves someone knew this digest no later than the confirming")
+            body.append("     block — not authorship, ownership, originality or contents)")
+        else:
+            body.append(f"  HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+
     if type_ == "p2pkh":
         body.append(f"  owner_pkh: {payload['owner_pkh']}")
     elif type_ in ("nft", "ft"):
