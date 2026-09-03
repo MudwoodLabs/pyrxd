@@ -356,7 +356,7 @@ class TestWaveIdentityNamesAreSanitized:
         record = {"attestation": {"outcome": "valid", "recovered_hash160": "ab" * 20}}
         glyph_inspect._resolve_one_wave_identity(ctx, record)
 
-        stored = record["wave_identity"]["names"]
+        stored = record["wave_identity"]["names_resolving_now"]
         assert "\x1b" not in stored[0], "the escape reached the stored record"
         assert stored[1] == "honest.rxd", "an ordinary name must survive untouched"
 

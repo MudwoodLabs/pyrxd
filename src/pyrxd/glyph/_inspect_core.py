@@ -326,6 +326,28 @@ def _ref_summary(script: bytes) -> dict:
     return {"token_bearing": bool(carried), "input_refs": carried, "referenced_refs": named}  # nosec B105
 
 
+def _address_for(hash160_hex: str | None, network: str) -> str | None:
+    """Base58check address for a recovered signer hash160, or None.
+
+    Separate from the attestation itself because the address is a RE-ENCODING of the
+    recovered key, not a second piece of evidence: it is the same fact in the form a
+    human can compare against a wallet.
+    """
+    if not hash160_hex:
+        return None
+    from ..base58 import base58check_encode
+    from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+
+    try:
+        prefix = NETWORK_ADDRESS_PREFIX_DICT[Network(network)]
+    except (KeyError, ValueError):
+        prefix = NETWORK_ADDRESS_PREFIX_DICT[Network.MAINNET]
+    try:
+        return base58check_encode(prefix + bytes.fromhex(hash160_hex))
+    except ValueError:  # pragma: no cover - the hash160 came from our own recovery
+        return None
+
+
 def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
     from ..script.timelock import parse_p2pkh_timelock_script
@@ -452,6 +474,10 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 out["hashmark"]["attestation"] = {
                     "outcome": att.outcome.value,
                     "recovered_hash160": att.recovered_hash160_hex,
+                    # The address form of the recovered key. §7.6's sound statement
+                    # LEADS with this — it is the only identity fact the mark itself
+                    # carries. Anything a naming system adds is separate context.
+                    "signer_address": _address_for(att.recovered_hash160_hex, network),
                     "assumed_network": f"radiant-{assumed}",
                     "detail": att.detail,
                 }

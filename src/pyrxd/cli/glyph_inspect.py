@@ -367,6 +367,47 @@ def _render_inspect_human(payload: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in payload.items())
 
 
+def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
+    """Names resolving to the signer's key NOW — as context, never as part of the mark.
+
+    HashMark §7.6 is explicit that a naming system must not be folded into a mark's
+    verdict. A name resolves to whatever it points at now; a mark was made at a past
+    block. Applying a present-tense lookup to a past event is wrong in BOTH directions
+    once a name changes hands:
+
+    * a genuine mark signed by the previous holder starts failing, because the name
+      resolves elsewhere — a real record rejected;
+    * whoever acquires a lapsed name can make NEW marks that verify as "signed by
+      whoever owns company.rxd", which is TRUE and which a reader hears as "the
+      company made this". Names on Radiant have terms and expire, so this is ordinary
+      rather than exotic.
+
+    This block previously read "the signing key owns these names — file matches the
+    digest AND was recorded by that name's holder". That is the unsound form verbatim:
+    a past-tense claim manufactured from a present-tense lookup, printed inside the
+    attestation block as though the mark carried it.
+
+    So the two facts are separated, per §7.6 form 1: the signer ADDRESS sits with the
+    signature, where it belongs, and the name sits below the mark, at the outer indent,
+    marked present-tense. The sound form — "recorded by the holder at that time" —
+    needs point-in-time resolution against the mark's own block, which is issue-tracked
+    rather than approximated here.
+    """
+    if not wi:
+        return []
+    if not wi.get("resolved"):
+        return [f"{indent}separately — WAVE names: not resolved ({wi.get('reason')})"]
+    names = wi.get("names_resolving_now") or []
+    if not names:
+        return [f"{indent}separately — no WAVE name resolves to that key right now"]
+    return [
+        f"{indent}separately, and NOT part of the mark above:",
+        f"{indent}  WAVE names resolving to that key RIGHT NOW: {', '.join(names)}",
+        f"{indent}  (a present-tense lookup. Names change hands, so this does not say who",
+        f"{indent}   held the name when the mark was made, nor that the named party made it)",
+    ]
+
+
 def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
     """The `msg` and HashMark rendering, for EVERY human surface that shows one.
 
@@ -412,19 +453,10 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                 att = hm.get("attestation") or {}
                 if att.get("outcome") == "valid":
                     out.append(f"{indent}  signature VERIFIED — recovers to the committed signer")
+                    if att.get("signer_address"):
+                        out.append(f"{indent}    signer address: {att['signer_address']}")
                     out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
                     out.append(f"{indent}     the signed statement and a pasted script carries no context)")
-                    wi = hm.get("wave_identity")
-                    if wi and wi.get("resolved"):
-                        names = wi.get("names") or []
-                        if names:
-                            out.append(f"{indent}  WAVE identity: {', '.join(names)}")
-                            out.append(f"{indent}    (the signing key owns these names — file matches the")
-                            out.append(f"{indent}     digest AND was recorded by that name's holder)")
-                        else:
-                            out.append(f"{indent}  WAVE identity: none — the signing key owns no WAVE name")
-                    elif wi:
-                        out.append(f"{indent}  WAVE identity: not resolved ({wi.get('reason')})")
                 elif att.get("outcome") == "invalid_signature":
                     # The bytes decoded; the CLAIM does not hold. Saying "malformed"
                     # here would send whoever is debugging it after the wrong problem.
@@ -432,6 +464,11 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                     out.append(f"{indent}    (the record is well-formed; its claim is not supported)")
             out.append(f"{indent}  (proves someone knew this digest no later than the confirming")
             out.append(f"{indent}   block — not authorship, ownership, originality or contents)")
+            # AFTER the mark's own statement closes, and at the outer indent. §7.6
+            # allows a name only as present-tense context, "never beside the mark as
+            # though it were part of it", so it does not sit inside the block or
+            # between the signature and what that signature proves.
+            out.extend(_wave_context_lines(hm.get("wave_identity"), indent))
         else:
             out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
 
@@ -831,7 +868,10 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
 
 
 def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
-    """Resolve the WAVE names a VERIFIED HashMark signer owns, and attach them.
+    """Attach the WAVE names that resolve to a VERIFIED signer's key RIGHT NOW.
+
+    Present tense throughout, and deliberately not "the names the signer owns" — that
+    phrasing was the bug. See :func:`_resolve_one_wave_identity` and HashMark §7.6.
 
     ONLY runs on a signature that actually verified. Resolving an unverified
     signer would dress a claim up as an identity — the exact failure the
@@ -887,4 +927,23 @@ def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
     # under "signature VERIFIED" — the one line in this output that states an
     # independently checked cryptographic fact. Raw, it can carry the ANSI to
     # scroll that line off the screen and reprint it saying something else.
-    hm["wave_identity"] = {"resolved": True, "names": [_sanitize_display_string(n) for n in names]}
+    hm["wave_identity"] = {
+        "resolved": True,
+        # NAMED FOR WHAT IT IS. This was `names`, which invites exactly the inference
+        # §7.6 forbids: a name resolves to whatever it points at NOW, and the mark was
+        # made at a past block. Applying a present-tense lookup to a past event is
+        # wrong in both directions the moment a name changes hands — a genuine mark by
+        # the previous holder starts failing, and whoever picks up a lapsed name can
+        # make NEW marks that truthfully verify as "signed by whoever owns
+        # company.rxd", which a reader hears as "the company made this".
+        "names_resolving_now": [_sanitize_display_string(n) for n in names],
+        # Explicit so a downstream consumer cannot reach for this field believing it
+        # is the historical answer. Doing that properly means establishing what the
+        # name pointed at AT THE MARK'S OWN BLOCK, by fetching and verifying the chain
+        # of modification transactions — not by trusting an index (§2.8, §7.6).
+        "point_in_time": False,
+        "caveat": (
+            "present-tense lookup, not a property of the mark: names change hands, so this "
+            "does not establish who held the name when the mark was made"
+        ),
+    }
