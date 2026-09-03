@@ -387,6 +387,10 @@ def _render_script_human(payload: dict) -> str:
             body.append(f"    digest:  {hm['digest']}")
             if hm.get("label"):
                 body.append(f"    label:   {_truncate_for_human(hm['label'])}")
+            elif hm.get("label_withheld"):
+                # v1 keeps its timestamp evidence; the label is withheld WITH a reason,
+                # because silently showing nothing looks like a record that had no label.
+                body.append(f"    label:   [withheld — {hm['label_withheld']}]")
             if hm.get("signer_hash160"):
                 body.append(f"    signer:  {hm['signer_hash160']}")
                 att = hm.get("attestation") or {}

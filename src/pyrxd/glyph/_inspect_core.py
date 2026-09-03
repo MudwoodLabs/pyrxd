@@ -403,7 +403,13 @@ def _inspect_script(script_hex: str) -> dict:
                 "version": mark.version,
                 "algorithm": mark.algorithm,
                 "digest": mark.digest_hex,
-                "label": mark.label,
+                # SANITISED, like every other display string on this renderer. The
+                # decoder now refuses a non-canonical label outright (spec 5.4), so
+                # this is defence in depth — but `msg` two branches up was sanitised
+                # and this was not, in the same function, which is how a label got to
+                # inject whole lines under "signature VERIFIED".
+                "label": _sanitize_display_string(mark.label) if mark.label else None,
+                "label_withheld": mark.label_withheld,
                 # v2 only, and NOT verified here — verifying needs secp256k1 and
                 # the chain the tx was found on. Well-formed is not believed.
                 "signer_hash160": mark.signer_hash160_hex,

@@ -29,6 +29,7 @@ must be labelled as such by any caller that surfaces it.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 
@@ -58,6 +59,42 @@ HASHMARK_MAGIC = b"HASHMARK"
 _ALGORITHMS: dict[int, tuple[str, int]] = {0x01: ("sha256", 32)}
 
 _OP_RETURN = OpCode.OP_RETURN.value[0] if hasattr(OpCode.OP_RETURN, "value") else 0x6A
+
+
+#: Codepoints §5.4 REJECTS in a label, as ranges and singletons.
+#:
+#: C0 and DEL smuggle line breaks and terminal escapes past a human reviewer; C1
+#: is still acted on by real terminals; U+2028/2029 are genuine line separators;
+#: and the bidi marks, overrides and isolates reorder rendered text with no line
+#: break at all. U+200C ZWNJ and U+200D ZWJ are deliberately NOT rejected — they
+#: are joiners, and rejecting them would refuse legitimate text in several
+#: scripts.
+_LABEL_REJECTED_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00, 0x1F),  # C0
+    (0x7F, 0x9F),  # DEL + C1
+    (0x2028, 0x2029),  # line / paragraph separator
+    (0x202A, 0x202E),  # bidi embeddings and overrides
+    (0x2066, 0x2069),  # bidi isolates
+)
+_LABEL_REJECTED_CHARS: frozenset[int] = frozenset({0x061C, 0x200B, 0x200E, 0x200F, 0xFEFF})
+
+
+def _label_defect(label: str) -> str | None:
+    """Why this label is not canonical per §5.4, or None if it is fine.
+
+    CANONICALISATION RUNS ONE WAY. A decoder must never trim or normalise a label
+    it has read — it rejects or withholds a non-canonical one. Silently fixing it
+    would mean the string shown is not the string signed.
+    """
+    for ch in label:
+        cp = ord(ch)
+        if cp in _LABEL_REJECTED_CHARS or any(lo <= cp <= hi for lo, hi in _LABEL_REJECTED_RANGES):
+            return f"contains U+{cp:04X}"
+    if label != label.strip():
+        return "has leading or trailing whitespace"
+    if unicodedata.normalize("NFC", label) != label:
+        return "is not Unicode NFC"
+    return None
 
 
 class HashMarkOutcome(Enum):
@@ -95,6 +132,11 @@ class HashMarkRecord:
     #: than normalised, so a digest has exactly one accepted spelling.
     digest_hex: str | None = None
     label: str | None = None
+    #: v1 only: why the label was withheld from display, per §5.4. The record stays
+    #: valid — a v1 label is not signed and forms no part of any claim, so a
+    #: dangerous one can misrepresent itself on screen but not a statement.
+    #: Invalidating would discard timestamp evidence to fix a rendering problem.
+    label_withheld: str | None = None
     #: v2 only: hash160 of the key that signed. NOT verified here.
     signer_hash160_hex: str | None = None
     #: v2 only: 65-byte compact recoverable signature. NOT verified here.
@@ -170,6 +212,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         signer_hex, signature_hex = signer.hex(), signature.hex()
 
     label = None
+    label_withheld: str | None = None
     if len(pushes) == expected[1]:
         raw = pushes[-1]
         cap = 128 if version == 1 else 223
@@ -182,6 +225,21 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         except UnicodeDecodeError:
             return HashMarkRecord(HashMarkOutcome.INVALID, version=version, detail="label is not valid UTF-8")
 
+        # §5.4, and the split is version-dependent on purpose.
+        defect = _label_defect(label)
+        if defect is not None:
+            if version == 2:
+                # The label is INSIDE the signed statement, so a non-canonical label
+                # is not the label that was signed. The record is invalid.
+                return HashMarkRecord(
+                    HashMarkOutcome.INVALID, version=version, detail=f"label {defect} (spec 5.4)"
+                )
+            # v1: the label is not signed and forms no part of any claim, so a
+            # dangerous one can misrepresent itself on screen but not a statement.
+            # Withhold it and keep the record — invalidating would throw away
+            # timestamp evidence to fix a rendering problem.
+            label_withheld, label = f"label {defect} (spec 5.4)", None
+
     return HashMarkRecord(
         HashMarkOutcome.OK,
         version=version,
@@ -189,6 +247,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         algorithm=name,
         digest_hex=digest.hex(),  # .hex() is lowercase; the one accepted spelling
         label=label,
+        label_withheld=label_withheld,
         signer_hash160_hex=signer_hex,
         signature_hex=signature_hex,
     )

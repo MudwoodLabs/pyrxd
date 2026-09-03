@@ -179,3 +179,93 @@ class TestV1IsNotAFailure:
         v1 = b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST)
         res = verify_attestation(decode_hashmark(v1))
         assert res.outcome is AttestationOutcome.NOT_ATTESTED
+
+
+class TestLabelCanonicalityIsEnforced:
+    """§5.4 label rules — the gap that let a signer forge display lines.
+
+    Found by a security panel with a working exploit: a v2 record whose label
+    contained a newline printed an attacker-chosen line INSIDE the block the CLI
+    had just marked "signature VERIFIED", in the exact form of the WAVE-identity
+    attribution the tool prints only for a verified signature. A reader would
+    attribute a file to a key holder who never signed for that name. A U+202E in
+    the label additionally renders "invoice<RLO>gpj.exe" as "invoiceexe.jpg", so
+    the signed description is not the one the user reads.
+
+    The decoder applied only a length cap and `bytes.decode("utf-8")`, so every
+    one of these decoded OK and attested VALID — where the reference
+    implementation and any spec-conformant verifier return INVALID. Two verifiers
+    disagreeing about the same bytes is precisely the failure mode this project
+    cares most about.
+
+    THE VERSION SPLIT IS DELIBERATE, per §5.4: a v2 label is inside the signed
+    statement, so a non-canonical one is not the label that was signed and the
+    record is INVALID. A v1 label is not signed and forms no part of any claim, so
+    it is WITHHELD with a reason and the record stays valid — invalidating it
+    would discard timestamp evidence to fix a rendering problem.
+    """
+
+    #: One per row of the spec's rejected table, plus the two canonicalisation rules.
+    _BAD = {
+        "C0 newline": "file.pdf\nWAVE identity: treasury.rxd",
+        "C0 ESC": "ok\x1b[31mRED",
+        "C0 NUL": "a\x00b",
+        "DEL": "a\x7fb",
+        "C1": "a\x85b",
+        "U+2028 line sep": "a b",
+        "U+2029 para sep": "a b",
+        "U+061C ALM": "a؜b",
+        "U+200B ZWSP": "a​b",
+        "U+200E LRM": "a‎b",
+        "U+202E RLO": "invoice‮gpj.exe",
+        "U+2066 isolate": "a⁦b",
+        "U+FEFF BOM": "﻿contract",
+        "untrimmed": "  contract.pdf  ",
+        "non-NFC": "café",
+    }
+    #: Explicitly NOT rejected — joiners, and ordinary text.
+    _GOOD = {"ZWNJ": "a‌b", "ZWJ": "a‍b", "plain": "invoice.pdf", "emoji": "sun ☀"}
+
+    @pytest.mark.parametrize("label", _BAD.values(), ids=list(_BAD))
+    def test_v2_with_a_noncanonical_label_is_INVALID(self, label: str) -> None:
+        raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([2, 1])) + _push(_DIGEST) + _push(bytes(20)) + _push(bytes(65)) + _push(label.encode())
+        rec = decode_hashmark(raw)
+        assert rec.outcome is HashMarkOutcome.INVALID
+        assert "5.4" in (rec.detail or "")
+
+    @pytest.mark.parametrize("label", _BAD.values(), ids=list(_BAD))
+    def test_v1_stays_VALID_but_withholds_the_label(self, label: str) -> None:
+        raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + _push(label.encode())
+        rec = decode_hashmark(raw)
+        assert rec.ok, "a v1 label is unsigned; invalidating would discard timestamp evidence"
+        assert rec.label is None and rec.label_withheld
+
+    @pytest.mark.parametrize("label", _GOOD.values(), ids=list(_GOOD))
+    def test_a_legitimate_label_is_NOT_refused(self, label: str) -> None:
+        """The honest path. ZWNJ and ZWJ are joiners the spec deliberately permits —
+        rejecting them would refuse legitimate text in several scripts."""
+        for version, tail in ((1, b""), (2, _push(bytes(20)) + _push(bytes(65)))):
+            raw = b"\x6a" + _push(b"HASHMARK") + _push(bytes([version, 1])) + _push(_DIGEST) + tail + _push(label.encode())
+            rec = decode_hashmark(raw)
+            assert rec.ok and rec.label == label, f"v{version}"
+
+    def test_the_decoder_never_SILENTLY_repairs_a_label(self) -> None:
+        """Canonicalisation runs one way. Trimming or normalising a label we read
+        would mean the string shown is not the string signed."""
+        rec = decode_hashmark(
+            b"\x6a" + _push(b"HASHMARK") + _push(bytes([1, 1])) + _push(_DIGEST) + _push(b"  x  ")
+        )
+        assert rec.label != "x", "must withhold, never trim"
+        assert rec.label is None
+
+    def test_the_forged_attribution_no_longer_reaches_the_renderer(self) -> None:
+        """End-to-end, through the production classifier: the panel's exploit."""
+        from pyrxd.glyph._inspect_core import _inspect_script
+
+        raw = (b"\x6a" + _push(b"HASHMARK") + _push(bytes([2, 1])) + _push(_DIGEST)
+               + _push(bytes(20)) + _push(bytes(65))
+               + _push(b"report.pdf\n    WAVE identity: treasury.rxd"))
+        row = _inspect_script(raw.hex())
+        assert row["type"] == "op_return", "must not classify as a valid hashmark"
+        assert row["hashmark"]["outcome"] == "invalid"
+        assert "WAVE identity" not in str(row.get("hashmark", {}).get("label") or "")
