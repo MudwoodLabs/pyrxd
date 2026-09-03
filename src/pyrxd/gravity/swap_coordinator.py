@@ -396,7 +396,10 @@ class MarginPolicy:
             value = getattr(self, label)
             if not isinstance(value, Timelock):
                 raise ValidationError(f"MarginPolicy.{label} must be a Timelock")
-            blocks = value.normalize_to(TimeUnit.BLOCKS, block_interval_s=self.block_interval_s).value
+            # RADIANT fields convert with RADIANT's interval (#579); btc_claim_reorg_depth
+            # is a Bitcoin quantity and keeps the Bitcoin one.
+            interval = self.block_interval_s if label == "btc_claim_reorg_depth" else self.rxd_block_interval_s
+            blocks = value.normalize_to(TimeUnit.BLOCKS, block_interval_s=interval).value
             if blocks < floor:
                 raise ValidationError(
                     f"MarginPolicy.{label} = {blocks} blk < safety floor {floor}. "
@@ -1048,6 +1051,27 @@ def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
     return math.ceil(reserve.value / block_interval_s)
 
 
+def _radiant_reserve_blocks(policy: MarginPolicy, reserve: Timelock) -> int:
+    """Convert a RADIANT-chain reserve to blocks, using RADIANT's interval.
+
+    `rxd_claim_burial` and `rxd_claim_inclusion` count RADIANT blocks. They were
+    converted with `policy.block_interval_s` — the BITCOIN interval — at seven
+    sites, and `policy.rxd_block_interval_s` was used for them nowhere (#579).
+
+    Inert while every constructor tags them BLOCKS, because the conversion is then
+    the identity and the interval is never read. That is exactly why it survived:
+    a wrong argument that is never used looks like a working one. A SECONDS-tagged
+    value makes it live in BOTH directions — measured at 600/300, an 1800 s burial
+    (6 Radiant blocks) was used as 3, half the intended depth; and a 900 s burial
+    (3 honest Radiant blocks) was REFUSED at construction as "1 blk < floor 2".
+
+    Exists so the choice is made once rather than at each call site. Enforced by
+    `tests/test_radiant_reserves_use_the_radiant_interval.py`, which fails if any
+    site converts one of these fields with the Bitcoin interval again.
+    """
+    return _reserve_to_blocks(reserve, policy.rxd_block_interval_s)
+
+
 def _claim_floor_blocks(policy: MarginPolicy, *, burial: int, counter_reserve: int) -> int:
     """Blocks that must remain before the maker's refund opens for a claim started NOW to be buried
     in time. THE SINGLE DEFINITION — both the fund-time gate and the claim-time assessor call it.
@@ -1063,7 +1087,7 @@ def _claim_floor_blocks(policy: MarginPolicy, *, burial: int, counter_reserve: i
     Two gates computing the same quantity from separate expressions is the shape that produced
     #531 and the runner's empty-feasible-set class. Derived once here instead.
     """
-    return burial + counter_reserve + _reserve_to_blocks(policy.rxd_claim_inclusion, policy.block_interval_s)
+    return burial + counter_reserve + _radiant_reserve_blocks(policy, policy.rxd_claim_inclusion)
 
 
 def assess_claim_finality(
@@ -1129,7 +1153,7 @@ def assess_claim_finality(
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
         # Reserves round UP when seconds-tagged (flooring under-counts a reserve — unsafe);
         # t_rxd above floors, which is safe for a deadline (only shrinks the window).
-        flat_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        flat_burial = _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
         # VALUE-SCALED burial (red-team HIGH): the taker's claim must bury deep enough that
         # reorging it costs at least the value at stake; the flat burial is only a FLOOR.
         # Effective value: the explicit per-assessment value (watchtower per-record) overrides
@@ -1528,7 +1552,7 @@ class SwapCoordinator:
             # _reserve_to_blocks(policy.rxd_claim_burial, ...)) — NOT the hardcoded estimate (red-team
             # LOW): an operator who measures a burial != 6 would otherwise get a floor that blesses an
             # N the gate's actual (larger) squeeze reserve makes insufficient — false assurance.
-            burial_blocks = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            burial_blocks = _radiant_reserve_blocks(mp, mp.rxd_claim_burial)
             min_n = fin_reserve_blocks + burial_blocks - 1
             if config.maker_stall_safety_window_blocks < min_n:
                 raise ValidationError(
@@ -1777,7 +1801,7 @@ class SwapCoordinator:
         policy = self.config.margin_policy
         if not policy.is_measured:
             return None
-        return _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        return _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
 
     def _assert_t_rxd_can_reach_a_safe_claim(self, terms: NegotiatedTerms, *, cov_confs: int) -> PreBtcLockGate | None:
         """None when the swap can still reach a SAFE claim; a refusing gate otherwise.
@@ -1794,7 +1818,7 @@ class SwapCoordinator:
         """
         mp = self.config.margin_policy
         try:
-            flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            flat_burial = _radiant_reserve_blocks(mp, mp.rxd_claim_burial)
             burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
             # max(flat, value-scaled) — the SAME term the claim-time gate uses. Checking only the
             # value-scaled component let the FLAT burial dominate unnoticed, and made this inert
@@ -1814,7 +1838,7 @@ class SwapCoordinator:
                         f"t_rxd is {int(terms.t_rxd.value)} blocks and the maker's covenant is already "
                         f"{elapsed} deep, leaving {remaining} — but a safe claim needs {required} "
                         f"(burial {burial} + counter-leg reserve {counter_reserve} + "
-                        f"{_reserve_to_blocks(mp.rxd_claim_inclusion, mp.block_interval_s)} to be mined). "
+                        f"{_radiant_reserve_blocks(mp, mp.rxd_claim_inclusion)} to be mined). "
                         "This swap can NEVER reach a safe claim: the taker would reveal, find every "
                         "claim SQUEEZED, and be left choosing between a reorg-reversible claim and "
                         "walking away from a funded counter leg. Negotiate a longer t_rxd, fund "

@@ -6,6 +6,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Radiant-chain reserves were converted with the BITCOIN interval at seven sites (#579).**
+  `rxd_claim_burial` and `rxd_claim_inclusion` count RADIANT blocks and were normalised
+  with `policy.block_interval_s`; `policy.rxd_block_interval_s` was used for them nowhere.
+
+  **Inert on every shipped path**, because each constructor tags those fields BLOCKS and
+  the conversion is then the identity — the interval argument is never read. That is why
+  it survived review, the type system (`security/units.py` has one `BlockSpan` for all
+  chains) and an "auditor-grade" parity sweep: a wrong argument that is never used looks
+  exactly like a right one.
+
+  Both directions were reachable the moment a SECONDS value existed. Measured at 600/300:
+  an 1800 s burial is 6 Radiant blocks and was read as **3**, half the intended depth; a
+  900 s burial is 3 honest Radiant blocks and was **refused at construction** as
+  "1 blk < safety floor 2". Unsafe one way, refusing valid work the other.
+
+  One `_radiant_reserve_blocks` helper now makes the choice once, and
+  `MarginPolicy.__post_init__` applies each field's own chain interval — Bitcoin's for
+  `btc_claim_reorg_depth`, Radiant's for the rest.
+
+- **The parity sweep reproduced the same conflation and could not have caught it (#581).**
+  `test_assess_claim_finality_parity_sweep_byte_equivalent` bills its reference as deriving
+  the answer "from the rule rather than from the code", and it normalised the Radiant
+  reserves with the Bitcoin interval exactly as production did — so the two agreed by
+  sharing a defect. Every swept policy was also BLOCKS-tagged, making all conversion
+  arithmetic the identity, so no unit error of any size could have failed it. The reference
+  now derives the interval and the rounding independently, and the sweep includes a
+  SECONDS-tagged policy.
+
 ### Added
 
 - **`pyrxd glyph inspect --verify-wave` names the signer.** For a VERIFIED v2

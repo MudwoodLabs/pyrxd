@@ -869,3 +869,45 @@ async def test_the_executor_PINS_the_recorded_covenant_outpoint():
         f"the executor passed pin_outpoint={leg.chain_io.pin_seen!r} — it is re-discovering by scan, "
         "so a second payment to the covenant address still bricks the autonomous claim"
     )
+
+
+# --------------------------------------------------------- tests: the decision BOUNDARY
+
+
+class TestTheBroadcastBoundaryIsPinned:
+    """Every other broadcast test in this file runs at MAXIMUM slack, and that is a
+    problem the suite cannot see from the inside.
+
+    `_armed_executor` defaults `confs=1`, so `now_rxd == funded_h` and `blocks_left`
+    is the full `t_rxd` — while the BTC claim is 10 confirmations deep. Radiant does
+    not reach that state: 10 Bitcoin confirmations is roughly 100 minutes, which is
+    20-plus Radiant blocks at the measured 222 s median, not zero.
+
+    Measured through the production entry point, sweeping `confs` 1..199: the verdict
+    flips BROADCAST -> DECLINED between **137 and 138**. The suite's fixtures use 1
+    and 172 and nothing else, so no case sat within 136 blocks of the flip on one
+    side or 34 on the other. An off-by-one in the executor's depth-to-height
+    derivation (`now_rxd = funded_h + max(cov_confs, 1) - 1`) was therefore invisible.
+
+    Both directions of that off-by-one are real defects: one block LATE is a spurious
+    squeeze after `p` is public, which is a forfeiture path; one block EARLY certifies
+    a claim that cannot bury in time.
+    """
+
+    async def test_the_last_confs_that_still_broadcasts(self) -> None:
+        ex, _leg, rec, _ = await _armed_executor(confs=137)
+        assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+
+    async def test_one_block_further_declines(self) -> None:
+        ex, _leg, rec, _ = await _armed_executor(confs=138)
+        assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+
+    async def test_a_REACHABLE_state_still_broadcasts(self) -> None:
+        """The honest path at a co-occurring depth rather than at maximum slack.
+
+        With the BTC claim 10 confirmations deep, roughly 20-plus Radiant blocks have
+        also passed. Pinning that here means the happy path is exercised at a state
+        the chain can actually be in — the default `confs=1` never is.
+        """
+        ex, _leg, rec, _ = await _armed_executor(confs=24, btc_confs=10)
+        assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST

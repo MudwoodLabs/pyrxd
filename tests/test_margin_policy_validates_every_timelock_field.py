@@ -90,7 +90,22 @@ class TestEveryFlooredFieldIsActuallyEnforced:
 
     def test_a_SECONDS_tagged_value_is_normalised_before_the_floor_is_applied(self) -> None:
         """The floor is in BLOCKS, so a seconds-tagged reserve must be converted first — otherwise
-        `Timelock(1, SECONDS)` would pass a 2-block floor on its raw number."""
+        `Timelock(1, SECONDS)` would pass a 2-block floor on its raw number.
+
+        The VALUES changed with #579, the property did not. `rxd_claim_burial` counts RADIANT
+        blocks, so it converts at the Radiant interval (300 s default), not the Bitcoin one
+        (600 s). Under the old arithmetic 600 s read as 1 block; it is 2 Radiant blocks, which is
+        what a Radiant burial of 600 s actually is. Deliberately using the two intervals'
+        DIFFERENT values here — equal intervals would hide exactly the conflation this pins.
+        """
         with pytest.raises(ValidationError, match="rxd_claim_burial"):
-            MarginPolicy(**_base(rxd_claim_burial=t.Timelock(600, t.TimeUnit.SECONDS)))  # 1 block
-        MarginPolicy(**_base(rxd_claim_burial=t.Timelock(1200, t.TimeUnit.SECONDS)))  # 2 blocks
+            MarginPolicy(**_base(rxd_claim_burial=t.Timelock(300, t.TimeUnit.SECONDS)))  # 1 RXD block
+        MarginPolicy(**_base(rxd_claim_burial=t.Timelock(600, t.TimeUnit.SECONDS)))  # 2 RXD blocks
+
+    def test_a_BITCOIN_reserve_still_converts_at_the_BITCOIN_interval(self) -> None:
+        """The other half of #579: only the RADIANT fields moved. `btc_claim_reorg_depth` counts
+        Bitcoin blocks and must keep the Bitcoin interval, or the fix would have swapped one
+        conflation for its mirror image."""
+        with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+            MarginPolicy(**_base(btc_claim_reorg_depth=t.Timelock(600, t.TimeUnit.SECONDS)))  # 1 BTC block
+        MarginPolicy(**_base(btc_claim_reorg_depth=t.Timelock(1200, t.TimeUnit.SECONDS)))  # 2 BTC blocks
