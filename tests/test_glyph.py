@@ -1340,13 +1340,12 @@ class TestGlyphBuilder:
 
 
 class TestSecurityRejection:
-    def test_glyph_media_data_over_100kb_raises(self):
-        with pytest.raises(ValidationError, match="too large"):
-            GlyphMedia(mime_type="image/png", data=bytes(100_001))
-
-    def test_glyph_media_exactly_100kb_is_valid(self):
-        media = GlyphMedia(mime_type="image/png", data=bytes(100_000))
-        assert len(media.data) == 100_000
+    def test_glyph_media_carries_chain_sized_data(self):
+        """No size cap on GlyphMedia: it is constructed ONLY by the decoder, so a
+        cap here refused real on-chain tokens and guarded nothing that pyrxd
+        writes. Live mainnet carries webp payloads well past the old 100 KB."""
+        media = GlyphMedia(mime_type="image/png", data=bytes(236_726))
+        assert len(media.data) == 236_726
 
     def test_glyph_ref_negative_vout_raises(self):
         with pytest.raises(ValidationError):
@@ -1395,38 +1394,35 @@ class TestSecurityRejection:
         with pytest.raises(ValidationError, match="main.t.*too long"):
             decode_payload(evil)
 
-    def test_decode_payload_enforces_the_100kb_media_ceiling(self):
-        """The `main.b` cap applies on DECODE, not just on construction.
+    def test_decode_accepts_media_the_ENCODER_would_not_choose_to_write(self):
+        """The read/write asymmetry, restored.
 
-        ``decode_payload`` builds a ``GlyphMedia`` (``payload.py:122``), so the
-        100,000-byte ceiling in ``GlyphMedia.__post_init__``
-        (``types.py:116-117``) fires even though the enclosing CBOR body is
-        comfortably under the 256 KiB limit. Pinned because
-        ``docs/reference/glyph-token-protocol-spec.md`` §4.4 previously asserted
-        the opposite — that pyrxd "decodes media it would refuse to construct".
+        This case previously asserted the opposite, and its docstring recorded
+        why: the protocol spec §4.4 had said pyrxd "decodes media it would refuse
+        to construct", and that sentence was changed to match the code rather
+        than the code changed to match the sentence. The spec had it right.
+
+        Reading is not writing. A blob is already on chain; refusing to describe
+        it helps nobody, and one refusal took the whole token's metadata with it.
         """
         import cbor2
 
         from pyrxd.glyph.payload import decode_payload
 
-        oversize = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * 150_000}})
-        assert len(oversize) < 262_144  # well inside the body cap: the media cap is what fires
-        with pytest.raises(ValidationError, match="media too large"):
-            decode_payload(oversize)
+        body = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * 236_726}})
+        meta = decode_payload(body)
+        assert meta.main is not None and len(meta.main.data) == 236_726
 
-    @pytest.mark.parametrize(("size", "accepted"), [(100_000, True), (100_001, False)])
-    def test_decode_payload_media_ceiling_boundary(self, size: int, accepted: bool):
+    def test_the_dos_bound_is_the_PAYLOAD_cap_and_still_fires(self):
+        """Paired with the case above: leniency on the media field must not have
+        removed the bound, only moved it to where it always belonged."""
         import cbor2
 
         from pyrxd.glyph.payload import decode_payload
 
-        body = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * size}})
-        if accepted:
-            meta = decode_payload(body)
-            assert meta.main is not None and len(meta.main.data) == size
-        else:
-            with pytest.raises(ValidationError, match="media too large"):
-                decode_payload(body)
+        body = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * 500_000}})
+        with pytest.raises(ValidationError, match="payload too large"):
+            decode_payload(body)
 
     def test_commit_script_wrong_hash_len_raises(self):
         with pytest.raises(ValidationError, match="32 bytes"):
