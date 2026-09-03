@@ -120,18 +120,31 @@ def test_the_key_derivation_matches_hypothesis():
     assert _hash(digest) != _hash(digest + b".secondary")
 
 
-def test_no_committed_counterexample_is_orphaned():
+def test_unmatched_corpus_directories_are_reported_as_UNEXPLAINED():
+    """Report, do not delete — an unmatched directory is not proof of an orphan.
+
+    This test used to FAIL on any directory whose name did not match a key
+    computed here, and that check was wrong. It reported all six committed
+    directories as orphaned, they were archived out of the tree on that basis,
+    and a later fuzz failure re-created one of them (``04e6b3400353b141``) —
+    proving it belonged to a live test all along.
+
+    The derivation is incomplete. ``hypothesis/core.py:1409`` prefers an
+    explicitly-set ``_hypothesis_internal_database_key`` over ``function_digest``,
+    and where it computes one it uses the WRAPPED test rather than ``inner_test``.
+    Recomputing across the suite with the attribute form still does not account
+    for that directory, so at least one further key path exists that has not been
+    identified.
+
+    So this asserts nothing about orphanhood. It prints what it could not
+    explain, which is genuinely useful when a rename really has stranded
+    something, without licensing anyone to delete data on a key computation.
+    """
     keys, _ = _live_keys()
-    orphans = sorted(_corpus_dirs() - set(keys))
-    detail = []
-    for name in orphans:
-        n = sum(1 for _ in (_CORPUS / name).iterdir())
-        detail.append(f"  {name}/  ({n} entries)")
-    assert not orphans, (
-        "committed Hypothesis corpus entries belong to no live test, so nothing replays "
-        "them:\n" + "\n".join(detail) + "\n\n"
-        "A test was renamed or removed — function_digest incorporates the test NAME, so a "
-        "rename orphans its entries while leaving the files in place, looking like coverage.\n"
-        "Either restore the test's name, or delete the directory and freeze the case as a "
-        "NAMED reproducer instead (see tests/.hypothesis-corpus/README.md)."
-    )
+    unmatched = sorted(_corpus_dirs() - set(keys))
+    if unmatched:
+        print("\ncorpus directories not matched by any computed key (UNEXPLAINED, not orphaned):")
+        for name in unmatched:
+            n = sum(1 for _ in (_CORPUS / name).iterdir())
+            print(f"  {name}/  ({n} entries)")
+        print("Do NOT delete these on this basis. See tests/.hypothesis-corpus/README.md.")

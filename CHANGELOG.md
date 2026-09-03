@@ -6,7 +6,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`pyrxd inspect` classifies HashMark records.** HashMark is a THIRD-PARTY
+  `OP_RETURN` format on Radiant (MIT, spec at github.com/cdonnachie/hashmark.rxd)
+  that records a file's digest so anyone can later prove the file existed no later
+  than the confirming block. `pyrxd.script.hashmark.decode_hashmark` is an
+  independent read-only implementation of that spec — pyrxd never writes one — and
+  the inspector surfaces it additively: anything that is not a HashMark keeps
+  classifying exactly as before. Decoding is not attestation: a v2 record's
+  signature is returned UNVERIFIED, because verifying it needs secp256k1 and the
+  chain the transaction was found on.
+
+### Fixed
+
+- **`OpReturn.lock()` built `OP_FALSE OP_RETURN`, which Radiant does not relay.**
+  Core classifies a data carrier as `TX_NULL_DATA` — standard, and dust-exempt so
+  a 0-photon output is legal — only when `scriptPubKey[0]` is `OP_RETURN`
+  (`src/script/standard.cpp`, `Solver()`); the prefixed form falls through to
+  `TX_NONSTANDARD`. Measured on mainnet across 20 consecutive blocks: **232** bare
+  `OP_RETURN` data outputs and **zero** of the prefixed form. `OpReturn` is
+  exported public API with no production caller, so nothing pyrxd broadcasts was
+  affected — the exposure was to downstream users reaching for the helper. The
+  prefixed form, which is the only one Core's `IsUnspendable()` recognises, is now
+  an explicit `provably_unspendable=True` opt-in. Found by reading HashMark's spec,
+  which documents the Core inconsistency behind it.
+
+  The existing tests could not have caught this: they asserted `byte_length() > 2`
+  and `b"pyrxd" in raw`, both true of either spelling.
+
+### Internal
+
+- **The Hypothesis corpus orphan check was unsound and no longer asserts.** It
+  derived directory names from `function_digest(inner_test)`, reported all six
+  committed directories as orphaned, and they were archived on that basis — then a
+  fuzz failure re-created one, proving it was live. `hypothesis/core.py:1409`
+  prefers an explicitly-set `_hypothesis_internal_database_key`, and at least one
+  further key path remains unidentified. The directories are restored and the check
+  now REPORTS unmatched directories as *unexplained* rather than failing on them.
+
 
 ## [0.22.0] — 2026-09-02
 

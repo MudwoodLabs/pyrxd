@@ -102,8 +102,30 @@ class OpReturn(ScriptTemplate):
     def __repr__(self) -> str:  # pragma: no cover
         return self.__str__()
 
-    def lock(self, pushdatas: list[str | bytes]) -> Script:
-        script: bytes = OpCode.OP_FALSE + OpCode.OP_RETURN
+    def lock(self, pushdatas: list[str | bytes], *, provably_unspendable: bool = False) -> Script:
+        """Build a data-carrier output.
+
+        Emits a BARE ``OP_RETURN``. Radiant Core classifies an output as
+        ``TX_NULL_DATA`` — standard, and exempt from the dust rule so a 0-photon
+        output is legal — only when ``scriptPubKey[0]`` is ``OP_RETURN``
+        (``src/script/standard.cpp``, ``Solver()``). This builder emitted
+        ``OP_FALSE OP_RETURN`` until 2026-09-02, which falls through to
+        ``TX_NONSTANDARD`` and is not relayed.
+
+        Measured on Radiant mainnet, 20 consecutive recent blocks: 232 bare
+        ``OP_RETURN`` data outputs, and ZERO of the ``OP_FALSE``-prefixed form.
+
+        ``provably_unspendable=True`` restores the prefixed form. Core's
+        ``CScript::IsUnspendable()`` (``script.h``) detects only that spelling,
+        so it is the one a pruning helper recognises — but Core is internally
+        inconsistent here (``Solver()``'s comment claims to use that test and
+        its code does not), and such an output is not relayed. Opt in only if
+        you know the node you are broadcasting to accepts it.
+
+        The bare form is unspendable in practice — ``OP_RETURN`` aborts script
+        evaluation immediately — it is simply not FLAGGED as such by Core.
+        """
+        script: bytes = (OpCode.OP_FALSE + OpCode.OP_RETURN) if provably_unspendable else OpCode.OP_RETURN
         for pushdata in pushdatas:
             if isinstance(pushdata, str):
                 pushdata_bytes: bytes = pushdata.encode("utf-8")
