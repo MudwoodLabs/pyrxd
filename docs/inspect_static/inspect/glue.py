@@ -427,6 +427,19 @@ _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
         "payload_hash",
         "wire_hex",
         "input",
+        # The script bytes themselves. They were chopped to 200 hex chars while
+        # inspect.js told the reader the opposite — "the JSON drawer carries the
+        # full bytes" — so the drawer, and the Copy JSON button, silently held a
+        # prefix. The card printed the true byte count beside it, showing
+        # "length: 258 bytes" above 100 bytes of hex.
+        #
+        # Newly material rather than merely untidy: `data_hex` is now the only
+        # place a HashMark or `msg` record's raw bytes appear, and it is what the
+        # UI points at ("not valid UTF-8 — see data_hex"). The row stays scannable
+        # because inspect.js truncates for DISPLAY at 64 chars on its own; that is
+        # the right layer for it, since only the display needs to be short.
+        "hex",
+        "data_hex",
         # dMint mint-claim scriptSig pushes — exact bytes are load-bearing
         # for verifying a covenant push against an off-chain re-derivation.
         "nonce_hex",

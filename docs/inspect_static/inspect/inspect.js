@@ -722,6 +722,92 @@ function renderFetchedTxCard(payload) {
   return wrapper;
 }
 
+// The OP_RETURN payload decoders (HashMark, the Photonic `msg` convention) and
+// the relationship verifier, for EVERY card that can show one.
+//
+// One function because there are two cards and there was one renderer — and the
+// comment inside `renderOutputRow` already states the rule: "a field that only
+// the standalone-script card shows is a field most readers never see." The new
+// fields were added to the Python classifier and to neither card, so this page
+// rendered a forged HashMark as an authoritative-looking `OP_RETURN-HASHMARK-V2`
+// badge with no signer and NO VERDICT. The affirmative half of the record
+// survived and the part that contradicts it did not.
+//
+// Every value goes through `kv`, which assigns to textContent, so an attacker's
+// label cannot become markup. That is why the CLI needed an escaping fix here and
+// this does not.
+function appendOpReturnPayload(dl, row) {
+  const msg = row.message;
+  if (msg) {
+    if (msg.outcome === "ok") {
+      if (msg.is_utf8) {
+        dl.appendChild(kv(`message (${msg.byte_length} bytes)`, msg.text));
+      } else {
+        // Say WHY there is no text, or a reader assumes the field is empty
+        // rather than that the bytes simply are not text.
+        dl.appendChild(kv("message", `${msg.byte_length} bytes, not valid UTF-8 (see data_hex)`));
+      }
+    } else {
+      dl.appendChild(kv("message", msg.detail ? `${msg.outcome} — ${msg.detail}` : msg.outcome));
+    }
+  }
+
+  const hm = row.hashmark;
+  if (hm) {
+    if (hm.outcome !== "ok") {
+      dl.appendChild(kv("hashmark", hm.detail ? `${hm.outcome} — ${hm.detail}` : hm.outcome, "kv-warning"));
+    } else {
+      dl.appendChild(kv("hashmark", `v${hm.version} (${hm.algorithm})`));
+      dl.appendChild(kv("digest", hm.digest));
+      if (hm.label) {
+        dl.appendChild(kv("label", hm.label));
+      } else if (hm.label_withheld) {
+        // v1 keeps its timestamp evidence; the label is withheld WITH a reason,
+        // because showing nothing looks like a record that carried no label.
+        dl.appendChild(kv("label", `[withheld — ${hm.label_withheld}]`, "kv-warning"));
+      }
+      if (hm.signer_hash160) {
+        dl.appendChild(kv("signer", hm.signer_hash160));
+        const att = hm.attestation || {};
+        if (att.outcome === "valid") {
+          dl.appendChild(kvWithWarning(
+            "signature",
+            "VERIFIED — recovers to the committed signer",
+            `assuming ${att.assumed_network}; the chain is part of the signed statement`,
+          ));
+        } else if (att.outcome === "invalid_signature") {
+          // The bytes decoded; the CLAIM does not hold. Calling it "malformed"
+          // would send a reader after the wrong problem.
+          dl.appendChild(kv(
+            "signature",
+            `DOES NOT VERIFY — ${att.detail || "no detail"} (the record is well-formed; its claim is not supported)`,
+            "kv-warning",
+          ));
+        }
+      }
+      dl.appendChild(kv(
+        "what this proves",
+        "someone knew this digest no later than the confirming block — not authorship, ownership, originality or contents",
+      ));
+    }
+  }
+
+  // Declared container/creator membership, WITH its verdict. `in` and `by` are
+  // operator-supplied CBOR — anyone can name any collection — so the claim is
+  // never shown without whether the transaction was authorised to carry it.
+  const rels = (row.metadata && row.metadata.relationships) || row.relationships;
+  if (Array.isArray(rels)) {
+    for (const rel of rels) {
+      const backed = rel.outcome === "backed";
+      dl.appendChild(kv(
+        rel.kind === "author" ? "creator claim" : "collection claim",
+        `${rel.ref} — ${backed ? "VERIFIED (spent in this tx)" : "UNVERIFIED CLAIM (nothing in this tx authorises it)"}`,
+        backed ? undefined : "kv-warning",
+      ));
+    }
+  }
+}
+
 function renderOutputRow(row) {
   const type = String(row.type || "unknown").toLowerCase();
   const wrapper = el("section", { class: "output-row" });
@@ -745,6 +831,9 @@ function renderOutputRow(row) {
   // `_render_txid_human` omits both for the same reason).
   const relativeLockDisabled = row.relative_lock_disabled === true;
   const dl = el("dl", { class: "kv-list" });
+  // FIRST, because on an OP_RETURN row it is the whole content of the row, and
+  // because "signature DOES NOT VERIFY" must not sit below a scroll of kv pairs.
+  appendOpReturnPayload(dl, row);
   if (row.owner_pkh) dl.appendChild(kv("owner pkh", row.owner_pkh));
   if (row.ref_outpoint) dl.appendChild(kv("ref", row.ref_outpoint));
   // Dead pre-0.15.0 CONTAINER output. The child ref is the reason it cannot
@@ -1132,6 +1221,10 @@ function _detectTxShape(payload) {
 // the disabled shape (``_render_timelock_body``); so does this. Nothing here
 // re-derives the flag: ``relative_lock_disabled`` is decided in Python.
 function _structuralQualifierNote(type, payload) {
+  // A recognised payload renames the type to `op_return-hashmark-v2` /
+  // `op_return-msg`, so a lookup on the bare literal silently dropped the
+  // OP_RETURN note from exactly the outputs that had just gained content.
+  if (typeof type === "string" && type.startsWith("op_return-")) type = "op_return";
   if (type === "p2pkh-csv" && payload && payload.relative_lock_disabled === true) {
     return "Structural pattern match. Bit 31 of the sequence " +
            "(SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, so consensus enforces no " +
@@ -1231,9 +1324,14 @@ function renderScriptCard(payload) {
     op_return: "OP_RETURN data output",
     unknown: "Unrecognised script",
   };
-  const wrapper = card(titleMap[type] || "Locking script", scriptBadgeKind(type));
+  // `type` is now `op_return-hashmark-v2` / `op_return-msg` for a recognised
+  // payload, so a map keyed on the bare literal loses the title AND the structural
+  // note for exactly the outputs that gained content.
+  const baseType = type.startsWith("op_return") ? "op_return" : type;
+  const wrapper = card(titleMap[type] || titleMap[baseType] || "Locking script", scriptBadgeKind(type));
 
   const dl = el("dl", { class: "kv-list" });
+  appendOpReturnPayload(dl, payload);
   dl.appendChild(kv("type", type));
   if (payload.length !== undefined) {
     dl.appendChild(kv("length", `${payload.length} bytes`));
