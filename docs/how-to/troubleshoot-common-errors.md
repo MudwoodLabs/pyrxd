@@ -251,9 +251,8 @@ address with the largest UTXO by default) with more plain RXD.
 four rejection symptoms you'll actually hit, in its "Handling broadcast
 errors" section — `bad-txns-inputs-missingorspent`, `txn-mempool-conflict`,
 `min relay fee not met`, `mandatory-script-verify-flag-failed` — read that
-page for what each one means and how to recover. This section
-covers **what pyrxd actually raises today**, which is more specific than
-that page's "generic `NetworkError`, diagnose by on-chain symptom" framing.
+page for what each one means and how to recover. This section restates
+**what pyrxd raises** for them, which is the same answer that page gives.
 
 **Current behavior (verified):** `ElectrumXClient` now classifies a node's
 JSON-RPC error. If the error code is one of `{1, -25, -26, -27}` (the codes
@@ -275,7 +274,8 @@ except NetworkError:
     ...  # a genuine transport fault (dropped socket, timeout, etc.)
 ```
 
-— [`src/pyrxd/network/electrumx.py:83-175`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py).
+— [`src/pyrxd/network/electrumx.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py),
+`_rpc_error` and `_POLICY_MESSAGE_MARKERS`.
 `PolicyRejection` is a subclass of both `NetworkError` and `CovenantError`,
 so existing `except NetworkError` handlers still catch it. The node's
 rejection reason is sanitized (first line only, control characters
@@ -285,8 +285,9 @@ pyrxd's "never embed server text in an exception" rule, because discarding
 it previously hid a real covenant-rejection bug for weeks. All four
 rejections named in the broadcast-a-transaction.md table match a marker
 above, so all four **are** distinguishable via `exc.reason` — you no longer
-need to inspect the block explorer or turn on `DEBUG` logging to tell them
-apart.
+need to inspect the block explorer to tell them apart. `DEBUG` logging would
+not help either way: the reader loop's error branch logs nothing before
+setting the exception.
 
 **Fix:** catch `PolicyRejection` specifically and branch on `.reason`; fall
 back to the broadcast-a-transaction.md symptom table for what each reason
@@ -422,14 +423,16 @@ Both hashes are printed; compare them against
 error: --daa-mode requires --v2 (V1 dMint is FIXED difficulty only)
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:1244`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
+— [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py),
+`deploy_dmint_cmd`.
 V1 dMint contracts are fixed-difficulty only; a difficulty-adjustment mode
 (`fixed`/`asert`/`lwma`/`epoch`/`schedule`) only makes sense on a V2
 contract. **Fix:** add `--v2` to `glyph deploy-dmint`, or drop `--daa-mode`.
 
 **The historical V2 opt-out is now a non-blocking warning, not an error.**
 Verified in
-[`src/pyrxd/glyph/builder.py:453-480`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/builder.py):
+[`src/pyrxd/glyph/builder.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/builder.py),
+`GlyphBuilder._prepare_dmint_v2_deploy`:
 calling `prepare_dmint_deploy` with `allow_v2_deploy=False` on
 `DmintV2DeployParams` used to refuse; as of 0.9.0 (V2 consensus-proven on
 regtest + mainnet, #219) it only emits a `UserWarning`:
@@ -445,21 +448,45 @@ This only matters if you're calling `GlyphBuilder.prepare_dmint_deploy`
 directly with that argument — the CLI's `glyph deploy-dmint` doesn't expose
 `allow_v2_deploy` and always deploys V2 when `--v2` is passed.
 
-**Premine is deferred for both V1 and V2 dMint deploys.** Two
-`ValidationError`s, both verbatim:
+**Premine ships, for both V1 and V2.** This section used to say premine was
+deferred and quoted two `ValidationError` strings "verbatim". Neither string
+exists in the source, and neither ever fires: `_validate_premine`
+([`src/pyrxd/glyph/builder.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/builder.py),
+called from both `DmintV1DeployParams.__post_init__` and
+`DmintV2DeployParams.__post_init__`) is a **bound check**, not a refusal — it
+accepts any `premine_amount >= 1` photon. The CLI exposes it as
+`glyph deploy-dmint --premine <photons> [--premine-to <address>]`.
+
+The refusals that do exist, verbatim:
 
 ```
-V1 deploy with premine is deferred work — see docs/dmint-research-photonic-deploy.md §7.2. Set premine_amount=None for now.
+premine_amount must be >= 1 photon when set (use None for no premine), got 0
 ```
 ```
-V2 deploy with premine is deferred work (mirrors V1). Set premine_amount=None for now.
+premine_pkh was set without premine_amount — the premine output would not be emitted at all. Set premine_amount, or drop premine_pkh.
 ```
 
-— [`src/pyrxd/glyph/builder.py:376-381`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/builder.py)
-and
-[`:481-484`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/builder.py).
-**Fix:** dMint tokens deploy with no premine today (`premine_amount=None`);
-this is a permissionless-mining-only feature until premine support ships.
+and, from the CLI's own pre-check
+([`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py),
+`deploy_dmint_cmd`):
+
+```
+--premine must be >= 1 photon (omit the flag for no premine)
+```
+```
+--premine-to was given without --premine
+```
+
+The floor is **1 photon, not 546** — Radiant-Core has no dust threshold
+(`GetDustThreshold` returns 1 satoshi, `IsDust` is `nValue <= 0`), which is why
+every mainnet dMint contract sits at 1 photon. The 546-unit guard in
+`prepare_ft_deploy_reveal` is a pyrxd heuristic on a *different* flow (a whole FT
+supply below 546 units is almost certainly a decimals mistake) and does not
+apply here.
+
+**Fix:** if you wanted a premine, pass `--premine`. Those photons come out of
+your own wallet on top of the mineable supply — the total issued supply becomes
+`reward * max_height * num_contracts + premine`.
 
 ---
 

@@ -299,7 +299,11 @@ class TestInspectTxidWithRaw:
         # a bidi-override character. Sanitiser must strip it before return.
         from pyrxd.glyph import inspect as facade
 
-        def _evil(_txid, _raw):
+        # `**_kw` because this double exists to inject a PAYLOAD, not to pin the
+        # call shape. It had the exact old signature, so adding `network=` to the
+        # real function turned three unrelated sanitiser tests red — a stale test
+        # double is a forwarder like any other.
+        def _evil(_txid, _raw, **_kw):
             return {"form": "txid", "txid": _txid, "metadata": {"name": "gly‮bar"}}
 
         monkeypatch.setattr(facade, "classify_raw_tx", _evil)
@@ -395,7 +399,7 @@ class TestProtocolFieldHomoglyphCoverage:
     def test_protocol_with_mixed_script_entry_flagged(self, glue, monkeypatch):
         from pyrxd.glyph import inspect as facade
 
-        def _evil(_txid, _raw):
+        def _evil(_txid, _raw, **_kw):
             return {
                 "form": "txid",
                 "txid": _txid,
@@ -421,7 +425,7 @@ class TestProtocolFieldHomoglyphCoverage:
     def test_benign_protocol_not_flagged(self, glue, monkeypatch):
         from pyrxd.glyph import inspect as facade
 
-        def _benign(_txid, _raw):
+        def _benign(_txid, _raw, **_kw):
             return {
                 "form": "txid",
                 "txid": _txid,

@@ -6,12 +6,20 @@ rebuilds the tx, and never touches the preimage ``p`` — it only re-sends store
 
 Three properties make this safe to land before the external audit:
 
-* **Dormant-by-construction.** :func:`make_refund_broadcaster` returns ``BtcBroadcaster | None`` where
-  ``None`` == dormant: it calls the existing fail-closed :func:`require_audit_cleared`, so on a
-  value-bearing network (mainnet ``"bc"``) without an explicit opt-in there is simply *no broadcaster*
-  and the executor declines + pages. Dormancy is *which object exists*, not a flippable flag.
+* **Dormant unless a broadcaster is injected.** :func:`make_refund_broadcaster` returns
+  ``BtcBroadcaster | None`` where ``None`` == dormant, and the executor then declines + pages.
+  Dormancy is *which object exists*, not a flippable flag — but note what supplies it: the CALLER,
+  by choosing not to construct a broadcaster. It is not supplied by :func:`require_audit_cleared`,
+  which has been a no-op since 0.9.0 when the audit gate was made advisory rather than blocking
+  (see its docstring). This paragraph used to claim that function was fail-closed and that "no live
+  broadcaster can exist" on mainnet without an opt-in. MEASURED: ``make_refund_broadcaster("bc",
+  audit_cleared=False, broadcaster=<live>)`` returns the LIVE broadcaster. The interlock described
+  here did not exist, and it was the stated justification for landing this pre-audit.
 * **Capped, and dust-only on mainnet.** A value-bearing network hard-bounds the cap to the dust ceiling
-  at construction (autonomy is dust-only until an external audit lifts it).
+  at construction (autonomy is dust-only until an external audit lifts it). This one is real — verified
+  by construction in ``RefundExecutor.__init__`` — and with the dormancy claim above corrected it is
+  the ONLY structural bound on autonomous mainnet value, not the second of two. Read it that way
+  before arming anything.
 * **Bound to the swap, not trusted.** The pre-signed blob is parsed serialize-don't-trust: its single
   input must spend THIS swap's funding outpoint, its nSequence must equal the negotiated ``t_btc`` CSV,
   and its single output must pay the operator's pinned refund address within the cap — else decline + page.
@@ -135,10 +143,17 @@ def make_refund_broadcaster(
     """The structural dormancy gate. Returns the live ``broadcaster`` for a refund executor, or ``None``
     == DORMANT (the executor declines + pages, broadcasting nothing).
 
-    Calls the existing fail-closed :func:`require_audit_cleared`: a value-bearing network (mainnet
-    ``"bc"``) without ``audit_cleared=True`` RAISES → we return ``None`` (no live broadcaster can exist).
-    A cleared network (regtest/signet/testnet, or ``"bc"`` WITH an explicit opt-in for a deliberate dust
-    run) returns the injected concrete broadcaster (which the caller constructs only when arming)."""
+    Returns the injected ``broadcaster`` unchanged, or ``None`` when the caller injected ``None``.
+
+    IT DOES NOT GATE. :func:`require_audit_cleared` is still called, and still cannot raise: its body
+    has been ``return None`` since 0.9.0, when the audit gate was deliberately made advisory to match
+    Radiant Core's own posture. The ``try/except ValidationError`` below is therefore dead, and is kept
+    only so that re-arming that function would take effect here without a second edit.
+
+    So the real control is the CALLER constructing a broadcaster only when arming, plus the dust
+    ceiling ``RefundExecutor`` enforces at construction. This docstring previously said a mainnet
+    network without ``audit_cleared=True`` RAISES and that "no live broadcaster can exist" — measured
+    false: it returns the live object."""
     try:
         require_audit_cleared(network, audit_cleared=audit_cleared)
     except ValidationError:

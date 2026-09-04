@@ -11,9 +11,15 @@ repo's existing multi-backend idiom (``network.bitcoin.BtcDataSource(ABC)``) and
 coordinator's fail-closed ``isinstance`` discipline applies; the gravity tree is not in
 the typed (mypy) path, so a structural ``typing.Protocol`` would buy nothing here.
 
-SCOPE NOTE (honest): the proven BTC path consumes module functions in
-``btc_wallet.taproot`` via a duck-typed surface (see the coordinator + its test fakes),
-NOT a ``BitcoinTaprootLeg`` class — that class does not exist yet. Rewiring the
+SCOPE NOTE (honest): ``BitcoinTaprootLeg`` EXISTS — it is defined in
+``btc_wallet/htlc_leg.py``, exported from ``btc_wallet/__init__.py``, and constructed by
+the real-value runners (``scripts/dust_swap_run.py``, ``scripts/btc_swap_two_host.py``)
+and by the regtest end-to-end. This note used to say "that class does not exist yet",
+and a how-to guide repeated it and sent readers to hand-roll a duck-typed adapter over
+``btc_wallet.taproot`` instead — on a fund-moving surface.
+
+What remains deferred is narrower and is the part worth keeping: the coordinator still
+accepts ``btc_leg`` structurally rather than requiring THIS file's ABC. Rewiring the
 mainnet-proven coordinator + migrating the durable ``SwapRecord.btc_locator`` to a
 chain-tagged ``counterchain_locator`` union is the larger, riskier half of this work and
 is deferred to a dedicated, separately-tested change (it must not be done casually on
