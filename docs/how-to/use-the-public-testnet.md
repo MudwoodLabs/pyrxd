@@ -27,10 +27,26 @@ $ radiantd -testnet -server -txindex=1 \
     -rpcuser=you -rpcpassword=change-me -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1
 ```
 
-The `SCRIPT_SECURITY_UPGRADE` consensus rules (the 64 MB per-script stack budget
-added in v3.1.x) are **already active on testnet from block 1**, so testnet is
-the closest public mirror of post-upgrade mainnet behaviour — a good reason to
-validate covenant-heavy work here before mainnet.
+The `SCRIPT_SECURITY_UPGRADE` consensus rules added in v3.1.x — the per-script
+opcode-cost budget, the K12 bound, and *consensus* enforcement of the per-script
+peak stack-memory budget — are **already active on testnet from block 1**, so
+testnet is the closest public mirror of post-upgrade mainnet behaviour, and a
+good reason to validate covenant-heavy work here before mainnet.
+
+Do not read that as "none of it applies to mainnet yet". Half of it already
+does: `AcceptToMemoryPoolWorker` ORs `SCRIPT_VERIFY_MEMORY_BUDGET` into its
+policy verify flags **unconditionally** (`src/validation.cpp:802-804` @
+`v3.1.2`) — independently of `fRequireStandard` and of the activation height —
+so **every mainnet node's mempool enforces the peak stack-memory budget today**
+(`ScriptError::STACK_MEMORY`, `src/script/interpreter.cpp:2659-2665`). A script
+that exceeds it is refused relay on mainnet now, while remaining
+consensus-valid until the upgrade height. The opcode-cost budget is the half
+that really is testnet-only for now: it is gated on `SCRIPT_SECURITY_UPGRADE`
+alone (`src/validation.cpp:1782-1784`).
+
+Both budgets' numeric values live in `consensus.h`, which is not among the
+sources vendored at `tests/vendor/radiant_core/`, so this guide deliberately
+quotes no figure for either — read them from the node you are running.
 
 ## 2. Point pyrxd at testnet
 

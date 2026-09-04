@@ -265,8 +265,12 @@ def prepare_covenant_offer(
         signed size — see :func:`_assert_relayable`.
     """
     if photons < _DUST_PHOTONS:
-        # A reservation below the dust floor produces an unspendable (node-rejected) covenant UTXO the
-        # maker could not later fill or refund (audit F3, availability). Refuse it up front.
+        # NOT a node rule. Radiant never reaches ``IsDust`` (``policy.h:173``): its only caller is
+        # ``IsStandardTx``, called from exactly one place and gated on ``fRequireStandard``, which is
+        # hardcoded ``false`` (``validation.cpp:586`` / ``validation.cpp:271`` @ ``v3.1.2``). Nothing
+        # rejects a sub-546 output. The reason is ECONOMIC: a reservation this small cannot fund the
+        # refund or fill that must later spend it — at the reference node's relay rate that spend costs
+        # millions of photons — so the maker strands it (audit F3, availability). Refuse it up front.
         raise ValidationError(f"reserved photons {photons} is below the dust floor ({_DUST_PHOTONS})")
     if fee < 0:
         raise ValidationError("fee must be non-negative")
