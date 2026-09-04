@@ -286,9 +286,16 @@ class NegotiatedTerms:
     Timelocks are unit-tagged :class:`Timelock` (BIP68/112). The cross-chain
     ordering invariant ``t_rxd - t_btc >= margin`` is checked by the coordinator
     (see ``swap_coordinator.assert_timelock_margin``), not here — but the raw
-    ordering ``t_rxd > t_btc`` in the *same* unit is rejected at construction as a
+    ordering ``t_rxd <= t_btc`` in the *same* unit is rejected at construction as a
     cheap fail-closed guard. INVERTED 2026-08-31 (#482): the maker holds ``p`` and LOCKS
     the Radiant leg, so that leg carries the LONGER timeout.
+
+    THIS NAMED THE REQUIRED ORDERING AS THE REJECTED ONE. #482 appended the sentence above
+    and left the clause before it, so the paragraph said ``t_rxd > t_btc`` "is rejected at
+    construction" while ``__post_init__`` refuses ``t_rxd <= t_btc`` and its message reads
+    "requires t_rxd > t_btc". A reader taking the first sentence at face value builds the
+    pre-#482 layout, which lets the maker refund its own leg while ``p`` is secret and then
+    claim the counter leg.
     """
 
     hashlock: bytes  # H = SHA256(p), 32 bytes — NEVER p

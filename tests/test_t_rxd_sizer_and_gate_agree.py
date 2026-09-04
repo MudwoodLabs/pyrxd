@@ -2,14 +2,17 @@
 
 `eth_absolute_to_rxd_relative_blocks` DIVIDES a budget by an interval to size `t_rxd`.
 `assert_covenant_confirms_before_eth_deadline` MULTIPLIES `t_rxd` by an interval to project the
-refund forward. Its docstring says the interval "cancels" and is "a no-op input" — which is true
-only while both use the same one.
+refund forward. The two agree only while both use the SAME interval; the gate's docstring used to
+call the interval "a no-op input", which is true of a `t_rxd` the sizer itself produced and of
+nothing else, and it no longer says so.
 
-They did not. The coordinator passed the NOMINAL interval while the sizer divides by the FAST tail,
-an ~8x mismatch, so the gate refused precisely the value the sizer produces. A runner-side cap was
-then added to satisfy the gate, and that cap shortened `t_rxd` ~8x — widening the ASSET_VULNERABLE
-window (maker has the asset refunded AND can still claim the counter leg with `p`) from ~2h to ~21h
-at the fast tail. Two guards agreeing with each other and disagreeing with the thing they guard.
+They did not use the same one. The coordinator passed the NOMINAL interval while the sizer divides
+by the FAST tail, an ~8x mismatch, so the pre-#482 upper-bound gate refused precisely the value the
+sizer produces. A runner-side cap was then added to satisfy the gate, and that cap shortened
+`t_rxd` ~8x — widening the ASSET_VULNERABLE window (maker has the asset refunded AND can still
+claim the counter leg with `p`) from ~2h to ~21h at the fast tail. Two guards agreeing with each
+other and disagreeing with the thing they guard. Post-#482 the same mismatch fails in the opposite
+arrangement — see `test_the_MISMATCH_is_what_breaks_it`.
 
 These tests pin the relationship rather than either number, so re-introducing the mismatch fails
 here regardless of what the measured intervals happen to be.
