@@ -461,7 +461,7 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 # script genuinely carries no context and refusing to attest it would
                 # be worse than assuming and saying so. The --fetch path knows the
                 # chain it read from and now passes it.
-                from ..network.registry import genesis_hash_for
+                from ..constants import genesis_hash_for
 
                 # An unknown network falls back to mainnet AND SAYS MAINNET. Reporting
                 # the requested name beside a mainnet genesis would state an assumption

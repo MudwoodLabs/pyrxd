@@ -62,6 +62,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from ..constants import GENESIS_BLOCK_HASHES, genesis_hash_for
 from ..security.errors import ValidationError
 from .tls_pin import normalize_pin
 
@@ -81,11 +82,6 @@ KNOWN_NETWORKS: tuple[str, ...] = ("mainnet", "testnet", "regtest")
 
 #: Expected genesis block hash per network, in display (reversed) byte order —
 #: the form ``getblockhash 0`` prints. See the module docstring for provenance.
-GENESIS_BLOCK_HASHES: Mapping[str, str] = {
-    "mainnet": "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7a6f4e003fb4",
-    "testnet": "000000000d8ada264d16f87a590b2af320cd3c7e3f9be5482163e830fd00aca2",
-    "regtest": "7c1797514a165b0d99953a993a2a42081d6c0706026c36c06fc6fe728f93a5dd",
-}
 
 #: Shipped ElectrumX endpoints per network, in preference order.
 #:
@@ -124,15 +120,6 @@ def block_hash_hex(header: bytes) -> str:
     once = hashlib.new("sha512_256", bytes(header)).digest()
     twice = hashlib.new("sha512_256", once).digest()
     return twice[::-1].hex()
-
-
-def genesis_hash_for(network: str) -> str | None:
-    """Expected genesis hash for *network*, or ``None`` for an unknown network.
-
-    ``None`` means "pyrxd cannot verify this binding", not "the binding is fine";
-    callers should treat it as a reason to be *more* explicit, not less.
-    """
-    return GENESIS_BLOCK_HASHES.get(str(network))
 
 
 def default_endpoints(network: str) -> tuple[str, ...]:
