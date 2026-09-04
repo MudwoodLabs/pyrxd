@@ -98,9 +98,15 @@ coordinator = SwapCoordinator(
 )
 ```
 
-- **BTC counter-leg.** The proven BTC path consumes the Taproot-HTLC functions in
-  `pyrxd.btc_wallet.taproot` through a duck-typed surface (there is no `BitcoinTaprootLeg`
-  class yet — see `CounterChainLeg`'s scope note). Pass it as `btc_leg=`.
+- **BTC counter-leg.** Use `BitcoinTaprootLeg` from `pyrxd.btc_wallet` — the concrete,
+  exported production BTC leg, and what the proven regtest end-to-end drives. Pass it as
+  `btc_leg=`.
+
+  > This page previously said "there is no `BitcoinTaprootLeg` class yet" and sent readers
+  > to hand-roll a duck-typed adapter over `pyrxd.btc_wallet.taproot` — on a fund-moving
+  > surface, where a subtly different adapter is exactly the kind of thing that loses
+  > money. The class exists (`btc_wallet/htlc_leg.py`), is exported from
+  > `btc_wallet/__init__.py`, and is used by `tests/test_xchain_swap_regtest_e2e.py`.
 - **ETH counter-leg.** `EthLeg` wraps the Solidity `EthHtlc` contract via web3 (an optional
   dependency: `pip install pyrxd[eth]` or add `web3`).
 - **`MarginPolicy.measured(...)` vs estimated.** A real-value swap MUST use a measured

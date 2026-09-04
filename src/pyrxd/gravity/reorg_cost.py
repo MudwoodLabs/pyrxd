@@ -214,8 +214,17 @@ def measure_rxd_reorg_cost(
     modest hashrate is not as exposed as a SHA-256 chain of similar size — so it is an input here
     rather than something this function pretends to know.
 
-    Rounded UP: over-stating the attacker's cost would UNDER-bury, so the rounding goes the safe
-    way. Computed over ``Fraction`` because float division silently loses integer precision at
+    Rounded UP, which is the UNSAFE direction and is bounded to one photon. The burial DIVIDES by
+    this figure (``_value_scaled_burial_blocks``), so over-stating the cost yields FEWER required
+    blocks — the module docstring above and ``MarginPolicy.rxd_reorg_cost_per_block`` both say
+    "when in doubt, round DOWN" for exactly that reason. ``ceil`` is kept anyway because it
+    over-states by at most a single photon — one hundred-millionth of an RXD — and because
+    ``floor`` would truncate a sub-photon cost to 0, which the guard below then refuses outright:
+    a refusal of honest inputs bought with nothing.
+
+    THIS SAID "so the rounding goes the safe way", contradicting its own first clause in the same
+    sentence: over-stating the cost under-buries, so rounding up is the unsafe way, not the safe
+    one. Computed over ``Fraction`` because float division silently loses integer precision at
     large photon counts, the same reason ``_value_scaled_burial_blocks`` uses exact arithmetic.
     """
     if isinstance(difficulty, (int, float)) and not isinstance(difficulty, bool):

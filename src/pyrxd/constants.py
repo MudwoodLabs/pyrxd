@@ -106,17 +106,23 @@ SEQUENCE_FINAL: int = 0xFFFFFFFF
 #: Why it needs a name. An input is final iff ``nSequence == SEQUENCE_FINAL``, and a
 #: transaction whose inputs are all final skips ``nLockTime`` entirely
 #: (``CTransaction::IsFinalTx``). ``OP_CHECKLOCKTIMEVERIFY`` therefore *requires* the
-#: spending input to be non-final — it fails outright otherwise — and so does the
-#: BIP68 evaluation a CSV refund depends on. This value is the "non-final, but as
-#: close to final as possible" choice every timelocked spend in this SDK wants: bit 31
-#: is still set, so it disables the BIP68 RELATIVE lock on that input without
-#: disabling the absolute one on the transaction.
+#: spending input to be non-final — ``CheckLockTime`` returns false on a final input
+#: (``interpreter.cpp:2998-3000`` @ ``v3.1.2``) — so this is the "non-final, but as
+#: close to final as possible" choice every ABSOLUTE timelock in this SDK wants.
 #:
-#: It was written out three times — the RSWP refund spend, the Gravity ``forfeit()``
-#: CLTV input, and the HTLC refund's fee input. All three are the same rule, and the
-#: one-character slip to ``0xFFFFFFFF`` is silent at build time and fatal at spend
-#: time: the refund branch stops being satisfiable, on a chain with no RBF and no
-#: CPFP, in the one path a counterparty stall makes load-bearing.
+#: NOT the value a CSV input wants. Bit 31 IS set here, and ``CheckSequence`` returns
+#: false the moment ``nSequence & SEQUENCE_LOCKTIME_DISABLE_FLAG`` is non-zero
+#: (``interpreter.cpp:3021-3023``) — so this value DISABLES the BIP68 relative lock on
+#: the input carrying it, and an ``OP_CHECKSEQUENCEVERIFY`` gated by it would be
+#: satisfiable by nothing. A CSV input must carry the ENCODED relative lock instead
+#: (``gravity/htlc_spend.py`` passes ``covenant.refund_csv``, with ``tx.version = 2``
+#: for ``interpreter.cpp:3013-3015``); this constant is for its non-CSV companions.
+#:
+#: It is used three times, and all three are that: the RSWP refund spend (CLTV), the
+#: Gravity ``forfeit()`` CLTV input, and the HTLC refund's FEE input — never the CSV
+#: covenant input. The one-character slip to ``0xFFFFFFFF`` is silent at build time
+#: and fatal at spend time: the refund branch stops being satisfiable, on a chain with
+#: no RBF and no CPFP, in the one path a counterparty stall makes load-bearing.
 SEQUENCE_LOCKTIME_ENABLED: int = SEQUENCE_FINAL - 1
 
 #: Bit 31. Set on an input's ``nSequence`` means "not a relative lock-time" —
@@ -556,6 +562,30 @@ MAX_SCRIPT_SIZE: int = 32_000_000
 # derived from source instead of retyping it from a Bitcoin tutorial. Recorded
 # as unconsumed rather than wired into a plausible-looking check, because a
 # constant with a fake consumer pins nothing and reads as though it does.
+#
+# THEY ARE NOT THE WHOLE BUDGET, and an estimator built from these two alone
+# will pass scripts the interpreter rejects. ``EvalScript`` enforces two FURTHER
+# per-script limits that have no constant here, because their values live in
+# ``consensus.h`` — which is NOT in ``tests/vendor/radiant_core/``, so this SDK
+# cannot state what they equal. Vendor that header before pinning either.
+#
+#   * ``MAX_SCRIPT_STACK_MEMORY_USAGE`` — a peak stack MEMORY budget: the summed
+#     BYTES of every element across stack + altstack, re-checked after every
+#     executed opcode. Explicitly "Distinct from STACK_SIZE", which caps element
+#     COUNT and not bytes (``interpreter.cpp:2659-2665``,
+#     ``ScriptError::STACK_MEMORY``). It is LIVE ON MAINNET TODAY and not gated
+#     on the future ``SecurityUpgradeHeight``: ``AcceptToMemoryPoolWorker`` ORs
+#     ``SCRIPT_VERIFY_MEMORY_BUDGET`` into its policy verify flags
+#     unconditionally (``validation.cpp:802-804``), independently of
+#     ``fRequireStandard``. A script that trips it is refused RELAY now while
+#     staying consensus-valid until activation.
+#   * ``MAX_SCRIPT_OPCODE_COST`` — an opcode COST budget in bytes processed,
+#     charged by the hashing and bytewise opcodes (eight sites from
+#     ``interpreter.cpp:811-816``, ``ScriptError::OP_COUNT``). This one is gated
+#     on ``SCRIPT_SECURITY_UPGRADE`` alone (``validation.cpp:1782-1784``), so
+#     unlike the memory budget it is NOT yet active on mainnet.
+#
+# (Line numbers @ tag ``v3.1.2``, the pin in ``tests/vendor/radiant_core/MANIFEST.json``.)
 MAX_OPS_PER_SCRIPT: int = 32_000_000
 MAX_STACK_SIZE: int = 32_000_000
 

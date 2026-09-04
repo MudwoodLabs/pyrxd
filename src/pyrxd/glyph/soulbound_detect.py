@@ -85,6 +85,13 @@ _SELF_BYTECODE_OPS = frozenset({0xC7, 0xE9, 0xC1})  # OP_UTXOBYTECODE, OP_CODESC
 # replication form (own code hash via _SELF_BYTECODE_OPS + OP_HASH256, then count).
 _CODESCRIPTHASH_COUNT_OPS = frozenset({0xE5, 0xE6})  # OP_CODESCRIPTHASHOUTPUTCOUNT_{UTXOS,OUTPUTS}
 
+# The split that decides whether a self-equality covers the OWNER.
+# Full-bytecode opcodes compare the entire script; code-script opcodes compare only
+# the part after OP_STATESEPARATOR, leaving any state prefix free to change.
+_FULL_BYTECODE_OPS = frozenset({0xCD, 0xC7, 0xC1})  # OP_OUTPUTBYTECODE, OP_UTXOBYTECODE, OP_ACTIVEBYTECODE
+_CODESCRIPT_BYTECODE_OPS = frozenset({0xEA, 0xE9})  # OP_CODESCRIPTBYTECODE_{OUTPUT,UTXO}
+_OP_STATESEPARATOR = 0xBD
+
 
 class Transferability(Enum):
     """How a Glyph singleton UTXO restricts transfer at the consensus layer."""
@@ -94,7 +101,19 @@ class Transferability(Enum):
     metadata ``transferable:false`` flag, which is advisory only)."""
 
     SOULBOUND_COVENANT = "soulbound_covenant"
-    """Self-replication-or-burn covenant — transfer is impossible at consensus."""
+    """Self-replication-or-burn covenant pinning the WHOLE script, owner included —
+    the only spends are a clone with the same owner, or a burn."""
+
+    MUTABLE_STATE_COVENANT = "mutable_state_covenant"
+    """Self-replication of the CODE script only, with a mutable state prefix — so
+    the covenant survives a spend that changes the owner. That is a TRANSFER, and
+    this is therefore NOT soulbound.
+
+    ``OP_CODESCRIPTBYTECODE_*`` compares only the bytes after ``OP_STATESEPARATOR``.
+    With no separator the code script IS the whole script, so the same opcodes DO
+    pin the owner — which is why the deployed mainnet token and both pyrxd builders
+    remain ``SOULBOUND_COVENANT``. It is only the combination of code-script-only
+    equality WITH a state prefix that leaves the owner free."""
 
     NOT_A_SINGLETON = "not_a_singleton"
     """No ``OP_PUSHINPUTREFSINGLETON`` — not a singleton NFT at all."""
@@ -191,7 +210,27 @@ def classify_soulbound(script: bytes) -> SoulboundClassification:
         # A self-clone-or-burn lock. The burn branch is expected but not required
         # for the *transfer is restricted* conclusion (the self-equality alone
         # forbids moving to a different script).
-        transferability = Transferability.SOULBOUND_COVENANT
+        #
+        # ...BUT ONLY IF THE EQUALITY COVERS THE OWNER. `OP_CODESCRIPTBYTECODE_*`
+        # compares the bytes AFTER `OP_STATESEPARATOR`, so a script that carries a
+        # mutable state prefix and pins only its code script can recur with a
+        # different owner in that prefix — a transfer, under a lock this function
+        # used to call "transfer is impossible at consensus".
+        #
+        # This module knew it and did not act on it: `soulbound_covenant.py` says
+        # outright that "code-script-only equality would let the state (owner)
+        # change between hops — i.e. a transfer — so it is the wrong primitive for
+        # soulbinding", which is why the pyrxd builders emit NO state separator.
+        #
+        # The distinction is exactly the pair, never either half alone. With no
+        # separator the code script IS the whole script, so code-script equality
+        # pins everything — the deployed mainnet token uses those very opcodes and
+        # must keep its classification. Verified against all three real shapes.
+        codescript_only = not (op_set & _FULL_BYTECODE_OPS) and bool(op_set & _CODESCRIPT_BYTECODE_OPS)
+        if codescript_only and _OP_STATESEPARATOR in op_set:
+            transferability = Transferability.MUTABLE_STATE_COVENANT
+        else:
+            transferability = Transferability.SOULBOUND_COVENANT
     else:
         # A singleton whose only other structure is OP_DROP + P2PKH (or anything
         # without a self-replication constraint) is freely transferable.

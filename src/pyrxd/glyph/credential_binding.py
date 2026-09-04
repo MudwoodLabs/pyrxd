@@ -22,6 +22,14 @@ not a metadata flag). The security argument:
    (``classify_soulbound(...).is_consensus_soulbound`` — consensus-enforced,
    validated in ``tests/test_soulbound_covenant_regtest.py``). It therefore can
    NEVER move to a different owner: "owned by P" is permanent and immutable.
+
+   That conclusion rests on the self-equality covering the WHOLE script. It does
+   not follow from self-replication alone: ``OP_CODESCRIPTBYTECODE_*`` compares
+   only the bytes after ``OP_STATESEPARATOR``, so a covenant that pins its code
+   script while carrying a mutable state prefix can recur with a different owner —
+   a transfer. ``classify_soulbound`` returns ``MUTABLE_STATE_COVENANT`` for that
+   shape and ``is_consensus_soulbound`` is False, which is what keeps this
+   paragraph true rather than merely intended.
 2. The swap covenant pins ``output[0]`` to P (the existing HTLC recipient pin —
    consensus-enforced).
 
@@ -37,7 +45,8 @@ This module is the off-chain gate the funder runs BEFORE locking the asset. It i
 fail-closed: any doubt raises. The two load-bearing facts it composes are both
 consensus-enforced; the only off-chain step is reading the credential's current
 owner, and soulbound permanence makes even a stale read safe (the owner can't
-change).
+change) — for the shapes ``is_consensus_soulbound`` actually admits, which is the
+load-bearing qualifier and not a hedge.
 
 Limitation (documented, not yet built): this binds to the owner but does NOT
 re-check the credential at claim time, so it cannot enforce *revocation* (an
@@ -177,7 +186,9 @@ def assert_soulbound_credential(
 
     1. ``credential.current_spk`` is a genuine consensus-soulbound covenant
        (``classify_soulbound`` — NOT a plain NFT with an advisory metadata flag).
-       This is what makes "owner is permanent" true and rental impossible.
+       This is what makes "owner is permanent" true and rental impossible — and
+       it is the classifier, not this function, that has to be right about which
+       covenants pin the owner rather than only their own code.
     2. ``confirmations >= min_confirmations`` (reorg safety).
     3. if ``expected_credential_ref`` is given, the credential binds exactly it.
 
