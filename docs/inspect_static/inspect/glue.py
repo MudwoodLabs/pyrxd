@@ -138,7 +138,7 @@ def run(raw_input: str) -> dict:
         elif form == "outpoint":
             payload = _inspect.inspect_outpoint(value)
         elif form == "script":
-            payload = _inspect.inspect_script(value)
+            payload = _inspect.inspect_script(value, network=_PAGE_NETWORK)
         else:
             return _err(f"internal: unknown form {form!r}", form="error")
     except Exception as exc:
@@ -226,7 +226,7 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
     try:
-        payload = _inspect.classify_raw_tx(txid, raw)
+        payload = _inspect.classify_raw_tx(txid, raw, network=_PAGE_NETWORK)
     except Exception as exc:
         return _err(
             _safe_error(exc),
@@ -371,6 +371,16 @@ def _hint_for(form: str) -> str:
         ),
         "txid": "",
     }.get(form, "")
+
+
+# The page talks to ONE hard-coded mainnet ElectrumX endpoint
+# (``ELECTRUMX_WSS_URL`` in inspect.js), so mainnet is the chain every result here
+# was actually read from. Passed EXPLICITLY rather than left to the default,
+# because a HashMark v2 signature covers the chain's genesis hash: the same bytes
+# on another chain are a different statement and verify against a different key.
+# If this page ever gains a network selector, this constant is what has to move
+# with it, and an explicit argument is what makes that findable.
+_PAGE_NETWORK = "mainnet"
 
 
 def _err(message: str, *, form: str, hint: str = "") -> dict:
