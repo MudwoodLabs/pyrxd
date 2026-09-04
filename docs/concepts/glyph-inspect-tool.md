@@ -334,8 +334,21 @@ browser is structural, not a sync chore.
    capped via `truncate_for_human`. Token names and tickers are run
    through the TR39 confusables skeleton check
    (`looks_confusable_with_latin`) — a Cyrillic-spoofed "USDC" is
-   flagged with a warning banner before the user sees the rendered
-   metadata.
+   flagged before the user sees the rendered metadata: the CLI prints
+   a `*** WARNING ***` line ABOVE the field it applies to, and the
+   browser page paints a warning band on the card.
+
+   It reports **mimicry, not foreignness**. A wholly non-Latin name
+   like `トークン` or `中文` is not flagged — a warning that fires on
+   every legitimate Japanese token is the false positive that trains a
+   reader to ignore the real one.
+
+   This paragraph described the check as live while
+   `looks_confusable_with_latin` had **no production caller** — a
+   definition, a façade re-export and its tests. The CLI ran no
+   confusables check at all and the browser used a weaker script-mixing
+   heuristic. Wired 2026-09-03; both surfaces now read one verdict
+   computed in `_inspect_core`.
 
 5. **OP_RETURN ambiguity.** Data carriers are classified as
    `op_return` with the data split out, not silently grouped with
