@@ -1,10 +1,20 @@
 # Breaking changes since pyrxd 0.4.x
 
-**Scope:** the only break to the stable public API since 0.4.x landed in
-**0.5.0** — three signature changes on the V1 dMint mint path, documented below.
-Every release since (0.5.x through the current version) is **additive and
-drop-in**: existing import paths and CLI commands are unchanged. If you're on
-0.5.0 or later, there is nothing to migrate.
+**Scope:** this page documents the **0.5.0** break — three signature changes on
+the V1 dMint mint path. It is not the whole upgrade story. Under
+[the versioning policy](../versioning-and-deprecation-policy.md) a `0.N → 0.N+1`
+minor may carry breaking-class changes, and several have shipped since 0.5.0;
+each is named in its release's **"Breaking-class changes"** section of
+[`CHANGELOG.md`](../../CHANGELOG.md). **Read those before upgrading across a
+minor.** The largest is a hard removal:
+
+> **0.15.0 removed `GlyphBuilder.prepare_container_reveal(child_ref=...)`.**
+> Passing `child_ref` now raises `ValidationError`. From 0.9.0 to 0.14.0 that
+> argument built a 100-byte output that was permanently unspendable *and*
+> destroyed the child NFT's singleton ref in the act of creating it. There is no
+> migration for an output already built that way — it cannot be spent. Collection
+> membership is metadata on the **child**; see
+> [Create a token collection](create-a-token-collection.md).
 
 **Who this page is for:** anyone upgrading from a **0.4.x** pin who imports
 `build_pow_preimage`, `build_mint_scriptsig`, or `build_dmint_v1_mint_preimage`
@@ -188,35 +198,50 @@ the runnable reference.
 
 ---
 
-## End-to-end V1 mint snippet (0.5.0)
+## End-to-end V1 mint snippet
 
-The full mint loop, transcribed from
-[`examples/dmint_claim_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/dmint_claim_demo.py):
+The full mint loop, following
+[`examples/dmint_claim_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/dmint_claim_demo.py)
+(the runnable reference — check it against
+[`src/pyrxd/glyph/dmint/miner.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/src/pyrxd/glyph/dmint/miner.py)
+for the current signatures rather than trusting this transcription):
 
 ```python
 from pyrxd.glyph.dmint import (
+    build_dmint_mint_tx,
     build_dmint_v1_mint_preimage,
     build_mint_scriptsig,
     mine_solution,
 )
-from pyrxd.glyph.dmint import build_dmint_mint_tx  # builds the 4-output unsigned tx
+from pyrxd.script.script import Script
 
 # 1. Build the unsigned 4-output mint tx (vout[2] MUST be an OP_RETURN msg).
-unsigned = build_dmint_mint_tx(
+#    `nonce` here is a PLACEHOLDER of the right width: the tx has to exist
+#    before the preimage can bind to its outputs, and the real nonce is
+#    spliced into vin[0]'s scriptSig at step 4. build_dmint_mint_tx only
+#    validates the nonce's LENGTH, so a zero placeholder is safe.
+#    `current_time` is V2's DAA locktime; V1 has no DAA, so pass 0.
+result = build_dmint_mint_tx(
     contract_utxo=contract_utxo,
+    nonce=b"\x00" * 4,
+    miner_pkh=miner_pkh,
+    current_time=0,
+    fee_rate=fee_rate,
     funding_utxo=funding_utxo,
     op_return_msg=b"pyrxd mint",
-    # ... other args ...
-)
+)                        # -> DmintMintResult; result.tx is the Transaction
 
-# 2. Compute the preimage + the two script hashes from the unsigned tx.
-pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, unsigned)
+# 2. Compute the preimage + the two script hashes from the unsigned TX —
+#    note the third argument is `result.tx`, not the DmintMintResult.
+pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
 
 # 3. Mine. `pow_result.preimage` is the 64-byte input to SHA256d.
 #    mine_solution returns a DmintMineResult; unwrap .nonce.
+#    (The demo calls mine_solution_dispatch, which additionally routes to an
+#    external miner when EXTERNAL_MINER is set. Same return type.)
 mine_result = mine_solution(
-    preimage=pow_result.preimage,
-    target=contract_utxo.state.target,
+    pow_result.preimage,
+    contract_utxo.state.target,
     nonce_width=4,
 )
 
@@ -229,7 +254,13 @@ scriptsig = build_mint_scriptsig(
 )
 
 # 5. Attach the scriptSig to vin[0], sign vin[1] (the funding input), broadcast.
+result.tx.inputs[0].unlocking_script = Script(scriptsig)
 ```
+
+The three arguments this snippet used to omit — `nonce`, `miner_pkh` and
+`current_time` — are positional and required, so the old version raised
+`TypeError: build_dmint_mint_tx() missing 3 required positional arguments`
+before reaching the chain.
 
 ---
 

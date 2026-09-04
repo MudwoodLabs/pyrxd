@@ -176,9 +176,10 @@ who got what straight from the transaction.
 > *is* its output's value — 1 photon = 1 unit — so taking the fee out of a token
 > output would deliver fewer units than you asked for. The airdrop sources the
 > fee from a separate plain-RXD UTXO instead. Without one it stops with *"no
-> plain-RXD UTXO large enough to fund the airdrop fee"* rather than quietly
-> shorting a recipient. Budget roughly `0.0084 RXD` per recipient at the default
-> fee rate.
+> plain-RXD UTXO large enough to fund the fee"* rather than quietly shorting a
+> recipient. See [How much plain RXD an airdrop needs](#how-much-plain-rxd-an-airdrop-needs)
+> below — it is a few tenths of an RXD, not a few thousandths, and it must sit
+> on a **single** UTXO.
 
 > **A repeated address is refused, not merged.** Two rows for the same address
 > is usually a duplicated line in a holder export, and paying twice cannot be
@@ -319,14 +320,57 @@ chain enforce anything), and `splits` (a list of `{"address": …, "bps": …}`)
   units than you hold. Check with `pyrxd glyph list --type ft`.
 - **`FT transfer across multiple wallet addresses isn't supported`.**
   Consolidate the units onto one address first (see the note above).
-- **`no plain-RXD UTXO to fund the NFT transfer fee`.** Add a little RXD to the
+- **`no plain-RXD UTXO large enough to fund the NFT transfer fee`.** Add a little RXD to the
   wallet — the NFT itself can't pay its own fee.
-- **`no plain-RXD UTXO large enough to fund the airdrop fee`.** Same cause, and
-  an airdrop needs more of it: roughly `0.0084 RXD` per recipient at the default
-  fee rate, on a *single* non-token UTXO. Consolidate some RXD, or split the
-  list into smaller batches.
+- **`no plain-RXD UTXO large enough to fund the fee`.** Same cause, and an
+  airdrop needs more of it — see the table below. The amount has to be on a
+  *single* non-token UTXO. Consolidate some RXD, or split the list into smaller
+  batches.
 - **`recipient <address> appears more than once`.** A duplicated row in the
   holder list. Combine the two entries if the double payment is intended.
+
+### How much plain RXD an airdrop needs
+
+The funding check is a deliberately generous *pre-flight* bound, not the fee the
+transaction ends up paying. It is computed in
+[`src/pyrxd/glyph/transfer.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/transfer.py),
+`ft_funding`:
+
+```python
+est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
+needed    = est_bytes * fee_rate * 2
+```
+
+Three things that trip people up: the per-output byte cost is **doubled** for
+headroom (Radiant has neither RBF nor CPFP, so a transaction that lands under
+the relay floor cannot be repaired); there is a fixed overhead of two extra
+output slots, the inputs, and 50 bytes of envelope on top of the per-recipient
+term; and the whole amount must be available on one UTXO.
+
+At the default fee rate of **10,000 photons/byte**
+(`relay_floor_photons_per_byte()`), with the token held on a single FT UTXO:
+
+| Recipients | `est_bytes` | Needed (photons) | Needed (RXD) |
+| ---------: | ----------: | ---------------: | -----------: |
+|          1 |         598 |       11,960,000 |     0.1196 |
+|          2 |         682 |       13,640,000 |     0.1364 |
+|          5 |         934 |       18,680,000 |     0.1868 |
+|         10 |       1,354 |       27,080,000 |     0.2708 |
+|         25 |       2,614 |       52,280,000 |     0.5228 |
+|         50 |       4,714 |       94,280,000 |     0.9428 |
+|        100 |       8,914 |      178,280,000 |     1.7828 |
+
+Read off the shape rather than the rows: a **fixed ~0.1028 RXD** plus
+**0.0168 RXD per recipient**. Each additional FT input the wallet has to select
+adds a further 0.0296 RXD. Earlier revisions of this page said "roughly
+0.0084 RXD per recipient" — that was the *undoubled* per-output byte cost with
+the fixed overhead left out, and it under-states a one-recipient airdrop by
+more than 14x.
+
+> Numbers above are computed from the formula as written in `ft_funding`, at
+> `fee_rate = 10000`, `len(selected) = 1`. They are the amount the guard
+> **demands be present**, not a measurement of a broadcast transaction's fee —
+> the real fee is smaller.
 - **Couldn't reach ElectrumX.** The transfer needs the network to fetch source
   outputs and broadcast. Point at a reachable server with `--electrumx URL`.
 
