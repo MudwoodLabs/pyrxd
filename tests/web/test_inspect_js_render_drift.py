@@ -85,6 +85,9 @@ _SHAPE_NAMES = (
     "p2pkh",
     "p2sh",
     "op_return",
+    "op_return-msg",
+    "op_return-hashmark-v1",
+    "op_return-hashmark-v2",
     "nft",
     "ft",
     "mut",
@@ -163,6 +166,27 @@ def _corpus() -> dict[str, bytes]:
         "p2pkh": b"\x76\xa9\x14" + bytes(pkh) + b"\x88\xac",
         "p2sh": b"\xa9\x14" + os.urandom(20) + b"\x87",
         "op_return": b"\x6a" + b"\x4c\x28" + os.urandom(40),
+        # The OP_RETURN payload shapes. Built here rather than imported from a
+        # fixture because the point is what the CLASSIFIER emits for real bytes.
+        "op_return-msg": b"\x6a\x03msg\x0bhello there",
+        "op_return-hashmark-v1": (
+            b"\x6a\x08HASHMARK\x02" + bytes([1, 1]) + b"\x20" + os.urandom(32) + b"\x0breport.pdf"
+        ),
+        # v2 carries a signer and a signature, so it is the shape whose ATTESTATION
+        # VERDICT must reach the reader. The signature here is random, so the record
+        # decodes and does NOT verify — deliberately, because "does not verify" is
+        # the line that was missing from this page entirely.
+        "op_return-hashmark-v2": (
+            b"\x6a\x08HASHMARK\x02"
+            + bytes([2, 1])
+            + b"\x20"
+            + os.urandom(32)
+            + b"\x14"
+            + os.urandom(20)
+            + b"\x41"
+            + bytes([31])
+            + os.urandom(64)
+        ),
         "nft": build_nft_locking_script(pkh, ref),
         "ft": build_ft_locking_script(pkh, ref),
         "mut": build_mutable_nft_script(ref, payload_hash),
@@ -236,11 +260,38 @@ def _js_string(value) -> str:
     return str(value)
 
 
+# Keys INSIDE a nested payload block (hashmark, message, attestation) that the
+# renderer may drop. Same rule as the top-level tables: listed with a reason, or
+# it must appear. Without this the guard would demand the literal value of every
+# leaf, including ones that are deliberately rendered as prose.
+_OMITTED_NESTED_KEYS = {
+    "outcome": "rendered as prose — 'v2 (sha256)' when ok, 'DOES NOT VERIFY' or the "
+    "outcome text otherwise. The literal 'ok' would tell a reader nothing",
+    "signature_unverified": "the raw 65-byte signature. The VERDICT is what a reader "
+    "needs and the bytes are in the JSON drawer; the CLI omits it for the same reason",
+    "assumed_network": "shown beside a VERIFIED signature, where the assumption is "
+    "load-bearing. On a failure the reason is the detail, not the chain",
+    "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
+    "recovered_hash160": "identical to the committed signer whenever it is set, and "
+    "the signer is already rendered; printing both invites reading them as two facts",
+}
+
+
 def _required_evidence(key: str, value) -> list[str]:
     """Substrings the rendered text must contain for *key* to count as shown."""
-    if key in _PROSE_EVIDENCE and value in _PROSE_EVIDENCE[key]:
+    if key in _PROSE_EVIDENCE and _hashable(value) and value in _PROSE_EVIDENCE[key]:
         phrase = _PROSE_EVIDENCE[key][value]
         return [] if phrase is None else [phrase]
+    if isinstance(value, dict):
+        # A nested block (hashmark, message, attestation). Recurse to its LEAVES:
+        # asserting the dict's repr would be satisfied by nothing a renderer emits,
+        # and skipping it entirely is how the whole block went unrendered.
+        return [
+            evidence
+            for sub_key, sub_value in value.items()
+            if sub_key not in _OMITTED_NESTED_KEYS
+            for evidence in _required_evidence(sub_key, sub_value)
+        ]
     if isinstance(value, list):
         # input_refs / referenced_refs: every entry, both fields.
         return [str(field) for entry in value for field in entry.values() if str(field)]
@@ -250,6 +301,14 @@ def _required_evidence(key: str, value) -> list[str]:
     # Long blobs are truncated for scannability (data_hex in a tx row). Match
     # on the head, which is what the renderer promises to show.
     return [text[:64]]
+
+
+def _hashable(value) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
 
 
 @functools.lru_cache(maxsize=1)
@@ -551,3 +610,131 @@ class TestHarnessIntegrity:
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+class TestTheCorpusCoversEveryShapeTheClassifierCanEmit:
+    """The guard above is only as wide as `_SHAPE_NAMES`, which is hand-kept.
+
+    That is how the OP_RETURN payload shapes slipped past it: `hashmark`,
+    `attestation` and `message` were added to the Python classifier and to neither
+    card, and "every key must be rendered" never fired because no shape in the
+    corpus produced those keys. The structural guard was structural about FIELDS and
+    hand-kept about SHAPES.
+
+    So the shape list is now checked against the type strings the classifier can
+    actually emit, recovered from its source. A new `type` with no corpus entry
+    fails here rather than silently narrowing every test in this file.
+    """
+
+    #: Types no pasted script can produce, with the reason.
+    _UNREACHABLE = {
+        "error": "produced only when classification RAISES; there is no script that yields it",
+    }
+
+    @staticmethod
+    def _emitted_by_the_source() -> set[str]:
+        """Every `type` value written as a literal in the classifier, plus the
+        prefix of every one built by an f-string."""
+        import ast
+        import pathlib
+
+        source = pathlib.Path(_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8")
+        found: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            targets = []
+            if isinstance(node, ast.Dict):
+                targets = [
+                    v
+                    for k, v in zip(node.keys, node.values, strict=False)
+                    if isinstance(k, ast.Constant) and k.value == "type"
+                ]
+            elif isinstance(node, ast.Assign):
+                targets = [
+                    node.value
+                    for t in node.targets
+                    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "type"
+                ]
+            for value in targets:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    found.add(value.value)
+                elif isinstance(value, ast.JoinedStr) and value.values:
+                    # f"op_return-hashmark-v{version}" -> the literal prefix, which is
+                    # enough to demand SOME corpus shape of that family.
+                    head = value.values[0]
+                    if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                        found.add(head.value)
+        if len(found) < 10:
+            raise AssertionError(
+                f"only {len(found)} type values parsed from _inspect_core.py — the extraction is broken"
+            )
+        return found
+
+    def test_every_emitted_type_has_a_corpus_shape(self, payloads) -> None:
+        produced = {payloads[name]["script"].get("type", "") for name in _SHAPE_NAMES}
+        missing = []
+        for emitted in sorted(self._emitted_by_the_source()):
+            if emitted in self._UNREACHABLE:
+                continue
+            # Exact for a literal type; prefix for an f-string family.
+            if not any(t == emitted or t.startswith(emitted) for t in produced):
+                missing.append(emitted)
+        assert not missing, (
+            f"the classifier can emit {missing} and no corpus shape produces it, so every "
+            f"test in this file is blind to those shapes. Add one to `_SHAPE_NAMES` and "
+            f"`_corpus()`, or record it in `_UNREACHABLE` with a reason.\n"
+            f"currently produced: {sorted(produced)}"
+        )
+
+    def test_the_extraction_is_not_vacuous(self) -> None:
+        """A parser returning an empty set would make the check above pass forever."""
+        emitted = self._emitted_by_the_source()
+        assert {"p2pkh", "op_return", "op_return-hashmark-v"} <= emitted
+
+    def test_no_corpus_shape_is_unreachable_from_the_classifier(self, payloads) -> None:
+        """The other direction: a shape whose type no longer exists is a test that
+        silently stopped covering anything."""
+        emitted = self._emitted_by_the_source()
+        for name in _SHAPE_NAMES:
+            produced = payloads[name]["script"].get("type", "")
+            assert any(produced == e or produced.startswith(e) for e in emitted), (
+                f"corpus shape {name!r} classifies as {produced!r}, which the classifier "
+                f"source no longer emits — this shape is guarding nothing"
+            )
+
+
+class TestTheNestedRequirementIsNotVACUOUS:
+    """A nested block must demand SOMETHING on screen.
+
+    `_required_evidence` recurses into `hashmark` / `message` / `attestation` and
+    skips leaves listed in `_OMITTED_NESTED_KEYS`. If a block's every leaf ended up
+    listed there, it would return no requirements at all and the block would count
+    as "rendered" while the card showed nothing — the same shape as the corpus gap
+    that let these fields go unrendered in the first place, one level down.
+
+    The omission table is the right mechanism; it just needs a floor under it.
+    """
+
+    _NESTED = {"hashmark": ("op_return-hashmark-v2", 3), "message": ("op_return-msg", 1)}
+
+    @pytest.mark.parametrize("key", sorted(_NESTED))
+    def test_the_block_demands_evidence(self, key, payloads) -> None:
+        shape, minimum = self._NESTED[key]
+        block = payloads[shape]["row"][key]
+        evidence = _required_evidence(key, block)
+        assert len(evidence) >= minimum, (
+            f"{key!r} on shape {shape!r} requires only {len(evidence)} evidence strings "
+            f"({evidence}). Every leaf that matters has been omitted, so this block now "
+            f"passes whether or not the renderer shows it."
+        )
+
+    def test_the_digest_specifically_must_be_shown(self, payloads) -> None:
+        """The one field that identifies WHICH file was marked. A HashMark card
+        without it is decoration."""
+        block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert block["digest"] in _required_evidence("hashmark", block)
+
+    def test_the_attestation_detail_must_be_shown(self, payloads) -> None:
+        """The verdict's reason. Dropping it is how "does not verify" becomes a bare
+        badge again."""
+        block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert block["attestation"]["detail"] in _required_evidence("hashmark", block)
