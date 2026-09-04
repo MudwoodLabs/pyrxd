@@ -139,9 +139,35 @@ def sign_metadata(
 
 
 def verify_creator_signature(metadata: GlyphMetadata) -> tuple[bool, str]:
-    """Verify the creator signature embedded in metadata.
+    """Check that ``creator.pubkey`` signed this metadata.
 
-    :returns: (True, "") if valid; (False, reason) if invalid or missing.
+    WHAT A ``True`` ESTABLISHES, EXACTLY: *the key named in this blob signed this
+    blob.* Nothing more. ``creator.pubkey`` is a field of the same metadata being
+    verified — nothing here binds it to the minting key, to the commit outpoint, or
+    to any identity known in advance.
+
+    SO IT DOES NOT ESTABLISH AUTHORSHIP, and the failure is not subtle. Anyone can
+    take a token's metadata verbatim, re-sign it with their own key, and mint a copy
+    whose ``verify_creator_signature`` returns ``(True, "")`` — indistinguishable
+    from the original. Demonstrated in ``tests/test_creator_signature_scope.py``.
+    A marketplace building a "verified creator" badge on this boolean would badge
+    the counterfeit.
+
+    TO GET AUTHORSHIP you need a key fixed IN ADVANCE to compare the recovered one
+    against. That is the standard this repo already applies one module over, in
+    :func:`pyrxd.script.hashmark.verify_attestation`: "Without a value fixed in
+    advance to compare against, recovery is circular and proves nothing: an attacker
+    would simply write whatever hash their chosen signature recovers to." HashMark
+    commits the signer hash160 twice and requires both to match; this has one copy
+    and compares it to itself.
+
+    The check is still worth having — it detects a metadata blob altered after
+    signing, which is a real thing to detect. It is the INFERENCE from ``True`` that
+    has to stay narrow.
+
+    :returns: (True, "") if the named key signed this metadata; (False, reason)
+        otherwise. A non-empty reason on ``True`` flags a lossy decode — see
+        :func:`_cbor_for_verifying`.
     """
     if metadata.creator is None:
         return False, "no creator field"
