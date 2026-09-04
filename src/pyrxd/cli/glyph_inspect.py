@@ -99,15 +99,15 @@ def _inspect_outpoint(s: str) -> dict:
         raise UserError("outpoint failed to parse", cause=msg) from exc
 
 
-def _inspect_script(script_hex: str) -> dict:
+def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError``."""
     try:
-        return _inspect_script_core(script_hex)
+        return _inspect_script_core(script_hex, network=network)
     except ValidationError as exc:
         raise UserError(str(exc)) from exc
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
+def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
 
@@ -116,7 +116,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     CLI's three-line ``error / cause / fix`` formatting so existing
     test assertions (e.g. on ``"--electrumx"``) keep matching."""
     try:
-        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout)
+        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network)
     except ValidationError as exc:
         msg = str(exc)
         if "raw bytes too short" in msg:
@@ -166,7 +166,9 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         raise UserError(msg) from exc
 
 
-async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None) -> dict:
+async def _inspect_txid_inner(
+    client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None, network: str = "mainnet"
+) -> dict:
     """Fetch *txid_hex* via *client* and classify every output.
 
     Thin async wrapper around :func:`_classify_raw_tx`. The split is so
@@ -186,7 +188,7 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
         raise UserError("invalid txid", cause=str(exc)) from exc
 
     raw = await client.get_transaction(txid)
-    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout)
+    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
 
 
 def _render_txid_human(payload: dict) -> str:
@@ -208,6 +210,11 @@ def _render_txid_human(payload: dict) -> str:
             type_ = row.get("type", "?")
             head = f"  vout {row['vout']:>3}  type={type_:<10}  sats={sats}"
             lines.append(head)
+            # An OP_RETURN payload's verdict must reach the terminal HERE too, not
+            # only in the pasted-script view. This is the path that reaches a record
+            # actually on chain, and without it a v2 whose signature DOES NOT VERIFY
+            # rendered identically to a genuine one.
+            lines.extend(_op_return_payload_lines(row, indent="            "))
             if type_ in ("nft", "ft"):
                 lines.append(f"            ref={row.get('ref_outpoint', '')}")
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
@@ -242,6 +249,15 @@ def _render_txid_human(payload: dict) -> str:
                 lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '')}")
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
                 lines.append(f"            variant={row.get('variant', '')} (non-transferable at consensus)")
+                # The classifier attaches a `note` saying what this verdict does NOT
+                # establish, and this row used to drop it while the standalone script
+                # card printed it in full. This is the path most people meet the tool
+                # on, and "non-transferable at consensus" is exactly the sentence a
+                # credential or swap gate would over-trust. The sibling
+                # container-legacy branch already points the reader onward; soulbound
+                # did not.
+                lines.append("            does NOT verify the singleton is held here — see")
+                lines.append("            `pyrxd glyph inspect <script>` for the full qualifier")
             elif type_ == "self-replicating-covenant":
                 lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '(multiple)')}")
                 lines.append("            markers only — NOT proof of soulbound")
@@ -274,6 +290,11 @@ def _render_txid_human(payload: dict) -> str:
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
         lines.append(f"  protocol: {metadata['protocol']}")
+        # BEFORE the fields themselves. A look-alike warning printed after the name
+        # it applies to is a warning the reader has already acted on — and the whole
+        # point is that the rendered name looks correct.
+        for field, reason in (metadata.get("display_warnings") or {}).items():
+            lines.append(f"  *** WARNING: {field} contains {reason} ***")
         if metadata.get("name"):
             lines.append(f"  name:     {_truncate_for_human(metadata['name'])}")
         if metadata.get("ticker"):
@@ -360,22 +381,72 @@ def _render_inspect_human(payload: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in payload.items())
 
 
-def _render_script_human(payload: dict) -> str:
-    """Pretty-print a classified script result."""
-    type_ = payload.get("type", "?")
-    head = f"type: {type_}    length: {payload['length']} bytes"
-    body: list[str] = []
+def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
+    """Names resolving to the signer's key NOW — as context, never as part of the mark.
+
+    HashMark §7.6 is explicit that a naming system must not be folded into a mark's
+    verdict. A name resolves to whatever it points at now; a mark was made at a past
+    block. Applying a present-tense lookup to a past event is wrong in BOTH directions
+    once a name changes hands:
+
+    * a genuine mark signed by the previous holder starts failing, because the name
+      resolves elsewhere — a real record rejected;
+    * whoever acquires a lapsed name can make NEW marks that verify as "signed by
+      whoever owns company.rxd", which is TRUE and which a reader hears as "the
+      company made this". Names on Radiant have terms and expire, so this is ordinary
+      rather than exotic.
+
+    This block previously read "the signing key owns these names — file matches the
+    digest AND was recorded by that name's holder". That is the unsound form verbatim:
+    a past-tense claim manufactured from a present-tense lookup, printed inside the
+    attestation block as though the mark carried it.
+
+    So the two facts are separated, per §7.6 form 1: the signer ADDRESS sits with the
+    signature, where it belongs, and the name sits below the mark, at the outer indent,
+    marked present-tense. The sound form — "recorded by the holder at that time" —
+    needs point-in-time resolution against the mark's own block, which is issue-tracked
+    rather than approximated here.
+    """
+    if not wi:
+        return []
+    if not wi.get("resolved"):
+        return [f"{indent}separately — WAVE names: not resolved ({wi.get('reason')})"]
+    names = wi.get("names_resolving_now") or []
+    if not names:
+        return [f"{indent}separately — no WAVE name resolves to that key right now"]
+    return [
+        f"{indent}separately, and NOT part of the mark above:",
+        f"{indent}  WAVE names resolving to that key RIGHT NOW: {', '.join(names)}",
+        f"{indent}  (a present-tense lookup. Names change hands, so this does not say who",
+        f"{indent}   held the name when the mark was made, nor that the named party made it)",
+    ]
+
+
+def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
+    """The `msg` and HashMark rendering, for EVERY human surface that shows one.
+
+    Factored out because there are two such surfaces and there was one renderer. The
+    pasted-script view printed the digest, the signer and the attestation verdict; the
+    txid view — the DEFAULT path, and the only one that reaches a record actually on
+    chain — printed the type label alone. So a v2 whose signature DOES NOT VERIFY and
+    a genuine one rendered byte-identically, with the affirmative-sounding
+    `op_return-hashmark-v2` label surviving and the verdict discarded.
+
+    A computed verdict that no human sees is not a feature. Two copies of a renderer
+    is how one of them ends up missing the line that matters, so there is one.
+    """
+    out: list[str] = []
     msg = payload.get("message")
     if msg:
         if msg["outcome"] == "ok":
             if msg["is_utf8"]:
-                body.append(f"  message ({msg['byte_length']} bytes): {_truncate_for_human(msg['text'])}")
+                out.append(f"{indent}message ({msg['byte_length']} bytes): {_truncate_for_human(msg['text'])}")
             else:
                 # Say WHY there is no text rather than printing nothing, or a caller
                 # assumes the field is empty when the bytes simply are not text.
-                body.append(f"  message: {msg['byte_length']} bytes, not valid UTF-8 (see data_hex)")
+                out.append(f"{indent}message: {msg['byte_length']} bytes, not valid UTF-8 (see data_hex)")
         else:
-            body.append(f"  message: {msg['outcome']}" + (f" — {msg['detail']}" if msg.get("detail") else ""))
+            out.append(f"{indent}message: {msg['outcome']}" + (f" — {msg['detail']}" if msg.get("detail") else ""))
 
     hm = payload.get("hashmark")
     if hm:
@@ -383,37 +454,53 @@ def _render_script_human(payload: dict) -> str:
         # Classifying it in JSON and not printing it here would leave the feature
         # invisible to the person actually reading a terminal.
         if hm["outcome"] == "ok":
-            body.append(f"  HashMark v{hm['version']} ({hm['algorithm']})")
-            body.append(f"    digest:  {hm['digest']}")
+            out.append(f"{indent}HashMark v{hm['version']} ({hm['algorithm']})")
+            out.append(f"{indent}  digest:  {hm['digest']}")
             if hm.get("label"):
-                body.append(f"    label:   {_truncate_for_human(hm['label'])}")
+                out.append(f"{indent}  label:   {_truncate_for_human(hm['label'])}")
+            elif hm.get("label_withheld"):
+                # v1 keeps its timestamp evidence; the label is withheld WITH a reason,
+                # because silently showing nothing looks like a record that had no label.
+                out.append(f"{indent}  label:   [withheld — {hm['label_withheld']}]")
             if hm.get("signer_hash160"):
-                body.append(f"    signer:  {hm['signer_hash160']}")
+                out.append(f"{indent}  signer:  {hm['signer_hash160']}")
                 att = hm.get("attestation") or {}
                 if att.get("outcome") == "valid":
-                    body.append("    signature VERIFIED — recovers to the committed signer")
-                    body.append(f"      (assuming {att.get('assumed_network')}; the chain is part of")
-                    body.append("       the signed statement and a pasted script carries no context)")
-                    wi = hm.get("wave_identity")
-                    if wi and wi.get("resolved"):
-                        names = wi.get("names") or []
-                        if names:
-                            body.append(f"    WAVE identity: {', '.join(names)}")
-                            body.append("      (the signing key owns these names — file matches the")
-                            body.append("       digest AND was recorded by that name's holder)")
-                        else:
-                            body.append("    WAVE identity: none — the signing key owns no WAVE name")
-                    elif wi:
-                        body.append(f"    WAVE identity: not resolved ({wi.get('reason')})")
+                    out.append(f"{indent}  signature VERIFIED — recovers to the committed signer")
+                    if att.get("signer_address"):
+                        out.append(f"{indent}    signer address: {att['signer_address']}")
+                    out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
+                    out.append(f"{indent}     the signed statement and a pasted script carries no context)")
+                elif att.get("outcome") == "unverifiable":
+                    # Withheld, not decided. Falling through silently would leave a
+                    # v2 record showing a signer and no word about its signature —
+                    # which reads as "fine" far more than it reads as "unchecked".
+                    out.append(f"{indent}  signature NOT CHECKED — {att.get('detail', 'no detail')}")
+                    out.append(f"{indent}    (the record is well-formed; this is not a verdict on it)")
                 elif att.get("outcome") == "invalid_signature":
                     # The bytes decoded; the CLAIM does not hold. Saying "malformed"
                     # here would send whoever is debugging it after the wrong problem.
-                    body.append(f"    signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
-                    body.append("      (the record is well-formed; its claim is not supported)")
-            body.append("    (proves someone knew this digest no later than the confirming")
-            body.append("     block — not authorship, ownership, originality or contents)")
+                    out.append(f"{indent}  signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
+                    out.append(f"{indent}    (the record is well-formed; its claim is not supported)")
+            out.append(f"{indent}  (proves someone knew this digest no later than the confirming")
+            out.append(f"{indent}   block — not authorship, ownership, originality or contents)")
+            # AFTER the mark's own statement closes, and at the outer indent. §7.6
+            # allows a name only as present-tense context, "never beside the mark as
+            # though it were part of it", so it does not sit inside the block or
+            # between the signature and what that signature proves.
+            out.extend(_wave_context_lines(hm.get("wave_identity"), indent))
         else:
-            body.append(f"  HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+            out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+
+    return out
+
+
+def _render_script_human(payload: dict) -> str:
+    """Pretty-print a classified script result."""
+    type_ = payload.get("type", "?")
+    head = f"type: {type_}    length: {payload['length']} bytes"
+    body: list[str] = []
+    body.extend(_op_return_payload_lines(payload))
 
     if type_ == "p2pkh":
         body.append(f"  owner_pkh: {payload['owner_pkh']}")
@@ -451,9 +538,21 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  token_ref:    {payload['token_ref_outpoint']}")
         body.append(f"  height:       {payload['height']} / {payload['max_height']}")
         body.append(f"  reward:       {payload['reward']} photons/mint")
-        # Total minted supply if all mints succeed.
-        total = payload["max_height"] * payload["reward"]
-        body.append(f"  total supply: {total:,} photons")
+        # THIS CONTRACT's cap, which is not the token's supply. The label said
+        # "total supply" flat, with the "if all mints succeed" hedge living only in
+        # this comment where no reader sees it — and a real dMint token commonly
+        # deploys N parallel contracts sharing ONE token_ref, so its supply is the
+        # sum across them. The browser tool computes `reward x max_height x N` for
+        # the same token, so the two surfaces of one tool answered "what is this
+        # token's supply" with figures differing by the parallel-contract count.
+        #
+        # Naming the quantity is the fix: this output can only ever see the one
+        # contract script it was handed.
+        cap = payload["max_height"] * payload["reward"]
+        body.append(f"  this contract's cap: {cap:,} photons ({payload['max_height']:,} mints x {payload['reward']:,})")
+        body.append("  (the cap IF every mint succeeds, and for THIS contract only —")
+        body.append("   a token may deploy several contracts against one token_ref,")
+        body.append("   and its supply is the sum across them)")
         body.append(f"  algo:         {payload['algo']}")
         body.append(f"  daa_mode:     {payload['daa_mode']}")
         body.append("  (structural pattern match; does NOT verify the contract_ref points")
@@ -471,7 +570,24 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  self-replication branch: {payload['has_self_replication']}")
         body.append(f"  burn branch:             {payload['has_burn_branch']}")
         body.append("  NON-TRANSFERABLE AT CONSENSUS — the only spends this lock permits are")
-        body.append("  a byte-identical self-clone or a burn. There is no transfer path.")
+        # The two variants pin DIFFERENT things, and this said "byte-identical" for
+        # both. The fixed-index builder compares whole scripts
+        # (OP_OUTPUTBYTECODE / OP_UTXOBYTECODE); the composable one compares
+        # CODE-SCRIPT HASHES, and its own docstring says "code-identical clone".
+        #
+        # Those coincide only because neither builder emits OP_STATESEPARATOR, so the
+        # code script IS the whole script. That is not a detail to paper over: code-
+        # script equality plus a state prefix lets the OWNER change between hops, and
+        # `classify_soulbound` returns MUTABLE_STATE_COVENANT for exactly that shape.
+        # Naming the weaker constraint accurately is what makes the distinction
+        # visible to whoever reads this next.
+        if payload.get("variant") == "composable":
+            body.append("  a CODE-identical self-clone or a burn. There is no transfer path.")
+            body.append("  (this variant pins its code-script hash, not the whole script; the two")
+            body.append("   coincide here because the builder emits no OP_STATESEPARATOR, so there")
+            body.append("   is no mutable state for a clone to change)")
+        else:
+            body.append("  a byte-identical self-clone or a burn. There is no transfer path.")
         body.append("  (exact match against pyrxd's soulbound covenant builder. It does NOT")
         body.append("   verify the bound ref names a live Glyph singleton, that the singleton")
         body.append("   is actually held here, or that the covenant is defect-free — the")
@@ -745,7 +861,7 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool,
     elif form == "outpoint":
         payload = _inspect_outpoint(value)
     elif form == "script":
-        payload = _inspect_script(value)
+        payload = _inspect_script(value, network=ctx.network)
     else:  # pragma: no cover — _classify_input never returns other values
         raise UserError(f"internal: unknown form {form!r}")
 
@@ -779,7 +895,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
         client = ctx.make_client()
         async with client:
             if form == "txid":
-                return await _inspect_txid_inner(client, value)
+                return await _inspect_txid_inner(client, value, network=ctx.network)
             # form == "outpoint" + resolve: parse, fetch the source, classify
             # only the named vout.
             outpoint_payload = _inspect_outpoint(value)
@@ -787,6 +903,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
                 client,
                 outpoint_payload["txid"],
                 only_vout=outpoint_payload["vout"],
+                network=ctx.network,
             )
 
     try:
@@ -800,7 +917,10 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
 
 
 def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
-    """Resolve the WAVE names a VERIFIED HashMark signer owns, and attach them.
+    """Attach the WAVE names that resolve to a VERIFIED signer's key RIGHT NOW.
+
+    Present tense throughout, and deliberately not "the names the signer owns" — that
+    phrasing was the bug. See :func:`_resolve_one_wave_identity` and HashMark §7.6.
 
     ONLY runs on a signature that actually verified. Resolving an unverified
     signer would dress a claim up as an identity — the exact failure the
@@ -810,7 +930,20 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     Errors are attached rather than raised: a name lookup failing is not a reason
     to lose the classification the user asked for.
     """
-    hm = payload.get("hashmark")
+    # BOTH shapes. A pasted script puts the record at the top level; a txid puts one
+    # per output. Reading only the first meant `--verify-wave <txid> --fetch` attached
+    # nothing and never said why — a flag that silently does nothing on the form most
+    # people use it with.
+    records = (
+        [payload["hashmark"]]
+        if payload.get("hashmark")
+        else [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]
+    )
+    for hm in records:
+        _resolve_one_wave_identity(ctx, hm)
+
+
+def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
     if not hm:
         return
     att = hm.get("attestation") or {}
@@ -835,6 +968,31 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     try:
         names = asyncio.run(_do())
     except Exception as exc:
-        hm["wave_identity"] = {"resolved": False, "reason": f"lookup failed: {exc}"}
+        # The exception text can contain a server-controlled response body.
+        hm["wave_identity"] = {"resolved": False, "reason": _sanitize_display_string(f"lookup failed: {exc}")}
         return
-    hm["wave_identity"] = {"resolved": True, "names": names}
+    # SANITIZED AT THE BOUNDARY, like every other name the indexer hands back. A
+    # WAVE name is registration text an attacker chooses, and it lands directly
+    # under "signature VERIFIED" — the one line in this output that states an
+    # independently checked cryptographic fact. Raw, it can carry the ANSI to
+    # scroll that line off the screen and reprint it saying something else.
+    hm["wave_identity"] = {
+        "resolved": True,
+        # NAMED FOR WHAT IT IS. This was `names`, which invites exactly the inference
+        # §7.6 forbids: a name resolves to whatever it points at NOW, and the mark was
+        # made at a past block. Applying a present-tense lookup to a past event is
+        # wrong in both directions the moment a name changes hands — a genuine mark by
+        # the previous holder starts failing, and whoever picks up a lapsed name can
+        # make NEW marks that truthfully verify as "signed by whoever owns
+        # company.rxd", which a reader hears as "the company made this".
+        "names_resolving_now": [_sanitize_display_string(n) for n in names],
+        # Explicit so a downstream consumer cannot reach for this field believing it
+        # is the historical answer. Doing that properly means establishing what the
+        # name pointed at AT THE MARK'S OWN BLOCK, by fetching and verifying the chain
+        # of modification transactions — not by trusting an index (§2.8, §7.6).
+        "point_in_time": False,
+        "caveat": (
+            "present-tense lookup, not a property of the mark: names change hands, so this "
+            "does not establish who held the name when the mark was made"
+        ),
+    }

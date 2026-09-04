@@ -111,8 +111,10 @@ def cli(
 ) -> None:
     """pyrxd — wallet, Glyph token, and Gravity-swap CLI for Radiant.
 
-    Use `pyrxd <command> --help` for command-specific options. See the
-    repository docs (docs/api/cli.rst) for the full reference.
+    `pyrxd <command> --help` is the complete and authoritative command list — it is
+    generated from the code and cannot drift. docs/api/cli.rst is a hand-written
+    NARRATIVE guide covering a subset in depth; it called itself "the full reference"
+    here while omitting thirteen commands, five of which broadcast.
     """
     if json_output and quiet:
         click.echo("error: --json and --quiet are mutually exclusive", err=True)

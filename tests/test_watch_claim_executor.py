@@ -8,6 +8,7 @@ Dormant-by-construction: nothing here moves value; every BROADCAST is a fake leg
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ from pyrxd.btc_wallet import taproot as t
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
-from pyrxd.btc_wallet.taproot import btc_txid_from_raw
+from pyrxd.btc_wallet.taproot import Timelock, TimeUnit, btc_txid_from_raw
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import (
@@ -911,3 +912,77 @@ class TestTheBroadcastBoundaryIsPinned:
         """
         ex, _leg, rec, _ = await _armed_executor(confs=24, btc_confs=10)
         assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+
+
+class TestTheValueCapReadsTheRadiantInterval:
+    """`_check_value_cap` converts a RADIANT burial, so it must use RADIANT's interval.
+
+    #579 fixed seven sites; this one had NO test that failed when reverted. Measured
+    rather than argued: switching it back to `policy.block_interval_s` passed all
+    10,993 tests, `test_watch_claim_executor.py`, and the scanner written for exactly
+    this defect class — which is line-based and cannot see a call split over two
+    lines, the shape here.
+
+    It survives because it is INERT while every fixture tags the burial in BLOCKS:
+    `normalize_to` is then the identity and the interval argument is never read. No
+    test in this file supplied a SECONDS-tagged burial, so the wrong argument and the
+    right one produced identical output. **A test whose fixture cannot express the
+    defect passes for a reason unrelated to the code being correct.**
+
+    So the fixture below deliberately makes the two intervals DIFFER (600 vs 300) and
+    picks an amount BETWEEN the two ceilings. Equal values hide conflations; this is
+    the smallest fixture in which the two readings disagree.
+    """
+
+    #: 1800 s is 6 Radiant blocks (ceiling 3000) or 3 Bitcoin blocks (ceiling 1500).
+    BURIAL_S, RXD_INTERVAL, BTC_INTERVAL = 1800, 300.0, 600.0
+    COST, FACTOR = 1000, 2.0
+    CEILING_RADIANT, CEILING_BITCOIN = 3_000, 1_500
+    #: Between the two. Legitimate at the real ceiling, refused at the wrong one.
+    AMOUNT = 2_000
+
+    def _policy(self) -> MarginPolicy:
+        return dataclasses.replace(
+            MarginPolicy.estimated(),
+            block_interval_s=self.BTC_INTERVAL,
+            rxd_block_interval_s=self.RXD_INTERVAL,
+            rxd_claim_burial=Timelock(self.BURIAL_S, TimeUnit.SECONDS),
+        )
+
+    async def _gate(self, amount: int):
+        terms, _p, raw, txid, locator, _b = await _build_real_claim(radiant_amount=amount)
+        ex = ClaimExecutor(
+            resolve_leg=_resolver(_FakeRadiantLeg(_FakeChainIO())),
+            claim_status_source=_FakeStatusSource(claim_txid=txid),
+            claim_bytes_source=_FakeBytesSource({txid: raw}),
+            policy=self._policy(),
+            network="mainnet",
+            reorg_cost_per_block=self.COST,
+            reorg_safety_factor=self.FACTOR,
+            claim_dust_ceiling=10_000,
+            enable_autonomous_mainnet_custody=True,
+        )
+        rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, counterchain_locator=locator)
+        return ex._check_value_cap(rec)
+
+    def test_the_two_intervals_really_do_disagree_here(self) -> None:
+        """Guards the fixture itself. If these ever coincide the test below proves
+        nothing while still passing — the failure mode it exists to catch."""
+        policy = self._policy()
+        radiant = policy.rxd_claim_burial.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.rxd_block_interval_s)
+        bitcoin = policy.rxd_claim_burial.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s)
+        assert radiant.value == 6 and bitcoin.value == 3
+        assert self.CEILING_BITCOIN < self.AMOUNT < self.CEILING_RADIANT
+
+    async def test_an_honest_claim_inside_the_RADIANT_ceiling_is_allowed(self) -> None:
+        """The assertion that fails when #579 is reverted here. With Bitcoin's
+        interval the burial reads 3 blocks, the ceiling halves to 1500, and this
+        legitimate 2000-photon claim is refused — a guard refusing valid work, and
+        for an autonomous claim a refusal can mean the swap is not claimed at all."""
+        assert await self._gate(self.AMOUNT) is None
+
+    async def test_a_claim_above_the_RADIANT_ceiling_is_still_refused(self) -> None:
+        """The other half. A gate that allows everything would also pass the test
+        above, so pin that it still says no — and that it names the real ceiling."""
+        reason = await self._gate(self.CEILING_RADIANT + 1)
+        assert reason is not None and str(self.CEILING_RADIANT) in reason

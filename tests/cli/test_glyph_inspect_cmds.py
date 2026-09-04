@@ -279,14 +279,24 @@ class TestInspectScriptHex:
 
     def test_classifies_v1_dmint_contract_human(self, runner: CliRunner) -> None:
         """A real V1 contract from the RBG mainnet reveal must classify as
-        ``dmint`` and surface ``version: dMint v1`` plus the derived total
-        supply line."""
+        ``dmint`` and surface ``version: dMint v1`` plus the derived
+        per-contract cap line."""
         result = runner.invoke(cli, ["glyph", "inspect", _RBG_DMINT_V1_HEX])
         assert result.exit_code == 0, result.output
         assert "type: dmint" in result.output
         assert "version:      dMint v1" in result.output
-        # max_height (6_750_000) × reward (6_200) = 41_850_000_000
-        assert "total supply: 41,850,000,000" in result.output
+        # max_height (6_750_000) × reward (6_200) = 41_850_000_000.
+        #
+        # THE ARITHMETIC IS UNCHANGED; THE LABEL WAS WRONG. This asserted
+        # "total supply: 41,850,000,000". That figure is THIS CONTRACT's cap — a
+        # dMint token commonly deploys several contracts against one token_ref, and
+        # the browser tool computes `reward × max_height × N` for the same token, so
+        # the two surfaces disagreed by the parallel-contract count. This renderer is
+        # handed one contract script and cannot see the others, so it now names the
+        # quantity instead of overstating what it knows.
+        assert "this contract's cap: 41,850,000,000" in result.output
+        assert "total supply" not in result.output
+        assert "THIS contract only" in result.output
         assert "algo:         SHA256D" in result.output
         assert "daa_mode:     FIXED" in result.output
 

@@ -351,16 +351,40 @@ def refund_leaf_script(refund_pubkey_xonly: bytes, timeout: Timelock) -> bytes:
     #
     # It became reachable when #482 made `t_btc` a SUBTRACTION (`t_rxd - margin - 4`); the old
     # addition could not underflow. The first fix put a `< 1` refusal in three RUNNER scripts —
-    # fix-at-the-demonstrated-site, which is the shape this codebase keeps repeating. Any caller
-    # that builds a leaf, now or later, gets the floor by construction.
+    # fix-at-the-demonstrated-site, which is the shape this codebase keeps repeating. Moving it
+    # here gives every caller that builds a BLOCKS-tagged leaf the floor by construction.
+    #
+    # THE REFUSAL IS ON THE ENCODED MAGNITUDE, NOT THE UNIT TAG. It was
+    # `unit is BLOCKS and value < 1`, so "every caller gets the floor" was false for a
+    # SECONDS-tagged Timelock — BIP68 quantises time locks to 512 s, so Timelock(0..511,
+    # SECONDS) all encode to nSequence 0x00400000, zero time units: the SAME no-op lock,
+    # emitted without complaint.
+    #
+    # And it was reachable end to end. Nothing in `pyrxd` or `scripts/` CONSTRUCTS a
+    # SECONDS `t_btc`, but `NegotiatedTerms.from_dict` takes the unit tag straight off the
+    # wire, `swap_state`'s own `t_btc` floor was scoped to BLOCKS the same way, and its
+    # ordering guard only fires when both units match — so a counterparty-authored
+    # envelope carrying `{"value": 0, "unit": "seconds"}` reached here and produced a
+    # refund leaf spendable in its own funding block. A #482-shaped free option, one unit
+    # tag away from the floor meant to stop it.
+    #
+    # Deriving the check from `csv_script_operand()` makes it unit-agnostic by
+    # construction: whatever the tag, whatever units are added later, a relative lock that
+    # encodes to zero is refused. That is the difference between a floor and a floor for
+    # the one spelling someone thought of.
+    #
+    # It refuses nothing honest. The only inputs newly rejected are SECONDS 0..511, every
+    # one of which is ALREADY a zero lock — a caller asking for 511 seconds is silently
+    # getting none today.
     #
     # `build_htlc_covenant_*` has enforced the same floor on the Radiant side all along
-    # (`htlc_covenant.py`, "a 0 CSV is a no-op timelock"). This is the BTC-side twin it was missing.
-    if timeout.unit is TimeUnit.BLOCKS and timeout.value < 1:
+    # (`htlc_covenant.py`, "a 0 CSV is a no-op timelock"). This is the BTC-side twin.
+    if timeout.csv_script_operand() & SEQUENCE_LOCKTIME_MASK == 0:
         raise ValidationError(
-            f"refund timeout is {timeout.value} blocks — a 0-block CSV is a no-op: the refund leaf "
-            "would be spendable in the funding block, so the counter leg is refundable before the "
-            "swap can complete"
+            f"refund timeout {timeout.value} {timeout.unit.value} encodes to a relative lock of "
+            "ZERO — a no-op CSV: the refund leaf would be spendable in the funding block, so the "
+            "counter leg is refundable before the swap can complete. BIP68 quantises time locks "
+            "to 512 s, so any value under 512 seconds is zero."
         )
     return _push_minimal_int(timeout.csv_script_operand()) + _OP_CSV + _OP_DROP + _push_data(pk) + _OP_CHECKSIG
 

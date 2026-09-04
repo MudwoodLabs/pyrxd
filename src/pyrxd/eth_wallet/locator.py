@@ -120,9 +120,16 @@ class EthHtlcLocator:
     Attributes
     ----------
     chain_id:
-        EIP-155 chain id (Sepolia = 11155111, mainnet = 1). Pins which network this
-        locator belongs to; a claim/refund built for the wrong chain is rejected by the
-        node via EIP-155 signing, and the leg refuses a chain_id mismatch up front.
+        EIP-155 chain id (Sepolia = 11155111, mainnet = 1). RECORDS which network this
+        locator was created on, so a durable record read back later says which chain its
+        ``contract_address`` lives on. It is a note, not a gate: as of 2026-09-03 NO code
+        compares it to anything. ``EthRpc.assert_chain`` checks the NODE against the leg's
+        own ``expected_chain_id``, and ``_sign_and_send`` signs with the LEG's ``chain_id``
+        — so a leg pointed at the wrong network is caught, but a locator from a DIFFERENT
+        network driven by a correctly-configured leg is not. This entry claimed "the leg
+        refuses a chain_id mismatch up front" until 2026-09-03; it never did. Adding the
+        comparison is a behaviour change on fund-moving code and is deliberately left for
+        its own review rather than smuggled in with a docstring correction.
     contract_address:
         The deployed ``EthHtlc`` instance (deploy-per-swap).
     deploy_tx_hash:
@@ -137,7 +144,11 @@ class EthHtlcLocator:
     timeout:
         Absolute unix deadline (matches the contract immutable).
     amount_wei:
-        The funded value (verified == negotiated before the maker reveals p).
+        The NEGOTIATED value. Before the maker reveals p, ``verify_funded`` asserts the
+        contract's on-chain balance is ``>=`` this — a LOWER bound, because anyone can
+        force-send wei to a contract and an ``==`` check would be griefable into a
+        permanent verify failure. This said "verified == negotiated" until 2026-09-03; a
+        reader who took that literally would have believed an over-funded HTLC is refused.
     """
 
     #: The wire tag this locator serialises under inside ``counterchain_locator``.

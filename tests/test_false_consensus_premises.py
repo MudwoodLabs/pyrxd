@@ -342,3 +342,167 @@ class TestProseAgreesWithRadiantCore:
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text()
         assert "(442 cases)" not in changelog
         assert "459 collected cases" in changelog
+
+
+# ---------------------------------------------------------------------------
+# 6. The premise, not one spelling of it
+# ---------------------------------------------------------------------------
+#
+# Every literal scan above pins ONE sentence ("standardness limit is 80",
+# "below 546 dust limit"). Both were real, and both are blind to the next author
+# who writes the same false premise in different words — which is how
+# ``script/type.py`` came to say "is not relayed" twice and
+# ``swap/rswp/covenant.py`` to say "(node-rejected)" while ``glyph/ft.py`` and
+# ``glyph/builder.py`` already spelled out, correctly, that neither can happen.
+#
+# The premise underneath all of them is one fact: *standardness has force on a
+# default Radiant node*. It does not. ``IsStandardTx`` is reached from exactly
+# one place (``validation.cpp:586`` @ ``v3.1.2``), gated on ``fRequireStandard``,
+# which is hardcoded ``false`` (``validation.cpp:271``) — so ``IsDust``
+# (``policy.h:173``), the output-script classifier, and every other standardness
+# rule never run. This scan is keyed to that fact instead of to a sentence.
+
+#: Prose naming a standardness / dust SUBJECT. Presence of one of these is what
+#: makes a nearby refusal a *standardness* claim rather than a fee or consensus
+#: claim — the min-relay-fee floor and BIP68 maturity DO make nodes reject
+#: transactions, and prose saying so is true and must survive this scan.
+_STANDARDNESS_SUBJECT = re.compile(r"standardness|non-?standard|TX_NONSTANDARD|IsStandardTx|IsDust|dust", re.I)
+
+#: The asserted CONSEQUENCE: a node refusing the transaction.
+_NODE_REFUSAL = re.compile(
+    r"not\s+be\s+relay|not\s+relay|never\s+relay|won'?t\s+relay|will\s+not\s+relay|non-?relayable|"
+    r"node-rejected|rejected\s+by\s+(?:the\s+|most\s+|a\s+|any\s+)?node|node\s+(?:will|would|may)\s+reject|"
+    r"refus\w+\s+by\s+(?:the\s+|a\s+)?node|reject\w*\s+for\s+relay",
+    re.I,
+)
+
+#: Prose that REFUTES the premise in the same breath is the correct writing and
+#: must not be flagged — a correction has to be able to quote the claim it is
+#: correcting. Each of these names the reason the rule does not run.
+_PREMISE_REFUTED = re.compile(
+    r"fRequireStandard|never\s+consult|not\s+consult|never\s+run|no\s+path\s+by\s+which|"
+    r"NOT\s+a\s+(?:node|chain|Radiant)\s+rule|no\s+force\s+on\s+Radiant",
+    re.I,
+)
+
+#: Characters either side of a refusal that count as "the same breath". Measured,
+#: not chosen: the three offenders live on the parent commit need windows of 25,
+#: 40 and 555 characters to reach their subject — the widest being
+#: ``script/type.py``'s second "is not relayed", whose subject is the
+#: ``TX_NONSTANDARD`` nine lines above it. 600 clears that with a little headroom;
+#: wider starts joining unrelated paragraphs.
+_PREMISE_WINDOW = 600
+
+#: Bitcoin and Ethereum subtrees. Bitcoin really does enforce a 546-satoshi dust
+#: rule and really does refuse non-standard scripts, so the same sentence there
+#: is TRUE — excluded rather than allowlisted, because the exclusion is a chain
+#: boundary and not a list of forgiven lines.
+_OTHER_CHAIN_PREFIXES = ("btc_wallet/", "eth_wallet/")
+
+
+def _premise_hits(text: str) -> list[tuple[int, str]]:
+    """Every asserted standardness refusal in *text*, as ``(line, matched phrase)``."""
+    return [
+        (text[: m.start()].count("\n") + 1, m.group(0))
+        for m in _NODE_REFUSAL.finditer(text)
+        for window in [text[max(0, m.start() - _PREMISE_WINDOW) : m.end() + _PREMISE_WINDOW]]
+        if _STANDARDNESS_SUBJECT.search(window) and not _PREMISE_REFUTED.search(window)
+    ]
+
+
+@functools.cache
+def _premise_corpus() -> tuple[tuple[str, str], ...]:
+    """Shipped Radiant-side source plus the published docs, as ``(label, text)``.
+
+    ``docs/brainstorms`` and ``docs/plans`` are deliberately absent: they are
+    working space where a wrong premise may legitimately be written down and
+    then argued with.
+    """
+    files = [(p, p.relative_to(SRC).as_posix()) for p in sorted(SRC.rglob("*.py"))]
+    files = [(p, f"src/pyrxd/{rel}") for p, rel in files if not rel.startswith(_OTHER_CHAIN_PREFIXES)]
+    for sub in ("how-to", "runbooks", "reference", "tutorials"):
+        root = REPO_ROOT / "docs" / sub
+        files += [(p, p.relative_to(REPO_ROOT).as_posix()) for p in sorted(root.rglob("*.md"))]
+    return tuple((label, path.read_text()) for path, label in files)
+
+
+class TestNoProseAssertsAStandardnessRefusal:
+    """A node-level refusal asserted for a standardness or dust reason is false here.
+
+    What this covers: any sentence in shipped Radiant-side source or published
+    docs that pairs a standardness/dust subject with "the node rejects it" or
+    "it is not relayed", in either order, within ``_PREMISE_WINDOW`` characters,
+    without also stating why the rule does not run.
+
+    What it does NOT cover, said plainly rather than implied:
+
+    * The *other* shape of the same premise — "the limit is N" (Bitcoin's 80-byte
+      OP_RETURN cap, the 546 floor). Those remain pinned by the two literal
+      checks in sections 1 and 2, which this does not subsume.
+    * A refusal with no standardness subject within the window. That shape is
+      indistinguishable from the honest fee refusal at
+      ``swap/rswp/covenant.py``'s ``_assert_relayable``, so it is left alone on purpose.
+    * Semantics. It matches phrasing, so a claim written in words it does not
+      know stays invisible. It is a net, not a proof.
+    * Anything outside the corpus: the BTC/ETH subtrees (where the rules are
+      real), brainstorms and plans (working space), and tests.
+
+    If it fires on an honest sentence — a genuine min-relay-fee or BIP68
+    refusal that happens to sit near the word "dust" — the fix is to say which
+    rule does the rejecting, not to widen the pattern.
+    """
+
+    def test_no_shipped_file_asserts_a_standardness_refusal(self):
+        offenders = [
+            f"{label}:{line}: {phrase!r}" for label, text in _premise_corpus() for line, phrase in _premise_hits(text)
+        ]
+        assert offenders == [], (
+            "standardness/dust is asserted as a node-level refusal, but Radiant never reaches "
+            f"IsStandardTx (validation.cpp:271/586 @ v3.1.2): {offenders}"
+        )
+
+    def test_the_corpus_is_not_empty(self):
+        """A pass must mean "nothing asserts it", never "nothing was scanned"."""
+        corpus = _premise_corpus()
+        assert len(corpus) > 100, f"only {len(corpus)} files scanned — the corpus roots have moved"
+        assert any(label == "src/pyrxd/script/type.py" for label, _ in corpus)
+        assert any(label.startswith("docs/") for label, _ in corpus)
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            # The three that were live on the parent commit...
+            "A reservation below the dust floor produces an unspendable (node-rejected) covenant UTXO.",
+            "``OP_FALSE OP_RETURN`` falls through to ``TX_NONSTANDARD`` and is not relayed.",
+            "Core classifies it TX_NONSTANDARD, so such an output is not relayed. Opt in only if "
+            "you know the node you are broadcasting to accepts it.",
+            # ...and spellings that have never appeared in this repo, which is the
+            # point: a scan proved only against its own examples proves nothing.
+            "an output below the dust threshold will not be relayed by any node",
+            "a nonstandard script is rejected by the node, so keep the output above 546",
+            "sub-dust change is non-relayable and must be folded into the fee",
+            "outputs under the dust limit are refused by the node at relay time",
+            "the node will reject a transaction carrying a non-standard output script",
+        ],
+    )
+    def test_the_scan_catches_spellings_it_was_not_written_from(self, claim: str):
+        assert _premise_hits(claim), f"premise scan is blind to: {claim}"
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            # Radiant DOES charge a min-relay fee (validation.cpp:779) and DOES
+            # enforce BIP68 maturity (interpreter.cpp:3006-3023). Refusing these
+            # would make the guard itself a bug.
+            "Refuse to return a v2 transaction the node will reject as ``min relay fee not met``.",
+            "THE CSV IS NOT MATURE - a node will reject this refund until it is. Do not send it yet.",
+            "Radiant has NO dust threshold and standardness is not consulted, so nothing is rejected by the node.",
+            # A DELIBERATE blind spot, asserted so it stays deliberate: a refusal
+            # with no standardness subject anywhere near it is indistinguishable
+            # from the honest fee refusal above, so this scan does not judge it.
+            # ``swap/rswp/covenant.py``'s ``_assert_relayable`` is this shape, and TRUE.
+            "Refuse to return a v3 covenant transaction the node will not relay.",
+        ],
+    )
+    def test_the_scan_leaves_true_node_refusals_alone(self, claim: str):
+        assert not _premise_hits(claim), f"premise scan refuses an honest sentence: {claim}"

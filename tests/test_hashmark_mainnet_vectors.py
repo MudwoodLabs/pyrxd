@@ -108,3 +108,162 @@ class TestTheUnsignedMainnetRecords:
         """Not an assertion about our code — a note about the corpus, kept as a
         test so it cannot drift from the bytes above."""
         assert decode_hashmark(_V1_SAME_DIGEST).digest_hex == decode_hashmark(_V2_SIGNED).digest_hex
+
+
+class TestTheCanonicalStatementIsPinnedIndEPENDENTLY:
+    """The signed bytes must be pinned by something this module did not produce.
+
+    Every signed fixture elsewhere is built by `canonical_statement()` and then
+    verified through it, so a WRONG escaping rule is applied identically at sign and
+    at verify time and the round trip closes regardless. Measured: replacing the
+    hand-rolled `_json_string` with `json.dumps` — which escapes non-ASCII to
+    `\\uXXXX` and therefore changes the bytes a signature covers for any label with
+    an accent or an emoji — passed all 84 HashMark tests.
+
+    The real mainnet record next door IS an independent vector, and it is why key
+    ORDER is pinned: swapping "v" and "network" fails it. But that record has no
+    label, so the label branch — the only place non-ASCII can appear — is covered by
+    no independent bytes at all.
+
+    So the expected statement below is TYPED OUT from the spec's §5.6 field list,
+    not computed. If `canonical_statement` changes how it escapes, or reorders a
+    key, or starts emitting an absent label as "", the two stop matching. That is
+    the same second-implementer role the mainnet vector plays, done by hand because
+    no second implementation of this branch was available to borrow bytes from.
+    """
+
+    GENESIS = "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7a6f4e003fb4"
+    SIGNER = "26ba056431ec69cf27eabeaab250d99ddbd895d2"
+    DIGEST = "e2c55efb34b6e9d6db008ee72d56bf86456ab3f55ae76488ff677fda88df1f1e"
+
+    def _record(self, label):
+        from pyrxd.script.hashmark import HashMarkOutcome, HashMarkRecord
+
+        return HashMarkRecord(
+            HashMarkOutcome.OK,
+            version=2,
+            algorithm="sha256",
+            algorithm_id=1,
+            digest_hex=self.DIGEST,
+            signer_hash160_hex=self.SIGNER,
+            signature_hex="1f" + "00" * 64,
+            label=label,
+        )
+
+    def test_a_non_ascii_label_is_emitted_as_RAW_UTF8(self) -> None:
+        """The mutation that survived. `json.dumps` would give
+        `"facture-caf\\u00e9-\\u2600"` — a different string, and therefore a
+        different signature, for a label a French user would plausibly write."""
+        from pyrxd.script.hashmark import canonical_statement
+
+        expected = (
+            '{"v":"HashMark/v2"'
+            f',"network":"{self.GENESIS}"'
+            f',"signerHash160":"{self.SIGNER}"'
+            ',"algorithmId":"01"'
+            f',"digest":"{self.DIGEST}"'
+            ',"label":"facture-café-☀"'
+            "}"
+        )
+        assert canonical_statement(self._record("facture-café-☀"), network_genesis=self.GENESIS) == expected
+        assert "\\u" not in expected, "the point of the rule: no \\uXXXX escapes"
+
+    def test_a_quote_and_a_backslash_are_the_ONLY_escapes(self) -> None:
+        from pyrxd.script.hashmark import canonical_statement
+
+        statement = canonical_statement(self._record('a"b\\c'), network_genesis=self.GENESIS)
+        assert statement.endswith(',"label":"a\\"b\\\\c"}')
+
+    def test_an_absent_label_is_OMITTED_not_empty(self) -> None:
+        """A different statement, and therefore a different signature. This one the
+        mainnet vector does cover — pinned here too because it is the same rule."""
+        from pyrxd.script.hashmark import canonical_statement
+
+        assert "label" not in canonical_statement(self._record(None), network_genesis=self.GENESIS)
+        assert canonical_statement(self._record("")).endswith(',"label":""}')
+
+    def test_the_key_ORDER_is_fixed(self) -> None:
+        from pyrxd.script.hashmark import canonical_statement
+
+        statement = canonical_statement(self._record("x"), network_genesis=self.GENESIS)
+        keys = [p.split(":")[0].strip('"') for p in statement[1:-1].split(",") if p.startswith('"')]
+        assert keys == ["v", "network", "signerHash160", "algorithmId", "digest", "label"]
+
+
+class TestTheUncompressedSignerPathIsExercised:
+    """§5.6 allows headers 27..34; every fixture in this repo is COMPRESSED.
+
+    Measured: forcing `compressed=True` in the recovery passed all 52 HashMark
+    tests, because the mainnet vector's header is 0x1f (31, compressed) and so is
+    every generated one. The spec's 27..30 range was covered nowhere, so a verifier
+    that simply ignored the flag looked correct.
+    """
+
+    def test_a_signature_from_an_UNCOMPRESSED_key_verifies(self) -> None:
+        import os
+
+        from coincurve import PrivateKey
+
+        from pyrxd.hash import hash160
+        from pyrxd.script.hashmark import (
+            AttestationOutcome,
+            HashMarkOutcome,
+            HashMarkRecord,
+            canonical_statement,
+            verify_attestation,
+        )
+
+        key = PrivateKey(os.urandom(32))
+        uncompressed = key.public_key.format(compressed=False)
+        signer = hash160(uncompressed).hex()
+
+        record = HashMarkRecord(
+            HashMarkOutcome.OK,
+            version=2,
+            algorithm="sha256",
+            algorithm_id=1,
+            digest_hex="ab" * 32,
+            signer_hash160_hex=signer,
+            signature_hex="00" * 65,
+            label="uncompressed",
+        )
+        # The Bitcoin-signed-message framing the spec names, taken from pyrxd's own
+        # helper. Borrowed deliberately: this test pins the COMPRESSED-FLAG path, and
+        # the statement bytes are pinned independently by the class above. A test that
+        # re-derives everything at once localises nothing when it fails — my first
+        # version signed a bare double-SHA of the statement and failed here, which
+        # looked exactly like a verifier bug.
+        from pyrxd.hash import hash256 as _hash256
+        from pyrxd.utils import text_digest
+
+        statement = canonical_statement(record)
+        raw = key.sign_recoverable(text_digest(statement), hasher=_hash256)
+        # Header 27 + recid, with NO +4: that is what marks the key uncompressed.
+        signature = bytes([27 + raw[64]]) + raw[:64]
+
+        signed = HashMarkRecord(
+            HashMarkOutcome.OK,
+            version=2,
+            algorithm="sha256",
+            algorithm_id=1,
+            digest_hex="ab" * 32,
+            signer_hash160_hex=signer,
+            signature_hex=signature.hex(),
+            label="uncompressed",
+        )
+        result = verify_attestation(signed)
+        assert result.outcome is AttestationOutcome.VALID, result.detail
+        assert 27 <= signature[0] <= 30, "the header must be in the uncompressed range"
+
+    def test_the_compressed_and_uncompressed_hashes_actually_DIFFER(self) -> None:
+        """Guards the test above. The two encodings hash differently, so recovering
+        with the wrong flag cannot match by accident — if they ever coincided, the
+        test would pass while proving nothing."""
+        import os
+
+        from coincurve import PrivateKey
+
+        from pyrxd.hash import hash160
+
+        key = PrivateKey(os.urandom(32)).public_key
+        assert hash160(key.format(compressed=True)) != hash160(key.format(compressed=False))
