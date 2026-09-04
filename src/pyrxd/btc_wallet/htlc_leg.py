@@ -143,8 +143,17 @@ class BtcFundingReader(Protocol):
     enforcing ``min_confirmations`` (raise/fail-closed if shallower).
     ``confirmations`` is the symmetric confirmation-depth reader (mirrors
     ``RadiantChainIO.confirmations``) the reorg gate consumes. ``txid_of`` resolves a
-    raw tx's canonical txid VIA THE NODE — never a local segwit parse (see the reorg
-    gate plan; the gated txid must be that of the exact bytes ``p`` was scraped from).
+    raw tx's canonical txid LOCALLY, by re-serialising the non-witness form
+    (``taproot.btc_txid_from_raw``) — every shipped implementation does, including the
+    Bitcoin Core one, because on mainnet there is no node to ``decoderawtransaction``.
+
+    Until 2026-09-03 this said "VIA THE NODE — never a local segwit parse", which had
+    the mechanism exactly backwards. The safety property is unchanged, and is if
+    anything better served by the local derivation: the gated txid must be that of the
+    EXACT bytes ``p`` was scraped from, never a counterparty-supplied id. Serialising
+    those bytes yields that txid without asking anyone; a node round-trip would be one
+    more party to trust. ``btc_txid_from_raw`` is fail-closed on any structural problem,
+    and a mis-derived txid reads 0 confs at the gate — never a false depth.
     """
 
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
@@ -156,7 +165,7 @@ class BtcFundingReader(Protocol):
         ...
 
     async def txid_of(self, raw_tx: bytes) -> str:
-        """Resolve ``raw_tx``'s canonical txid via the node (NOT a local parse)."""
+        """Derive ``raw_tx``'s canonical txid from the bytes themselves (no node round-trip)."""
         ...
 
 
@@ -507,10 +516,16 @@ class BitcoinTaprootLeg:
     async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
         """Confirmation depth of the maker's BTC claim tx (the reorg gate's input).
 
-        The txid is resolved VIA THE NODE from the exact ``claim_tx_bytes`` ``p`` was
-        scraped from (never a local segwit parse) — so an attacker can't reveal ``p``
-        in a shallow tx while pointing the gate at a deep unrelated tx. Fail-closed:
-        any read/derivation error propagates (the coordinator then refuses to claim).
+        The txid is derived LOCALLY, by re-serialising the exact ``claim_tx_bytes`` ``p``
+        was scraped from (``taproot.btc_txid_from_raw``) — so an attacker can't reveal
+        ``p`` in a shallow tx while pointing the gate at a deep unrelated tx. Only the
+        DEPTH of that txid is then read from the reader. Fail-closed: any read/derivation
+        error propagates (the coordinator then refuses to claim).
+
+        Until 2026-09-03 this said the txid was "resolved VIA THE NODE ... never a local
+        segwit parse", contradicting the comment in its own body and every shipped
+        ``BtcFundingReader.txid_of``. Serialising the bytes in hand is what makes the
+        property hold: no third party gets to name the tx whose depth the gate trusts.
         """
         if not isinstance(claim_tx_bytes, (bytes, bytearray)) or len(claim_tx_bytes) == 0:
             raise ValidationError("claim_tx_bytes must be non-empty bytes")

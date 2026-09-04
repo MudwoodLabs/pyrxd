@@ -351,8 +351,19 @@ def refund_leaf_script(refund_pubkey_xonly: bytes, timeout: Timelock) -> bytes:
     #
     # It became reachable when #482 made `t_btc` a SUBTRACTION (`t_rxd - margin - 4`); the old
     # addition could not underflow. The first fix put a `< 1` refusal in three RUNNER scripts —
-    # fix-at-the-demonstrated-site, which is the shape this codebase keeps repeating. Any caller
-    # that builds a leaf, now or later, gets the floor by construction.
+    # fix-at-the-demonstrated-site, which is the shape this codebase keeps repeating. Moving it
+    # here gives every caller that builds a BLOCKS-tagged leaf the floor by construction.
+    #
+    # SCOPE, HONESTLY: the refusal below is BLOCKS-ONLY, so "every caller gets the floor" is NOT
+    # true of a SECONDS-tagged `Timelock` — which this comment asserted until 2026-09-03. BIP68
+    # time locks are quantised to 512 s, so `Timelock(0..511, SECONDS)` all encode to
+    # `nSequence = 0x00400000` (zero time units): the SAME no-op relative lock, emitted without a
+    # word of complaint. Nothing in `pyrxd` or `scripts/` CONSTRUCTS a SECONDS `t_btc` today, but
+    # `NegotiatedTerms.from_dict` takes the unit tag straight off the wire
+    # (`swap_state._timelock_from_dict`) and `swap_state`'s own `t_btc` floor is scoped to BLOCKS
+    # in exactly the same way, so a counterparty-authored envelope can carry one end to end. Left
+    # as-is deliberately: widening the refusal is a behaviour change on fund-moving code and needs
+    # its own review (what the SECONDS floor should be, and which honest terms it would refuse).
     #
     # `build_htlc_covenant_*` has enforced the same floor on the Radiant side all along
     # (`htlc_covenant.py`, "a 0 CSV is a no-op timelock"). This is the BTC-side twin it was missing.
