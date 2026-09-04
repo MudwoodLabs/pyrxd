@@ -766,6 +766,8 @@ def input_backed_ref_opcode_names() -> frozenset[str]:
 def input_backed_ref_opcodes() -> frozenset[int]:
     table = opcode_table()
     return frozenset(table[n] for n in input_backed_ref_opcode_names())
+
+
 # Fact 7 — per-script resource budgets (consensus/consensus.h)
 # ---------------------------------------------------------------------------
 
