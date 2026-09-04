@@ -439,33 +439,52 @@ def assert_t_rxd_fits_the_eth_deadline(
 ) -> None:
     """Check a SUPPLIED ``t_rxd`` against the counter-chain deadline. Fail-closed.
 
-    :func:`eth_absolute_to_rxd_relative_blocks` DERIVES the largest safe window; this checks that an
-    independently-chosen one fits inside it. Both are needed because operators supply ``t_rxd`` as a
-    raw integer and the runners had no way to tell them it was wrong: the script-level check they
+    :func:`eth_absolute_to_rxd_relative_blocks` DERIVES the SMALLEST safe window; this checks that an
+    independently-chosen one is at least that. Both are needed because operators supply ``t_rxd`` as
+    a raw integer and the runners had no way to tell them it was wrong: the script-level check they
     ran compared ``t_btc - t_rxd >= margin`` against a ``t_btc`` constructed as
     ``t_rxd + margin + 4``, so it passed for every possible input while being labelled the safety
     gate.
 
-    A ``t_rxd`` LARGER than the derived maximum pushes the Radiant refund past the counter-chain
-    deadline, which inverts the leg ordering the whole protocol rests on. Smaller is safe here and
-    deliberately permitted — a shorter window is the maker's own liveness cost, and #507 is the gate
-    that stops it being made TOO short.
+    A ``t_rxd`` SMALLER than the derived minimum lets the Radiant refund open BEFORE the
+    counter-chain deadline plus margin, which is the #482 ordering inversion: the maker can refund
+    its own leg while the preimage is still secret and then claim the counter leg, taking both.
+    Larger is safe and deliberately permitted — a longer window is the maker's own liveness cost.
+
+    THIS FUNCTION WAS EXACTLY INVERTED, and it is exported and called by the real-value runner as
+    "THE safety gate". It named the sizer's output ``largest`` and refused ``t_rxd > largest``,
+    while #482 had already turned the sizer into a LOWER bound — its own comment says so: "the gate
+    is now a LOWER bound on t_rxd, so ``ceil`` with no -1 is the smallest accepted value, where it
+    was ``ceil - 1`` for the largest accepted one". Measured before the fix, against
+    :func:`assert_covenant_confirms_before_eth_deadline`, which is the relation that actually holds:
+
+        t_rxd  this function   the real gate
+          150       ACCEPTS         UNSAFE
+          299       ACCEPTS         UNSAFE
+          301       refuses           SAFE
+          600       refuses           SAFE
+
+    It accepted every unsafe value and refused every safe one above the minimum. The too-short
+    direction is backstopped downstream by ``assert_covenant_confirms_before_eth_deadline``, so this
+    was not by itself a clean theft path — the live harm was refusing honest configurations while
+    printing "margin OK", pushing operators to shrink ``t_rxd`` toward the boundary, and documenting
+    the unsafe direction as deliberately safe for the next reader.
     """
     if not isinstance(t_rxd, Timelock) or t_rxd.unit is not TimeUnit.BLOCKS:
         raise ValidationError("t_rxd must be a BLOCKS Timelock")
-    largest = eth_absolute_to_rxd_relative_blocks(
+    smallest = eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=eth_timeout_unix_s,
         expected_rxd_lock_time_unix_s=expected_rxd_lock_time_unix_s,
         margin=margin,
         rxd_block_interval_s=rxd_block_interval_s,
         floor_blocks=floor_blocks,
     )
-    if int(t_rxd.value) > int(largest.value):
+    if int(t_rxd.value) < int(smallest.value):
         raise ValidationError(
-            f"t_rxd of {t_rxd.value} blocks exceeds the largest window the counter-chain deadline "
-            f"allows ({largest.value} blocks): the Radiant refund would open at or after the ETH "
-            "deadline minus margin, inverting the leg ordering. Shorten t_rxd or extend the ETH "
-            "timeout."
+            f"t_rxd of {t_rxd.value} blocks is below the smallest window the counter-chain deadline "
+            f"requires ({smallest.value} blocks): the Radiant refund would open BEFORE the ETH "
+            "deadline plus margin, letting the maker refund its own leg while the preimage is still "
+            "secret and then claim the counter leg (#482). Lengthen t_rxd or shorten the ETH timeout."
         )
 
 
