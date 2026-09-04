@@ -49,9 +49,17 @@ files**, not by trusting a Python transcription of them:
 | which flags are mandatory vs standard | `MANDATORY_/STANDARD_SCRIPT_VERIFY_FLAGS` in `policy.h` |
 | which flags a **block** is connected under, and `fRequireStandard` | `GetNextBlockScriptFlags` in `validation.cpp` |
 | DER signature size bounds and the flags gating strict-DER / low-S | `IsValidDERSignatureEncoding` and its callers in `sigencoding.cpp` |
+| the per-script stack-memory and opcode-cost budgets | `MAX_SCRIPT_STACK_MEMORY_USAGE` / `MAX_SCRIPT_OPCODE_COST` in `consensus.h` |
+| the order refs are hashed into `hashOutputHashes` | `base_blob::Compare` and `operator<` in `uint256.h` |
 
 A hand-maintained Python table of the same facts would reintroduce exactly the transcription step
 that produced the bugs.
+
+The last two entries were added because a citation is only evidence if the cited file is here.
+`interpreter.cpp` enforces both script budgets and declares neither, so their *values* were
+uncheckable; and `transaction_preimage.py` cited `src/primitives/transaction.h` for the ref sort
+order, which holds the `std::set<uint288>` but does not define how it orders — that lives in
+`uint256.h`, and getting it wrong made dMint contract-output signing fail about half the time.
 
 Local filenames match upstream basenames except `primitives_transaction.h`, which is
 `src/primitives/transaction.h` renamed so it cannot be confused with a pyrxd module; `MANIFEST.json`
@@ -76,7 +84,11 @@ The cost is that the pin can go stale. That is handled explicitly rather than ig
   manifest, and reports what changed. Run it when a new Radiant Core release lands.
 - `tests/test_consensus_opcode_parity.py::test_vendored_sources_match_manifest_digest` fails if the
   vendored bytes stop matching the recorded sha256, so a local edit or a botched refresh cannot go
-  unnoticed.
+  unnoticed. Its parameters come from `MANIFEST.json`, not from a list in the test — it was
+  hand-listed as `["script.h", "script.cpp"]` while eight files were vendored, which is a check that
+  passes vacuously on whatever was added after it was written. `test_every_vendored_file_is_digest_checked`
+  and `test_the_refresh_script_covers_every_vendored_file` close the other two directions: a file on
+  disk with no manifest entry, and a manifest entry the refresh script would never re-fetch.
 - `scripts/refresh_radiant_core_vendor.py --check` exits non-zero when upstream has moved. It needs
   network, so it is **not** part of the offline test suite. Its scheduled owner is the
   **`vendor-freshness` job in `.github/workflows/integration.yml`**, which runs nightly and on
@@ -97,9 +109,11 @@ pins the tag the SOURCE came from; `pyrxd.devnet.DEFAULT_RADIANT_VERSION` pins t
 regtest image's BINARY is built from, and the two are bumped on different schedules — today the
 source is at `v3.1.2` and the image at `v3.1.1`. That gap is fine only while the two releases share
 these files, so `--check` verifies exactly that and fails if they ever diverge. (They are currently
-byte-identical: `script.h` `3de78962…` and `script.cpp` `759ab524…` at both tags.) If they do
-diverge, every parity assertion would be describing a different script interpreter than the one the
-lane asks — bump the image, or pin the source to the image's tag.
+byte-identical: `script.h` `3de78962…` and `script.cpp` `759ab524…` at both tags, and likewise the
+two most recently added — `consensus.h` `c344ba58…` and `uint256.h` `e4cc8933…`, checked at `v3.1.1`
+and `v3.1.2` when they were vendored.) If they do diverge, every parity assertion would be
+describing a different script interpreter than the one the lane asks — bump the image, or pin the
+source to the image's tag.
 
 ## Refreshing
 
