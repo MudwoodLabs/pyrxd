@@ -538,9 +538,21 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  token_ref:    {payload['token_ref_outpoint']}")
         body.append(f"  height:       {payload['height']} / {payload['max_height']}")
         body.append(f"  reward:       {payload['reward']} photons/mint")
-        # Total minted supply if all mints succeed.
-        total = payload["max_height"] * payload["reward"]
-        body.append(f"  total supply: {total:,} photons")
+        # THIS CONTRACT's cap, which is not the token's supply. The label said
+        # "total supply" flat, with the "if all mints succeed" hedge living only in
+        # this comment where no reader sees it — and a real dMint token commonly
+        # deploys N parallel contracts sharing ONE token_ref, so its supply is the
+        # sum across them. The browser tool computes `reward x max_height x N` for
+        # the same token, so the two surfaces of one tool answered "what is this
+        # token's supply" with figures differing by the parallel-contract count.
+        #
+        # Naming the quantity is the fix: this output can only ever see the one
+        # contract script it was handed.
+        cap = payload["max_height"] * payload["reward"]
+        body.append(f"  this contract's cap: {cap:,} photons ({payload['max_height']:,} mints x {payload['reward']:,})")
+        body.append("  (the cap IF every mint succeeds, and for THIS contract only —")
+        body.append("   a token may deploy several contracts against one token_ref,")
+        body.append("   and its supply is the sum across them)")
         body.append(f"  algo:         {payload['algo']}")
         body.append(f"  daa_mode:     {payload['daa_mode']}")
         body.append("  (structural pattern match; does NOT verify the contract_ref points")
