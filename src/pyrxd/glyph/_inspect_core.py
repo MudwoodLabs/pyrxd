@@ -56,12 +56,19 @@ from .types import GlyphProtocol
 # here so a single change updates both surfaces.
 _TXID_HEX_LEN = 64
 _CONTRACT_HEX_LEN = 72
-# The smallest script we classify is P2SH — ``OP_HASH160 <20> OP_EQUAL``, 23
-# bytes / 46 hex. It used to be plain P2PKH (25 bytes / 50 hex), which meant a
-# pasted P2SH scriptPubKey was rejected by the input dispatcher before any
-# classifier saw it. Lowering the floor only widens what reaches
-# ``_inspect_script``; anything it cannot name still comes back ``unknown``.
-_MIN_SCRIPT_HEX_LEN = 46
+# The smallest script we classify. It was 46 hex (23 bytes), calibrated to P2SH —
+# ``OP_HASH160 <20> OP_EQUAL`` — which was the smallest shape that existed before the
+# OP_RETURN payload decoders. It is now an OP_RETURN data carrier: ``OP_RETURN`` plus
+# a 3-byte marker plus a one-byte payload is 6 bytes / 12 hex, and a real short ``msg``
+# is smaller than P2SH.
+#
+# The floor sits in ``_classify_input`` and runs BEFORE dispatch, so a short but
+# perfectly valid pasted `msg` was refused with "could not classify input" even though
+# ``_inspect_script`` decodes it correctly — a guard refusing valid work, and only on
+# the pasted-script form, since ``--fetch`` calls the classifier per output with no
+# floor. Lowering it only widens what reaches ``_inspect_script``; anything it cannot
+# name still comes back ``unknown``.
+_MIN_SCRIPT_HEX_LEN = 12
 # Cap accidental "paste a whole tx" before running every classifier on it.
 _MAX_SCRIPT_HEX_LEN = 20_000
 
@@ -320,7 +327,29 @@ def _ref_summary(script: bytes) -> dict:
     return {"token_bearing": bool(carried), "input_refs": carried, "referenced_refs": named}  # nosec B105
 
 
-def _inspect_script(script_hex: str) -> dict:
+def _address_for(hash160_hex: str | None, network: str) -> str | None:
+    """Base58check address for a recovered signer hash160, or None.
+
+    Separate from the attestation itself because the address is a RE-ENCODING of the
+    recovered key, not a second piece of evidence: it is the same fact in the form a
+    human can compare against a wallet.
+    """
+    if not hash160_hex:
+        return None
+    from ..base58 import base58check_encode
+    from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+
+    try:
+        prefix = NETWORK_ADDRESS_PREFIX_DICT[Network(network)]
+    except (KeyError, ValueError):
+        prefix = NETWORK_ADDRESS_PREFIX_DICT[Network.MAINNET]
+    try:
+        return base58check_encode(prefix + bytes.fromhex(hash160_hex))
+    except ValueError:  # pragma: no cover - the hash160 came from our own recovery
+        return None
+
+
+def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
     from ..script.timelock import parse_p2pkh_timelock_script
     from .dmint import DmintState
@@ -404,7 +433,13 @@ def _inspect_script(script_hex: str) -> dict:
                 "version": mark.version,
                 "algorithm": mark.algorithm,
                 "digest": mark.digest_hex,
-                "label": mark.label,
+                # SANITISED, like every other display string on this renderer. The
+                # decoder now refuses a non-canonical label outright (spec 5.4), so
+                # this is defence in depth — but `msg` two branches up was sanitised
+                # and this was not, in the same function, which is how a label got to
+                # inject whole lines under "signature VERIFIED".
+                "label": _sanitize_display_string(mark.label) if mark.label else None,
+                "label_withheld": mark.label_withheld,
                 # v2 only, and NOT verified here — verifying needs secp256k1 and
                 # the chain the tx was found on. Well-formed is not believed.
                 "signer_hash160": mark.signer_hash160_hex,
@@ -413,16 +448,38 @@ def _inspect_script(script_hex: str) -> dict:
             }
             if mark.ok:
                 out["type"] = f"op_return-hashmark-v{mark.version}"
-                # ATTEST, now that we can. The signed statement includes the
-                # chain's genesis hash — the verified context the tx was found
-                # in — and a pasted script carries no such context, so mainnet is
-                # ASSUMED and the assumption is reported rather than hidden. The
-                # same bytes on another chain are a different statement.
-                att = verify_attestation(mark, network_genesis=RADIANT_MAINNET_GENESIS)
+                # ATTEST, now that we can. The signed statement includes the chain's
+                # genesis hash, so THE SAME BYTES ON ANOTHER CHAIN ARE A DIFFERENT
+                # STATEMENT and verify against a different key.
+                #
+                # §6.3 step 2 says to use the genesis of the chain the transaction was
+                # actually found on. Mainnet was hardcoded, so `--network testnet
+                # glyph inspect` attested against mainnet and announced
+                # "assuming radiant-mainnet" — an answer to a question the user had
+                # explicitly not asked.
+                #
+                # Mainnet remains the DEFAULT rather than an error, because a pasted
+                # script genuinely carries no context and refusing to attest it would
+                # be worse than assuming and saying so. The --fetch path knows the
+                # chain it read from and now passes it.
+                from ..constants import genesis_hash_for
+
+                # An unknown network falls back to mainnet AND SAYS MAINNET. Reporting
+                # the requested name beside a mainnet genesis would state an assumption
+                # the code did not make, which is worse than the hardcoding this
+                # replaces: the reader could not tell the verdict was against a
+                # different chain.
+                genesis = genesis_hash_for(network)
+                assumed = network if genesis else "mainnet"
+                att = verify_attestation(mark, network_genesis=genesis or RADIANT_MAINNET_GENESIS)
                 out["hashmark"]["attestation"] = {
                     "outcome": att.outcome.value,
                     "recovered_hash160": att.recovered_hash160_hex,
-                    "assumed_network": "radiant-mainnet",
+                    # The address form of the recovered key. §7.6's sound statement
+                    # LEADS with this — it is the only identity fact the mark itself
+                    # carries. Anything a naming system adds is separate context.
+                    "signer_address": _address_for(att.recovered_hash160_hex, network),
+                    "assumed_network": f"radiant-{assumed}",
                     "detail": att.detail,
                 }
         return out
@@ -652,6 +709,28 @@ def _classify_self_replicating(script: bytes, base: dict) -> dict:
     return {**base, "type": "unknown", **_ref_summary(script)}
 
 
+def _confusable_warnings(metadata) -> dict[str, str]:
+    """Fields whose text mimics Latin characters, per the TR39 skeleton check.
+
+    Only reports MIMICRY. A name in a wholly non-Latin script is not flagged —
+    ``looks_confusable_with_latin`` says so explicitly, listing "トークン" and "中文"
+    among its non-flagged examples. That distinction is the point: a warning that
+    fires on every legitimate Japanese token is the false positive that trains a
+    reader to ignore the real one, which this repo names as a hazard elsewhere.
+
+    Returns ``{}`` when nothing is suspicious, so a caller can treat presence as
+    the signal and absence as silence.
+    """
+    from .confusables import looks_confusable_with_latin
+
+    out: dict[str, str] = {}
+    for field in ("name", "ticker", "description"):
+        value = getattr(metadata, field, "") or ""
+        if value and looks_confusable_with_latin(value):
+            out[field] = "characters that mimic Latin letters (possible look-alike name)"
+    return out
+
+
 def _classify_metadata_protocol(metadata) -> str:
     """Return the highest-specificity Glyph-protocol classification label.
 
@@ -717,7 +796,7 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
+def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
     Synchronous, network-free core. The CLI's ``--fetch`` path wraps this
@@ -791,7 +870,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     for idx, out in enumerated:
         try:
             script_bytes = out.locking_script.serialize()
-            row = _inspect_script(script_bytes.hex())
+            row = _inspect_script(script_bytes.hex(), network=network)
             row.pop("form", None)  # always "script" — redundant inside a tx listing
             row["vout"] = idx
             row["satoshis"] = out.satoshis
@@ -842,6 +921,17 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
             "ticker": _sanitize_display_string(metadata.ticker) if metadata.ticker else "",
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",
             "decimals": metadata.decimals,
+            # TR39 confusables. `docs/concepts/glyph-inspect-tool.md` has described
+            # this as a live protection — "a Cyrillic-spoofed USDC is flagged with a
+            # warning banner before the user sees the rendered metadata" — while
+            # `looks_confusable_with_latin` had NO PRODUCTION CALLER anywhere: a
+            # definition, a facade re-export, and tests. The CLI performed no
+            # confusables check at all, and the browser page used a weaker
+            # script-mixing heuristic that fires on any all-non-Latin name.
+            #
+            # Computed here rather than in either renderer so both surfaces get it
+            # from one place. Sanitization strips control and bidi codepoints; it
+            # cannot help with a Cyrillic "С" that simply LOOKS like "C".
         }
         # RELATIONSHIP CLAIMS, WITH THEIR VERDICT (#591). `in` and `by` are
         # operator-supplied CBOR — anyone can name any collection — so the claim is
@@ -863,6 +953,13 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
                 for v in rel
             ]
 
+        # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
+        # something to say. Emitting an empty dict unconditionally made "flagged" and
+        # "checked and clean" indistinguishable to a caller testing for the key — and
+        # the browser drift guard caught exactly that the moment the two branches met.
+        confusables = _confusable_warnings(metadata)
+        if confusables:
+            metadata_payload["display_warnings"] = confusables
         # TIMELOCK: say WHEN it opens, not just that it is one (#556). `classification` already
         # reported "timelock"; the field that answers the holder's actual question — can I read
         # this yet — was decoded nowhere until now.

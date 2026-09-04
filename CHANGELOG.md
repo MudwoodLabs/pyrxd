@@ -26,6 +26,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Delegated authorization is out of scope: pyrxd has no delegate concept, so a
   legitimately delegated claim reads as unbacked.
+### Security
+
+- **`pyrxd[eth]` now floors `urllib3>=2.7.0`.** pyrxd does not import urllib3; it arrives two levels
+  down (`web3` -> `requests` -> `urllib3<3,>=1.26`), so installing the extra pulls it either way.
+  Versions below 2.7.0 carry PYSEC-2026-141 (a proxied cross-origin redirect forwards sensitive
+  headers) and PYSEC-2026-142 (a decompression bomb via Brotli streaming or `drain_conn`).
+
+  **Hygiene, not a fix — neither is reachable through pyrxd's usage**, measured: brotli is not
+  installed, `drain_conn` appears in 0 files of web3/requests, and web3 uses `stream=True` at 0
+  sites. The header leak needs both a configured proxy and a hostile redirect from the RPC endpoint.
+  The floor exists so a consumer's own `pip-audit` is not handed a finding by our extra, and should
+  be removed once `requests` floors urllib3 itself.
 
 ### Fixed
 

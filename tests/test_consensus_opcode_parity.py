@@ -31,6 +31,9 @@ oracle.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 import pyrxd.constants as pyrxd_constants
@@ -44,6 +47,7 @@ from pyrxd.constants import (
 )
 from tests.consensus_oracle import (
     VENDOR_DIR,
+    consensus_limit,
     manifest,
     max_opcode,
     opcode_table,
@@ -53,11 +57,15 @@ from tests.consensus_oracle import (
     ref_operand_opcode_names,
     ref_operand_opcodes,
     ref_operand_width,
+    script_budgets_enforced_by_interpreter,
     script_limit,
     vendored_digest,
 )
 
 pytestmark = pytest.mark.unit
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REFRESH_SCRIPT = _REPO_ROOT / "scripts" / "refresh_radiant_core_vendor.py"
 
 
 # Enumerators in `enum opcodetype` that are not opcodes: a sentinel used to
@@ -90,12 +98,22 @@ def _upstream_opcodes() -> dict[str, int]:
 # The oracle itself must be trustworthy before anything is asserted against it
 # ---------------------------------------------------------------------------
 
+#: Every vendored file, taken from the manifest instead of hand-listed. This was
+#: spelled ``["script.h", "script.cpp"]`` while eight files were vendored, so the
+#: digest check — structurally correct — ran over a quarter of its subject and
+#: passed vacuously for everything added after it was written. Deriving the set
+#: from the manifest makes "vendored" and "digest-checked" the same list by
+#: construction; ``test_every_vendored_file_is_digest_checked`` closes the other
+#: direction, and asserts non-emptiness so a parametrisation over nothing cannot
+#: report green.
+_VENDORED_FILES = sorted(manifest()["files"])
+
 
 class TestOracleIntegrity:
     """Guard the oracle. Each of these failing means the differentials below
     are meaningless, so they must fail loudly rather than degrade."""
 
-    @pytest.mark.parametrize("name", sorted(manifest()["files"]))
+    @pytest.mark.parametrize("name", _VENDORED_FILES)
     def test_vendored_sources_match_manifest_digest(self, name):
         expected = manifest()["files"][name]["sha256"]
         assert vendored_digest(name) == expected, (
@@ -105,20 +123,45 @@ class TestOracleIntegrity:
             f"scripts/refresh_radiant_core_vendor.py to update them and the manifest together."
         )
 
-    def test_every_vendored_file_is_covered_in_BOTH_directions(self):
-        """The digest check above was a hand-typed list of two while eight files were
-        vendored, so six consensus sources — including the one holding the ref-backing
-        rule — could be edited with the suite still green. Verified by tampering: an
-        appended line to validation.h changed nothing until this was derived.
+    def test_every_vendored_file_is_digest_checked(self):
+        """Both directions, so neither half can drift out of the other's sight.
 
-        Both directions matter. A file on disk with no manifest entry is unpinned; a
-        manifest entry with no file is a check that silently stopped running."""
+        A source in the vendor directory with no manifest entry is an oracle
+        input nothing digests; a manifest entry with no file on disk is a check
+        that has silently stopped running. Either way the failure is invisible
+        in the output of the test above, which only ever reports on the names it
+        was handed.
+        """
+        assert _VENDORED_FILES, "MANIFEST.json lists no files — the digest parametrisation would be empty"
         on_disk = {p.name for p in VENDOR_DIR.iterdir() if p.suffix in {".h", ".cpp"}}
-        in_manifest = set(manifest()["files"])
-        assert on_disk == in_manifest, (
-            f"vendored-source coverage has drifted: on disk only {sorted(on_disk - in_manifest)}, "
-            f"in manifest only {sorted(in_manifest - on_disk)}. Re-run "
-            f"scripts/refresh_radiant_core_vendor.py rather than editing either by hand."
+        assert on_disk == set(_VENDORED_FILES), (
+            "the vendored sources and MANIFEST.json disagree about what is vendored.\n"
+            f"  on disk, not in the manifest: {sorted(on_disk - set(_VENDORED_FILES))}\n"
+            f"  in the manifest, not on disk: {sorted(set(_VENDORED_FILES) - on_disk)}\n"
+            "Re-run scripts/refresh_radiant_core_vendor.py so the two are written together."
+        )
+
+    def test_the_refresh_script_covers_every_vendored_file(self):
+        """The third list that has to agree: what ``--check`` actually re-fetches.
+
+        A file added to the manifest but not to the script's ``FILES`` map is
+        digest-checked locally and never compared against upstream again, so it
+        would go stale in exactly the silent way vendoring exists to prevent.
+        """
+        spec = importlib.util.spec_from_file_location("_refresh_radiant_core_vendor", _REFRESH_SCRIPT)
+        assert spec and spec.loader, f"could not load {_REFRESH_SCRIPT}"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        assert set(module.FILES) == set(_VENDORED_FILES), (
+            "scripts/refresh_radiant_core_vendor.py and MANIFEST.json disagree about what is vendored.\n"
+            f"  in the script, not in the manifest: {sorted(set(module.FILES) - set(_VENDORED_FILES))}\n"
+            f"  in the manifest, not in the script: {sorted(set(_VENDORED_FILES) - set(module.FILES))}"
+        )
+        upstream = {name: manifest()["files"][name]["upstream_path"] for name in _VENDORED_FILES}
+        assert upstream == module.FILES, (
+            "the script and the manifest disagree about where a vendored file comes from upstream; "
+            "a refresh would overwrite it from a different path than the one recorded as its provenance."
         )
 
     def test_opcode_table_parsed_plausibly(self):
@@ -317,3 +360,65 @@ class TestScalarConsensusLimits:
         """
         assert script_limit("MAX_SCRIPT_ELEMENT_SIZE") == 32_000_000
         assert script_limit("MAX_SCRIPT_ELEMENT_SIZE_LEGACY") == 520
+
+
+#: The per-script resource budgets, and the values ``consensus.h`` gives them.
+#: Pinned as literals on purpose: this is the one fact in this file with no
+#: pyrxd-side constant to compare against (pyrxd builds and parses scripts, it
+#: has no interpreter), so the assertion's whole job is to turn an upstream
+#: change into a reviewable diff rather than a silent one. ``ONE_MEGABYTE`` is
+#: 1,000,000 here, not 1,048,576 — reading the budget as 2^20-based overstates
+#: the memory ceiling by 6.3 MB.
+_PINNED_SCRIPT_BUDGETS = {
+    "MAX_SCRIPT_STACK_MEMORY_USAGE": 128_000_000,
+    "MAX_SCRIPT_OPCODE_COST": 1_000_000_000,
+}
+
+
+class TestScriptResourceBudgets:
+    """The budgets ``interpreter.cpp`` enforces and ``consensus/consensus.h`` declares.
+
+    Both were cited in pyrxd comments while the header that defines them was not
+    vendored, so their VALUES could not be checked by anything — the same shape
+    as the ref-operand rule: a consensus number in the repo with no mechanism
+    tying it to the C++.
+    """
+
+    @pytest.mark.parametrize(("name", "expected"), sorted(_PINNED_SCRIPT_BUDGETS.items()))
+    def test_budget_matches_radiant(self, name, expected):
+        upstream = consensus_limit(name)
+        assert upstream == expected, (
+            f"Radiant's consensus.h declares {name}={upstream:,}; this test pins {expected:,}. "
+            "A budget moving upstream is a consensus change — read the diff before re-pinning."
+        )
+
+    def test_no_enforced_budget_is_unpinned(self):
+        """The set comes from ``interpreter.cpp``'s comparisons, not from a list.
+
+        Both directions: a budget the interpreter enforces and nothing here pins
+        is the gap this test exists for, and a name pinned above that the
+        interpreter never compares against means the pin has stopped describing
+        anything.
+        """
+        enforced = script_budgets_enforced_by_interpreter()
+        assert enforced == set(_PINNED_SCRIPT_BUDGETS), (
+            "the consensus.h budgets EvalScript compares against and the ones pinned here differ.\n"
+            f"  enforced, not pinned: {sorted(enforced - set(_PINNED_SCRIPT_BUDGETS))}\n"
+            f"  pinned, not enforced: {sorted(set(_PINNED_SCRIPT_BUDGETS) - enforced)}"
+        )
+
+    def test_the_memory_budget_admits_a_maximum_size_push(self):
+        """Cross-file consistency, ``consensus.h`` against ``script.h``.
+
+        ``MAX_SCRIPT_ELEMENT_SIZE`` is what a builder may push; the stack-memory
+        budget is what the interpreter will hold. A budget at or below the push
+        limit would make a single legal push unspendable, so the two limits
+        being read from the same pin and still disagreeing is a fact worth
+        failing on rather than a coincidence worth assuming.
+        """
+        budget = consensus_limit("MAX_SCRIPT_STACK_MEMORY_USAGE")
+        element = script_limit("MAX_SCRIPT_ELEMENT_SIZE")
+        assert budget > element, (
+            f"the stack-memory budget ({budget:,}) does not exceed the maximum pushable element "
+            f"({element:,}); a single maximum-size push would exhaust it."
+        )

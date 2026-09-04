@@ -426,34 +426,51 @@ class TestASuppliedTRxdIsCheckedAgainstTheCounterChainDeadline:
             rxd_block_interval_s=interval,
         )
 
-    def test_a_t_rxd_that_overruns_the_eth_deadline_is_REFUSED(self) -> None:
-        """The case the tautology could never catch: a Radiant refund opening at or after the ETH
-        deadline minus margin inverts the leg ordering the protocol rests on."""
-        largest = eth_absolute_to_rxd_relative_blocks(
-            eth_timeout_unix_s=1_700_000_000 + 200_000,
-            expected_rxd_lock_time_unix_s=1_700_000_000,
-            margin=self._margin(),
-            rxd_block_interval_s=229.0,
+    def _sized(self) -> int:
+        return int(
+            eth_absolute_to_rxd_relative_blocks(
+                eth_timeout_unix_s=1_700_000_000 + 200_000,
+                expected_rxd_lock_time_unix_s=1_700_000_000,
+                margin=self._margin(),
+                rxd_block_interval_s=229.0,
+            ).value
         )
-        with pytest.raises(ValidationError, match="exceeds the largest window"):
-            self._check(int(largest.value) + 1)
 
-    def test_the_LARGEST_fitting_window_is_accepted(self) -> None:
-        """The boundary. Refusing here would reject the correctly-maximised window the sizer itself
-        computes — a guard that refuses valid work, on the parameter an honest maker must choose."""
-        largest = eth_absolute_to_rxd_relative_blocks(
-            eth_timeout_unix_s=1_700_000_000 + 200_000,
-            expected_rxd_lock_time_unix_s=1_700_000_000,
-            margin=self._margin(),
-            rxd_block_interval_s=229.0,
-        )
-        self._check(int(largest.value))
+    # THESE THREE TESTS PINNED THE INVERTED CONTRACT and were rewritten, not deleted.
+    #
+    # They asserted "a t_rxd ABOVE the sizer's output is refused" and "a shorter window is
+    # permitted" — the pre-#482 relation. #482 made the gate a LOWER bound, and the sizer's own
+    # comment records it ("the gate is now a LOWER bound on t_rxd, so `ceil` with no -1 is the
+    # smallest accepted value"), but this function and these tests were never turned round.
+    #
+    # The authority for which side is right is `assert_covenant_confirms_before_eth_deadline` —
+    # the relation the protocol actually enforces — not this arithmetic. Measured before the fix:
+    # the old behaviour disagreed with it at EVERY point sampled, accepting t_rxd=150 and 299 which
+    # that gate calls unsafe, and refusing 301 and 600 which it calls safe. That differential, not
+    # a restatement of the formula, is what `TestTheSuppliedTRxdGateAgreesWithTheRealOne` pins.
 
-    def test_a_SHORTER_window_is_permitted(self) -> None:
-        """Deliberately allowed: a shorter window is the maker's own liveness cost, and #507 is the
-        gate that stops it being made too short to contain the value-scaled burial. This check is
-        only about the upper bound."""
-        self._check(12)
+    def test_a_t_rxd_that_opens_BEFORE_the_eth_deadline_is_REFUSED(self) -> None:
+        """The #482 direction: a Radiant refund opening before the ETH deadline PLUS margin lets
+        the maker refund its own leg while the preimage is secret and then claim the counter leg."""
+        with pytest.raises(ValidationError, match="below the smallest"):
+            self._check(self._sized() - 1)
+
+    def test_the_SMALLEST_fitting_window_is_accepted(self) -> None:
+        """The boundary. Refusing here would reject the very window the sizer computes — a guard
+        refusing valid work on the parameter an honest maker must choose."""
+        self._check(self._sized())
+
+    def test_a_LONGER_window_is_permitted(self) -> None:
+        """Deliberately allowed: a longer window is the maker's own liveness cost. The inverted
+        version refused exactly this while the runner printed "margin OK", which is what pushed
+        operators to shrink t_rxd toward the unsafe boundary."""
+        self._check(self._sized() + 1)
+        self._check(self._sized() * 2)
+
+    def test_a_grossly_short_window_is_refused(self) -> None:
+        """The old suite asserted 12 blocks was fine. It is the exploitable direction."""
+        with pytest.raises(ValidationError, match="below the smallest"):
+            self._check(12)
 
 
 class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
@@ -566,3 +583,95 @@ class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
         maker alone and the taker is strictly better off.
         """
         assert self._verdict(229.0, lock_delay=-3_600, wait=0)
+
+
+class TestTheSuppliedTRxdGateAgreesWithTheRealOne:
+    """`assert_t_rxd_fits_the_eth_deadline` must accept exactly what is safe.
+
+    It was exactly INVERTED. It named the sizer's output `largest` and refused
+    `t_rxd > largest`, while #482 had already turned the sizer into a LOWER bound —
+    the sizer's own comment says "the gate is now a LOWER bound on t_rxd, so `ceil`
+    with no -1 is the smallest accepted value, where it was `ceil - 1` for the
+    largest accepted one". So it accepted every unsafe value and refused every safe
+    one above the minimum, while `scripts/eth_swap_two_host.py` calls it "THE safety
+    gate" and prints "margin OK: (independent check passed)" on success.
+
+    Pinned as a DIFFERENTIAL rather than by asserting values. The authority is
+    `assert_covenant_confirms_before_eth_deadline`, which is the relation the
+    protocol actually enforces; a test that restated the arithmetic would have
+    agreed with the inverted version just as happily.
+    """
+
+    NOW, ETH_TIMEOUT, INTERVAL = 1_000_000, 1_086_400, 300.0
+
+    def _margin(self):
+        return _margin(900, 1800, 600, 300)
+
+    def _kw(self):
+        return dict(
+            eth_timeout_unix_s=self.ETH_TIMEOUT,
+            expected_rxd_lock_time_unix_s=self.NOW,
+            margin=self._margin(),
+            rxd_block_interval_s=self.INTERVAL,
+        )
+
+    def _fits(self, t: int) -> bool:
+        try:
+            assert_t_rxd_fits_the_eth_deadline(t_rxd=Timelock(t, TimeUnit.BLOCKS), **self._kw())
+        except ValidationError:
+            return False
+        return True
+
+    def _really_safe(self, t: int) -> bool:
+        try:
+            assert_covenant_confirms_before_eth_deadline(
+                t_rxd=Timelock(t, TimeUnit.BLOCKS),
+                now_unix_s=self.NOW,
+                eth_timeout_unix_s=self.ETH_TIMEOUT,
+                margin=self._margin(),
+                rxd_block_interval_s=self.INTERVAL,
+                elapsed_blocks=0,
+                max_covenant_confirm_wait_s=600,
+            )
+        except ValidationError:
+            return False
+        return True
+
+    def test_the_two_gates_agree_across_a_sweep(self) -> None:
+        sized = eth_absolute_to_rxd_relative_blocks(**self._kw()).value
+        disagree = [
+            (t, self._fits(t), self._really_safe(t))
+            for t in range(max(1, sized // 2), sized * 2, 7)
+            if self._fits(t) != self._really_safe(t)
+        ]
+        assert not disagree, (
+            "the supplied-t_rxd gate disagrees with the relation the protocol enforces "
+            f"at {disagree[:6]} (t_rxd, fits_gate, really_safe)"
+        )
+
+    def test_a_TOO_SHORT_window_is_refused(self) -> None:
+        """The #482 direction. A short t_rxd lets the maker refund its own leg while
+        the preimage is secret, then claim the counter leg — taking both."""
+        sized = eth_absolute_to_rxd_relative_blocks(**self._kw()).value
+        assert not self._fits(sized - 1)
+        assert not self._fits(sized // 2)
+
+    def test_a_LONGER_window_is_permitted(self) -> None:
+        """The honest path, and the half the inversion broke. A longer window costs
+        the maker liveness and is safe; refusing it while printing "margin OK" is
+        what pushed operators toward the boundary."""
+        sized = eth_absolute_to_rxd_relative_blocks(**self._kw()).value
+        assert self._fits(sized)
+        assert self._fits(sized + 1)
+        assert self._fits(sized * 2)
+
+    def test_the_refusal_names_the_right_direction(self) -> None:
+        """The old message said the refund would open "at or after the ETH deadline
+        MINUS margin" — the pre-#482 relation. A reader following it would shorten
+        t_rxd, which is the exploitable direction."""
+        sized = eth_absolute_to_rxd_relative_blocks(**self._kw()).value
+        with pytest.raises(ValidationError) as exc:
+            assert_t_rxd_fits_the_eth_deadline(t_rxd=Timelock(sized - 1, TimeUnit.BLOCKS), **self._kw())
+        text = str(exc.value)
+        assert "below the smallest" in text and "plus margin" in text
+        assert "Lengthen t_rxd" in text, "the remedy must not tell an operator to shorten it"

@@ -138,7 +138,7 @@ def run(raw_input: str) -> dict:
         elif form == "outpoint":
             payload = _inspect.inspect_outpoint(value)
         elif form == "script":
-            payload = _inspect.inspect_script(value)
+            payload = _inspect.inspect_script(value, network=_PAGE_NETWORK)
         else:
             return _err(f"internal: unknown form {form!r}", form="error")
     except Exception as exc:
@@ -226,7 +226,7 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
     try:
-        payload = _inspect.classify_raw_tx(txid, raw)
+        payload = _inspect.classify_raw_tx(txid, raw, network=_PAGE_NETWORK)
     except Exception as exc:
         return _err(
             _safe_error(exc),
@@ -257,13 +257,24 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
     # renderer paints a warning band on the affected card.
     metadata = payload.get("metadata") if isinstance(payload, dict) else None
     if isinstance(metadata, dict):
-        warnings = {}
+        # SEEDED FROM THE CLASSIFIER, NOT OVERWRITING IT. `_inspect_core` now runs the
+        # TR39 confusables skeleton check and puts its findings in this same key. This
+        # block used to ASSIGN `display_warnings`, which would have silently replaced
+        # the stronger check's results with this weaker one's on the browser path —
+        # the same field name, two producers, last writer wins.
+        #
+        # The two are complementary and neither subsumes the other: TR39 catches
+        # per-character Latin MIMICRY ("USDС" with a Cyrillic С) and deliberately
+        # ignores wholly non-Latin names; the heuristic below also flags script
+        # mixing and whole-word non-Latin, which is broader and noisier. Where both
+        # fire on one field, the TR39 reason is kept — it is the more specific claim.
+        warnings = dict(metadata.get("display_warnings") or {})
         for field_name in ("name", "ticker", "description"):
             field_value = metadata.get(field_name)
             if isinstance(field_value, str) and field_value:
                 reason = _suspicious_reason(field_value)
                 if reason:
-                    warnings[field_name] = reason
+                    warnings.setdefault(field_name, reason)
         # ``protocol`` is a list of CBOR-supplied values rendered to the
         # user as a comma-joined string. An attacker can put a homoglyph
         # in any element. Walk the list and flag the field if any entry
@@ -274,7 +285,7 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
                 if isinstance(entry, str) and entry:
                     reason = _suspicious_reason(entry)
                     if reason:
-                        warnings["protocol"] = reason
+                        warnings.setdefault("protocol", reason)
                         break
         if warnings:
             metadata["display_warnings"] = warnings
@@ -373,6 +384,16 @@ def _hint_for(form: str) -> str:
     }.get(form, "")
 
 
+# The page talks to ONE hard-coded mainnet ElectrumX endpoint
+# (``ELECTRUMX_WSS_URL`` in inspect.js), so mainnet is the chain every result here
+# was actually read from. Passed EXPLICITLY rather than left to the default,
+# because a HashMark v2 signature covers the chain's genesis hash: the same bytes
+# on another chain are a different statement and verify against a different key.
+# If this page ever gains a network selector, this constant is what has to move
+# with it, and an explicit argument is what makes that findable.
+_PAGE_NETWORK = "mainnet"
+
+
 def _err(message: str, *, form: str, hint: str = "") -> dict:
     """Build a structured error result. ``message`` and ``hint`` are passed
     through the sanitizer so a hostile parser exception text can't leak
@@ -427,6 +448,19 @@ _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
         "payload_hash",
         "wire_hex",
         "input",
+        # The script bytes themselves. They were chopped to 200 hex chars while
+        # inspect.js told the reader the opposite — "the JSON drawer carries the
+        # full bytes" — so the drawer, and the Copy JSON button, silently held a
+        # prefix. The card printed the true byte count beside it, showing
+        # "length: 258 bytes" above 100 bytes of hex.
+        #
+        # Newly material rather than merely untidy: `data_hex` is now the only
+        # place a HashMark or `msg` record's raw bytes appear, and it is what the
+        # UI points at ("not valid UTF-8 — see data_hex"). The row stays scannable
+        # because inspect.js truncates for DISPLAY at 64 chars on its own; that is
+        # the right layer for it, since only the display needs to be short.
+        "hex",
+        "data_hex",
         # dMint mint-claim scriptSig pushes — exact bytes are load-bearing
         # for verifying a covenant push against an off-chain re-derivation.
         "nonce_hex",

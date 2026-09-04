@@ -7,8 +7,10 @@ script-walking rules (``script.h``/``script.cpp``), the BIP68 sequence-lock
 constants (``primitives_transaction.h``) and how CSV consumes them
 (``interpreter.cpp``), the DER signature-encoding rules (``sigencoding.cpp``),
 and which verification flags are consensus rather than policy
-(``script_flags.h``, ``policy.h``, ``validation.cpp``). See the README beside
-those files for the full table.
+(``script_flags.h``, ``policy.h``, ``validation.cpp``), the per-script resource
+budgets ``interpreter.cpp`` enforces but does not declare (``consensus.h``), and
+the ``uint288`` comparator that fixes the sighash ref order (``uint256.h``). See
+the README beside those files for the full table.
 
 The point is that **no consensus fact in here is typed by a human.** Every value
 is recovered from the C++ that defines it. A hand-maintained Python table of the
@@ -29,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
@@ -763,3 +766,233 @@ def input_backed_ref_opcode_names() -> frozenset[str]:
 def input_backed_ref_opcodes() -> frozenset[int]:
     table = opcode_table()
     return frozenset(table[n] for n in input_backed_ref_opcode_names())
+# Fact 7 — per-script resource budgets (consensus/consensus.h)
+# ---------------------------------------------------------------------------
+
+#: ``inline constexpr <type> NAME = <expr>;`` — the shape every scalar in
+#: ``consensus.h`` is declared with. Deliberately a SEPARATE pattern from
+#: ``_SCALAR_LIMIT``: ``script.h`` writes ``static const int NAME = <int>;`` and
+#: these are ``inline constexpr`` with an *expression* initialiser, so widening
+#: the existing regex to cover both would have made it accept shapes in either
+#: file that nobody has read.
+_CONSENSUS_SCALAR = r"inline\s+constexpr\s+(?:unsigned\s+)?(?:uint64_t|int)\s+{name}\s*=\s*([^;]+);"
+
+#: The same declaration shape, name-capturing, for enumerating the header.
+_CONSENSUS_SCALAR_ANY = re.compile(r"inline\s+constexpr\s+(?:unsigned\s+)?(?:uint64_t|int)\s+([A-Z][A-Z0-9_]*)\s*=")
+
+
+@lru_cache(maxsize=1)
+def _one_megabyte() -> int:
+    """``ONE_MEGABYTE`` — the unit every size budget in ``consensus.h`` is a multiple of.
+
+    Radiant's is 1,000,000, not 1,048,576. Reading it from the header rather
+    than assuming a power of two is the point: at 128 units the two readings
+    differ by 6.3 MB.
+    """
+    src = _strip_comments(vendored_source("consensus.h"))
+    match = re.search(_CONSENSUS_SCALAR.format(name="ONE_MEGABYTE"), src)
+    if not match:
+        raise OracleParseError("could not locate ONE_MEGABYTE in vendored consensus/consensus.h")
+    text = match.group(1).strip()
+    if not text.isdigit():
+        raise OracleParseError(f"ONE_MEGABYTE is no longer a bare integer literal in consensus.h: {text!r}")
+    return int(text)
+
+
+def _eval_megabyte_expression(raw: str) -> int:
+    """Evaluate the tiny expression grammar ``consensus.h``'s scalars use.
+
+    Three shapes appear: a bare literal (``1000000``), a multiple of the unit
+    (``12 * ONE_MEGABYTE``) and the same with an explicit cast
+    (``uint64_t(128) * ONE_MEGABYTE``). Anything else raises rather than
+    guessing — a mis-evaluated budget is a plausible number that pins nothing.
+    """
+    text = re.sub(r"\buint64_t\s*\(\s*(\d+)\s*\)", r"\1", raw.strip())
+    if text.isdigit():
+        return int(text)
+    match = re.fullmatch(r"(\d+)\s*\*\s*ONE_MEGABYTE", text)
+    if match:
+        return int(match.group(1)) * _one_megabyte()
+    raise OracleParseError(f"unparsable initialiser in vendored consensus.h: {raw!r}")
+
+
+@lru_cache(maxsize=16)
+def consensus_limit(name: str) -> int:
+    """A scalar budget from ``consensus/consensus.h``, by its C++ name.
+
+    The two that bound a script are ``MAX_SCRIPT_STACK_MEMORY_USAGE`` (peak
+    bytes held across main stack + altstack) and ``MAX_SCRIPT_OPCODE_COST``
+    (cumulative bytes processed by the hashing/bytewise opcodes).
+    ``interpreter.cpp`` compares against both and declares neither, so until
+    this header was vendored their values were citable and checkable by nobody.
+    """
+    src = _strip_comments(vendored_source("consensus.h"))
+    match = re.search(_CONSENSUS_SCALAR.format(name=re.escape(name)), src)
+    if not match:
+        raise OracleParseError(
+            f"{name} is no longer declared as `inline constexpr <type> {name} = <expr>;` in the "
+            "vendored consensus/consensus.h; re-derive it in tests/consensus_oracle.py."
+        )
+    return _eval_megabyte_expression(match.group(1))
+
+
+@lru_cache(maxsize=1)
+def consensus_scalar_names() -> frozenset[str]:
+    """Every scalar ``consensus/consensus.h`` declares."""
+    names = frozenset(_CONSENSUS_SCALAR_ANY.findall(_strip_comments(vendored_source("consensus.h"))))
+    if "ONE_MEGABYTE" not in names:
+        raise OracleParseError(f"implausible consensus.h scalar table parsed ({sorted(names)})")
+    return names
+
+
+@lru_cache(maxsize=1)
+def script_budgets_enforced_by_interpreter() -> frozenset[str]:
+    """``consensus.h`` budgets that ``interpreter.cpp`` actually compares against.
+
+    Recovered from the comparisons themselves rather than from a list of names,
+    so a budget added upstream and wired into ``EvalScript`` shows up here with
+    nobody editing anything — and the test requiring every enforced budget to be
+    pinned starts failing, which is the intended alarm.
+
+    Intersected with what ``consensus.h`` declares, so limits belonging to other
+    headers (``MAX_SCRIPT_ELEMENT_SIZE`` is ``script.h``'s) cannot leak in.
+    """
+    compared = frozenset(re.findall(r">\s*(MAX_[A-Z0-9_]+)", _strip_comments(vendored_source("interpreter.cpp"))))
+    names = compared & consensus_scalar_names()
+    if not names:
+        raise OracleParseError(
+            "no consensus.h budget appears in a comparison in the vendored interpreter.cpp — the "
+            "extractor found nothing, which would make the budget differential vacuous."
+        )
+    return names
+
+
+# ---------------------------------------------------------------------------
+# Fact 8 — the uint288 ordering behind the sighash ref sort (uint256.h)
+# ---------------------------------------------------------------------------
+#
+# Radiant collects an output's refs into a ``std::set<uint288>`` and hashes them
+# in ITERATION order (``primitives_transaction.h``, ``getRefHashDataSummary``).
+# That header holds the set; it does not define the order. The order lives in
+# ``base_blob::Compare`` and ``operator<``, which ``std::less<uint288>`` — and so
+# ``std::set`` — sorts by. Getting it wrong is not cosmetic: sorting the 36 raw
+# bytes lexicographically rather than as a little-endian integer produced a
+# ``hashOutputHashes`` the node disagreed with, and made dMint contract-output
+# signing fail about half the time.
+
+
+def _base_blob_compare_body() -> str:
+    src = _strip_comments(vendored_source("uint256.h"))
+    start = src.find("int Compare(const base_blob")
+    if start < 0:
+        raise OracleParseError("could not locate base_blob::Compare in vendored uint256.h")
+    end = src.find("friend ", start)
+    if end < 0:
+        raise OracleParseError("could not delimit the body of base_blob::Compare in vendored uint256.h")
+    return src[start:end]
+
+
+@lru_cache(maxsize=1)
+def uint288_width_bytes() -> int:
+    """``uint288``'s byte width, as ``base_blob`` computes it from ``BITS``.
+
+    Read as ``BITS / 8`` from the two places that define it rather than as the
+    literal 36, so a re-parameterisation upstream fails the parse instead of
+    silently keeping a stale width.
+    """
+    src = _strip_comments(vendored_source("uint256.h"))
+    blob = re.search(r"class\s+uint288\s*:\s*public\s+base_blob<\s*(\d+)\s*>", src)
+    if not blob:
+        raise OracleParseError("could not locate `class uint288 : public base_blob<BITS>` in vendored uint256.h")
+    width = re.search(r"static\s+constexpr\s+unsigned\s+WIDTH\s*=\s*BITS\s*/\s*(\d+)\s*;", src)
+    if not width:
+        raise OracleParseError("base_blob no longer defines WIDTH as `BITS / <n>` in vendored uint256.h")
+    bits, divisor = int(blob.group(1)), int(width.group(1))
+    if divisor == 0 or bits % divisor:
+        raise OracleParseError(f"uint288's base_blob<{bits}> is not divisible by {divisor}")
+    return bits // divisor
+
+
+@lru_cache(maxsize=1)
+def base_blob_significance_order() -> str:
+    """``"little"`` or ``"big"`` — which end of ``m_data`` ``Compare`` reads as most significant.
+
+    ``Compare`` walks one index at a time and returns on the first differing
+    byte, so the index it starts from IS the byte order. Both directions are
+    recognised and exactly one must match, which is what stops a rewrite
+    upstream from being mistaken for "unchanged".
+    """
+    body = _base_blob_compare_body()
+    if not re.search(r"const\s+uint8_t\s+a\s*=\s*m_data\[i\]\s*;", body) or not re.search(
+        r"const\s+uint8_t\s+b\s*=\s*other\.m_data\[i\]\s*;", body
+    ):
+        raise OracleParseError("base_blob::Compare no longer compares `m_data[i]` against `other.m_data[i]`")
+    if not re.search(r"if\s*\(\s*a\s*>\s*b\s*\)\s*\{?\s*return\s+1\s*;", body) or not re.search(
+        r"if\s*\(\s*a\s*<\s*b\s*\)\s*\{?\s*return\s+-1\s*;", body
+    ):
+        raise OracleParseError("base_blob::Compare no longer returns +1/-1 for the greater/lesser byte")
+
+    from_the_top = bool(
+        re.search(r"unsigned\s+i\s*=\s*WIDTH\s*-\s*1\s*;", body) and re.search(r"while\s*\(\s*i--\s*!=\s*0\s*\)", body)
+    )
+    from_the_bottom = bool(
+        re.search(r"unsigned\s+i\s*=\s*0\s*;", body) and re.search(r"while\s*\(\s*\+\+i\s*<\s*WIDTH\s*\)", body)
+    )
+    if from_the_top == from_the_bottom:
+        raise OracleParseError(
+            "base_blob::Compare no longer walks m_data in a recognised direction — it must start at "
+            "WIDTH-1 and count down (little-endian) or at 0 and count up (big-endian). Re-derive the "
+            "ref sort order in tests/consensus_oracle.py before trusting any sighash built on it."
+        )
+    return "little" if from_the_top else "big"
+
+
+@lru_cache(maxsize=1)
+def base_blob_less_than_sense() -> str:
+    """The operator ``base_blob::operator<`` applies to ``Compare``'s result — ``"<"``.
+
+    ``std::set`` orders with ``std::less``, i.e. ``operator<``, so this is the
+    step that turns "Compare says a is smaller" into "a is hashed first". A flip
+    here would reverse the sighash ref order without touching ``Compare`` at all.
+    """
+    src = _strip_comments(vendored_source("uint256.h"))
+    match = re.search(
+        r"operator<\s*\(\s*const\s+base_blob\s*&\s*a\s*,\s*const\s+base_blob\s*&\s*b\s*\)"
+        r"[^{]*\{\s*return\s+a\.Compare\(b\)\s*(<=?|>=?)\s*0\s*;",
+        src,
+    )
+    if not match:
+        raise OracleParseError(
+            "base_blob::operator< is no longer defined as `return a.Compare(b) <op> 0;` in vendored uint256.h"
+        )
+    return match.group(1)
+
+
+def uint288_sorted(refs: Iterable[bytes]) -> list[bytes]:
+    """Order 36-byte refs the way ``std::set<uint288>`` iterates them.
+
+    Assembled from the parsed C++ — the byte examined first comes from
+    ``Compare``'s loop direction, the ascending/descending sense from
+    ``operator<`` — so if either flips upstream this flips with it and the
+    differential against ``transaction_preimage._get_push_refs`` fails.
+    """
+    width = uint288_width_bytes()
+    items = list(refs)
+    wrong = sorted({len(r) for r in items if len(r) != width})
+    if wrong:
+        raise ValueError(f"uint288 is {width} bytes; got refs of length {wrong}")
+
+    sense = base_blob_less_than_sense()
+    if sense == "<":
+        reverse = False
+    elif sense == ">":
+        reverse = True
+    else:
+        raise OracleParseError(
+            f"base_blob::operator< compares Compare()'s result with {sense!r} 0, which is not a strict "
+            "ordering; std::set<uint288> iteration order cannot be derived from it."
+        )
+
+    if base_blob_significance_order() == "little":
+        return sorted(items, key=lambda r: r[::-1], reverse=reverse)
+    return sorted(items, reverse=reverse)

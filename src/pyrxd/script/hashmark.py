@@ -29,6 +29,7 @@ must be labelled as such by any caller that surfaces it.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 
@@ -58,6 +59,42 @@ HASHMARK_MAGIC = b"HASHMARK"
 _ALGORITHMS: dict[int, tuple[str, int]] = {0x01: ("sha256", 32)}
 
 _OP_RETURN = OpCode.OP_RETURN.value[0] if hasattr(OpCode.OP_RETURN, "value") else 0x6A
+
+
+#: Codepoints §5.4 REJECTS in a label, as ranges and singletons.
+#:
+#: C0 and DEL smuggle line breaks and terminal escapes past a human reviewer; C1
+#: is still acted on by real terminals; U+2028/2029 are genuine line separators;
+#: and the bidi marks, overrides and isolates reorder rendered text with no line
+#: break at all. U+200C ZWNJ and U+200D ZWJ are deliberately NOT rejected — they
+#: are joiners, and rejecting them would refuse legitimate text in several
+#: scripts.
+_LABEL_REJECTED_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00, 0x1F),  # C0
+    (0x7F, 0x9F),  # DEL + C1
+    (0x2028, 0x2029),  # line / paragraph separator
+    (0x202A, 0x202E),  # bidi embeddings and overrides
+    (0x2066, 0x2069),  # bidi isolates
+)
+_LABEL_REJECTED_CHARS: frozenset[int] = frozenset({0x061C, 0x200B, 0x200E, 0x200F, 0xFEFF})
+
+
+def _label_defect(label: str) -> str | None:
+    """Why this label is not canonical per §5.4, or None if it is fine.
+
+    CANONICALISATION RUNS ONE WAY. A decoder must never trim or normalise a label
+    it has read — it rejects or withholds a non-canonical one. Silently fixing it
+    would mean the string shown is not the string signed.
+    """
+    for ch in label:
+        cp = ord(ch)
+        if cp in _LABEL_REJECTED_CHARS or any(lo <= cp <= hi for lo, hi in _LABEL_REJECTED_RANGES):
+            return f"contains U+{cp:04X}"
+    if label != label.strip():
+        return "has leading or trailing whitespace"
+    if unicodedata.normalize("NFC", label) != label:
+        return "is not Unicode NFC"
+    return None
 
 
 class HashMarkOutcome(Enum):
@@ -95,6 +132,11 @@ class HashMarkRecord:
     #: than normalised, so a digest has exactly one accepted spelling.
     digest_hex: str | None = None
     label: str | None = None
+    #: v1 only: why the label was withheld from display, per §5.4. The record stays
+    #: valid — a v1 label is not signed and forms no part of any claim, so a
+    #: dangerous one can misrepresent itself on screen but not a statement.
+    #: Invalidating would discard timestamp evidence to fix a rendering problem.
+    label_withheld: str | None = None
     #: v2 only: hash160 of the key that signed. NOT verified here.
     signer_hash160_hex: str | None = None
     #: v2 only: 65-byte compact recoverable signature. NOT verified here.
@@ -106,6 +148,46 @@ class HashMarkRecord:
         return self.outcome is HashMarkOutcome.OK
 
 
+#: v1's label cap is a flat number in the spec (§5.4).
+_V1_LABEL_CAP = 128
+
+#: The whole-record ceiling both versions share, in bytes (§5.4, §7).
+_MAX_RECORD_BYTES = 223
+
+
+def _encoded_push_size(n: int) -> int:
+    """Bytes a push of *n* payload bytes occupies, minimally encoded (§4.1)."""
+    return 1 + n if n <= 75 else 2 + n if n <= 255 else 3 + n
+
+
+def _max_label_bytes(digest_len: int) -> int:
+    """The v2 label cap for a given digest length — DERIVED, per §5.4.
+
+    v2 spends 87 bytes on the signer and signature, so the label gets whatever is
+    left of the 223-byte record ceiling. For sha256 that is 88.
+
+    This was hardcoded to 223 — the whole-RECORD ceiling, mistaken for the label's
+    share of it. It was unreachable only because the push walker refused every
+    ``OP_PUSHDATA1``, so no label above 75 bytes could arrive at all; fixing the
+    walker in the same commit is what makes getting this right load-bearing.
+
+    Computed rather than tabulated so that registering a longer digest shrinks the
+    label automatically, instead of silently producing records that stop relaying.
+    """
+    fixed = (
+        1  # OP_RETURN
+        + _encoded_push_size(8)  # magic
+        + _encoded_push_size(2)  # header
+        + _encoded_push_size(digest_len)
+        + _encoded_push_size(20)  # signer hash160
+        + _encoded_push_size(65)  # recoverable signature
+    )
+    # Largest L whose own push still fits. Solved directly rather than by search:
+    # the label push costs 1 + L up to 75, then 2 + L.
+    room = _MAX_RECORD_BYTES - fixed
+    return room - 1 if room - 1 <= 75 else room - 2
+
+
 def decode_hashmark(script: bytes) -> HashMarkRecord:
     """Decode a ``scriptPubKey`` as a HashMark record.
 
@@ -115,7 +197,9 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
     if not script or script[0] != _OP_RETURN:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 
-    pushes = data_pushes_after_op_return(script)
+    # HashMark 4.1: every record has exactly one valid serialization, so a
+    # non-minimal push makes this not-a-HashMark rather than a HashMark to repair.
+    pushes = data_pushes_after_op_return(script, require_minimal=True)
     if pushes is None or not pushes or pushes[0] != HASHMARK_MAGIC:
         return HashMarkRecord(HashMarkOutcome.NOT_HASHMARK)
 
@@ -170,9 +254,10 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         signer_hex, signature_hex = signer.hex(), signature.hex()
 
     label = None
+    label_withheld: str | None = None
     if len(pushes) == expected[1]:
         raw = pushes[-1]
-        cap = 128 if version == 1 else 223
+        cap = _V1_LABEL_CAP if version == 1 else _max_label_bytes(len(digest))
         if not raw or len(raw) > cap:
             return HashMarkRecord(
                 HashMarkOutcome.INVALID, version=version, detail=f"label is {len(raw)} bytes, expected 1..{cap}"
@@ -182,6 +267,19 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         except UnicodeDecodeError:
             return HashMarkRecord(HashMarkOutcome.INVALID, version=version, detail="label is not valid UTF-8")
 
+        # §5.4, and the split is version-dependent on purpose.
+        defect = _label_defect(label)
+        if defect is not None:
+            if version == 2:
+                # The label is INSIDE the signed statement, so a non-canonical label
+                # is not the label that was signed. The record is invalid.
+                return HashMarkRecord(HashMarkOutcome.INVALID, version=version, detail=f"label {defect} (spec 5.4)")
+            # v1: the label is not signed and forms no part of any claim, so a
+            # dangerous one can misrepresent itself on screen but not a statement.
+            # Withhold it and keep the record — invalidating would throw away
+            # timestamp evidence to fix a rendering problem.
+            label_withheld, label = f"label {defect} (spec 5.4)", None
+
     return HashMarkRecord(
         HashMarkOutcome.OK,
         version=version,
@@ -189,6 +287,7 @@ def decode_hashmark(script: bytes) -> HashMarkRecord:
         algorithm=name,
         digest_hex=digest.hex(),  # .hex() is lowercase; the one accepted spelling
         label=label,
+        label_withheld=label_withheld,
         signer_hash160_hex=signer_hex,
         signature_hex=signature_hex,
     )
@@ -221,6 +320,12 @@ class AttestationOutcome(Enum):
     #: v1 carries no signer, so there is nothing to attest. Not a failure — v1
     #: never claimed to say WHO, only WHEN.
     NOT_ATTESTED = "not_attested"
+    #: secp256k1 is not available here, so the signature could not be checked.
+    #: NOT a verdict on the record: it is well-formed and undecided. §6 separates
+    #: decoding from attestation for exactly this reason — "verifying a v2
+    #: signature additionally needs secp256k1 … which a decoder in a
+    #: dependency-free library will not have".
+    UNVERIFIABLE = "unverifiable"
 
 
 @dataclass(frozen=True)
@@ -283,15 +388,52 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     are a different statement.
     """
     from ..hash import hash160, hash256
-    from ..keys import recover_public_key
     from ..utils import text_digest
+
+    # secp256k1 lives behind `pyrxd.keys`, which imports `coincurve` at module top.
+    # The browser inspect page runs pyrxd under Pyodide and installs only micropip
+    # and pycryptodome, so this import RAISES there — and it used to raise straight
+    # out of this function, which meant a HashMark output did not classify AT ALL in
+    # the browser: the per-output try in `_inspect_core` caught it and the row
+    # degraded to `type=error`. Verified by blocking `coincurve` with a meta-path
+    # finder and calling `_inspect_script` on a real v2 record.
+    #
+    # §6 already says what should happen: "Decoding and attestation are SEPARATE
+    # steps with separate outcomes. Decoding needs only these bytes; verifying a v2
+    # signature additionally needs secp256k1 … which a decoder in a dependency-free
+    # library will not have. A record that decodes is well-formed, not yet believed."
+    #
+    # So a missing curve is UNVERIFIABLE — the digest, label and signer still reach
+    # the reader, and only the verdict is withheld, with the reason. Reporting
+    # INVALID_SIGNATURE here would be far worse: it would tell a reader a genuine
+    # mark's claim does not hold, on the strength of a missing dependency.
+    try:
+        from ..keys import recover_public_key
+    except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
+        )
 
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")
     if record.version != 2 or not record.signature_hex or not record.signer_hash160_hex:
         return AttestationResult(AttestationOutcome.NOT_ATTESTED, detail="v1 record carries no signer")
 
-    sig = bytes.fromhex(record.signature_hex)
+    # §6.3 step 3 makes "65 bytes" part of VERIFYING, not only of decoding, and this
+    # function is public API: `decode_hashmark` enforces the length, but a caller doing
+    # offline verification builds a `HashMarkRecord` from stored fields and reaches here
+    # directly. Without the check a 33-byte value slices to an EMPTY s, which is int 0 —
+    # a wrong-but-typed answer rather than a refusal — and malformed hex escaped as an
+    # uncaught ValueError instead of one of this function's own outcomes.
+    try:
+        sig = bytes.fromhex(record.signature_hex)
+    except ValueError:
+        return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="signature is not valid hex")
+    if len(sig) != 65:
+        return AttestationResult(
+            AttestationOutcome.INVALID_SIGNATURE, detail=f"signature is {len(sig)} bytes, expected 65"
+        )
     header, r_bytes, s_bytes = sig[0], sig[1:33], sig[33:65]
 
     # §5.6: header is 27 + recoveryId, +4 when the key is compressed; 27..34.

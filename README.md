@@ -73,11 +73,15 @@ mainnet. If you find a bug that affects funds, report it via the
 **Experimental — newer surface, proven on regtest / testnet (and small real-value runs):**
 
 - Cross-chain HTLC atomic swaps (`pyrxd.gravity`) — RXD covenant + BTC Taproot + ETH
-  Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
-  small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
-  Linea) — the EVM legs in native ETH, in USDC on any of those chains, or in USDT on the
-  three where it is pinned (Ethereum, Optimism, Base). This cross-chain swap stack is
-  **unaudited — verify it yourself before moving real value.**
+  Solidity legs driven by a chain-neutral coordinator. Proven end-to-end on regtest, plus
+  small real-value single-operator dust runs: **RXD ↔ BTC mainnet-to-mainnet**, and
+  **RXD mainnet ↔ Ethereum/Base Sepolia** for the EVM legs. Other EVM chains — Optimism,
+  Arbitrum, Linea — are **wired and fail closed if you get them wrong, but no run of any
+  kind has exercised them**; USDC and USDT are pinned per chain and several of those pins
+  are proven only against a forked contract state, never a public chain.
+  [`docs/reference/counter-chain-support.md`](docs/reference/counter-chain-support.md)
+  gives the proof level for every chain and asset, and is the authority. This
+  cross-chain swap stack is **unaudited — verify it yourself before moving real value.**
 
 ## Upgrading
 

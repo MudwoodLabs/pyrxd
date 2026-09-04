@@ -69,13 +69,42 @@ for `SINGLE`, none for `NONE`), pyrxd writes:
 It then `hash256`'s the whole concatenation. The result is the 32-byte
 `hashOutputHashes` field.
 
-The `push_refs` list is built by scanning the locking script's bytes
-for `OP_PUSHINPUTREF` (`0xd0`) and `OP_PUSHINPUTREFSINGLETON` (`0xd8`),
-each followed by exactly 36 bytes of ref data. **Refs are sorted
-ascending and deduplicated** before hashing — this matches radiantjs
-consensus exactly and pyrxd's vectors are pinned against a confirmed
-mainnet reveal. See `_compute_hash_output_hashes` and `_get_push_refs`
-in `transaction_preimage.py`.
+The `push_refs` list is built by **walking the locking script as an opcode
+stream** — not by scanning its bytes — and collecting the operands of
+`OP_PUSHINPUTREF` (`0xd0`) and `OP_PUSHINPUTREFSINGLETON` (`0xd8`).
+
+> ### ⚠ Two things this page told you to do wrong, until 2026-09-03
+>
+> Both were the versions pyrxd itself shipped and fixed, and both are
+> re-derivable from Radiant Core. If you ported from this page before that
+> date, check these two first — each produces signatures a real node rejects.
+>
+> **1. Walk all FIVE ref-operand opcodes, collect only two.**
+> `OP_REQUIREINPUTREF` (`0xd1`), `OP_DISALLOWPUSHINPUTREF` (`0xd2`) and
+> `OP_DISALLOWPUSHINPUTREFSIBLING` (`0xd3`) each carry a 36-byte immediate
+> operand too (`src/script/script.cpp:710-726`); they simply land in
+> different sets (`:585-607`). Treating one as a bare one-byte opcode resumes
+> the walk *inside* the ref bytes and reads ref data as opcodes. On a Photonic
+> `nftAuthScript` that produced the wrong ref set for **~80% of refs**
+> (measured over 2,000 random refs) — an invalid signature on every input of
+> any transaction paying to such a script. **"Not collected" never means "no
+> operand."**
+>
+> **2. Sort by the REVERSED bytes, not the raw ones.**
+> Consensus collects refs into a `std::set<uint288>` and hashes them in
+> iteration order — ascending by the *uint288 numeric value*, which is
+> **little-endian** (byte 35 is most-significant). So sort by `ref[::-1]`.
+> Sorting by the raw 36 bytes is big-endian/lexicographic; it agrees for
+> single-ref outputs, where order is moot, and **diverges for any output with
+> two or more refs**. That is the bug that made dMint contract-output signing
+> fail ~50% of the time against a real node.
+
+Refs are then **deduplicated and sorted by `ref[::-1]`** before hashing. See
+`_compute_hash_output_hashes` and `_get_push_refs` in
+`transaction_preimage.py`, whose docstring carries the full derivation, and
+`tests/test_dmint_v1_regtest_e2e.py`, which validates a 2-ref contract output
+end-to-end against radiant-core regtest — the case a single-ref vector cannot
+distinguish.
 
 For a plain P2PKH output, `len(push_refs)` is 0 and the trailing
 32 bytes are zero — but the field is still computed and still
@@ -194,8 +223,11 @@ the moment any output in the tx carries a ref.
 
 ### 4. Hashing refs in script order instead of sorted+deduped
 
-Refs are **sorted ascending by their 36 bytes and deduplicated** before
-being concatenated and hashed. Hashing them in the order they appear
+Refs are **deduplicated and sorted by their fully-reversed bytes**
+(`ref[::-1]`, i.e. ascending `uint288` numeric value — little-endian) before
+being concatenated and hashed. Sorting by the raw 36 bytes is the
+big-endian/lexicographic order and is a *different* sort for any output
+carrying two or more refs. Hashing them in the order they appear
 in the script produces a different `hashOutputHashes` whenever a
 script contains two refs (e.g. multi-ref covenants, Gravity offers).
 

@@ -17,8 +17,14 @@ fed to the signer at the call site and never persisted as an ``eth_account`` obj
 Security gates enforced here (off-chain, per the security review):
   * pre-fund: ``eth_getCode`` runtime-bytecode == the committed artifact's, the
     contract immutables (hashlock/claimant/refundee/timeout) == negotiated, and the
-    funded balance == negotiated amount. Run inside the funder's own ``fund()``, and again
+    funded balance >= the negotiated amount. Run inside the funder's own ``fund()``, and again
     on the maker's side before the maker reveals p (the maker's RXD lock precedes both).
+    The balance is a LOWER BOUND on purpose — anyone can force-send wei to a contract
+    (selfdestruct/coinbase), so an ``== expected`` check is griefable into a permanent
+    verify failure; over-funding is safe because claim/refund sweep the whole balance to
+    the winner. This line said "== negotiated amount" until 2026-09-03; the check has been
+    ``bal < expected_amount_wei`` since the red-team LOW that introduced it, and
+    :meth:`EthHtlcContractLeg.verify_funded` documents it correctly at the check itself.
   * EOA-only claimant/refundee (a recipient contract that reverts on receive would lock
     funds via the contract's ``require(ok)``).
 """
