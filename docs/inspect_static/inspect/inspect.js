@@ -1304,19 +1304,16 @@ function _detectTxShape(payload) {
     // output at all. Both are checkable from rows this function has already
     // walked, so check them and say which way it came out. The canonical shape
     // is a claim about POSITIONS, so the test is positional.
-    const ftRows = outputs.filter((o) => String(o.type).toLowerCase() === "ft");
-    const ftNote =
-      ftRows.length === 1
-        ? `The freshly-minted FT is the ft output at vout ${ftRows[0].vout}. `
-        : ftRows.length > 1
-          ? `${ftRows.length} ft outputs are present here; the minted reward is one of them. `
-          : "This transaction has NO ft output, so the minted reward is not " +
-            "where the canonical mint shape puts it — read the rows below " +
-            "rather than assuming a reward output exists. ";
-    // A truncated outputs list (a single-vout classification) can neither
-    // confirm nor deny a whole-tx shape, so it gets no verdict at all.
+    //
+    // A PARTIAL OUTPUTS LIST ANSWERS NEITHER. `classify_raw_tx` takes an
+    // `only_vout` that returns one row while `output_count` still reports the
+    // whole transaction, and off a one-row list "this transaction has NO ft
+    // output" would be the same unchecked claim wearing a new sentence — a
+    // defect the fix invents for itself. So the completeness test gates BOTH
+    // notes, not only the shape one.
     const outputsComplete =
       typeof payload.output_count !== "number" || outputs.length === payload.output_count;
+    const ftRows = outputs.filter((o) => String(o.type).toLowerCase() === "ft");
     const typeAt = (i) => String((outputs[i] || {}).type || "").toLowerCase();
     const canonicalShape =
       outputs.length === 4 &&
@@ -1327,12 +1324,28 @@ function _detectTxShape(payload) {
     const shapeSentence =
       "the canonical mint tx has 4 outputs: [0] dMint continuation, [1] " +
       "75-byte FT-wrapped reward, [2] OP_RETURN message, [3] P2PKH change";
-    const shapeNote = !outputsComplete
-      ? `For reference, ${shapeSentence}. `
-      : canonicalShape
+    let ftNote;
+    let shapeNote;
+    if (!outputsComplete) {
+      ftNote =
+        `Only ${outputs.length} of this transaction's ${payload.output_count} ` +
+        `outputs were classified here, so where the minted FT sits is not ` +
+        `decided from this view. `;
+      shapeNote = `For reference, ${shapeSentence}. `;
+    } else {
+      ftNote =
+        ftRows.length === 1
+          ? `The freshly-minted FT is the ft output at vout ${ftRows[0].vout}. `
+          : ftRows.length > 1
+            ? `${ftRows.length} ft outputs are present here; the minted reward is one of them. `
+            : "This transaction has NO ft output, so the minted reward is not " +
+              "where the canonical mint shape puts it — read the rows below " +
+              "rather than assuming a reward output exists. ";
+      shapeNote = canonicalShape
         ? `Its outputs match the canonical mint shape — ${shapeSentence}. `
         : `Its ${outputs.length} outputs do NOT match the canonical mint shape ` +
           `in count or in order — ${shapeSentence}. Read the rows below. `;
+    }
     return (
       `This is a dMint claim transaction (height ${dmintOutput.height} ` +
       `of ${dmintOutput.max_height}) — somebody spent the contract's ` +

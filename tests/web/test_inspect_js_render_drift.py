@@ -848,6 +848,38 @@ def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> di
     return result["payload"]
 
 
+def _tx_payload_single_vout(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], vout: int) -> dict:
+    """The same transaction classified with ``only_vout`` — one output row while
+    ``output_count`` still reports the whole transaction.
+
+    Built through ``pyrxd.glyph.inspect.classify_raw_tx`` rather than the glue,
+    because the glue has no ``only_vout`` parameter — but the public classifier
+    does, and ``renderFetchedTxCard`` renders whatever a txid payload contains.
+    A partial list is the shape in which "this transaction has NO ft output" is
+    a lie told from an incomplete reading, which is the defect class this whole
+    file is about.
+    """
+    from pyrxd.glyph.inspect import classify_raw_tx
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    tx = Transaction(
+        tx_inputs=[
+            TransactionInput(source_txid="ab" * 32, source_output_index=i, unlocking_script=Script(ss))
+            for i, ss in enumerate(scriptsigs)
+        ],
+        tx_outputs=[
+            TransactionOutput(locking_script=Script(spk, allow_malformed=True), satoshis=value)
+            for spk, value in outputs
+        ],
+    )
+    raw = tx.serialize()
+    return classify_raw_tx(hash256(raw)[::-1].hex(), raw, only_vout=vout)
+
+
 @functools.lru_cache(maxsize=1)
 def _tx_payloads() -> dict[str, dict]:
     """One classified transaction per claim the tx card makes, each built to sit
@@ -949,6 +981,14 @@ def _tx_payloads() -> dict[str, dict]:
         "dmint-claim-canonical": _tx_payload(
             [_mint_claim_scriptsig()],
             [(dmint(5, tref=token_ref), 546), (ft, 100_000), (op_return, 0), (p2pkh, 546)],
+        ),
+        # The SAME canonical claim tx, classified one output at a time. Every
+        # output-derived verdict has to withhold itself here: the reward output
+        # exists and this view cannot see it.
+        "dmint-claim-single-vout": _tx_payload_single_vout(
+            [_mint_claim_scriptsig()],
+            [(dmint(5, tref=token_ref), 546), (ft, 100_000), (op_return, 0), (p2pkh, 546)],
+            0,
         ),
         "dmint-claim-no-ft": _tx_payload(
             [_mint_claim_scriptsig()],
@@ -1190,6 +1230,21 @@ class TestTheDmintClaimBannerLooksAtTheOutputs:
         assert "has NO ft output" in text
         assert "do NOT match the canonical mint shape" in text
         assert "lives in a separate ft output" not in text
+
+    def test_a_partial_outputs_list_decides_neither(self, tx_payloads, tx_rendered):
+        """The third branch, and the one a fix invents for itself. This is the
+        canonical claim tx with a reward output that DOES exist, classified one
+        vout at a time — so "NO ft output" would be a fresh false claim made
+        from an incomplete reading, in the sentence written to remove one."""
+        payload = tx_payloads["dmint-claim-single-vout"]
+        assert len(payload["outputs"]) == 1 and payload["output_count"] == 4, (
+            "the fixture stopped being a partial classification"
+        )
+        text = tx_rendered["dmint-claim-single-vout"]
+        assert "Only 1 of this transaction's 4 outputs were classified here" in text
+        assert "has NO ft output" not in text
+        assert "do NOT match the canonical mint shape" not in text
+        assert "match the canonical mint shape" not in text
 
 
 class TestTheOpReturnNoteStopsContradictingItsOwnHeader:
