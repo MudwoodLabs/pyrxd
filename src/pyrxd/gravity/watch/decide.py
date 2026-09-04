@@ -227,15 +227,25 @@ def _required_btc_depth_blocks(policy: MarginPolicy) -> BlockSpan:
         pages PAGE_CLAIM and arms ``autonomous_asset_claim`` one block shallower than the
         policy's own reserve requires.
 
-    So the mismatch guard does not make them agree; it fires only on the WAIT path. Left as-is
-    rather than changed under a docs pass — a SECONDS-tagged reorg depth is reachable through
-    ``MarginPolicy`` directly but is not produced anywhere in this repo.
+    So the mismatch guard did not make them agree; it fired only on the WAIT path.
+
+    FIXED by using the gate's own conversion here rather than a second one. The two now
+    agree by construction instead of by coincidence, which is what the original sentence
+    claimed. Measured: identical for every BLOCKS-tagged value — everything this repo
+    constructs — so no shipped configuration changes behaviour.
     """
-    # normalize_to(BLOCKS) is what makes this a BlockSpan rather than seconds; the tag records
-    # that the conversion happened, so a raw SECONDS timelock cannot reach a blocks slot.
-    return BlockSpan(
-        policy.btc_claim_reorg_depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-    )
+    # ONE CONVERSION, the gate's. `_reserve_to_blocks` is what `assess_claim_finality`
+    # uses, so calling it here is what makes "cannot diverge" true instead of merely
+    # intended — the divergence above is not a documentation problem, it is two
+    # roundings of one quantity.
+    #
+    # It CEILS, and that is the safe direction for a reserve: flooring under-counts,
+    # which is what armed the autonomous claim a block shallow. Identity-preserving
+    # for every BLOCKS-tagged value, which is everything this repo constructs, so
+    # nothing in the shipped configuration space changes.
+    from ..swap_coordinator import _reserve_to_blocks
+
+    return BlockSpan(_reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s))
 
 
 def _refund_opens_at(policy: MarginPolicy, terms: NegotiatedTerms, asset_locked_at_height: ChainHeight) -> ChainHeight:
