@@ -429,7 +429,17 @@ class NegotiatedTerms:
         # `p` is public. Reachable on the dust defaults (t_rxd=20) at a measured margin of 16.
         #
         # Refused here rather than clamped at each builder: clamping silently hands back a swap
-        # nobody asked for, and this is the layer that makes it unrepresentable for every caller.
+        # nobody asked for.
+        #
+        # SCOPE, HONESTLY: this refusal is BLOCKS-ONLY. Until 2026-09-03 the sentence above ended
+        # "and this is the layer that makes it unrepresentable for every caller", which is not what
+        # the condition says. `t_rxd` IS pinned to BLOCKS a few lines up; `t_btc` is not, and
+        # `from_dict` takes the unit tag off the wire, so a SECONDS-tagged `t_btc` skips this floor,
+        # skips the same-unit ordering guard below (the units differ), normalises to 0 blocks in
+        # `assert_timelock_margin`, and reaches `refund_leaf_script`, whose own floor is scoped the
+        # same way. BIP68 quantises time locks to 512 s, so `Timelock(0..511, SECONDS)` is the same
+        # no-op lock as `Timelock(0, BLOCKS)`. Not fixed here: pinning `t_btc` to BLOCKS (or giving
+        # SECONDS a floor) is a behaviour change on fund-moving code and needs its own review.
         if self.t_btc.unit is TimeUnit.BLOCKS and self.t_btc.value < 1:
             raise ValidationError(
                 f"t_btc is {self.t_btc.value} blocks — a counter leg that matures in its own funding "
