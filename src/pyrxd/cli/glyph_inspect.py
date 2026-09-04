@@ -249,6 +249,15 @@ def _render_txid_human(payload: dict) -> str:
                 lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '')}")
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
                 lines.append(f"            variant={row.get('variant', '')} (non-transferable at consensus)")
+                # The classifier attaches a `note` saying what this verdict does NOT
+                # establish, and this row used to drop it while the standalone script
+                # card printed it in full. This is the path most people meet the tool
+                # on, and "non-transferable at consensus" is exactly the sentence a
+                # credential or swap gate would over-trust. The sibling
+                # container-legacy branch already points the reader onward; soulbound
+                # did not.
+                lines.append("            does NOT verify the singleton is held here — see")
+                lines.append("            `pyrxd glyph inspect <script>` for the full qualifier")
             elif type_ == "self-replicating-covenant":
                 lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '(multiple)')}")
                 lines.append("            markers only — NOT proof of soulbound")
@@ -549,7 +558,24 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  self-replication branch: {payload['has_self_replication']}")
         body.append(f"  burn branch:             {payload['has_burn_branch']}")
         body.append("  NON-TRANSFERABLE AT CONSENSUS — the only spends this lock permits are")
-        body.append("  a byte-identical self-clone or a burn. There is no transfer path.")
+        # The two variants pin DIFFERENT things, and this said "byte-identical" for
+        # both. The fixed-index builder compares whole scripts
+        # (OP_OUTPUTBYTECODE / OP_UTXOBYTECODE); the composable one compares
+        # CODE-SCRIPT HASHES, and its own docstring says "code-identical clone".
+        #
+        # Those coincide only because neither builder emits OP_STATESEPARATOR, so the
+        # code script IS the whole script. That is not a detail to paper over: code-
+        # script equality plus a state prefix lets the OWNER change between hops, and
+        # `classify_soulbound` returns MUTABLE_STATE_COVENANT for exactly that shape.
+        # Naming the weaker constraint accurately is what makes the distinction
+        # visible to whoever reads this next.
+        if payload.get("variant") == "composable":
+            body.append("  a CODE-identical self-clone or a burn. There is no transfer path.")
+            body.append("  (this variant pins its code-script hash, not the whole script; the two")
+            body.append("   coincide here because the builder emits no OP_STATESEPARATOR, so there")
+            body.append("   is no mutable state for a clone to change)")
+        else:
+            body.append("  a byte-identical self-clone or a burn. There is no transfer path.")
         body.append("  (exact match against pyrxd's soulbound covenant builder. It does NOT")
         body.append("   verify the bound ref names a live Glyph singleton, that the singleton")
         body.append("   is actually held here, or that the covenant is defect-free — the")
