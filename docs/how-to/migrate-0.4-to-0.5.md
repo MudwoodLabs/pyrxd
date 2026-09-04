@@ -19,8 +19,9 @@ minor.** The largest is a hard removal:
 **Who this page is for:** anyone upgrading from a **0.4.x** pin who imports
 `build_pow_preimage`, `build_mint_scriptsig`, or `build_dmint_v1_mint_preimage`
 from `pyrxd.glyph.dmint`. If you only use the CLI, the higher-level
-`GlyphBuilder` API, or the inspect tool, 0.5.0 is a drop-in upgrade and you can
-stop reading here.
+`GlyphBuilder` API, or the inspect tool, **0.5.0 specifically** is a drop-in
+upgrade for you — but the 0.15.0 removal above is a `GlyphBuilder` change, so
+read that one either way.
 
 0.5.0 makes three signature changes to the V1 dMint mint path. They
 are deliberately **hard breaks with loud errors** — no deprecation

@@ -328,6 +328,8 @@ chain enforce anything), and `splits` (a list of `{"address": …, "bps": …}`)
   batches.
 - **`recipient <address> appears more than once`.** A duplicated row in the
   holder list. Combine the two entries if the double payment is intended.
+- **Couldn't reach ElectrumX.** The transfer needs the network to fetch source
+  outputs and broadcast. Point at a reachable server with `--electrumx URL`.
 
 ### How much plain RXD an airdrop needs
 
@@ -371,8 +373,6 @@ more than 14x.
 > `fee_rate = 10000`, `len(selected) = 1`. They are the amount the guard
 > **demands be present**, not a measurement of a broadcast transaction's fee —
 > the real fee is smaller.
-- **Couldn't reach ElectrumX.** The transfer needs the network to fetch source
-  outputs and broadcast. Point at a reachable server with `--electrumx URL`.
 
 ---
 
