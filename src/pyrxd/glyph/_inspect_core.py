@@ -931,8 +931,14 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
             # Computed here rather than in either renderer so both surfaces get it
             # from one place. Sanitization strips control and bidi codepoints; it
             # cannot help with a Cyrillic "С" that simply LOOKS like "C".
-            "display_warnings": _confusable_warnings(metadata),
         }
+        # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
+        # something to say. Emitting an empty dict unconditionally made "flagged" and
+        # "checked and clean" indistinguishable to a caller testing for the key — and
+        # the browser drift guard caught exactly that the moment the two branches met.
+        confusables = _confusable_warnings(metadata)
+        if confusables:
+            metadata_payload["display_warnings"] = confusables
         # TIMELOCK: say WHEN it opens, not just that it is one (#556). `classification` already
         # reported "timelock"; the field that answers the holder's actual question — can I read
         # this yet — was decoded nowhere until now.

@@ -87,14 +87,17 @@ class TestItRunsThroughTheProductionCLASSIFIER:
 
     def test_a_spoofed_name_is_flagged_END_TO_END(self) -> None:
         meta = self._classified("USDС")  # Cyrillic С
-        assert meta["display_warnings"].get("name"), "the classifier does not run the check"
+        assert meta.get("display_warnings", {}).get("name"), "the classifier does not run the check"
 
     def test_an_honest_name_produces_no_warning_END_TO_END(self) -> None:
-        assert self._classified("My Token")["display_warnings"] == {}
+        # Absent, not empty: the payload omits the key when there is nothing to say,
+        # matching `glue.py`. An empty dict would make "flagged" and "clean"
+        # indistinguishable to a caller testing for the key.
+        assert "display_warnings" not in self._classified("My Token")
 
     def test_a_legitimate_non_latin_name_produces_no_warning_END_TO_END(self) -> None:
         """The false positive that would matter most, through the real path."""
-        assert self._classified("トークン")["display_warnings"] == {}
+        assert "display_warnings" not in self._classified("トークン")
 
 
 class TestTheWarningReachesAHuman:

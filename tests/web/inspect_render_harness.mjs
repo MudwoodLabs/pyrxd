@@ -16,9 +16,18 @@
 //
 // Contract:
 //   node inspect_render_harness.mjs [payloads.json|-]
-//   stdin/file: JSON — {"name": {"script": {...}, "row": {...}}, ...}
-//   stdout:     JSON — {"name": {"script_card": "…", "output_row": "…"}}
-//               where each value is the rendered text, one text node per line.
+//   stdin/file: JSON — {"name": {"script": {...}, "row": {...}, "tx": {...}}, ...}
+//               each of the three keys optional; at least one required.
+//   stdout:     JSON — {"name": {"script_card": "…", "output_row": "…",
+//                                "fetched_tx_card": "…"}}
+//               where each value is the rendered text, one text node per line,
+//               and a key is present only when its input payload was.
+//
+// `tx` drives `renderFetchedTxCard`, which is where the TX-LEVEL prose lives:
+// the shape banner (`_detectTxShape`) and the reveal-metadata block. Those are
+// whole-transaction claims — "this is a burn", "N contracts share a token_ref",
+// "the freshly-minted FT lives in a separate ft output" — and no per-output row
+// can carry them, so nothing reached them until this key existed.
 //
 // inspect.js is loaded VERBATIM in a `vm` context. It is not modified, not
 // wrapped and not preprocessed: a guard that tests a rewritten copy of the
@@ -125,7 +134,7 @@ function loadRenderer() {
   const sandbox = makeSandbox();
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: INSPECT_JS });
-  for (const name of ["renderScriptCard", "renderOutputRow"]) {
+  for (const name of ["renderScriptCard", "renderOutputRow", "renderFetchedTxCard"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
         `${name} is not reachable after loading inspect.js. It was a top-level ` +
@@ -146,10 +155,20 @@ function main() {
   const renderer = loadRenderer();
   const results = {};
   for (const [name, payloads] of Object.entries(cases)) {
-    results[name] = {
-      script_card: renderedLines(renderer.renderScriptCard(payloads.script)),
-      output_row: renderedLines(renderer.renderOutputRow(payloads.row)),
-    };
+    const out = {};
+    // A key is rendered only when its payload is present, so a tx-level case
+    // need not carry a fake script and vice versa. A case carrying NONE of them
+    // is a typo in the caller, and returning `{}` for it would look like a
+    // renderer that produced nothing — throw instead.
+    if (payloads.script) out.script_card = renderedLines(renderer.renderScriptCard(payloads.script));
+    if (payloads.row) out.output_row = renderedLines(renderer.renderOutputRow(payloads.row));
+    if (payloads.tx) out.fetched_tx_card = renderedLines(renderer.renderFetchedTxCard(payloads.tx));
+    if (Object.keys(out).length === 0) {
+      throw new Error(
+        `case ${JSON.stringify(name)} has none of "script", "row", "tx" — nothing to render`
+      );
+    }
+    results[name] = out;
   }
   process.stdout.write(JSON.stringify(results));
 }
