@@ -292,19 +292,25 @@ def prepare_covenant_offer(
         signed size — see :func:`_assert_relayable`.
     """
     if photons < minimum_reservable_photons(fee_policy):
-        # A reservation the maker cannot later REFUND is the failure this guard was
-        # written for — its comment said so ("could not later fill or refund", audit
-        # F3) — and it was sized to the wrong quantity. The dust floor alone is 546,
-        # but the refund is a one-in-one-out spend that pays its fee OUT OF the
-        # covenant value and must still leave a non-dust output, so it needs the
-        # relay fee for its own size PLUS dust.
+        # NOT a node rule, and not the dust floor either. Radiant never reaches
+        # ``IsDust`` (``policy.h:173``): its only caller is ``IsStandardTx``, called from
+        # exactly one place and gated on ``fRequireStandard``, hardcoded ``false``
+        # (``validation.cpp:586`` / ``:271`` @ ``v3.1.2``). Nothing rejects a sub-546
+        # output.
         #
-        # MEASURED before fixing, through the production builders: reservations of
-        # 546, 100_000, 1_000_000 and 1_900_000 photons were all accepted here and
-        # then produced NO refund at any fee. Meanwhile `pyrxd swap reserve` printed
-        # "Reclaim at --expiry is GUARANTEED" on the consent screen, and `swap
-        # cancel` — documented as the only hard revocation there is — fails the same
-        # way. Those funds were unreachable by any pyrxd path.
+        # The reason is ECONOMIC, and the guard was sized to the wrong quantity for it.
+        # A reservation the maker cannot later REFUND is the failure this was written
+        # for — its own comment said so, "could not later fill or refund", audit F3 —
+        # but it compared against dust alone (546) when the refund is a one-in-one-out
+        # spend that pays its fee OUT OF the covenant value and must still leave a
+        # non-dust output. It needs the relay fee for its own size PLUS dust.
+        #
+        # MEASURED through the production builders: reservations of 546, 100_000,
+        # 1_000_000 and 1_900_000 photons were all accepted here and then produced NO
+        # refund at any fee, while ``pyrxd swap reserve`` printed "Reclaim at --expiry is
+        # GUARANTEED" on the consent screen and ``swap cancel`` — documented as the only
+        # hard revocation there is — failed the same way. Those funds were unreachable
+        # by any pyrxd path.
         raise ValidationError(
             f"reserved photons {photons} cannot fund its own refund: a refund spends this output "
             f"and must pay the relay floor for its own size and still leave a non-dust output, so "

@@ -38,7 +38,7 @@ From the CLI, `glyph init-metadata --type container-nft` writes that shape, and
 `glyph mint-nft` mints it:
 
 ```console
-$ pyrxd glyph init-metadata --type container-nft -o collection.json
+$ pyrxd glyph init-metadata --type container-nft --out collection.json
 $ pyrxd glyph mint-nft collection.json
 ```
 
