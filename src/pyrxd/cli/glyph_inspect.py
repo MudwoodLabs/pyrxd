@@ -457,6 +457,12 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                         out.append(f"{indent}    signer address: {att['signer_address']}")
                     out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
                     out.append(f"{indent}     the signed statement and a pasted script carries no context)")
+                elif att.get("outcome") == "unverifiable":
+                    # Withheld, not decided. Falling through silently would leave a
+                    # v2 record showing a signer and no word about its signature —
+                    # which reads as "fine" far more than it reads as "unchecked".
+                    out.append(f"{indent}  signature NOT CHECKED — {att.get('detail', 'no detail')}")
+                    out.append(f"{indent}    (the record is well-formed; this is not a verdict on it)")
                 elif att.get("outcome") == "invalid_signature":
                     # The bytes decoded; the CLAIM does not hold. Saying "malformed"
                     # here would send whoever is debugging it after the wrong problem.

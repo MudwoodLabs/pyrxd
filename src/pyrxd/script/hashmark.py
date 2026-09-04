@@ -320,6 +320,12 @@ class AttestationOutcome(Enum):
     #: v1 carries no signer, so there is nothing to attest. Not a failure — v1
     #: never claimed to say WHO, only WHEN.
     NOT_ATTESTED = "not_attested"
+    #: secp256k1 is not available here, so the signature could not be checked.
+    #: NOT a verdict on the record: it is well-formed and undecided. §6 separates
+    #: decoding from attestation for exactly this reason — "verifying a v2
+    #: signature additionally needs secp256k1 … which a decoder in a
+    #: dependency-free library will not have".
+    UNVERIFIABLE = "unverifiable"
 
 
 @dataclass(frozen=True)
@@ -382,8 +388,32 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     are a different statement.
     """
     from ..hash import hash160, hash256
-    from ..keys import recover_public_key
     from ..utils import text_digest
+
+    # secp256k1 lives behind `pyrxd.keys`, which imports `coincurve` at module top.
+    # The browser inspect page runs pyrxd under Pyodide and installs only micropip
+    # and pycryptodome, so this import RAISES there — and it used to raise straight
+    # out of this function, which meant a HashMark output did not classify AT ALL in
+    # the browser: the per-output try in `_inspect_core` caught it and the row
+    # degraded to `type=error`. Verified by blocking `coincurve` with a meta-path
+    # finder and calling `_inspect_script` on a real v2 record.
+    #
+    # §6 already says what should happen: "Decoding and attestation are SEPARATE
+    # steps with separate outcomes. Decoding needs only these bytes; verifying a v2
+    # signature additionally needs secp256k1 … which a decoder in a dependency-free
+    # library will not have. A record that decodes is well-formed, not yet believed."
+    #
+    # So a missing curve is UNVERIFIABLE — the digest, label and signer still reach
+    # the reader, and only the verdict is withheld, with the reason. Reporting
+    # INVALID_SIGNATURE here would be far worse: it would tell a reader a genuine
+    # mark's claim does not hold, on the strength of a missing dependency.
+    try:
+        from ..keys import recover_public_key
+    except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
+        )
 
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")

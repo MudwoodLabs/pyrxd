@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from enum import Enum
 
 NUMBER_BYTE_LENGTH: int = 32
@@ -587,6 +588,32 @@ MAX_SCRIPT_SIZE: int = 32_000_000
 # (Line numbers @ tag ``v3.1.2``, the pin in ``tests/vendor/radiant_core/MANIFEST.json``.)
 MAX_OPS_PER_SCRIPT: int = 32_000_000
 MAX_STACK_SIZE: int = 32_000_000
+
+# Genesis block hash per network — the chain's identity, and the value a HashMark
+# v2 signature commits to (the same bytes on another chain are a different signed
+# statement). Lives HERE, in the dependency-free bottom layer, rather than in
+# `network.registry`, because the offline inspect core needs it and importing
+# `pyrxd.network` drags in `electrumx` -> `script.type` -> `keys` -> `coincurve`.
+#
+# That is not hypothetical weight: the browser inspect page runs pyrxd under
+# Pyodide WITHOUT coincurve, so a network import there is a hard failure. Reaching
+# for the registry from the inspect core broke HashMark classification in the
+# browser entirely until this moved.
+GENESIS_BLOCK_HASHES: Mapping[str, str] = {
+    "mainnet": "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7a6f4e003fb4",
+    "testnet": "000000000d8ada264d16f87a590b2af320cd3c7e3f9be5482163e830fd00aca2",
+    "regtest": "7c1797514a165b0d99953a993a2a42081d6c0706026c36c06fc6fe728f93a5dd",
+}
+
+
+def genesis_hash_for(network: str) -> str | None:
+    """Expected genesis hash for *network*, or ``None`` for an unknown network.
+
+    ``None`` means "pyrxd cannot verify this binding", not "the binding is fine";
+    callers should treat it as a reason to be *more* explicit, not less.
+    """
+    return GENESIS_BLOCK_HASHES.get(str(network))
+
 
 # Below this an nLockTime is a block height; at or above it, a Unix timestamp.
 # Consumed by :mod:`pyrxd.script.timelock`, which used to spell it out again.
