@@ -445,10 +445,18 @@ def test_ft_inner_refused_everywhere() -> None:
         _inner_p2pkh_pkh(spk)  # …but the RXD-only gate refuses it
 
 
-def test_reservation_below_dust_refused() -> None:
-    """Audit F3: a sub-dust reservation would produce an unspendable covenant UTXO."""
+def test_reservation_too_small_to_fund_its_own_refund_is_refused() -> None:
+    """Audit F3: a reservation the maker could not later refund.
+
+    This asserted `match="below the dust floor"`, and the guard was sized to dust
+    alone — 546 photons — while a refund pays its fee out of the covenant value and
+    needs the relay floor for its own size PLUS dust. Everything from 546 up to
+    ~2,000,000 was accepted and then unrefundable at any fee, under a CLI screen
+    promising "Reclaim at --expiry is GUARANTEED". The message changed with the
+    guard; 100 photons is still refused, now for the reason that was always meant.
+    """
     maker, mk_pkh = _key()
-    with pytest.raises(ValidationError, match="below the dust floor"):
+    with pytest.raises(ValidationError, match="cannot fund its own refund"):
         prepare_covenant_offer(
             funding=[FundingInput(_rxd_src(mk_pkh, 10_000), 0, maker)],
             photons=100,  # < 546

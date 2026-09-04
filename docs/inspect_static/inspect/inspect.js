@@ -73,6 +73,11 @@ let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex) -> dict
 // CSP whitelists in ``connect-src``. Changing this also requires
 // updating the CSP meta-tag in index.html.
 const ELECTRUMX_WSS_URL = "wss://electrumx.radiant4people.com:50022";
+// MAINNET. glue.py's `_PAGE_NETWORK` is bound to this and passes it to the
+// classifier, because a HashMark v2 signature covers the chain's genesis hash —
+// the same bytes on another chain verify against a different key. Changing this
+// endpoint to another chain without changing `_PAGE_NETWORK` would make the page
+// report attestations against the wrong one.
 
 // Hard cap on a fetched transaction's hex length. Mirrors the cap
 // glue.py applies on the Python side (8 MB hex = 4 MB binary, the
@@ -855,6 +860,10 @@ function appendOpReturnPayload(dl, row) {
       if (hm.signer_hash160) {
         dl.appendChild(kv("signer", hm.signer_hash160));
         const att = hm.attestation || {};
+        // The recovered key in the form a person can compare against a wallet. Added
+        // to the payload with the signer-address work and rendered nowhere here, which
+        // the structural guard caught the moment the two branches met.
+        if (att.signer_address) dl.appendChild(kv("signer address", att.signer_address));
         if (att.outcome === "valid") {
           dl.appendChild(kvWithWarning(
             "signature",

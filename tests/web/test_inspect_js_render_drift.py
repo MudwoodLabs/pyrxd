@@ -1287,9 +1287,9 @@ class TestTheHomoglyphBannerReflectsTheReasonItWasGiven:
         """The honest-path half. Cyrillic С inside ASCII USD is the attack the
         banner exists for, and it must still shout."""
         warnings = tx_payloads["homoglyph-mixed"]["metadata"]["display_warnings"]
-        assert warnings["name"].startswith("mixed scripts"), warnings
+        assert "mimic Latin letters" in warnings["name"], warnings
         text = tx_rendered["homoglyph-mixed"]
-        assert "mixed scripts (possible homoglyph)" in text
+        assert "mimic Latin letters" in text, "the mimicry case must still shout"
         assert "may be imitating Latin ones" in text
 
     def test_an_honest_japanese_name_is_not_accused_of_mimicry(self, tx_payloads, tx_rendered):
@@ -1309,7 +1309,12 @@ class TestTheHomoglyphBannerReflectsTheReasonItWasGiven:
         this same field — the banner states the one it was handed rather than a
         sentence written from one example of it."""
         assert "name: non-Latin script" in tx_rendered["homoglyph-non-latin"]
-        assert "name: mixed scripts" in tx_rendered["homoglyph-mixed"]
+        # The mixed-script case is now reported by the TR39 SKELETON CHECK rather than
+        # by `_suspicious_reason`'s script-mixing heuristic. Both fire on it; the
+        # classifier's lands first and `glue.py` uses `setdefault`, so the more SPECIFIC
+        # reason wins — which is the intended precedence, and the point of wiring TR39
+        # at all. This assertion said "mixed scripts" until the two branches met.
+        assert "name: characters that mimic Latin letters" in tx_rendered["homoglyph-mixed"]
 
     def test_a_clean_name_gets_no_banner_at_all(self, tx_payloads, tx_rendered):
         """The other direction, and the one that keeps the banner worth reading."""

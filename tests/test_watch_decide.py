@@ -669,3 +669,88 @@ def test_eth_stale_btc_locked_record_with_an_observed_asset_lock_does_not_page_r
 def test_observations_rejects_a_negative_clock():
     with pytest.raises(ValidationError):
         Observations(maker_has_claimed_btc=False, now_rxd_height=10, now_unix_s=-1)
+
+
+class TestTheDepthVerdictAndTheGateUseONEConversion:
+    """`_required_btc_depth_blocks` and `assess_claim_finality` must not round apart.
+
+    The docstring said they were "identical to the coordinator's construction … so the
+    verdict and the gate's internal reserve cannot diverge (assess_claim_finality fails
+    closed on a mismatch)". They were two different roundings of one quantity:
+    `normalize_to` FLOORS, `_reserve_to_blocks` CEILS. At
+    `btc_claim_reorg_depth = Timelock(3700, SECONDS)` with `block_interval_s = 600` they
+    gave 6 and 7.
+
+    And the mismatch guard did not save it, because it only covers the WAIT path:
+
+    * at 5 confirmations the guard raises and an honest WATCH degrades to
+      PAGE_SQUEEZED "un-assessable" — a guard refusing valid work;
+    * at 6 the FINAL branch returns BEFORE the guard, so the tower pages PAGE_CLAIM and
+      arms `autonomous_asset_claim` one block shallower than the policy's own reserve.
+
+    Fixed by calling the gate's conversion rather than a second one, so they agree by
+    construction. CEIL is the safe direction for a reserve — flooring under-counts, and
+    under-counting is what armed the claim early.
+    """
+
+    INTERVAL = 600.0
+
+    def _policy(self, value: int, unit):
+        import dataclasses
+
+        from pyrxd.btc_wallet.taproot import Timelock
+        from pyrxd.gravity.swap_coordinator import MarginPolicy
+
+        return dataclasses.replace(
+            MarginPolicy.estimated(),
+            block_interval_s=self.INTERVAL,
+            btc_claim_reorg_depth=Timelock(value, unit),
+        )
+
+    @pytest.mark.parametrize("seconds", [3599, 3600, 3700, 4200, 7777])
+    def test_they_agree_on_a_SECONDS_tagged_reserve(self, seconds: int) -> None:
+        from pyrxd.btc_wallet.taproot import TimeUnit
+        from pyrxd.gravity.swap_coordinator import _reserve_to_blocks
+        from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
+
+        policy = self._policy(seconds, TimeUnit.SECONDS)
+        assert int(_required_btc_depth_blocks(policy)) == int(
+            _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
+        )
+
+    @pytest.mark.parametrize("blocks", [2, 3, 6, 12, 20])
+    def test_nothing_the_repo_actually_builds_changes(self, blocks: int) -> None:
+        """Every constructor here produces BLOCKS, where both conversions are the
+        identity. The fix must be a no-op across the shipped configuration space, or it
+        is a behaviour change smuggled in as a correctness fix."""
+        from pyrxd.btc_wallet.taproot import TimeUnit
+        from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
+
+        assert int(_required_btc_depth_blocks(self._policy(blocks, TimeUnit.BLOCKS))) == blocks
+
+    def test_the_divergent_case_really_did_diverge(self) -> None:
+        """Guards the fixture. If floor and ceil ever coincided at these parameters the
+        tests above would pass while proving nothing."""
+        from pyrxd.btc_wallet.taproot import TimeUnit
+
+        policy = self._policy(3700, TimeUnit.SECONDS)
+        floored = policy.btc_claim_reorg_depth.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        assert floored == 6, "the old FLOOR path"
+        from pyrxd.gravity.swap_coordinator import _reserve_to_blocks
+
+        assert _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s) == 7
+
+    def test_the_verdict_never_requires_LESS_depth_than_the_reserve(self) -> None:
+        """The property that matters, swept. Requiring less is what arms an autonomous
+        claim shallower than policy; the reverse only costs a wait."""
+        from pyrxd.btc_wallet.taproot import TimeUnit
+        from pyrxd.gravity.swap_coordinator import _reserve_to_blocks
+        from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
+
+        for seconds in range(3000, 5000, 37):
+            policy = self._policy(seconds, TimeUnit.SECONDS)
+            assert int(_required_btc_depth_blocks(policy)) >= int(
+                _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
+            ), seconds

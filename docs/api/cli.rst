@@ -25,7 +25,19 @@ Glyph tokens
 Cross-chain swaps
 -----------------
 
-All four commands below are **strictly read-only — none of them broadcasts**. They print
+.. warning::
+
+   **This page does not list every** ``pyrxd swap`` **command, and some of the ones it
+   omits DO broadcast and spend funds.** ``swap reserve``, ``post``, ``take``, ``cancel``
+   and ``refund`` each prompt for confirmation and then broadcast; ``swap orders`` reads
+   the on-chain book. Run ``pyrxd swap --help`` for the complete set — that is generated
+   from the code and cannot drift.
+
+   The read-only statement below is scoped to the four commands listed under it. It used
+   to open this section unqualified, on a page the top-level ``--help`` calls "the full
+   reference", which left a reader to conclude that ``pyrxd swap`` never broadcasts.
+
+The four commands below are **strictly read-only — none of them broadcasts**. They print
 facts and raw transaction hex; you inspect the result and broadcast it yourself, from your
 own node, at a fee you chose. That is deliberate: Radiant has neither RBF nor CPFP, so a
 time-critical claim or refund that fails to get mined cannot be bumped by any means, and a

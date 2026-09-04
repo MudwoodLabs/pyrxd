@@ -9,7 +9,8 @@ behavior — a potential gap.
 
 ```bash
 poetry install --with dev   # brings in cosmic-ray
-poetry run task mutate                    # default scope: spv (the original gate)
+poetry run task mutate                    # no argument: the default scope, spv
+poetry run task mutate spv                # spv/ — the original gate, named explicitly
 poetry run task mutate script             # script/ primitives
 poetry run task mutate transaction        # transaction/ incl. the FORKID sighash preimage
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
@@ -19,14 +20,26 @@ poetry run task mutate wallet             # wallet.py — the flat-key send/swee
 poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/sweep builders
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
 poetry run task mutate mint               # glyph/mint.py + transfer.py + client.py — mint/move facade
+poetry run task mutate glyphscript        # glyph/script.py + glyph/payload.py — envelope + locking scripts
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
+poetry run task mutate keys               # security/secrets + base58 + hd/bip32 + hd/descriptor + watch/cli_secrets
+poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg (11 modules)
+poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the eight value-moving groups
+poetry run task mutate value              # the twelve value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
+
+The runnable list above is the complete set. `VALUE_GROUPS` in
+[`scripts/mutation_test.sh`](../../scripts/mutation_test.sh) is the source of
+truth for it, and `tests/test_mutation_groups_are_wired.py` fails if this page
+falls behind it — which it did: `glyphscript`, `keys`, `ethleg` and
+`ethtimelock` were all absent while this page said "eight". `glyphscript` was
+the sharpest case: this page carries a whole "Baseline results — mint and
+glyphscript" section for a group its own runnable list did not mention.
 
 This runs [`scripts/mutation_test.sh`](../../scripts/mutation_test.sh). It mutates
 `src/pyrxd/<scope>/<file>.py` **in place** (the editable install picks it up), runs a scope-targeted
@@ -416,9 +429,20 @@ worth stating up front, because in each case the guard is load-bearing and its r
   failure: rejected for `min relay fee not met`, holding its inputs until mempool expiry — on a claim,
   against a deadline. The same file's line 149 appends the sighash flag with `to_bytes(1, "little")`
   and survives a width of 2, which would emit a scriptSig consensus rejects; nothing asserts the bytes.
-- **The cross-chain timelock ordering guard is not boundary-tested.** `swap_coordinator`'s
-  `assert_timelock_margin` line 510, `if btc_blocks <= rxd_blocks`, survives rewriting, as does the
-  margin comparison on line 514. The equal-timelock case is exactly the unsafe one.
+- **The cross-chain timelock ordering guard is not boundary-tested.** In
+  `swap_coordinator.assert_timelock_margin`, the ordering comparison survives rewriting, as does the
+  margin comparison below it. The equal-timelock case is exactly the unsafe one.
+
+  > **The 2026-08 run quoted the PRE-#482 source, and that quote is not repeated here.** At the time
+  > this line read `if btc_blocks <= rxd_blocks` — the *wrong* direction, which #482 identified as a
+  > deterministic maker-theft path and inverted. The current source reads
+  > `if rxd_blocks <= btc_blocks`, and #567 replaced the margin comparison underneath it with a
+  > wall-clock one (`maker_refund_opens_s < taker_refund_opens_s + margin_s`) because the two legs
+  > count different chains' blocks. Re-run `task mutate coordinator` before triaging either against
+  > today's tree; the same caveat is on
+  > [`docs/reference/mutation-survivors/coordinator.md`](../reference/mutation-survivors/coordinator.md),
+  > whose rows are a 2026-08-12 snapshot. An unmarked quote of the superseded ordering is how the
+  > unsafe direction re-acquires authority, which is the whole reason #482 was a security release.
 - **Validation loops can be made to iterate zero times.** `ZeroIterationForLoop` survives on
   `swap_coordinator`'s `__post_init__` and `taker_refund_window_open` parameter-validation loops —
   every guard inside them is unexercised. `accept_flat_burial: bool = False` also survives flipping to

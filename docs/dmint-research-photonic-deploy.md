@@ -435,7 +435,7 @@ The plan §4 (Acceptance Criteria) already lists the three-tier gate
 
 ### From pyrxd M1 work (this branch's parent `feat/dmint-v1-mint`)
 
-- `src/pyrxd/glyph/dmint.py` — `build_dmint_v1_contract_script`, `build_dmint_v1_state_script`, `build_dmint_v1_code_script`, `is_token_bearing_script`, `find_dmint_funding_utxo`. **All reused as-is by M2.**
+- `src/pyrxd/glyph/dmint/` — `build_dmint_v1_contract_script`, `build_dmint_v1_state_script`, `build_dmint_v1_code_script` (now in `builders.py`), `is_token_bearing_script`, `find_dmint_funding_utxo` (now in `chain.py`). **All reused as-is by M2.** (Written when this was one `dmint.py` module.)
 - `docs/dmint-research-mainnet.md` §2–§5 — original V1 contract decode.
 - `docs/dmint-research-photonic.md` — original Photonic source citations from M1.
 - `docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md` — institutional lesson #1.

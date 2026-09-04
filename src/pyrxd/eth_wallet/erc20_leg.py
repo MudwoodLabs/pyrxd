@@ -565,9 +565,16 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         #468. Putting it in front of the dangerous action makes it unskippable rather than
         merely available.
 
-        The contract address is checked alongside both parties, because that is the freeze with
-        no way out: measured on a mainnet fork, freezing the HTLC makes ``claim`` AND ``refund``
-        revert permanently, so no timeout rescues it.
+        The addresses checked here are the HTLC CONTRACT and the CLAIMANT — not the refundee. The
+        contract is the freeze with no way out: measured on a mainnet fork, freezing the HTLC makes
+        ``claim`` AND ``refund`` revert permanently, so no timeout rescues it. The refundee is
+        deliberately absent, because a ``claim`` sweeps to the claimant and never touches it; see
+        the reasoning at the call site below, and :func:`assert_not_frozen_before_funding`, the
+        pre-FUND gate that is where a frozen refundee actually matters.
+
+        Until 2026-09-03 this read "checked alongside both parties", describing round 4's list
+        rather than round 5's — which removed the refundee precisely because refusing on it was a
+        guard refusing valid work and handed the counterparty a free unilateral veto.
 
         The claim itself is the parent's, unchanged — this adds a precondition, not a different
         settlement path.
