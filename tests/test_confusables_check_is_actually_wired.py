@@ -223,3 +223,61 @@ class TestTheSoulboundVERDICTIsPreciseOnBothSurfaces:
         )
         assert "non-transferable at consensus" in text
         assert "does NOT verify" in text, "the bare verdict must not travel alone on this path"
+
+
+class TestTheDmintCapIsNotCalledTheTokensSupply:
+    """`max_height * reward` is ONE CONTRACT's cap, not a token's supply.
+
+    The CLI labelled it "total supply" flat, with the "if all mints succeed" hedge
+    living only in a code comment. A real dMint token commonly deploys N parallel
+    contracts against one `token_ref`, so its supply is the sum across them — and
+    the browser tool computes `reward × max_height × N` for the same token. Two
+    surfaces of one tool answered "what is this token's supply" with figures
+    differing by the parallel-contract count, and the CLI's carried no qualifier.
+
+    This renderer is handed one contract script and can never see the others, so
+    naming the quantity is the fix rather than trying to compute a total it has no
+    way to know.
+    """
+
+    @staticmethod
+    def _card(max_height: int = 21_000, reward: int = 50_000) -> str:
+        from pyrxd.cli.glyph_inspect import _render_script_human
+
+        return _render_script_human(
+            {
+                "type": "dmint",
+                "length": 200,
+                "contract_ref_outpoint": "ab" * 32 + ":0",
+                "token_ref_outpoint": "cd" * 32 + ":0",
+                "height": 0,
+                "max_height": max_height,
+                "reward": reward,
+                "algo": "sha256d",
+                "daa_mode": "LWMA",
+                "target": "00" * 32,
+            }
+        )
+
+    def test_it_is_not_called_the_tokens_total_supply(self) -> None:
+        assert "total supply" not in self._card()
+
+    def test_it_names_the_quantity_as_per_contract(self) -> None:
+        text = self._card()
+        assert "this contract's cap" in text
+        assert "THIS contract only" in text
+
+    def test_the_if_all_mints_succeed_hedge_is_RENDERED_not_just_commented(self) -> None:
+        """It was in the source and nowhere a reader could see it."""
+        assert "IF every mint succeeds" in self._card()
+
+    def test_the_parallel_contract_case_is_stated(self) -> None:
+        """Without it a reader has no way to know the figure is a lower bound for
+        the token — which is precisely how the two surfaces came to disagree."""
+        assert "sum across them" in self._card()
+
+    def test_the_arithmetic_is_still_shown_and_correct(self) -> None:
+        """Correcting a label must not lose the number. It is right for the one
+        contract, which is the whole point."""
+        text = self._card(max_height=1_000, reward=7)
+        assert "7,000 photons" in text and "1,000 mints x 7" in text
