@@ -1,7 +1,7 @@
 # External miner protocol: JSON-over-stdio subprocess contract
 
 **Why this page exists:** pyrxd ships a pure-Python reference miner
-([`mine_solution`](../../src/pyrxd/glyph/dmint/__init__.py)) so the library is
+([`mine_solution`](../../src/pyrxd/glyph/dmint/miner.py)) so the library is
 self-contained and the verifier path is the same as the mining path —
 no silent divergence between "what the miner accepts" and "what
 on-chain validation enforces." That correctness comes at a cost: a
@@ -13,7 +13,7 @@ is in wall clock depends on the machine; measure it with `pyrxd glyph
 dmint-estimate` rather than assuming a rate. Anyone wanting to mine V1 dMint contracts in
 production wants a faster miner — a parallel Python worker pool, a C
 binary, a WebGPU shader. The shim that bridges pyrxd to those is
-[`mine_solution_external`](../../src/pyrxd/glyph/dmint/__init__.py): it spawns
+[`mine_solution_external`](../../src/pyrxd/glyph/dmint/miner.py): it spawns
 a caller-supplied binary, hands it the search problem over JSON, and
 **re-verifies the returned nonce locally** before letting it touch a
 transaction. This page documents that wire protocol so you can wire
@@ -26,7 +26,7 @@ in your own miner.
 Two entry points:
 
 1. **Direct API.** Pass an `argv` list to
-   [`mine_solution_external`](../../src/pyrxd/glyph/dmint/__init__.py):
+   [`mine_solution_external`](../../src/pyrxd/glyph/dmint/miner.py):
 
    ```python
    from pyrxd.glyph.dmint import mine_solution_external, build_pow_preimage
@@ -52,7 +52,7 @@ Two entry points:
      reference miner.
    - `EXTERNAL_MINER_TIMEOUT_S` — hard timeout in seconds (default
      `600.0`, defined as `EXTERNAL_MINER_TIMEOUT_S` at
-     [`src/pyrxd/glyph/dmint.py:877`](../../src/pyrxd/glyph/dmint/__init__.py)).
+     [`src/pyrxd/glyph/dmint/miner.py`](../../src/pyrxd/glyph/dmint/miner.py)).
      On timeout the subprocess is killed and `MaxAttemptsError` is
      raised.
 
@@ -84,7 +84,7 @@ exits.
 | `nonce_width`  | int    | yes      | `4` for V1 contracts, `8` for V2                   |
 
 The exact request shape lives in
-[`src/pyrxd/glyph/dmint.py:951-957`](../../src/pyrxd/glyph/dmint/__init__.py):
+[`mine_solution_external`](../../src/pyrxd/glyph/dmint/miner.py):
 
 ```python
 request = json.dumps({
@@ -112,7 +112,7 @@ pyrxd then checks:
   `nonce_width` bytes long.
 
 If any of those fail, pyrxd raises `ValidationError`. See
-[`src/pyrxd/glyph/dmint.py:988-1016`](../../src/pyrxd/glyph/dmint/__init__.py)
+[the stdout-decoding block of `mine_solution_external`](../../src/pyrxd/glyph/dmint/miner.py)
 for the exact decoding path.
 
 ### Exit codes
@@ -132,12 +132,19 @@ parent timeout fires, or exit non-zero (which surfaces as
 
 ### Stderr
 
-Discarded. pyrxd attaches `stderr=subprocess.DEVNULL` so a misbehaving
+**Not a result channel, under either mode.** With no `progress` callback —
+the default — pyrxd attaches `stderr=subprocess.DEVNULL` so a misbehaving
 miner cannot OOM the parent by flooding stderr (see the comment at
-[`src/pyrxd/glyph/dmint.py:967-971`](../../src/pyrxd/glyph/dmint/__init__.py)).
-Loss of debug output is the price; if you need to see what your miner
-is doing, run it standalone with the same JSON request and watch
-stderr there.
+[the `subprocess.run` call in `mine_solution_external`](../../src/pyrxd/glyph/dmint/miner.py)).
+If you need to see what your miner is doing on that path, run it standalone
+with the same JSON request and watch stderr there.
+
+Pass a `progress` callback and stderr is *read* instead of discarded: a
+background thread (`_ExternalMinerProgressReader`) parses progress frames
+off it while the miner runs. The bounded-memory guarantee is preserved by
+construction — only the single most recently parsed frame is retained, and
+one physical line is capped — so a flood still cannot grow the parent. Either
+way, stdout remains the only channel a result may arrive on.
 
 ---
 
@@ -145,7 +152,7 @@ stderr there.
 
 The 64 bytes pyrxd hands the miner are the **canonical V1 mint
 preimage** built by
-[`build_pow_preimage`](../../src/pyrxd/glyph/dmint/__init__.py): a fixed-layout
+[`build_pow_preimage`](../../src/pyrxd/glyph/dmint/miner.py): a fixed-layout
 concatenation of the contract's previous txid, the contract ref, the
 miner's input script hash, and the miner's output script hash. The
 exact byte layout is pinned in
@@ -162,7 +169,7 @@ full[0:4] == b'\x00\x00\x00\x00'  AND  int.from_bytes(full[4:12], 'big') < targe
 ```
 
 This is the exact check `verify_sha256d_solution` performs at
-[`src/pyrxd/glyph/dmint.py:711`](../../src/pyrxd/glyph/dmint/__init__.py),
+[`verify_sha256d_solution`](../../src/pyrxd/glyph/dmint/miner.py),
 which `mine_solution_external` calls against every returned nonce
 before declaring success. A nonce that fails this check raises
 `ValidationError` regardless of what the miner claims, which is the
@@ -263,39 +270,59 @@ contract documented above will continue to work without change.
 Those throughput figures are one dated machine, not a spec. Benchmark
 yours with `pyrxd glyph dmint-estimate`.
 
-## No progress frames (yet)
+## Optional progress frames
 
-The protocol is strictly request → response: the miner is silent until
-it finds a nonce, exhausts the space, or errors. There is no frame for
-"I have tried N nonces so far", so `pyrxd glyph claim-dmint` shows no
-live hash rate or ETA when driving an external `--miner-cmd` — it says
-so and points at `dmint-estimate` for the up-front numbers instead.
+This section previously said the protocol had none. It does: a miner MAY
+write progress lines to **stderr** while it searches, one JSON object per
+line —
 
-The in-process miners (the bundled parallel miner, which is the CLI
-default, and `mine_solution`) do stream progress; they need no wire
-format to do it. Adding progress frames here would be a protocol change
-affecting every third-party miner, so it is deliberately left as a
-follow-up rather than bundled with the estimator.
+```json
+{"progress": {"attempts": 4200000, "elapsed_s": 1.7}}
+```
+
+— and pyrxd forwards each valid frame to the `progress` callback of
+`mine_solution_external`. `pyrxd glyph claim-dmint` passes one, so an
+external `--miner-cmd` that emits frames drives the same live hash-rate
+and ETA display the in-process miners do. The wire format is specified in
+[Parallel mining](parallel-mining.md).
+
+**Emitting them is optional, and silence is valid.** A miner that has
+never heard of progress frames writes nothing extra to stderr and works
+exactly as before — the CLI says as much and points at
+`pyrxd glyph dmint-estimate` for up-front numbers. Parsing is
+best-effort and deliberately outside the trust boundary:
+`_parse_external_progress_frame` returns `None` for anything that is not
+exactly that shape with in-range values, never raises, and structurally
+cannot return anything nonce-shaped. A malformed or adversarial stderr
+line cannot abort an otherwise-successful grind, and it never reaches the
+result-verification path.
+
+stdout remains the sole result channel: the request → response contract
+above is unchanged.
 
 ---
 
 ## Footguns the library guards against
 
 1. **A buggy miner returning a nonce that doesn't satisfy the
-   target.** Local re-verification (line 1019) calls the same
+   target.** Local re-verification calls the same
    `verify_sha256d_solution` the validator uses; a wrong nonce
    raises `ValidationError` rather than getting embedded in a tx the
    network would reject.
 2. **A miner of wrong width.** A 4-byte miner answering an 8-byte
-   request (or vice versa) is caught by the explicit length check
-   at line 1013 — `ValidationError` with both widths in the
+   request (or vice versa) is caught by an explicit length check
+   before verification — `ValidationError` with both widths in the
    message.
-3. **A miner flooding stdout.** Capped at 4096 bytes (line 997); the
+3. **A miner flooding stdout.** Capped at 4096 bytes
+   (`_EXTERNAL_MINER_MAX_STDOUT_BYTES`); the
    `subprocess.PIPE` buffer would otherwise fill, blocking the
    miner, and silently producing a timeout instead of a usable
    error.
-4. **A miner flooding stderr.** Routed to `/dev/null` (line 976) so
-   gigabyte-per-second stderr cannot OOM the parent.
+4. **A miner flooding stderr.** Routed to `/dev/null` when no
+   `progress` callback is given, so gigabyte-per-second stderr cannot
+   OOM the parent. With a callback the stream is read instead, under a
+   4096-byte-per-line cap and retaining only the most recent frame — the
+   same flat-memory bound by a different route.
 5. **NaN / Inf / negative `elapsed_s`.** `json.loads` accepts those
    constants by default; pyrxd checks `math.isfinite` and discards
    any miner-supplied metric that fails. Same for `attempts > 2**40`,
@@ -308,5 +335,5 @@ follow-up rather than bundled with the estimator.
    network. Mitigations: invoke with an absolute path, verify
    checksums against the upstream release, run in a controlled
    environment. See the supply-chain warning in the
-   [`mine_solution_external` docstring](../../src/pyrxd/glyph/dmint/__init__.py)
+   [`mine_solution_external` docstring](../../src/pyrxd/glyph/dmint/miner.py)
    for the full discussion.

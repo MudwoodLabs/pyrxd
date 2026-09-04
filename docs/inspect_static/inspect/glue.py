@@ -138,7 +138,7 @@ def run(raw_input: str) -> dict:
         elif form == "outpoint":
             payload = _inspect.inspect_outpoint(value)
         elif form == "script":
-            payload = _inspect.inspect_script(value)
+            payload = _inspect.inspect_script(value, network=_PAGE_NETWORK)
         else:
             return _err(f"internal: unknown form {form!r}", form="error")
     except Exception as exc:
@@ -226,7 +226,7 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
     try:
-        payload = _inspect.classify_raw_tx(txid, raw)
+        payload = _inspect.classify_raw_tx(txid, raw, network=_PAGE_NETWORK)
     except Exception as exc:
         return _err(
             _safe_error(exc),
@@ -384,6 +384,16 @@ def _hint_for(form: str) -> str:
     }.get(form, "")
 
 
+# The page talks to ONE hard-coded mainnet ElectrumX endpoint
+# (``ELECTRUMX_WSS_URL`` in inspect.js), so mainnet is the chain every result here
+# was actually read from. Passed EXPLICITLY rather than left to the default,
+# because a HashMark v2 signature covers the chain's genesis hash: the same bytes
+# on another chain are a different statement and verify against a different key.
+# If this page ever gains a network selector, this constant is what has to move
+# with it, and an explicit argument is what makes that findable.
+_PAGE_NETWORK = "mainnet"
+
+
 def _err(message: str, *, form: str, hint: str = "") -> dict:
     """Build a structured error result. ``message`` and ``hint`` are passed
     through the sanitizer so a hostile parser exception text can't leak
@@ -438,6 +448,19 @@ _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
         "payload_hash",
         "wire_hex",
         "input",
+        # The script bytes themselves. They were chopped to 200 hex chars while
+        # inspect.js told the reader the opposite — "the JSON drawer carries the
+        # full bytes" — so the drawer, and the Copy JSON button, silently held a
+        # prefix. The card printed the true byte count beside it, showing
+        # "length: 258 bytes" above 100 bytes of hex.
+        #
+        # Newly material rather than merely untidy: `data_hex` is now the only
+        # place a HashMark or `msg` record's raw bytes appear, and it is what the
+        # UI points at ("not valid UTF-8 — see data_hex"). The row stays scannable
+        # because inspect.js truncates for DISPLAY at 64 chars on its own; that is
+        # the right layer for it, since only the display needs to be short.
+        "hex",
+        "data_hex",
         # dMint mint-claim scriptSig pushes — exact bytes are load-bearing
         # for verifying a covenant push against an off-chain re-derivation.
         "nonce_hex",

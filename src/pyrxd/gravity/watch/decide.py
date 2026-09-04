@@ -204,15 +204,48 @@ def _value_at_risk_photons(terms: NegotiatedTerms) -> PhotonValue | None:
 
 
 def _required_btc_depth_blocks(policy: MarginPolicy) -> BlockSpan:
-    """The reorg depth the FINAL verdict requires, in blocks — identical to the
-    coordinator's construction (swap_coordinator.py:1258-1260), so the verdict and
-    the gate's internal reserve cannot diverge (assess_claim_finality fails closed
-    on a mismatch)."""
-    # normalize_to(BLOCKS) is what makes this a BlockSpan rather than seconds; the tag records
-    # that the conversion happened, so a raw SECONDS timelock cannot reach a blocks slot.
-    return BlockSpan(
-        policy.btc_claim_reorg_depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-    )
+    """The reorg depth the FINAL verdict requires, in blocks.
+
+    THE SAME NUMBER AS THE GATE'S OWN RESERVE ONLY WHILE ``btc_claim_reorg_depth`` IS
+    BLOCKS-TAGGED, which is what every constructor in this repo produces (``measured_policy``
+    and ``watch/run.py`` both build a ``TimeUnit.BLOCKS`` Timelock, as does the field default).
+    On a BLOCKS value both conversions are the identity and the two agree.
+
+    THE DOCSTRING HERE CLAIMED MORE THAN THAT — "identical to the coordinator's construction
+    (swap_coordinator.py:1258-1260), so the verdict and the gate's internal reserve cannot
+    diverge". Both halves are wrong. The line reference has drifted onto an unrelated comment
+    about the seen-store; the construction lives in ``assess_claim_finality`` as
+    ``_reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)``. And the two
+    are NOT the same conversion: ``_reserve_to_blocks`` CEILS a seconds-tagged reserve (flooring
+    under-counts a reserve — the unsafe direction), while ``normalize_to`` FLOORS. Measured at
+    ``btc_claim_reorg_depth = Timelock(3700, SECONDS)`` with ``block_interval_s = 600``: this
+    function returns 6 and the gate computes 7, and the divergence lands in BOTH directions —
+
+      * 5 confirmations: the mismatch guard in ``assess_claim_finality`` raises, ``decide``
+        catches it, and an honest WATCH is degraded to PAGE_SQUEEZED "un-assessable";
+      * 6 confirmations: the FINAL branch returns BEFORE that guard is reached, so the tower
+        pages PAGE_CLAIM and arms ``autonomous_asset_claim`` one block shallower than the
+        policy's own reserve requires.
+
+    So the mismatch guard did not make them agree; it fired only on the WAIT path.
+
+    FIXED by using the gate's own conversion here rather than a second one. The two now
+    agree by construction instead of by coincidence, which is what the original sentence
+    claimed. Measured: identical for every BLOCKS-tagged value — everything this repo
+    constructs — so no shipped configuration changes behaviour.
+    """
+    # ONE CONVERSION, the gate's. `_reserve_to_blocks` is what `assess_claim_finality`
+    # uses, so calling it here is what makes "cannot diverge" true instead of merely
+    # intended — the divergence above is not a documentation problem, it is two
+    # roundings of one quantity.
+    #
+    # It CEILS, and that is the safe direction for a reserve: flooring under-counts,
+    # which is what armed the autonomous claim a block shallow. Identity-preserving
+    # for every BLOCKS-tagged value, which is everything this repo constructs, so
+    # nothing in the shipped configuration space changes.
+    from ..swap_coordinator import _reserve_to_blocks
+
+    return BlockSpan(_reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s))
 
 
 def _refund_opens_at(policy: MarginPolicy, terms: NegotiatedTerms, asset_locked_at_height: ChainHeight) -> ChainHeight:
