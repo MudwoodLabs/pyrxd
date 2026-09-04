@@ -680,15 +680,38 @@ function renderFetchedTxCard(payload) {
   }
 
   // Reveal metadata (if present).
+  //
+  // WHICH GLYPH THIS IS (#577). A multi-glyph reveal carries one payload per
+  // minted glyph. The Python reports the FIRST decodable one as `metadata`,
+  // stamps `of_n_payloads` on it when there is more than one, and lists every
+  // payload-carrying input in `metadata_inputs` — and this card read neither.
+  // Under a bare "Reveal metadata" heading, one name, ticker, description and
+  // media therefore read as a description of the whole transaction. The
+  // classifier's own note records an observed mainnet reveal minting 35 refs
+  // from 36 inputs, so 34 of those refs were being shown another token's
+  // identity. The CLI was fixed (`_render_txid_human`); this page was not.
   const metadata = payload.metadata;
+  const metadataInputs = Array.isArray(payload.metadata_inputs) ? payload.metadata_inputs : [];
   if (metadata) {
-    wrapper.appendChild(el("h3", { class: "result-subhead", text: "Reveal metadata" }));
+    const ofN = metadata.of_n_payloads;
+    wrapper.appendChild(el("h3", {
+      class: "result-subhead",
+      text: ofN
+        ? `Reveal metadata (from input ${metadata.input_index} — 1 of ${ofN} glyphs minted here)`
+        : `Reveal metadata (from input ${metadata.input_index})`,
+    }));
     const mdl = el("dl", { class: "kv-list" });
     const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
     if (Array.isArray(metadata.protocol) && metadata.protocol.length > 0) {
       mdl.appendChild(kvWithWarning("protocol", metadata.protocol.join(", "), warnings.protocol));
     }
+    // The classifier's own highest-specificity label ("wave", "container",
+    // "timelock", …). It is drawn from a fixed internal vocabulary, computed
+    // from the real GlyphMetadata — and it was the one field on this block that
+    // states what the token IS, dropped while the raw protocol integers beside
+    // it were shown.
+    if (metadata.classification) mdl.appendChild(kv("classification", metadata.classification));
     if (metadata.name) mdl.appendChild(kvWithWarning("name", metadata.name, warnings.name));
     if (metadata.ticker) mdl.appendChild(kvWithWarning("ticker", metadata.ticker, warnings.ticker));
     if (metadata.description) mdl.appendChild(kvWithWarning("description", metadata.description, warnings.description));
@@ -696,27 +719,90 @@ function renderFetchedTxCard(payload) {
       mdl.appendChild(kv("decimals", metadata.decimals));
     }
     if (metadata.main) mdl.appendChild(kv("main", metadata.main));
+    // TIMELOCK: WHEN it opens (#556). The page already carried a banner saying a
+    // TIMELOCK marker means "the reveal is subject to a time-based condition",
+    // and then showed nothing about what the condition IS — the decoded spec was
+    // in the payload and rendered nowhere.
+    //
+    // NO UNLOCKED/LOCKED VERDICT, deliberately, and for the reason the Python
+    // and the CLI both give: deciding it needs a chain tip for mode="block" or a
+    // timestamp for mode="time", and this renderer is handed a payload, not a
+    // node. A verdict off the browser's wall clock would be a guess wearing the
+    // clothes of a fact, and for mode="block" it would be meaningless.
+    if (metadata.timelock) {
+      const tl = metadata.timelock;
+      mdl.appendChild(kv("timelock", `opens at ${tl.unlock_at} (${tl.mode})`));
+      if (tl.hint) mdl.appendChild(kv("timelock hint", tl.hint));
+      mdl.appendChild(kv("timelock cek commitment", tl.cek_hash));
+    }
     wrapper.appendChild(mdl);
+    if (metadata.timelock) {
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: "Whether that timelock has opened is not decided here — it needs " +
+              "the chain tip for a block-mode lock, or the current time for a " +
+              "time-mode one. Pass this token's metadata and your chain tip to " +
+              "pyrxd.is_unlocked / pyrxd.get_unlock_remaining.",
+      }));
+    }
 
-    // Top-level warning banner if any field tripped a homoglyph flag.
-    // The Python side sets metadata.display_warnings as a {field: reason}
-    // dict; we surface it visibly so a user reading "USDC" can tell at a
-    // glance whether the string is what it looks like. Two reason
-    // shapes today: "mixed scripts" (per-character substitution like
-    // Latin "USDC" with Cyrillic "С") and "non-Latin script"
-    // (whole-word substitution like Cyrillic "ВТС" mimicking Latin
-    // "BTC"). Both warrant a banner; the body text covers both shapes.
+    // Top-level warning banner if any field tripped a display flag.
+    //
+    // THE BANNER STATES THE REASON IT WAS GIVEN, it does not invent one. It
+    // used to assert that the metadata "contains characters that visually mimic
+    // Latin letters" for every entry in `display_warnings` — but one of the
+    // producing branches (`glue.py` `_suspicious_reason`) is a pure category
+    // test: every Letter is non-Latin, therefore flag. No confusability check
+    // runs there at all, so a token honestly named in Japanese, Chinese or
+    // Arabic was told the whole page it was imitating Latin. A warning that
+    // fires on every non-Latin name is the false positive that teaches a reader
+    // to skip the real one.
+    //
+    // Three reason strings reach this field today — "mixed scripts (possible
+    // homoglyph)" and "non-Latin script (…)" from `_suspicious_reason`, and the
+    // TR39 skeleton check's "characters that mimic Latin letters (…)" — and
+    // they do not all mean the same thing. Rendering the reason keeps the
+    // banner correct as that set changes, which a hardcoded sentence cannot.
     if (Object.keys(warnings).length > 0) {
+      const reasons = Object.keys(warnings)
+        .sort()
+        .map((field) => `${field}: ${warnings[field]}`)
+        .join("; ");
       const banner = el("p", { class: "warning-banner" });
       banner.textContent =
-        "⚠ This token's metadata contains characters that visually mimic " +
-        "Latin letters. Treat the displayed name, ticker, description, " +
-        "and protocol fields with care — they may use letters from a " +
-        "different alphabet (e.g. Cyrillic 'а' looks identical to Latin " +
-        "'a'). The only reliable identifier for this token is the txid " +
-        "above; verify by txid, not by visual name.";
+        "⚠ The displayed text on this token was flagged — " + reasons + ". " +
+        "A reason naming mixed scripts or mimicry means characters from " +
+        "another alphabet may be imitating Latin ones (Cyrillic 'а' is not " +
+        "Latin 'a'). A reason naming a non-Latin script means only that the " +
+        "text is not written in Latin at all, which is ordinary for a name in " +
+        "Japanese, Chinese or Arabic and is not by itself evidence of a spoof. " +
+        "Either way, the only reliable identifier for this token is the txid " +
+        "above — verify by txid, not by visual name.";
       wrapper.appendChild(banner);
     }
+  }
+
+  // The OTHER glyphs in a multi-glyph reveal. Rendered outside the `metadata`
+  // block, exactly as the CLI computes it: the headline payload is one entry in
+  // `metadata_inputs`, and the rest of that list is the part a reader has no
+  // other way to learn about. `kv` assigns to textContent, so a hostile token
+  // name here cannot become markup.
+  const headlineIndex = metadata ? metadata.input_index : undefined;
+  const otherGlyphs = metadataInputs.filter((row) => row.input_index !== headlineIndex);
+  if (otherGlyphs.length > 0) {
+    wrapper.appendChild(el("h3", {
+      class: "result-subhead",
+      text: `Other glyphs minted in this transaction (${otherGlyphs.length})`,
+    }));
+    const odl = el("dl", { class: "kv-list" });
+    for (const row of otherGlyphs) {
+      // Name AND ticker, not whichever is truthy first: a glyph carrying both
+      // and shown one of them is the same "you were told about a different
+      // token" failure one level down.
+      const label = [row.name, row.ticker].filter(Boolean).join(" / ") || "(unnamed)";
+      odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}`));
+    }
+    wrapper.appendChild(odl);
   }
 
   return wrapper;
@@ -966,20 +1052,32 @@ function _detectTxShape(payload) {
   const dmintOutput = outputs.find((o) => String(o.type).toLowerCase() === "dmint");
 
   // Burn — the explicit Glyph protocol marker (GlyphProtocol.BURN = 6)
-  // appearing in the reveal-metadata's protocol list. A burn tx
-  // consumes an FT/NFT input and signals "this token / NFT is
-  // permanently destroyed" via the reveal CBOR. The tx may have no
-  // ref-bearing outputs at all, or may have ones marked as burn-tagged.
-  // We rely on the explicit marker rather than absence-of-outputs
-  // because plain RXD sends also lack ref outputs.
+  // appearing in the reveal-metadata's protocol list.
+  //
+  // THE TRIGGER IS A CBOR FLAG AND NOTHING ELSE, so the banner may not claim an
+  // on-chain outcome. It used to say the tokens "are removed from circulation"
+  // and that "subsequent transfers cannot reference the burned ref" — two
+  // consensus-level assertions derived from one operator-supplied integer in
+  // the reveal envelope. Nothing here reads the outputs, and nothing could:
+  // `GlyphMetadata` has no field naming WHICH ref is burned (glyph/types.py),
+  // so "the burned ref" is not something this payload identifies. A tx can
+  // carry protocol 6 and still hand every ref straight back out to an ordinary
+  // FT output; the marker does not stop it.
+  //
+  // The sibling markers below already state this correctly ("the marker is
+  // purely a CBOR metadata flag", "not enforced by script"). BURN was the one
+  // branch that dropped the caveat, and it was the branch making the largest
+  // claim.
   const protocol = ((payload.metadata || {}).protocol || []).map(String);
   if (protocol.includes("6") || protocol.some((p) => p.endsWith("BURN"))) {
     return (
-      "This is a Glyph burn transaction — the deployer/holder signalled " +
-      "that an FT or NFT is permanently destroyed. Tokens consumed by " +
-      "this transaction are removed from circulation; subsequent " +
-      "transfers cannot reference the burned ref. The reveal metadata " +
-      "carries the BURN protocol marker (= 6)."
+      "This transaction carries the Glyph BURN marker (protocol = 6) — the " +
+      "deployer/holder DECLARED that an FT or NFT is destroyed. The marker is " +
+      "purely a CBOR metadata flag: nothing in the locking scripts and nothing " +
+      "in Radiant consensus enforces it, and the envelope does not name which " +
+      "ref is burned. This tool does not verify that any token stopped " +
+      "circulating — read the output rows below for what the scripts in this " +
+      "transaction actually do."
     );
   }
 
@@ -1125,19 +1223,55 @@ function _detectTxShape(payload) {
   // inputs. The contract_ref + token_ref point to the deploy outpoint
   // either way.
   if (dmintOutput) {
-    const dmintCount = counts["dmint"] || 0;
+    // THE ROWS, not just a count of them. This branch used to assert from
+    // `counts["dmint"]` alone that N contracts were "all sharing the same
+    // token_ref" and that "total supply is reward × max_height × N" — claims
+    // about three fields it never compared, while every dmint row carries all
+    // three (_inspect_core's dmint classification emits token_ref_outpoint,
+    // reward and max_height). N rows of type dmint is not N contracts of ONE
+    // token: a transaction may carry dmint outputs for unrelated tokens, or for
+    // one token on different terms, and the banner called it a parallel deploy
+    // of a single token either way.
+    const dmintRows = outputs.filter((o) => String(o.type).toLowerCase() === "dmint");
+    const dmintCount = dmintRows.length;
+    // `undefined === undefined` is true, so a field absent from every row would
+    // "agree" vacuously and the check would pass by having nothing to compare.
+    // Require it present before believing it matches.
+    const agreesOn = (field) =>
+      dmintRows.every(
+        (o) => o[field] !== undefined && o[field] !== null && o[field] === dmintRows[0][field],
+      );
     if (dmintOutput.height === 0 || dmintOutput.height === "0") {
       // V1 deploy reveal: typically ships N parallel contracts in one
       // tx (mainnet GLYPH had 32). One-contract deploys are also valid;
       // distinguish in the banner so callers don't confuse a multi-
       // contract V1 deploy with a V2 single-contract deploy.
-      const parallel =
-        dmintCount > 1
-          ? `${dmintCount} parallel dMint contract UTXOs, all sharing the ` +
-            `same token_ref. Each contract can be mined from independently, ` +
-            `so claims race in parallel — total supply is reward × ` +
-            `max_height × ${dmintCount}. `
-          : `a single dMint contract UTXO. `;
+      let parallel;
+      if (dmintCount > 1) {
+        const oneToken = agreesOn("token_ref_outpoint");
+        const sameTerms = agreesOn("reward") && agreesOn("max_height");
+        parallel = `${dmintCount} dMint contract UTXOs. `;
+        if (!oneToken) {
+          parallel +=
+            `They do NOT all carry the same token_ref, so this is not one ` +
+            `token deployed in parallel — check the token ref on each row ` +
+            `before treating the contracts as interchangeable. `;
+        } else if (sameTerms) {
+          parallel +=
+            `All ${dmintCount} carry the same token_ref and agree on reward ` +
+            `and max_height, so they mint one token in parallel, claims race ` +
+            `between them, and the supply ceiling is reward × max_height × ` +
+            `${dmintCount}. `;
+        } else {
+          parallel +=
+            `All ${dmintCount} carry the same token_ref, so claims race ` +
+            `between them — but their reward / max_height are not all equal, ` +
+            `so no single reward × max_height × ${dmintCount} figure ` +
+            `describes this deploy. Read the per-row values below. `;
+        }
+      } else {
+        parallel = "a single dMint contract UTXO. ";
+      }
       return (
         `This is a dMint deploy reveal — creates ${parallel}` +
         `Subsequent transactions can spend any of these to claim a mint, ` +
@@ -1164,17 +1298,51 @@ function _detectTxShape(payload) {
     const versionNote = versionHint
       ? ` Mint scriptSig at vin[0] is ${versionHint} shape (${versionHint === "v1" ? "4-byte nonce, 72 bytes" : "8-byte nonce, 76 bytes"}); the 4-output shape is identical across V1 and V2 by construction, but only V1 has been observed on Radiant mainnet (no V2 contract has been deployed yet).`
       : "";
+    // "The freshly-minted FT lives in a separate ft output in this same tx" and
+    // "the canonical mint tx has 4 outputs: …" were stated unconditionally, on
+    // every tx carrying a dmint output at height > 0 — including one with no ft
+    // output at all. Both are checkable from rows this function has already
+    // walked, so check them and say which way it came out. The canonical shape
+    // is a claim about POSITIONS, so the test is positional.
+    const ftRows = outputs.filter((o) => String(o.type).toLowerCase() === "ft");
+    const ftNote =
+      ftRows.length === 1
+        ? `The freshly-minted FT is the ft output at vout ${ftRows[0].vout}. `
+        : ftRows.length > 1
+          ? `${ftRows.length} ft outputs are present here; the minted reward is one of them. `
+          : "This transaction has NO ft output, so the minted reward is not " +
+            "where the canonical mint shape puts it — read the rows below " +
+            "rather than assuming a reward output exists. ";
+    // A truncated outputs list (a single-vout classification) can neither
+    // confirm nor deny a whole-tx shape, so it gets no verdict at all.
+    const outputsComplete =
+      typeof payload.output_count !== "number" || outputs.length === payload.output_count;
+    const typeAt = (i) => String((outputs[i] || {}).type || "").toLowerCase();
+    const canonicalShape =
+      outputs.length === 4 &&
+      typeAt(0) === "dmint" &&
+      typeAt(1) === "ft" &&
+      typeAt(2).startsWith("op_return") &&
+      typeAt(3) === "p2pkh";
+    const shapeSentence =
+      "the canonical mint tx has 4 outputs: [0] dMint continuation, [1] " +
+      "75-byte FT-wrapped reward, [2] OP_RETURN message, [3] P2PKH change";
+    const shapeNote = !outputsComplete
+      ? `For reference, ${shapeSentence}. `
+      : canonicalShape
+        ? `Its outputs match the canonical mint shape — ${shapeSentence}. `
+        : `Its ${outputs.length} outputs do NOT match the canonical mint shape ` +
+          `in count or in order — ${shapeSentence}. Read the rows below. `;
     return (
       `This is a dMint claim transaction (height ${dmintOutput.height} ` +
       `of ${dmintOutput.max_height}) — somebody spent the contract's ` +
       "previous output to mint themselves a token, and the contract " +
-      "continues at the new dmint output. The freshly-minted FT lives " +
-      "in a separate ft output in this same tx; the canonical mint tx " +
-      "has 4 outputs: [0] dMint continuation, [1] 75-byte FT-wrapped " +
-      "reward, [2] OP_RETURN message, [3] P2PKH change. V1 is verified " +
-      "on mainnet against pinned golden vectors; V2 is byte-identical " +
-      "by construction (R1 fix) but untested on chain. Inspect the " +
-      "contract's deploy outpoint to see the original parameters." +
+      "continues at the new dmint output. " +
+      ftNote +
+      shapeNote +
+      "V1 is verified on mainnet against pinned golden vectors; V2 is " +
+      "byte-identical by construction (R1 fix) but untested on chain. " +
+      "Inspect the contract's deploy outpoint to see the original parameters." +
       versionNote
     );
   }
@@ -1232,6 +1400,39 @@ function _structuralQualifierNote(type, payload) {
            "the decoded delay is inert script bytes. pyrxd's builder refuses " +
            "to emit this shape.";
   }
+  // OP_RETURN. The note used to end "Does NOT carry value" — printed six lines
+  // under a row header that reads `${row.satoshis} sats`. For a nonzero-value
+  // OP_RETURN the sentence is false AND it buries the fact worth stating: the
+  // output does carry photons, no scriptSig can ever satisfy OP_RETURN, so
+  // those photons are unrecoverable. `satoshis` exists on a fetched-tx row and
+  // not on a pasted script, so the amount is quoted only where it is known and
+  // the script-card path keeps the general statement.
+  if (type === "op_return") {
+    const known = payload && payload.satoshis !== undefined && payload.satoshis !== null;
+    const sats = known ? Number(payload.satoshis) : NaN;
+    let valueNote;
+    if (Number.isFinite(sats) && sats > 0) {
+      valueNote =
+        `This output carries ${sats} photons and no scriptSig can ever ` +
+        `satisfy OP_RETURN, so those photons are destroyed — they are not ` +
+        `spendable by anyone, including the sender.`;
+    } else if (Number.isFinite(sats)) {
+      valueNote =
+        "This output carries no photons, which is the usual shape: nothing " +
+        "can satisfy OP_RETURN, so any photons paid to one would be destroyed.";
+    } else {
+      valueNote =
+        "Nothing can satisfy OP_RETURN, so any photons paid to one are " +
+        "destroyed; paste the transaction to see what this output was funded " +
+        "with.";
+    }
+    return (
+      "OP_RETURN: an unspendable data carrier, not part of the Glyph " +
+      "protocol. Used by some non-Glyph protocols (legacy Atomicals-style " +
+      "markers, third-party tooling) to embed arbitrary bytes on-chain. " +
+      valueNote
+    );
+  }
   const NOTES = {
     ft: "Structural pattern match: bytes match the FT script template; " +
         "does NOT verify the ref points to a valid Glyph contract.",
@@ -1243,18 +1444,28 @@ function _structuralQualifierNote(type, payload) {
     "commit-ft": "Structural pattern match. The payload_hash is an opaque " +
         "commitment to the reveal-tx CBOR. A commit-ft output is the " +
         "FT contract's metadata anchor — present in every Glyph FT deploy.",
+    // NOT "the NFT singleton anchor that every Glyph FT deploy carries …
+    // not a separately-mintable collectible". That sentence was printed for
+    // EVERY commit-nft row, and a plain NFT mint produces one: `prepare_commit`
+    // (glyph/builder.py) sets `is_nft = GlyphProtocol.NFT in metadata.protocol`
+    // and `build_commit_locking_script` then emits OP_2/SINGLETON, which is
+    // exactly what `is_commit_nft_script` matches. So the note told the holder
+    // of a standalone collectible that their own commit output was somebody
+    // else's FT-deploy artifact — and this page's own tx banner for that shape
+    // ("commit-nft without commit-ft") says the opposite. The FT-deploy framing
+    // is correct only where `_detectTxShape` already states it: on the branch
+    // guarded by commit-ft AND commit-nft together.
     "commit-nft": "Structural pattern match. The payload_hash is an opaque " +
-        "commitment to the reveal-tx CBOR. A commit-nft output is the " +
-        "NFT singleton anchor that every Glyph FT deploy carries " +
-        "alongside its FT outputs — it's a protocol artifact, not a " +
-        "separately-mintable collectible.",
+        "commitment to the reveal-tx CBOR. The single byte separating this " +
+        "from a commit-ft is OP_REFTYPE_OUTPUT = 2 (SINGLETON): the commit " +
+        "requires its reveal to produce a singleton output. pyrxd emits this " +
+        "shape for any metadata carrying the NFT protocol marker — a " +
+        "standalone NFT, a mutable / container / WAVE NFT, and the authority " +
+        "NFT alongside an FT deploy alike — so this output on its own does " +
+        "not say which of those it anchors; the reveal tx does.",
     dmint: "Structural pattern match: does NOT verify the contract_ref " +
         "points to a valid mint chain or that the parameters match a " +
         "deployed token.",
-    op_return: "OP_RETURN: an unspendable data carrier. Used by some " +
-        "non-Glyph protocols (legacy Atomicals-style markers, " +
-        "third-party tooling) to embed arbitrary bytes on-chain. " +
-        "Does NOT carry value and is not part of the Glyph protocol.",
     p2sh: "Pay-to-script-hash. The redeem script this commits to is not " +
         "on-chain until the output is spent, so nothing further can be " +
         "said about what it does.",
