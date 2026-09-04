@@ -46,6 +46,7 @@ from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
+from .relationships import verify_relationship_claims
 from .types import GlyphProtocol
 
 # --- Length / shape constants ----------------------------------------------
@@ -932,6 +933,26 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
             # from one place. Sanitization strips control and bidi codepoints; it
             # cannot help with a Cyrillic "С" that simply LOOKS like "C".
         }
+        # RELATIONSHIP CLAIMS, WITH THEIR VERDICT (#591). `in` and `by` are
+        # operator-supplied CBOR — anyone can name any collection — so the claim is
+        # never surfaced without whether the transaction was authorised to carry it.
+        # Consensus's subset rule makes that checkable from this transaction alone:
+        # a ref in an output carried by one of the THREE subset-checked opcodes
+        # (`INPUT_BACKED_REF_OPCODES`) must be backed by an input ref, so a claimed
+        # parent appearing under one of those means the transaction spent it. The
+        # other two operand-carrying opcodes prove nothing and are discarded — see
+        # `output_ref_operands`.
+        rel = verify_relationship_claims(metadata, [bytes(o.locking_script.serialize()) for o in tx.outputs])
+        if rel:
+            metadata_payload["relationships"] = [
+                {
+                    "kind": v.kind.value,
+                    "ref": f"{v.ref.txid}:{v.ref.vout}",
+                    "outcome": v.outcome.value,
+                }
+                for v in rel
+            ]
+
         # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
         # something to say. Emitting an empty dict unconditionally made "flagged" and
         # "checked and clean" indistinguishable to a caller testing for the key — and

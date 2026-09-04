@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Container and creator claims are now VERIFIED, not just repeated (#591).** `in` and
+  `by` are operator-supplied CBOR — anyone can write any collection's ref into their own
+  token — and pyrxd decoded them and handed them on, so a wallet or marketplace reading
+  `metadata.container_refs` would render "part of collection X" as though it were a fact.
+
+  `pyrxd.glyph.relationships.verify_relationship_claims` checks each claim against what
+  the transaction actually carries, and `inspect` now shows the claim **and** the verdict
+  together — never the claim alone.
+
+  The check is LOCAL, needing no parent lookup, because Radiant's induction rules enforce
+  a subset rule: every ref in an output must be backed by an input ref, where the input
+  set includes the spent outpoints. So a claimed parent appearing among a transaction's
+  output refs proves that transaction spent it. Verified against upstream Radiant-Core at
+  the commit this repo vendors — and note the opcode handler alone gives the opposite
+  answer, saying outright that it performs no membership check.
+
+  Delegated authorization is out of scope: pyrxd has no delegate concept, so a
+  legitimately delegated claim reads as unbacked.
 ### Security
 
 - **`pyrxd[eth]` now floors `urllib3>=2.7.0`.** pyrxd does not import urllib3; it arrives two levels
