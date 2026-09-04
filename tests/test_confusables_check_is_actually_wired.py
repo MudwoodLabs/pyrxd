@@ -143,3 +143,83 @@ class TestTheWarningReachesAHuman:
         assert 'warnings = dict(metadata.get("display_warnings") or {})' in inspect_source, (
             "the bridge must SEED from the classifier's warnings, not replace them"
         )
+
+
+class TestTheSoulboundVERDICTIsPreciseOnBothSurfaces:
+    """Two claims the CLI made that the code does not support.
+
+    1. The tx-listing row printed `variant=… (non-transferable at consensus)` and
+       DROPPED the classifier's own `note` — "does NOT verify that ref names a live
+       Glyph singleton, that the singleton is actually held here, or that the
+       covenant is free of defects". The standalone script card printed it in full.
+       The tx listing is the path most people meet the tool on, and this is exactly
+       the sentence a credential or swap gate would over-trust.
+
+    2. Both variants were described as permitting "a byte-identical self-clone".
+       The fixed-index builder does compare whole scripts; the COMPOSABLE one
+       compares CODE-SCRIPT HASHES, and its own docstring says "code-identical
+       clone". They coincide only because neither builder emits OP_STATESEPARATOR —
+       and code-script equality WITH a state prefix is precisely the shape that lets
+       the owner change, which `classify_soulbound` now reports as
+       MUTABLE_STATE_COVENANT.
+    """
+
+    @staticmethod
+    def _script_card(variant: str) -> str:
+        from pyrxd.cli.glyph_inspect import _render_script_human
+
+        return _render_script_human(
+            {
+                "type": "soulbound-covenant",
+                "length": 100,
+                "variant": variant,
+                "bound_ref_outpoint": "ab" * 32 + ":0",
+                "owner_pkh": "cd" * 20,
+                "has_self_replication": True,
+                "has_burn_branch": True,
+                "transferability": "soulbound_covenant",
+            }
+        )
+
+    def test_the_composable_variant_is_not_called_byte_identical(self) -> None:
+        text = self._script_card("composable")
+        assert "CODE-identical" in text
+        assert "byte-identical" not in text, "composable pins a code-script hash, not the whole script"
+
+    def test_the_fixed_index_variant_still_says_byte_identical(self) -> None:
+        """It really does compare whole scripts — weakening this would be its own
+        inaccuracy, in the safe-sounding direction."""
+        assert "byte-identical" in self._script_card("fixed-index")
+
+    def test_the_composable_card_says_WHY_the_two_coincide(self) -> None:
+        """Without the state-separator reasoning a reader cannot tell whether the
+        weaker constraint matters here. It does not — and that is a fact about the
+        builder, not about the opcodes."""
+        assert "OP_STATESEPARATOR" in self._script_card("composable")
+
+    def test_the_tx_listing_row_carries_a_qualifier(self) -> None:
+        from pyrxd.cli.glyph_inspect import _render_txid_human
+
+        text = _render_txid_human(
+            {
+                "txid": "aa" * 32,
+                "version": 2,
+                "locktime": 0,
+                "byte_length": 300,
+                "input_count": 1,
+                "output_count": 1,
+                "inputs": [],
+                "outputs": [
+                    {
+                        "vout": 0,
+                        "satoshis": 1000,
+                        "type": "soulbound-covenant",
+                        "variant": "fixed-index",
+                        "bound_ref_outpoint": "ab" * 32 + ":0",
+                        "owner_pkh": "cd" * 20,
+                    }
+                ],
+            }
+        )
+        assert "non-transferable at consensus" in text
+        assert "does NOT verify" in text, "the bare verdict must not travel alone on this path"
