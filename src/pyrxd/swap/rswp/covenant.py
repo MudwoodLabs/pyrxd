@@ -241,6 +241,33 @@ def _assert_relayable(tx: Transaction, fee: int, policy: DeadlineFeePolicy | Non
 # --------------------------------------------------------------------------- maker: reserve + post
 
 
+#: Relay-charged bytes of a covenant refund: one covenant input, one P2PKH output.
+#:
+#: MEASURED, not estimated — ``radiant_relay_size`` of refunds built by the
+#: production builder across 12 fresh keys gave 192-193, the spread being DER
+#: signature length. 200 leaves headroom for the high tail without over-charging.
+#:
+#: Both directions matter and a test pins both: too LOW re-opens the unreclaimable
+#: band this constant exists to close, and too HIGH refuses honest reservations that
+#: could in fact be refunded. The first draft of this guessed 320 and would have
+#: refused reservations down to ~1.6x the real floor.
+_REFUND_TX_BYTES = 200
+
+
+def minimum_reservable_photons(fee_policy: DeadlineFeePolicy | None = None) -> int:
+    """Smallest reservation whose REFUND can still be built and relayed.
+
+    A refund pays its fee out of the covenant value and must leave a non-dust
+    output, so the floor is ``relay_fee(refund_size) + dust`` — not ``dust``.
+    Exported because a caller sizing a reservation needs the same number the guard
+    uses, and because the CLI's "reclaim is GUARANTEED" promise is only true above
+    it.
+    """
+    policy = fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    fee = policy.required_fee(size_bytes=_REFUND_TX_BYTES, blocks_to_deadline=None)
+    return int(fee) + _DUST_PHOTONS
+
+
 def prepare_covenant_offer(
     *,
     funding: list,
@@ -264,14 +291,32 @@ def prepare_covenant_offer(
         If ``fee`` is below the node's min-relay floor for the transaction's real,
         signed size — see :func:`_assert_relayable`.
     """
-    if photons < _DUST_PHOTONS:
-        # NOT a node rule. Radiant never reaches ``IsDust`` (``policy.h:173``): its only caller is
-        # ``IsStandardTx``, called from exactly one place and gated on ``fRequireStandard``, which is
-        # hardcoded ``false`` (``validation.cpp:586`` / ``validation.cpp:271`` @ ``v3.1.2``). Nothing
-        # rejects a sub-546 output. The reason is ECONOMIC: a reservation this small cannot fund the
-        # refund or fill that must later spend it — at the reference node's relay rate that spend costs
-        # millions of photons — so the maker strands it (audit F3, availability). Refuse it up front.
-        raise ValidationError(f"reserved photons {photons} is below the dust floor ({_DUST_PHOTONS})")
+    if photons < minimum_reservable_photons(fee_policy):
+        # NOT a node rule, and not the dust floor either. Radiant never reaches
+        # ``IsDust`` (``policy.h:173``): its only caller is ``IsStandardTx``, called from
+        # exactly one place and gated on ``fRequireStandard``, hardcoded ``false``
+        # (``validation.cpp:586`` / ``:271`` @ ``v3.1.2``). Nothing rejects a sub-546
+        # output.
+        #
+        # The reason is ECONOMIC, and the guard was sized to the wrong quantity for it.
+        # A reservation the maker cannot later REFUND is the failure this was written
+        # for — its own comment said so, "could not later fill or refund", audit F3 —
+        # but it compared against dust alone (546) when the refund is a one-in-one-out
+        # spend that pays its fee OUT OF the covenant value and must still leave a
+        # non-dust output. It needs the relay fee for its own size PLUS dust.
+        #
+        # MEASURED through the production builders: reservations of 546, 100_000,
+        # 1_000_000 and 1_900_000 photons were all accepted here and then produced NO
+        # refund at any fee, while ``pyrxd swap reserve`` printed "Reclaim at --expiry is
+        # GUARANTEED" on the consent screen and ``swap cancel`` — documented as the only
+        # hard revocation there is — failed the same way. Those funds were unreachable
+        # by any pyrxd path.
+        raise ValidationError(
+            f"reserved photons {photons} cannot fund its own refund: a refund spends this output "
+            f"and must pay the relay floor for its own size and still leave a non-dust output, so "
+            f"the smallest reservable amount is {minimum_reservable_photons(fee_policy)} photons "
+            f"(dust alone is {_DUST_PHOTONS}). Reserve more, or the funds are unreclaimable."
+        )
     if fee < 0:
         raise ValidationError("fee must be non-negative")
     tx = Transaction()
