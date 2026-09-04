@@ -286,9 +286,16 @@ class NegotiatedTerms:
     Timelocks are unit-tagged :class:`Timelock` (BIP68/112). The cross-chain
     ordering invariant ``t_rxd - t_btc >= margin`` is checked by the coordinator
     (see ``swap_coordinator.assert_timelock_margin``), not here — but the raw
-    ordering ``t_rxd > t_btc`` in the *same* unit is rejected at construction as a
+    ordering ``t_rxd <= t_btc`` in the *same* unit is rejected at construction as a
     cheap fail-closed guard. INVERTED 2026-08-31 (#482): the maker holds ``p`` and LOCKS
     the Radiant leg, so that leg carries the LONGER timeout.
+
+    THIS NAMED THE REQUIRED ORDERING AS THE REJECTED ONE. #482 appended the sentence above
+    and left the clause before it, so the paragraph said ``t_rxd > t_btc`` "is rejected at
+    construction" while ``__post_init__`` refuses ``t_rxd <= t_btc`` and its message reads
+    "requires t_rxd > t_btc". A reader taking the first sentence at face value builds the
+    pre-#482 layout, which lets the maker refund its own leg while ``p`` is secret and then
+    claim the counter leg.
     """
 
     hashlock: bytes  # H = SHA256(p), 32 bytes — NEVER p
@@ -429,7 +436,17 @@ class NegotiatedTerms:
         # `p` is public. Reachable on the dust defaults (t_rxd=20) at a measured margin of 16.
         #
         # Refused here rather than clamped at each builder: clamping silently hands back a swap
-        # nobody asked for, and this is the layer that makes it unrepresentable for every caller.
+        # nobody asked for.
+        #
+        # SCOPE, HONESTLY: this refusal is BLOCKS-ONLY. Until 2026-09-03 the sentence above ended
+        # "and this is the layer that makes it unrepresentable for every caller", which is not what
+        # the condition says. `t_rxd` IS pinned to BLOCKS a few lines up; `t_btc` is not, and
+        # `from_dict` takes the unit tag off the wire, so a SECONDS-tagged `t_btc` skips this floor,
+        # skips the same-unit ordering guard below (the units differ), normalises to 0 blocks in
+        # `assert_timelock_margin`, and reaches `refund_leaf_script`, whose own floor is scoped the
+        # same way. BIP68 quantises time locks to 512 s, so `Timelock(0..511, SECONDS)` is the same
+        # no-op lock as `Timelock(0, BLOCKS)`. Not fixed here: pinning `t_btc` to BLOCKS (or giving
+        # SECONDS a floor) is a behaviour change on fund-moving code and needs its own review.
         if self.t_btc.unit is TimeUnit.BLOCKS and self.t_btc.value < 1:
             raise ValidationError(
                 f"t_btc is {self.t_btc.value} blocks — a counter leg that matures in its own funding "

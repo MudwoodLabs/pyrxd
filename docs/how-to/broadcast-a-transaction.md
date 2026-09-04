@@ -50,18 +50,31 @@ regtest node.
 ## Handling broadcast errors
 
 Every broadcast failure pyrxd can detect surfaces as
-`pyrxd.security.errors.NetworkError`. The client deliberately does not
-embed the server's raw error string in the exception message (that
-string can include attacker-controlled bytes from the rejected tx).
-Diagnose by the *symptom* on the chain, not the exception text.
+`pyrxd.security.errors.NetworkError`. A failure the *node* decided —
+it evaluated your transaction and said no — surfaces as the narrower
+`PolicyRejection`, which subclasses `NetworkError` (and `CovenantError`),
+so an existing `except NetworkError` handler still catches it.
+
+`PolicyRejection` carries the node's own reject reason: `.code` is the
+JSON-RPC error code and `.reason` is the sanitized server message —
+first line only, control characters stripped, long tokens redacted,
+clipped to 200 characters. That sanitized reason is also embedded in the
+exception message. It is the one deliberate carve-out from the module's
+"never put server text in an exception" rule: discarding it previously
+made a covenant script failure indistinguishable from a dropped socket,
+and hid a real dMint bug for weeks.
 
 ```python
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import NetworkError, PolicyRejection
 
 try:
     txid = await client.broadcast(raw_tx)
+except PolicyRejection as exc:
+    # The node evaluated the tx and rejected it. Branch on exc.reason.
+    print(exc.code, exc.reason)   # e.g. -26 bad-txns-inputs-missingorspent
+    raise
 except NetworkError:
-    # Inspect inputs against the chain to decide what went wrong.
+    # A genuine transport fault: dropped socket, timeout, unreachable server.
     raise
 ```
 
@@ -89,10 +102,18 @@ The four rejections you will actually hit:
   (Radiant uses BIP143 variants, see `pyrxd.security.types.SighashFlag`),
   the signed digest, and any ref-aware preimage pieces.
 
-The client surfaces all four as a generic `NetworkError`. To see the
-underlying ElectrumX response code, log at `DEBUG` level on the
-`pyrxd.network.electrumx` logger — the reader loop logs RPC errors
-before wrapping them.
+All four reach you as a `PolicyRejection` whose `.reason` is the string
+above, so you can branch on them in code rather than inspecting a block
+explorer. Classification is by RPC code (`1`, `-25`, `-26`, `-27`) or by
+a reject-reason marker; the full marker list is `_POLICY_MESSAGE_MARKERS`
+in [`src/pyrxd/network/electrumx.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py),
+and `bad-txns-`, `txn-mempool-conflict`, `min relay fee not met` and
+`mandatory-script-verify-flag-failed` are all in it. An RPC error that
+matches neither stays a plain `NetworkError` carrying only the code.
+
+Turning on `DEBUG` logging for `pyrxd.network.electrumx` will not add
+anything here: the reader loop's error branch logs nothing before
+setting the exception. The exception message *is* the diagnostic.
 
 ---
 

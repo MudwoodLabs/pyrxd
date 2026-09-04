@@ -241,6 +241,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
             _log.warning("decode_payload: malformed 'crypto.timelock' field ignored: %s", e)
 
     return GlyphMetadata(
+        source_cbor=cbor_bytes,
         protocol=d["p"],
         timelock=timelock,
         container_refs=_decode_rel_refs(d.get("in"), "in"),

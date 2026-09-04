@@ -199,10 +199,16 @@ class RadiantChainIO:
         """Locate the funded covenant UTXO for ``spk`` -> ``(outpoint, value, height)``.
 
         Scans the UTXO set of the covenant scriptPubKey (ElectrumX script-hash =
-        ``sha256(spk)`` reversed). The covenant funds exactly one output, so there
-        is one matching UTXO; if ``expected_value`` is given, the match must equal it
-        (a wrong value is a mis-funded covenant -> fail-closed). The returned value
-        is the ON-CHAIN value, never a self-report.
+        ``sha256(spk)`` reversed). The HONEST funding is one output, but the SPK is a pure
+        function of PUBLIC negotiated terms, so anyone can pay it and the scan can return
+        several — see the ``len(utxos) > 1`` branch below, which SELECTS the earliest-confirmed
+        match rather than refusing (refusing on ambiguity is a denial anyone can trigger). If
+        ``expected_value`` is given, a match must equal it (a wrong value is a mis-funded
+        covenant -> fail-closed); ``pin_outpoint``, once known, selects instead of
+        re-discovering. The returned value is the ON-CHAIN value, never a self-report.
+
+        THIS SAID "the covenant funds exactly one output, so there is one matching UTXO", one
+        screen above the address-poisoning branch that exists because that is not true.
 
         UNITS. ``expected_value`` is a :data:`~pyrxd.security.units.PhotonValue` because it
         is matched against the UTXO's NATIVE carrier value. It is NOT a Glyph FT token

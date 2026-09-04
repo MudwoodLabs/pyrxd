@@ -95,3 +95,103 @@ def test_non_singleton_is_classified_as_such():
 def test_truncated_script_is_unknown_not_crash():
     c = classify_soulbound(b"\xd8\x00\x01\x02")  # d8 then truncated ref
     assert c.transferability is Transferability.UNKNOWN
+
+
+class TestCodeScriptEqualityDoesNotPinAMutableOwner:
+    """Self-replication only forbids transfer when the equality covers the OWNER.
+
+    `OP_CODESCRIPTBYTECODE_OUTPUT`/`_UTXO` compare the bytes AFTER
+    `OP_STATESEPARATOR`. A covenant that pins its code script while carrying a
+    mutable state prefix can therefore recur with a DIFFERENT owner in that prefix
+    — which is a transfer, under a lock the classifier used to call "transfer is
+    impossible at consensus".
+
+    THE REPOSITORY ALREADY KNEW. `soulbound_covenant.py` says outright that
+    "code-script-only equality would let the state (owner) change between hops —
+    i.e. a transfer — so it is the wrong primitive for soulbinding", which is why
+    both pyrxd builders deliberately emit NO state separator. The detector was
+    written from the opcode markers and never encoded the caveat, so it accepted a
+    shape the module beside it had already ruled out.
+
+    IT IS THE PAIR, NEVER EITHER HALF. With no separator the code script IS the
+    whole script, so the same opcodes DO pin the owner. The deployed mainnet token
+    uses exactly those opcodes; declassifying it would be a guard refusing valid
+    work on the only real instance that exists.
+    """
+
+    #: Owner in the STATE prefix, self-equality over the CODE script only.
+    @staticmethod
+    def _mutable_owner_spk(pkh: bytes) -> bytes:
+        return (
+            b"\xd8"
+            + _REF.to_bytes()  # singleton ref
+            + b"\x76\xa9\x14"
+            + pkh
+            + b"\x88\xac"  # P2PKH owner -- STATE
+            + b"\xbd"  # OP_STATESEPARATOR
+            + b"\x00\xea\xc0\xe9\x87"  # OP_0 CSB_OUTPUT OP_INPUTINDEX CSB_UTXO OP_EQUAL
+        )
+
+    def test_the_owner_really_can_change_under_this_lock(self) -> None:
+        """The premise, established before any classification is asserted. If the
+        code scripts ever differed, the rest of this class would be theatre."""
+        a, b = self._mutable_owner_spk(b"\xaa" * 20), self._mutable_owner_spk(b"\xbb" * 20)
+        code_a, code_b = a[a.index(b"\xbd") + 1 :], b[b.index(b"\xbd") + 1 :]
+        assert code_a == code_b, "the covenant's own equality is satisfied by both owners"
+        assert a != b, "yet the scripts differ — the owner moved"
+
+    def test_it_is_NOT_reported_as_soulbound(self) -> None:
+        c = classify_soulbound(self._mutable_owner_spk(b"\xaa" * 20))
+        assert c.transferability is Transferability.MUTABLE_STATE_COVENANT
+        assert not c.is_consensus_soulbound
+
+    def test_the_self_replication_fact_is_still_reported(self) -> None:
+        """Declassifying must not erase what IS true: the lock does self-replicate.
+        Reporting `has_self_replication=False` would be a second wrong answer."""
+        assert classify_soulbound(self._mutable_owner_spk(b"\xaa" * 20)).has_self_replication
+
+    def test_the_credential_gate_now_refuses_it(self) -> None:
+        """Reachability: the classifier is what `assert_soulbound_credential` gates
+        on, so the fix has to be visible through the production entry point."""
+        from pyrxd.glyph.credential_binding import extract_owner_pkh
+
+        spk = self._mutable_owner_spk(b"\xaa" * 20)
+        assert extract_owner_pkh(spk) == b"\xaa" * 20, "the owner is still readable"
+        assert not classify_soulbound(spk).is_consensus_soulbound, "but it must not gate a swap"
+
+
+class TestTheHONESTShapesAreStillSoulbound:
+    """The other half. Every real soulbound covenant that exists must survive.
+
+    All three carry NO state separator, so their code script is their whole script
+    and code-script equality pins the owner. A rule keyed on the opcodes alone
+    would have broken all of them."""
+
+    def test_the_deployed_mainnet_token(self) -> None:
+        c = classify_soulbound(_DEPLOYED_SPK)
+        assert c.is_consensus_soulbound, "the only real instance on chain"
+        assert 0xBD not in _DEPLOYED_SPK, "and it has no state prefix, which is why"
+
+    def test_both_pyrxd_builders(self) -> None:
+        from pyrxd.glyph.soulbound_covenant import (
+            build_composable_soulbound_nft_covenant,
+            build_soulbound_nft_covenant,
+        )
+
+        for build in (build_soulbound_nft_covenant, build_composable_soulbound_nft_covenant):
+            spk = build(_REF, _PKH).funded_spk
+            assert classify_soulbound(spk).is_consensus_soulbound, build.__name__
+
+    def test_full_bytecode_equality_is_soulbound_even_WITH_a_state_prefix(self) -> None:
+        """The discriminator is the PAIR, not the separator alone. Full-bytecode
+        equality covers the state prefix too, so such a script stays soulbound."""
+        spk = (
+            b"\xd8"
+            + _REF.to_bytes()
+            + b"\x76\xa9\x14"
+            + _PKH
+            + b"\x88\xac"
+            + b"\xbd"
+            + b"\x00\xcd\xc0\xc7\x87"  # OP_0 OP_OUTPUTBYTECODE OP_INPUTINDEX OP_UTXOBYTECODE OP_EQUAL
+        )
+        assert classify_soulbound(spk).is_consensus_soulbound

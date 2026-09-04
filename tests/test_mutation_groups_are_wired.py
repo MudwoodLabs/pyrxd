@@ -19,9 +19,11 @@ import re
 import sys
 from pathlib import Path
 
-import pytest
-
-yaml = pytest.importorskip("yaml", reason="PyYAML parses the workflow matrix")
+# NOTE: this module used to open with ``pytest.importorskip("yaml")``, which made every
+# check below conditional on a dependency none of them use — the matrix is parsed by
+# `scripts/mutation_groups.py` in a subprocess and returned as JSON, and the workflow is
+# read as text. A whole file of guards that can silently not run is the failure mode
+# these guards exist to catch, so the import is gone.
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT = _ROOT / "scripts" / "mutation_test.sh"
@@ -116,3 +118,46 @@ def test_a_threshold_names_a_group_that_exists() -> None:
     for entry in json.loads(r.stdout)["include"]:
         assert entry["group"] in _matrix_groups()
         assert str(entry["min_kill"]).isdigit()
+
+
+def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
+    """The third statement of the same fact — and the one a reader acts on.
+
+    `scripts/mutation_test.sh` defines the groups, `.github/workflows/mutation.yml`
+    schedules them (derived, above), and `docs/how-to/mutation-testing.md` is what
+    somebody reads before typing `task mutate <something>`. That page's runnable list was
+    hand-typed, so it drifted exactly as the workflow matrix had: it offered eight
+    `task mutate` lines and called them "the eight value-moving groups" while
+    `VALUE_GROUPS` held twelve. `glyphscript`, `keys`, `ethleg` and `ethtimelock` were
+    undocumented — `glyphscript` while the same page carried a "Baseline results"
+    section for it.
+
+    A group nobody knows to run is as unmeasured as one no job invokes.
+    """
+    doc = _ROOT / "docs" / "how-to" / "mutation-testing.md"
+    body = doc.read_text()
+    documented = set(re.findall(r"^poetry run task mutate ([a-z]+)", body, re.M))
+    expected = _script_groups()
+    assert expected, "no groups parsed from mutation_test.sh — the derivation broke, not the doc"
+
+    missing = expected - documented
+    assert not missing, (
+        f"{doc.relative_to(_ROOT)} does not tell a reader these groups exist: {sorted(missing)}. "
+        "They are defined in scripts/mutation_test.sh and runnable today."
+    )
+
+    # The other direction: a documented `task mutate <name>` the script cannot resolve
+    # exits 2 with "unknown group", so a reader following the page hits an error.
+    invented = documented - expected - {"all", "consensus", "value"}
+    assert not invented, f"{doc.relative_to(_ROOT)} documents groups the script rejects: {sorted(invented)}"
+
+    # The prose count is a fourth statement of the same fact, and it is the one that read
+    # "eight" against twelve for four groups' worth of drift.
+    stated = re.search(r"the ([a-z]+) value-moving groups", body)
+    assert stated, "the page no longer states how many value-moving groups there are"
+    words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen"}
+    want = words.get(len(_value_groups()))
+    assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
+    assert stated.group(1) == want, (
+        f"the page says '{stated.group(1)} value-moving groups'; VALUE_GROUPS holds {len(_value_groups())} ({want})"
+    )

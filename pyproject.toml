@@ -74,10 +74,28 @@ dependencies = [
 #                 DIRECTLY, so leaving it implicit rests on two levels of transitive luck.
 #
 # aiohttp is deliberately absent: it is already a runtime dependency, not an eth-only one.
+#
+# urllib3 is different from the three above and the difference matters: pyrxd does NOT import it.
+# It arrives two levels down — `web3` requires `requests>=2.23.0`, which requires
+# `urllib3<3,>=1.26` — so installing this extra pulls it whether we mention it or not.
+#
+# HYGIENE, NOT A FIX. urllib3 < 2.7.0 carries PYSEC-2026-141 (a proxied cross-origin redirect
+# forwards sensitive headers) and PYSEC-2026-142 (a decompression bomb via Brotli streaming or
+# `drain_conn`). MEASURED as unreachable through pyrxd's usage on 2026-09-03: brotli is not
+# installed, `drain_conn` appears in 0 files of web3/requests, and web3 uses `stream=True` at 0
+# sites. The header leak needs a proxy configured AND a hostile redirect from the RPC endpoint —
+# the vulnerable call does exist (`requests/adapters.py:651` passes `assert_same_host=False`
+# through a ProxyManager), so the path is real but the exploit was not demonstrated.
+#
+# The floor is here so `pip install pyrxd[eth]` does not hand a consumer a package their own
+# `pip-audit` will flag. Owning a constraint on a package we do not import has a cost — it can
+# conflict with a consumer's tree — so this is the only such floor, and it should be REMOVED once
+# `requests` itself floors urllib3 above 2.7.0.
 eth = [
     "web3>=7.16.0,<8.0.0",
     "eth-account>=0.14.0,<1.0.0",
     "eth-keys>=0.8.0,<1.0.0",
+    "urllib3>=2.7.0",
 ]
 
 [project.urls]

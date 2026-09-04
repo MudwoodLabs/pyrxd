@@ -106,24 +106,37 @@ class OpReturn(ScriptTemplate):
         """Build a data-carrier output.
 
         Emits a BARE ``OP_RETURN``. Radiant Core classifies an output as
-        ``TX_NULL_DATA`` — standard, and exempt from the dust rule so a 0-photon
-        output is legal — only when ``scriptPubKey[0]`` is ``OP_RETURN``
-        (``src/script/standard.cpp``, ``Solver()``). This builder emitted
-        ``OP_FALSE OP_RETURN`` until 2026-09-02, which falls through to
-        ``TX_NONSTANDARD`` and is not relayed.
+        ``TX_NULL_DATA`` only when ``scriptPubKey[0]`` is ``OP_RETURN``
+        (``src/script/standard.cpp``, ``Solver()``); ``OP_FALSE OP_RETURN``,
+        which this builder emitted until 2026-09-02, falls through to
+        ``TX_NONSTANDARD``.
 
-        Measured on Radiant mainnet, 20 consecutive recent blocks: 232 bare
-        ``OP_RETURN`` data outputs, and ZERO of the ``OP_FALSE``-prefixed form.
+        NEITHER classification has any force on Radiant, so both spellings
+        relay. ``IsStandardTx`` is reached from exactly one place
+        (``validation.cpp:586`` @ ``v3.1.2``) and is gated on
+        ``fRequireStandard``, hardcoded ``false`` (``validation.cpp:271``) —
+        the same fact ``glyph/ft.py`` and ``glyph/builder.py`` rest on. The
+        default is a matter of convention, not of policy.
+
+        The convention is real, though. Measured on Radiant mainnet, 20
+        consecutive recent blocks: 232 bare ``OP_RETURN`` data outputs, and
+        ZERO of the ``OP_FALSE``-prefixed form.
 
         ``provably_unspendable=True`` restores the prefixed form. Core's
-        ``CScript::IsUnspendable()`` (``script.h``) detects only that spelling,
-        so it is the one a pruning helper recognises — but Core is internally
-        inconsistent here (``Solver()``'s comment claims to use that test and
-        its code does not), and such an output is not relayed. Opt in only if
-        you know the node you are broadcasting to accepts it.
+        ``CScript::IsUnspendable()`` (``script.h:882-885``) detects only that
+        spelling, so it is the one a pruning helper recognises — but Core is
+        internally inconsistent here (``Solver()``'s comment claims to use that
+        test and its code does not).
 
-        The bare form is unspendable in practice — ``OP_RETURN`` aborts script
-        evaluation immediately — it is simply not FLAGGED as such by Core.
+        Both forms are unspendable, by two DIFFERENT mechanisms; only the
+        prefixed one is FLAGGED as such by Core. Prefixed: ``OP_FALSE`` leaves
+        an element on the stack, so ``OP_RETURN`` fails with
+        ``ScriptError::OP_RETURN`` (``interpreter.cpp:564-571``). Bare: an
+        empty ``scriptSig`` leaves the stack empty, and there ``OP_RETURN``
+        does NOT abort — it terminates evaluation as SUCCESSFUL (same lines);
+        the spend then fails on ``VerifyScript``'s empty-final-stack check,
+        ``ScriptError::EVAL_FALSE`` (``interpreter.cpp:3092-3094``). Any
+        non-empty ``scriptSig`` fails at the ``OP_RETURN`` itself instead.
         """
         script: bytes = (OpCode.OP_FALSE + OpCode.OP_RETURN) if provably_unspendable else OpCode.OP_RETURN
         for pushdata in pushdatas:

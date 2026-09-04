@@ -19,8 +19,10 @@
 >   shape, Photonic divergences, footguns)
 > - [`docs/dmint-research-photonic-deploy.md`](dmint-research-photonic-deploy.md) —
 >   M2 byte-by-byte decode of the GLYPH mainnet deploy
-> - [`src/pyrxd/glyph/dmint.py`](../src/pyrxd/glyph/dmint.py) —
->   builders, parsers, miner, verifier, chain helpers
+> - [`src/pyrxd/glyph/dmint/`](../src/pyrxd/glyph/dmint) — builders
+>   (`builders.py`), parsers and chain helpers (`chain.py`), the miner and
+>   verifier (`miner.py`), types (`types.py`). This was a single
+>   `dmint.py` module when the list above was written.
 > - [`src/pyrxd/glyph/builder.py`](../src/pyrxd/glyph/builder.py) —
 >   `prepare_dmint_deploy` (V1 default; V2 behind `allow_v2_deploy=True`
 >   footgun guard); `DmintV1DeployParams` / `DmintV2DeployParams`
@@ -34,7 +36,9 @@
 > **What's still genuinely future work:**
 >
 > - Auth NFT in the V1 deploy reveal (M2 demo omits this; GLYPH has it)
-> - Premine FT output on V1 deploy (deferred per Photonic divergence #2)
+> - ~~Premine FT output on V1 deploy~~ — **shipped.** V1 and V2 deploys both
+>   take `premine_amount` / `premine_pkh`, exposed on the CLI as
+>   `glyph deploy-dmint --premine` / `--premine-to`.
 > - Walking forward through mined-from contracts in
 >   `find_dmint_contract_utxos` (current impl returns fresh contracts only)
 > - Live-mainnet V2 deploy proof (M3, deferred indefinitely — no

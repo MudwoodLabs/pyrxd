@@ -307,7 +307,19 @@ class Script:
         return Script(encode_pushdata(octets))
 
 
-def data_pushes_after_op_return(script: bytes) -> list[bytes] | None:
+#: The three opcodes that carry an arbitrary-length data payload. Direct pushes
+#: (``0x01``-``0x4B``) encode the length in the opcode itself; ``OP_PUSHDATA1``
+#: takes one length byte and ``OP_PUSHDATA2`` two. ``OP_PUSHDATA4`` is excluded:
+#: nothing that fits in an ``OP_RETURN`` data carrier needs a 4-byte length, and
+#: HashMark §4.1 requires verifiers to reject it outright.
+_OP_PUSHDATA1, _OP_PUSHDATA2 = 0x4C, 0x4D
+
+#: Smallest payload each opcode is the MINIMAL encoding for. A push shorter than
+#: its opcode's threshold has a shorter spelling and is therefore non-canonical.
+_MINIMAL_FLOOR = {_OP_PUSHDATA1: 76, _OP_PUSHDATA2: 256}
+
+
+def data_pushes_after_op_return(script: bytes, *, require_minimal: bool = False) -> list[bytes] | None:
     """Every data push following a leading ``OP_RETURN``, or None if not push-only.
 
     Shared by the ``OP_RETURN`` payload decoders (HashMark, the Photonic ``msg``
@@ -316,6 +328,31 @@ def data_pushes_after_op_return(script: bytes) -> list[bytes] | None:
     failure means "some other protocol", not "a broken record". Radiant Core
     classifies a data carrier as ``TX_NULL_DATA`` only when the remainder after
     ``OP_RETURN`` is push-only, so a non-push chunk means this is not one.
+
+    ``OP_PUSHDATA1``/``OP_PUSHDATA2`` ARE data pushes. This originally refused
+    every opcode above ``0x4B`` under a comment claiming they were not, which put
+    a cliff at exactly 76 bytes — the length at which every encoder in this repo
+    switches to ``OP_PUSHDATA1``. pyrxd therefore WROTE ``msg`` outputs that
+    pyrxd could not READ, and skipped spec-legal signed HashMark records as
+    though they were some other protocol.
+
+    ``OP_1NEGATE`` and ``OP_1``-``OP_16`` are never data pushes here — they are
+    push operations in Bitcoin's ``IsPushOnly`` sense, but reading them as data
+    would give a one-byte field a second spelling. The opcode bound covers them.
+
+    :param require_minimal: reject any push that is not the SHORTEST spelling of
+        itself — ``OP_PUSHDATA1`` carrying ≤75 bytes, ``OP_PUSHDATA2`` carrying
+        ≤255, and ``OP_0`` for the empty push. HashMark §4.1 mandates this:
+        every record must have exactly one valid serialization, or two
+        implementations cannot compare records as bytes.
+
+        Left OFF by default for the ``msg`` convention, which has no canonical
+        form to protect. Refusing a third-party writer's honest text over its
+        choice of length prefix would be a guard refusing valid work — and
+        turning it on unconditionally measurably was one: it downgraded a
+        ``msg`` whose payload is ``OP_0`` from "malformed message, empty push"
+        to "not a message at all", losing the diagnostic for a record that
+        plainly IS one.
     """
     if not script or script[0] != 0x6A:
         return None
@@ -325,7 +362,12 @@ def data_pushes_after_op_return(script: bytes) -> list[bytes] | None:
     out: list[bytes] = []
     for chunk in parsed.chunks:
         op = chunk.op[0] if isinstance(chunk.op, bytes) else chunk.op
-        if op > 0x4B:  # not a direct or OP_PUSHDATA data push
+        if op > _OP_PUSHDATA2:  # OP_PUSHDATA4, OP_1NEGATE, OP_1-OP_16, or a non-push opcode
             return None
-        out.append(chunk.data or b"")
+        data = chunk.data or b""
+        # OP_0 counts as a zero-length push here; under `require_minimal` it does not
+        # (see below). Both are floor-1 cases, so one comparison covers them.
+        if require_minimal and len(data) < _MINIMAL_FLOOR.get(op, 1):
+            return None
+        out.append(data)
     return out
