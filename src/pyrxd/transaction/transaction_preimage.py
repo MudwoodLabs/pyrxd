@@ -39,15 +39,25 @@ def _get_push_refs(script_bytes: bytes) -> list:
     consensus collects an output's refs into a ``std::set<uint288>`` and
     hashes them in iteration order — i.e. ascending by the *uint288 numeric
     value* of each 36-byte ref, which is **little-endian** (byte[35] is the
-    most-significant). See Radiant-Core ``src/primitives/transaction.h``
+    most-significant). Two different files, and the distinction matters:
+    Radiant-Core ``src/primitives/transaction.h``
     (``getRefHashDataSummary`` / ``writeOutputDataSummaryVector`` /
-    ``GetHashOutputHashes``). We therefore sort by ``ref[::-1]`` (the
+    ``GetHashOutputHashes``) holds the ``std::set`` and hashes it in
+    iteration order, but the ORDER itself is ``base_blob::Compare`` and
+    ``operator<`` in ``src/uint256.h:47-63`` and ``:71-73`` — ``Compare``
+    walks ``m_data`` from ``WIDTH - 1`` down, so the last byte is the most
+    significant, and ``operator<`` is ``Compare(...) < 0``, which is what
+    ``std::less`` and therefore ``std::set`` sort by. ``uint288`` is
+    ``base_blob<288>``, i.e. 36 bytes (``:178``). We therefore sort by
+    ``ref[::-1]`` (the
     fully-reversed bytes), NOT by the raw byte order (which would be
     big-endian / lexicographic and diverges for any output with 2+ refs —
     the bug that made dMint contract-output signing fail ~50% of the time on
     a real node; single-ref outputs are unaffected since order is moot).
     Validated end-to-end against radiant-core regtest by
-    ``tests/test_dmint_v1_regtest_e2e.py`` (2-ref contract output).
+    ``tests/test_dmint_v1_regtest_e2e.py`` (2-ref contract output), and
+    against the vendored ``uint256.h`` itself by
+    ``tests/test_preimage_differential.py::TestUint288OrderIsTheOneRadiantUses``.
 
     Raises ``ValidationError`` if a pushref opcode is followed by fewer
     than 36 bytes (truncated script). Earlier versions silently produced

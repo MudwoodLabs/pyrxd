@@ -72,6 +72,15 @@ FILES = {
     # which is the only authority on "consensus vs policy". Also the file where
     # `fRequireStandard = false` is hardcoded, so the policy layer is absent here.
     "validation.cpp": "src/validation.cpp",
+    # MAX_SCRIPT_STACK_MEMORY_USAGE and MAX_SCRIPT_OPCODE_COST — the per-script
+    # resource budgets `interpreter.cpp` enforces (it references both but declares
+    # neither), so without this file their VALUES are uncheckable.
+    "consensus.h": "src/consensus/consensus.h",
+    # base_blob::Compare / operator< — the comparator behind `std::set<uint288>`,
+    # and therefore the ref ordering inside hashOutputHashes. `transaction.h` holds
+    # the sets but not the ordering: sorting refs the wrong way made dMint signing
+    # fail ~50% of the time, and nothing vendored could adjudicate the rule.
+    "uint256.h": "src/uint256.h",
 }
 
 

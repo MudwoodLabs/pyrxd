@@ -23,9 +23,13 @@ Specification sources for the reference implementation:
 * Refs sort ascending by the **uint288 numeric value** of the 36-byte ref,
   which is little-endian (byte[35] most significant), and are
   **deduplicated** — Radiant collects them into a ``std::set<uint288>``.
-  The reference sorts *integers* (``int.from_bytes(ref, "little")``),
-  deliberately a different derivation than the production code's byte-wise
-  sort key, so a sort-order regression cannot hide in shared code.
+  The set is in ``primitives/transaction.h``; the *ordering* is
+  ``base_blob::Compare`` and ``operator<`` in ``src/uint256.h``, which
+  ``std::less<uint288>`` sorts by. The reference sorts *integers*
+  (``int.from_bytes(ref, "little")``), deliberately a different derivation
+  than the production code's byte-wise sort key, so a sort-order regression
+  cannot hide in shared code. Both are checked against the C++ itself by
+  ``TestUint288OrderIsTheOneRadiantUses``.
 
 The reference is itself anchored to the radiantjs-generated golden vectors
 committed in ``tests/test_preimage.py`` (verified against mainnet reveal tx
@@ -48,8 +52,16 @@ from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.transaction.transaction_preimage import tx_preimage, tx_preimages
-from tests.consensus_oracle import push_ref_opcodes, ref_operand_opcodes, ref_operand_width
+from pyrxd.transaction.transaction_preimage import _get_push_refs, tx_preimage, tx_preimages
+from tests.consensus_oracle import (
+    base_blob_less_than_sense,
+    base_blob_significance_order,
+    push_ref_opcodes,
+    ref_operand_opcodes,
+    ref_operand_width,
+    uint288_sorted,
+    uint288_width_bytes,
+)
 
 _BUDGET_MULT = int(os.environ.get("FUZZ_BUDGET_MULTIPLIER", "1"))
 
@@ -474,3 +486,74 @@ class TestReferenceWalksAllOperandOpcodes:
         assert {0xD0, 0xD1, 0xD2, 0xD3, 0xD8} == _OPERAND_OPS
         assert {0xD0, 0xD8} == _PUSHREF_OPS
         assert _OPERAND_WIDTH == 36
+
+
+#: Two refs whose little-endian and big-endian orderings DISAGREE — the byte
+#: that decides it (index 35) points one way and the leading bytes the other.
+#: A fixture where the two orders happen to coincide passes against a
+#: big-endian sort as readily as a little-endian one and proves nothing, which
+#: is precisely how the original bug survived single-ref outputs.
+_REF_LOW_LE = bytes([0xFF] * 35 + [0x01])  # smaller as uint288, larger lexicographically
+_REF_HIGH_LE = bytes([0x00] * 35 + [0x02])  # larger as uint288, smaller lexicographically
+
+
+class TestUint288OrderIsTheOneRadiantUses:
+    """The sighash ref order, checked against the C++ that defines it.
+
+    ``transaction_preimage`` claims the refs in an output are hashed "ascending
+    by the uint288 numeric value ... which is little-endian (byte[35] is the
+    most-significant)" and sorts on ``ref[::-1]`` accordingly. That claim was
+    cited to ``src/primitives/transaction.h``, which holds the
+    ``std::set<uint288>`` but does **not** define its order — so for as long as
+    ``uint256.h`` was unvendored, the rule behind a sighash was an assertion
+    nothing in the repo could adjudicate. It is load-bearing: sorting the raw
+    bytes instead made dMint contract-output signing fail about half the time.
+    """
+
+    def test_uint288_is_thirty_six_bytes(self):
+        assert uint288_width_bytes() == _OPERAND_WIDTH == 36
+
+    def test_the_comparator_reads_the_last_byte_as_most_significant(self):
+        """``base_blob::Compare`` starts at ``WIDTH - 1`` and counts down."""
+        assert base_blob_significance_order() == "little", (
+            "Radiant's base_blob::Compare no longer treats m_data's high index as the most "
+            "significant byte. Every ref sort in this repo — production and reference — is "
+            "written for little-endian and must be re-derived before it can be trusted."
+        )
+
+    def test_the_ordering_is_ascending(self):
+        """``std::set`` iterates by ``std::less``, i.e. ``operator<``."""
+        assert base_blob_less_than_sense() == "<", (
+            "base_blob::operator< no longer means `Compare(...) < 0`; std::set<uint288> would "
+            "iterate in the opposite order and hashOutputHashes with it."
+        )
+
+    def test_the_fixture_actually_discriminates(self):
+        """Non-vacuity: the two orderings must disagree on these refs.
+
+        Without this, the differential below could pass because both sorts are
+        right *or* because the inputs cannot tell them apart.
+        """
+        assert uint288_sorted([_REF_HIGH_LE, _REF_LOW_LE]) != sorted([_REF_HIGH_LE, _REF_LOW_LE])
+
+    def test_production_sorts_refs_the_way_the_cpp_orders_them(self):
+        """The differential, through the production walker that builds the sighash.
+
+        ``_get_push_refs`` is what ``tx_preimage`` calls; the expected order is
+        assembled from the parsed comparator rather than restated here, so if
+        upstream flips either the loop direction or the comparison sense this
+        fails instead of agreeing with a stale rule.
+        """
+        script = (
+            bytes([0xD0]) + _REF_HIGH_LE + bytes([0xD8]) + _REF_LOW_LE + bytes([0xD0]) + _REF_HIGH_LE  # duplicate
+        )
+        assert _get_push_refs(script) == uint288_sorted({_REF_HIGH_LE, _REF_LOW_LE})
+
+    def test_the_reference_implementation_sorts_the_same_way(self):
+        """``_ref_scan_refs`` derives the order from integers, not from ``ref[::-1]``.
+
+        Two independent spellings of the same rule, both now anchored to the
+        vendored comparator rather than to each other.
+        """
+        script = bytes([0xD0]) + _REF_HIGH_LE + bytes([0xD8]) + _REF_LOW_LE
+        assert _ref_scan_refs(script) == uint288_sorted({_REF_HIGH_LE, _REF_LOW_LE})
