@@ -257,13 +257,24 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
     # renderer paints a warning band on the affected card.
     metadata = payload.get("metadata") if isinstance(payload, dict) else None
     if isinstance(metadata, dict):
-        warnings = {}
+        # SEEDED FROM THE CLASSIFIER, NOT OVERWRITING IT. `_inspect_core` now runs the
+        # TR39 confusables skeleton check and puts its findings in this same key. This
+        # block used to ASSIGN `display_warnings`, which would have silently replaced
+        # the stronger check's results with this weaker one's on the browser path —
+        # the same field name, two producers, last writer wins.
+        #
+        # The two are complementary and neither subsumes the other: TR39 catches
+        # per-character Latin MIMICRY ("USDС" with a Cyrillic С) and deliberately
+        # ignores wholly non-Latin names; the heuristic below also flags script
+        # mixing and whole-word non-Latin, which is broader and noisier. Where both
+        # fire on one field, the TR39 reason is kept — it is the more specific claim.
+        warnings = dict(metadata.get("display_warnings") or {})
         for field_name in ("name", "ticker", "description"):
             field_value = metadata.get(field_name)
             if isinstance(field_value, str) and field_value:
                 reason = _suspicious_reason(field_value)
                 if reason:
-                    warnings[field_name] = reason
+                    warnings.setdefault(field_name, reason)
         # ``protocol`` is a list of CBOR-supplied values rendered to the
         # user as a comma-joined string. An attacker can put a homoglyph
         # in any element. Walk the list and flag the field if any entry
@@ -274,7 +285,7 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
                 if isinstance(entry, str) and entry:
                     reason = _suspicious_reason(entry)
                     if reason:
-                        warnings["protocol"] = reason
+                        warnings.setdefault("protocol", reason)
                         break
         if warnings:
             metadata["display_warnings"] = warnings

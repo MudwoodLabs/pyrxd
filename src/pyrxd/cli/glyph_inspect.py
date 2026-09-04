@@ -281,6 +281,11 @@ def _render_txid_human(payload: dict) -> str:
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
         lines.append(f"  protocol: {metadata['protocol']}")
+        # BEFORE the fields themselves. A look-alike warning printed after the name
+        # it applies to is a warning the reader has already acted on — and the whole
+        # point is that the rendered name looks correct.
+        for field, reason in (metadata.get("display_warnings") or {}).items():
+            lines.append(f"  *** WARNING: {field} contains {reason} ***")
         if metadata.get("name"):
             lines.append(f"  name:     {_truncate_for_human(metadata['name'])}")
         if metadata.get("ticker"):

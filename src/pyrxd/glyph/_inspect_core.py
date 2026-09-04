@@ -708,6 +708,28 @@ def _classify_self_replicating(script: bytes, base: dict) -> dict:
     return {**base, "type": "unknown", **_ref_summary(script)}
 
 
+def _confusable_warnings(metadata) -> dict[str, str]:
+    """Fields whose text mimics Latin characters, per the TR39 skeleton check.
+
+    Only reports MIMICRY. A name in a wholly non-Latin script is not flagged —
+    ``looks_confusable_with_latin`` says so explicitly, listing "トークン" and "中文"
+    among its non-flagged examples. That distinction is the point: a warning that
+    fires on every legitimate Japanese token is the false positive that trains a
+    reader to ignore the real one, which this repo names as a hazard elsewhere.
+
+    Returns ``{}`` when nothing is suspicious, so a caller can treat presence as
+    the signal and absence as silence.
+    """
+    from .confusables import looks_confusable_with_latin
+
+    out: dict[str, str] = {}
+    for field in ("name", "ticker", "description"):
+        value = getattr(metadata, field, "") or ""
+        if value and looks_confusable_with_latin(value):
+            out[field] = "characters that mimic Latin letters (possible look-alike name)"
+    return out
+
+
 def _classify_metadata_protocol(metadata) -> str:
     """Return the highest-specificity Glyph-protocol classification label.
 
@@ -898,6 +920,18 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
             "ticker": _sanitize_display_string(metadata.ticker) if metadata.ticker else "",
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",
             "decimals": metadata.decimals,
+            # TR39 confusables. `docs/concepts/glyph-inspect-tool.md` has described
+            # this as a live protection — "a Cyrillic-spoofed USDC is flagged with a
+            # warning banner before the user sees the rendered metadata" — while
+            # `looks_confusable_with_latin` had NO PRODUCTION CALLER anywhere: a
+            # definition, a facade re-export, and tests. The CLI performed no
+            # confusables check at all, and the browser page used a weaker
+            # script-mixing heuristic that fires on any all-non-Latin name.
+            #
+            # Computed here rather than in either renderer so both surfaces get it
+            # from one place. Sanitization strips control and bidi codepoints; it
+            # cannot help with a Cyrillic "С" that simply LOOKS like "C".
+            "display_warnings": _confusable_warnings(metadata),
         }
         # TIMELOCK: say WHEN it opens, not just that it is one (#556). `classification` already
         # reported "timelock"; the field that answers the holder's actual question — can I read
