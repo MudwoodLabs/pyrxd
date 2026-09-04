@@ -1934,14 +1934,18 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
-            # interval is "a no-op input" because the sizer divides by it and this multiplies by
-            # it — true ONLY while both use the same one. It was passed the NOMINAL while
-            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
-            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
-            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
-            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
-            # maker holds the refunded asset AND can still claim the counter leg with p.
+            # THE FAST TAIL, matching the interval the sizer divides by. This was passed the
+            # NOMINAL while `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an
+            # 8.3x mismatch: under the pre-#482 upper-bound gate that REFUSED exactly the t_rxd
+            # the sizer produces, and a runner-side cap was added to satisfy it, shortening t_rxd
+            # ~8x and widening the ASSET_VULNERABLE window from ~2h to ~21h at the fast tail —
+            # the window in which the maker holds the refunded asset AND can still claim the
+            # counter leg with p. THE MISMATCH NOW FAILS THE OTHER WAY: the gate is a LOWER bound,
+            # so a slower interval over-projects where the refund opens and ACCEPTS a t_rxd ~8x
+            # too short (measured: 312 blk accepted at 300 s where the 36 s tail requires 2,597).
+            # Same defect, opposite arrangement. This comment used to justify the fast tail by
+            # citing the gate docstring's "the interval is a no-op input" — a claim that docstring
+            # no longer makes, because it is only ever true of a t_rxd the sizer itself produced.
             rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=policy.max_covenant_confirm_wait_s,
             elapsed_blocks=elapsed_blocks,
@@ -2162,14 +2166,18 @@ class SwapCoordinator:
             eth_timeout_unix_s=terms.eth_timeout_unix_s,
             margin=policy.cross_clock_margin,
             t_rxd=terms.t_rxd,
-            # THE FAST TAIL, so the interval genuinely cancels. This gate's docstring says the
-            # interval is "a no-op input" because the sizer divides by it and this multiplies by
-            # it — true ONLY while both use the same one. It was passed the NOMINAL while
-            # `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an 8.3x mismatch, so
-            # the gate refused exactly the t_rxd the sizer produces. A runner-side cap was then
-            # added to satisfy the gate, which shortened t_rxd ~8x and widened the
-            # ASSET_VULNERABLE window from ~2h to ~21h at the fast tail — the window in which the
-            # maker holds the refunded asset AND can still claim the counter leg with p.
+            # THE FAST TAIL, matching the interval the sizer divides by. This was passed the
+            # NOMINAL while `eth_absolute_to_rxd_relative_blocks` divides by the fast tail, an
+            # 8.3x mismatch: under the pre-#482 upper-bound gate that REFUSED exactly the t_rxd
+            # the sizer produces, and a runner-side cap was added to satisfy it, shortening t_rxd
+            # ~8x and widening the ASSET_VULNERABLE window from ~2h to ~21h at the fast tail —
+            # the window in which the maker holds the refunded asset AND can still claim the
+            # counter leg with p. THE MISMATCH NOW FAILS THE OTHER WAY: the gate is a LOWER bound,
+            # so a slower interval over-projects where the refund opens and ACCEPTS a t_rxd ~8x
+            # too short (measured: 312 blk accepted at 300 s where the 36 s tail requires 2,597).
+            # Same defect, opposite arrangement. This comment used to justify the fast tail by
+            # citing the gate docstring's "the interval is a no-op input" — a claim that docstring
+            # no longer makes, because it is only ever true of a t_rxd the sizer itself produced.
             rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
         )

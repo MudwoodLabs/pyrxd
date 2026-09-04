@@ -8,28 +8,47 @@ only starts counting once the covenant is MINED. This module bridges the two:
 
 * :func:`eth_absolute_to_rxd_relative_blocks` converts the absolute ETH deadline into the
   relative RXD-block window the maker should lock the covenant for, with conservative
-  (floor) rounding + a fail-closed safety floor, so the canonical HTLC ordering invariant
-  holds across the unit + anchor boundary: the asset/RXD leg (claimed SECOND, by the taker)
-  opens its refund strictly BEFORE the counter/ETH leg's deadline by at least the margin —
-  i.e. the counter/ETH leg, claimed FIRST by the maker, holds the SHORTER deadline (the
-  cross-clock analog of the BTC ``t_BTC > t_RXD`` invariant). The inherent risk this ordering
-  creates (a maker withholding its claim until past the RXD refund, then claiming AND
-  refunding) is mitigated by the proactive asset-refund + the cross-clock margin coupling, not
-  by the timelock alone — see
-  :func:`pyrxd.gravity.swap_coordinator.taker_refund_window_open`.
+  (ceil) rounding + a fail-closed safety floor, so the canonical HTLC ordering invariant
+  holds across the unit + anchor boundary: the asset/RXD leg (LOCKED by the maker, who holds
+  ``p``) opens its refund strictly AFTER the counter/ETH leg's deadline by at least the margin
+  — i.e. the counter/ETH leg, claimed FIRST by the maker, holds the SHORTER deadline (the
+  cross-clock analog of the BTC ``t_rxd > t_btc`` invariant). The risk this ordering leaves —
+  a maker that withholds its claim entirely, or reveals only at the very end — is bounded by
+  the proactive asset-refund + the cross-clock margin coupling, not by the timelock alone —
+  see :func:`pyrxd.gravity.swap_coordinator.taker_refund_window_open`.
 
-  RESIDUAL FREE-OPTION (red-team HIGH, NOT fully closed pre-audit). The reveal-on-the-long-leg
-  free-option is INHERENT to this swap shape and is only BOUNDED here, not eliminated. Honest
-  caveats: (1) the proactive asset-refund returns the covenant to the MAKER (it owns the asset;
+  HALF-CORRECTED BY #482, FINISHED HERE. That commit rewrote one clause of the sentence above
+  ("holds the LONGER deadline" -> "SHORTER") and left its premise standing: it still said the
+  RXD refund opens "strictly BEFORE" the ETH deadline, still cited "the BTC ``t_BTC > t_RXD``
+  invariant", and still called the rounding "(floor)". All three describe the PRE-#482
+  protocol, in which the maker could refund the leg it locked while ``p`` was still secret and
+  then claim the counter leg with ``p`` — both legs, deterministically. The code has computed
+  ``budget_s = eth_timeout + margin - lock_time`` and rounded with ``math.ceil`` since #482,
+  and ``floor`` is now the UNSAFE rounding: it SHORTENS the window, opening the maker's refund
+  sooner.
+
+  RESIDUAL FREE-OPTION (red-team HIGH, NOT fully closed pre-audit). STATED IN THE PRE-#482
+  GEOMETRY AND NOT RE-DERIVED SINCE: caveat (2) below turns on the taker's claim window having
+  CLOSED before ``eth_timeout``, and that is the relation #482 inverted — under the corrected
+  ordering :func:`assert_covenant_confirms_before_eth_deadline` refuses to lock unless the
+  window closes no earlier than ``eth_timeout + margin``. Whether the residual survives the
+  inversion, and in what shape, is an open question for the external audit. It is left as
+  written rather than quietly rewritten to match the code, because rewriting a threat model to
+  match the code is how the inverted rule acquired its authority in the first place.
+
+  The reveal-on-the-long-leg free-option is INHERENT to this swap shape and is only BOUNDED
+  here, not eliminated. Honest caveats:
+  (1) the proactive asset-refund returns the covenant to the MAKER (it owns the asset;
   p is not yet public), so it does NOT recover value for the ETH TAKER — the taker's value sits
   in the ETH HTLC, refundable only after ``eth_timeout`` via ``mutual_refund``. (2) A maker that
   reveals at ``eth_timeout - epsilon`` (genuinely FINAL, not a stall) after the ``t_rxd`` window
   has closed can race its own CSV refund; the coordinator's reorg gate then SQUEEZES the taker to
   ``ASSET_VULNERABLE`` and a winner-take-all claim can lose to the already-landed CSV refund —
   the FSM-modeled ``ASSET_VULNERABLE -> ONE_SIDED_LOSS_TAKER`` residual. The defenses that BOUND
-  it: the cross-clock margin (this module) sizes ``t_rxd`` to open strictly before the ETH
-  deadline minus the full finality-stall-tolerant margin, and the coordinator couples the
-  proactive-refund window ``N`` to the finality+burial reserve so a reveal cannot be timed into a
+  it: the cross-clock margin (this module) sizes ``t_rxd`` to open strictly AFTER the ETH
+  deadline PLUS the full finality-stall-tolerant margin (this said "before ... minus", the
+  pre-#482 relation — the sizer and the gate have read ``+ margin`` since), and the coordinator
+  couples the proactive-refund window ``N`` to the finality+burial reserve so a reveal cannot be timed into a
   squeeze the taker could otherwise have acted in. This residual is an ACCEPTED, documented,
   pre-external-audit property (same as the BTC<->RXD direction), surfaced loudly (never a silent
   COMPLETED) and gated behind the external audit + the test
@@ -75,10 +94,17 @@ _MAX_RXD_CSV_BLOCKS = SEQUENCE_LOCKTIME_MASK
 class CrossClockMargin:
     """The safety budget (seconds) carved out of the ETH→RXD deadline gap.
 
-    Each component is a deliberate, documented seconds budget; the converter subtracts
-    their sum from the ETH deadline before sizing the RXD window, so the RXD refund opens
-    strictly BEFORE the ETH deadline by at least this much wall-clock (the RXD/asset leg,
-    LOCKED by the maker, holds the LONGER deadline; the ETH/counter leg the shorter).
+    Each component is a deliberate, documented seconds budget; the converter ADDS their sum to
+    the ETH deadline before sizing the RXD window, so the RXD refund opens strictly AFTER the
+    ETH deadline by at least this much wall-clock (the RXD/asset leg, LOCKED by the maker,
+    holds the LONGER deadline; the ETH/counter leg the shorter).
+
+    THIS SENTENCE CONTRADICTED ITS OWN PARENTHETICAL. #482 inverted the relation and updated
+    only the clause in brackets, leaving "subtracts their sum" and "opens strictly BEFORE" —
+    the pre-#482 rule, which is the deterministic maker theft (refund the locked leg while
+    ``p`` is secret, then claim the counter leg with ``p``). The code has read
+    ``budget_s = eth_timeout_unix_s + margin.total_s() - expected_rxd_lock_time_unix_s`` and
+    gated on ``earliest_rxd_open_s >= eth_timeout + margin`` since #482.
 
     ``eth_reorg_finality_s`` is the post-Merge ETH finalized-checkpoint lag in the STEADY
     STATE (~2 epochs ≈ 768 s ≈ 12.8 min — formally specified, ethereum.org/eth2book).
@@ -94,8 +120,11 @@ class CrossClockMargin:
     to AT LEAST a May-2023-class hour for a mainnet ETH leg; larger is safer (the cost is only
     the maker's asset being locked longer, a liveness cost, never a safety one).
 
-    ``rounding_slack_s`` MUST be at least one ``rxd_block_interval_s`` to absorb the converter's
-    floor rounding plus a cross-chain clock-skew budget.
+    ``rounding_slack_s`` MUST be at least one ``rxd_block_interval_s``: a cross-chain clock-skew
+    budget, plus a block of slack against an interval that is a MEASURED estimate and not a
+    guarantee. It said "to absorb the converter's floor rounding"; the converter has rounded UP
+    since #482, which LENGTHENS the window — the safe direction — so rounding is no longer the
+    thing this absorbs.
     """
 
     eth_reorg_finality_s: int  # ETH finalized-checkpoint STEADY-STATE lag (~2 epochs, specified)
@@ -159,16 +188,23 @@ def eth_absolute_to_rxd_relative_blocks(
 
         budget_s = eth_timeout_unix_s + margin.total_s() - expected_rxd_lock_time_unix_s
 
-    converted to blocks by FLOOR. Flooring can only SHORTEN the RXD window, which lets the
-    maker reclaim the asset no later than computed (never longer); the sub-block remainder
-    is covered by ``margin.rounding_slack_s``. Fail-closed ``ValidationError`` if the budget
-    is non-positive, below the safety floor, or beyond the BIP68 16-bit cap.
+    converted to blocks by CEIL — the inline comment at the ``math.ceil`` below says so in as
+    many words. Ceiling can only LENGTHEN the RXD window, so the maker's refund opens no EARLIER
+    than the budget requires; the sub-block remainder costs the maker lock time, which is a
+    liveness cost and never a safety one. Fail-closed ``ValidationError`` if the budget is
+    non-positive, below the safety floor, or beyond the BIP68 16-bit cap.
+
+    THIS PARAGRAPH STILL SAID "FLOOR" after #482 changed the code to ``ceil`` and made the
+    punctuality gate a LOWER bound — and it named flooring's effect, SHORTENING the window, as
+    the safe direction. It is the unsafe one now: a shorter window opens the maker's refund
+    sooner, which is exactly the theft the inversion removed.
 
     ``rxd_block_interval_s`` MUST be a conservative FAST-TAIL percentile of the RXD inter-block
     distribution (e.g. p10), NOT the mean. Rationale (the attacker-benefits-when-RXD-runs-fast
-    rule): ``t_rxd = ceil(budget_s / interval) - 1`` picks the block count whose EXPECTED wall-clock
-    is ``budget_s``; if RXD then mines FASTER than ``interval`` assumed, those ``t_rxd`` blocks
-    elapse SOONER than ``budget_s`` and the refund opens EARLY — shrinking (in the worst case
+    rule): ``t_rxd = ceil(budget_s / interval)`` picks the smallest block count whose EXPECTED
+    wall-clock reaches ``budget_s`` (the trailing ``- 1`` this line carried is the pre-#482 form,
+    from when the gate was an upper bound); if RXD then mines FASTER than ``interval`` assumed,
+    those ``t_rxd`` blocks elapse SOONER than ``budget_s`` and the refund opens EARLY — shrinking (in the worst case
     eliminating) the taker's claim window. A smaller (fast-tail) ``interval`` yields MORE blocks
     for the same budget, so the refund opens later in the fast case — the safe direction. Using
     the mean UNDERESTIMATES how fast the window can open. Measured RXD mainnet 2026-06-02 (150
@@ -205,9 +241,14 @@ def eth_absolute_to_rxd_relative_blocks(
     # (eth_timeout 12-48h x 8 fast tails x 5 confirm waits): 111 divided exactly, and the gate
     # refused the sizer's own output on all 111 and on no others.
     #
-    # It stayed invisible because nothing in production calls this function — the runner takes a
+    # It stayed invisible because nothing in production called this function — the runner took a
     # hand-typed `--t-rxd-blocks` — and because the test asserting sizer and gate agree sizes with
-    # a zero confirm wait, which never lands on the boundary. The real run's parameters do:
+    # a zero confirm wait, which never lands on the boundary. NO LONGER TRUE, and the tense
+    # mattered: `scripts/eth_swap_run.py::_derive_t_rxd_blocks` calls this on every ETH run now
+    # (`--t-rxd-blocks` survives only as a rehearsal override), and
+    # `assert_t_rxd_fits_the_eth_deadline`, just below, is called by `eth_swap_two_host.py`. A
+    # "nobody calls this" note left in the present tense is an invitation to skip the very
+    # boundary a live caller reaches. The real run's parameters do:
     # (86400 - 7068 - 600) / 36 = 2187.0 exactly, so the canonical derivation produced 2187 and the
     # gate accepted only 2186. Deriving one block SHORT is the safe direction anyway: it opens the
     # maker's refund marginally LATER, costing the maker a block of lock time rather than letting
@@ -302,38 +343,46 @@ def assert_covenant_confirms_before_eth_deadline(
 ) -> None:
     """Covenant-punctuality gate (re-audit SC-3/TLK-1).
 
-    WHAT THIS ACTUALLY VERIFIES — read before changing it. The arithmetic below looks like a
-    wall-clock projection of the RXD refund, and its previous docstring described it as one. It is
-    not, because ``rxd_block_interval_s`` **cancels**: ``eth_absolute_to_rxd_relative_blocks``
-    computes ``t_rxd = floor(budget_s / interval)`` and this function then computes
-    ``ceil(t_rxd * interval)``, which are inverse operations and return ``budget_s`` again. Measured
-    over 20 scenarios at six intervals spanning 9s to 1200s — a 133x range straddling the whole
-    observed RXD distribution — the verdict did not change once. The interval is a no-op input.
+    WHAT THIS ACTUALLY VERIFIES — read before changing it. The check is the ordering invariant
+    itself, not a proxy for it::
 
-    Substituting the reduction, the check that actually happens is::
+        now_unix_s + ceil((t_rxd - elapsed_blocks) * rxd_block_interval_s)
+            >=  eth_timeout_unix_s + margin.total_s()
 
-        now_unix_s + max_covenant_confirm_wait_s  <  expected_rxd_lock_time_unix_s
+    i.e. **does the Radiant refund open no earlier than the ETH deadline plus the full margin**,
+    measured from the EARLIEST plausible covenant confirmation. ``max_covenant_confirm_wait_s`` is
+    validated but deliberately absent from that arithmetic — adding it would assume a LATE
+    confirm, which is the optimistic direction now; see the comment at the check below.
 
-    i.e. **does the covenant confirm by the time the sizing assumed it would**. That is a real and
-    useful property — the CSV clock starts at covenant MINING, so a covenant that confirms late
-    shifts the whole RXD window right — but it is punctuality, not a slow-chain defence.
+    ``rxd_block_interval_s`` IS A LOAD-BEARING INPUT. Pass the same FAST tail the sizer divides
+    by: a LARGER interval projects the refund further out and so ACCEPTS a SHORTER ``t_rxd``.
+    Measured at ``eth_timeout`` 86,400 s with the standard margin — sizing and gating at a 300 s
+    nominal accepts ``t_rxd = 312``, which the 36 s fast-tail gate refuses and which is 8.3x
+    shorter than the 2,597 the fast tail requires. On a chain that then runs at its fast tail,
+    that window opens the maker's refund long before the deadline it is meant to outlast. The
+    safety-critical direction is RXD running FAST, and the sizer and this gate must BOTH assume
+    it; ``tests/test_t_rxd_sizer_and_gate_agree.py`` pins the pairing, and both production call
+    sites route through ``swap_coordinator._dividing_interval_s`` for exactly this reason.
 
-    DO NOT "FIX" THIS BY PASSING A SLOWER PERCENTILE. That was attempted and it refuses every
-    configuration at every budget, because sizing deliberately maximises the block count using a
-    FAST-tail interval while a projection multiplied by a slow-tail one inflates it by the ratio
-    between the two (~5.3x at p10 vs median). It would also be defending the wrong direction:
-    :func:`eth_absolute_to_rxd_relative_blocks` establishes that a slow RXD only lengthens the
-    MAKER'S LOCK — a liveness cost, never a safety one — because it gives the taker *more* time to
-    claim, not less. The safety-critical direction is RXD running FAST, and that is handled where
-    it belongs, in the sizing.
+    THIS BLOCK SAID THE OPPOSITE OF ALL OF THAT, and #482 did not reach it. It called the
+    interval "a no-op input" that "**cancels**" — true only of a ``t_rxd`` the sizer itself
+    produced at the same interval, whereas production passes an independently negotiated
+    ``terms.t_rxd``; it reduced the check to ``now_unix_s + max_covenant_confirm_wait_s <
+    expected_rxd_lock_time_unix_s``, a punctuality question this function no longer asks and
+    whose second operand is not even one of its parameters; and it warned that a slower
+    percentile "refuses every configuration", when under the inverted relation a slower
+    percentile is the direction that wrongly ACCEPTS. The comment at the check below already
+    recorded that the punctuality reading was "the right question under the OLD relation".
 
-    The projected open is rounded UP (``ceil``) so the gate errs toward refusing; that rounding is
-    the only residual effect the interval has, worth about one block at the boundary. Run this TWICE: (1)
+    The projected open is rounded UP (``ceil``), which makes refusal marginally LESS likely, by
+    under a second: the gate is a LOWER bound, so a larger projection is the permissive
+    direction. (This said the rounding made the gate "err toward refusing", "worth about one
+    block at the boundary" — both true of the pre-#482 upper-bound form.) Run this TWICE: (1)
     pre-lock with the worst-case ``max_covenant_confirm_wait_s`` (a projection before
     broadcasting the covenant), and (2) post-confirm with ``now_unix_s = actual mining time``
     and ``max_covenant_confirm_wait_s = 0``; if (2) fails the maker must refund the covenant
-    proactively rather than proceed. Raises ``ValidationError`` when the covenant would
-    confirm too late to lock RXD safely.
+    proactively rather than proceed. Raises ``ValidationError`` when the Radiant refund could
+    open too early to lock RXD safely.
     """
     if not isinstance(t_rxd, Timelock) or t_rxd.unit is not TimeUnit.BLOCKS:
         raise ValidationError("t_rxd must be a BLOCKS Timelock")
