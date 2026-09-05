@@ -15,6 +15,7 @@ Verification reverses steps 1-3 and calls PublicKey.verify().
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 
 import cbor2
@@ -44,7 +45,25 @@ def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> by
     off a chain, prefer :func:`_cbor_for_verifying`, which does not route the bytes
     through this object's fields.
     """
+    # POP THEN SET, so `creator` is ALWAYS the last key — regardless of whether the input
+    # already had one. `cbor2.dumps` is not canonical here, so it preserves insertion order, and
+    # Python keeps an existing key's position on plain assignment. That made signing (no creator
+    # yet -> appended last) and verifying (creator already present -> left where `to_cbor_dict`
+    # emits it) produce different byte orders from the same logical map: identical dicts,
+    # different bytes, "signature mismatch" on an honest token. Popping first collapses both
+    # paths onto one order.
+    #
+    # Latent while `creator` happened to be last anyway, which is every plain NFT — so every test
+    # passed. It bites the moment a field is emitted AFTER creator, which `crypto` is. Nothing on
+    # chain can carry that combination yet, because until now `sign_metadata` stripped `crypto`
+    # before returning, so this changes no signature that already exists.
+    #
+    # Last is also the position a third-party writer uses (it appends creator to a finished
+    # map), and canonical ordering is deliberately NOT used here: the on-chain bytes of a
+    # non-pyrxd mint are in the writer's order, and re-encoding them canonically would report
+    # an honest token as "normalised by the decoder".
     d = metadata.to_cbor_dict()
+    d.pop("creator", None)
     d["creator"] = {"pubkey": pubkey_hex, "sig": "", "algo": algo}
     return cbor2.dumps(d)
 
@@ -113,29 +132,20 @@ def sign_metadata(
     sig_hex = sig_der.hex()
 
     creator = GlyphCreator(pubkey=pubkey_hex, sig=sig_hex, algo=algo)
-    return GlyphMetadata(
-        protocol=metadata.protocol,
-        name=metadata.name,
-        ticker=metadata.ticker,
-        description=metadata.description,
-        token_type=metadata.token_type,
-        main=metadata.main,
-        attrs=metadata.attrs,
-        loc=metadata.loc,
-        loc_hash=metadata.loc_hash,
-        decimals=metadata.decimals,
-        image_url=metadata.image_url,
-        image_ipfs=metadata.image_ipfs,
-        image_sha256=metadata.image_sha256,
-        v=metadata.v,
-        dmint_params=metadata.dmint_params,
-        creator=creator,
-        royalty=metadata.royalty,
-        policy=metadata.policy,
-        rights=metadata.rights,
-        created=metadata.created,
-        commit_outpoint=metadata.commit_outpoint,
-    )
+    # DERIVED FROM THE TYPE, not a hand-copied field list. This rebuilt GlyphMetadata by naming 20
+    # fields, and the fields it did not name were silently dropped: `crypto`, `encrypted_main`,
+    # `timelock`, `container_refs`, `author_refs`. The damage was not merely lost data — the
+    # signature is computed over `to_cbor_dict()` BEFORE the copy, so signing a timelocked token
+    # returned metadata whose own signature reported "signature mismatch" to every verifier, while
+    # also losing the CEK commitment and the per-recipient key wraps.
+    #
+    # `dataclasses.replace` copies whatever the dataclass declares, so a field added later is
+    # carried without anyone remembering this call site. That is the whole point: a list of field
+    # names in a copy constructor is a list somebody has to maintain, and nobody did.
+    #
+    # `source_cbor` is reset deliberately: it is the exact bytes this object was DECODED from, and
+    # those bytes are now stale — this metadata has a creator signature they do not contain.
+    return dataclasses.replace(metadata, creator=creator, source_cbor=None)
 
 
 def verify_creator_signature(metadata: GlyphMetadata) -> tuple[bool, str]:
