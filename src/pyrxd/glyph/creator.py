@@ -45,23 +45,18 @@ def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> by
     off a chain, prefer :func:`_cbor_for_verifying`, which does not route the bytes
     through this object's fields.
     """
-    # Build the creator IN PLACE rather than appending it. `cbor2.dumps` here is not canonical, so
-    # it preserves insertion order — and appending moved `creator` to the END of the map while the
-    # verifier saw it in the position `to_cbor_dict` puts it. Identical dicts, different bytes,
-    # "signature mismatch" on an honest token.
-    #
-    # Latent for as long as `creator` happened to be the last key anyway, which is every plain
-    # NFT — so every test passed. It bites the moment any field is emitted AFTER creator, which
-    # `crypto` is. Nothing on chain can carry that combination yet, because until now
-    # `sign_metadata` stripped `crypto` before returning, so this changes no signature that exists.
     # POP THEN SET, so `creator` is ALWAYS the last key — regardless of whether the input
-    # already had one. Python keeps an existing key's position on assignment, so signing (no
-    # creator yet -> appended last) and verifying (creator present -> left where the encoder
-    # emits it) produced different byte orders from the same logical map. Identical dicts,
-    # different bytes, "signature mismatch" on an honest token.
+    # already had one. `cbor2.dumps` is not canonical here, so it preserves insertion order, and
+    # Python keeps an existing key's position on plain assignment. That made signing (no creator
+    # yet -> appended last) and verifying (creator already present -> left where `to_cbor_dict`
+    # emits it) produce different byte orders from the same logical map: identical dicts,
+    # different bytes, "signature mismatch" on an honest token. Popping first collapses both
+    # paths onto one order.
     #
-    # Latent while `creator` happened to be last anyway, which is every plain NFT — so every
-    # test passed. It bites the moment a field is emitted AFTER creator, which `crypto` is.
+    # Latent while `creator` happened to be last anyway, which is every plain NFT — so every test
+    # passed. It bites the moment a field is emitted AFTER creator, which `crypto` is. Nothing on
+    # chain can carry that combination yet, because until now `sign_metadata` stripped `crypto`
+    # before returning, so this changes no signature that already exists.
     #
     # Last is also the position a third-party writer uses (it appends creator to a finished
     # map), and canonical ordering is deliberately NOT used here: the on-chain bytes of a
