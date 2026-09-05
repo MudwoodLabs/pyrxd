@@ -261,6 +261,9 @@ def _refund_opens_at(policy: MarginPolicy, terms: NegotiatedTerms, asset_locked_
     covenant was MINED at — a confirmation depth here puts the deadline a whole chain-length
     out of place, which is precisely the inversion the shim fix created downstream.
     """
+    # floor-is-deliberate: this IS the claim deadline, and every consumer counts blocks REMAINING
+    # to it. A smaller deadline yields less headroom, so the tower pages a squeeze sooner rather
+    # than certifying a claim race it has not got room for. (No-op: t_rxd is pinned to BLOCKS.)
     t_rxd_blocks = BlockSpan(terms.t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value)
     return ChainHeight(int(asset_locked_at_height) + int(t_rxd_blocks))
 

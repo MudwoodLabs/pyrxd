@@ -216,6 +216,23 @@ _TIMELOCK_FLOORS: dict[str, int] = {
 _MIN_ETH_FINALIZATION_WINDOW_S = ETH_FINALIZATION_WINDOW_FLOOR_S
 
 
+@functools.cache
+def _float_field_names(cls: type) -> tuple[str, ...]:
+    """The ``float``-typed field names of a dataclass, read off the dataclass itself.
+
+    The twin of ``_TIMELOCK_FLOORS``' derived cross-check, for the knobs that carry a NUMBER
+    rather than a Timelock. Kept a derivation because the alternative — a tuple of names beside
+    the validator — is the shape that let ``rxd_claim_inclusion`` ship with no floor at all.
+
+    ``from __future__ import annotations`` makes ``field.type`` the ANNOTATION STRING, so the
+    match is on text; the class object is accepted too so the derivation does not silently return
+    nothing if that import is ever dropped. ``tests/test_margin_policy_rejects_non_finite_floats``
+    asserts the result against the fields both ways, so an empty or partial answer fails loudly
+    rather than passing vacuously.
+    """
+    return tuple(f.name for f in dataclasses.fields(cls) if f.type in ("float", "float | None", float))
+
+
 @dataclass(frozen=True)
 class MarginPolicy:
     """How the cross-chain timelock margin is computed and enforced.
@@ -353,6 +370,37 @@ class MarginPolicy:
             # Populate the plain field so every existing consumer (`_value_scaled_burial_blocks`,
             # the setup gate, the watchtower) reads it unchanged.
             object.__setattr__(self, "rxd_reorg_cost_per_block", self.reorg_cost.photons_per_block)
+        # EVERY float knob here must be FINITE, and the `> 0` / `>= 1.0` bounds below do not say
+        # so: IEEE-754 makes every comparison with NaN False, so `nan <= 0` and `nan < 1.0` are
+        # both False and NaN passes the bound written to exclude it — vacuously, which is
+        # indistinguishable in the output from passing because the value is sound. `inf` passes
+        # for the honest reason that it genuinely is >= the bound. `argparse(type=float)` accepts
+        # both spellings, so `--burial-safety-factor nan` reached this dataclass from the shipped
+        # watchtower CLI. `ClaimExecutor.__init__` and `max_protected_value` already carry
+        # `math.isfinite` for their own factors and say this is why; MarginPolicy was the one
+        # factor site without it.
+        #
+        # It is a REFUSAL, not a clamp, and it costs nothing honest: every finite positive float
+        # is unaffected. What it prevents is the far side — a non-finite factor does not crash,
+        # it reaches `Fraction(...)` inside the reorg gate, raises ValueError/OverflowError, gets
+        # rewrapped as "could not normalise reorg depths to blocks", and comes out of the
+        # watchtower as PAGE_SQUEEZED "verify finality manually" on EVERY tick of EVERY rxd swap.
+        # Fail-closed (never a false SAFE), but a guard that pages a healthy swap as a squeeze and
+        # pushes its operator to act by hand under time pressure is refusing valid work.
+        # DERIVED FROM THE DATACLASS, not a tuple of names typed out here. A hand-kept list of the
+        # fields a validator covers is how `rxd_claim_inclusion` went unchecked when #511 added it
+        # (see `_TIMELOCK_FLOORS` below, fixed the same way); the float knobs would have gone the
+        # same way on the next one. `tests/test_margin_policy_rejects_non_finite_floats.py` pins
+        # the derivation in both directions, so it cannot silently start returning nothing.
+        for _label in _float_field_names(type(self)):
+            _val = getattr(self, _label)
+            if isinstance(_val, (int, float)) and not isinstance(_val, bool) and not math.isfinite(_val):
+                raise ValidationError(
+                    f"MarginPolicy.{_label} = {_val} is not finite. NaN/inf pass every numeric bound "
+                    "on this dataclass by construction (NaN compares False to everything) and then "
+                    "raise deep inside the reorg gate, where the failure surfaces as an "
+                    "un-assessable finality verdict on every swap."
+                )
         if not isinstance(self.block_interval_s, (int, float)) or self.block_interval_s <= 0:
             raise ValidationError("MarginPolicy.block_interval_s must be > 0")
         if not isinstance(self.rxd_block_interval_s, (int, float)) or self.rxd_block_interval_s <= 0:
@@ -755,16 +803,48 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
         # check is repeated at the use site so a hand-built policy cannot slip past.
         raise ValidationError("real-value mode requires a measured margin (fail-closed)")
 
-    # Normalise everything to BLOCKS in one place. normalize_to raises if it cannot
-    # convert (e.g. block_interval_s <= 0), which is the fail-closed path.
+    # Convert in one place, and per TERM — because WHICH SIDE OF THE COMPARISON a term lands on,
+    # not whether it is a "deadline" or a "reserve", is what decides whether rounding is safe.
+    #
+    # The gate below is `maker_refund_opens_s < taker_refund_opens_s + margin_s: raise`.
+    #
+    #   t_rxd   -> LHS.  Rounding DOWN shrinks the left side  -> STRICTER  -> conservative.
+    #   t_btc   -> RHS.  Rounding DOWN shrinks the bar        -> PERMISSIVE -> the unsafe side.
+    #   margin  -> RHS.  Same as t_btc.
+    #
+    # #624 derived exactly that for `margin` and fixed it to ceil — and then wrote, right here,
+    # that "`t_btc`/`t_rxd` above are DEADLINES and floor correctly (flooring only shrinks the
+    # window their holder gets)". That grouped `t_btc` with `t_rxd` when it shares a side with
+    # `margin`. The sentence was a CLAIM, no test evaluated it, and the SAME premise was recorded
+    # as the reason `t_btc` was safe to leave out of the guard test's derived field set — so the
+    # guard for the class carried the error of the instance.
+    #
+    # `t_btc` is not fixed by ceiling it, though: it is a DEADLINE, and its maturity is not a
+    # rounding of anything. BIP68 quantises a SECONDS lock to 512 s, while `normalize_to(BLOCKS)`
+    # quantised it to `block_interval_s`. Measured over every encodable value at 600 s/block, the
+    # old expression put the taker's refund up to 592 s EARLY (V=20992 -> gate said 20400 s, the
+    # chain says 20992 s: a maker-chosen 592 s off a margin the policy demanded in full) and up to
+    # 504 s LATE (V=17400 -> gate said 17400 s, the chain says 16896 s: honest terms refused).
+    # `consensus_maturity_s` is derived from `to_nsequence()`, so it is the chain's own number in
+    # both units and there is nothing left to round. Reachable because `NegotiatedTerms` does NOT
+    # pin `t_btc` to BLOCKS — `from_dict` takes the unit tag off the wire and both of that class's
+    # own guards are unit-scoped (see `swap_state.py`, "SCOPE, HONESTLY"). No-op for every
+    # BLOCKS-tagged `t_btc`, which is everything this tree constructs.
     try:
-        btc_blocks = t_btc.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+        taker_refund_opens_s = t_btc.consensus_maturity_s(block_interval_s=policy.block_interval_s)
+        # Display + the cheap ordering pre-check only, derived FROM the exact seconds so the
+        # message cannot quote a block count the inequality did not use. A BLOCKS lock takes its
+        # own value rather than dividing back out: `int(v * iv // iv)` is a block LOW for some v
+        # at sub-second intervals, and while nothing real runs one, a pre-check that quietly
+        # disagrees with its own input is how the next reader loses an hour.
+        btc_blocks = (
+            t_btc.value if t_btc.unit is TimeUnit.BLOCKS else int(taker_refund_opens_s // policy.block_interval_s)
+        )
+        # floor-is-deliberate: t_rxd is the LHS above — flooring shrinks it and makes the gate
+        # stricter. (No-op in practice: `NegotiatedTerms` pins t_rxd to BLOCKS.)
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-        # `margin` is a REQUIREMENT: it is ADDED to the bar at `maker_refund_opens_s <
-        # taker_refund_opens_s + margin_s`, so flooring it shrinks the bar — permissive, the
-        # unsafe direction. `t_btc`/`t_rxd` above are DEADLINES and floor correctly (flooring
-        # only shrinks the window their holder gets), which is why the three do not share one
-        # conversion. No-op today: every policy the codebase builds tags margin in BLOCKS.
+        # `margin` is a REQUIREMENT on the RHS, so it ceils. No-op today: every policy the
+        # codebase builds tags margin in BLOCKS.
         margin_blocks = _reserve_to_blocks(policy.margin, policy.block_interval_s)
     except ValidationError:
         raise
@@ -811,11 +891,21 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
     # `margin` stays a BTC-block Timelock: its measured derivation (`ceil(tail_gap / median)`) is
     # "one slow BTC block", a counter-chain quantity, and nothing persisted carries the policy.
     maker_refund_opens_s = rxd_blocks * policy.rxd_block_interval_s
-    taker_refund_opens_s = btc_blocks * policy.block_interval_s
+    # `taker_refund_opens_s` is BIP68's own number, computed in the conversion block above — not
+    # `btc_blocks * block_interval_s`, which re-quantised it onto the wrong grid.
     margin_s = margin_blocks * policy.block_interval_s
 
     def _h(seconds: float) -> str:
         return f"{seconds / 3600:.2f} h"
+
+    # Say WHERE the counter-leg number came from, in t_btc's own unit. Printing
+    # "{btc_blocks} blk x {block_interval_s}s" beside `taker_refund_opens_s` made the message
+    # contradict the inequality it was explaining whenever the two grids disagreed.
+    t_btc_desc = (
+        f"{t_btc.value} blk x {policy.block_interval_s:g}s"
+        if t_btc.unit is TimeUnit.BLOCKS
+        else f"{t_btc.value}s, which BIP68 quantises to {taker_refund_opens_s:g}s"
+    )
 
     # The cheap ordering check stays as a NECESSARY condition with a clearer message. It is implied
     # by the inequality below whenever the Radiant interval is the shorter one, so it never refuses
@@ -835,7 +925,7 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
             f"{_h(maker_refund_opens_s)} ({rxd_blocks} blk"
             f"{f' remaining of {rxd_blocks + elapsed_blocks}' if elapsed_blocks else ''} "
             f"x {policy.rxd_block_interval_s:g}s), but the taker's counter-leg refund opens at "
-            f"{_h(taker_refund_opens_s)} ({btc_blocks} blk x {policy.block_interval_s:g}s) and the "
+            f"{_h(taker_refund_opens_s)} ({t_btc_desc}) and the "
             f"margin needs {_h(margin_s)} on top — a shortfall of "
             f"{_h(taker_refund_opens_s + margin_s - maker_refund_opens_s)} "
             f"({'measured' if policy.is_measured else 'ESTIMATED'}). "
@@ -915,6 +1005,9 @@ def taker_refund_window_open(
             raise ValidationError(f"{label} must be a non-negative int")
     if not isinstance(safety_window_blocks, int) or isinstance(safety_window_blocks, bool) or safety_window_blocks < 0:
         raise ValidationError("safety_window_blocks must be a non-negative int")
+    # floor-is-deliberate: this builds `maturity`, and the predicate is `now >= maturity - N`.
+    # A SMALLER maturity makes the taker stop waiting SOONER — the conservative direction for a
+    # "stop waiting" trigger. (No-op in practice: `NegotiatedTerms` pins t_rxd to BLOCKS.)
     rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=block_interval_s).value
     # The Radiant refund opens at asset_locked_at_height + t_rxd (relative timelock).
     # Act once we are within `safety_window_blocks` of that maturity.
@@ -1171,9 +1264,14 @@ def assess_claim_finality(
             "is impossible on an honest chain (lagging/lying node); fail-closed"
         )
     try:
+        # floor-is-deliberate: this builds `refund_opens_at`, and `blocks_left` counts DOWN from
+        # it. A SMALLER deadline leaves FEWER blocks, so the gate squeezes sooner rather than
+        # certifying SAFE on a window it does not have. (No-op: t_rxd is pinned to BLOCKS.)
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
         # Reserves round UP when seconds-tagged (flooring under-counts a reserve — unsafe);
-        # t_rxd above floors, which is safe for a deadline (only shrinks the window).
+        # t_rxd above floors, which is safe HERE for the reason stated on it — not because it is
+        # a deadline. `t_btc` is a deadline too and floors on the PERMISSIVE side of the margin
+        # gate, which is how #624's comment came to certify the opposite of the truth.
         flat_burial = _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
         # VALUE-SCALED burial (red-team HIGH): the taker's claim must bury deep enough that
         # reorging it costs at least the value at stake; the flat burial is only a FLOOR.
@@ -2999,6 +3097,11 @@ class SwapCoordinator:
         # hostile mempool (deadline-pinning) makes "rely on node rejection" fragile. Refuse to broadcast
         # before maturity with an exact "matures at height N, now M" message; a block-based poller
         # retries at maturity. (Uses the SAME normalize_to(BLOCKS) as the trigger so the two agree.)
+        #
+        # floor-is-deliberate: it MUST match `taker_refund_window_open`'s conversion, or the
+        # trigger and the pre-check disagree about the same height and the refund wedges. This
+        # gate is also consensus-backstopped — the node rejects a non-final CSV spend — so the
+        # floor cannot admit anything the chain would accept. (No-op: t_rxd is pinned to BLOCKS.)
         rxd_blocks = self.record.terms.t_rxd.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=self.config.margin_policy.block_interval_s
         ).value
