@@ -12,6 +12,8 @@ Key safety rules (mirrors the live coordinator, never routes around it):
   observed on-chain (``maker_has_claimed_btc``), the asset claim is assessed
   REGARDLESS of ``record.state`` — a record stuck at ``BOTH_LOCKED`` while the
   chain shows the reveal must still page the claim race (spec-flow Gap 2/7).
+  WHETHER to page is chain truth; WHICH STEP to name is the record, because the
+  coordinator's claim methods are state-gated (``_claim_action``, #580).
 * Fail-closed: any un-assessable input (missing depth/lock-height, a lying/lagging
   ``now < lock`` reading) pages a decision-required alert, never a silent "all
   clear".
@@ -144,8 +146,12 @@ class Observations:
 class Decision:
     """The watchtower's conclusion for one swap, this tick.
 
-    ``recommended_action`` names the one-shot coordinator step the operator should
-    run (a string, for the alert payload — v1 does not invoke it). ``deadline_rxd_height``
+    ``recommended_action`` names the coordinator step(s) the operator should run (a string,
+    for the alert payload — v1 does not invoke it). It is chosen for the RECORD'S OWN STATE,
+    because both claim methods are strictly state-gated and a name the record cannot run
+    costs claim window (#580) — see :func:`_claim_action`. Usually one step; a lagging or
+    already-squeezed record legitimately needs a short sequence, and where no step applies it
+    says so rather than naming one. ``deadline_rxd_height``
     is the RXD height by which the action must land (the maker's CSV refund opens),
     or ``None`` when not time-bounded. ``low_corroboration`` is propagated from the
     observations so the alert layer can mark a single-source page.
@@ -276,6 +282,94 @@ def _btc_refund_matured(terms: NegotiatedTerms, obs: Observations) -> bool:
     )
 
 
+# -- naming a coordinator step the coordinator will actually ACCEPT (#580) --------------------
+#
+# ``decide()`` assesses the claim race from CHAIN TRUTH and deliberately ignores ``record.state``
+# when deciding WHETHER to page — a record stuck at BOTH_LOCKED while the chain shows the reveal
+# must still page the claim race. But WHICH step to name is a different question, and it is
+# answered by the record, because both claim methods are strictly state-gated:
+#
+#   taker_scrape_and_claim_asset       — SECRET_REVEALED only  (swap_coordinator.py:2745, :2811)
+#   taker_claim_asset_from_vulnerable  — ASSET_VULNERABLE only (swap_coordinator.py:2884, :2900)
+#   taker_observed_reveal              — BOTH_LOCKED only      (swap_coordinator.py:2676)
+#
+# Naming a step the record cannot run burns claim window at exactly the moment it is scarcest:
+# after ``p`` is public, under a running timelock, at 3am. The page said
+# "taker_scrape_and_claim_asset" for EVERY state, so an ASSET_VULNERABLE record — the state the
+# gate itself creates when it squeezes — was paged an action that raises
+# "only valid from SECRET_REVEALED, not asset_vulnerable".
+#
+# THE COORDINATOR IS RIGHT AND THE PAGE WAS WRONG. Both guards are load-bearing, not incidental:
+# taker_scrape_and_claim_asset's own SQUEEZED branch advances TAKER_OFFLINE_OR_PINNED, a transition
+# the FSM does not allow FROM ASSET_VULNERABLE, so accepting it there would trade a clear refusal
+# for a raise several network reads later; and taker_claim_asset_from_vulnerable deliberately
+# SKIPS the reorg gate ("a CONSCIOUS choice the caller makes after the gate refused the automatic
+# SAFE claim — never invoked silently"), so accepting it from SECRET_REVEALED would make that gate
+# skippable by accident. The FSM already allows both routes to COMPLETED; only the alert text was
+# wrong, so only the alert text changes here.
+#
+# The pattern already existed for ONE action — "investigate (mutual_refund is only valid from
+# BOTH_LOCKED)" on the MAKER_STALLS branches — and was never generalised. This generalises it.
+# nosec B105 x2 below — bandit keys on the SECRET in these NAMES; the values are coordinator
+# method names bound for an alert payload, the same false positive SwapState.SECRET_REVEALED
+# carries. Nothing here is a credential and none of it goes near `p`.
+_STEP_TO_SECRET_REVEALED = "taker_observed_reveal"  # nosec B105
+_STEP_FROM_SECRET_REVEALED = "taker_scrape_and_claim_asset"  # nosec B105
+_STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
+
+#: Coordinator steps, IN ORDER, that carry a record at this state to a claimed asset. A state
+#: absent here has NO valid claim step and is paged "investigate" rather than a name that raises.
+#: Cross-checked against the coordinator's own ``record.state is not …`` / ``state not in (…)``
+#: guards, read out of the source by ``tests/test_watch_pages_name_state_valid_steps.py`` — so a
+#: guard that moves, or a step renamed, is a failing test rather than a 3am refusal.
+_CLAIM_PATH: dict[SwapState, tuple[str, ...]] = {
+    # The record lags the chain (the case the module docstring calls spec-flow Gap 2/7).
+    # ``taker_observed_reveal`` is the taker-side BOTH_LOCKED -> SECRET_REVEALED transition; it
+    # re-verifies the reveal (sha256(p) == H + the per-swap provenance gate) and does NOT claim,
+    # so the gated claim still runs its own finality gate afterwards.
+    SwapState.BOTH_LOCKED: (_STEP_TO_SECRET_REVEALED, _STEP_FROM_SECRET_REVEALED),
+    SwapState.SECRET_REVEALED: (_STEP_FROM_SECRET_REVEALED,),
+    SwapState.ASSET_VULNERABLE: (_STEP_FROM_VULNERABLE,),
+}
+
+
+def _claim_action(state: SwapState, *, winner_take_all: bool = False, note: str = "") -> str:
+    """The claim step(s) the coordinator will ACCEPT from ``state``, as an alert-payload string.
+
+    ``winner_take_all`` names the SQUEEZED decision, whose endpoint is always
+    ``taker_claim_asset_from_vulnerable`` — ASSET_VULNERABLE-only, and the gated claim is what puts
+    a record there. From SECRET_REVEALED/BOTH_LOCKED that is a genuine two-or-three-step sequence,
+    and saying so is the point: the previous single name was a step the record could not run.
+
+    Falls back to an ``investigate`` page — never a step name — for any state with no valid claim
+    path, mirroring the MAKER_STALLS branches. That is a REPORT, not a refusal: the page still goes
+    out at the same severity with the same deadline, and it states which step needs which state so
+    the operator can act instead of discovering it from a ValidationError.
+    """
+    path = _CLAIM_PATH.get(state)
+    if path is None:
+        return (
+            f"investigate — no coordinator claim step is valid from {state.value} "
+            f"({_STEP_FROM_SECRET_REVEALED} requires secret_revealed, "
+            f"{_STEP_FROM_VULNERABLE} requires asset_vulnerable, "
+            f"{_STEP_TO_SECRET_REVEALED} requires both_locked)"
+        )
+    if winner_take_all and path[-1] != _STEP_FROM_VULNERABLE:
+        # The gated claim re-runs the finality gate against a FRESH read: it claims outright if the
+        # window reopened to SAFE, does nothing on WAIT, and on SQUEEZED advances the record to
+        # ASSET_VULNERABLE — which is what makes the final step runnable. All three are correct
+        # outcomes, so naming it first is right regardless of which one the fresh read produces.
+        path = (*path, _STEP_FROM_VULNERABLE)
+        action = f"{', then '.join(path[:-1])} (its gate advances a still-squeezed record to asset_vulnerable), then {path[-1]}"
+    else:
+        action = ", then ".join(path)
+    if winner_take_all:
+        action += " (winner-take-all) vs accept loss"
+    if note:
+        action += f" ({note})"
+    return action
+
+
 def decide(
     *,
     record: SwapRecord,
@@ -328,7 +422,7 @@ def decide(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason="maker claim observed but finality un-assessable (missing claim depth or asset-lock height) — fail-closed",
-                recommended_action="taker_scrape_and_claim_asset (verify finality manually)",
+                recommended_action=_claim_action(state, note="verify finality manually"),
                 low_corroboration=corr,
             )
         verdict = CounterClaimFinality.from_btc_depth(obs.btc_claim_confirmations, _required_btc_depth_blocks(policy))
@@ -347,7 +441,7 @@ def decide(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason=f"maker claim observed but finality gate un-assessable, fail-closed: {exc}",
-                recommended_action="taker_scrape_and_claim_asset (verify finality manually)",
+                recommended_action=_claim_action(state, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
             )
@@ -355,7 +449,7 @@ def decide(
             return Decision(
                 Intent.PAGE_CLAIM,
                 reason=f"maker revealed p; BTC claim reorg-safe ({obs.btc_claim_confirmations} conf) and burial fits the window",
-                recommended_action="taker_scrape_and_claim_asset",
+                recommended_action=_claim_action(state),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 # BTC↔RXD SAFE claim race → arm the autonomous ClaimExecutor (BTC branch ONLY; the ETH
@@ -373,7 +467,7 @@ def decide(
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason="maker revealed p but t_rxd window closing (gate=SQUEEZED) — ASSET_VULNERABLE, decision required",
-            recommended_action="taker_claim_asset_from_vulnerable (winner-take-all) vs accept loss",
+            recommended_action=_claim_action(state, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
         )
@@ -527,7 +621,7 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason="maker ETH claim observed but finality un-assessable (missing finalized verdict or asset-lock height) — fail-closed",
-                recommended_action="taker_scrape_and_claim_asset (verify finality manually)",
+                recommended_action=_claim_action(state, note="verify finality manually"),
                 low_corroboration=corr,
             )
         # Depth-less verdict (ETH finalized checkpoint): assess_claim_finality takes the no-depth path.
@@ -547,7 +641,7 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason=f"maker ETH claim observed but finality gate un-assessable, fail-closed: {exc}",
-                recommended_action="taker_scrape_and_claim_asset (verify finality manually)",
+                recommended_action=_claim_action(state, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
             )
@@ -555,7 +649,7 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_CLAIM,
                 reason="maker revealed p on ETH; claim finalized and burial fits the window",
-                recommended_action="taker_scrape_and_claim_asset",
+                recommended_action=_claim_action(state),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
             )
@@ -570,7 +664,7 @@ def _decide_eth(
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason="maker revealed p on ETH but t_rxd window closing (gate=SQUEEZED) — ASSET_VULNERABLE, decision required",
-            recommended_action="taker_claim_asset_from_vulnerable (winner-take-all) vs accept loss",
+            recommended_action=_claim_action(state, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
         )

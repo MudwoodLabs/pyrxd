@@ -46,7 +46,7 @@ import aiohttp
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.reorg_cost import ReorgCostMeasurement, measure_rxd_reorg_cost
-from pyrxd.gravity.swap_coordinator import MarginPolicy
+from pyrxd.gravity.swap_coordinator import ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS, MarginPolicy
 from pyrxd.gravity.watch import (
     AckingAlerter,
     AlertChannel,
@@ -350,14 +350,79 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
             block_interval_s=args.block_interval_s,
             btc_claim_reorg_depth=Timelock(args.btc_reorg_depth, TimeUnit.BLOCKS),
             rxd_claim_burial=Timelock(args.rxd_claim_burial, TimeUnit.BLOCKS),
+            # #580: this was omitted, so `--measured` — real-value mode — ran on the ESTIMATED
+            # default of 2 with no way to change it. `_claim_floor_blocks` reserves it before a
+            # claim can bury, so an operator whose claims routinely take 5 blocks to be mined was
+            # certified SAFE at a height where the claim could not be MINED in time, let alone
+            # buried. The policy field's own comment already made this argument one layer in
+            # ("a knob only settable through the raw dataclass is not a knob"); it applies to the
+            # entry point too. `test_watchtower_cli_forwards_every_margin_policy_knob` derives the
+            # forwarded set from `MarginPolicy.measured`'s signature so the next field added
+            # cannot be silently unreachable here.
+            rxd_claim_inclusion=(
+                Timelock(args.rxd_claim_inclusion, TimeUnit.BLOCKS)
+                if args.rxd_claim_inclusion is not None
+                else None  # -> measured() keeps the shipped estimate; the startup report says so
+            ),
             rxd_block_interval_s=args.rxd_block_interval_s,
             rxd_block_interval_fast_s=args.rxd_block_interval_fast_s,
             rxd_reorg_cost_per_block=args.rxd_reorg_cost_per_block,
+            # Same omission, same shape: the value-scaled burial multiplies the value at risk by
+            # this factor, and 1.0 is break-even (an attack costs exactly what it wins). An
+            # operator who wants margin above break-even had no way to ask for it.
+            burial_safety_factor=args.burial_safety_factor,
             accept_flat_burial=args.accept_flat_burial,
         )
     # Estimated policy is acceptable for alert-only v1 (no value moves); the operator
     # verifies each page. Use --measured with real block data before any autonomy (v2).
     return MarginPolicy.estimated(block_interval_s=args.block_interval_s, accept_flat_burial=args.accept_flat_burial)
+
+
+def _report_claim_reserves(policy: MarginPolicy, *, inclusion_measured: bool) -> None:
+    """Print, once at startup, the reserve terms every SAFE claim verdict is computed from.
+
+    THE HALF OF #580 THAT REACHES A HUMAN. A flag whose effect nobody can see is half a knob:
+    before this the operator could neither confirm ``--rxd-claim-inclusion`` took nor tell that
+    a real-value tower was running on the SHIPPED ESTIMATE — the reserve simply never appeared
+    on any surface. It goes to the tower's own log, which is the one an operator already reads
+    (and the only channel that exists before the first page).
+
+    Uses the GATE'S OWN conversions rather than re-deriving the arithmetic here. Re-deriving is
+    what #607 found: two roundings of one quantity that disagreed by a block on the autonomous
+    claim path. A report that computes its own version of the number can tell the operator
+    something the gate does not believe.
+    """
+    # Private helpers on purpose — importing them is what makes this report the gate's number
+    # rather than a second opinion about it.
+    from pyrxd.gravity.swap_coordinator import _claim_floor_blocks, _radiant_reserve_blocks
+
+    burial = _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
+    inclusion = _radiant_reserve_blocks(policy, policy.rxd_claim_inclusion)
+    logger.info(
+        "claim-race reserves (%s policy): rxd_claim_burial=%d blk + rxd_claim_inclusion=%d blk (%s) "
+        "=> flat floor %d RXD block(s) of headroom before the maker's t_rxd refund opens for a SAFE "
+        "verdict (value-scaling raises it per swap); burial_safety_factor=%.2f%s",
+        "MEASURED" if policy.is_measured else "estimated",
+        burial,
+        inclusion,
+        "measured, --rxd-claim-inclusion" if inclusion_measured else "SHIPPED ESTIMATE — not measured",
+        _claim_floor_blocks(policy, burial=burial, counter_reserve=0),
+        policy.burial_safety_factor,
+        "" if policy.rxd_reorg_cost_per_block is not None else " (inert — no reorg cost set)",
+    )
+    # A WARNING, not a refusal. 2 is a defensible estimate and refusing every existing --measured
+    # invocation over it would be a guard refusing honest work; but a real-value tower silently
+    # inheriting an estimate for the one term its operator CAN measure is what #580 is about.
+    if policy.require_measured and not inclusion_measured:
+        logger.warning(
+            "--measured watchtower is using the SHIPPED ESTIMATE for rxd_claim_inclusion (%d blocks). "
+            "It is the one reserve here you can measure on your own node: count blocks from broadcast "
+            "to inclusion for correctly-fee'd Radiant spends, take the WORST, and pass "
+            "--rxd-claim-inclusion. Radiant has neither RBF nor CPFP, so a claim that misses cannot be "
+            "accelerated, and an under-set reserve certifies SAFE at a height where the claim cannot be "
+            "mined in time, let alone buried.",
+            ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS,
+        )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -432,7 +497,37 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--btc-reorg-depth", type=int, default=6)
     p.add_argument("--rxd-claim-burial", type=int, default=2)
+    # HOW MANY BLOCKS A CORRECTLY-FEE'D CLAIM MAY WAIT TO BE MINED (#511, wired to the CLI by #580).
+    # Reserved by `_claim_floor_blocks` BEFORE burial starts counting, so it is subtracted from the
+    # headroom the SAFE verdict needs. Under-setting it certifies SAFE at a height where the claim
+    # cannot be mined in time; over-setting it only makes the tower page a squeeze sooner.
+    #
+    # MEASURE IT on your own node — it is the one term here an operator can. Watch a handful of
+    # correctly-fee'd Radiant spends and count blocks from broadcast to inclusion; take the WORST,
+    # not the median. Radiant has neither RBF nor CPFP, so a claim that misses cannot be
+    # accelerated. The default is the shipped ESTIMATE, not a measurement.
+    #
+    # Left at None rather than defaulted to the estimate, so "the operator measured it" and "the
+    # shipped estimate was used" stay distinguishable — `--rxd-claim-inclusion 2` from someone who
+    # actually counted blocks is not the same fact as never passing the flag, and the startup
+    # report says which one this run is.
+    p.add_argument(
+        "--rxd-claim-inclusion",
+        type=int,
+        default=None,
+        help="blocks reserved for YOUR Radiant claim to be MINED before its burial starts counting "
+        f"(default {ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS}, the shipped ESTIMATE — measure the worst "
+        "broadcast-to-inclusion gap on your own node for a real-value run)",
+    )
     p.add_argument("--margin-blocks", type=int, default=72)
+    p.add_argument(
+        "--burial-safety-factor",
+        type=float,
+        default=1.0,
+        help="value-scaled burial margin: require cost-to-reorg >= factor x value at risk "
+        "(default 1.0 = break-even, i.e. an attack costs exactly what it wins; raise for margin). "
+        "Only bites with --rxd-difficulty/--rxd-reorg-cost-per-block set.",
+    )
     # Value-scaled burial (audit follow-up): the tower must value-scale RXD claims the same way
     # the coordinator does, or it pages SAFE where the coordinator would SQUEEZE. The per-record
     # value comes from each swap's terms; the per-block reorg cost is this chain-wide flag.
@@ -598,6 +693,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args(argv)
     policy = _policy_from_args(args)
+    _report_claim_reserves(policy, inclusion_measured=args.rxd_claim_inclusion is not None)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
