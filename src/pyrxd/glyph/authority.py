@@ -153,10 +153,10 @@ def build_authority_metadata(
         protocol=[GlyphProtocol.NFT, GlyphProtocol.AUTHORITY],
         name=name,
         description=description,
-        # S106 flags any literal assigned to a `*_token*` argument as a
-        # credential. `token_type` is the Glyph envelope's `type` string — a
-        # classification, not a secret. Suppressed on the line itself below.
-        token_type="authority",  # noqa: S106
+        # Both ruff (S106) and bandit (B106) read a literal assigned to a
+        # `*_token*` keyword as a credential. `token_type` is the Glyph
+        # envelope's `type` string — a classification, not a secret.
+        token_type="authority",  # noqa: S106  # nosec B106
         attrs=attrs.to_attrs(),
     )
 
@@ -212,8 +212,12 @@ def validate_authority(metadata: GlyphMetadata | None) -> list[str]:
     if not isinstance(getattr(metadata, "attrs", None), dict):
         errors.append("missing attrs object")
         return errors
+    # NOT an assert: `python -O` strips those, so a type narrowing written that
+    # way is absent in exactly the build where a surprise would matter.
     attrs = read_authority_attrs(metadata)
-    assert attrs is not None  # attrs is a dict, checked above
+    if attrs is None:  # pragma: no cover - unreachable, attrs is a dict above
+        errors.append("attrs could not be decoded")
+        return errors
     if not attrs.issuer:
         errors.append("issuer is required")
     if attrs.expires is not None and _parse_expiry(attrs.expires, on_error="none") is None:
