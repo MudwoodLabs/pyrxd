@@ -34,7 +34,6 @@ from .erc20 import (
     assert_not_frozen_before_reveal,
     assert_token_matches_chain,
     balance_of,
-    is_blacklisted,
 )
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy, normalise_tx_hash
@@ -729,33 +728,4 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             raise ValidationError(
                 f"funded {self._token.symbol} balance {held} < negotiated {expected_amount_wei} "
                 "base units (under-funded)"
-            )
-        # #486: the freeze read the maker never had. Every check above binds this contract to the
-        # negotiated terms; none of them asks whether the issuer has FROZEN it. A frozen contract
-        # reverts claim() *and* refund() with no timeout to rescue the tokens, and a frozen claimant
-        # cannot receive a claim at all — so a leg can pass every check here and still be one that
-        # could never pay the party it names.
-        #
-        # The REFUNDEE is deliberately absent. A claim never touches it, so refusing on a frozen
-        # refundee would block a swap that can still complete happily and hand the counterparty a
-        # free unilateral veto — the reasoning that removed it from the pre-reveal gate. It is
-        # checked in `assert_not_frozen_before_funding`, where a dead refund path is the funder's
-        # own risk to weigh before paying in.
-        #
-        # This does NOT protect the maker's lock, and #486's premise that it could is stale: by the
-        # time a maker runs this, the covenant is already committed (see the HZ-1 ordering note on
-        # `EthLeg.verify_counterparty_funded`). What it buys is EARLIER notice. Without it the maker
-        # first learns at claim time — after sitting out the finality gates — when
-        # `assert_not_frozen_before_reveal` aborts the reveal.
-        frozen = [
-            f"{role} ({addr})"
-            for role, addr in (("htlc contract", locator.contract_address), ("claimant", locator.claimant))
-            if await is_blacklisted(self._rpc, self._token, addr)
-        ]
-        if frozen:
-            raise ValidationError(
-                f"refusing to verify this HTLC as funded: {', '.join(frozen)} is frozen by the "
-                f"{self._token.symbol} issuer. A frozen contract can be paid by neither claim() nor "
-                "refund(); a frozen claimant cannot be paid by claim() at all. This leg cannot pay "
-                "the claimant no matter what either party does next. NOTHING HAS MOVED."
             )
