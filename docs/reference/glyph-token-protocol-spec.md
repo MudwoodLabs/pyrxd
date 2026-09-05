@@ -253,7 +253,7 @@ Field names, decoder types, and limits are from
 | `desc` | text | no | 1000 | Description |
 | `type` | text | no | 64 | Free-form NFT type tag |
 | `main` | map | no | — | Embedded media, `{"t": <mime>, "b": <bytes>}` |
-| `attrs` | map | no | 64 entries | Free-form string attributes |
+| `attrs` | map | no | 64 entries | Free-form attributes. Values are scalars (string, int, float, bool) or lists of scalars, **not strings only** — Photonic's authority tokens carry a boolean `revocable` and a `permissions` list. pyrxd's decoder coerced every value to `str` until 0.24.0, which turned `false` into the truthy `"False"`; anything nested is still flattened to a string. |
 | `loc` | text | no | 512 | External URI (IPFS or other) |
 | `loc_hash` | text | no | 128 | Integrity hash for `loc` |
 | `decimals` | uint | no | `0..18` | Display precision only |

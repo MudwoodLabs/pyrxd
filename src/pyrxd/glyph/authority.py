@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from ..security.errors import ValidationError
@@ -233,7 +233,7 @@ def _parse_expiry(value: str, *, on_error: str) -> datetime | None:
         if on_error == "raise":
             raise ValidationError(f"expires {value!r} is not a parseable ISO-8601 timestamp") from exc
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def is_authority_expired(metadata: GlyphMetadata | None, *, now: datetime | None = None) -> bool:
@@ -250,7 +250,7 @@ def is_authority_expired(metadata: GlyphMetadata | None, *, now: datetime | None
     expiry = _parse_expiry(attrs.expires, on_error="none")
     if expiry is None:
         return False
-    return expiry < (now or datetime.now(UTC))
+    return expiry < (now or datetime.now(timezone.utc))
 
 
 def has_permission(metadata: GlyphMetadata | None, permission: str) -> bool:

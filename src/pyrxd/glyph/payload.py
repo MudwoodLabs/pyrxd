@@ -86,13 +86,43 @@ _MAX_ATTRS_COUNT = 64  # unreasonable beyond this; prevents memory bombs
 _MAX_MIME_TYPE_CHARS = 256
 
 
-def _decode_attrs(raw: object) -> dict[str, str]:
+#: Longest list preserved inside an ``attrs`` value. Beyond this the list is
+#: truncated rather than rejected — ``attrs`` is attacker-controlled CBOR and an
+#: unbounded list is a memory surface, but an over-long one is not grounds to
+#: make the whole token unreadable.
+_MAX_ATTRS_LIST_LEN = 64
+
+
+def _decode_attr_value(value: object) -> object:
+    """Preserve a scalar or a list of scalars; coerce anything else to ``str``.
+
+    THIS USED TO BE A BLANKET ``str(value)``, and that was lossy in a way that
+    inverted meaning rather than merely degrading it. Glyph ``attrs`` carry
+    non-strings in the wild — Photonic's authority tokens have
+    ``revocable: boolean`` and ``permissions: string[]``
+    (``packages/lib/src/authority.ts``). Coerced, ``False`` became the string
+    ``"False"``, which is truthy, so a NON-revocable authority read back as
+    revocable; and ``["mint"]`` became ``"['mint']"``, so every permission was
+    silently lost.
+
+    Nested maps and deeper structures are still flattened to ``str``: nothing in
+    the protocol needs them, and preserving arbitrary nesting from untrusted
+    CBOR widens the surface for no gain.
+    """
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [x for x in value[:_MAX_ATTRS_LIST_LEN] if isinstance(x, (bool, int, float, str))]
+    return str(value)
+
+
+def _decode_attrs(raw: object) -> dict[str, object]:
     """Decode the 'attrs' CBOR field, enforcing count and type constraints."""
     if not isinstance(raw, dict):
         return {}
     if len(raw) > _MAX_ATTRS_COUNT:
         raise ValidationError(f"'attrs' map too large: {len(raw)} entries > {_MAX_ATTRS_COUNT}")
-    return {str(k): str(v) for k, v in raw.items()}
+    return {str(k): _decode_attr_value(v) for k, v in raw.items()}
 
 
 def _decode_rel_refs(raw: object, key: str) -> tuple[GlyphRef, ...]:

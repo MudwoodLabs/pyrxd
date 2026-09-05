@@ -12,7 +12,7 @@ evidence supports.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -145,11 +145,11 @@ def test_a_non_authority_is_reported_as_such():
 @pytest.mark.parametrize(
     ("expires", "now", "expected"),
     [
-        ("2030-01-01T00:00:00Z", datetime(2029, 1, 1, tzinfo=UTC), False),
-        ("2030-01-01T00:00:00Z", datetime(2031, 1, 1, tzinfo=UTC), True),
+        ("2030-01-01T00:00:00Z", datetime(2029, 1, 1, tzinfo=timezone.utc), False),
+        ("2030-01-01T00:00:00Z", datetime(2031, 1, 1, tzinfo=timezone.utc), True),
         # Naive timestamps are read as UTC rather than crashing on the compare.
-        ("2030-01-01T00:00:00", datetime(2031, 1, 1, tzinfo=UTC), True),
-        ("2030-01-01T00:00:00+05:00", datetime(2029, 1, 1, tzinfo=UTC), False),
+        ("2030-01-01T00:00:00", datetime(2031, 1, 1, tzinfo=timezone.utc), True),
+        ("2030-01-01T00:00:00+05:00", datetime(2029, 1, 1, tzinfo=timezone.utc), False),
     ],
 )
 def test_expiry_handles_the_timestamp_shapes_that_occur(expires, now, expected):
@@ -296,3 +296,87 @@ def test_the_inspector_names_a_gated_output_and_says_what_it_does_not_prove():
     assert row["ref_outpoint"] == f"{ITEM.txid}:{ITEM.vout}"
     # The note is the load-bearing part: gated NOW is not minted-under-authority.
     assert "not proof it was MINTED" in row["note"]
+
+
+# ---------------------------------------------------------------------------
+# Through the transport that actually carries it
+# ---------------------------------------------------------------------------
+
+
+def test_authority_attrs_survive_a_real_cbor_round_trip():
+    """The test that was missing, and the defect it would have caught.
+
+    Every other test in this file builds metadata in memory. `attrs` was typed
+    `dict[str, str]` and the decoder coerced every value with `str()`, so a
+    token read back OFF THE CHAIN came out wrong in two ways at once:
+
+    * ``revocable=False`` decoded as the string ``"False"``, which is truthy —
+      a NON-revocable authority read back as revocable;
+    * ``permissions=["mint"]`` decoded as ``"['mint']"``, parsed as ``()`` —
+      every permission silently lost, so `has_permission` was False for all.
+
+    Both are what a reader gets for a Photonic-minted authority too, since
+    `authority.ts` writes exactly those types.
+    """
+    from pyrxd.glyph.payload import decode_payload
+
+    minted = build_authority_metadata(
+        "rxd1qissuer",
+        scope="tournaments",
+        permissions=["mint", "revoke"],
+        expires="2030-01-01T00:00:00Z",
+        revocable=False,
+    )
+    cbor_bytes, _hash = encode_payload(minted)
+    recovered = read_authority_attrs(decode_payload(cbor_bytes))
+
+    assert recovered is not None
+    assert recovered.revocable is False, "a non-revocable authority must not read back as revocable"
+    assert recovered.permissions == ("mint", "revoke")
+    assert recovered.issuer == "rxd1qissuer" and recovered.scope == "tournaments"
+    assert has_permission(decode_payload(cbor_bytes), "mint")
+
+
+def test_a_photonic_shaped_authority_decodes_with_its_types_intact():
+    """Read side, from raw CBOR nobody in this repo produced."""
+    import cbor2
+
+    from pyrxd.glyph.payload import decode_payload
+
+    raw = cbor2.dumps(
+        {
+            "p": [2, 10],
+            "name": "Issuer",
+            "attrs": {"issuer": "them", "revocable": False, "permissions": ["mint"]},
+        }
+    )
+    attrs = read_authority_attrs(decode_payload(raw))
+    assert attrs is not None and attrs.revocable is False and attrs.permissions == ("mint",)
+
+
+def test_wave_attrs_are_unaffected_by_the_wider_attrs_type():
+    """Honest-path check: widening the value type must not disturb string attrs."""
+    import cbor2
+
+    from pyrxd.glyph.payload import decode_payload
+    from pyrxd.glyph.wave import WaveAttrs
+
+    raw = cbor2.dumps(
+        {
+            "p": [2, 5, 11],
+            "name": "w",
+            "attrs": {"name": "alice.rxd", "domain": "rxd", "target": "1abc", "target_type": "address"},
+        }
+    )
+    attrs = WaveAttrs.from_dict(decode_payload(raw).attrs)
+    assert attrs.name == "alice.rxd" and attrs.domain == "rxd"
+
+
+def test_a_nested_attr_value_is_still_flattened():
+    """Nothing in the protocol needs nesting, and untrusted CBOR should not carry it."""
+    import cbor2
+
+    from pyrxd.glyph.payload import decode_payload
+
+    raw = cbor2.dumps({"p": [2], "name": "x", "attrs": {"deep": {"a": {"b": 1}}}})
+    assert isinstance(decode_payload(raw).attrs["deep"], str)
