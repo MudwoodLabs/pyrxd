@@ -653,10 +653,10 @@ that the funding is therefore bound — the address is bound; the **value** is n
 
 ### HZ-4: `t_btc` is required on an ETH swap and means nothing
 
-On an ETH swap `t_btc` must still be supplied, must still be a `Timelock`, and must still exceed
-`t_rxd` (`swap_state.py:323-325, 364-368`) — but the real deadline is the absolute
+On an ETH swap `t_btc` must still be supplied, must still be a `Timelock`, and `t_rxd` must
+still exceed it (`swap_state.py:450, 457-460`) — but the real deadline is the absolute
 `eth_timeout_unix_s`, and the ETH leg **explicitly ignores** the relative timelock the coordinator
-passes to `refund` (`eth_leg.py:196-199`). The pre-fund ordering gate correctly routes ETH swaps to
+passes to `refund` (`eth_leg.py:277-280`). The pre-fund ordering gate correctly routes ETH swaps to
 a different, cross-clock check (`swap_coordinator.py:1279-1282, 1297-1328`) rather than
 `assert_timelock_margin`.
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
+from pyrxd.eth_wallet.erc20 import is_blacklisted
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality
@@ -269,6 +270,42 @@ class EthLeg:
         await self._leg.verify_funded(
             expected, expected_amount_wei=int(terms.value_amount), block_identifier=block_identifier
         )
+        # #486: the freeze read the maker never had. Every check above binds this contract to the
+        # negotiated terms; none asks whether the ISSUER has frozen it. A frozen contract reverts
+        # claim() *and* refund(), with no timeout to rescue the tokens, and a frozen claimant cannot
+        # receive a claim at all — so a leg passes every bind above and can still be one that could
+        # never pay the maker.
+        #
+        # HERE, not in `Erc20HtlcLeg.verify_funded`. That was the first placement and it was wrong:
+        # `fund` and `_push_and_bind` also call `verify_funded`, having ALREADY run
+        # `assert_not_frozen_before_funding` a few lines earlier, so the read was redundant there —
+        # and because the freeze predicate fails CLOSED on an unreadable answer, it added a fresh
+        # way for a RESUME to abort over a question already answered. This gate is the one place
+        # the value is: the maker's own pre-reveal verification of a leg the counterparty built.
+        #
+        # It does NOT protect the maker's lock, and #486's premise that it could is stale — see the
+        # HZ-1 ordering note above; the covenant is already committed when this runs. What it buys
+        # is EARLIER notice. Without it the maker first learns at claim time, after sitting out the
+        # finality gates, when `assert_not_frozen_before_reveal` aborts the reveal.
+        #
+        # The REFUNDEE is deliberately absent. A claim never touches it, so refusing on a frozen
+        # refundee would block a swap that can still complete happily and hand the counterparty a
+        # free unilateral veto — the reasoning that keeps it out of the pre-reveal gate too.
+        token = getattr(self._leg, "token", None)
+        if token is not None:
+            frozen = [
+                f"{role} ({addr})"
+                for role, addr in (("htlc contract", expected.contract_address), ("claimant", expected.claimant))
+                if await is_blacklisted(self._leg._rpc, token, addr)
+            ]
+            if frozen:
+                raise ValidationError(
+                    f"refusing to verify the counterparty's HTLC as funded: {', '.join(frozen)} is "
+                    f"frozen by the {token.symbol} issuer. A frozen contract can be paid by neither "
+                    "claim() nor refund(); a frozen claimant cannot be paid by claim() at all. This "
+                    "leg cannot pay the claimant no matter what either party does next, so the maker "
+                    "should refund its own covenant via CSV rather than reveal p. NOTHING HAS MOVED."
+                )
         return expected
 
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
