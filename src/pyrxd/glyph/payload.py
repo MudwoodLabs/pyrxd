@@ -14,6 +14,8 @@ from .types import GlyphCreator, GlyphMedia, GlyphMetadata, GlyphPolicy, GlyphRe
 _log = logging.getLogger(__name__)
 
 GLY_MARKER = b"gly"
+#: The extra marker a DAT commit pops ahead of ``gly`` (Photonic ``datCommitScript``).
+DAT_MARKER = b"dat"
 
 
 def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
@@ -269,6 +271,21 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
     )
 
 
+def build_dat_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
+    """The ``'gly'`` + ``'dat'`` + CBOR portion of a DAT reveal scriptSig.
+
+    A DAT commit pops three things: the payload (hashed and compared), then
+    ``"dat"``, then ``"gly"``. Pushes land in order, so the suffix pushes them
+    the other way round — ``gly``, ``dat``, payload — and the payload ends up on
+    top where ``OP_HASH256`` needs it.
+
+    Using :func:`build_reveal_scriptsig_suffix` for a DAT reveal produces a
+    scriptSig one item short; the ``OP_EQUALVERIFY`` on ``"dat"`` then compares
+    the marker against whatever the P2PKH pushed and the spend fails.
+    """
+    return b"\x03" + GLY_MARKER + b"\x03" + DAT_MARKER + _encode_payload_push(cbor_bytes)
+
+
 def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     """
     Return the 'gly' + CBOR portion of the reveal scriptSig.
@@ -284,21 +301,25 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
     """
-    # Push 'gly' marker (3 bytes)
-    gly_push = b"\x03" + GLY_MARKER
-    # Push CBOR bytes
+    return b"\x03" + GLY_MARKER + _encode_payload_push(cbor_bytes)
+
+
+def _encode_payload_push(cbor_bytes: bytes) -> bytes:
+    """The payload's pushdata, opcode selected by length. ONE definition.
+
+    Both reveal-suffix builders use this. Spelling the ladder twice is how the
+    DAT variant would quietly cap at PUSHDATA2 while the NFT one did not.
+    """
     cbor_len = len(cbor_bytes)
     if cbor_len <= 75:
-        cbor_push = bytes([cbor_len]) + cbor_bytes
-    elif cbor_len <= 255:
-        cbor_push = b"\x4c" + bytes([cbor_len]) + cbor_bytes  # OP_PUSHDATA1
-    elif cbor_len <= 65535:
-        cbor_push = b"\x4d" + cbor_len.to_bytes(2, "little") + cbor_bytes  # OP_PUSHDATA2
-    elif cbor_len <= _MAX_CBOR_PAYLOAD_BYTES:
-        cbor_push = b"\x4e" + cbor_len.to_bytes(4, "little") + cbor_bytes  # OP_PUSHDATA4
-    else:
-        raise ValidationError(f"CBOR payload too large for script: {cbor_len} > {_MAX_CBOR_PAYLOAD_BYTES}")
-    return gly_push + cbor_push
+        return bytes([cbor_len]) + cbor_bytes
+    if cbor_len <= 255:
+        return b"\x4c" + bytes([cbor_len]) + cbor_bytes  # OP_PUSHDATA1
+    if cbor_len <= 65535:
+        return b"\x4d" + cbor_len.to_bytes(2, "little") + cbor_bytes  # OP_PUSHDATA2
+    if cbor_len <= _MAX_CBOR_PAYLOAD_BYTES:
+        return b"\x4e" + cbor_len.to_bytes(4, "little") + cbor_bytes  # OP_PUSHDATA4
+    raise ValidationError(f"CBOR payload too large for script: {cbor_len} > {_MAX_CBOR_PAYLOAD_BYTES}")
 
 
 def _push_minimal_int(n: int) -> bytes:

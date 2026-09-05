@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from pyrxd.security.errors import ValidationError
 
-from .payload import GLY_MARKER, decode_payload
+from .payload import DAT_MARKER, GLY_MARKER, decode_payload
 from .script import (
     MUTABLE_NFT_SCRIPT_RE,
     extract_owner_pkh_from_ft_script,
@@ -349,8 +349,24 @@ class GlyphInspector:
             else:
                 break  # non-push opcode, stop
 
-        # Look for 'gly' marker item followed by CBOR
+        # Look for the 'gly' marker, then the payload.
+        #
+        # A DAT reveal pushes a SECOND marker between them — `gly`, `dat`,
+        # payload — because its commit pops `"dat"` as well (see
+        # `build_dat_commit_locking_script`). Taking `items[i + 1]`
+        # unconditionally hands `decode_payload` the four bytes `b"dat"`, it
+        # raises, and the caller sees `None`: a DAT glyph minted by pyrxd was
+        # unreadable BY pyrxd, which for DAT means the entire content was
+        # unreachable, since a DAT reveal has no token output and the payload
+        # is all there is.
+        #
+        # Only the one known marker is skipped. Skipping any short item would
+        # let a crafted scriptSig push filler between the marker and a payload
+        # of its choosing.
         for i, item in enumerate(items):
-            if item == GLY_MARKER and i + 1 < len(items):
-                return decode_payload(items[i + 1])
+            if item != GLY_MARKER:
+                continue
+            payload_index = i + 2 if (i + 1 < len(items) and items[i + 1] == DAT_MARKER) else i + 1
+            if payload_index < len(items):
+                return decode_payload(items[payload_index])
         return None

@@ -158,6 +158,13 @@ COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda
 # Kept for backwards compatibility — matches either variant.
 COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda[0-9a-f]{2}9d76a914[0-9a-f]{40}88ac$")
 
+# A DAT commit carries NO OP_REFTYPE_OUTPUT block — a DAT reveal mints nothing —
+# and adds a "dat" marker push ahead of "gly". 70 bytes.
+DAT_COMMIT_SCRIPT_SIZE = 70
+DAT_COMMIT_SCRIPT_RE = re.compile(
+    r"^aa20([0-9a-f]{64})8803646174880367 6c798876a914([0-9a-f]{40})88ac$".replace(" ", "")
+)
+
 # --- Authority-gated NFT (Photonic ``packages/lib/src/authority.ts:239``) -----
 # ``OP_REQUIREINPUTREF <auth_ref> OP_DROP OP_PUSHINPUTREFSINGLETON <ref> OP_DROP``
 # + P2PKH. 38 + 38 + 25 = 101 bytes. See
@@ -248,6 +255,84 @@ def build_commit_locking_script(
         + bytes(owner_pkh)
         + b"\x88\xac"  # P2PKH tail
     )
+
+
+# ---------------------------------------------------------------------------
+# DAT commit (data storage, protocol 3)
+# ---------------------------------------------------------------------------
+
+
+def build_dat_commit_locking_script(
+    payload_hash: bytes,
+    owner_pkh: Hex20,
+    *,
+    delegate_ref: GlyphRef | None = None,
+) -> bytes:
+    """Build a DAT commit output script — 70 bytes, or 126 with a delegate.
+
+    Mirrors Photonic ``datCommitScript`` (``packages/lib/src/script.ts:298``)::
+
+        OP_HASH256 <payload_hash> OP_EQUALVERIFY
+        PUSH "dat" OP_EQUALVERIFY
+        PUSH "gly" OP_EQUALVERIFY
+        OP_DUP OP_HASH160 <owner_pkh> OP_EQUALVERIFY OP_CHECKSIG
+
+    The difference from :func:`build_commit_locking_script` is the whole point:
+    there is **no** ``OP_REFTYPE_OUTPUT`` block. An NFT or FT commit obliges its
+    reveal to produce an output of a given ref type — that is what mints the
+    token. A DAT reveal creates no token at all; it stores data, and the only
+    thing the commit binds is that the revealed payload hashes to
+    *payload_hash*.
+
+    So a DAT reveal has nothing to transfer and nothing to own afterwards. The
+    payload is recovered from the reveal's scriptSig, exactly as for any other
+    glyph, and lives as long as the chain does.
+
+    Note the extra ``"dat"`` push: it means a DAT reveal's scriptSig is NOT the
+    one :func:`~pyrxd.glyph.payload.build_reveal_scriptsig_suffix` builds. Use
+    :func:`~pyrxd.glyph.payload.build_dat_reveal_scriptsig_suffix`, which pushes
+    the two markers in the order this script pops them.
+    """
+    if len(payload_hash) != 32:
+        raise ValidationError("payload_hash must be 32 bytes")
+    prefix = build_delegate_commit_prefix(delegate_ref) if delegate_ref is not None else b""
+    script = (
+        prefix
+        + b"\xaa"  # OP_HASH256
+        + b"\x20"
+        + payload_hash  # PUSH 32 + hash
+        + b"\x88"  # OP_EQUALVERIFY
+        + b"\x03dat"  # PUSH 3 + "dat"
+        + b"\x88"  # OP_EQUALVERIFY
+        + b"\x03gly"  # PUSH 3 + "gly"
+        + b"\x88"  # OP_EQUALVERIFY
+        + b"\x76\xa9\x14"
+        + bytes(owner_pkh)
+        + b"\x88\xac"  # P2PKH tail
+    )
+    expected = DAT_COMMIT_SCRIPT_SIZE + (DELEGATE_COMMIT_PREFIX_SIZE if delegate_ref is not None else 0)
+    if len(script) != expected:  # internal invariant
+        raise RuntimeError(f"DAT commit script length invariant violated: expected {expected}, got {len(script)}")
+    return script
+
+
+def parse_dat_commit_script(script: bytes) -> tuple[bytes, Hex20] | None:
+    """Return ``(payload_hash, owner_pkh)`` from a DAT commit, or ``None``.
+
+    Fields come from the regex's capture groups rather than from hand-written
+    byte offsets. The DAT layout differs from the NFT/FT commit by the extra
+    ``"dat"`` push, so every offset shifts — which is exactly the kind of
+    transcription the inspector got wrong first time.
+
+    There is deliberately no ``is_dat_commit_script`` companion: ``... is not
+    None`` answers the same question with strictly more information, and a
+    second predicate is a second thing to keep in step with this regex.
+    """
+    _delegate_ref, core = split_delegate_commit_prefix(script)
+    m = DAT_COMMIT_SCRIPT_RE.fullmatch(core.hex().lower())
+    if m is None:
+        return None
+    return bytes.fromhex(m.group(1)), Hex20(bytes.fromhex(m.group(2)))
 
 
 # ---------------------------------------------------------------------------

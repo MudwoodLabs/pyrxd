@@ -93,6 +93,8 @@ _SHAPE_NAMES = (
     "mut",
     "commit-nft",
     "commit-ft",
+    "commit-dat",
+    "op_return-burn",
     "delegate-token",
     "delegate-burn",
     # A commit output carrying the 56-byte delegate prefix. Same emitted TYPE as
@@ -129,11 +131,13 @@ def _corpus() -> dict[str, bytes]:
     Built lazily; see the import note at the top of the module.
     """
     from pyrxd.constants import SEQUENCE_LOCKTIME_DISABLE_FLAG
+    from pyrxd.glyph.burn import build_burn_proof_script
     from pyrxd.glyph.dmint.builders import build_dmint_contract_script, build_dmint_v1_contract_script
     from pyrxd.glyph.dmint.types import DmintDeployParams
     from pyrxd.glyph.script import (
         build_authority_gated_nft_script,
         build_commit_locking_script,
+        build_dat_commit_locking_script,
         build_delegate_burn_script,
         build_delegate_token_script,
         build_ft_locking_script,
@@ -204,6 +208,10 @@ def _corpus() -> dict[str, bytes]:
         "mut": build_mutable_nft_script(ref, payload_hash),
         "commit-nft": build_commit_locking_script(payload_hash, pkh, is_nft=True),
         "commit-ft": build_commit_locking_script(payload_hash, pkh, is_nft=False),
+        # No OP_REFTYPE_OUTPUT block and an extra "dat" push: every offset after
+        # the payload hash shifts relative to the two commits above.
+        "commit-dat": build_dat_commit_locking_script(payload_hash, pkh),
+        "op_return-burn": build_burn_proof_script(ref, amount=250, burn_reason="redeemed"),
         # A delegate token is the SAME 63 bytes as "nft" above with a different
         # opcode (0xd0 vs 0xd8), which is exactly why it gets its own shape.
         "delegate-token": build_delegate_token_script(pkh, ref2),

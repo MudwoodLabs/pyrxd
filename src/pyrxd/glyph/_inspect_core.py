@@ -354,6 +354,11 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
     from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
+
+    # Function-local for the same reason as the authority import below: the
+    # Pyodide module budget covers what `pyrxd.glyph.inspect` loads at IMPORT,
+    # and burn decoding is only needed once an output turns out to be one.
+    from .burn import parse_burn_proof
     from .dmint import DmintState
     from .script import (
         MUTABLE_NFT_SCRIPT_RE,
@@ -370,9 +375,11 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         is_ft_script,
         is_nft_script,
         parse_authority_gated_script,
+        parse_dat_commit_script,
         parse_delegate_burn_script,
         parse_legacy_container_script,
         parse_mutable_nft_script,
+        split_delegate_commit_prefix,
     )
     from .types import GlyphRef
 
@@ -432,6 +439,27 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
             }
             if msg.ok:
                 out["type"] = "op_return-msg"
+
+        # A Glyph BURN proof. Refines `op_return` the way the message and
+        # HashMark decoders do. Everything in it is operator CBOR — the ref it
+        # names, the amount, the reason — so it is emitted under `claims` and
+        # the note says what is missing to turn it into a verdict.
+        proof = parse_burn_proof(script)
+        if proof is not None:
+            out["type"] = "op_return-burn"
+            out["burn"] = {
+                "claims": {
+                    "token_ref": _sanitize_display_string(proof.token_ref),
+                    "action": _sanitize_display_string(proof.action),
+                    "amount": proof.amount,
+                    "reason": _sanitize_display_string(proof.reason) if proof.reason else "",
+                },
+                "note": (
+                    "a burn proof is an OP_RETURN and anyone can write one about any token — "
+                    "it is only a burn if this transaction also SPENT that token and no output "
+                    "carries it; see verify_burn"
+                ),
+            }
 
         mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
@@ -600,6 +628,24 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 "ref_outpoint": f"{ref.txid}:{ref.vout}",
                 "payload_hash": payload_hash.hex(),
             }
+
+    # DAT commit: no OP_REFTYPE_OUTPUT block, so its reveal mints nothing. It is
+    # checked BEFORE the NFT/FT commit branches only for readability — the three
+    # regexes are disjoint, and the test suite pins that they are.
+    parsed_dat = parse_dat_commit_script(script)
+    if parsed_dat is not None:
+        dat_hash, dat_pkh = parsed_dat
+        _delegate_ref, _core = split_delegate_commit_prefix(script)
+        row = {
+            **base,
+            "type": "commit-dat",
+            "payload_hash": dat_hash.hex(),
+            "owner_pkh": bytes(dat_pkh).hex(),
+            "note": "a DAT reveal creates no token — the payload in its scriptSig is the whole point",
+        }
+        if _delegate_ref is not None:
+            row["delegate_base_ref"] = f"{_delegate_ref.txid}:{_delegate_ref.vout}"
+        return row
 
     if is_commit_nft_script(script_hex):
         return {

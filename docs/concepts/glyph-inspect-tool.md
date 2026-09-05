@@ -162,10 +162,11 @@ row of the `outputs[]` list on a fetched transaction. Every value
 `_inspect_core` can emit:
 
 `p2pkh`, `p2pkh-cltv`, `p2pkh-csv`, `p2sh`, `nft`, `ft`, `mut`,
-`commit-nft`, `commit-ft`, `dmint`, `container-legacy`,
+`commit-nft`, `commit-ft`, `commit-dat`, `dmint`, `container-legacy`,
 `delegate-token`, `delegate-burn`, `authority-gated-nft`,
 `soulbound-covenant`, `self-replicating-covenant`, `op_return`,
 `op_return-msg`, `op_return-hashmark-v1`, `op_return-hashmark-v2`,
+`op_return-burn`,
 `unknown`.
 
 Plus one that only ever appears in a fetched transaction's `outputs[]`
@@ -173,6 +174,23 @@ row, never from a pasted script: `error`, when classifying that one
 output raised. The row keeps its `vout` and `satoshis`, and the `error`
 field is the exception's class name and nothing more. The remaining
 rows are unaffected, which is the point of the per-output `try`.
+
+`commit-dat` is the commit half of a DAT (data-storage) glyph. It
+differs from `commit-nft` / `commit-ft` by having **no**
+`OP_REFTYPE_OUTPUT` block, which is the whole point: its reveal obliges
+no token output and mints nothing. What survives is the payload in the
+reveal's scriptSig. It also carries an extra `dat` marker push, so
+every field after the payload hash sits at a different offset than in
+the other two commits.
+
+`op_return-burn` is a Glyph BURN proof — an `OP_RETURN` declaring that a
+token was destroyed. Read the `note` on that row before believing it:
+anyone can write one, about any token, in a transaction that never held
+it. The proof is a claim, and it becomes a burn only when the
+transaction also **spent** the token and no output carries its ref.
+`verify_burn` reports which of those two it could establish, and it
+cannot establish the first from the burning transaction alone — the
+spent outputs live in earlier transactions.
 
 `authority-gated-nft` is a 101-byte item whose script carries
 `OP_REQUIREINPUTREF` on an issuer's authority ref ahead of its own

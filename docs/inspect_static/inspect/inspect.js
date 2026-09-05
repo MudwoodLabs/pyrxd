@@ -843,6 +843,23 @@ function appendOpReturnPayload(dl, row) {
     }
   }
 
+  // A Glyph BURN proof. Every field is operator CBOR, so the header says
+  // "claims" and the caveat travels with them: without it a reader sees
+  // "token_ref: <X>  action: burn" and concludes X was burned, which this
+  // output alone does not establish.
+  const burn = row.burn;
+  if (burn) {
+    const c = burn.claims || {};
+    dl.appendChild(kv("burn proof", "CLAIMED — operator-supplied, see note", "kv-warning"));
+    if (c.token_ref) dl.appendChild(kv("token ref (claimed)", c.token_ref));
+    if (c.action) dl.appendChild(kv("action (claimed)", c.action));
+    if (c.amount !== undefined && c.amount !== null) {
+      dl.appendChild(kv("amount (claimed)", c.amount));
+    }
+    if (c.reason) dl.appendChild(kv("reason (claimed)", c.reason));
+    if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));
+  }
+
   const hm = row.hashmark;
   if (hm) {
     if (hm.outcome !== "ok") {
@@ -1754,6 +1771,9 @@ function scriptBadgeKind(type) {
   // wearing an extra ref opcode; borrow the NFT colour rather than reading as
   // "unknown", which is what the classifier says when it could not tell.
   if (type === "authority-gated-nft" || type === "delegate-token") return "nft";
+  // A burn proof is an OP_RETURN refinement, like the message and hashmark
+  // variants; a DAT commit is a commit variant.
+  if (type === "op_return-burn") return "unknown";
   // No badge colour is defined for the dead container shape or for P2SH;
   // reuse the `unknown` styling rather than emitting a class the stylesheet
   // lacks.

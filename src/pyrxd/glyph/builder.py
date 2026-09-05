@@ -18,14 +18,16 @@ from pyrxd.fee_sizing import (
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
 
+from .burn import build_burn_proof_script
 from .dmint import (
     DmintDeployParams,
     build_dmint_contract_script,
 )
-from .payload import build_reveal_scriptsig_suffix, encode_payload
+from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
     build_commit_locking_script,
+    build_dat_commit_locking_script,
     build_delegate_base_script,
     build_delegate_burn_script,
     build_delegate_token_script,
@@ -957,6 +959,71 @@ class GlyphBuilder:
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             child_ref=None,
         )
+
+    def prepare_dat_commit(self, params: CommitParams) -> CommitResult:
+        """Prepare a DAT (data-storage) commit — a glyph that mints no token.
+
+        Same two-transaction shape as :meth:`prepare_commit`, but the commit
+        carries no ``OP_REFTYPE_OUTPUT`` obligation, so the reveal creates no
+        NFT and no FT. What survives is the payload in the reveal's scriptSig.
+
+        Protocol must include ``GlyphProtocol.DAT`` (3). Build the reveal with
+        :meth:`prepare_dat_reveal` — a DAT commit pops an extra ``"dat"`` marker
+        and the ordinary reveal scriptSig is one push short of satisfying it.
+        """
+        self._assert_metadata_protocol(params.metadata, GlyphProtocol.DAT, "DAT commit")
+        cbor_bytes, payload_hash = encode_payload(params.metadata)
+        return CommitResult(
+            commit_script=build_dat_commit_locking_script(
+                payload_hash, params.owner_pkh, delegate_ref=params.delegate_ref
+            ),
+            cbor_bytes=cbor_bytes,
+            payload_hash=payload_hash,
+            estimated_fee=(276 if params.delegate_ref is None else 276 + 148 + 56) * MIN_FEE_RATE,
+            delegate_ref=params.delegate_ref,
+        )
+
+    def prepare_dat_reveal(self, cbor_bytes: bytes, *, delegate_ref: GlyphRef | None = None) -> RevealScripts:
+        """Prepare a DAT reveal's scriptSig suffix.
+
+        There is no ``locking_script``: a DAT reveal mints nothing, so the
+        caller's outputs are whatever they want to keep the value on (ordinary
+        P2PKH change). :attr:`RevealScripts.locking_script` is returned empty to
+        say so rather than handing back a token script that would be wrong.
+        """
+        self._assert_protocol(cbor_bytes, GlyphProtocol.DAT, "DAT reveal")
+        return RevealScripts(
+            locking_script=b"",
+            scriptsig_suffix=build_dat_reveal_scriptsig_suffix(cbor_bytes),
+            delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
+        )
+
+    @staticmethod
+    def prepare_burn_proof(
+        token_ref: GlyphRef,
+        *,
+        amount: int | None = None,
+        burn_reason: str | None = None,
+    ) -> bytes:
+        """The ``OP_RETURN`` output that records a deliberate burn.
+
+        Add it to the transaction that spends the token, with value 0, and do
+        NOT re-create the token in any output. See
+        :func:`~pyrxd.glyph.burn.build_burn_proof_script` for what the proof
+        does and does not establish — it is an operator claim, and
+        :func:`~pyrxd.glyph.burn.verify_burn` is careful about which parts of it
+        a reader may rely on.
+        """
+        return build_burn_proof_script(token_ref, amount=amount, burn_reason=burn_reason)
+
+    @staticmethod
+    def _assert_metadata_protocol(metadata: GlyphMetadata, marker: GlyphProtocol, label: str) -> None:
+        """Cross-check a metadata object declares *marker* before encoding it."""
+        if marker not in (metadata.protocol or ()):
+            raise ValidationError(
+                f"{label}: metadata protocol {list(metadata.protocol or ())!r} must include "
+                f"GlyphProtocol.{marker.name} ({int(marker)})"
+            )
 
     def prepare_authority_gated_reveal(
         self,
