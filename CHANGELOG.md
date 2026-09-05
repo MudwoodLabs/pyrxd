@@ -6,6 +6,54 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Timelocked Glyph content can now be minted and revealed** (#556). The feature had
+  ~700 lines and three test files and no way for a user to reach any of it; the
+  maintainer's call was to wire it rather than delete it.
+
+  - `pyrxd glyph timelock-mint` encrypts a file, mints an NFT committing to
+    `sha256(key)`, and writes the key and the ciphertext to paths you must name —
+    **neither is on chain**, and a mint cannot be re-run, so both outputs are required
+    arguments and both files are written before the mint is broadcast. `--recipient
+    KID:HEX64` additionally wraps the key to an X25519 public key so that party can
+    decrypt immediately, without waiting for the reveal.
+  - `pyrxd glyph timelock-reveal` publishes the key. It fetches the token's mint
+    envelope **from the chain** and refuses a key that is not the one committed to, and
+    refuses a reveal before the unlock point unless `--allow-early` is passed.
+    `--dry-run` runs every check, signs the transaction, prints the exact key that would
+    become public, and broadcasts nothing.
+  - `GlyphClient.mint_timelocked_nft`, `.build_timelock_reveal`, `.reveal_timelock` and
+    `.plan_timelock_reveal` are the SDK equivalents. The clock for the unlock check comes
+    from the chain — the tip height, or the tip block header's timestamp for a
+    `mode="time"` lock — not from the local wall clock.
+  - New top-level exports: `build_timelock_mint`, `plan_timelock_reveal`,
+    `parse_reveal_proof_script`, `validate_reveal_proof`, `TimelockParams`,
+    `TimelockRecipient`, `TimelockMintBuild`, `TimelockRevealPlan`, `RevealProof`,
+    `RevealValidation`, `CekCommitmentMismatch`, `TimelockNotExpired`.
+    `create_reveal_proof` is deliberately **not** exported: it is never given the token,
+    so it cannot check the key against the commitment or refuse an early reveal, and both
+    of those mistakes are permanent. `plan_timelock_reveal` is the same capability with
+    both checks inside it, and is the only supported way to obtain a publishable script.
+  - `pyrxd.is_unlocked` / `pyrxd.get_unlock_remaining` now accept the metadata shape
+    `decode_payload` returns, not only Photonic's stub. Asking them about a token read off
+    the chain previously raised `AttributeError`.
+
+### Fixed
+
+- **A TIMELOCK mint could go on chain carrying no CEK commitment at all.**
+  `GlyphMetadata.to_cbor_dict` emitted no `crypto` key under any circumstance, so metadata
+  declaring `p = [NFT, ENCRYPTED, TIMELOCK]` produced a token that said it was sealed and
+  held nothing a reveal could ever be checked against. The encoder now carries the block
+  (`GlyphMetadata.crypto` / `.encrypted_main`), and `GlyphMinter` refuses a TIMELOCK mint
+  whose metadata has no `crypto.timelock` rather than broadcasting one — a mint cannot be
+  amended, and the failure was silent. The decoder stays permissive on third-party data.
+- `EncryptedContentStub`'s docstring had, since #556 was filed, told callers to construct
+  it via `pyrxd.glyph.timelock.build_timelock_mint` — a function that did not exist. It
+  exists now, and enforces the two invariants the docstring claimed: `main.hash` is the
+  SHA-256 of the plaintext (it is the AAD prefix every chunk is authenticated against) and
+  `crypto.cek_hash` is the SHA-256 of the key that encrypted it.
+
 ## [0.23.0] — 2026-09-04
 
 Most of this release came from one audit, of a defect class rather than a

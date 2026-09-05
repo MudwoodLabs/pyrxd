@@ -41,6 +41,18 @@ from .mint import (
     PendingMint,
     PendingStore,
 )
+from .timelock import (
+    TimelockMintBuild,
+    TimelockParams,
+    TimelockRecipient,
+    build_timelock_mint,
+)
+from .timelock_reveal_tx import (
+    TimelockRevealBuild,
+    TimelockRevealPlan,
+    build_timelock_reveal,
+    plan_timelock_reveal,
+)
 from .transfer import (
     FtAirdropBuild,
     FtTransferBuild,
@@ -53,7 +65,14 @@ from .transfer import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import GlyphMetadata, GlyphRef
 
-__all__ = ["BroadcastEchoMismatch", "GlyphClient", "NftTransferReceipt", "TransferReceipt"]
+__all__ = [
+    "BroadcastEchoMismatch",
+    "GlyphClient",
+    "NftTransferReceipt",
+    "TimelockMintReceipt",
+    "TimelockRevealReceipt",
+    "TransferReceipt",
+]
 
 
 class TransferReceipt:
@@ -191,6 +210,77 @@ class NftTransferReceipt:
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"NftTransferReceipt(txid={self.txid!r}, fee={self.fee})"
+
+
+class TimelockMintReceipt:
+    """A minted timelocked token, and the two things only the minter now holds.
+
+    ``mint`` is the ordinary :class:`~pyrxd.glyph.mint.MintResult`. The rest is what makes
+    this different from every other receipt in this module: a mint that finishes leaves the
+    caller holding material the chain does not have, and losing either half loses the
+    content permanently.
+
+    - ``cek`` — the key. Nothing on chain carries it, only ``sha256(cek)``. Persist it
+      encrypted at rest, alongside the ``ref`` it belongs to.
+    - ``ciphertext`` — the encrypted payload. The mint carries its plaintext hash, size and
+      chunk count; **it does not carry the bytes**. Publish or store them yourself.
+
+    ``cek`` is ``repr=False``: the printed form of a 32-byte key is a working key, and a
+    receipt is exactly the object that ends up in a log line.
+    """
+
+    __slots__ = ("cek", "cek_hash", "ciphertext", "mint", "stub", "unlock_at")
+
+    def __init__(
+        self,
+        *,
+        mint: MintResult,
+        cek: bytes,
+        cek_hash: str,
+        ciphertext: Any,
+        stub: Any,
+        unlock_at: int,
+    ) -> None:
+        self.mint = mint
+        self.cek = cek
+        self.cek_hash = cek_hash
+        self.ciphertext = ciphertext
+        self.stub = stub
+        self.unlock_at = unlock_at
+
+    @property
+    def ref(self) -> GlyphRef:
+        """The token's permanent ref — what a reveal names as its ``token_ref``."""
+        return self.mint.ref
+
+    @property
+    def token_ref(self) -> str:
+        """``"<txid>:<vout>"``, the form :meth:`GlyphClient.reveal_timelock` takes."""
+        return f"{self.mint.ref.txid}:{self.mint.ref.vout}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"TimelockMintReceipt(ref={self.token_ref!r}, unlock_at={self.unlock_at}, cek_hash={self.cek_hash!r})"
+
+
+class TimelockRevealReceipt:
+    """What a broadcast reveal actually published.
+
+    Reports the ``cek`` that is now public, deliberately. Every other secret in this SDK is
+    kept out of a ``repr`` — this one stopped being a secret the moment the transaction
+    relayed, and a receipt that hid it would be describing the wrong state of the world.
+    """
+
+    __slots__ = ("cek", "commitment", "fee", "token_ref", "txid")
+
+    def __init__(self, *, txid: str, token_ref: str, cek: str, commitment: str, fee: int) -> None:
+        self.txid = txid
+        self.token_ref = token_ref
+        self.cek = cek
+        self.commitment = commitment
+        self.fee = fee
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"TimelockRevealReceipt(txid={self.txid!r}, token_ref={self.token_ref!r}, fee={self.fee})"
 
 
 class GlyphClient:
@@ -589,3 +679,229 @@ class GlyphClient:
         build = await self.build_nft_transfer(ref, to_pkh, allow_overpay=allow_overpay)
         echoed = await self._client.broadcast(build.serialize())
         return NftTransferReceipt(txid=_confirmed_txid(build, echoed), ref=ref, fee=build.fee, to_pkh=to_pkh)
+
+    # -- timelocked content (#556) -----------------------------------------
+
+    def build_timelock_mint(
+        self,
+        *,
+        name: str,
+        content_type: str,
+        plaintext: bytes,
+        params: TimelockParams,
+        cek: bytes | None = None,
+        recipients: Sequence[TimelockRecipient] = (),
+        locator: str | None = None,
+    ) -> TimelockMintBuild:
+        """Encrypt and seal content **without minting it**. See :func:`~pyrxd.glyph.timelock.build_timelock_mint`.
+
+        Synchronous and network-free: this is pure construction, and it is exposed on the
+        client so a caller can inspect the envelope — and take a copy of the CEK — before
+        committing anything to a chain. :meth:`mint_timelocked_nft` is this plus the mint.
+        """
+        return build_timelock_mint(
+            name=name,
+            content_type=content_type,
+            plaintext=plaintext,
+            params=params,
+            cek=cek,
+            recipients=recipients,
+            locator=locator,
+        )
+
+    async def mint_timelocked_nft(
+        self,
+        *,
+        name: str,
+        content_type: str,
+        plaintext: bytes,
+        params: TimelockParams,
+        cek: bytes | None = None,
+        recipients: Sequence[TimelockRecipient] = (),
+        locator: str | None = None,
+        owner_pkh: Hex20 | bytes | None = None,
+    ) -> TimelockMintReceipt:
+        """Seal ``plaintext`` behind a timelock and mint the NFT that commits to its key.
+
+        The mint itself is :meth:`mint_nft` — the same two-phase commit/reveal, the same
+        store, the same fee rules. What this adds is the envelope: the content is encrypted
+        with ``chunked-aead-v1``, the key's SHA-256 goes on chain as ``crypto.timelock``, and
+        the key comes back to the caller.
+
+        **The returned CEK and ciphertext are not recoverable from the chain.** The mint
+        carries a commitment to the key and a hash of the plaintext, nothing more. Persist
+        both halves of the receipt before doing anything else with it; a mint cannot be
+        re-run and there is no path from ``sha256(cek)`` back to ``cek``.
+
+        See :func:`~pyrxd.glyph.timelock.build_timelock_mint` for the arguments. ``owner_pkh``
+        behaves as it does on :meth:`mint_nft`, defaulting to the funding key's own hash.
+
+        Raises:
+            ~pyrxd.security.errors.ValidationError: no store was configured (minting needs
+                one), or the parameters were refused. Raised before anything is broadcast.
+        """
+        build = self.build_timelock_mint(
+            name=name,
+            content_type=content_type,
+            plaintext=plaintext,
+            params=params,
+            cek=cek,
+            recipients=recipients,
+            locator=locator,
+        )
+        result = await self.mint_nft(build.metadata, owner_pkh=owner_pkh)
+        return TimelockMintReceipt(
+            mint=result,
+            cek=build.cek,
+            cek_hash=build.cek_hash,
+            ciphertext=build.ciphertext,
+            stub=build.stub,
+            unlock_at=params.unlock_at,
+        )
+
+    async def plan_timelock_reveal(
+        self,
+        metadata: Any,
+        *,
+        token_ref: str,
+        cek: bytes,
+        hint: str = "",
+        allow_early: bool = False,
+    ) -> TimelockRevealPlan:
+        """Check a reveal against the chain's own clock, and return what it would publish.
+
+        The clock is read here rather than taken from the caller, which is the point of the
+        method existing: :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal` cannot
+        judge a lock it is not given a time for, and a caller passing its own number is a
+        caller who can pass the wrong one.
+
+        * ``mode="block"`` — the tip height from ``get_tip_height()``.
+        * ``mode="time"`` — the **timestamp in the tip block's header**, not this process's
+          wall clock. A local clock can be wrong by any amount and nothing would say so;
+          the chain's is at least the clock the lock was written against. It is not exact —
+          a block's timestamp may run ahead of real time under consensus rules — so this is
+          a gate against the obvious mistake, not a substitute for the operator knowing
+          what they are publishing.
+
+        Everything the plan is checked for happens in the underlying function; see its
+        docstring. This adds only the clock.
+        """
+        current_block: int | None = None
+        current_time: int | None = None
+        spec_mode = getattr(getattr(metadata, "crypto", None), "timelock", None) or getattr(metadata, "timelock", None)
+        mode = getattr(spec_mode, "mode", "block")
+        tip = int(await self._client.get_tip_height())
+        if mode == "time":
+            header = bytes(await self._client.get_block_header(tip))
+            if len(header) < 72:  # pragma: no cover - a short header is a broken server
+                raise ValidationError(
+                    f"the node returned a {len(header)}-byte block header for height {tip}; "
+                    "a time-mode timelock cannot be judged without the tip's timestamp"
+                )
+            # Bitcoin/Radiant 80-byte header: version(4) prev(32) merkle(32) time(4) ...
+            current_time = int.from_bytes(header[68:72], "little")
+        else:
+            current_block = tip
+        return plan_timelock_reveal(
+            metadata,
+            token_ref=token_ref,
+            cek=cek,
+            current_block=current_block,
+            current_time=current_time,
+            hint=hint,
+            allow_early=allow_early,
+        )
+
+    async def build_timelock_reveal(
+        self,
+        metadata: Any,
+        *,
+        token_ref: str,
+        cek: bytes,
+        hint: str = "",
+        allow_early: bool = False,
+        allow_overpay: bool = False,
+    ) -> TimelockRevealBuild:
+        """Build and sign a reveal **without broadcasting it** — the dry run.
+
+        For showing an operator exactly what would become public before it does, which is
+        what ``pyrxd glyph timelock-reveal --dry-run`` does with it. The plan inside the
+        returned build has already passed the commitment check and the unlock gate; there is
+        no way to obtain one of these that has not.
+        """
+        plan = await self.plan_timelock_reveal(
+            metadata, token_ref=token_ref, cek=cek, hint=hint, allow_early=allow_early
+        )
+        return await build_timelock_reveal(
+            self._wallet,
+            plan,
+            client=self._client,
+            fee_rate=self._fee_rate,
+            allow_overpay=allow_overpay,
+            allow_below_relay_floor=self._allow_below_relay_floor,
+        )
+
+    async def reveal_timelock(
+        self,
+        metadata: Any,
+        *,
+        token_ref: str,
+        cek: bytes,
+        hint: str = "",
+        allow_early: bool = False,
+        allow_overpay: bool = False,
+    ) -> TimelockRevealReceipt:
+        """Publish the CEK on chain, and broadcast.
+
+        **Irreversible.** After this relays, anyone holding the ciphertext can decrypt it,
+        forever. There is no unreveal and no second reveal.
+
+        Two mistakes are refused before anything is sent, both by
+        :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal`: a CEK that is not the
+        one this token committed to, and a reveal before ``unlock_at`` without
+        ``allow_early``. Both are :class:`~pyrxd.security.errors.ValidationError` subclasses,
+        so they land with everything else raised pre-broadcast.
+
+        Raises:
+            ~pyrxd.glyph.timelock_reveal_tx.CekCommitmentMismatch: ``sha256(cek)`` is not the
+                token's commitment. Publishing it would spend the reveal and leave the
+                payload unreadable for good.
+            ~pyrxd.glyph.timelock_reveal_tx.TimelockNotExpired: the lock has not expired and
+                ``allow_early`` was not set.
+            BroadcastEchoMismatch: the node echoed a txid other than the one the signed bytes
+                hash to. Deliberately not a ``ValidationError`` — a caller retrying on one
+                would re-publish a key that may already be public.
+            ~pyrxd.security.errors.InsufficientFundsError: no plain-RXD UTXO large enough to
+                fund the reveal. Raised before anything is signed.
+        """
+        build = await self.build_timelock_reveal(
+            metadata,
+            token_ref=token_ref,
+            cek=cek,
+            hint=hint,
+            allow_early=allow_early,
+            allow_overpay=allow_overpay,
+        )
+        return await self.broadcast_timelock_reveal(build)
+
+    async def broadcast_timelock_reveal(self, build: TimelockRevealBuild) -> TimelockRevealReceipt:
+        """Broadcast a reveal that was already built and shown to someone.
+
+        Split out from :meth:`reveal_timelock` so a caller that displayed a build can send
+        **those bytes**. The CLI confirms a reveal by printing the key it is about to
+        publish; calling ``reveal_timelock`` after that prompt would build a second
+        transaction and broadcast it instead — a confirmation showing one artifact and
+        sending another, which is worse than no confirmation because it looks like one.
+
+        The build already carries a checked plan; there is no way to construct a
+        :class:`~pyrxd.glyph.timelock_reveal_tx.TimelockRevealBuild` that has not been
+        through :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal`.
+        """
+        echoed = await self._client.broadcast(build.serialize())
+        return TimelockRevealReceipt(
+            txid=_confirmed_txid(build, echoed),
+            token_ref=build.plan.token_ref,
+            cek=build.plan.proof.cek,
+            commitment=build.plan.commitment,
+            fee=build.fee,
+        )

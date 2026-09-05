@@ -1299,14 +1299,30 @@ nothing implements it either).
 
 ### 16.3 A second, incompatible envelope shape for ENCRYPTED / TIMELOCK
 
-`EncryptedContentStub.to_dict()` (`src/pyrxd/glyph/encrypted_content.py:247-254`)
-produces `{p, type, name, main, crypto}` where `main` is
+`EncryptedContentStub.to_dict()` (`src/pyrxd/glyph/encrypted_content.py`) produces
+`{p, type, name, main, crypto}` where `main` is
 `{type, hash, enc, size, chunks, scheme}` — a completely different shape from the
-`{t, b}` media map of §4.3 — and adds a top-level `crypto` object. The general
-decoder handles neither: it sees no `t`/`b` keys and sets `main = None`, and it has
-no `crypto` field at all. There is also no builder in pyrxd that CBOR-encodes this
-stub, so the canonical-encoding rule of §4.2 is not applied to it by any shipped
-code path. The relationship between the two `main` shapes is unspecified.
+`{t, b}` media map of §4.3 — and adds a top-level `crypto` object. **The
+relationship between the two `main` shapes is still unspecified**, which is what
+keeps this entry open.
+
+What has changed since this entry was written is the reachability, in both
+directions, and unevenly:
+
+- **Encoding.** `GlyphMetadata` carries the shape in `encrypted_main` and `crypto`,
+  and `to_cbor_dict()` emits both, so the canonical-encoding rule of §4.2 now does
+  apply to it — `pyrxd.glyph.timelock.build_timelock_mint` produces such an
+  envelope and `GlyphClient.mint_timelocked_nft` / `pyrxd glyph timelock-mint` mint
+  it. The emitted dict is asserted equal to `EncryptedContentStub.to_dict()` and to
+  Photonic's own block-mode vector in
+  `tests/test_glyph_timelock_write_side_is_reachable.py`.
+- **Decoding.** `decode_payload` reads `crypto.timelock` and nothing else from the
+  `crypto` object; `main` in the encrypted shape still has no `t`/`b` keys, so it
+  still decodes to `main = None`. This asymmetry is deliberate rather than an
+  oversight — the per-recipient wraps in `crypto.recipients` are key material, and
+  surfacing them through the inspect path is not something to do incidentally — but
+  it does mean `decode(encode(x)) != x` for an encrypted envelope. A caller that
+  needs the exact bytes a token arrived as reads `GlyphMetadata.source_cbor`.
 
 ### 16.4 Commit script ref-type byte is under-validated
 

@@ -233,9 +233,17 @@ class EncryptedContentStub:
     scriptSig. It encapsulates the protocol marker list + content
     metadata + crypto metadata as one cohesive structure.
 
-    Construct via :func:`pyrxd.glyph.timelock.build_timelock_mint` (or
-    the equivalent encrypted-only builder when that lands), not directly,
-    so the cek_hash + main.hash invariants are enforced.
+    Construct via :func:`pyrxd.glyph.timelock.build_timelock_mint`, not directly, so the
+    ``cek_hash`` + ``main.hash`` invariants are enforced: ``main.hash`` must be the SHA-256 of
+    the plaintext (it is the AAD prefix every chunk is authenticated against, so a wrong one
+    yields content that cannot be decrypted even with the right key), and ``crypto.cek_hash``
+    must be the SHA-256 of the key that encrypted it (it is the only thing a published CEK can
+    ever be checked against). Neither is repairable after a mint.
+
+    That function did not exist when this sentence was first written — the docstring named it
+    anyway, from #556's first line to the commit that added it. It exists now, and
+    :meth:`pyrxd.glyph.client.GlyphClient.mint_timelocked_nft` and
+    ``pyrxd glyph timelock-mint`` are its production callers.
     """
 
     p: list[int]  # protocol markers

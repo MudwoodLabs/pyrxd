@@ -159,10 +159,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the actual use
     # case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1 vector.
     #
-    # Exported rather than wired to a caller, deliberately. #556 found them unreachable along with
-    # the timelocked-content feature that is their only in-repo consumer, but they are GENERAL
-    # primitives whose reachability does not depend on that feature's fate — see the allowlist in
-    # tests/test_reachability_shipped_callers.py, where the timelock half stays recorded as debt.
+    # These were exported rather than wired when #560 landed: #556 had found them unreachable
+    # alongside the timelocked-content feature, and nothing in `src/` imported them at all. That
+    # is no longer true — `glyph.timelock.build_timelock_mint` calls `encrypt_chunked` and
+    # `wrap_cek_x25519` to seal a mint. The export still stands on its own reason rather than on
+    # that caller: these are GENERAL primitives, and a caller who wants to encrypt Glyph content
+    # without minting anything should not have to route through a token workflow to reach them.
     #
     # The set is chosen so the surface is USABLE, the same rule as GlyphMinter/JsonFilePendingStore
     # above: `encrypt_chunked` returns a `ChunkedCiphertext` that `decrypt_chunked` consumes, and
@@ -173,16 +175,40 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # exactly two things: can I read it yet, and how much longer. `verify_cek_reveal` is the third
     # — checking a published CEK against the on-chain commitment before trusting it to decrypt.
     #
-    # The MINT and REVEAL builders are deliberately NOT exported. They publish a CEK on-chain and
-    # have never had a production caller or a real-value run; exporting a workflow nothing reaches
-    # would restate #556 rather than close it.
-    #
     # `TimelockSpec` comes with them because `is_unlocked` takes metadata carrying one, and
     # `GlyphMetadata.timelock` is how a caller gets one — decoded from the CBOR since this change.
     "TimelockSpec": ("pyrxd.glyph.encrypted_content", "TimelockSpec"),
     "get_unlock_remaining": ("pyrxd.glyph.timelock", "get_unlock_remaining"),
     "is_unlocked": ("pyrxd.glyph.timelock", "is_unlocked"),
     "verify_cek_reveal": ("pyrxd.glyph.timelock", "verify_cek_reveal"),
+    # Timelocked content — the WRITE side (#556, wired on the maintainer's decision to wire
+    # rather than delete). `GlyphClient.mint_timelocked_nft` / `.reveal_timelock` and
+    # `pyrxd glyph timelock-mint` / `timelock-reveal` are the production callers; these names are
+    # the pieces an SDK caller assembles a different workflow from.
+    #
+    # ONE NAME IS DELIBERATELY ABSENT: `create_reveal_proof`. It builds a publishable OP_RETURN
+    # from a CEK and a ref alone, and it is never given the token — so it cannot check the key
+    # against the commitment, and cannot know whether the lock has expired. Both mistakes it
+    # cannot see are permanent. `plan_timelock_reveal` is the same capability with the token in
+    # hand and both checks inside it, so exporting the unguarded door beside the guarded one
+    # would hand callers a footgun with a shorter name. It stays module-private surface, reached
+    # through the gate.
+    #
+    # `parse_reveal_proof_script` and `validate_reveal_proof` ARE exported: they are the reading
+    # half, what an observer runs on someone else's reveal, and without them the exported
+    # `verify_cek_reveal` has no way to get a CEK out of an on-chain script.
+    "RevealProof": ("pyrxd.glyph.timelock_reveal_tx", "RevealProof"),
+    "RevealValidation": ("pyrxd.glyph.timelock_reveal_tx", "RevealValidation"),
+    "CekCommitmentMismatch": ("pyrxd.glyph.timelock_reveal_tx", "CekCommitmentMismatch"),
+    "TimelockMintBuild": ("pyrxd.glyph.timelock", "TimelockMintBuild"),
+    "TimelockNotExpired": ("pyrxd.glyph.timelock_reveal_tx", "TimelockNotExpired"),
+    "TimelockParams": ("pyrxd.glyph.timelock", "TimelockParams"),
+    "TimelockRecipient": ("pyrxd.glyph.timelock", "TimelockRecipient"),
+    "TimelockRevealPlan": ("pyrxd.glyph.timelock_reveal_tx", "TimelockRevealPlan"),
+    "build_timelock_mint": ("pyrxd.glyph.timelock", "build_timelock_mint"),
+    "parse_reveal_proof_script": ("pyrxd.glyph.timelock_reveal_tx", "parse_reveal_proof_script"),
+    "plan_timelock_reveal": ("pyrxd.glyph.timelock_reveal_tx", "plan_timelock_reveal"),
+    "validate_reveal_proof": ("pyrxd.glyph.timelock_reveal_tx", "validate_reveal_proof"),
     "ChunkedCiphertext": ("pyrxd.crypto.aead", "ChunkedCiphertext"),
     "EncryptedChunk": ("pyrxd.crypto.aead", "EncryptedChunk"),
     "WrappedCEK": ("pyrxd.crypto.kem", "WrappedCEK"),
