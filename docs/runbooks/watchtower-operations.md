@@ -108,6 +108,34 @@ first two at startup; honor the third when sizing swaps.
    dead-man's-switch. A shorter value makes it go blind while the watchdog still says "alive"; a longer
    one makes it act on a count from a tower that is already being reported down.
 
+## Claim-race reserves — what `--measured` expects you to measure
+
+A `SAFE` claim verdict means *"there is still room to get our claim mined AND buried before the
+maker's `t_rxd` CSV refund opens"*. The room it needs is the sum of three reserves, and the tower
+prints them, with their total, once at startup:
+
+```
+claim-race reserves (MEASURED policy): rxd_claim_burial=2 blk + rxd_claim_inclusion=2 blk
+(SHIPPED ESTIMATE — not measured) => flat floor 4 RXD block(s) of headroom before the maker's
+t_rxd refund opens for a SAFE verdict (value-scaling raises it per swap); burial_safety_factor=1.00
+```
+
+**Read that line on every start.** `(SHIPPED ESTIMATE — not measured)` means the tower is
+real-value mode running on a shipped guess for the one reserve you can measure yourself; it also
+emits a `WARNING` saying so.
+
+| Flag | What it reserves | How to get the number |
+|---|---|---|
+| `--rxd-claim-inclusion` | Blocks your claim may wait to be **mined**, before burial starts counting. Default **2, an estimate.** | Broadcast a handful of correctly-fee'd Radiant spends and count blocks from broadcast to inclusion. **Take the worst, not the median** — Radiant has neither RBF nor CPFP (see *Fee sizing* below), so a claim that misses cannot be accelerated. |
+| `--rxd-claim-burial` | Blocks the claim must then be buried to be reorg-safe. | Your own reorg tolerance; the value-scaled burial raises it per swap when a reorg cost is set. |
+| `--btc-reorg-depth` | Depth the **maker's** counter-leg claim must reach before you rely on the revealed `p`. | Bitcoin-side; 6 is the conventional figure. |
+| `--burial-safety-factor` | Multiplier on the value at risk for the value-scaled burial. **1.0 = break-even** — an attack costs exactly what it wins. | Raise it for margin. Inert unless `--rxd-difficulty` / `--rxd-reorg-cost-per-block` is set. |
+
+**Under-setting `--rxd-claim-inclusion` is the dangerous direction.** On a congested mempool where
+claims routinely take five blocks to be mined, a tower reserving two will page `PAGE_CLAIM` at a
+height where the claim cannot be mined in time, let alone buried — and you act on it. Over-setting
+it only makes the tower page a squeeze decision sooner, which costs nothing but attention.
+
 ## Restart & graceful upgrade
 
 **Footgun #2 — a restart longer than `--max-silence-s` false-pages CRITICAL.** A naive
@@ -263,7 +291,21 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 - The tower logs each tick at the mapped severity; the heartbeat file's mtime is the liveness signal.
 - The dead-man's-switch posts to `--webhook-url` (optionally HMAC-signed via `--webhook-secret`).
 - A `PAGE_SQUEEZED` / decision-required page means a swap is in a winner-take-all state — act on the
-  printed one-shot step immediately; do not wait for the next tick.
+  printed step immediately; do not wait for the next tick.
+- **Run the `action:` line exactly as printed, in order, and nothing else.** The coordinator's claim
+  methods are strictly state-gated, so the tower names the step(s) valid for *that record's current
+  state* — which is not always one step:
+
+  | What the page prints | Why |
+  |---|---|
+  | `taker_scrape_and_claim_asset` | The usual case: the record is at `secret_revealed`. |
+  | `taker_observed_reveal, then taker_scrape_and_claim_asset` | The record is still at `both_locked` — the chain shows the reveal before the record caught up. The first step is the taker-side transition that makes the second one legal; it re-verifies the reveal and claims nothing. |
+  | `taker_claim_asset_from_vulnerable` | The record is already at `asset_vulnerable` (an earlier tick squeezed). `taker_scrape_and_claim_asset` is *refused* from there. |
+  | `… then taker_claim_asset_from_vulnerable (winner-take-all) vs accept loss` | The gate squeezed. Run the earlier step(s) first; they are what move the record to `asset_vulnerable`. |
+  | `investigate — no coordinator claim step is valid from <state>` | Exactly what it says. No step will run; the page tells you which step needs which state. Do not guess one. |
+
+  Substituting a step you remember from a previous incident costs a `ValidationError` and the
+  minutes it takes to read it — under a running timelock, with `p` already public.
 - The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
   it does not know, so **upgrade the tower before the monitor**, not the other way round.
 - **What the escalation channel sends, and what each one means:**
