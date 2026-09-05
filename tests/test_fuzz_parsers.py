@@ -39,6 +39,14 @@ Targets:
        ``extract_owner_pkh_from_{nft,ft,commit}_script``,
        ``extract_payload_hash_from_commit_script``,
        ``parse_mutable_nft_script``
+   11. delegate / authority / burn / DAT parsers
+       — ``parse_delegate_{base,burn}_script``,
+       ``split_delegate_commit_prefix``,
+       ``parse_authority_gated_script``, ``parse_dat_commit_script``,
+       ``parse_burn_proof`` (all return a value or ``None``, never raise),
+       plus the verdict functions ``verify_burn`` /
+       ``verify_relationship_claims`` / ``delegate_burn_refs`` /
+       ``resolve_delegated_refs`` over arbitrary output scripts
    10. ``glyph.script`` opcode-ref walkers
        — ``iter_input_refs`` / ``count_input_refs`` (raise only
        ``TruncatedScriptError``, a ``ValidationError`` subclass) and
@@ -64,10 +72,17 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from pyrxd.glyph._inspect_core import _classify_input, _inspect_script
+from pyrxd.glyph.authority import verify_authority_gate
+from pyrxd.glyph.burn import parse_burn_proof, verify_burn
 from pyrxd.glyph.dmint import DmintState
 from pyrxd.glyph.dmint.chain import is_token_bearing_script
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import build_mutable_scriptsig, decode_payload
+from pyrxd.glyph.relationships import (
+    delegate_burn_refs,
+    resolve_delegated_refs,
+    verify_relationship_claims,
+)
 from pyrxd.glyph.script import (
     count_input_refs,
     extract_owner_pkh_from_commit_script,
@@ -83,7 +98,12 @@ from pyrxd.glyph.script import (
     is_ft_script,
     is_nft_script,
     iter_input_refs,
+    parse_authority_gated_script,
+    parse_dat_commit_script,
+    parse_delegate_base_script,
+    parse_delegate_burn_script,
     parse_mutable_nft_script,
+    split_delegate_commit_prefix,
 )
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.swap_order import RswpOrder, decode_rswp_order, parse_price_terms_lenient
@@ -720,3 +740,201 @@ def test_parse_price_terms_lenient_never_raises(data):
         _fail_unexpected("parse_price_terms_lenient", exc, data)
         return
     assert result is None or isinstance(result, list)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. delegate / authority / burn / DAT parsers
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These consume the same fully-attacker-supplied bytes as the classifiers above:
+# an output script pasted into the inspect tool, or one read off a transaction a
+# hostile ElectrumX server returned. Every one is documented to return a value or
+# ``None`` — none of them has a raising contract — so ANY exception is a leak of
+# an internal failure mode past a trust boundary.
+#
+# Bias the generator toward bytes that actually enter each parser's deeper
+# branches: the ref opcodes these shapes open with, the OP_RETURN and pushdata
+# prefixes a burn proof uses, and the "gly" marker.
+_shapeish_byte = st.sampled_from(
+    [0xD0, 0xD1, 0xD8, 0x75, 0x6A, 0x03, 0x67, 0x6C, 0x79, 0x4C, 0x4D, 0x4E, 0xAA, 0x20, 0x88, 0x00, 0xFF]
+)
+
+
+def _real_shapes() -> list[bytes]:
+    """Genuine instances of every shape these parsers accept.
+
+    WITHOUT THESE THE TESTS BELOW ARE VACUOUS on the branch that matters.
+    Hypothesis cannot stumble on a valid 56-byte delegate commit prefix — it
+    would have to produce an exact 20-byte opcode layout AND a ref that
+    round-trips through ``build_delegate_commit_prefix``. Measured: planting a
+    defect in the prefix-split branch changed nothing, because random bytes
+    never reached it. Seeding the corpus with real shapes, and mutating them by
+    one byte, is what makes the deep branches reachable.
+    """
+    from pyrxd.glyph.burn import build_burn_proof_script
+    from pyrxd.glyph.script import (
+        build_authority_gated_nft_script,
+        build_commit_locking_script,
+        build_dat_commit_locking_script,
+        build_delegate_base_script,
+        build_delegate_burn_script,
+        build_delegate_token_script,
+        build_nft_locking_script,
+    )
+    from pyrxd.security.types import Hex20
+
+    pkh = Hex20(bytes(range(20)))
+    a = GlyphRef(txid="11" * 32, vout=0)
+    b = GlyphRef(txid="22" * 32, vout=1)
+    payload_hash = bytes(range(32))
+    return [
+        build_delegate_base_script(pkh, [a, b]),
+        build_delegate_token_script(pkh, a),
+        build_delegate_burn_script(a),
+        build_commit_locking_script(payload_hash, pkh, is_nft=True, delegate_ref=a),
+        build_commit_locking_script(payload_hash, pkh, is_nft=False, delegate_ref=b),
+        build_dat_commit_locking_script(payload_hash, pkh),
+        build_dat_commit_locking_script(payload_hash, pkh, delegate_ref=a),
+        build_authority_gated_nft_script(pkh, a, b),
+        build_nft_locking_script(pkh, a),
+        build_burn_proof_script(a, amount=7, burn_reason="x" * 40),
+        build_burn_proof_script(b),
+    ]
+
+
+def _mutated(script: bytes, index: int, value: int) -> bytes:
+    """One byte of a real shape flipped — the near-miss inputs that break parsers."""
+    if not script:
+        return script
+    i = index % len(script)
+    return script[:i] + bytes([value % 256]) + script[i + 1 :]
+
+
+_real_shape = st.sampled_from(_real_shapes())
+_script_bytes = st.one_of(
+    st.binary(min_size=0, max_size=300),
+    st.lists(_shapeish_byte, min_size=0, max_size=140).map(bytes),
+    _real_shape,
+    # Real shapes with one byte changed, and real shapes truncated.
+    st.builds(_mutated, _real_shape, st.integers(0, 200), st.integers(0, 255)),
+    st.builds(lambda s, n: s[: n % (len(s) + 1)], _real_shape, st.integers(0, 200)),
+    # A real shape with trailing junk — the "ignores an unrecognised tail" path.
+    st.builds(lambda s, t: s + t, _real_shape, st.binary(max_size=20)),
+)
+
+
+@given(data=_script_bytes)
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_new_shape_parsers_never_raise(data):
+    """Each returns its shape or ``None``. None of them may raise."""
+    for name, fn in (
+        ("parse_delegate_base_script", parse_delegate_base_script),
+        ("parse_delegate_burn_script", parse_delegate_burn_script),
+        ("parse_authority_gated_script", parse_authority_gated_script),
+        ("parse_dat_commit_script", parse_dat_commit_script),
+        ("parse_burn_proof", parse_burn_proof),
+        ("split_delegate_commit_prefix", split_delegate_commit_prefix),
+    ):
+        try:
+            fn(data)
+        except Exception as exc:
+            _fail_unexpected(name, exc, data)
+            return
+
+
+@given(data=_script_bytes)
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_split_delegate_commit_prefix_never_grows_the_script(data):
+    """The core it returns must be a genuine suffix of the input.
+
+    Everything downstream indexes fixed offsets into that core — payload hash,
+    owner PKH. A split that handed back bytes the caller did not pass in, or
+    that dropped the wrong count, would move every one of those offsets.
+    """
+    try:
+        delegate_ref, core = split_delegate_commit_prefix(data)
+    except Exception as exc:
+        _fail_unexpected("split_delegate_commit_prefix", exc, data)
+        return
+    assert isinstance(core, (bytes, bytearray))
+    assert bytes(data).endswith(bytes(core))
+    # No prefix found => the input is returned untouched, not merely equal.
+    assert delegate_ref is not None or bytes(core) == bytes(data)
+    assert delegate_ref is None or len(data) - len(core) == 56
+
+
+@given(scripts=st.lists(_script_bytes, min_size=0, max_size=6))
+@settings(max_examples=_budget(250), suppress_health_check=[HealthCheck.too_slow])
+def test_verdict_functions_never_raise_on_arbitrary_outputs(scripts):
+    """The verdict layer walks whatever outputs a transaction happens to carry.
+
+    An unwalkable output must not make an honest token unreadable, and must not
+    surface an ``IndexError`` from inside a walker to a caller that only knows
+    about ``ValidationError``.
+    """
+    ref = GlyphRef(txid="11" * 32, vout=0)
+    try:
+        burned = delegate_burn_refs(list(scripts))
+        assert isinstance(burned, set)
+        verdict = verify_burn(list(scripts), ref)
+        assert isinstance(verdict.valid, bool)
+        verify_burn(list(scripts), ref, spent_output_scripts=list(scripts))
+        resolved = resolve_delegated_refs(ref.to_bytes(), list(scripts))
+        assert isinstance(resolved, tuple)
+        for s in scripts:
+            assert isinstance(verify_authority_gate(s, ref).valid, bool)
+    except Exception as exc:
+        _fail_unexpected("verdict functions", exc, scripts)
+
+
+@given(scripts=st.lists(_script_bytes, min_size=0, max_size=6), delegated=st.lists(_script_bytes, max_size=4))
+@settings(max_examples=_budget(250), suppress_health_check=[HealthCheck.too_slow])
+def test_relationship_verdicts_never_raise_and_never_invent_backing(scripts, delegated):
+    """A claim is only BACKED if its ref is genuinely in one of the two sets.
+
+    ``delegated_refs`` is caller-supplied, so the fuzzer feeds it garbage of the
+    wrong length. Garbage must not back anything — the verdict has to come from
+    a real match, not from the parameter merely being non-empty.
+    """
+    from pyrxd.glyph.relationships import RelationshipBacking, RelationshipOutcome, output_ref_operands
+    from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+    claimed = GlyphRef(txid="c0" * 32, vout=0)
+    metadata = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x", container_refs=(claimed,))
+    try:
+        verdicts = verify_relationship_claims(metadata, list(scripts), delegated_refs=[bytes(d) for d in delegated])
+        direct = output_ref_operands(list(scripts))
+    except Exception as exc:
+        _fail_unexpected("verify_relationship_claims", exc, (scripts, delegated))
+        return
+
+    wire = claimed.to_bytes()
+    for v in verdicts:
+        if v.outcome is RelationshipOutcome.BACKED:
+            assert wire in direct or wire in {bytes(d) for d in delegated}, "backed without a real match"
+            if v.backing is RelationshipBacking.DIRECT:
+                assert wire in direct
+        else:
+            assert v.backing is RelationshipBacking.NONE
+
+
+@given(base_ref=st.binary(min_size=0, max_size=80), scripts=st.lists(_script_bytes, min_size=0, max_size=4))
+@settings(max_examples=_budget(250), suppress_health_check=[HealthCheck.too_slow])
+def test_resolve_delegated_refs_rejects_anything_that_is_not_a_wire_ref(base_ref, scripts):
+    """The REF argument is attacker-shaped too, and the earlier test never varied it.
+
+    A burn output's ref reaches this function after a round trip through the
+    caller's own formatting, so a wrong-length value is reachable. Without the
+    length guard, ``base_ref[32:36]`` on a short value is empty,
+    ``int.from_bytes(b"", "little")`` is 0, and the function happily resolves
+    OUTPUT ZERO of an unrelated transaction — refs the burn never pointed at.
+    It returns nothing instead, and that is what this pins.
+    """
+    try:
+        resolved = resolve_delegated_refs(base_ref, list(scripts))
+    except Exception as exc:
+        _fail_unexpected("resolve_delegated_refs", exc, (base_ref, scripts))
+        return
+    assert isinstance(resolved, tuple)
+    if len(base_ref) != 36:
+        assert resolved == (), "a value that is not a 36-byte wire ref must resolve to nothing"

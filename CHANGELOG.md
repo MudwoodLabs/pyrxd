@@ -8,6 +8,58 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Every Glyph protocol marker that had a classifier label and no way to write one
+  now has a write side** — `by` (via delegate refs), `AUTHORITY` (10), `BURN` (6) and
+  `DAT` (3). The classifier was built from the full protocol table so every marker got
+  a label; the build side was built consumer-by-consumer, so a marker only got a
+  builder when someone asked. Nothing surfaces that asymmetry until you try to *write*
+  one. Each write side is byte-matched to Photonic Wallet and proven against a Radiant
+  Core v3.1.1 regtest node.
+
+  - **Delegate refs** authorise a token's `in`/`by` claim without the minter holding
+    the parent singletons. `GlyphMetadata.author_refs` previously had exactly one
+    producer — the CBOR emit — so a `by` claim could be declared and never authorised,
+    and `relationships.py` reported every one of them `UNBACKED`. The parents are spent
+    **once** into a base output under `OP_REQUIREINPUTREF`; disposable delegate tokens
+    point at that base; each mint burns one. `GlyphBuilder.prepare_delegate_setup`,
+    `CommitParams.delegate_ref`, `RevealScripts.delegate_burn_script`, and
+    `delegate_burn_refs` / `resolve_delegated_refs` on the read side.
+  - **`RelationshipVerdict.backing`** distinguishes `DIRECT` (the reveal spent the
+    parent itself) from `DELEGATED` (one step removed) rather than flattening both to
+    "backed". Canon (`canon.rxd.zone`), an independent verifier, draws the same
+    distinction — read from its `/protocol` rules 2026-09-05.
+  - **AUTHORITY**: `build_authority_metadata`, `verify_authority_gate`,
+    `verify_authority_claim`, `has_permission`, and the 101-byte
+    `build_authority_gated_nft_script` covenant with
+    `GlyphBuilder.prepare_authority_gated_reveal`.
+  - **BURN**: `build_burn_proof_script` / `parse_burn_proof` / `verify_burn`, and
+    `GlyphBuilder.prepare_burn_proof`.
+  - **DAT**: `build_dat_commit_locking_script` (70 bytes, no `OP_REFTYPE_OUTPUT` block —
+    its reveal mints nothing), `build_dat_reveal_scriptsig_suffix`,
+    `GlyphBuilder.prepare_dat_commit` / `.prepare_dat_reveal`.
+  - The inspector emits `delegate-token`, `delegate-burn`, `authority-gated-nft`,
+    `commit-dat` and `op_return-burn`, each carrying what it does **not** establish, and
+    `glyph inspect --fetch` resolves a delegated claim rather than printing
+    `CLAIMED ONLY — nothing authorised it` at an honest token.
+
+- **Two verifiers deliberately refuse what the reference implementation accepts.**
+  Photonic's `verifyAuthorityChain` matches a token's `by` field against a candidate
+  authority's ref and reports success on a string match; `by` is operator CBOR, so a
+  forger writes a real issuer's ref into their own token and passes. Photonic's
+  `validateBurn` checks only that the ref is absent from the outputs — a condition
+  every unrelated transaction on the chain satisfies. pyrxd's equivalents take the
+  relationship verdicts, and the spent outputs, respectively. **Measured on a node: a
+  transaction emitting a burn proof for a token it never held is relayed happily and
+  the victim's token stays spendable.**
+
+  What the authority gate does and does not bind was also measured, and it is not what
+  the name suggests: minting a gated item without the authority is rejected, and so is
+  minting a *second* gated item from an existing one (so it is a real supply cap) — but
+  a holder **cannot** transfer a gated item while keeping the gate, and **can** strip
+  the gate entirely by transferring to a plain NFT script, same ref, nobody's
+  permission. "Authority-gated" is a claim about an item's genesis, not a durable
+  property of a live UTXO.
+
 - **Timelocked Glyph content can now be minted and revealed** (#556). The feature had
   ~700 lines and three test files and no way for a user to reach any of it; the
   maintainer's call was to wire it rather than delete it.
@@ -40,6 +92,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the chain previously raised `AttributeError`.
 
 ### Fixed
+
+- **`attrs` values did not survive a round trip through the chain.** `_decode_attrs`
+  coerced every value with `str()` and `GlyphMetadata.attrs` was typed `dict[str, str]`.
+  Harmless while nothing wrote non-string attrs — but Photonic's authority tokens carry
+  `revocable: boolean` and `permissions: string[]`, so reading a real one gave the
+  string `"False"` (truthy: a **non-revocable authority read back as revocable**) and
+  `"['mint']"` (parsed as empty: **every permission silently lost**). Scalars and lists
+  of scalars are now preserved; anything nested is still flattened to `str`, since
+  nothing in the protocol needs it. Spec §5's `attrs` row, which said "Free-form string
+  attributes", was the claim the bug was built on and is corrected.
+- **A DAT glyph minted by pyrxd was unreadable by pyrxd.** `_parse_reveal_scriptsig`
+  took the push immediately after the `gly` marker, which for a DAT reveal is the `dat`
+  marker rather than the payload — `decode_payload` raised and the caller got `None`.
+  A DAT reveal has no token output, so the entire content was unreachable. Only the one
+  known marker is skipped; skipping any short item would let a crafted scriptSig push
+  filler ahead of a payload of its choosing.
 
 - **A TIMELOCK mint could go on chain carrying no CEK commitment at all.**
   `GlyphMetadata.to_cbor_dict` emitted no `crypto` key under any circumstance, so metadata

@@ -23,6 +23,7 @@ for splitting a group's subcommands across modules.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 import click
@@ -35,15 +36,20 @@ from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
 from ..glyph._inspect_core import _truncate_for_human
+from ..glyph.relationships import resolve_delegated_refs
+from ..glyph.types import GlyphRef
 from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
+from ..transaction.transaction import Transaction
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "inspect_cmd",
@@ -188,7 +194,42 @@ async def _inspect_txid_inner(
         raise UserError("invalid txid", cause=str(exc)) from exc
 
     raw = await client.get_transaction(txid)
-    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+    payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+
+    # DELEGATED CLAIMS. A token may authorise its `in`/`by` through a delegate
+    # rather than by spending the parent here, and `_classify_raw_tx` cannot see
+    # that: resolving it means fetching the base transaction the burn points at.
+    # Skipping the fetch would render an honest token as "CLAIMED ONLY —
+    # nothing authorised it", which is a false accusation, not a safe default.
+    burns = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}).get("delegate_burns") or []
+    resolved: list[bytes] = []
+    for outpoint in burns:
+        base_txid, _, vout_str = str(outpoint).rpartition(":")
+        try:
+            base_ref = GlyphRef(txid=Txid(base_txid.lower()), vout=int(vout_str))
+            base_raw = await client.get_transaction(Txid(base_txid.lower()))
+        except (ValidationError, ValueError):
+            continue
+        except Exception as exc:
+            # An unreachable or unknown base leaves the claim UNRESOLVED rather
+            # than failing the whole inspect — the rest of the report is still
+            # true, and the renderer says the resolution did not happen.
+            # Logged, not swallowed: a claim that reads UNRESOLVED because a
+            # fetch failed looks identical to one whose base does not exist,
+            # and whoever is debugging that needs to know which it was.
+            _log.debug("could not resolve delegate base %s: %s", outpoint, exc)
+            continue
+        base_tx = Transaction.from_bytes(bytes(base_raw))
+        resolved.extend(
+            resolve_delegated_refs(
+                base_ref.to_bytes(),
+                [bytes(o.locking_script.serialize()) for o in base_tx.outputs],
+            )
+        )
+
+    if resolved:
+        payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network, delegated_refs=resolved)
+    return payload
 
 
 def _render_txid_human(payload: dict) -> str:
@@ -307,10 +348,25 @@ def _render_txid_human(payload: dict) -> str:
         # "in collection X" without saying whether anything authorised it is the
         # defect this exists to fix — the same shape as showing a WAVE name for
         # an unverified HashMark signer.
+        # Four verdicts, not two. "spent in this tx" is FALSE for a delegated
+        # claim — the parent was spent when the delegate BASE was created, by
+        # someone who need not be this minter — and "nothing authorised it" is
+        # false when a delegate was burned and simply could not be resolved.
+        # Both wrong strings are the confident kind, which is the kind people
+        # act on.
+        burned = metadata.get("delegate_burns") or []
         for rel in metadata.get("relationships") or []:
             label = "collection" if rel["kind"] == "container" else "creator"
-            if rel["outcome"] == "backed":
+            backing = rel.get("backing")
+            if rel["outcome"] == "backed" and backing == "delegated":
+                via = f" via delegate {burned[0]}" if len(burned) == 1 else " via delegate"
+                lines.append(f"  {label}: {rel['ref']}  [VERIFIED{via} — authorised by its base, not spent here]")
+            elif rel["outcome"] == "backed":
                 lines.append(f"  {label}: {rel['ref']}  [VERIFIED — spent in this tx]")
+            elif burned:
+                lines.append(
+                    f"  {label}: {rel['ref']}  [UNRESOLVED — this tx burned delegate {burned[0]}; fetch it to check]"
+                )
             else:
                 lines.append(f"  {label}: {rel['ref']}  [CLAIMED ONLY — nothing authorised it]")
 

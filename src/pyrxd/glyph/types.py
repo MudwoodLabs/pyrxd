@@ -317,7 +317,13 @@ class GlyphMetadata:
     description: str = ""
     token_type: str = ""  # NFT type tag
     main: GlyphMedia | None = None
-    attrs: dict[str, str] = field(default_factory=dict)
+    #: ``dict[str, object]``, not ``dict[str, str]``: Glyph ``attrs`` carry
+    #: non-strings in the wild (Photonic authority tokens use a boolean
+    #: ``revocable`` and a ``permissions`` list). Values are scalars or lists of
+    #: scalars; :func:`~pyrxd.glyph.payload._decode_attr_value` flattens
+    #: anything deeper. Consumers expecting text should ``str()`` what they
+    #: read, as ``WaveAttrs.from_dict`` does.
+    attrs: dict[str, object] = field(default_factory=dict)
     loc: str = ""  # IPFS or external URI
     loc_hash: str = ""  # integrity hash
     decimals: int = 0  # FT decimals (display only — consensus is 1 photon = 1 unit)

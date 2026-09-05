@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, overload
@@ -17,16 +18,23 @@ from pyrxd.fee_sizing import (
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
 
+from .burn import build_burn_proof_script
 from .dmint import (
     DmintDeployParams,
     build_dmint_contract_script,
 )
-from .payload import build_reveal_scriptsig_suffix, encode_payload
+from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
+    build_authority_gated_nft_script,
     build_commit_locking_script,
+    build_dat_commit_locking_script,
+    build_delegate_base_script,
+    build_delegate_burn_script,
+    build_delegate_token_script,
     build_ft_locking_script,
     build_mutable_nft_script,
     build_nft_locking_script,
+    extract_delegate_ref_from_commit_script,
     extract_ref_from_nft_script,
     hash_payload,
     is_legacy_container_script,
@@ -126,6 +134,13 @@ class CommitParams:
     funding_satoshis: int  # total input satoshis available
     # pyrxd's uneconomic-change floor, NOT a chain minimum (Radiant's is 1 photon).
     dust_limit: int = DUST_THRESHOLD_PHOTONS
+    #: Delegate BASE ref authorising this mint's ``in``/``by`` claims. When set,
+    #: the commit script gains the 56-byte prefix of
+    #: :func:`~pyrxd.glyph.script.build_delegate_commit_prefix`, the commit tx
+    #: MUST spend a delegate token carrying this ref, and the reveal MUST carry
+    #: the matching burn output — see :class:`RevealParams`. Leave ``None`` to
+    #: back relationships directly (spend-and-recreate) or not at all.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -136,6 +151,11 @@ class CommitResult:
     cbor_bytes: bytes  # store this — needed for reveal scriptSig
     payload_hash: bytes  # 32-byte hash committed into the script
     estimated_fee: int  # in photons
+    #: Echoed back from :class:`CommitParams` so the caller carries it to the
+    #: reveal. A commit built with a delegate whose reveal omits the burn output
+    #: is rejected by the covenant, stranding the commit value until a correct
+    #: reveal is built — so keep this alongside ``cbor_bytes``.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -157,6 +177,15 @@ class RevealParams:
     cbor_bytes: bytes  # from CommitResult
     owner_pkh: Hex20  # recipient PKH — can differ from commit spender PKH
     is_nft: bool  # True = NFT, False = FT
+    #: The commit output's locking script. Preferred over ``delegate_ref``:
+    #: pass the script you are about to spend and the delegate ref is READ from
+    #: it, so a delegate-carrying commit cannot be revealed without its burn
+    #: output by a caller who simply forgot. If both are given they are
+    #: cross-checked and a mismatch raises.
+    commit_script: bytes | None = None
+    #: Delegate BASE ref, for callers that do not have the commit script to
+    #: hand. Prefer ``commit_script``.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -165,6 +194,59 @@ class RevealScripts:
 
     locking_script: bytes  # output scriptPubKey
     scriptsig_suffix: bytes  # the 'gly' + CBOR portion; caller prepends sig+pubkey
+    #: When not ``None``, the reveal MUST include this as an additional output
+    #: with value 0. The commit covenant counts it (exactly one required), so a
+    #: reveal that omits it is rejected outright rather than minting an
+    #: unauthorised token — the failure is loud, not silent.
+    delegate_burn_script: bytes | None = None
+
+
+@dataclass
+class AuthorityGatedRevealScripts:
+    """Scripts for revealing an item GATED on an issuer's authority token.
+
+    Two token outputs, like the container-child reveal: the gated item, and the
+    authority re-created unchanged. See
+    :meth:`GlyphBuilder.prepare_authority_gated_reveal`.
+    """
+
+    #: The item's own ref (its commit outpoint).
+    ref: GlyphRef
+    #: vout[0] — the 101-byte authority-gated item.
+    item_script: bytes
+    #: vout[1] — the authority token, byte-identical to the one being spent.
+    #: **Omitting this output BURNS the issuer's authority**, and a consumed
+    #: singleton can never be re-minted.
+    authority_script: bytes
+    #: The ``'gly'`` + CBOR portion; caller prepends sig+pubkey.
+    scriptsig_suffix: bytes
+    #: The authority this item is gated on.
+    authority_ref: GlyphRef
+
+
+@dataclass
+class DelegateSetupScripts:
+    """Output scripts for the one-time delegate setup — see :meth:`GlyphBuilder.prepare_delegate_setup`."""
+
+    #: Spend the parent tokens into this. Its outpoint becomes the base ref.
+    base_script: bytes
+    #: The refs *base_script* authorises, in script order — echoed back so the
+    #: caller can assert it built the base it meant to.
+    authorised_refs: tuple[GlyphRef, ...]
+    #: **The parent NFT outputs the base transaction must ALSO carry**, one per
+    #: authorised ref and in the same order, each byte-identical to the output
+    #: being spent.
+    #:
+    #: ``OP_REQUIREINPUTREF`` requires a ref as an INPUT; it does not carry it
+    #: forward. So a base transaction whose outputs are the base alone SPENDS
+    #: the container and author singletons and re-creates neither — it burns
+    #: them, permanently and irrecoverably, and a consumed singleton can never
+    #: be re-minted (spec §7.5.1). Photonic builds ``outputs = [base, ...tokens]``
+    #: for exactly this reason (``mint.ts:634``). These are those tokens.
+    parent_scripts: tuple[bytes, ...] = ()
+    #: Built only when ``base_ref`` was supplied (a second transaction, after
+    #: the base has confirmed and its outpoint is known).
+    token_scripts: tuple[bytes, ...] = ()
 
 
 @dataclass
@@ -304,14 +386,17 @@ class GlyphBuilder:
             payload_hash,
             params.owner_pkh,
             is_nft=is_nft,
+            delegate_ref=params.delegate_ref,
         )
-        # Rough estimate: commit tx ~276 bytes
-        estimated_fee = 276 * MIN_FEE_RATE
+        # Rough estimate: commit tx ~276 bytes, plus the delegate token input
+        # (~148 B) and the 56-byte script prefix when this mint is delegated.
+        estimated_fee = (276 if params.delegate_ref is None else 276 + 148 + 56) * MIN_FEE_RATE
         return CommitResult(
             commit_script=commit_script,
             cbor_bytes=cbor_bytes,
             payload_hash=payload_hash,
             estimated_fee=estimated_fee,
+            delegate_ref=params.delegate_ref,
         )
 
     def prepare_reveal(self, params: RevealParams) -> RevealScripts:
@@ -349,10 +434,26 @@ class GlyphBuilder:
         else:
             locking = build_ft_locking_script(params.owner_pkh, ref)
 
+        # Delegate: prefer READING the ref off the commit script the caller is
+        # about to spend, so the burn output cannot be forgotten. A mismatch
+        # between the two sources is a caller bug that would produce a reveal
+        # the covenant rejects, so it raises rather than picking a winner.
+        delegate_ref = params.delegate_ref
+        if params.commit_script is not None:
+            from_script = extract_delegate_ref_from_commit_script(params.commit_script)
+            if delegate_ref is not None and from_script != delegate_ref:
+                raise ValidationError(
+                    f"delegate_ref {delegate_ref.txid}:{delegate_ref.vout} does not match the delegate ref "
+                    f"carried by commit_script ({from_script.txid + ':' + str(from_script.vout) if from_script else 'none'}). "
+                    "The commit script is authoritative — it is the covenant that will be evaluated."
+                )
+            delegate_ref = from_script
+
         scriptsig_suffix = build_reveal_scriptsig_suffix(params.cbor_bytes)
         return RevealScripts(
             locking_script=locking,
             scriptsig_suffix=scriptsig_suffix,
+            delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
         )
 
     def prepare_ft_deploy_reveal(
@@ -857,6 +958,201 @@ class GlyphBuilder:
             locking_script=build_nft_locking_script(owner_pkh, ref),
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             child_ref=None,
+        )
+
+    def prepare_dat_commit(self, params: CommitParams) -> CommitResult:
+        """Prepare a DAT (data-storage) commit — a glyph that mints no token.
+
+        Same two-transaction shape as :meth:`prepare_commit`, but the commit
+        carries no ``OP_REFTYPE_OUTPUT`` obligation, so the reveal creates no
+        NFT and no FT. What survives is the payload in the reveal's scriptSig.
+
+        Protocol must include ``GlyphProtocol.DAT`` (3). Build the reveal with
+        :meth:`prepare_dat_reveal` — a DAT commit pops an extra ``"dat"`` marker
+        and the ordinary reveal scriptSig is one push short of satisfying it.
+        """
+        self._assert_metadata_protocol(params.metadata, GlyphProtocol.DAT, "DAT commit")
+        cbor_bytes, payload_hash = encode_payload(params.metadata)
+        return CommitResult(
+            commit_script=build_dat_commit_locking_script(
+                payload_hash, params.owner_pkh, delegate_ref=params.delegate_ref
+            ),
+            cbor_bytes=cbor_bytes,
+            payload_hash=payload_hash,
+            estimated_fee=(276 if params.delegate_ref is None else 276 + 148 + 56) * MIN_FEE_RATE,
+            delegate_ref=params.delegate_ref,
+        )
+
+    def prepare_dat_reveal(self, cbor_bytes: bytes, *, delegate_ref: GlyphRef | None = None) -> RevealScripts:
+        """Prepare a DAT reveal's scriptSig suffix.
+
+        There is no ``locking_script``: a DAT reveal mints nothing, so the
+        caller's outputs are whatever they want to keep the value on (ordinary
+        P2PKH change). :attr:`RevealScripts.locking_script` is returned empty to
+        say so rather than handing back a token script that would be wrong.
+        """
+        self._assert_protocol(cbor_bytes, GlyphProtocol.DAT, "DAT reveal")
+        return RevealScripts(
+            locking_script=b"",
+            scriptsig_suffix=build_dat_reveal_scriptsig_suffix(cbor_bytes),
+            delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
+        )
+
+    @staticmethod
+    def prepare_burn_proof(
+        token_ref: GlyphRef,
+        *,
+        amount: int | None = None,
+        burn_reason: str | None = None,
+    ) -> bytes:
+        """The ``OP_RETURN`` output that records a deliberate burn.
+
+        Add it to the transaction that spends the token, with value 0, and do
+        NOT re-create the token in any output. See
+        :func:`~pyrxd.glyph.burn.build_burn_proof_script` for what the proof
+        does and does not establish — it is an operator claim, and
+        :func:`~pyrxd.glyph.burn.verify_burn` is careful about which parts of it
+        a reader may rely on.
+        """
+        return build_burn_proof_script(token_ref, amount=amount, burn_reason=burn_reason)
+
+    @staticmethod
+    def _assert_metadata_protocol(metadata: GlyphMetadata, marker: GlyphProtocol, label: str) -> None:
+        """Cross-check a metadata object declares *marker* before encoding it."""
+        if marker not in (metadata.protocol or ()):
+            raise ValidationError(
+                f"{label}: metadata protocol {list(metadata.protocol or ())!r} must include "
+                f"GlyphProtocol.{marker.name} ({int(marker)})"
+            )
+
+    def prepare_authority_gated_reveal(
+        self,
+        commit_txid: str,
+        commit_vout: int,
+        cbor_bytes: bytes,
+        owner_pkh: Hex20,
+        authority_ref: GlyphRef,
+        authority_owner_pkh: Hex20,
+    ) -> AuthorityGatedRevealScripts:
+        """Prepare scripts for minting an item gated on an issuer's authority.
+
+        Build the reveal with **two** inputs — the commit outpoint and the
+        authority token's UTXO — and **two** token outputs:
+
+        =========  ==================================================
+        output      script
+        =========  ==================================================
+        ``0``       :attr:`~AuthorityGatedRevealScripts.item_script`
+        ``1``       :attr:`~AuthorityGatedRevealScripts.authority_script`
+        =========  ==================================================
+
+        (plus change). The authority output is byte-identical to the one being
+        spent when *authority_owner_pkh* is unchanged, so the authority neither
+        moves nor changes hands — and, more to the point, is not destroyed.
+        Spending a singleton without re-creating it burns it irrecoverably.
+
+        Consensus enforces the gate: ``OP_REQUIREINPUTREF`` in the item's script
+        is subset-checked against this transaction's inputs, so the mint fails
+        outright without the authority. Measured, along with what the gate does
+        NOT bind, in ``tests/test_authority_regtest_e2e.py`` — read
+        :func:`~pyrxd.glyph.script.build_authority_gated_nft_script` before
+        treating "gated" as a durable property of the minted item.
+
+        :raises ValidationError: the envelope is unparseable or does not include
+            ``GlyphProtocol.NFT``.
+        """
+        self._assert_protocol(cbor_bytes, GlyphProtocol.NFT, "authority-gated item")
+        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        return AuthorityGatedRevealScripts(
+            ref=ref,
+            item_script=build_authority_gated_nft_script(owner_pkh, ref, authority_ref),
+            authority_script=build_nft_locking_script(authority_owner_pkh, authority_ref),
+            scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
+            authority_ref=authority_ref,
+        )
+
+    def prepare_delegate_setup(
+        self,
+        owner_pkh: Hex20,
+        authorised_refs: Sequence[GlyphRef],
+        *,
+        parent_owner_pkh: Hex20 | None = None,
+        base_ref: GlyphRef | None = None,
+        token_count: int = 0,
+    ) -> DelegateSetupScripts:
+        """Prepare the one-time delegate setup that authorises ``in``/``by`` claims.
+
+        This is the alternative to :meth:`prepare_container_child_reveal` for a
+        minting service, and the only write path pyrxd has for ``by`` at all.
+        Where the container-child reveal makes *every* mint spend and re-create
+        the parent — permanent custody in the minting wallet, and one serialised
+        UTXO every mint contends on — a delegate spends the parents **once**.
+
+        Two transactions, because the second needs the first's outpoint:
+
+        1. Call with *authorised_refs* only. Spend the container and/or author
+           tokens, with outputs = :attr:`~DelegateSetupScripts.base_script`
+           **plus every script in
+           :attr:`~DelegateSetupScripts.parent_scripts`**, which re-create the
+           parents unchanged. Consensus refuses the base output unless those
+           refs really were among the inputs (``OP_REQUIREINPUTREF`` is
+           subset-checked), which is what makes every later claim authorised
+           rather than merely asserted.
+
+           **Omitting the parent outputs BURNS the container and author
+           tokens.** ``OP_REQUIREINPUTREF`` requires a ref as an input and does
+           not carry it forward, so a base transaction that does not re-create
+           the parents destroys them — permanently, since a consumed singleton
+           can never be re-minted. Only once the parents are back in outputs is
+           it true that they can go to cold storage and never be spent again.
+        2. Call again with *base_ref* (that output's outpoint) and a
+           *token_count*. Spend the base, paying to each of
+           :attr:`~DelegateSetupScripts.token_scripts`. Each token authorises one
+           mint, so pre-mint as many as you expect to need — N tokens serve N
+           concurrent mints with no lock.
+
+        Then each mint passes ``base_ref`` as
+        :attr:`CommitParams.delegate_ref`, spends one token in the commit, and
+        emits :attr:`RevealScripts.delegate_burn_script` in the reveal.
+
+        What this does NOT prove: that the parent's owner approved this
+        particular mint. It proves the mint held a token from a base that held
+        the parents. Anyone holding a delegate token can make the claim — that
+        is the mechanism working as designed, and why
+        :class:`~pyrxd.glyph.relationships.RelationshipBacking` reports
+        DELEGATED separately from DIRECT rather than flattening the two.
+
+        :param parent_owner_pkh: who the re-created parent outputs pay to.
+            Defaults to *owner_pkh*, which is right when the setup wallet is the
+            one holding the parents — the usual case, since it has to spend them.
+        :raises ValidationError: *authorised_refs* is empty, or *token_count* is
+            given without *base_ref* (or vice versa with no tokens to build).
+        """
+        if not authorised_refs:
+            raise ValidationError(
+                "prepare_delegate_setup() needs at least one ref to authorise — a base authorising "
+                "nothing delegates nothing and is indistinguishable from a plain P2PKH output."
+            )
+        if token_count < 0:
+            raise ValidationError("token_count must be >= 0")
+        if token_count and base_ref is None:
+            raise ValidationError(
+                "token_count requires base_ref: delegate tokens carry the BASE outpoint, which does "
+                "not exist until the base transaction from step 1 has been broadcast. Build the base "
+                "first, then call again with base_ref=<that output's outpoint>."
+            )
+        refs = tuple(authorised_refs)
+        # Defaults to the setup wallet: whoever spends a parent singleton IS its
+        # owner, so the same key almost always receives it back. Pass it
+        # explicitly when a parent should be re-created to a different holder.
+        parents_to = owner_pkh if parent_owner_pkh is None else parent_owner_pkh
+        return DelegateSetupScripts(
+            base_script=build_delegate_base_script(owner_pkh, refs),
+            authorised_refs=refs,
+            parent_scripts=tuple(build_nft_locking_script(parents_to, ref) for ref in refs),
+            token_scripts=tuple(build_delegate_token_script(owner_pkh, base_ref) for _ in range(token_count))
+            if base_ref is not None
+            else (),
         )
 
     def prepare_container_child_reveal(
