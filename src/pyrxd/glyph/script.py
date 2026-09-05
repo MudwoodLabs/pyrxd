@@ -158,6 +158,14 @@ COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda
 # Kept for backwards compatibility — matches either variant.
 COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda[0-9a-f]{2}9d76a914[0-9a-f]{40}88ac$")
 
+# --- Authority-gated NFT (Photonic ``packages/lib/src/authority.ts:239``) -----
+# ``OP_REQUIREINPUTREF <auth_ref> OP_DROP OP_PUSHINPUTREFSINGLETON <ref> OP_DROP``
+# + P2PKH. 38 + 38 + 25 = 101 bytes. See
+# :func:`build_authority_gated_nft_script` for what the gate does and does NOT
+# bind.
+AUTHORITY_GATED_SCRIPT_SIZE = 101
+AUTHORITY_GATED_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})75d8([0-9a-f]{72})7576a914([0-9a-f]{40})88ac$")
+
 # --- Delegate refs (Photonic ``packages/lib/src/script.ts:455-499``) ----------
 # A delegate authorises a token's ``in``/``by`` claim WITHOUT the minting wallet
 # holding the parent singleton. The parent refs are spent ONCE into a delegate
@@ -239,6 +247,123 @@ def build_commit_locking_script(
         + b"\x76\xa9\x14"
         + bytes(owner_pkh)
         + b"\x88\xac"  # P2PKH tail
+    )
+
+
+# ---------------------------------------------------------------------------
+# Authority-gated NFT
+# ---------------------------------------------------------------------------
+
+
+def build_authority_gated_nft_script(owner_pkh: Hex20, ref: GlyphRef, authority_ref: GlyphRef) -> bytes:
+    """Build the 101-byte authority-gated NFT locking script.
+
+    Mirrors Photonic ``authorityGatedNftScript``
+    (``packages/lib/src/authority.ts:239``)::
+
+        OP_REQUIREINPUTREF <authority_ref> OP_DROP
+        OP_PUSHINPUTREFSINGLETON <ref> OP_DROP
+        OP_DUP OP_HASH160 <owner_pkh> OP_EQUALVERIFY OP_CHECKSIG
+
+    What the gate binds
+    -------------------
+
+    ``OP_REQUIREINPUTREF`` is subset-checked against the transaction's inputs
+    (:data:`~pyrxd.constants.INPUT_BACKED_REF_OPCODES`), so **an output carrying
+    this script can only be created by a transaction whose input ref set
+    contains** *authority_ref*. At genesis that means the minter held the
+    issuer's authority token, which is the point: a counterfeiter without it
+    cannot mint a gated item.
+
+    What it binds, MEASURED on a node
+    ---------------------------------
+
+    All three answers below come from ``tests/test_authority_regtest_e2e.py``
+    against Radiant Core v3.1.1 — not from reading the opcode table, because
+    the input ref set includes refs carried by the spent inputs' own scripts and
+    a gated output carries *authority_ref* in its script. Whether that counts
+    when spent decides everything here, and it turns out not to:
+
+    ================================================== ==========
+    attempt                                             verdict
+    ================================================== ==========
+    mint a gated item without the authority as input    REJECTED
+    mint a SECOND gated item from an existing one       REJECTED
+    transfer to a new owner, KEEPING the gate           REJECTED
+    transfer to a plain NFT script, dropping the gate   ACCEPTED
+    ================================================== ==========
+
+    Two consequences the name does not suggest:
+
+    **It is not a mint-time rule.** Photonic calls it "creation-time
+    (mint-time)". It is that, but re-creating this script in ANY later
+    transaction also needs the authority ref among that transaction's inputs. So
+    the holder cannot move a gated item and keep it gated without the issuer
+    signing alongside them.
+
+    **"Gated" is not a durable property of a token.** The item's own singleton
+    ref survives in a plain 63-byte NFT script, so the holder can transfer to
+    one — unilaterally, in a single transaction — and end up with the same ref
+    and no gate. A check of the form "is this token authority-gated?" applied to
+    a token's CURRENT output is therefore defeatable by its holder. Authority
+    gating is a claim about an item's **genesis**, and only the genesis
+    transaction establishes it. :func:`is_authority_gated_script` answers "is
+    this output gated", which is a different and weaker question — see
+    :func:`~pyrxd.glyph.authority.verify_authority_gate` for the one that reads
+    the genesis.
+
+    What it does buy is real: the issuer's authority token is required to bring
+    any gated item into existence, and holding one gated item does not let you
+    mint another. The gate IS a supply cap.
+
+    :param ref: the item's own singleton ref (its commit outpoint).
+    :param authority_ref: the issuer's authority token ref.
+    :raises ValidationError: *ref* and *authority_ref* are the same outpoint —
+        a token gated on itself is satisfied by its own creation and gates
+        nothing, which is never what the caller meant.
+    """
+    if ref.txid == authority_ref.txid and ref.vout == authority_ref.vout:
+        raise ValidationError(
+            f"authority_ref {authority_ref.txid}:{authority_ref.vout} is the item's own ref — a token "
+            "gated on itself imposes no requirement its own creation does not already satisfy."
+        )
+    script = (
+        b"\xd1"  # OP_REQUIREINPUTREF
+        + authority_ref.to_bytes()
+        + b"\x75"  # OP_DROP
+        + b"\xd8"  # OP_PUSHINPUTREFSINGLETON
+        + ref.to_bytes()
+        + b"\x75"  # OP_DROP
+        + b"\x76\xa9\x14"
+        + bytes(owner_pkh)
+        + b"\x88\xac"  # P2PKH tail
+    )
+    if len(script) != AUTHORITY_GATED_SCRIPT_SIZE:  # internal invariant
+        raise RuntimeError(
+            f"authority-gated script length invariant violated: "
+            f"expected {AUTHORITY_GATED_SCRIPT_SIZE}, got {len(script)}"
+        )
+    return script
+
+
+def is_authority_gated_script(script_hex: str) -> bool:
+    """Return True if *script_hex* is an authority-gated NFT output."""
+    return bool(AUTHORITY_GATED_SCRIPT_RE.fullmatch(script_hex.lower()))
+
+
+def parse_authority_gated_script(script: bytes) -> tuple[GlyphRef, GlyphRef, Hex20] | None:
+    """Return ``(authority_ref, ref, owner_pkh)``, or ``None`` if not gated.
+
+    Refs come back as :class:`~pyrxd.glyph.types.GlyphRef`, decoded from the
+    little-endian script form they appear in.
+    """
+    m = AUTHORITY_GATED_SCRIPT_RE.fullmatch(script.hex().lower())
+    if m is None:
+        return None
+    return (
+        GlyphRef.from_bytes(bytes.fromhex(m.group(1))),
+        GlyphRef.from_bytes(bytes.fromhex(m.group(2))),
+        Hex20(bytes.fromhex(m.group(3))),
     )
 
 

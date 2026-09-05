@@ -101,6 +101,7 @@ _SHAPE_NAMES = (
     # script. Built without it, a delegate commit is 131 bytes with each field
     # shifted by 56 and reads as an unrecognised output.
     "commit-nft-delegate",
+    "authority-gated-nft",
     "container-legacy",
     "dmint-v1",
     "dmint-v2",
@@ -131,6 +132,7 @@ def _corpus() -> dict[str, bytes]:
     from pyrxd.glyph.dmint.builders import build_dmint_contract_script, build_dmint_v1_contract_script
     from pyrxd.glyph.dmint.types import DmintDeployParams
     from pyrxd.glyph.script import (
+        build_authority_gated_nft_script,
         build_commit_locking_script,
         build_delegate_burn_script,
         build_delegate_token_script,
@@ -207,6 +209,9 @@ def _corpus() -> dict[str, bytes]:
         "delegate-token": build_delegate_token_script(pkh, ref2),
         "delegate-burn": build_delegate_burn_script(ref2),
         "commit-nft-delegate": build_commit_locking_script(payload_hash, pkh, is_nft=True, delegate_ref=ref2),
+        # 101 bytes: the item's singleton behind an OP_REQUIREINPUTREF on the
+        # issuer's authority ref. ref2 is the authority, ref the item.
+        "authority-gated-nft": build_authority_gated_nft_script(pkh, ref, ref2),
         # The dead pre-0.15.0 CONTAINER-with-child-ref output: OP_PUSHINPUTREF
         # <child> then a plain NFT script. Built the way it used to be built.
         "container-legacy": b"\xd0" + ref2.to_bytes() + build_nft_locking_script(pkh, ref),

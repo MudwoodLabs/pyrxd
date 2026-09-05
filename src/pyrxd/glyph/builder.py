@@ -24,6 +24,7 @@ from .dmint import (
 )
 from .payload import build_reveal_scriptsig_suffix, encode_payload
 from .script import (
+    build_authority_gated_nft_script,
     build_commit_locking_script,
     build_delegate_base_script,
     build_delegate_burn_script,
@@ -196,6 +197,29 @@ class RevealScripts:
     #: reveal that omits it is rejected outright rather than minting an
     #: unauthorised token — the failure is loud, not silent.
     delegate_burn_script: bytes | None = None
+
+
+@dataclass
+class AuthorityGatedRevealScripts:
+    """Scripts for revealing an item GATED on an issuer's authority token.
+
+    Two token outputs, like the container-child reveal: the gated item, and the
+    authority re-created unchanged. See
+    :meth:`GlyphBuilder.prepare_authority_gated_reveal`.
+    """
+
+    #: The item's own ref (its commit outpoint).
+    ref: GlyphRef
+    #: vout[0] — the 101-byte authority-gated item.
+    item_script: bytes
+    #: vout[1] — the authority token, byte-identical to the one being spent.
+    #: **Omitting this output BURNS the issuer's authority**, and a consumed
+    #: singleton can never be re-minted.
+    authority_script: bytes
+    #: The ``'gly'`` + CBOR portion; caller prepends sig+pubkey.
+    scriptsig_suffix: bytes
+    #: The authority this item is gated on.
+    authority_ref: GlyphRef
 
 
 @dataclass
@@ -932,6 +956,52 @@ class GlyphBuilder:
             locking_script=build_nft_locking_script(owner_pkh, ref),
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             child_ref=None,
+        )
+
+    def prepare_authority_gated_reveal(
+        self,
+        commit_txid: str,
+        commit_vout: int,
+        cbor_bytes: bytes,
+        owner_pkh: Hex20,
+        authority_ref: GlyphRef,
+        authority_owner_pkh: Hex20,
+    ) -> AuthorityGatedRevealScripts:
+        """Prepare scripts for minting an item gated on an issuer's authority.
+
+        Build the reveal with **two** inputs — the commit outpoint and the
+        authority token's UTXO — and **two** token outputs:
+
+        =========  ==================================================
+        output      script
+        =========  ==================================================
+        ``0``       :attr:`~AuthorityGatedRevealScripts.item_script`
+        ``1``       :attr:`~AuthorityGatedRevealScripts.authority_script`
+        =========  ==================================================
+
+        (plus change). The authority output is byte-identical to the one being
+        spent when *authority_owner_pkh* is unchanged, so the authority neither
+        moves nor changes hands — and, more to the point, is not destroyed.
+        Spending a singleton without re-creating it burns it irrecoverably.
+
+        Consensus enforces the gate: ``OP_REQUIREINPUTREF`` in the item's script
+        is subset-checked against this transaction's inputs, so the mint fails
+        outright without the authority. Measured, along with what the gate does
+        NOT bind, in ``tests/test_authority_regtest_e2e.py`` — read
+        :func:`~pyrxd.glyph.script.build_authority_gated_nft_script` before
+        treating "gated" as a durable property of the minted item.
+
+        :raises ValidationError: the envelope is unparseable or does not include
+            ``GlyphProtocol.NFT``.
+        """
+        self._assert_protocol(cbor_bytes, GlyphProtocol.NFT, "authority-gated item")
+        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        return AuthorityGatedRevealScripts(
+            ref=ref,
+            item_script=build_authority_gated_nft_script(owner_pkh, ref, authority_ref),
+            authority_script=build_nft_locking_script(authority_owner_pkh, authority_ref),
+            scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
+            authority_ref=authority_ref,
         )
 
     def prepare_delegate_setup(

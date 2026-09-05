@@ -363,11 +363,13 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         extract_payload_hash_from_commit_script,
         extract_ref_from_ft_script,
         extract_ref_from_nft_script,
+        is_authority_gated_script,
         is_commit_ft_script,
         is_commit_nft_script,
         is_delegate_token_script,
         is_ft_script,
         is_nft_script,
+        parse_authority_gated_script,
         parse_delegate_burn_script,
         parse_legacy_container_script,
         parse_mutable_nft_script,
@@ -499,6 +501,28 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
             "ref_vout": ref.vout,
             "ref_outpoint": f"{ref.txid}:{ref.vout}",
             "owner_pkh": bytes(pkh).hex(),
+        }
+
+    # An authority-gated NFT: 101 bytes, the item's singleton behind an
+    # OP_REQUIREINPUTREF on the issuer's authority ref. Without this branch it
+    # reads as "unknown", and the note below is the part that matters — the gate
+    # is strippable by the holder, so seeing one here says the item is gated NOW,
+    # not that it was minted under that authority.
+    if is_authority_gated_script(script_hex):
+        gate_ref, item_ref, gate_pkh = parse_authority_gated_script(script)  # type: ignore[misc]
+        return {
+            **base,
+            "type": "authority-gated-nft",
+            "ref_txid": item_ref.txid,
+            "ref_vout": item_ref.vout,
+            "ref_outpoint": f"{item_ref.txid}:{item_ref.vout}",
+            "owner_pkh": bytes(gate_pkh).hex(),
+            "authority_ref": f"{gate_ref.txid}:{gate_ref.vout}",
+            "note": (
+                "gated on this authority NOW — the holder can transfer to a plain NFT script and "
+                "drop the gate, so this is not proof it was MINTED under that authority; read the "
+                "genesis transaction for that"
+            ),
         }
 
     # A delegate token is 63 bytes of <ref opcode> <ref> OP_DROP + P2PKH — the
@@ -1036,6 +1060,36 @@ def _classify_raw_tx(
                 "cek_hash": _sanitize_display_string(tl.cek_hash),
                 "hint": _sanitize_display_string(tl.hint) if tl.hint else "",
             }
+        # Imported HERE, not at module scope. `pyrxd.glyph.inspect` is loaded in
+        # the browser under Pyodide and `test_inspect_imports_pyodide_clean`
+        # holds it to a module budget; authority decoding is not needed to
+        # import the facade, only to classify a token that declares it.
+        from .authority import is_authority, is_authority_expired, read_authority_attrs, validate_authority
+
+        # AUTHORITY: report the issuer and permissions, and say what they are.
+        # The classifier already labelled this "authority"; that label is a
+        # protocol MARKER, which anyone can write. Everything here is likewise
+        # operator CBOR, so it is emitted under `claims` and paired with the
+        # metadata problems `validate_authority` found — an authority whose
+        # issuer is missing or whose expiry does not parse still classifies as
+        # one, and a reader shown only the label would not know.
+        if is_authority(metadata):
+            attrs = read_authority_attrs(metadata)
+            problems = validate_authority(metadata)
+            authority_payload: dict = {
+                "claims": {
+                    "issuer": _sanitize_display_string(attrs.issuer) if attrs else "",
+                    "scope": _sanitize_display_string(attrs.scope) if attrs and attrs.scope else "",
+                    "permissions": [_sanitize_display_string(p) for p in (attrs.permissions if attrs else ())],
+                    "expires": _sanitize_display_string(attrs.expires) if attrs and attrs.expires else "",
+                    "revocable": attrs.revocable if attrs else True,
+                },
+                "expired": is_authority_expired(metadata),
+            }
+            if problems:
+                authority_payload["problems"] = problems
+            metadata_payload["authority"] = authority_payload
+
         if metadata.main is not None:
             from ..hash import sha256
 

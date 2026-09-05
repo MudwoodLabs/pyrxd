@@ -163,7 +163,7 @@ row of the `outputs[]` list on a fetched transaction. Every value
 
 `p2pkh`, `p2pkh-cltv`, `p2pkh-csv`, `p2sh`, `nft`, `ft`, `mut`,
 `commit-nft`, `commit-ft`, `dmint`, `container-legacy`,
-`delegate-token`, `delegate-burn`,
+`delegate-token`, `delegate-burn`, `authority-gated-nft`,
 `soulbound-covenant`, `self-replicating-covenant`, `op_return`,
 `op_return-msg`, `op_return-hashmark-v1`, `op_return-hashmark-v2`,
 `unknown`.
@@ -173,6 +173,22 @@ row, never from a pasted script: `error`, when classifying that one
 output raised. The row keeps its `vout` and `satoshis`, and the `error`
 field is the exception's class name and nothing more. The remaining
 rows are unaffected, which is the point of the per-output `try`.
+
+`authority-gated-nft` is a 101-byte item whose script carries
+`OP_REQUIREINPUTREF` on an issuer's authority ref ahead of its own
+singleton. Consensus refuses to create such an output unless the
+transaction holds the authority token, so it cannot be minted by a
+counterfeiter.
+
+The label answers "is this output gated **now**", which is weaker than
+it sounds and is why the row carries a `note`. Measured on a node
+(`tests/test_authority_regtest_e2e.py`): the holder can transfer the
+item to a plain 63-byte `nft` script — same ref, no gate, nobody's
+permission needed — so a live UTXO's gatedness is whatever its holder
+last chose. Authority gating is a claim about an item's **genesis**, and
+only the transaction that minted it establishes one. What the gate does
+buy is real: minting a *further* gated item from an existing one is
+rejected, so the issuer's authority is a genuine supply cap.
 
 `delegate-token` and `delegate-burn` are the two halves of a delegate,
 which is how a token's `in`/`by` claim can be authorised without the

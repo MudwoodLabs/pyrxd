@@ -936,6 +936,10 @@ function renderOutputRow(row) {
   // row rather than left to the note the reader may not open. CLI parity:
   // `child_ref=` + `UNSPENDABLE`.
   if (row.child_ref_outpoint) dl.appendChild(kv("child ref", row.child_ref_outpoint));
+  // The authority an item is gated on. It is a DIFFERENT ref from the item's
+  // own, so unlike the delegate rows it is not covered by printing `ref` —
+  // dropping it would leave the reader unable to tell WHICH issuer gates this.
+  if (row.authority_ref) dl.appendChild(kv("authority ref", row.authority_ref));
   if (row.spendable === false) {
     dl.appendChild(kv("spendable", "*** UNSPENDABLE ***", "kv-warning"));
   }
@@ -1576,6 +1580,9 @@ function renderScriptCard(payload) {
   if (payload.child_ref_outpoint) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
   }
+  if (payload.authority_ref) {
+    dl.appendChild(kv("authority ref", payload.authority_ref));
+  }
   // The dead pre-0.15.0 container. The title and the note both say so, but
   // the verdict also belongs in the field list where a reader scanning
   // key/value pairs will meet it. CLI parity: `*** UNSPENDABLE ***`.
@@ -1743,6 +1750,10 @@ function scriptBadgeKind(type) {
   if (type === "p2pkh-cltv" || type === "p2pkh-csv") return "p2pkh";
   // The covenant shapes bind an NFT singleton; borrow the NFT colour.
   if (type === "soulbound-covenant" || type === "self-replicating-covenant") return "nft";
+  // An authority-gated item and a delegate token are both NFT-shaped singletons
+  // wearing an extra ref opcode; borrow the NFT colour rather than reading as
+  // "unknown", which is what the classifier says when it could not tell.
+  if (type === "authority-gated-nft" || type === "delegate-token") return "nft";
   // No badge colour is defined for the dead container shape or for P2SH;
   // reuse the `unknown` styling rather than emitting a class the stylesheet
   // lacks.
