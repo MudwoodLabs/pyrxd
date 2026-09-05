@@ -1705,7 +1705,10 @@ async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     rec = await coord.maker_claims_btc(p_secret)
     claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
     # Window closing (now near t_rxd maturity) + shallow -> SQUEEZED -> ASSET_VULNERABLE.
-    # 75 of the 80 blocks spent -> 5 left, under the 6-block burial -> SQUEEZED.
+    # 75 of the 80 blocks spent -> 5 left. The shallow claim takes the NOT_YET_FINAL branch, whose
+    # floor is burial 6 + counter reserve ceil(6*600/300)=12 + inclusion 2 (#511) = 20, so 5 is far
+    # under it. The comment here read "under the 6-block burial", which named neither the F-007
+    # reserve nor the #511 inclusion term and so understated the floor by 14 blocks.
     rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1075, asset_locked_at_height=1000)
     assert rec.state is SwapState.ASSET_VULNERABLE
     assert rxd.claimed_with is None  # not auto-claimed
@@ -1713,6 +1716,63 @@ async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
     rec = await coord.taker_claim_asset_from_vulnerable(claim_tx)
     assert rec.state is SwapState.COMPLETED
     assert rxd.claimed_with is not None
+
+
+class TestTheCoordinatorClaimVerdictBoundaries:
+    """The coordinator's own claim tests all run at MAXIMUM slack or far past the flip.
+
+    Every happy-path call above is `taker_scrape_and_claim_asset(..., now_rxd_height=1000,
+    asset_locked_at_height=1000)` — the asset locked in the very block we claim in, so
+    `blocks_left` is the whole negotiated window — and the one squeeze case sits at
+    `blocks_left = 5`. Nothing in between.
+
+    Measured through `taker_scrape_and_claim_asset` itself (t_rxd 80, locked at 1000, refund
+    opens at 1080, `MarginPolicy.estimated()`), sweeping every height from 1000 to 1080:
+
+      * a FINAL maker claim (10 conf): COMPLETED at blocks_left 8, ASSET_VULNERABLE at 7
+      * a shallow one (1 conf):        SECRET_REVEALED (wait) at blocks_left 20, ASSET_VULNERABLE at 19
+
+    8 is burial 6 + inclusion 2; 20 adds the F-007 counter reserve `ceil(6*600/300) = 12`.
+    The nearest existing case is 3 blocks from the first flip and 14 from the second.
+
+    What these close is this METHOD's own height arithmetic, not the gate it calls: a change
+    inside `assess_claim_finality` is separately caught by the parity sweep above. Planting
+    `now_rxd_height + 1` here — the coordinator's peer of the executor off-by-one #581 item 2
+    names — fails EXACTLY these two tests and nothing else in the tree (measured over the full
+    suite: 11,417 passed, 2 failed).
+
+    Pinned from both sides, because both are real: one block early advances a swap to
+    COMPLETED on a claim that cannot bury before the maker's CSV refund opens; one block late
+    drops an honest, claimable swap to ASSET_VULNERABLE with `p` already public.
+    """
+
+    @staticmethod
+    async def _claim_at(now: int, *, claim_confs: int) -> SwapState:
+        p_secret, h = generate_secret()
+        terms = _terms(variant="rxd", t_rxd_blocks=80, hashlock=h)
+        btc = FakeBtcLeg(claim_confs=claim_confs)
+        rxd = FakeRadiantLeg()
+        coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+        await coord.taker_funds_btc(terms)
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+        rec = await coord.maker_claims_btc(p_secret)
+        claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+        rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=now, asset_locked_at_height=1000)
+        return rec.state
+
+    async def test_final_claim_completes_with_exactly_the_floor_left(self):
+        """blocks_left == 8 is the last height at which the claim can still be mined and buried."""
+        assert await self._claim_at(1080 - 8, claim_confs=10) is SwapState.COMPLETED
+
+    async def test_final_claim_goes_vulnerable_one_block_past_the_floor(self):
+        assert await self._claim_at(1080 - 7, claim_confs=10) is SwapState.ASSET_VULNERABLE
+
+    async def test_shallow_claim_still_waits_with_exactly_the_reserve_left(self):
+        """blocks_left == 20 still leaves room to wait out the remaining BTC depth and then bury."""
+        assert await self._claim_at(1080 - 20, claim_confs=1) is SwapState.SECRET_REVEALED
+
+    async def test_shallow_claim_goes_vulnerable_one_block_past_the_reserve(self):
+        assert await self._claim_at(1080 - 19, claim_confs=1) is SwapState.ASSET_VULNERABLE
 
 
 async def test_gate_fail_closed_on_confs_read_error():

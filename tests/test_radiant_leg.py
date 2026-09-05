@@ -1287,6 +1287,68 @@ class TestTheFundingGateIsExercisedPerAssetVariant:
         assert value == 1000
 
 
+class TestTheRefundPathIsReachedThroughTheLegPerAssetVariant:
+    """`refund_asset` — the LEG, not the builder — is exercised for `rxd` only.
+
+    #510 item 3 named two functions with no FT/NFT coverage anywhere: `build_htlc_refund_tx` and
+    `radiant_leg.refund_asset`. The first was covered at the builder level in
+    `tests/test_htlc_refund_ft_nft_coverage.py`, deliberately so. This is the second — the
+    production entry point every caller (`mutual_refund`, `maybe_refund_asset_on_maker_stall`,
+    the watchtower's refund page) actually reaches, and the path that recovers a stalled maker's
+    asset.
+
+    Between the caller and the builder sits `_resolve_covenant`, which rebuilds the covenant from
+    `terms` per variant and pins the on-chain value against `terms.radiant_amount`; a variant
+    that never runs through it has never had its recovery path executed, only its bytes checked.
+
+    Both halves per variant, because the leg-level gate is the P3 CSV maturity self-check and a
+    refusal test on its own cannot distinguish "refuses a premature refund" from "refuses this
+    variant". The mature case proves each variant can still be recovered.
+
+    Measured, planting the variant-specific maturity error #510 item 3 names — reading `t_btc`
+    instead of `t_rxd` for ft/nft at radiant_leg.py:836 — the full suite loses EXACTLY the two
+    premature cases here (11,417 passed, 2 failed) and nothing else; the rxd peer is untouched,
+    which is the point. Planting the mirror error (one block too STRICT for ft/nft) loses the
+    two mature cases, so neither half is decorative.
+    """
+
+    @staticmethod
+    def _terms_and_carrier(variant: str):
+        """Terms plus the photon value the covenant is funded with, csv 6 in every case.
+
+        An FT's quantity IS its output value on Radiant (1 photon = 1 token unit), so 1000 tokens
+        funds as 1000 photons; the NFT's is carrier dust. They differ from the RXD leg's 100_000
+        deliberately — a shared value would hide a variant reading the wrong one.
+        """
+        if variant == "rxd":
+            return _rxd_terms(amount=100_000), 100_000
+        if variant == "ft":
+            return _ft_terms(amount=1000), 1000
+        return _nft_terms(carrier=1000), 1000
+
+    @pytest.mark.parametrize("variant", ["rxd", "ft", "nft"])
+    @pytest.mark.asyncio
+    async def test_a_mature_covenant_is_refunded(self, variant: str) -> None:
+        terms, carrier = self._terms_and_carrier(variant)
+        # csv is 6, so 6 confirmations is exactly maturity.
+        client = FakeClient(utxo_value=carrier, confirmations=6)
+        leg = _leg(client=client)
+        rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+        assert await leg.refund_asset(rec) == "ab" * 32
+        assert len(client.broadcast_raw) == 1
+
+    @pytest.mark.parametrize("variant", ["rxd", "ft", "nft"])
+    @pytest.mark.asyncio
+    async def test_a_premature_covenant_is_refused_and_nothing_is_broadcast(self, variant: str) -> None:
+        terms, carrier = self._terms_and_carrier(variant)
+        client = FakeClient(utxo_value=carrier, confirmations=5)  # one short of csv 6
+        leg = _leg(client=client)
+        rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+        with pytest.raises(NetworkError, match="not yet mature: needs 6 confirmations, has 5"):
+            await leg.refund_asset(rec)
+        assert client.broadcast_raw == [], "no non-final refund may be broadcast before CSV maturity"
+
+
 class TestAnEvictedClaimCanBeRebroadcast:
     """A claim only beats the CSV refund by BEING in the mempool when maturity arrives — a
     non-BIP68-final refund is rejected from the mempool, so the maker cannot pre-broadcast. Radiant

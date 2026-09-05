@@ -201,10 +201,14 @@ def test_asset_refunded_terminal_retires_while_btc_still_locked():
 # ---------------------------------------------------------------------------
 # ETH counter-leg (v3) — finalized-checkpoint finality, mutual_refund on stall
 # ---------------------------------------------------------------------------
-# With _eth_policy(): rxd_burial = 2, counter_reserve_rxd = ceil(768/300) = 3, t_rxd = 72,
-# LOCK = 100 → REFUND_OPENS = 172, blocks_left = 172 - now. So:
-#   FINAL              → SAFE iff blocks_left >= 2, else SQUEEZED.
-#   NOT_YET_FINAL_LIVE → WAIT iff blocks_left >= 5 (blocks_left - 3 >= 2), else SQUEEZED.
+# With _eth_policy(): rxd_burial = 2, rxd_claim_inclusion = 2 (#511), counter_reserve_rxd =
+# ceil(768/300) = 3, t_rxd = 72, LOCK = 100 → REFUND_OPENS = 172, blocks_left = 172 - now. So:
+#   FINAL              → SAFE iff blocks_left >= 4 (burial 2 + inclusion 2), else SQUEEZED.
+#   NOT_YET_FINAL_LIVE → WAIT iff blocks_left >= 7 (burial 2 + reserve 3 + inclusion 2), else SQUEEZED.
+# Both floors said 2 and 5 here until this line was corrected: #511 added the inclusion term and
+# nothing updated the arithmetic these tests are read against. Measured through `decide()`, not
+# derived: FINAL flips PAGE_CLAIM→PAGE_SQUEEZED between blocks_left 4 and 3, NOT_YET_FINAL_LIVE
+# flips WATCH→PAGE_SQUEEZED between 7 and 6.
 
 
 def _eth_obs(*, detected, finality, now, lock=LOCK, low_corroboration=False):
@@ -228,14 +232,14 @@ def test_eth_claim_finalized_pages_claim():
 
 
 def test_eth_claim_not_yet_finalized_waits():
-    # NOT_YET_FINAL_LIVE but window has room (blocks_left 22 >= 5) → WAIT → WATCH (no page).
+    # NOT_YET_FINAL_LIVE but window has room (blocks_left 22 >= the floor of 7) → WAIT → WATCH (no page).
     obs = _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=150)
     d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
     assert d.intent is Intent.WATCH
 
 
 def test_eth_claim_finalized_but_window_closing_squeezes():
-    # FINAL but only 1 block left (< rxd_burial 2) → SQUEEZED → PAGE_SQUEEZED (decision-required).
+    # FINAL but only 1 block left (< the floor of 4 = burial 2 + inclusion 2) → SQUEEZED → PAGE_SQUEEZED.
     obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=REFUND_OPENS - 1)
     d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
     assert d.intent is Intent.PAGE_SQUEEZED
@@ -243,7 +247,7 @@ def test_eth_claim_finalized_but_window_closing_squeezes():
 
 
 def test_eth_claim_not_yet_final_window_closing_squeezes():
-    # NOT_YET_FINAL_LIVE and blocks_left 4 < 5 → no room to wait for finality → SQUEEZED.
+    # NOT_YET_FINAL_LIVE and blocks_left 4 < the floor of 7 → no room to wait for finality → SQUEEZED.
     obs = _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=168)
     d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
     assert d.intent is Intent.PAGE_SQUEEZED
@@ -447,7 +451,7 @@ def test_claim_wait_keeps_watching():
 
 
 def test_claim_squeezed_pages_decision():
-    # FINAL but window closing (1 block left < rxd_burial 2) → SQUEEZED → PAGE_SQUEEZED.
+    # FINAL but window closing (1 block left < the floor of 4 = burial 2 + inclusion 2) → SQUEEZED.
     obs = Observations(
         maker_has_claimed_btc=True,
         now_rxd_height=REFUND_OPENS - 1,
@@ -492,6 +496,60 @@ def test_claim_now_below_lock_fails_closed():
     )
     d = _decide(_record(SwapState.SECRET_REVEALED), obs)
     assert d.intent is Intent.PAGE_SQUEEZED
+
+
+class TestTheBtcClaimRaceVerdictBoundaries:
+    """Every BTC claim-race test above sits tens of blocks from the flip it is about.
+
+    They use `now=150` (blocks_left 22) or `REFUND_OPENS - 1` (blocks_left 1) and nothing
+    else. Measured through `decide()` with `_policy()` — swept over every height from LOCK
+    to REFUND_OPENS rather than derived — the two verdicts actually flip at:
+
+      * FINAL (6 conf):              PAGE_CLAIM at blocks_left 4, PAGE_SQUEEZED at 3
+      * NOT_YET_FINAL_LIVE (3 conf): WATCH at blocks_left 16, PAGE_SQUEEZED at 15
+
+    4 is the #511 floor (burial 2 + inclusion 2); 16 adds the F-007 counter reserve
+    `ceil(6 * 600 / 300) = 12`.
+
+    What these close is the BTC DISPATCH, not the gate. A change inside
+    `assess_claim_finality` itself is already caught elsewhere — planting the pre-#511 floor
+    (`burial + counter_reserve`, inclusion dropped) fails the coordinator's parity sweep, the
+    ETH reserve boundary and the executor's broadcast boundary as well as these. What nothing
+    covered was `decide()`'s own BTC branch: planting `now_rxd_height + 1` on it alone fails
+    EXACTLY these four tests and nothing else in the tree (measured over the full suite —
+    11,417 passed, 2 failed, twice, once per direction).
+
+    Both directions are real defects, which is why each flip is pinned from BOTH sides: one
+    block early certifies a claim that cannot bury before the maker's refund opens; one block
+    late refuses an honest claim after `p` is already public, which is the forfeiture path.
+
+    The ETH branch already had `test_eth_not_yet_final_reserve_boundary`; the BTC branch,
+    which is the one the shipped BTC↔RXD swaps take, had no boundary case at all.
+    """
+
+    @staticmethod
+    def _at(confs: int, now: int) -> Intent:
+        obs = Observations(
+            maker_has_claimed_btc=True,
+            now_rxd_height=now,
+            asset_locked_at_height=LOCK,
+            btc_claim_confirmations=confs,
+        )
+        return _decide(_record(SwapState.SECRET_REVEALED), obs).intent
+
+    def test_final_pages_claim_with_exactly_the_floor_left(self) -> None:
+        """blocks_left == 4 is the LAST height a claim can still be mined and buried in time."""
+        assert self._at(6, REFUND_OPENS - 4) is Intent.PAGE_CLAIM
+
+    def test_final_squeezes_one_block_past_the_floor(self) -> None:
+        assert self._at(6, REFUND_OPENS - 3) is Intent.PAGE_SQUEEZED
+
+    def test_not_yet_final_waits_with_exactly_the_reserve_left(self) -> None:
+        """blocks_left == 16 still leaves room to wait out the remaining BTC depth and then bury."""
+        assert self._at(3, REFUND_OPENS - 16) is Intent.WATCH
+
+    def test_not_yet_final_squeezes_one_block_past_the_reserve(self) -> None:
+        assert self._at(3, REFUND_OPENS - 15) is Intent.PAGE_SQUEEZED
 
 
 # ---------------------------------------------------------------------------

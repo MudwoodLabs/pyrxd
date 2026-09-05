@@ -214,8 +214,35 @@ def _claim_decision(*, low_corroboration=False) -> Decision:
     )
 
 
+def _value_scaled_policy(*, cost_per_block: int = 100) -> MarginPolicy:
+    """A policy with value-scaling ON — `rxd_reorg_cost_per_block` set.
+
+    `MarginPolicy.estimated()` leaves it None, which switches `_value_scaled_burial_blocks` off
+    entirely and makes `value_at_risk_photons` unread. A test about the value-at-risk plumbing run
+    on that policy cannot express the defect it names, however the plumbing behaves.
+
+    At cost 100 photons/block and the default `burial_safety_factor` of 1.0, a 1_234-photon swap
+    requires `ceil(1234/100) = 13` blocks of burial, above the flat 6 — so the value genuinely
+    changes the answer here rather than being carried and ignored.
+    """
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_reorg_cost_per_block=cost_per_block,
+    )
+
+
 async def _armed_executor(
-    *, network="bcrt", confs=1, missing=False, btc_confs=10, status_claimed=True, mempool_unspent=None, **kw
+    *,
+    network="bcrt",
+    confs=1,
+    missing=False,
+    btc_confs=10,
+    status_claimed=True,
+    mempool_unspent=None,
+    policy=None,
+    **kw,
 ):
     terms, p, raw, claim_txid, locator, _btc_leg = await _build_real_claim(
         variant=kw.pop("variant", "rxd"), radiant_amount=kw.pop("radiant_amount", 1_000)
@@ -230,7 +257,7 @@ async def _armed_executor(
         resolve_leg=_resolver(leg),
         claim_status_source=_FakeStatusSource(claim_txid=claim_txid, claimed=status_claimed, confs=btc_confs),
         claim_bytes_source=_FakeBytesSource({claim_txid: raw}),
-        policy=MarginPolicy.estimated(),
+        policy=policy or MarginPolicy.estimated(),
         network=network,
         **kw,
     )
@@ -511,12 +538,8 @@ async def test_shallow_btc_claim_waits_or_declines():
     assert leg.claimed_with is None
 
 
-async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
-    # CLAIM-1 regression: the executor's fresh pre-broadcast re-assess must pass the SAME per-record
-    # value-at-risk that decide() uses (radiant_amount for an rxd swap), not let it default to None.
-    # Otherwise, under the recommended value-scaled policy (rxd_reorg_cost_per_block set,
-    # value_at_risk_photons=None), assess_claim_finality returns SQUEEZED for EVERY swap and the
-    # autonomous claim silently never fires (degrades to alert-only). Spy on the call to lock the kwarg.
+def _assess_spy(monkeypatch) -> dict:
+    """Record the kwargs `claim_executor` hands `assess_claim_finality`, and still run the real gate."""
     import pyrxd.gravity.watch.claim_executor as ce
 
     captured: dict = {}
@@ -527,30 +550,71 @@ async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(ce, "assess_claim_finality", _spy)
-    ex, _leg, rec, _p = await _armed_executor(radiant_amount=1_234)
+    return captured
+
+
+async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
+    """CLAIM-1 regression: the fresh pre-broadcast re-assess must pass the SAME per-record
+    value-at-risk `decide()` uses (`radiant_amount` for an rxd swap) rather than let it default to
+    None — under which `assess_claim_finality` returns SQUEEZED for EVERY swap and the autonomous
+    claim silently never fires, degrading to alert-only.
+
+    THIS TEST RAN ON `MarginPolicy.estimated()`, WHERE THAT DEFECT CANNOT HAPPEN. That policy
+    leaves `rxd_reorg_cost_per_block` at None, so `_value_scaled_burial_blocks` returns 0 and the
+    gate never reads the value at all: BROADCAST was the outcome whether the kwarg arrived or not,
+    and only the spy line was load-bearing. A test whose fixture cannot express the defect it
+    describes is passing for a reason unrelated to the code being correct.
+
+    So it runs under the value-scaled policy the docstring names. 1_234 photons at 100
+    photons/block needs 13 blocks of burial against the flat 6 — the value is now what decides the
+    verdict, and dropping the kwarg turns this BROADCAST into a DECLINED.
+
+    Measured, with `value_at_risk_photons=None` planted at the call site (claim_executor.py:527
+    — the CLAIM-1 regression itself): on `MarginPolicy.estimated()` the executor still returns
+    BROADCAST, so only the spy line below noticed; on the value-scaled policy it returns
+    DECLINED, so the outcome assertion carries the test.
+    """
+    captured = _assess_spy(monkeypatch)
+    ex, _leg, rec, _p = await _armed_executor(radiant_amount=1_234, policy=_value_scaled_policy())
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
     assert captured.get("value_at_risk_photons") == 1_234  # the rxd per-record value reached the gate, not None
 
 
 async def test_fresh_reassess_value_at_risk_is_none_for_ft_nft(monkeypatch):
-    # The FT/NFT peer of the above: their on-chain radiant_amount is carrier dust, not market value, so
-    # decide()'s _value_at_risk_photons returns None and the gate still fails closed (SQUEEZED) under a
-    # value-scaled policy. Lock that the executor passes None (not the dust amount) for nft.
-    import pyrxd.gravity.watch.claim_executor as ce
+    """The FT/NFT peer: their on-chain `radiant_amount` is carrier dust, not market value, so
+    `_value_at_risk_photons` returns None and the gate must FAIL CLOSED under a value-scaled policy
+    rather than certify a claim on value it cannot see.
 
-    captured: dict = {}
-    real = ce.assess_claim_finality
-
-    def _spy(**kw):
-        captured.update(kw)
-        return real(**kw)
-
-    monkeypatch.setattr(ce, "assess_claim_finality", _spy)
+    Also on the value-scaled policy now, for the same reason as its rxd peer — and here the
+    consequence is the point: this is a DECLINE, not a broadcast. On `MarginPolicy.estimated()` the
+    identical None produced a cheerful BROADCAST, so the fail-closed behaviour the comment claimed
+    was never exercised.
+    """
+    captured = _assess_spy(monkeypatch)
     # unbounded dust opt-in so an nft swap reaches the fresh re-assess on bcrt (past the value cap).
-    ex, _leg, rec, _ = await _armed_executor(variant="nft", radiant_amount=1, accept_unbounded_reorg_risk=True)
-    await ex.execute("s1", rec, _claim_decision())
+    ex, leg, rec, _ = await _armed_executor(
+        variant="nft", radiant_amount=1, accept_unbounded_reorg_risk=True, policy=_value_scaled_policy()
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claimed_with is None  # fail-closed: no autonomous claim on unreadable value
     assert "value_at_risk_photons" in captured
     assert captured["value_at_risk_photons"] is None  # ft/nft carrier dust is NOT treated as economic value
+
+
+async def test_a_value_scaled_policy_still_broadcasts_a_swap_its_burial_covers(monkeypatch):
+    """The honest path under value-scaling, which must not be refused.
+
+    The peer above is a refusal, and a refusal test alone cannot tell "fails closed correctly"
+    apart from "refuses everything once value-scaling is on". Here the same policy, given a swap
+    small enough for the flat burial to cover (100 photons needs `ceil(100/100) = 1` block, under
+    the flat 6), broadcasts — so the DECLINE above is attributable to the unreadable NFT value and
+    not to the policy.
+    """
+    captured = _assess_spy(monkeypatch)
+    ex, leg, rec, _p = await _armed_executor(radiant_amount=100, policy=_value_scaled_policy())
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert leg.claimed_with is not None
+    assert captured["value_at_risk_photons"] == 100
 
 
 # --------------------------------------------------------------------------- FIX 1: fire-once guard

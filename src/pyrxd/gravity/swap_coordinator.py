@@ -1126,8 +1126,24 @@ def assess_claim_finality(
     fails closed (SQUEEZED — never an optimistic value-blind SAFE): the watchtower cannot
     certify an FT/NFT swap SAFE on value it cannot see; the operator must decide.
 
-    Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of
-    time"). All depths normalised to Radiant BLOCKS via ``policy.block_interval_s``.
+    Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of time").
+
+    Every quantity here ends up in RADIANT blocks, but they do NOT all divide by the same
+    interval, and this line used to say they did — "All depths normalised to Radiant BLOCKS
+    via ``policy.block_interval_s``", which stated #579's conflation as the rule and is the
+    sentence that would send the next reviewer away from the sites that had it. What is
+    actually true:
+
+    * the Radiant RESERVES (``rxd_claim_burial``, ``rxd_claim_inclusion``) go through
+      ``_radiant_reserve_blocks``, i.e. ``policy.rxd_block_interval_s`` — fixed by #579;
+    * the BITCOIN reserve ``btc_claim_reorg_depth`` divides by ``policy.block_interval_s``,
+      correctly, and the F-007 step below rescales it into Radiant blocks by the ratio;
+    * ``t_rxd`` is a RADIANT deadline and STILL divides by ``policy.block_interval_s`` below —
+      the same conflation #579 fixed for the reserves, on a field #579 did not enumerate and
+      that ``tests/test_radiant_reserves_use_the_radiant_interval.py`` cannot see (it derives
+      its field set from ``MarginPolicy`` names PREFIXED with a chain; ``t_rxd`` lives on
+      ``NegotiatedTerms`` and is SUFFIXED). Inert today for the same reason the reserves were —
+      every constructor tags it BLOCKS — and stated here rather than quietly left out.
     """
     if not isinstance(policy, MarginPolicy):
         raise ValidationError("assess_claim_finality requires a MarginPolicy")
