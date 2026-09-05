@@ -171,7 +171,8 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
     """
     if not script or script[0] != 0x6A:
         return None
-    pos, chunks = 1, []
+    pos = 1
+    chunks: list[bytes] = []
     while pos < len(script) and len(chunks) < 4:
         op = script[pos]
         if op <= 75:
@@ -199,15 +200,26 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
         return None
     if not isinstance(d, dict) or not isinstance(d.get("token_ref"), str):
         return None
+    # Bound to locals before narrowing: `d.get(...)` called twice is two
+    # lookups AND two unrelated values as far as a type checker is concerned,
+    # so the isinstance() guard on the first does not narrow the second.
     protocol = d.get("p")
     amount = d.get("amount")
+    action = d.get("action")
+    # NOT `version`: that name is already the envelope's version BYTE from the
+    # chunk unpack above. These are two different versions — the push byte the
+    # script carries, and the `v` field inside the CBOR — and giving them one
+    # name reads as if the second checked the first.
+    cbor_version = d.get("v")
+    reason = d.get("reason")
+    token_ref = d["token_ref"]
     return BurnProof(
-        token_ref=d["token_ref"],
-        action=d.get("action") if isinstance(d.get("action"), str) else "",
-        version=d.get("v") if isinstance(d.get("v"), int) else 0,
-        protocol=tuple(p for p in protocol if isinstance(p, int)) if isinstance(protocol, (list, tuple)) else (),
+        token_ref=token_ref if isinstance(token_ref, str) else "",
+        action=action if isinstance(action, str) else "",
+        version=cbor_version if isinstance(cbor_version, int) else 0,
+        protocol=tuple(x for x in protocol if isinstance(x, int)) if isinstance(protocol, (list, tuple)) else (),
         amount=amount if isinstance(amount, int) else None,
-        reason=d.get("reason") if isinstance(d.get("reason"), str) else None,
+        reason=reason if isinstance(reason, str) else None,
     )
 
 

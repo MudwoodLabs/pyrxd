@@ -76,7 +76,7 @@ class AuthorityAttrs:
     expires: str | None = None
     revocable: bool = True
 
-    def to_attrs(self) -> dict:
+    def to_attrs(self) -> dict[str, object]:
         """The CBOR ``attrs`` map. Absent optionals are omitted, not nulled.
 
         A key present with a null value and a key that is absent are different
@@ -178,15 +178,20 @@ def read_authority_attrs(metadata: GlyphMetadata | None) -> AuthorityAttrs | Non
     """
     if metadata is None or not isinstance(getattr(metadata, "attrs", None), dict):
         return None
+    # `attrs` is `dict[str, object]` since the round-trip fix, so each value is
+    # bound to a local before its isinstance() guard: a second `a.get(...)` is a
+    # separate expression and the narrowing on the first does not reach it.
     a = metadata.attrs
     issuer = a.get("issuer")
     perms = a.get("permissions")
     revocable = a.get("revocable")
+    scope = a.get("scope")
+    expires = a.get("expires")
     return AuthorityAttrs(
         issuer=issuer if isinstance(issuer, str) else "",
-        scope=a.get("scope") if isinstance(a.get("scope"), str) else None,
-        permissions=tuple(p for p in perms if isinstance(p, str)) if isinstance(perms, (list, tuple)) else (),
-        expires=a.get("expires") if isinstance(a.get("expires"), str) else None,
+        scope=scope if isinstance(scope, str) else None,
+        permissions=tuple(x for x in perms if isinstance(x, str)) if isinstance(perms, (list, tuple)) else (),
+        expires=expires if isinstance(expires, str) else None,
         # Photonic defaults revocable to true; only an explicit false is false.
         revocable=revocable is not False,
     )

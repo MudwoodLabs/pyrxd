@@ -265,6 +265,32 @@ test = "pytest"
 # green. A gate that fails on hundreds of pre-existing errors gets switched off. To widen it,
 # clear a module's errors FIRST, then add its path here.
 #
+# WIDENING THIS IS WORTH MORE THAN TIDINESS, and is currently BLOCKED. `python_version`
+# below is 3.10 — the floor in `requires-python` — so mypy reports a 3.11+ stdlib symbol
+# as an error (`Module "datetime" has no attribute "UTC"`). Exactly that defect shipped
+# to CI from a 3.12 dev machine and failed only the 3.10 job; it would have been caught
+# here had the file been in scope.
+#
+# `glyph/relationships.py`, `glyph/authority.py` and `glyph/burn.py` ARE now --strict
+# clean and were tried here. Adding them was REVERTED, for a reason worth writing down
+# because it will look like a mistake otherwise:
+#
+# Those files grow the module graph mypy analyses, and past some point mypy stops
+# treating `websockets` as `Any` and reports
+# `network/electrumx.py:766: Module has no attribute "connect"`. It is a STATIC issue
+# only — `websockets.connect` is callable at runtime on the installed version, and CI's
+# Type check step passes on the branch that added them.
+#
+# It reproduces locally with a cold cache, and the difference is the environment:
+# `web3` 7.x caps `websockets<16.0.0`, so anyone who installs the `[eth]` extra (which
+# the ETH-leg suites need) gets 15.x, where `connect` is reached through a lazy
+# `__getattr__` mypy will not follow. CI resolves higher and sees a real attribute.
+#
+# So widening here would produce a gate that is GREEN IN CI and RED for any developer
+# with the eth extra — the precise way a gate gets switched off, which is what the note
+# above is guarding against. Fix `electrumx.py` to import `connect` from its real module
+# first (verifying runtime behaviour on both websockets majors), then add these three.
+#
 # scripts/ is in scope on purpose: `radiant_mainnet_chainio.py` is the mainnet transport that
 # produced the height/confs conflation, and `_dust_swap_shared.py` holds the reorg-gate anchor
 # that consumed it. Excluding them would leave the type-checked boundary short of where the bug

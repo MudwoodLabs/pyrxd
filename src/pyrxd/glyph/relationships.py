@@ -68,6 +68,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from ..constants import INPUT_BACKED_REF_OPCODES
 from ..security.errors import ValidationError
@@ -220,7 +221,11 @@ def resolve_delegated_refs(base_ref: bytes, base_tx_output_scripts: list[bytes])
 
 
 def verify_relationship_claims(
-    metadata,
+    # `Any`, not `GlyphMetadata | None`, and deliberately: every field is read
+    # through `getattr(..., default)` so that a Photonic-shaped stub or any other
+    # object carrying `container_refs`/`author_refs` is accepted. Narrowing the
+    # annotation would advertise a restriction the body does not impose.
+    metadata: Any,
     output_scripts: list[bytes],
     *,
     delegated_refs: Iterable[bytes] = (),
