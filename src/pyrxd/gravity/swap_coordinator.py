@@ -760,7 +760,12 @@ def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolic
     try:
         btc_blocks = t_btc.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-        margin_blocks = policy.margin.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+        # `margin` is a REQUIREMENT: it is ADDED to the bar at `maker_refund_opens_s <
+        # taker_refund_opens_s + margin_s`, so flooring it shrinks the bar — permissive, the
+        # unsafe direction. `t_btc`/`t_rxd` above are DEADLINES and floor correctly (flooring
+        # only shrinks the window their holder gets), which is why the three do not share one
+        # conversion. No-op today: every policy the codebase builds tags margin in BLOCKS.
+        margin_blocks = _reserve_to_blocks(policy.margin, policy.block_interval_s)
     except ValidationError:
         raise
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
@@ -2775,9 +2780,13 @@ class SwapCoordinator:
         # assess against the t_rxd window.
         btc_confs = await self.counter_leg.confirmations_of_claim(maker_claim_tx_bytes)
         policy = self.config.margin_policy
-        required_depth = policy.btc_claim_reorg_depth.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
+        # ONE CONVERSION, the gate's. `_reserve_to_blocks` CEILS a seconds-tagged reserve;
+        # `normalize_to` FLOORS it, which under-counts the reserve — the direction
+        # `_reserve_to_blocks` documents as unsafe. Both numbers feed the SAME
+        # `from_btc_depth` gate, so flooring here declares the maker's BTC claim final one
+        # block early. #607 fixed the third site (`_required_btc_depth_blocks`) and its guard
+        # was scoped to `decide.py`, leaving this one and the executor's behind.
+        required_depth = _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
         verdict = CounterClaimFinality.from_btc_depth(btc_confs, required_depth)
         finality = assess_claim_finality(
             counter_claim_finality=verdict,
