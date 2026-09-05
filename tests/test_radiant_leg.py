@@ -1304,6 +1304,12 @@ class TestTheRefundPathIsReachedThroughTheLegPerAssetVariant:
     Both halves per variant, because the leg-level gate is the P3 CSV maturity self-check and a
     refusal test on its own cannot distinguish "refuses a premature refund" from "refuses this
     variant". The mature case proves each variant can still be recovered.
+
+    Measured, planting the variant-specific maturity error #510 item 3 names — reading `t_btc`
+    instead of `t_rxd` for ft/nft at radiant_leg.py:836 — the full suite loses EXACTLY the two
+    premature cases here (11,417 passed, 2 failed) and nothing else; the rxd peer is untouched,
+    which is the point. Planting the mirror error (one block too STRICT for ft/nft) loses the
+    two mature cases, so neither half is decorative.
     """
 
     @staticmethod

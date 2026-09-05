@@ -509,9 +509,15 @@ class TestTheBtcClaimRaceVerdictBoundaries:
       * NOT_YET_FINAL_LIVE (3 conf): WATCH at blocks_left 16, PAGE_SQUEEZED at 15
 
     4 is the #511 floor (burial 2 + inclusion 2); 16 adds the F-007 counter reserve
-    `ceil(6 * 600 / 300) = 12`. An off-by-one in either — in `_claim_floor_blocks`, in the
-    F-007 conversion, or in `decide()`'s own height arithmetic — moves the flip by one block
-    and every existing test still passes, because 22 and 1 are both 18-plus blocks away.
+    `ceil(6 * 600 / 300) = 12`.
+
+    What these close is the BTC DISPATCH, not the gate. A change inside
+    `assess_claim_finality` itself is already caught elsewhere — planting the pre-#511 floor
+    (`burial + counter_reserve`, inclusion dropped) fails the coordinator's parity sweep, the
+    ETH reserve boundary and the executor's broadcast boundary as well as these. What nothing
+    covered was `decide()`'s own BTC branch: planting `now_rxd_height + 1` on it alone fails
+    EXACTLY these four tests and nothing else in the tree (measured over the full suite —
+    11,417 passed, 2 failed, twice, once per direction).
 
     Both directions are real defects, which is why each flip is pinned from BOTH sides: one
     block early certifies a claim that cannot bury before the maker's refund opens; one block

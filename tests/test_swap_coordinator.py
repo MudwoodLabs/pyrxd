@@ -1733,8 +1733,13 @@ class TestTheCoordinatorClaimVerdictBoundaries:
       * a shallow one (1 conf):        SECRET_REVEALED (wait) at blocks_left 20, ASSET_VULNERABLE at 19
 
     8 is burial 6 + inclusion 2; 20 adds the F-007 counter reserve `ceil(6*600/300) = 12`.
-    The nearest existing case is 3 blocks from the first flip and 14 from the second, so an
-    off-by-one in `_claim_floor_blocks` or in the F-007 conversion moved neither.
+    The nearest existing case is 3 blocks from the first flip and 14 from the second.
+
+    What these close is this METHOD's own height arithmetic, not the gate it calls: a change
+    inside `assess_claim_finality` is separately caught by the parity sweep above. Planting
+    `now_rxd_height + 1` here — the coordinator's peer of the executor off-by-one #581 item 2
+    names — fails EXACTLY these two tests and nothing else in the tree (measured over the full
+    suite: 11,417 passed, 2 failed).
 
     Pinned from both sides, because both are real: one block early advances a swap to
     COMPLETED on a claim that cannot bury before the maker's CSV refund opens; one block late

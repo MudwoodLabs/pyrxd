@@ -568,6 +568,11 @@ async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
     So it runs under the value-scaled policy the docstring names. 1_234 photons at 100
     photons/block needs 13 blocks of burial against the flat 6 — the value is now what decides the
     verdict, and dropping the kwarg turns this BROADCAST into a DECLINED.
+
+    Measured, with `value_at_risk_photons=None` planted at the call site (claim_executor.py:527
+    — the CLAIM-1 regression itself): on `MarginPolicy.estimated()` the executor still returns
+    BROADCAST, so only the spy line below noticed; on the value-scaled policy it returns
+    DECLINED, so the outcome assertion carries the test.
     """
     captured = _assess_spy(monkeypatch)
     ex, _leg, rec, _p = await _armed_executor(radiant_amount=1_234, policy=_value_scaled_policy())
