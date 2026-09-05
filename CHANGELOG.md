@@ -6,6 +6,193 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-04
+
+Most of this release came from one audit, of a defect class rather than a
+component: **assertive text is a claim, and no test evaluates claims.** Tests pin
+that a sentence is emitted, never that it is true — so prose drifts from the code
+beside it in silence, and prose is what people act on. Chasing that turned up the
+fund-safety defects below, which were sitting underneath sentences that read as
+settled.
+
+### Security
+
+- **A reservation could be accepted, called GUARANTEED reclaimable, and never
+  refunded.** `pyrxd swap reserve` prints "Reclaim at `--expiry` is GUARANTEED"
+  on the consent screen. Its only amount guard refused below the 546-photon dust
+  floor — but a refund is a one-in-one-out spend that pays its fee OUT OF the
+  covenant value and must still leave a non-dust output, so it needs the relay
+  floor for its own size PLUS dust, about 2,000,000 photons.
+
+  Measured through the production builders: reservations of 546, 100,000,
+  1,000,000 and 1,900,000 photons were all accepted and then produced **no refund
+  at any fee**. `swap cancel` — documented as the only hard revocation there is —
+  failed identically, so an unwanted advert could not be revoked either. Those
+  funds were unreachable by any pyrxd path.
+
+  The guard existed and measured the wrong quantity; its own comment named the
+  right one. `minimum_reservable_photons` is exported so a caller sizing a
+  reservation asks for the same number the guard uses.
+
+- **The gate the ETH runner calls "THE safety gate" was exactly inverted.**
+  `assert_t_rxd_fits_the_eth_deadline` named the sizer's output `largest` and
+  refused `t_rxd > largest`, while #482 had already made the sizer a LOWER bound.
+  Measured against the relation the protocol actually enforces, it **accepted
+  every unsafe value and refused every safe one** above the minimum, while
+  `scripts/eth_swap_two_host.py` printed `margin OK: (independent check passed)`.
+  Its error text named the pre-#482 relation and told operators to *shorten*
+  `t_rxd`, which is the exploitable direction.
+
+  The too-short direction is backstopped downstream, so this was not by itself a
+  clean theft path; the live harm was refusing honest configurations while
+  printing "margin OK", and documenting the unsafe direction as safe. Now pinned
+  as a differential against the enforcing gate rather than a restatement of the
+  arithmetic — a formula-shaped test would have agreed with the inverted version.
+
+- **A zero relative lock was reachable from a counterparty's envelope.**
+  `refund_leaf_script`'s floor was `unit is BLOCKS and value < 1`, under a comment
+  saying every caller got the floor by construction. BIP68 quantises time locks to
+  512 s, so `Timelock(0..511, SECONDS)` all encode to the same no-op lock — and
+  the unit tag comes off the WIRE: `NegotiatedTerms.from_dict` accepts
+  `{"value": 0, "unit": "seconds"}`, `swap_state`'s own floor is scoped to BLOCKS
+  the same way, and its ordering guard only fires when both units match. The
+  result was a refund leaf spendable in its own funding block.
+
+  The refusal now keys on the ENCODED magnitude, so it is unit-agnostic by
+  construction. It refuses nothing honest: the only newly-rejected inputs are
+  SECONDS 0..511, every one of which is already a zero lock.
+
+- **A covenant whose owner can change was classified "transfer is impossible at
+  consensus".** `OP_CODESCRIPTBYTECODE_*` compares only the bytes after
+  `OP_STATESEPARATOR`, so a covenant that pins its code script while carrying a
+  mutable state prefix can recur with a different owner — a transfer.
+  `assert_soulbound_credential` gates on that verdict before a maker locks an
+  asset against a credential. `soulbound_covenant.py` had said so all along
+  ("code-script-only equality would let the state (owner) change between hops");
+  the detector was written from the opcode markers and never encoded the caveat.
+
+  The discriminator is the PAIR — code-script-only equality WITH a state prefix.
+  With no separator the code script IS the whole script, so the deployed mainnet
+  token and both pyrxd builders keep their classification; only the mutable-owner
+  shape becomes `MUTABLE_STATE_COVENANT`.
+
+- **The autonomous BTC refund's "dormant-by-construction" interlock did not
+  exist.** `executor.py` listed three properties making it safe to land
+  pre-audit; the first said `make_refund_broadcaster` calls a fail-closed
+  `require_audit_cleared` so "no live broadcaster can exist" on mainnet without
+  an opt-in. That function has had a body of `return None` since 0.9.0, when the
+  audit gate was deliberately made advisory. Measured: it returns the live
+  broadcaster.
+
+  Not re-armed — that would undo a deliberate decision. The prose now says what
+  actually bounds the value: the caller choosing not to construct a broadcaster,
+  and the 10,000-sat dust ceiling, which is real and is now the ONLY structural
+  bound rather than the second of two.
+
+- **The claim-finality verdict and the gate's own reserve rounded apart.**
+  `_required_btc_depth_blocks` floored where `assess_claim_finality` ceils, under
+  a docstring saying they "cannot diverge". The mismatch guard covers only the
+  WAIT path, so at the boundary the FINAL branch returned before it and armed
+  `autonomous_asset_claim` one block shallower than policy. Both now use the
+  gate's conversion; a measured no-op on every BLOCKS-tagged value, which is
+  everything this repo constructs.
+
+### Added
+
+- **HashMark labels are checked against §5.4, and a signer cannot forge display
+  lines.** A v2 record whose label contained a newline printed an
+  attacker-chosen line inside the block the CLI had just marked "signature
+  VERIFIED", in the exact form of the WAVE-identity attribution — so a reader
+  attributed a file to a key holder who never signed for that name. A bidi
+  override rendered `invoice<RLO>gpj.exe` as `invoiceexe.jpg`.
+
+  Enforced at the decoder, so no caller can build such a record. The version
+  split is the spec's and is load-bearing: a v2 label is inside the signed
+  statement, so a non-canonical one is INVALID; a v1 label is unsigned and is
+  WITHHELD with a reason, because invalidating it would discard timestamp
+  evidence to fix a rendering problem. Canonicalisation runs one way only — a
+  label read is never trimmed or normalised, because the string shown must be the
+  string signed.
+
+- **Token names are run through a TR39 confusables check that actually runs.**
+  `looks_confusable_with_latin` was documented as live protection and had **no
+  production caller** — a definition, a façade re-export and its tests. It is
+  computed once in the classifier so both surfaces read one verdict, and the CLI
+  prints it ABOVE the field it applies to. It reports MIMICRY, not foreignness:
+  `USDС` with a Cyrillic С is flagged, `トークン` and `中文` are not.
+
+- **The browser inspect page renders the verdicts it was already computing.**
+  A forged HashMark v2 showed as an authoritative badge with no signer and no
+  verdict; multi-glyph reveals presented one glyph's name as the transaction's;
+  seven banners asserted outcomes the page never computed, including a burn
+  banner claiming tokens were "removed from circulation" from an unenforced CBOR
+  marker. The render harness could not exercise the transaction card at all, so
+  every whole-transaction claim ran outside a browser for the first time.
+
+### Fixed
+
+- **A missing curve withheld nothing — it failed the whole decode.** HashMark
+  records did not classify AT ALL in the browser: `verify_attestation` imports
+  `coincurve`, which Pyodide does not install, and the row became `type=error`.
+  §6 already said what should happen — decoding and attestation are separate
+  steps — so the outcome is now `UNVERIFIABLE`, with digest, label and signer
+  still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
+  reader a genuine mark's claim fails on the strength of a missing dependency.
+
+- **An honest token was reported as forged.** `verify_creator_signature`
+  re-derived the signed bytes from the DECODED metadata, and decoding is
+  deliberately lossy — Photonic mints `loc` as an INTEGER on mainnet. So the
+  verifier compared against bytes the creator never signed. It now verifies
+  against the original bytes, and says explicitly when a decode was lossy, so
+  "valid" never quietly means "signed bytes you are not being shown".
+
+- **pyrxd wrote `msg` outputs pyrxd could not read.** The OP_RETURN walker
+  refused every opcode above `0x4B` under a comment claiming those were not data
+  pushes — `OP_PUSHDATA1`/`2` are — putting a cliff at exactly 76 bytes, where
+  every encoder here switches. Spec-legal signed HashMark records with a 76–88
+  byte label were skipped as "not this protocol". Minimality is enforced for
+  HashMark, which requires one serialization per record, and left lenient for
+  `msg`, which has no canonical form to protect.
+
+- **A dMint contract's cap was labelled the token's total supply**, while the
+  browser computed `reward × max_height × N` for the same token — two surfaces
+  differing by the parallel-contract count.
+
+### Changed
+
+- **Documentation that taught defects to third parties.** The BIP143 porting
+  guide — written so others can implement Radiant's sighash in another language —
+  told implementers to sort refs "ascending by their 36 bytes" (the code sorts by
+  the reversed bytes; the lexicographic reading is the bug that made dMint signing
+  fail ~50% of the time against a real node) and to scan only two of the five
+  ref-operand opcodes (measured at ~80% of refs wrong). The two sort orders agree
+  for single-ref outputs, so a porter's own vectors pass.
+
+  The README claimed swaps were "proven end-to-end … against BTC, ETH, and EVM
+  L2s (Base / Optimism / Arbitrum / Linea)" while `counter-chain-support.md` marks
+  six of those rows **not run**; Optimism, Arbitrum and Linea have zero chain-id
+  occurrences anywhere in `tests/`.
+
+  Also corrected: nine how-to claims (two of which error when run, and an airdrop
+  budget understated 14×), eight inspect-tool concept claims, five wallet-layer
+  claims, four comments resting on a standardness rule Radiant does not execute,
+  and a guide telling readers to hand-roll an adapter for a class that ships and
+  is used by the real-value runners.
+
+### Internal
+
+- **`validation.h`, `consensus.h` and `uint256.h` are vendored.** 44% of pyrxd's
+  112 citations into Radiant Core pointed at files no test could read — and that
+  is exactly how the ref-backing defect above shipped. The two script budgets and
+  the `uint288` comparator behind the sighash ref ordering are now checkable.
+
+- **Guards that derive their own coverage.** A repeated failure this cycle was a
+  check that was structural about the thing and hand-kept about the SET it ran
+  over, so it passed vacuously over the case it was written for. Four were fixed
+  that way: the vendored-source digest list, the reserve-interval scanner's field
+  map, the browser render corpus, and `MarginPolicy`'s validated fields. New
+  checks resolve "covered by <test>" references and citations into Radiant Core.
+
 ### Added
 
 - **Container and creator claims are now VERIFIED, not just repeated (#591).** `in` and
@@ -18,10 +205,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   together — never the claim alone.
 
   The check is LOCAL, needing no parent lookup, because Radiant's induction rules enforce
-  a subset rule: every ref in an output must be backed by an input ref, where the input
-  set includes the spent outpoints. So a claimed parent appearing among a transaction's
-  output refs proves that transaction spent it. Verified against upstream Radiant-Core at
-  the commit this repo vendors — and note the opcode handler alone gives the opposite
+  a subset rule — **for three of the five operand-carrying ref opcodes.**
+  `ReferenceParser::validateTransactionReferenceOperations` passes only the push, require
+  and singleton sets to the every-output-ref-must-appear-among-the-input-refs check.
+  `OP_DISALLOWPUSHINPUTREF` reaches no out-parameter at all and
+  `OP_DISALLOWPUSHINPUTREFSIBLING` is compared only against OTHER OUTPUTS, so either can
+  name any ref without holding it. Counting those as backing would forge the verdict
+  outright, so they are walked and discarded.
+
+  That rule lives in `src/validation.h`, which was not among the vendored consensus
+  sources when this was written — so no differential could check it, and an earlier
+  revision of this entry claimed it had been "verified against upstream" when it could
+  not have been. The file is vendored in this release and
+  `consensus_oracle.input_backed_ref_opcodes()` now recovers the covered set from the C++
+  rather than anyone re-typing it. The opcode handler alone still gives the opposite
   answer, saying outright that it performs no membership check.
 
   Delegated authorization is out of scope: pyrxd has no delegate concept, so a
@@ -72,11 +269,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **`pyrxd glyph inspect --verify-wave` names the signer.** For a VERIFIED v2
-  signature, resolves the WAVE names the signing key owns: hash160 -> address ->
-  `wave.reverse_lookup`. A recipient can then confirm both that a file matches the
-  recorded digest AND that it was recorded by the holder of `company.rxd`.
+  signature, resolves the WAVE names that resolve to the signing key RIGHT NOW:
+  hash160 -> address -> `wave.reverse_lookup`.
   `pyrxd.glyph.wave.wave_names_for_hash160` is the reusable half and is not
   HashMark-specific.
+
+  **Present tense, and stated separately from the mark.** An earlier revision of this
+  entry said a recipient could confirm a file "was recorded by the holder of
+  `company.rxd`". That does not follow, and HashMark §7.6 now spells out why: a name
+  resolves to whatever it points at NOW, and a mark was made at a past block. Once a name
+  changes hands it is wrong both ways — a genuine mark by the previous holder starts
+  failing, and whoever acquires a lapsed name can make NEW marks that truthfully verify
+  as "signed by whoever owns company.rxd", which a reader hears as "the company made
+  this". The signer ADDRESS now sits with the signature; the names sit below the mark's
+  own statement, marked RIGHT NOW, saying they do not establish who held the name when
+  the mark was made. Point-in-time resolution is issue #598.
 
   **Gated on verification.** An unverified or absent signature resolves nothing and
   says why — presenting a name for an unproven signer would dress a claim up as an
@@ -162,17 +369,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than the confirming block. `pyrxd.script.hashmark.decode_hashmark` is an
   independent read-only implementation of that spec — pyrxd never writes one — and
   the inspector surfaces it additively: anything that is not a HashMark keeps
-  classifying exactly as before. Decoding is not attestation: a v2 record's
-  signature is returned UNVERIFIED, because verifying it needs secp256k1 and the
-  chain the transaction was found on.
+  classifying exactly as before. Decoding is kept separate from attestation, as the
+  spec requires — see the verification entry above, added later in this same release.
 
 ### Fixed
 
-- **`OpReturn.lock()` built `OP_FALSE OP_RETURN`, which Radiant does not relay.**
-  Core classifies a data carrier as `TX_NULL_DATA` — standard, and dust-exempt so
-  a 0-photon output is legal — only when `scriptPubKey[0]` is `OP_RETURN`
-  (`src/script/standard.cpp`, `Solver()`); the prefixed form falls through to
-  `TX_NONSTANDARD`. Measured on mainnet across 20 consecutive blocks: **232** bare
+- **`OpReturn.lock()` built `OP_FALSE OP_RETURN`, the form nothing on chain uses.**
+  Core classifies a data carrier as `TX_NULL_DATA` only when `scriptPubKey[0]` is
+  `OP_RETURN` (`src/script/standard.cpp`, `Solver()`); the prefixed form falls through to
+  `TX_NONSTANDARD`. An earlier revision of this entry said Radiant therefore "does not
+  relay" it — **that is wrong, and this release corrects the same false premise in four
+  other places.** `validation.cpp` sets `fRequireStandard = false` and `IsStandardTx` has
+  exactly one gated caller, so standardness never executes on a default node and a
+  `TX_NONSTANDARD` output relays fine. The change stands on the measurement below, which
+  is evidence about what people BUILD, not about what relays. Measured on mainnet across 20 consecutive blocks: **232** bare
   `OP_RETURN` data outputs and **zero** of the prefixed form. `OpReturn` is
   exported public API with no production caller, so nothing pyrxd broadcasts was
   affected — the exposure was to downstream users reaching for the helper. The
