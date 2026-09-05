@@ -42,7 +42,19 @@ the parent refs under ``OP_REQUIREINPUTREF``. That is consensus-backed by the
 same subset rule, one step removed — the base transaction provably spent the
 parents, and the burn provably spent a token carrying the base ref. It is what
 lets a minting service authorise claims without custody of the parent
-singletons. pyrxd honours it, but only when the caller supplies the resolved
+singletons.
+
+Canon (``canon.rxd.zone``), an independent Radiant glyph verifier, draws the
+same two-pathway distinction — read from its ``/protocol`` rules on 2026-09-05,
+which describe direct backing as the parent's "reference re-created in an
+output, which the chain only permits when the token was actually spent as an
+input", and delegated backing as a delegate whose "creation required control of
+the collection/creator references", where "the Glyph's commit transaction
+consumed that delegate and its reveal provably burned it". So a delegated claim
+is honoured by at least one reader other than Photonic. That is an observation
+about a live third-party service on a date, not a guarantee about its future.
+
+pyrxd honours it, but only when the caller supplies the resolved
 refs: extract the burned base refs with :func:`delegate_burn_refs`, resolve each
 to the refs its base authorises with
 :func:`~pyrxd.glyph.script.parse_delegate_base_script`, and pass the result as
