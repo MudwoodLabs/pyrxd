@@ -30,6 +30,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from pyrxd.glyph.dmint.types import DaaMode, DmintAlgo, DmintCborPayload
+from pyrxd.glyph.encrypted_content import CryptoMetadata, TimelockSpec
 from pyrxd.glyph.payload import (
     _MAX_CBOR_PAYLOAD_BYTES,
     build_reveal_scriptsig_suffix,
@@ -114,11 +115,34 @@ _ref = st.builds(
 _rel_refs = st.lists(_ref, max_size=3).map(tuple)
 
 
+#: A TIMELOCK glyph without a CEK commitment is now REFUSED at encode (payload.py) — the marker
+#: with nothing behind it is unverifiable forever and a mint cannot be amended. So the strategy
+#: must build what the chain can actually carry: declaring 9 means carrying `crypto.timelock`.
+_cek_hash = st.binary(min_size=32, max_size=32).map(lambda b: "sha256:" + b.hex())
+_crypto_timelock = st.builds(
+    CryptoMetadata,
+    cek_hash=_cek_hash,
+    timelock=st.builds(
+        TimelockSpec,
+        mode=st.sampled_from(["block", "time"]),
+        unlock_at=st.integers(min_value=1, max_value=2_000_000_000),
+        cek_hash=_cek_hash,
+    ),
+)
+
+
 @st.composite
 def _metadata(draw) -> GlyphMetadata:
     protocol = draw(st.sampled_from(_PROTOCOL_COMBOS))
     dmint = draw(_dmint_payload()) if 4 in protocol else None
+    crypto = draw(_crypto_timelock) if 9 in protocol else None
     return GlyphMetadata(
+        crypto=crypto,
+        # BOTH, consistently. `decode_payload` populates the write-side `crypto` AND the read-side
+        # `timelock` from the same CBOR block, so a decoded object always has them in agreement.
+        # A fixture that set only one would fail round-trip for a reason about the FIXTURE rather
+        # than the encoder. Keeping two fields in sync by hand is the remaining half of #626.
+        timelock=crypto.timelock if crypto else None,
         container_refs=draw(_rel_refs),
         author_refs=draw(_rel_refs),
         protocol=list(protocol),
