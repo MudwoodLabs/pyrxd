@@ -395,6 +395,60 @@ class TestRadiantHtlcOnConsensus:
         node.mine(1)
         assert node.cli("gettxout", cov_txid, "0") in (None, ""), "covenant UTXO should be spent after claim"
 
+    def test_wrong_LENGTH_preimage_is_rejected_by_consensus(self, node):
+        """The size pin, against a node. `OP_SIZE 0x20 OP_EQUALVERIFY` sits in every shipped
+        covenant and until now was asserted only against our own builders.
+
+        `test_claim_accepted_wrong_preimage_rejected` above uses a wrong-VALUE preimage of the
+        RIGHT length, so it sails through the size check and fails at the hashlock. The length
+        branch was never presented to a node at all.
+
+        `build_htlc_claim_tx` refuses a non-32-byte preimage (`htlc_spend.py:330`), which is the
+        correct producer-side guard and also the reason this has to mutate post-build: the only
+        way to ask consensus the question is to hand it bytes our builder will not make.
+
+        HONEST SCOPE: a wrong-length preimage cannot hash to H either, so it fails the size check
+        AND would fail the hashlock. This proves consensus REFUSES a non-32-byte preimage; it does
+        not isolate which opcode did the refusing. That is still a different input class from the
+        test above, and it is the class the size pin exists for.
+        """
+        carrier = 100_000
+        cov, p = _rxd_covenant(carrier=carrier, refund_csv=3)
+        cov_txid = _pay_to_spk(node, cov.funded_spk, carrier)
+        outpoint = f"{cov_txid}:0"
+
+        claim = build_htlc_claim_tx(
+            covenant=cov, covenant_outpoint=outpoint, carrier_value=carrier, preimage=p, fee=_fee_input(node)
+        )
+        raw_good = claim.serialize().hex()
+
+        # scriptSig = <push preimage> <OP_0>. For 32 bytes that is 0x20||p||0x00 = 34 bytes,
+        # so the length varint before it is 0x22. Asserted, not assumed: if the scriptSig shape
+        # ever changes, this fails loudly here rather than silently mutating nothing.
+        good_frag = "22" + "20" + p.hex() + "00"
+        assert good_frag in raw_good, "covenant scriptSig shape changed — re-derive the fragment"
+
+        for n in (31, 33):
+            wrong = os.urandom(n)
+            bad_frag = f"{n + 2:02x}{n:02x}" + wrong.hex() + "00"
+            raw_bad = raw_good.replace(good_frag, bad_frag, 1)
+            assert raw_bad != raw_good, f"mutation for n={n} did not land"
+            res = node.accepts(raw_bad)
+            assert res["allowed"] is False, (n, res)
+            # The node must have EVALUATED the script, not bounced a malformed transaction.
+            # Without this the refusal above would pass just as well for a tx the node could
+            # not deserialise — proving nothing about the covenant. Measured on v3.1.1: both
+            # lengths return "mandatory-script-verify-flag-failed (Script failed an
+            # OP_EQUALVERIFY operation)", the same string a wrong-VALUE preimage produces,
+            # which is why the docstring does not claim to isolate the size opcode.
+            assert "mandatory-script-verify-flag-failed" in res.get("reject-reason", ""), (n, res)
+
+        # Honest path through the SAME covenant and the same node: the 32-byte preimage is
+        # accepted. Without this the refusals above would pass equally well against a covenant
+        # that refuses everything.
+        res = node.accepts(raw_good)
+        assert res["allowed"] is True, res
+
     def test_premature_refund_rejected_matured_accepted(self, node):
         carrier = 100_000
         refund_csv = 3
