@@ -34,6 +34,7 @@ its structured-dict response.
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Iterable
 
 from ..hash import hash256
 from ..script.hashmark import (
@@ -46,7 +47,7 @@ from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
-from .relationships import verify_relationship_claims
+from .relationships import delegate_burn_refs, verify_relationship_claims
 from .types import GlyphProtocol
 
 # --- Length / shape constants ----------------------------------------------
@@ -351,6 +352,7 @@ def _address_for(hash160_hex: str | None, network: str) -> str | None:
 
 def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
+    from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
     from .dmint import DmintState
     from .script import (
@@ -363,11 +365,14 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         extract_ref_from_nft_script,
         is_commit_ft_script,
         is_commit_nft_script,
+        is_delegate_token_script,
         is_ft_script,
         is_nft_script,
+        parse_delegate_burn_script,
         parse_legacy_container_script,
         parse_mutable_nft_script,
     )
+    from .types import GlyphRef
 
     try:
         script = bytes.fromhex(script_hex)
@@ -494,6 +499,37 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
             "ref_vout": ref.vout,
             "ref_outpoint": f"{ref.txid}:{ref.vout}",
             "owner_pkh": bytes(pkh).hex(),
+        }
+
+    # A delegate token is 63 bytes of <ref opcode> <ref> OP_DROP + P2PKH — the
+    # SAME shape as the NFT singleton above, differing only in the opcode
+    # (0xd0 vs 0xd8). Without this branch it falls through to "unknown", and a
+    # holder inspecting their own wallet cannot tell a mint authorisation from
+    # an unrecognised output. It is token-bearing: spending it as ordinary
+    # funding destroys the delegate.
+    if is_delegate_token_script(script_hex):
+        ref = GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH])
+        return {
+            **base,
+            "type": "delegate-token",
+            "ref_txid": ref.txid,
+            "ref_vout": ref.vout,
+            "ref_outpoint": f"{ref.txid}:{ref.vout}",
+            "owner_pkh": script[41:61].hex(),
+            "delegate_base_ref": f"{ref.txid}:{ref.vout}",
+        }
+
+    burned = parse_delegate_burn_script(script)
+    if burned is not None:
+        burned_ref = GlyphRef.from_bytes(burned)
+        return {
+            **base,
+            "type": "delegate-burn",
+            "spendable": False,
+            "ref_txid": burned_ref.txid,
+            "ref_vout": burned_ref.vout,
+            "ref_outpoint": f"{burned_ref.txid}:{burned_ref.vout}",
+            "delegate_base_ref": f"{burned_ref.txid}:{burned_ref.vout}",
         }
 
     if is_ft_script(script_hex):
@@ -796,7 +832,14 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
+def _classify_raw_tx(
+    txid_hex: str,
+    raw: bytes,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    delegated_refs: Iterable[bytes] = (),
+) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
     Synchronous, network-free core. The CLI's ``--fetch`` path wraps this
@@ -942,16 +985,32 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
         # parent appearing under one of those means the transaction spent it. The
         # other two operand-carrying opcodes prove nothing and are discarded — see
         # `output_ref_operands`.
-        rel = verify_relationship_claims(metadata, [bytes(o.locking_script.serialize()) for o in tx.outputs])
+        output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
+        rel = verify_relationship_claims(metadata, output_scripts, delegated_refs=delegated_refs)
         if rel:
             metadata_payload["relationships"] = [
                 {
                     "kind": v.kind.value,
                     "ref": f"{v.ref.txid}:{v.ref.vout}",
                     "outcome": v.outcome.value,
+                    "backing": v.backing.value,
                 }
                 for v in rel
             ]
+        # A claim may instead be authorised by a DELEGATE, which this function
+        # cannot resolve: it is handed a pre-fetched transaction and has no way
+        # to fetch the base whose refs the burn points at. So report what is
+        # visible rather than letting "unbacked" stand as the whole story — an
+        # UNBACKED verdict beside a burned base ref means "not resolved here",
+        # not "forged", and a reader who cannot see the second fact will draw
+        # the wrong conclusion from the first.
+        from .types import GlyphRef
+
+        burns = delegate_burn_refs(output_scripts)
+        if burns:
+            metadata_payload["delegate_burns"] = sorted(
+                f"{GlyphRef.from_bytes(b).txid}:{GlyphRef.from_bytes(b).vout}" for b in burns
+            )
 
         # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
         # something to say. Emitting an empty dict unconditionally made "flagged" and

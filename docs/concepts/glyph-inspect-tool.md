@@ -163,6 +163,7 @@ row of the `outputs[]` list on a fetched transaction. Every value
 
 `p2pkh`, `p2pkh-cltv`, `p2pkh-csv`, `p2sh`, `nft`, `ft`, `mut`,
 `commit-nft`, `commit-ft`, `dmint`, `container-legacy`,
+`delegate-token`, `delegate-burn`,
 `soulbound-covenant`, `self-replicating-covenant`, `op_return`,
 `op_return-msg`, `op_return-hashmark-v1`, `op_return-hashmark-v2`,
 `unknown`.
@@ -172,6 +173,24 @@ row, never from a pasted script: `error`, when classifying that one
 output raised. The row keeps its `vout` and `satoshis`, and the `error`
 field is the exception's class name and nothing more. The remaining
 rows are unaffected, which is the point of the per-output `try`.
+
+`delegate-token` and `delegate-burn` are the two halves of a delegate,
+which is how a token's `in`/`by` claim can be authorised without the
+minter holding the parent singleton. A `delegate-token` output is the
+**same 63 bytes as `nft`**, differing only in the opcode (`0xd0`
+`OP_PUSHINPUTREF` rather than `0xd8` `OP_PUSHINPUTREFSINGLETON`), so
+anything classifying by length alone gets it wrong; it is token-bearing
+either way, and spending one as ordinary funding destroys it. A
+`delegate-burn` is the unspendable 42-byte marker a mint emits to prove
+it consumed one.
+
+Both name a **base** ref, not a container or author ref. The base is
+where the authorisation actually lives, and the inspector cannot follow
+it from the transaction in front of it — resolving a delegated claim
+means fetching the base transaction, which `glyph inspect --fetch`
+does and a pasted script cannot. A relationship that reads
+`UNRESOLVED` alongside a `delegate_burns` entry means exactly that: the
+lookup did not happen, **not** that the claim was forged.
 
 The three `op_return-*` values are refinements of `op_return`, added
 when the data carrier self-identifies (see "OP_RETURN data carriers"

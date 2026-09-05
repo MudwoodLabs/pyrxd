@@ -129,6 +129,7 @@ See ``examples/ft_transfer_demo.py`` for the canonical filter pattern.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from pyrxd.constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
 from pyrxd.hash import hash256
@@ -156,6 +157,24 @@ COMMIT_SCRIPT_NFT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807ed
 COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda519d76a914[0-9a-f]{40}88ac$")
 # Kept for backwards compatibility — matches either variant.
 COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda[0-9a-f]{2}9d76a914[0-9a-f]{40}88ac$")
+
+# --- Delegate refs (Photonic ``packages/lib/src/script.ts:455-499``) ----------
+# A delegate authorises a token's ``in``/``by`` claim WITHOUT the minting wallet
+# holding the parent singleton. The parent refs are spent ONCE into a delegate
+# BASE output; disposable delegate TOKENS point at that base; each mint spends a
+# token and emits a BURN output naming the base ref. See
+# :func:`build_delegate_base_script` for the full chain and why each link is
+# consensus-backed rather than conventional.
+DELEGATE_TOKEN_SCRIPT_SIZE = 63
+DELEGATE_BURN_SCRIPT_SIZE = 42
+# The 56-byte prefix ``build_commit_locking_script(delegate_ref=...)`` prepends.
+DELEGATE_COMMIT_PREFIX_SIZE = 56
+# A delegate token is ``OP_PUSHINPUTREF <base_ref> OP_DROP`` + P2PKH — the SAME
+# 63 bytes as an NFT singleton, differing only in the first opcode (0xd0 vs
+# 0xd8). It is token-bearing: spending one as ordinary funding destroys it, so
+# coin selection must exclude it via ``is_token_bearing_script``.
+DELEGATE_TOKEN_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
+DELEGATE_BURN_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})6a0364656c$")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +205,7 @@ def build_commit_locking_script(
     owner_pkh: Hex20,
     *,
     is_nft: bool = True,
+    delegate_ref: GlyphRef | None = None,
 ) -> bytes:
     """Build commit transaction output script.
 
@@ -202,8 +222,10 @@ def build_commit_locking_script(
     if len(payload_hash) != 32:
         raise ValidationError("payload_hash must be 32 bytes")
     reftype_push = b"\x52" if is_nft else b"\x51"  # OP_2 = SINGLETON, OP_1 = NORMAL
+    prefix = build_delegate_commit_prefix(delegate_ref) if delegate_ref is not None else b""
     return (
-        b"\xaa"  # OP_HASH256
+        prefix
+        + b"\xaa"  # OP_HASH256
         + b"\x20"
         + payload_hash  # PUSH 32 + hash
         + b"\x88"  # OP_EQUALVERIFY
@@ -218,6 +240,247 @@ def build_commit_locking_script(
         + bytes(owner_pkh)
         + b"\x88\xac"  # P2PKH tail
     )
+
+
+# ---------------------------------------------------------------------------
+# Delegate refs
+# ---------------------------------------------------------------------------
+
+
+def build_delegate_base_script(owner_pkh: Hex20, refs: Sequence[GlyphRef]) -> bytes:
+    """Build the delegate BASE locking script — the one-time authorisation.
+
+    Mirrors Photonic ``delegateBaseScript`` (``packages/lib/src/script.ts:455``).
+
+    Layout: ``(OP_REQUIREINPUTREF <ref> OP_DROP)*N`` followed by a P2PKH tail,
+    so ``38 * N + 25`` bytes.
+
+    Why this authorises anything
+    ----------------------------
+
+    ``OP_REQUIREINPUTREF`` (``0xd1``) is one of the three opcodes Radiant
+    subset-checks against the transaction's inputs
+    (:data:`~pyrxd.constants.INPUT_BACKED_REF_OPCODES`; see
+    :mod:`pyrxd.glyph.relationships` for why the other two ref opcodes are NOT
+    authorisation). So consensus refused this output unless the transaction
+    creating it actually spent every ref named here. Building a base is
+    therefore the moment the container and author singletons are held — and
+    the only such moment.
+
+    The full chain, and what each link buys:
+
+    ==== ============================================ =========================
+    step transaction                                   what consensus enforces
+    ==== ============================================ =========================
+    1    spend container + author → base output        base's refs were held
+    2    spend base → N delegate token outputs         tokens carry the base ref
+    3    mint: spend a token; commit carries the       the mint held a token,
+         56-byte prefix; reveal emits the burn         and burned it
+    ==== ============================================ =========================
+
+    After step 1 the singletons are free to go back to cold storage: steps 2
+    and 3 never touch them again. That is the whole point — it is what lets a
+    hot minting service authorise ``in``/``by`` claims without custody of the
+    tokens those claims are about, and what lets N pre-minted delegate tokens
+    serve N concurrent mints instead of serialising on one singleton UTXO.
+
+    :param refs: the parent refs to authorise — container refs, author refs, or
+        both. Order is preserved but carries no meaning.
+    :raises ValidationError: *refs* is empty. A base authorising nothing is
+        never what the caller meant, and it parses back as an ordinary P2PKH.
+    """
+    if not refs:
+        raise ValidationError(
+            "build_delegate_base_script() needs at least one ref: a base authorising nothing "
+            "is indistinguishable from a plain P2PKH output and delegates nothing."
+        )
+    script = b""
+    for ref in refs:
+        script += b"\xd1" + ref.to_bytes() + b"\x75"  # OP_REQUIREINPUTREF <ref> OP_DROP
+    script += b"\x76\xa9\x14" + bytes(owner_pkh) + b"\x88\xac"  # P2PKH tail
+    expected = 38 * len(refs) + 25
+    if len(script) != expected:  # internal invariant
+        raise RuntimeError(f"delegate base script length invariant violated: expected {expected}, got {len(script)}")
+    return script
+
+
+def build_delegate_token_script(owner_pkh: Hex20, base_ref: GlyphRef) -> bytes:
+    """Build a 63-byte delegate TOKEN locking script.
+
+    Mirrors Photonic ``delegateTokenScript`` (``script.ts:464``):
+    ``OP_PUSHINPUTREF <base_ref> OP_DROP`` + P2PKH.
+
+    *base_ref* is the outpoint of the :func:`build_delegate_base_script` output,
+    NOT a container or author ref. Spending this token carries the base ref into
+    the spending transaction's input ref set, which is what the mint's commit
+    prefix and burn output both require.
+
+    The ``OP_DROP`` is load-bearing: ``OP_PUSHINPUTREF`` leaves its operand on
+    the stack, and without the drop the P2PKH tail hashes the *ref* instead of
+    the signature's pubkey and the output is permanently unspendable. That is
+    the exact defect pyrxd shipped in its removed ``child_ref`` prefix
+    (0.9.0-0.14.0) — see :func:`is_legacy_container_script` and spec §7.5.1.
+    """
+    script = b"\xd0" + base_ref.to_bytes() + b"\x75\x76\xa9\x14" + bytes(owner_pkh) + b"\x88\xac"
+    if len(script) != DELEGATE_TOKEN_SCRIPT_SIZE:  # internal invariant
+        raise RuntimeError(
+            f"delegate token script length invariant violated: expected {DELEGATE_TOKEN_SCRIPT_SIZE}, got {len(script)}"
+        )
+    return script
+
+
+def build_delegate_burn_script(base_ref: GlyphRef) -> bytes:
+    """Build the 42-byte delegate BURN output script.
+
+    Mirrors Photonic ``delegateBurnScript`` (``script.ts:471``):
+    ``OP_REQUIREINPUTREF <base_ref> OP_RETURN "del"``.
+
+    This is the marker an indexer looks for. It is unspendable (``OP_RETURN``)
+    and carries no value, so give it 0 photons. Its ``OP_REQUIREINPUTREF``
+    means consensus rejects the transaction unless a delegate token carrying
+    *base_ref* really was spent — the claim cannot be written by someone who
+    does not hold one.
+    """
+    script = b"\xd1" + base_ref.to_bytes() + b"\x6a" + b"\x03" + b"del"
+    if len(script) != DELEGATE_BURN_SCRIPT_SIZE:  # internal invariant
+        raise RuntimeError(
+            f"delegate burn script length invariant violated: expected {DELEGATE_BURN_SCRIPT_SIZE}, got {len(script)}"
+        )
+    return script
+
+
+def build_delegate_commit_prefix(delegate_ref: GlyphRef) -> bytes:
+    """The 56-byte prefix a delegate-carrying commit script opens with.
+
+    Mirrors Photonic ``addDelegateRefScript`` (``script.ts:214``), and is
+    prepended by :func:`build_commit_locking_script` when ``delegate_ref`` is
+    given. *delegate_ref* is the BASE ref (see
+    :func:`build_delegate_token_script`).
+
+    It is a covenant on the reveal — it runs when the commit output is SPENT,
+    and asserts two things about the reveal transaction:
+
+    1. ``OP_REFOUTPUTCOUNT_OUTPUTS == 0`` — the reveal must not carry the base
+       ref forward into any output, so the authorisation is consumed rather
+       than inherited by the minted token.
+    2. the reveal has exactly ONE output whose code-script hash equals
+       ``HASH256(OP_REQUIREINPUTREF || base_ref || OP_RETURN "del")`` — i.e. the
+       burn output of :func:`build_delegate_burn_script` is present, exactly
+       once. The script rebuilds that hash on the stack with ``OP_CAT`` rather
+       than trusting a value from the scriptSig, so the unlocking side cannot
+       influence which output satisfies it.
+    """
+    return (
+        b"\xd0"  # OP_PUSHINPUTREF
+        + delegate_ref.to_bytes()  # <base_ref>, bare 36-byte operand
+        + b"\x76"  # OP_DUP
+        + b"\xde"  # OP_REFOUTPUTCOUNT_OUTPUTS
+        + b"\x00"  # OP_0
+        + b"\x9d"  # OP_NUMEQUALVERIFY      -> base ref appears in 0 outputs
+        + b"\x01\xd1"  # PUSH 1 <0xd1>          -> the burn script's first byte
+        + b"\x7c"  # OP_SWAP                -> [0xd1, base_ref]
+        + b"\x05\x6a\x03\x64\x65\x6c"  # PUSH 5 <OP_RETURN "del">
+        + b"\x7e"  # OP_CAT                 -> [0xd1, base_ref||6a0364656c]
+        + b"\x7e"  # OP_CAT                 -> [the whole burn script]
+        + b"\xaa"  # OP_HASH256
+        + b"\xe6"  # OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS
+        + b"\x51"  # OP_1
+        + b"\x9d"  # OP_NUMEQUALVERIFY      -> exactly one burn output
+    )
+
+
+def split_delegate_commit_prefix(script: bytes) -> tuple[GlyphRef | None, bytes]:
+    """Split a commit script into ``(delegate_ref, core_script)``.
+
+    A commit output built with ``delegate_ref`` is the ordinary 75-byte commit
+    script behind the 56-byte prefix of
+    :func:`build_delegate_commit_prefix`. Every classifier and extractor in this
+    module works on the CORE, so each one calls this first; without it a
+    delegate commit is 131 bytes with every fixed offset shifted by 56, and
+    reads as "not a commit script" — which is how a mint built through the very
+    feature that adds the prefix becomes invisible to the code that inspects it.
+
+    Returns ``(None, script)`` unchanged when there is no prefix. The prefix is
+    matched against its exact opcode layout (the ref being the only variable
+    part), so a script that merely starts with ``0xd0`` is not mistaken for one.
+    """
+    if len(script) <= DELEGATE_COMMIT_PREFIX_SIZE or script[0] != 0xD0:
+        return None, script
+    head, core = script[:DELEGATE_COMMIT_PREFIX_SIZE], script[DELEGATE_COMMIT_PREFIX_SIZE:]
+    ref_bytes = head[1 : 1 + REF_OPERAND_WIDTH]
+    if head != build_delegate_commit_prefix(GlyphRef.from_bytes(ref_bytes)):
+        return None, script
+    return GlyphRef.from_bytes(ref_bytes), core
+
+
+def extract_delegate_ref_from_commit_script(script: bytes) -> GlyphRef | None:
+    """Return the delegate base ref a commit script carries, or ``None``.
+
+    ``None`` means the commit authorises no ``in``/``by`` claim by delegation —
+    not that the token has no relationships. A claim can equally be backed by
+    the reveal spending the parent directly; see
+    :mod:`pyrxd.glyph.relationships`.
+    """
+    delegate_ref, _core = split_delegate_commit_prefix(script)
+    return delegate_ref
+
+
+def parse_delegate_base_script(script: bytes) -> tuple[bytes, ...]:
+    """Return the wire refs a delegate base script authorises, in script order.
+
+    The counterpart of :func:`build_delegate_base_script`, and the read half of
+    Photonic ``parseDelegateBaseScript`` (``script.ts:480``).
+
+    Reads the LEADING run of ``OP_REQUIREINPUTREF <ref> OP_DROP`` pairs and
+    stops at the first instruction that is not one, ignoring whatever tail
+    follows — Photonic's regex ends in ``.*`` and does the same. Being stricter
+    here (demanding a P2PKH tail, say) would refuse honest bases built by
+    another wallet, which is a defect, not a safety measure.
+
+    The walk goes through :func:`iter_script_ops_strict` rather than a regex or
+    a byte scan, so a ``0xd1`` byte inside pushed data cannot be misread as an
+    opcode. Returns ``()`` for any script that does not open with such a pair,
+    including one that does not decode.
+    """
+    refs: list[bytes] = []
+    try:
+        ops = list(iter_script_ops_strict(script))
+    except TruncatedScriptError:
+        return ()
+    i = 0
+    while i + 1 < len(ops):
+        op, nxt = ops[i], ops[i + 1]
+        if op.opcode != 0xD1 or op.operand is None or nxt.opcode != 0x75:  # OP_REQUIREINPUTREF .. OP_DROP
+            break
+        refs.append(bytes(op.operand))
+        i += 2
+    return tuple(refs)
+
+
+def parse_delegate_burn_script(script: bytes) -> bytes | None:
+    """Return the base ref a delegate burn output names, or ``None``.
+
+    The counterpart of :func:`build_delegate_burn_script`, and the read half of
+    Photonic ``parseDelegateBurnScript`` (``script.ts:495``). The layout is
+    fixed-width and fully anchored, so an exact byte comparison is both
+    sufficient and unambiguous.
+    """
+    if len(script) != DELEGATE_BURN_SCRIPT_SIZE:
+        return None
+    if script[0] != 0xD1 or script[1 + REF_OPERAND_WIDTH :] != b"\x6a\x03del":
+        return None
+    return script[1 : 1 + REF_OPERAND_WIDTH]
+
+
+def is_delegate_token_script(script_hex: str) -> bool:
+    """Return True if *script_hex* is a 63-byte delegate token output.
+
+    Note the shape collision this exists to resolve: a delegate token and an
+    NFT singleton are both 63 bytes of ``<ref opcode> <ref> OP_DROP`` + P2PKH,
+    differing only in the opcode (``0xd0`` vs ``0xd8``). Anything classifying
+    chain outputs must test the opcode, not the length.
+    """
+    return bool(DELEGATE_TOKEN_SCRIPT_RE.fullmatch(script_hex.lower()))
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +554,43 @@ def parse_legacy_container_script(script: bytes) -> tuple[GlyphRef, GlyphRef, He
     return container_ref, child_ref, owner_pkh
 
 
+def _commit_core_hex(script_hex: str) -> str:
+    """The commit script's 75-byte core hex, with any delegate prefix removed.
+
+    Returns the input unchanged if it is not hex — the caller's regex then
+    fails, which is the same answer it would have given anyway.
+    """
+    try:
+        raw = bytes.fromhex(script_hex)
+    except ValueError:
+        return script_hex.lower()
+    _delegate_ref, core = split_delegate_commit_prefix(raw)
+    return core.hex()
+
+
 def is_commit_script(script_hex: str) -> bool:
-    """Return True if script_hex matches either commit pattern (NFT or FT)."""
-    return bool(COMMIT_SCRIPT_RE.fullmatch(script_hex.lower()))
+    """Return True if script_hex matches either commit pattern (NFT or FT).
+
+    Accepts the delegate-carrying form (:func:`build_delegate_commit_prefix`)
+    as well as the bare 75-byte one.
+    """
+    return bool(COMMIT_SCRIPT_RE.fullmatch(_commit_core_hex(script_hex.lower())))
 
 
 def is_commit_nft_script(script_hex: str) -> bool:
-    """Return True if script_hex matches the NFT-variant commit pattern."""
-    return bool(COMMIT_SCRIPT_NFT_RE.fullmatch(script_hex.lower()))
+    """Return True if script_hex matches the NFT-variant commit pattern.
+
+    Accepts the delegate-carrying form as well as the bare one.
+    """
+    return bool(COMMIT_SCRIPT_NFT_RE.fullmatch(_commit_core_hex(script_hex.lower())))
 
 
 def is_commit_ft_script(script_hex: str) -> bool:
-    """Return True if script_hex matches the FT-variant commit pattern."""
-    return bool(COMMIT_SCRIPT_FT_RE.fullmatch(script_hex.lower()))
+    """Return True if script_hex matches the FT-variant commit pattern.
+
+    Accepts the delegate-carrying form as well as the bare one.
+    """
+    return bool(COMMIT_SCRIPT_FT_RE.fullmatch(_commit_core_hex(script_hex.lower())))
 
 
 def is_dmint_contract_script(script: bytes) -> bool:
@@ -369,17 +656,27 @@ def extract_owner_pkh_from_ft_script(script: bytes) -> Hex20:
 
 
 def extract_payload_hash_from_commit_script(script: bytes) -> bytes:
-    """Extract 32-byte payload hash from a commit script (NFT or FT variant)."""
-    if len(script) != 75 or not COMMIT_SCRIPT_RE.match(script.hex()):
+    """Extract 32-byte payload hash from a commit script (NFT or FT variant).
+
+    Handles the delegate-carrying form by splitting the prefix off first; the
+    offsets below index the 75-byte core.
+    """
+    _delegate_ref, core = split_delegate_commit_prefix(script)
+    if len(core) != 75 or not COMMIT_SCRIPT_RE.match(core.hex()):
         raise ValidationError("Not a valid commit script")
-    return script[2:34]
+    return core[2:34]
 
 
 def extract_owner_pkh_from_commit_script(script: bytes) -> Hex20:
-    """Extract 20-byte owner PKH from a commit script (NFT or FT variant)."""
-    if len(script) != 75 or not COMMIT_SCRIPT_RE.match(script.hex()):
+    """Extract 20-byte owner PKH from a commit script (NFT or FT variant).
+
+    Handles the delegate-carrying form by splitting the prefix off first; the
+    offsets below index the 75-byte core.
+    """
+    _delegate_ref, core = split_delegate_commit_prefix(script)
+    if len(core) != 75 or not COMMIT_SCRIPT_RE.match(core.hex()):
         raise ValidationError("Not a valid commit script")
-    return Hex20(script[53:73])
+    return Hex20(core[53:73])
 
 
 # ---------------------------------------------------------------------------

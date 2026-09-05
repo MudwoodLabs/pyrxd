@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, overload
@@ -24,9 +25,13 @@ from .dmint import (
 from .payload import build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_commit_locking_script,
+    build_delegate_base_script,
+    build_delegate_burn_script,
+    build_delegate_token_script,
     build_ft_locking_script,
     build_mutable_nft_script,
     build_nft_locking_script,
+    extract_delegate_ref_from_commit_script,
     extract_ref_from_nft_script,
     hash_payload,
     is_legacy_container_script,
@@ -126,6 +131,13 @@ class CommitParams:
     funding_satoshis: int  # total input satoshis available
     # pyrxd's uneconomic-change floor, NOT a chain minimum (Radiant's is 1 photon).
     dust_limit: int = DUST_THRESHOLD_PHOTONS
+    #: Delegate BASE ref authorising this mint's ``in``/``by`` claims. When set,
+    #: the commit script gains the 56-byte prefix of
+    #: :func:`~pyrxd.glyph.script.build_delegate_commit_prefix`, the commit tx
+    #: MUST spend a delegate token carrying this ref, and the reveal MUST carry
+    #: the matching burn output — see :class:`RevealParams`. Leave ``None`` to
+    #: back relationships directly (spend-and-recreate) or not at all.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -136,6 +148,11 @@ class CommitResult:
     cbor_bytes: bytes  # store this — needed for reveal scriptSig
     payload_hash: bytes  # 32-byte hash committed into the script
     estimated_fee: int  # in photons
+    #: Echoed back from :class:`CommitParams` so the caller carries it to the
+    #: reveal. A commit built with a delegate whose reveal omits the burn output
+    #: is rejected by the covenant, stranding the commit value until a correct
+    #: reveal is built — so keep this alongside ``cbor_bytes``.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -157,6 +174,15 @@ class RevealParams:
     cbor_bytes: bytes  # from CommitResult
     owner_pkh: Hex20  # recipient PKH — can differ from commit spender PKH
     is_nft: bool  # True = NFT, False = FT
+    #: The commit output's locking script. Preferred over ``delegate_ref``:
+    #: pass the script you are about to spend and the delegate ref is READ from
+    #: it, so a delegate-carrying commit cannot be revealed without its burn
+    #: output by a caller who simply forgot. If both are given they are
+    #: cross-checked and a mismatch raises.
+    commit_script: bytes | None = None
+    #: Delegate BASE ref, for callers that do not have the commit script to
+    #: hand. Prefer ``commit_script``.
+    delegate_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -165,6 +191,25 @@ class RevealScripts:
 
     locking_script: bytes  # output scriptPubKey
     scriptsig_suffix: bytes  # the 'gly' + CBOR portion; caller prepends sig+pubkey
+    #: When not ``None``, the reveal MUST include this as an additional output
+    #: with value 0. The commit covenant counts it (exactly one required), so a
+    #: reveal that omits it is rejected outright rather than minting an
+    #: unauthorised token — the failure is loud, not silent.
+    delegate_burn_script: bytes | None = None
+
+
+@dataclass
+class DelegateSetupScripts:
+    """Output scripts for the one-time delegate setup — see :meth:`GlyphBuilder.prepare_delegate_setup`."""
+
+    #: Spend the parent tokens into this. Its outpoint becomes the base ref.
+    base_script: bytes
+    #: The refs *base_script* authorises, in script order — echoed back so the
+    #: caller can assert it built the base it meant to.
+    authorised_refs: tuple[GlyphRef, ...]
+    #: Built only when ``base_ref`` was supplied (a second transaction, after
+    #: the base has confirmed and its outpoint is known).
+    token_scripts: tuple[bytes, ...] = ()
 
 
 @dataclass
@@ -304,14 +349,17 @@ class GlyphBuilder:
             payload_hash,
             params.owner_pkh,
             is_nft=is_nft,
+            delegate_ref=params.delegate_ref,
         )
-        # Rough estimate: commit tx ~276 bytes
-        estimated_fee = 276 * MIN_FEE_RATE
+        # Rough estimate: commit tx ~276 bytes, plus the delegate token input
+        # (~148 B) and the 56-byte script prefix when this mint is delegated.
+        estimated_fee = (276 if params.delegate_ref is None else 276 + 148 + 56) * MIN_FEE_RATE
         return CommitResult(
             commit_script=commit_script,
             cbor_bytes=cbor_bytes,
             payload_hash=payload_hash,
             estimated_fee=estimated_fee,
+            delegate_ref=params.delegate_ref,
         )
 
     def prepare_reveal(self, params: RevealParams) -> RevealScripts:
@@ -349,10 +397,26 @@ class GlyphBuilder:
         else:
             locking = build_ft_locking_script(params.owner_pkh, ref)
 
+        # Delegate: prefer READING the ref off the commit script the caller is
+        # about to spend, so the burn output cannot be forgotten. A mismatch
+        # between the two sources is a caller bug that would produce a reveal
+        # the covenant rejects, so it raises rather than picking a winner.
+        delegate_ref = params.delegate_ref
+        if params.commit_script is not None:
+            from_script = extract_delegate_ref_from_commit_script(params.commit_script)
+            if delegate_ref is not None and from_script != delegate_ref:
+                raise ValidationError(
+                    f"delegate_ref {delegate_ref.txid}:{delegate_ref.vout} does not match the delegate ref "
+                    f"carried by commit_script ({from_script.txid + ':' + str(from_script.vout) if from_script else 'none'}). "
+                    "The commit script is authoritative — it is the covenant that will be evaluated."
+                )
+            delegate_ref = from_script
+
         scriptsig_suffix = build_reveal_scriptsig_suffix(params.cbor_bytes)
         return RevealScripts(
             locking_script=locking,
             scriptsig_suffix=scriptsig_suffix,
+            delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
         )
 
     def prepare_ft_deploy_reveal(
@@ -857,6 +921,72 @@ class GlyphBuilder:
             locking_script=build_nft_locking_script(owner_pkh, ref),
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             child_ref=None,
+        )
+
+    def prepare_delegate_setup(
+        self,
+        owner_pkh: Hex20,
+        authorised_refs: Sequence[GlyphRef],
+        *,
+        base_ref: GlyphRef | None = None,
+        token_count: int = 0,
+    ) -> DelegateSetupScripts:
+        """Prepare the one-time delegate setup that authorises ``in``/``by`` claims.
+
+        This is the alternative to :meth:`prepare_container_child_reveal` for a
+        minting service, and the only write path pyrxd has for ``by`` at all.
+        Where the container-child reveal makes *every* mint spend and re-create
+        the parent — permanent custody in the minting wallet, and one serialised
+        UTXO every mint contends on — a delegate spends the parents **once**.
+
+        Two transactions, because the second needs the first's outpoint:
+
+        1. Call with *authorised_refs* only. Spend the container and/or author
+           tokens, paying to :attr:`~DelegateSetupScripts.base_script`. Consensus
+           refuses this output unless those refs really were among the inputs
+           (``OP_REQUIREINPUTREF`` is subset-checked), which is what makes every
+           later claim authorised rather than merely asserted. **After this
+           confirms the parent tokens are free to go back to cold storage.**
+        2. Call again with *base_ref* (that output's outpoint) and a
+           *token_count*. Spend the base, paying to each of
+           :attr:`~DelegateSetupScripts.token_scripts`. Each token authorises one
+           mint, so pre-mint as many as you expect to need — N tokens serve N
+           concurrent mints with no lock.
+
+        Then each mint passes ``base_ref`` as
+        :attr:`CommitParams.delegate_ref`, spends one token in the commit, and
+        emits :attr:`RevealScripts.delegate_burn_script` in the reveal.
+
+        What this does NOT prove: that the parent's owner approved this
+        particular mint. It proves the mint held a token from a base that held
+        the parents. Anyone holding a delegate token can make the claim — that
+        is the mechanism working as designed, and why
+        :class:`~pyrxd.glyph.relationships.RelationshipBacking` reports
+        DELEGATED separately from DIRECT rather than flattening the two.
+
+        :raises ValidationError: *authorised_refs* is empty, or *token_count* is
+            given without *base_ref* (or vice versa with no tokens to build).
+        """
+        if not authorised_refs:
+            raise ValidationError(
+                "prepare_delegate_setup() needs at least one ref to authorise — a base authorising "
+                "nothing delegates nothing and is indistinguishable from a plain P2PKH output."
+            )
+        if token_count < 0:
+            raise ValidationError("token_count must be >= 0")
+        if token_count and base_ref is None:
+            raise ValidationError(
+                "token_count requires base_ref: delegate tokens carry the BASE outpoint, which does "
+                "not exist until the base transaction from step 1 has been broadcast. Build the base "
+                "first, then call again with base_ref=<that output's outpoint>."
+            )
+        refs = tuple(authorised_refs)
+        return DelegateSetupScripts(
+            base_script=build_delegate_base_script(owner_pkh, refs),
+            authorised_refs=refs,
+            token_scripts=tuple(build_delegate_token_script(owner_pkh, base_ref) for _ in range(token_count))
+            if base_ref is not None
+            else (),
         )
 
     def prepare_container_child_reveal(

@@ -93,6 +93,14 @@ _SHAPE_NAMES = (
     "mut",
     "commit-nft",
     "commit-ft",
+    "delegate-token",
+    "delegate-burn",
+    # A commit output carrying the 56-byte delegate prefix. Same emitted TYPE as
+    # "commit-nft", deliberately: what it exercises is that every offset in the
+    # classifier is taken from the CORE rather than from the start of the
+    # script. Built without it, a delegate commit is 131 bytes with each field
+    # shifted by 56 and reads as an unrecognised output.
+    "commit-nft-delegate",
     "container-legacy",
     "dmint-v1",
     "dmint-v2",
@@ -124,6 +132,8 @@ def _corpus() -> dict[str, bytes]:
     from pyrxd.glyph.dmint.types import DmintDeployParams
     from pyrxd.glyph.script import (
         build_commit_locking_script,
+        build_delegate_burn_script,
+        build_delegate_token_script,
         build_ft_locking_script,
         build_mutable_nft_script,
         build_nft_locking_script,
@@ -192,6 +202,11 @@ def _corpus() -> dict[str, bytes]:
         "mut": build_mutable_nft_script(ref, payload_hash),
         "commit-nft": build_commit_locking_script(payload_hash, pkh, is_nft=True),
         "commit-ft": build_commit_locking_script(payload_hash, pkh, is_nft=False),
+        # A delegate token is the SAME 63 bytes as "nft" above with a different
+        # opcode (0xd0 vs 0xd8), which is exactly why it gets its own shape.
+        "delegate-token": build_delegate_token_script(pkh, ref2),
+        "delegate-burn": build_delegate_burn_script(ref2),
+        "commit-nft-delegate": build_commit_locking_script(payload_hash, pkh, is_nft=True, delegate_ref=ref2),
         # The dead pre-0.15.0 CONTAINER-with-child-ref output: OP_PUSHINPUTREF
         # <child> then a plain NFT script. Built the way it used to be built.
         "container-legacy": b"\xd0" + ref2.to_bytes() + build_nft_locking_script(pkh, ref),
