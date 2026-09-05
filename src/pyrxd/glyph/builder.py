@@ -207,6 +207,17 @@ class DelegateSetupScripts:
     #: The refs *base_script* authorises, in script order — echoed back so the
     #: caller can assert it built the base it meant to.
     authorised_refs: tuple[GlyphRef, ...]
+    #: **The parent NFT outputs the base transaction must ALSO carry**, one per
+    #: authorised ref and in the same order, each byte-identical to the output
+    #: being spent.
+    #:
+    #: ``OP_REQUIREINPUTREF`` requires a ref as an INPUT; it does not carry it
+    #: forward. So a base transaction whose outputs are the base alone SPENDS
+    #: the container and author singletons and re-creates neither — it burns
+    #: them, permanently and irrecoverably, and a consumed singleton can never
+    #: be re-minted (spec §7.5.1). Photonic builds ``outputs = [base, ...tokens]``
+    #: for exactly this reason (``mint.ts:634``). These are those tokens.
+    parent_scripts: tuple[bytes, ...] = ()
     #: Built only when ``base_ref`` was supplied (a second transaction, after
     #: the base has confirmed and its outpoint is known).
     token_scripts: tuple[bytes, ...] = ()
@@ -928,6 +939,7 @@ class GlyphBuilder:
         owner_pkh: Hex20,
         authorised_refs: Sequence[GlyphRef],
         *,
+        parent_owner_pkh: Hex20 | None = None,
         base_ref: GlyphRef | None = None,
         token_count: int = 0,
     ) -> DelegateSetupScripts:
@@ -942,11 +954,20 @@ class GlyphBuilder:
         Two transactions, because the second needs the first's outpoint:
 
         1. Call with *authorised_refs* only. Spend the container and/or author
-           tokens, paying to :attr:`~DelegateSetupScripts.base_script`. Consensus
-           refuses this output unless those refs really were among the inputs
-           (``OP_REQUIREINPUTREF`` is subset-checked), which is what makes every
-           later claim authorised rather than merely asserted. **After this
-           confirms the parent tokens are free to go back to cold storage.**
+           tokens, with outputs = :attr:`~DelegateSetupScripts.base_script`
+           **plus every script in
+           :attr:`~DelegateSetupScripts.parent_scripts`**, which re-create the
+           parents unchanged. Consensus refuses the base output unless those
+           refs really were among the inputs (``OP_REQUIREINPUTREF`` is
+           subset-checked), which is what makes every later claim authorised
+           rather than merely asserted.
+
+           **Omitting the parent outputs BURNS the container and author
+           tokens.** ``OP_REQUIREINPUTREF`` requires a ref as an input and does
+           not carry it forward, so a base transaction that does not re-create
+           the parents destroys them — permanently, since a consumed singleton
+           can never be re-minted. Only once the parents are back in outputs is
+           it true that they can go to cold storage and never be spent again.
         2. Call again with *base_ref* (that output's outpoint) and a
            *token_count*. Spend the base, paying to each of
            :attr:`~DelegateSetupScripts.token_scripts`. Each token authorises one
@@ -964,6 +985,9 @@ class GlyphBuilder:
         :class:`~pyrxd.glyph.relationships.RelationshipBacking` reports
         DELEGATED separately from DIRECT rather than flattening the two.
 
+        :param parent_owner_pkh: who the re-created parent outputs pay to.
+            Defaults to *owner_pkh*, which is right when the setup wallet is the
+            one holding the parents — the usual case, since it has to spend them.
         :raises ValidationError: *authorised_refs* is empty, or *token_count* is
             given without *base_ref* (or vice versa with no tokens to build).
         """
@@ -981,9 +1005,14 @@ class GlyphBuilder:
                 "first, then call again with base_ref=<that output's outpoint>."
             )
         refs = tuple(authorised_refs)
+        # Defaults to the setup wallet: whoever spends a parent singleton IS its
+        # owner, so the same key almost always receives it back. Pass it
+        # explicitly when a parent should be re-created to a different holder.
+        parents_to = owner_pkh if parent_owner_pkh is None else parent_owner_pkh
         return DelegateSetupScripts(
             base_script=build_delegate_base_script(owner_pkh, refs),
             authorised_refs=refs,
+            parent_scripts=tuple(build_nft_locking_script(parents_to, ref) for ref in refs),
             token_scripts=tuple(build_delegate_token_script(owner_pkh, base_ref) for _ in range(token_count))
             if base_ref is not None
             else (),

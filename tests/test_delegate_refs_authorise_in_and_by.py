@@ -397,6 +397,34 @@ def test_delegate_setup_is_two_steps_because_tokens_need_the_bases_outpoint():
     assert all(is_delegate_token_script(s.hex()) for s in step2.token_scripts)
 
 
+def test_the_base_transaction_must_re_create_the_parents_or_it_burns_them():
+    """OP_REQUIREINPUTREF requires a ref as an INPUT — it does not carry it forward.
+
+    A base transaction whose only output is the base SPENDS the container and
+    author singletons and re-creates neither. That burns them permanently: a
+    consumed singleton can never be re-minted (spec §7.5.1). Photonic builds
+    ``outputs = [base, ...tokens]`` for this reason (mint.ts:634), so the setup
+    hands the caller those outputs rather than describing them in prose.
+    """
+    builder = GlyphBuilder()
+    setup = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR])
+
+    assert setup.parent_scripts == (
+        build_nft_locking_script(PKH, CONTAINER),
+        build_nft_locking_script(PKH, AUTHOR),
+    ), "the parent outputs must be byte-identical to the ones being spent, in the same order"
+    # Same guarantee the container-child reveal gives: nothing moves or re-owns.
+    assert all(is_nft_script(s.hex()) and len(s) == 63 for s in setup.parent_scripts)
+
+
+def test_a_parent_can_be_re_created_to_a_different_holder():
+    """The spender is normally the owner, but the two need not be the same key."""
+    builder = GlyphBuilder()
+    cold = Hex20(bytes.fromhex("00" * 19 + "ff"))
+    setup = builder.prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=cold)
+    assert setup.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
+
+
 def test_delegate_setup_refuses_the_two_ways_to_build_a_useless_one():
     builder = GlyphBuilder()
     with pytest.raises(ValidationError, match="at least one ref"):
