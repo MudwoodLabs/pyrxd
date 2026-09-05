@@ -9,7 +9,16 @@ from pyrxd.security.errors import ValidationError
 
 from .dmint import DmintCborPayload
 from .script import hash_payload
-from .types import GlyphCreator, GlyphMedia, GlyphMetadata, GlyphPolicy, GlyphRef, GlyphRights, GlyphRoyalty
+from .types import (
+    GlyphCreator,
+    GlyphMedia,
+    GlyphMetadata,
+    GlyphPolicy,
+    GlyphProtocol,
+    GlyphRef,
+    GlyphRights,
+    GlyphRoyalty,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -32,6 +41,29 @@ def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
     logical payload — required for any future indexer that re-encodes
     metadata to verify against the on-chain commit hash.
     """
+    # THE ONE FUNNEL EVERY WRITE PATH GOES THROUGH. #625 put this invariant on
+    # `GlyphMinter._require_protocol`, reasoning it belonged "inside the operation that
+    # broadcasts" — but there are TWO such operations, and the CLI uses the other one.
+    # `pyrxd glyph mint-nft` (and `glyph timelock-mint`, which routes through the same
+    # `_mint_nft_inner`) build through `GlyphBuilder.prepare_commit`, which never calls
+    # `GlyphMinter`. So the exact token the gate was written to prevent — the TIMELOCK marker
+    # with no CEK commitment — stayed mintable from the CLI, which is how most users mint.
+    #
+    # Here instead, because it is WRITE-ONLY: `decode_payload` does not call this, so the read
+    # path stays permissive about third-party bytes (it must — timelocked tokens with junk
+    # metadata exist on chain and a reader has to survive them). Every builder entry point
+    # (builder.py:301, :508, :617) and the fee estimator funnel through here, so there is no
+    # second door to remember.
+    #
+    # A mint cannot be amended and the failure is silent: the token looks sealed, the operator
+    # holds a CEK, and nothing on chain can ever verify the reveal.
+    if GlyphProtocol.TIMELOCK in (metadata.protocol or []) and getattr(metadata.crypto, "timelock", None) is None:
+        raise ValidationError(
+            "refusing to encode a TIMELOCK glyph with no crypto.timelock: the CBOR would carry the "
+            "marker and no CEK commitment, so nothing on chain could ever verify the reveal and the "
+            "mint cannot be amended. Build it with pyrxd.glyph.timelock.build_timelock_mint(...), "
+            "which commits the key hash by construction, or use GlyphClient.mint_timelocked_nft."
+        )
     cbor_bytes = cbor2.dumps(metadata.to_cbor_dict(), canonical=True)
     return cbor_bytes, hash_payload(cbor_bytes)
 
@@ -180,6 +212,23 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
                 blob = blob.value
             main = GlyphMedia(mime_type=mime_type, data=bytes(blob))
 
+    # The ENCRYPTED spelling of the same CBOR key (#626, third field of the same class).
+    # `encrypted_main` and `main` both encode to `main` (types.py:522), and the block above only
+    # recognises the PLAINTEXT shape (`t`/`b`) — so an encrypted descriptor fell through to
+    # nothing and decode -> re-encode dropped it silently, exactly as `crypto` did. Found by the
+    # byte-exact re-encode property, which is why that test asserts bytes rather than fields.
+    #
+    # Only ever one of the two: setting both raises (types.py:499), so this is reached only when
+    # the plaintext parse above declined.
+    encrypted_main = None
+    if main is None and isinstance(d.get("main"), dict):
+        from .encrypted_content import EncryptionMetadata
+
+        try:
+            encrypted_main = EncryptionMetadata.from_dict(d["main"])
+        except (ValidationError, KeyError, ValueError, TypeError) as e:
+            _log.warning("decode_payload: malformed encrypted 'main' field ignored: %s", e)
+
     version = d.get("v")
     if version is not None:
         try:
@@ -240,10 +289,29 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         except (ValidationError, KeyError, ValueError, TypeError) as e:
             _log.warning("decode_payload: malformed 'crypto.timelock' field ignored: %s", e)
 
+    # ...and the WRITE-side field too (#626). Decoding into `timelock` alone left the object
+    # un-round-trippable: `to_cbor_dict` emits from `crypto`, so decode -> re-encode SILENTLY
+    # DROPPED the commitment, turning a sealed token into a marker with nothing behind it. That
+    # stayed invisible until the encode guard above made TIMELOCK-without-commitment refusable and
+    # the round-trip property test — which generates exactly that combo — started failing on it.
+    #
+    # Defensive in the same shape as the block above: this parses third-party bytes off the chain,
+    # so a malformed `crypto` is logged and ignored rather than raising. `timelock` is still
+    # populated independently, so nothing that reads it changes behaviour.
+    crypto = None
+    if isinstance(d.get("crypto"), dict):
+        from .encrypted_content import CryptoMetadata
+
+        try:
+            crypto = CryptoMetadata.from_dict(d["crypto"])
+        except (ValidationError, KeyError, ValueError, TypeError) as e:
+            _log.warning("decode_payload: malformed 'crypto' field ignored: %s", e)
+
     return GlyphMetadata(
         source_cbor=cbor_bytes,
         protocol=d["p"],
         timelock=timelock,
+        crypto=crypto,
         container_refs=_decode_rel_refs(d.get("in"), "in"),
         author_refs=_decode_rel_refs(d.get("by"), "by"),
         name=_cbor_str(d, "name", 64),
@@ -251,6 +319,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         description=_cbor_str(d, "desc", 1000),
         token_type=_cbor_str(d, "type", 64),
         main=main,
+        encrypted_main=encrypted_main,
         attrs=_decode_attrs(d.get("attrs", {})),
         loc=_cbor_str(d, "loc", 512),
         loc_hash=_cbor_str(d, "loc_hash", 128),
