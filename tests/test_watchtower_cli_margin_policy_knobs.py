@@ -190,7 +190,7 @@ def _report(caplog, *extra: str) -> str:
     args = _parse_args([*_MEASURED, *extra])
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        _report_claim_reserves(_policy_from_args(args), inclusion_measured=args.rxd_claim_inclusion is not None)
+        _report_claim_reserves(_policy_from_args(args), requested_inclusion_blocks=args.rxd_claim_inclusion)
     assert caplog.records, f"nothing was logged to {_LOGGER!r} — the report reaches no human"
     return "\n".join(r.getMessage() for r in caplog.records)
 
@@ -225,7 +225,7 @@ def test_the_estimated_alert_only_tower_reports_but_does_not_warn(caplog):
     args = _parse_args(["--records-dir", "/tmp/x"])
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        _report_claim_reserves(_policy_from_args(args), inclusion_measured=args.rxd_claim_inclusion is not None)
+        _report_claim_reserves(_policy_from_args(args), requested_inclusion_blocks=args.rxd_claim_inclusion)
     assert "claim-race reserves (estimated policy)" in "\n".join(r.getMessage() for r in caplog.records)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -250,3 +250,159 @@ def test_an_impossible_inclusion_reserve_is_refused(bad):
 
     with pytest.raises(ValidationError):
         _policy("--rxd-claim-inclusion", bad)
+
+
+# ---------------------------------------------------------------------------
+# The OTHER branch: without --measured, a policy flag must be REFUSED, never dropped
+# ---------------------------------------------------------------------------
+#
+# The AST guard above derives its set from calls to ``MarginPolicy.measured`` — so it covers the
+# ``--measured`` branch completely and says nothing at all about the one below it. The estimated
+# branch called ``MarginPolicy.estimated(block_interval_s=..., accept_flat_burial=...)`` and
+# forwarded neither ``--rxd-claim-inclusion`` nor ``--burial-safety-factor`` (nor ten others),
+# while ``_report_claim_reserves`` derived its provenance label from the ARGV rather than from the
+# policy — so the surface #580 added so an operator could confirm the flag TOOK was the surface
+# that certified a flag that had been dropped. Measured on the shipped parser before the fix:
+#
+#   --rxd-claim-inclusion 5 --burial-safety-factor 3
+#     -> "rxd_claim_inclusion=2 blk (measured, --rxd-claim-inclusion) ... burial_safety_factor=1.00"
+#
+# Every reserve assertion in this file ran under ``_MEASURED``, and the one estimated-path test
+# passed no flags, so the combination was never exercised.
+
+
+def _policy_from_args_ast() -> ast.FunctionDef:
+    tree = ast.parse(_RUN_PY.read_text())
+    return next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_policy_from_args"
+    )
+
+
+def _args_attribute_reads(*nodes: ast.AST) -> set[str]:
+    """Every ``args.<dest>`` named anywhere under these nodes."""
+    return {
+        n.attr
+        for node in nodes
+        for n in ast.walk(node)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "args"
+    }
+
+
+def _derived_measured_only_flags() -> set[str]:
+    """Recompute ``_MEASURED_ONLY_POLICY_FLAGS`` from the code, so the tuple is not its own witness.
+
+    ``{dests read under ``if args.measured:``} - {dests the estimated path also reads}``. The
+    measured branch delegates to ``_reorg_cost_from_args``, so its reads count too — after checking
+    that it is called from the measured branch ONLY, which is what makes attributing them here
+    correct rather than convenient.
+    """
+    fn = _policy_from_args_ast()
+    branch = next(n for n in fn.body if isinstance(n, ast.If) and ast.unparse(n.test) == "args.measured")
+    rest = [n for n in fn.body if n is not branch]
+
+    helper_calls = [
+        n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) == "_reorg_cost_from_args"
+    ]
+    assert helper_calls, "_policy_from_args no longer calls _reorg_cost_from_args — this derivation has broken"
+    in_branch = {id(n) for n in ast.walk(branch)}
+    assert all(id(c) in in_branch for c in helper_calls), (
+        "_reorg_cost_from_args is now called outside the --measured branch; its argument reads can "
+        "no longer be attributed to that branch alone"
+    )
+    helper = next(
+        n
+        for n in ast.walk(ast.parse(_RUN_PY.read_text()))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_reorg_cost_from_args"
+    )
+
+    inside = _args_attribute_reads(*branch.body, helper)
+    outside = _args_attribute_reads(*rest, *branch.orelse)
+    return inside - outside - {"measured"}
+
+
+def test_the_measured_only_flag_list_matches_the_code_both_ways():
+    """The tell is a tuple of names near the top of a file; this is what produces that list.
+
+    Both directions: a knob wired into the measured branch and left off the tuple is silently
+    dropped again on the estimated branch (the original defect), and a name on the tuple the
+    measured branch no longer reads is a refusal with nothing behind it.
+    """
+    derived = _derived_measured_only_flags()
+    assert derived, "the derivation found no measured-only flags — it has stopped running"
+    listed = set(run_module._MEASURED_ONLY_POLICY_FLAGS)
+    assert listed == derived, (
+        f"_MEASURED_ONLY_POLICY_FLAGS is stale: missing {sorted(derived - listed)}, extra {sorted(listed - derived)}"
+    )
+
+
+def test_the_two_flags_the_review_found_are_in_that_set():
+    """Non-vacuity, named. A derivation that returned the wrong set would still satisfy the
+    equality above, because the tuple would have been written from the same wrong derivation."""
+    assert {"rxd_claim_inclusion", "burial_safety_factor"} <= set(run_module._MEASURED_ONLY_POLICY_FLAGS)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--rxd-claim-inclusion", "5"),
+        ("--burial-safety-factor", "3"),
+        ("--margin-blocks", "100"),
+        ("--btc-reorg-depth", "12"),
+        ("--rxd-claim-burial", "9"),
+        ("--rxd-reorg-cost-per-block", "1000"),
+        ("--rxd-block-interval-s", "240"),
+        ("--rxd-block-interval-fast-s", "36"),
+    ],
+)
+def test_a_policy_flag_without_measured_is_refused_not_dropped(flag, value):
+    from pyrxd.security.errors import ValidationError
+
+    with pytest.raises(ValidationError) as e:
+        _policy_from_args(_parse_args(["--records-dir", "/tmp/x", flag, value]))
+    assert flag in str(e.value)
+
+
+def test_the_plain_estimated_tower_still_starts():
+    """THE HONEST PATH, paired with every refusal above: the default alert-only invocation — the
+    one the README documents and the one most towers actually run — is untouched."""
+    p = _policy_from_args(_parse_args(["--records-dir", "/tmp/x"]))
+    assert p.is_measured is False
+    assert p.block_interval_s == 600.0
+
+
+@pytest.mark.parametrize("extra", [[], ["--accept-flat-burial"], ["--block-interval-s", "610"]])
+def test_the_flags_the_estimated_branch_really_carries_are_not_refused(extra):
+    """The other side of the refusal. ``--block-interval-s`` and ``--accept-flat-burial`` DO reach
+    the estimated policy, so refusing them would be a guard refusing valid work."""
+    p = _policy_from_args(_parse_args(["--records-dir", "/tmp/x", *extra]))
+    assert p.block_interval_s == (610.0 if "--block-interval-s" in extra else 600.0)
+    assert p.accept_flat_burial is ("--accept-flat-burial" in extra)
+
+
+def test_the_report_refuses_to_label_a_reserve_the_flag_did_not_set(caplog):
+    """The second layer, and the one that would have caught the original bug at runtime: the
+    provenance label is checked against the policy before it is printed.
+
+    Constructed by hand precisely because ``_policy_from_args`` no longer produces this pairing —
+    the point is that the REPORT cannot assert 'measured, --rxd-claim-inclusion' over a number the
+    flag did not set, whatever hands it that policy.
+    """
+    from pyrxd.security.errors import ValidationError
+
+    shipped_estimate = _policy_from_args(_parse_args([*_MEASURED]))
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        with pytest.raises(ValidationError) as e:
+            _report_claim_reserves(shipped_estimate, requested_inclusion_blocks=5)
+    assert "did not reach the policy" in str(e.value)
+    assert "measured, --rxd-claim-inclusion" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_the_report_prints_when_the_flag_did_take(caplog):
+    """Paired honest path: the check must not stand between a correct run and its report."""
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _report_claim_reserves(_policy("--rxd-claim-inclusion", "5"), requested_inclusion_blocks=5)
+    assert "rxd_claim_inclusion=5 blk (measured, --rxd-claim-inclusion)" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
