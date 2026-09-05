@@ -273,6 +273,19 @@ class GlyphScanner:
             logger.debug("Reveal lookup failed for %s:%d: %s", ref.txid, ref.vout, exc)
             return None
 
+    async def fetch_metadata(self, ref: GlyphRef) -> GlyphMetadata | None:
+        """The mint envelope for ``ref``, read off the chain. ``None`` if it cannot be found.
+
+        Public because a caller may want a token's own metadata without wanting its holder's
+        whole inventory — ``pyrxd glyph timelock-reveal`` needs exactly this, and needs it
+        from the CHAIN rather than from the operator: a CEK checked against a commitment the
+        operator supplied proves only that they typed two matching things.
+
+        Walks commit-output history to find the reveal that carried the envelope; see the
+        module docstring for why ``ref.txid`` alone is not enough.
+        """
+        return await self._fetch_reveal_metadata(ref)
+
     async def _fetch_reveal_metadata(self, ref: GlyphRef) -> GlyphMetadata | None:
         """Find the tx that spent ``ref`` via commit-output history, and parse it."""
         from ..transaction.transaction import Transaction

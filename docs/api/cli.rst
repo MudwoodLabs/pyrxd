@@ -21,6 +21,55 @@ Glyph tokens
 - ``pyrxd glyph dmint-estimate`` — benchmark this machine's SHA256d rate and estimate
   time-to-mint (MEASURED rate, EXACT attempt distribution, PROJECTED ETA — kept apart).
 - ``pyrxd glyph list`` — list the Glyph tokens a wallet holds.
+- ``pyrxd glyph timelock-mint`` / ``timelock-reveal`` — seal content behind a timelock,
+  and later publish the key that opens it. See below.
+
+Timelocked content
+------------------
+
+A TIMELOCK Glyph is an NFT whose payload is encrypted off chain while the envelope carries
+only ``sha256(key)``, an unlock point and an optional hint. The token itself is spendable and
+transferable from the moment it is minted; the timelock gates *visibility*, not ownership.
+
+.. warning::
+
+   **Both of these commands do something that cannot be undone**, and they fail in opposite
+   directions.
+
+   ``timelock-mint`` writes the key and the ciphertext to files, and **nothing on chain
+   carries either**. Lose them and the content is sealed forever — a mint cannot be re-run
+   against the same token. Both output paths are required arguments for that reason, and both
+   files are written before the mint is broadcast.
+
+   ``timelock-reveal`` publishes the key in an OP_RETURN. Once the transaction relays, anyone
+   holding the ciphertext can decrypt it, permanently. There is no unreveal and no second
+   reveal.
+
+- ``pyrxd glyph timelock-mint --content FILE --name NAME --unlock-at N --cek-out PATH
+  --ciphertext-out PATH`` — encrypt ``FILE``, mint an NFT committing to the key, and save both
+  halves. ``--mode block`` (default) reads ``--unlock-at`` as a block height; ``--mode time``
+  reads it as a unix timestamp. ``--recipient KID:HEX64`` wraps the key to an X25519 public
+  key so that party can decrypt **immediately**, without waiting for the reveal; with no
+  recipients the reveal is the only way in. The key file is written with mode ``0600``, and an
+  existing output path is refused rather than overwritten.
+
+- ``pyrxd glyph timelock-reveal REF --cek-file PATH`` — publish the key for the token at
+  ``REF`` (its commit outpoint, the ref ``glyph list`` and ``glyph inspect`` report). The
+  token's mint envelope is fetched **from the chain** and the key is checked against the
+  commitment recorded there, so a key that does not belong to this token is refused before
+  anything is signed — publishing the wrong one would spend the reveal and leave the payload
+  unreadable for good. A reveal before ``--unlock-at`` is refused unless ``--allow-early`` is
+  passed, which the confirmation prompt then says in as many words.
+
+  ``--dry-run`` runs every check, builds and signs the transaction, prints the exact key that
+  would become public and the raw transaction hex, and broadcasts nothing. Use it first.
+
+  The key is taken from a file rather than an option: a 32-byte key typed on a command line
+  lands in shell history. Hex or raw bytes are both accepted.
+
+The read side needs no command of its own — ``pyrxd glyph inspect`` already reports a
+timelocked token's unlock point and hint, and ``pyrxd.is_unlocked`` /
+``pyrxd.get_unlock_remaining`` answer "can I read it yet" for a caller holding a chain view.
 
 Cross-chain swaps
 -----------------

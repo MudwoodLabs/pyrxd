@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     # .encrypted_content is a leaf today (it imports nothing from this package), so a runtime
     # import would not cycle — but this file's convention is annotation-only for intra-package
     # types, and a leaf can grow an import later.
-    from .encrypted_content import TimelockSpec
+    from .encrypted_content import CryptoMetadata, EncryptionMetadata, TimelockSpec
 
 
 class GlyphProtocol(IntEnum):
@@ -345,6 +345,31 @@ class GlyphMetadata:
     # format are mint-side concerns, and surfacing per-recipient key material through the
     # inspect path is not something to do incidentally.
     timelock: TimelockSpec | None = None
+    # CBOR ``crypto`` and the ENCRYPTED form of ``main`` — the WRITE side of the same block
+    # ``timelock`` above reads (#556).
+    #
+    # These exist because the encoder could not carry a commitment at all. ``to_cbor_dict``
+    # emitted no ``crypto`` key under any circumstance, so a mint declaring
+    # ``p = [NFT, ENCRYPTED, TIMELOCK]`` went on chain with no ``crypto.cek_hash`` and no
+    # ``crypto.timelock`` — a token that SAYS it is sealed while carrying nothing a reveal
+    # could ever be checked against. That is not a missing convenience: the CEK commitment is
+    # the only thing that makes a published key verifiable, and a mint cannot be repaired.
+    #
+    # ``encrypted_main`` is a SECOND spelling of ``main`` rather than a widening of it, because
+    # the two are different shapes on the wire. An ordinary glyph's ``main`` is
+    # ``{"t": mime, "b": bytes}`` (:class:`GlyphMedia`); an encrypted glyph's is Photonic's
+    # ``{"type", "hash", "enc", "size", "chunks", "scheme"}``
+    # (:class:`~pyrxd.glyph.encrypted_content.EncryptionMetadata`), which describes the
+    # PLAINTEXT that was encrypted while the ciphertext itself lives off chain. Only one of the
+    # two may be set; ``__post_init__`` refuses both.
+    #
+    # WRITE-SIDE ONLY, deliberately asymmetric with the decoder: ``decode_payload`` fills
+    # ``timelock`` and leaves these ``None``. The per-recipient wraps in ``crypto.recipients``
+    # are key material, and surfacing them through the inspect path is not something to do
+    # incidentally — the note on ``timelock`` above records that decision. A caller that needs
+    # the exact bytes a token was decoded from has ``source_cbor``.
+    encrypted_main: EncryptionMetadata | None = None
+    crypto: CryptoMetadata | None = None
     # The EXACT CBOR these fields were decoded from, when they came off a chain.
     #
     # Carried because decoding is LOSSY and creator-signature verification is not
@@ -459,6 +484,24 @@ class GlyphMetadata:
                 if not isinstance(r, GlyphRef):
                     raise ValidationError(f"{_fname} entries must be GlyphRef, got {type(r).__name__!r}: {r!r}")
             object.__setattr__(self, _fname, tuple(value))
+        # ``main`` and ``encrypted_main`` both encode to the CBOR key ``main``, so setting
+        # both is not an over-specification the encoder can resolve — one of the two would be
+        # dropped silently, and which one depends on statement order in ``to_cbor_dict``. For
+        # an encrypted mint the dropped field decides whether the token carries the plaintext
+        # hash a recipient needs to decrypt, so it is refused here rather than resolved.
+        #
+        # Nothing else about the encrypted block is required here on purpose. A metadata
+        # object carrying TIMELOCK with no ``crypto`` is still constructible, because
+        # ``decode_payload`` builds exactly that for every timelocked token it reads off the
+        # chain: the decoder must stay permissive on third-party data. The mint path is where
+        # a missing commitment is fatal, and :func:`pyrxd.glyph.timelock.build_timelock_mint`
+        # is the entry point that makes it unrepresentable there.
+        if self.main is not None and self.encrypted_main is not None:
+            raise ValidationError(
+                "main and encrypted_main both encode to the CBOR 'main' key — set one. "
+                "Use `main` for an ordinary glyph (mime type + embedded bytes) and "
+                "`encrypted_main` for an ENCRYPTED one (plaintext hash + AEAD scheme)."
+            )
 
     def to_cbor_dict(self) -> dict:
         """Build the dict that gets CBOR-encoded (excluding 'gly' marker)."""
@@ -476,6 +519,10 @@ class GlyphMetadata:
             d["type"] = self.token_type
         if self.main:
             d["main"] = {"t": self.main.mime_type, "b": self.main.data}
+        if self.encrypted_main is not None:
+            # Photonic's shape, not GlyphMedia's — see the field comment. ``__post_init__``
+            # has already refused the case where both are set, so this cannot overwrite.
+            d["main"] = self.encrypted_main.to_dict()
         if self.attrs:
             d["attrs"] = self.attrs
         if self.loc:
@@ -504,6 +551,13 @@ class GlyphMetadata:
             rights_d = self.rights.to_cbor_dict()
             if rights_d:
                 d["rights"] = rights_d
+        if self.crypto is not None:
+            # The commitment, the key format and (when the mint wraps to recipients) the
+            # per-recipient wraps. ``crypto.timelock`` inside it is what
+            # :func:`pyrxd.glyph.payload.decode_payload` reads back and what
+            # :func:`pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal` checks a published
+            # CEK against — so this line is the reason a reveal is verifiable at all.
+            d["crypto"] = self.crypto.to_dict()
         if self.created:
             d["created"] = self.created
         if self.commit_outpoint:

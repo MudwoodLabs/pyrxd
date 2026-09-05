@@ -9,6 +9,8 @@ Commands:
   glyph transfer-ft     FT transfer with conservation enforcement.
   glyph airdrop-ft      One-tx FT distribution to many recipients.
   glyph transfer-nft    NFT singleton transfer.
+  glyph timelock-mint   Seal content behind a timelock and mint the NFT.
+  glyph timelock-reveal Publish the key for a timelocked token (irreversible).
   glyph list            Scan wallet addresses for Glyph holdings.
 
 Design choices that follow the v0.3 plan:
@@ -1747,6 +1749,18 @@ glyph_group.add_command(inspect_cmd)
 # ``claim-dmint`` reuses all live in ``glyph_estimate``.
 glyph_group.add_command(dmint_estimate_cmd)
 
+# ---------------------------------------------------------------------------
+# timelock-mint / timelock-reveal — the write side of Glyph TIMELOCK (#556)
+# ---------------------------------------------------------------------------
+# Same split again. Imported here rather than at the top of the file because
+# ``glyph_timelock_cmds`` imports ``_mint_nft_inner`` from this module: the mint
+# half is the ordinary two-phase NFT mint with a sealed envelope, and a second
+# copy of that flow is a second place for its fund-safety ordering to drift.
+from .glyph_timelock_cmds import timelock_mint_cmd, timelock_reveal_cmd  # noqa: E402
+
+glyph_group.add_command(timelock_mint_cmd)
+glyph_group.add_command(timelock_reveal_cmd)
+
 
 # ---------------------------------------------------------------------------
 # deploy-dmint (V1 dMint contract genesis)
@@ -2777,6 +2791,8 @@ __all__ = [
     "inspect_cmd",
     "list_cmd",
     "mint_nft_cmd",
+    "timelock_mint_cmd",
+    "timelock_reveal_cmd",
     "transfer_ft_cmd",
     "transfer_nft_cmd",
 ]

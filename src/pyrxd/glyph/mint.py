@@ -944,6 +944,24 @@ class GlyphMinter:
         # already rejects that combination (and the co-protocol requirements that make
         # [NFT, DMINT] and bare [WAVE] unconstructable), so a second check would be
         # unreachable code pretending to be a guard.
+        #
+        # A TIMELOCK mint must carry the commitment it will be revealed against (#556).
+        #
+        # This is checked HERE, inside the operation that broadcasts, rather than in
+        # `GlyphMetadata.__post_init__`, because the two directions of this field are not
+        # symmetric. `decode_payload` builds exactly this object — TIMELOCK marked, `crypto`
+        # empty — for every timelocked token it reads off the chain, and the read path has to
+        # stay permissive about third-party data. Minting one is the case with no defence:
+        # `crypto.timelock.cek_hash` is the only thing a published CEK can ever be checked
+        # against, a mint cannot be amended, and the failure is silent — the token looks
+        # sealed, the operator holds a CEK, and the reveal is unverifiable by anyone.
+        if GlyphProtocol.TIMELOCK in protocol and getattr(metadata.crypto, "timelock", None) is None:
+            raise ValidationError(
+                f"{method} refuses a TIMELOCK mint with no crypto.timelock: the CBOR would carry "
+                "the marker and no CEK commitment, so nothing on chain could ever verify the "
+                "reveal. Build it with pyrxd.glyph.timelock.build_timelock_mint(...), which "
+                "commits the key hash by construction, or use GlyphClient.mint_timelocked_nft."
+            )
 
     async def _commit(
         self,

@@ -1,10 +1,17 @@
 """Glyph TIMELOCK reveal-transaction primitives (Photonic-compatible).
 
 Mirrors Photonic Wallet's ``packages/lib/src/reveal.ts`` for the
-*proof* / *script* layer. The wrapping transaction (funding inputs +
-change output, signing) is left to pyrxd's existing transaction
-machinery — this module produces the OP_RETURN script bytes that go
-*inside* a reveal tx, plus parser + validator counterparts.
+*proof* / *script* layer: the OP_RETURN script bytes that go *inside* a
+reveal tx, plus parser + validator counterparts.
+
+It also carries the two pieces above that layer, which Photonic has no
+counterpart for because a wallet holds them in its UI:
+:func:`plan_timelock_reveal`, the gate that checks a CEK against the
+token's on-chain commitment and refuses an early reveal, and
+:func:`build_timelock_reveal`, which wraps a checked plan in a funded,
+signed transaction. They live here so that the only way to obtain
+publishable bytes is through the gate — see ``plan_timelock_reveal``'s
+docstring for why that ordering is the point rather than a convenience.
 
 On-chain OP_RETURN format::
 
@@ -42,12 +49,29 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import cbor2
 
 from ..constants import OpCode
+from ..security.errors import ValidationError
 from ..utils import encode_pushdata
-from .timelock import compute_cek_hash, parse_cek_hash
+from .timelock import (
+    _protocols_and_spec,
+    compute_cek_hash,
+    get_unlock_remaining,
+    is_unlocked,
+    parse_cek_hash,
+    verify_cek_reveal,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..transaction.transaction import Transaction
+    from .encrypted_content import EncryptedContentStub
+    from .types import GlyphMetadata
+
+    #: Either shape of Glyph mint metadata — see :func:`pyrxd.glyph.timelock._protocols_and_spec`.
+    TimelockMetadata = EncryptedContentStub | GlyphMetadata
 
 #: Magic bytes prefix on every Glyph OP_RETURN output. "gly" in ASCII.
 GLYPH_MAGIC_BYTES = bytes.fromhex("676c79")
@@ -381,14 +405,358 @@ def validate_reveal_proof(
     return RevealValidation(valid=True, proof=proof)
 
 
+# ──────────────────────────────────────────── the reveal gate ──
+
+
+class CekCommitmentMismatch(ValidationError):
+    """The CEK offered for publication is not the one this token committed to.
+
+    A :class:`~pyrxd.security.errors.ValidationError`, so it lands with everything else
+    raised BEFORE a broadcast. Publishing the wrong key is worse than publishing nothing:
+    the reveal is spent, the payload stays unreadable forever, and there is no second
+    reveal to correct it.
+    """
+
+
+class TimelockNotExpired(ValidationError):
+    """Refusing to publish the CEK before ``unlock_at``.
+
+    Revealing early does not fail — it *works*, and destroys the only property the token
+    exists to provide. It cannot be undone: the key is on a public chain.
+    """
+
+
+@dataclass(frozen=True)
+class TimelockRevealPlan:
+    """Exactly what a reveal would publish, and the checks it already passed.
+
+    Produced by :func:`plan_timelock_reveal`, which raises rather than returning a plan
+    that would be wrong to broadcast — so holding one of these means the CEK matched the
+    on-chain commitment and (unless ``early_override`` is set) the timelock has expired.
+
+    ``cek`` is not a field. It is in ``proof.cek`` because that IS the published payload,
+    and hiding it in a structure whose whole purpose is to show the operator what goes on
+    chain would be theatre.
+    """
+
+    token_ref: str
+    op_return_script: bytes
+    proof: RevealProof
+    #: The ``"sha256:<hex>"`` the mint committed to, and what ``cek`` was checked against.
+    commitment: str
+    mode: str
+    unlock_at: int
+    #: ``True`` when the caller's clock says the lock has expired.
+    unlocked: bool
+    #: Blocks (mode ``"block"``) or seconds (mode ``"time"``) still to go. 0 when unlocked.
+    remaining: int
+    #: ``True`` when this plan was built for a still-locked token because the operator
+    #: passed ``allow_early``. Carried so the confirmation prompt can say so.
+    early_override: bool = False
+
+
+def plan_timelock_reveal(
+    metadata: TimelockMetadata,
+    *,
+    token_ref: str,
+    cek: bytes,
+    current_block: int | None = None,
+    current_time: int | None = None,
+    hint: str = "",
+    allow_early: bool = False,
+) -> TimelockRevealPlan:
+    """Check a reveal against the token that is being revealed, then build its script.
+
+    **This is the only supported way to produce a publishable reveal script.**
+    :func:`create_reveal_proof` builds a proof from a CEK and a ref alone; it cannot check
+    either against the token, because it is never given the token. That is the whole gap:
+    both permanent mistakes on this path are invisible to a function that only sees the key.
+
+    * A CEK that is not the one committed to. ``create_reveal_proof`` happily emits a
+      self-consistent proof for any 32 bytes — ``sha256(cek) == proof.cek_hash`` holds for
+      the wrong key just as well as the right one. Only the mint's ``crypto.timelock``
+      says which key was right, so the comparison has to happen where the metadata is.
+    * A reveal published before ``unlock_at``, which does not fail. It succeeds, and the
+      sealed content is public years early.
+
+    So the checks are here, in the function that returns the bytes, rather than beside it in
+    a caller that has to remember them. Every entry point that can broadcast a reveal —
+    ``GlyphClient.build_timelock_reveal``, ``GlyphClient.reveal_timelock`` and
+    ``pyrxd glyph timelock-reveal`` — goes through this, and none of them takes a
+    pre-built script.
+
+    The script this returns is then parsed back with :func:`parse_reveal_proof_script` and
+    run through :func:`validate_reveal_proof` against the same commitment, so what is
+    checked is the bytes that will actually be published rather than the object they were
+    built from.
+
+    Args:
+        metadata: the token's mint metadata — either shape (see
+            :func:`pyrxd.glyph.timelock._protocols_and_spec`). ``decode_payload`` on the
+            mint's CBOR gives you one; ``build_timelock_mint`` gives you the other.
+        token_ref: ``"<64-hex txid>:<vout>"`` of the token being revealed.
+        cek: the 32-byte key to publish.
+        current_block: chain tip, for a ``mode="block"`` lock.
+        current_time: unix seconds, for a ``mode="time"`` lock.
+        hint: optional operator note carried in the proof.
+        allow_early: publish anyway, before ``unlock_at``. The refusal exists because the
+            mistake is unrepairable, not because early reveal is never wanted — a seller
+            who decides to open a sealed lot early has honest work to do here. It must be
+            asked for explicitly, and the returned plan records that it was.
+
+    Raises:
+        TimelockNotExpired: the lock has not expired (or cannot be judged, because the
+            clock for its mode was not supplied) and ``allow_early`` is False.
+        CekCommitmentMismatch: ``sha256(cek)`` is not the token's committed hash.
+        ~pyrxd.security.errors.ValidationError: the metadata carries no timelock spec to
+            check against, or the proof this function built does not validate.
+    """
+    protocols, spec = _protocols_and_spec(metadata)
+    if spec is None:
+        raise ValidationError(
+            "this metadata carries no crypto.timelock, so there is no commitment to check a "
+            "CEK against. Revealing against it would publish a key nothing on chain can "
+            f"verify. Protocol markers: {list(protocols)!r}"
+        )
+
+    # CHECK THE KEY FIRST, before the clock. Both refusals matter, but a wrong CEK is the
+    # one an operator cannot detect from the output — an early reveal at least publishes a
+    # key that works.
+    if not verify_cek_reveal(cek, spec.cek_hash):
+        raise CekCommitmentMismatch(
+            "this CEK does not match the token's on-chain commitment "
+            f"({spec.cek_hash}). Publishing it would spend the reveal and leave the payload "
+            "permanently unreadable — the commitment cannot be changed and there is no "
+            "second reveal. Check that you loaded the CEK saved for THIS token."
+        )
+
+    unlocked = is_unlocked(metadata, current_block=current_block, current_time=current_time)
+    remaining = get_unlock_remaining(metadata, current_block=current_block, current_time=current_time)
+    if not unlocked and not allow_early:
+        clock = "current_block" if spec.mode == "block" else "current_time"
+        supplied = current_block if spec.mode == "block" else current_time
+        detail = (
+            f"{remaining:,} {'blocks' if spec.mode == 'block' else 'seconds'} remaining"
+            if supplied is not None
+            else f"no {clock} was supplied, so the lock cannot be judged"
+        )
+        raise TimelockNotExpired(
+            f"this token unlocks at {spec.unlock_at} ({spec.mode}) and {detail}. Publishing "
+            "the CEK now destroys the timelock permanently — it is on a public chain the "
+            "moment the transaction relays. Pass allow_early=True (CLI: --allow-early) if "
+            "that is genuinely what you want."
+        )
+
+    script, _proof = create_reveal_proof(token_ref, cek, hint=hint, cek_hash_override=spec.cek_hash)
+
+    # Re-parse and validate THE BYTES, not the object they came from. `create_reveal_proof`
+    # returns both; checking the object would prove the dataclass agrees with itself, which
+    # nothing has ever doubted. What matters is that the script an indexer will read decodes
+    # to a proof that validates against this token's commitment.
+    reparsed = parse_reveal_proof_script(script)
+    if reparsed is None:  # pragma: no cover - unreachable unless the encoder breaks
+        raise ValidationError(
+            "the reveal script this build produced does not parse back as a reveal proof; "
+            "refusing to broadcast bytes we cannot read ourselves"
+        )
+    verdict = validate_reveal_proof(reparsed, expected_token_ref=token_ref, expected_cek_hash=spec.cek_hash)
+    if not verdict.valid:  # pragma: no cover - unreachable unless the encoder breaks
+        raise ValidationError(f"the reveal proof this build produced does not validate: {verdict.error}")
+
+    return TimelockRevealPlan(
+        token_ref=token_ref,
+        op_return_script=script,
+        proof=reparsed,
+        commitment=spec.cek_hash,
+        mode=spec.mode,
+        unlock_at=spec.unlock_at,
+        unlocked=unlocked,
+        remaining=remaining,
+        early_override=not unlocked,
+    )
+
+
+# ─────────────────────────────────────── the reveal transaction ──
+
+
+#: Modelled bytes of a reveal transaction WITHOUT its OP_RETURN script, that script's length
+#: varint, and any change output.
+#:
+#: ``4`` version + ``1`` input count + (``36`` outpoint + ``1`` script varint + ``107``
+#: unlocking script + ``4`` sequence) + ``1`` output count + ``8`` value + ``4`` locktime
+#: = **166**. ``107`` is :meth:`P2PKH.unlock`'s ``estimated_unlocking_byte_length`` and is an
+#: upper bound on this template (the real script is 105-107 B), so this models the largest
+#: transaction the builder can produce.
+TIMELOCK_REVEAL_MODELLED_BYTES = 166
+
+
+def timelock_reveal_funding_bar(op_return_script: bytes, fee_rate: int) -> int:
+    """Photons a plain-RXD UTXO must hold to fund one reveal, at *fee_rate*.
+
+    Modelled on the **no-change** shape, for the reason
+    :func:`pyrxd.glyph.transfer.nft_transfer_funding_bar` documents: ``Transaction.fee``
+    drops the change output when the funding cannot also cover it, so the smallest UTXO
+    that works is the one paying for the ONE-output transaction. Sizing against the larger
+    shape refuses funding that would in fact relay.
+
+    A reveal's OP_RETURN is large by data-carrier standards — 263 B with no hint, more with
+    one — so its length varint is sized here rather than assumed to be one byte.
+    """
+    from ..fee_sizing import required_fee
+
+    script_len = len(op_return_script)
+    len_varint = 1 if script_len < 0xFD else 3
+    return required_fee(TIMELOCK_REVEAL_MODELLED_BYTES + len_varint + script_len, fee_rate)
+
+
+@dataclass(frozen=True)
+class TimelockRevealBuild:
+    """A signed, un-broadcast reveal transaction.
+
+    :param tx: the signed transaction
+    :param fee: photons paid, from the plain-RXD funding input
+    :param plan: the checked :class:`TimelockRevealPlan` these bytes were built from —
+        carried so a confirmation prompt can show what is about to become public without
+        re-deriving it
+    :param from_address: the wallet address that funded the reveal
+    :param has_change: ``False`` when the whole funding UTXO became the fee
+    """
+
+    tx: Transaction
+    fee: int
+    plan: TimelockRevealPlan
+    from_address: str
+    has_change: bool
+
+    def serialize(self) -> bytes:
+        """Raw transaction bytes, ready for ``await client.broadcast(...)``."""
+        return bytes(self.tx.serialize())
+
+
+async def build_timelock_reveal(
+    wallet: Any,
+    plan: TimelockRevealPlan,
+    *,
+    client: Any,
+    fee_rate: int,
+    allow_overpay: bool = False,
+    allow_below_relay_floor: bool = False,
+) -> TimelockRevealBuild:
+    """Wrap a checked reveal plan in a funded, signed transaction. Does not broadcast.
+
+    Takes a :class:`TimelockRevealPlan`, never a raw script. That is the whole reason the
+    argument is typed this way: a plan can only come from :func:`plan_timelock_reveal`, so
+    the CEK-against-commitment check and the unlock gate are already behind any transaction
+    this function can produce. A ``script: bytes`` parameter would have let a caller skip
+    both and still get signed bytes back.
+
+    The reveal publishes data, not value: output 0 is the OP_RETURN at value 0 and the fee
+    comes from one plain-RXD input, with change returning to the funding address.
+    :func:`~pyrxd.glyph.transfer.find_plain_rxd_utxo` verifies each candidate's **on-chain**
+    script is a bare P2PKH, so a token-bearing UTXO is never spent here — burning an NFT to
+    publish a key about a different token would be a memorable way to close this issue.
+
+    Raises:
+        ~pyrxd.security.errors.InsufficientFundsError: no plain-RXD UTXO large enough.
+            Raised before anything is signed.
+        ~pyrxd.security.errors.ValidationError: the fee rate is out of bounds, or the signed
+            transaction does not pay for its own size.
+    """
+    from ..fee_models import SatoshisPerKilobyte
+    from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
+    from ..script.script import Script
+    from ..script.type import P2PKH
+    from ..transaction.transaction import Transaction
+    from ..transaction.transaction_input import TransactionInput
+    from ..transaction.transaction_output import TransactionOutput
+    from .transfer import NoFeeFundingError, find_plain_rxd_utxo
+
+    assert_fee_rate_clears_relay_floor(
+        fee_rate,
+        what="build_timelock_reveal",
+        allow_overpay=allow_overpay,
+        allow_below_relay_floor=allow_below_relay_floor,
+        error_type=ValidationError,
+    )
+
+    script = plan.op_return_script
+    needed = timelock_reveal_funding_bar(script, fee_rate)
+    triples = await wallet.collect_spendable(client)
+    fund = await find_plain_rxd_utxo(triples, client, exclude=set(), needed=needed)
+    if fund is None:
+        raise NoFeeFundingError(
+            f"no plain-RXD UTXO large enough to fund the timelock reveal — need at least "
+            f"{needed:,} photons on a single non-token UTXO (~{TIMELOCK_REVEAL_MODELLED_BYTES + len(script)} B "
+            f"at {fee_rate:,} photons/B). The reveal carries a {len(script)}-byte OP_RETURN."
+        )
+    fund_utxo, fund_addr, fund_key = fund
+    fund_spk = P2PKH().lock(fund_addr)
+
+    def _shim(vout: int, locking: Script, value: int, txid: str) -> Transaction:
+        """A stand-in parent tx so preimage computation can index ``outputs[vout]``.
+
+        Same shim as :func:`pyrxd.glyph.transfer.build_nft_transfer` uses, and for the same
+        reason: only the txid and the output at ``vout`` are real.
+        """
+        outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]
+        outs.append(TransactionOutput(locking, value))
+        src = Transaction(tx_inputs=[], tx_outputs=outs)
+        src.txid = lambda: txid  # type: ignore[method-assign]
+        return src
+
+    fund_input = TransactionInput(
+        source_transaction=_shim(fund_utxo.tx_pos, fund_spk, fund_utxo.value, fund_utxo.tx_hash),
+        source_txid=fund_utxo.tx_hash,
+        source_output_index=fund_utxo.tx_pos,
+        unlocking_script_template=P2PKH().unlock(fund_key),
+    )
+    fund_input.satoshis = fund_utxo.value
+    fund_input.locking_script = fund_spk
+
+    tx = Transaction(
+        tx_inputs=[fund_input],
+        tx_outputs=[
+            TransactionOutput(Script(script), 0),  # the reveal proof — value 0, unspendable
+            TransactionOutput(fund_spk, 0, change=True),
+        ],
+    )
+    tx.fee(SatoshisPerKilobyte(fee_rate * 1000))  # type: ignore[no-untyped-call]
+    tx.sign()
+
+    raw = tx.serialize()
+    fee_paid = tx.get_fee()
+    assert_pays_for_its_size(
+        size_bytes=len(raw),
+        fee_paid=fee_paid,
+        fee_rate=fee_rate,
+        what="the timelock reveal",
+        error_type=ValidationError,
+    )
+    return TimelockRevealBuild(
+        tx=tx,
+        fee=fee_paid,
+        plan=plan,
+        from_address=fund_addr,
+        has_change=len(tx.outputs) > 1,
+    )
+
+
 __all__ = [
     "GLYPH_MAGIC_BYTES",
     "REVEAL_ACTION",
     "REVEAL_MARKER",
     "REVEAL_VERSION",
+    "TIMELOCK_REVEAL_MODELLED_BYTES",
+    "CekCommitmentMismatch",
     "RevealProof",
     "RevealValidation",
+    "TimelockNotExpired",
+    "TimelockRevealBuild",
+    "TimelockRevealPlan",
+    "build_timelock_reveal",
     "create_reveal_proof",
     "parse_reveal_proof_script",
+    "plan_timelock_reveal",
+    "timelock_reveal_funding_bar",
     "validate_reveal_proof",
 ]

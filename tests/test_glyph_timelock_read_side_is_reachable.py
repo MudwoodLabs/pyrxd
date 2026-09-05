@@ -10,8 +10,9 @@ So this file drives the whole path — CBOR bytes in, verdict out — rather tha
 and calling the helper with it. A test that constructs the input by hand proves the mechanism; the
 mechanism was never in doubt.
 
-THE MINT AND REVEAL BUILDERS ARE STILL UNWIRED, deliberately. They publish a CEK on-chain and have
-never had a production caller or a real-value run. #556 stays open for that half.
+THE MINT AND REVEAL BUILDERS ARE NOW WIRED TOO, on the maintainer's decision (#556, 2026-09-01:
+"WIRE it"). `tests/test_glyph_timelock_write_side_is_reachable.py` covers that half; what survives
+here is the one export line that half did NOT take, pinned below.
 """
 
 from __future__ import annotations
@@ -126,12 +127,42 @@ class TestTheInspectSurfaceSaysWHENItOpens:
         assert "is_unlocked" in src, "the human output should name the helper that answers it"
 
 
-class TestTheMintAndRevealHalfIsStillNotExported:
-    """#556 stays open for that half, and this pins the decision so it is not quietly reversed."""
+class TestOnlyTheGuardedRevealDoorIsExported:
+    """This class used to assert the whole write side was absent from `pyrxd.__all__`, because it
+    was unwired: it published a CEK on-chain with no production caller and no real-value run, and
+    exporting a workflow nothing reaches would have restated #556 rather than closing it.
 
-    @pytest.mark.parametrize("name", ["build_timelock_mint", "create_reveal_proof", "validate_reveal_proof"])
-    def test_the_write_side_is_absent_from_the_top_level(self, name: str) -> None:
-        assert name not in pyrxd.__all__, (
-            f"{name} publishes a CEK on-chain and has never had a production caller or a real-value "
-            "run. Exporting a workflow nothing reaches restates #556 rather than closing it."
+    THE MAINTAINER DECIDED TO WIRE IT (#556, 2026-09-01), so that assertion is gone — kept as this
+    paragraph rather than deleted, because a pinning test removed without a replacement is how a
+    reasoned decision disappears. `build_timelock_mint`, `plan_timelock_reveal`,
+    `parse_reveal_proof_script` and `validate_reveal_proof` are now exported and reached from
+    `GlyphClient` and two CLI commands; `tests/test_glyph_timelock_write_side_is_reachable.py`
+    proves the reaching.
+
+    WHAT SURVIVES IS THE NARROWER DECISION, and it is the part with teeth. `create_reveal_proof`
+    stays unexported. It builds a publishable OP_RETURN from a CEK and a token ref alone and is
+    never handed the token, so it cannot check the key against the on-chain commitment and cannot
+    know whether the lock has expired — and both of those mistakes are permanent. Publishing the
+    wrong key spends the reveal and leaves the payload unreadable forever; publishing the right key
+    early destroys the timelock for everyone. `plan_timelock_reveal` is the same capability with
+    both checks inside it, so exporting the unguarded door beside the guarded one would hand
+    callers a footgun with a shorter name.
+    """
+
+    def test_the_unchecked_proof_builder_is_not_exported(self) -> None:
+        assert "create_reveal_proof" not in pyrxd.__all__, (
+            "create_reveal_proof cannot see the token, so it cannot check the CEK against the "
+            "on-chain commitment or refuse an early reveal — and both mistakes are permanent. "
+            "Export pyrxd.plan_timelock_reveal instead; it is the same capability with both "
+            "checks inside it."
         )
+
+    @pytest.mark.parametrize(
+        "name",
+        ["build_timelock_mint", "plan_timelock_reveal", "parse_reveal_proof_script", "validate_reveal_proof"],
+    )
+    def test_the_guarded_write_side_IS_exported(self, name: str) -> None:
+        """The honest-path half of the pair above: refusing the unchecked builder is only right if
+        the checked one is actually available. A test that asserted the absence and not the
+        presence would pass just as well with the whole feature deleted."""
+        assert name in pyrxd.__all__, f"{name} is the wired write side of #556 and must stay exported"
