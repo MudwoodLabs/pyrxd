@@ -59,9 +59,9 @@ from ..utils import encode_pushdata
 from .timelock import (
     _protocols_and_spec,
     compute_cek_hash,
-    get_unlock_remaining,
-    is_unlocked,
     parse_cek_hash,
+    spec_is_unlocked,
+    spec_unlock_remaining,
     verify_cek_reveal,
 )
 
@@ -453,6 +453,19 @@ class TimelockRevealPlan:
     #: ``True`` when this plan was built for a still-locked token because the operator
     #: passed ``allow_early``. Carried so the confirmation prompt can say so.
     early_override: bool = False
+    #: THE CLOCK READING THE GATE ACTUALLY COMPARED AGAINST — the tip height for a
+    #: ``"block"`` lock, the tip header's unix timestamp for a ``"time"`` one, and ``None``
+    #: when no clock for this spec's mode was supplied.
+    #:
+    #: Carried because the number that decides whether a key becomes public was, until this
+    #: field existed, never shown to anyone. ``GlyphClient.plan_timelock_reveal`` takes it
+    #: from an ElectrumX server, which no part of this SDK authenticates: nothing checks the
+    #: proof of work behind the height, links the header to a known one, or asks a second
+    #: endpoint. A server that overstates the tip therefore decides an irreversible
+    #: publication, and a server that lags refuses an honest holder — and neither shows up in
+    #: ``unlocked`` alone. An operator who can see "tip 812,340" against "opens at 900,000"
+    #: can notice; one shown only "opens at 900,000" cannot.
+    judged_at: int | None = None
 
 
 def plan_timelock_reveal(
@@ -509,7 +522,9 @@ def plan_timelock_reveal(
             clock for its mode was not supplied) and ``allow_early`` is False.
         CekCommitmentMismatch: ``sha256(cek)`` is not the token's committed hash.
         ~pyrxd.security.errors.ValidationError: the metadata carries no timelock spec to
-            check against, or the proof this function built does not validate.
+            check against, the commitment it carries is not a readable ``"sha256:<hex>"``
+            (which a third-party mint can be — the decoder stores that string raw), or the
+            proof this function built does not validate.
     """
     protocols, spec = _protocols_and_spec(metadata)
     if spec is None:
@@ -522,7 +537,36 @@ def plan_timelock_reveal(
     # CHECK THE KEY FIRST, before the clock. Both refusals matter, but a wrong CEK is the
     # one an operator cannot detect from the output — an early reveal at least publishes a
     # key that works.
-    if not verify_cek_reveal(cek, spec.cek_hash):
+    #
+    # `spec.cek_hash` came off a chain and `TimelockSpec.from_dict` stores it as whatever
+    # string was there — the decoder is deliberately permissive about third-party bytes. So
+    # `parse_cek_hash` inside `verify_cek_reveal` can raise a bare ValueError on a token
+    # nobody in this project minted, and a bare ValueError is not in the set the CLI catches:
+    # the operator got a traceback where a refusal belonged. Nothing is broadcast either way,
+    # so this is liveness, not fund safety — but a traceback tells them nothing about which
+    # of their two files was wrong.
+    #
+    # The commitment is parsed on its own rather than inside `verify_cek_reveal`, so that the
+    # message can say which of the two inputs was wrong. Wrapping the whole comparison caught
+    # the short-CEK ValueError from `compute_cek_hash` as well and reported it as a malformed
+    # on-chain commitment — a sentence about the token, produced by a fault in the operator's
+    # key file, which is the worst possible steer at this prompt.
+    try:
+        expected_hash = parse_cek_hash(spec.cek_hash)
+    except ValueError as exc:
+        raise ValidationError(
+            f"this token's on-chain commitment is not a readable sha256 hash ({spec.cek_hash!r}): "
+            f"{exc}. No key can be checked against it, so no reveal can be built — pyrxd did not "
+            "mint this token, and whatever tool did wrote a commitment in a shape the Glyph "
+            "spec does not define."
+        ) from exc
+    if len(cek) != 32:
+        raise ValidationError(
+            f"a Glyph CEK is 32 bytes and this one is {len(cek)}. Nothing was checked against the "
+            "token's commitment, because a key of the wrong length cannot be the one it committed "
+            "to — load the key file this token's mint wrote."
+        )
+    if not verify_cek_reveal(cek, expected_hash):
         raise CekCommitmentMismatch(
             "this CEK does not match the token's on-chain commitment "
             f"({spec.cek_hash}). Publishing it would spend the reveal and leave the payload "
@@ -530,16 +574,38 @@ def plan_timelock_reveal(
             "second reveal. Check that you loaded the CEK saved for THIS token."
         )
 
-    unlocked = is_unlocked(metadata, current_block=current_block, current_time=current_time)
-    remaining = get_unlock_remaining(metadata, current_block=current_block, current_time=current_time)
+    # JUDGE THE LOCK FROM `spec`, NOT FROM THE PROTOCOL MARKER. `is_unlocked` answers a
+    # different question — "is this token's content readable" — and for a token with no
+    # TIMELOCK marker its honest answer is True, because nothing is sealed. Asking it here
+    # made the gate fail OPEN on the one shape that matters: an envelope carrying
+    # `crypto.timelock` while omitting 9 from `p` got past the `spec is None` check above,
+    # came back unlocked=True from a marker that was not there, and published the key with
+    # `early_override` False — so the CLI's `*** EARLY REVEAL` banner, keyed on that same
+    # boolean, stayed silent too. `decode_payload` builds exactly that object: it fills
+    # `timelock` from `d["crypto"]["timelock"]` without consulting `d["p"]` at all.
+    #
+    # It does NOT refuse the marker-less shape. A holder of a token some other tool minted
+    # has honest work to do here once its unlock_at has passed, and refusing them would be
+    # its own defect. The spec is simply what gets judged.
+    unlocked = spec_is_unlocked(spec, current_block=current_block, current_time=current_time)
+    remaining = spec_unlock_remaining(spec, current_block=current_block, current_time=current_time)
+    supplied = current_block if spec.mode == "block" else current_time if spec.mode == "time" else None
     if not unlocked and not allow_early:
-        clock = "current_block" if spec.mode == "block" else "current_time"
-        supplied = current_block if spec.mode == "block" else current_time
-        detail = (
-            f"{remaining:,} {'blocks' if spec.mode == 'block' else 'seconds'} remaining"
-            if supplied is not None
-            else f"no {clock} was supplied, so the lock cannot be judged"
-        )
+        if spec.mode not in ("block", "time"):
+            # Not "no current_time was supplied" — that message names a fix that does not
+            # exist for this token and sends the operator looking for a clock they already
+            # passed. The mode is the problem.
+            detail = (
+                f"its mode {spec.mode!r} is not one this SDK can judge (the Glyph spec "
+                "defines 'block' and 'time'), so the lock cannot be evaluated at all"
+            )
+        elif supplied is None:
+            clock = "current_block" if spec.mode == "block" else "current_time"
+            detail = f"no {clock} was supplied, so the lock cannot be judged"
+        else:
+            detail = (
+                f"{remaining:,} {'blocks' if spec.mode == 'block' else 'seconds'} remaining (clock read: {supplied:,})"
+            )
         raise TimelockNotExpired(
             f"this token unlocks at {spec.unlock_at} ({spec.mode}) and {detail}. Publishing "
             "the CEK now destroys the timelock permanently — it is on a public chain the "
@@ -573,6 +639,7 @@ def plan_timelock_reveal(
         unlocked=unlocked,
         remaining=remaining,
         early_override=not unlocked,
+        judged_at=supplied,
     )
 
 

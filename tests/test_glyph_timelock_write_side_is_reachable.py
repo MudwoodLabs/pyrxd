@@ -661,6 +661,8 @@ class TestTheMintCommandRefusesToClobberAKeyFile:
                 str(existing),
                 "--ciphertext-out",
                 str(tmp_path / "ct.json"),
+                "--envelope-out",
+                str(tmp_path / "env.cbor"),
             ],
         )
         assert result.exit_code == 1

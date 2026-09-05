@@ -19,7 +19,8 @@ one-line fix rather than failing later.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import inspect
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..fee_sizing import assert_fee_rate_clears_relay_floor
@@ -716,6 +717,7 @@ class GlyphClient:
         content_type: str,
         plaintext: bytes,
         params: TimelockParams,
+        persist: Callable[[TimelockMintBuild], Any] | None = None,
         cek: bytes | None = None,
         recipients: Sequence[TimelockRecipient] = (),
         locator: str | None = None,
@@ -728,18 +730,52 @@ class GlyphClient:
         with ``chunked-aead-v1``, the key's SHA-256 goes on chain as ``crypto.timelock``, and
         the key comes back to the caller.
 
-        **The returned CEK and ciphertext are not recoverable from the chain.** The mint
-        carries a commitment to the key and a hash of the plaintext, nothing more. Persist
-        both halves of the receipt before doing anything else with it; a mint cannot be
+        **The CEK and ciphertext are not recoverable from the chain.** The mint carries a
+        commitment to the key and a hash of the plaintext, nothing more; a mint cannot be
         re-run and there is no path from ``sha256(cek)`` back to ``cek``.
 
-        See :func:`~pyrxd.glyph.timelock.build_timelock_mint` for the arguments. ``owner_pkh``
-        behaves as it does on :meth:`mint_nft`, defaulting to the funding key's own hash.
+        **KEY CUSTODY HAS TO PRECEDE THE COMMIT, so this method makes you say how.** Supply
+        either ``persist`` — called with the :class:`~pyrxd.glyph.timelock.TimelockMintBuild`
+        after the envelope is built and **before a single byte is broadcast** — or ``cek``,
+        a key you already hold. With neither, this raises before touching the network.
+
+        The refusal is not pedantry about defaults. Generating the key inside a call that
+        then blocks on confirmation put the only copy of it in a local variable for as long
+        as a Radiant block takes: a ``NetworkError``, a ``ConfirmationTimeoutError``, a
+        cancellation or a kill in that window and the receipt is never constructed, while
+        the pending store holds a resumable commit whose CBOR commits to ``sha256(cek)``.
+        The documented recovery — :meth:`reveal_nft` on that pending mint — then succeeds,
+        and mints a token nobody can ever open. The advice this docstring used to give
+        instead ("persist both halves of the receipt before doing anything else with it")
+        is advice a caller cannot act on: the receipt does not exist until after the window
+        has closed. ``pyrxd glyph timelock-mint`` never had this problem because it writes
+        its files before broadcasting; the hook is that ordering, for the SDK.
+
+        ``persist`` may be sync or async, and anything it raises propagates with nothing
+        broadcast. The build it receives carries ``cek``, ``ciphertext``, ``cek_hash``,
+        ``stub`` and ``metadata`` — and ``metadata`` is worth saving too: a commit that
+        confirms while its reveal does not is spendable only by a reveal pushing
+        byte-identical CBOR, which a build with ``recipients`` cannot reproduce.
+
+        See :func:`~pyrxd.glyph.timelock.build_timelock_mint` for the rest of the arguments.
+        ``owner_pkh`` behaves as it does on :meth:`mint_nft`, defaulting to the funding key's
+        own hash.
 
         Raises:
-            ~pyrxd.security.errors.ValidationError: no store was configured (minting needs
-                one), or the parameters were refused. Raised before anything is broadcast.
+            ~pyrxd.security.errors.ValidationError: neither ``persist`` nor ``cek`` was
+                given, no store was configured (minting needs one), or the parameters were
+                refused. Raised before anything is broadcast.
         """
+        if persist is None and cek is None:
+            raise ValidationError(
+                "mint_timelocked_nft needs somewhere to put the key BEFORE it commits anything. "
+                "Pass persist=<callable> — it is handed the TimelockMintBuild (cek, ciphertext, "
+                "metadata) before the first broadcast — or pass cek=<32 bytes> you already hold. "
+                "Without one of those, the generated key exists only inside this call while it "
+                "waits for a confirmation, and a failure there leaves a resumable commit whose "
+                "reveal would mint a token no one can ever open: there is no path from "
+                "sha256(cek) back to cek."
+            )
         build = self.build_timelock_mint(
             name=name,
             content_type=content_type,
@@ -749,6 +785,13 @@ class GlyphClient:
             recipients=recipients,
             locator=locator,
         )
+        # BEFORE the mint, not after. This is the whole point of the parameter; awaiting it
+        # here means a persist that raises stops the mint, which is the correct direction —
+        # an un-saved key is a reason not to broadcast.
+        if persist is not None:
+            outcome = persist(build)
+            if inspect.isawaitable(outcome):
+                await outcome
         result = await self.mint_nft(build.metadata, owner_pkh=owner_pkh)
         return TimelockMintReceipt(
             mint=result,
@@ -777,11 +820,29 @@ class GlyphClient:
 
         * ``mode="block"`` — the tip height from ``get_tip_height()``.
         * ``mode="time"`` — the **timestamp in the tip block's header**, not this process's
-          wall clock. A local clock can be wrong by any amount and nothing would say so;
-          the chain's is at least the clock the lock was written against. It is not exact —
-          a block's timestamp may run ahead of real time under consensus rules — so this is
-          a gate against the obvious mistake, not a substitute for the operator knowing
-          what they are publishing.
+          wall clock. A local clock can be wrong by any amount and nothing would say so,
+          and the header timestamp is at least the unit the lock was written in. It is not
+          exact — a block's timestamp may run ahead of real time under consensus rules — so
+          this is a gate against the obvious mistake, not a substitute for the operator
+          knowing what they are publishing.
+
+        **The clock is the SERVER'S, and this SDK does not authenticate it.** Neither read
+        is verified: ``get_tip_height`` checks only that a non-negative integer came back
+        and ``get_block_header`` only that 80 bytes did. Nothing checks the proof of work
+        behind that height, links the header to one already known, or asks a second
+        endpoint — and pyrxd's default endpoints are third-party public servers. So an
+        endpoint that overstates the tip obtains a permanent early reveal from a gate that
+        reports itself satisfied, and one that merely lags refuses an honest holder past
+        ``unlock_at``. Calling this "the chain's clock" would be the more reassuring
+        sentence and it would not be true: it is one server's claim about the chain.
+
+        What the reveal path does with that is show it. The returned plan carries
+        :attr:`~pyrxd.glyph.timelock_reveal_tx.TimelockRevealPlan.judged_at` — the reading
+        actually compared against — and ``pyrxd glyph timelock-reveal`` prints it beside
+        ``opens at`` in the confirmation prompt, so the operator can disagree with a number
+        that would otherwise never have been on screen. An SDK caller who needs more than
+        that should pass a clock they trust to
+        :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal` directly.
 
         Everything the plan is checked for happens in the underlying function; see its
         docstring. This adds only the clock.
