@@ -124,9 +124,7 @@ def test_the_correct_direction_is_stated_somewhere() -> None:
     """The other half. A file could pass above by saying nothing at all, so pin that the spec
     positively teaches the safe relation rather than merely avoiding the unsafe sentence."""
     spec = (_ROOT / "docs/htlc-handshake-wire-format.md").read_text()
-    forward = [
-        m for m in _CLAIM.finditer(spec) if m.group("left") == "t_rxd" and m.group("right") == "t_btc"
-    ]
+    forward = [m for m in _CLAIM.finditer(spec) if m.group("left") == "t_rxd" and m.group("right") == "t_btc"]
     assert forward, "the handshake spec must state that t_rxd exceeds t_btc, not merely omit the inverse"
 
 
@@ -139,8 +137,7 @@ class TestTheGuardCanTellUseFromMention:
 
     def test_naming_the_inverted_case_as_broken_is_not_caught(self) -> None:
         assert not _inverted_claims(
-            "**What breaks if it is inverted.** A spec asserting `t_btc` must exceed `t_rxd` "
-            "hands the maker both legs."
+            "**What breaks if it is inverted.** A spec asserting `t_btc` must exceed `t_rxd` hands the maker both legs."
         )
 
     def test_describing_the_old_published_defect_is_not_caught(self) -> None:
