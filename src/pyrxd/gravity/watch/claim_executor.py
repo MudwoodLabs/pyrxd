@@ -508,9 +508,12 @@ class ClaimExecutor:
                 return ExecOutcome.DECLINED, "RXD depth not corroborated by quorum — refusing to auto-claim"
             cov_confs = max(single_node_confs, corro)  # the DEEPER read; a lagging single node can't false-SAFE
         now_rxd = funded_h + max(cov_confs, 1) - 1
-        required_depth = self._policy.btc_claim_reorg_depth.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=self._policy.block_interval_s
-        ).value
+        # ONE CONVERSION, the gate's — see the same note in `swap_coordinator`. `normalize_to`
+        # FLOORS, which under-counts a reserve and would declare the maker's BTC claim final a
+        # block early on the AUTONOMOUS path, where nothing human re-checks it.
+        from ..swap_coordinator import _reserve_to_blocks
+
+        required_depth = _reserve_to_blocks(self._policy.btc_claim_reorg_depth, self._policy.block_interval_s)
         verdict = CounterClaimFinality.from_btc_depth(btc_confs, required_depth)
         try:
             finality = assess_claim_finality(
@@ -643,6 +646,11 @@ class ClaimExecutor:
         # `policy.block_interval_s` — Bitcoin's — and fed the result to
         # `max_protected_value`, so a seconds-tagged burial would have halved the
         # value ceiling this gate exists to enforce.
+        # floor-is-deliberate: the direction REVERSES here. Everywhere else a reserve is a
+        # depth REQUIREMENT and flooring under-counts it. Here burial feeds
+        # `max_protected_value` = burial x cost / factor, so a LARGER burial permits MORE
+        # value — ceiling would raise the ceiling this gate exists to hold down. Flooring is
+        # the conservative direction, and `_reserve_to_blocks` would be wrong at this site.
         burial_blocks = self._policy.rxd_claim_burial.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=self._policy.rxd_block_interval_s
         ).value
