@@ -28,6 +28,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     parent itself) from `DELEGATED` (one step removed) rather than flattening both to
     "backed". Canon (`canon.rxd.zone`), an independent verifier, draws the same
     distinction — read from its `/protocol` rules 2026-09-05.
+  - ⚠️ **A delegate token is a bearer credential for the collection, not one mint.**
+    Measured on a node: the commit transaction that spends a delegate token is under
+    no covenant, so one token was spent into three. Whoever holds one can mint into
+    the collection without limit until the base is retired. Keep them in the minting
+    service; do not distribute them.
+  - ⚠️ **Authority gating is not durable.** Measured: a holder can transfer a gated
+    item to a plain NFT script — same ref, no gate, nobody's permission — and cannot
+    transfer it while KEEPING the gate without the issuer. It IS a real supply cap
+    (minting a second gated item from an existing one is refused), and it is a claim
+    about an item's GENESIS, not a property of a live UTXO. `verify_authority_gate`
+    takes the genesis output for that reason.
+  - `verify_burn` reports `SPENT_AND_ABSENT` vs `ABSENT_ONLY`, and `valid` is True
+    only for the former. Absence from a transaction's outputs is a condition every
+    unrelated transaction satisfies, so without the spent outputs the honest answer
+    is "not established" — including on a transaction that genuinely did burn.
   - **AUTHORITY**: `build_authority_metadata`, `verify_authority_gate`,
     `verify_authority_claim`, `has_permission`, and the 101-byte
     `build_authority_gated_nft_script` covenant with
