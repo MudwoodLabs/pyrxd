@@ -346,3 +346,24 @@ def test_a_stray_disallow_mention_does_not_make_an_honest_burn_read_as_survival(
 
     verdict = verify_burn([proof, noise], victim, spent_output_scripts=[build_nft_locking_script(PKH, victim)])
     assert verdict.valid and verdict.basis is BurnBasis.SPENT_AND_ABSENT
+
+
+def test_a_transaction_burning_two_tokens_answers_for_both():
+    """Selecting the FIRST parseable proof refused an honest batch burn.
+
+    A transaction burning A and B carries two proofs. Taking proofs[0] reported
+    B as "the proof names A, not B" — a guard refusing valid work.
+    """
+    a, b = TOKEN, OTHER
+    outputs = [build_burn_proof_script(a), build_burn_proof_script(b)]
+    spent = [build_nft_locking_script(PKH, a), build_nft_locking_script(PKH, b)]
+
+    for ref in (a, b):
+        verdict = verify_burn(outputs, ref, spent_output_scripts=spent)
+        assert verdict.valid, f"honest batch burn refused for {ref.txid[:8]}"
+        assert verdict.proof is not None
+        assert verdict.proof.token_ref == f"{ref.txid}:{ref.vout}"
+
+    # A token neither proof names is still refused.
+    third = GlyphRef(txid="33" * 32, vout=2)
+    assert not verify_burn(outputs, third, spent_output_scripts=spent).valid

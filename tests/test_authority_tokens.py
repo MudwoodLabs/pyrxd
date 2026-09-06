@@ -490,3 +490,19 @@ def test_the_scanner_returns_a_gated_item_as_an_nft_it_holds():
     src = _inspect.getsource(_scanner)
     assert '"authority-gated-nft"' in src, "the scanner must build an item for a gated NFT"
     assert '"delegate-token"' in src, "a held delegate token must at least be reported, not dropped silently"
+
+
+def test_more_permissions_than_the_decoder_keeps_are_refused_at_build_time():
+    """The decoder truncates a list attr; minting past it loses entries forever.
+
+    `has_permission` would answer False for the lost ones for the life of the
+    token, and a mint cannot be undone — so the refusal belongs on the encode
+    path, where the caller can still change their mind.
+    """
+    from pyrxd.glyph.payload import _MAX_ATTRS_LIST_LEN
+
+    ok = [f"perm{i}" for i in range(_MAX_ATTRS_LIST_LEN)]
+    assert len(read_authority_attrs(build_authority_metadata("i", permissions=ok)).permissions) == len(ok)
+
+    with pytest.raises(ValidationError, match="exceeds"):
+        build_authority_metadata("i", permissions=[*ok, "one-too-many"])

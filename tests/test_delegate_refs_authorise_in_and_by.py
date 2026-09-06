@@ -712,3 +712,52 @@ def test_parent_owner_pkh_has_no_default_and_never_should():
     cold = Hex20(bytes.fromhex("00" * 19 + "ff"))
     setup = GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=cold)
     assert setup.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
+
+
+def test_delegated_refs_are_ignored_when_the_tx_burned_no_delegate():
+    """`delegated_refs` is caller-supplied, so it needs on-chain corroboration.
+
+    Without this gate a caller who resolved a base for some OTHER transaction —
+    or who passed refs from anywhere at all — produced BACKED/DELEGATED for a
+    mint that consumed no authorisation. The burn is the evidence, and it is
+    right there in the outputs being checked.
+    """
+    authorised = parse_delegate_base_script(build_delegate_base_script(PKH, [CONTAINER, AUTHOR]))
+    no_burn = [build_nft_locking_script(PKH, MINTED)]
+
+    verdicts = verify_relationship_claims(_metadata(), no_burn, delegated_refs=authorised)
+    assert all(v.outcome is RelationshipOutcome.UNBACKED for v in verdicts), (
+        "delegated refs were honoured for a transaction that burned nothing"
+    )
+
+    # With the burn present, the same refs do back the claim.
+    with_burn = [*no_burn, build_delegate_burn_script(BASE)]
+    assert all(
+        v.outcome is RelationshipOutcome.BACKED
+        for v in verify_relationship_claims(_metadata(), with_burn, delegated_refs=authorised)
+    )
+
+
+def test_a_backed_verdict_cannot_carry_backing_NONE():
+    """The pair is read together, so a self-contradictory verdict must not exist.
+
+    `verify_authority_claim` branches on `backing` after checking `backed`; a
+    BACKED verdict defaulting to NONE would have had it describe a delegate burn
+    that never happened.
+    """
+    from pyrxd.glyph.relationships import RelationshipBacking, RelationshipKind, RelationshipVerdict
+
+    with pytest.raises(ValidationError, match="self-contradictory"):
+        RelationshipVerdict(
+            kind=RelationshipKind.AUTHOR,
+            ref=AUTHOR,
+            outcome=RelationshipOutcome.BACKED,
+            backing=RelationshipBacking.NONE,
+        )
+    with pytest.raises(ValidationError, match="self-contradictory"):
+        RelationshipVerdict(
+            kind=RelationshipKind.AUTHOR,
+            ref=AUTHOR,
+            outcome=RelationshipOutcome.UNBACKED,
+            backing=RelationshipBacking.DIRECT,
+        )
