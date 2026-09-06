@@ -2155,8 +2155,22 @@ class SwapCoordinator:
         The pre-fund ordering gate (:meth:`_assert_eth_timelock_ordering`) projects where the RXD
         CSV refund opens from the TAKER's fund time. We re-run it here at the ACTUAL lock time with
         ``max_covenant_confirm_wait_s = 0`` (the covenant is confirmed now), and refuse to advance
-        to BOTH_LOCKED if the ordering no longer holds — the taker refunds the counter leg rather
-        than proceed into a reopened one-sided-loss window. Fail-closed.
+        to BOTH_LOCKED if the ordering no longer holds. Fail-closed.
+
+        WHO THIS PROTECTS, AND WHO RUNS IT — the previous sentence said a failure means "the
+        taker refunds the counter leg rather than proceed", and that names a party this code
+        cannot speak for. In the two-host flow the only caller of
+        :meth:`post_asset_lock_revalidate` is the MAKER's process
+        (``scripts/eth_swap_two_host.py`` ``maker_phase_lock_claim``, which enters the flow at
+        BTC_LOCKED because "the maker never ran taker_funds_btc — that happened in the TAKER's
+        process"); the taker phase never calls it. So refusing here stops the MAKER advancing
+        and revealing ``p``, and the maker's recovery is the CSV refund of its own covenant. It
+        is maker SELF-RESTRAINT, not a control the taker holds over a hostile maker — a maker
+        who wants to skip it simply does not call it.
+
+        The taker's own post-fund defences are elsewhere and are the party-correct ones:
+        :func:`assess_claim_finality` and :meth:`taker_refund_window_open`, both of which read
+        real Radiant heights rather than projecting from an interval estimate.
 
         THIS DOCSTRING DESCRIBED THE OPPOSITE HAZARD until now, and #482 corrected its sibling
         while leaving this one. It said the danger was a maker who STALLS the broadcast, "pushing
