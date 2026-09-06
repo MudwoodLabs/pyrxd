@@ -91,7 +91,8 @@ class BurnBasis(Enum):
     SPENT_AND_ABSENT = "spent-and-absent"
     #: A proof is present and no output carries the ref, but the spent outputs
     #: were not supplied, so nothing rules out a proof written about a token
-    #: this transaction never held.
+    #: this transaction never held. **This does not make a verdict valid** —
+    #: absence from the outputs is true of every unrelated transaction there is.
     ABSENT_ONLY = "absent-only"
     #: The claim does not stand.
     NONE = "none"
@@ -255,6 +256,14 @@ def verify_burn(
         ABSENT_ONLY** — a proof plus an absence, which is also what a
         transaction that never held the token produces.
 
+    ``valid`` is True ONLY for :attr:`BurnBasis.SPENT_AND_ABSENT`. Without
+    *spent_output_scripts* the strongest honest answer is "not established", and
+    that is what you get — the same rule
+    :func:`~pyrxd.glyph.relationships.verify_relationship_claims` applies when
+    the delegate lookup has not been done. A caller who wants to distinguish
+    "no proof at all" from "a proof I could not corroborate" reads
+    :attr:`BurnVerdict.basis`.
+
     A ``valid`` verdict never means "the owner intended this"; it means the
     token is gone and something recorded that it was meant to be.
     """
@@ -278,12 +287,21 @@ def verify_burn(
         )
     if spent_output_scripts is None:
         return BurnVerdict(
-            valid=True,
+            # valid=False, and this is the important line in the module.
+            # ABSENT_ONLY means a proof exists and this transaction's outputs do
+            # not carry the ref — a condition every unrelated transaction on the
+            # chain also satisfies. Returning True here would make
+            # `if verify_burn(outs, ref).valid:` — the obvious way to call this —
+            # accept a proof anyone could have written about someone else's
+            # token, with the qualification parked in a prose field nothing makes
+            # the caller read. The basis is there for a caller that wants the
+            # distinction; `valid` is not the place to put a maybe.
+            valid=False,
             basis=BurnBasis.ABSENT_ONLY,
             reason=(
-                "a proof is present and no output carries the ref — but the spent outputs were not "
-                "supplied, so this does not rule out a proof written about a token this transaction "
-                "never held"
+                "a proof is present and no output carries the ref, but the spent outputs were not "
+                "supplied — so this does not rule out a proof written about a token this transaction "
+                "never held. Pass spent_output_scripts to get a verdict"
             ),
             proof=proof,
         )

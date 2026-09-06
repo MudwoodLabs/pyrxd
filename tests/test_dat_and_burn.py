@@ -201,11 +201,23 @@ def _proof_and_token():
     return build_burn_proof_script(TOKEN), build_nft_locking_script(PKH, TOKEN)
 
 
-def test_without_the_spent_outputs_the_verdict_is_explicitly_the_weaker_one():
+def test_without_the_spent_outputs_the_verdict_is_NOT_valid():
+    """`valid` is not the place to put a maybe.
+
+    ABSENT_ONLY says a proof exists and this transaction's outputs do not carry
+    the ref — which every unrelated transaction on the chain also satisfies. If
+    that returned True, `if verify_burn(outs, ref).valid:` (the obvious call)
+    would accept a proof anyone could have written about someone else's token,
+    with the caveat parked in a prose field nothing makes the caller read.
+    """
     proof, _tok = _proof_and_token()
     verdict = verify_burn([proof], TOKEN)
-    assert verdict.valid and verdict.basis is BurnBasis.ABSENT_ONLY
+    assert not verdict.valid
+    assert verdict.basis is BurnBasis.ABSENT_ONLY
     assert "does not rule out" in verdict.reason
+    # And it is still distinguishable from "no proof at all", which is the
+    # reason the basis exists.
+    assert verify_burn([build_nft_locking_script(PKH, OTHER)], TOKEN).basis is BurnBasis.NONE
 
 
 def test_with_the_spent_outputs_it_is_the_strong_one():

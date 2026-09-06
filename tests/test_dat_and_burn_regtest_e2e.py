@@ -204,9 +204,10 @@ def test_a_token_really_can_be_burned_and_the_proof_reads_back(node):  # noqa: F
     # The token is gone: no output carries its ref.
     assert not any(any(op == token["ref"].to_bytes() for _o, op in iter_input_refs(s)) for s in outputs)
 
-    # Without the spent outputs, the honest verdict is the weaker one...
+    # Without the spent outputs the honest verdict is "not established" — even
+    # here, on a transaction that genuinely did burn the token.
     weak = verify_burn(outputs, token["ref"])
-    assert weak.valid and weak.basis is BurnBasis.ABSENT_ONLY
+    assert not weak.valid and weak.basis is BurnBasis.ABSENT_ONLY
     # ...and with them, the strong one.
     strong = verify_burn(outputs, token["ref"], spent_output_scripts=[token["script"]])
     assert strong.valid and strong.basis is BurnBasis.SPENT_AND_ABSENT
