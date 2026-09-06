@@ -38,6 +38,33 @@ def _signing_message(commit_hash: bytes) -> bytes:
     return hashlib.sha256(_CREATOR_PREFIX + commit_hash).digest()
 
 
+def _comparable(raw: bytes, pubkey_hex: str, algo: str) -> bytes:
+    """Normalise CBOR for the lossy-decode DISCLOSURE only — never for a signature.
+
+    The disclosure asks one question: did the DECODER change a VALUE, so that the object being
+    rendered is not the object that was signed? Two things are therefore not differences:
+
+    * **key order** — a writer may publish its map in any order, and pyrxd re-emits in RFC 8949
+      canonical order. Both sides are canonicalised here.
+    * **the creator sub-map** — its `sig` is blanked on one side by construction, and writers
+      differ on whether to spell out an `algo` that equals the default (`to_cbor_dict` omits it,
+      types.py:174). Rebuilt identically on both sides so only the OTHER fields are compared.
+
+    Without this the disclosure reports "the decoder normalised at least one field" for honest
+    third-party tokens whose only sin is a different encoder — the mirror of the false-forgery
+    verdict `_cbor_for_verifying` exists to prevent.
+    """
+    try:
+        d = cbor2.loads(raw)
+        if isinstance(d, dict) and isinstance(d.get("creator"), dict):
+            unsigned = GlyphCreator(pubkey=pubkey_hex, sig="00", algo=algo).to_cbor_dict()
+            unsigned["sig"] = ""
+            d["creator"] = unsigned
+        return cbor2.dumps(d, canonical=True)
+    except Exception:  # pragma: no cover - both inputs were produced by cbor2 moments earlier
+        return raw
+
+
 def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> bytes:
     """CBOR-encode metadata with creator.sig = "" (unsigned canonical form).
 
@@ -64,8 +91,30 @@ def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> by
     # an honest token as "normalised by the decoder".
     d = metadata.to_cbor_dict()
     d.pop("creator", None)
-    d["creator"] = {"pubkey": pubkey_hex, "sig": "", "algo": algo}
-    return cbor2.dumps(d)
+    # Derived from GlyphCreator, not hand-built. `to_cbor_dict` OMITS `algo` when it is the
+    # default (types.py:174), so a hand-built three-key map signs bytes carrying a key the
+    # published bytes never had — a structural mismatch, independent of any ordering.
+    # A PLACEHOLDER sig, then blanked. `to_cbor_dict` omits an empty `sig` entirely
+    # (types.py:172), and the unsigned canonical form needs the key PRESENT with an empty
+    # value — that is what "blank the signature" means, and it is what the verifier rebuilds.
+    # Going through the type still derives the rest of the key set, including the rule that
+    # `algo` is omitted at its default, which a hand-built literal duplicates and drifts from.
+    unsigned = GlyphCreator(pubkey=pubkey_hex, sig="00", algo=algo).to_cbor_dict()
+    unsigned["sig"] = ""
+    d["creator"] = unsigned
+    # CANONICAL, because that is what `encode_payload` PUBLISHES (payload.py:67). Signing
+    # insertion-order bytes made pyrxd unable to verify its own tokens once they were on chain:
+    # measured, a plain NFT verified, an NFT with a `description` did not, and every timelocked
+    # token did not — canonical ordering sorts `desc` before `name` and re-sorts the `crypto`
+    # sub-map, so the published bytes were never the bytes that were signed.
+    #
+    # #633 fixed the in-memory case and stopped there, because its tests never crossed
+    # `encode_payload`. A signature only exists for the wire; verifying one without going through
+    # the transport that carries it tests the mechanism, not the property.
+    #
+    # Third-party tokens are unaffected: their signature is checked against `_cbor_for_verifying`,
+    # which rebuilds from `source_cbor` and so keeps whatever order the writer used.
+    return cbor2.dumps(d, canonical=True)
 
 
 def _cbor_for_verifying(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> bytes:
@@ -96,9 +145,25 @@ def _cbor_for_verifying(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> 
         return _cbor_for_signing(metadata, pubkey_hex, algo)
     if not isinstance(d, dict):  # pragma: no cover - likewise
         return _cbor_for_signing(metadata, pubkey_hex, algo)
-    # Blank the signature the same way the signer did, leaving every OTHER field with
-    # the type and value it had on chain.
-    d["creator"] = {"pubkey": pubkey_hex, "sig": "", "algo": algo}
+    # Blank the signature IN PLACE, leaving every other field — and the creator sub-map's own key
+    # ORDER — exactly as it was on chain.
+    #
+    # Replacing the whole sub-map (what this did before) rebuilds it as `pubkey, sig, algo`
+    # regardless of the order the writer used, and the dumps below is deliberately non-canonical,
+    # so the rebuilt bytes stopped matching what was signed. That broke pyrxd's OWN tokens the
+    # moment signing became canonical: on chain the sub-map is sorted `sig, algo, pubkey`, and the
+    # rebuild put it back in declaration order.
+    #
+    # In-place also keeps this honest for a third-party writer whose sub-map order is neither.
+    existing = d.get("creator")
+    if isinstance(existing, dict):
+        # ONLY the signature, and in place. Setting `pubkey`/`algo` too would APPEND any key the
+        # writer omitted — the chain carries `{sig, pubkey}` for a default `algo` — and appending
+        # changes the bytes. Their values came from this very map, so re-setting them is a no-op
+        # at best and a reordering at worst.
+        existing["sig"] = ""
+    else:
+        d["creator"] = GlyphCreator(pubkey=pubkey_hex, sig="", algo=algo).to_cbor_dict()
     return cbor2.dumps(d)
 
 
@@ -219,7 +284,13 @@ def verify_creator_signature(metadata: GlyphMetadata) -> tuple[bool, str]:
     # Detected by comparison rather than by tracking each field as it is normalised —
     # a hand-kept list of lossy fields would go stale the first time the decoder
     # learns a new leniency, which is exactly how this class of bug arrives.
-    if metadata.source_cbor is not None and cbor_bytes != _cbor_for_signing(metadata, creator.pubkey, creator.algo):
+    # Compared CANONICALLY on both sides. This detects a normalised VALUE, and key ORDER is not a
+    # value: a third-party writer may publish its map in any order, and flagging that as "the
+    # decoder normalised a field" is a false accusation against an honest publisher — the mirror
+    # of the false-forgery verdict this block sits next to.
+    if metadata.source_cbor is not None and _comparable(cbor_bytes, creator.pubkey, creator.algo) != _comparable(
+        _cbor_for_signing(metadata, creator.pubkey, creator.algo), creator.pubkey, creator.algo
+    ):
         return True, (
             "signature is valid over the on-chain bytes, but the decoder normalised at "
             "least one field — the metadata shown is NOT byte-identical to what was signed"
