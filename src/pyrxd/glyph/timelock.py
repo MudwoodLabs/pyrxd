@@ -457,6 +457,55 @@ def _protocols_and_spec(metadata: object) -> tuple[tuple[int, ...], TimelockSpec
     return tuple(protocols), spec
 
 
+def spec_is_unlocked(
+    spec: TimelockSpec,
+    *,
+    current_block: int | None = None,
+    current_time: int | None = None,
+) -> bool:
+    """Has THIS spec's lock expired? — judged from the spec alone, with no reference to
+    any protocol marker.
+
+    Split out of :func:`is_unlocked` because the two questions are different and only one
+    of them is safe to ask on the reveal path. :func:`is_unlocked` answers "is this
+    *token's* content readable", and for a token carrying no TIMELOCK marker the honest
+    answer is yes — nothing is sealed. :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal`
+    is asking something narrower: it has already found a spec and is about to publish the
+    key that spec commits to, so the marker is not what it should be judging.
+
+    Delegating the second question to the first made the gate fail OPEN: an envelope
+    carrying ``crypto.timelock`` while omitting ``9`` from ``p`` passed the planner's spec
+    check, came back ``unlocked=True`` from a marker that was not there, and published the
+    key with the CLI's early-reveal banner silent — the banner is keyed on the same wrong
+    boolean. Decoded off the chain that shape is not exotic: ``decode_payload`` fills
+    ``timelock`` from ``d["crypto"]["timelock"]`` without consulting ``d["p"]`` at all.
+
+    Conservative on anything it cannot judge: an unrecognised ``mode``, or a missing clock
+    for the mode this spec uses, reads as still locked. ``allow_early`` remains the way
+    past it, so a holder of a token minted by some other tool is refused, not stranded.
+    """
+    if spec.mode == "block":
+        return current_block is not None and current_block >= spec.unlock_at
+    if spec.mode == "time":
+        return current_time is not None and current_time >= spec.unlock_at
+    return False  # unknown mode → locked
+
+
+def spec_unlock_remaining(
+    spec: TimelockSpec,
+    *,
+    current_block: int | None = None,
+    current_time: int | None = None,
+) -> int:
+    """Blocks or seconds still to go on THIS spec. The counterpart of
+    :func:`spec_is_unlocked`, and 0 whenever that returns True or cannot judge."""
+    if spec.mode == "block" and current_block is not None:
+        return max(0, spec.unlock_at - current_block)
+    if spec.mode == "time" and current_time is not None:
+        return max(0, spec.unlock_at - current_time)
+    return 0
+
+
 def is_unlocked(
     metadata: EncryptedContentStub | GlyphMetadata,
     *,
@@ -484,15 +533,7 @@ def is_unlocked(
     if timelock is None:
         # Malformed: marker present but no spec. Be conservative — locked.
         return False
-    if timelock.mode == "block":
-        if current_block is None:
-            return False
-        return current_block >= timelock.unlock_at
-    if timelock.mode == "time":
-        if current_time is None:
-            return False
-        return current_time >= timelock.unlock_at
-    return False  # unknown mode → locked
+    return spec_is_unlocked(timelock, current_block=current_block, current_time=current_time)
 
 
 def get_unlock_remaining(
@@ -513,15 +554,7 @@ def get_unlock_remaining(
         return 0
     if timelock is None:
         return 0
-    if timelock.mode == "block":
-        if current_block is None:
-            return 0
-        return max(0, timelock.unlock_at - current_block)
-    if timelock.mode == "time":
-        if current_time is None:
-            return 0
-        return max(0, timelock.unlock_at - current_time)
-    return 0
+    return spec_unlock_remaining(timelock, current_block=current_block, current_time=current_time)
 
 
 __all__ = [
@@ -538,5 +571,7 @@ __all__ = [
     "glyph_metadata_for",
     "is_unlocked",
     "parse_cek_hash",
+    "spec_is_unlocked",
+    "spec_unlock_remaining",
     "verify_cek_reveal",
 ]

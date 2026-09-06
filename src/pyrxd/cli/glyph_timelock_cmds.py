@@ -3,10 +3,12 @@
 Two commands, and the asymmetry between them is the whole design.
 
 ``timelock-mint`` seals content: it encrypts locally, commits ``sha256(key)`` on chain, and
-hands the operator back the two things the chain does **not** have — the key and the
-ciphertext. Both are written to files, and both paths are required arguments rather than
-optional conveniences. A mint that succeeded while its key scrolled off a terminal is a
-token nobody can ever open, and there is no second mint.
+hands the operator back the things the chain does **not** have — the key, the ciphertext,
+and the envelope bytes the reveal must push. All three are written to files, and all three
+paths are required arguments rather than optional conveniences. A mint that succeeded while
+its key scrolled off a terminal is a token nobody can ever open, and there is no second
+mint; a mint whose commit confirms while its reveal does not is value spendable by nothing
+but those exact envelope bytes, which this command cannot rebuild once the process is gone.
 
 ``timelock-reveal`` publishes that key, and is irreversible in the other direction. It
 refuses two things before anything is signed:
@@ -35,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from ..glyph.client import GlyphClient
+from ..glyph.payload import encode_payload
 from ..glyph.scanner import GlyphScanner
 from ..glyph.timelock import TimelockParams, TimelockRecipient
 from ..glyph.timelock_reveal_tx import (
@@ -202,6 +205,15 @@ def _ciphertext_json(build: TimelockMintBuild) -> str:
     type=click.Path(dir_okay=False, path_type=Path),
     help="REQUIRED. Where to write the encrypted payload. The mint carries only its hash and size.",
 )
+@click.option(
+    "--envelope-out",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="REQUIRED. Where to write the raw envelope CBOR — the exact bytes the reveal must push. "
+    "This mint has no metadata file to rebuild from and, with --recipient, the envelope is NOT "
+    "reproducible from the same inputs. Without this file a commit that confirms while the reveal "
+    "does not is unspendable forever.",
+)
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def timelock_mint_cmd(
@@ -216,6 +228,7 @@ def timelock_mint_cmd(
     locator: str | None,
     cek_out: Path,
     ciphertext_out: Path,
+    envelope_out: Path,
     passphrase: bool,
 ) -> None:
     """Encrypt --content, mint an NFT committing to its key, and save both halves.
@@ -225,8 +238,17 @@ def timelock_mint_cmd(
     the hint; nobody can read the content until the key is published by
     `pyrxd glyph timelock-reveal` (or, for a --recipient, immediately).
 
-    Both output files are written BEFORE the mint is broadcast. That ordering is deliberate:
-    a mint that succeeds while the key write fails is a permanently sealed token.
+    All three output files are written BEFORE the mint is broadcast. That ordering is
+    deliberate: a mint that succeeds while the key write fails is a permanently sealed token.
+
+    --envelope-out is the third for a different reason. The mint is two transactions: a
+    commit whose output is a hashlock over the envelope bytes, then a reveal that pushes
+    those exact bytes to spend it. If the commit confirms and the reveal does not — a
+    timeout, a kill during the 10+ minute wait, a declined prompt — the only way to recover
+    the commit's value is to rebuild the reveal from BYTE-IDENTICAL CBOR, and this CLI keeps
+    no pending store. `glyph mint-nft` can rebuild from its metadata file; this command has
+    none, and with --recipient the envelope cannot be rebuilt from the same inputs at all,
+    because each wrap draws a fresh ephemeral X25519 key and nonce. So the bytes are saved.
     """
     if unlock_at <= 0:
         raise UserError(f"--unlock-at must be positive, got {unlock_at}")
@@ -235,7 +257,7 @@ def timelock_mint_cmd(
             f"--hint is {len(hint.encode('utf-8'))} bytes, over the {_MAX_HINT_BYTES}-byte cap",
             fix="shorten it — the hint is a public label, not the content",
         )
-    for out in (cek_out, ciphertext_out):
+    for out in (cek_out, ciphertext_out, envelope_out):
         if out.exists():
             raise UserError(
                 f"{out} already exists",
@@ -280,21 +302,34 @@ def timelock_mint_cmd(
                     f"recipients:  {', '.join(r.kid for r in recipients) if recipients else '(none — reveal only)'}",
                     f"key file:    {cek_out}  <- THE ONLY COPY. Nothing on chain carries the key.",
                     f"ciphertext:  {ciphertext_out}  <- the payload itself is NOT on chain.",
+                    f"envelope:    {envelope_out}  <- the only way to rebuild the reveal if it fails.",
                     f"network:     {ctx.network}",
                 ],
             )
         ],
     )
 
-    # Write both halves before broadcasting anything. If the disk write fails, nothing has
-    # been minted and the operator can retry; if the mint were first, a failed write would
-    # leave a sealed token whose key existed only in this process.
+    # Write all three before broadcasting anything. If a disk write fails, nothing has been
+    # minted and the operator can retry; if the mint were first, a failed write would leave
+    # a sealed token whose key existed only in this process.
+    #
+    # The envelope is the third because the two-phase mint below can strand its own commit.
+    # `_mint_nft_inner` broadcasts the commit, waits 10+ minutes for confirmation, then
+    # prompts AGAIN for the reveal — and the commit output is `OP_HASH256 <payload_hash>
+    # OP_EQUALVERIFY`, spendable only by a reveal pushing byte-identical CBOR. A timeout, a
+    # kill or a declined prompt in that window leaves value recoverable ONLY from these
+    # bytes: there is no pending store on this path, no metadata file for this command, and
+    # `wrap_cek_x25519` draws a fresh ephemeral key and nonce per call, so re-running the
+    # same command with the same key does not reproduce the envelope when --recipient was
+    # given. Written raw rather than hex: these bytes go into `RevealParams(cbor_bytes=...)`
+    # unmodified, and a re-encode from anything else is exactly the drift that strands it.
     try:
         _write_secret(cek_out, build.cek.hex() + "\n")
         ciphertext_out.write_text(_ciphertext_json(build))
+        envelope_out.write_bytes(encode_payload(build.metadata)[0])
     except OSError as exc:
         raise UserError(
-            "could not write the key or ciphertext file — nothing was broadcast",
+            "could not write the key, ciphertext or envelope file — nothing was broadcast",
             cause=str(exc),
             fix="fix the path or permissions and re-run; no funds and no token were committed",
         ) from exc
@@ -329,6 +364,7 @@ def timelock_mint_cmd(
         "mode": mode,
         "cek_file": str(cek_out),
         "ciphertext_file": str(ciphertext_out),
+        "envelope_file": str(envelope_out),
     }
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
@@ -343,7 +379,8 @@ def timelock_mint_cmd(
         click.echo(f"  commitment:  {build.cek_hash}")
         click.echo(f"\n  key:         {cek_out} (mode 0600)")
         click.echo(f"  ciphertext:  {ciphertext_out}")
-        click.echo("\n  Back up both files now. The chain carries neither, and a mint cannot be redone.")
+        click.echo(f"  envelope:    {envelope_out}")
+        click.echo("\n  Back up all three files now. The chain carries none of them, and a mint cannot be redone.")
         click.echo(f"  To open it later:  pyrxd glyph timelock-reveal {payload['ref']} --cek-file {cek_out}")
 
 
@@ -358,12 +395,32 @@ def _reveal_lines(build: TimelockRevealBuild, *, network: str, fee_rate: int) ->
     Shows the CEK itself. Every other secret in this CLI is masked; this one is the payload
     of the transaction being confirmed, and a prompt that hid the thing about to become
     public would be asking the operator to approve something it declined to show them.
+
+    It shows ``chain says`` for the same reason. The number that decides whether this key
+    becomes public is read from an ElectrumX server, and nothing in this SDK authenticates
+    it — no proof-of-work check, no link to a known header, no second endpoint asked. A
+    server that overstates the tip gets an irreversible reveal past a gate that reports
+    itself satisfied, with the ``*** EARLY REVEAL`` banner silent because by its own
+    arithmetic the lock HAS expired. Printing ``opens at`` alone gave the operator nothing
+    to disagree with; printing both sides of the comparison gives them the one check this
+    code cannot do for them.
     """
     plan = build.plan
     raw = build.serialize()
+    # Built as a branch, not as an f-string chosen by one: `judged_at` is None whenever the
+    # token's mode is neither "block" nor "time", and `f"{None:,}"` is a TypeError. That is a
+    # reachable prompt — a third-party token with mode "BLOCK" plus --allow-early gets here —
+    # so formatting it eagerly would have turned this very fix into the traceback-instead-of-a-
+    # message defect it was written beside.
+    if plan.judged_at is None:
+        judged = f"(no clock for lock mode {plan.mode!r} — the gate could not evaluate it)"
+    else:
+        clock_units = "block" if plan.mode == "block" else "unix time"
+        judged = f"{plan.judged_at:,} ({clock_units}, as reported by the node — unverified)"
     lines = [
         f"token:       {plan.token_ref}",
-        f"opens at:    {plan.unlock_at} ({plan.mode})",
+        f"opens at:    {plan.unlock_at:,} ({plan.mode})",
+        f"chain says:  {judged}",
         f"commitment:  {plan.commitment}  <- matched by this key",
         f"PUBLISHES:   {plan.proof.cek}",
         f"funded from: {build.from_address}",
@@ -526,6 +583,9 @@ def timelock_reveal_cmd(
         "unlock_at": plan.unlock_at,
         "mode": plan.mode,
         "unlocked": plan.unlocked,
+        # The clock the gate compared against, so a scripted caller can disagree with it —
+        # it comes from an ElectrumX server this SDK does not authenticate.
+        "judged_at": plan.judged_at,
         "early_override": plan.early_override,
         "fee": build.fee,
         "op_return_script_hex": plan.op_return_script.hex(),
