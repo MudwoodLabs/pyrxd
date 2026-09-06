@@ -23,9 +23,12 @@ rules so the two stay in sync.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from pyrxd.glyph._inspect_core import _classify_metadata_protocol, _classify_raw_tx
+from pyrxd.glyph.encrypted_content import CryptoMetadata, TimelockSpec
 from pyrxd.glyph.payload import build_reveal_scriptsig_suffix, encode_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.wave import build_wave_metadata
@@ -153,9 +156,17 @@ class TestClassifyRawTxSurfacesClassification:
         assert result["metadata"]["classification"] == "container"
 
     def test_classification_key_for_timelock(self):
+        # Carries a real commitment, as any genuine timelocked token must: encoding a TIMELOCK
+        # glyph without `crypto.timelock` is refused at the payload funnel, because the marker
+        # with nothing behind it can never be verified and a mint cannot be amended.
+        _cek = "sha256:" + os.urandom(32).hex()
         md = GlyphMetadata(
             protocol=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED, GlyphProtocol.TIMELOCK],
             name="t",
+            crypto=CryptoMetadata(
+                cek_hash=_cek,
+                timelock=TimelockSpec(mode="block", unlock_at=500_000, cek_hash=_cek),
+            ),
         )
         raw, txid = _build_reveal_tx(md)
         result = _classify_raw_tx(txid, raw)
