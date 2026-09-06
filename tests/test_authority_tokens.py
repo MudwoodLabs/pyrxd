@@ -506,3 +506,45 @@ def test_more_permissions_than_the_decoder_keeps_are_refused_at_build_time():
 
     with pytest.raises(ValidationError, match="exceeds"):
         build_authority_metadata("i", permissions=[*ok, "one-too-many"])
+
+
+@pytest.mark.parametrize(
+    ("opcode", "name"),
+    [(0xD1, "OP_REQUIREINPUTREF"), (0xD2, "OP_DISALLOWPUSHINPUTREF"), (0xD3, "OP_DISALLOWPUSHINPUTREFSIBLING")],
+)
+def test_a_script_that_only_NAMES_the_authority_is_refused(opcode, name):
+    """Found by re-attacking the fix that added this cross-check.
+
+    The check accepted any of the five ref opcodes, so a script that merely
+    NAMED the authority — 0xd2 is a local assertion consensus never
+    subset-checks, writable by anyone — passed as "the authority's script". The
+    reveal then re-creates that instead of the authority, and the real
+    authority, spent as an input, is BURNED.
+
+    Third occurrence of this exact opcode-set mistake on one branch, which is
+    why `script_carries_ref` now exists and every call site goes through it.
+    """
+    from pyrxd.glyph.payload import encode_payload
+
+    builder = GlyphBuilder()
+    cbor_bytes, _hash = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="Gated item"))
+    impostor = bytes([opcode]) + AUTHORITY.to_bytes() + b"\x75" + b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+
+    with pytest.raises(ValidationError, match="does not carry"):
+        builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, impostor)
+
+
+def test_script_carries_ref_counts_only_the_two_opcodes_that_mean_possession():
+    """The primitive itself — one definition, so a fourth call site cannot get it wrong."""
+    from pyrxd.glyph.script import build_delegate_token_script, script_carries_ref
+
+    wire = AUTHORITY.to_bytes()
+    # 0xd0 (FT / delegate token) and 0xd8 (NFT singleton) hold a token.
+    assert script_carries_ref(build_nft_locking_script(PKH, AUTHORITY), wire)
+    assert script_carries_ref(build_delegate_token_script(PKH, AUTHORITY), wire)
+    # The other three do not.
+    for opcode in (0xD1, 0xD2, 0xD3):
+        assert not script_carries_ref(bytes([opcode]) + wire + b"\x75", wire)
+    # A different ref, and an undecodable script, are both False rather than raising.
+    assert not script_carries_ref(build_nft_locking_script(PKH, ITEM), wire)
+    assert not script_carries_ref(b"\xd8" + b"\x00" * 10, wire)

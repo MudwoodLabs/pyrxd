@@ -42,10 +42,9 @@ from enum import Enum
 
 import cbor2
 
-from ..constants import PUSH_REF_OPCODES
 from ..security.errors import ValidationError
 from .payload import GLY_MARKER, _encode_payload_push
-from .script import TruncatedScriptError, iter_input_refs
+from .script import TruncatedScriptError, script_carries_ref
 from .types import GlyphProtocol, GlyphRef
 
 _log = logging.getLogger(__name__)
@@ -251,7 +250,7 @@ def _carries(scripts: list[bytes], wire_ref: bytes) -> bool:
     """
     for script in scripts:
         try:
-            if any(operand == wire_ref for op, operand in iter_input_refs(script) if op in PUSH_REF_OPCODES):
+            if script_carries_ref(script, wire_ref):
                 return True
         except TruncatedScriptError as exc:
             # An unwalkable script cannot be shown to carry the ref, and must

@@ -1106,6 +1106,40 @@ def iter_input_refs(script: bytes):
             yield op.opcode, op.operand
 
 
+def script_carries_ref(script: bytes, wire_ref: bytes) -> bool:
+    """Does *script* HOLD the token *wire_ref* — push it, not merely name it?
+
+    USE THIS INSTEAD OF FILTERING :func:`iter_input_refs` BY HAND. That walk
+    yields all five operand-carrying opcodes, and only ``OP_PUSHINPUTREF``
+    (``0xd0``) and ``OP_PUSHINPUTREFSINGLETON`` (``0xd8``) mean possession:
+
+    * ``OP_REQUIREINPUTREF`` (``0xd1``) is a requirement placed on the spending
+      transaction, not a holding;
+    * ``OP_DISALLOWPUSHINPUTREF`` (``0xd2``) and ``...SIBLING`` (``0xd3``) are
+      LOCAL assertions consensus never subset-checks — anyone can name any ref
+      with one, for the price of an output.
+
+    This function exists because that distinction was got wrong THREE times on
+    one branch, each time by calling ``iter_input_refs`` and comparing operands:
+    once in ``verify_burn`` (forging a burn of a token the transaction never
+    held), once in :func:`parse_delegate_base_script` (an authority-gated item
+    parsing as a delegate base), and once in the authority cross-check inside
+    ``prepare_authority_gated_reveal`` (accepting a non-token script as the
+    authority, which re-emits it and BURNS the real one).
+    :mod:`pyrxd.glyph.relationships` records a fourth, earlier instance. The
+    fix that holds is not another careful filter at a fourth call site — it is
+    one primitive that cannot be called wrongly.
+
+    A script that will not decode returns ``False``: it cannot be SHOWN to hold
+    the ref. Callers deciding whether something survived need
+    :func:`iter_input_refs` and its ``TruncatedScriptError` directly.
+    """
+    try:
+        return any(operand == wire_ref for op, operand in iter_input_refs(script) if op in PUSH_REF_OPCODES)
+    except TruncatedScriptError:
+        return False
+
+
 def count_input_refs(script: bytes) -> dict[bytes, int]:
     """Return a map of ``ref_operand -> count`` for every OP_PUSHINPUTREF-family
     opcode in *script* (opcode-aware; see :func:`iter_input_refs`).

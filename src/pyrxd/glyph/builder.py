@@ -38,7 +38,7 @@ from .script import (
     extract_ref_from_nft_script,
     hash_payload,
     is_legacy_container_script,
-    iter_input_refs,
+    script_carries_ref,
 )
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 
@@ -1082,8 +1082,11 @@ class GlyphBuilder:
         # Cross-check rather than trust: the script handed in must actually be
         # the authority named by `authority_ref`, or the reveal would re-create
         # some other token and burn the real authority.
-        carried = {operand for _op, operand in iter_input_refs(authority_script)}
-        if authority_ref.to_bytes() not in carried:
+        # `script_carries_ref`, NOT a hand-rolled `iter_input_refs` filter: this
+        # check accepted a script that merely NAMED the authority under 0xd2 — a
+        # local assertion anyone can write — and re-emitting that in place of the
+        # authority burns the real one.
+        if not script_carries_ref(authority_script, authority_ref.to_bytes()):
             raise ValidationError(
                 f"authority_script does not carry {authority_ref.txid}:{authority_ref.vout} — pass the "
                 "authority UTXO's own locking script, so it is re-created exactly as it is being spent"
