@@ -683,3 +683,32 @@ def test_an_unfetchable_base_leaves_the_claim_unresolved_not_crashed():
     assert verdicts["container"]["outcome"] == "unbacked"
     # And the burn is still reported, so the reader knows resolution was possible.
     assert payload["metadata"]["delegate_burns"]
+
+
+def test_parent_owner_pkh_has_no_default_and_never_should():
+    """A default here silently moves COLD singletons into a HOT key.
+
+    `prepare_delegate_setup` exists to serve a hot minting service, so
+    `owner_pkh` is typically the hot key while the container and author are held
+    cold. Defaulting `parent_owner_pkh` to `owner_pkh` re-created the parents to
+    the hot wallet in the one transaction whose stated purpose is letting them
+    go back to cold storage — and the docstring one screen above said exactly
+    that. It also silently consolidated two parents held by different keys.
+
+    Pinned structurally as well as behaviourally: re-adding the default is a
+    one-word change that no other test in this file would notice.
+    """
+    import inspect as _inspect
+
+    param = _inspect.signature(GlyphBuilder.prepare_delegate_setup).parameters["parent_owner_pkh"]
+    assert param.default is _inspect.Parameter.empty, (
+        "parent_owner_pkh must stay required — a default sends cold singletons to the hot key"
+    )
+
+    with pytest.raises(TypeError, match="parent_owner_pkh"):
+        GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER])
+
+    # The honest call is unaffected, and a cold destination is honoured.
+    cold = Hex20(bytes.fromhex("00" * 19 + "ff"))
+    setup = GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=cold)
+    assert setup.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
