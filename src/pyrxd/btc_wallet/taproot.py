@@ -39,6 +39,7 @@ Design rules (house style)
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import struct
 from dataclasses import dataclass
@@ -278,6 +279,35 @@ class Timelock:
             return self.value & SEQUENCE_LOCKTIME_MASK
         units = self.value // _BIP68_SECONDS_GRANULARITY
         return SEQUENCE_LOCKTIME_TYPE_FLAG | (units & SEQUENCE_LOCKTIME_MASK)
+
+    def consensus_maturity_s(self, *, block_interval_s: float) -> float:
+        """Wall-clock seconds this relative lock actually holds for, AS CONSENSUS ENCODES IT.
+
+        NOT ``normalize_to(SECONDS)``. That round-trips a SECONDS lock through the CALLER'S block
+        grid (``floor(value / block_interval_s) * block_interval_s``), and BIP68 does not quantise
+        time locks on that grid — it quantises them to 512 s. The two disagree in BOTH directions:
+        measured over every encodable value at ``block_interval_s=600``, the block-grid answer is
+        up to **592 s LOW** (at 20992 s) and up to **504 s HIGH** (at 17400 s).
+
+        Which direction is unsafe depends on which side of a comparison the value lands on, so the
+        fix is not a rounding rule but an exact quantity. Derived from :meth:`to_nsequence` so it
+        cannot drift from the bytes the refund leaf actually pushes:
+
+        * BLOCKS — ``value`` blocks, priced at the caller's measured ``block_interval_s``. There is
+          no rounding here at all; the only estimate is the interval.
+        * SECONDS — ``(value // 512) * 512``, the encoded 512-second time units, exactly.
+
+        ``block_interval_s`` is only consulted for a BLOCKS-tagged lock; it is still validated for
+        both so a bad interval fails closed rather than silently applying to one unit and not the
+        other.
+        """
+        if not isinstance(block_interval_s, (int, float)) or isinstance(block_interval_s, bool):
+            raise ValidationError("block_interval_s must be a number")
+        if not math.isfinite(block_interval_s) or block_interval_s <= 0:
+            raise ValidationError("block_interval_s must be finite and > 0")
+        if self.unit is TimeUnit.BLOCKS:
+            return self.value * float(block_interval_s)
+        return float((self.to_nsequence() & SEQUENCE_LOCKTIME_MASK) * _BIP68_SECONDS_GRANULARITY)
 
     def normalize_to(self, unit: TimeUnit, *, block_interval_s: float) -> Timelock:
         """Return an equivalent ``Timelock`` in ``unit``.

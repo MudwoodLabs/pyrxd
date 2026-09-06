@@ -17,6 +17,7 @@ Full mint flow requires a real chain and is covered by
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -1792,10 +1793,23 @@ class TestConfirmationTimeoutRecoveryHint:
         assert "COMMIT_TXID" not in fix
         assert "--resume" not in fix
         # Whatever it names must actually be reachable from the shipped CLI options.
-        from pyrxd.cli.glyph_cmds import deploy_ft_cmd, mint_nft_cmd
+        #
+        # Derived from the `glyph` group rather than a hand-typed tuple of two commands. This
+        # hint is raised by `_wait_for_tx`, which `mint-nft`, `deploy-ft` AND `timelock-mint`
+        # (through `_mint_nft_inner`) all reach — so a tuple naming two of them was structural
+        # about the words and hand-kept about the scope, and it failed the moment the hint
+        # started naming an option on the third. `glyph_group.commands` is the set the CLI
+        # itself publishes; it cannot fall behind a command that was registered on it.
+        from pyrxd.cli.glyph_cmds import glyph_group
 
-        declared = {opt for cmd in (mint_nft_cmd, deploy_ft_cmd) for p in cmd.params for opt in getattr(p, "opts", ())}
-        assert not any(word.startswith("--") and word not in declared for word in fix.split())
+        assert glyph_group.commands, "the group is empty, so this check would pass vacuously"
+        declared = {opt for cmd in glyph_group.commands.values() for p in cmd.params for opt in getattr(p, "opts", ())}
+        # Extracted by pattern, not by whitespace splitting: `--envelope-out` inside backticks,
+        # or an option followed by a comma, is still an option this hint is telling someone to
+        # type, and a splitter that skips it lets an unreachable flag through unnoticed.
+        named = set(re.findall(r"--[a-z0-9][a-z0-9-]*", fix))
+        assert named, "the hint names no CLI option at all — this check has stopped running"
+        assert not named - declared
 
     def test_hint_points_at_the_sdk_call_that_exists(self) -> None:
         from pyrxd.glyph.builder import GlyphBuilder, RevealParams

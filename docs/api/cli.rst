@@ -36,18 +36,23 @@ transferable from the moment it is minted; the timelock gates *visibility*, not 
    **Both of these commands do something that cannot be undone**, and they fail in opposite
    directions.
 
-   ``timelock-mint`` writes the key and the ciphertext to files, and **nothing on chain
-   carries either**. Lose them and the content is sealed forever — a mint cannot be re-run
-   against the same token. Both output paths are required arguments for that reason, and both
-   files are written before the mint is broadcast.
+   ``timelock-mint`` writes the key, the ciphertext and the envelope bytes to files, and
+   **nothing on chain carries any of them**. Lose the key or the ciphertext and the content is
+   sealed forever — a mint cannot be re-run against the same token. Lose the envelope and a
+   mint whose commit confirms while its reveal does not can never be completed: the commit
+   output is a hashlock over those exact bytes, this CLI keeps no pending store, and an
+   envelope built with ``--recipient`` cannot be reproduced from the same inputs (each wrap
+   draws a fresh ephemeral key and nonce). All three output paths are required arguments for
+   that reason, and all three files are written before the mint is broadcast.
 
    ``timelock-reveal`` publishes the key in an OP_RETURN. Once the transaction relays, anyone
    holding the ciphertext can decrypt it, permanently. There is no unreveal and no second
    reveal.
 
 - ``pyrxd glyph timelock-mint --content FILE --name NAME --unlock-at N --cek-out PATH
-  --ciphertext-out PATH`` — encrypt ``FILE``, mint an NFT committing to the key, and save both
-  halves. ``--mode block`` (default) reads ``--unlock-at`` as a block height; ``--mode time``
+  --ciphertext-out PATH --envelope-out PATH`` — encrypt ``FILE``, mint an NFT committing to
+  the key, and save all three halves. ``--mode block`` (default) reads ``--unlock-at`` as a
+  block height; ``--mode time``
   reads it as a unix timestamp. ``--recipient KID:HEX64`` wraps the key to an X25519 public
   key so that party can decrypt **immediately**, without waiting for the reveal; with no
   recipients the reveal is the only way in. The key file is written with mode ``0600``, and an
@@ -58,8 +63,15 @@ transferable from the moment it is minted; the timelock gates *visibility*, not 
   token's mint envelope is fetched **from the chain** and the key is checked against the
   commitment recorded there, so a key that does not belong to this token is refused before
   anything is signed — publishing the wrong one would spend the reveal and leave the payload
-  unreadable for good. A reveal before ``--unlock-at`` is refused unless ``--allow-early`` is
-  passed, which the confirmation prompt then says in as many words.
+  unreadable for good. A reveal before the token's unlock point is refused unless
+  ``--allow-early`` is passed, which the confirmation prompt then says in as many words.
+
+  The prompt also shows the chain reading the unlock check was decided by — ``chain says:``,
+  beside ``opens at:``. That number comes from the ElectrumX endpoint and **pyrxd does not
+  verify it**: there is no proof-of-work check, no link to a header you already trust, and no
+  second endpoint asked. An endpoint reporting a tip past the unlock point gets a permanent
+  early reveal from a gate that believes itself satisfied, so the number is on screen for you
+  to disagree with.
 
   ``--dry-run`` runs every check, builds and signs the transaction, prints the exact key that
   would become public and the raw transaction hex, and broadcasts nothing. Use it first.

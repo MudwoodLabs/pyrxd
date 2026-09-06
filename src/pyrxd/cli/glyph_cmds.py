@@ -570,9 +570,12 @@ async def _wait_for_tx(
                 "check the txid on a block explorer. Not confirmed: nothing is stranded — re-run the "
                 "command. Confirmed: this CLI has no resume flag, so rebuild the reveal with the SDK — "
                 "GlyphBuilder.prepare_reveal(RevealParams(commit_txid=<txid>, commit_vout=0, "
-                "commit_value=<photons>, cbor_bytes=..., owner_pkh=..., is_nft=...)) using the SAME "
-                "unmodified metadata file and the SAME wallet (the commit output is spendable only by a "
-                "reveal carrying byte-identical metadata). See docs/how-to/troubleshoot-common-errors.md"
+                "commit_value=<photons>, cbor_bytes=..., owner_pkh=..., is_nft=...)) with the SAME wallet "
+                "and BYTE-IDENTICAL CBOR — that is what the commit output is a hashlock over. For "
+                "`glyph mint-nft` the bytes come from re-encoding the SAME unmodified metadata file; for "
+                "`glyph timelock-mint` they are the file --envelope-out wrote, which is the only source "
+                "(a timelocked envelope with --recipient is NOT reproducible from the same inputs — each "
+                "wrap draws a fresh ephemeral key and nonce). See docs/how-to/troubleshoot-common-errors.md"
             ),
         ) from exc
 

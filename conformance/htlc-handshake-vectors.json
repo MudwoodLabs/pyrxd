@@ -139,7 +139,7 @@
       "block_interval_s": 600.0,
       "rxd_block_interval_s": 300.0,
       "verdict": "reject",
-      "why": "timelock ordering violated: t_rxd (12 blk) must exceed t_btc (72 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg. NOTE: NegotiatedTerms' cheap same-unit construction guard does NOT fire on this pair — it only compares t_btc and t_rxd when they share a unit. A conforming implementation MUST run the normalising check and not just the construction guard."
+      "why": "timelock ordering violated: t_rxd (12 blk) must exceed t_btc (71 blk) — the maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER timeout (Herlihy 1801.09515 §1). The reverse lets the maker refund the covenant while p is still secret and then claim the counter leg. NOTE: NegotiatedTerms' cheap same-unit construction guard does NOT fire on this pair — it only compares t_btc and t_rxd when they share a unit. A conforming implementation MUST run the normalising check and not just the construction guard. NOTE 2: the 71 is not 43200/600. A SECONDS relative timelock is quantised by BIP68 to 512-second units, so 43200 s locks for floor(43200/512)*512 = 43008 s — 71.68 counter-chain blocks, not 72. A verifier MUST price a SECONDS t_btc on BIP68's 512 s grid and not on its assumed block interval: the two disagree by up to one block interval in EITHER direction (measured at 600 s/block: 592 s of the taker's margin handed to the maker at t_btc=20992 s, and 504 s of honest margin refused at t_btc=17400 s)."
     }
   ],
   "terms_vectors": [

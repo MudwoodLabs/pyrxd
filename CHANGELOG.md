@@ -80,20 +80,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maintainer's call was to wire it rather than delete it.
 
   - `pyrxd glyph timelock-mint` encrypts a file, mints an NFT committing to
-    `sha256(key)`, and writes the key and the ciphertext to paths you must name —
-    **neither is on chain**, and a mint cannot be re-run, so both outputs are required
-    arguments and both files are written before the mint is broadcast. `--recipient
-    KID:HEX64` additionally wraps the key to an X25519 public key so that party can
-    decrypt immediately, without waiting for the reveal.
+    `sha256(key)`, and writes the key, the ciphertext and the envelope CBOR to paths you
+    must name — **none of the three is on chain**, and a mint cannot be re-run, so all
+    three outputs are required arguments and all three files are written before the mint
+    is broadcast. The envelope is required because the commit output is a hashlock over
+    those exact bytes and this CLI keeps no pending store: a commit that confirms while
+    its reveal does not is recoverable only from the saved CBOR, which an envelope built
+    with `--recipient` cannot reproduce (each wrap draws a fresh ephemeral key and nonce).
+    `--recipient KID:HEX64` additionally wraps the key to an X25519 public key so that
+    party can decrypt immediately, without waiting for the reveal.
   - `pyrxd glyph timelock-reveal` publishes the key. It fetches the token's mint
     envelope **from the chain** and refuses a key that is not the one committed to, and
     refuses a reveal before the unlock point unless `--allow-early` is passed.
     `--dry-run` runs every check, signs the transaction, prints the exact key that would
-    become public, and broadcasts nothing.
+    become public, and broadcasts nothing. The confirmation prompt shows the chain reading
+    the unlock check was decided by (`chain says:`, beside `opens at:`) — that number comes
+    from the ElectrumX endpoint and **pyrxd does not verify it**, so it is on screen for an
+    operator to disagree with.
   - `GlyphClient.mint_timelocked_nft`, `.build_timelock_reveal`, `.reveal_timelock` and
     `.plan_timelock_reveal` are the SDK equivalents. The clock for the unlock check comes
     from the chain — the tip height, or the tip block header's timestamp for a
-    `mode="time"` lock — not from the local wall clock.
+    `mode="time"` lock — not from the local wall clock. It is the *endpoint's* report of
+    that clock and is not authenticated; `TimelockRevealPlan.judged_at` carries the reading
+    used. `mint_timelocked_nft` requires either `persist=<callable>` (handed the build
+    before anything is broadcast) or a `cek` the caller already holds, so key custody
+    precedes the commit rather than depending on the call returning.
   - New top-level exports: `build_timelock_mint`, `plan_timelock_reveal`,
     `parse_reveal_proof_script`, `validate_reveal_proof`, `TimelockParams`,
     `TimelockRecipient`, `TimelockMintBuild`, `TimelockRevealPlan`, `RevealProof`,
@@ -108,6 +119,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The TIMELOCK unlock gate failed OPEN on a lock with no protocol marker.**
+  `plan_timelock_reveal` decided "is this timelocked" from `crypto.timelock` and "has it
+  expired" from the `9` marker in `p`, by way of `is_unlocked` — which correctly answers
+  "yes, readable" for anything unmarked, because that is a different question. An envelope
+  carrying the spec while omitting the marker therefore passed the first check and skipped
+  the second: a lock 99,000,000 blocks out returned `unlocked=True`, `remaining=0`,
+  `early_override=False`, and the CLI's `*** EARLY REVEAL` banner is keyed on that last
+  value, so the one visual warning was suppressed too. `decode_payload` builds exactly that
+  object for any token whose CBOR carries `crypto.timelock` without `9` in `p`. The gate now
+  judges the spec it is holding. It does not *refuse* the marker-less shape — a holder of a
+  token another tool minted has honest work to do once its unlock point passes.
+- **A malformed on-chain `cek_hash` was a traceback rather than a refusal.** The decoder
+  stores third-party commitment strings raw, so `parse_cek_hash` could raise a bare
+  `ValueError` from inside the reveal planner — not a type the CLI catches. It is now a
+  `ValidationError` naming the unreadable commitment. Separately, a timelock whose `mode` is
+  neither `block` nor `time` reported "no `current_time` was supplied" while the caller had
+  supplied `current_block`; the refusal now names the mode. Neither change blocks
+  `--allow-early`, and nothing was ever broadcast on these paths.
 - **`attrs` values did not survive a round trip through the chain.** `_decode_attrs`
   coerced every value with `str()` and `GlyphMetadata.attrs` was typed `dict[str, str]`.
   Harmless while nothing wrote non-string attrs — but Photonic's authority tokens carry
@@ -123,7 +152,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A DAT reveal has no token output, so the entire content was unreachable. Only the one
   known marker is skipped; skipping any short item would let a crafted scriptSig push
   filler ahead of a payload of its choosing.
-
 - **A TIMELOCK mint could go on chain carrying no CEK commitment at all.**
   `GlyphMetadata.to_cbor_dict` emitted no `crypto` key under any circumstance, so metadata
   declaring `p = [NFT, ENCRYPTED, TIMELOCK]` produced a token that said it was sealed and
@@ -136,6 +164,49 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exists now, and enforces the two invariants the docstring claimed: `main.hash` is the
   SHA-256 of the plaintext (it is the AAD prefix every chunk is authenticated against) and
   `crypto.cek_hash` is the SHA-256 of the key that encrypted it.
+- **The cross-chain margin gate priced the counter leg on the wrong grid, and the comment
+  beside it certified that it did not.** `assert_timelock_margin` converted `t_btc` with
+  `normalize_to(BLOCKS)`, quantising it onto `policy.block_interval_s`; BIP68 quantises a
+  SECONDS relative timelock to **512-second** units. The two grids disagree in both
+  directions — measured over every encodable value at 600 s/block, up to **592 s** of the
+  taker's cross-chain margin handed to whoever authored the terms (at `t_btc = 20992 s`)
+  and up to **504 s** of honest margin refused (at `t_btc = 17400 s`). It now reads the
+  exact quantity through the new `Timelock.consensus_maturity_s`, derived from
+  `to_nsequence()` so it cannot drift from the bytes the refund leaf pushes.
+
+  The comment #624 added at that site had grouped `t_btc` with `t_rxd` as deadlines that
+  "floor correctly", when `t_btc` sits on the same side of the inequality as `margin` —
+  the term #624 had just fixed for exactly that reason — and the same premise was written
+  into the guard test's docstring as the reason `t_btc` was safe to exclude from its
+  derived field set. Both are corrected, the guard now scans `NegotiatedTerms`' timelocks
+  as well as `MarginPolicy`'s and matches bare-name receivers (the defect site converted a
+  parameter, which the attribute-only match could not see either), and every remaining
+  floor states its own direction. **No behaviour change for a BLOCKS-tagged `t_btc`**,
+  which is everything this tree constructs; the published conformance vector
+  `margin-cross-unit-inversion` keeps its `reject` verdict and gains the corrected
+  block-equivalent (72 → 71) plus a note stating the rule.
+- **`MarginPolicy` accepted a NaN/inf `burial_safety_factor`, and the shipped
+  `--burial-safety-factor` flag could set one.** `nan < 1.0` is False, so NaN passed the
+  below-break-even bound *vacuously*; `argparse(type=float)` parses `nan` happily. The
+  value then reached `Fraction(...)` in the reorg gate and surfaced as PAGE_SQUEEZED
+  "verify finality manually" on every tick of every RXD swap — fail-closed (never a false
+  SAFE), but a healthy swap paged as a squeeze is a guard refusing valid work. Every
+  float knob on the policy is now required to be finite, over a field set **derived from
+  the dataclass** rather than typed out beside the check.
+
+### Changed
+
+- **`pyrxd-watchtower` now refuses a policy flag it cannot honour instead of dropping it.**
+  Without `--measured`, twelve flags — including `--rxd-claim-inclusion`,
+  `--burial-safety-factor`, `--margin-blocks`, `--btc-reorg-depth` and
+  `--rxd-reorg-cost-per-block` — reached no policy at all, because `MarginPolicy.estimated`
+  takes only `block_interval_s` and `accept_flat_burial`. Worse, the startup reserve report
+  #580 added *so an operator could confirm the flag took* derived its provenance label from
+  the argv: `--rxd-claim-inclusion 5 --burial-safety-factor 3` logged
+  `rxd_claim_inclusion=2 blk (measured, --rxd-claim-inclusion) ... burial_safety_factor=1.00`.
+  Such an invocation now exits at startup naming the flags and the remedy, and the report
+  additionally checks its own label against the policy before printing it. The default
+  alert-only invocation and every existing `--measured` invocation are unchanged.
 
 ## [0.23.0] — 2026-09-04
 
