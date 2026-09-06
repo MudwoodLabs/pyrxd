@@ -331,6 +331,30 @@ def _reorg_cost_from_args(args: argparse.Namespace) -> ReorgCostMeasurement | No
     )
 
 
+#: The CLI flags whose value reaches the :class:`MarginPolicy` ONLY through ``--measured``.
+#:
+#: A tuple of names near the top of a file is exactly the shape that goes stale, so this one does
+#: not get to be the authority on itself: ``tests/test_watchtower_cli_margin_policy_knobs.py``
+#: re-derives it from the AST of ``_policy_from_args`` (the ``args.X`` reads inside the
+#: ``if args.measured:`` branch and the helper it calls, minus the ones the estimated branch reads
+#: too) and asserts equality BOTH ways — a knob added to the measured branch and not listed here
+#: fails, and a name listed here that the measured branch stopped reading fails too.
+_MEASURED_ONLY_POLICY_FLAGS: tuple[str, ...] = (
+    "btc_reorg_depth",
+    "burial_safety_factor",
+    "margin_blocks",
+    "reorg_cost_max_age_s",
+    "rxd_block_interval_fast_s",
+    "rxd_block_interval_s",
+    "rxd_claim_burial",
+    "rxd_claim_inclusion",
+    "rxd_difficulty",
+    "rxd_price_usd",
+    "rxd_reorg_cost_per_block",
+    "rxd_usd_per_hash",
+)
+
+
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if args.measured:
         # Fail closed (mirrors the coordinator's setup gate): a measured tower signals real-value
@@ -375,10 +399,44 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
         )
     # Estimated policy is acceptable for alert-only v1 (no value moves); the operator
     # verifies each page. Use --measured with real block data before any autonomy (v2).
+    #
+    # REFUSE A POLICY FLAG THIS BRANCH CANNOT CARRY, rather than dropping it in silence.
+    # `MarginPolicy.estimated()` takes exactly `block_interval_s` and `accept_flat_burial` — that
+    # is the point of it, it IS the shipped estimate — so every other policy flag above reached
+    # the policy only through `MarginPolicy.measured`. Without `--measured` they went nowhere, and
+    # the startup report then printed "measured, --rxd-claim-inclusion" for a value the flag never
+    # set: `--rxd-claim-inclusion 5 --burial-safety-factor 3` logged `rxd_claim_inclusion=2 blk
+    # (measured, --rxd-claim-inclusion) ... burial_safety_factor=1.00`. That report is the one
+    # surface #580 added so an operator could confirm the flag TOOK, and it asserted the opposite
+    # of the truth.
+    #
+    # Refusing rather than forwarding, for two reasons. The gap is not two flags — TWELVE were
+    # dropped here, including `--margin-blocks`, `--btc-reorg-depth` and `--rxd-reorg-cost-per-block`
+    # — so forwarding fixes the instances and leaves the class. And an "estimated" policy carrying
+    # measured knobs is a third thing with no name, which the report would then have to describe.
+    #
+    # BEHAVIOUR CHANGE, deliberate: `pyrxd-watchtower --rxd-claim-inclusion 5` (no `--measured`)
+    # used to start with the value ignored and now exits at startup. It refuses no honest run —
+    # nothing that ran correctly before is rejected, only invocations whose stated intent the
+    # estimated policy never honoured — it moves no funds (the tower is alert-only and keyless),
+    # and the remedy is in the message.
+    parser_defaults = _build_parser()
+    given = [
+        f"--{dest.replace('_', '-')}"
+        for dest in _MEASURED_ONLY_POLICY_FLAGS
+        if getattr(args, dest) != parser_defaults.get_default(dest)
+    ]
+    if given:
+        raise ValidationError(
+            f"{', '.join(given)} only reach the MarginPolicy through --measured; without it they are "
+            "dropped and the startup reserve report would describe a policy you did not ask for. Add "
+            "--measured (and its required measurements), or drop these flags to run the shipped "
+            "ESTIMATE knowingly."
+        )
     return MarginPolicy.estimated(block_interval_s=args.block_interval_s, accept_flat_burial=args.accept_flat_burial)
 
 
-def _report_claim_reserves(policy: MarginPolicy, *, inclusion_measured: bool) -> None:
+def _report_claim_reserves(policy: MarginPolicy, *, requested_inclusion_blocks: int | None) -> None:
     """Print, once at startup, the reserve terms every SAFE claim verdict is computed from.
 
     THE HALF OF #580 THAT REACHES A HUMAN. A flag whose effect nobody can see is half a knob:
@@ -398,6 +456,27 @@ def _report_claim_reserves(policy: MarginPolicy, *, inclusion_measured: bool) ->
 
     burial = _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
     inclusion = _radiant_reserve_blocks(policy, policy.rxd_claim_inclusion)
+    # THE LABEL IS CHECKED AGAINST THE POLICY BEFORE IT IS PRINTED.
+    #
+    # Provenance genuinely lives in the ARGV — `--rxd-claim-inclusion 2` from someone who counted
+    # blocks is not the same fact as never passing the flag, and the policy cannot tell them apart
+    # — so this still takes the operator's request as its input. What it must not do is take the
+    # argv's WORD for it: "(measured, --rxd-claim-inclusion)" used to be derived from the flag
+    # being present, on a line printing a number the flag had not set, so the one surface built to
+    # confirm the flag took was also the surface that could certify a flag that had been dropped.
+    #
+    # Deriving the label from the policy alone would lose the distinction; comparing the two keeps
+    # it and makes the sentence unable to disagree with the number beside it. Fail-closed at
+    # startup, before a swap is watched: refusing to run beats running while asserting the
+    # opposite of the truth. Unreachable while `_policy_from_args` is correct — which is the point
+    # of a check, and it would have caught the defect that motivated it.
+    inclusion_measured = requested_inclusion_blocks is not None
+    if requested_inclusion_blocks is not None and inclusion != requested_inclusion_blocks:
+        raise ValidationError(
+            f"--rxd-claim-inclusion {requested_inclusion_blocks} did not reach the policy, which holds "
+            f"{inclusion} block(s). Refusing to start: the next line would have labelled that number "
+            "'measured, --rxd-claim-inclusion'."
+        )
     logger.info(
         "claim-race reserves (%s policy): rxd_claim_burial=%d blk + rxd_claim_inclusion=%d blk (%s) "
         "=> flat floor %d RXD block(s) of headroom before the maker's t_rxd refund opens for a SAFE "
@@ -425,7 +504,13 @@ def _report_claim_reserves(policy: MarginPolicy, *, inclusion_measured: bool) ->
         )
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
+    """The tower's argument parser.
+
+    Split out of ``_parse_args`` so ``_policy_from_args`` can ask it what each flag's DEFAULT is,
+    and therefore tell "the operator passed this" from "nobody passed anything" without a second
+    copy of the defaults to keep in sync.
+    """
     p = argparse.ArgumentParser(description="HTLC swap watchtower (v1 alert-only, BTC)")
     p.add_argument("--records-dir", required=True, help="dir of SwapRecord JSON files to watch")
     p.add_argument(
@@ -640,7 +725,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="permit an autonomous refund on a single-source (low-corroboration) read — required for a dust run "
         "until a multi-source RXD quorum lands",
     )
-    return p.parse_args(argv)
+    return p
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return _build_parser().parse_args(argv)
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:
@@ -693,7 +782,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args(argv)
     policy = _policy_from_args(args)
-    _report_claim_reserves(policy, inclusion_measured=args.rxd_claim_inclusion is not None)
+    _report_claim_reserves(policy, requested_inclusion_blocks=args.rxd_claim_inclusion)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
