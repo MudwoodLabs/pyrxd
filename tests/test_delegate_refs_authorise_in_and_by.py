@@ -384,12 +384,12 @@ def test_the_honest_non_delegate_path_still_works_unchanged():
 def test_delegate_setup_is_two_steps_because_tokens_need_the_bases_outpoint():
     builder = GlyphBuilder()
 
-    step1 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR])
+    step1 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH)
     assert parse_delegate_base_script(step1.base_script) == (CONTAINER.to_bytes(), AUTHOR.to_bytes())
     assert step1.authorised_refs == (CONTAINER, AUTHOR)
     assert step1.token_scripts == ()  # no base ref yet, so no tokens
 
-    step2 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], base_ref=BASE, token_count=3)
+    step2 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH, base_ref=BASE, token_count=3)
     assert len(step2.token_scripts) == 3
     # Every token carries the SAME base ref — they are distinguished by being
     # separate UTXOs, not by their scripts (Photonic createDelegateTokens).
@@ -407,7 +407,7 @@ def test_the_base_transaction_must_re_create_the_parents_or_it_burns_them():
     hands the caller those outputs rather than describing them in prose.
     """
     builder = GlyphBuilder()
-    setup = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR])
+    setup = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH)
 
     assert setup.parent_scripts == (
         build_nft_locking_script(PKH, CONTAINER),
@@ -428,9 +428,9 @@ def test_a_parent_can_be_re_created_to_a_different_holder():
 def test_delegate_setup_refuses_the_two_ways_to_build_a_useless_one():
     builder = GlyphBuilder()
     with pytest.raises(ValidationError, match="at least one ref"):
-        builder.prepare_delegate_setup(PKH, [])
+        builder.prepare_delegate_setup(PKH, [], parent_owner_pkh=PKH)
     with pytest.raises(ValidationError, match="token_count requires base_ref"):
-        builder.prepare_delegate_setup(PKH, [CONTAINER], token_count=2)
+        builder.prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=PKH, token_count=2)
 
 
 def test_resolver_uses_the_vout_in_the_ref_not_the_first_output_that_parses():
@@ -560,3 +560,126 @@ def test_a_claim_with_no_delegate_at_all_is_still_called_out():
     """The honest-path check: the original warning must survive."""
     out = _render([{"kind": "container", "ref": "c0:0", "outcome": "unbacked", "backing": "none"}])
     assert "[CLAIMED ONLY — nothing authorised it]" in out
+
+
+# ---------------------------------------------------------------------------
+# The CLI resolution path, driven end to end
+# ---------------------------------------------------------------------------
+#
+# THE TEST WHOSE ABSENCE LET TWO CRITICALS SHIP. `_inspect_txid_inner` is the
+# only production caller of `resolve_delegated_refs`, and nothing exercised it:
+# the renderer was tested from a hand-built dict, and the resolution logic was
+# tested by calling the library functions directly. So `Transaction.from_bytes`
+# (a method that does not exist) and a `delegated_refs=` kwarg passed to a
+# wrapper that did not accept it both sat on a path no test entered. Every
+# transaction carrying a delegate burn raised, and the delegated verdict this
+# feature exists to produce could never be produced.
+
+
+class _StubElectrumX:
+    """Returns canned raw transactions by txid, and records what was asked for."""
+
+    def __init__(self, by_txid: dict[str, bytes]) -> None:
+        self._by_txid = by_txid
+        self.requested: list[str] = []
+
+    async def get_transaction(self, txid):
+        self.requested.append(str(txid))
+        try:
+            return self._by_txid[str(txid)]
+        except KeyError:  # pragma: no cover - a miss is a test bug, not a path
+            raise AssertionError(f"stub asked for an unexpected txid: {txid}") from None
+
+
+def _delegated_reveal_and_base():
+    """A real reveal that burns a delegate, and the real base that authorises it."""
+    from pyrxd.glyph.payload import build_reveal_scriptsig_suffix, encode_payload
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    metadata = GlyphMetadata(
+        protocol=[GlyphProtocol.NFT],
+        name="DELEGATED-MEMBER",
+        container_refs=(CONTAINER,),
+        author_refs=(AUTHOR,),
+    )
+    cbor_bytes, _hash = encode_payload(metadata)
+
+    # The base transaction: output 0 is a delegate base authorising both parents.
+    base_tx = Transaction(
+        tx_inputs=[],
+        tx_outputs=[TransactionOutput(Script(build_delegate_base_script(PKH, [CONTAINER, AUTHOR])), 1000)],
+    )
+    base_txid = base_tx.txid()
+    base_ref = GlyphRef(txid=base_txid, vout=0)
+
+    # The reveal: mints an NFT and burns a token carrying that base ref. Its
+    # scriptSig carries the envelope, which is how the inspector finds it.
+    reveal_tx = Transaction(
+        tx_inputs=[],
+        tx_outputs=[
+            TransactionOutput(Script(build_nft_locking_script(PKH, MINTED)), 1000),
+            TransactionOutput(Script(build_delegate_burn_script(base_ref)), 0),
+        ],
+    )
+    reveal_tx.inputs = []
+    # Build the scriptSig the reveal would carry, then attach it to one input.
+    from pyrxd.transaction.transaction_input import TransactionInput
+
+    inp = TransactionInput(source_txid="11" * 32, source_output_index=0)
+    inp.unlocking_script = Script(
+        b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + build_reveal_scriptsig_suffix(cbor_bytes)
+    )
+    reveal_tx.inputs = [inp]
+    return reveal_tx, base_tx, base_ref
+
+
+def test_the_cli_resolves_a_delegated_claim_end_to_end():
+    """Drives `_inspect_txid_inner` with a stub client, through the real path."""
+    import asyncio
+
+    from pyrxd.cli.glyph_inspect import _inspect_txid_inner
+
+    reveal_tx, base_tx, base_ref = _delegated_reveal_and_base()
+    reveal_txid = reveal_tx.txid()
+    client = _StubElectrumX(
+        {reveal_txid: reveal_tx.serialize(), base_tx.txid(): base_tx.serialize()},
+    )
+
+    payload = asyncio.run(_inspect_txid_inner(client, reveal_txid))
+
+    # It fetched the base named by the burn — the second round trip is the
+    # whole mechanism, and it never happened before.
+    assert base_tx.txid() in client.requested
+
+    metadata = payload["metadata"]
+    assert metadata["delegate_burns"] == [f"{base_ref.txid}:{base_ref.vout}"]
+    verdicts = {r["kind"]: r for r in metadata["relationships"]}
+    for kind in ("container", "author"):
+        assert verdicts[kind]["outcome"] == "backed", f"{kind} unresolved through the CLI path"
+        assert verdicts[kind]["backing"] == "delegated"
+
+
+def test_an_unfetchable_base_leaves_the_claim_unresolved_not_crashed():
+    """The block's stated contract: a failed resolution never fails the inspect."""
+    import asyncio
+
+    from pyrxd.cli.glyph_inspect import _inspect_txid_inner
+
+    reveal_tx, base_tx, _base_ref = _delegated_reveal_and_base()
+    reveal_txid = reveal_tx.txid()
+
+    class _Failing(_StubElectrumX):
+        async def get_transaction(self, txid):
+            if str(txid) == base_tx.txid():
+                raise TimeoutError("base unreachable")
+            return await super().get_transaction(txid)
+
+    client = _Failing({reveal_txid: reveal_tx.serialize()})
+    payload = asyncio.run(_inspect_txid_inner(client, reveal_txid))
+
+    verdicts = {r["kind"]: r for r in payload["metadata"]["relationships"]}
+    assert verdicts["container"]["outcome"] == "unbacked"
+    # And the burn is still reported, so the reader knows resolution was possible.
+    assert payload["metadata"]["delegate_burns"]

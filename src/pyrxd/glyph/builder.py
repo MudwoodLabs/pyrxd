@@ -192,7 +192,9 @@ class RevealParams:
 class RevealScripts:
     """Scripts needed to build the reveal tx — caller constructs the full tx."""
 
-    locking_script: bytes  # output scriptPubKey
+    #: Output scriptPubKey. ``None`` for a DAT reveal, which mints nothing —
+    #: NOT ``b""``, which is a valid anyone-can-spend script.
+    locking_script: bytes | None
     scriptsig_suffix: bytes  # the 'gly' + CBOR portion; caller prepends sig+pubkey
     #: When not ``None``, the reveal MUST include this as an additional output
     #: with value 0. The commit covenant counts it (exactly one required), so a
@@ -993,7 +995,12 @@ class GlyphBuilder:
         """
         self._assert_protocol(cbor_bytes, GlyphProtocol.DAT, "DAT reveal")
         return RevealScripts(
-            locking_script=b"",
+            # None, NOT b"". An empty scriptPubKey is a VALID output script that
+            # anyone can spend, so a caller reusing the ordinary reveal loop —
+            # `TransactionOutput(Script(scripts.locking_script), value)` — would
+            # put the commit value up for grabs. `None` makes that construction
+            # fail instead of succeeding dangerously.
+            locking_script=None,
             scriptsig_suffix=build_dat_reveal_scriptsig_suffix(cbor_bytes),
             delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
         )
@@ -1076,7 +1083,7 @@ class GlyphBuilder:
         owner_pkh: Hex20,
         authorised_refs: Sequence[GlyphRef],
         *,
-        parent_owner_pkh: Hex20 | None = None,
+        parent_owner_pkh: Hex20,
         base_ref: GlyphRef | None = None,
         token_count: int = 0,
     ) -> DelegateSetupScripts:
@@ -1123,8 +1130,15 @@ class GlyphBuilder:
         DELEGATED separately from DIRECT rather than flattening the two.
 
         :param parent_owner_pkh: who the re-created parent outputs pay to.
-            Defaults to *owner_pkh*, which is right when the setup wallet is the
-            one holding the parents — the usual case, since it has to spend them.
+            **Required, and deliberately not defaulted to** *owner_pkh*. It read
+            as the safe default — whoever spends a singleton holds it — but this
+            method exists to serve a HOT minting service, so *owner_pkh* is
+            typically the hot key while the container and author are held cold.
+            Defaulting would have silently moved them to the hot wallet, in the
+            one transaction whose whole purpose is to let them go back to cold
+            storage, and a later hot-key compromise would take a singleton that
+            can never be re-minted. It also silently consolidates two parents
+            held by two different keys. State where each parent goes.
         :raises ValidationError: *authorised_refs* is empty, or *token_count* is
             given without *base_ref* (or vice versa with no tokens to build).
         """
@@ -1142,14 +1156,10 @@ class GlyphBuilder:
                 "first, then call again with base_ref=<that output's outpoint>."
             )
         refs = tuple(authorised_refs)
-        # Defaults to the setup wallet: whoever spends a parent singleton IS its
-        # owner, so the same key almost always receives it back. Pass it
-        # explicitly when a parent should be re-created to a different holder.
-        parents_to = owner_pkh if parent_owner_pkh is None else parent_owner_pkh
         return DelegateSetupScripts(
             base_script=build_delegate_base_script(owner_pkh, refs),
             authorised_refs=refs,
-            parent_scripts=tuple(build_nft_locking_script(parents_to, ref) for ref in refs),
+            parent_scripts=tuple(build_nft_locking_script(parent_owner_pkh, ref) for ref in refs),
             token_scripts=tuple(build_delegate_token_script(owner_pkh, base_ref) for _ in range(token_count))
             if base_ref is not None
             else (),

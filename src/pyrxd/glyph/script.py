@@ -131,7 +131,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from pyrxd.constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
+from pyrxd.constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
 from pyrxd.hash import hash256
 from pyrxd.script.consensus import get_script_op
 from pyrxd.security.errors import ValidationError
@@ -641,11 +641,27 @@ def parse_delegate_base_script(script: bytes) -> tuple[bytes, ...]:
     The counterpart of :func:`build_delegate_base_script`, and the read half of
     Photonic ``parseDelegateBaseScript`` (``script.ts:480``).
 
-    Reads the LEADING run of ``OP_REQUIREINPUTREF <ref> OP_DROP`` pairs and
-    stops at the first instruction that is not one, ignoring whatever tail
-    follows — Photonic's regex ends in ``.*`` and does the same. Being stricter
-    here (demanding a P2PKH tail, say) would refuse honest bases built by
-    another wallet, which is a defect, not a safety measure.
+    Reads the LEADING run of ``OP_REQUIREINPUTREF <ref> OP_DROP`` pairs, then
+    REFUSES the script outright if what follows carries a pushed ref
+    (:data:`~pyrxd.constants.PUSH_REF_OPCODES` — ``0xd0``/``0xd8``).
+
+    That refusal is the security property, not fussiness. An authority-gated
+    NFT is ``OP_REQUIREINPUTREF <authority> OP_DROP OP_PUSHINPUTREFSINGLETON
+    <item> OP_DROP`` + P2PKH — it OPENS with exactly the pair this function
+    collects, so ignoring the tail made a gated item parse as a base
+    authorising the issuer's ref, indistinguishable from the real thing. The
+    holder of one gated item, who never held the authority, could then spend its
+    outpoint, emit a burn naming it (consensus puts every spent outpoint in the
+    require set, so that is permitted), and have every token in that
+    transaction claiming ``by:[authority]`` read BACKED/DELEGATED. Confirmed by
+    execution.
+
+    A genuine base carries no token — it is require-pairs and a payment tail —
+    so refusing a pushed ref costs honest callers nothing. Photonic's regex
+    (``/^((d1..75)+).*/``) has the same hole; this deliberately diverges. An
+    earlier version of this docstring argued that tail-tolerance was the safe
+    choice and strictness "a defect, not a safety measure". That argument was
+    the vulnerability.
 
     The walk goes through :func:`iter_script_ops_strict` rather than a regex or
     a byte scan, so a ``0xd1`` byte inside pushed data cannot be misread as an
@@ -664,6 +680,11 @@ def parse_delegate_base_script(script: bytes) -> tuple[bytes, ...]:
             break
         refs.append(bytes(op.operand))
         i += 2
+    # The tail must not carry a token. See the docstring: an authority-gated
+    # NFT opens with the same require-pair and would otherwise read as a base
+    # authorising the very authority it is gated on.
+    if any(rest.opcode in PUSH_REF_OPCODES for rest in ops[i:]):
+        return ()
     return tuple(refs)
 
 

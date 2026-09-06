@@ -138,7 +138,10 @@ def test_a_dat_reveal_returns_no_locking_script():
     """It mints nothing; handing back a token script would be a lie about that."""
     builder = GlyphBuilder()
     cbor_bytes, _h = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.DAT], name="blob"))
-    assert builder.prepare_dat_reveal(cbor_bytes).locking_script == b""
+    # None, not b"": an empty scriptPubKey is a VALID anyone-can-spend script,
+    # so returning it would let a caller reusing the ordinary reveal loop put
+    # the commit value up for grabs. None makes that construction fail.
+    assert builder.prepare_dat_reveal(cbor_bytes).locking_script is None
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +293,56 @@ def test_the_inspector_names_both_shapes_and_qualifies_the_burn_claim():
     assert burn["burn"]["claims"]["amount"] == 7
     # The caveat must travel with the claim.
     assert "anyone can write one" in burn["burn"]["note"]
+
+
+# ---------------------------------------------------------------------------
+# Forged burns (found by the security panel, 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+def test_a_disallow_ref_opcode_does_not_count_as_having_held_the_token():
+    """`_carries` must count only PUSHED refs. Regression for a real forgery.
+
+    `OP_DISALLOWPUSHINPUTREF` (0xd2) and `...SIBLING` (0xd3) are LOCAL
+    assertions — consensus never asks whether an input carried them, so anyone
+    can name any ref with one for the price of an output. Walking the wide
+    opcode set let an attacker create `0xd2 <victim_ref> OP_DROP <P2PKH>`, spend
+    it beside a burn proof naming the victim's live NFT, and receive
+    SPENT_AND_ABSENT / valid=True for a token they never held.
+
+    This is the identical defect `relationships.py` records having had — "the
+    verifier ... originally used the widest one and reported forged collection
+    membership as VERIFIED" — committed a second time in a second module.
+    """
+    victim = GlyphRef(txid="ab" * 32, vout=0)
+    proof = build_burn_proof_script(victim)
+    p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+
+    for opcode, name in ((0xD2, "OP_DISALLOWPUSHINPUTREF"), (0xD3, "OP_DISALLOWPUSHINPUTREFSIBLING")):
+        forged = bytes([opcode]) + victim.to_bytes() + b"\x75" + p2pkh
+        verdict = verify_burn([proof], victim, spent_output_scripts=[forged])
+        assert not verdict.valid, f"{name} forged a burn of someone else's token"
+        assert verdict.basis is BurnBasis.NONE
+
+    # OP_REQUIREINPUTREF is a requirement, not possession — also not enough.
+    required = bytes([0xD1]) + victim.to_bytes() + b"\x75" + p2pkh
+    assert not verify_burn([proof], victim, spent_output_scripts=[required]).valid
+
+    # And the honest path still works: a real singleton the tx spent.
+    honest = build_nft_locking_script(PKH, victim)
+    assert verify_burn([proof], victim, spent_output_scripts=[honest]).valid
+
+
+def test_a_stray_disallow_mention_does_not_make_an_honest_burn_read_as_survival():
+    """The same over-wide set, in the other direction — refusing valid work.
+
+    On the OUTPUT side, counting 0xd2 as "the token is still here" would report
+    a genuine burn as `forwarded, not burned`.
+    """
+    victim = GlyphRef(txid="ab" * 32, vout=0)
+    proof = build_burn_proof_script(victim)
+    p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    noise = bytes([0xD2]) + victim.to_bytes() + b"\x75" + p2pkh
+
+    verdict = verify_burn([proof, noise], victim, spent_output_scripts=[build_nft_locking_script(PKH, victim)])
+    assert verdict.valid and verdict.basis is BurnBasis.SPENT_AND_ABSENT

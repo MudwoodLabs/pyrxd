@@ -380,3 +380,33 @@ def test_a_nested_attr_value_is_still_flattened():
 
     raw = cbor2.dumps({"p": [2], "name": "x", "attrs": {"deep": {"a": {"b": 1}}}})
     assert isinstance(decode_payload(raw).attrs["deep"], str)
+
+
+def test_an_authority_gated_item_does_NOT_parse_as_a_delegate_base():
+    """Regression for a confirmed forgery of an authority claim.
+
+    A gated item is `OP_REQUIREINPUTREF <authority> OP_DROP
+    OP_PUSHINPUTREFSINGLETON <item> OP_DROP` + P2PKH — it OPENS with exactly the
+    pair `parse_delegate_base_script` collects. While that parser ignored its
+    tail, a gated item parsed as a base authorising the issuer, byte-for-byte
+    indistinguishable from a real one.
+
+    The attack: the holder of ONE gated item, who never held the authority,
+    spends its outpoint and emits a burn naming it — permitted, because
+    consensus puts every spent outpoint into the require set. Every token in
+    that transaction claiming `by:[authority]` then resolved to
+    BACKED/DELEGATED, and `verify_authority_claim` returned valid=True.
+    """
+    from pyrxd.glyph.script import build_delegate_base_script, parse_delegate_base_script
+
+    gated = build_authority_gated_nft_script(PKH, ITEM, AUTHORITY)
+    assert parse_delegate_base_script(gated) == (), "a gated item must not read as a delegate base"
+
+    # A genuine base still parses, including one with an unrecognised tail —
+    # the fix must not refuse honest bases built by another wallet.
+    real = build_delegate_base_script(PKH, [AUTHORITY, ITEM])
+    assert parse_delegate_base_script(real) == (AUTHORITY.to_bytes(), ITEM.to_bytes())
+    assert parse_delegate_base_script(real + bytes.fromhex("6a02ffff")) == (
+        AUTHORITY.to_bytes(),
+        ITEM.to_bytes(),
+    )

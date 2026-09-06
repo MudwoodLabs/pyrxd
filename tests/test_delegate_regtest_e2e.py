@@ -197,6 +197,7 @@ def tokens(node, base):  # noqa: F811
     setup = GlyphBuilder().prepare_delegate_setup(
         base["pkh"],
         list(base["authorised"]),
+        parent_owner_pkh=base["pkh"],
         base_ref=base["ref"],
         token_count=_TOKEN_COUNT,
     )

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import click
@@ -50,6 +51,9 @@ if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
 
 _log = logging.getLogger(__name__)
+
+#: Most delegate bases one `inspect --fetch` will resolve. See the loop below.
+_MAX_DELEGATE_BASES = 25
 
 __all__ = [
     "inspect_cmd",
@@ -113,7 +117,14 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         raise UserError(str(exc)) from exc
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
+def _classify_raw_tx(
+    txid_hex: str,
+    raw: bytes,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    delegated_refs: Iterable[bytes] = (),
+) -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
 
@@ -122,7 +133,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
     CLI's three-line ``error / cause / fix`` formatting so existing
     test assertions (e.g. on ``"--electrumx"``) keep matching."""
     try:
-        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network)
+        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network, delegated_refs=delegated_refs)
     except ValidationError as exc:
         msg = str(exc)
         if "raw bytes too short" in msg:
@@ -202,12 +213,28 @@ async def _inspect_txid_inner(
     # Skipping the fetch would render an honest token as "CLAIMED ONLY —
     # nothing authorised it", which is a false accusation, not a safe default.
     burns = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}).get("delegate_burns") or []
+    # BOUNDED. Each entry costs a `blockchain.transaction.get` round trip, and
+    # the burn output that produces one is 42 bytes — a single transaction
+    # within the 4 MB / 100,000-output classifier caps can name ~78,000 distinct
+    # bases, so an unbounded loop lets one crafted txid hang the CLI and get the
+    # user's ElectrumX endpoint rate-limited. Resolve a prefix and say what was
+    # left; an unresolved claim already renders honestly as UNRESOLVED.
+    unresolved_over_cap = max(0, len(burns) - _MAX_DELEGATE_BASES)
     resolved: list[bytes] = []
-    for outpoint in burns:
+    for outpoint in burns[:_MAX_DELEGATE_BASES]:
         base_txid, _, vout_str = str(outpoint).rpartition(":")
         try:
             base_ref = GlyphRef(txid=Txid(base_txid.lower()), vout=int(vout_str))
             base_raw = await client.get_transaction(Txid(base_txid.lower()))
+            # INSIDE the try. This was `Transaction.from_bytes`, which does not
+            # exist, and it sat outside — so every transaction carrying a
+            # delegate burn raised AttributeError out of a block whose stated
+            # contract is that a failed resolution never fails the inspect.
+            # Anyone could crash `inspect --fetch` by emitting one.
+            base_tx = Transaction.from_hex(bytes(base_raw))
+            if base_tx is None:
+                raise ValidationError(f"base tx {base_txid} did not decode")
+            base_outputs = [bytes(o.locking_script.serialize()) for o in base_tx.outputs]
         except (ValidationError, ValueError):
             continue
         except Exception as exc:
@@ -219,16 +246,12 @@ async def _inspect_txid_inner(
             # and whoever is debugging that needs to know which it was.
             _log.debug("could not resolve delegate base %s: %s", outpoint, exc)
             continue
-        base_tx = Transaction.from_bytes(bytes(base_raw))
-        resolved.extend(
-            resolve_delegated_refs(
-                base_ref.to_bytes(),
-                [bytes(o.locking_script.serialize()) for o in base_tx.outputs],
-            )
-        )
+        resolved.extend(resolve_delegated_refs(base_ref.to_bytes(), base_outputs))
 
     if resolved:
         payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network, delegated_refs=resolved)
+    if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
+        payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
 
 

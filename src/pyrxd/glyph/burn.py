@@ -42,6 +42,7 @@ from enum import Enum
 
 import cbor2
 
+from ..constants import PUSH_REF_OPCODES
 from ..security.errors import ValidationError
 from .payload import GLY_MARKER
 from .script import iter_input_refs
@@ -225,10 +226,34 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
 
 
 def _carries(scripts: list[bytes], wire_ref: bytes) -> bool:
-    """True if any script carries *wire_ref* under a ref opcode."""
+    """True if any script CARRIES *wire_ref* — pushes it, not merely names it.
+
+    THE OPCODE SET IS THE WHOLE SECURITY PROPERTY HERE. ``iter_input_refs``
+    yields all five operand-carrying opcodes, and only ``OP_PUSHINPUTREF``
+    (``0xd0``) and ``OP_PUSHINPUTREFSINGLETON`` (``0xd8``) mean the output holds
+    the token. ``OP_DISALLOWPUSHINPUTREF`` (``0xd2``) and
+    ``...SIBLING`` (``0xd3``) are LOCAL ASSERTIONS: consensus never asks whether
+    an input carried them, so anyone can name any ref with one for the price of
+    an output (:data:`~pyrxd.constants.INPUT_BACKED_REF_OPCODES`).
+    ``OP_REQUIREINPUTREF`` (``0xd1``) is a requirement, not possession.
+
+    Walking the wide set broke this function in BOTH directions:
+
+    * on the spent side it forged a burn — an attacker creates
+      ``0xd2 <victim_ref> OP_DROP <P2PKH>``, spends it alongside a burn proof
+      naming the victim's live NFT, and got ``SPENT_AND_ABSENT, valid=True``
+      for a token they never held;
+    * on the output side a stray ``0xd2`` mention would read as the token
+      surviving, refusing an honest burn.
+
+    :mod:`pyrxd.glyph.relationships` records the identical defect —
+    "the verifier ... originally used the widest one and reported forged
+    collection membership as VERIFIED". This is that bug, made a second time,
+    in a second module.
+    """
     for script in scripts:
         try:
-            if any(operand == wire_ref for _op, operand in iter_input_refs(script)):
+            if any(operand == wire_ref for op, operand in iter_input_refs(script) if op in PUSH_REF_OPCODES):
                 return True
         except Exception as exc:
             # An unwalkable script cannot be shown to carry the ref, and must
