@@ -72,7 +72,12 @@ from typing import Any
 
 from ..constants import INPUT_BACKED_REF_OPCODES
 from ..security.errors import ValidationError
-from .script import iter_input_refs, parse_delegate_base_script, parse_delegate_burn_script
+from .script import (
+    TruncatedScriptError,
+    iter_input_refs,
+    parse_delegate_base_script,
+    parse_delegate_burn_script,
+)
 from .types import GlyphRef
 
 _log = logging.getLogger(__name__)
@@ -128,6 +133,19 @@ class RelationshipVerdict:
     outcome: RelationshipOutcome
     backing: RelationshipBacking = RelationshipBacking.NONE
 
+    def __post_init__(self) -> None:
+        # BACKED with backing=NONE was representable, and consumers read the
+        # two together — `verify_authority_claim` branches on `backing` after
+        # checking `backed`, and would have described a delegate burn that never
+        # happened. The default exists for UNBACKED verdicts; pair it with
+        # BACKED and the object contradicts itself.
+        backed = self.outcome is RelationshipOutcome.BACKED
+        if backed is (self.backing is RelationshipBacking.NONE):
+            raise ValidationError(
+                f"RelationshipVerdict is self-contradictory: outcome={self.outcome.value} with "
+                f"backing={self.backing.value}"
+            )
+
     @property
     def backed(self) -> bool:
         return self.outcome is RelationshipOutcome.BACKED
@@ -164,7 +182,7 @@ def output_ref_operands(output_scripts: list[bytes]) -> set[bytes]:
                 if op not in INPUT_BACKED_REF_OPCODES:
                     continue
                 operands.add(bytes(operand))
-        except Exception as exc:
+        except TruncatedScriptError as exc:
             # Logged, not swallowed: if a claim reads UNBACKED because an output could
             # not be walked, whoever is debugging that needs to know it happened.
             _log.debug("output_ref_operands: skipping unwalkable output script: %s", exc)
@@ -246,7 +264,12 @@ def verify_relationship_claims(
     if metadata is None:
         return []
     direct = output_ref_operands(output_scripts)
-    delegated = {bytes(r) for r in delegated_refs}
+    # Delegated refs are honoured ONLY if this transaction actually burned a
+    # delegate. They are caller-supplied, and without this a caller who resolved
+    # a base for some other transaction — or who passed refs from anywhere —
+    # could produce DELEGATED for a mint that consumed no authorisation at all.
+    # The burn is the on-chain evidence, and it is right here in the outputs.
+    delegated = {bytes(r) for r in delegated_refs} if delegate_burn_refs(output_scripts) else set()
     verdicts: list[RelationshipVerdict] = []
     for kind, refs in (
         (RelationshipKind.CONTAINER, getattr(metadata, "container_refs", ()) or ()),

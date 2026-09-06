@@ -387,8 +387,12 @@ def _render_txid_human(payload: dict) -> str:
             elif rel["outcome"] == "backed":
                 lines.append(f"  {label}: {rel['ref']}  [VERIFIED — spent in this tx]")
             elif burned:
+                # Name a specific delegate ONLY when there is exactly one. With
+                # two burns, `burned[0]` pointed at a delegate that may have
+                # nothing to do with this particular claim.
+                which = f" {burned[0]}" if len(burned) == 1 else ""
                 lines.append(
-                    f"  {label}: {rel['ref']}  [UNRESOLVED — this tx burned delegate {burned[0]}; fetch it to check]"
+                    f"  {label}: {rel['ref']}  [UNRESOLVED — this tx burned a delegate{which}; fetch it to check]"
                 )
             else:
                 lines.append(f"  {label}: {rel['ref']}  [CLAIMED ONLY — nothing authorised it]")

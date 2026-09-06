@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Literal
 
 import cbor2
@@ -92,6 +93,11 @@ _MAX_MIME_TYPE_CHARS = 256
 #: make the whole token unreadable.
 _MAX_ATTRS_LIST_LEN = 64
 
+#: Widest integer preserved in an ``attrs`` value. Beyond this it becomes a short
+#: descriptive string — see :func:`_decode_attr_value` for why an unbounded one
+#: is a live exception in every consumer that stringifies the metadata.
+_MAX_ATTRS_INT_BITS = 512
+
 
 def _decode_attr_value(value: object) -> object:
     """Preserve a scalar or a list of scalars; coerce anything else to ``str``.
@@ -109,8 +115,22 @@ def _decode_attr_value(value: object) -> object:
     the protocol needs them, and preserving arbitrary nesting from untrusted
     CBOR widens the surface for no gain.
     """
-    if isinstance(value, (bool, int, float, str)) or value is None:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
         return value
+    if isinstance(value, int):
+        # A CBOR bignum decodes fine and then breaks the consumer: CPython
+        # refuses `str()` on an integer over ~4300 digits (ValueError), and
+        # `json.dumps` inherits that. Widening this decoder to preserve ints
+        # therefore handed library callers an uncaught exception where the old
+        # blanket `str()` had merely mangled the value. Anything an `attrs`
+        # field legitimately carries fits far inside this bound.
+        if value.bit_length() > _MAX_ATTRS_INT_BITS:
+            return f"<oversized integer: {value.bit_length()} bits>"
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity are valid CBOR and are NOT valid JSON — `json.dumps`
+        # emits a bare `NaN`, which no strict parser will read back.
+        return value if math.isfinite(value) else f"<non-finite: {'nan' if math.isnan(value) else 'inf'}>"
     if isinstance(value, (list, tuple)):
         return [x for x in value[:_MAX_ATTRS_LIST_LEN] if isinstance(x, (bool, int, float, str))]
     return str(value)

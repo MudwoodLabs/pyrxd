@@ -84,14 +84,14 @@ pytestmark = pytest.mark.integration
 # Every transaction here funds itself from what it spends, so the values form a
 # chain: parents -> base -> tokens -> commit -> reveal, each leaving enough for
 # the next one's flat _FEE. Radiant has no dust rule, so the carriers are small.
-_BASE_VALUE = 200_000_000  # 2 RXD on the base, funding the token transaction
-_PARENT_CARRIER = 60_000_000  # 0.6 RXD back onto each parent — enough to pay a fee later
+_BASE_VALUE = 250_000_000  # 2.5 RXD on the base, funding the token transaction
+_PARENT_CARRIER = 40_000_000  # 0.4 RXD back onto each parent — enough to pay a fee later
 _TOKEN_VALUE = 42_000_000  # 0.42 RXD per delegate token, so each can fund a commit
 _MINT_CARRIER = 500_000  # photons on a minted token / a forged output
-# Four, because each case below consumes one: the honest mint, the two negative
+# Five, because each case below consumes one: the honest mint, the two negative
 # reveals (whose COMMITS are broadcast even though their reveals are refused),
-# and the no-prefix control.
-_TOKEN_COUNT = 4
+# the no-prefix control, and the fan-out question.
+_TOKEN_COUNT = 5
 
 INSPECTOR = GlyphInspector()
 
@@ -505,3 +505,47 @@ def test_the_claim_verifies_as_DELEGATED_from_chain_data_alone(node, base, deleg
     # And without the lookup it is honestly UNBACKED, not silently assumed.
     bare = verify_relationship_claims(metadata, reveal_outputs)
     assert all(v.outcome is RelationshipOutcome.UNBACKED for v in bare)
+
+
+def test_ONE_delegate_token_can_mint_MANY_more(node, base, tokens):  # noqa: F811
+    """The docstring said "each token authorises one mint". Ask the chain.
+
+    The 56-byte prefix is a covenant on the REVEAL. The COMMIT transaction that
+    spends a delegate token is an ordinary transaction under no covenant at all,
+    and a delegate token's script is `OP_PUSHINPUTREF <base>` — so spending one
+    puts the base ref into the input ref set, and consensus permits one input
+    ref to back arbitrarily many output copies.
+
+    If that holds, a delegate token handed to a third party is not one mint. It
+    is an unlimited mint pass, and the difference matters to anyone deciding who
+    to give one to.
+    """
+    token_value = tokens["value"]
+    fanned = [build_delegate_token_script(base["pkh"], base["ref"]) for _ in range(3)]
+    per_output = (token_value - _FEE) // 3
+
+    tx = Transaction(
+        tx_inputs=[
+            TransactionInput(
+                source_transaction=_src(tokens["txid"], 4, tokens["scripts"][4], token_value),
+                source_txid=tokens["txid"],
+                source_output_index=4,
+                unlocking_script_template=_p2pkh_unlock(tokens["key"]),
+            )
+        ],
+        tx_outputs=[TransactionOutput(Script(s), per_output) for s in fanned],
+    )
+    tx.sign()
+    res = node.accepts(_assert_fee_covers(tx, _FEE))
+    assert res.get("allowed") is True, (
+        "expected consensus to permit fan-out; if it REFUSES, the docstring's "
+        f"'each token authorises one mint' was right and this test should be inverted: {res}"
+    )
+
+    txid = str(node.cli("sendrawtransaction", tx.serialize().hex()))
+    node.mine(1)
+    confirmed = _confirmed(node, txid)
+    minted = [_out_spk(confirmed, i) for i in range(len(confirmed["vout"]))]
+    assert len(minted) == 3
+    assert all(is_delegate_token_script(s.hex()) for s in minted)
+    assert all(s[1:37] == base["ref"].to_bytes() for s in minted)

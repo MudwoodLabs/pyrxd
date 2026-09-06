@@ -41,8 +41,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal
 
 from ..security.errors import ValidationError
+from .payload import _MAX_ATTRS_LIST_LEN
 from .relationships import RelationshipBacking, RelationshipKind, RelationshipVerdict
 from .script import parse_authority_gated_script
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
@@ -140,6 +142,16 @@ def build_authority_metadata(
     """
     if not issuer or not issuer.strip():
         raise ValidationError("authority issuer is required — an authority naming no issuer vouches for nothing")
+    # The DECODER truncates a list attr at this length. Minting past it is
+    # irreversible and silent: entries beyond the cap decode away and
+    # `has_permission` answers False for them forever. Refuse here, where the
+    # caller can still change their mind.
+    if len(permissions) > _MAX_ATTRS_LIST_LEN:
+        raise ValidationError(
+            f"{len(permissions)} permissions exceeds the {_MAX_ATTRS_LIST_LEN} a Glyph attrs list can "
+            f"carry — the decoder truncates past it, so the extra entries would be silently lost on a "
+            f"mint that cannot be undone"
+        )
     if expires is not None:
         _parse_expiry(expires, on_error="raise")
     attrs = AuthorityAttrs(
@@ -230,7 +242,7 @@ def validate_authority(metadata: GlyphMetadata | None) -> list[str]:
     return errors
 
 
-def _parse_expiry(value: str, *, on_error: str) -> datetime | None:
+def _parse_expiry(value: str, *, on_error: Literal["raise", "none"]) -> datetime | None:
     """Parse an ISO-8601 expiry. Naive values are read as UTC."""
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))

@@ -44,8 +44,8 @@ import cbor2
 
 from ..constants import PUSH_REF_OPCODES
 from ..security.errors import ValidationError
-from .payload import GLY_MARKER
-from .script import iter_input_refs
+from .payload import GLY_MARKER, _encode_payload_push
+from .script import TruncatedScriptError, iter_input_refs
 from .types import GlyphProtocol, GlyphRef
 
 _log = logging.getLogger(__name__)
@@ -150,18 +150,13 @@ def build_burn_proof_script(
         + GLY_MARKER  # PUSH 3 "gly"
         + bytes([1, BURN_PROOF_VERSION])  # PUSH 1 <version>
         + bytes([1, BURN_MARKER_BYTE])  # PUSH 1 <BURN>
-        + _push(encoded)
+        + _encode_payload_push(encoded)
     )
 
 
-def _push(data: bytes) -> bytes:
-    """Non-minimal pushdata, matching the payload encoder's selection."""
-    n = len(data)
-    if n <= 75:
-        return bytes([n]) + data
-    if n <= 255:
-        return b"\x4c" + bytes([n]) + data
-    return b"\x4d" + n.to_bytes(2, "little") + data
+def _is_int(value: object) -> bool:
+    """A real integer — NOT a bool, which `isinstance(x, int)` accepts."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def parse_burn_proof(script: bytes) -> BurnProof | None:
@@ -218,9 +213,12 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
     return BurnProof(
         token_ref=token_ref if isinstance(token_ref, str) else "",
         action=action if isinstance(action, str) else "",
-        version=cbor_version if isinstance(cbor_version, int) else 0,
-        protocol=tuple(x for x in protocol if isinstance(x, int)) if isinstance(protocol, (list, tuple)) else (),
-        amount=amount if isinstance(amount, int) else None,
+        # `not isinstance(_, bool)` throughout: in Python `isinstance(True, int)`
+        # is True, so a CBOR `true` was decoding into a version, a protocol entry
+        # and an amount, and `_inspect_core` then emitted `"amount": true`.
+        version=cbor_version if _is_int(cbor_version) else 0,
+        protocol=tuple(x for x in protocol if _is_int(x)) if isinstance(protocol, (list, tuple)) else (),
+        amount=amount if _is_int(amount) else None,
         reason=reason if isinstance(reason, str) else None,
     )
 
@@ -255,7 +253,7 @@ def _carries(scripts: list[bytes], wire_ref: bytes) -> bool:
         try:
             if any(operand == wire_ref for op, operand in iter_input_refs(script) if op in PUSH_REF_OPCODES):
                 return True
-        except Exception as exc:
+        except TruncatedScriptError as exc:
             # An unwalkable script cannot be shown to carry the ref, and must
             # not make an honest burn read as a survival. Logged, not swallowed:
             # a burn that reads valid because an output would not parse is a
@@ -293,10 +291,15 @@ def verify_burn(
     token is gone and something recorded that it was meant to be.
     """
     wire = token_ref.to_bytes()
-    proof = next((p for p in (parse_burn_proof(s) for s in output_scripts) if p is not None), None)
+    # Select the proof that names THIS token, not the first parseable one. A
+    # transaction burning A and B carries two proofs; taking the first reported
+    # B as "the proof names A, not B" — refusing an honest batch burn.
+    wanted_ref = f"{token_ref.txid}:{token_ref.vout}"
+    proofs = [p for p in (parse_burn_proof(script) for script in output_scripts) if p is not None]
+    proof = next((p for p in proofs if p.token_ref == wanted_ref), None) or (proofs[0] if proofs else None)
     if proof is None:
         return BurnVerdict(valid=False, basis=BurnBasis.NONE, reason="no burn proof output found")
-    if proof.token_ref != f"{token_ref.txid}:{token_ref.vout}":
+    if proof.token_ref != wanted_ref:
         return BurnVerdict(
             valid=False,
             basis=BurnBasis.NONE,

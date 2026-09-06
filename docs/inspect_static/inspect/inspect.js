@@ -724,6 +724,21 @@ function renderFetchedTxCard(payload) {
       mdl.appendChild(kv("decimals", metadata.decimals));
     }
     if (metadata.main) mdl.appendChild(kv("main", metadata.main));
+    // The claim AND its verdict. This card showed protocol, name, ticker,
+    // description and timelock, and dropped `relationships` and
+    // `delegate_burns` entirely — so a token's collection and creator claims
+    // reached nobody here at all.
+    appendRelationshipVerdicts(mdl, metadata.relationships, metadata.delegate_burns);
+    if (Array.isArray(metadata.delegate_burns) && metadata.delegate_burns.length > 1) {
+      mdl.appendChild(kv("delegate burns", metadata.delegate_burns.join(", ")));
+    }
+    if (metadata.delegate_bases_unresolved) {
+      mdl.appendChild(kv(
+        "delegate bases not resolved",
+        `${metadata.delegate_bases_unresolved} more — capped to bound the fetches`,
+        "kv-warning",
+      ));
+    }
     // TIMELOCK: WHEN it opens (#556). The page already carried a banner saying a
     // TIMELOCK marker means "the reveal is subject to a time-based condition",
     // and then showed nothing about what the condition IS — the decoded spec was
@@ -907,16 +922,48 @@ function appendOpReturnPayload(dl, row) {
   // Declared container/creator membership, WITH its verdict. `in` and `by` are
   // operator-supplied CBOR — anyone can name any collection — so the claim is
   // never shown without whether the transaction was authorised to carry it.
-  const rels = (row.metadata && row.metadata.relationships) || row.relationships;
-  if (Array.isArray(rels)) {
-    for (const rel of rels) {
-      const backed = rel.outcome === "backed";
-      dl.appendChild(kv(
-        rel.kind === "author" ? "creator claim" : "collection claim",
-        `${rel.ref} — ${backed ? "VERIFIED (spent in this tx)" : "UNVERIFIED CLAIM (nothing in this tx authorises it)"}`,
-        backed ? undefined : "kv-warning",
-      ));
+  appendRelationshipVerdicts(
+    dl,
+    (row.metadata && row.metadata.relationships) || row.relationships,
+    (row.metadata && row.metadata.delegate_burns) || [],
+  );
+}
+
+// FOUR verdicts, not two, and ONE definition of them.
+//
+// This logic lived only in the output-row renderer and had two states: `backed`
+// → "spent in this tx", everything else → "nothing in this tx authorises it".
+// BOTH are false for a delegated mint. A DELEGATED claim was spent when the
+// delegate BASE was created, by someone who need not be this minter; and a claim
+// whose base could not be resolved is "we did not look", not "nobody authorised
+// it" — the exact false accusation the CLI change existed to stop.
+//
+// It was also absent from the fetched-tx card entirely, which is the surface
+// most people meet. That card's own comment above records this same shape
+// happening before ("The CLI was fixed; this page was not"). Hence one function,
+// called from both.
+function appendRelationshipVerdicts(dl, rels, burnedRefs) {
+  if (!Array.isArray(rels) || rels.length === 0) return;
+  const burned = Array.isArray(burnedRefs) ? burnedRefs : [];
+  for (const rel of rels) {
+    const label = rel.kind === "author" ? "creator claim" : "collection claim";
+    const backed = rel.outcome === "backed";
+    let verdict;
+    let cls = "kv-warning";
+    if (backed && rel.backing === "delegated") {
+      const via = burned.length === 1 ? ` ${burned[0]}` : "";
+      verdict = `VERIFIED via delegate${via} — authorised by its base, not spent here`;
+      cls = undefined;
+    } else if (backed) {
+      verdict = "VERIFIED (spent in this tx)";
+      cls = undefined;
+    } else if (burned.length) {
+      const which = burned.length === 1 ? ` (${burned[0]})` : "";
+      verdict = `UNRESOLVED — this tx burned a delegate${which}; fetch it to check`;
+    } else {
+      verdict = "UNVERIFIED CLAIM (nothing in this tx authorises it)";
     }
+    dl.appendChild(kv(label, `${rel.ref} — ${verdict}`, cls));
   }
 }
 

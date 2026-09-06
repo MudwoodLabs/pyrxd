@@ -38,6 +38,7 @@ from .script import (
     extract_ref_from_nft_script,
     hash_payload,
     is_legacy_container_script,
+    iter_input_refs,
 )
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 
@@ -1039,7 +1040,7 @@ class GlyphBuilder:
         cbor_bytes: bytes,
         owner_pkh: Hex20,
         authority_ref: GlyphRef,
-        authority_owner_pkh: Hex20,
+        authority_script: bytes,
     ) -> AuthorityGatedRevealScripts:
         """Prepare scripts for minting an item gated on an issuer's authority.
 
@@ -1053,10 +1054,19 @@ class GlyphBuilder:
         ``1``       :attr:`~AuthorityGatedRevealScripts.authority_script`
         =========  ==================================================
 
-        (plus change). The authority output is byte-identical to the one being
-        spent when *authority_owner_pkh* is unchanged, so the authority neither
+        (plus change). The authority output is re-emitted VERBATIM, so it neither
         moves nor changes hands — and, more to the point, is not destroyed.
         Spending a singleton without re-creating it burns it irrecoverably.
+
+        *authority_script* is the authority UTXO's CURRENT locking script, not a
+        PKH, for two reasons. Rebuilding it from a PKH with
+        ``build_nft_locking_script`` STRIPS anything the authority itself
+        carried — an authority that is itself authority-gated came back
+        un-gated, silently, in the transaction that was supposed to leave it
+        untouched. And a ``Hex20`` here sat next to *owner_pkh*, so transposing
+        the two irreversibly gifted the issuer's authority to the mint
+        recipient in a transaction consensus accepts. A script cannot be
+        confused with a PKH.
 
         Consensus enforces the gate: ``OP_REQUIREINPUTREF`` in the item's script
         is subset-checked against this transaction's inputs, so the mint fails
@@ -1069,11 +1079,20 @@ class GlyphBuilder:
             ``GlyphProtocol.NFT``.
         """
         self._assert_protocol(cbor_bytes, GlyphProtocol.NFT, "authority-gated item")
+        # Cross-check rather than trust: the script handed in must actually be
+        # the authority named by `authority_ref`, or the reveal would re-create
+        # some other token and burn the real authority.
+        carried = {operand for _op, operand in iter_input_refs(authority_script)}
+        if authority_ref.to_bytes() not in carried:
+            raise ValidationError(
+                f"authority_script does not carry {authority_ref.txid}:{authority_ref.vout} — pass the "
+                "authority UTXO's own locking script, so it is re-created exactly as it is being spent"
+            )
         ref = GlyphRef(txid=commit_txid, vout=commit_vout)
         return AuthorityGatedRevealScripts(
             ref=ref,
             item_script=build_authority_gated_nft_script(owner_pkh, ref, authority_ref),
-            authority_script=build_nft_locking_script(authority_owner_pkh, authority_ref),
+            authority_script=bytes(authority_script),
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             authority_ref=authority_ref,
         )
@@ -1114,9 +1133,25 @@ class GlyphBuilder:
            it true that they can go to cold storage and never be spent again.
         2. Call again with *base_ref* (that output's outpoint) and a
            *token_count*. Spend the base, paying to each of
-           :attr:`~DelegateSetupScripts.token_scripts`. Each token authorises one
-           mint, so pre-mint as many as you expect to need — N tokens serve N
-           concurrent mints with no lock.
+           :attr:`~DelegateSetupScripts.token_scripts`. Pre-mint as many as you
+           expect to need — N tokens serve N concurrent mints with no lock on a
+           shared UTXO, which is the operational point.
+
+        .. warning::
+           **A delegate token is not one mint. It is an unlimited mint pass.**
+           An earlier version of this text said "each token authorises one
+           mint"; that was wrong, and MEASURED wrong on a node
+           (``test_ONE_delegate_token_can_mint_MANY_more``). The 56-byte prefix
+           is a covenant on the REVEAL. The commit that spends a delegate token
+           is an ordinary transaction under no covenant, and the token's script
+           is ``OP_PUSHINPUTREF <base>`` — so spending one puts the base ref in
+           the input ref set, and consensus lets one input ref back arbitrarily
+           many output copies. One token was spent into three on regtest.
+
+           So a token handed to a third party lets them mint into the collection
+           without limit until the base is retired. Treat the tokens as bearer
+           credentials for the collection, not as counted vouchers, and keep
+           them in the minting service rather than distributing them.
 
         Then each mint passes ``base_ref`` as
         :attr:`CommitParams.delegate_ref`, spends one token in the commit, and
@@ -1149,6 +1184,11 @@ class GlyphBuilder:
             )
         if token_count < 0:
             raise ValidationError("token_count must be >= 0")
+        if base_ref is not None and token_count == 0:
+            raise ValidationError(
+                "base_ref was given with token_count=0: step 2 spends the base and would create no "
+                "delegate tokens at all. Pass the number of mints you want to authorise."
+            )
         if token_count and base_ref is None:
             raise ValidationError(
                 "token_count requires base_ref: delegate tokens carry the BASE outpoint, which does "

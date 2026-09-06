@@ -265,13 +265,16 @@ def test_the_gated_reveal_re_creates_the_authority_rather_than_burning_it():
     builder = GlyphBuilder()
     cbor_bytes, _hash = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="Gated item"))
 
-    scripts = builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, ISSUER_PKH)
+    authority_utxo_script = build_nft_locking_script(ISSUER_PKH, AUTHORITY)
+    scripts = builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, authority_utxo_script)
 
     assert is_authority_gated_script(scripts.item_script.hex())
     assert parse_authority_gated_script(scripts.item_script) == (AUTHORITY, scripts.ref, PKH)
     # Byte-identical to the authority output being spent — it neither moves nor
     # changes hands.
-    assert scripts.authority_script == build_nft_locking_script(ISSUER_PKH, AUTHORITY)
+    # Re-emitted VERBATIM — not rebuilt from a pkh, which would strip anything
+    # the authority itself carried.
+    assert scripts.authority_script == authority_utxo_script
     assert scripts.authority_ref == AUTHORITY
 
 
@@ -279,7 +282,40 @@ def test_the_gated_reveal_refuses_a_non_nft_envelope():
     builder = GlyphBuilder()
     cbor_bytes, _hash = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.FT], name="not an nft"))
     with pytest.raises(ValidationError, match="NFT"):
-        builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, ISSUER_PKH)
+        builder.prepare_authority_gated_reveal(
+            "11" * 32, 0, cbor_bytes, PKH, AUTHORITY, build_nft_locking_script(ISSUER_PKH, AUTHORITY)
+        )
+
+
+def test_the_gated_reveal_refuses_a_script_that_is_not_the_named_authority():
+    """A wrong script here re-creates some other token and BURNS the authority.
+
+    The parameter used to be a `Hex20` sitting next to `owner_pkh`; transposing
+    the two irreversibly gifted the issuer's authority to the mint recipient in
+    a transaction consensus accepts. It is now the authority's own script, and
+    cross-checked against the ref it is supposed to be.
+    """
+    from pyrxd.glyph.payload import encode_payload
+
+    builder = GlyphBuilder()
+    cbor_bytes, _hash = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="Gated item"))
+    someone_else = build_nft_locking_script(PKH, GlyphRef(txid="ee" * 32, vout=7))
+    with pytest.raises(ValidationError, match="does not carry"):
+        builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, someone_else)
+
+
+def test_a_gated_authority_is_re_emitted_with_its_own_gate_intact():
+    """An authority may itself be gated. Rebuilding from a pkh silently un-gated it."""
+    from pyrxd.glyph.payload import encode_payload
+
+    builder = GlyphBuilder()
+    cbor_bytes, _hash = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="Gated item"))
+    parent_authority = GlyphRef(txid="dd" * 32, vout=3)
+    gated_authority = build_authority_gated_nft_script(ISSUER_PKH, AUTHORITY, parent_authority)
+
+    scripts = builder.prepare_authority_gated_reveal("11" * 32, 0, cbor_bytes, PKH, AUTHORITY, gated_authority)
+    assert scripts.authority_script == gated_authority
+    assert is_authority_gated_script(scripts.authority_script.hex())
 
 
 # ---------------------------------------------------------------------------
@@ -410,3 +446,47 @@ def test_an_authority_gated_item_does_NOT_parse_as_a_delegate_base():
         AUTHORITY.to_bytes(),
         ITEM.to_bytes(),
     )
+
+
+def test_find_glyphs_recognises_a_gated_item_and_a_delegate_token():
+    """The wallet-holdings classifier, which knew neither shape.
+
+    `GlyphInspector.find_glyphs` is what `GlyphScanner` runs to enumerate what an
+    address holds (`scanner.py:160`). It is a hand-typed if/elif chain that falls
+    through to a SILENT skip, and both new spendable shapes fell through it — so
+    an authority-gated NFT or an unspent delegate token in a wallet was not
+    reported as unknown, it simply was not reported. `_inspect_script` knew both
+    shapes; this classifier did not.
+    """
+    from pyrxd.glyph.inspector import GlyphInspector
+    from pyrxd.glyph.script import build_delegate_token_script
+
+    gated = build_authority_gated_nft_script(PKH, ITEM, AUTHORITY)
+    delegate = build_delegate_token_script(PKH, AUTHORITY)
+    plain = build_nft_locking_script(PKH, ITEM)
+
+    found = {g.glyph_type: g for g in GlyphInspector().find_glyphs([(546, gated), (546, delegate), (546, plain)])}
+    assert set(found) == {"authority-gated-nft", "delegate-token", "nft"}
+
+    item = found["authority-gated-nft"]
+    assert item.ref == ITEM and item.owner_pkh == PKH
+    assert item.authority_ref == AUTHORITY
+    # The gated item's pkh sits at a different offset than a plain NFT's, so the
+    # plain extractor must not be used on it.
+    assert found["delegate-token"].ref == AUTHORITY and found["delegate-token"].owner_pkh == PKH
+
+
+def test_the_scanner_returns_a_gated_item_as_an_nft_it_holds():
+    """Recognising the shape is not enough — the scanner dispatched on two types.
+
+    `find_glyphs` returning `authority-gated-nft` still produced nothing, because
+    the scanner's dispatch built items only for "nft" and "ft" and dropped
+    everything else without a word.
+    """
+    import inspect as _inspect
+
+    from pyrxd.glyph import scanner as _scanner
+
+    src = _inspect.getsource(_scanner)
+    assert '"authority-gated-nft"' in src, "the scanner must build an item for a gated NFT"
+    assert '"delegate-token"' in src, "a held delegate token must at least be reported, not dropped silently"

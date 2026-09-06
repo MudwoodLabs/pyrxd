@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from pyrxd.constants import REF_OPERAND_WIDTH
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Hex20
 
 from .payload import DAT_MARKER, GLY_MARKER, decode_payload
 from .script import (
@@ -12,9 +14,11 @@ from .script import (
     extract_owner_pkh_from_nft_script,
     extract_ref_from_ft_script,
     extract_ref_from_nft_script,
+    is_delegate_token_script,
     is_ft_script,
     is_legacy_container_script,
     is_nft_script,
+    parse_authority_gated_script,
     parse_legacy_container_script,
     parse_mutable_nft_script,
 )
@@ -41,7 +45,8 @@ class GlyphOutput:
     """
 
     vout: int
-    glyph_type: str  # "nft", "ft", "mut", "dmint", "container-legacy"
+    glyph_type: str  # "nft", "ft", "mut", "dmint", "container-legacy",
+    # "authority-gated-nft", "delegate-token"
     ref: GlyphRef
     metadata: GlyphMetadata | None  # None if this is a transfer (no reveal)
     script: bytes
@@ -53,6 +58,12 @@ class GlyphOutput:
     # ``glyph_type`` leaves it ``True``.
     spendable: bool = True
     child_ref: GlyphRef | None = None
+    #: Only ``authority-gated-nft`` outputs set this — the issuer's authority
+    #: ref the item is gated on. Note what it does NOT establish: the gate is
+    #: strippable by the holder, so its presence says the output is gated NOW,
+    #: not that the item was minted under that authority. See
+    #: :func:`~pyrxd.glyph.authority.verify_authority_gate`.
+    authority_ref: GlyphRef | None = None
 
 
 class GlyphInspector:
@@ -107,6 +118,45 @@ class GlyphInspector:
                         metadata=None,
                         script=script,
                         owner_pkh=extract_owner_pkh_from_ft_script(script),
+                    )
+                )
+            # A real, spendable, token-bearing output. Without this branch a gated
+            # item in a wallet fell through to a silent skip — not even reported
+            # as unknown — so `pyrxd glyph list` simply did not show a token its
+            # holder owns. `_inspect_script` knew the shape and this classifier
+            # did not, which is the two-classifier divergence this repo has been
+            # bitten by before.
+            #
+            # Walrus, not predicate-then-parse: that form needed an
+            # `assert gate is not None` to narrow, and `python -O` strips
+            # asserts — so the narrowing would be gone in exactly the build where
+            # a surprise matters.
+            elif (gate := parse_authority_gated_script(script)) is not None:
+                authority_ref, item_ref, gated_pkh = gate
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="authority-gated-nft",
+                        ref=item_ref,
+                        metadata=None,
+                        script=script,
+                        owner_pkh=gated_pkh,
+                        authority_ref=authority_ref,
+                    )
+                )
+            elif is_delegate_token_script(script_hex):
+                # Also spendable and token-bearing, and the SAME 63 bytes as an
+                # NFT singleton with one opcode changed — so the `is_nft_script`
+                # branch above correctly does not claim it, and nothing else did.
+                # A holder needs to see these: they are consumed one per mint.
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="delegate-token",
+                        ref=GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH]),
+                        metadata=None,
+                        script=script,
+                        owner_pkh=Hex20(script[41:61]),
                     )
                 )
             elif is_legacy_container_script(script_hex):
