@@ -142,7 +142,6 @@ _KNOWN_BROKEN = {
     "test_xchain_eth_swap_regtest_e2e.py": "t_btc = t_rxd + 40; t_btc is decorative on ETH (HZ-4) so likely a mechanical fix",
     "test_xchain_erc20_usdc_lifecycle_e2e.py": "same shape, passed as a constructor keyword rather than a local",
     "test_xchain_swap_regtest_e2e.py": "BTC<->RXD, where t_btc is REAL; includes an adversarial test that needs re-deriving post-#482",
-    "test_xchain_eth_glyph_real_rxindexer_e2e.py": "fixed on the branch for #630; entry goes when that merges",
 }
 
 
