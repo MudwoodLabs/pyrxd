@@ -38,6 +38,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -49,9 +50,10 @@ from pyrxd.btc_wallet import taproot as bt
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd_relative_blocks
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
@@ -388,9 +390,41 @@ class TestEthRealGlyphSwap:
         p_secret = SecretBytes(os.urandom(32))
         h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
         carrier = 1000 if is_nft else minted.reveal_value
-        t_rxd = bt.Timelock(60, bt.TimeUnit.BLOCKS)
-        t_btc = bt.Timelock(100, bt.TimeUnit.BLOCKS)
         eth_timeout = _anvil_now(url) + 50_000
+        # DERIVED FROM THE GATE'S OWN SIZER, not hand-picked. The fixture used to read
+        # `t_rxd=60 / t_btc=100`, which is the PRE-#482 ordering — the arrangement where the maker
+        # refunds its own covenant while p is still secret and then claims the counter leg, taking
+        # both. It shipped that way because #482 inverted the invariant and NOTHING EVER RAN THIS
+        # FILE, so the production guard that refuses it was never asked. Same class as the
+        # conformance vectors (0.22.0) and the HZ-4 spec paragraph (#620): unrun artifacts keep
+        # teaching the old rule.
+        #
+        # Correcting the ORDER alone was not enough, and that is the more useful half of the
+        # finding: at 300 s/block, t_rxd=60 covers 18,000 s against a 50,000 s ETH deadline, so this
+        # fixture could not have satisfied the cross-clock margin gate at ANY ordering since that
+        # gate landed. It was stale on two separate changes.
+        #
+        # So t_rxd is now SIZED by `eth_absolute_to_rxd_relative_blocks` — the same function
+        # production uses — from this test's own policy. A hand-picked constant is what rotted here
+        # twice; a derived one moves when the gate moves.
+        _pol = _eth_policy()
+        t_rxd = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=eth_timeout,
+            # ANCHORED EARLIER THAN NOW, and the sign is the whole point. The gate checks the
+            # REMAINING window — it reports "178 blk left of 179" — because the CSV clock starts
+            # at covenant MINING and confirmations elapse between sizing and locking. Those blocks
+            # have to be pre-paid, and the sizer's budget is
+            # `eth_timeout + margin - expected_lock`, so a LATER anchor makes the window SMALLER.
+            # (Tried it the other way first: +600 s took t_rxd from 179 to 177 and the gate refused
+            # by more, not less.) Anchoring one confirm-wait EARLIER buys exactly the elapsed
+            # blocks, using the policy's own number for that wait rather than a padding constant.
+            expected_rxd_lock_time_unix_s=_anvil_now(url) - int(_pol.max_covenant_confirm_wait_s),
+            margin=_pol.cross_clock_margin,
+            rxd_block_interval_s=_pol.rxd_block_interval_s,
+        )
+        # Advisory on an ETH swap (HZ-4: "a required placeholder with no on-chain meaning"), but the
+        # same-unit ordering guard is real, so keep it strictly under t_rxd.
+        t_btc = bt.Timelock(max(1, t_rxd.value // 2), bt.TimeUnit.BLOCKS)
 
         taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
         taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
@@ -472,6 +506,13 @@ class TestEthRealGlyphSwap:
             radiant_leg=rxd_leg,
             indexer=indexer,
             seen_store=_MemSeen(),
+            # An ETH counter leg's contract address exists nowhere until the deploy receipt returns,
+            # so the coordinator refuses to fund without somewhere durable to write it. That
+            # requirement landed after this file last ran, which is why it was never supplied here.
+            # The SIBLING suite (`test_xchain_eth_swap_regtest_e2e.py`) hit the identical wall and
+            # recorded why: opt-in suites "never run in CI, so when that requirement landed they
+            # went red unnoticed — a whole e2e suite". This file is the same story, one suite over.
+            persist=JsonFileRecordSink(tempfile.mkdtemp(prefix="xchain-glyph-e2e-") + "/swap.swaprec.json"),
             # accept_estimated_eth_margins: this e2e runs the estimated _eth_policy()
             # (is_measured=False) on a value-bearing (anvil) counter-leg; the MEDIUM-1 guard (#192)
             # refuses that unless the operator opts in — the same explicit hatch the sibling ETH

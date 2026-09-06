@@ -212,12 +212,33 @@ class TestTheMinterRefusesAMintItCannotBackWithACommitment:
         )
 
     def test_a_decoded_timelocked_token_is_still_constructible(self) -> None:
-        """The read path builds exactly the object the guard refuses, for every timelocked token
-        on the chain. Putting this check in ``GlyphMetadata.__post_init__`` instead would have made
-        third-party tokens undecodable — a refusal of honest work, aimed at the wrong half."""
+        """The read path must stay permissive — that part is unchanged and still the point.
+
+        Putting the commitment check in ``GlyphMetadata.__post_init__`` would have made every
+        third-party timelocked token undecodable: a refusal of honest work, aimed at the wrong half.
+        It lives on the WRITE funnel (``encode_payload``) instead, which decode never calls.
+
+        REVERSED DELIBERATELY: this used to assert ``decoded.crypto is None`` — "decode stays
+        write-side-asymmetric on purpose". That asymmetry was not a feature. ``to_cbor_dict``
+        emits from ``crypto``, so decode -> re-encode SILENTLY DROPPED the commitment and turned a
+        sealed token into a marker with nothing behind it (#626). Decode now populates both, and
+        the round-trip below is the reason the old assertion could not stay."""
         decoded = decode_payload(encode_payload(_seal().metadata)[0])
         assert decoded.timelock is not None
-        assert decoded.crypto is None, "decode stays write-side-asymmetric on purpose"
+        assert decoded.crypto is not None, "decode must populate the write-side field too (#626)"
+        assert decoded.crypto.timelock == decoded.timelock, "the two views must agree"
+
+    def test_a_decoded_token_can_be_RE_ENCODED_without_losing_the_commitment(self) -> None:
+        """The property the old asymmetry broke, pinned directly rather than implied.
+
+        Before this, reading a timelocked token and writing it back produced CBOR that declared
+        TIMELOCK and carried no ``crypto`` key — unverifiable forever, and silent."""
+        # ONE seal, encoded once: `_seal()` mints a fresh random CEK per call, so calling it
+        # twice compares two different tokens and the test passes or fails for the wrong reason.
+        sealed = _seal().metadata
+        original = encode_payload(sealed)[0]
+        round_tripped = encode_payload(decode_payload(original))[0]
+        assert round_tripped == original, "re-encoding a decoded token must reproduce its bytes"
 
 
 class TestTheStateHelpersReadTheShapeTheParsePathProduces:
