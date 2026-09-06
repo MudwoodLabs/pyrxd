@@ -229,9 +229,12 @@ _NOT_GENERATED = {
         "a DECODE artifact, not metadata — carried so a re-verify can hash the exact bytes that "
         "arrived. Declared compare=False, so it cannot affect `decoded == m` either way."
     ),
-    "crypto": "#626 — the write-side commitment field; round-trip is BROKEN for it today.",
-    "timelock": "#626 — the read-side output field; decode populates it and to_cbor_dict drops it.",
-    "encrypted_main": "#626 — same encrypted-content group; untested alongside `crypto`.",
+    "encrypted_main": (
+        "the ENCRYPTED spelling of the `main` key. `decode_payload` populates it (#632) and the "
+        "round-trip byte property in test_glyph_timelock_write_side_is_reachable covers it end "
+        "to end; generating it HERE would need a strategy that never sets plain `main` at the "
+        "same time, since setting both raises."
+    ),
 }
 
 
@@ -274,10 +277,24 @@ def test_every_metadata_field_is_generated_or_explained() -> None:
         "round-trip does not need checking."
     )
 
-    # The other direction: an entry naming a field that no longer exists is a check that has
-    # silently stopped running.
+    # Two ways an entry goes stale, and the first version of this guard caught only one.
+    #
+    # (a) it names a field GlyphMetadata no longer has — a check that has stopped running.
     stale = set(_NOT_GENERATED) - declared
     assert not stale, f"_NOT_GENERATED names fields GlyphMetadata no longer has: {sorted(stale)}"
+
+    # (b) it names a field the strategy DOES generate. That entry is a false statement sitting in
+    # the guard, and the check above cannot see it: a field that is both generated and excluded is
+    # not "unexplained", so every assertion passes while the recorded reason is wrong.
+    #
+    # Not hypothetical. #629 added this file listing `crypto` as "round-trip is BROKEN for it
+    # today" and `timelock` as "to_cbor_dict drops it"; #632 fixed both and started generating
+    # them, and this file stayed green while those two sentences became false.
+    contradicted = set(_NOT_GENERATED) & generated
+    assert not contradicted, (
+        f"_NOT_GENERATED explains why these are not generated, but the strategy generates them: "
+        f"{sorted(contradicted)}. Delete the entries — the reason recorded in them is no longer true."
+    )
 
 
 def test_an_all_empty_subobject_is_equivalent_to_absent() -> None:
