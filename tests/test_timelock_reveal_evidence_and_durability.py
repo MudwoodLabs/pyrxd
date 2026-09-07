@@ -114,6 +114,63 @@ def _reveal(
     return result, h
 
 
+def _mint_paths(tmp_path, files=None):
+    return files or {
+        "cek": tmp_path / "cek.hex",
+        "ct": tmp_path / "ct.json",
+        "env": tmp_path / "envelope.cbor",
+    }
+
+
+def _run_mint(runner, tmp_path, monkeypatch, *, inner, paths, on_load_wallet=None):
+    """Drive the real ``pyrxd glyph timelock-mint`` with the network stubbed out at *inner*.
+
+    ``on_load_wallet`` fires where the real hidden-mnemonic prompt would block: after the
+    up-front existence check on the three output paths and before anything is written. That is
+    the TOCTOU window, and it is minutes wide in a real run.
+    """
+    import pyrxd.cli.glyph_cmds as gc
+    import pyrxd.cli.glyph_timelock_cmds as gtc
+    from pyrxd.cli.main import cli
+
+    content = tmp_path / "secret.txt"
+    content.write_text("the reserve price is 1000 RXD")
+
+    def _load(ctx, **kw):
+        if on_load_wallet is not None:
+            on_load_wallet()
+        return MagicMock()
+
+    monkeypatch.setattr(gtc, "_load_wallet", _load)
+    monkeypatch.setattr(gc, "_mint_nft_inner", inner)
+    monkeypatch.setattr(
+        "pyrxd.cli.context.CliContext.make_client",
+        lambda self: MagicMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock()),
+    )
+    return runner.invoke(
+        cli,
+        [
+            "--wallet",
+            str(tmp_path / "w.dat"),
+            "--yes",
+            "glyph",
+            "timelock-mint",
+            "--content",
+            str(content),
+            "--name",
+            "Sealed Lot",
+            "--unlock-at",
+            str(UNLOCK_AT),
+            "--cek-out",
+            str(paths["cek"]),
+            "--ciphertext-out",
+            str(paths["ct"]),
+            "--envelope-out",
+            str(paths["env"]),
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. The clock that decided reaches the operator on every path that can broadcast
 # ---------------------------------------------------------------------------
@@ -435,52 +492,8 @@ class TestTheMintsOnlyKeyIsDurableBeforeTheCommitRelays:
     """
 
     def _mint(self, runner, tmp_path, monkeypatch, *, inner, files=None, on_load_wallet=None):
-        import pyrxd.cli.glyph_cmds as gc
-        import pyrxd.cli.glyph_timelock_cmds as gtc
-        from pyrxd.cli.main import cli
-
-        content = tmp_path / "secret.txt"
-        content.write_text("the reserve price is 1000 RXD")
-        paths = files or {
-            "cek": tmp_path / "cek.hex",
-            "ct": tmp_path / "ct.json",
-            "env": tmp_path / "envelope.cbor",
-        }
-        self.paths = paths
-
-        def _load(ctx, **kw):
-            if on_load_wallet is not None:
-                on_load_wallet()
-            return MagicMock()
-
-        monkeypatch.setattr(gtc, "_load_wallet", _load)
-        monkeypatch.setattr(gc, "_mint_nft_inner", inner)
-        monkeypatch.setattr(
-            "pyrxd.cli.context.CliContext.make_client",
-            lambda self: MagicMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock()),
-        )
-        return runner.invoke(
-            cli,
-            [
-                "--wallet",
-                str(tmp_path / "w.dat"),
-                "--yes",
-                "glyph",
-                "timelock-mint",
-                "--content",
-                str(content),
-                "--name",
-                "Sealed Lot",
-                "--unlock-at",
-                str(UNLOCK_AT),
-                "--cek-out",
-                str(paths["cek"]),
-                "--ciphertext-out",
-                str(paths["ct"]),
-                "--envelope-out",
-                str(paths["env"]),
-            ],
-        )
+        self.paths = _mint_paths(tmp_path, files)
+        return _run_mint(runner, tmp_path, monkeypatch, inner=inner, paths=self.paths, on_load_wallet=on_load_wallet)
 
     def test_all_three_files_AND_their_directory_are_fsynced_before_the_broadcast(
         self, runner, tmp_path, monkeypatch
@@ -565,6 +578,84 @@ class TestTheMintsOnlyKeyIsDurableBeforeTheCommitRelays:
         assert oct(self.paths["cek"].stat().st_mode)[-3:] == "600"
         assert len(bytes.fromhex(self.paths["cek"].read_text().strip())) == 32
         assert json.loads(self.paths["ct"].read_text())["chunks"], "the ciphertext file is not an empty shell"
+
+
+class TestDurabilityDoesNotBecomeARefusal:
+    """The honest-path pair for the fsyncs, and the defect the first draft of them had.
+
+    Not every host can flush a directory entry — Windows has no directory descriptor, and
+    ``fsync`` on one raises on some network filesystems. The first version of ``_fsync_dir``
+    let that propagate, which the caller turns into "nothing was broadcast": an otherwise
+    perfectly good mint, refused over a call the host was never going to honour, on the one
+    command in this SDK that cannot be re-run. A guard that refuses valid work is a bug, and
+    this is what it would have looked like.
+
+    The FILE fsync keeps the opposite treatment, and that is asserted too — it failing means
+    the bytes may not be on disk at all, and broadcasting on top of that is the whole finding.
+    """
+
+    @staticmethod
+    async def _ok_mint(ctx, wallet, metadata, client):
+        return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+
+    def test_a_host_that_cannot_fsync_a_DIRECTORY_still_mints(self, runner, tmp_path, monkeypatch) -> None:
+        """Run through the real command, not through ``_write_new_file`` — the claim in the name
+        is about a mint completing, and a unit call cannot make it."""
+        import stat as stat_mod
+
+        real_fsync = os.fsync
+
+        def _no_dir_fsync(fd: int) -> None:
+            if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(22, "Invalid argument")  # what some network filesystems do
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _no_dir_fsync)
+        paths = _mint_paths(tmp_path)
+        result = _run_mint(runner, tmp_path, monkeypatch, inner=self._ok_mint, paths=paths)
+        assert result.exit_code == 0, result.output
+        assert len(bytes.fromhex(paths["cek"].read_text().strip())) == 32
+        assert paths["env"].read_bytes(), "the envelope is written even where the entry cannot be flushed"
+
+    def test_a_host_with_no_directory_DESCRIPTOR_still_mints(self, runner, tmp_path, monkeypatch) -> None:
+        """The Windows shape: ``os.open`` on a directory raises rather than fsync doing so."""
+        real_open = os.open
+
+        def _no_dir_open(path, flags, mode=0o777, **kw):
+            if os.path.isdir(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, mode, **kw)
+
+        monkeypatch.setattr(os, "open", _no_dir_open)
+        paths = _mint_paths(tmp_path)
+        result = _run_mint(runner, tmp_path, monkeypatch, inner=self._ok_mint, paths=paths)
+        assert result.exit_code == 0, result.output
+        assert len(bytes.fromhex(paths["cek"].read_text().strip())) == 32
+
+    def test_a_FILE_fsync_failure_STOPS_the_mint(self, runner, tmp_path, monkeypatch) -> None:
+        """The other side of the asymmetry, and the reason it is not "swallow everything".
+
+        A file fsync failing means the bytes may not be on disk at all, which is the whole
+        guarantee — so it propagates, and the commit is never broadcast.
+        """
+        import stat as stat_mod
+
+        real_fsync = os.fsync
+
+        def _no_file_fsync(fd: int) -> None:
+            if stat_mod.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(5, "Input/output error")
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _no_file_fsync)
+
+        async def _inner(ctx, wallet, metadata, client):  # pragma: no cover - must not be reached
+            raise AssertionError("a commit was broadcast for a key that may not be on disk")
+
+        paths = _mint_paths(tmp_path)
+        result = _run_mint(runner, tmp_path, monkeypatch, inner=_inner, paths=paths)
+        assert result.exit_code == 1
+        assert "nothing was broadcast" in result.output
 
 
 class TestTheDurableWriterItself:

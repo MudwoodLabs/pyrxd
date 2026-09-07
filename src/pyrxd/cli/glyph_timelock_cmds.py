@@ -72,16 +72,30 @@ def _fsync_dir(directory: Path) -> None:
     data was flushed. ``timelock-mint`` broadcasts within milliseconds of writing these files
     and then blocks for 10+ minutes, so the window is real rather than theoretical.
 
-    Skipped where the platform has no directory handle to sync: ``os.open`` on a directory
-    raises on Windows, and refusing a mint there — a mint that cannot be redone — to hold a
-    guarantee that platform cannot offer would be the larger bug. On POSIX every error
-    propagates, and the caller turns it into "nothing was broadcast", which is the safe end.
+    **A failure here is not fatal, and that asymmetry is deliberate.** Not every platform or
+    filesystem offers this: ``os.open`` on a directory raises on Windows, and ``fsync`` on a
+    directory descriptor raises on some network filesystems. The file's own bytes are already
+    flushed by the time this is called, so what is missing on those hosts is the weaker half of
+    the guarantee — and aborting a mint that cannot be redone, over a call the host was never
+    going to honour, is the larger bug. An earlier draft of this let the error propagate and
+    would have refused an otherwise perfectly good mint on exactly those filesystems.
+    :meth:`pyrxd.glyph.mint.JsonFilePendingStore._fsync_dir` made the same call for the same
+    reason on the same kind of file; the two agree on purpose.
+
+    The FILE fsync in :func:`_write_new_file` does NOT get this treatment. That one failing
+    means the bytes may not be on disk at all, which is the whole guarantee, and it propagates
+    into "nothing was broadcast".
     """
     if os.name != "posix":  # pragma: no cover - CI and the dev hosts are POSIX
         return
-    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:  # pragma: no cover - platforms without directory descriptors
+        return
     try:
         os.fsync(dir_fd)
+    except OSError:  # pragma: no cover - e.g. some network filesystems
+        pass
     finally:
         os.close(dir_fd)
 
