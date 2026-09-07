@@ -355,6 +355,16 @@ _MEASURED_ONLY_POLICY_FLAGS: tuple[str, ...] = (
 )
 
 
+#: Measured-only flags that ALSO have a live consumer outside the policy, so supplying one without
+#: ``--measured`` still does something and must not be refused.
+#:
+#: Derived-checked, not trusted: ``tests/test_watchtower_cli_margin_policy_knobs.py`` asserts every
+#: name here really is read outside ``_policy_from_args`` and its helpers, and that no measured-only
+#: flag with such a read is missing — an entry that stops being true is a refusal quietly turned off,
+#: and a missing one is honest work refused.
+_ALSO_USED_OUTSIDE_THE_POLICY: tuple[str, ...] = ("rxd_block_interval_s",)
+
+
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if args.measured:
         # Fail closed (mirrors the coordinator's setup gate): a measured tower signals real-value
@@ -421,11 +431,22 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     # estimated policy never honoured — it moves no funds (the tower is alert-only and keyless),
     # and the remedy is in the message.
     parser_defaults = _build_parser()
-    given = [
-        f"--{dest.replace('_', '-')}"
-        for dest in _MEASURED_ONLY_POLICY_FLAGS
-        if getattr(args, dest) != parser_defaults.get_default(dest)
-    ]
+    supplied = [d for d in _MEASURED_ONLY_POLICY_FLAGS if getattr(args, d) != parser_defaults.get_default(d)]
+
+    # A flag with a LIVE consumer outside the policy is not dropped, so refusing it is a guard
+    # refusing valid work — the refusal added here in #636 was over-broad by exactly one flag.
+    # `--rxd-block-interval-s` also feeds `preflight_timing` (`_amain`), which uses it to warn that
+    # a slow tick can page AFTER the safety window it protects. Exiting 1 on it pushes an operator
+    # toward the 300 s default, which silences that warning — the opposite of what the refusal is
+    # for. It warns instead, so the operator learns the policy did not take it and still gets the
+    # preflight check.
+    for dest in sorted(set(supplied) & set(_ALSO_USED_OUTSIDE_THE_POLICY)):
+        logger.warning(
+            "--%s did not reach the MarginPolicy (that needs --measured); it still applies to the "
+            "timing preflight. The reserve report below describes the shipped ESTIMATE.",
+            dest.replace("_", "-"),
+        )
+    given = [f"--{d.replace('_', '-')}" for d in supplied if d not in _ALSO_USED_OUTSIDE_THE_POLICY]
     if given:
         raise ValidationError(
             f"{', '.join(given)} only reach the MarginPolicy through --measured; without it they are "

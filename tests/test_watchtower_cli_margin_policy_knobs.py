@@ -343,6 +343,24 @@ def test_the_two_flags_the_review_found_are_in_that_set():
     assert {"rxd_claim_inclusion", "burial_safety_factor"} <= set(run_module._MEASURED_ONLY_POLICY_FLAGS)
 
 
+def test_a_flag_with_a_LIVE_OUTSIDE_USE_is_warned_about_not_refused(caplog):
+    """The honest-path partner to the refusal above, and the case it originally got wrong.
+
+    `--rxd-block-interval-s` was in that parametrisation until this change. It also feeds
+    `preflight_timing`, so supplying it without `--measured` genuinely does something — refusing it
+    was a guard refusing valid work, and it pushed the operator toward the 300 s default, silencing
+    the very warning about paging after the safety window."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=run_module.logger.name):
+        policy = _policy_from_args(_parse_args(["--records-dir", "/tmp/x", "--rxd-block-interval-s", "42"]))
+    assert policy is not None, "must not refuse"
+    assert any("did not reach the MarginPolicy" in r.getMessage() for r in caplog.records), (
+        "accepting it silently would restore the ORIGINAL bug — the operator has to learn the "
+        f"policy did not take it. Got: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
@@ -352,7 +370,6 @@ def test_the_two_flags_the_review_found_are_in_that_set():
         ("--btc-reorg-depth", "12"),
         ("--rxd-claim-burial", "9"),
         ("--rxd-reorg-cost-per-block", "1000"),
-        ("--rxd-block-interval-s", "240"),
         ("--rxd-block-interval-fast-s", "36"),
     ],
 )
@@ -406,3 +423,95 @@ def test_the_report_prints_when_the_flag_did_take(caplog):
     assert "rxd_claim_inclusion=5 blk (measured, --rxd-claim-inclusion)" in "\n".join(
         r.getMessage() for r in caplog.records
     )
+
+
+class TestTheRefusalDoesNotBlockHonestWork:
+    """`_ALSO_USED_OUTSIDE_THE_POLICY` is an EXEMPTION from a refusal, so it is checked both ways.
+
+    The refusal shipped in #636 was over-broad by exactly one flag: `--rxd-block-interval-s` also
+    feeds `preflight_timing`, which warns that a slow tick can page AFTER the safety window it
+    protects. Exiting 1 on it pushed the operator toward the 300 s default and silenced that
+    warning — a guard refusing valid work, and pressure in the unsafe direction.
+
+    An exemption that stops being true is a refusal quietly turned off; a missing one is honest
+    work refused. Both derived from the source, never from this file's own opinion.
+    """
+
+    @staticmethod
+    def _read_outside_the_policy() -> set[str]:
+        """Measured-only dests read anywhere except `_policy_from_args` AND the helpers it calls."""
+        import ast
+        import re
+        from pathlib import Path
+
+        src = Path(run_module.__file__).read_text()
+        tree = ast.parse(src)
+
+        def span(name: str) -> tuple[int, int]:
+            fn = next(
+                f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == name
+            )
+            return fn.lineno, max(getattr(x, "lineno", fn.lineno) for x in ast.walk(fn))
+
+        policy_lo, policy_hi = span("_policy_from_args")
+        # ...and every helper it calls, whose reads are policy reads too. Missing these is how a
+        # first pass at this check reported six flags instead of one.
+        helpers = [
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id.startswith("_")
+            and policy_lo <= getattr(n, "lineno", 0) <= policy_hi
+        ]
+        spans = [(policy_lo, policy_hi)]
+        for h in helpers:
+            try:
+                spans.append(span(h))
+            except StopIteration:
+                continue
+
+        lines = src.splitlines()
+        out = set()
+        for dest in run_module._MEASURED_ONLY_POLICY_FLAGS:
+            for i, line in enumerate(lines, start=1):
+                if re.search(rf"args\.{re.escape(dest)}\b", line) and not any(lo <= i <= hi for lo, hi in spans):
+                    out.add(dest)
+        return out
+
+    def test_every_exemption_really_is_used_outside_the_policy(self) -> None:
+        outside = self._read_outside_the_policy()
+        stale = set(run_module._ALSO_USED_OUTSIDE_THE_POLICY) - outside
+        assert not stale, (
+            f"{sorted(stale)} are exempt from the measured-only refusal, but nothing outside "
+            "_policy_from_args reads them any more. The exemption is now a refusal silently "
+            "switched off — delete it."
+        )
+
+    def test_the_reverse_direction_is_reviewed_by_hand_and_says_why(self) -> None:
+        """NOT automated, deliberately, and this test exists to say so rather than to leave a
+        one-directional check looking complete.
+
+        A read outside `_policy_from_args` is not by itself a reason to exempt a flag.
+        `rxd_claim_inclusion` has one — `_report_claim_reserves(..., requested_inclusion_blocks=)`
+        — but that call sits AFTER the policy is built, so it cannot run when the refusal fires;
+        it reports what was requested rather than doing something independent of the policy.
+        `rxd_block_interval_s`'s read feeds `preflight_timing`, a safety warning that has nothing
+        to do with the policy at all.
+
+        Distinguishing those two mechanically means asking whether a call is reachable when an
+        earlier one raises, which no AST scan answers honestly. So the exemption list is reviewed,
+        and what IS derived is the direction that can be: an exemption naming a flag with no
+        outside read at all is stale, and that is checked above.
+        """
+        outside = self._read_outside_the_policy()
+        assert set(run_module._ALSO_USED_OUTSIDE_THE_POLICY) <= outside
+        assert outside - set(run_module._ALSO_USED_OUTSIDE_THE_POLICY) == {"rxd_claim_inclusion"}, (
+            "the set of measured-only flags read outside the policy has changed; re-review which "
+            "of them do something INDEPENDENT of the policy and update the exemption list"
+        )
+
+    def test_the_derivation_is_not_vacuous(self) -> None:
+        """It found six flags before the helper spans were accounted for, and would find zero if
+        the scan broke. Pin that it finds the one real case."""
+        assert self._read_outside_the_policy() == {"rxd_block_interval_s", "rxd_claim_inclusion"}

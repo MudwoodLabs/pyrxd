@@ -68,6 +68,17 @@ def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
     return cbor_bytes, hash_payload(cbor_bytes)
 
 
+#: What a MALFORMED third-party field may raise on the READ path, all of which must be logged and
+#: ignored rather than propagated. `decode_payload` parses attacker-authored on-chain bytes: a
+#: token every other decoder reads must not become `metadata: NONE` in pyrxd.
+#:
+#: `ArithmeticError` is here because `OverflowError` is NOT a `ValueError` — it subclasses
+#: `ArithmeticError` — so a CBOR float16 Infinity (0x7c00, two bytes, legal and cheap) in a numeric
+#: field escaped the original tuple and propagated out of `decode_payload`. Measured: a `main` with
+#: `size: Infinity` raised `OverflowError` while `cbor2` read the same bytes fine.
+_DECODE_REFUSALS = (ValidationError, KeyError, ValueError, TypeError, ArithmeticError)
+
+
 def _cbor_str(d: dict, key: str, max_len: int) -> str:
     """Extract a string field from a CBOR dict, dropping it if it is unusable.
 
@@ -226,7 +237,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
 
         try:
             encrypted_main = EncryptionMetadata.from_dict(d["main"])
-        except (ValidationError, KeyError, ValueError, TypeError) as e:
+        except _DECODE_REFUSALS as e:
             _log.warning("decode_payload: malformed encrypted 'main' field ignored: %s", e)
 
     version = d.get("v")
@@ -286,7 +297,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
 
         try:
             timelock = TimelockSpec.from_dict(d["crypto"]["timelock"])
-        except (ValidationError, KeyError, ValueError, TypeError) as e:
+        except _DECODE_REFUSALS as e:
             _log.warning("decode_payload: malformed 'crypto.timelock' field ignored: %s", e)
 
     # ...and the WRITE-side field too (#626). Decoding into `timelock` alone left the object
@@ -304,7 +315,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
 
         try:
             crypto = CryptoMetadata.from_dict(d["crypto"])
-        except (ValidationError, KeyError, ValueError, TypeError) as e:
+        except _DECODE_REFUSALS as e:
             _log.warning("decode_payload: malformed 'crypto' field ignored: %s", e)
 
     return GlyphMetadata(
