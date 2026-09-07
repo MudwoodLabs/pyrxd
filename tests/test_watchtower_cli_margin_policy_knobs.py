@@ -21,6 +21,7 @@ someone adds is a failing test rather than another silently-unreachable knob.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import inspect
 import logging
@@ -30,7 +31,7 @@ import pathlib
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
-from pyrxd.gravity.finality import CounterClaimFinality
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_coordinator import (
     ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS,
     ClaimFinality,
@@ -44,26 +45,47 @@ from pyrxd.gravity.watch.run import _parse_args, _policy_from_args, _report_clai
 
 _RUN_PY = pathlib.Path(__file__).resolve().parent.parent / "src" / "pyrxd" / "gravity" / "watch" / "run.py"
 
-#: Constructor keywords the tower deliberately does NOT expose, each with the reason. A tower flag
-#: would be WRONG for these, not merely missing — so they are exempt, not overlooked.
-_DELIBERATELY_NOT_A_TOWER_FLAG = {
+#: :class:`MarginPolicy` FIELDS the tower deliberately does NOT set, each with the reason. A tower
+#: flag would be WRONG for these, not merely missing — so they are exempt, not overlooked.
+#:
+#: Keyed on FIELDS, not on ``measured()``'s parameters, because that is the universe the guards
+#: below now run over — see ``test_every_margin_policy_FIELD_is_reachable_from_the_cli``.
+_NOT_A_TOWER_KNOB: dict[str, str] = {
     # One tower watches MANY swaps, and the value at risk is per-swap. decide() supplies it from
     # each record's own terms (`_value_at_risk_photons`); a single chain-wide flag would apply one
     # swap's value to all of them.
-    "value_at_risk_photons",
+    "value_at_risk_photons": "per-swap; decide() reads it from each record's own terms",
+    # Set by the constructors themselves — `estimated()` pins is_measured=False, `measured()` pins
+    # both True. The CLI chooses between them with `--measured`, which IS the flag for these.
+    "is_measured": "chosen by --measured, which picks the constructor",
+    "require_measured": "chosen by --measured, which picks the constructor",
+    # FUND-TIME gates only: `SwapCoordinator` reads these in `assert_eth_ordering` /
+    # the post-confirm recheck, i.e. before and around the taker's funding broadcast. The
+    # watchtower never funds anything (alert-only, keyless) and never calls those gates —
+    # `test_the_fund_time_only_fields_really_are_unread_by_the_tower` is the evidence, not this
+    # sentence.
+    "cross_clock_margin": "fund-time ETH ordering gate; no watchtower code path reads it",
+    "max_covenant_confirm_wait_s": "fund-time ETH ordering gate; no watchtower code path reads it",
 }
 
 
-def _forwarded_keywords() -> set[str]:
-    """Keyword names ``_policy_from_args`` actually passes to ``MarginPolicy.measured(...)``."""
+def _forwarded_keywords(*ctors: str) -> set[str]:
+    """Keyword names ``_policy_from_args`` passes to the named ``MarginPolicy`` constructors.
+
+    Defaults to ``measured`` alone, which is what the two original guards ask about. The
+    field-level guard passes both, because the ESTIMATED branch is a real production policy too:
+    an alert-only tower watching an ETH counter leg builds its policy there.
+    """
+    ctors = ctors or ("measured",)
     tree = ast.parse(_RUN_PY.read_text())
     fn = next(
         n
         for n in ast.walk(tree)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_policy_from_args"
     )
-    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) == "MarginPolicy.measured"]
-    assert calls, "_policy_from_args no longer calls MarginPolicy.measured — this guard has stopped running"
+    wanted = {f"MarginPolicy.{c}" for c in ctors}
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in wanted]
+    assert calls, f"_policy_from_args no longer calls {sorted(wanted)} — this guard has stopped running"
     return {kw.arg for call in calls for kw in call.keywords if kw.arg is not None}
 
 
@@ -75,11 +97,11 @@ def test_every_measured_policy_knob_is_reachable_from_the_cli():
         if p.kind is inspect.Parameter.KEYWORD_ONLY
     }
     assert params, "could not read MarginPolicy.measured's parameters — this guard is running empty"
-    missing = params - _forwarded_keywords() - _DELIBERATELY_NOT_A_TOWER_FLAG
+    missing = params - _forwarded_keywords() - set(_NOT_A_TOWER_KNOB)
     assert not missing, (
         f"MarginPolicy.measured takes {sorted(missing)}, which --measured cannot set: the tower "
         "silently uses the default. Either wire a flag in _policy_from_args or add it to "
-        "_DELIBERATELY_NOT_A_TOWER_FLAG with the reason."
+        "_NOT_A_TOWER_KNOB with the reason."
     )
 
 
@@ -91,9 +113,148 @@ def test_the_cli_forwards_nothing_the_constructor_does_not_take():
 
 
 def test_the_exemption_list_still_names_real_parameters():
-    """An exemption for a parameter that no longer exists is a stale excuse hiding a real gap."""
-    params = set(inspect.signature(MarginPolicy.measured).parameters)
-    assert params >= _DELIBERATELY_NOT_A_TOWER_FLAG
+    """An exemption for a field that no longer exists is a stale excuse hiding a real gap.
+
+    Checked against the DATACLASS, not against ``measured()``'s signature — the exemption list now
+    covers fields that constructor never took, which is the blind spot this file's field-level
+    guard exists to close.
+    """
+    stale = set(_NOT_A_TOWER_KNOB) - _policy_field_names()
+    assert not stale, f"{sorted(stale)} are exempt from a check about fields MarginPolicy no longer has"
+
+
+# ---------------------------------------------------------------------------
+# The guard's UNIVERSE: MarginPolicy's fields, not one constructor's signature
+# ---------------------------------------------------------------------------
+#
+# The two guards above ask "does every parameter of `MarginPolicy.measured` reach the CLI?", and
+# the AST derivation below asks the same question of that constructor's call keywords. Both take
+# `measured()`'s SIGNATURE as the definition of "the set of policy knobs" — so a field that
+# constructor never accepted is invisible to both, and passes them vacuously.
+#
+# `eth_finalization_window_s` was exactly that. It is required (non-None) for a finalized-checkpoint
+# counter leg: without it `assess_claim_finality` RAISES on every depth-less verdict, `_decide_eth`
+# catches that and pages `PAGE_SQUEEZED` "verify finality manually", and a tower watching a healthy
+# ETH swap did so on EVERY tick for the whole window between the maker's claim and its finalized
+# checkpoint (~13 min steady-state; hours during a finality stall, which is the case the stall
+# budget exists for). The guards written to stop precisely this class reported clean throughout —
+# the mechanism built to catch a class carrying the error of the instance it was built from.
+#
+# So the universe is `dataclasses.fields(MarginPolicy)`, the way `_float_field_names` already does
+# it one layer in, minus an exemption list that is itself checked against those fields.
+
+
+def _policy_field_names() -> set[str]:
+    names = {f.name for f in dataclasses.fields(MarginPolicy)}
+    assert names, "could not read MarginPolicy's fields — this guard is running empty"
+    return names
+
+
+def _unreachable_policy_fields(field_names: set[str]) -> set[str]:
+    """Of ``field_names``, those no ``MarginPolicy`` constructor call in ``_policy_from_args``
+    passes and that are not exempt. Takes its universe as an ARGUMENT so the mechanism can be
+    tested against a field it was not built from."""
+    return set(field_names) - _forwarded_keywords("measured", "estimated") - set(_NOT_A_TOWER_KNOB)
+
+
+def test_every_margin_policy_FIELD_is_reachable_from_the_cli():
+    """DIRECTION 1, widened: a FIELD with no CLI route is an unreachable knob, whether or not
+    ``measured()`` happens to name it.
+
+    SCOPE, STATED RATHER THAN LEFT TO BE ASSUMED. This asks whether SOME constructor call in
+    ``_policy_from_args`` forwards the field — not whether BOTH do. A field wired into the
+    ``--measured`` branch and dropped from the estimated one still passes here, and that was
+    confirmed by planting it: removing only the estimated-branch forwarding of
+    ``eth_finalization_window_s`` left this test green while five behavioural tests below went red
+    (``test_the_eth_window_comes_from_the_chain_id_and_is_PER_CHAIN``,
+    ``test_the_window_changes_what_the_watchtower_PAGES_for_an_ETH_swap`` among them). Which fields
+    an ALERT-ONLY tower needs is a judgement no AST scan answers honestly, so that half is covered
+    by tests that build a policy with the shipped parser and look at what the tower does with it.
+    """
+    missing = _unreachable_policy_fields(_policy_field_names())
+    assert not missing, (
+        f"MarginPolicy has {sorted(missing)}, which no watchtower invocation can set: the tower "
+        "silently uses the field default. Wire a flag in _policy_from_args (BOTH branches, if an "
+        "alert-only tower needs it) or add it to _NOT_A_TOWER_KNOB with the reason."
+    )
+
+
+def test_the_field_universe_is_strictly_wider_than_the_constructor_signature():
+    """NON-VACUITY, and the whole argument for this section in one assertion.
+
+    If the two sets were equal, the field-level guard would be a restatement of the
+    signature-level one and would have been blind to `eth_finalization_window_s` in the same way.
+    """
+    params = {
+        name
+        for name, p in inspect.signature(MarginPolicy.measured).parameters.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    fields = _policy_field_names()
+    assert fields > params, (
+        "MarginPolicy.measured now names every field, so this guard has stopped adding anything — "
+        "check whether the signature-derived guards are still the narrower ones."
+    )
+
+
+def test_the_field_guard_catches_a_field_it_was_NOT_built_from():
+    """SCOPE, not instance. Planting the demonstrated defect proves nothing about generality: a fix
+    at the site and a fix of the class behave identically on it. So run the mechanism over a field
+    name that has nothing to do with ETH finality and check it is reported."""
+    assert _unreachable_policy_fields({"a_knob_nobody_wired_up"}) == {"a_knob_nobody_wired_up"}
+    # ...and the reverse: a name that IS forwarded must not be reported, or the guard would fire on
+    # everything and its passing would mean nothing.
+    assert _unreachable_policy_fields({"block_interval_s"}) == set()
+
+
+def test_the_fund_time_only_fields_really_are_unread_by_the_tower():
+    """The EVIDENCE for two exemptions above, rather than the sentence asserting it.
+
+    ``cross_clock_margin`` and ``max_covenant_confirm_wait_s`` are exempt because no watchtower
+    code path reads them. That is a claim about coverage, and claims about coverage were wrong
+    every time they were checked in this codebase — so check it: nothing in the shipped
+    ``pyrxd.gravity.watch`` package names either attribute.
+    """
+    watch_pkg = pathlib.Path(run_module.__file__).parent
+    modules = sorted(watch_pkg.rglob("*.py"))
+    assert modules, "found no watchtower modules to scan — this check is running empty"
+    reads = {
+        (p.name, node.lineno)
+        for p in modules
+        for node in ast.walk(ast.parse(p.read_text()))
+        if isinstance(node, ast.Attribute) and node.attr in {"cross_clock_margin", "max_covenant_confirm_wait_s"}
+    }
+    assert not reads, f"the exemption says the tower never reads these; it does, at {sorted(reads)}"
+
+
+def test_the_tower_never_reads_policy_margin_so_its_parser_default_is_inert():
+    """Why ``--margin-blocks``'s parser default (72) is left disagreeing with
+    ``ESTIMATED_DEFAULT_MARGIN_BLOCKS`` (36) instead of being "aligned".
+
+    ``policy.margin`` is consumed by ``assert_timelock_margin``, which is a FUND-TIME gate: the
+    only callers are ``SwapCoordinator``'s own funding paths. The watchtower neither reads the
+    field nor calls that gate, so the number it carries changes no verdict — and 72 is the more
+    conservative of the two, so lowering it would move a fund-relevant field in the unsafe
+    direction to fix nothing. Both halves are checked here rather than asserted in prose.
+    """
+    watch_pkg = pathlib.Path(run_module.__file__).parent
+    modules = sorted(watch_pkg.rglob("*.py"))
+    assert modules, "found no watchtower modules to scan — this check is running empty"
+    trees = {p.name: ast.parse(p.read_text()) for p in modules}
+    margin_reads = {
+        (name, node.lineno)
+        for name, tree in trees.items()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "margin"
+    }
+    assert not margin_reads, f"something in the tower now reads .margin, at {sorted(margin_reads)}"
+    gate_calls = {
+        (name, node.lineno)
+        for name, tree in trees.items()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("assert_timelock_margin")
+    }
+    assert not gate_calls, f"the tower now calls assert_timelock_margin, at {sorted(gate_calls)}"
 
 
 # ---------------------------------------------------------------------------
@@ -515,3 +676,251 @@ class TestTheRefusalDoesNotBlockHonestWork:
         """It found six flags before the helper spans were accounted for, and would find zero if
         the scan broke. Pin that it finds the one real case."""
         assert self._read_outside_the_policy() == {"rxd_block_interval_s", "rxd_claim_inclusion"}
+
+
+# ---------------------------------------------------------------------------
+# ...and the ETH window through the SHIPPED parser, all the way to what the tower PAGES
+# ---------------------------------------------------------------------------
+
+_ESTIMATED = ["--records-dir", "/tmp/x"]
+
+
+def _est_policy(*extra: str) -> MarginPolicy:
+    """The DEFAULT alert-only tower's policy, built by the shipped parser."""
+    return _policy_from_args(_parse_args([*_ESTIMATED, *extra]))
+
+
+def _eth_record() -> SwapRecord:
+    p = os.urandom(32)
+    return SwapRecord(
+        state=SwapState.SECRET_REVEALED,
+        terms=NegotiatedTerms(
+            hashlock=hashlib.sha256(p).digest(),
+            btc_sats=100_000,
+            radiant_amount=1_000,
+            t_btc=t.Timelock(36, t.TimeUnit.BLOCKS),
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            asset_variant="ft",
+            genesis_ref=b"\xaa" * 36,
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            # The documented 32-byte zero placeholder: `NegotiatedTerms` REFUSES a real Taproot key
+            # on an ETH swap, so a real key here would be a fixture the system cannot produce.
+            btc_claim_pubkey_xonly=b"\x00" * 32,
+            btc_refund_pubkey_xonly=b"\x00" * 32,
+            counter_chain="eth",
+            value_amount=10**15,
+            eth_timeout_unix_s=4_000_000_000,
+        ),
+    )
+
+
+def test_the_eth_window_comes_from_the_chain_id_and_is_PER_CHAIN():
+    """The window is a per-chain FACT with provenance (``pyrxd.eth_wallet.chains``), so the flag
+    defaults to the registry rather than to one number that would be wrong for every other chain."""
+    assert _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "1").eth_finalization_window_s == 768
+    assert _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "8453").eth_finalization_window_s == 900
+    assert _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "59144").eth_finalization_window_s == 6000
+
+
+def test_the_explicit_window_flag_overrides_the_registry():
+    p = _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "1", "--eth-finalization-window-s", "1200")
+    assert p.eth_finalization_window_s == 1200
+
+
+def test_the_measured_branch_carries_the_window_too():
+    """BOTH branches. An alert-only tower and a --measured one watch the same ETH swaps."""
+    assert _policy(*("--eth-rpc-url", "http://x", "--eth-chain-id", "8453")).eth_finalization_window_s == 900
+
+
+def test_a_btc_only_tower_still_has_no_window():
+    """THE OTHER BRANCH, and the honest path: a depth-based counter leg uses
+    ``btc_claim_reorg_depth`` and must stay exactly as it was — None, not a number."""
+    assert _est_policy().eth_finalization_window_s is None
+    assert _policy().eth_finalization_window_s is None
+
+
+def test_an_unknown_chain_id_fails_closed_and_names_the_flag(caplog):
+    """A guessed window is the UNSAFE direction: too small a reserve lets the gate say WAIT with
+    too little margin. So an unvetted chain keeps today's fail-closed None and the operator is told
+    which flag fixes it — rather than silently inheriting the L1 floor."""
+    with caplog.at_level(logging.ERROR, logger=_LOGGER):
+        p = _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "31337")
+    assert p.eth_finalization_window_s is None
+    assert any("--eth-finalization-window-s" in r.getMessage() for r in caplog.records), (
+        f"the operator must be told what to pass. Got: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_the_window_changes_what_the_watchtower_PAGES_for_an_ETH_swap():
+    """THE HALF THAT REACHES A HUMAN — through the tower's own decision core, on a policy the
+    shipped CLI built.
+
+    lock=100, t_rxd=72 -> the maker's refund opens at 172. The estimated policy's flat burial is 6
+    and its inclusion reserve 2; the ETH finalization reserve is ceil(768 / 300 s) = 3, so the
+    claim floor is 11 and 12 blocks of headroom is a WAIT. Without the window the gate cannot be
+    evaluated at all and every tick of this healthy swap pages SQUEEZED "verify finality manually".
+    """
+    obs = Observations(
+        maker_has_claimed_btc=False,
+        now_rxd_height=160,
+        asset_locked_at_height=100,
+        eth_claim_detected=True,
+        eth_claim_finality=CounterClaimState.NOT_YET_FINAL_LIVE,
+    )
+    kw = {"record": _eth_record(), "observations": obs, "safety_window_blocks": 6}
+
+    blind = decide(policy=_est_policy(), **kw)
+    assert blind.intent is Intent.PAGE_SQUEEZED
+    assert "un-assessable" in blind.reason
+
+    wired = decide(policy=_est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "1"), **kw)
+    assert wired.intent is Intent.WATCH, f"a healthy pre-finality ETH swap must not page: {wired.reason}"
+
+
+def test_the_window_does_not_turn_a_real_squeeze_into_a_wait():
+    """PAIRED WITH THE ABOVE, and the direction that would matter for funds: wiring the reserve
+    must not make the gate more permissive. Same swap 5 blocks later — 7 blocks of headroom
+    against a floor of 11 — still pages SQUEEZED, now for the real reason."""
+    obs = Observations(
+        maker_has_claimed_btc=False,
+        now_rxd_height=165,
+        asset_locked_at_height=100,
+        eth_claim_detected=True,
+        eth_claim_finality=CounterClaimState.NOT_YET_FINAL_LIVE,
+    )
+    d = decide(
+        record=_eth_record(),
+        observations=obs,
+        policy=_est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "1"),
+        safety_window_blocks=6,
+    )
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert "window closing" in d.reason
+
+
+def test_the_eth_reserve_is_printed_where_an_operator_will_see_it(caplog):
+    """A knob whose effect is invisible is half a knob — the same rule the claim-race reserves
+    already follow. ceil(768 / 300 s) = 3 RXD blocks."""
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _report_claim_reserves(
+            _est_policy("--eth-rpc-url", "http://x", "--eth-chain-id", "1"), requested_inclusion_blocks=None
+        )
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "eth_finalization_window_s=768 s" in text
+    assert "3 RXD block(s) reserved" in text
+
+
+def test_a_btc_only_tower_does_not_print_an_eth_reserve(caplog):
+    """The other branch of that conditional: a BTC tower's report must not grow a line about a
+    counter chain it is not watching."""
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _report_claim_reserves(_est_policy(), requested_inclusion_blocks=None)
+    assert "ETH counter-leg finality reserve" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# PRESENCE, not "differs from the default"
+# ---------------------------------------------------------------------------
+#
+# The refusal above compared `getattr(args, dest)` with the parser's default, so `--flag <default>`
+# was indistinguishable from never passing the flag — and the original defect ("the value went
+# nowhere, silently") survived for exactly one spelling per flag. Not a harmless spelling: two
+# parser defaults disagree with what the estimated policy holds, so an operator who typed either
+# number was running the other one.
+
+
+def _parser_default(dest: str):
+    return run_module._build_parser().get_default(dest)
+
+
+def _typeable_defaults() -> set[str]:
+    """Measured-only dests whose parser default can actually be TYPED on a command line. A
+    ``None`` default has no spelling, so it was never vulnerable to the value comparison."""
+    return {d for d in run_module._MEASURED_ONLY_POLICY_FLAGS if _parser_default(d) is not None}
+
+
+def test_there_really_are_flags_whose_default_can_be_typed():
+    """NON-VACUITY for everything below. If every measured-only flag defaulted to None, the whole
+    section would be exercising a case that cannot occur and passing for that reason."""
+    assert _typeable_defaults(), "no measured-only flag has a typeable default — this section is empty"
+
+
+@pytest.mark.parametrize("dest", run_module._MEASURED_ONLY_POLICY_FLAGS)
+def test_presence_is_detected_for_every_measured_only_flag(dest):
+    """STRUCTURAL OVER THE TUPLE, so a flag added to it is covered without anyone remembering to.
+
+    Uses the flag's OWN parser default as the value wherever it has one — that is precisely the
+    spelling the value comparison could not see.
+    """
+    flag = "--" + dest.replace("_", "-")
+    default = _parser_default(dest)
+    value = str(default) if default is not None else "7"
+    assert dest not in run_module._supplied_policy_flags(_ESTIMATED), "not passed, yet reported present"
+    assert dest in run_module._supplied_policy_flags([*_ESTIMATED, flag, value]), (
+        f"{flag} {value} was on the command line and went undetected"
+    )
+
+
+@pytest.mark.parametrize("dest", sorted(_typeable_defaults() - set(run_module._ALSO_USED_OUTSIDE_THE_POLICY)))
+def test_a_policy_flag_at_its_OWN_parser_default_is_refused_not_dropped(dest):
+    """End to end through the shipped parser: the refusal now fires on every spelling, not only on
+    values that differ from the default. Derived from the tuple, minus the one flag that has a live
+    consumer outside the policy (warned, never refused — see the honest-path test below)."""
+    from pyrxd.security.errors import ValidationError
+
+    flag = "--" + dest.replace("_", "-")
+    with pytest.raises(ValidationError) as e:
+        _policy_from_args(_parse_args([*_ESTIMATED, flag, str(_parser_default(dest))]))
+    assert flag in str(e.value)
+
+
+def test_the_two_parser_defaults_that_disagree_with_the_estimated_policy():
+    """WHY presence has to beat value here, pinned as an assertion rather than left in prose.
+
+    ``--margin-blocks`` defaults to 72 while ``MarginPolicy.estimated()`` holds 36 blocks, and
+    ``--rxd-claim-burial`` defaults to 2 while it holds 6. Before the presence fix both were
+    ACCEPTED and DROPPED, so the operator ran the number they had not typed.
+
+    Neither default is changed. ``--rxd-claim-burial 2`` is the deliberate dust-run value —
+    ``scripts/dust_swap_run.py`` and ``scripts/dust_swap_resume.py`` default to 2 and
+    ``docs/runbooks/watchtower-operations.md`` prints it in the startup line it tells operators to
+    read — so raising it to 6 would make the tower page SQUEEZED on swaps its own runners consider
+    fine. ``--margin-blocks``'s value is inert in the tower (see
+    ``test_the_tower_never_reads_policy_margin_so_its_parser_default_is_inert``) and 72 is the more
+    conservative of the two. If someone aligns either one, this fails and they re-read that
+    argument first.
+    """
+    estimated = MarginPolicy.estimated()
+    assert _parser_default("margin_blocks") == 72
+    assert estimated.margin == t.Timelock(36, t.TimeUnit.BLOCKS)
+    assert _parser_default("rxd_claim_burial") == 2
+    assert estimated.rxd_claim_burial == t.Timelock(6, t.TimeUnit.BLOCKS)
+
+
+def test_the_flag_with_a_live_outside_use_is_still_warned_at_its_default_not_refused(caplog):
+    """THE HONEST PATH FOR THE WIDER REFUSAL. ``--rxd-block-interval-s 300`` is now DETECTED where
+    it previously was not, so the exemption has to hold at the default spelling too — otherwise
+    presence detection would have re-introduced exactly the over-broad refusal this branch exists
+    to undo."""
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        policy = _policy_from_args(_parse_args([*_ESTIMATED, "--rxd-block-interval-s", "300"]))
+    assert policy is not None, "must not refuse"
+    assert any("did not reach the MarginPolicy" in r.getMessage() for r in caplog.records)
+
+
+def test_a_hand_built_namespace_keeps_the_old_predicate_and_still_starts():
+    """``_policy_from_args`` is reached through ``_parse_args`` on every shipped path, but an
+    embedder can hand it a Namespace with no presence set. That must degrade to the old
+    value-vs-default comparison, not to "nothing was ever supplied" and not to a crash."""
+    from pyrxd.security.errors import ValidationError
+
+    args = _parse_args([*_ESTIMATED])
+    delattr(args, run_module._SUPPLIED_ATTR)
+    assert _policy_from_args(args).is_measured is False
+    args = _parse_args([*_ESTIMATED, "--margin-blocks", "100"])
+    delattr(args, run_module._SUPPLIED_ATTR)
+    with pytest.raises(ValidationError):
+        _policy_from_args(args)

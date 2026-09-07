@@ -519,12 +519,24 @@ class MarginPolicy:
 
     @classmethod
     def estimated(
-        cls, *, block_interval_s: float = 600.0, require_measured: bool = False, accept_flat_burial: bool = False
+        cls,
+        *,
+        block_interval_s: float = 600.0,
+        require_measured: bool = False,
+        accept_flat_burial: bool = False,
+        eth_finalization_window_s: int | None = None,
     ) -> MarginPolicy:
         """The ESTIMATED, test-only policy. Refuses to construct in real-value mode.
 
         ``accept_flat_burial`` is the dust opt-out from the value-scaled-burial setup gate —
         set it for a deliberate dust run whose value is below the Radiant reorg cost.
+
+        ``eth_finalization_window_s`` is NOT an estimate this class ships — it is a per-chain
+        FACT (``pyrxd.eth_wallet.chains``), and it is here because the finality gate RAISES
+        without it on any finalized-checkpoint counter leg. An alert-only watchtower watching an
+        ETH swap builds its policy through this constructor, and with the window unset every tick
+        of a healthy swap came out as ``PAGE_SQUEEZED`` "verify finality manually". None keeps the
+        BTC (depth-based) behaviour exactly.
         """
         return cls(
             margin=Timelock(ESTIMATED_DEFAULT_MARGIN_BLOCKS, TimeUnit.BLOCKS),
@@ -532,6 +544,7 @@ class MarginPolicy:
             is_measured=False,
             require_measured=require_measured,
             accept_flat_burial=accept_flat_burial,
+            eth_finalization_window_s=eth_finalization_window_s,
         )
 
     @classmethod
@@ -550,6 +563,7 @@ class MarginPolicy:
         value_at_risk_photons: int | None = None,
         burial_safety_factor: float = 1.0,
         accept_flat_burial: bool = False,
+        eth_finalization_window_s: int | None = None,
     ) -> MarginPolicy:
         """A measured policy for real-value mainnet swaps.
 
@@ -571,6 +585,13 @@ class MarginPolicy:
         (the assessed economic value) drive the VALUE-SCALED claim burial (red-team HIGH):
         supply both for a value-bearing Radiant swap, or set ``accept_flat_burial=True`` for
         a dust run — the coordinator refuses a value-bearing swap that leaves them unset.
+
+        ``eth_finalization_window_s`` is REQUIRED (non-None) for a finalized-checkpoint (ETH)
+        counter leg and must stay None for a depth-based (BTC) one; take it from
+        ``pyrxd.eth_wallet.chains.evm_chain_by_id`` rather than guessing. Its absence here was
+        the reason the watchtower could not set it at all: a field this constructor does not
+        accept is invisible to the reachability guards derived from this signature, and the
+        finality gate then raised on every tick of a healthy ETH swap.
         """
         kwargs: dict = {
             "margin": margin,
@@ -614,6 +635,8 @@ class MarginPolicy:
             kwargs["reorg_cost"] = reorg_cost
         if value_at_risk_photons is not None:
             kwargs["value_at_risk_photons"] = value_at_risk_photons
+        if eth_finalization_window_s is not None:
+            kwargs["eth_finalization_window_s"] = eth_finalization_window_s
         return cls(**kwargs)
 
 

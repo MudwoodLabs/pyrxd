@@ -52,6 +52,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd-watchtower` paged `PAGE_SQUEEZED` on every tick of a healthy ETH swap**, because
+  `MarginPolicy.eth_finalization_window_s` was unreachable from the tower. The finality gate
+  RAISES on a depth-less (finalized-checkpoint) verdict without it, `_decide_eth` catches
+  that and pages "verify finality manually", and the tower had no flag to set it — so for the
+  whole window between the maker's ETH claim and its finalized checkpoint (~13 min in the
+  steady state, hours during a finality stall, which is exactly the case the stall budget
+  exists for) the operator was paged once per tick and pushed to act by hand under time
+  pressure on the one path where the correct behaviour is WAIT. The window is now taken from
+  the vetted per-chain registry for `--eth-chain-id`, with `--eth-finalization-window-s` to
+  override it, and it reaches BOTH policies — an alert-only tower watches ETH swaps too. An
+  unvetted chain id logs an `ERROR` naming the flag and keeps the fail-closed `None` rather
+  than guessing a window, since too small a reserve is the unsafe direction.
+
+  The reachability guards written for exactly this class did not see it: both derived their
+  universe of "policy knobs" from `MarginPolicy.measured`'s **signature**, and this field was
+  not a parameter of that constructor. The guard now runs over
+  `dataclasses.fields(MarginPolicy)` minus an exemption list checked against those same
+  fields, and is tested against a field name it was not built from.
+
 - **The TIMELOCK unlock gate failed OPEN on a lock with no protocol marker.**
   `plan_timelock_reveal` decided "is this timelocked" from `crypto.timelock` and "has it
   expired" from the `9` marker in `p`, by way of `is_unlocked` — which correctly answers
@@ -125,6 +144,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Such an invocation now exits at startup naming the flags and the remedy, and the report
   additionally checks its own label against the policy before printing it. The default
   alert-only invocation and every existing `--measured` invocation are unchanged.
+
+  **The refusal now tests PRESENCE, not "differs from the default".** It compared the parsed
+  value against the parser's own default, so `--flag <that default>` was indistinguishable
+  from never passing the flag and the original defect survived for exactly one spelling per
+  flag — and not a harmless one: `--margin-blocks` defaults to 72 while the estimated policy
+  holds 36 blocks, and `--rxd-claim-burial` to 2 while it holds 6, so those two operators
+  were running the number they had not typed. `--btc-reorg-depth 6`,
+  `--burial-safety-factor 1.0`, `--margin-blocks 72`, `--rxd-claim-burial 2` and
+  `--reorg-cost-max-age-s 86400` without `--measured` therefore now exit 1 where they used to
+  start. Neither parser default is changed: 2 is the deliberate dust-run value the swap
+  runners and this runbook already use, and `policy.margin` is read by no watchtower code
+  path at all (pinned by a test), so lowering 72 to 36 would move a fund-relevant field in
+  the unsafe direction to fix nothing. `--rxd-block-interval-s` stays exempt — it feeds the
+  timing preflight, so it warns rather than refusing.
 
 ## [0.23.0] — 2026-09-04
 
