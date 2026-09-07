@@ -588,11 +588,32 @@ class TestTheDurableWriterItself:
             _write_new_file(target, b"clobber", mode=0o600)
         assert target.read_bytes() == b"the previous mint's only key"
 
-    def test_the_mode_is_set_at_CREATION_not_by_a_later_chmod(self, tmp_path) -> None:
-        """Between an ``open`` and a ``chmod`` there is a window in which a key is
-        world-readable. Asserted through the file's own mode, which is the only observable the
-        window leaves behind."""
+    def test_the_mode_is_set_at_CREATION_not_by_a_later_chmod(self, tmp_path, monkeypatch) -> None:
+        """Between an ``open`` and a ``chmod`` there is a window in which a key sits
+        world-readable, and on a shared host that window is the vulnerability.
+
+        The final mode cannot see it. A later ``chmod`` reaches the same final mode, so a test
+        asserting only ``stat()`` passes on the defect — planting exactly that (create 0666,
+        chmod 0600) left an earlier version of this test green. What is checked instead is the
+        mode the descriptor was CREATED with, and that no ``chmod`` happens at all.
+        """
+        opens: list[tuple[str, int]] = []
+        real_open = os.open
+
+        def _spy_open(path, flags, mode=0o777, **kw):
+            opens.append((str(path), mode))
+            return real_open(path, flags, mode, **kw)
+
+        def _no_chmod(*a, **k):
+            pytest.fail("the mode was applied after creation, leaving a world-readable window")
+
+        monkeypatch.setattr(os, "open", _spy_open)
+        monkeypatch.setattr(os, "chmod", _no_chmod)
+
         target = tmp_path / "k.hex"
         _write_new_file(target, b"secret", mode=0o600)
+
+        created = [m for p, m in opens if p == str(target)]
+        assert created == [0o600], f"created with {[oct(m) for m in created]}, not 0o600"
         assert oct(target.stat().st_mode)[-3:] == "600"
         assert target.read_bytes() == b"secret"
