@@ -83,21 +83,48 @@ def _timelock_sites(scope: ast.AST) -> list[tuple[str, ast.AST, int]]:
     return sites
 
 
+def _scope_of_each_site(tree: ast.AST) -> dict[int, str]:
+    """Innermost enclosing function for every line, so bindings in different tests never pair.
+
+    Without this the scan compared ONE `t_rxd` against ONE `t_btc` per file. Pairing across
+    unrelated test functions is meaningless, and — worse — the single-slot dict that produced it
+    let a later correct pair MASK an earlier inverted one.
+    """
+    scope: dict[int, str] = {}
+
+    def walk(node: ast.AST, name: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            here = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else name
+            if hasattr(child, "lineno"):
+                scope[child.lineno] = here
+            walk(child, here)
+
+    walk(tree, "<module>")
+    return scope
+
+
 def _inverted_relations(path: Path) -> list[tuple[int, str]]:
-    """Bindings that give `t_btc` a value provably >= `t_rxd` — the pre-#482 ordering.
+    """Every binding that gives `t_btc` a value provably >= `t_rxd` — the pre-#482 ordering.
+
+    EVERY pair, not the last one. The first version kept `literals[name]` in a single per-file
+    slot and compared once at the end, so a file with an inverted pair followed by a correct pair
+    came back CLEAN — measured: `t_rxd=60/t_btc=100` then `t_rxd=100/t_btc=60` returned []. Any
+    honest test added below an inverted fixture silently certified it.
 
     Two detectable forms, both observed in this repo:
-      * two int literals, e.g. `t_rxd = Timelock(60)` / `t_btc = Timelock(100)`
-      * an OFFSET off a shared base, e.g. `t_btc = Timelock(t_rxd_blocks + 40)` — inverted for
-        EVERY value of the base, which a literal comparison alone would never have caught.
+      * two int literals in the same scope, e.g. `t_rxd = Timelock(60)` / `t_btc = Timelock(100)`
+      * an OFFSET off a shared base, `t_btc = Timelock(t_rxd_blocks + 40)` — inverted for EVERY
+        value of the base, which a literal comparison alone would never catch.
     """
     tree = ast.parse(path.read_text(errors="ignore"))
+    scope_of = _scope_of_each_site(tree)
     bad: set[tuple[int, str]] = set()
-    literals: dict[str, tuple[int, int]] = {}
+    by_scope: dict[str, list[tuple[str, int, int]]] = {}
+
     for name, value, lineno in _timelock_sites(tree):
         blocks = _timelock_blocks(value)
         if blocks is not None:
-            literals[name] = (blocks, lineno)
+            by_scope.setdefault(scope_of.get(lineno, "<module>"), []).append((name, blocks, lineno))
             continue
         if name == "t_btc" and isinstance(value, ast.Call) and value.args:
             arg = value.args[0]
@@ -110,11 +137,52 @@ def _inverted_relations(path: Path) -> list[tuple[int, str]]:
             ):
                 base = getattr(arg.left, "id", "<expr>")
                 bad.add((lineno, f"t_btc = Timelock({base} + {arg.right.value}) — exceeds t_rxd for every base"))
-    if "t_btc" in literals and "t_rxd" in literals:
-        (btc, btc_ln), (rxd, _) = literals["t_btc"], literals["t_rxd"]
-        if rxd <= btc:
-            bad.add((btc_ln, f"t_rxd={rxd} <= t_btc={btc}"))
+
+    # Within a scope, compare each `t_btc` against the NEAREST `t_rxd`, and flag every offender.
+    for sites in by_scope.values():
+        sites.sort(key=lambda s: s[2])
+        rxds = [(v, ln) for n, v, ln in sites if n == "t_rxd"]
+        for n, btc, btc_ln in sites:
+            if n != "t_btc" or not rxds:
+                continue
+            rxd, _ = min(rxds, key=lambda r: abs(r[1] - btc_ln))
+            if rxd <= btc:
+                bad.add((btc_ln, f"t_rxd={rxd} <= t_btc={btc}"))
     return sorted(bad)
+
+
+#: A file whose timelocks come from the production sizer cannot drift from the gate by
+#: construction — there is no constant to go stale. That is the SAFE pattern, and it is also
+#: invisible to a scan looking for literals, so the two have to be told apart.
+_DERIVED_FROM_PRODUCTION = "eth_absolute_to_rxd_relative_blocks"
+
+
+def _comparisons_made(path: Path) -> int:
+    """How many orderings this scan actually EVALUATED in this file.
+
+    Not how many bindings exist. The motivating suite has four `t_rxd`/`t_btc` bindings and the
+    scan can compare NONE of them — they are derived expressions, not literals — so it returned an
+    empty finding list that read exactly like a clean file.
+
+    "No findings" and "nothing was checked" must not look the same. This is the number that tells
+    them apart, and `test_the_scan_is_not_silently_blind` below asserts on it.
+    """
+    tree = ast.parse(path.read_text(errors="ignore"))
+    scope_of = _scope_of_each_site(tree)
+    by_scope: dict[str, list[tuple[str, int, int]]] = {}
+    offsets = 0
+    for name, value, lineno in _timelock_sites(tree):
+        blocks = _timelock_blocks(value)
+        if blocks is not None:
+            by_scope.setdefault(scope_of.get(lineno, "<module>"), []).append((name, blocks, lineno))
+        elif name == "t_btc" and isinstance(value, ast.Call) and value.args:
+            arg = value.args[0]
+            if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add) and isinstance(arg.right, ast.Constant):
+                offsets += 1
+    pairs = sum(
+        sum(1 for n, _, _ in s if n == "t_btc") for s in by_scope.values() if any(n == "t_rxd" for n, _, _ in s)
+    )
+    return pairs + offsets
 
 
 def test_the_scan_finds_the_opt_in_swap_suites() -> None:
@@ -143,6 +211,25 @@ _KNOWN_BROKEN = {
     "test_xchain_erc20_usdc_lifecycle_e2e.py": "same shape, passed as a constructor keyword rather than a local",
     "test_xchain_swap_regtest_e2e.py": "BTC<->RXD, where t_btc is REAL; includes an adversarial test that needs re-deriving post-#482",
 }
+
+
+def _blindness_reason(path: Path) -> str | None:
+    """None if this file's clean verdict is trustworthy; otherwise why it is not.
+
+    EXTRACTED so it can be tested on a synthetic file. Inline, its failing branch existed nowhere
+    in the tree — all four real suites satisfy it — so short-circuiting the whole check left every
+    test green. A check whose failure case cannot occur in the corpus it runs over is vacuous, and
+    that is precisely the defect this module exists to catch.
+    """
+    if _comparisons_made(path) > 0:
+        return None
+    if _DERIVED_FROM_PRODUCTION in path.read_text(errors="ignore"):
+        return None
+    return (
+        f"{path.name} builds swap terms, but this scan evaluated NOTHING in it and it does not "
+        f"derive them via {_DERIVED_FROM_PRODUCTION}. A clean result here means the scan could not "
+        "read the file, not that the file is correct — extend the scan or derive the timelocks."
+    )
 
 
 @pytest.mark.parametrize("path", _opt_in_swap_suites(), ids=lambda p: p.name)
@@ -207,3 +294,93 @@ def test_the_known_broken_list_names_only_real_files() -> None:
     present = {p.name for p in _opt_in_swap_suites()}
     stale = set(_KNOWN_BROKEN) - present
     assert not stale, f"_KNOWN_BROKEN names suites that are no longer discovered: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("path", _opt_in_swap_suites(), ids=lambda p: p.name)
+def test_the_scan_is_not_silently_blind(path: Path) -> None:
+    """A clean verdict must mean "checked and correct", never "could not read it".
+
+    The scan returned an empty list for `test_xchain_eth_glyph_real_rxindexer_e2e.py` — the suite
+    it was WRITTEN from — because that file now derives `t_rxd` from the production sizer, so
+    there is no literal to compare. That is the right thing for the file to do and the wrong thing
+    for the guard to report as a pass.
+
+    So a file is acceptable on exactly one of two grounds, and it must be clear WHICH:
+      * the scan evaluated at least one ordering in it, or
+      * it takes its timelocks from the production sizer, where no constant can drift.
+    """
+    assert _blindness_reason(path) is None, _blindness_reason(path)
+
+
+class TestTheScanItselfBehaves:
+    """Synthetic inputs, because every assertion above is over the FILES CURRENTLY IN THE TREE —
+    and none of them happens to contain a masking pair. Planting the old single-slot comparison
+    back left the whole module green, which is how the masking bug survived being "verified" by an
+    ad-hoc probe that never became a test.
+    """
+
+    @staticmethod
+    def _scan(tmp_path, body: str):
+        f = tmp_path / "sample.py"
+        f.write_text(body)
+        return _inverted_relations(f)
+
+    def test_an_inversion_is_not_masked_by_a_later_correct_pair(self, tmp_path) -> None:
+        """THE REGRESSION. One slot per file meant only the LAST binding of each name was
+        compared, so appending an honest test silenced an inverted fixture above it."""
+        found = self._scan(
+            tmp_path,
+            "def t():\n"
+            "    t_rxd = bt.Timelock(60, B)\n"
+            "    t_btc = bt.Timelock(100, B)\n"
+            "    t_rxd = bt.Timelock(100, B)\n"
+            "    t_btc = bt.Timelock(60, B)\n",
+        )
+        assert found, "an inverted pair followed by a correct one must still be reported"
+        assert any(ln == 3 for ln, _ in found), f"must name the inverted line, got {found}"
+
+    def test_bindings_in_different_functions_do_not_pair(self, tmp_path) -> None:
+        """The other direction. Comparing a `t_rxd` from one test against a `t_btc` from another
+        invents an ordering neither test states — a guard refusing valid work."""
+        found = self._scan(
+            tmp_path,
+            "def a():\n    t_rxd = bt.Timelock(100, B)\n    t_btc = bt.Timelock(60, B)\n"
+            "def b():\n    t_rxd = bt.Timelock(200, B)\n    t_btc = bt.Timelock(120, B)\n",
+        )
+        assert found == [], f"two independently correct scopes must be clean, got {found}"
+
+    def test_every_offender_is_reported_not_just_the_first(self, tmp_path) -> None:
+        found = self._scan(
+            tmp_path,
+            "def a():\n    t_rxd = bt.Timelock(60, B)\n    t_btc = bt.Timelock(100, B)\n"
+            "def b():\n    t_rxd = bt.Timelock(3, B)\n    t_btc = bt.Timelock(6, B)\n",
+        )
+        assert len(found) == 2, f"both scopes are inverted; got {found}"
+
+    def test_a_derived_file_reports_zero_COMPARISONS_not_zero_findings(self, tmp_path) -> None:
+        """The blindness half, pinned on the scan rather than on a real file — so it keeps holding
+        when those files change."""
+        f = tmp_path / "derived.py"
+        f.write_text(
+            "def t():\n    t_rxd = eth_absolute_to_rxd_relative_blocks(x)\n    t_btc = bt.Timelock(t_rxd.value // 2, B)\n"
+        )
+        assert _inverted_relations(f) == []
+        assert _comparisons_made(f) == 0, "a derived file must report that nothing was evaluated"
+
+    def test_a_file_the_scan_cannot_read_is_NOT_called_clean(self, tmp_path) -> None:
+        """The blindness check's own failing case, which no real suite provides.
+
+        Planting `if True: return` into it left all 14 tests green, because every file in the tree
+        satisfies it for a good reason. This supplies the bad reason."""
+        f = tmp_path / "opaque.py"
+        f.write_text("def t():\n    t_rxd = compute_it_somehow()\n    t_btc = compute_it_too()\n")
+        assert _comparisons_made(f) == 0
+        reason = _blindness_reason(f)
+        assert reason is not None and "evaluated NOTHING" in reason
+
+    def test_a_file_the_scan_CAN_read_is_accepted(self, tmp_path) -> None:
+        """The honest partner, so the check above cannot be satisfied by refusing everything."""
+        f = tmp_path / "readable.py"
+        f.write_text("def t():\n    t_rxd = bt.Timelock(100, B)\n    t_btc = bt.Timelock(60, B)\n")
+        assert _comparisons_made(f) > 0
+        assert _blindness_reason(f) is None
