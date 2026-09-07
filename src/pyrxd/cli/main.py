@@ -89,7 +89,8 @@ class _SafePath(click.Path):
     "--yes",
     "-y",
     is_flag=True,
-    help="Skip confirmation prompts. Required with --json for destructive ops.",
+    help="Skip the confirmation QUESTION — the summary is still printed (to stderr under "
+    "--json/--quiet, so stdout stays parseable). Required with --json for destructive ops.",
 )
 @click.option(
     "--debug",
