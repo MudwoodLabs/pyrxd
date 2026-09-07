@@ -39,6 +39,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ..security.errors import ValidationError
+
 # Wire constants matching Photonic exactly.
 SCHEME_CHUNKED_AEAD_V1 = "chunked-aead-v1"
 ENC_XCHACHA20POLY1305 = "xchacha20poly1305"
@@ -87,12 +89,21 @@ class EncryptionMetadata:
 
     @classmethod
     def from_dict(cls, d: dict) -> EncryptionMetadata:
+        # A byte count and a chunk count cannot be negative, and this parses ATTACKER-AUTHORED
+        # on-chain bytes. `int(-1)` succeeds, so a negative size used to sail through and reach
+        # consumers as a real value — the same malformed-number class as the CBOR Infinity that
+        # raised OverflowError here, except silent. Both are now refused, and `decode_payload`
+        # logs and drops the field exactly as it does for every other malformed input.
+        size = int(d.get("size", 0))
+        chunks = int(d.get("chunks", 1))
+        if size < 0 or chunks < 1:
+            raise ValidationError(f"encrypted main has a nonsensical size/chunks: {size}/{chunks}")
         return cls(
             type=str(d["type"]),
             hash=str(d["hash"]),
             enc=str(d.get("enc", ENC_XCHACHA20POLY1305)),
-            size=int(d.get("size", 0)),
-            chunks=int(d.get("chunks", 1)),
+            size=size,
+            chunks=chunks,
             scheme=str(d.get("scheme", SCHEME_CHUNKED_AEAD_V1)),
         )
 
