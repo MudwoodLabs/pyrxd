@@ -125,12 +125,34 @@ def confirm_action(
 ) -> bool:
     """Display *summary* lines and ask for y/N. Returns True on confirm.
 
-    With ``--yes`` the prompt is skipped and True is returned
-    immediately. ``--json`` mode without ``--yes`` should already have
-    been blocked by the destructive-mode gate, but we defensively check
-    again here.
+    With ``--yes`` the QUESTION is skipped — the DISCLOSURE is not. ``--yes`` is an
+    operator saying "do not ask me", and until this branch echoed anything it also meant
+    "do not tell me": every line a command had assembled to justify an irreversible
+    broadcast went nowhere on the one path that runs unattended, while the interactive path
+    printed all of them.
+
+    That gap mattered most on ``pyrxd glyph timelock-reveal``, whose summary is the only
+    place the unlock gate's ``chain says`` reading is ever rendered. That number is a tip
+    height read from an ElectrumX server this SDK does not authenticate, and it is what
+    decides whether a decryption key becomes public forever; an endpoint overstating it gets
+    a permanent early reveal past a gate reporting itself satisfied, with the
+    ``*** EARLY REVEAL`` banner silent because by its own arithmetic the lock has expired.
+    Showing the operator both sides of that comparison was the whole fix, and
+    :meth:`~pyrxd.cli.context.CliContext.is_destructive_mode_safe` requires ``--yes`` for
+    every destructive ``--json`` run — so this branch is the *only* one an automated reveal
+    can take, and it was the one branch the fix did not reach.
+
+    Stream: human mode echoes to stdout, exactly where the interactive branch below puts
+    the same lines. ``--json`` and ``--quiet`` echo to stderr instead, so stdout stays a
+    single machine-readable document for the caller that asked for one.
+
+    ``--json`` mode without ``--yes`` should already have been blocked by the
+    destructive-mode gate, but we defensively check again here.
     """
     if ctx.yes:
+        to_stderr = ctx.output_mode in ("json", "quiet")
+        for line in summary:
+            click.echo(line, err=to_stderr)
         return True
     if ctx.output_mode == "json":
         # Belt-and-suspenders: never auto-confirm in JSON mode.
