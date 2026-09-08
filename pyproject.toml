@@ -65,7 +65,13 @@ dependencies = [
 # `pip install 'pyrxd[eth]'` therefore warned "does not provide the extra 'eth'" and installed
 # nothing, and the import then failed telling the user to do the thing that had just no-opped.
 #
-# Floors are measured, not guessed (clean-venv resolution of web3 7.16.0, 2026-08-22):
+# Floors are measured, not guessed (clean-venv resolution of web3 8.0.0, 2026-09-08):
+#   Re-measured when the constraint moved to `web3>=8.0.0,<9.0.0`. The previous line cited a
+#   7.16.0 resolution, which the major bump made false while the numbers below stayed right —
+#   a provenance claim outliving the measurement behind it. Under 8.0.0 web3 declares
+#   `eth-account>=0.14` (matching the floor here) and still does NOT declare `eth-keys`,
+#   which resolves to 0.8.0 via eth-account, so the reason for declaring it directly is
+#   unchanged.
 #   web3        — the same pin the `test` group already carries, so the tested configuration is
 #                 unchanged by declaring it here.
 #   eth-account — web3's OWN declared floor (`eth-account>=0.13.6`); imported directly by
