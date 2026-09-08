@@ -92,7 +92,7 @@ dependencies = [
 # conflict with a consumer's tree — so this is the only such floor, and it should be REMOVED once
 # `requests` itself floors urllib3 above 2.7.0.
 eth = [
-    "web3>=7.16.0,<8.0.0",
+    "web3>=8.0.0,<9.0.0",
     "eth-account>=0.14.0,<1.0.0",
     "eth-keys>=0.8.0,<1.0.0",
     "urllib3>=2.7.0",
@@ -397,7 +397,7 @@ test = [
     # through web3. Previously undeclared: the suites were importable only if a developer happened
     # to have web3 installed, so they silently skipped. web3 caps websockets<16.0.0 — see the
     # runtime `websockets` floor above for why that constraint is compatible rather than a conflict.
-    "web3>=7.16.0,<8.0.0",
+    "web3>=8.0.0,<9.0.0",
 ]
 docs = [
     "furo>=2025.12,<2026.0",
