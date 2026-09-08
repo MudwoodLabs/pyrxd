@@ -390,8 +390,14 @@ def timelock_mint_cmd(
     # unmodified, and a re-encode from anything else is exactly the drift that strands it.
     try:
         _write_secret(cek_out, build.cek.hex() + "\n")
-        _write_new_file(ciphertext_out, _ciphertext_json(build).encode("utf-8"), mode=0o644)
-        _write_new_file(envelope_out, encode_payload(build.metadata)[0], mode=0o644)
+        # 0600, not 0644. Both are safe to PUBLISH — the envelope is the CBOR that goes on
+        # chain, and the ciphertext is sealed by the CEK — but that is an argument about
+        # what may be shared, not about what a CLI should write into an operator's
+        # directory by default. World-readable buys nobody anything here and costs a
+        # shared host; an operator who wants to publish them can chmod. CodeQL flagged
+        # `_write_new_file` for exactly this, and it was right to.
+        _write_new_file(ciphertext_out, _ciphertext_json(build).encode("utf-8"), mode=0o600)
+        _write_new_file(envelope_out, encode_payload(build.metadata)[0], mode=0o600)
     except OSError as exc:
         raise UserError(
             "could not write the key, ciphertext or envelope file — nothing was broadcast",

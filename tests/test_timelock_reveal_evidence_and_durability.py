@@ -621,7 +621,7 @@ class TestDurabilityDoesNotBecomeARefusal:
         """The Windows shape: ``os.open`` on a directory raises rather than fsync doing so."""
         real_open = os.open
 
-        def _no_dir_open(path, flags, mode=0o777, **kw):
+        def _no_dir_open(path, flags, mode=0o600, **kw):
             if os.path.isdir(path):
                 raise PermissionError(13, "Permission denied")
             return real_open(path, flags, mode, **kw)
@@ -691,7 +691,7 @@ class TestTheDurableWriterItself:
         opens: list[tuple[str, int]] = []
         real_open = os.open
 
-        def _spy_open(path, flags, mode=0o777, **kw):
+        def _spy_open(path, flags, mode=0o600, **kw):
             opens.append((str(path), mode))
             return real_open(path, flags, mode, **kw)
 
