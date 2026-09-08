@@ -110,4 +110,4 @@ An order with two price-term pushes `0102030405` + `060708090a` and signature `0
 7. Sign the offered UTXO with sighash `0xC3` (FORKID/BIP143 preimage); `signature` push = full P2PKH scriptSig `PUSH(der||0xC3) PUSH(pubkey)`.
 8. Emit `OP_RETURN "RSWP" 0x02 flags offeredType termsType tokenID [wantTokenID] offeredUTXOHash offeredUTXOIndex priceTerms signature` as a value-0 output in any funded tx.
 
-pyrxd already has the preimage + signing for `0xC3` (`src/pyrxd/transaction/transaction_preimage.py:190-235`, `src/pyrxd/script/type.py:78-85`, `src/pyrxd/constants.py:38`). Remaining work is the OP_RETURN/`MultiTxOutV1` serializer + a per-input sighash-aware offer builder.
+pyrxd already has the preimage + signing for `0xC3` (`src/pyrxd/transaction/transaction_preimage.py:180-223`, `src/pyrxd/script/type.py:78-85`, `src/pyrxd/constants.py:38`). Remaining work is the OP_RETURN/`MultiTxOutV1` serializer + a per-input sighash-aware offer builder.
