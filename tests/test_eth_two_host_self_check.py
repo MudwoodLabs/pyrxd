@@ -20,6 +20,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from tests.test_two_host_recovery_phases import _EXPECTED_PHASES
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "eth_swap_two_host.py"
 
 
@@ -36,6 +38,13 @@ def test_self_check_passes():
     pass. It also raises SystemExit if its own timelocks no longer derive, which is the regression
     this test exists for."""
     _load().run_self_check()
+
+
+def test_dispatch_table_is_complete():
+    """The BTC sibling has pinned its dispatch table since the harness was written and this one
+    pinned nothing — the same documented-gap shape that let ``run_self_check`` rot here. Same
+    literal as the BTC file, so a phase added to one harness and not the other is visible."""
+    assert set(_load()._DISPATCH) == _EXPECTED_PHASES
 
 
 class TestTheFastTailIsWiredAndTheRegimeIsDISCLOSED:
