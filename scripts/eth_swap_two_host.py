@@ -228,6 +228,31 @@ def _margin_policy(args: argparse.Namespace) -> MarginPolicy:
     # stall-tolerance flag defaulted to 0 while its own help text credited a guard that lives in
     # another program. An unenforced floor that a reader believes is enforced is worse than no
     # floor: it stops them checking.
+    # THE SAME REASONING AS THE STALL-TOLERANCE WARNING ABOVE, for the knob that scales every
+    # reserve. `_dividing_interval_s` falls back to the NOMINAL interval when no fast tail is set,
+    # so an omitted flag does not fail — it silently sizes every reserve against 300s instead of
+    # the 36s p10, measured 8.3x looser. `eth_swap_run.py:193` REFUSES a real-value run without
+    # this; refusing here would be wrong, because there is no mainnet path in this file at all.
+    #
+    # But this harness is what the two-party adversarial run drives, and that run is meant to be
+    # EVIDENCE. Evidence that silently exercised a configuration production refuses is worth less
+    # than the reader assumes, so the run states which regime it was in rather than leaving it to
+    # be inferred from a flag nobody passed.
+    if not args.rxd_block_interval_fast_s:
+        print(
+            f"  [WARN] no --rxd-block-interval-fast-s: reserves are sized against the NOMINAL "
+            f"{args.rxd_block_interval_s}s Radiant interval, not a measured p10. At the shipped "
+            "defaults that is 8.3x looser than production (300s vs 36s), so this run does NOT "
+            "exercise the sizing discipline a real-value run must pass. Fine for a mechanism "
+            "check; not evidence about timing.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  [ok]   fast tail {args.rxd_block_interval_fast_s}s (measured p10) — reserves "
+            "sized as a real-value run would size them.",
+            file=sys.stderr,
+        )
     if args.eth_finality_stall_tolerance_s < _REAL_VALUE_STALL_TOLERANCE_FLOOR_S:
         print(
             f"  [WARN] --eth-finality-stall-tolerance-s is {args.eth_finality_stall_tolerance_s}s, "
@@ -242,6 +267,7 @@ def _margin_policy(args: argparse.Namespace) -> MarginPolicy:
         block_interval_s=args.btc_block_interval_s,
         is_measured=False,
         rxd_block_interval_s=args.rxd_block_interval_s,
+        rxd_block_interval_fast_s=args.rxd_block_interval_fast_s,
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_cross_clock_margin(args),
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
@@ -1106,6 +1132,18 @@ def _args() -> argparse.Namespace:
     )
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=None,
+        help=(
+            "The MEASURED p10 Radiant inter-block, in seconds. Every reserve DIVIDES by this, so "
+            "leaving it unset sizes them against the NOMINAL interval instead — measured 8.3x "
+            "looser at the shipped defaults (300s vs the 36s p10 of 2026-08-26). This harness "
+            "cannot move real value, so it is not required; but a run that omits it exercises "
+            "timing production would never accept, and says so at startup."
+        ),
+    )
     ap.add_argument("--eth-finalization-window-s", type=int, default=None)
     ap.add_argument(
         "--eth-finality-stall-tolerance-s",
