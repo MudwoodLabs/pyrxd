@@ -255,8 +255,8 @@ def _parse_expiry(value: str, *, on_error: Literal["raise", "none"]) -> datetime
 def is_authority_expired(metadata: GlyphMetadata | None, *, now: datetime | None = None) -> bool:
     """Return True if the authority has an expiry and it has passed.
 
-    An UNPARSEABLE expiry returns ``False`` — not expired — which is the same
-    answer Photonic gives, and it is the dangerous direction, so
+    An UNPARSEABLE expiry returns ``False`` — not expired — which was the same
+    answer Photonic gave at ``becf41a``, and it is the dangerous direction, so
     :func:`build_authority_metadata` refuses to mint one and
     :func:`validate_authority` reports it. Check validity before trusting this.
     """
@@ -316,10 +316,11 @@ def verify_authority_claim(
 ) -> AuthorityVerdict:
     """Does the item's ``by`` claim on *authority_ref* stand up?
 
-    Deliberately takes VERDICTS rather than metadata. Photonic's
-    ``verifyAuthorityChain`` matches the ``by`` field against a candidate
-    authority's ref and reports success on a string match — so a forger who
-    writes a real issuer's ref into their own ``by`` passes it. ``by`` is an
+    Deliberately takes VERDICTS rather than metadata. At ``becf41a`` Photonic's
+    ``verifyAuthorityChain`` matched the ``by`` field against a candidate
+    authority's ref and reported success on a string match — so a forger who
+    wrote a real issuer's ref into their own ``by`` passed it (reported as M26).
+    The argument for taking verdicts does not depend on that defect: ``by`` is an
     operator assertion; only :func:`~pyrxd.glyph.relationships.verify_relationship_claims`
     can say whether anything authorised it.
 

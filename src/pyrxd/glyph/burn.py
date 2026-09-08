@@ -30,8 +30,10 @@ So :func:`verify_burn` reports a BASIS rather than a boolean:
   the spent outputs' scripts, which live in earlier transactions, so the caller
   fetches them and passes them in.
 
-Photonic's ``validateBurn`` checks only the first of those, plus the magic
-bytes. A transaction that never touched a token can pass it.
+Photonic's ``validateBurn`` checked only the first of those, plus the magic
+bytes, at ``becf41a`` — a transaction that never touched a token passed it.
+Reported as M27; if a later Photonic requires the spent scripts too, this
+paragraph is history rather than a live difference, and the two agree.
 """
 
 from __future__ import annotations

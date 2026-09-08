@@ -1254,6 +1254,13 @@ reference. It is not treated as infallible. Where pyrxd diverges, it does so
 deliberately and for a stated reason; an interoperating implementation needs to
 know which behaviour it will encounter.
 
+**Photonic behaviour below is stated as of `becf41a`** and is a claim about that
+commit, not a standing one. Photonic is actively maintained, so a row may
+describe history rather than a live difference — the EPOCH/LWMA row already does.
+The last three rows were reported upstream as H15, M27 and M26; when a fix lands,
+mark the row rather than deleting it, because tokens written under the old
+behaviour stay on chain and a reader still has to handle them.
+
 | Area | Photonic | pyrxd | Reason |
 |---|---|---|---|
 | Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:26-33`). Consumers on both sides must accept either (§4.2). |
@@ -1266,6 +1273,9 @@ know which behaviour it will encounter.
 | V2 EPOCH / LWMA difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply; LWMA floors `timeDelta` at 0 | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py:291-311, 252-264`). The mainnet LWMA deploy `dea3beb9…` predates it and is deliberately **not** used as a golden anchor. |
 | ASERT shift | `OP_LSHIFT`/`OP_RSHIFT`, which Radiant evaluates as big-endian bit-string shifts — wrong for the 8-byte little-endian target | Unrolled `OP_2MUL`/`OP_2DIV` steps with per-step overflow caps | The shift opcodes diverge from the miner's bigint arithmetic for any nonzero drift (`src/pyrxd/glyph/dmint/builders.py:158-167`). |
 | WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:686-734`). |
+| Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
+| Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
+| `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |
 
 ## 16. Underspecified and implementation-defined
 
