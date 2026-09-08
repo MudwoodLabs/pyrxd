@@ -20,7 +20,6 @@ from pyrxd.glyph.authority import (
     AuthorityAttrs,
     AuthorityBasis,
     build_authority_metadata,
-    has_permission,
     is_authority,
     is_authority_expired,
     read_authority_attrs,
@@ -31,9 +30,8 @@ from pyrxd.glyph.authority import (
 from pyrxd.glyph.builder import GlyphBuilder
 from pyrxd.glyph.payload import encode_payload
 from pyrxd.glyph.relationships import (
-    RelationshipBacking,
+    RelationshipBasis,
     RelationshipKind,
-    RelationshipOutcome,
     RelationshipVerdict,
 )
 from pyrxd.glyph.script import (
@@ -163,9 +161,10 @@ def test_no_expiry_never_expires():
 
 def test_permissions_are_read_exactly():
     md = build_authority_metadata("issuer", permissions=["mint", "revoke"])
-    assert has_permission(md, "mint") and has_permission(md, "revoke")
-    assert not has_permission(md, "burn")
-    assert not has_permission(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x"), "mint")
+    perms = read_authority_attrs(md).permissions
+    assert "mint" in perms and "revoke" in perms
+    assert "burn" not in perms
+    assert read_authority_attrs(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x")).permissions == ()
 
 
 def test_revocable_defaults_true_and_only_explicit_false_is_false():
@@ -192,7 +191,7 @@ def test_wrong_typed_attrs_degrade_to_defaults_rather_than_raising():
 
 def test_the_gate_verdict_reads_the_genesis_output():
     verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), AUTHORITY)
-    assert verdict.valid and verdict.basis is AuthorityBasis.GATE
+    assert verdict.ok and verdict.basis is AuthorityBasis.GATE
     assert verdict.authority_ref == AUTHORITY
 
 
@@ -200,17 +199,17 @@ def test_the_gate_verdict_refuses_a_different_authority():
     """Gated, but by someone else. Reporting 'valid' here would be the whole bug."""
     other = GlyphRef(txid="bb" * 32, vout=3)
     verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), other)
-    assert not verdict.valid and verdict.authority_ref == AUTHORITY
+    assert not verdict.ok and verdict.authority_ref == AUTHORITY
     assert "not on" in verdict.reason
 
 
 def test_the_gate_verdict_refuses_an_ungated_output():
     verdict = verify_authority_gate(build_nft_locking_script(PKH, ITEM), AUTHORITY)
-    assert not verdict.valid and verdict.basis is AuthorityBasis.NONE
+    assert not verdict.ok and verdict.basis is AuthorityBasis.NONE
 
 
-def _author_verdict(outcome, backing):
-    return [RelationshipVerdict(kind=RelationshipKind.AUTHOR, ref=AUTHORITY, outcome=outcome, backing=backing)]
+def _author_verdict(ok, basis):
+    return [RelationshipVerdict(kind=RelationshipKind.AUTHOR, ref=AUTHORITY, ok=ok, basis=basis, reason="fixture")]
 
 
 def test_an_unbacked_by_claim_is_NOT_reported_as_an_issuer():
@@ -221,8 +220,8 @@ def test_an_unbacked_by_claim_is_NOT_reported_as_an_issuer():
     CBOR: a forger writes a real issuer's ref into their own token and passes.
     Only the relationship verdict can say whether anything authorised it.
     """
-    verdict = verify_authority_claim(AUTHORITY, _author_verdict(RelationshipOutcome.UNBACKED, RelationshipBacking.NONE))
-    assert not verdict.valid
+    verdict = verify_authority_claim(AUTHORITY, _author_verdict(False, RelationshipBasis.NONE))
+    assert not verdict.ok
     assert verdict.basis is AuthorityBasis.NONE
     assert "nothing authorised the claim" in verdict.reason
 
@@ -230,25 +229,25 @@ def test_an_unbacked_by_claim_is_NOT_reported_as_an_issuer():
 @pytest.mark.parametrize(
     ("backing", "evidence"),
     [
-        (RelationshipBacking.DIRECT, "spent the authority itself"),
-        (RelationshipBacking.DELEGATED, "delegate"),
+        (RelationshipBasis.DIRECT, "spent the authority itself"),
+        (RelationshipBasis.DELEGATED, "delegate"),
     ],
 )
 def test_a_backed_by_claim_is_accepted_and_says_HOW(backing, evidence):
-    verdict = verify_authority_claim(AUTHORITY, _author_verdict(RelationshipOutcome.BACKED, backing))
-    assert verdict.valid and verdict.basis is AuthorityBasis.BACKED_CLAIM
+    verdict = verify_authority_claim(AUTHORITY, _author_verdict(True, backing))
+    assert verdict.ok and verdict.basis is AuthorityBasis.BACKED_CLAIM
     assert evidence in verdict.reason
 
 
 def test_a_claim_on_a_different_authority_is_not_borrowed():
     """A backed claim on X must not validate a question about Y."""
     other = GlyphRef(txid="bb" * 32, vout=3)
-    verdict = verify_authority_claim(other, _author_verdict(RelationshipOutcome.BACKED, RelationshipBacking.DIRECT))
-    assert not verdict.valid and "makes no `by` claim" in verdict.reason
+    verdict = verify_authority_claim(other, _author_verdict(True, RelationshipBasis.DIRECT))
+    assert not verdict.ok and "makes no `by` claim" in verdict.reason
 
 
 def test_no_verdicts_at_all_is_not_an_issuer():
-    assert not verify_authority_claim(AUTHORITY, []).valid
+    assert not verify_authority_claim(AUTHORITY, []).ok
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +348,7 @@ def test_authority_attrs_survive_a_real_cbor_round_trip():
     * ``revocable=False`` decoded as the string ``"False"``, which is truthy —
       a NON-revocable authority read back as revocable;
     * ``permissions=["mint"]`` decoded as ``"['mint']"``, parsed as ``()`` —
-      every permission silently lost, so `has_permission` was False for all.
+      every permission silently lost, so a permission check was False for all.
 
     Both are what a reader gets for a Photonic-minted authority too, since
     `authority.ts` writes exactly those types.
@@ -370,7 +369,7 @@ def test_authority_attrs_survive_a_real_cbor_round_trip():
     assert recovered.revocable is False, "a non-revocable authority must not read back as revocable"
     assert recovered.permissions == ("mint", "revoke")
     assert recovered.issuer == "rxd1qissuer" and recovered.scope == "tournaments"
-    assert has_permission(decode_payload(cbor_bytes), "mint")
+    assert "mint" in read_authority_attrs(decode_payload(cbor_bytes)).permissions
 
 
 def test_a_photonic_shaped_authority_decodes_with_its_types_intact():
@@ -495,7 +494,7 @@ def test_the_scanner_returns_a_gated_item_as_an_nft_it_holds():
 def test_more_permissions_than_the_decoder_keeps_are_refused_at_build_time():
     """The decoder truncates a list attr; minting past it loses entries forever.
 
-    `has_permission` would answer False for the lost ones for the life of the
+    a permission check would answer False for the lost ones for the life of the
     token, and a mint cannot be undone — so the refusal belongs on the encode
     path, where the caller can still change their mind.
     """

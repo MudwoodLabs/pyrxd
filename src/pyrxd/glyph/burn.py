@@ -89,18 +89,13 @@ class BurnBasis(Enum):
     #: The transaction spent an output carrying the ref AND no output carries
     #: it. This is a burn.
     SPENT_AND_ABSENT = "spent-and-absent"
-    #: A proof is present and no output carries the ref, but the spent outputs
-    #: were not supplied, so nothing rules out a proof written about a token
-    #: this transaction never held. **This does not make a verdict valid** —
-    #: absence from the outputs is true of every unrelated transaction there is.
-    ABSENT_ONLY = "absent-only"
     #: The claim does not stand.
     NONE = "none"
 
 
 @dataclass(frozen=True)
 class BurnVerdict:
-    valid: bool
+    ok: bool
     basis: BurnBasis
     reason: str
     proof: BurnProof | None = None
@@ -265,8 +260,7 @@ def _carries(scripts: list[bytes], wire_ref: bytes) -> bool:
 def verify_burn(
     output_scripts: list[bytes],
     token_ref: GlyphRef,
-    *,
-    spent_output_scripts: list[bytes] | None = None,
+    spent_output_scripts: list[bytes],
 ) -> BurnVerdict:
     """Check a burn claim against what the transaction actually did.
 
@@ -274,20 +268,20 @@ def verify_burn(
     :param token_ref: the token the caller is asking about.
     :param spent_output_scripts: the locking scripts of the outputs this
         transaction SPENT. They live in earlier transactions, so the caller
-        fetches them. **Without them the strongest available verdict is
-        ABSENT_ONLY** — a proof plus an absence, which is also what a
-        transaction that never held the token produces.
+        fetches them.
 
-    ``valid`` is True ONLY for :attr:`BurnBasis.SPENT_AND_ABSENT`. Without
-    *spent_output_scripts* the strongest honest answer is "not established", and
-    that is what you get — the same rule
-    :func:`~pyrxd.glyph.relationships.verify_relationship_claims` applies when
-    the delegate lookup has not been done. A caller who wants to distinguish
-    "no proof at all" from "a proof I could not corroborate" reads
-    :attr:`BurnVerdict.basis`.
+        **Required, deliberately.** It was optional, and omitting it returned
+        ``ok=False`` for a genuine burn — a function called ``verify_burn``
+        answering False about a real burn is the most surprising thing an API
+        can do. Absence from the outputs alone is a condition every unrelated
+        transaction on the chain satisfies, so there is no useful verdict to
+        give without this. Requiring it means the weak answer cannot arise:
+        either you have the evidence, or you cannot ask. Pass ``[]`` only if you
+        genuinely mean "this transaction spent nothing relevant", which is a
+        refusal.
 
-    A ``valid`` verdict never means "the owner intended this"; it means the
-    token is gone and something recorded that it was meant to be.
+    An ``ok`` verdict never means "the owner intended this"; it means the token
+    is gone and something recorded that it was meant to be.
     """
     wire = token_ref.to_bytes()
     # Select the proof that names THIS token, not the first parseable one. A
@@ -297,50 +291,30 @@ def verify_burn(
     proofs = [p for p in (parse_burn_proof(script) for script in output_scripts) if p is not None]
     proof = next((p for p in proofs if p.token_ref == wanted_ref), None) or (proofs[0] if proofs else None)
     if proof is None:
-        return BurnVerdict(valid=False, basis=BurnBasis.NONE, reason="no burn proof output found")
+        return BurnVerdict(ok=False, basis=BurnBasis.NONE, reason="no burn proof output found")
     if proof.token_ref != wanted_ref:
         return BurnVerdict(
-            valid=False,
+            ok=False,
             basis=BurnBasis.NONE,
             reason=f"the burn proof names {proof.token_ref}, not {token_ref.txid}:{token_ref.vout}",
             proof=proof,
         )
     if _carries(output_scripts, wire):
         return BurnVerdict(
-            valid=False,
+            ok=False,
             basis=BurnBasis.NONE,
             reason="an output still carries the token ref — it was forwarded, not burned",
             proof=proof,
         )
-    if spent_output_scripts is None:
-        return BurnVerdict(
-            # valid=False, and this is the important line in the module.
-            # ABSENT_ONLY means a proof exists and this transaction's outputs do
-            # not carry the ref — a condition every unrelated transaction on the
-            # chain also satisfies. Returning True here would make
-            # `if verify_burn(outs, ref).valid:` — the obvious way to call this —
-            # accept a proof anyone could have written about someone else's
-            # token, with the qualification parked in a prose field nothing makes
-            # the caller read. The basis is there for a caller that wants the
-            # distinction; `valid` is not the place to put a maybe.
-            valid=False,
-            basis=BurnBasis.ABSENT_ONLY,
-            reason=(
-                "a proof is present and no output carries the ref, but the spent outputs were not "
-                "supplied — so this does not rule out a proof written about a token this transaction "
-                "never held. Pass spent_output_scripts to get a verdict"
-            ),
-            proof=proof,
-        )
     if not _carries(spent_output_scripts, wire):
         return BurnVerdict(
-            valid=False,
+            ok=False,
             basis=BurnBasis.NONE,
             reason="this transaction spent nothing carrying the token ref — the proof is about someone else's token",
             proof=proof,
         )
     return BurnVerdict(
-        valid=True,
+        ok=True,
         basis=BurnBasis.SPENT_AND_ABSENT,
         reason="the transaction spent an output carrying the ref and no output carries it",
         proof=proof,

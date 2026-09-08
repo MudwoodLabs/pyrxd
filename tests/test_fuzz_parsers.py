@@ -876,13 +876,12 @@ def test_verdict_functions_never_raise_on_arbitrary_outputs(scripts):
     try:
         burned = delegate_burn_refs(list(scripts))
         assert isinstance(burned, set)
-        verdict = verify_burn(list(scripts), ref)
-        assert isinstance(verdict.valid, bool)
-        verify_burn(list(scripts), ref, spent_output_scripts=list(scripts))
+        verdict = verify_burn(list(scripts), ref, list(scripts))
+        assert isinstance(verdict.ok, bool)
         resolved = resolve_delegated_refs(ref.to_bytes(), list(scripts))
         assert isinstance(resolved, tuple)
         for s in scripts:
-            assert isinstance(verify_authority_gate(s, ref).valid, bool)
+            assert isinstance(verify_authority_gate(s, ref).ok, bool)
     except Exception as exc:
         _fail_unexpected("verdict functions", exc, scripts)
 
@@ -896,7 +895,7 @@ def test_relationship_verdicts_never_raise_and_never_invent_backing(scripts, del
     wrong length. Garbage must not back anything — the verdict has to come from
     a real match, not from the parameter merely being non-empty.
     """
-    from pyrxd.glyph.relationships import RelationshipBacking, RelationshipOutcome, output_ref_operands
+    from pyrxd.glyph.relationships import RelationshipBasis, output_ref_operands
     from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 
     claimed = GlyphRef(txid="c0" * 32, vout=0)
@@ -910,12 +909,12 @@ def test_relationship_verdicts_never_raise_and_never_invent_backing(scripts, del
 
     wire = claimed.to_bytes()
     for v in verdicts:
-        if v.outcome is RelationshipOutcome.BACKED:
+        if v.ok is True:
             assert wire in direct or wire in {bytes(d) for d in delegated}, "backed without a real match"
-            if v.backing is RelationshipBacking.DIRECT:
+            if v.basis is RelationshipBasis.DIRECT:
                 assert wire in direct
         else:
-            assert v.backing is RelationshipBacking.NONE
+            assert v.basis is RelationshipBasis.NONE
 
 
 @given(base_ref=st.binary(min_size=0, max_size=80), scripts=st.lists(_script_bytes, min_size=0, max_size=4))

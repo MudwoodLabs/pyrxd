@@ -83,9 +83,8 @@ from .types import GlyphRef
 _log = logging.getLogger(__name__)
 
 __all__ = [
-    "RelationshipBacking",
+    "RelationshipBasis",
     "RelationshipKind",
-    "RelationshipOutcome",
     "RelationshipVerdict",
     "delegate_burn_refs",
     "output_ref_operands",
@@ -99,19 +98,8 @@ class RelationshipKind(Enum):
     AUTHOR = "author"
 
 
-class RelationshipOutcome(Enum):
-    #: The claimed ref appears in an output under an opcode consensus subset-checks
-    #: against the inputs, so the transaction provably spent it. The claim is
-    #: authorised. A ref named only by ``OP_DISALLOWPUSHINPUTREF``/``...SIBLING`` does
-    #: NOT qualify — see :func:`output_ref_operands`.
-    BACKED = "backed"
-    #: The glyph claims a parent that appears nowhere in the transaction's outputs.
-    #: Nothing authorised it — display it as a claim, never as a fact.
-    UNBACKED = "unbacked"
-
-
-class RelationshipBacking(Enum):
-    """HOW a BACKED claim was authorised. Meaningless when UNBACKED."""
+class RelationshipBasis(Enum):
+    """HOW a claim was authorised. ``NONE`` exactly when the verdict is not ``ok``."""
 
     #: The reveal's own outputs carry the parent ref under a subset-checked
     #: opcode — the transaction spent the parent itself.
@@ -128,27 +116,29 @@ class RelationshipBacking(Enum):
 
 @dataclass(frozen=True)
 class RelationshipVerdict:
+    """One verdict on one claimed relationship.
+
+    Shares its shape with :class:`~pyrxd.glyph.authority.AuthorityVerdict` and
+    :class:`~pyrxd.glyph.burn.BurnVerdict`: every verdict in this SDK answers
+    ``ok`` (may I rely on it), ``basis`` (on what), and ``reason`` (in words).
+    There used to be three different shapes for that question, including a
+    two-valued ``RelationshipOutcome`` enum that duplicated ``ok``.
+    """
+
     kind: RelationshipKind
     ref: GlyphRef
-    outcome: RelationshipOutcome
-    backing: RelationshipBacking = RelationshipBacking.NONE
+    ok: bool
+    basis: RelationshipBasis
+    reason: str
 
     def __post_init__(self) -> None:
-        # BACKED with backing=NONE was representable, and consumers read the
-        # two together — `verify_authority_claim` branches on `backing` after
-        # checking `backed`, and would have described a delegate burn that never
-        # happened. The default exists for UNBACKED verdicts; pair it with
-        # BACKED and the object contradicts itself.
-        backed = self.outcome is RelationshipOutcome.BACKED
-        if backed is (self.backing is RelationshipBacking.NONE):
+        # `ok` and `basis` are read together — `verify_authority_claim` branches
+        # on the basis after checking ok, and an ok verdict with basis=NONE would
+        # have it describe a delegate burn that never happened.
+        if self.ok is (self.basis is RelationshipBasis.NONE):
             raise ValidationError(
-                f"RelationshipVerdict is self-contradictory: outcome={self.outcome.value} with "
-                f"backing={self.backing.value}"
+                f"RelationshipVerdict is self-contradictory: ok={self.ok} with basis={self.basis.value}"
             )
-
-    @property
-    def backed(self) -> bool:
-        return self.outcome is RelationshipOutcome.BACKED
 
 
 def output_ref_operands(output_scripts: list[bytes]) -> set[bytes]:
@@ -284,10 +274,14 @@ def verify_relationship_claims(
             # reporting the weaker one for a claim that stands on its own would
             # understate a verdict a UI shows to a user.
             if wire in direct:
-                outcome, backing = RelationshipOutcome.BACKED, RelationshipBacking.DIRECT
+                ok, basis, why = True, RelationshipBasis.DIRECT, "the reveal spent the parent itself"
             elif wire in delegated:
-                outcome, backing = RelationshipOutcome.BACKED, RelationshipBacking.DELEGATED
+                ok, basis, why = (
+                    True,
+                    RelationshipBasis.DELEGATED,
+                    "a delegate whose base held the parent was burned by the reveal",
+                )
             else:
-                outcome, backing = RelationshipOutcome.UNBACKED, RelationshipBacking.NONE
-            verdicts.append(RelationshipVerdict(kind=kind, ref=ref, outcome=outcome, backing=backing))
+                ok, basis, why = False, RelationshipBasis.NONE, "nothing in this transaction authorised it"
+            verdicts.append(RelationshipVerdict(kind=kind, ref=ref, ok=ok, basis=basis, reason=why))
     return verdicts

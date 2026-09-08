@@ -204,29 +204,24 @@ def _proof_and_token():
     return build_burn_proof_script(TOKEN), build_nft_locking_script(PKH, TOKEN)
 
 
-def test_without_the_spent_outputs_the_verdict_is_NOT_valid():
-    """`valid` is not the place to put a maybe.
+def test_the_spent_outputs_cannot_be_omitted():
+    """The weak verdict is gone: you either have the evidence or cannot ask.
 
-    ABSENT_ONLY says a proof exists and this transaction's outputs do not carry
-    the ref — which every unrelated transaction on the chain also satisfies. If
-    that returned True, `if verify_burn(outs, ref).valid:` (the obvious call)
-    would accept a proof anyone could have written about someone else's token,
-    with the caveat parked in a prose field nothing makes the caller read.
+    `spent_output_scripts` was optional, and omitting it returned ok=False for a
+    GENUINE burn — a function called `verify_burn` answering False about a real
+    burn is the most surprising thing an API can do. Absence from the outputs
+    alone is satisfied by every unrelated transaction on the chain, so there was
+    no useful verdict to give without it.
     """
     proof, _tok = _proof_and_token()
-    verdict = verify_burn([proof], TOKEN)
-    assert not verdict.valid
-    assert verdict.basis is BurnBasis.ABSENT_ONLY
-    assert "does not rule out" in verdict.reason
-    # And it is still distinguishable from "no proof at all", which is the
-    # reason the basis exists.
-    assert verify_burn([build_nft_locking_script(PKH, OTHER)], TOKEN).basis is BurnBasis.NONE
+    with pytest.raises(TypeError):
+        verify_burn([proof], TOKEN)  # type: ignore[call-arg]
 
 
 def test_with_the_spent_outputs_it_is_the_strong_one():
     proof, tok = _proof_and_token()
-    verdict = verify_burn([proof], TOKEN, spent_output_scripts=[tok])
-    assert verdict.valid and verdict.basis is BurnBasis.SPENT_AND_ABSENT
+    verdict = verify_burn([proof], TOKEN, [tok])
+    assert verdict.ok and verdict.basis is BurnBasis.SPENT_AND_ABSENT
 
 
 def test_a_proof_about_a_token_the_tx_never_held_is_REFUSED():
@@ -237,27 +232,27 @@ def test_a_proof_about_a_token_the_tx_never_held_is_REFUSED():
     assertion about someone else's property.
     """
     proof = build_burn_proof_script(TOKEN)
-    verdict = verify_burn([proof], TOKEN, spent_output_scripts=[build_nft_locking_script(PKH, OTHER)])
-    assert not verdict.valid and verdict.basis is BurnBasis.NONE
+    verdict = verify_burn([proof], TOKEN, [build_nft_locking_script(PKH, OTHER)])
+    assert not verdict.ok and verdict.basis is BurnBasis.NONE
     assert "spent nothing carrying the token ref" in verdict.reason
 
 
 def test_a_token_that_survives_in_an_output_is_not_burned():
     proof, tok = _proof_and_token()
-    verdict = verify_burn([proof, tok], TOKEN, spent_output_scripts=[tok])
-    assert not verdict.valid and "forwarded, not burned" in verdict.reason
+    verdict = verify_burn([proof, tok], TOKEN, [tok])
+    assert not verdict.ok and "forwarded, not burned" in verdict.reason
 
 
 def test_a_proof_naming_a_different_token_does_not_burn_this_one():
-    verdict = verify_burn([build_burn_proof_script(OTHER)], TOKEN)
-    assert not verdict.valid and "names" in verdict.reason
+    verdict = verify_burn([build_burn_proof_script(OTHER)], TOKEN, [build_nft_locking_script(PKH, TOKEN)])
+    assert not verdict.ok and "names" in verdict.reason
 
 
 def test_no_proof_at_all_is_not_a_burn():
     """A token can vanish by accident; the proof is what records it was meant."""
     _proof, tok = _proof_and_token()
-    verdict = verify_burn([build_nft_locking_script(PKH, OTHER)], TOKEN, spent_output_scripts=[tok])
-    assert not verdict.valid and "no burn proof" in verdict.reason
+    verdict = verify_burn([build_nft_locking_script(PKH, OTHER)], TOKEN, [tok])
+    assert not verdict.ok and "no burn proof" in verdict.reason
 
 
 def test_an_unwalkable_output_does_not_turn_a_survival_into_a_burn():
@@ -268,10 +263,10 @@ def test_an_unwalkable_output_does_not_turn_a_survival_into_a_burn():
     """
     proof, tok = _proof_and_token()
     truncated = b"\xd8" + b"\x00" * 10
-    verdict = verify_burn([proof, truncated], TOKEN, spent_output_scripts=[tok])
+    verdict = verify_burn([proof, truncated], TOKEN, [tok])
     # The real token is genuinely absent here, so this is still a burn — the
     # point is that the unwalkable output neither crashed it nor was counted.
-    assert verdict.valid and verdict.basis is BurnBasis.SPENT_AND_ABSENT
+    assert verdict.ok and verdict.basis is BurnBasis.SPENT_AND_ABSENT
 
 
 # ---------------------------------------------------------------------------
@@ -320,17 +315,17 @@ def test_a_disallow_ref_opcode_does_not_count_as_having_held_the_token():
 
     for opcode, name in ((0xD2, "OP_DISALLOWPUSHINPUTREF"), (0xD3, "OP_DISALLOWPUSHINPUTREFSIBLING")):
         forged = bytes([opcode]) + victim.to_bytes() + b"\x75" + p2pkh
-        verdict = verify_burn([proof], victim, spent_output_scripts=[forged])
-        assert not verdict.valid, f"{name} forged a burn of someone else's token"
+        verdict = verify_burn([proof], victim, [forged])
+        assert not verdict.ok, f"{name} forged a burn of someone else's token"
         assert verdict.basis is BurnBasis.NONE
 
     # OP_REQUIREINPUTREF is a requirement, not possession — also not enough.
     required = bytes([0xD1]) + victim.to_bytes() + b"\x75" + p2pkh
-    assert not verify_burn([proof], victim, spent_output_scripts=[required]).valid
+    assert not verify_burn([proof], victim, [required]).ok
 
     # And the honest path still works: a real singleton the tx spent.
     honest = build_nft_locking_script(PKH, victim)
-    assert verify_burn([proof], victim, spent_output_scripts=[honest]).valid
+    assert verify_burn([proof], victim, [honest]).ok
 
 
 def test_a_stray_disallow_mention_does_not_make_an_honest_burn_read_as_survival():
@@ -344,8 +339,8 @@ def test_a_stray_disallow_mention_does_not_make_an_honest_burn_read_as_survival(
     p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
     noise = bytes([0xD2]) + victim.to_bytes() + b"\x75" + p2pkh
 
-    verdict = verify_burn([proof, noise], victim, spent_output_scripts=[build_nft_locking_script(PKH, victim)])
-    assert verdict.valid and verdict.basis is BurnBasis.SPENT_AND_ABSENT
+    verdict = verify_burn([proof, noise], victim, [build_nft_locking_script(PKH, victim)])
+    assert verdict.ok and verdict.basis is BurnBasis.SPENT_AND_ABSENT
 
 
 def test_a_transaction_burning_two_tokens_answers_for_both():
@@ -359,11 +354,11 @@ def test_a_transaction_burning_two_tokens_answers_for_both():
     spent = [build_nft_locking_script(PKH, a), build_nft_locking_script(PKH, b)]
 
     for ref in (a, b):
-        verdict = verify_burn(outputs, ref, spent_output_scripts=spent)
-        assert verdict.valid, f"honest batch burn refused for {ref.txid[:8]}"
+        verdict = verify_burn(outputs, ref, spent)
+        assert verdict.ok, f"honest batch burn refused for {ref.txid[:8]}"
         assert verdict.proof is not None
         assert verdict.proof.token_ref == f"{ref.txid}:{ref.vout}"
 
     # A token neither proof names is still refused.
     third = GlyphRef(txid="33" * 32, vout=2)
-    assert not verify_burn(outputs, third, spent_output_scripts=spent).valid
+    assert not verify_burn(outputs, third, spent).ok

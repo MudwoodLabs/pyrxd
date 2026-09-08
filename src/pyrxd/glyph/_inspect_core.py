@@ -1062,8 +1062,9 @@ def _classify_raw_tx(
                 {
                     "kind": v.kind.value,
                     "ref": f"{v.ref.txid}:{v.ref.vout}",
-                    "outcome": v.outcome.value,
-                    "backing": v.backing.value,
+                    "ok": v.ok,
+                    "basis": v.basis.value,
+                    "reason": v.reason,
                 }
                 for v in rel
             ]

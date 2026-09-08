@@ -39,10 +39,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (minting a second gated item from an existing one is refused), and it is a claim
     about an item's GENESIS, not a property of a live UTXO. `verify_authority_gate`
     takes the genesis output for that reason.
-  - `verify_burn` reports `SPENT_AND_ABSENT` vs `ABSENT_ONLY`, and `valid` is True
-    only for the former. Absence from a transaction's outputs is a condition every
-    unrelated transaction satisfies, so without the spent outputs the honest answer
-    is "not established" — including on a transaction that genuinely did burn.
+  - **Every verdict in the SDK has one shape: `ok` / `basis` / `reason`.**
+    `RelationshipVerdict`, `AuthorityVerdict` and `BurnVerdict` previously answered
+    "is this good, and why" three different ways, including a two-valued
+    `RelationshipOutcome` enum that duplicated a boolean. That enum is gone, `valid`
+    is now `ok`, and every verdict carries a `reason`. The inspect payload's
+    relationship entries are correspondingly `{kind, ref, ok, basis, reason}`.
+  - `verify_burn` **requires** `spent_output_scripts`. Absence from a transaction's
+    outputs is a condition every unrelated transaction satisfies, so there is no
+    useful verdict without them — and while the parameter was optional, omitting it
+    returned `ok=False` for a genuine burn. Requiring it means that answer cannot
+    arise: you either have the evidence or you cannot ask.
   - **AUTHORITY**: `build_authority_metadata`, `verify_authority_gate`,
     `verify_authority_claim`, `has_permission`, and the 101-byte
     `build_authority_gated_nft_script` covenant with

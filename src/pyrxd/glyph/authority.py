@@ -45,7 +45,7 @@ from typing import Literal
 
 from ..security.errors import ValidationError
 from .payload import _MAX_ATTRS_LIST_LEN
-from .relationships import RelationshipBacking, RelationshipKind, RelationshipVerdict
+from .relationships import RelationshipBasis, RelationshipKind, RelationshipVerdict
 from .script import parse_authority_gated_script
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
 
@@ -54,7 +54,6 @@ __all__ = [
     "AuthorityBasis",
     "AuthorityVerdict",
     "build_authority_metadata",
-    "has_permission",
     "is_authority",
     "is_authority_expired",
     "read_authority_attrs",
@@ -110,7 +109,7 @@ class AuthorityBasis(Enum):
 
 @dataclass(frozen=True)
 class AuthorityVerdict:
-    valid: bool
+    ok: bool
     basis: AuthorityBasis
     reason: str
     authority_ref: GlyphRef | None = None
@@ -270,16 +269,6 @@ def is_authority_expired(metadata: GlyphMetadata | None, *, now: datetime | None
     return expiry < (now or datetime.now(timezone.utc))
 
 
-def has_permission(metadata: GlyphMetadata | None, permission: str) -> bool:
-    """Return True if the authority lists *permission*.
-
-    Says nothing about whether the authority is valid, unexpired, or genuinely
-    held — only what its metadata lists.
-    """
-    attrs = read_authority_attrs(metadata)
-    return attrs is not None and permission in attrs.permissions
-
-
 def verify_authority_gate(genesis_output_script: bytes, authority_ref: GlyphRef) -> AuthorityVerdict:
     """Was this item minted under *authority_ref*? The consensus-backed question.
 
@@ -298,14 +287,14 @@ def verify_authority_gate(genesis_output_script: bytes, authority_ref: GlyphRef)
     parsed = parse_authority_gated_script(genesis_output_script)
     if parsed is None:
         return AuthorityVerdict(
-            valid=False,
+            ok=False,
             basis=AuthorityBasis.NONE,
             reason="the genesis output is not an authority-gated script",
         )
     gate_ref, _item_ref, _pkh = parsed
     if gate_ref != authority_ref:
         return AuthorityVerdict(
-            valid=False,
+            ok=False,
             basis=AuthorityBasis.NONE,
             reason=(
                 f"the genesis output is gated on {gate_ref.txid}:{gate_ref.vout}, "
@@ -314,7 +303,7 @@ def verify_authority_gate(genesis_output_script: bytes, authority_ref: GlyphRef)
             authority_ref=gate_ref,
         )
     return AuthorityVerdict(
-        valid=True,
+        ok=True,
         basis=AuthorityBasis.GATE,
         reason="consensus refused to create this output without the authority ref among the inputs",
         authority_ref=gate_ref,
@@ -340,9 +329,9 @@ def verify_authority_claim(
     for verdict in verdicts:
         if verdict.kind is not RelationshipKind.AUTHOR or verdict.ref != authority_ref:
             continue
-        if not verdict.backed:
+        if not verdict.ok:
             return AuthorityVerdict(
-                valid=False,
+                ok=False,
                 basis=AuthorityBasis.NONE,
                 reason=(
                     "the item declares this authority in `by`, but nothing authorised the claim — "
@@ -352,17 +341,17 @@ def verify_authority_claim(
             )
         how = (
             "the reveal spent the authority itself"
-            if verdict.backing is RelationshipBacking.DIRECT
+            if verdict.basis is RelationshipBasis.DIRECT
             else ("a delegate whose base held the authority was burned by the reveal")
         )
         return AuthorityVerdict(
-            valid=True,
+            ok=True,
             basis=AuthorityBasis.BACKED_CLAIM,
             reason=f"the `by` claim is backed: {how}",
             authority_ref=authority_ref,
         )
     return AuthorityVerdict(
-        valid=False,
+        ok=False,
         basis=AuthorityBasis.NONE,
         reason=f"the item makes no `by` claim on {authority_ref.txid}:{authority_ref.vout}",
         authority_ref=authority_ref,

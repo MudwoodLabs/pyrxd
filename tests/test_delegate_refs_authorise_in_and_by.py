@@ -22,9 +22,8 @@ import pytest
 
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.relationships import (
-    RelationshipBacking,
+    RelationshipBasis,
     RelationshipKind,
-    RelationshipOutcome,
     delegate_burn_refs,
     verify_relationship_claims,
 )
@@ -223,18 +222,18 @@ def test_by_is_backable_by_delegate_which_is_the_whole_point():
     verdicts = verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs=authorised)
 
     by_kind = {v.kind: v for v in verdicts}
-    assert by_kind[RelationshipKind.AUTHOR].outcome is RelationshipOutcome.BACKED
-    assert by_kind[RelationshipKind.AUTHOR].backing is RelationshipBacking.DELEGATED
-    assert by_kind[RelationshipKind.CONTAINER].outcome is RelationshipOutcome.BACKED
+    assert by_kind[RelationshipKind.AUTHOR].ok is True
+    assert by_kind[RelationshipKind.AUTHOR].basis is RelationshipBasis.DELEGATED
+    assert by_kind[RelationshipKind.CONTAINER].ok is True
 
 
 def test_direct_backing_still_wins_and_is_reported_as_direct():
     """A spend-and-recreate reveal is the stronger statement; don't understate it."""
     reveal_outputs = [build_nft_locking_script(PKH, MINTED), build_nft_locking_script(PKH, CONTAINER)]
     verdicts = {v.kind: v for v in verify_relationship_claims(_metadata(), reveal_outputs)}
-    assert verdicts[RelationshipKind.CONTAINER].backing is RelationshipBacking.DIRECT
+    assert verdicts[RelationshipKind.CONTAINER].basis is RelationshipBasis.DIRECT
     # The author was never spent and no delegate was burned.
-    assert verdicts[RelationshipKind.AUTHOR].outcome is RelationshipOutcome.UNBACKED
+    assert verdicts[RelationshipKind.AUTHOR].ok is False
 
 
 def test_a_delegate_does_not_back_a_ref_its_base_never_authorised():
@@ -245,16 +244,16 @@ def test_a_delegate_does_not_back_a_ref_its_base_never_authorised():
 
     verdicts = {v.kind: v for v in verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs=authorised)}
 
-    assert verdicts[RelationshipKind.CONTAINER].outcome is RelationshipOutcome.BACKED
-    assert verdicts[RelationshipKind.AUTHOR].outcome is RelationshipOutcome.UNBACKED
-    assert verdicts[RelationshipKind.AUTHOR].backing is RelationshipBacking.NONE
+    assert verdicts[RelationshipKind.CONTAINER].ok is True
+    assert verdicts[RelationshipKind.AUTHOR].ok is False
+    assert verdicts[RelationshipKind.AUTHOR].basis is RelationshipBasis.NONE
 
 
 def test_without_the_base_lookup_a_delegated_claim_reads_unbacked():
     """Default is 'no evidence gathered', never 'assume authorised'."""
     reveal_outputs = [build_nft_locking_script(PKH, MINTED), build_delegate_burn_script(BASE)]
     verdicts = verify_relationship_claims(_metadata(), reveal_outputs)
-    assert all(v.outcome is RelationshipOutcome.UNBACKED for v in verdicts)
+    assert all(v.ok is False for v in verdicts)
 
 
 def test_delegate_burn_refs_finds_the_base_ref_to_resolve():
@@ -531,14 +530,14 @@ def _render(relationships, burns=()):
 
 
 def test_a_directly_backed_claim_says_spent_in_this_tx():
-    out = _render([{"kind": "container", "ref": "c0:0", "outcome": "backed", "backing": "direct"}])
+    out = _render([{"kind": "container", "ref": "c0:0", "ok": True, "basis": "direct"}])
     assert "[VERIFIED — spent in this tx]" in out
 
 
 def test_a_delegated_claim_does_not_claim_it_was_spent_here():
     """It was not. The parent was spent when the BASE was created."""
     out = _render(
-        [{"kind": "author", "ref": "a1:1", "outcome": "backed", "backing": "delegated"}],
+        [{"kind": "author", "ref": "a1:1", "ok": True, "basis": "delegated"}],
         burns=["b2:2"],
     )
     assert "spent in this tx" not in out
@@ -549,7 +548,7 @@ def test_a_delegated_claim_does_not_claim_it_was_spent_here():
 def test_an_unresolved_claim_is_not_called_forged():
     """A burn we could not resolve is 'we did not look', not 'nobody authorised it'."""
     out = _render(
-        [{"kind": "container", "ref": "c0:0", "outcome": "unbacked", "backing": "none"}],
+        [{"kind": "container", "ref": "c0:0", "ok": False, "basis": "none"}],
         burns=["b2:2"],
     )
     assert "nothing authorised it" not in out
@@ -558,7 +557,7 @@ def test_an_unresolved_claim_is_not_called_forged():
 
 def test_a_claim_with_no_delegate_at_all_is_still_called_out():
     """The honest-path check: the original warning must survive."""
-    out = _render([{"kind": "container", "ref": "c0:0", "outcome": "unbacked", "backing": "none"}])
+    out = _render([{"kind": "container", "ref": "c0:0", "ok": False, "basis": "none"}])
     assert "[CLAIMED ONLY — nothing authorised it]" in out
 
 
@@ -657,8 +656,8 @@ def test_the_cli_resolves_a_delegated_claim_end_to_end():
     assert metadata["delegate_burns"] == [f"{base_ref.txid}:{base_ref.vout}"]
     verdicts = {r["kind"]: r for r in metadata["relationships"]}
     for kind in ("container", "author"):
-        assert verdicts[kind]["outcome"] == "backed", f"{kind} unresolved through the CLI path"
-        assert verdicts[kind]["backing"] == "delegated"
+        assert verdicts[kind]["ok"] is True, f"{kind} unresolved through the CLI path"
+        assert verdicts[kind]["basis"] == "delegated"
 
 
 def test_an_unfetchable_base_leaves_the_claim_unresolved_not_crashed():
@@ -680,7 +679,7 @@ def test_an_unfetchable_base_leaves_the_claim_unresolved_not_crashed():
     payload = asyncio.run(_inspect_txid_inner(client, reveal_txid))
 
     verdicts = {r["kind"]: r for r in payload["metadata"]["relationships"]}
-    assert verdicts["container"]["outcome"] == "unbacked"
+    assert verdicts["container"]["ok"] is False
     # And the burn is still reported, so the reader knows resolution was possible.
     assert payload["metadata"]["delegate_burns"]
 
@@ -726,38 +725,35 @@ def test_delegated_refs_are_ignored_when_the_tx_burned_no_delegate():
     no_burn = [build_nft_locking_script(PKH, MINTED)]
 
     verdicts = verify_relationship_claims(_metadata(), no_burn, delegated_refs=authorised)
-    assert all(v.outcome is RelationshipOutcome.UNBACKED for v in verdicts), (
-        "delegated refs were honoured for a transaction that burned nothing"
-    )
+    assert all(v.ok is False for v in verdicts), "delegated refs were honoured for a transaction that burned nothing"
 
     # With the burn present, the same refs do back the claim.
     with_burn = [*no_burn, build_delegate_burn_script(BASE)]
-    assert all(
-        v.outcome is RelationshipOutcome.BACKED
-        for v in verify_relationship_claims(_metadata(), with_burn, delegated_refs=authorised)
-    )
+    assert all(v.ok is True for v in verify_relationship_claims(_metadata(), with_burn, delegated_refs=authorised))
 
 
-def test_a_backed_verdict_cannot_carry_backing_NONE():
+def test_an_ok_verdict_cannot_carry_basis_NONE():
     """The pair is read together, so a self-contradictory verdict must not exist.
 
     `verify_authority_claim` branches on `backing` after checking `backed`; a
     BACKED verdict defaulting to NONE would have had it describe a delegate burn
     that never happened.
     """
-    from pyrxd.glyph.relationships import RelationshipBacking, RelationshipKind, RelationshipVerdict
+    from pyrxd.glyph.relationships import RelationshipBasis, RelationshipKind, RelationshipVerdict
 
     with pytest.raises(ValidationError, match="self-contradictory"):
         RelationshipVerdict(
             kind=RelationshipKind.AUTHOR,
             ref=AUTHOR,
-            outcome=RelationshipOutcome.BACKED,
-            backing=RelationshipBacking.NONE,
+            ok=True,
+            basis=RelationshipBasis.NONE,
+            reason="a fixture that should not be constructible",
         )
     with pytest.raises(ValidationError, match="self-contradictory"):
         RelationshipVerdict(
             kind=RelationshipKind.AUTHOR,
             ref=AUTHOR,
-            outcome=RelationshipOutcome.UNBACKED,
-            backing=RelationshipBacking.DIRECT,
+            ok=False,
+            basis=RelationshipBasis.DIRECT,
+            reason="a fixture that should not be constructible",
         )

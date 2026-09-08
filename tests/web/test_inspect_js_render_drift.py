@@ -284,10 +284,10 @@ _PROSE_EVIDENCE = {
     "kind": {"container": "collection claim", "author": "creator claim"},
     # The verdict word is prose, not the enum value: `direct` renders as
     # "spent in this tx", `delegated` as "via delegate", `none` as part of
-    # whichever refusal line applies. `outcome` carries the same information
-    # and is asserted through the VERIFIED/UNVERIFIED/UNRESOLVED wording.
-    "backing": {"direct": "spent in this tx", "delegated": "via delegate", "none": None},
-    "outcome": {"backed": "VERIFIED", "unbacked": None},
+    # whichever refusal line applies. `ok` carries the same information and is
+    # asserted through the VERIFIED/UNVERIFIED/UNRESOLVED wording.
+    "basis": {"direct": "spent in this tx", "delegated": "via delegate", "none": None},
+    "ok": {True: "VERIFIED", False: None},
 }
 
 
@@ -312,6 +312,10 @@ _OMITTED_NESTED_KEYS = {
     "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
     "recovered_hash160": "identical to the committed signer whenever it is set, and "
     "the signer is already rendered; printing both invites reading them as two facts",
+    "reason": "a relationship verdict's machine-readable explanation. Both renderers "
+    "write their own, better-worded sentence for the same fact ('VERIFIED via delegate "
+    "... not spent here'); printing the library's string beside it would say the thing "
+    "twice, in two voices",
 }
 
 

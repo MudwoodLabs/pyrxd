@@ -947,10 +947,10 @@ function appendRelationshipVerdicts(dl, rels, burnedRefs) {
   const burned = Array.isArray(burnedRefs) ? burnedRefs : [];
   for (const rel of rels) {
     const label = rel.kind === "author" ? "creator claim" : "collection claim";
-    const backed = rel.outcome === "backed";
+    const backed = rel.ok === true;
     let verdict;
     let cls = "kv-warning";
-    if (backed && rel.backing === "delegated") {
+    if (backed && rel.basis === "delegated") {
       const via = burned.length === 1 ? ` ${burned[0]}` : "";
       verdict = `VERIFIED via delegate${via} — authorised by its base, not spent here`;
       cls = undefined;

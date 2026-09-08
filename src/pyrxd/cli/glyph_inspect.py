@@ -380,11 +380,11 @@ def _render_txid_human(payload: dict) -> str:
         burned = metadata.get("delegate_burns") or []
         for rel in metadata.get("relationships") or []:
             label = "collection" if rel["kind"] == "container" else "creator"
-            backing = rel.get("backing")
-            if rel["outcome"] == "backed" and backing == "delegated":
+            basis = rel.get("basis")
+            if rel["ok"] and basis == "delegated":
                 via = f" via delegate {burned[0]}" if len(burned) == 1 else " via delegate"
                 lines.append(f"  {label}: {rel['ref']}  [VERIFIED{via} — authorised by its base, not spent here]")
-            elif rel["outcome"] == "backed":
+            elif rel["ok"]:
                 lines.append(f"  {label}: {rel['ref']}  [VERIFIED — spent in this tx]")
             elif burned:
                 # Name a specific delegate ONLY when there is exactly one. With

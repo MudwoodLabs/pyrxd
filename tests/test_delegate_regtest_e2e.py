@@ -54,9 +54,8 @@ from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.relationships import (
-    RelationshipBacking,
+    RelationshipBasis,
     RelationshipKind,
-    RelationshipOutcome,
     delegate_burn_refs,
     resolve_delegated_refs,
     verify_relationship_claims,
@@ -499,12 +498,12 @@ def test_the_claim_verifies_as_DELEGATED_from_chain_data_alone(node, base, deleg
 
     verdicts = {v.kind: v for v in verify_relationship_claims(metadata, reveal_outputs, delegated_refs=authorised)}
     for kind in (RelationshipKind.CONTAINER, RelationshipKind.AUTHOR):
-        assert verdicts[kind].outcome is RelationshipOutcome.BACKED, f"{kind} unbacked on a real delegated mint"
-        assert verdicts[kind].backing is RelationshipBacking.DELEGATED
+        assert verdicts[kind].ok is True, f"{kind} unbacked on a real delegated mint"
+        assert verdicts[kind].basis is RelationshipBasis.DELEGATED
 
     # And without the lookup it is honestly UNBACKED, not silently assumed.
     bare = verify_relationship_claims(metadata, reveal_outputs)
-    assert all(v.outcome is RelationshipOutcome.UNBACKED for v in bare)
+    assert all(v.ok is False for v in bare)
 
 
 def test_ONE_delegate_token_can_mint_MANY_more(node, base, tokens):  # noqa: F811

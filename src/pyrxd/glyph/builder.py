@@ -1164,7 +1164,7 @@ class GlyphBuilder:
         particular mint. It proves the mint held a token from a base that held
         the parents. Anyone holding a delegate token can make the claim — that
         is the mechanism working as designed, and why
-        :class:`~pyrxd.glyph.relationships.RelationshipBacking` reports
+        :class:`~pyrxd.glyph.relationships.RelationshipBasis` reports
         DELEGATED separately from DIRECT rather than flattening the two.
 
         :param parent_owner_pkh: who the re-created parent outputs pay to.

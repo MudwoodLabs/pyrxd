@@ -204,13 +204,9 @@ def test_a_token_really_can_be_burned_and_the_proof_reads_back(node):  # noqa: F
     # The token is gone: no output carries its ref.
     assert not any(any(op == token["ref"].to_bytes() for _o, op in iter_input_refs(s)) for s in outputs)
 
-    # Without the spent outputs the honest verdict is "not established" — even
-    # here, on a transaction that genuinely did burn the token.
-    weak = verify_burn(outputs, token["ref"])
-    assert not weak.valid and weak.basis is BurnBasis.ABSENT_ONLY
-    # ...and with them, the strong one.
-    strong = verify_burn(outputs, token["ref"], spent_output_scripts=[token["script"]])
-    assert strong.valid and strong.basis is BurnBasis.SPENT_AND_ABSENT
+    # Shown what the transaction spent, the verdict is the strong one.
+    strong = verify_burn(outputs, token["ref"], [token["script"]])
+    assert strong.ok and strong.basis is BurnBasis.SPENT_AND_ABSENT
 
 
 def test_a_burn_proof_about_a_token_this_tx_never_held_is_reported_as_such(node):  # noqa: F811
@@ -250,7 +246,7 @@ def test_a_burn_proof_about_a_token_this_tx_never_held_is_reported_as_such(node)
     # Shown the spent outputs, the verdict refuses it.
     spent = [bytes(P2PKH().lock(liar.public_key().hash160()).serialize())]
     verdict = verify_burn(outputs, victim["ref"], spent_output_scripts=spent)
-    assert not verdict.valid
+    assert not verdict.ok
     assert "spent nothing carrying the token ref" in verdict.reason
 
     # And the victim's token is still alive on chain.

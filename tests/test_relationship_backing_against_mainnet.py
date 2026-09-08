@@ -29,9 +29,8 @@ import cbor2
 
 from pyrxd.glyph.payload import decode_payload
 from pyrxd.glyph.relationships import (
-    RelationshipBacking,
+    RelationshipBasis,
     RelationshipKind,
-    RelationshipOutcome,
     delegate_burn_refs,
     output_ref_operands,
     verify_relationship_claims,
@@ -79,8 +78,8 @@ def test_the_mainnet_author_claim_verifies_as_BACKED_DIRECT():
     verdict = verdicts[0]
     assert verdict.kind is RelationshipKind.AUTHOR
     assert verdict.ref.txid == _AUTHOR_REF
-    assert verdict.outcome is RelationshipOutcome.BACKED
-    assert verdict.backing is RelationshipBacking.DIRECT
+    assert verdict.ok is True
+    assert verdict.basis is RelationshipBasis.DIRECT
 
 
 def test_this_transaction_used_no_delegate():
@@ -114,5 +113,5 @@ def test_removing_the_backing_output_flips_the_verdict():
     assert len(kept) == 34, "exactly one output should carry the author ref"
 
     verdicts = verify_relationship_claims(_envelope(), kept)
-    assert verdicts[0].outcome is RelationshipOutcome.UNBACKED
-    assert verdicts[0].backing is RelationshipBacking.NONE
+    assert verdicts[0].ok is False
+    assert verdicts[0].basis is RelationshipBasis.NONE
