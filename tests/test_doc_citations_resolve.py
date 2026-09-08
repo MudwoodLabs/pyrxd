@@ -10,10 +10,11 @@ teaching a stale rule.
 
 Measured when this file was written, over the scanned set below: 347 citations,
 282 of which name a file this repository contains. **60 of those landed on a
-blank line or past end-of-file**, and 2 bare basenames were ambiguous between two
-real files (``htlc_leg.py`` — ``btc_wallet`` and ``eth_wallet`` both have one;
-``wallet.py`` — ``hd/wallet.py`` and ``wallet.py``). All were repaired in the
-commit that added this file; this test is what keeps them repaired.
+blank line** (none past end-of-file, and no cited file was missing), and 2 bare
+basenames were ambiguous between two real files (``htlc_leg.py`` — ``btc_wallet``
+and ``eth_wallet`` both have one; ``wallet.py`` — ``hd/wallet.py`` and
+``wallet.py``). All were repaired in the commit that added this file; this test
+is what keeps them repaired.
 
 What this test proves
 ---------------------

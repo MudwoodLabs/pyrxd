@@ -4,7 +4,7 @@
 
 ## Why this exists
 
-Third-party RXD wallets that post to the on-chain swap orderbook (e.g. Orbital, Photonic) must sign their offered UTXO with `SIGHASH_SINGLE | ANYONECANPAY | FORKID`. Because `SINGLE` binds the signature to the one paired output *including its exact value*, the offered side must be a single UTXO of an exact amount — which is why those wallets do a "self-send" to mint a clean exact-amount UTXO before posting an offer. pyrxd's signing stack already supports `0xC3` (`SIGHASH.SINGLE_ANYONECANPAY_FORKID`, `src/pyrxd/constants.py:38`), so building/parsing these orders is a serializer job, not a crypto gap. This doc pins the byte format so a builder can be implemented without re-deriving it.
+Third-party RXD wallets that post to the on-chain swap orderbook (e.g. Orbital, Photonic) must sign their offered UTXO with `SIGHASH_SINGLE | ANYONECANPAY | FORKID`. Because `SINGLE` binds the signature to the one paired output *including its exact value*, the offered side must be a single UTXO of an exact amount — which is why those wallets do a "self-send" to mint a clean exact-amount UTXO before posting an offer. pyrxd's signing stack already supports `0xC3` (`SIGHASH.SINGLE_ANYONECANPAY_FORKID`, `src/pyrxd/constants.py:173`), so building/parsing these orders is a serializer job, not a crypto gap. This doc pins the byte format so a builder can be implemented without re-deriving it.
 
 ## Source authority
 

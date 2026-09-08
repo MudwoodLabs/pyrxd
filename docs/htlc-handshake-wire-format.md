@@ -41,7 +41,7 @@ re-derive from it.
 |---|---|
 | The negotiated-terms object and its JSON wire form | `src/pyrxd/gravity/swap_state.py:279-515` (`NegotiatedTerms`) |
 | The state machine every message drives | `src/pyrxd/gravity/swap_state.py:65-240` (13 states, 14 edges, `advance`) |
-| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:39, 423-558` (`SwapRecord`) |
+| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:42, 524-776` (`SwapRecord`) |
 | Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:110-130, 475-514` |
 | Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1750-1930` |
 | Post-asset-lock revalidation (what a taker checks after the maker locks) | `src/pyrxd/gravity/swap_coordinator.py:2399-2466` |
@@ -156,7 +156,7 @@ strands the funds (`taproot.py:527-532`), so it is durable state, not a transien
 | `btc_locator` | object | BTC — a serialised `BtcHtlcLocator` |
 | `eth_locator` | object | ETH — a serialised `EthHtlcLocator` |
 
-`BtcHtlcLocator` (`taproot.py:572-584`): `funding_outpoint{txid,vout}`, `claim_script`,
+`BtcHtlcLocator` (`taproot.py:622-628`): `funding_outpoint{txid,vout}`, `claim_script`,
 `refund_script`, `leaf_version`, `control_block_claim`, `control_block_refund`, `internal_key`,
 `amount_sats`, `network`.
 
