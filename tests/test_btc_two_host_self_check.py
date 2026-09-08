@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_two_host_recovery_phases import _EXPECTED_PHASES
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "btc_swap_two_host.py"
 
 
@@ -33,14 +35,11 @@ def test_self_check_passes():
 
 
 def test_dispatch_table_is_complete():
+    """#520 added (taker|maker, refund|abort) — the four recovery phases. The expected set lives in
+    ``tests/test_two_host_recovery_phases.py`` so ONE literal covers both harnesses; that file also
+    pins the argparse choices against it, in both directions."""
     mod = _load()
-    assert set(mod._DISPATCH) == {
-        ("taker", "intro"),
-        ("taker", "fund"),
-        ("taker", "claim"),
-        ("maker", "envelope"),
-        ("maker", "lock-claim"),
-    }
+    assert set(mod._DISPATCH) == _EXPECTED_PHASES
 
 
 def test_public_only_guard_rejects_smuggled_secret():
