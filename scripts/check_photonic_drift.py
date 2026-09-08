@@ -40,6 +40,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 REPO = "Radiant-Core/Photonic-Wallet"
 PIN_PATH = Path("tests/fixtures/photonic_upstream_pin.json")
@@ -57,6 +58,19 @@ SKIP_DIRS = {".claude", ".venv", "node_modules", "vendor", "__pycache__", ".git"
 
 class HarnessError(RuntimeError):
     """The check could not run. Never reported as 'no drift'."""
+
+
+def _urlopen(req: urllib.request.Request, what: str) -> Any:
+    """``urlopen`` with the scheme actually checked rather than assumed.
+
+    Every URL here is built from module constants, so a non-HTTPS scheme would
+    mean the constants were edited — but ``urlopen`` honours ``file:`` and would
+    read a local path without complaint, so the check is worth its two lines
+    rather than a blanket suppression.
+    """
+    if not req.full_url.startswith("https://"):
+        raise HarnessError(f"refusing non-HTTPS URL for {what}: {req.full_url!r}")
+    return urllib.request.urlopen(req, timeout=30)  # noqa: S310 - scheme checked above
 
 
 def cited_paths(root: Path) -> dict[str, list[str]]:
@@ -92,8 +106,9 @@ def fetch(path: str, ref: str) -> bytes:
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
+        with _urlopen(req, path) as resp:
+            data: bytes = resp.read()
+            return data
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise FileNotFoundError(path) from exc
@@ -102,10 +117,11 @@ def fetch(path: str, ref: str) -> bytes:
         raise HarnessError(f"network error fetching {path}: {exc.reason}") from exc
 
 
-def load_pin() -> dict:
+def load_pin() -> dict[str, Any]:
     if not PIN_PATH.exists():
         raise HarnessError(f"{PIN_PATH} is missing — run with --update-pin to create it")
-    return json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    pin: dict[str, Any] = json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    return pin
 
 
 def resolve_head() -> str:
@@ -116,8 +132,9 @@ def resolve_head() -> str:
     if token := os.environ.get("GITHUB_TOKEN"):
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)["sha"]
+        with _urlopen(req, f"{REPO}@main") as resp:
+            sha: str = json.load(resp)["sha"]
+            return sha
     except (urllib.error.URLError, KeyError, ValueError) as exc:
         raise HarnessError(f"could not resolve {REPO}@main: {exc}") from exc
 

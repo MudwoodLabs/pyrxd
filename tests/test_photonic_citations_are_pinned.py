@@ -22,6 +22,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -30,7 +32,7 @@ PIN_PATH = ROOT / "tests/fixtures/photonic_upstream_pin.json"
 SCRIPT = ROOT / "scripts/check_photonic_drift.py"
 
 
-def _drift_module():
+def _drift_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("_photonic_drift", SCRIPT)
     assert spec and spec.loader, f"cannot load {SCRIPT}"
     module = importlib.util.module_from_spec(spec)
@@ -40,13 +42,15 @@ def _drift_module():
 
 @pytest.fixture(scope="module")
 def cited() -> dict[str, list[str]]:
-    return _drift_module().cited_paths(ROOT)
+    paths: dict[str, list[str]] = _drift_module().cited_paths(ROOT)
+    return paths
 
 
 @pytest.fixture(scope="module")
-def pin() -> dict:
+def pin() -> dict[str, Any]:
     assert PIN_PATH.exists(), f"{PIN_PATH} missing — python scripts/check_photonic_drift.py --update-pin"
-    return json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    data: dict[str, Any] = json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    return data
 
 
 def test_the_scan_finds_citations_at_all(cited: dict[str, list[str]]) -> None:
@@ -63,12 +67,12 @@ def test_the_scan_finds_citations_at_all(cited: dict[str, list[str]]) -> None:
     assert len(cited) >= 10, f"only {len(cited)} cited paths; expected the full surface (was 26)"
 
 
-def test_the_pin_is_not_empty(pin: dict) -> None:
+def test_the_pin_is_not_empty(pin: dict[str, Any]) -> None:
     assert pin.get("files"), "the pin records no files — the drift watcher checks nothing"
     assert len(pin["commit"]) >= 7, f"pin commit {pin['commit']!r} is not a usable sha"
 
 
-def test_every_cited_photonic_file_is_pinned(cited: dict[str, list[str]], pin: dict) -> None:
+def test_every_cited_photonic_file_is_pinned(cited: dict[str, list[str]], pin: dict[str, Any]) -> None:
     """The load-bearing one: you cannot depend on a Photonic file unwatched."""
     known = set(pin["files"]) | set(pin.get("not_found_at_this_commit", []))
     unpinned = {path: sorted(set(who)) for path, who in cited.items() if path not in known}
@@ -79,7 +83,7 @@ def test_every_cited_photonic_file_is_pinned(cited: dict[str, list[str]], pin: d
     )
 
 
-def test_also_watch_entries_are_really_pinned(pin: dict) -> None:
+def test_also_watch_entries_are_really_pinned(pin: dict[str, Any]) -> None:
     """``also_watch`` must not become a list of names nothing fetches."""
     missing = [p for p in pin.get("also_watch", []) if p not in pin["files"]]
     assert not missing, f"also_watch names files absent from the pin, so unwatched: {missing}"
