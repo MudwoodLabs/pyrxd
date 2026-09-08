@@ -95,9 +95,19 @@ class _FakeRadiantLeg:
         return "cc" * 32 + ":0", int(expected_value or 0), 1
 
     async def refund_asset(self, record):
-        # A REAL refund dispenses a fee input before it can build anything; keep that property so a
-        # phase wired with _NoFeeSource still fails here rather than silently "refunding".
+        # Two properties of the REAL leg that the phases under test are built around, kept here so
+        # the fixture is a situation that can actually occur rather than a permissive stand-in:
+        #  1. it dispenses a fee input before it can build anything, so a phase wired with
+        #     _NoFeeSource fails here rather than silently "refunding";
+        #  2. its P3 maturity self-check refuses a non-final CSV refund (radiant_leg.refund_asset:
+        #     "needs N confirmations, has M"). Without this the taker-refund pre-check could be
+        #     deleted and the fake would happily "refund" an immature covenant.
         self.fee_source.next_fee_input()
+        if self._confs < record.terms.t_rxd.value:
+            raise NetworkError(
+                f"covenant CSV refund is not yet mature: needs {record.terms.t_rxd.value} "
+                f"confirmations, has {self._confs}"
+            )
         self.refund_calls.append(record)
         return "rxdrefund" + "0" * 55
 
