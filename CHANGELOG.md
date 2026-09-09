@@ -292,6 +292,34 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
+- **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
+  is operator-authored CBOR read off the chain, and every `from_dict` in
+  `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
+  could trust — `CryptoRecipient.from_dict` calls `d.get("mlkem_ct")` first, so a
+  recipient that was a string, an int, a list or null raised **AttributeError**. That
+  is not in `payload._DECODE_REFUSALS`, so it escaped the decoder's "log the malformed
+  field and degrade" contract and came out of `GlyphInspector.extract_reveal_metadata`.
+  Four shapes reached it.
+
+  All five parsers now refuse a non-map with `ValidationError` — at the boundary, not
+  at the four reachable sites. Widening the catch to swallow `AttributeError` was the
+  alternative and is worse: it would also swallow a genuine typo in pyrxd's own parser,
+  which is the bug such a catch exists to surface.
+
+  **Neither fuzzer could have found this**, and that is the more useful half. Both feed
+  the decoder random bytes — `tests/test_fuzz_parsers.py` uses `st.binary()` and the
+  atheris harness mutates raw input — so reaching the field parsers requires
+  synthesising a well-formed CBOR map carrying `p`, then `crypto`, then `recipients`,
+  then a non-map inside it. Every defect behind a well-formed envelope was structurally
+  unreachable, not merely unlikely. The new suite generates *structure*: valid
+  envelopes with hostile values at the nested positions the decoder walks.
+
+  A first draft of that generator made `crypto` and `recipients` optional and **passed
+  against the planted defect** — 400 examples seldom produced the one crashing shape. A
+  generator that reaches the interesting position only sometimes reports "no defect" for
+  the wrong reason, and reads as thorough because it is random. The position is now
+  guaranteed and the value randomised.
+
 - **An honest token was reported as forged.** `verify_creator_signature`
   re-derived the signed bytes from the DECODED metadata, and decoding is
   deliberately lossy — Photonic mints `loc` as an INTEGER on mainnet. So the
