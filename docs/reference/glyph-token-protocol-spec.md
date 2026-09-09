@@ -242,7 +242,7 @@ Three normative consequences follow:
 All fields are OPTIONAL except `p`. Unknown fields MUST be ignored by a decoder
 rather than treated as an error (see §16.1 for what pyrxd does with them today).
 Field names, decoder types, and limits are from
-`src/pyrxd/glyph/payload.py:92-189` and `src/pyrxd/glyph/types.py:381-429`.
+`src/pyrxd/glyph/payload.py:92-189` and `src/pyrxd/glyph/types.py:314-408`.
 
 | Key | CBOR type | Required | Max length | Meaning |
 |---|---|---|---|---|

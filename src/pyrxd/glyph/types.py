@@ -341,9 +341,14 @@ class GlyphMetadata:
     # `get_unlock_remaining` had nothing to be called WITH — which is why they had no caller.
     # The unreachability was a parser gap, not a missing convenience method.
     #
-    # Only the timelock spec is carried, not the whole `crypto` block: the wraps and the key
-    # format are mint-side concerns, and surfacing per-recipient key material through the
-    # inspect path is not something to do incidentally.
+    # Populated INDEPENDENTLY of `crypto` below, and that independence is load-bearing: a
+    # token whose `crypto.recipients` is malformed still declares a real unlock height, and
+    # dropping the whole block with it would tell the holder nothing about WHEN it opens.
+    # `decode_payload` parses the two separately for exactly that reason.
+    #
+    # This comment used to say only the timelock spec was carried, "not the whole `crypto`
+    # block". That stopped being true when #632 made decode fill `crypto` as well, to stop
+    # decode -> re-encode silently dropping the commitment (#626).
     timelock: TimelockSpec | None = None
     # CBOR ``crypto`` and the ENCRYPTED form of ``main`` — the WRITE side of the same block
     # ``timelock`` above reads (#556).
@@ -363,11 +368,19 @@ class GlyphMetadata:
     # PLAINTEXT that was encrypted while the ciphertext itself lives off chain. Only one of the
     # two may be set; ``__post_init__`` refuses both.
     #
-    # WRITE-SIDE ONLY, deliberately asymmetric with the decoder: ``decode_payload`` fills
-    # ``timelock`` and leaves these ``None``. The per-recipient wraps in ``crypto.recipients``
-    # are key material, and surfacing them through the inspect path is not something to do
-    # incidentally — the note on ``timelock`` above records that decision. A caller that needs
-    # the exact bytes a token was decoded from has ``source_cbor``.
+    # NO LONGER WRITE-SIDE ONLY. This comment claimed ``decode_payload`` "fills ``timelock``
+    # and leaves these ``None``" — measured on the tree that shipped it, decode fills
+    # ``crypto`` too, recipients included. #632 made it do so because the round trip needs it:
+    # ``to_cbor_dict`` emits from ``crypto``, so decoding into ``timelock`` alone turned a
+    # sealed token into a marker with nothing behind it on re-encode (#626).
+    #
+    # The wraps in ``crypto.recipients`` are therefore reachable from a decoded object. That
+    # is not a disclosure — they are public bytes, already on chain — and no render path
+    # prints them: the CLI shows recipient KIDs at MINT time and nothing reads
+    # ``metadata.crypto.recipients`` for display. The original concern was about what the
+    # inspect surface volunteers, and that part still holds; it is just no longer enforced by
+    # the field being empty. A caller that needs the exact bytes a token was decoded from
+    # still has ``source_cbor``.
     encrypted_main: EncryptionMetadata | None = None
     crypto: CryptoMetadata | None = None
     # The EXACT CBOR these fields were decoded from, when they came off a chain.
