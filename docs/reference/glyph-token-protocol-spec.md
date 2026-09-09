@@ -127,8 +127,8 @@ rejects a valid script or — when the byte it resumes on happens to be a valid
 single-byte opcode — silently resynchronizes, reporting a **phantom** ref and
 dropping the real one. Implementations MUST use the five-opcode set.
 
-pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:454-509`) over
-the constant `REF_OPCODES` (`:442`); the differential test against a port of the
+pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:556-578`) over
+the constant `REF_OPCODES` (`:511`); the differential test against a port of the
 consensus rule is `TestRefWalkerConsensusDifferential` in `tests/test_glyph.py`.
 A script that ends mid-push or mid-ref-operand has ambiguous length;
 implementations MUST refuse it rather than guess (`TruncatedScriptError`,
@@ -144,8 +144,8 @@ A ref is an outpoint encoded for embedding in a script:
 <txid in wire order:32> || <vout as uint32 little-endian:4>     = 36 bytes
 ```
 
-`src/pyrxd/glyph/types.py:43-54`. The txid bytes are the reverse of the display
-form. `vout` MUST be in `[0, 2^32-1]` (`src/pyrxd/glyph/types.py:39-41`).
+`src/pyrxd/glyph/types.py:48-59`. The txid bytes are the reverse of the display
+form. `vout` MUST be in `[0, 2^32-1]` (`src/pyrxd/glyph/types.py:44-46`).
 
 ### 3.2 Contract id — the 72-hex display form
 
@@ -189,11 +189,11 @@ The push opcode for the CBOR body MUST be selected by length
 
 `OP_PUSHDATA4` is not hypothetical: the mainnet Glyph Protocol reveal
 `b965b32dba8628c339bc39a3369d0c46d645a77828aeb941904c77323bb99dd6` carries a
-65,569-byte body and uses it (`tests/test_glyph.py:506-530`).
+65,569-byte body and uses it (`tests/test_glyph.py:507-525`).
 
 A parser MUST locate the envelope by walking the scriptSig's pushes and taking the
 push immediately **after** a push equal to `gly`
-(`src/pyrxd/glyph/inspector.py:280-319`). It MUST NOT assume the marker is at a
+(`src/pyrxd/glyph/inspector.py:256-356`). It MUST NOT assume the marker is at a
 fixed offset, and it MUST support all four push opcodes — a walker that stops at
 `0x4e` never reaches the marker on the mainnet token above.
 
@@ -206,7 +206,7 @@ This is the most consequential detail in the envelope, and it is easy to get
 backwards.
 
 **Producer rule.** pyrxd encodes with `cbor2.dumps(payload, canonical=True)`
-(`src/pyrxd/glyph/payload.py:35`) — RFC 8949 deterministic form: map keys sorted
+(`src/pyrxd/glyph/payload.py:67`) — RFC 8949 deterministic form: map keys sorted
 length-first then bytewise, shortest-form integer and length encodings, shortest
 unambiguous floats. Producers SHOULD use this form. It makes an envelope a pure
 function of its logical content, independent of field-declaration order in the
@@ -278,13 +278,13 @@ Notes on individual fields:
   the refs it parsed out of the reveal's *output* scripts, which is the only
   check either field admits (§7.5, §9.4). Entries MAY be raw byte strings or
   wrapped in **CBOR tag 64**, like `main.b`; a decoder MUST accept both
-  (`src/pyrxd/glyph/payload.py:81-121`). pyrxd emits raw byte strings.
+  (`src/pyrxd/glyph/payload.py:139-178`). pyrxd emits raw byte strings.
   A decoder SHOULD drop a malformed entry rather than fail the whole envelope —
   this is advisory metadata on an attacker-controlled payload.
 
 - **`main.b`** MAY be a raw byte string or a byte string wrapped in **CBOR tag 64**
   (uint8 array). Photonic emits tag 64; a decoder MUST unwrap it
-  (`src/pyrxd/glyph/payload.py:115-122`). The mainnet fixture uses tag 64 for a
+  (`src/pyrxd/glyph/payload.py:217-224`). The mainnet fixture uses tag 64 for a
   65,430-byte PNG (verified by decoding the fixture).
 - **`decimals`** is display metadata only. On chain, one photon is one FT unit;
   nothing scales by `decimals`. A decoder MUST reject a float or boolean here —
@@ -345,8 +345,8 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:138-165`). A malformed
-`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:131-136`) — an
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:257-284`). A malformed
+`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:250-255`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
 
@@ -363,7 +363,7 @@ bidi overrides, zero-width joiners, and combining marks are all reachable throug
 payload_hash = SHA256d(cbor_bytes)          # 32 bytes
 ```
 
-`src/pyrxd/glyph/script.py:189-191`. The `gly` marker is excluded. This is a
+`src/pyrxd/glyph/script.py:228-230`. The `gly` marker is excluded. This is a
 **double** SHA-256 — it matches `OP_HASH256`, which is what the commit script
 executes.
 
@@ -396,7 +396,7 @@ produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
 (`src/pyrxd/glyph/builder.py:251-258`), and reads it back with
-`extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:258-269`).
+`extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
 
@@ -409,7 +409,7 @@ builds the matching locking script by constructing
   ref equals the ref extracted from the reveal output, starts with the commit
   txid, and does not start with the reveal txid.
 - The ref is invariant across transfers: a transfer re-emits the same 36 bytes
-  (`tests/test_glyph_transfer.py:117-130`).
+  (`tests/test_glyph_transfer.py:120-129`).
 
 **Chain corroboration.** On the mainnet Glyph Protocol deploy, the reveal's 32
 dMint contracts all carry `tokenRef = a443d9df…878b:0` and
@@ -502,9 +502,9 @@ d8 <ref:36>                OP_PUSHINPUTREFSINGLETON <ref>
 88 ac                      OP_EQUALVERIFY OP_CHECKSIG
 ```
 
-`src/pyrxd/glyph/script.py:127-132`. Total length MUST be 63 bytes; the builder
+`src/pyrxd/glyph/script.py:166-171`. Total length MUST be 63 bytes; the builder
 asserts it. Classifier regex: `^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$`
-(`src/pyrxd/glyph/script.py:113`).
+(`src/pyrxd/glyph/script.py:145`).
 
 The ref is pushed and immediately dropped — its only purpose is to invoke the
 opcode's consensus effect. After the drop the remainder is an ordinary P2PKH, so a
@@ -520,9 +520,9 @@ d0 <token_ref:36>                OP_PUSHINPUTREF <ref>         (37 bytes)
 de c0 e9 aa 76 e3 78 e4 a2 69 e6 9d   conservation epilogue    (12 bytes)
 ```
 
-`src/pyrxd/glyph/script.py:135-142`; offset-by-offset assertions at
-`tests/test_dmint_module.py:609-624`. Classifier regex at
-`src/pyrxd/glyph/script.py:114`.
+`src/pyrxd/glyph/script.py:174-181`; offset-by-offset assertions at
+`tests/test_dmint_module.py:610-624`. Classifier regex at
+`src/pyrxd/glyph/script.py:153`.
 
 The token quantity carried by an FT output **is** the output's `satoshis` value:
 one photon is one FT unit. There is no separate amount field.
@@ -567,10 +567,10 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 <body:102>                 fixed body
 ```
 
-`src/pyrxd/glyph/script.py:340-364`. The 102-byte body is a fixed constant
-(`src/pyrxd/glyph/script.py:306-330`) derived from Photonic Wallet's
+`src/pyrxd/glyph/script.py:433-457`. The 102-byte body is a fixed constant
+(`src/pyrxd/glyph/script.py:391-415`) derived from Photonic Wallet's
 `parseMutableScript` regex with the `gly` magic bytes substituted, and pinned at
-`tests/test_glyph_v2.py:110-127`.
+`tests/test_glyph_v2.py:112-121`.
 
 A MUT reveal produces **two** outputs: the 63-byte NFT singleton the owner holds,
 and this 174-byte contract UTXO that holds the mutable state
@@ -584,7 +584,7 @@ PUSH3 "gly" PUSH <cbor> PUSH <op> <contract_output_index> <ref_hash_index> <ref_
 
 where `op` is `"mod"` (update the payload hash) or `"sl"` (seal — burn the
 contract). Index integers use minimal push encoding
-(`src/pyrxd/glyph/payload.py:246-302`).
+(`src/pyrxd/glyph/payload.py:384-403`).
 
 This specification reproduces the body as a constant and does not restate a
 stack-level derivation of it. Note that pyrxd's own size constant is **174**
@@ -721,7 +721,7 @@ six vectors covering all five modes, each giving `params` and the expected
 `tests/test_dmint_conformance_vectors.py`.
 
 An honesty note carried over from that suite's own docstring
-(`tests/test_dmint_conformance_vectors.py:6-12`): only the `v2-fixed-mainnet`
+(`tests/test_dmint_conformance_vectors.py:7-12`): only the `v2-fixed-mainnet`
 vector is anchored to an independent artifact (mainnet deploy
 `95335028…bb16fb09` vout 0). The other five are pyrxd-produced regression locks,
 not cross-implementation agreement, and MUST NOT be cited as such.
@@ -914,7 +914,7 @@ following as guarantees:
 
 ### 10.1 Algorithm
 
-`src/pyrxd/glyph/creator.py:29-98`:
+`src/pyrxd/glyph/creator.py:164-207`:
 
 1. Build the envelope map with `creator` set to
    `{"pubkey": <hex>, "sig": "", "algo": <algo>}` — `sig` empty, `algo` always
@@ -925,29 +925,55 @@ following as guarantees:
 5. Store the DER hex in `creator.sig`.
 
 `creator.pubkey` MUST be a 33-byte compressed secp256k1 public key, hex-encoded
-with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:141-149`).
+with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:160-168`).
 
-### 10.2 The canonicalisation caveat
+### 10.2 The canonicalisation rule
 
-The signing encoder is `cbor2.dumps(d)` — **without** `canonical=True`
-(`src/pyrxd/glyph/creator.py:43`), whereas the on-chain envelope is encoded with
-`canonical=True` (`src/pyrxd/glyph/payload.py:35`). Verified: for a metadata
-object with more than one field the two encodings differ, so the signed byte
-string is not the canonical form of the signed map.
+The signing encoder is `cbor2.dumps(d, canonical=True)`
+(`src/pyrxd/glyph/creator.py:117`) — the **same** canonical form the on-chain
+envelope is encoded with (`src/pyrxd/glyph/payload.py:67`). Signing and
+publication therefore agree byte-for-byte for a pyrxd-minted token, which is
+what makes such a signature verifiable from the chain at all.
 
-Consequences an interoperating implementation MUST know:
+To verify a pyrxd-produced creator signature, an interoperating implementation:
 
-- To verify a pyrxd-produced creator signature, an implementation MUST reproduce
-  the **insertion order** of pyrxd's `to_cbor_dict`
-  (`src/pyrxd/glyph/types.py:381-429`), not a canonical ordering. Using a
-  canonical encoder here produces a different message and the signature fails.
-- Note also that this makes the signature dependent on source-code field order —
-  the exact fragility `canonical=True` was introduced to eliminate on the envelope
-  path (`src/pyrxd/glyph/payload.py:26-33`).
-- The `creator` sub-map used for signing always contains all three keys, whereas
-  the published `creator` omits `sig` when empty and `algo` when it equals the
-  default (`src/pyrxd/glyph/types.py:151-157`). Signing and verification agree,
-  but the signed map is not the published map.
+1. takes the metadata map **as published**;
+2. sets `creator.sig` to the empty string **in place** — changing nothing else:
+   not the other fields, not the map's key order, and not the remaining keys of
+   the `creator` sub-map;
+3. re-encodes and applies the §10.1 commit-hash and prefix steps to the result.
+
+For a pyrxd-minted token the bytes produced by step 3 are canonical, because the
+published bytes were.
+
+An implementation MUST NOT rebuild the map in pyrxd's source-declaration order.
+`to_cbor_dict` emits `p, name, desc, …` (`src/pyrxd/glyph/types.py:506-575`)
+whereas the signed and published form is canonical `p, desc, name, …`; the two
+differ for any token carrying more than one optional field, so reconstructing
+declaration order yields a different message and a **false forgery verdict**.
+
+The `creator` sub-map used for signing is derived from the same rule as the
+published one (`src/pyrxd/glyph/types.py:170-176`): `sig` present with an empty
+value, `algo` omitted when it equals the default. Measured: the signed key set
+equals the published key set, so the only difference between the signed map and
+the published map is the *value* of `sig`.
+
+Third-party tokens are treated differently, deliberately. When pyrxd holds the
+original bytes it rebuilds from those, non-canonically, preserving whatever key
+order the writer used (`src/pyrxd/glyph/creator.py:160-167`). A writer that
+signed its own insertion order still verifies: pyrxd does not re-canonicalise
+another implementation's bytes and then report the mismatch as a forgery.
+
+> **Changed after 0.23.0 — earlier revisions of this section stated the opposite
+> rule.** Signing was previously non-canonical, over a hand-built three-key
+> `creator` sub-map. That form could not survive publication: measured against
+> the pre-change code, a single-field NFT verified and an NFT carrying a
+> `description` did not, because the envelope was already published canonically
+> while the signature was taken over declaration order. A signature produced by
+> the older code does not verify under the current code. No conformance vector,
+> pinned mainnet anchor, or checked-in fixture in this repository carries a
+> creator signature, so no signature this project can point at was invalidated;
+> a third party that implemented the older rule must update.
 
 ### 10.3 What the signature covers
 
@@ -1165,7 +1191,7 @@ the live scriptSig:
 ```
 
 Reproduced by `build_reveal_scriptsig_suffix(fixture)`, which yields 65,578 bytes
-beginning `03676c794e21000100`. Pinned at `tests/test_glyph.py:506-530`.
+beginning `03676c794e21000100`. Pinned at `tests/test_glyph.py:507-525`.
 
 **Step 5 — ref derivation.** The commit's FT commit output is
 `a443d9df…878b:0`, so the token's genesis ref is that outpoint. In wire form:
@@ -1256,7 +1282,7 @@ know which behaviour it will encounter.
 
 | Area | Photonic | pyrxd | Reason |
 |---|---|---|---|
-| Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:26-33`). Consumers on both sides must accept either (§4.2). |
+| Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:28-68`). Consumers on both sides must accept either (§4.2). |
 | Royalty `minimum` with `splits` | Each split computed independently; `minimum` never consulted, so a royalty declaring `bps=100, minimum=50000` pays the minimum with one recipient and ignores it with two | Total computed once, then divided | Photonic's version can pay the creator less than the recorded terms (`src/pyrxd/glyph/royalty.py:56-68`). |
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
@@ -1347,7 +1373,7 @@ in pyrxd are wallet policy, not chain rules, and are labelled as such at
 
 The commit covenant only constrains the input that spends it. Whether an envelope
 on some *other* input is meaningful is unspecified; pyrxd's scanner will find and
-use it (`src/pyrxd/glyph/scanner.py:297-308`), which is lenient rather than
+use it (`src/pyrxd/glyph/scanner.py:289-325`), which is lenient rather than
 normative.
 
 ## 17. Provenance of the claims in this document
@@ -1358,24 +1384,30 @@ transaction in CI. The anchors:
 | Artifact | Anchor transaction | Test |
 |---|---|---|
 | FT lock (75 B) | `ac7f1f70…0ae4` vout 0 (RBG transfer) | `tests/test_dmint_module.py:632+` |
-| NFT lock (63 B) | `27390efa…be7e` vout 0 | `tests/test_glyph.py:129-198` |
+| NFT lock (63 B) | `27390efa…be7e` vout 0 | `tests/test_glyph.py:130-196` |
 | Commit script, both variants (75 B) | `a443d9df…878b` vouts 0 and 33 | `tests/test_glyph_dmint.py:171-240` |
-| CBOR envelope + reveal framing (65,569 B) | `b965b32d…9dd6` vin 0 | `tests/test_glyph.py:435-530` |
+| CBOR envelope + reveal framing (65,569 B) | `b965b32d…9dd6` vin 0 | `tests/test_glyph.py:436-525` |
 | dMint V1 contract (241 B) | `b965b32d…9dd6` vout 0 | `tests/test_dmint_v1_deploy.py:1098-1214` |
-| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py:253-291` |
+| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py:252-289` |
 | dMint V2 contract, FIXED (380 B) | `95335028…bb16fb09` vout 0 | `tests/test_dmint_v2_mainnet_golden.py:23-68` |
-| Mutable NFT body (102 B) | Photonic `parseMutableScript` reference | `tests/test_glyph_v2.py:110-127` |
+| Mutable NFT body (102 B) | Photonic `parseMutableScript` reference | `tests/test_glyph_v2.py:112-121` |
 | Container lock (63 B) + `in` envelope | frozen goldfile | `tests/test_golden_vectors.py`, `TestFrozenContainerVectors` |
 | Canonical CBOR determinism | frozen goldfile | `tests/test_golden_vectors.py:42-143` |
 | Envelope push framing across boundaries | property-based | `tests/test_glyph_cbor_roundtrip.py:184-232` |
-| Genesis ref = commit outpoint | round-trip through the built reveal | `tests/cli/test_glyph_cmds.py`, `tests/test_glyph_mint_facade.py:212-216` |
+| Genesis ref = commit outpoint | round-trip through the built reveal | `tests/cli/test_glyph_cmds.py`, `tests/test_glyph_mint_facade.py:213-217` |
 
 Measurements stated in this document that are **not** covered by an existing test —
-the non-canonicality of the mainnet fixture (§4.2, §14), the creator-signature
-canonicalisation gap (§10.2), and the signature's indifference to unknown fields
-(§10.3) — were produced by running pyrxd against the checked-in fixture and
-builders while writing this specification. They are reproducible from the
-snippets given, but they are not yet regression-locked in CI.
+the non-canonicality of the mainnet fixture (§4.2, §14) and the signature's
+indifference to unknown fields (§10.3) — were produced by running pyrxd against the
+checked-in fixture and builders while writing this specification. They are
+reproducible from the snippets given, but they are not yet regression-locked in CI.
+
+§10.2 was on that list, and it is the reason the list is worth taking seriously: the
+section went stale, in the direction that breaks an interoperating implementation, and
+nothing failed. It is now regression-locked by
+`tests/test_spec_10_2_recipe_verifies_a_creator_signature.py`, which does not read the
+prose — it EXECUTES the recipe §10.2 gives and asserts a second implementer verifies an
+honest token, and separately that the reconstruction §10.2 forbids really does fail.
 
 ### 17.1 Consensus behaviour verified on a node
 
