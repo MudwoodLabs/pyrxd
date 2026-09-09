@@ -292,6 +292,27 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
+- **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
+  and put it in `glyph_envelopes`, which was then read by **nothing** — three references
+  repo-wide, all of them the write. So the default terminal output still rendered the mainnet
+  update `315b4630…` as `type=unknown / type=mut / type=p2pkh`, with no mention of the change
+  and no sight of the new target: the same blindness that PR's subject line is about, one layer
+  up. `pyrxd glyph inspect` now names the update and its target, and says what it does **not**
+  establish — that an envelope changes a *glyph's* fields, not which name resolves to it.
+
+  An `unreadable` envelope is named just as loudly, because "I could not read this" and "there
+  is nothing here" are opposite facts and the blind one reads as reassuring.
+
+- **`WaveAttrs` silently dropped `attrs.expires`.** Measured, a real mainnet record round-tripped
+  `[domain, expires, name, target, target_type]` back out as `[domain, name, target,
+  target_type]`. It is now carried, refused rather than dropped when unusable (`True` included —
+  `isinstance(True, int)` is True in Python, so a bool would have become a 1970 timestamp), and
+  emitted only when set, so a mint that never asked for it publishes the same four keys as before.
+
+  Carried is not consumed: Photonic's own source says the indexer is authoritative on renewals
+  and `attrs.expires` is "display-level", so nothing may read it as an expiry. An AST scan pins
+  that nothing does.
+
 - **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
   Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
   `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'

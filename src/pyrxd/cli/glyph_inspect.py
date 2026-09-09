@@ -343,6 +343,50 @@ def _render_txid_human(payload: dict) -> str:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
             lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
 
+    # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
+    # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —
+    # `type=unknown / type=mut / type=p2pkh` and no mention of the change. #661 taught the
+    # classifier to read those envelopes and put them in the JSON, and stopped there: nothing
+    # consumed `glyph_envelopes`, so the default terminal output stayed exactly as blind as
+    # before. A production caller is necessary and not sufficient; the result has to reach a
+    # human, and this is the surface humans read.
+    envelopes = payload.get("glyph_envelopes") or []
+    if envelopes:
+        lines.append("")
+        lines.append(f"Glyph envelopes carrying no full payload ({len(envelopes)}):")
+        for env in envelopes:
+            idx = env.get("input_index")
+            if env.get("kind") == "update":
+                lines.append(f"  input {idx:>3}: UPDATE — a mutable glyph's fields are being changed here")
+                fields = env.get("fields") or {}
+                attrs = fields.get("attrs")
+                if isinstance(attrs, dict):
+                    # `target` FIRST and on its own line: for a WAVE name it is where the name
+                    # will point, which is the one value a reader is here for.
+                    if "target" in attrs:
+                        lines.append(f"           attrs.target = {_truncate_for_human(str(attrs['target']))}")
+                    rest = ", ".join(
+                        f"{k}={_truncate_for_human(str(v))}" for k, v in sorted(attrs.items()) if k != "target"
+                    )
+                    if rest:
+                        lines.append(f"           attrs: {rest}")
+                for key, value in sorted(fields.items()):
+                    if key == "attrs":
+                        continue
+                    lines.append(f"           {key} = {_truncate_for_human(str(value))}")
+                # WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether that
+                # glyph is the name someone means is an index's answer, not this transaction's,
+                # and the gap between the two is the whole of HashMark §7.6.
+                lines.append("           (changes this glyph's fields — does NOT establish which")
+                lines.append("            name resolves to it, nor who held that name when)")
+            else:
+                # NOT SILENTLY DROPPED. "I could not read this" and "there is nothing here" are
+                # opposite facts, and the blind one reads as reassuring.
+                lines.append(f"  input {idx:>3}: UNREADABLE — a 'gly' marker with content neither reader accepted")
+                reason = env.get("reason") or ""
+                if reason:
+                    lines.append(f"           {_truncate_for_human(reason)}")
+
     # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
     # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
     # V1 = 4-byte nonce / 72-byte scriptSig; V2 = 8-byte / 76-byte.

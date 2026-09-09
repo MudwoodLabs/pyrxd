@@ -46,6 +46,21 @@ SCHEME_ADDRESS: Final = "address"
 """``target_type`` value for plain Radiant addresses."""
 
 
+def _optional_int(value: object) -> int | None:
+    """Read an optional integer attr, or refuse it. Never silently drop.
+
+    A bool is refused explicitly: `isinstance(True, int)` is True in Python, so `expires: true`
+    would otherwise be carried as 1 - a timestamp in 1970.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValidationError(f"WAVE attrs 'expires' must be a number, got {type(value).__name__}")
+    if isinstance(value, int):
+        return value
+    raise ValidationError(f"WAVE attrs 'expires' must be a number, got {type(value).__name__}")
+
+
 @dataclass(frozen=True)
 class WaveAttrs:
     """Parsed WAVE attrs dict, mirroring the on-chain Photonic shape."""
@@ -54,15 +69,35 @@ class WaveAttrs:
     domain: str
     target: str
     target_type: str = SCHEME_ADDRESS
+    #: CBOR ``attrs.expires``, when the record carried one.
+    #:
+    #: MODELLED BECAUSE IT WAS BEING DROPPED. `from_dict` read four keys and ignored the rest, so
+    #: a real mainnet record round-tripped `[domain, expires, name, target, target_type]` back out
+    #: as `[domain, name, target, target_type]` - silently, and for the one field that decides
+    #: whether a name was even held at a given time.
+    #:
+    #: NOT AUTHORITATIVE, and callers must not read it as an expiry. Photonic states in its own
+    #: source that "the indexer is the authority on renewals ... the attrs.expires written here is
+    #: display-level": real expiry follows from treasury payments this type never sees. It is
+    #: carried so a round trip is lossless, not so anything can be concluded from it.
+    expires: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        """Serialize as the CBOR ``attrs`` dict."""
-        return {
+    def to_dict(self) -> dict[str, object]:
+        """Serialize as the CBOR ``attrs`` dict.
+
+        ``expires`` is emitted ONLY when set, so a record that never carried one still mints the
+        exact four-key map it always did - adding a field to this type must not change the bytes
+        pyrxd publishes for callers that never asked for it.
+        """
+        d: dict[str, object] = {
             "name": self.name,
             "domain": self.domain,
             "target": self.target,
             "target_type": self.target_type,
         }
+        if self.expires is not None:
+            d["expires"] = self.expires
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> WaveAttrs:
@@ -76,6 +111,9 @@ class WaveAttrs:
             domain=str(d["domain"]),
             target=str(d["target"]),
             target_type=str(d.get("target_type", SCHEME_ADDRESS)),
+            # Refused rather than coerced when unusable: `int("soon")` raises, and silently
+            # dropping it would reintroduce exactly the loss this field was added to stop.
+            expires=_optional_int(d.get("expires")),
         )
 
 
