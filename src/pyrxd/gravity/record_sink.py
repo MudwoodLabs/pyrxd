@@ -42,8 +42,49 @@ class JsonFileRecordSink:
     def path(self) -> Path:
         return self._path
 
+    def _refuse_to_clobber_a_different_swap(self, incoming: dict) -> None:
+        """Refuse to overwrite a record that belongs to a DIFFERENT swap (#504 item 3).
+
+        `os.replace` below is unconditional, and the record path derives from `--keys-out`, which
+        is per-RUN rather than per-swap. So re-running with a `--keys-out` that already has a
+        record silently replaced it — and the record it replaced may reference a contract that
+        still holds value. It is the only durable trace of where that value went: the pending
+        counter-contract address and the funded locator live nowhere else.
+
+        Until now the only thing standing in the way was incidental — the KEYS file's `O_EXCL`.
+        The runbook tells operators to delete that file after sweep, which removes the accident
+        and leaves the record unprotected.
+
+        Keyed on the HASHLOCK, not on existence, because this sink is called repeatedly through
+        one swap as state advances. Refusing any existing file would break every update after the
+        first, which is the shape of guard this project treats as a bug in its own right. Same
+        hashlock is the normal path and must stay silent; a different one is the clobber.
+
+        A record whose hashlock cannot be read is refused too, by `load()` — which already fails
+        closed on a torn or hand-edited file, and says so in its own words. Deliberately not
+        `NetworkError`: this is not transient and must not be retried.
+        """
+        if not self._path.exists():
+            return
+        prior = self.load()  # fails closed on torn / corrupt / non-object, with its own message
+        if prior is None:  # pragma: no cover - exists() was true, so load() returns a dict or raises
+            return
+        prior_h = (prior.get("terms") or {}).get("hashlock")
+        incoming_h = (incoming.get("terms") or {}).get("hashlock")
+        if prior_h and incoming_h and prior_h != incoming_h:
+            raise ValidationError(
+                f"the swap record at {self._path} belongs to a DIFFERENT swap "
+                f"(hashlock {prior_h[:16]}…, this one is {incoming_h[:16]}…). Refusing to "
+                "overwrite it: it is the only durable trace of that swap's pending contract and "
+                "funded locator, and the contract it references may still hold value. Settle or "
+                "sweep that swap, verify the record is no longer needed, then move it aside — or "
+                "use a different --keys-out for this run."
+            )
+
     async def __call__(self, record: Any) -> None:
-        payload = json.dumps(record.to_dict(), indent=2, sort_keys=True).encode()
+        as_dict = record.to_dict()
+        self._refuse_to_clobber_a_different_swap(as_dict)
+        payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         tmp = None
         try:
             # INSIDE the try: creating the temp file is itself a filesystem operation that fails on
