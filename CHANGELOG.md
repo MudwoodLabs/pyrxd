@@ -292,6 +292,34 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
+- **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
+  Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
+  `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'
+  field`) and is right to; `p` is what identifies a glyph payload. Nothing else read it, so
+  every update on the chain was invisible.
+
+  Measured on mainnet — `custodian-gate-x7f3.rxd`, whose target moved from
+  `1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7` to `14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i` at height
+  458591. Three of that name's four transactions carry the `gly` marker; the inspect path
+  rendered one, and the two that MOVED where the name points rendered blank.
+
+  `decode_update_payload` reads the partial envelope, and
+  `GlyphInspector.classify_glyph_scriptsig` returns a three-state answer: a full payload, an
+  update, or **unreadable**. The third state is the point. `extract_reveal_metadata` returns
+  `None` both for "no glyph here" and "a glyph I could not parse", and those are opposite facts
+  — a reader that cannot see updates does not report an error, it reports "nothing changed",
+  which is the more confident answer and the wrong one.
+
+  Two supporting changes fall out. The push walker now has a **prefix** view alongside the
+  strict one: a MUT-contract unlock ends in real opcodes (`OP_1 OP_1 OP_0 OP_0` on those
+  transactions), so the pure-push walker reported `None` for the whole script and discarded the
+  envelope it had already read. And an update's CBOR **keys** are publisher-chosen just like its
+  values, so both are sanitised before display.
+
+  Scoped deliberately: this reads an update. It does not fold a chain of them into the state at
+  a past block — that merge rule belongs to the WAVE protocol, not to pyrxd's guess at it — and
+  it makes no claim about who held a name when (#598).
+
 - **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
   is operator-authored CBOR read off the chain, and every `from_dict` in
   `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
