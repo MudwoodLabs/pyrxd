@@ -9,6 +9,7 @@ mutual exclusion in the funding path, and resuming an interrupted fund deliberat
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import multiprocessing as mp
 import time
@@ -198,3 +199,84 @@ class TestLoadingBackIsFailClosed:
         sink.path.write_text(json.dumps(d))
         with pytest.raises(ValidationError, match="must be set together"):
             sink.load_record()
+
+
+class TestItRefusesToClobberADifferentSwap:
+    """`os.replace` is unconditional, and the record path derives from `--keys-out` — per RUN.
+
+    So re-running with a `--keys-out` that already has a record silently replaced it, and the
+    record it replaced may reference a contract that still holds value: the pending counter
+    contract address and the funded locator live nowhere else. Until now the only obstacle was
+    incidental, the KEYS file's `O_EXCL` — and the runbook tells operators to delete that file
+    after sweep, which removes the accident and leaves the record unprotected (#504 item 3).
+
+    Keyed on the HASHLOCK rather than on existence, because this sink is called repeatedly as one
+    swap advances. A guard that refused any existing file would break every update after the
+    first, which is the failure this project treats as a bug in its own right — so the same-swap
+    path is asserted here just as hard as the refusal.
+    """
+
+    def _rec(self, hashlock: bytes, *, nonce: int = 41):
+        from pyrxd.gravity.swap_state import SwapRecord, SwapState
+        from tests.test_swap_coordinator import _eth_terms
+
+        return SwapRecord(
+            state=SwapState.NEGOTIATED,
+            terms=_eth_terms(hashlock=hashlock, eth_timeout_unix_s=1_700_040_000),
+            pending_counter_contract="0x" + "ab" * 20,
+            pending_counter_deploy_tx="0x" + "cd" * 32,
+            pending_push_nonce=nonce,
+        )
+
+    def test_the_same_swap_may_be_written_repeatedly(self, tmp_path: Path) -> None:
+        """THE honest path. One swap persists many times as its state advances."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        for nonce in (41, 42, 43):
+            asyncio.run(sink(self._rec(b"\x33" * 32, nonce=nonce)))
+        back = sink.load_record()
+        assert back is not None and back.pending_push_nonce == 43, "later updates must land"
+
+    def test_a_first_write_to_a_fresh_path_is_allowed(self, tmp_path: Path) -> None:
+        sink = JsonFileRecordSink(tmp_path / "fresh.json")
+        asyncio.run(sink(self._rec(b"\x44" * 32)))
+        assert sink.load_record() is not None
+
+    def test_a_different_swap_is_refused(self, tmp_path: Path) -> None:
+        """The clobber. Two swaps, one `--keys-out`."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(self._rec(b"\x33" * 32)))
+        with pytest.raises(ValidationError) as exc:
+            asyncio.run(sink(self._rec(b"\x55" * 32)))
+        assert "DIFFERENT swap" in str(exc.value)
+
+    def test_the_refusal_names_both_swaps_and_the_path(self, tmp_path: Path) -> None:
+        """Operator-facing. A refusal that does not say WHICH record it protected, or where it
+        is, sends someone hunting — and the tempting next move is to delete the file."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(self._rec(b"\x33" * 32)))
+        with pytest.raises(ValidationError) as exc:
+            asyncio.run(sink(self._rec(b"\x55" * 32)))
+        msg = str(exc.value)
+        assert "swap.json" in msg
+        assert ("33" * 8) in msg and ("55" * 8) in msg, "both hashlocks must be identifiable"
+        assert "--keys-out" in msg, "the message must name the flag an operator can change"
+
+    def test_the_existing_record_survives_the_refusal(self, tmp_path: Path) -> None:
+        """A refusal that had already truncated the file would be worse than the clobber."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(self._rec(b"\x33" * 32, nonce=41)))
+        with contextlib.suppress(ValidationError):
+            asyncio.run(sink(self._rec(b"\x55" * 32, nonce=99)))
+        back = sink.load_record()
+        assert back is not None
+        assert back.pending_push_nonce == 41, "the protected record was modified anyway"
+        assert back.terms.hashlock == b"\x33" * 32
+
+    def test_a_torn_existing_record_is_refused_rather_than_overwritten(self, tmp_path: Path) -> None:
+        """`load()` already fails closed on a torn file; routing the write through it means a
+        record that cannot be READ cannot be silently replaced either."""
+        path = tmp_path / "swap.json"
+        path.write_text('{"state": "negotiated", "ter')
+        with pytest.raises(ValidationError):
+            asyncio.run(JsonFileRecordSink(path)(self._rec(b"\x33" * 32)))
+        assert path.read_text() == '{"state": "negotiated", "ter', "the torn file was overwritten"
