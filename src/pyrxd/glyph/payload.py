@@ -191,6 +191,53 @@ def _decode_decimals(raw: object) -> int:
     return raw
 
 
+def decode_update_payload(cbor_bytes: bytes) -> dict:
+    """Decode a PARTIAL update envelope — the mutated fields only, carrying no ``p``.
+
+    A mutable Glyph is updated by publishing a second ``gly`` envelope that contains just the
+    fields being changed. Measured on Radiant mainnet, `custodian-gate-x7f3.rxd` (a WAVE name)
+    at heights 458585 / 458591 / 458601::
+
+        mint    {"p": [2, 5, 11], "v": 2, "name": "...", "type": "wave_name", "attrs": {...}}
+        update  {"attrs": {"name": "...", "domain": "rxd", "target": "14XmXG...", ...}}
+
+    :func:`decode_payload` refuses the second shape — ``CBOR payload missing 'p' field`` — and
+    it is right to: ``p`` is what identifies a glyph payload, and loosening that check would make
+    every ``p``-less blob on the chain decode as a token. So the update envelope gets its own
+    reader instead, and callers have to say which one they mean.
+
+    WHY THIS MATTERS BEYOND MUTABILITY. Without it pyrxd could read a WAVE name's MINT-TIME target
+    and nothing else: on that chain three of the four transactions carry the ``gly`` marker and the
+    reveal parser decoded exactly one. A reader that cannot see updates reports "nothing changed",
+    which is the more confident answer and the wrong one.
+
+    :raises ValidationError: if the bytes are not a CBOR map, are oversized, or DO carry ``p``
+        (that is a full payload — use :func:`decode_payload`).
+    """
+    if len(cbor_bytes) > _MAX_CBOR_PAYLOAD_BYTES:
+        raise ValidationError(f"CBOR payload too large: {len(cbor_bytes)} > {_MAX_CBOR_PAYLOAD_BYTES} bytes")
+    try:
+        d = cbor2.loads(cbor_bytes)
+    except Exception as e:
+        raise ValidationError("Invalid CBOR payload") from e
+    if not isinstance(d, dict):
+        raise ValidationError("CBOR update payload must be a map")
+    if "p" in d:
+        raise ValidationError(
+            "CBOR payload carries 'p' — that is a full glyph payload, not a partial update; "
+            "decode it with decode_payload()"
+        )
+    if not d:
+        raise ValidationError("CBOR update payload is an empty map — it mutates nothing")
+    # Keys are attacker-authored. Refuse a non-string key rather than coercing: `str(1)` and the
+    # string "1" would then collide, and a fold that merges these onto mint state would let a
+    # writer overwrite a field it never named.
+    for k in d:
+        if not isinstance(k, str):
+            raise ValidationError(f"CBOR update payload has a non-string key: {type(k).__name__}")
+    return d
+
+
 def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
     """Decode CBOR bytes (without 'gly' marker) to GlyphMetadata."""
     if len(cbor_bytes) > _MAX_CBOR_PAYLOAD_BYTES:
