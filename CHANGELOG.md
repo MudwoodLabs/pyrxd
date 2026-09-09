@@ -313,6 +313,18 @@ settled.
 
 ### Changed
 
+- **Creator signatures are now made over the canonical encoding, and signatures
+  made by earlier versions do not verify.** Signing used `cbor2.dumps(d)` while
+  `encode_payload` published `canonical=True`, so the bytes signed were not the
+  bytes published: measured against the previous code, a single-field NFT verified
+  after a round trip through the envelope and an NFT carrying a `description` did
+  not. The two now use one encoder. This is a behavioural change to a published
+  signature scheme and it was not previously recorded here. No conformance vector,
+  pinned mainnet anchor or checked-in fixture in this repository carries a creator
+  signature, and `verify_creator_signature` has no internal caller — it is exported
+  API — so no signature this project can point at was invalidated, but a third
+  party holding one produced by an earlier version must re-sign.
+
 - **Documentation that taught defects to third parties.** The BIP143 porting
   guide — written so others can implement Radiant's sighash in another language —
   told implementers to sort refs "ascending by their 36 bytes" (the code sorts by
@@ -331,6 +343,28 @@ settled.
   claims, four comments resting on a standardness rule Radiant does not execute,
   and a guide telling readers to hand-roll an adapter for a class that ships and
   is used by the real-value runners.
+
+  **Glyph spec §10.2 told a second implementer to build a verifier that rejects
+  valid pyrxd signatures.** It stated that the creator-signature encoder omits
+  `canonical=True` and that an implementation "MUST reproduce the insertion order
+  of pyrxd's `to_cbor_dict` … using a canonical encoder here produces a different
+  message and the signature fails". Signing became canonical in the same cycle
+  (below), so every clause was false, in the direction that breaks interoperation —
+  the 0.22.0 shape, where a published artifact teaches a rule the code does not
+  implement. The same claim was mirrored twice in `security-audit-scope.md`, once
+  as an accepted residual asserting the encoding was a *permanent compatibility
+  constraint*.
+
+  It also survived a mechanical repair: a citation sweep re-pointed the sentence
+  from `creator.py:43` to `creator.py:117` — onto `return cbor2.dumps(d,
+  canonical=True)`, the line that refutes it. A citation checker asks whether a
+  pointer lands on code, never whether the code says what the prose claims.
+
+  §10.2 now gives the recipe that works, and
+  `tests/test_spec_10_2_recipe_verifies_a_creator_signature.py` **executes** it
+  rather than reading it: it verifies an honest token the way an outside
+  implementation would, and asserts that the reconstruction the section forbids
+  really does fail.
 
 ### Internal
 

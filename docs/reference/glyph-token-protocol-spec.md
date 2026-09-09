@@ -914,7 +914,7 @@ following as guarantees:
 
 ### 10.1 Algorithm
 
-`src/pyrxd/glyph/creator.py:170-213`:
+`src/pyrxd/glyph/creator.py:164-207`:
 
 1. Build the envelope map with `creator` set to
    `{"pubkey": <hex>, "sig": "", "algo": <algo>}` — `sig` empty, `algo` always
@@ -927,27 +927,53 @@ following as guarantees:
 `creator.pubkey` MUST be a 33-byte compressed secp256k1 public key, hex-encoded
 with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:160-168`).
 
-### 10.2 The canonicalisation caveat
+### 10.2 The canonicalisation rule
 
-The signing encoder is `cbor2.dumps(d)` — **without** `canonical=True`
-(`src/pyrxd/glyph/creator.py:117`), whereas the on-chain envelope is encoded with
-`canonical=True` (`src/pyrxd/glyph/payload.py:67`). Verified: for a metadata
-object with more than one field the two encodings differ, so the signed byte
-string is not the canonical form of the signed map.
+The signing encoder is `cbor2.dumps(d, canonical=True)`
+(`src/pyrxd/glyph/creator.py:117`) — the **same** canonical form the on-chain
+envelope is encoded with (`src/pyrxd/glyph/payload.py:67`). Signing and
+publication therefore agree byte-for-byte for a pyrxd-minted token, which is
+what makes such a signature verifiable from the chain at all.
 
-Consequences an interoperating implementation MUST know:
+To verify a pyrxd-produced creator signature, an interoperating implementation:
 
-- To verify a pyrxd-produced creator signature, an implementation MUST reproduce
-  the **insertion order** of pyrxd's `to_cbor_dict`
-  (`src/pyrxd/glyph/types.py:506-575`), not a canonical ordering. Using a
-  canonical encoder here produces a different message and the signature fails.
-- Note also that this makes the signature dependent on source-code field order —
-  the exact fragility `canonical=True` was introduced to eliminate on the envelope
-  path (`src/pyrxd/glyph/payload.py:28-68`).
-- The `creator` sub-map used for signing always contains all three keys, whereas
-  the published `creator` omits `sig` when empty and `algo` when it equals the
-  default (`src/pyrxd/glyph/types.py:170-176`). Signing and verification agree,
-  but the signed map is not the published map.
+1. takes the metadata map **as published**;
+2. sets `creator.sig` to the empty string **in place** — changing nothing else:
+   not the other fields, not the map's key order, and not the remaining keys of
+   the `creator` sub-map;
+3. re-encodes and applies the §10.1 commit-hash and prefix steps to the result.
+
+For a pyrxd-minted token the bytes produced by step 3 are canonical, because the
+published bytes were.
+
+An implementation MUST NOT rebuild the map in pyrxd's source-declaration order.
+`to_cbor_dict` emits `p, name, desc, …` (`src/pyrxd/glyph/types.py:506-575`)
+whereas the signed and published form is canonical `p, desc, name, …`; the two
+differ for any token carrying more than one optional field, so reconstructing
+declaration order yields a different message and a **false forgery verdict**.
+
+The `creator` sub-map used for signing is derived from the same rule as the
+published one (`src/pyrxd/glyph/types.py:170-176`): `sig` present with an empty
+value, `algo` omitted when it equals the default. Measured: the signed key set
+equals the published key set, so the only difference between the signed map and
+the published map is the *value* of `sig`.
+
+Third-party tokens are treated differently, deliberately. When pyrxd holds the
+original bytes it rebuilds from those, non-canonically, preserving whatever key
+order the writer used (`src/pyrxd/glyph/creator.py:160-167`). A writer that
+signed its own insertion order still verifies: pyrxd does not re-canonicalise
+another implementation's bytes and then report the mismatch as a forgery.
+
+> **Changed after 0.23.0 — earlier revisions of this section stated the opposite
+> rule.** Signing was previously non-canonical, over a hand-built three-key
+> `creator` sub-map. That form could not survive publication: measured against
+> the pre-change code, a single-field NFT verified and an NFT carrying a
+> `description` did not, because the envelope was already published canonically
+> while the signature was taken over declaration order. A signature produced by
+> the older code does not verify under the current code. No conformance vector,
+> pinned mainnet anchor, or checked-in fixture in this repository carries a
+> creator signature, so no signature this project can point at was invalidated;
+> a third party that implemented the older rule must update.
 
 ### 10.3 What the signature covers
 
@@ -1371,11 +1397,17 @@ transaction in CI. The anchors:
 | Genesis ref = commit outpoint | round-trip through the built reveal | `tests/cli/test_glyph_cmds.py`, `tests/test_glyph_mint_facade.py:213-217` |
 
 Measurements stated in this document that are **not** covered by an existing test —
-the non-canonicality of the mainnet fixture (§4.2, §14), the creator-signature
-canonicalisation gap (§10.2), and the signature's indifference to unknown fields
-(§10.3) — were produced by running pyrxd against the checked-in fixture and
-builders while writing this specification. They are reproducible from the
-snippets given, but they are not yet regression-locked in CI.
+the non-canonicality of the mainnet fixture (§4.2, §14) and the signature's
+indifference to unknown fields (§10.3) — were produced by running pyrxd against the
+checked-in fixture and builders while writing this specification. They are
+reproducible from the snippets given, but they are not yet regression-locked in CI.
+
+§10.2 was on that list, and it is the reason the list is worth taking seriously: the
+section went stale, in the direction that breaks an interoperating implementation, and
+nothing failed. It is now regression-locked by
+`tests/test_spec_10_2_recipe_verifies_a_creator_signature.py`, which does not read the
+prose — it EXECUTES the recipe §10.2 gives and asserts a second implementer verifies an
+honest token, and separately that the reconstruction §10.2 forbids really does fail.
 
 ### 17.1 Consensus behaviour verified on a node
 

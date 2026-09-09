@@ -284,12 +284,17 @@ this commit, not against a plan:
    and `v` — most consequentially, `policy.transferable: false` mints as freely transferable,
    silently (recorded residual, CHANGELOG 0.14.0; `red-team-checklist.md` §5.1 flags the
    affected manual step as known-failing).
-5. **Creator signatures are computed over a non-canonical encoding** (`glyph/creator.py:117` —
-   `cbor2.dumps` without `canonical=True`, insertion-order dependent), and they attest to
-   pyrxd's *decoded field set*, not the on-chain bytes: adding an unknown field to a signed
-   payload does not invalidate the signature (spec §10.2–10.3). This **cannot be changed without
-   invalidating every existing on-chain signature** — it is a permanent compatibility constraint
-   to audit around, not an oversight awaiting a fix.
+5. **Creator signatures attest to pyrxd's *decoded field set*, not to the on-chain bytes**:
+   adding an unknown field to a signed payload does not invalidate the signature (spec
+   §10.3). That is the standing property to audit around.
+
+   This item previously read "computed over a non-canonical encoding … **cannot be changed
+   without invalidating every existing on-chain signature** — a permanent compatibility
+   constraint". Both halves were wrong. Signing is canonical (`glyph/creator.py:117`), the
+   same form `encode_payload` publishes; and the older non-canonical form was never
+   wire-compatible in the first place — the envelope was already published canonically, so a
+   signature over a token with more than one optional field failed verification as soon as it
+   was read back from the chain (`tests/test_signature_survives_the_wire.py`).
 
 ## 9. Residual register (consolidated, stable IDs)
 
@@ -379,7 +384,7 @@ these would otherwise be missed).
 | `GLYPH-OWNERPKH` | high | mitigated (CLI) | The CLI mint paths now derive `owner_pkh` from the funding wallet (not from the metadata file) and the pre-broadcast summary prints it — `owner_pkh: … (this wallet)` (`cli/glyph_cmds.py:446,719`). TM S7 / gap #9's "summary does not surface owner_pkh" wording predates this. The hostile-metadata residual has **moved**, not vanished: see `GLYPH-METADATA-DROPPED-FIELDS` | `cli/glyph_cmds.py` · TM S7 / gap #9 |
 | `GLYPH-METADATA-DROPPED-FIELDS` | high | open | The CLI metadata-file loader silently drops `creator`, `policy`, `rights`, `v` (`royalty` and `dmint` were the same bug, fixed 0.14.0). Most consequential: `policy.transferable: false` — a token the creator marked soulbound mints freely transferable, with no warning, permanently | `cli/glyph_helpers.py` · CHANGELOG 0.14.0 residual |
 | `GLYPH-ENVELOPE-LOSSY` | medium | accepted | `decode_payload` drops unknown keys; decode-then-encode is not an identity and MUST NOT verify a payload against a commit hash. The reference mainnet token's `by` refs are no longer part of the loss (`in` / `by` decode since 0.15.0), but tag-64-wrapped byte strings still re-encode untagged, so the property stands | `glyph/payload.py` · spec §16.1 |
-| `GLYPH-CREATOR-SIG-CANON` | medium | accepted | Creator signatures are computed over a **non-canonical**, insertion-order CBOR encoding (`glyph/creator.py:117`) and attest to the modelled field set, not the on-chain bytes (unknown fields do not invalidate). Unchangeable without invalidating every existing on-chain signature — a permanent compat constraint | `glyph/creator.py` · spec §10.2–10.3 |
+| `GLYPH-CREATOR-SIG-CANON` | medium | mitigated (encoding) / accepted (field set) | Formerly: "computed over a **non-canonical**, insertion-order CBOR encoding — unchangeable without invalidating every existing on-chain signature". Neither half held. Signing is canonical (`glyph/creator.py:117`), matching what `encode_payload` publishes; before that change a pyrxd signature over a token with more than one optional field did not verify once read back from the chain, so the "permanent compat constraint" was protecting signatures that did not work. **Still accepted**: the signature attests to the modelled field set, so unknown on-chain fields do not invalidate it (spec §10.3) | `glyph/creator.py` · spec §10.2–10.3 · `tests/test_signature_survives_the_wire.py` |
 | `GLYPH-CONTAINER-UNROUTABLE` | high | mitigated | Re-rated from medium after regtest investigation: the 100-byte CONTAINER-with-child-ref output was not merely unroutable, it was **unspendable**, and building one **destroyed the child NFT** (§8 item 2). The builder parameter now raises; a container is a plain NFT and membership is the child's envelope `in` field. Residual: any such output already on chain is unrecoverable — pyrxd identifies it (`is_legacy_container_script`) and says so | `glyph/builder.py`, `glyph/script.py`, `glyph/inspector.py` · `tests/test_container_regtest_e2e.py` · spec §7.5, §17.1 |
 | `GLYPH-PARSER-FUZZ` | medium | mitigated (partial) | Formerly "not yet fuzzed". Coverage-guided atheris harnesses now exist for the attacker-facing parsers — `scripts/fuzz_atheris/` (`harness_decode_payload.py`, `harness_inspect_script.py`, `harness_classify_input.py`, `harness_extract_reveal_metadata.py`, `harness_dmint_from_script.py`, plus RSWP + SPV harnesses) — on a **weekly scheduled** CI lane (`.github/workflows/fuzz.yml`), not per-PR. TM gap #3's CLI-surface fuzzing (issue #10) remains open | `scripts/fuzz_atheris/harness_decode_payload.py` · TM gap #3 |
 | `GLYPH-DUAL-WALKER` | medium | mitigated | Formerly: divergent opcode walkers could drift on reserved bytes. This is exactly the defect the 0.14.0 panel found live (§7 item 2 — four walkers, split two-and-two). All walkers now share the single consensus-correct `REF_OPCODES` (`glyph/script.py:442`), differential-locked against a port of Radiant's `GetScriptOp` (`tests/test_glyph.py`) | `glyph/script.py`, `glyph/credential_binding.py` · FT-covenant note |
