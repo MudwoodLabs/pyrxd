@@ -147,9 +147,27 @@ class FileFundLock:
     pretend it is covered. Pass nothing instead: the coordinator refuses to resume without a lock,
     which is the honest outcome. `scripts/eth_swap_two_host.py` does exactly that.
 
-    The path is derived from the caller's key path, NOT from the hashlock, so two swaps sharing a
-    funding key share a lock — conservative (over-exclusion) rather than unsafe, but it means this
-    is not a per-swap lock and should not be described as one.
+    **WHAT THE KEY ACTUALLY IS.** The lock file is ``<the path you pass> + ".fundlock"``, and
+    nothing more. It is not keyed by the hashlock, and it is not keyed by the funding key either.
+
+    This paragraph used to say the path came from "the caller's key path, so two swaps sharing a
+    funding key share a lock — conservative (over-exclusion) rather than unsafe". That was false in
+    the direction that matters. Both runners construct it from ``args.keys_out``, which is
+    PER-RUN, so two concurrent swaps on ONE funding key with different ``--keys-out`` get two
+    different lock files and **exclude nothing**. Measured, not reasoned: same path, the second
+    acquisition is refused; different paths, both acquire.
+
+    So the over-exclusion the old wording offered as reassurance does not exist, and the case it
+    described as covered is the case that is not. A lock whose documented scope is wider than its
+    real scope is worse than no lock: the next person reasons from the sentence.
+
+    The exclusion this DOES give you is exact and worth stating positively: **two processes that
+    pass the same path are excluded.** Anything else — a different path, another host, a copied
+    directory — is not, and cannot be detected here.
+
+    ``tests/test_fund_lock_scope_is_the_path.py`` pins both halves, and pins the two construction
+    sites, so keying this by ``H`` (see #504 item 3) fails that test and forces this paragraph to
+    be re-read rather than silently inherited.
     """
 
     def __init__(self, path: str | Path) -> None:
