@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "Baseline for scripts/check_photonic_drift.py. Each digest is the sha256 of",
+    "that file in Radiant-Core/Photonic-Wallet at the commit below.",
+    "Do NOT hand-edit. Refresh with: python scripts/check_photonic_drift.py --update-pin",
+    "and say in the commit message WHY each changed file is still consistent with",
+    "what pyrxd claims about it \u2014 that review is the entire point of the pin."
+  ],
+  "repo": "Radiant-Core/Photonic-Wallet",
+  "commit": "becf41a",
+  "also_watch": [
+    "packages/lib/src/authority.ts",
+    "packages/lib/src/burn.ts"
+  ],
+  "not_found_at_this_commit": [],
+  "files": {
+    "packages/app/src/electrum/worker/NFT.ts": "a69688b2a429ce3a4a9b014acb54e82597e29ee3790328f8ec22db4b78636bb4",
+    "packages/app/src/keys.ts": "7878c888da260a203d65b67fcad9715320e589e804e25f5791d15c09322677cd",
+    "packages/app/src/pages/Mint.tsx": "f6948dafe9dc7495d8a150cd5adb88aff437d23054547f0371b7065a40eb6345",
+    "packages/app/src/pages/Swap.tsx": "47bb53fedb1c4eade74875679354d0368e6323a44291247916b7db2b2fbfccb3",
+    "packages/app/src/swap.ts": "4a2ab4a48a61004b6c51fce0c947245462a622ae0d76c880645a11d16f89afc7",
+    "packages/app/src/swapBroadcast.ts": "3edf70660dd8e967b1f3c51ba9e8b4d2709521b977652a35db0770439d12377c",
+    "packages/app/src/types.ts": "9414d134734eb70311af674c39190ce5d2d3c1409dd532af63ea6b69fd1e6261",
+    "packages/lib/src/__tests__/dmint.test.ts": "9851cc5186114da4e5072819035cece0a8fab1295753141bc6d16dcd466644b8",
+    "packages/lib/src/__tests__/protocols.test.ts": "6e021ac157f88e7de0218968c63d0464fd0cec5e19a32245a04c0a371c2a852a",
+    "packages/lib/src/authority.ts": "95cedf777a4d484e8ec8e16ffdcb461abcbcaf813375cda5c447cff1187c1ff8",
+    "packages/lib/src/burn.ts": "997c032f3b5492616055bc56f4896677ebe1647f2768726babc837fdbc78ef5f",
+    "packages/lib/src/encryption.ts": "958ad4ca762f71d1afa917da2feab3a5a1e083dc02da87ee230ef1db13b5c1b6",
+    "packages/lib/src/mint.ts": "81251d0e7bc54f651488f27f29a4fd835ae1aeb7058d8dc0b89073e30c0f15b7",
+    "packages/lib/src/protocols.ts": "4e1e74fc80943dee1b85a445e5ab9418718b892318d6b74b94a6f32e93de0aee",
+    "packages/lib/src/reveal.ts": "f141ecfabbc4b95336ea29ebd58ac2c019d93cf833de83c77d1a4b440fa01b51",
+    "packages/lib/src/royalty.ts": "71a912820432a13de701cce7bfe425d465a3091a64a4e6d5deceb6fcd56a824b",
+    "packages/lib/src/royaltyCovenant.ts": "ea13b033c1a281d7ed17350645b93e644294a98e6f12636c9e4c0b833adec90f",
+    "packages/lib/src/script.ts": "06fa9ef912d9119fab7f3c653a1b8c61cc0930e4112fa100cb568c5cc76935cd",
+    "packages/lib/src/soulbound.ts": "a00b89306e755313923d4bca58d00d4d6c6a7bc92bb77079a1dddb91de828ca6",
+    "packages/lib/src/swapRefundCovenant.ts": "050872bef886dd99d329e1fac93d8d612d86edfabbeb4720d41b14744f240f48",
+    "packages/lib/src/timelock.ts": "638b2222563148b4566ccde8d92812bad99459dd294c48c3f575bb16a76e5b43",
+    "packages/lib/src/token.ts": "a574df9f1342b5099387cc2c1d32e829eb0924a88a15500dc0294d71fd31cb1b",
+    "packages/lib/src/transfer.tsx": "5ec4508f6720252e7aeee3dd7589b208e9b7416e86752f65103093f575cf6681",
+    "packages/lib/src/types.ts": "e63dc369ea41a8289b683792543bfb6ba49b637c2c68ab11c7c3250fc6311fe8",
+    "packages/lib/src/vault.ts": "53c25f5f9f303de3daa0c38df1cc6c0144973342ed9ad10f2af220f25eff1844",
+    "packages/lib/src/wave.ts": "54e8bc423da63b745b701c92404425b6626ee1f397e897ae28f6291b1c33add0"
+  }
+}

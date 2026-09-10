@@ -1,0 +1,110 @@
+# Photonic upstream drift watch.
+#
+# pyrxd cites Radiant-Core/Photonic-Wallet in ~170 places — docstrings asserting
+# what its verifiers do, protocol-spec §15 rows, and interop fixtures generated
+# by calling its actual TypeScript. Every one is a claim about another repository
+# that NO test here can evaluate: the suite is equally green whether the sentence
+# is still true or went false last Tuesday. Photonic is actively maintained, so
+# those claims decay silently and in the flattering direction.
+#
+# This job reads the upstream files we cite and says when they move. It never
+# edits anything and never decides anything — "upstream changed" can mean they
+# fixed a defect we reported, changed bytes we emit, or just moved a line we
+# cite, and only a person can tell those apart.
+#
+# Companion: tests/test_photonic_citations_are_pinned.py runs offline in normal
+# CI and fails if a newly cited Photonic file was never added to the pin, so the
+# watch set cannot silently stop covering something.
+
+name: Photonic drift
+
+on:
+  schedule:
+    # Weekly, Mondays 09:00 UTC — after OSV (08:00), which is after Scorecard.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+  pull_request:
+    # Re-run when the watcher or its baseline is edited, so a change to the
+    # mechanism is exercised on the PR that makes it.
+    paths:
+      - "scripts/check_photonic_drift.py"
+      - "tests/fixtures/photonic_upstream_pin.json"
+      - ".github/workflows/photonic-drift.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Has Photonic moved under a claim we make?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check cited Photonic files against the pin
+        id: drift
+        env:
+          # Raises the anonymous rate limit; the script works without it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python scripts/check_photonic_drift.py | tee drift-report.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # Exit 2 means the check could not run — no citations found, a 404, a
+      # network failure. That is a broken watcher, and it must never be
+      # mistaken for a clean result, so the job goes red.
+      - name: Fail loudly if the watcher could not run
+        if: steps.drift.outputs.code == '2'
+        run: |
+          echo "::error::The Photonic drift watcher could not complete. This is NOT 'no drift' — the check itself is broken."
+          exit 1
+
+      - name: Open or update the drift issue
+        if: steps.drift.outputs.code == '1' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Photonic Wallet moved under a claim pyrxd makes"
+          BODY_FILE=body.md
+          {
+            echo "The weekly watcher found upstream changes in files pyrxd cites."
+            echo "**This is a report, not a verdict** — read the diff and decide which case applies."
+            echo
+            echo '```'
+            cat drift-report.txt
+            echo '```'
+            echo
+            echo "When resolved, re-pin and say in the commit message which case it was:"
+            echo
+            echo '```'
+            echo "python scripts/check_photonic_drift.py --update-pin"
+            echo '```'
+            echo
+            echo "_Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
+          } > "$BODY_FILE"
+
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+            echo "commented on #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body-file "$BODY_FILE"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: photonic-drift-report
+          path: drift-report.txt
