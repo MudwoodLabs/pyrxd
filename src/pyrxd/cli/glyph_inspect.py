@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -34,7 +35,6 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
-from ..glyph._inspect_core import _truncate_for_human
 from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
@@ -365,20 +365,35 @@ def _render_txid_human(payload: dict) -> str:
                     # will point, which is the one value a reader is here for.
                     if "target" in attrs:
                         lines.append(f"           attrs.target = {_truncate_for_human(str(attrs['target']))}")
+                    # KEYS ARE TRUNCATED TOO. They are as publisher-chosen as the values, and
+                    # capping only the value left a 100,000-character key rendering in full - a
+                    # 200,004-character line, measured.
+                    others = [(k, v) for k, v in sorted(attrs.items()) if k != "target"]
                     rest = ", ".join(
-                        f"{k}={_truncate_for_human(str(v))}" for k, v in sorted(attrs.items()) if k != "target"
+                        f"{_truncate_for_human(str(k))}={_truncate_for_human(str(v))}"
+                        for k, v in others[:_HUMAN_ENTRY_CAP]
                     )
                     if rest:
                         lines.append(f"           attrs: {rest}")
-                for key, value in sorted(fields.items()):
-                    if key == "attrs":
-                        continue
-                    lines.append(f"           {key} = {_truncate_for_human(str(value))}")
+                    if len(others) > _HUMAN_ENTRY_CAP:
+                        lines.append(f"           ... and {len(others) - _HUMAN_ENTRY_CAP} more attrs not shown")
+                top = [(k, v) for k, v in sorted(fields.items()) if k != "attrs"]
+                for key, value in top[:_HUMAN_ENTRY_CAP]:
+                    lines.append(f"           {_truncate_for_human(str(key))} = {_truncate_for_human(str(value))}")
+                if len(top) > _HUMAN_ENTRY_CAP:
+                    lines.append(f"           ... and {len(top) - _HUMAN_ENTRY_CAP} more fields not shown")
                 # WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether that
                 # glyph is the name someone means is an index's answer, not this transaction's,
                 # and the gap between the two is the whole of HashMark §7.6.
                 lines.append("           (changes this glyph's fields — does NOT establish which")
                 lines.append("            name resolves to it, nor who held that name when)")
+            elif env.get("kind") == "payload_unrendered":
+                # A DISAGREEMENT, not an unreadable envelope. One reader decoded a full payload
+                # here and the other did not, so neither "rendered above" nor "could not be read"
+                # is true — and silently trusting the reveal reader made the glyph vanish.
+                lines.append(f"  input {idx:>3}: PAYLOAD the reveal reader did not return")
+                lines.append("           the two glyph readers disagree about these bytes — treat")
+                lines.append("           the metadata section above as incomplete for this input")
             else:
                 # NOT SILENTLY DROPPED. "I could not read this" and "there is nothing here" are
                 # opposite facts, and the blind one reads as reassuring.

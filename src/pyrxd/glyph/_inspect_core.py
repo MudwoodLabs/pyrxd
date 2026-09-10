@@ -84,6 +84,13 @@ _MAX_OUTPUT_COUNT = 100_000
 # JSON mode preserves the full string (still ASCII-safe via ensure_ascii).
 _HUMAN_STRING_CAP = 200
 
+#: How many publisher-chosen entries one envelope may render before the rest are summarised.
+#: An update envelope's KEY SET is chosen by whoever published the transaction, and nothing caps
+#: it: a 256 KB payload of one-byte keys renders tens of thousands of lines, pushing the verified
+#: facts above it off the operator's screen. The cap is on the count only - what is dropped is
+#: always stated, because a silent truncation reads as "that was everything".
+_HUMAN_ENTRY_CAP = 32
+
 
 # Unicode general categories that must NOT reach a terminal: control (Cc),
 # format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
@@ -938,8 +945,29 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
     glyph_envelopes: list[dict] = []
     for idx, ss in enumerate(scriptsigs):
         env = inspector.classify_glyph_scriptsig(ss)
-        if env is None or env.kind == "payload":
-            continue  # payloads are rendered by metadata_payload below
+        if env is None:
+            continue
+        if env.kind == "payload":
+            # ONLY when the OTHER reader actually rendered it. `find_reveal_metadata` walks
+            # `_parse_reveal_scriptsig`, which was NOT unified with `_walk_pushes` - it breaks on
+            # `OP_0` where the new walker treats it as an empty push. So for a push-only scriptSig
+            # with one leading zero byte, classify sees a payload, extract sees nothing, and
+            # skipping here on the assumption that the metadata block will render it meant a glyph
+            # reveal rendered as NOTHING AT ALL - the blindness this whole surface exists to end,
+            # reintroduced one layer up. When the two disagree, say so rather than trusting either.
+            if found is not None and found[0] == idx:
+                continue
+            glyph_envelopes.append(
+                {
+                    "input_index": idx,
+                    "kind": "payload_unrendered",
+                    "reason": _sanitize_display_string(
+                        "this input carries a full glyph payload that the reveal reader did not "
+                        "return — the two readers disagree about these bytes"
+                    ),
+                }
+            )
+            continue
         entry: dict = {"input_index": idx, "kind": env.kind}
         if env.kind == "update":
             # Attacker-authored CBOR landing in terminal output: same sanitisation rule as every

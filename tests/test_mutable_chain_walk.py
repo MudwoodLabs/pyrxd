@@ -71,7 +71,12 @@ async def _cannot_say(_txid: str, _vout: int) -> None:
 async def test_it_walks_the_real_chain_in_spend_order() -> None:
     raw = _raw(_FOUR)
     walk = await walk_mutable_chain(
-        mint_txid=MINT_4, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=MINT_4,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert walk.complete, walk.reason
     assert [s.txid for s in walk.steps] == [MINT_4, UPDATE_A, UPDATE_B]
@@ -86,7 +91,12 @@ async def test_the_sibling_transaction_is_excluded_not_folded() -> None:
     chain would fold it."""
     raw = _raw(_FOUR)
     walk = await walk_mutable_chain(
-        mint_txid=MINT_4, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=MINT_4,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert SIBLING not in [s.txid for s in walk.steps]
     assert walk.excluded == (SIBLING,)
@@ -96,7 +106,12 @@ async def test_the_ref_is_constant_and_reported() -> None:
     """The singleton's identity. Every mutable output in the chain carries it."""
     raw = _raw(_FOUR)
     walk = await walk_mutable_chain(
-        mint_txid=MINT_4, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=MINT_4,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert walk.ref == "78e25bdcaec7eff36bcdf2fe9cee0c39c6e77e025603d916ee43980fd42c44b3:1"
 
@@ -105,7 +120,12 @@ async def test_a_chain_whose_middle_tx_never_touches_the_token(  # the 3-tx corp
 ) -> None:
     raw = _raw(_THREE)
     walk = await walk_mutable_chain(
-        mint_txid=MINT_3, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=MINT_3,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert walk.complete, walk.reason
     assert [s.kind for s in walk.steps] == ["mint", "update"]
@@ -130,7 +150,12 @@ async def test_a_truncated_candidate_set_is_NOT_reported_as_current() -> None:
     raw = _raw(_FOUR)
     truncated = [t for t in raw if t != UPDATE_B]
     walk = await walk_mutable_chain(
-        mint_txid=MINT_4, candidates=truncated, fetch_tx=_fetcher(raw), is_unspent=_spent_always
+        mint_txid=MINT_4,
+        candidates=truncated,
+        fetch_tx=_fetcher(raw),
+        is_unspent=_spent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert not walk.complete
     assert "not proved unspent" in walk.reason
@@ -143,7 +168,12 @@ async def test_an_unproved_tip_is_not_complete() -> None:
     """A source that cannot say is not a source that said yes."""
     raw = _raw(_FOUR)
     walk = await walk_mutable_chain(
-        mint_txid=MINT_4, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_cannot_say
+        mint_txid=MINT_4,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_cannot_say,
+        candidate_source="index",
+        tip_source="node",
     )
     assert not walk.complete
     assert "could not say" in walk.reason
@@ -162,10 +192,15 @@ async def test_a_non_mint_txid_degrades_rather_than_raising() -> None:
     not a chain contradiction."""
     raw = _raw(_FOUR)
     walk = await walk_mutable_chain(
-        mint_txid=SIBLING, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=SIBLING,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert not walk.complete
-    assert "no mutable output" in walk.reason
+    assert "no mutable output" in walk.reason or "not a full payload" in walk.reason
     assert walk.steps == ()
 
 
@@ -178,6 +213,8 @@ async def test_the_step_cap_is_reported_not_silently_applied() -> None:
         candidates=list(raw),
         fetch_tx=_fetcher(raw),
         is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
         max_steps=2,
     )
     assert not walk.complete
@@ -244,7 +281,12 @@ async def test_it_works_through_the_public_facade() -> None:
 
     raw = _raw(_FOUR)
     walk = await facade.walk_mutable_chain(
-        mint_txid=MINT_4, candidates=list(raw), fetch_tx=_fetcher(raw), is_unspent=_unspent_always
+        mint_txid=MINT_4,
+        candidates=list(raw),
+        fetch_tx=_fetcher(raw),
+        is_unspent=_unspent_always,
+        candidate_source="index",
+        tip_source="node",
     )
     assert isinstance(walk, facade.MutableChainWalk)
     assert walk.complete

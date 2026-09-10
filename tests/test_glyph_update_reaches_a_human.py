@@ -157,6 +157,12 @@ def test_no_shipped_code_consumes_expires_as_an_expiry() -> None:
     Pinned as MEMBERSHIP rather than described in a docstring: today nothing reads it, and if
     that changes this fails and someone has to re-read why the field is not an answer. An AST
     scan, so the comment blocks explaining this are not themselves mistaken for a read.
+
+    THE SCAN MATCHES THREE SPELLINGS, not one. It originally looked for `ast.Attribute` alone,
+    which is the shape the DATACLASS uses — and `attrs` is a plain dict everywhere else, so the
+    two ways a real consumer would actually reach the field, `attrs["expires"]` and
+    `attrs.get("expires")`, both passed it silently. A guard written from one example generalises
+    over the axis it was shown; this one was shown the attribute.
     """
     import ast
 
@@ -167,12 +173,37 @@ def test_no_shipped_code_consumes_expires_as_an_expiry() -> None:
     readers = []
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        # EXEMPT BY SCOPE, NOT BY SPELLING. `WaveAttrs` parsing and serialising its own field is
+        # not a caller drawing a conclusion from it. Scoping to the class body (derived from the
+        # AST) rather than to `self.` covers `d["expires"]` and `d.get("expires")` inside
+        # `from_dict`/`to_dict` too, which a `self.`-only exemption would have flagged.
+        own = set()
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Attribute) and node.attr == "expires"):
+            if isinstance(node, ast.ClassDef) and node.name == "WaveAttrs":
+                own.update(id(sub) for sub in ast.walk(node))
+
+        for node in ast.walk(tree):
+            if (
+                (isinstance(node, ast.Attribute) and node.attr == "expires")
+                or (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.slice, ast.Constant)
+                    and node.slice.value == "expires"
+                )
+                or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("get", "pop", "setdefault")
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "expires"
+                )
+            ):
+                pass
+            else:
                 continue
-            # `self.expires` inside WaveAttrs is the type serialising its own field, not a
-            # caller drawing a conclusion from it. Everything else counts.
-            if isinstance(node.value, ast.Name) and node.value.id == "self":
+            if id(node) in own:
                 continue
             readers.append(f"{path.relative_to(root.parent.parent)}:{node.lineno}")
 

@@ -810,7 +810,99 @@ function renderFetchedTxCard(payload) {
     wrapper.appendChild(odl);
   }
 
+  // Glyph envelopes carrying no full payload.
+  //
+  // EMITTED BY THE PYTHON AND READ BY NOBODY HERE. `glyph_envelopes` reached the
+  // JSON and the CLI's human mode and this card rendered none of it, so on the
+  // web page a mutable glyph's UPDATE — the transaction that changes where a
+  // WAVE name points — showed as an ordinary transfer, and an envelope neither
+  // reader could parse showed as nothing at all. "I could not read this" and
+  // "there is nothing here" are opposite facts, and the blind one reads as
+  // reassuring.
+  //
+  // Every value goes through `kv`, which assigns to textContent, so an
+  // attacker-authored key or value cannot become markup. Keys are truncated as
+  // well as values: they are as publisher-chosen as the values, and capping only
+  // the value left a 100,000-character key rendering in full.
+  const envelopes = Array.isArray(payload.glyph_envelopes) ? payload.glyph_envelopes : [];
+  if (envelopes.length > 0) {
+    wrapper.appendChild(el("h3", {
+      class: "result-subhead",
+      text: `Glyph envelopes carrying no full payload (${envelopes.length})`,
+    }));
+    for (const env of envelopes) {
+      const edl = el("dl", { class: "kv-list" });
+      if (env.kind === "update") {
+        edl.appendChild(kv(`input ${env.input_index}`, "UPDATE — a mutable glyph's fields are being changed here"));
+        const fields = env.fields || {};
+        const attrs = fields.attrs;
+        if (attrs && typeof attrs === "object" && !Array.isArray(attrs)) {
+          // `target` first and on its own row: for a WAVE name it is where the
+          // name will point, which is the one value a reader is here for.
+          if (attrs.target !== undefined) edl.appendChild(kv("attrs.target", _capText(attrs.target)));
+          const others = Object.keys(attrs).filter((k) => k !== "target").sort();
+          for (const k of others.slice(0, _ENTRY_CAP)) {
+            edl.appendChild(kv(`attrs.${_capText(k)}`, _capText(attrs[k])));
+          }
+          if (others.length > _ENTRY_CAP) {
+            edl.appendChild(kv("", `… and ${others.length - _ENTRY_CAP} more attrs not shown`));
+          }
+        }
+        const top = Object.keys(fields).filter((k) => k !== "attrs").sort();
+        for (const k of top.slice(0, _ENTRY_CAP)) {
+          edl.appendChild(kv(_capText(k), _capText(fields[k])));
+        }
+        if (top.length > _ENTRY_CAP) {
+          edl.appendChild(kv("", `… and ${top.length - _ENTRY_CAP} more fields not shown`));
+        }
+        wrapper.appendChild(edl);
+        // WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether
+        // that glyph is the name someone means is an index's answer, not this
+        // transaction's, and the gap between the two is the whole of HashMark §7.6.
+        wrapper.appendChild(el("p", {
+          class: "card-note",
+          text: "Changes this glyph's fields — does NOT establish which name resolves " +
+                "to it, nor who held that name when.",
+        }));
+        continue;
+      }
+      if (env.kind === "payload_unrendered") {
+        // A DISAGREEMENT, not an unreadable envelope. One reader decoded a full
+        // payload here and the other did not, so neither "rendered above" nor
+        // "could not be read" is true.
+        edl.appendChild(kv(`input ${env.input_index}`, "payload_unrendered — PAYLOAD the reveal reader did not return"));
+        // The classifier's own reason, not a re-description of it. It names which
+        // reader saw what, and re-wording it here is how the rendered sentence
+        // drifts from the fact it claims to report.
+        if (env.reason) edl.appendChild(kv("reason", _capText(env.reason)));
+        wrapper.appendChild(edl);
+        wrapper.appendChild(el("p", {
+          class: "card-note",
+          text: "The two glyph readers disagree about these bytes — treat the reveal " +
+                "metadata above as incomplete for this input.",
+        }));
+        continue;
+      }
+      edl.appendChild(kv(`input ${env.input_index}`, "UNREADABLE — a 'gly' marker with content neither reader accepted"));
+      if (env.reason) edl.appendChild(kv("reason", _capText(env.reason)));
+      wrapper.appendChild(edl);
+    }
+  }
+
   return wrapper;
+}
+
+// Display caps for publisher-chosen text, mirroring `_HUMAN_STRING_CAP` and
+// `_HUMAN_ENTRY_CAP` on the Python side. The count cap matters as much as the
+// length one: a 256 KB envelope of one-byte keys renders tens of thousands of
+// rows and pushes every verified fact off the screen, and no single row is long
+// enough for a length cap to notice.
+const _STRING_CAP = 200;
+const _ENTRY_CAP = 32;
+
+function _capText(value) {
+  const text = value === null || value === undefined ? "" : String(value);
+  return text.length <= _STRING_CAP ? text : text.slice(0, _STRING_CAP - 1) + "…";
 }
 
 // The OP_RETURN payload decoders (HashMark, the Photonic `msg` convention) and

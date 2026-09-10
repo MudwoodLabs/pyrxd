@@ -57,7 +57,7 @@ Read from Photonic-Wallet `upstream/main` and verified directly:
   `attrs: { ...g.attrs, ...attrs }` — a shallow merge, `attrs` only.
 - It reads **only the latest** mod envelope. Intermediate mods are never read.
 - Ordering is delegated to the indexer: `const current = refResult[refResult.length - 1]`.
-- The merge site is **untested** upstream.
+- The merge site is **untested** upstream — re-verified at `upstream/main` `becf41a`: of the 36 test files under `packages/app`, none names `reconcileRefTrackedNfts` and none imports `electrum/worker/NFT`. (Stated with the ref and the check because a coverage claim is a claim: a later review asserted the opposite, and re-deriving it took one `git grep`.)
 
 The consequence that matters: **Photonic's answer is observer-dependent.** Its stored row is
 path-dependent accumulation — a wallet that watched every update has merged each one; a wallet

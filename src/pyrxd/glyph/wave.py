@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final
 if TYPE_CHECKING:
     from ..constants import Network
 
+from ..network._guards import finite_int
 from ..security.errors import ValidationError
 from .types import GlyphMetadata, GlyphProtocol
 
@@ -49,8 +50,20 @@ SCHEME_ADDRESS: Final = "address"
 def _optional_int(value: object) -> int | None:
     """Read an optional integer attr, or refuse it. Never silently drop.
 
-    A bool is refused explicitly: `isinstance(True, int)` is True in Python, so `expires: true`
-    would otherwise be carried as 1 - a timestamp in 1970.
+    ACCEPTS A DIGIT STRING, because that is the form the mint reader ALWAYS produces.
+    `GlyphMetadata.attrs` is `dict[str, str]` (`payload.py`'s `_decode_attrs` stringifies every
+    value), so a mint's CBOR integer `expires` reaches this function as `'1850743929'`. Demanding
+    an `int` therefore refused every real mainnet WAVE mint: `wave_attrs_from_metadata` returned
+    `None` and `classify_glyph_metadata` fell through to `'mut'`, so a WAVE name stopped being a
+    WAVE name through the public facade - strictly worse than the dropped field this was added to
+    fix, because the whole record was lost rather than one key.
+
+    The fact that falsifies the int-only rule is written down twice in this same change - in
+    `mutable_chain.fold_chain`'s docstring and in the fold decision record, both noting that the
+    two readers disagree on value TYPE. It was applied to the fold and not here.
+
+    A bool is still refused explicitly: `isinstance(True, int)` is True in Python, so `expires:
+    true` would otherwise be carried as 1 - a timestamp in 1970.
     """
     if value is None:
         return None
@@ -58,7 +71,20 @@ def _optional_int(value: object) -> int | None:
         raise ValidationError(f"WAVE attrs 'expires' must be a number, got {type(value).__name__}")
     if isinstance(value, int):
         return value
-    raise ValidationError(f"WAVE attrs 'expires' must be a number, got {type(value).__name__}")
+    # A WHOLE FLOAT IS AN INT HERE, because it already is everywhere else in this codebase:
+    # `network._guards.finite_int` accepts `1850743929.0` and refuses `1.5`, Infinity and NaN,
+    # and CBOR can carry any of them. Refusing a whole float only here made one field stricter
+    # than the rule the rest of the SDK applies to numbers off the wire, for no stated reason.
+    if isinstance(value, float):
+        try:
+            return finite_int(value)
+        except ValueError as exc:
+            raise ValidationError(f"WAVE attrs 'expires' is not a whole number: {exc}") from exc
+    # Only a plain non-negative decimal string: the stringified form of an integer, and nothing
+    # that `int()` would otherwise accept (whitespace, signs, underscores, unicode digits).
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise ValidationError(f"WAVE attrs 'expires' must be a number or its decimal string, got {type(value).__name__}")
 
 
 @dataclass(frozen=True)
