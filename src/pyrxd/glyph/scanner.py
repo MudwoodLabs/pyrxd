@@ -234,7 +234,7 @@ class GlyphScanner:
                     # NOT a GlyphNft — it is a mint authorisation, not a
                     # collectible, and handing it back as an NFT would invite a
                     # holder to transfer it like one. But it must not be SILENT
-                    # either: these are consumed one per mint, so a holder
+                    # either: they authorise mints against the base, so a holder
                     # counting them needs to know they are there.
                     logger.info(
                         "Holding a delegate token at %s:%d (base ref %s:%d) — a mint authorisation, "

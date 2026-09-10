@@ -259,6 +259,31 @@ def _carries(scripts: list[bytes], wire_ref: bytes) -> bool:
     return False
 
 
+def _ref_spellings(ref: GlyphRef) -> frozenset[str]:
+    """Every spelling of *ref* a burn proof may legitimately use.
+
+    TWO IMPLEMENTATIONS, TWO SPELLINGS. pyrxd writes ``"<txid>:<vout>"``. Photonic writes
+    ``Outpoint.toString()`` — the txid hex followed by the vout as 8 hex digits, big-endian, with
+    no separator — and it does so on BOTH sides: ``createBurnProof`` builds the proof that way
+    (``packages/lib/src/burn.ts``) and ``validateBurn`` normalises through
+    ``Outpoint.fromString(...).toString()`` before comparing. Nothing in either project emits the
+    other's form.
+
+    So a `verify_burn` that matched only the colon form refused every burn proof Photonic has ever
+    written, and said so in a sentence that was itself false: "the burn proof names X, not Y" —
+    when the proof named the same token, spelled the way the other implementation spells it.
+
+    Matching both is safe because the mapping is injective in each direction: a 72-hex string and
+    a colon string cannot collide, and each decodes to exactly one outpoint.
+    """
+    return frozenset(
+        {
+            f"{ref.txid}:{ref.vout}",
+            f"{ref.txid}{ref.vout.to_bytes(4, 'big').hex()}",
+        }
+    )
+
+
 def verify_burn(
     output_scripts: list[bytes],
     token_ref: GlyphRef,
@@ -289,12 +314,12 @@ def verify_burn(
     # Select the proof that names THIS token, not the first parseable one. A
     # transaction burning A and B carries two proofs; taking the first reported
     # B as "the proof names A, not B" — refusing an honest batch burn.
-    wanted_ref = f"{token_ref.txid}:{token_ref.vout}"
+    wanted = _ref_spellings(token_ref)
     proofs = [p for p in (parse_burn_proof(script) for script in output_scripts) if p is not None]
-    proof = next((p for p in proofs if p.token_ref == wanted_ref), None) or (proofs[0] if proofs else None)
+    proof = next((p for p in proofs if p.token_ref in wanted), None) or (proofs[0] if proofs else None)
     if proof is None:
         return BurnVerdict(ok=False, basis=BurnBasis.NONE, reason="no burn proof output found")
-    if proof.token_ref != wanted_ref:
+    if proof.token_ref not in wanted:
         return BurnVerdict(
             ok=False,
             basis=BurnBasis.NONE,

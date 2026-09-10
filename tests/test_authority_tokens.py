@@ -190,7 +190,7 @@ def test_wrong_typed_attrs_degrade_to_defaults_rather_than_raising():
 
 
 def test_the_gate_verdict_reads_the_genesis_output():
-    verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), AUTHORITY)
+    verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), AUTHORITY, item_ref=ITEM)
     assert verdict.ok and verdict.basis is AuthorityBasis.GATE
     assert verdict.authority_ref == AUTHORITY
 
@@ -198,13 +198,13 @@ def test_the_gate_verdict_reads_the_genesis_output():
 def test_the_gate_verdict_refuses_a_different_authority():
     """Gated, but by someone else. Reporting 'valid' here would be the whole bug."""
     other = GlyphRef(txid="bb" * 32, vout=3)
-    verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), other)
+    verdict = verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), other, item_ref=ITEM)
     assert not verdict.ok and verdict.authority_ref == AUTHORITY
     assert "not on" in verdict.reason
 
 
 def test_the_gate_verdict_refuses_an_ungated_output():
-    verdict = verify_authority_gate(build_nft_locking_script(PKH, ITEM), AUTHORITY)
+    verdict = verify_authority_gate(build_nft_locking_script(PKH, ITEM), AUTHORITY, item_ref=ITEM)
     assert not verdict.ok and verdict.basis is AuthorityBasis.NONE
 
 
@@ -547,3 +547,104 @@ def test_script_carries_ref_counts_only_the_two_opcodes_that_mean_possession():
     # A different ref, and an undecodable script, are both False rather than raising.
     assert not script_carries_ref(build_nft_locking_script(PKH, ITEM), wire)
     assert not script_carries_ref(b"\xd8" + b"\x00" * 10, wire)
+
+
+def test_a_gated_genesis_for_ANOTHER_item_does_not_answer_about_this_one() -> None:
+    """The substitution the old signature made undetectable.
+
+    `verify_authority_gate` took only (script, authority) and returned ok=True with basis GATE for
+    a genuine gated output under the right authority — whichever ITEM that output was the genesis
+    of. No forgery needed: handing it item B's genesis while asking about item A was enough, and
+    the function could not notice although B's ref is in the bytes it was handed.
+
+    `item_ref` is keyword-only and REQUIRED, so the unbound call is not expressible. An optional
+    parameter would have left the old behaviour reachable by omission, which for a security
+    verdict is the same defect with a longer fuse.
+    """
+    item_a = GlyphRef(txid="11" * 32, vout=0)
+    item_b = GlyphRef(txid="22" * 32, vout=0)
+    genesis_of_b = build_authority_gated_nft_script(PKH, item_b, AUTHORITY)
+
+    honest = verify_authority_gate(genesis_of_b, AUTHORITY, item_ref=item_b)
+    assert honest.ok, "the honest case must still pass — a guard that refuses valid work is a bug"
+
+    substituted = verify_authority_gate(genesis_of_b, AUTHORITY, item_ref=item_a)
+    assert not substituted.ok
+    assert "a different item" in substituted.reason
+
+
+def test_the_unbound_call_is_not_expressible() -> None:
+    """Structural: omitting `item_ref` must be a TypeError, not a permissive default."""
+    with pytest.raises(TypeError):
+        verify_authority_gate(build_authority_gated_nft_script(PKH, ITEM, AUTHORITY), AUTHORITY)  # type: ignore[call-arg]
+
+
+def _authority_reveal_payload(**attrs_overrides):
+    """A classified payload for a real AUTHORITY reveal, through the production classifier.
+
+    Built as a transaction and run through `_classify_raw_tx` rather than hand-shaping a dict, so
+    the fixture is a shape the producer actually emits. `_classify_raw_tx` binds the echoed txid,
+    so the real one is computed rather than invented.
+    """
+    import cbor2
+
+    from pyrxd.glyph._inspect_core import _classify_raw_tx
+    from pyrxd.glyph.payload import GLY_MARKER
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    attrs = {
+        "issuer": "mudwood-issuer",
+        "scope": "collection:x",
+        "permissions": ["mint", "revoke"],
+        "expires": "2020-01-01T00:00:00Z",
+        "revocable": True,
+    }
+    attrs.update(attrs_overrides)
+    blob = cbor2.dumps({"p": [2, 10], "v": 2, "name": "Issuer Authority", "type": "authority", "attrs": attrs})
+    scriptsig = bytes([len(GLY_MARKER)]) + GLY_MARKER + b"\x4c" + bytes([len(blob)]) + blob
+    tx = Transaction()
+    tx.inputs.append(
+        TransactionInput(
+            source_txid="ab" * 32,
+            source_output_index=0,
+            unlocking_script=Script(scriptsig, allow_malformed=True),
+        )
+    )
+    tx.outputs.append(TransactionOutput(satoshis=546, locking_script=Script(b"\x6a", allow_malformed=True)))
+    return _classify_raw_tx(tx.txid(), bytes(tx.serialize()))
+
+
+def test_an_expired_authority_says_so_on_the_terminal() -> None:
+    """`metadata.authority` was computed and rendered by NOTHING — not the CLI, not the browser.
+
+    So an authority that expired years ago printed identically to a live one, and `problems` (the
+    one signal that `validate_authority` could not read the expiry at all) was invisible too. The
+    classifier had the answer; nobody could see it.
+    """
+    from pyrxd.cli.glyph_inspect import _render_txid_human
+
+    payload = _authority_reveal_payload()
+    auth = (payload.get("metadata") or {}).get("authority")
+    assert auth is not None, "the classifier stopped emitting metadata.authority"
+    assert auth["expired"] is True, "the fixture is meant to be an EXPIRED authority"
+
+    text = _render_txid_human(payload)
+    assert "EXPIRED" in text, "an expired authority renders the same as a live one"
+    assert "mudwood-issuer" in text
+    assert "collection:x" in text
+    assert "mint, revoke" in text
+    # And what it does NOT establish, which is the whole reason to print the block.
+    assert "NOT proof any item was minted" in text
+
+
+def test_a_live_authority_does_not_say_expired() -> None:
+    """The other branch. A guard that refuses valid work is a bug, and so is a banner that fires
+    on everything — an EXPIRED label on live authorities would train readers to ignore it."""
+    from pyrxd.cli.glyph_inspect import _render_txid_human
+
+    payload = _authority_reveal_payload(expires="2999-01-01T00:00:00Z")
+    assert (payload["metadata"]["authority"])["expired"] is False
+    assert "EXPIRED" not in _render_txid_human(payload)

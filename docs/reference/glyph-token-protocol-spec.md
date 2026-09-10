@@ -375,7 +375,7 @@ reveal txid.
 
 This is not a convention layered on top of the chain; it is what the commit
 covenant enforces. Walking `build_commit_locking_script`
-(`src/pyrxd/glyph/script.py:218-257`) with the reveal's scriptSig on the stack:
+(`src/pyrxd/glyph/script.py:238-277`) with the reveal's scriptSig on the stack:
 
 ```
 stack: [sig, pubkey, "gly", cbor]
@@ -548,7 +548,7 @@ da                              OP_REFTYPE_OUTPUT
 76 a9 14 <owner_pkh:20> 88 ac   P2PKH tail
 ```
 
-`src/pyrxd/glyph/script.py:218-257`. The FT and NFT variants are byte-identical
+`src/pyrxd/glyph/script.py:238-277`. The FT and NFT variants are byte-identical
 except for the ref-type opcode at **offset 48**: `0x51` for FT, `0x52` for NFT.
 That single byte is pinned against both shapes appearing in one mainnet
 transaction at `tests/test_glyph_dmint.py:227-240`.
@@ -568,7 +568,7 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 ```
 
 `src/pyrxd/glyph/script.py:961-985`. The 102-byte body is a fixed constant
-(`src/pyrxd/glyph/script.py:391-415`) derived from Photonic Wallet's
+(`src/pyrxd/glyph/script.py:411-435`) derived from Photonic Wallet's
 `parseMutableScript` regex with the `gly` magic bytes substituted, and pinned at
 `tests/test_glyph_v2.py:112-121`.
 
@@ -663,7 +663,7 @@ recognises the shape only to report it: `_inspect_script` returns
 `GlyphInspector.find_glyphs` returns a `container-legacy` entry with
 `spendable=False`, `GlyphScanner` logs it and does not hand it back as a token,
 and `build_nft_transfer_tx` refuses it by name
-(`src/pyrxd/glyph/script.py:732-780`).
+(`src/pyrxd/glyph/script.py:762-810`).
 
 ### 7.6 dMint contracts
 

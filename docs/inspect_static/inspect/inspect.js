@@ -755,7 +755,44 @@ function renderFetchedTxCard(payload) {
       if (tl.hint) mdl.appendChild(kv("timelock hint", tl.hint));
       mdl.appendChild(kv("timelock cek commitment", tl.cek_hash));
     }
+
+    // AUTHORITY — claims, EXPIRED, and anything validate_authority could not read.
+    //
+    // The Python computed this whole block and NEITHER renderer read it, so an authority that
+    // expired years ago looked identical to a live one on both surfaces — while the AUTHORITY
+    // banner on this page affirmatively told the reader the holder "can authorize operations".
+    // `problems` is the signal that the expiry did not even parse, and it was the least visible
+    // of the lot. Every value goes through `kv`, which assigns to textContent.
+    const authority = metadata.authority;
+    if (authority) {
+      const claims = authority.claims || {};
+      if (claims.issuer) mdl.appendChild(kv("authority issuer", _capText(claims.issuer)));
+      if (claims.scope) mdl.appendChild(kv("authority scope", _capText(claims.scope)));
+      if (Array.isArray(claims.permissions) && claims.permissions.length > 0) {
+        const shown = claims.permissions.slice(0, _ENTRY_CAP).map((p) => _capText(p)).join(", ");
+        mdl.appendChild(kv("authority permissions", shown));
+        if (claims.permissions.length > _ENTRY_CAP) {
+          mdl.appendChild(kv("", `… and ${claims.permissions.length - _ENTRY_CAP} more not shown`));
+        }
+      }
+      if (claims.expires) mdl.appendChild(kv("authority expires", _capText(claims.expires)));
+      if (claims.revocable === false) mdl.appendChild(kv("authority revocable", "false"));
+      if (authority.expired) mdl.appendChild(kv("authority status", "*** EXPIRED ***"));
+      for (const problem of authority.problems || []) {
+        mdl.appendChild(kv("authority unreadable", _capText(problem)));
+      }
+    }
     wrapper.appendChild(mdl);
+    if (authority) {
+      // WHAT THE MARKER IS NOT. It says the token calls itself an authority; it does not
+      // establish that any item was minted under it, nor that the issuer still honours it.
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: "These are the token's own claims, not a verdict — the AUTHORITY marker does not " +
+              "establish that any item was minted under this authority. That question is " +
+              "verify_authority_gate's, and it needs the item's genesis output.",
+      }));
+    }
     if (metadata.timelock) {
       wrapper.appendChild(el("p", {
         class: "card-note",

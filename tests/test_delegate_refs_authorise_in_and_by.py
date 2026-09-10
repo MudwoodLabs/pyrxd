@@ -31,6 +31,7 @@ from pyrxd.glyph.script import (
     DELEGATE_BURN_SCRIPT_SIZE,
     DELEGATE_COMMIT_PREFIX_SIZE,
     DELEGATE_TOKEN_SCRIPT_SIZE,
+    build_authority_gated_nft_script,
     build_commit_locking_script,
     build_delegate_base_script,
     build_delegate_burn_script,
@@ -46,6 +47,7 @@ from pyrxd.glyph.script import (
     is_nft_script,
     parse_delegate_base_script,
     parse_delegate_burn_script,
+    split_delegate_commit_prefix,
 )
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
@@ -383,12 +385,14 @@ def test_the_honest_non_delegate_path_still_works_unchanged():
 def test_delegate_setup_is_two_steps_because_tokens_need_the_bases_outpoint():
     builder = GlyphBuilder()
 
-    step1 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH)
+    step1 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_scripts=_parents(PKH, [CONTAINER, AUTHOR]))
     assert parse_delegate_base_script(step1.base_script) == (CONTAINER.to_bytes(), AUTHOR.to_bytes())
     assert step1.authorised_refs == (CONTAINER, AUTHOR)
     assert step1.token_scripts == ()  # no base ref yet, so no tokens
 
-    step2 = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH, base_ref=BASE, token_count=3)
+    step2 = builder.prepare_delegate_setup(
+        PKH, [CONTAINER, AUTHOR], parent_scripts=_parents(PKH, [CONTAINER, AUTHOR]), base_ref=BASE, token_count=3
+    )
     assert len(step2.token_scripts) == 3
     # Every token carries the SAME base ref — they are distinguished by being
     # separate UTXOs, not by their scripts (Photonic createDelegateTokens).
@@ -406,7 +410,7 @@ def test_the_base_transaction_must_re_create_the_parents_or_it_burns_them():
     hands the caller those outputs rather than describing them in prose.
     """
     builder = GlyphBuilder()
-    setup = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_owner_pkh=PKH)
+    setup = builder.prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_scripts=_parents(PKH, [CONTAINER, AUTHOR]))
 
     assert setup.parent_scripts == (
         build_nft_locking_script(PKH, CONTAINER),
@@ -420,16 +424,16 @@ def test_a_parent_can_be_re_created_to_a_different_holder():
     """The spender is normally the owner, but the two need not be the same key."""
     builder = GlyphBuilder()
     cold = Hex20(bytes.fromhex("00" * 19 + "ff"))
-    setup = builder.prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=cold)
+    setup = builder.prepare_delegate_setup(PKH, [CONTAINER], parent_scripts=_parents(cold, [CONTAINER]))
     assert setup.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
 
 
 def test_delegate_setup_refuses_the_two_ways_to_build_a_useless_one():
     builder = GlyphBuilder()
     with pytest.raises(ValidationError, match="at least one ref"):
-        builder.prepare_delegate_setup(PKH, [], parent_owner_pkh=PKH)
+        builder.prepare_delegate_setup(PKH, [], parent_scripts=[])
     with pytest.raises(ValidationError, match="token_count requires base_ref"):
-        builder.prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=PKH, token_count=2)
+        builder.prepare_delegate_setup(PKH, [CONTAINER], parent_scripts=_parents(PKH, [CONTAINER]), token_count=2)
 
 
 def test_resolver_uses_the_vout_in_the_ref_not_the_first_output_that_parses():
@@ -684,33 +688,61 @@ def test_an_unfetchable_base_leaves_the_claim_unresolved_not_crashed():
     assert payload["metadata"]["delegate_burns"]
 
 
-def test_parent_owner_pkh_has_no_default_and_never_should():
-    """A default here silently moves COLD singletons into a HOT key.
+def test_the_parents_are_re_created_from_their_OWN_scripts_not_rebuilt_from_a_pkh():
+    """Rebuilding a parent output from a PKH strips whatever the parent carried.
 
-    `prepare_delegate_setup` exists to serve a hot minting service, so
-    `owner_pkh` is typically the hot key while the container and author are held
-    cold. Defaulting `parent_owner_pkh` to `owner_pkh` re-created the parents to
-    the hot wallet in the one transaction whose stated purpose is letting them
-    go back to cold storage — and the docstring one screen above said exactly
-    that. It also silently consolidated two parents held by different keys.
+    This test replaces `test_parent_owner_pkh_has_no_default_and_never_should`, and the change is
+    worth recording. That test pinned a `parent_owner_pkh` parameter as required, because
+    defaulting it to `owner_pkh` re-created cold-held singletons to the HOT key in the one
+    transaction whose purpose is letting them go back to cold storage. The reasoning was right and
+    the mechanism was too weak: the method still rebuilt each parent with
+    `build_nft_locking_script(parent_owner_pkh, ref)`, which is precisely what
+    `prepare_authority_gated_reveal` — forty lines away in the same file — documents as unsafe and
+    refuses to do, because it STRIPS anything the parent itself carried.
 
-    Pinned structurally as well as behaviourally: re-adding the default is a
-    one-word change that no other test in this file would notice.
+    So a container or author that is itself authority-gated (101 bytes), mutable, or held by a
+    soulbound covenant came back as a plain 63-byte NFT: ref preserved, covenant gone, silently.
+
+    Taking each parent's own script verbatim closes that AND makes the original hazard
+    unrepresentable — a parent keeps paying whoever it already paid, so there is no destination to
+    default wrongly and no two-parents-consolidated case left to argue about in prose.
     """
     import inspect as _inspect
 
-    param = _inspect.signature(GlyphBuilder.prepare_delegate_setup).parameters["parent_owner_pkh"]
-    assert param.default is _inspect.Parameter.empty, (
-        "parent_owner_pkh must stay required — a default sends cold singletons to the hot key"
+    params = _inspect.signature(GlyphBuilder.prepare_delegate_setup).parameters
+    assert "parent_owner_pkh" not in params, (
+        "parent_owner_pkh is back. Rebuilding a parent output from a PKH cannot preserve a "
+        "covenant the parent carries — take parent_scripts instead."
+    )
+    assert params["parent_scripts"].default is _inspect.Parameter.empty, (
+        "parent_scripts must stay required — an optional one leaves the rebuild reachable"
     )
 
-    with pytest.raises(TypeError, match="parent_owner_pkh"):
-        GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER])
+    # THE CASE THE OLD SHAPE DESTROYED: a container that is itself authority-gated.
+    authority = GlyphRef(txid="ee" * 32, vout=2)
+    gated_container = build_authority_gated_nft_script(PKH, CONTAINER, authority)
+    assert len(gated_container) == 101, "the fixture must be a gated parent, not a plain NFT"
 
-    # The honest call is unaffected, and a cold destination is honoured.
+    setup = GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_scripts=[gated_container])
+    assert setup.parent_scripts == (gated_container,), (
+        "the gated container was not re-created verbatim — its covenant was stripped"
+    )
+    assert setup.parent_scripts[0] != build_nft_locking_script(PKH, CONTAINER)
+
+    # The ordinary case still works, and a cold destination is still honoured — because the
+    # parent's own script already names it.
     cold = Hex20(bytes.fromhex("00" * 19 + "ff"))
-    setup = GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_owner_pkh=cold)
-    assert setup.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
+    plain = GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_scripts=_parents(cold, [CONTAINER]))
+    assert plain.parent_scripts == (build_nft_locking_script(cold, CONTAINER),)
+
+
+def test_a_parent_script_that_does_not_carry_its_ref_is_refused():
+    """A reordered or mismatched list would otherwise re-create the WRONG parent, silently."""
+    other = GlyphRef(txid="99" * 32, vout=0)
+    with pytest.raises(ValidationError, match="does not carry that ref"):
+        GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER], parent_scripts=[build_nft_locking_script(PKH, other)])
+    with pytest.raises(ValidationError, match="parent_scripts"):
+        GlyphBuilder().prepare_delegate_setup(PKH, [CONTAINER, AUTHOR], parent_scripts=[])
 
 
 def test_delegated_refs_are_ignored_when_the_tx_burned_no_delegate():
@@ -757,3 +789,82 @@ def test_an_ok_verdict_cannot_carry_basis_NONE():
             basis=RelationshipBasis.DIRECT,
             reason="a fixture that should not be constructible",
         )
+
+
+# ---------------------------------------------------------------------------
+# The prefix bytes themselves — the only consensus enforcement in the scheme
+# ---------------------------------------------------------------------------
+
+
+def _parents(pkh, refs):
+    """The parents' own current scripts. Plain NFTs here — the point of the parameter is that the
+    CALLER supplies whatever the parent actually carries, so a plain one is the ordinary case."""
+    return [build_nft_locking_script(pkh, r) for r in refs]
+
+
+class TestTheDelegateCommitPrefixIsPinnedByte:
+    """A length check is not a check of a covenant.
+
+    Until this existed, the only assertion anywhere about `build_delegate_commit_prefix` was
+    `len(...) == 56`, and `split_delegate_commit_prefix` validated a prefix by REBUILDING it with
+    the same builder — which proves self-consistency, not correctness. Measured: changing the
+    `OP_1` at offset 54 to `OP_2`, so the covenant demands TWO burn outputs, kept the length at 56
+    and passed 12,490 tests. Every honest delegate mint would then be refused by the node, and the
+    photons in the already-broadcast commit plus the delegate token spent to create it are
+    unrecoverable — no second chance, no upgrade path.
+
+    The other two scripts added by the same feature each have a regex pinning their bytes, and the
+    equivalent plants against them DO fail. This is that second spelling for the prefix.
+    """
+
+    #: Hand-written, NOT generated from the builder. That is the entire point: a generated
+    #: expectation changes with the thing it is supposed to pin.
+    TAIL_HEX = "76de009d01d17c056a0364656c7e7eaae6519d"
+
+    def test_the_prefix_is_exactly_these_bytes(self) -> None:
+        ref = GlyphRef(txid="ab" * 32, vout=7)
+        built = build_delegate_commit_prefix(ref).hex()
+        expected = "d0" + ("ab" * 32) + "07000000" + self.TAIL_HEX
+        assert built == expected, (
+            "the delegate commit prefix changed. This is a COVENANT: if the new bytes are wrong, "
+            "every delegate mint is node-rejected and the commit value is stranded. Re-derive the "
+            "opcodes against Radiant-Core's script.h before updating this literal."
+        )
+        assert len(built) // 2 == DELEGATE_COMMIT_PREFIX_SIZE == 56
+
+    def test_each_load_bearing_opcode_is_the_one_the_covenant_needs(self) -> None:
+        """Named individually, so a failure says WHICH rule changed rather than 'bytes differ'."""
+        tail = bytes.fromhex(self.TAIL_HEX)
+        assert tail[0] == 0x76, "OP_DUP — the ref copy the output-count check consumes"
+        assert tail[1] == 0xDE, "OP_REFOUTPUTCOUNT_OUTPUTS (0xdd is _UTXOS and asks a different question)"
+        assert tail[2] == 0x00, "OP_0 — the base ref must appear in NO output"
+        assert tail[3] == 0x9D, "OP_NUMEQUALVERIFY"
+        assert tail[4:6] == b"\x01\xd1", "PUSH 1 <0xd1> — the burn script's OP_REQUIREINPUTREF byte"
+        assert tail[6] == 0x7C, "OP_SWAP"
+        assert tail[7:13] == b"\x05\x6a\x03\x64\x65\x6c", 'PUSH 5 <OP_RETURN "del">'
+        assert tail[13] == 0x7E and tail[14] == 0x7E, "two OP_CAT — rebuild the burn script"
+        assert tail[15] == 0xAA, "OP_HASH256"
+        assert tail[16] == 0xE6, "OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS (0xe5 is _UTXOS)"
+        assert tail[17] == 0x51, "OP_1 — EXACTLY ONE burn output. OP_2 here bricks every mint."
+        assert tail[18] == 0x9D, "OP_NUMEQUALVERIFY"
+
+    def test_the_splitter_refuses_a_prefix_the_builder_did_not_write(self) -> None:
+        """A tampered prefix is refused.
+
+        NOTE WHAT THIS DOES NOT PROVE. The previous splitter validated by rebuilding with
+        `build_delegate_commit_prefix`, and that rejects a tampered prefix just as well — planting
+        the rebuild back leaves this test green. The circularity it removes matters against a WRONG
+        BUILDER, where the rebuild agrees with whatever is emitted; `test_the_prefix_is_exactly_
+        these_bytes` is the assertion that catches that, and it is the load-bearing one.
+        """
+        ref = GlyphRef(txid="cd" * 32, vout=1)
+        core = build_commit_locking_script(b"\x11" * 32, Hex20(b"\x22" * 20), is_nft=True)
+        good = build_delegate_commit_prefix(ref) + core
+        assert split_delegate_commit_prefix(good) == (ref, core)
+
+        for offset, name in ((37, "OP_DUP"), (38, "OP_REFOUTPUTCOUNT_OUTPUTS"), (54, "OP_1")):
+            tampered = bytearray(good)
+            tampered[offset] ^= 0x01
+            assert split_delegate_commit_prefix(bytes(tampered)) == (None, bytes(tampered)), (
+                f"a prefix with a corrupted {name} was accepted as a delegate commit"
+            )

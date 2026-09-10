@@ -156,9 +156,11 @@ def base(node, parents):  # noqa: F811
     setup = GlyphBuilder().prepare_delegate_setup(
         owner_pkh,
         [container["ref"], author["ref"]],
-        parent_owner_pkh=owner_pkh,
+        # THE PARENTS' OWN CURRENT SCRIPTS, re-created verbatim. Passing a PKH to rebuild them
+        # from would strip any covenant a parent carries — see the builder's docstring.
+        parent_scripts=[container["script"], author["script"]],
     )
-    # The parents are re-created to ONE key here so a single unlock signs the
+    # Both parents happen to be held by ONE key here so a single unlock signs the
     # later spends; nothing about the mechanism requires that.
     total = container["value"] + author["value"]
     change = total - _BASE_VALUE - 2 * _PARENT_CARRIER - _FEE
@@ -187,6 +189,10 @@ def base(node, parents):  # noqa: F811
         "key": owner,
         "pkh": owner_pkh,
         "authorised": (container["ref"], author["ref"]),
+        # The parents as they exist NOW, for step 2 to re-create verbatim. Rebuilding them from a
+        # PKH would strip any covenant they carry; the builder refuses a script that does not
+        # carry its paired ref, so this list is order-checked too.
+        "parent_scripts": (container["script"], author["script"]),
     }
 
 
@@ -196,7 +202,7 @@ def tokens(node, base):  # noqa: F811
     setup = GlyphBuilder().prepare_delegate_setup(
         base["pkh"],
         list(base["authorised"]),
-        parent_owner_pkh=base["pkh"],
+        parent_scripts=list(base["parent_scripts"]),
         base_ref=base["ref"],
         token_count=_TOKEN_COUNT,
     )

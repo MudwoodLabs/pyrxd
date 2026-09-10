@@ -8,6 +8,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **A seven-reviewer panel over the Glyph write sides, and the fixes it forced.** As with the
+  form-2 stack, NONE OF THIS REACHED A RELEASE — the write sides are unreleased. Recorded because
+  the shape of the mistakes is reusable.
+
+  The finding worth reading is about testing, not code. **The delegate commit prefix — the only
+  consensus enforcement in the whole delegate scheme — had no byte-level test.** The single
+  assertion anywhere was `len(...) == 56`, and `split_delegate_commit_prefix` validated a prefix by
+  REBUILDING it with the same builder, which proves self-consistency, not correctness. Measured:
+  changing the `OP_1` at offset 54 to `OP_2`, so the covenant demands TWO burn outputs, kept the
+  length at 56 and **passed 12,490 tests** — while making every honest delegate mint node-rejected
+  and stranding both the commit photons and the delegate token spent to create it. The other two
+  scripts added by the same feature each had a regex pinning their bytes and the equivalent plants
+  against them DO fail; the prefix was the one with no second spelling. It now has a
+  hand-written byte literal, a per-opcode assertion naming which consensus rule each byte carries,
+  and `DELEGATE_COMMIT_PREFIX_RE` that the splitter matches instead of rebuilding.
+
+  - **`verify_burn` refused every burn proof Photonic Wallet has ever written.** pyrxd wrote
+    `"<txid>:<vout>"`; Photonic writes `Outpoint.toString()` — txid hex then the vout as 8
+    big-endian hex digits, no separator — on both sides, in `createBurnProof` and in `validateBurn`.
+    Neither project emitted the other's form, so every real proof was rejected with a sentence that
+    was itself false: "the burn proof names X, not Y", about a proof naming the same token. Both
+    spellings are accepted now; a proof naming a DIFFERENT token is still refused in either.
+  - **`verify_authority_gate` answered about whichever item the caller passed.** It took only
+    (script, authority), so handing it item B's genesis output while asking about item A returned
+    `ok=True` with basis GATE. No forgery — a substitution was enough, and the function could not
+    notice although B's ref was in the bytes it was given. `item_ref` is now keyword-only and
+    REQUIRED, so the unbound call is not expressible.
+  - **`prepare_delegate_setup` stripped covenants from the parents it was re-creating.** It rebuilt
+    each parent with `build_nft_locking_script(parent_owner_pkh, ref)` — the exact hazard
+    `prepare_authority_gated_reveal` documents forty lines away and refuses, because rebuilding
+    from a PKH strips whatever the parent carried. A container or author that is itself
+    authority-gated, mutable, or soulbound came back as a plain 63-byte NFT (ref preserved,
+    covenant gone) in the one transaction whose purpose is to leave the parents untouched before
+    they return to cold storage. It now takes `parent_scripts` — the parents' own current scripts —
+    and cross-checks each against its ref. That also makes the older hazard the removed
+    `parent_owner_pkh` guarded against unrepresentable: a parent keeps paying whoever it paid.
+  - **The CLI printed none of the caveats.** Five new row types had no branch in the human
+    renderer, so `pyrxd glyph inspect` showed `type: op_return-burn` and nothing else — while the
+    browser rendered the claims and the note in full. The sentences that exist to stop over-trust
+    ("anyone can write one about any token"; "gated on this authority NOW — the holder can transfer
+    to a plain NFT script and drop the gate") reached no terminal. The `note` is now printed
+    generically for every row that carries one, so the next type added cannot repeat this.
+  - **An expired authority was indistinguishable from a live one, on BOTH surfaces.**
+    `metadata.authority` — issuer, scope, permissions, expiry, `expired`, and the `problems` list
+    saying the expiry did not even parse — was computed by the classifier and rendered by nobody.
+    Both renderers show it now, and `problems` goes through the sanitiser its siblings already
+    crossed (measured: `repr()` escapes bidi overrides but NOT combining marks, 40 of which
+    survived).
+  - The three regtest suites proving these on a node were in **no CI workflow** — so "measured on a
+    node" was true only of hand runs. They are in `integration.yml` and the `test-regtest` task now.
+
+  **Scope, stated plainly rather than implied:** the four write sides are **builder-level**.
+  `GlyphClient` and the CLI cannot mint a delegated, authority-gated, DAT or burn transaction, and
+  the glossary said the opposite ("ships no `prepare_authority_*` builder — you cannot mint one
+  with pyrxd today"). `tests/test_glyph_write_sides_are_builder_only.py` pins that scope in both
+  directions, so if one gains a production caller the claim fails rather than rotting.
+
+  Also corrected: the CHANGELOG listed `has_permission` as shipped when the spec deliberately
+  records that pyrxd ships none, and "each mint burns one" was wrong in three places — the covenant
+  requires exactly one burn output per REVEAL and does not count mints, so N commits can share one
+  reveal and one burn marker. Anyone metering a delegated collection by counting them undercounts.
+
+
 - **The HashMark §7.6 form-2 stack was re-attacked before it shipped, and the walker was reading
   the wrong bytes.** NONE OF THIS EVER REACHED A RELEASE — every defect below is in unreleased
   code from the same branch, found by a seven-reviewer panel across two model families and fixed
@@ -84,7 +147,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     producer — the CBOR emit — so a `by` claim could be declared and never authorised,
     and `relationships.py` reported every one of them `UNBACKED`. The parents are spent
     **once** into a base output under `OP_REQUIREINPUTREF`; disposable delegate tokens
-    point at that base; each mint burns one. `GlyphBuilder.prepare_delegate_setup`,
+    point at that base. The covenant requires the reveal to carry EXACTLY ONE burn output naming
+    the base — it does not count mints, and N commits spending N tokens can share a single
+    reveal and a single burn output, so burn markers are not a per-mint tally.
+    `GlyphBuilder.prepare_delegate_setup`,
     `CommitParams.delegate_ref`, `RevealScripts.delegate_burn_script`, and
     `delegate_burn_refs` / `resolve_delegated_refs` on the read side.
   - **`RelationshipVerdict.backing`** distinguishes `DIRECT` (the reveal spent the
@@ -114,7 +180,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     returned `ok=False` for a genuine burn. Requiring it means that answer cannot
     arise: you either have the evidence or you cannot ask.
   - **AUTHORITY**: `build_authority_metadata`, `verify_authority_gate`,
-    `verify_authority_claim`, `has_permission`, and the 101-byte
+    `verify_authority_claim`, and the 101-byte
     `build_authority_gated_nft_script` covenant with
     `GlyphBuilder.prepare_authority_gated_reveal`.
   - **BURN**: `build_burn_proof_script` / `parse_burn_proof` / `verify_burn`, and

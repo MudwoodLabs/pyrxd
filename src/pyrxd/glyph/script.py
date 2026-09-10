@@ -191,6 +191,26 @@ DELEGATE_COMMIT_PREFIX_SIZE = 56
 DELEGATE_TOKEN_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
 DELEGATE_BURN_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})6a0364656c$")
 
+#: The delegate commit prefix, spelled INDEPENDENTLY of the builder that emits it.
+#:
+#: WHY THIS EXISTS. These 19 tail bytes are the only consensus enforcement in the whole delegate
+#: scheme, and nothing pinned them. The only assertion any test made was
+#: ``len(build_delegate_commit_prefix(...)) == 56``, and ``split_delegate_commit_prefix`` validated
+#: a prefix by REBUILDING it with the same builder — self-consistency, not correctness. Measured:
+#: changing the ``OP_1`` at offset 54 to ``OP_2`` (so the covenant demands TWO burn outputs, which
+#: would make every honest delegate mint node-rejected and strand both the commit photons and the
+#: delegate token spent to create it) left the length at 56 and passed 12,490 tests.
+#:
+#: The other two new scripts already had this and their equivalent plants DO fail —
+#: ``AUTHORITY_GATED_SCRIPT_RE`` and ``DAT_COMMIT_SCRIPT_RE`` are each a second spelling that has
+#: to be changed in step. This is the same thing for the prefix.
+#:
+#: Reading the tail: OP_DUP, OP_REFOUTPUTCOUNT_OUTPUTS, OP_0, OP_NUMEQUALVERIFY (the base ref
+#: appears in no output), PUSH<0xd1>, OP_SWAP, PUSH<OP_RETURN "del">, OP_CAT, OP_CAT (rebuild the
+#: burn script), OP_HASH256, OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS, OP_1, OP_NUMEQUALVERIFY
+#: (exactly one such output exists).
+DELEGATE_COMMIT_PREFIX_RE = re.compile(r"^d0([0-9a-f]{72})76de009d01d17c056a0364656c7e7eaae6519d$")
+
 
 # ---------------------------------------------------------------------------
 # Script construction
@@ -610,17 +630,27 @@ def split_delegate_commit_prefix(script: bytes) -> tuple[GlyphRef | None, bytes]
     reads as "not a commit script" — which is how a mint built through the very
     feature that adds the prefix becomes invisible to the code that inspects it.
 
-    Returns ``(None, script)`` unchanged when there is no prefix. The prefix is
-    matched against its exact opcode layout (the ref being the only variable
-    part), so a script that merely starts with ``0xd0`` is not mistaken for one.
+    Returns ``(None, script)`` unchanged when there is no prefix. The prefix is matched against
+    :data:`DELEGATE_COMMIT_PREFIX_RE` — an INDEPENDENT spelling of the layout — so a script that
+    merely starts with ``0xd0`` is not mistaken for one.
+
+    IT USED TO REBUILD THE PREFIX with :func:`build_delegate_commit_prefix` and compare. Both
+    forms reject a TAMPERED prefix equally well; the difference is a WRONG BUILDER, where the
+    rebuild agrees with whatever the builder emits and this does not.
+
+    Being accurate about the split: what actually catches a wrong builder is the byte-literal
+    assertion in ``TestTheDelegateCommitPrefixIsPinnedByte``, which is where the covenant's bytes
+    are spelled out by hand. This regex is defence in depth — it means a wrong builder has to get
+    past two spellings instead of one, and it removes the circularity that let a single edit move
+    the writer and its checker together.
     """
     if len(script) <= DELEGATE_COMMIT_PREFIX_SIZE or script[0] != 0xD0:
         return None, script
     head, core = script[:DELEGATE_COMMIT_PREFIX_SIZE], script[DELEGATE_COMMIT_PREFIX_SIZE:]
-    ref_bytes = head[1 : 1 + REF_OPERAND_WIDTH]
-    if head != build_delegate_commit_prefix(GlyphRef.from_bytes(ref_bytes)):
+    match = DELEGATE_COMMIT_PREFIX_RE.fullmatch(head.hex())
+    if match is None:
         return None, script
-    return GlyphRef.from_bytes(ref_bytes), core
+    return GlyphRef.from_bytes(bytes.fromhex(match.group(1))), core
 
 
 def extract_delegate_ref_from_commit_script(script: bytes) -> GlyphRef | None:

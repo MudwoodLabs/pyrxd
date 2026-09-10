@@ -337,7 +337,7 @@ check-vendor = "python3 scripts/refresh_radiant_core_vendor.py --check"
 # (.github/workflows/integration.yml, job `regtest-core`). Needs docker and the
 # radiant-core regtest image — build it once with `pyrxd regtest setup`. Each module
 # stands up its own container, so this is sequential by construction; ~2 min.
-test-regtest = 'RADIANT_REGTEST=1 pytest -o "addopts=" -m integration -q tests/test_htlc_regtest_e2e.py tests/test_soulbound_covenant_regtest.py tests/test_wallet_send_regtest_e2e.py tests/test_container_regtest_e2e.py tests/test_mut_wave_regtest_e2e.py tests/test_ft_airdrop_regtest_e2e.py tests/test_ft_transfer_regtest_e2e.py tests/test_gravity_maker_offer_regtest_e2e.py tests/test_cold_recovery_regtest_e2e.py tests/test_remaining_builder_floors_regtest_e2e.py tests/test_fee_floor_boundary_regtest_e2e.py'
+test-regtest = 'RADIANT_REGTEST=1 pytest -o "addopts=" -m integration -q tests/test_htlc_regtest_e2e.py tests/test_soulbound_covenant_regtest.py tests/test_wallet_send_regtest_e2e.py tests/test_container_regtest_e2e.py tests/test_mut_wave_regtest_e2e.py tests/test_ft_airdrop_regtest_e2e.py tests/test_ft_transfer_regtest_e2e.py tests/test_gravity_maker_offer_regtest_e2e.py tests/test_cold_recovery_regtest_e2e.py tests/test_remaining_builder_floors_regtest_e2e.py tests/test_fee_floor_boundary_regtest_e2e.py tests/test_authority_regtest_e2e.py tests/test_dat_and_burn_regtest_e2e.py tests/test_delegate_regtest_e2e.py'
 # `task check-manifest` diffs git-tracked files against the built sdist and
 # fails on any gap, so a file declared in `[tool.poetry] include` can't
 # silently stop shipping again, and a new top-level file/dir can't silently go

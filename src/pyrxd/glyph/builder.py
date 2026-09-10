@@ -1105,7 +1105,7 @@ class GlyphBuilder:
         owner_pkh: Hex20,
         authorised_refs: Sequence[GlyphRef],
         *,
-        parent_owner_pkh: Hex20,
+        parent_scripts: Sequence[bytes],
         base_ref: GlyphRef | None = None,
         token_count: int = 0,
     ) -> DelegateSetupScripts:
@@ -1167,16 +1167,30 @@ class GlyphBuilder:
         :class:`~pyrxd.glyph.relationships.RelationshipBasis` reports
         DELEGATED separately from DIRECT rather than flattening the two.
 
-        :param parent_owner_pkh: who the re-created parent outputs pay to.
-            **Required, and deliberately not defaulted to** *owner_pkh*. It read
-            as the safe default — whoever spends a singleton holds it — but this
-            method exists to serve a HOT minting service, so *owner_pkh* is
-            typically the hot key while the container and author are held cold.
-            Defaulting would have silently moved them to the hot wallet, in the
-            one transaction whose whole purpose is to let them go back to cold
-            storage, and a later hot-key compromise would take a singleton that
-            can never be re-minted. It also silently consolidates two parents
-            held by two different keys. State where each parent goes.
+        :param parent_scripts: the parents' OWN current locking scripts, in the
+            same order as *authorised_refs*, re-created verbatim.
+
+            **This used to be a single** ``parent_owner_pkh`` **and the outputs
+            were rebuilt with** :func:`~pyrxd.glyph.script.build_nft_locking_script`.
+            That is the exact hazard :meth:`prepare_authority_gated_reveal`
+            documents forty lines from here and refuses: rebuilding from a PKH
+            STRIPS whatever the parent itself carried. A container or author
+            that is itself authority-gated (101 bytes), mutable, or held by a
+            soulbound covenant came back as a plain 63-byte NFT — ref preserved,
+            covenant gone — in the one transaction whose stated purpose is to
+            leave the parents untouched before they return to cold storage.
+
+            Taking the scripts verbatim also settles the question the old
+            parameter existed for. A parent keeps paying whoever it already
+            paid, so a hot minting service cannot silently move a cold-held
+            singleton to the hot key, and two parents held by two different keys
+            are not consolidated. Both were argued for at length in prose; now
+            neither is expressible.
+
+            Each script is cross-checked with
+            :func:`~pyrxd.glyph.script.script_carries_ref` against the ref it is
+            paired with, so a mismatched or reordered list is refused rather
+            than silently re-creating the wrong parent.
         :raises ValidationError: *authorised_refs* is empty, or *token_count* is
             given without *base_ref* (or vice versa with no tokens to build).
         """
@@ -1199,10 +1213,23 @@ class GlyphBuilder:
                 "first, then call again with base_ref=<that output's outpoint>."
             )
         refs = tuple(authorised_refs)
+        parents = tuple(parent_scripts)
+        if len(parents) != len(refs):
+            raise ValidationError(
+                f"prepare_delegate_setup() got {len(parents)} parent_scripts for {len(refs)} "
+                "authorised_refs — pass each parent's own current locking script, in the same order."
+            )
+        for ref, script in zip(refs, parents, strict=True):
+            if not script_carries_ref(script, ref.to_bytes()):
+                raise ValidationError(
+                    f"the parent script paired with {ref.txid}:{ref.vout} does not carry that ref. "
+                    "Pass each parent's OWN locking script in the same order as authorised_refs; "
+                    "re-creating the wrong script here strips whatever covenant the parent carried."
+                )
         return DelegateSetupScripts(
             base_script=build_delegate_base_script(owner_pkh, refs),
             authorised_refs=refs,
-            parent_scripts=tuple(build_nft_locking_script(parent_owner_pkh, ref) for ref in refs),
+            parent_scripts=parents,
             token_scripts=tuple(build_delegate_token_script(owner_pkh, base_ref) for _ in range(token_count))
             if base_ref is not None
             else (),

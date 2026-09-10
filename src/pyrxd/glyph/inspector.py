@@ -176,7 +176,10 @@ class GlyphInspector:
                 # Also spendable and token-bearing, and the SAME 63 bytes as an
                 # NFT singleton with one opcode changed — so the `is_nft_script`
                 # branch above correctly does not claim it, and nothing else did.
-                # A holder needs to see these: they are consumed one per mint.
+                # A holder needs to see these: they authorise mints against the base.
+                # NOT a per-mint tally — the covenant requires exactly one burn output per
+                # REVEAL, and one reveal can carry several commits, so counting burn markers
+                # undercounts mints by an arbitrary factor.
                 results.append(
                     GlyphOutput(
                         vout=vout,

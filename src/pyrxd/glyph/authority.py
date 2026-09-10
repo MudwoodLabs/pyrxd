@@ -143,7 +143,7 @@ def build_authority_metadata(
         raise ValidationError("authority issuer is required — an authority naming no issuer vouches for nothing")
     # The DECODER truncates a list attr at this length. Minting past it is
     # irreversible and silent: entries beyond the cap decode away and
-    # `has_permission` answers False for them forever. Refuse here, where the
+    # nothing can read them back. Refuse here, where the
     # caller can still change their mind.
     if len(permissions) > _MAX_ATTRS_LIST_LEN:
         raise ValidationError(
@@ -269,7 +269,12 @@ def is_authority_expired(metadata: GlyphMetadata | None, *, now: datetime | None
     return expiry < (now or datetime.now(timezone.utc))
 
 
-def verify_authority_gate(genesis_output_script: bytes, authority_ref: GlyphRef) -> AuthorityVerdict:
+def verify_authority_gate(
+    genesis_output_script: bytes,
+    authority_ref: GlyphRef,
+    *,
+    item_ref: GlyphRef,
+) -> AuthorityVerdict:
     """Was this item minted under *authority_ref*? The consensus-backed question.
 
     *genesis_output_script* must be the item's output script **as it was created**
@@ -291,7 +296,27 @@ def verify_authority_gate(genesis_output_script: bytes, authority_ref: GlyphRef)
             basis=AuthorityBasis.NONE,
             reason="the genesis output is not an authority-gated script",
         )
-    gate_ref, _item_ref, _pkh = parsed
+    gate_ref, gated_item_ref, _pkh = parsed
+
+    # WHICH ITEM IS THIS ABOUT. `item_ref` is keyword-only and required because the answer used to
+    # be whatever script the caller passed: this function took only the script and the authority,
+    # so handing it item B's genesis output while asking about item A returned ok=True with basis
+    # GATE. Measured. No forgery is needed — a substitution is enough, and the function could not
+    # notice, even though the item's own ref is right there in the bytes it was given.
+    #
+    # Making the parameter required rather than optional is the point: an optional one would leave
+    # the unbound call representable, and this is a security verdict whose first honest caller
+    # writes their code from this signature.
+    if gated_item_ref != item_ref:
+        return AuthorityVerdict(
+            ok=False,
+            basis=AuthorityBasis.NONE,
+            reason=(
+                f"this genesis output is the genesis of {gated_item_ref.txid}:{gated_item_ref.vout}, "
+                f"not of {item_ref.txid}:{item_ref.vout} — it answers about a different item"
+            ),
+            authority_ref=gate_ref,
+        )
     if gate_ref != authority_ref:
         return AuthorityVerdict(
             ok=False,

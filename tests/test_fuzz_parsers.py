@@ -881,7 +881,7 @@ def test_verdict_functions_never_raise_on_arbitrary_outputs(scripts):
         resolved = resolve_delegated_refs(ref.to_bytes(), list(scripts))
         assert isinstance(resolved, tuple)
         for s in scripts:
-            assert isinstance(verify_authority_gate(s, ref).ok, bool)
+            assert isinstance(verify_authority_gate(s, ref, item_ref=ref).ok, bool)
     except Exception as exc:
         _fail_unexpected("verdict functions", exc, scripts)
 

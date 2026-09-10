@@ -362,3 +362,60 @@ def test_a_transaction_burning_two_tokens_answers_for_both():
     # A token neither proof names is still refused.
     third = GlyphRef(txid="33" * 32, vout=2)
     assert not verify_burn(outputs, third, spent).ok
+
+
+def _proof_script_naming(token_ref_text: str) -> bytes:
+    """A real burn-proof script whose `token_ref` is spelled *token_ref_text*.
+
+    Built by taking `build_burn_proof_script`'s own output and substituting the one field, so the
+    version, protocol and push layout are whatever production actually emits. Hand-rolling the
+    script got `v` and `p` wrong and produced a proof `parse_burn_proof` refused, which would have
+    made this test pass for the wrong reason.
+    """
+    import cbor2
+
+    from pyrxd.glyph.burn import build_burn_proof_script
+
+    template = build_burn_proof_script(GlyphRef(txid="ab" * 32, vout=7))
+    marker = template.index(b"\x4c")
+    decoded = cbor2.loads(template[marker + 2 :])
+    decoded["token_ref"] = token_ref_text
+    blob = cbor2.dumps(decoded)
+    return template[:marker] + b"\x4c" + bytes([len(blob)]) + blob
+
+
+def test_a_burn_proof_in_photonics_spelling_is_accepted() -> None:
+    """pyrxd refused every burn proof Photonic has ever written, with a false reason.
+
+    pyrxd writes `"<txid>:<vout>"`. Photonic writes `Outpoint.toString()` — txid hex then the vout
+    as 8 big-endian hex digits, no separator — on BOTH sides: `createBurnProof` builds it that way
+    and `validateBurn` normalises through `Outpoint.fromString(...).toString()` before comparing
+    (`packages/lib/src/burn.ts`). Neither project emits the other's form, so matching only the
+    colon form rejected all of them — and said "the burn proof names X, not Y" about a proof that
+    named the same token in the other implementation's spelling.
+    """
+    from pyrxd.glyph.burn import verify_burn
+
+    ref = GlyphRef(txid="ab" * 32, vout=7)
+    photonic = f"{ref.txid}{(7).to_bytes(4, 'big').hex()}"
+    assert ":" not in photonic and len(photonic) == 72
+
+    held = [build_nft_locking_script(Hex20(b"\x11" * 20), ref)]
+    verdict = verify_burn([_proof_script_naming(photonic)], ref, held)
+    assert verdict.ok, f"a Photonic-spelled burn proof was refused: {verdict.reason}"
+
+    # pyrxd's own spelling must still work — this must not trade one implementation for the other.
+    assert verify_burn([_proof_script_naming(f"{ref.txid}:{ref.vout}")], ref, held).ok
+
+
+def test_a_proof_naming_a_DIFFERENT_token_is_still_refused_in_both_spellings() -> None:
+    """Widening the match must not widen it to everything."""
+    from pyrxd.glyph.burn import verify_burn
+
+    ref = GlyphRef(txid="ab" * 32, vout=7)
+    other = GlyphRef(txid="cd" * 32, vout=1)
+    held = [build_nft_locking_script(Hex20(b"\x11" * 20), ref)]
+
+    for spelling in (f"{other.txid}:{other.vout}", f"{other.txid}{(1).to_bytes(4, 'big').hex()}"):
+        verdict = verify_burn([_proof_script_naming(spelling)], ref, held)
+        assert not verdict.ok, f"a proof naming another token was accepted ({spelling})"

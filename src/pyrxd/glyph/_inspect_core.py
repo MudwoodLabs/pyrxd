@@ -1206,7 +1206,15 @@ def _classify_raw_tx(
                 "expired": is_authority_expired(metadata),
             }
             if problems:
-                authority_payload["problems"] = problems
+                # SANITISED LIKE EVERY SIBLING IN `claims`. `validate_authority` embeds the raw
+                # attacker-chosen `expires` with `!r`, and `repr()` escapes format characters but
+                # NOT combining marks — measured, 40 of them survive a repr that strips the bidi
+                # override beside them. This was the one field in the block that skipped the
+                # sanitiser, harmless only because nothing rendered it; rendering it makes that
+                # live, so it is fixed in the same change.
+                authority_payload["problems"] = [
+                    _truncate_for_human(_sanitize_display_string(str(p))) for p in problems
+                ]
             metadata_payload["authority"] = authority_payload
 
         if metadata.main is not None:

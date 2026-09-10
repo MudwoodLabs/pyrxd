@@ -336,8 +336,33 @@ def _render_txid_human(payload: dict) -> str:
                     )
                 if row.get("token_bearing") is None:
                     lines.append("            token-bearing UNKNOWN (does not decode) — treat as token-bearing")
+            elif type_ == "authority-gated-nft":
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            authority_ref={row.get('authority_ref', '')}")
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ in ("delegate-token", "delegate-burn"):
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            delegate_base_ref={row.get('delegate_base_ref', '')}")
+                if row.get("owner_pkh"):
+                    lines.append(f"            owner_pkh={row['owner_pkh']}")
+                if row.get("spendable") is False:
+                    lines.append("            *** UNSPENDABLE *** (OP_RETURN — the value on it is gone)")
             elif type_ == "error":
                 lines.append(f"            (classifier error: {row.get('error')})")
+
+            # THE CAVEAT, FOR EVERY TYPE THAT HAS ONE — printed generically rather than per
+            # branch. The classifier attaches `note` to say what a row does NOT establish
+            # ("gated on this authority NOW — the holder can transfer to a plain NFT script and
+            # drop the gate"; "anyone can write one about any token"). Five new row types had no
+            # branch here at all, so on the CLI the affirmative type label survived and every one
+            # of those sentences was dropped, while the browser rendered them in full. That is
+            # exactly the failure `_op_return_payload_lines` was written to fix one level down.
+            #
+            # Generic because the alternative is hand-keeping a list of which types have notes,
+            # and the next type added would repeat this.
+            note = row.get("note")
+            if note:
+                lines.append(f"            {_truncate_for_human(str(note))}")
     metadata = payload.get("metadata")
     if metadata is not None:
         lines.append("")
@@ -412,6 +437,34 @@ def _render_txid_human(payload: dict) -> str:
             # and for mode="block" it would be meaningless.
             lines.append("            (unlocked? pass this token's metadata and your chain tip to")
             lines.append("             pyrxd.is_unlocked / pyrxd.get_unlock_remaining)")
+        # AUTHORITY — the claims, whether it has EXPIRED, and anything `validate_authority` could
+        # not read. The classifier computed all of this and neither renderer read it, so an
+        # authority token that expired years ago printed identically to a live one, on both the
+        # terminal and the browser. The one signal that flags an unparseable expiry — `problems` —
+        # was the one nobody could see.
+        auth = metadata.get("authority")
+        if auth:
+            claims = auth.get("claims") or {}
+            lines.append("  authority:")
+            for key in ("issuer", "scope", "expires"):
+                if claims.get(key):
+                    lines.append(f"            {key}: {_truncate_for_human(str(claims[key]))}")
+            perms = claims.get("permissions") or []
+            if perms:
+                shown = ", ".join(_truncate_for_human(str(x)) for x in perms[:_HUMAN_ENTRY_CAP])
+                lines.append(f"            permissions: {shown}")
+                if len(perms) > _HUMAN_ENTRY_CAP:
+                    lines.append(f"            ... and {len(perms) - _HUMAN_ENTRY_CAP} more not shown")
+            if claims.get("revocable") is False:
+                lines.append("            revocable: false")
+            if auth.get("expired"):
+                lines.append("            *** EXPIRED *** (by the `expires` claim above)")
+            for problem in auth.get("problems") or []:
+                lines.append(f"            unreadable: {_truncate_for_human(str(problem))}")
+            # WHAT THIS IS NOT. The marker says the token calls itself an authority; it does not
+            # establish that anything was minted under it, nor that the issuer still honours it.
+            lines.append("            (a marker and its claims — NOT proof any item was minted")
+            lines.append("             under it; see verify_authority_gate for that question)")
     # THE OTHER GLYPHS IN A MULTI-GLYPH REVEAL (#577). Pointing at a JSON key is
     # no use to someone reading the terminal, which is where this renderer is read.
     others = [
@@ -644,6 +697,21 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
             out.extend(_wave_context_lines(hm.get("wave_identity"), indent))
         else:
             out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+
+    # BURN — the claims AND the note. The browser prints both (`inspect.js`); the CLI printed
+    # neither, so a burn proof rendered as the bare label `type: op_return-burn` and the sentence
+    # that stops a reader believing it ("anyone can write one about any token") reached nobody.
+    # Every value is CLAIMED: the proof is an OP_RETURN, so it is whatever its author typed.
+    burn = payload.get("burn")
+    if burn:
+        claims = burn.get("claims") or {}
+        out.append(f"{indent}burn proof (CLAIMED — an OP_RETURN, not a verdict):")
+        for key in ("token_ref", "action", "amount", "reason"):
+            value = claims.get(key)
+            if value not in (None, ""):
+                out.append(f"{indent}  {key}: {_truncate_for_human(str(value))}")
+        if burn.get("note"):
+            out.append(f"{indent}  {_truncate_for_human(str(burn['note']))}")
 
     return out
 
