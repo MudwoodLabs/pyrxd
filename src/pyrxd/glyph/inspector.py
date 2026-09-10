@@ -291,9 +291,13 @@ class GlyphInspector:
         for i, item in enumerate(items):
             if item != GLY_MARKER:
                 continue
-            if i + 1 >= len(items):
-                return GlyphEnvelope(kind="unreadable", reason="'gly' marker is the last push — no payload follows")
-            blob = items[i + 1]
+            payload_index = self._payload_index_after_marker(items, i)
+            if payload_index is None:
+                return GlyphEnvelope(
+                    kind="unreadable",
+                    reason="nothing follows the 'gly' marker (or the 'dat' marker after it) — no payload",
+                )
+            blob = items[payload_index]
             try:
                 return GlyphEnvelope(kind="payload", metadata=decode_payload(blob))
             except Exception as payload_exc:
@@ -456,6 +460,31 @@ class GlyphInspector:
         items, complete = GlyphInspector._walk_pushes(scriptsig)
         return items if complete else None
 
+    @staticmethod
+    def _payload_index_after_marker(items: list[bytes], marker_index: int) -> int | None:
+        """Which push is the PAYLOAD, given the ``gly`` marker at *marker_index*. ``None`` if none.
+
+        ONE DEFINITION, because there are TWO readers that find ``gly`` and take what follows —
+        :meth:`_parse_reveal_scriptsig` and :meth:`classify_glyph_scriptsig` — and they fed the
+        same screen with opposite answers. A DAT reveal pushes a SECOND marker between the two:
+        ``gly``, ``dat``, payload (``payload.py``'s DAT builder emits exactly that, because the
+        commit pops ``"dat"`` as well). The skip was added to the reveal reader only, so for a DAT
+        glyph minted by pyrxd the metadata block decoded and rendered while the envelope block
+        below it said "UNREADABLE — a 'gly' marker with content neither reader accepted", about
+        the same bytes. Measured, not theorised.
+
+        That is the guard-universality failure in miniature: the question is not "does the fix
+        have a caller" but "what are all the ways to reach this, and does each cross the fix".
+        Both callers now cross this one function, so there is no second door to remember.
+
+        ONLY the one known marker is skipped. Skipping any short item would let a crafted
+        scriptSig push filler between the marker and a payload of its choosing.
+        """
+        nxt = marker_index + 1
+        if nxt < len(items) and items[nxt] == DAT_MARKER:
+            nxt += 1
+        return nxt if nxt < len(items) else None
+
     def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
         """Walk the scriptSig push-data stack to find 'gly' marker + CBOR.
 
@@ -496,14 +525,7 @@ class GlyphInspector:
         for i, item in enumerate(items):
             if item != GLY_MARKER:
                 continue
-            payload_index = i + 2 if (i + 1 < len(items) and items[i + 1] == DAT_MARKER) else i + 1
-            if payload_index < len(items):
-                return decode_payload(items[payload_index])
-        return None
-        for i, item in enumerate(items):
-            if item != GLY_MARKER:
-                continue
-            payload_index = i + 2 if (i + 1 < len(items) and items[i + 1] == DAT_MARKER) else i + 1
-            if payload_index < len(items):
+            payload_index = self._payload_index_after_marker(items, i)
+            if payload_index is not None:
                 return decode_payload(items[payload_index])
         return None
