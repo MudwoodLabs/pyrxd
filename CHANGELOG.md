@@ -115,6 +115,80 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The changelog claimed 0.23.0 shipped seven things it did not.** Entries kept landing under
+  `## [0.23.0]` after v0.23.0 was tagged — the released section sits directly below
+  `## [Unreleased]`, both carry a `### Fixed`, and in a diff appending to the wrong one looks
+  exactly like appending to the right one. Seven reached it, from six PRs — #655, #656, #661,
+  #662 (two), #665 and #666 — every one of them mine, each a public statement that a shipped
+  release contained work that came after it. #665 moved four of the seven; this change moves the
+  remaining three, keeping each in its original subsection (`### Changed` did not become
+  `### Fixed`). `[0.23.0]` again matches the v0.23.0 tag exactly: 29 entries, none lost, none
+  extra, compared section-to-section rather than against the whole tagged file.
+
+  A guard stops it recurring: `tests/test_released_changelog_sections_are_frozen.py` digests
+  every `## [x.y.z]` section against a committed manifest, so editing a released section fails
+  the build and says to use `[Unreleased]` instead. It compares the FILE against a manifest
+  rather than against `git show v<version>:CHANGELOG.md`, because CI checks out at depth 1 with
+  no tags — a tag-based check would have skipped in CI and passed locally, which is worse than
+  no check. It prevents recurrence and did not detect these seven; the manifest was generated
+  after they were moved by hand.
+
+- **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
+  is operator-authored CBOR read off the chain, and every `from_dict` in
+  `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
+  could trust — `CryptoRecipient.from_dict` calls `d.get("mlkem_ct")` first, so a
+  recipient that was a string, an int, a list or null raised **AttributeError**. That
+  is not in `payload._DECODE_REFUSALS`, so it escaped the decoder's "log the malformed
+  field and degrade" contract and came out of `GlyphInspector.extract_reveal_metadata`.
+  Four shapes reached it.
+
+  All five parsers now refuse a non-map with `ValidationError` — at the boundary, not
+  at the four reachable sites. Widening the catch to swallow `AttributeError` was the
+  alternative and is worse: it would also swallow a genuine typo in pyrxd's own parser,
+  which is the bug such a catch exists to surface.
+
+  **Neither fuzzer could have found this**, and that is the more useful half. Both feed
+  the decoder random bytes — `tests/test_fuzz_parsers.py` uses `st.binary()` and the
+  atheris harness mutates raw input — so reaching the field parsers requires
+  synthesising a well-formed CBOR map carrying `p`, then `crypto`, then `recipients`,
+  then a non-map inside it. Every defect behind a well-formed envelope was structurally
+  unreachable, not merely unlikely. The new suite generates *structure*: valid
+  envelopes with hostile values at the nested positions the decoder walks.
+
+  A first draft of that generator made `crypto` and `recipients` optional and **passed
+  against the planted defect** — 400 examples seldom produced the one crashing shape. A
+  generator that reaches the interesting position only sometimes reports "no defect" for
+  the wrong reason, and reads as thorough because it is random. The position is now
+  guaranteed and the value randomised.
+
+- **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
+  Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
+  `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'
+  field`) and is right to; `p` is what identifies a glyph payload. Nothing else read it, so
+  every update on the chain was invisible.
+
+  Measured on mainnet — `custodian-gate-x7f3.rxd`, whose target moved from
+  `1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7` to `14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i` at height
+  458591. Three of that name's four transactions carry the `gly` marker; the inspect path
+  rendered one, and the two that MOVED where the name points rendered blank.
+
+  `decode_update_payload` reads the partial envelope, and
+  `GlyphInspector.classify_glyph_scriptsig` returns a three-state answer: a full payload, an
+  update, or **unreadable**. The third state is the point. `extract_reveal_metadata` returns
+  `None` both for "no glyph here" and "a glyph I could not parse", and those are opposite facts
+  — a reader that cannot see updates does not report an error, it reports "nothing changed",
+  which is the more confident answer and the wrong one.
+
+  Two supporting changes fall out. The push walker now has a **prefix** view alongside the
+  strict one: a MUT-contract unlock ends in real opcodes (`OP_1 OP_1 OP_0 OP_0` on those
+  transactions), so the pure-push walker reported `None` for the whole script and discarded the
+  envelope it had already read. And an update's CBOR **keys** are publisher-chosen just like its
+  values, so both are sanitised before display.
+
+  Scoped deliberately: this reads an update. It does not fold a chain of them into the state at
+  a past block — that merge rule belongs to the WAVE protocol, not to pyrxd's guess at it — and
+  it makes no claim about who held a name when (#598).
+
 - **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
   `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
   refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
@@ -265,6 +339,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the dataclass** rather than typed out beside the check.
 
 ### Changed
+
+- **Creator signatures are now made over the canonical encoding, and signatures
+  made by earlier versions do not verify.** Signing used `cbor2.dumps(d)` while
+  `encode_payload` published `canonical=True`, so the bytes signed were not the
+  bytes published: measured against the previous code, a single-field NFT verified
+  after a round trip through the envelope and an NFT carrying a `description` did
+  not. The two now use one encoder. This is a behavioural change to a published
+  signature scheme and it was not previously recorded here. No conformance vector,
+  pinned mainnet anchor or checked-in fixture in this repository carries a creator
+  signature, and `verify_creator_signature` has no internal caller — it is exported
+  API — so no signature this project can point at was invalidated, but a third
+  party holding one produced by an earlier version must re-sign.
 
 - **`pyrxd-watchtower` now refuses a policy flag it cannot honour instead of dropping it.**
   Without `--measured`, twelve flags — including `--rxd-claim-inclusion`,
@@ -425,62 +511,6 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
-- **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
-  Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
-  `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'
-  field`) and is right to; `p` is what identifies a glyph payload. Nothing else read it, so
-  every update on the chain was invisible.
-
-  Measured on mainnet — `custodian-gate-x7f3.rxd`, whose target moved from
-  `1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7` to `14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i` at height
-  458591. Three of that name's four transactions carry the `gly` marker; the inspect path
-  rendered one, and the two that MOVED where the name points rendered blank.
-
-  `decode_update_payload` reads the partial envelope, and
-  `GlyphInspector.classify_glyph_scriptsig` returns a three-state answer: a full payload, an
-  update, or **unreadable**. The third state is the point. `extract_reveal_metadata` returns
-  `None` both for "no glyph here" and "a glyph I could not parse", and those are opposite facts
-  — a reader that cannot see updates does not report an error, it reports "nothing changed",
-  which is the more confident answer and the wrong one.
-
-  Two supporting changes fall out. The push walker now has a **prefix** view alongside the
-  strict one: a MUT-contract unlock ends in real opcodes (`OP_1 OP_1 OP_0 OP_0` on those
-  transactions), so the pure-push walker reported `None` for the whole script and discarded the
-  envelope it had already read. And an update's CBOR **keys** are publisher-chosen just like its
-  values, so both are sanitised before display.
-
-  Scoped deliberately: this reads an update. It does not fold a chain of them into the state at
-  a past block — that merge rule belongs to the WAVE protocol, not to pyrxd's guess at it — and
-  it makes no claim about who held a name when (#598).
-
-- **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
-  is operator-authored CBOR read off the chain, and every `from_dict` in
-  `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
-  could trust — `CryptoRecipient.from_dict` calls `d.get("mlkem_ct")` first, so a
-  recipient that was a string, an int, a list or null raised **AttributeError**. That
-  is not in `payload._DECODE_REFUSALS`, so it escaped the decoder's "log the malformed
-  field and degrade" contract and came out of `GlyphInspector.extract_reveal_metadata`.
-  Four shapes reached it.
-
-  All five parsers now refuse a non-map with `ValidationError` — at the boundary, not
-  at the four reachable sites. Widening the catch to swallow `AttributeError` was the
-  alternative and is worse: it would also swallow a genuine typo in pyrxd's own parser,
-  which is the bug such a catch exists to surface.
-
-  **Neither fuzzer could have found this**, and that is the more useful half. Both feed
-  the decoder random bytes — `tests/test_fuzz_parsers.py` uses `st.binary()` and the
-  atheris harness mutates raw input — so reaching the field parsers requires
-  synthesising a well-formed CBOR map carrying `p`, then `crypto`, then `recipients`,
-  then a non-map inside it. Every defect behind a well-formed envelope was structurally
-  unreachable, not merely unlikely. The new suite generates *structure*: valid
-  envelopes with hostile values at the nested positions the decoder walks.
-
-  A first draft of that generator made `crypto` and `recipients` optional and **passed
-  against the planted defect** — 400 examples seldom produced the one crashing shape. A
-  generator that reaches the interesting position only sometimes reports "no defect" for
-  the wrong reason, and reads as thorough because it is random. The position is now
-  guaranteed and the value randomised.
-
 - **An honest token was reported as forged.** `verify_creator_signature`
   re-derived the signed bytes from the DECODED metadata, and decoding is
   deliberately lossy — Photonic mints `loc` as an INTEGER on mainnet. So the
@@ -501,18 +531,6 @@ settled.
   differing by the parallel-contract count.
 
 ### Changed
-
-- **Creator signatures are now made over the canonical encoding, and signatures
-  made by earlier versions do not verify.** Signing used `cbor2.dumps(d)` while
-  `encode_payload` published `canonical=True`, so the bytes signed were not the
-  bytes published: measured against the previous code, a single-field NFT verified
-  after a round trip through the envelope and an NFT carrying a `description` did
-  not. The two now use one encoder. This is a behavioural change to a published
-  signature scheme and it was not previously recorded here. No conformance vector,
-  pinned mainnet anchor or checked-in fixture in this repository carries a creator
-  signature, and `verify_creator_signature` has no internal caller — it is exported
-  API — so no signature this project can point at was invalidated, but a third
-  party holding one produced by an earlier version must re-sign.
 
 - **Documentation that taught defects to third parties.** The BIP143 porting
   guide — written so others can implement Radiant's sighash in another language —
