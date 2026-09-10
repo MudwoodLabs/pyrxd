@@ -65,7 +65,13 @@ dependencies = [
 # `pip install 'pyrxd[eth]'` therefore warned "does not provide the extra 'eth'" and installed
 # nothing, and the import then failed telling the user to do the thing that had just no-opped.
 #
-# Floors are measured, not guessed (clean-venv resolution of web3 7.16.0, 2026-08-22):
+# Floors are measured, not guessed (clean-venv resolution of web3 8.0.0, 2026-09-08):
+#   Re-measured when the constraint moved to `web3>=8.0.0,<9.0.0`. The previous line cited a
+#   7.16.0 resolution, which the major bump made false while the numbers below stayed right —
+#   a provenance claim outliving the measurement behind it. Under 8.0.0 web3 declares
+#   `eth-account>=0.14` (matching the floor here) and still does NOT declare `eth-keys`,
+#   which resolves to 0.8.0 via eth-account, so the reason for declaring it directly is
+#   unchanged.
 #   web3        — the same pin the `test` group already carries, so the tested configuration is
 #                 unchanged by declaring it here.
 #   eth-account — web3's OWN declared floor (`eth-account>=0.13.6`); imported directly by
@@ -92,7 +98,7 @@ dependencies = [
 # conflict with a consumer's tree — so this is the only such floor, and it should be REMOVED once
 # `requests` itself floors urllib3 above 2.7.0.
 eth = [
-    "web3>=7.16.0,<8.0.0",
+    "web3>=8.0.0,<9.0.0",
     "eth-account>=0.14.0,<1.0.0",
     "eth-keys>=0.8.0,<1.0.0",
     "urllib3>=2.7.0",
@@ -385,11 +391,11 @@ dev = [
     "bandit[toml]>=1.9.4,<2.0.0",
     "cosmic-ray>=8.7.0,<9.0.0",
     "detect-secrets>=1.5.0,<2.0.0",
-    "hypothesis>=6.165.10,<7.0.0",
+    "hypothesis>=6.167.1,<7.0.0",
     "mypy>=2.3.1,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.5,<0.17.0",
+    "ruff>=0.16.6,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
@@ -407,7 +413,7 @@ dev = [
     # IndexFile.from_tree (GHSA-9rj7-rf2p-w77r, GHSA-4gmw-gg2m-w46p), all patched 3.1.58. cosmic-ray
     # sets no upper cap, so floor at the highest patched version. Dev-scope only — gitpython is not a
     # pyrxd runtime dependency and never ships in the published package.
-    "gitpython>=3.1.60",
+    "gitpython>=3.1.61",
 ]
 test = [
     "bandit[toml]>=1.9.4,<2.0.0",
@@ -423,7 +429,7 @@ test = [
     # through web3. Previously undeclared: the suites were importable only if a developer happened
     # to have web3 installed, so they silently skipped. web3 caps websockets<16.0.0 — see the
     # runtime `websockets` floor above for why that constraint is compatible rather than a conflict.
-    "web3>=7.16.0,<8.0.0",
+    "web3>=8.0.0,<9.0.0",
 ]
 docs = [
     "furo>=2025.12,<2026.0",

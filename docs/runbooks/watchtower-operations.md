@@ -47,7 +47,14 @@ into the same app or receiver changes nothing.
 - A `--records-dir` of `SwapRecord` JSON files (what the coordinator persists per swap).
 - An RXD source: `--rxd-electrumx-url wss://…` (or an ssh-tr radiant-cli backend).
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
-- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`).
+- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
+  chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
+  from its own vetted registry for the given chain id (768 s Ethereum/Sepolia, 900 s Base/Optimism,
+  1200 s Arbitrum, 6000 s Linea). On a chain id the registry does not know, it logs an `ERROR` and
+  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick* —
+  pass `--eth-finalization-window-s` with a sourced figure for that chain. Do not shrink it to
+  quieten a page: the reserve is compared against the room left before the maker's refund opens, so
+  a smaller window makes the gate say WAIT with less margin than the chain actually needs.
 - For the v2 *autonomous refund*: a `<swap_id>.refund.json` sidecar per swap (see Key rotation below).
 
 ## Running
@@ -130,6 +137,16 @@ emits a `WARNING` saying so.
 | `--rxd-claim-burial` | Blocks the claim must then be buried to be reorg-safe. | Your own reorg tolerance; the value-scaled burial raises it per swap when a reorg cost is set. |
 | `--btc-reorg-depth` | Depth the **maker's** counter-leg claim must reach before you rely on the revealed `p`. | Bitcoin-side; 6 is the conventional figure. |
 | `--burial-safety-factor` | Multiplier on the value at risk for the value-scaled burial. **1.0 = break-even** — an attack costs exactly what it wins. | Raise it for margin. Inert unless `--rxd-difficulty` / `--rxd-reorg-cost-per-block` is set. |
+
+**Every flag in that table needs `--measured`, and the tower now exits 1 if you pass one without
+it.** Those flags reach the `MarginPolicy` only through `MarginPolicy.measured()`; on the estimated
+(alert-only default) policy they were silently dropped, and the reserve line above then described a
+policy you had not asked for. The tower refuses at startup instead. This bites *even when the value
+you typed is the flag's own printed default* — `--margin-blocks 72` and `--rxd-claim-burial 2` are
+the two where that mattered, because the estimated policy holds 36 and 6 blocks, not 72 and 2. Add
+`--measured` (with its required measurements) or drop the flag. The one exception is
+`--rxd-block-interval-s`, which also feeds the boot-time timing preflight: it warns rather than
+refusing.
 
 **Under-setting `--rxd-claim-inclusion` is the dangerous direction.** On a congested mempool where
 claims routinely take five blocks to be mined, a tower reserving two will page `PAGE_CLAIM` at a

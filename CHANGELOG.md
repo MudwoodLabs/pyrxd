@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **The HashMark §7.6 form-2 stack was re-attacked before it shipped, and the walker was reading
+  the wrong bytes.** NONE OF THIS EVER REACHED A RELEASE — every defect below is in unreleased
+  code from the same branch, found by a seven-reviewer panel across two model families and fixed
+  here. It is recorded because the shape of the mistakes is reusable, not because a published
+  version was affected.
+
+  The keystone: a mutable output's script commits to `payload_hash`, and measured on every real
+  mainnet step of two WAVE chains that is exactly `sha256d` of the step's envelope CBOR. The
+  walker had been reading "the first `gly` push in any input" instead, which let the publisher
+  choose the record — a decoy envelope in an earlier input replaced it wholesale, and a readable
+  decoy in front of an unreadable envelope flipped `complete` False→True, defeating the degrade
+  the module advertises. `walk_mutable_chain` now accepts only the envelope the covenant commits
+  to.
+
+  - **Two claimants for one outpoint now degrade instead of racing.** The spender was chosen with
+    `sorted(pool)`, so one fabricated conflicting txid ground to sort first hijacked the chain —
+    and the real confirmed update was then reported in `excluded`, i.e. the walk asserted the
+    truth did not belong to the token. Nothing in the walk can tell a real spend from a forged
+    one, so two claimants is an ambiguity it refuses to resolve.
+  - **One source may no longer supply both the candidate set and the tip proof.** Omitting the
+    later updates AND certifying the earlier tip takes two lies from one endpoint and produced
+    `complete=True` over a stale record with an empty reason. Unattributed sources count as
+    possibly-identical.
+  - **Block heights are validated and required to be non-decreasing.** `(h or 0)` turned `False`
+    into height 0 — before any mark — and a JSON string raised `TypeError` out of a function
+    documented as always degrading. Heights along a spend-ordered chain cannot decrease, so a
+    decrease now degrades; enforcing it also makes the in-range filter a genuine prefix, which is
+    what `fold_chain(through_index=...)` folds. Previously a step the range calculation had
+    EXCLUDED was folded in anyway and its target reported authoritatively.
+  - **"The record is not known" is now one derived set, not three hand-kept tuples.** They had
+    already drifted: `fold_chain` listed only `unreadable`, so an `unbound` step folded as a
+    readable no-op; and a step whose output commits to a payload nobody revealed was in no list at
+    all, folding as "unchanged" and reporting the previous target as current.
+  - **Form 2 refuses an ambiguously encoded envelope.** `cbor2` silently discards trailing bytes
+    and takes the LAST of a repeated key, so one committed blob had two readings — a
+    cross-implementation split on exactly the question form 2 answers. This narrows the CLAIM, not
+    the decoder: `decode_payload` is unchanged, because six real envelopes is not evidence enough
+    to start refusing mints.
+  - **A walk no longer costs `steps x candidates` round trips.** Measured on the three-step
+    mainnet chain with a 1,000-txid discovery hint: 3,007 fetches before, 1,004 after. `max_steps`
+    is validated too — a cap below 1 made the loop body unreachable, so the walk returned the mint
+    as the tip with an empty reason.
+  - **Publisher-chosen envelope text can no longer own the screen.** Values were truncated and
+    KEYS were not, so a 100,000-character key rendered in full — a 200,004-character line,
+    measured — and nothing capped how many entries an envelope may list. Both the CLI and the
+    `docs/inspect_static` page now cap length and count, and state what was dropped. The page had
+    never rendered the envelope block at all, so on the web a mutable glyph's UPDATE showed as an
+    ordinary transfer and an unreadable envelope showed as nothing.
+  - **There is now actually one push walker.** `_scriptsig_pushes` claimed in its own docstring
+    that there was "one walker rather than two that can drift" while `_parse_reveal_scriptsig`
+    kept a hand-rolled copy — and the two had drifted in both directions: the copy bailed at
+    `OP_0` (which every real MUT unlock ends with) and clamped truncated pushes into
+    plausible-looking short items.
+  - `MAX_CHAIN_STEPS`, `RECORD_UNKNOWN_KINDS`, `EXPIRY_UNKNOWN` and `UNVERIFIED_CAVEAT` are
+    exported from `pyrxd.glyph`. Comparing `verdict.expiry` previously meant importing a private
+    module or retyping the string, which is how "unknown" quietly becomes "not expired".
+
+  Each fix is pinned by a test that was verified two-sided — asserted to pass with the fix and to
+  FAIL with the original defect planted back. The first harness written for this reported one
+  false survival, so it was rebuilt to check both directions and purge bytecode between them.
+
 ### Added
 
 - **Every Glyph protocol marker that had a classifier label and no way to write one
@@ -126,6 +189,191 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The repo's own git tooling did not work from a git worktree** — the workflow it asks agents
+  to use. Two instances of one blindness, both hit rather than reviewed: `scripts/git-hooks/
+  pre-push` located the venv with `git rev-parse --show-toplevel`, which is the CURRENT worktree,
+  and a linked worktree has no `.venv` (it lives in the main checkout), so every push from one
+  aborted with a bare "task not found". And `scripts/install-git-hooks.sh` targeted
+  `${REPO_ROOT}/.git/hooks`, but in a linked worktree `.git` is a FILE pointing at the real repo,
+  so the installer refused with "are you inside the pyrxd git repo?" — from inside the repo.
+  `--git-common-dir` answers both: it resolves to the one shared git directory from any worktree.
+
+  Re-attacking the fix found a defect it would have added: the installer symlinks the SHARED hook
+  to `${REPO_ROOT}/scripts/git-hooks/…`, so merely letting it succeed from a worktree would have
+  pointed every checkout's hook into an ephemeral directory — dangling the moment that worktree
+  was removed, silently disabling pre-push checks repo-wide. Both the source and the destination
+  now derive from the main checkout, and it warns when run from a worktree.
+
+  Also corrected: `install-git-hooks.sh` advertised that pre-push "runs the full local-CI matrix
+  (`task ci`)". It runs `task ci-fast`, and the hook it installs explains at length why the full
+  suite there is actively wrong — git opens the remote connection before the hook runs and GitHub
+  drops an idle receive-pack after ~5 minutes, so a long hook makes the push die with SIGPIPE
+  having transferred nothing. The installer was telling you your pushes were covered by a check
+  that deliberately does not run.
+
+- **The changelog claimed 0.23.0 shipped seven things it did not.** Entries kept landing under
+  `## [0.23.0]` after v0.23.0 was tagged — the released section sits directly below
+  `## [Unreleased]`, both carry a `### Fixed`, and in a diff appending to the wrong one looks
+  exactly like appending to the right one. Seven reached it, from six PRs — #655, #656, #661,
+  #662 (two), #665 and #666 — every one of them mine, each a public statement that a shipped
+  release contained work that came after it. #665 moved four of the seven; this change moves the
+  remaining three, keeping each in its original subsection (`### Changed` did not become
+  `### Fixed`). `[0.23.0]` again matches the v0.23.0 tag exactly: 29 entries, none lost, none
+  extra, compared section-to-section rather than against the whole tagged file.
+
+  A guard stops it recurring: `tests/test_released_changelog_sections_are_frozen.py` digests
+  every `## [x.y.z]` section against a committed manifest, so editing a released section fails
+  the build and says to use `[Unreleased]` instead. It compares the FILE against a manifest
+  rather than against `git show v<version>:CHANGELOG.md`, because CI checks out at depth 1 with
+  no tags — a tag-based check would have skipped in CI and passed locally, which is worse than
+  no check. It prevents recurrence and did not detect these seven; the manifest was generated
+  after they were moved by hand.
+
+- **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
+  is operator-authored CBOR read off the chain, and every `from_dict` in
+  `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
+  could trust — `CryptoRecipient.from_dict` calls `d.get("mlkem_ct")` first, so a
+  recipient that was a string, an int, a list or null raised **AttributeError**. That
+  is not in `payload._DECODE_REFUSALS`, so it escaped the decoder's "log the malformed
+  field and degrade" contract and came out of `GlyphInspector.extract_reveal_metadata`.
+  Four shapes reached it.
+
+  All five parsers now refuse a non-map with `ValidationError` — at the boundary, not
+  at the four reachable sites. Widening the catch to swallow `AttributeError` was the
+  alternative and is worse: it would also swallow a genuine typo in pyrxd's own parser,
+  which is the bug such a catch exists to surface.
+
+  **Neither fuzzer could have found this**, and that is the more useful half. Both feed
+  the decoder random bytes — `tests/test_fuzz_parsers.py` uses `st.binary()` and the
+  atheris harness mutates raw input — so reaching the field parsers requires
+  synthesising a well-formed CBOR map carrying `p`, then `crypto`, then `recipients`,
+  then a non-map inside it. Every defect behind a well-formed envelope was structurally
+  unreachable, not merely unlikely. The new suite generates *structure*: valid
+  envelopes with hostile values at the nested positions the decoder walks.
+
+  A first draft of that generator made `crypto` and `recipients` optional and **passed
+  against the planted defect** — 400 examples seldom produced the one crashing shape. A
+  generator that reaches the interesting position only sometimes reports "no defect" for
+  the wrong reason, and reads as thorough because it is random. The position is now
+  guaranteed and the value randomised.
+
+- **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
+  Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
+  `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'
+  field`) and is right to; `p` is what identifies a glyph payload. Nothing else read it, so
+  every update on the chain was invisible.
+
+  Measured on mainnet — `custodian-gate-x7f3.rxd`, whose target moved from
+  `1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7` to `14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i` at height
+  458591. Three of that name's four transactions carry the `gly` marker; the inspect path
+  rendered one, and the two that MOVED where the name points rendered blank.
+
+  `decode_update_payload` reads the partial envelope, and
+  `GlyphInspector.classify_glyph_scriptsig` returns a three-state answer: a full payload, an
+  update, or **unreadable**. The third state is the point. `extract_reveal_metadata` returns
+  `None` both for "no glyph here" and "a glyph I could not parse", and those are opposite facts
+  — a reader that cannot see updates does not report an error, it reports "nothing changed",
+  which is the more confident answer and the wrong one.
+
+  Two supporting changes fall out. The push walker now has a **prefix** view alongside the
+  strict one: a MUT-contract unlock ends in real opcodes (`OP_1 OP_1 OP_0 OP_0` on those
+  transactions), so the pure-push walker reported `None` for the whole script and discarded the
+  envelope it had already read. And an update's CBOR **keys** are publisher-chosen just like its
+  values, so both are sanitised before display.
+
+  Scoped deliberately: this reads an update. It does not fold a chain of them into the state at
+  a past block — that merge rule belongs to the WAVE protocol, not to pyrxd's guess at it — and
+  it makes no claim about who held a name when (#598).
+
+- **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
+  `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
+  refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
+  the eras a present-tense lookup conflates: a mark at 458586 resolves to `1CPfirXZ…`, one at
+  458595 to `14XmXG3d…`.
+
+  The verdict is **structurally** narrow rather than narrow by docstring: `form` is an int so no
+  caller can read a single flag optimistically, `expiry` is a string state so nothing can compare
+  it to a clock, and `binding_verified` stays False until something checks the name→glyph binding
+  on chain. It degrades to form 1 **with a reason** when the mark has no block, is too shallow,
+  when the walk is incomplete, when a step cannot be placed against the mark — and when the height
+  and the binding came from the **same source**, since one endpoint supplying both can choose the
+  block and then choose what the name said at it.
+
+  `resolve_mark_anchor` supplies the block, which nothing did before: `_classify_raw_tx` returns no
+  height, blockhash or confirmations. It takes a **required** `min_confirmations` with no default,
+  following the registry's own rule that depth is value-scaled per chain and that "'6 confirmations'
+  folklore transfers across chains even less than it transfers across values".
+
+  **The height is the endpoint's claim, not a proof**, and every anchor and verdict says so.
+  `pyrxd.spv` is Bitcoin-only; there is no Radiant header, proof-of-work or merkle check. Fetching a
+  merkle path would not help — with no work check, fabricating a header whose root commits to the
+  transaction is free, so inclusion-without-work buys nothing against a hostile endpoint while
+  looking exactly like security.
+
+  Exported as consumer API. The CLI cannot drive form 2 yet: it needs a token's transaction list and
+  `RxinDexerClient` has no history method, so wiring a caller that always degrades would be a
+  wrapper around dead code.
+
+- **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
+  `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
+  mutable output at a time — and reports `complete` only when every link verified *and* the
+  final output is proved unspent. Anything else returns the walked prefix with a reason.
+
+  That distinction is the point: a truncated history is how a superseded value becomes
+  authoritative. Stop one transaction early and a naive walker reports the previous target with
+  no sign anything is missing, which is exactly what an index was observed doing to a live WAVE
+  name.
+
+  **The chain is the singleton, not an index's history list.** Measured on mainnet,
+  `custodian-gate-x7f3.rxd`'s history contains a transaction that shares a block with a real
+  update and is spent *from* by the next one — and never touches the token. It is reported as
+  `excluded`, not folded and not allowed to order anything. Height cannot order a chain either:
+  two of that name's transactions share height 458591, and another name has two update envelopes
+  at one height.
+
+  A step whose mutable output carries a **different ref** raises rather than degrades — following
+  it would splice two tokens' histories together. Absence degrades; contradiction raises.
+
+- **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
+  and put it in `glyph_envelopes`, which was then read by **nothing** — three references
+  repo-wide, all of them the write. So the default terminal output still rendered the mainnet
+  update `315b4630…` as `type=unknown / type=mut / type=p2pkh`, with no mention of the change
+  and no sight of the new target: the same blindness that PR's subject line is about, one layer
+  up. `pyrxd glyph inspect` now names the update and its target, and says what it does **not**
+  establish — that an envelope changes a *glyph's* fields, not which name resolves to it.
+
+  An `unreadable` envelope is named just as loudly, because "I could not read this" and "there
+  is nothing here" are opposite facts and the blind one reads as reassuring.
+
+- **`WaveAttrs` silently dropped `attrs.expires`.** Measured, a real mainnet record round-tripped
+  `[domain, expires, name, target, target_type]` back out as `[domain, name, target,
+  target_type]`. It is now carried, refused rather than dropped when unusable (`True` included —
+  `isinstance(True, int)` is True in Python, so a bool would have become a 1970 timestamp), and
+  emitted only when set, so a mint that never asked for it publishes the same four keys as before.
+
+  Carried is not consumed: Photonic's own source says the indexer is authoritative on renewals
+  and `attrs.expires` is "display-level", so nothing may read it as an expiry. An AST scan pins
+  that nothing does.
+
+- **`pyrxd-watchtower` paged `PAGE_SQUEEZED` on every tick of a healthy ETH swap**, because
+  `MarginPolicy.eth_finalization_window_s` was unreachable from the tower. The finality gate
+  RAISES on a depth-less (finalized-checkpoint) verdict without it, `_decide_eth` catches
+  that and pages "verify finality manually", and the tower had no flag to set it — so for the
+  whole window between the maker's ETH claim and its finalized checkpoint (~13 min in the
+  steady state, hours during a finality stall, which is exactly the case the stall budget
+  exists for) the operator was paged once per tick and pushed to act by hand under time
+  pressure on the one path where the correct behaviour is WAIT. The window is now taken from
+  the vetted per-chain registry for `--eth-chain-id`, with `--eth-finalization-window-s` to
+  override it, and it reaches BOTH policies — an alert-only tower watches ETH swaps too. An
+  unvetted chain id logs an `ERROR` naming the flag and keeps the fail-closed `None` rather
+  than guessing a window, since too small a reserve is the unsafe direction.
+
+  The reachability guards written for exactly this class did not see it: both derived their
+  universe of "policy knobs" from `MarginPolicy.measured`'s **signature**, and this field was
+  not a parameter of that constructor. The guard now runs over
+  `dataclasses.fields(MarginPolicy)` minus an exemption list checked against those same
+  fields, and is tested against a field name it was not built from.
+
 - **The TIMELOCK unlock gate failed OPEN on a lock with no protocol marker.**
   `plan_timelock_reveal` decided "is this timelocked" from `crypto.timelock` and "has it
   expired" from the `9` marker in `p`, by way of `is_unlocked` — which correctly answers
@@ -203,6 +451,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Creator signatures are now made over the canonical encoding, and signatures
+  made by earlier versions do not verify.** Signing used `cbor2.dumps(d)` while
+  `encode_payload` published `canonical=True`, so the bytes signed were not the
+  bytes published: measured against the previous code, a single-field NFT verified
+  after a round trip through the envelope and an NFT carrying a `description` did
+  not. The two now use one encoder. This is a behavioural change to a published
+  signature scheme and it was not previously recorded here. No conformance vector,
+  pinned mainnet anchor or checked-in fixture in this repository carries a creator
+  signature, and `verify_creator_signature` has no internal caller — it is exported
+  API — so no signature this project can point at was invalidated, but a third
+  party holding one produced by an earlier version must re-sign.
+
 - **`pyrxd-watchtower` now refuses a policy flag it cannot honour instead of dropping it.**
   Without `--measured`, twelve flags — including `--rxd-claim-inclusion`,
   `--burial-safety-factor`, `--margin-blocks`, `--btc-reorg-depth` and
@@ -214,6 +474,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Such an invocation now exits at startup naming the flags and the remedy, and the report
   additionally checks its own label against the policy before printing it. The default
   alert-only invocation and every existing `--measured` invocation are unchanged.
+
+  **The refusal now tests PRESENCE, not "differs from the default".** It compared the parsed
+  value against the parser's own default, so `--flag <that default>` was indistinguishable
+  from never passing the flag and the original defect survived for exactly one spelling per
+  flag — and not a harmless one: `--margin-blocks` defaults to 72 while the estimated policy
+  holds 36 blocks, and `--rxd-claim-burial` to 2 while it holds 6, so those two operators
+  were running the number they had not typed. `--btc-reorg-depth 6`,
+  `--burial-safety-factor 1.0`, `--margin-blocks 72`, `--rxd-claim-burial 2` and
+  `--reorg-cost-max-age-s 86400` without `--measured` therefore now exit 1 where they used to
+  start. Neither parser default is changed: 2 is the deliberate dust-run value the swap
+  runners and this runbook already use, and `policy.margin` is read by no watchtower code
+  path at all (pinned by a test), so lowering 72 to 36 would move a fund-relevant field in
+  the unsafe direction to fix nothing. `--rxd-block-interval-s` stays exempt — it feeds the
+  timing preflight, so it warns rather than refusing.
 
 ## [0.23.0] — 2026-09-04
 
@@ -387,6 +661,28 @@ settled.
   claims, four comments resting on a standardness rule Radiant does not execute,
   and a guide telling readers to hand-roll an adapter for a class that ships and
   is used by the real-value runners.
+
+  **Glyph spec §10.2 told a second implementer to build a verifier that rejects
+  valid pyrxd signatures.** It stated that the creator-signature encoder omits
+  `canonical=True` and that an implementation "MUST reproduce the insertion order
+  of pyrxd's `to_cbor_dict` … using a canonical encoder here produces a different
+  message and the signature fails". Signing became canonical in the same cycle
+  (below), so every clause was false, in the direction that breaks interoperation —
+  the 0.22.0 shape, where a published artifact teaches a rule the code does not
+  implement. The same claim was mirrored twice in `security-audit-scope.md`, once
+  as an accepted residual asserting the encoding was a *permanent compatibility
+  constraint*.
+
+  It also survived a mechanical repair: a citation sweep re-pointed the sentence
+  from `creator.py:43` to `creator.py:117` — onto `return cbor2.dumps(d,
+  canonical=True)`, the line that refutes it. A citation checker asks whether a
+  pointer lands on code, never whether the code says what the prose claims.
+
+  §10.2 now gives the recipe that works, and
+  `tests/test_spec_10_2_recipe_verifies_a_creator_signature.py` **executes** it
+  rather than reading it: it verifies an honest token the way an outside
+  implementation would, and asserts that the reconstruction the section forbids
+  really does fail.
 
 ### Internal
 

@@ -49,6 +49,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 — fixed argv, no shell, repo-local script
 import sys
@@ -1463,3 +1464,80 @@ class TestTheTimelockSpecReachesTheReader:
         assert "is_unlocked" in text
         assert "UNLOCKED" not in text.upper().replace("IS_UNLOCKED", "")
         assert "LOCKED" not in text.upper().replace("IS_UNLOCKED", "")
+
+
+class TestThePageCapsPublisherChosenEnvelopeText:
+    """The web card renders attacker-authored envelope keys and values.
+
+    The Python renderer caps both the LENGTH of each string and the COUNT of entries; this page
+    got the same block later and needs the same caps, because it has the same problem: an update
+    envelope's key set is chosen by whoever published the transaction. Without the length cap a
+    100,000-character key renders in full; without the count cap a 256 KB payload of one-byte keys
+    renders tens of thousands of rows and pushes every verified fact off the screen — and no single
+    row is long enough for a length cap to notice, so the two are separate checks.
+    """
+
+    STRING_CAP = 200
+    ENTRY_CAP = 32
+
+    @staticmethod
+    def _render(envelope: dict) -> str:
+        case = {
+            "hostile": {
+                "tx": {
+                    "form": "txid",
+                    "txid": "ab" * 32,
+                    "byte_length": 300,
+                    "input_count": 1,
+                    "output_count": 1,
+                    "outputs": [],
+                    "glyph_envelopes": [envelope],
+                }
+            }
+        }
+        return _run_harness(_require_node(), case)["hostile"]["fetched_tx_card"]
+
+    def test_a_long_key_and_a_long_value_are_both_truncated(self):
+        text = self._render(
+            {
+                "input_index": 0,
+                "kind": "update",
+                "fields": {"attrs": {"K" * 100_000: "V" * 100_000}},
+            }
+        )
+        assert "K" * 1_000 not in text, "an untruncated key reached the page"
+        assert "V" * 1_000 not in text, "an untruncated value reached the page"
+        longest = max(len(line) for line in text.split("\n"))
+        assert longest < self.STRING_CAP * 4, f"longest rendered line is {longest:,}"
+
+    def test_the_entry_count_is_capped_and_the_omission_is_stated(self):
+        text = self._render(
+            {
+                "input_index": 0,
+                "kind": "update",
+                "fields": {"attrs": {f"k{i:04d}": "v" for i in range(500)}},
+            }
+        )
+        rendered = len(re.findall(r"k\d{4}", text))
+        assert rendered == self.ENTRY_CAP, f"{rendered} attrs rendered, cap is {self.ENTRY_CAP}"
+        assert "more attrs not shown" in text, "entries were dropped without saying so"
+
+    def test_an_ordinary_update_is_shown_in_full(self):
+        """The honest-path half: a real WAVE update is far under both caps."""
+        text = self._render(
+            {
+                "input_index": 1,
+                "kind": "update",
+                "fields": {
+                    "attrs": {
+                        "name": "custodian-gate-x7f3",
+                        "domain": "rxd",
+                        "target": "14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i",
+                        "target_type": "address",
+                    }
+                },
+            }
+        )
+        assert "14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i" in text
+        assert "custodian-gate-x7f3" in text
+        assert "not shown" not in text

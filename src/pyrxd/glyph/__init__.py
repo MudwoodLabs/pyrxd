@@ -89,6 +89,32 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "sign_metadata": ("pyrxd.glyph.creator", "sign_metadata"),
     "target_to_difficulty": ("pyrxd.glyph.dmint", "target_to_difficulty"),
     "verify_creator_signature": ("pyrxd.glyph.creator", "verify_creator_signature"),
+    # Walking a mutable glyph's own spend chain, and proving the walk reached the tip.
+    # EXPORTED DELIBERATELY, not orphaned: an indexer or wallet integrating WAVE (or any mutable
+    # glyph) needs "what did this token say, and am I looking at its current state" — and getting
+    # that wrong quietly is how a superseded target gets served as authoritative. The in-repo
+    # caller arrives with HashMark §7.6 form 2 (#598); until then this is consumer surface, the
+    # same shape as `verify_creator_signature` above.
+    "walk_mutable_chain": ("pyrxd.glyph.mutable_chain", "walk_mutable_chain"),
+    "MutableChainWalk": ("pyrxd.glyph.mutable_chain", "MutableChainWalk"),
+    "ChainStep": ("pyrxd.glyph.mutable_chain", "ChainStep"),
+    "FoldedRecord": ("pyrxd.glyph.mutable_chain", "FoldedRecord"),
+    "fold_chain": ("pyrxd.glyph.mutable_chain", "fold_chain"),
+    "MAX_CHAIN_STEPS": ("pyrxd.glyph.mutable_chain", "MAX_CHAIN_STEPS"),
+    "RECORD_UNKNOWN_KINDS": ("pyrxd.glyph.mutable_chain", "RECORD_UNKNOWN_KINDS"),
+    # HashMark §7.6 form 2. Consumer surface for the same reason as the walker above: the CLI
+    # cannot drive it yet because pyrxd has no way to enumerate a token's transactions (the
+    # indexer client has `glyph_get_token`, which returns a record, not a history), so the
+    # candidate set has to come from the consumer's own index for now.
+    "MarkAnchor": ("pyrxd.glyph.mark_anchor", "MarkAnchor"),
+    "resolve_mark_anchor": ("pyrxd.glyph.mark_anchor", "resolve_mark_anchor"),
+    "WaveIdentityVerdict": ("pyrxd.glyph.wave_identity", "WaveIdentityVerdict"),
+    "judge_name_at_mark": ("pyrxd.glyph.wave_identity", "judge_name_at_mark"),
+    # The two sentinels a consumer has to be able to COMPARE AGAINST rather than retype. Without
+    # them exported, reading `verdict.expiry` means hardcoding the string from a private module -
+    # which is how a consumer ends up silently treating "unknown" as "not expired".
+    "EXPIRY_UNKNOWN": ("pyrxd.glyph.wave_identity", "EXPIRY_UNKNOWN"),
+    "UNVERIFIED_CAVEAT": ("pyrxd.glyph.mark_anchor", "UNVERIFIED_CAVEAT"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final
 if TYPE_CHECKING:
     from ..constants import Network
 
+from ..network._guards import finite_int
 from ..security.errors import ValidationError
 from .types import GlyphMetadata, GlyphProtocol
 
@@ -46,6 +47,46 @@ SCHEME_ADDRESS: Final = "address"
 """``target_type`` value for plain Radiant addresses."""
 
 
+def _optional_int(value: object) -> int | None:
+    """Read an optional integer attr, or refuse it. Never silently drop.
+
+    ACCEPTS A DIGIT STRING, because that is the form the mint reader ALWAYS produces.
+    `GlyphMetadata.attrs` is `dict[str, str]` (`payload.py`'s `_decode_attrs` stringifies every
+    value), so a mint's CBOR integer `expires` reaches this function as `'1850743929'`. Demanding
+    an `int` therefore refused every real mainnet WAVE mint: `wave_attrs_from_metadata` returned
+    `None` and `classify_glyph_metadata` fell through to `'mut'`, so a WAVE name stopped being a
+    WAVE name through the public facade - strictly worse than the dropped field this was added to
+    fix, because the whole record was lost rather than one key.
+
+    The fact that falsifies the int-only rule is written down twice in this same change - in
+    `mutable_chain.fold_chain`'s docstring and in the fold decision record, both noting that the
+    two readers disagree on value TYPE. It was applied to the fold and not here.
+
+    A bool is still refused explicitly: `isinstance(True, int)` is True in Python, so `expires:
+    true` would otherwise be carried as 1 - a timestamp in 1970.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValidationError(f"WAVE attrs 'expires' must be a number, got {type(value).__name__}")
+    if isinstance(value, int):
+        return value
+    # A WHOLE FLOAT IS AN INT HERE, because it already is everywhere else in this codebase:
+    # `network._guards.finite_int` accepts `1850743929.0` and refuses `1.5`, Infinity and NaN,
+    # and CBOR can carry any of them. Refusing a whole float only here made one field stricter
+    # than the rule the rest of the SDK applies to numbers off the wire, for no stated reason.
+    if isinstance(value, float):
+        try:
+            return finite_int(value)
+        except ValueError as exc:
+            raise ValidationError(f"WAVE attrs 'expires' is not a whole number: {exc}") from exc
+    # Only a plain non-negative decimal string: the stringified form of an integer, and nothing
+    # that `int()` would otherwise accept (whitespace, signs, underscores, unicode digits).
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise ValidationError(f"WAVE attrs 'expires' must be a number or its decimal string, got {type(value).__name__}")
+
+
 @dataclass(frozen=True)
 class WaveAttrs:
     """Parsed WAVE attrs dict, mirroring the on-chain Photonic shape."""
@@ -54,15 +95,35 @@ class WaveAttrs:
     domain: str
     target: str
     target_type: str = SCHEME_ADDRESS
+    #: CBOR ``attrs.expires``, when the record carried one.
+    #:
+    #: MODELLED BECAUSE IT WAS BEING DROPPED. `from_dict` read four keys and ignored the rest, so
+    #: a real mainnet record round-tripped `[domain, expires, name, target, target_type]` back out
+    #: as `[domain, name, target, target_type]` - silently, and for the one field that decides
+    #: whether a name was even held at a given time.
+    #:
+    #: NOT AUTHORITATIVE, and callers must not read it as an expiry. Photonic states in its own
+    #: source that "the indexer is the authority on renewals ... the attrs.expires written here is
+    #: display-level": real expiry follows from treasury payments this type never sees. It is
+    #: carried so a round trip is lossless, not so anything can be concluded from it.
+    expires: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        """Serialize as the CBOR ``attrs`` dict."""
-        return {
+    def to_dict(self) -> dict[str, object]:
+        """Serialize as the CBOR ``attrs`` dict.
+
+        ``expires`` is emitted ONLY when set, so a record that never carried one still mints the
+        exact four-key map it always did - adding a field to this type must not change the bytes
+        pyrxd publishes for callers that never asked for it.
+        """
+        d: dict[str, object] = {
             "name": self.name,
             "domain": self.domain,
             "target": self.target,
             "target_type": self.target_type,
         }
+        if self.expires is not None:
+            d["expires"] = self.expires
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> WaveAttrs:
@@ -76,6 +137,9 @@ class WaveAttrs:
             domain=str(d["domain"]),
             target=str(d["target"]),
             target_type=str(d.get("target_type", SCHEME_ADDRESS)),
+            # Refused rather than coerced when unusable: `int("soon")` raises, and silently
+            # dropping it would reintroduce exactly the loss this field was added to stop.
+            expires=_optional_int(d.get("expires")),
         )
 
 

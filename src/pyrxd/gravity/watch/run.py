@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import math
 import signal
 import sys
 import time
@@ -45,6 +46,11 @@ import aiohttp
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+
+# The EVM chain registry, not web3: `pyrxd.eth_wallet.chains` imports only dataclasses and the
+# error type, so this stays importable without the optional `eth` extra (the web3-backed `EthRpc`
+# is still imported lazily, inside `_build_eth_source`).
+from pyrxd.eth_wallet.chains import evm_chain_by_id
 from pyrxd.gravity.reorg_cost import ReorgCostMeasurement, measure_rxd_reorg_cost
 from pyrxd.gravity.swap_coordinator import ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS, MarginPolicy
 from pyrxd.gravity.watch import (
@@ -365,7 +371,71 @@ _MEASURED_ONLY_POLICY_FLAGS: tuple[str, ...] = (
 _ALSO_USED_OUTSIDE_THE_POLICY: tuple[str, ...] = ("rxd_block_interval_s",)
 
 
+#: Namespace attribute carrying the measured-only dests the operator actually TYPED, stashed by
+#: :func:`_parse_args`. See :func:`_supplied_policy_flags` for why a value comparison is not enough.
+_SUPPLIED_ATTR = "_supplied_policy_flags"
+
+#: Identity sentinel: argparse applies an action's default only when the dest is MISSING from the
+#: namespace, so a dest still holding this after a parse was not on the command line.
+_UNSET = object()
+
+
+def _supplied_policy_flags(argv: Sequence[str] | None) -> frozenset[str]:
+    """The measured-only dests PRESENT on ``argv`` — presence, not "differs from the default".
+
+    The refusal below used ``getattr(args, dest) != parser.get_default(dest)``, which cannot tell
+    ``--margin-blocks 72`` (the parser's own default) from never passing the flag. So the original
+    defect — the value goes nowhere, silently — survived for exactly one spelling per flag, and it
+    was not a harmless spelling: the parser defaults and the ESTIMATED policy's values differ for
+    two of them (``--margin-blocks`` 72 vs 36 blk, ``--rxd-claim-burial`` 2 vs 6 blk), so an
+    operator who typed either number was running the other one.
+
+    Seeds ONLY the measured-only dests, all of which are plain ``store`` actions. Seeding every
+    dest would break ``action="append"`` flags (``_AppendAction`` copies the existing value and
+    appends to it — on a sentinel that is an ``AttributeError``);
+    ``test_presence_is_detected_for_every_measured_only_flag`` iterates the tuple, so a flag of
+    another action type added to it fails loudly rather than quietly mis-reporting presence.
+    """
+    seeded = argparse.Namespace(**{dest: _UNSET for dest in _MEASURED_ONLY_POLICY_FLAGS})
+    parsed = _build_parser().parse_args(argv, namespace=seeded)
+    return frozenset(dest for dest in _MEASURED_ONLY_POLICY_FLAGS if getattr(parsed, dest) is not _UNSET)
+
+
+def _eth_finalization_window_s_from_args(args: argparse.Namespace) -> int | None:
+    """The finalized-checkpoint (ETH) counter leg's finalization window, in seconds, or ``None``.
+
+    ``None`` for a BTC-only tower — the reorg gate then uses ``btc_claim_reorg_depth`` and nothing
+    changes. For an ETH tower it must be set, or ``assess_claim_finality`` raises on every
+    depth-less verdict and ``_decide_eth`` pages ``PAGE_SQUEEZED`` "verify finality manually" once
+    per tick until the maker's ETH claim finalizes.
+
+    Provenance order: the operator's explicit ``--eth-finalization-window-s``, else the vetted
+    per-chain value for ``--eth-chain-id``. An UNKNOWN chain id returns ``None`` rather than a
+    fallback guess: too small a window under-reserves, and the gate then says WAIT where it should
+    SQUEEZE — so fail closed (today's behaviour) and name the flag that fixes it.
+    """
+    if args.eth_finalization_window_s is not None:
+        return int(args.eth_finalization_window_s)
+    if not args.eth_rpc_url or args.eth_chain_id is None:
+        # No ETH leg, or no chain id yet — `_build_eth_source` is the one that refuses the
+        # second case, with the message that names --eth-chain-id.
+        return None
+    try:
+        return evm_chain_by_id(args.eth_chain_id).finalization_window_s
+    except ValidationError:
+        logger.error(
+            "chain id %s has no vetted finalization window, so the ETH finality gate cannot be "
+            "assessed: every finalized-checkpoint verdict will page SQUEEZED 'verify finality "
+            "manually'. Pass --eth-finalization-window-s with a sourced figure for this chain.",
+            args.eth_chain_id,
+        )
+        return None
+
+
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
+    # Computed OUTSIDE the branch on purpose: an alert-only (estimated) tower watches ETH swaps
+    # too, so this is not a measured-only flag and must not be refused as one.
+    eth_window = _eth_finalization_window_s_from_args(args)
     if args.measured:
         # Fail closed (mirrors the coordinator's setup gate): a measured tower signals real-value
         # intent, so it must either value-scale (set the per-block reorg cost; the per-record value
@@ -406,13 +476,16 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
             # operator who wants margin above break-even had no way to ask for it.
             burial_safety_factor=args.burial_safety_factor,
             accept_flat_burial=args.accept_flat_burial,
+            eth_finalization_window_s=eth_window,
         )
     # Estimated policy is acceptable for alert-only v1 (no value moves); the operator
     # verifies each page. Use --measured with real block data before any autonomy (v2).
     #
     # REFUSE A POLICY FLAG THIS BRANCH CANNOT CARRY, rather than dropping it in silence.
-    # `MarginPolicy.estimated()` takes exactly `block_interval_s` and `accept_flat_burial` — that
-    # is the point of it, it IS the shipped estimate — so every other policy flag above reached
+    # `MarginPolicy.estimated()` takes `block_interval_s`, `accept_flat_burial` and the ETH
+    # finalization window — the first two because it IS the shipped estimate, the third because it
+    # is not an estimate at all but a per-chain fact the finality gate RAISES without, and an
+    # alert-only tower watches ETH swaps like any other — so every other policy flag above reached
     # the policy only through `MarginPolicy.measured`. Without `--measured` they went nowhere, and
     # the startup report then printed "measured, --rxd-claim-inclusion" for a value the flag never
     # set: `--rxd-claim-inclusion 5 --burial-safety-factor 3` logged `rxd_claim_inclusion=2 blk
@@ -426,12 +499,33 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     # measured knobs is a third thing with no name, which the report would then have to describe.
     #
     # BEHAVIOUR CHANGE, deliberate: `pyrxd-watchtower --rxd-claim-inclusion 5` (no `--measured`)
-    # used to start with the value ignored and now exits at startup. It refuses no honest run —
-    # nothing that ran correctly before is rejected, only invocations whose stated intent the
-    # estimated policy never honoured — it moves no funds (the tower is alert-only and keyless),
-    # and the remedy is in the message.
+    # used to start with the value ignored and now exits at startup.
+    #
+    # AND IT IS WIDER THAN #636 SAID. That comment read "It refuses no honest run — nothing that
+    # ran correctly before is rejected", which was true only because the presence test was broken:
+    # a measured-only flag passed at the parser's OWN default slipped through and kept running. It
+    # no longer does, so `--btc-reorg-depth 6`, `--burial-safety-factor 1.0`, `--margin-blocks 72`,
+    # `--rxd-claim-burial 2` and `--reorg-cost-max-age-s 86400` without `--measured` now exit 1
+    # where they used to start. Two of those were the harmful spelling (the policy held 36 and 6,
+    # not the 72 and 2 the operator typed); the rest are flags that genuinely do nothing on this
+    # branch. Refusing them is the same call #636 made, applied to the whole set instead of to the
+    # values that happened to differ — it moves no funds (the tower is alert-only and keyless) and
+    # the remedy is in the message. `--rxd-block-interval-s` stays exempt below: it has a live
+    # consumer outside the policy.
+    #
+    # PRESENCE, NOT "DIFFERS FROM THE DEFAULT". The value comparison alone left the original defect
+    # alive for exactly one spelling per flag: `--margin-blocks 72` and `--rxd-claim-burial 2` are
+    # the parser's own defaults, so they read as "nobody passed anything" and were accepted and
+    # dropped — while `MarginPolicy.estimated()` holds 36 and 6, so those two operators were
+    # running the number they did not type. `_parse_args` records what was actually on the command
+    # line; the `!=` is OR'd in rather than replaced so a hand-built `Namespace` (an embedder, not
+    # a shipped path — every caller in this tree goes through `_parse_args`) keeps today's
+    # behaviour instead of silently detecting nothing.
+    given_dests = getattr(args, _SUPPLIED_ATTR, frozenset())
     parser_defaults = _build_parser()
-    supplied = [d for d in _MEASURED_ONLY_POLICY_FLAGS if getattr(args, d) != parser_defaults.get_default(d)]
+    supplied = [
+        d for d in _MEASURED_ONLY_POLICY_FLAGS if d in given_dests or getattr(args, d) != parser_defaults.get_default(d)
+    ]
 
     # A flag with a LIVE consumer outside the policy is not dropped, so refusing it is a guard
     # refusing valid work — the refusal added here in #636 was over-broad by exactly one flag.
@@ -450,11 +544,15 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if given:
         raise ValidationError(
             f"{', '.join(given)} only reach the MarginPolicy through --measured; without it they are "
-            "dropped and the startup reserve report would describe a policy you did not ask for. Add "
-            "--measured (and its required measurements), or drop these flags to run the shipped "
-            "ESTIMATE knowingly."
+            "dropped and the policy is the shipped ESTIMATE whatever you passed — which, for some of "
+            "these flags, is not even the value this parser reports as their default. Add --measured "
+            "(and its required measurements), or drop these flags to run the shipped ESTIMATE knowingly."
         )
-    return MarginPolicy.estimated(block_interval_s=args.block_interval_s, accept_flat_burial=args.accept_flat_burial)
+    return MarginPolicy.estimated(
+        block_interval_s=args.block_interval_s,
+        accept_flat_burial=args.accept_flat_burial,
+        eth_finalization_window_s=eth_window,
+    )
 
 
 def _report_claim_reserves(policy: MarginPolicy, *, requested_inclusion_blocks: int | None) -> None:
@@ -522,6 +620,19 @@ def _report_claim_reserves(policy: MarginPolicy, *, requested_inclusion_blocks: 
             "accelerated, and an under-set reserve certifies SAFE at a height where the claim cannot be "
             "mined in time, let alone buried.",
             ESTIMATED_RXD_CLAIM_INCLUSION_BLOCKS,
+        )
+    # THE ETH LEG'S RESERVE REACHES THE SAME HUMAN, and by the same rule: a knob whose effect is
+    # invisible is half a knob. `_dividing_interval_s` is the gate's own conversion, imported
+    # rather than re-derived, so this line cannot quote a block count the gate disagrees with.
+    if policy.eth_finalization_window_s is not None:
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        logger.info(
+            "ETH counter-leg finality reserve: eth_finalization_window_s=%d s / %.0f s fast-tail "
+            "interval => %d RXD block(s) reserved in the WAIT branch before the taker may claim.",
+            policy.eth_finalization_window_s,
+            _dividing_interval_s(policy),
+            math.ceil(policy.eth_finalization_window_s / _dividing_interval_s(policy)),
         )
 
 
@@ -712,6 +823,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="expected EIP-155 chain id for --eth-rpc-url (e.g. 1 mainnet, 11155111 Sepolia); "
         "the tower fails closed if the endpoint reports a different chain",
     )
+    # THE ETH LEG'S FINALITY RESERVE. Left unset and un-settable, `assess_claim_finality` RAISES on
+    # every depth-less (finalized-checkpoint) verdict, which `_decide_eth` turns into PAGE_SQUEEZED
+    # "verify finality manually" — every tick, for the whole window between the maker's ETH claim
+    # and its finalized checkpoint, on a perfectly healthy swap.
+    #
+    # Defaults to the registry value for --eth-chain-id (see `_eth_finalization_window_s_from_args`)
+    # rather than to a number typed here: the window is a per-chain FACT with provenance (768s L1,
+    # 900s OP-stack, 1200s Arbitrum, 6000s Linea), and one default would be wrong for all but one
+    # chain. Reserves DIVIDE by the interval and are COMPARED against this, so a too-SMALL window
+    # under-reserves and lets the gate say WAIT with too little margin — hence no fallback guess for
+    # an unknown chain: it stays None (fail-closed, as today) and the operator is told to pass this.
+    p.add_argument(
+        "--eth-finalization-window-s",
+        type=int,
+        default=None,
+        help="seconds the ETH counter leg's `finalized` tag lags the tip, reserved by the reorg "
+        "gate (default: the vetted per-chain value for --eth-chain-id). Override only with a "
+        "figure you can source; a smaller one collapses the finalization reserve.",
+    )
     # v2 AUTONOMOUS refund (opt-in; DORMANT on a value-bearing network without --audit-cleared). Without
     # --refund-spk the tower is ALERT-ONLY (broadcasts nothing), byte-identical to v1.
     p.add_argument(
@@ -750,7 +880,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    return _build_parser().parse_args(argv)
+    """Parse, and record WHICH measured-only flags were actually typed.
+
+    The presence set has to be taken here because it is the only place with the argv: a parsed
+    ``Namespace`` cannot tell "the operator passed the default" from "the operator passed
+    nothing", and that difference is a whole class of silently-dropped flags (see
+    :func:`_supplied_policy_flags`). Every caller of ``_policy_from_args`` in this tree reaches it
+    through here, so the refusal downstream sees a real presence set on every shipped path.
+    """
+    args = _build_parser().parse_args(argv)
+    setattr(args, _SUPPLIED_ATTR, _supplied_policy_flags(argv))
+    return args
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:

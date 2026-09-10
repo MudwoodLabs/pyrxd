@@ -72,23 +72,17 @@ def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> by
     off a chain, prefer :func:`_cbor_for_verifying`, which does not route the bytes
     through this object's fields.
     """
-    # POP THEN SET, so `creator` is ALWAYS the last key — regardless of whether the input
-    # already had one. `cbor2.dumps` is not canonical here, so it preserves insertion order, and
-    # Python keeps an existing key's position on plain assignment. That made signing (no creator
-    # yet -> appended last) and verifying (creator already present -> left where `to_cbor_dict`
-    # emits it) produce different byte orders from the same logical map: identical dicts,
-    # different bytes, "signature mismatch" on an honest token. Popping first collapses both
-    # paths onto one order.
+    # POP THEN SET, so a `creator` already on the input cannot survive as a stale entry.
+    # This USED to be load-bearing for byte ORDER: the encoder below was non-canonical, so it
+    # preserved insertion order, and Python keeps an existing key's position on plain
+    # assignment — signing (no creator yet -> appended last) and verifying (creator already
+    # present -> left where `to_cbor_dict` emits it) produced different bytes from the same
+    # logical map, i.e. "signature mismatch" on an honest token. Canonical encoding sorts the
+    # keys and makes position irrelevant, so the pop is now belt-and-braces rather than the fix.
     #
-    # Latent while `creator` happened to be last anyway, which is every plain NFT — so every test
-    # passed. It bites the moment a field is emitted AFTER creator, which `crypto` is. Nothing on
-    # chain can carry that combination yet, because until now `sign_metadata` stripped `crypto`
-    # before returning, so this changes no signature that already exists.
-    #
-    # Last is also the position a third-party writer uses (it appends creator to a finished
-    # map), and canonical ordering is deliberately NOT used here: the on-chain bytes of a
-    # non-pyrxd mint are in the writer's order, and re-encoding them canonically would report
-    # an honest token as "normalised by the decoder".
+    # Do not read the ordering rules of `_cbor_for_verifying` into this function. That one is
+    # deliberately NON-canonical, because it rebuilds a THIRD PARTY's bytes and must keep the
+    # writer's own order; this one produces the bytes pyrxd itself signs and publishes.
     d = metadata.to_cbor_dict()
     d.pop("creator", None)
     # Derived from GlyphCreator, not hand-built. `to_cbor_dict` OMITS `algo` when it is the

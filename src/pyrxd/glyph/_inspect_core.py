@@ -85,6 +85,13 @@ _MAX_OUTPUT_COUNT = 100_000
 # JSON mode preserves the full string (still ASCII-safe via ensure_ascii).
 _HUMAN_STRING_CAP = 200
 
+#: How many publisher-chosen entries one envelope may render before the rest are summarised.
+#: An update envelope's KEY SET is chosen by whoever published the transaction, and nothing caps
+#: it: a 256 KB payload of one-byte keys renders tens of thousands of lines, pushing the verified
+#: facts above it off the operator's screen. The cap is on the count only - what is dropped is
+#: always stated, because a silent truncation reads as "that was everything".
+_HUMAN_ENTRY_CAP = 32
+
 
 # Unicode general categories that must NOT reach a terminal: control (Cc),
 # format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
@@ -92,6 +99,27 @@ _HUMAN_STRING_CAP = 200
 # marks (Mn/Me — overlay glyphs onto the previous char). This subsumes the
 # explicit bidi-override / BOM allow-list the previous version maintained.
 _UNICODE_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Zl", "Zp", "Mn", "Me"})
+
+
+def _sanitize_update_fields(fields: dict) -> dict:
+    """Sanitise a partial-update CBOR map for display — KEYS as well as values.
+
+    An update envelope's keys are chosen by whoever published the transaction, exactly like its
+    values, and they land in terminal output beside verified facts. Sanitising only the values
+    would leave the ANSI injection in the key.
+
+    Nested one level, because that is where the interesting content is (`attrs.target`). Deeper
+    structures are rendered as their repr and sanitised whole rather than walked — an attacker
+    choosing the nesting depth should not choose how much work this does.
+    """
+    out: dict = {}
+    for k, v in fields.items():
+        key = _sanitize_display_string(str(k))
+        if isinstance(v, dict):
+            out[key] = {_sanitize_display_string(str(ik)): _sanitize_display_string(str(iv)) for ik, iv in v.items()}
+        else:
+            out[key] = _sanitize_display_string(str(v))
+    return out
 
 
 def _sanitize_display_string(s: str) -> str:
@@ -1018,6 +1046,50 @@ def _classify_raw_tx(
     mint_scriptsig: dict | None = None
     if scriptsigs:
         mint_scriptsig = inspector.parse_mint_scriptsig(scriptsigs[0])
+    # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
+    # token payload here", and returns None both for "no glyph" and for "a glyph I could not
+    # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on
+    # mainnet (`custodian-gate-x7f3.rxd`): three of its four transactions carry the `gly` marker
+    # and this path rendered one, while the two that MOVED where the name points rendered blank.
+    #
+    # Reported for every input, not just the first, and an envelope that neither reader accepts
+    # is reported as UNREADABLE rather than omitted — "I cannot read this" and "there is nothing
+    # here" are opposite facts and the blind one is the more reassuring.
+    glyph_envelopes: list[dict] = []
+    for idx, ss in enumerate(scriptsigs):
+        env = inspector.classify_glyph_scriptsig(ss)
+        if env is None:
+            continue
+        if env.kind == "payload":
+            # ONLY when the OTHER reader actually rendered it. `find_reveal_metadata` walks
+            # `_parse_reveal_scriptsig`, which was NOT unified with `_walk_pushes` - it breaks on
+            # `OP_0` where the new walker treats it as an empty push. So for a push-only scriptSig
+            # with one leading zero byte, classify sees a payload, extract sees nothing, and
+            # skipping here on the assumption that the metadata block will render it meant a glyph
+            # reveal rendered as NOTHING AT ALL - the blindness this whole surface exists to end,
+            # reintroduced one layer up. When the two disagree, say so rather than trusting either.
+            if found is not None and found[0] == idx:
+                continue
+            glyph_envelopes.append(
+                {
+                    "input_index": idx,
+                    "kind": "payload_unrendered",
+                    "reason": _sanitize_display_string(
+                        "this input carries a full glyph payload that the reveal reader did not "
+                        "return — the two readers disagree about these bytes"
+                    ),
+                }
+            )
+            continue
+        entry: dict = {"input_index": idx, "kind": env.kind}
+        if env.kind == "update":
+            # Attacker-authored CBOR landing in terminal output: same sanitisation rule as every
+            # other indexer/chain string here, applied to keys AND values.
+            entry["fields"] = _sanitize_update_fields(env.fields or {})
+        else:
+            entry["reason"] = _sanitize_display_string(env.reason)
+        glyph_envelopes.append(entry)
+
     metadata_payload: dict | None = None
     if found is not None:
         input_idx, metadata = found
@@ -1184,6 +1256,9 @@ def _classify_raw_tx(
         "output_count": len(tx.outputs),
         "outputs": output_rows,
         "metadata": metadata_payload,
+        # Glyph envelopes that are NOT full payloads: updates, and envelopes that
+        # could not be read. Empty list when the transaction carries neither.
+        "glyph_envelopes": glyph_envelopes,
         "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }
