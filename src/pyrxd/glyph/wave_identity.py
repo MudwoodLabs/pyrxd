@@ -31,8 +31,11 @@ and always honest; a form-2 sentence built on an unproved input is neither.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
+
+from pyrxd.network._guards import nonneg_int
 
 from .mark_anchor import MarkAnchor
 from .mutable_chain import MutableChainWalk, fold_chain
@@ -131,20 +134,85 @@ def judge_name_at_mark(
             anchor=anchor,
         )
 
-    missing = [s.txid for s in walk.steps if step_heights.get(s.txid) is None]
-    if missing:
+    # THE CHAIN THIS VERDICT IS ABOUT. `ref` arrives from the name->glyph binding and `walk` from
+    # somewhere else; nothing compared them, so a form-2 sentence could name one glyph while
+    # reporting a target folded from another's chain - false about both halves, with no reason.
+    if walk.ref != ref:
         return _degrade(
             ref=ref,
             binding_source=binding_source,
-            reason=f"no block height for {missing[0]} — a step that cannot be placed cannot be ordered against the mark",
+            reason=(
+                f"the walk is of ref {walk.ref}, not {ref} — this verdict would be about one "
+                "glyph and built from another's history"
+            ),
             anchor=anchor,
         )
 
-    # The last step at or before the mark's block. Steps are already in SPEND order, which is the
-    # order that counts: two updates can share a height, so a height comparison alone cannot
-    # order them - it can only decide which ones are in range.
-    in_range = [i for i, s in enumerate(walk.steps) if (step_heights[s.txid] or 0) <= (anchor.height or 0)]
-    if not in_range:
+    # HEIGHTS, VALIDATED LIKE EVERY OTHER UNTRUSTED NUMBER HERE. `mark_anchor` runs the mark's own
+    # depth through `finite_int` and refuses negatives; `wave._optional_int` refuses a bool
+    # `expires` with a comment explaining that `isinstance(True, int)` is True in Python. This -
+    # the newest and most trust-critical of the four - accepted bools, negatives and zero, and
+    # `(h or 0)` turned `False` into "the genesis block", i.e. definitely before any mark.
+    placed: dict[str, int] = {}
+    for step in walk.steps:
+        raw = step_heights.get(step.txid)
+        if raw is None:
+            continue
+        try:
+            placed[step.txid] = nonneg_int(raw)
+        except ValueError as exc:
+            return _degrade(
+                ref=ref,
+                binding_source=binding_source,
+                reason=f"unusable block height for {step.txid}: {exc}",
+                anchor=anchor,
+            )
+
+    # NON-DECREASING BY CONSENSUS: a transaction cannot be mined before the transaction it spends,
+    # and this walk is spend-ordered. So a decreasing pair is not a quirk to tolerate - it is
+    # EVIDENCE that the height source is lying or that state was read across a reorg, which is
+    # exactly the case that must degrade.
+    #
+    # It is also what made `in_range` unsafe. That list is a FILTER; `fold_chain(through_index=N)`
+    # folds the PREFIX `steps[:N+1]`. With heights out of order, a step the filter EXCLUDED was
+    # folded in anyway, and the verdict reported its target authoritatively with an empty reason.
+    # Enforcing monotonicity makes the filter a prefix, and the fold correct by construction
+    # rather than by luck.
+    ordered = [placed[s.txid] for s in walk.steps if s.txid in placed]
+    if any(b < a for a, b in itertools.pairwise(ordered)):
+        return _degrade(
+            ref=ref,
+            binding_source=binding_source,
+            reason=(
+                f"the reported block heights {ordered} decrease along a spend-ordered chain, which "
+                "consensus forbids — the height source is wrong, or this was read across a reorg"
+            ),
+            anchor=anchor,
+        )
+
+    # A step with no height only matters while it could still be IN range. Once a step is known to
+    # be after the mark, monotonicity puts every later one after it too, so an unconfirmed tip
+    # update cannot affect an answer about an older block. Requiring a height for those refused
+    # honest work: any name with an unconfirmed update at its tip became permanently unanswerable
+    # about any block, however old.
+    cutoff = -1
+    for index, step in enumerate(walk.steps):
+        height = placed.get(step.txid)
+        if height is None:
+            return _degrade(
+                ref=ref,
+                binding_source=binding_source,
+                reason=(
+                    f"no block height for {step.txid}, and it is not yet known to be after the "
+                    "mark — a step that cannot be placed cannot be ordered against it"
+                ),
+                anchor=anchor,
+            )
+        if height > (anchor.height or 0):
+            break
+        cutoff = index
+
+    if cutoff < 0:
         return _degrade(
             ref=ref,
             binding_source=binding_source,
@@ -155,7 +223,7 @@ def judge_name_at_mark(
             anchor=anchor,
         )
 
-    folded = fold_chain(walk, through_index=in_range[-1])
+    folded = fold_chain(walk, through_index=cutoff)
     if folded.incomplete:
         return _degrade(ref=ref, binding_source=binding_source, reason=folded.reason, anchor=anchor)
 

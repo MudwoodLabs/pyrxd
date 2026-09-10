@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **The HashMark §7.6 form-2 stack was re-attacked before it shipped, and the walker was reading
+  the wrong bytes.** NONE OF THIS EVER REACHED A RELEASE — every defect below is in unreleased
+  code from the same branch, found by a seven-reviewer panel across two model families and fixed
+  here. It is recorded because the shape of the mistakes is reusable, not because a published
+  version was affected.
+
+  The keystone: a mutable output's script commits to `payload_hash`, and measured on every real
+  mainnet step of two WAVE chains that is exactly `sha256d` of the step's envelope CBOR. The
+  walker had been reading "the first `gly` push in any input" instead, which let the publisher
+  choose the record — a decoy envelope in an earlier input replaced it wholesale, and a readable
+  decoy in front of an unreadable envelope flipped `complete` False→True, defeating the degrade
+  the module advertises. `walk_mutable_chain` now accepts only the envelope the covenant commits
+  to.
+
+  - **Two claimants for one outpoint now degrade instead of racing.** The spender was chosen with
+    `sorted(pool)`, so one fabricated conflicting txid ground to sort first hijacked the chain —
+    and the real confirmed update was then reported in `excluded`, i.e. the walk asserted the
+    truth did not belong to the token. Nothing in the walk can tell a real spend from a forged
+    one, so two claimants is an ambiguity it refuses to resolve.
+  - **One source may no longer supply both the candidate set and the tip proof.** Omitting the
+    later updates AND certifying the earlier tip takes two lies from one endpoint and produced
+    `complete=True` over a stale record with an empty reason. Unattributed sources count as
+    possibly-identical.
+  - **Block heights are validated and required to be non-decreasing.** `(h or 0)` turned `False`
+    into height 0 — before any mark — and a JSON string raised `TypeError` out of a function
+    documented as always degrading. Heights along a spend-ordered chain cannot decrease, so a
+    decrease now degrades; enforcing it also makes the in-range filter a genuine prefix, which is
+    what `fold_chain(through_index=...)` folds. Previously a step the range calculation had
+    EXCLUDED was folded in anyway and its target reported authoritatively.
+  - **"The record is not known" is now one derived set, not three hand-kept tuples.** They had
+    already drifted: `fold_chain` listed only `unreadable`, so an `unbound` step folded as a
+    readable no-op; and a step whose output commits to a payload nobody revealed was in no list at
+    all, folding as "unchanged" and reporting the previous target as current.
+  - **Form 2 refuses an ambiguously encoded envelope.** `cbor2` silently discards trailing bytes
+    and takes the LAST of a repeated key, so one committed blob had two readings — a
+    cross-implementation split on exactly the question form 2 answers. This narrows the CLAIM, not
+    the decoder: `decode_payload` is unchanged, because six real envelopes is not evidence enough
+    to start refusing mints.
+  - **A walk no longer costs `steps x candidates` round trips.** Measured on the three-step
+    mainnet chain with a 1,000-txid discovery hint: 3,007 fetches before, 1,004 after. `max_steps`
+    is validated too — a cap below 1 made the loop body unreachable, so the walk returned the mint
+    as the tip with an empty reason.
+  - **Publisher-chosen envelope text can no longer own the screen.** Values were truncated and
+    KEYS were not, so a 100,000-character key rendered in full — a 200,004-character line,
+    measured — and nothing capped how many entries an envelope may list. Both the CLI and the
+    `docs/inspect_static` page now cap length and count, and state what was dropped. The page had
+    never rendered the envelope block at all, so on the web a mutable glyph's UPDATE showed as an
+    ordinary transfer and an unreadable envelope showed as nothing.
+  - **There is now actually one push walker.** `_scriptsig_pushes` claimed in its own docstring
+    that there was "one walker rather than two that can drift" while `_parse_reveal_scriptsig`
+    kept a hand-rolled copy — and the two had drifted in both directions: the copy bailed at
+    `OP_0` (which every real MUT unlock ends with) and clamped truncated pushes into
+    plausible-looking short items.
+  - `MAX_CHAIN_STEPS`, `RECORD_UNKNOWN_KINDS`, `EXPIRY_UNKNOWN` and `UNVERIFIED_CAVEAT` are
+    exported from `pyrxd.glyph`. Comparing `verdict.expiry` previously meant importing a private
+    module or retyping the string, which is how "unknown" quietly becomes "not expired".
+
+  Each fix is pinned by a test that was verified two-sided — asserted to pass with the fix and to
+  FAIL with the original defect planted back. The first harness written for this reported one
+  false survival, so it was rebuilt to check both directions and purge bytecode between them.
+
 ### Added
 
 - **Timelocked Glyph content can now be minted and revealed** (#556). The feature had
@@ -51,6 +114,76 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the chain previously raised `AttributeError`.
 
 ### Fixed
+
+- **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
+  `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
+  refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
+  the eras a present-tense lookup conflates: a mark at 458586 resolves to `1CPfirXZ…`, one at
+  458595 to `14XmXG3d…`.
+
+  The verdict is **structurally** narrow rather than narrow by docstring: `form` is an int so no
+  caller can read a single flag optimistically, `expiry` is a string state so nothing can compare
+  it to a clock, and `binding_verified` stays False until something checks the name→glyph binding
+  on chain. It degrades to form 1 **with a reason** when the mark has no block, is too shallow,
+  when the walk is incomplete, when a step cannot be placed against the mark — and when the height
+  and the binding came from the **same source**, since one endpoint supplying both can choose the
+  block and then choose what the name said at it.
+
+  `resolve_mark_anchor` supplies the block, which nothing did before: `_classify_raw_tx` returns no
+  height, blockhash or confirmations. It takes a **required** `min_confirmations` with no default,
+  following the registry's own rule that depth is value-scaled per chain and that "'6 confirmations'
+  folklore transfers across chains even less than it transfers across values".
+
+  **The height is the endpoint's claim, not a proof**, and every anchor and verdict says so.
+  `pyrxd.spv` is Bitcoin-only; there is no Radiant header, proof-of-work or merkle check. Fetching a
+  merkle path would not help — with no work check, fabricating a header whose root commits to the
+  transaction is free, so inclusion-without-work buys nothing against a hostile endpoint while
+  looking exactly like security.
+
+  Exported as consumer API. The CLI cannot drive form 2 yet: it needs a token's transaction list and
+  `RxinDexerClient` has no history method, so wiring a caller that always degrades would be a
+  wrapper around dead code.
+
+- **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
+  `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
+  mutable output at a time — and reports `complete` only when every link verified *and* the
+  final output is proved unspent. Anything else returns the walked prefix with a reason.
+
+  That distinction is the point: a truncated history is how a superseded value becomes
+  authoritative. Stop one transaction early and a naive walker reports the previous target with
+  no sign anything is missing, which is exactly what an index was observed doing to a live WAVE
+  name.
+
+  **The chain is the singleton, not an index's history list.** Measured on mainnet,
+  `custodian-gate-x7f3.rxd`'s history contains a transaction that shares a block with a real
+  update and is spent *from* by the next one — and never touches the token. It is reported as
+  `excluded`, not folded and not allowed to order anything. Height cannot order a chain either:
+  two of that name's transactions share height 458591, and another name has two update envelopes
+  at one height.
+
+  A step whose mutable output carries a **different ref** raises rather than degrades — following
+  it would splice two tokens' histories together. Absence degrades; contradiction raises.
+
+- **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
+  and put it in `glyph_envelopes`, which was then read by **nothing** — three references
+  repo-wide, all of them the write. So the default terminal output still rendered the mainnet
+  update `315b4630…` as `type=unknown / type=mut / type=p2pkh`, with no mention of the change
+  and no sight of the new target: the same blindness that PR's subject line is about, one layer
+  up. `pyrxd glyph inspect` now names the update and its target, and says what it does **not**
+  establish — that an envelope changes a *glyph's* fields, not which name resolves to it.
+
+  An `unreadable` envelope is named just as loudly, because "I could not read this" and "there
+  is nothing here" are opposite facts and the blind one reads as reassuring.
+
+- **`WaveAttrs` silently dropped `attrs.expires`.** Measured, a real mainnet record round-tripped
+  `[domain, expires, name, target, target_type]` back out as `[domain, name, target,
+  target_type]`. It is now carried, refused rather than dropped when unusable (`True` included —
+  `isinstance(True, int)` is True in Python, so a bool would have become a 1970 timestamp), and
+  emitted only when set, so a mint that never asked for it publishes the same four keys as before.
+
+  Carried is not consumed: Photonic's own source says the indexer is authoritative on renewals
+  and `attrs.expires` is "display-level", so nothing may read it as an expiry. An AST scan pins
+  that nothing does.
 
 - **`pyrxd-watchtower` paged `PAGE_SQUEEZED` on every tick of a healthy ETH swap**, because
   `MarginPolicy.eth_finalization_window_s` was unreachable from the tower. The finality gate
@@ -291,76 +424,6 @@ settled.
   steps — so the outcome is now `UNVERIFIABLE`, with digest, label and signer
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
-
-- **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
-  `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
-  refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
-  the eras a present-tense lookup conflates: a mark at 458586 resolves to `1CPfirXZ…`, one at
-  458595 to `14XmXG3d…`.
-
-  The verdict is **structurally** narrow rather than narrow by docstring: `form` is an int so no
-  caller can read a single flag optimistically, `expiry` is a string state so nothing can compare
-  it to a clock, and `binding_verified` stays False until something checks the name→glyph binding
-  on chain. It degrades to form 1 **with a reason** when the mark has no block, is too shallow,
-  when the walk is incomplete, when a step cannot be placed against the mark — and when the height
-  and the binding came from the **same source**, since one endpoint supplying both can choose the
-  block and then choose what the name said at it.
-
-  `resolve_mark_anchor` supplies the block, which nothing did before: `_classify_raw_tx` returns no
-  height, blockhash or confirmations. It takes a **required** `min_confirmations` with no default,
-  following the registry's own rule that depth is value-scaled per chain and that "'6 confirmations'
-  folklore transfers across chains even less than it transfers across values".
-
-  **The height is the endpoint's claim, not a proof**, and every anchor and verdict says so.
-  `pyrxd.spv` is Bitcoin-only; there is no Radiant header, proof-of-work or merkle check. Fetching a
-  merkle path would not help — with no work check, fabricating a header whose root commits to the
-  transaction is free, so inclusion-without-work buys nothing against a hostile endpoint while
-  looking exactly like security.
-
-  Exported as consumer API. The CLI cannot drive form 2 yet: it needs a token's transaction list and
-  `RxinDexerClient` has no history method, so wiring a caller that always degrades would be a
-  wrapper around dead code.
-
-- **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
-  `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
-  mutable output at a time — and reports `complete` only when every link verified *and* the
-  final output is proved unspent. Anything else returns the walked prefix with a reason.
-
-  That distinction is the point: a truncated history is how a superseded value becomes
-  authoritative. Stop one transaction early and a naive walker reports the previous target with
-  no sign anything is missing, which is exactly what an index was observed doing to a live WAVE
-  name.
-
-  **The chain is the singleton, not an index's history list.** Measured on mainnet,
-  `custodian-gate-x7f3.rxd`'s history contains a transaction that shares a block with a real
-  update and is spent *from* by the next one — and never touches the token. It is reported as
-  `excluded`, not folded and not allowed to order anything. Height cannot order a chain either:
-  two of that name's transactions share height 458591, and another name has two update envelopes
-  at one height.
-
-  A step whose mutable output carries a **different ref** raises rather than degrades — following
-  it would splice two tokens' histories together. Absence degrades; contradiction raises.
-
-- **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
-  and put it in `glyph_envelopes`, which was then read by **nothing** — three references
-  repo-wide, all of them the write. So the default terminal output still rendered the mainnet
-  update `315b4630…` as `type=unknown / type=mut / type=p2pkh`, with no mention of the change
-  and no sight of the new target: the same blindness that PR's subject line is about, one layer
-  up. `pyrxd glyph inspect` now names the update and its target, and says what it does **not**
-  establish — that an envelope changes a *glyph's* fields, not which name resolves to it.
-
-  An `unreadable` envelope is named just as loudly, because "I could not read this" and "there
-  is nothing here" are opposite facts and the blind one reads as reassuring.
-
-- **`WaveAttrs` silently dropped `attrs.expires`.** Measured, a real mainnet record round-tripped
-  `[domain, expires, name, target, target_type]` back out as `[domain, name, target,
-  target_type]`. It is now carried, refused rather than dropped when unusable (`True` included —
-  `isinstance(True, int)` is True in Python, so a bool would have become a 1970 timestamp), and
-  emitted only when set, so a mint that never asked for it publishes the same four keys as before.
-
-  Carried is not consumed: Photonic's own source says the indexer is authoritative on renewals
-  and `attrs.expires` is "display-level", so nothing may read it as an expiry. An AST scan pins
-  that nothing does.
 
 - **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
   Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no

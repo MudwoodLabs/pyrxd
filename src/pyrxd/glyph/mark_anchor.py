@@ -10,12 +10,25 @@ header verifier, no Radiant proof-of-work check and no Radiant merkle-inclusion 
 can hash a Radiant header but nothing checks that header's work or its place on the most-work
 chain.
 
-AND MERKLE INCLUSION WOULD NOT FIX THAT — read this before "improving" it. Fetching a merkle path
-and checking it against a header the same server supplied proves nothing against a hostile server:
-with no proof-of-work check, fabricating a header whose merkle root commits to the transaction is
-free. Inclusion-without-work catches accidental inconsistency and buys nothing against the threat
-model, while looking exactly like security. The honest options are a real Radiant SPV client or the
-caveat this module carries; there is no cheap middle.
+AND MERKLE INCLUSION ALONE WOULD NOT FIX THAT — read this before "improving" it. Fetching a merkle
+path and checking it against a header the same server supplied proves nothing against a hostile
+server: with no proof-of-work check, fabricating a header whose merkle root commits to the
+transaction is free. Inclusion-without-work catches accidental inconsistency and buys nothing
+against a server that is lying on purpose, while looking exactly like security.
+
+Two cheaper-than-SPV steps DO buy something, and this module implements neither, so do not read the
+paragraph above as "nothing short of full SPV is worth doing":
+
+  * CHECKING THE HEADER'S OWN PROOF-OF-WORK (does it hash below its stated target) makes fabricating
+    a header cost real work instead of nothing. It still does not prove the header is on the
+    most-work chain, which is what a reorg-depth argument needs.
+  * COMPARING HEIGHTS FROM INDEPENDENT ENDPOINTS turns one lie into a detectable disagreement. That
+    is a weaker claim than consensus, and it is the same independence argument ``source`` exists to
+    make checkable one level up.
+
+What this module ships today is the caveat, because neither of those is built here yet. The honest
+ordering is: caveat now, the two steps above as real improvements, a Radiant SPV client for a claim
+that does not need a caveat at all.
 
 WHAT IT IS. ``get_transaction_verbose`` binds the echoed txid, so an endpoint cannot answer about a
 DIFFERENT transaction — that much is checked. Beyond it, an endpoint that lies about the height
@@ -35,7 +48,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from pyrxd.network._guards import finite_int
+from pyrxd.network._guards import nonneg_int
 from pyrxd.security.errors import NetworkError, ValidationError
 
 #: Text attached to every anchor. Deliberately not optional and deliberately blunt: the whole
@@ -83,6 +96,7 @@ async def resolve_mark_anchor(
     fetch_verbose: Callable[[str], Awaitable[dict]],
     source: str,
     min_confirmations: int,
+    tip_height: int | None = None,
 ) -> MarkAnchor:
     """Ask an endpoint where ``txid`` is, and return it qualified.
 
@@ -105,23 +119,53 @@ async def resolve_mark_anchor(
     if not isinstance(info, dict):
         raise NetworkError(f"get_transaction_verbose did not return a dict for {txid}")
 
-    raw_confs = info.get("confirmations", 0) or 0
+    # BIND THE ECHO HERE, not beside. `ElectrumXClient.get_transaction_verbose` does bind it, but
+    # it is not the only shipped source of this shape, and this function is the funnel every path
+    # crosses with both values in hand. Without it `MarkAnchor.txid` was simply the txid REQUESTED
+    # however different the answer was.
+    echoed = info.get("txid")
+    if isinstance(echoed, str) and echoed.lower() != txid.lower():
+        raise NetworkError(f"endpoint answered about {echoed} when asked about {txid}; fail-closed")
+
+    # NO `or 0`. It short-circuited `finite_int` for every falsy value, so null, "", false and -1
+    # all became depth 0 and then read as "unmined" - the exact conflation this module's own
+    # contract forbids, and the opposite of how the height branch below treats a negative.
+    raw_confs = info.get("confirmations", 0)
+    if raw_confs is None:
+        raw_confs = 0
     try:
-        confirmations = finite_int(raw_confs)
+        confirmations = nonneg_int(raw_confs)
     except ValueError as exc:
         raise NetworkError(f"endpoint reported an unreadable confirmation depth for {txid}; fail-closed") from exc
-    confirmations = max(confirmations, 0)
 
+    # HEIGHT IS DERIVED, NOT READ. Measured against a live mainnet node and both shipped public
+    # ElectrumX servers, `getrawtransaction <txid> true` returns
+    # ['blockhash','blocktime','confirmations','hash','locktime','size','time','txid','version'] -
+    # NEITHER `height` NOR `blockheight`. Reading those keys meant `height` was always None in
+    # production, so form 2 could never fire honestly; worse, the ONLY way to obtain a usable
+    # anchor was an endpoint that ADDED a key no honest source emits, so the feature was reachable
+    # exclusively by anomalous or hostile responses.
+    #
+    # `tip - confirmations + 1` uses what the endpoint really returns. It is the same endpoint's
+    # claim, which the caveat already says; a caller wanting better supplies `tip_height` from
+    # somewhere independent.
     height: int | None = None
     if confirmations > 0:
-        raw_height = info.get("height", info.get("blockheight"))
-        if raw_height is not None:
-            try:
-                height = finite_int(raw_height)
-            except ValueError as exc:
-                raise NetworkError(f"endpoint reported an unreadable block height for {txid}; fail-closed") from exc
-            if height < 0:
-                raise NetworkError(f"endpoint reported a negative block height for {txid}; fail-closed")
+        if tip_height is None:
+            raise NetworkError(
+                f"cannot place {txid}: it has {confirmations} confirmations but no chain tip was "
+                "supplied, and this endpoint shape carries no height field of its own"
+            )
+        try:
+            tip = nonneg_int(tip_height)
+        except ValueError as exc:
+            raise NetworkError(f"unusable chain tip height for {txid}; fail-closed") from exc
+        height = tip - confirmations + 1
+        if height < 0:
+            raise NetworkError(
+                f"endpoint reports {confirmations} confirmations against tip {tip} for {txid}, "
+                "which places it before the genesis block; fail-closed"
+            )
 
     return MarkAnchor(
         txid=txid,

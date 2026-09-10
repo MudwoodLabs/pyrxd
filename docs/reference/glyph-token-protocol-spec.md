@@ -813,9 +813,16 @@ envelope carries more type information than the chain does.
 | CONTAINER | **not distinguishable** — byte-identical to an NFT by design (§7.5) | envelope only |
 | DAT, BURN, ENCRYPTED, TIMELOCK, AUTHORITY, WAVE | **not distinguishable** — envelope markers only | envelope only |
 
-`src/pyrxd/glyph/_inspect_core.py:210-322` is the dispatch order pyrxd uses, and
-`src/pyrxd/glyph/_inspect_core.py:325-369` is the envelope-side classification,
-which returns the highest-specificity marker present.
+`src/pyrxd/glyph/_inspect_core.py:515-585` is the dispatch order pyrxd uses — NFT, FT,
+container-legacy, MUT, commit-NFT, commit-FT, in that order — and
+`src/pyrxd/glyph/_inspect_core.py:762-824` is the envelope-side classification, which returns
+the highest-specificity marker present.
+
+(Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,
+which land in `_is_exact_timelock_script`'s and `_ref_summary`'s docstrings — prose about a
+64-hex-string preference and about ref counting, not either of the things this sentence claims.
+The citation guard checks that a cited line is non-blank, which those were, so the pointers
+resolved cleanly while naming the wrong code.)
 
 An implementation classifying a *token* (rather than an output) MUST read the
 envelope. An implementation classifying an *output* can only report the script

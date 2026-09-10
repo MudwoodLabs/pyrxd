@@ -46,7 +46,14 @@ async def _unspent(_t: str, _v: int) -> bool:
 
 
 async def _walk():
-    return await walk_mutable_chain(mint_txid=MINT, candidates=list(_RAW), fetch_tx=_fetch, is_unspent=_unspent)
+    return await walk_mutable_chain(
+        mint_txid=MINT,
+        candidates=list(_RAW),
+        fetch_tx=_fetch,
+        is_unspent=_unspent,
+        candidate_source="index",
+        tip_source="node",
+    )
 
 
 def _anchor(height: int | None, *, confs: int = 50, floor: int = 6, source: str = NODE) -> MarkAnchor:
@@ -63,11 +70,12 @@ def _anchor(height: int | None, *, confs: int = 50, floor: int = 6, source: str 
     [(458586, MINT_TARGET), (458590, MINT_TARGET), (458595, MOVED), (458605, MOVED)],
 )
 async def test_it_reports_the_target_in_force_at_the_marks_block(mark_height: int, expected: str) -> None:
+    walk = await _walk()
     verdict = judge_name_at_mark(
-        ref=(await _walk()).ref,
+        ref=walk.ref,
         binding_source=BINDING,
         anchor=_anchor(mark_height),
-        walk=await _walk(),
+        walk=walk,
         step_heights=_HEIGHTS,
     )
     assert verdict.form == 2, verdict.degraded_reason
@@ -168,12 +176,30 @@ async def test_a_step_with_no_height_degrades() -> None:
     """A step that cannot be PLACED cannot be ordered against the mark — and quietly treating
     it as 'before' would fold in an update that may have come after."""
     walk = await _walk()
-    holes = {**_HEIGHTS, walk.steps[-1].txid: None}
+    holes = {**_HEIGHTS, walk.steps[0].txid: None}
     verdict = judge_name_at_mark(
         ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=holes
     )
     assert verdict.form == 1
     assert "no block height for" in verdict.degraded_reason
+
+
+async def test_a_missing_height_AFTER_the_mark_does_not_refuse() -> None:
+    """A guard that refuses valid work is a bug.
+
+    The unplaceable-step sweep used to run over EVERY step, including ones far after the mark.
+    An unconfirmed tip update cannot be in a block at or before the mark — the answer is fully
+    determined without it — yet it made any name with an unconfirmed update permanently
+    unanswerable about any block, however old. Monotonicity settles it: once a step is known to
+    be after the mark, so is every later one.
+    """
+    walk = await _walk()
+    holes = {**_HEIGHTS, walk.steps[-1].txid: None}
+    verdict = judge_name_at_mark(
+        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458586), walk=walk, step_heights=holes
+    )
+    assert verdict.form == 2, verdict.degraded_reason
+    assert verdict.target_at_height == MINT_TARGET
 
 
 async def test_a_mark_older_than_the_name_degrades() -> None:

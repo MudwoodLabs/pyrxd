@@ -409,39 +409,24 @@ class GlyphInspector:
     def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
         """Walk the scriptSig push-data stack to find 'gly' marker + CBOR.
 
-        Handles all four push-data opcodes including OP_PUSHDATA4 (0x4e):
-        V1 dMint deploy reveals on Radiant mainnet carry CBOR bodies > 65535
-        bytes (the GLYPH deploy's body is 65,569 bytes including a PNG), which
-        forces OP_PUSHDATA4. Without 0x4e support the walker bails out
-        before reaching the 'gly' marker that follows it.
-        """
-        pos = 0
-        items = []
-        while pos < len(scriptsig):
-            opcode = scriptsig[pos]
-            pos += 1
-            if 1 <= opcode <= 75:
-                items.append(scriptsig[pos : pos + opcode])
-                pos += opcode
-            elif opcode == 0x4C:  # OP_PUSHDATA1
-                length = scriptsig[pos]
-                pos += 1
-                items.append(scriptsig[pos : pos + length])
-                pos += length
-            elif opcode == 0x4D:  # OP_PUSHDATA2
-                length = int.from_bytes(scriptsig[pos : pos + 2], "little")
-                pos += 2
-                items.append(scriptsig[pos : pos + length])
-                pos += length
-            elif opcode == 0x4E:  # OP_PUSHDATA4
-                length = int.from_bytes(scriptsig[pos : pos + 4], "little")
-                pos += 4
-                items.append(scriptsig[pos : pos + length])
-                pos += length
-            else:
-                break  # non-push opcode, stop
+        NOW ACTUALLY ONE WALKER. :meth:`_scriptsig_pushes` claimed in its own docstring that the
+        push logic was expressed over :meth:`_walk_pushes` "so there is one walker rather than two
+        that can drift" — while this method kept a second, hand-rolled copy. The claim was false,
+        and the two had already drifted in both directions:
 
-        # Look for 'gly' marker item followed by CBOR
+          * ``OP_0`` (0x00) — :meth:`_walk_pushes` reads it as an empty push and continues; this
+            copy fell through to ``break``. A real MUT unlock ends ``OP_1 OP_1 OP_0 OP_0``, so the
+            two readers disagreed about real mainnet scripts, which is the disagreement the
+            ``payload_unrendered`` state exists to surface rather than resolve silently.
+          * TRUNCATED PUSHES — this copy sliced past the end of the script, and Python clamps, so
+            a push declaring more bytes than remain yielded a SHORT item and left ``pos`` past the
+            end; :meth:`_walk_pushes` bounds-checks and stops. Clamping turns malformed bytes into
+            a plausible-looking item, which is the worse of the two failures.
+
+        Both PUSHDATA4 support (the GLYPH deploy's 65,569-byte body forces 0x4e) and the
+        marker-then-CBOR search are unchanged; only the duplicated walking is gone.
+        """
+        items, _complete = self._walk_pushes(scriptsig)
         for i, item in enumerate(items):
             if item == GLY_MARKER and i + 1 < len(items):
                 return decode_payload(items[i + 1])

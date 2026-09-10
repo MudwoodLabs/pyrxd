@@ -100,6 +100,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ChainStep": ("pyrxd.glyph.mutable_chain", "ChainStep"),
     "FoldedRecord": ("pyrxd.glyph.mutable_chain", "FoldedRecord"),
     "fold_chain": ("pyrxd.glyph.mutable_chain", "fold_chain"),
+    "MAX_CHAIN_STEPS": ("pyrxd.glyph.mutable_chain", "MAX_CHAIN_STEPS"),
+    "RECORD_UNKNOWN_KINDS": ("pyrxd.glyph.mutable_chain", "RECORD_UNKNOWN_KINDS"),
     # HashMark §7.6 form 2. Consumer surface for the same reason as the walker above: the CLI
     # cannot drive it yet because pyrxd has no way to enumerate a token's transactions (the
     # indexer client has `glyph_get_token`, which returns a record, not a history), so the
@@ -108,6 +110,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "resolve_mark_anchor": ("pyrxd.glyph.mark_anchor", "resolve_mark_anchor"),
     "WaveIdentityVerdict": ("pyrxd.glyph.wave_identity", "WaveIdentityVerdict"),
     "judge_name_at_mark": ("pyrxd.glyph.wave_identity", "judge_name_at_mark"),
+    # The two sentinels a consumer has to be able to COMPARE AGAINST rather than retype. Without
+    # them exported, reading `verdict.expiry` means hardcoding the string from a private module -
+    # which is how a consumer ends up silently treating "unknown" as "not expired".
+    "EXPIRY_UNKNOWN": ("pyrxd.glyph.wave_identity", "EXPIRY_UNKNOWN"),
+    "UNVERIFIED_CAVEAT": ("pyrxd.glyph.mark_anchor", "UNVERIFIED_CAVEAT"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),
