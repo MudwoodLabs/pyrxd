@@ -115,6 +115,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The repo's own git tooling did not work from a git worktree** — the workflow it asks agents
+  to use. Two instances of one blindness, both hit rather than reviewed: `scripts/git-hooks/
+  pre-push` located the venv with `git rev-parse --show-toplevel`, which is the CURRENT worktree,
+  and a linked worktree has no `.venv` (it lives in the main checkout), so every push from one
+  aborted with a bare "task not found". And `scripts/install-git-hooks.sh` targeted
+  `${REPO_ROOT}/.git/hooks`, but in a linked worktree `.git` is a FILE pointing at the real repo,
+  so the installer refused with "are you inside the pyrxd git repo?" — from inside the repo.
+  `--git-common-dir` answers both: it resolves to the one shared git directory from any worktree.
+
+  Re-attacking the fix found a defect it would have added: the installer symlinks the SHARED hook
+  to `${REPO_ROOT}/scripts/git-hooks/…`, so merely letting it succeed from a worktree would have
+  pointed every checkout's hook into an ephemeral directory — dangling the moment that worktree
+  was removed, silently disabling pre-push checks repo-wide. Both the source and the destination
+  now derive from the main checkout, and it warns when run from a worktree.
+
+  Also corrected: `install-git-hooks.sh` advertised that pre-push "runs the full local-CI matrix
+  (`task ci`)". It runs `task ci-fast`, and the hook it installs explains at length why the full
+  suite there is actively wrong — git opens the remote connection before the hook runs and GitHub
+  drops an idle receive-pack after ~5 minutes, so a long hook makes the push die with SIGPIPE
+  having transferred nothing. The installer was telling you your pushes were covered by a check
+  that deliberately does not run.
+
 - **The changelog claimed 0.23.0 shipped seven things it did not.** Entries kept landing under
   `## [0.23.0]` after v0.23.0 was tagged — the released section sits directly below
   `## [Unreleased]`, both carry a `### Fixed`, and in a diff appending to the wrong one looks

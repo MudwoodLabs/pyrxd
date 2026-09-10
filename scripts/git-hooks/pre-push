@@ -35,9 +35,28 @@ fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; exit 1; }
 # requiring the caller to have activated it — an unactivated venv used to abort
 # the push with a bare "task not found".
 if ! command -v task >/dev/null 2>&1; then
-  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  if [ -n "$repo_root" ] && [ -x "$repo_root/.venv/bin/task" ]; then
-    PATH="$repo_root/.venv/bin:$PATH"
+  # TWO CANDIDATES, because `--show-toplevel` is the CURRENT worktree and a linked
+  # worktree has no `.venv` — the venv lives in the main checkout. Measured from a
+  # linked worktree: `--show-toplevel` gives the worktree, while `--git-common-dir`
+  # gives `<main checkout>/.git`, whose parent is the checkout that owns the venv.
+  # From the main checkout `--git-common-dir` is the relative `.git`, which resolves
+  # the same way because git runs hooks from the top level.
+  #
+  # Without the second candidate this aborted every push made from a worktree with a
+  # bare "task not found" — and worktrees are the workflow this repo asks agents to
+  # use. The worktree is still tried FIRST, so a checkout with its own venv wins.
+  hook_toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  hook_common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  hook_main=""
+  if [ -n "$hook_common" ]; then
+    hook_main="$(cd "$hook_common/.." 2>/dev/null && pwd || true)"
+  fi
+
+  if [ -n "$hook_toplevel" ] && [ -x "$hook_toplevel/.venv/bin/task" ]; then
+    PATH="$hook_toplevel/.venv/bin:$PATH"
+    export PATH
+  elif [ -n "$hook_main" ] && [ -x "$hook_main/.venv/bin/task" ]; then
+    PATH="$hook_main/.venv/bin:$PATH"
     export PATH
   fi
 fi
