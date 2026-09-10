@@ -98,6 +98,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "walk_mutable_chain": ("pyrxd.glyph.mutable_chain", "walk_mutable_chain"),
     "MutableChainWalk": ("pyrxd.glyph.mutable_chain", "MutableChainWalk"),
     "ChainStep": ("pyrxd.glyph.mutable_chain", "ChainStep"),
+    "FoldedRecord": ("pyrxd.glyph.mutable_chain", "FoldedRecord"),
+    "fold_chain": ("pyrxd.glyph.mutable_chain", "fold_chain"),
+    # HashMark §7.6 form 2. Consumer surface for the same reason as the walker above: the CLI
+    # cannot drive it yet because pyrxd has no way to enumerate a token's transactions (the
+    # indexer client has `glyph_get_token`, which returns a record, not a history), so the
+    # candidate set has to come from the consumer's own index for now.
+    "MarkAnchor": ("pyrxd.glyph.mark_anchor", "MarkAnchor"),
+    "resolve_mark_anchor": ("pyrxd.glyph.mark_anchor", "resolve_mark_anchor"),
+    "WaveIdentityVerdict": ("pyrxd.glyph.wave_identity", "WaveIdentityVerdict"),
+    "judge_name_at_mark": ("pyrxd.glyph.wave_identity", "judge_name_at_mark"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),

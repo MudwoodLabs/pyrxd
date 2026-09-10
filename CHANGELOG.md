@@ -292,6 +292,35 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
+- **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
+  `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
+  refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
+  the eras a present-tense lookup conflates: a mark at 458586 resolves to `1CPfirXZ…`, one at
+  458595 to `14XmXG3d…`.
+
+  The verdict is **structurally** narrow rather than narrow by docstring: `form` is an int so no
+  caller can read a single flag optimistically, `expiry` is a string state so nothing can compare
+  it to a clock, and `binding_verified` stays False until something checks the name→glyph binding
+  on chain. It degrades to form 1 **with a reason** when the mark has no block, is too shallow,
+  when the walk is incomplete, when a step cannot be placed against the mark — and when the height
+  and the binding came from the **same source**, since one endpoint supplying both can choose the
+  block and then choose what the name said at it.
+
+  `resolve_mark_anchor` supplies the block, which nothing did before: `_classify_raw_tx` returns no
+  height, blockhash or confirmations. It takes a **required** `min_confirmations` with no default,
+  following the registry's own rule that depth is value-scaled per chain and that "'6 confirmations'
+  folklore transfers across chains even less than it transfers across values".
+
+  **The height is the endpoint's claim, not a proof**, and every anchor and verdict says so.
+  `pyrxd.spv` is Bitcoin-only; there is no Radiant header, proof-of-work or merkle check. Fetching a
+  merkle path would not help — with no work check, fabricating a header whose root commits to the
+  transaction is free, so inclusion-without-work buys nothing against a hostile endpoint while
+  looking exactly like security.
+
+  Exported as consumer API. The CLI cannot drive form 2 yet: it needs a token's transaction list and
+  `RxinDexerClient` has no history method, so wiring a caller that always degrades would be a
+  wrapper around dead code.
+
 - **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
   `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
   mutable output at a time — and reports `complete` only when every link verified *and* the

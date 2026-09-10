@@ -154,3 +154,66 @@ def test_the_fixture_states_the_decision_it_serves() -> None:
     assert expected["replay_merge"]["expires"] == 1849006310
     assert expected["latest_snapshot"]["expires"] is None
     assert DECISION_DOC.is_file(), f"the decision record is missing: {DECISION_DOC}"
+
+
+# ---------------------------------------------------------------------------
+# The implementation must actually obey the decision
+# ---------------------------------------------------------------------------
+
+
+async def test_fold_chain_implements_REPLAY_MERGE_not_snapshot() -> None:
+    """The decision, asserted against the CODE rather than against two rules computed here.
+
+    Everything above compares candidate rules the TEST computes, which proves the fixture can
+    express the decision and proves nothing about `fold_chain`. Planting the rejected rule into
+    `fold_chain` passed every test in this file and every form-2 test — because the two rules
+    differ only on `expires`, and nothing asserted `expires`.
+
+    So this is the link between the decision and the implementation: fold the discriminating
+    chain and require the field that only survives under replay-merge.
+    """
+    from pyrxd.glyph.mutable_chain import fold_chain, walk_mutable_chain
+    from pyrxd.transaction.transaction import Transaction
+
+    raw = {t["txid"]: bytes.fromhex(t["raw"]) for t in _CHAIN["transactions"]}
+    mint = min(_CHAIN["transactions"], key=lambda t: t["height"])["txid"]
+
+    async def fetch(txid: str):
+        return Transaction.from_hex(raw[txid])
+
+    async def unspent(_t: str, _v: int) -> bool:
+        return True
+
+    walk = await walk_mutable_chain(mint_txid=mint, candidates=list(raw), fetch_tx=fetch, is_unspent=unspent)
+    folded = fold_chain(walk)
+
+    expected = _CHAIN["_expected_fold"]
+    assert expected["decision"] == "replay_merge"
+    assert folded.attrs["target"] == expected["replay_merge"]["target"]
+    assert folded.attrs.get("expires") == str(expected["replay_merge"]["expires"]), (
+        "`expires` did not survive the fold — that is the LATEST-SNAPSHOT rule, which this "
+        "project rejected: deletion is not representable, so omission cannot mean clear"
+    )
+    assert expected["latest_snapshot"]["expires"] is None, "the fixture no longer discriminates"
+
+
+async def test_the_fold_normalises_value_types() -> None:
+    """The two readers disagree — mint attrs are `dict[str, str]`, update attrs are raw CBOR.
+    A consumer must never have to ask which envelope last wrote a field to know its type."""
+    from pyrxd.glyph.mutable_chain import fold_chain, walk_mutable_chain
+    from pyrxd.transaction.transaction import Transaction
+
+    raw = {t["txid"]: bytes.fromhex(t["raw"]) for t in _CHAIN["transactions"]}
+    mint = min(_CHAIN["transactions"], key=lambda t: t["height"])["txid"]
+
+    async def fetch(txid: str):
+        return Transaction.from_hex(raw[txid])
+
+    async def unspent(_t: str, _v: int) -> bool:
+        return True
+
+    folded = fold_chain(
+        await walk_mutable_chain(mint_txid=mint, candidates=list(raw), fetch_tx=fetch, is_unspent=unspent)
+    )
+    assert folded.attrs, "the fold produced nothing — it is not reaching the envelopes"
+    assert all(isinstance(v, str) for v in folded.attrs.values()), folded.attrs

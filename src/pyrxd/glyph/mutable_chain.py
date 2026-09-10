@@ -236,4 +236,67 @@ async def walk_mutable_chain(
     )
 
 
-__all__ = ["MAX_CHAIN_STEPS", "ChainStep", "MutableChainWalk", "walk_mutable_chain"]
+@dataclass(frozen=True)
+class FoldedRecord:
+    """A mutable glyph's ``attrs`` as of some point in its chain."""
+
+    attrs: dict
+    #: How many chain steps were folded to produce it.
+    steps_applied: int
+    #: The last step included. Empty if only the mint was.
+    through_txid: str
+    #: True when a step in the folded range could not be read. The result is then a fold of
+    #: what WAS readable, which is not the same thing as the record - callers must degrade.
+    incomplete: bool
+    reason: str = ""
+
+
+def fold_chain(walk: MutableChainWalk, *, through_index: int | None = None) -> FoldedRecord:
+    """Replay a walk's updates onto the mint, shallow-merging ``attrs``.
+
+    THE RULE: an update that OMITS a field leaves that field UNCHANGED. Decided in
+    ``docs/solutions/design-decisions/wave-update-fold-omission-means-unchanged.md``, and the
+    argument is that deletion is not representable - Photonic's ``filterAttrs`` drops
+    ``null``/``undefined`` before merging, so if omission meant *clear* a field could be
+    destroyed only by accident and never on purpose. Measured, the two candidate rules disagree
+    on 3 of the 7 real chains on mainnet, and only about ``expires``.
+
+    NEW SEMANTICS, NOT A PORT. Photonic computes only CURRENT state, by merging the mint with the
+    LATEST envelope, ordered by an index's array - and its stored row is path-dependent, so two
+    of its wallets can disagree about one name. This replays every step in spend order, which is
+    deterministic where the reference is not. It agrees with the reference on all 7 observed
+    chains.
+
+    VALUES ARE NORMALISED TO STRINGS. The two readers disagree on type: ``GlyphMetadata.attrs``
+    is ``dict[str, str]`` so a mint stringifies, while ``decode_update_payload`` returns raw
+    CBOR. Merged raw, a field's type would depend on which envelope last wrote it - ``expires``
+    is ``'1849006310'`` from a mint and ``1849006310`` from an update, and ``str > int`` raises
+    in Python 3. Normalising here means a consumer never has to ask which envelope won.
+
+    :param through_index: fold only the first N+1 steps. ``None`` folds all of them.
+    """
+    steps = walk.steps if through_index is None else walk.steps[: through_index + 1]
+    attrs: dict = {}
+    unreadable = None
+    for step in steps:
+        if step.kind == "unreadable":
+            unreadable = unreadable or step
+            continue
+        for key, value in step.attrs.items():
+            attrs[str(key)] = str(value)
+    reason = ""
+    if unreadable is not None:
+        reason = (
+            f"{unreadable.txid} carries an envelope that could not be read ({unreadable.reason}); "
+            "this is a fold of what was readable, not the record"
+        )
+    return FoldedRecord(
+        attrs=attrs,
+        steps_applied=len(steps),
+        through_txid=steps[-1].txid if steps else "",
+        incomplete=unreadable is not None,
+        reason=reason,
+    )
+
+
+__all__ = ["MAX_CHAIN_STEPS", "ChainStep", "FoldedRecord", "MutableChainWalk", "fold_chain", "walk_mutable_chain"]
