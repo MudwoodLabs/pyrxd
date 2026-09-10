@@ -292,6 +292,26 @@ settled.
   still reaching the reader. Reporting `INVALID_SIGNATURE` would have told a
   reader a genuine mark's claim fails on the strength of a missing dependency.
 
+- **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
+  `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
+  mutable output at a time — and reports `complete` only when every link verified *and* the
+  final output is proved unspent. Anything else returns the walked prefix with a reason.
+
+  That distinction is the point: a truncated history is how a superseded value becomes
+  authoritative. Stop one transaction early and a naive walker reports the previous target with
+  no sign anything is missing, which is exactly what an index was observed doing to a live WAVE
+  name.
+
+  **The chain is the singleton, not an index's history list.** Measured on mainnet,
+  `custodian-gate-x7f3.rxd`'s history contains a transaction that shares a block with a real
+  update and is spent *from* by the next one — and never touches the token. It is reported as
+  `excluded`, not folded and not allowed to order anything. Height cannot order a chain either:
+  two of that name's transactions share height 458591, and another name has two update envelopes
+  at one height.
+
+  A step whose mutable output carries a **different ref** raises rather than degrades — following
+  it would splice two tokens' histories together. Absence degrades; contradiction raises.
+
 - **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
   and put it in `glyph_envelopes`, which was then read by **nothing** — three references
   repo-wide, all of them the write. So the default terminal output still rendered the mainnet

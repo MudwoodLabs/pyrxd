@@ -89,6 +89,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "sign_metadata": ("pyrxd.glyph.creator", "sign_metadata"),
     "target_to_difficulty": ("pyrxd.glyph.dmint", "target_to_difficulty"),
     "verify_creator_signature": ("pyrxd.glyph.creator", "verify_creator_signature"),
+    # Walking a mutable glyph's own spend chain, and proving the walk reached the tip.
+    # EXPORTED DELIBERATELY, not orphaned: an indexer or wallet integrating WAVE (or any mutable
+    # glyph) needs "what did this token say, and am I looking at its current state" — and getting
+    # that wrong quietly is how a superseded target gets served as authoritative. The in-repo
+    # caller arrives with HashMark §7.6 form 2 (#598); until then this is consumer surface, the
+    # same shape as `verify_creator_signature` above.
+    "walk_mutable_chain": ("pyrxd.glyph.mutable_chain", "walk_mutable_chain"),
+    "MutableChainWalk": ("pyrxd.glyph.mutable_chain", "MutableChainWalk"),
+    "ChainStep": ("pyrxd.glyph.mutable_chain", "ChainStep"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),
