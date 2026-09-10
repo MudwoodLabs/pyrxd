@@ -193,7 +193,7 @@ The push opcode for the CBOR body MUST be selected by length
 
 A parser MUST locate the envelope by walking the scriptSig's pushes and taking the
 push immediately **after** a push equal to `gly`
-(`src/pyrxd/glyph/inspector.py:256-356`). It MUST NOT assume the marker is at a
+(`src/pyrxd/glyph/inspector.py:256-360`). It MUST NOT assume the marker is at a
 fixed offset, and it MUST support all four push opcodes — a walker that stops at
 `0x4e` never reaches the marker on the mainnet token above.
 
