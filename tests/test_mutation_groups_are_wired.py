@@ -153,9 +153,37 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
 
     # The prose count is a fourth statement of the same fact, and it is the one that read
     # "eight" against twelve for four groups' worth of drift.
-    stated = re.search(r"the ([a-z]+) value-moving groups", body)
+    # `[a-z-]+`, with the hyphen: the count passed fourteen and the spellings became compound
+    # ("twenty-three"), which `[a-z]+` cannot match — so the guard reported "the page no longer
+    # states how many" when the page stated it perfectly well. A pattern that stops matching as
+    # the thing it guards grows is a guard with an expiry date.
+    stated = re.search(r"the ([a-z-]+) value-moving groups", body)
     assert stated, "the page no longer states how many value-moving groups there are"
-    words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen"}
+    words = {
+        8: "eight",
+        9: "nine",
+        10: "ten",
+        11: "eleven",
+        12: "twelve",
+        13: "thirteen",
+        14: "fourteen",
+        15: "fifteen",
+        16: "sixteen",
+        17: "seventeen",
+        18: "eighteen",
+        19: "nineteen",
+        20: "twenty",
+        21: "twenty-one",
+        22: "twenty-two",
+        23: "twenty-three",
+        24: "twenty-four",
+        25: "twenty-five",
+        26: "twenty-six",
+        27: "twenty-seven",
+        28: "twenty-eight",
+        29: "twenty-nine",
+        30: "thirty",
+    }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
     assert stated.group(1) == want, (
