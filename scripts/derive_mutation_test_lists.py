@@ -62,8 +62,14 @@ for g, mods in groups.items():
     per_mod_top, pooled = [], defaultdict(int)
     for mod in mods:
         ranked = sorted(weight.get(mod, {}).items(), key=lambda kv: -kv[1])
-        if ranked:
-            per_mod_top.append(ranked[0][0])  # each module's single best test, guaranteed
+        # TOP THREE per module, not top one. Taking a single test dropped
+        # `tests/test_ripemd160_fallback.py` for `hash.py`: it reaches 61 distinct lines and is
+        # the ONLY test that forces the pure-Python RIPEMD160 path (it monkeypatches
+        # `hashlib.new` to raise), and it lost to `test_consensus_parser_strictness.py` at 69.
+        # `hash` then scored 0% across 1,400 mutants: where OpenSSL provides ripemd160 the
+        # fallback never executes, and mutating unexecuted code always survives. Third time a
+        # cap on a derived list silently removed the load-bearing entry.
+        per_mod_top.extend(t for t, _ in ranked[:3])
         for t, n in ranked:
             pooled[t] += n
     # BOTH SIGNALS, because each misses what the other catches.
