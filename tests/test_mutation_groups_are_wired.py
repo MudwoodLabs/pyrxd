@@ -15,6 +15,7 @@ become false. This test closes the mutation-harness instance of it.
 
 from __future__ import annotations
 
+import pathlib
 import re
 import sys
 from pathlib import Path
@@ -188,4 +189,63 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
     assert stated.group(1) == want, (
         f"the page says '{stated.group(1)} value-moving groups'; VALUE_GROUPS holds {len(_value_groups())} ({want})"
+    )
+
+
+def test_every_mutated_module_runs_its_own_dedicated_test() -> None:
+    """A group's test list must include each module's OWN test file, if one exists.
+
+    THE FAILURE THIS CATCHES COST EIGHTEEN HOURS OF COMPUTE. The ten newest groups had their test
+    lists derived by counting how many of the group's modules each test file imports and taking
+    the top N. That ranking is exactly backwards for relevance: a single-purpose test like
+    `test_glyph_royalty.py` imports ONE module and scores 1, while a broad one like
+    `test_fuzz_parsers.py` imports five and scores 5 — so the cap dropped precisely the tests that
+    constrain a module best. 27 modules lost their own test that way.
+
+    The results looked like devastating coverage findings and were measurement artifacts:
+    `hash` scored 0% killed over 1,400 mutants because `tests/test_hash.py` never ran;
+    `glyph/royalty` and `glyph/credential_binding` scored 0% for the same reason. A mutation score
+    is only a statement about the tests you actually ran.
+
+    Derived, not hand-kept: the pairing is "a test whose filename stem contains the module's leaf
+    name", computed from the tree. A module with no such file is not an error — plenty are covered
+    only by broader suites — this asserts that where a dedicated test EXISTS, it is in the list.
+    """
+    mods, tests = {}, {}
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z]+)\)\s+echo "([^"]*)" ;;', line)
+        if not m:
+            continue
+        items = m.group(2).split()
+        if not items or all(re.fullmatch(r"[\d.]+", i) for i in items):
+            continue
+        (tests if items[0].startswith("tests/") else mods)[m.group(1)] = items
+
+    assert mods, "no module lists parsed — the derivation broke, not the script"
+    test_files = {p.as_posix() for p in (_ROOT / "tests").rglob("test_*.py")}
+    assert len(test_files) > 100, f"only {len(test_files)} test files found — the scan is wrong"
+
+    missing = []
+    for group, modules in mods.items():
+        listed = set(tests.get(group, ()))
+        for module in modules:
+            parts = module.split("/")
+            leaf = parts[-1]
+            wanted = (
+                {f"tests/test_{leaf}.py"}
+                if len(parts) == 1
+                else {
+                    f"tests/test_{'_'.join(parts[:-1])}_{leaf}.py",
+                    f"tests/{'/'.join(parts[:-1])}/test_{leaf}.py",
+                    f"tests/test_{parts[-2]}_{leaf}.py",
+                }
+            )
+            dedicated = {t.replace(f"{_ROOT.as_posix()}/", "") for t in test_files} & wanted
+            if dedicated and not (dedicated & listed):
+                missing.append(f"{group}: {module} (has {sorted(dedicated)[0]})")
+
+    assert not missing, (
+        "these mutation groups do not run the module's own test file, so the module is mutated "
+        "against tests that were never written for it — a low kill rate would be an artifact, not "
+        "a finding:\n  " + "\n  ".join(sorted(missing))
     )
