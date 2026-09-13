@@ -500,11 +500,22 @@ def fold_chain(walk: MutableChainWalk, *, through_index: int | None = None) -> F
     deterministic where the reference is not. It agrees with the reference on all 7 observed
     chains.
 
-    VALUES ARE NORMALISED TO STRINGS. The two readers disagree on type: ``GlyphMetadata.attrs``
-    is ``dict[str, str]`` so a mint stringifies, while ``decode_update_payload`` returns raw
-    CBOR. Merged raw, a field's type would depend on which envelope last wrote it - ``expires``
-    is ``'1849006310'`` from a mint and ``1849006310`` from an update, and ``str > int`` raises
-    in Python 3. Normalising here means a consumer never has to ask which envelope won.
+    VALUES ARE PRESERVED, NOT STRINGIFIED, and that reversed an earlier decision here. This used
+    to normalise every value to ``str`` because the two readers disagreed on type: a mint arrived
+    already stringified while ``decode_update_payload`` returned raw CBOR, so ``expires`` was
+    ``'1849006310'`` from one and ``1849006310`` from the other.
+
+    They no longer disagree. ``_decode_attr_value`` now preserves scalars and scalar lists on the
+    mint side, because the blanket ``str()`` was not merely lossy — it INVERTED meaning: an
+    authority token's ``revocable: false`` became the string ``'False'``, which is truthy, so a
+    NON-revocable authority read back as revocable, and ``permissions: ['mint']`` became
+    ``"['mint']"``, losing every entry. Measured on the mainnet WAVE chain, both readers now
+    return ``int`` for ``expires``.
+
+    So stringifying here would re-introduce that inversion one layer down, in the folded record a
+    consumer actually reads. The premise the normalisation rested on is gone, and keeping it would
+    turn a fixed bug back on for anything that folds. Keys stay strings — ``_as_attrs`` already
+    drops non-string keys, for the collision reason ``payload.py`` gives.
 
     :param through_index: fold only the first N+1 steps. ``None`` folds all of them.
     """
@@ -516,7 +527,7 @@ def fold_chain(walk: MutableChainWalk, *, through_index: int | None = None) -> F
             unreadable = unreadable or step
             continue
         for key, value in step.attrs.items():
-            attrs[str(key)] = str(value)
+            attrs[str(key)] = value
     reason = ""
     if unreadable is not None:
         reason = f"{unreadable.txid}: {unreadable.reason}; this is a fold of what was readable, not the record"

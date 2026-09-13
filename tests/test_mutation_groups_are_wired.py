@@ -153,11 +153,140 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
 
     # The prose count is a fourth statement of the same fact, and it is the one that read
     # "eight" against twelve for four groups' worth of drift.
-    stated = re.search(r"the ([a-z]+) value-moving groups", body)
+    # `[a-z-]+`, with the hyphen: the count passed fourteen and the spellings became compound
+    # ("twenty-three"), which `[a-z]+` cannot match — so the guard reported "the page no longer
+    # states how many" when the page stated it perfectly well. A pattern that stops matching as
+    # the thing it guards grows is a guard with an expiry date.
+    stated = re.search(r"the ([a-z-]+) value-moving groups", body)
     assert stated, "the page no longer states how many value-moving groups there are"
-    words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen"}
+    words = {
+        8: "eight",
+        9: "nine",
+        10: "ten",
+        11: "eleven",
+        12: "twelve",
+        13: "thirteen",
+        14: "fourteen",
+        15: "fifteen",
+        16: "sixteen",
+        17: "seventeen",
+        18: "eighteen",
+        19: "nineteen",
+        20: "twenty",
+        21: "twenty-one",
+        22: "twenty-two",
+        23: "twenty-three",
+        24: "twenty-four",
+        25: "twenty-five",
+        26: "twenty-six",
+        27: "twenty-seven",
+        28: "twenty-eight",
+        29: "twenty-nine",
+        30: "thirty",
+    }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
     assert stated.group(1) == want, (
         f"the page says '{stated.group(1)} value-moving groups'; VALUE_GROUPS holds {len(_value_groups())} ({want})"
+    )
+
+
+def test_every_mutated_module_runs_its_own_dedicated_test() -> None:
+    """A group's test list must include each module's OWN test file, if one exists.
+
+    THE FAILURE THIS CATCHES COST EIGHTEEN HOURS OF COMPUTE. The ten newest groups had their test
+    lists derived by counting how many of the group's modules each test file imports and taking
+    the top N. That ranking is exactly backwards for relevance: a single-purpose test like
+    `test_glyph_royalty.py` imports ONE module and scores 1, while a broad one like
+    `test_fuzz_parsers.py` imports five and scores 5 — so the cap dropped precisely the tests that
+    constrain a module best. 27 modules lost their own test that way.
+
+    The results looked like devastating coverage findings and were measurement artifacts:
+    `hash` scored 0% killed over 1,400 mutants because `tests/test_hash.py` never ran;
+    `glyph/royalty` and `glyph/credential_binding` scored 0% for the same reason. A mutation score
+    is only a statement about the tests you actually ran.
+
+    Derived, not hand-kept: the pairing is "a test whose filename stem contains the module's leaf
+    name", computed from the tree. A module with no such file is not an error — plenty are covered
+    only by broader suites — this asserts that where a dedicated test EXISTS, it is in the list.
+    """
+    mods, tests = {}, {}
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z]+)\)\s+echo "([^"]*)" ;;', line)
+        if not m:
+            continue
+        items = m.group(2).split()
+        if not items or all(re.fullmatch(r"[\d.]+", i) for i in items):
+            continue
+        (tests if items[0].startswith("tests/") else mods)[m.group(1)] = items
+
+    assert mods, "no module lists parsed — the derivation broke, not the script"
+    test_files = {p.as_posix() for p in (_ROOT / "tests").rglob("test_*.py")}
+    assert len(test_files) > 100, f"only {len(test_files)} test files found — the scan is wrong"
+
+    missing = []
+    for group, modules in mods.items():
+        listed = set(tests.get(group, ()))
+        for module in modules:
+            parts = module.split("/")
+            leaf = parts[-1]
+            wanted = (
+                {f"tests/test_{leaf}.py"}
+                if len(parts) == 1
+                else {
+                    f"tests/test_{'_'.join(parts[:-1])}_{leaf}.py",
+                    f"tests/{'/'.join(parts[:-1])}/test_{leaf}.py",
+                    f"tests/test_{parts[-2]}_{leaf}.py",
+                }
+            )
+            dedicated = {t.replace(f"{_ROOT.as_posix()}/", "") for t in test_files} & wanted
+            if dedicated and not (dedicated & listed):
+                missing.append(f"{group}: {module} (has {sorted(dedicated)[0]})")
+
+    assert not missing, (
+        "these mutation groups do not run the module's own test file, so the module is mutated "
+        "against tests that were never written for it — a low kill rate would be an artifact, not "
+        "a finding:\n  " + "\n  ".join(sorted(missing))
+    )
+
+
+def test_every_test_file_a_group_names_actually_EXISTS() -> None:
+    """`tests/test_htlc_spend.py` was deleted by #518 and stayed in the `script` and `transaction`
+    lists for four months. Nothing said so: every other guard here checks that GROUPS line up with
+    each other, and none checked that the paths resolve to files on disk.
+
+    It fails closed rather than silently — `pytest` answers a missing path with **exit 4, a usage
+    error, even when real files are named alongside it**, so the harness's clean-suite baseline
+    refuses the group. That is the right direction (cosmic-ray reads a non-zero exit as "mutant
+    killed", so a collectable-but-red list would have scored 100% and been a complete fiction) but
+    it is only discovered by trying to run the group, and these two had not been run since.
+
+    Derived from the script, so a new group is covered the moment it is added."""
+    gaps_m = re.search(r'^GAPS="([^"]*)"', _SCRIPT.read_text(encoding="utf-8"), re.M)
+    assert gaps_m, "GAPS is no longer a simple double-quoted assignment; this expansion is stale"
+    expansions = {"$GAPS": gaps_m.group(1).split()}
+
+    missing: list[str] = []
+    checked = 0
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        if not m:
+            continue
+        group = m.group(1)
+        for token in m.group(2).split():
+            for path in expansions.get(token, [token]):
+                if not path.startswith("tests/"):
+                    continue
+                checked += 1
+                if not (_ROOT / path).exists():
+                    missing.append(f"{group}: {path}")
+
+    # Non-vacuity: if the parse stops matching, "no missing files" must not read as success.
+    assert checked > 100, (
+        f"only {checked} test paths parsed out of scripts/mutation_test.sh — the case-line regex "
+        "has stopped matching and this guard is passing over nothing"
+    )
+    assert not missing, (
+        "these mutation groups name test files that do not exist, so `pytest` exits 4 and the "
+        "group cannot run at all:\n  " + "\n  ".join(sorted(missing))
     )

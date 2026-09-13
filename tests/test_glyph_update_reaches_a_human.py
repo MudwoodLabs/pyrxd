@@ -147,22 +147,47 @@ def test_a_record_with_no_expires_is_still_accepted() -> None:
     assert attrs.to_dict() == without
 
 
-def test_no_shipped_code_consumes_expires_as_an_expiry() -> None:
-    """`expires` is carried so the round trip is lossless — NOT so anything can be concluded.
+#: Every place shipped code reads an `expires`, as ``(module, enclosing symbol)``, and why each
+#: one is not the mistake this guard exists to stop.
+#:
+#: REVIEWED, NOT DERIVED — say which kind of check you are trusting. A scan cannot tell a WAVE
+#: name's `attrs.expires` from an AUTHORITY token's: they are different fields on different token
+#: types that happen to share a name. So the set is pinned and each entry carries its reason; a
+#: new reader fails this test and forces someone to re-read, which is the whole point.
+_EXPIRES_READERS_REVIEWED = {
+    # ALL FIVE ARE THE AUTHORITY TOKEN'S OWN `expires`, not a WAVE record's. They are different
+    # fields on different token types that happen to share a name, and the types differ too: an
+    # authority `expires` is an ISO-8601 STRING parsed by `_parse_expiry`, a WAVE `expires` is a
+    # unix integer. Concluding an expiry is exactly what the authority field is for — it is
+    # written and read by the same protocol, with no indexer and no treasury payment in the story.
+    ("src/pyrxd/glyph/authority.py", "AuthorityAttrs.to_attrs"),  # serialises its own field
+    ("src/pyrxd/glyph/authority.py", "read_authority_attrs"),  # parses it off a token
+    ("src/pyrxd/glyph/authority.py", "validate_authority"),  # checks it parses as ISO-8601
+    ("src/pyrxd/glyph/authority.py", "is_authority_expired"),  # the verdict itself
+    ("src/pyrxd/glyph/_inspect_core.py", "_classify_raw_tx"),  # renders that claim and verdict
+}
 
-    Photonic's own source says the indexer is authoritative on renewals and that `attrs.expires`
-    is "display-level": real expiry follows from treasury payments this type never sees. A plain
-    integer field invites `if now > attrs.expires`, and that comparison would be wrong.
 
-    Pinned as MEMBERSHIP rather than described in a docstring: today nothing reads it, and if
-    that changes this fails and someone has to re-read why the field is not an answer. An AST
-    scan, so the comment blocks explaining this are not themselves mistaken for a read.
+def test_only_reviewed_code_consumes_expires_as_an_expiry() -> None:
+    """`WaveAttrs.expires` is carried so the round trip is lossless — NOT so anything can be
+    concluded from it.
+
+    Photonic's own source says the indexer is authoritative on renewals and that a WAVE record's
+    `attrs.expires` is "display-level": real expiry follows from treasury payments this type never
+    sees. A plain integer field invites `if now > attrs.expires`, and that comparison would be
+    wrong.
 
     THE SCAN MATCHES THREE SPELLINGS, not one. It originally looked for `ast.Attribute` alone,
-    which is the shape the DATACLASS uses — and `attrs` is a plain dict everywhere else, so the
-    two ways a real consumer would actually reach the field, `attrs["expires"]` and
-    `attrs.get("expires")`, both passed it silently. A guard written from one example generalises
-    over the axis it was shown; this one was shown the attribute.
+    which is the shape the DATACLASS uses — and `attrs` is a plain dict everywhere else, so the two
+    ways a real consumer would actually reach the field, `attrs["expires"]` and
+    `attrs.get("expires")`, both passed it silently.
+
+    AND IT NO LONGER ASSERTS THAT NOBODY READS IT. That version was over-broad in the other
+    direction: it fired on `AuthorityAttrs.expires`, a different field on a different token type
+    where drawing an expiry IS the intended use. The guard's reason was WAVE-specific while its
+    match was not — a guard generalising over an axis it was not built for. Pinned by
+    ``(module, enclosing symbol)`` rather than line number so it survives edits above it and still
+    fails when a genuinely new reader appears.
     """
     import ast
 
@@ -170,21 +195,43 @@ def test_no_shipped_code_consumes_expires_as_an_expiry() -> None:
     files = sorted(root.rglob("*.py"))
     assert len(files) > 50, f"the scan reached only {len(files)} modules — it is not reaching src/"
 
-    readers = []
+    def scopes(tree: ast.AST) -> dict[int, str]:
+        """`{node id: innermost enclosing Class.func / func}` for every node in the tree.
+
+        INNERMOST, computed by walking parents down — an earlier version picked whichever
+        ancestor had the LONGEST name, which is a heuristic, not the answer, and mis-attributed
+        reads to the wrong function.
+        """
+        out: dict[int, str] = {}
+
+        def walk(node: ast.AST, prefix: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    name = f"{prefix}.{child.name}" if prefix else child.name
+                    for sub in ast.walk(child):
+                        out[id(sub)] = name
+                    walk(child, name)
+                else:
+                    walk(child, prefix)
+
+        walk(tree, "")
+        return out
+
+    found = set()
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        scope = scopes(tree)
 
-        # EXEMPT BY SCOPE, NOT BY SPELLING. `WaveAttrs` parsing and serialising its own field is
-        # not a caller drawing a conclusion from it. Scoping to the class body (derived from the
-        # AST) rather than to `self.` covers `d["expires"]` and `d.get("expires")` inside
-        # `from_dict`/`to_dict` too, which a `self.`-only exemption would have flagged.
+        # `WaveAttrs` parsing and serialising its own field is not a caller concluding anything.
+        # Scoped to the class body (from the AST) rather than to `self.`, so `d["expires"]` and
+        # `d.get("expires")` inside `from_dict`/`to_dict` are covered too.
         own = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name == "WaveAttrs":
                 own.update(id(sub) for sub in ast.walk(node))
 
         for node in ast.walk(tree):
-            if (
+            hit = (
                 (isinstance(node, ast.Attribute) and node.attr == "expires")
                 or (
                     isinstance(node, ast.Subscript)
@@ -199,18 +246,22 @@ def test_no_shipped_code_consumes_expires_as_an_expiry() -> None:
                     and isinstance(node.args[0], ast.Constant)
                     and node.args[0].value == "expires"
                 )
-            ):
-                pass
-            else:
+            )
+            if not hit or id(node) in own:
                 continue
-            if id(node) in own:
-                continue
-            readers.append(f"{path.relative_to(root.parent.parent)}:{node.lineno}")
+            found.add((str(path.relative_to(root.parent.parent)), scope.get(id(node), "<module>")))
 
-    assert not readers, (
-        f"shipped code now reads `.expires`: {readers}. It is display-level, not an expiry — "
-        "the indexer decides renewals from treasury payments. Re-read the note on WaveAttrs "
-        "before treating this as an answer."
+    new_readers = sorted(found - _EXPIRES_READERS_REVIEWED)
+    assert not new_readers, (
+        f"shipped code reads an `expires` in a place nobody has reviewed: {new_readers}. If this "
+        "is a WAVE record's `attrs.expires`, it is display-level and NOT an expiry — the indexer "
+        "decides renewals from treasury payments this type never sees. If it is an authority "
+        "token's own `expires`, add it to _EXPIRES_READERS_REVIEWED with the reason."
+    )
+    gone = sorted(_EXPIRES_READERS_REVIEWED - found)
+    assert not gone, (
+        f"_EXPIRES_READERS_REVIEWED names {gone}, which no longer reads `expires`. A reviewed "
+        "exemption for code that is gone is a check that has silently stopped running — drop it."
     )
 
 

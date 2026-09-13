@@ -724,6 +724,21 @@ function renderFetchedTxCard(payload) {
       mdl.appendChild(kv("decimals", metadata.decimals));
     }
     if (metadata.main) mdl.appendChild(kv("main", metadata.main));
+    // The claim AND its verdict. This card showed protocol, name, ticker,
+    // description and timelock, and dropped `relationships` and
+    // `delegate_burns` entirely — so a token's collection and creator claims
+    // reached nobody here at all.
+    appendRelationshipVerdicts(mdl, metadata.relationships, metadata.delegate_burns);
+    if (Array.isArray(metadata.delegate_burns) && metadata.delegate_burns.length > 1) {
+      mdl.appendChild(kv("delegate burns", metadata.delegate_burns.join(", ")));
+    }
+    if (metadata.delegate_bases_unresolved) {
+      mdl.appendChild(kv(
+        "delegate bases not resolved",
+        `${metadata.delegate_bases_unresolved} more — capped to bound the fetches`,
+        "kv-warning",
+      ));
+    }
     // TIMELOCK: WHEN it opens (#556). The page already carried a banner saying a
     // TIMELOCK marker means "the reveal is subject to a time-based condition",
     // and then showed nothing about what the condition IS — the decoded spec was
@@ -740,7 +755,44 @@ function renderFetchedTxCard(payload) {
       if (tl.hint) mdl.appendChild(kv("timelock hint", tl.hint));
       mdl.appendChild(kv("timelock cek commitment", tl.cek_hash));
     }
+
+    // AUTHORITY — claims, EXPIRED, and anything validate_authority could not read.
+    //
+    // The Python computed this whole block and NEITHER renderer read it, so an authority that
+    // expired years ago looked identical to a live one on both surfaces — while the AUTHORITY
+    // banner on this page affirmatively told the reader the holder "can authorize operations".
+    // `problems` is the signal that the expiry did not even parse, and it was the least visible
+    // of the lot. Every value goes through `kv`, which assigns to textContent.
+    const authority = metadata.authority;
+    if (authority) {
+      const claims = authority.claims || {};
+      if (claims.issuer) mdl.appendChild(kv("authority issuer", _capText(claims.issuer)));
+      if (claims.scope) mdl.appendChild(kv("authority scope", _capText(claims.scope)));
+      if (Array.isArray(claims.permissions) && claims.permissions.length > 0) {
+        const shown = claims.permissions.slice(0, _ENTRY_CAP).map((p) => _capText(p)).join(", ");
+        mdl.appendChild(kv("authority permissions", shown));
+        if (claims.permissions.length > _ENTRY_CAP) {
+          mdl.appendChild(kv("", `… and ${claims.permissions.length - _ENTRY_CAP} more not shown`));
+        }
+      }
+      if (claims.expires) mdl.appendChild(kv("authority expires", _capText(claims.expires)));
+      if (claims.revocable === false) mdl.appendChild(kv("authority revocable", "false"));
+      if (authority.expired) mdl.appendChild(kv("authority status", "*** EXPIRED ***"));
+      for (const problem of authority.problems || []) {
+        mdl.appendChild(kv("authority unreadable", _capText(problem)));
+      }
+    }
     wrapper.appendChild(mdl);
+    if (authority) {
+      // WHAT THE MARKER IS NOT. It says the token calls itself an authority; it does not
+      // establish that any item was minted under it, nor that the issuer still honours it.
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: "These are the token's own claims, not a verdict — the AUTHORITY marker does not " +
+              "establish that any item was minted under this authority. That question is " +
+              "verify_authority_gate's, and it needs the item's genesis output.",
+      }));
+    }
     if (metadata.timelock) {
       wrapper.appendChild(el("p", {
         class: "card-note",
@@ -935,6 +987,23 @@ function appendOpReturnPayload(dl, row) {
     }
   }
 
+  // A Glyph BURN proof. Every field is operator CBOR, so the header says
+  // "claims" and the caveat travels with them: without it a reader sees
+  // "token_ref: <X>  action: burn" and concludes X was burned, which this
+  // output alone does not establish.
+  const burn = row.burn;
+  if (burn) {
+    const c = burn.claims || {};
+    dl.appendChild(kv("burn proof", "CLAIMED — operator-supplied, see note", "kv-warning"));
+    if (c.token_ref) dl.appendChild(kv("token ref (claimed)", c.token_ref));
+    if (c.action) dl.appendChild(kv("action (claimed)", c.action));
+    if (c.amount !== undefined && c.amount !== null) {
+      dl.appendChild(kv("amount (claimed)", c.amount));
+    }
+    if (c.reason) dl.appendChild(kv("reason (claimed)", c.reason));
+    if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));
+  }
+
   const hm = row.hashmark;
   if (hm) {
     if (hm.outcome !== "ok") {
@@ -982,16 +1051,48 @@ function appendOpReturnPayload(dl, row) {
   // Declared container/creator membership, WITH its verdict. `in` and `by` are
   // operator-supplied CBOR — anyone can name any collection — so the claim is
   // never shown without whether the transaction was authorised to carry it.
-  const rels = (row.metadata && row.metadata.relationships) || row.relationships;
-  if (Array.isArray(rels)) {
-    for (const rel of rels) {
-      const backed = rel.outcome === "backed";
-      dl.appendChild(kv(
-        rel.kind === "author" ? "creator claim" : "collection claim",
-        `${rel.ref} — ${backed ? "VERIFIED (spent in this tx)" : "UNVERIFIED CLAIM (nothing in this tx authorises it)"}`,
-        backed ? undefined : "kv-warning",
-      ));
+  appendRelationshipVerdicts(
+    dl,
+    (row.metadata && row.metadata.relationships) || row.relationships,
+    (row.metadata && row.metadata.delegate_burns) || [],
+  );
+}
+
+// FOUR verdicts, not two, and ONE definition of them.
+//
+// This logic lived only in the output-row renderer and had two states: `backed`
+// → "spent in this tx", everything else → "nothing in this tx authorises it".
+// BOTH are false for a delegated mint. A DELEGATED claim was spent when the
+// delegate BASE was created, by someone who need not be this minter; and a claim
+// whose base could not be resolved is "we did not look", not "nobody authorised
+// it" — the exact false accusation the CLI change existed to stop.
+//
+// It was also absent from the fetched-tx card entirely, which is the surface
+// most people meet. That card's own comment above records this same shape
+// happening before ("The CLI was fixed; this page was not"). Hence one function,
+// called from both.
+function appendRelationshipVerdicts(dl, rels, burnedRefs) {
+  if (!Array.isArray(rels) || rels.length === 0) return;
+  const burned = Array.isArray(burnedRefs) ? burnedRefs : [];
+  for (const rel of rels) {
+    const label = rel.kind === "author" ? "creator claim" : "collection claim";
+    const backed = rel.ok === true;
+    let verdict;
+    let cls = "kv-warning";
+    if (backed && rel.basis === "delegated") {
+      const via = burned.length === 1 ? ` ${burned[0]}` : "";
+      verdict = `VERIFIED via delegate${via} — authorised by its base, not spent here`;
+      cls = undefined;
+    } else if (backed) {
+      verdict = "VERIFIED (spent in this tx)";
+      cls = undefined;
+    } else if (burned.length) {
+      const which = burned.length === 1 ? ` (${burned[0]})` : "";
+      verdict = `UNRESOLVED — this tx burned a delegate${which}; fetch it to check`;
+    } else {
+      verdict = "UNVERIFIED CLAIM (nothing in this tx authorises it)";
     }
+    dl.appendChild(kv(label, `${rel.ref} — ${verdict}`, cls));
   }
 }
 
@@ -1028,6 +1129,10 @@ function renderOutputRow(row) {
   // row rather than left to the note the reader may not open. CLI parity:
   // `child_ref=` + `UNSPENDABLE`.
   if (row.child_ref_outpoint) dl.appendChild(kv("child ref", row.child_ref_outpoint));
+  // The authority an item is gated on. It is a DIFFERENT ref from the item's
+  // own, so unlike the delegate rows it is not covered by printing `ref` —
+  // dropping it would leave the reader unable to tell WHICH issuer gates this.
+  if (row.authority_ref) dl.appendChild(kv("authority ref", row.authority_ref));
   if (row.spendable === false) {
     dl.appendChild(kv("spendable", "*** UNSPENDABLE ***", "kv-warning"));
   }
@@ -1668,6 +1773,9 @@ function renderScriptCard(payload) {
   if (payload.child_ref_outpoint) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
   }
+  if (payload.authority_ref) {
+    dl.appendChild(kv("authority ref", payload.authority_ref));
+  }
   // The dead pre-0.15.0 container. The title and the note both say so, but
   // the verdict also belongs in the field list where a reader scanning
   // key/value pairs will meet it. CLI parity: `*** UNSPENDABLE ***`.
@@ -1835,6 +1943,13 @@ function scriptBadgeKind(type) {
   if (type === "p2pkh-cltv" || type === "p2pkh-csv") return "p2pkh";
   // The covenant shapes bind an NFT singleton; borrow the NFT colour.
   if (type === "soulbound-covenant" || type === "self-replicating-covenant") return "nft";
+  // An authority-gated item and a delegate token are both NFT-shaped singletons
+  // wearing an extra ref opcode; borrow the NFT colour rather than reading as
+  // "unknown", which is what the classifier says when it could not tell.
+  if (type === "authority-gated-nft" || type === "delegate-token") return "nft";
+  // A burn proof is an OP_RETURN refinement, like the message and hashmark
+  // variants; a DAT commit is a commit variant.
+  if (type === "op_return-burn") return "unknown";
   // No badge colour is defined for the dead container shape or for P2SH;
   // reuse the `unknown` styling rather than emitting a class the stylesheet
   // lacks.

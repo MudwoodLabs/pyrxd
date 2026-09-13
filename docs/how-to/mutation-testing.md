@@ -21,6 +21,17 @@ poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/s
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
 poetry run task mutate mint               # glyph/mint.py + transfer.py + client.py — mint/move facade
 poetry run task mutate glyphscript        # glyph/script.py + glyph/payload.py — envelope + locking scripts
+poetry run task mutate verdicts           # authority/burn/relationship/mutable-chain verdicts — the modules that answer "is this true"
+poetry run task mutate btcleg            # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
+poetry run task mutate covenants         # consensus-enforced covenant bytes — Gravity, HTLC, RSWP, soulbound
+poetry run task mutate gravitycore       # the Gravity swap machinery — state, trade, maker, fee policy, finality, reorg cost
+poetry run task mutate cryptoprim        # crypto primitives and secret handling — AEAD, KEM, AES-CBC, curve, RNG, types
+poetry run task mutate glyphverify       # glyph verification and classification — creator sigs, royalties, scanner, inspector
+poetry run task mutate glyphlock         # timelocked glyph content — reveal tx, encryption envelope, fee sizing
+poetry run task mutate wire              # wire encodings and proofs — compactsize, merkle path, consensus walk, HashMark
+poetry run task mutate hdseed            # BIP39 mnemonics, BIP44 paths, and account discovery
+poetry run task mutate feecore           # the fee models beneath fee_sizing
+poetry run task mutate walletcore        # consensus constants and the partial/resolve swap halves
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
@@ -29,7 +40,7 @@ poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg 
 poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the twelve value-moving groups
+poetry run task mutate value              # the twenty-three value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 

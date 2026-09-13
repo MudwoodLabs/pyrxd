@@ -104,32 +104,38 @@ def test_the_two_candidate_rules_really_disagree_here() -> None:
     snapshot = dict(updates[-1])
 
     assert replay != snapshot, "the two rules agree on this chain — it cannot express the decision"
-    # `str()` because the two readers disagree on VALUE TYPE — see the test below. The rules'
-    # disagreement is about the key's PRESENCE, and that must not be obscured by the coercion.
+    # `str()` on both sides so this stays about the key's PRESENCE, which is what the two rules
+    # actually disagree about, independent of how the readers type the value.
     assert str(replay.get("expires")) == "1849006310"
     assert "expires" not in snapshot
 
 
-def test_the_two_readers_disagree_on_value_TYPE() -> None:
-    """A constraint the fold has to handle, recorded where it will be found.
+def test_the_two_readers_now_AGREE_on_value_TYPE() -> None:
+    """They used to disagree, and this test used to pin that. It is inverted deliberately.
 
-    `GlyphMetadata.attrs` is declared `dict[str, str]`, so the MINT reader stringifies every
-    value. `decode_update_payload` returns raw CBOR, so an UPDATE keeps native types. Merge the
-    two naively and a field's type depends on which envelope last wrote it — `expires` is
-    `'1849006310'` when only the mint set it and `1849006310` when an update did.
+    `GlyphMetadata.attrs` was declared `dict[str, str]`, so the MINT reader stringified every
+    value while `decode_update_payload` returned raw CBOR — `expires` was `'1849006310'` from one
+    and `1849006310` from the other, and `fold_chain` normalised to `str` to hide the seam.
 
-    That is not cosmetic: in Python 3 comparing a str to an int raises, so a consumer doing
-    `attrs["expires"] > now` would work or crash depending on the name's update history. The
-    fold must normalise, or read the mint from raw CBOR rather than through `GlyphMetadata`.
+    `_decode_attr_value` ended that. The blanket `str()` was not merely lossy, it INVERTED
+    meaning: an authority token's `revocable: false` became the string `'False'`, which is truthy,
+    so a NON-revocable authority read back as revocable, and `permissions: ['mint']` became
+    `"['mint']"`. Preserving scalars fixed that at the source — and with both readers preserving
+    types, the fold's normalisation stopped being a seam-hider and became the same inversion one
+    layer down, so it was removed too.
+
+    Pinned because the fold's rule DEPENDS on this. If a reader ever starts coercing again, the
+    fold silently goes back to merging mixed types and this fails first.
     """
     seq = _envelopes_in_order()
     mint_attrs = seq[0][2]
-    assert isinstance(mint_attrs["expires"], str), (
-        "the mint reader stopped stringifying — re-check whether the fold still needs to normalise"
-    )
-    # And the update reader keeps native types: `target` is a string on both sides, but the
-    # update's values come straight from CBOR with no coercion layer.
     update_attrs = [a for _h, k, a in seq if k == "update"][-1]
+
+    assert isinstance(mint_attrs["expires"], int) and not isinstance(mint_attrs["expires"], bool), (
+        f"the mint reader coerced `expires` to {type(mint_attrs['expires']).__name__} — if it is "
+        "stringifying again, `fold_chain` is merging mixed types"
+    )
+    assert isinstance(mint_attrs["target"], str), "a real string must still arrive as a string"
     assert isinstance(update_attrs["target"], str)
 
 
@@ -190,16 +196,19 @@ async def test_fold_chain_implements_REPLAY_MERGE_not_snapshot() -> None:
     expected = _CHAIN["_expected_fold"]
     assert expected["decision"] == "replay_merge"
     assert folded.attrs["target"] == expected["replay_merge"]["target"]
-    assert folded.attrs.get("expires") == str(expected["replay_merge"]["expires"]), (
+    # No `str()`: the fold PRESERVES types now (see `fold_chain`). The rules' disagreement here
+    # is about the key's PRESENCE, which the type change does not touch.
+    assert folded.attrs.get("expires") == expected["replay_merge"]["expires"], (
         "`expires` did not survive the fold — that is the LATEST-SNAPSHOT rule, which this "
         "project rejected: deletion is not representable, so omission cannot mean clear"
     )
     assert expected["latest_snapshot"]["expires"] is None, "the fixture no longer discriminates"
 
 
-async def test_the_fold_normalises_value_types() -> None:
-    """The two readers disagree — mint attrs are `dict[str, str]`, update attrs are raw CBOR.
-    A consumer must never have to ask which envelope last wrote a field to know its type."""
+async def test_the_fold_preserves_value_types() -> None:
+    """The fold must NOT coerce. Both readers preserve CBOR types now, so stringifying here would
+    re-introduce the inversion `_decode_attr_value` was written to stop — a folded
+    `revocable: false` becoming the truthy string `'False'` — in the record a consumer reads."""
     from pyrxd.glyph.mutable_chain import fold_chain, walk_mutable_chain
     from pyrxd.transaction.transaction import Transaction
 
@@ -216,4 +225,7 @@ async def test_the_fold_normalises_value_types() -> None:
         await walk_mutable_chain(mint_txid=mint, candidates=list(raw), fetch_tx=fetch, is_unspent=unspent)
     )
     assert folded.attrs, "the fold produced nothing — it is not reaching the envelopes"
-    assert all(isinstance(v, str) for v in folded.attrs.values()), folded.attrs
+    assert isinstance(folded.attrs["expires"], int), (
+        f"the fold coerced `expires` to {type(folded.attrs['expires']).__name__}"
+    )
+    assert isinstance(folded.attrs["target"], str), "a real string must survive as a string"

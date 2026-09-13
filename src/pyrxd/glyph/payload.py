@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Literal
 
 import cbor2
@@ -23,6 +24,8 @@ from .types import (
 _log = logging.getLogger(__name__)
 
 GLY_MARKER = b"gly"
+#: The extra marker a DAT commit pops ahead of ``gly`` (Photonic ``datCommitScript``).
+DAT_MARKER = b"dat"
 
 
 def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
@@ -127,13 +130,62 @@ _MAX_ATTRS_COUNT = 64  # unreasonable beyond this; prevents memory bombs
 _MAX_MIME_TYPE_CHARS = 256
 
 
-def _decode_attrs(raw: object) -> dict[str, str]:
+#: Longest list preserved inside an ``attrs`` value. Beyond this the list is
+#: truncated rather than rejected — ``attrs`` is attacker-controlled CBOR and an
+#: unbounded list is a memory surface, but an over-long one is not grounds to
+#: make the whole token unreadable.
+_MAX_ATTRS_LIST_LEN = 64
+
+#: Widest integer preserved in an ``attrs`` value. Beyond this it becomes a short
+#: descriptive string — see :func:`_decode_attr_value` for why an unbounded one
+#: is a live exception in every consumer that stringifies the metadata.
+_MAX_ATTRS_INT_BITS = 512
+
+
+def _decode_attr_value(value: object) -> object:
+    """Preserve a scalar or a list of scalars; coerce anything else to ``str``.
+
+    THIS USED TO BE A BLANKET ``str(value)``, and that was lossy in a way that
+    inverted meaning rather than merely degrading it. Glyph ``attrs`` carry
+    non-strings in the wild — Photonic's authority tokens have
+    ``revocable: boolean`` and ``permissions: string[]``
+    (``packages/lib/src/authority.ts``). Coerced, ``False`` became the string
+    ``"False"``, which is truthy, so a NON-revocable authority read back as
+    revocable; and ``["mint"]`` became ``"['mint']"``, so every permission was
+    silently lost.
+
+    Nested maps and deeper structures are still flattened to ``str``: nothing in
+    the protocol needs them, and preserving arbitrary nesting from untrusted
+    CBOR widens the surface for no gain.
+    """
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        # A CBOR bignum decodes fine and then breaks the consumer: CPython
+        # refuses `str()` on an integer over ~4300 digits (ValueError), and
+        # `json.dumps` inherits that. Widening this decoder to preserve ints
+        # therefore handed library callers an uncaught exception where the old
+        # blanket `str()` had merely mangled the value. Anything an `attrs`
+        # field legitimately carries fits far inside this bound.
+        if value.bit_length() > _MAX_ATTRS_INT_BITS:
+            return f"<oversized integer: {value.bit_length()} bits>"
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity are valid CBOR and are NOT valid JSON — `json.dumps`
+        # emits a bare `NaN`, which no strict parser will read back.
+        return value if math.isfinite(value) else f"<non-finite: {'nan' if math.isnan(value) else 'inf'}>"
+    if isinstance(value, (list, tuple)):
+        return [x for x in value[:_MAX_ATTRS_LIST_LEN] if isinstance(x, (bool, int, float, str))]
+    return str(value)
+
+
+def _decode_attrs(raw: object) -> dict[str, object]:
     """Decode the 'attrs' CBOR field, enforcing count and type constraints."""
     if not isinstance(raw, dict):
         return {}
     if len(raw) > _MAX_ATTRS_COUNT:
         raise ValidationError(f"'attrs' map too large: {len(raw)} entries > {_MAX_ATTRS_COUNT}")
-    return {str(k): str(v) for k, v in raw.items()}
+    return {str(k): _decode_attr_value(v) for k, v in raw.items()}
 
 
 def _decode_rel_refs(raw: object, key: str) -> tuple[GlyphRef, ...]:
@@ -396,6 +448,21 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
     )
 
 
+def build_dat_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
+    """The ``'gly'`` + ``'dat'`` + CBOR portion of a DAT reveal scriptSig.
+
+    A DAT commit pops three things: the payload (hashed and compared), then
+    ``"dat"``, then ``"gly"``. Pushes land in order, so the suffix pushes them
+    the other way round — ``gly``, ``dat``, payload — and the payload ends up on
+    top where ``OP_HASH256`` needs it.
+
+    Using :func:`build_reveal_scriptsig_suffix` for a DAT reveal produces a
+    scriptSig one item short; the ``OP_EQUALVERIFY`` on ``"dat"`` then compares
+    the marker against whatever the P2PKH pushed and the spend fails.
+    """
+    return b"\x03" + GLY_MARKER + b"\x03" + DAT_MARKER + _encode_payload_push(cbor_bytes)
+
+
 def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     """
     Return the 'gly' + CBOR portion of the reveal scriptSig.
@@ -411,21 +478,25 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
     """
-    # Push 'gly' marker (3 bytes)
-    gly_push = b"\x03" + GLY_MARKER
-    # Push CBOR bytes
+    return b"\x03" + GLY_MARKER + _encode_payload_push(cbor_bytes)
+
+
+def _encode_payload_push(cbor_bytes: bytes) -> bytes:
+    """The payload's pushdata, opcode selected by length. ONE definition.
+
+    Both reveal-suffix builders use this. Spelling the ladder twice is how the
+    DAT variant would quietly cap at PUSHDATA2 while the NFT one did not.
+    """
     cbor_len = len(cbor_bytes)
     if cbor_len <= 75:
-        cbor_push = bytes([cbor_len]) + cbor_bytes
-    elif cbor_len <= 255:
-        cbor_push = b"\x4c" + bytes([cbor_len]) + cbor_bytes  # OP_PUSHDATA1
-    elif cbor_len <= 65535:
-        cbor_push = b"\x4d" + cbor_len.to_bytes(2, "little") + cbor_bytes  # OP_PUSHDATA2
-    elif cbor_len <= _MAX_CBOR_PAYLOAD_BYTES:
-        cbor_push = b"\x4e" + cbor_len.to_bytes(4, "little") + cbor_bytes  # OP_PUSHDATA4
-    else:
-        raise ValidationError(f"CBOR payload too large for script: {cbor_len} > {_MAX_CBOR_PAYLOAD_BYTES}")
-    return gly_push + cbor_push
+        return bytes([cbor_len]) + cbor_bytes
+    if cbor_len <= 255:
+        return b"\x4c" + bytes([cbor_len]) + cbor_bytes  # OP_PUSHDATA1
+    if cbor_len <= 65535:
+        return b"\x4d" + cbor_len.to_bytes(2, "little") + cbor_bytes  # OP_PUSHDATA2
+    if cbor_len <= _MAX_CBOR_PAYLOAD_BYTES:
+        return b"\x4e" + cbor_len.to_bytes(4, "little") + cbor_bytes  # OP_PUSHDATA4
+    raise ValidationError(f"CBOR payload too large for script: {cbor_len} > {_MAX_CBOR_PAYLOAD_BYTES}")
 
 
 def _push_minimal_int(n: int) -> bytes:
