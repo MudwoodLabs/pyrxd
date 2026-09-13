@@ -290,3 +290,60 @@ def test_every_test_file_a_group_names_actually_EXISTS() -> None:
         "these mutation groups name test files that do not exist, so `pytest` exits 4 and the "
         "group cannot run at all:\n  " + "\n  ".join(sorted(missing))
     )
+
+
+def _declared_mutation_targets() -> dict[str, set[str]]:
+    """test file -> modules it declares via a module-level ``MUTATION_TARGETS`` list."""
+    import ast
+
+    out: dict[str, set[str]] = {}
+    for path in sorted((_ROOT / "tests").rglob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - unreadable test file
+            continue
+        for node in tree.body:  # module level only
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "MUTATION_TARGETS" for t in node.targets):
+                continue
+            if isinstance(node.value, ast.List | ast.Tuple | ast.Set):
+                mods = {e.value for e in node.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+                if mods:
+                    out[path.relative_to(_ROOT).as_posix()] = mods
+    return out
+
+
+def test_a_declared_mutation_target_names_a_module_that_EXISTS() -> None:
+    """``MUTATION_TARGETS`` exists because neither derivation signal can see some tests: one
+    named after a function, whose coverage is unremarkable because a weaker test already runs
+    the same lines. Coverage cannot observe assertions, so such a test must declare itself.
+
+    A declaration pointing at a module that was renamed or deleted is a check that has
+    silently stopped running — the deriver would add the test to no group at all."""
+    declared = _declared_mutation_targets()
+    assert declared, (
+        "no test declares MUTATION_TARGETS any more. Either the convention was removed (then "
+        "delete this guard and the deriver's scanner) or the declarations were lost."
+    )
+    bad = [
+        f"{test} -> {mod}"
+        for test, mods in declared.items()
+        for mod in sorted(mods)
+        if not (_ROOT / "src" / "pyrxd" / f"{mod}.py").exists()
+    ]
+    assert not bad, "MUTATION_TARGETS naming modules that do not exist:\n  " + "\n  ".join(bad)
+
+
+def test_a_declared_test_actually_REACHES_a_mutation_group() -> None:
+    """The other direction. Declaring a target is pointless if the module belongs to no group,
+    or if the regenerated lists were never applied to the script — the declaration would look
+    like protection while changing nothing."""
+    declared = _declared_mutation_targets()
+    script = _SCRIPT.read_text(encoding="utf-8")
+    missing = [f"{test} (declares {sorted(mods)})" for test, mods in declared.items() if test not in script]
+    assert not missing, (
+        "these tests declare MUTATION_TARGETS but no group's test list names them, so the "
+        "declaration does nothing. Re-run scripts/derive_mutation_test_lists.py and apply the "
+        "result to scripts/mutation_test.sh:\n  " + "\n  ".join(missing)
+    )

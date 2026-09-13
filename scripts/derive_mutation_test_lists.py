@@ -13,6 +13,7 @@ tests that exercise a module MOST at the top, which is what a capped list should
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sqlite3
@@ -55,6 +56,46 @@ for line in script.split("\n"):
     if not items or items[0].startswith("tests/") or all(re.fullmatch(r"[\d.]+", i) for i in items):
         continue
     groups[m.group(1)] = items
+
+# A THIRD SIGNAL, because the other two provably cannot see this one.
+#
+# `tests/test_sign_custom_k_emits_strict_der.py` killed 117 mutants in `keys._sign_custom_k`
+# (41% -> 56% reported for the module) and NEITHER existing signal finds it:
+#
+#   * name-pairing looks for `tests/test_keys.py`; this test is named after a FUNCTION.
+#   * coverage ranks it 60th of 97 by arcs, 48th of 77 among tests that import `keys`, and it
+#     has ZERO exclusive arcs — every line it touches, something else already touched.
+#
+# That is not a tuning problem. `test_coverage_gaps2.py` already EXECUTED `sign(k=...)`; it
+# simply asserted determinism, which every mutant satisfies. The two tests run the same lines
+# and differ only in what they CHECK, and coverage cannot observe assertions. No ranking over
+# execution data can separate them, so a test whose value is its assertions must say so itself.
+#
+# Declared in the test file, not in a list here: the declaration lives beside the thing it
+# describes, so it cannot rot in a central registry nobody reads. `tests/test_mutation_groups_
+# are_wired.py` asserts every declared target names a module that exists.
+def declared_targets(test_path: Path) -> set[str]:
+    """Modules a test declares it targets, via a module-level ``MUTATION_TARGETS`` list."""
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):  # pragma: no cover - unreadable test file
+        return set()
+    for node in tree.body:  # module level only; a nested one is not a declaration
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "MUTATION_TARGETS" for t in node.targets):
+            continue
+        if isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+            return {e.value for e in node.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    return set()
+
+
+# module -> tests that DECLARE it, scanned once
+declared: dict[str, list[str]] = defaultdict(list)
+for tf in sorted((ROOT / "tests").rglob("test_*.py")):
+    rel = tf.relative_to(ROOT).as_posix()
+    for mod in declared_targets(tf):
+        declared[mod].append(rel)
 
 out = {}
 for g, mods in groups.items():
@@ -104,6 +145,9 @@ for g, mods in groups.items():
             }
         )
         for c in sorted(cands):
+            take(c)
+        # Declared targets are unconditional: they exist precisely because ranking misses them.
+        for c in declared.get(mod, []):
             take(c)
     for t in per_mod_top:
         take(t)
