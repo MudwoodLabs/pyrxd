@@ -15,8 +15,10 @@ byte computed with ``%``/``&``/``^``, ``to_bytes(1)`` widened to ``to_bytes(2)``
 ``if s > curve.n // 2`` rewritten to ``if s != curve.n // 2`` — i.e. low-s normalisation
 applied to almost every signature instead of half of them.
 
-Nothing here is a live defect: the shipped implementation is correct. The gap was that a
-future edit to hand-rolled ECDSA on a production-reachable path would not be noticed.
+These tests found a LIVE defect on first contact: the DER encoder emitted non-minimal
+integers for ~0.7% of signatures, which Radiant's SCRIPT_VERIFY_STRICTENC rejects. See
+the note above the last two tests. The rest of the function was correct; what was
+missing was anything that would notice either way.
 
 Two properties make these tests bite where the old one did not:
 
@@ -126,8 +128,11 @@ def test_the_encoding_is_byte_exact_against_a_reference_framing(padding_ks: tupl
         signature = key.sign(_MESSAGE, k=k)
         r, s = deserialize_ecdsa_der(signature, require_low_s=True)
 
-        r_bytes = r.to_bytes(32, "big")
-        s_bytes = s.to_bytes((s.bit_length() + 7) // 8 or 1, "big")
+        # Minimal encoding, exactly as `utils.serialize_ecdsa_der` does it. Building the
+        # expectation with a fixed 32-byte int would re-enact the very defect this file
+        # found, and would pass only for k values whose r has no leading zero byte.
+        r_bytes = r.to_bytes(32, "big").lstrip(b"\x00")
+        s_bytes = s.to_bytes(32, "big").lstrip(b"\x00")
         if r_bytes[0] & 0x80:
             r_bytes = b"\x00" + r_bytes
         if s_bytes[0] & 0x80:
@@ -154,3 +159,56 @@ def test_a_nonce_congruent_to_zero_is_refused(bad_k: int) -> None:
     key = PrivateKey()
     with pytest.raises(ValueError):
         key.sign(_MESSAGE, k=bad_k)
+
+
+# --------------------------------------------------------------------------------------
+# The defect these tests found on first contact.
+#
+# `_sign_custom_k` encoded r and s as FIXED 32-byte integers and never stripped leading
+# zeros, while DER requires minimal encoding. Whenever r or s fell below 2**248 — about
+# 1/256 each — the signature carried a leading 0x00 that DER forbids, and Radiant applies
+# SCRIPT_VERIFY_STRICTENC, so it could not confirm. Measured on the old code: 14 of 2000
+# signatures rejected by this project's own strict parser (0.70%).
+#
+# The correct encoder, `utils.serialize_ecdsa_der`, was already imported in keys.py. The
+# fix deletes the duplicate rather than patching it, so there is no second spelling left
+# to drift. These two tests pin the branch the old code got wrong, deterministically: a
+# probabilistic defect needs a trigger chosen on purpose, or the test is merely flaky.
+# --------------------------------------------------------------------------------------
+
+
+def _k_with_leading_zero_r() -> int:
+    """Smallest k whose r < 2**248, i.e. whose big-endian r starts with 0x00."""
+    for k in range(1, 20_000):
+        if _r_of(k).to_bytes(32, "big")[0] == 0x00:
+            return k
+    raise AssertionError("no k in 1..19999 produces an r with a leading zero byte")
+
+
+def test_a_leading_zero_in_r_is_encoded_minimally() -> None:
+    """r < 2**248 used to emit `02 21 00 ...` — non-minimal, and consensus-invalid."""
+    key = PrivateKey()
+    k = _k_with_leading_zero_r()
+    assert _r_of(k).to_bytes(32, "big")[0] == 0x00, "this k no longer triggers the branch"
+
+    signature = key.sign(_MESSAGE, k=k)
+    r, _ = deserialize_ecdsa_der(signature, require_low_s=True)  # raised before the fix
+    assert r == _r_of(k)
+    # and the encoding itself carries no redundant pad
+    r_len = signature[3]
+    assert signature[4] != 0x00 or (signature[5] & 0x80), "r retains a non-minimal zero byte"
+    assert r_len <= 33
+
+
+def test_a_leading_zero_in_s_is_encoded_minimally() -> None:
+    """Same defect on the s half. s depends on the key, so search k for this key."""
+    key = PrivateKey()
+    z_msg = _MESSAGE
+    for k in range(1, 20_000):
+        signature = key.sign(z_msg, k=k)
+        _, s = deserialize_ecdsa_der(signature, require_low_s=True)
+        if s.to_bytes(32, "big")[0] == 0x00:
+            s_off = 4 + signature[3] + 2
+            assert signature[s_off] != 0x00 or (signature[s_off + 1] & 0x80), "s retains a non-minimal zero byte"
+            return
+    raise AssertionError("no k in 1..19999 produced an s with a leading zero byte")

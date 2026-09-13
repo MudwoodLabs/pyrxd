@@ -254,33 +254,14 @@ class PrivateKey:
         if s == 0:
             raise ValueError("Invalid s value")
 
-        # Ensure the signature is canonical (low S value)
-        if s > curve.n // 2:
-            s = curve.n - s
-
-        # Convert r and s to bytes
-        r_bytes = r.to_bytes(32, "big")
-        s_bytes = s.to_bytes(32, "big")
-
-        # Add prefix if the MSB is set
-        if r_bytes[0] & 0x80:
-            r_bytes = b"\x00" + r_bytes
-        if s_bytes[0] & 0x80:
-            s_bytes = b"\x00" + s_bytes
-
-        # Serialize the signature in DER format
-        signature = (
-            b"\x30"
-            + (4 + len(r_bytes) + len(s_bytes)).to_bytes(1, "big")
-            + b"\x02"
-            + len(r_bytes).to_bytes(1, "big")
-            + r_bytes
-            + b"\x02"
-            + len(s_bytes).to_bytes(1, "big")
-            + s_bytes
-        )
-
-        return signature
+        # `serialize_ecdsa_der` enforces low-s AND minimal DER integer encoding, and it was
+        # already imported here. This function used to re-implement both and got the second
+        # one wrong: it encoded r and s as fixed 32-byte integers with no `lstrip(b"\x00")`,
+        # so whenever r or s fell below 2**248 (~1/256 each) the result carried a leading
+        # zero byte that DER forbids as non-minimal. Radiant applies SCRIPT_VERIFY_STRICTENC,
+        # so such a signature is not merely unusual - it cannot confirm. Measured on the old
+        # code: 14 of 2000 signatures rejected by this project's own strict parser.
+        return serialize_ecdsa_der((r, s))
 
     def verify(self, signature: bytes, message: bytes, hasher: Callable[[bytes], bytes] | None = hash256) -> bool:
         """
