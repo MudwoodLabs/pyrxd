@@ -248,3 +248,45 @@ def test_every_mutated_module_runs_its_own_dedicated_test() -> None:
         "against tests that were never written for it — a low kill rate would be an artifact, not "
         "a finding:\n  " + "\n  ".join(sorted(missing))
     )
+
+
+def test_every_test_file_a_group_names_actually_EXISTS() -> None:
+    """`tests/test_htlc_spend.py` was deleted by #518 and stayed in the `script` and `transaction`
+    lists for four months. Nothing said so: every other guard here checks that GROUPS line up with
+    each other, and none checked that the paths resolve to files on disk.
+
+    It fails closed rather than silently — `pytest` answers a missing path with **exit 4, a usage
+    error, even when real files are named alongside it**, so the harness's clean-suite baseline
+    refuses the group. That is the right direction (cosmic-ray reads a non-zero exit as "mutant
+    killed", so a collectable-but-red list would have scored 100% and been a complete fiction) but
+    it is only discovered by trying to run the group, and these two had not been run since.
+
+    Derived from the script, so a new group is covered the moment it is added."""
+    gaps_m = re.search(r'^GAPS="([^"]*)"', _SCRIPT.read_text(encoding="utf-8"), re.M)
+    assert gaps_m, "GAPS is no longer a simple double-quoted assignment; this expansion is stale"
+    expansions = {"$GAPS": gaps_m.group(1).split()}
+
+    missing: list[str] = []
+    checked = 0
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        if not m:
+            continue
+        group = m.group(1)
+        for token in m.group(2).split():
+            for path in expansions.get(token, [token]):
+                if not path.startswith("tests/"):
+                    continue
+                checked += 1
+                if not (_ROOT / path).exists():
+                    missing.append(f"{group}: {path}")
+
+    # Non-vacuity: if the parse stops matching, "no missing files" must not read as success.
+    assert checked > 100, (
+        f"only {checked} test paths parsed out of scripts/mutation_test.sh — the case-line regex "
+        "has stopped matching and this guard is passing over nothing"
+    )
+    assert not missing, (
+        "these mutation groups name test files that do not exist, so `pytest` exits 4 and the "
+        "group cannot run at all:\n  " + "\n  ".join(sorted(missing))
+    )
