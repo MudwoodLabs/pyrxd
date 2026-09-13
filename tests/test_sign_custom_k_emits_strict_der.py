@@ -44,6 +44,14 @@ from pyrxd.hash import hash256
 from pyrxd.keys import PrivateKey
 from pyrxd.utils import deserialize_ecdsa_der
 
+#: Modules this file is a dedicated test for, read by scripts/derive_mutation_test_lists.py.
+#: Needed because neither derivation signal can see this test: it is named after a function
+#: rather than a module, and its coverage is unremarkable (rank 60 of 97, zero exclusive arcs)
+#: because `test_coverage_gaps2.py` already executes the same lines — it just asserts only that
+#: signing is deterministic, which every mutant satisfies. The difference is in the assertions,
+#: and coverage cannot see assertions.
+MUTATION_TARGETS = ["keys"]
+
 _MESSAGE = b"strict der round trip"
 
 
