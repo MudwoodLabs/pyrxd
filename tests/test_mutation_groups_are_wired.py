@@ -15,7 +15,6 @@ become false. This test closes the mutation-harness instance of it.
 
 from __future__ import annotations
 
-import pathlib
 import re
 import sys
 from pathlib import Path
