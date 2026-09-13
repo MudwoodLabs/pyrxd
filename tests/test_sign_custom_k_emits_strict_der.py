@@ -177,19 +177,32 @@ def test_a_nonce_congruent_to_zero_is_refused(bad_k: int) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _k_with_leading_zero_r() -> int:
-    """Smallest k whose r < 2**248, i.e. whose big-endian r starts with 0x00."""
-    for k in range(1, 20_000):
-        if _r_of(k).to_bytes(32, "big")[0] == 0x00:
+def _has_redundant_leading_zero(value: int) -> bool:
+    """True when a fixed 32-byte encoding of *value* carries a zero DER forbids.
+
+    A leading 0x00 is REQUIRED when the next byte's high bit is set, or the integer reads
+    as negative. It is redundant — and non-minimal, and consensus-invalid — only when the
+    next byte's high bit is clear. Getting this wrong makes the test pass for the wrong
+    reason: k=153 gives r=0x00e3..., where the zero IS required, so the pre-fix encoder is
+    accidentally correct there and the planted defect went undetected.
+    """
+    raw = value.to_bytes(32, "big")
+    return raw[0] == 0x00 and not (raw[1] & 0x80)
+
+
+def _k_with_redundant_leading_zero_r() -> int:
+    """Smallest k whose r carries a zero byte DER forbids. k=246 at the time of writing."""
+    for k in range(1, 200_000):
+        if _has_redundant_leading_zero(_r_of(k)):
             return k
-    raise AssertionError("no k in 1..19999 produces an r with a leading zero byte")
+    raise AssertionError("no k in 1..199999 produces an r with a redundant leading zero")
 
 
 def test_a_leading_zero_in_r_is_encoded_minimally() -> None:
     """r < 2**248 used to emit `02 21 00 ...` — non-minimal, and consensus-invalid."""
     key = PrivateKey()
-    k = _k_with_leading_zero_r()
-    assert _r_of(k).to_bytes(32, "big")[0] == 0x00, "this k no longer triggers the branch"
+    k = _k_with_redundant_leading_zero_r()
+    assert _has_redundant_leading_zero(_r_of(k)), "this k no longer triggers the branch"
 
     signature = key.sign(_MESSAGE, k=k)
     r, _ = deserialize_ecdsa_der(signature, require_low_s=True)  # raised before the fix
@@ -207,7 +220,7 @@ def test_a_leading_zero_in_s_is_encoded_minimally() -> None:
     for k in range(1, 20_000):
         signature = key.sign(z_msg, k=k)
         _, s = deserialize_ecdsa_der(signature, require_low_s=True)
-        if s.to_bytes(32, "big")[0] == 0x00:
+        if _has_redundant_leading_zero(s):
             s_off = 4 + signature[3] + 2
             assert signature[s_off] != 0x00 or (signature[s_off + 1] & 0x80), "s retains a non-minimal zero byte"
             return
