@@ -223,7 +223,12 @@ def test_a_real_wave_mint_still_classifies_as_wave() -> None:
                 metadata = env.metadata
                 break
         assert metadata is not None, name
-        assert isinstance(metadata.attrs["expires"], str), "the mint reader stopped stringifying"
+        # NOT `isinstance(..., str)` any more. This used to pin that the mint reader stringified,
+        # which was incidental to what the test is for — `_decode_attr_value` now preserves CBOR
+        # types, because coercing them inverted meaning elsewhere (`revocable: false` -> truthy
+        # `'False'`). `_optional_int` takes the int and the digit string, so classification is
+        # unaffected either way, which is the actual claim here.
+        assert metadata.attrs["expires"] is not None
         assert classify_glyph_metadata(metadata) == "wave", name
         assert wave_attrs_from_metadata(metadata) is not None, name
 
@@ -263,7 +268,7 @@ def test_non_string_attrs_keys_are_dropped_not_coerced() -> None:
     assert _as_attrs({1: "int-key", "1": "text-key", "target": "t"}) == {"1": "text-key", "target": "t"}
 
 
-def test_the_fold_normalises_types_on_a_chain_that_can_show_it() -> None:
+def test_an_update_still_carries_a_non_string_value_so_this_stays_testable() -> None:
     """The previous version of this folded the chain whose values are already all strings, so
     removing the normalisation passed it. This one uses the chain whose second update carries
     `expires` as a CBOR int."""
@@ -278,10 +283,18 @@ def test_the_fold_normalises_types_on_a_chain_that_can_show_it() -> None:
     assert "int" in raw_kinds, "no update carries a non-str value — this fixture cannot show it"
 
 
-async def test_the_fold_output_is_all_strings() -> None:
+async def test_the_fold_output_preserves_types_rather_than_stringifying() -> None:
+    """REVERSED, deliberately. This asserted every folded value was a `str`, because the two
+    readers disagreed on type and the fold hid the seam. They agree now — `_decode_attr_value`
+    stopped coercing, since the blanket `str()` INVERTED meaning (an authority token's
+    `revocable: false` became the truthy string `'False'`). Coercing in the fold would put that
+    same inversion back one layer down, in the record a consumer actually reads."""
     folded = fold_chain(await _walk())
     assert folded.attrs
-    assert all(isinstance(v, str) for v in folded.attrs.values()), folded.attrs
+    assert isinstance(folded.attrs["expires"], int), (
+        f"the fold coerced `expires` to {type(folded.attrs['expires']).__name__}"
+    )
+    assert isinstance(folded.attrs["target"], str), "a real string must survive as a string"
 
 
 # ---------------------------------------------------------------------------

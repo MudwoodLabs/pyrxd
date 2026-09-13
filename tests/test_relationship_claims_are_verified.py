@@ -30,7 +30,6 @@ import pytest
 
 from pyrxd.glyph.relationships import (
     RelationshipKind,
-    RelationshipOutcome,
     output_ref_operands,
     verify_relationship_claims,
 )
@@ -53,12 +52,12 @@ def _meta(**kw) -> GlyphMetadata:
 class TestAClaimBackedByTheTransaction:
     def test_a_container_ref_carried_in_an_output_is_verified(self) -> None:
         v = verify_relationship_claims(_meta(container_refs=(_PARENT,)), [_singleton_carrying(_PARENT), _P2PKH])
-        assert [x.outcome for x in v] == [RelationshipOutcome.BACKED]
+        assert [x.ok for x in v] == [True]
         assert v[0].kind is RelationshipKind.CONTAINER
 
     def test_an_author_ref_is_verified_the_same_way(self) -> None:
         v = verify_relationship_claims(_meta(author_refs=(_PARENT,)), [_singleton_carrying(_PARENT)])
-        assert v[0].kind is RelationshipKind.AUTHOR and v[0].backed
+        assert v[0].kind is RelationshipKind.AUTHOR and v[0].ok
 
     def test_both_kinds_are_reported_separately(self) -> None:
         v = verify_relationship_claims(
@@ -66,7 +65,7 @@ class TestAClaimBackedByTheTransaction:
             [_singleton_carrying(_PARENT), _singleton_carrying(_OTHER)],
         )
         assert {x.kind for x in v} == {RelationshipKind.CONTAINER, RelationshipKind.AUTHOR}
-        assert all(x.backed for x in v)
+        assert all(x.ok for x in v)
 
 
 class TestAnUnbackedClaim:
@@ -74,17 +73,17 @@ class TestAnUnbackedClaim:
         """The whole point. Writing someone else's collection ref into your own
         token must not read as membership."""
         v = verify_relationship_claims(_meta(container_refs=(_PARENT,)), [_P2PKH])
-        assert v[0].outcome is RelationshipOutcome.UNBACKED
+        assert v[0].ok is False
 
     def test_carrying_a_DIFFERENT_ref_does_not_back_the_claim(self) -> None:
         """A transaction that legitimately carries some other token's ref must not
         launder an unrelated claim."""
         v = verify_relationship_claims(_meta(container_refs=(_PARENT,)), [_singleton_carrying(_OTHER)])
-        assert v[0].outcome is RelationshipOutcome.UNBACKED
+        assert v[0].ok is False
 
     def test_one_backed_and_one_not_are_reported_independently(self) -> None:
         v = verify_relationship_claims(_meta(container_refs=(_PARENT, _OTHER)), [_singleton_carrying(_PARENT)])
-        assert [x.outcome for x in v] == [RelationshipOutcome.BACKED, RelationshipOutcome.UNBACKED]
+        assert [x.ok for x in v] == [True, False]
 
 
 class TestNoClaimIsNotAFailure:
@@ -110,4 +109,4 @@ class TestTheRefWalkIsOpcodeAware:
         must not make an honest claim read as unbacked."""
         truncated = b"\xd8" + b"\x00" * 10  # ref opcode with a short operand
         v = verify_relationship_claims(_meta(container_refs=(_PARENT,)), [truncated, _singleton_carrying(_PARENT)])
-        assert v[0].backed
+        assert v[0].ok

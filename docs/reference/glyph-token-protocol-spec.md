@@ -193,7 +193,7 @@ The push opcode for the CBOR body MUST be selected by length
 
 A parser MUST locate the envelope by walking the scriptSig's pushes and taking the
 push immediately **after** a push equal to `gly`
-(`src/pyrxd/glyph/inspector.py:256-356`). It MUST NOT assume the marker is at a
+(`src/pyrxd/glyph/inspector.py:256-360`). It MUST NOT assume the marker is at a
 fixed offset, and it MUST support all four push opcodes — a walker that stops at
 `0x4e` never reaches the marker on the mainnet token above.
 
@@ -242,7 +242,7 @@ Three normative consequences follow:
 All fields are OPTIONAL except `p`. Unknown fields MUST be ignored by a decoder
 rather than treated as an error (see §16.1 for what pyrxd does with them today).
 Field names, decoder types, and limits are from
-`src/pyrxd/glyph/payload.py:92-189` and `src/pyrxd/glyph/types.py:314-408`.
+`src/pyrxd/glyph/payload.py:95-241` and `src/pyrxd/glyph/types.py:314-408`.
 
 | Key | CBOR type | Required | Max length | Meaning |
 |---|---|---|---|---|
@@ -253,7 +253,7 @@ Field names, decoder types, and limits are from
 | `desc` | text | no | 1000 | Description |
 | `type` | text | no | 64 | Free-form NFT type tag |
 | `main` | map | no | — | Embedded media, `{"t": <mime>, "b": <bytes>}` |
-| `attrs` | map | no | 64 entries | Free-form string attributes |
+| `attrs` | map | no | 64 entries | Free-form attributes. Values are scalars (string, int, float, bool) or lists of scalars, **not strings only** — Photonic's authority tokens carry a boolean `revocable` and a `permissions` list. pyrxd's decoder coerced every value to `str` until 0.24.0, which turned `false` into the truthy `"False"`; anything nested is still flattened to a string. |
 | `loc` | text | no | 512 | External URI (IPFS or other) |
 | `loc_hash` | text | no | 128 | Integrity hash for `loc` |
 | `decimals` | uint | no | `0..18` | Display precision only |
@@ -324,7 +324,7 @@ over it.** The cap is gone; this sentence is restored.
 
 ### 4.5 What a decoder MUST reject
 
-`src/pyrxd/glyph/payload.py:92-189`:
+`src/pyrxd/glyph/payload.py:95-241`:
 
 - A body larger than 262,144 bytes.
 - Bytes that are not decodable CBOR.
@@ -375,7 +375,7 @@ reveal txid.
 
 This is not a convention layered on top of the chain; it is what the commit
 covenant enforces. Walking `build_commit_locking_script`
-(`src/pyrxd/glyph/script.py:145-181`) with the reveal's scriptSig on the stack:
+(`src/pyrxd/glyph/script.py:238-277`) with the reveal's scriptSig on the stack:
 
 ```
 stack: [sig, pubkey, "gly", cbor]
@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:251-258`), and reads it back with
+(`src/pyrxd/glyph/builder.py:336-343`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:209-215`).
+(`src/pyrxd/glyph/builder.py:294-300`).
 
 ### 6.2 Phase 2 — reveal
 
@@ -504,7 +504,7 @@ d8 <ref:36>                OP_PUSHINPUTREFSINGLETON <ref>
 
 `src/pyrxd/glyph/script.py:166-171`. Total length MUST be 63 bytes; the builder
 asserts it. Classifier regex: `^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$`
-(`src/pyrxd/glyph/script.py:145`).
+(`src/pyrxd/glyph/script.py:146`).
 
 The ref is pushed and immediately dropped — its only purpose is to invoke the
 opcode's consensus effect. After the drop the remainder is an ordinary P2PKH, so a
@@ -548,7 +548,7 @@ da                              OP_REFTYPE_OUTPUT
 76 a9 14 <owner_pkh:20> 88 ac   P2PKH tail
 ```
 
-`src/pyrxd/glyph/script.py:145-181`. The FT and NFT variants are byte-identical
+`src/pyrxd/glyph/script.py:238-277`. The FT and NFT variants are byte-identical
 except for the ref-type opcode at **offset 48**: `0x51` for FT, `0x52` for NFT.
 That single byte is pinned against both shapes appearing in one mainnet
 transaction at `tests/test_glyph_dmint.py:227-240`.
@@ -567,8 +567,8 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 <body:102>                 fixed body
 ```
 
-`src/pyrxd/glyph/script.py:433-457`. The 102-byte body is a fixed constant
-(`src/pyrxd/glyph/script.py:391-415`) derived from Photonic Wallet's
+`src/pyrxd/glyph/script.py:961-985`. The 102-byte body is a fixed constant
+(`src/pyrxd/glyph/script.py:411-435`) derived from Photonic Wallet's
 `parseMutableScript` regex with the `gly` magic bytes substituted, and pinned at
 `tests/test_glyph_v2.py:112-121`.
 
@@ -584,7 +584,7 @@ PUSH3 "gly" PUSH <cbor> PUSH <op> <contract_output_index> <ref_hash_index> <ref_
 
 where `op` is `"mod"` (update the payload hash) or `"sl"` (seal — burn the
 contract). Index integers use minimal push encoding
-(`src/pyrxd/glyph/payload.py:384-403`).
+(`src/pyrxd/glyph/payload.py:436-470`).
 
 This specification reproduces the body as a constant and does not restate a
 stack-level derivation of it. Note that pyrxd's own size constant is **174**
@@ -594,7 +594,7 @@ the regex and the built script (`src/pyrxd/glyph/script.py:332-335`).
 ### 7.5 CONTAINER
 
 A container's locking script is the **63-byte NFT singleton of §7.1, unchanged**
-(`src/pyrxd/glyph/builder.py:673-737`). There is no container script shape.
+(`src/pyrxd/glyph/builder.py:777-841`). There is no container script shape.
 Container-ness is the `7` marker in the envelope's `p` field, and it is invisible
 on chain — exactly as in Photonic Wallet, which has a single `nftScript` and no
 container variant (`packages/lib/src/script.ts`).
@@ -663,7 +663,7 @@ recognises the shape only to report it: `_inspect_script` returns
 `GlyphInspector.find_glyphs` returns a `container-legacy` entry with
 `spendable=False`, `GlyphScanner` logs it and does not hand it back as a token,
 and `build_nft_transfer_tx` refuses it by name
-(`src/pyrxd/glyph/script.py:238-286`).
+(`src/pyrxd/glyph/script.py:762-810`).
 
 ### 7.6 dMint contracts
 
@@ -748,7 +748,7 @@ producers to have done.
 ### 7.7 Mint scriptSig (dMint claim)
 
 A dMint mint spends a contract UTXO with exactly four pushes
-(`src/pyrxd/glyph/inspector.py:277-329`):
+(`src/pyrxd/glyph/inspector.py:327-379`):
 
 ```
 <nonce:4 or 8> <input_hash:32> <output_hash:32> OP_0
@@ -1287,6 +1287,13 @@ reference. It is not treated as infallible. Where pyrxd diverges, it does so
 deliberately and for a stated reason; an interoperating implementation needs to
 know which behaviour it will encounter.
 
+**Photonic behaviour below is stated as of `becf41a`** and is a claim about that
+commit, not a standing one. Photonic is actively maintained, so a row may
+describe history rather than a live difference — the EPOCH/LWMA row already does.
+The last three rows were reported upstream as H15, M27 and M26; when a fix lands,
+mark the row rather than deleting it, because tokens written under the old
+behaviour stay on chain and a reader still has to handle them.
+
 | Area | Photonic | pyrxd | Reason |
 |---|---|---|---|
 | Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:28-68`). Consumers on both sides must accept either (§4.2). |
@@ -1299,6 +1306,9 @@ know which behaviour it will encounter.
 | V2 EPOCH / LWMA difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply; LWMA floors `timeDelta` at 0 | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py:291-311, 252-264`). The mainnet LWMA deploy `dea3beb9…` predates it and is deliberately **not** used as a golden anchor. |
 | ASERT shift | `OP_LSHIFT`/`OP_RSHIFT`, which Radiant evaluates as big-endian bit-string shifts — wrong for the 8-byte little-endian target | Unrolled `OP_2MUL`/`OP_2DIV` steps with per-step overflow caps | The shift opcodes diverge from the miner's bigint arithmetic for any nonzero drift (`src/pyrxd/glyph/dmint/builders.py:158-167`). |
 | WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:686-734`). |
+| Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
+| Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
+| `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |
 
 ## 16. Underspecified and implementation-defined
 
@@ -1369,7 +1379,7 @@ for such a script is undefined.
 No consensus rule fixes the photon value of a commit, contract, or NFT carrier
 output. Radiant-Core has no dust threshold — `GetDustThreshold` returns 1 and
 `IsDust` is `nValue <= 0` — so any output worth at least one photon is standard
-(`src/pyrxd/glyph/builder.py:930-942`, citing `src/policy/policy.cpp:19-25` at
+(`src/pyrxd/glyph/builder.py:1279-1291`, citing `src/policy/policy.cpp:19-25` at
 `afdf57b1`). The 1-photon value on dMint contract outputs is pinned by the
 **covenant** (`OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`,
 `src/pyrxd/glyph/dmint/builders.py:448`), not by the chain. The 546-photon floors
@@ -1380,7 +1390,7 @@ in pyrxd are wallet policy, not chain rules, and are labelled as such at
 
 The commit covenant only constrains the input that spends it. Whether an envelope
 on some *other* input is meaningful is unspecified; pyrxd's scanner will find and
-use it (`src/pyrxd/glyph/scanner.py:289-325`), which is lenient rather than
+use it (`src/pyrxd/glyph/scanner.py:317-353`), which is lenient rather than
 normative.
 
 ## 17. Provenance of the claims in this document
