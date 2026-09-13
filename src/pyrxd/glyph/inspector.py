@@ -3,18 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from pyrxd.constants import REF_OPERAND_WIDTH
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Hex20
 
-from .payload import GLY_MARKER, decode_payload, decode_update_payload
+from .payload import DAT_MARKER, GLY_MARKER, decode_payload, decode_update_payload
 from .script import (
     MUTABLE_NFT_SCRIPT_RE,
     extract_owner_pkh_from_ft_script,
     extract_owner_pkh_from_nft_script,
     extract_ref_from_ft_script,
     extract_ref_from_nft_script,
+    is_delegate_token_script,
     is_ft_script,
     is_legacy_container_script,
     is_nft_script,
+    parse_authority_gated_script,
     parse_legacy_container_script,
     parse_mutable_nft_script,
 )
@@ -41,7 +45,8 @@ class GlyphOutput:
     """
 
     vout: int
-    glyph_type: str  # "nft", "ft", "mut", "dmint", "container-legacy"
+    glyph_type: str  # "nft", "ft", "mut", "dmint", "container-legacy",
+    # "authority-gated-nft", "delegate-token"
     ref: GlyphRef
     metadata: GlyphMetadata | None  # None if this is a transfer (no reveal)
     script: bytes
@@ -53,6 +58,12 @@ class GlyphOutput:
     # ``glyph_type`` leaves it ``True``.
     spendable: bool = True
     child_ref: GlyphRef | None = None
+    #: Only ``authority-gated-nft`` outputs set this — the issuer's authority
+    #: ref the item is gated on. Note what it does NOT establish: the gate is
+    #: strippable by the holder, so its presence says the output is gated NOW,
+    #: not that the item was minted under that authority. See
+    #: :func:`~pyrxd.glyph.authority.verify_authority_gate`.
+    authority_ref: GlyphRef | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +146,48 @@ class GlyphInspector:
                         metadata=None,
                         script=script,
                         owner_pkh=extract_owner_pkh_from_ft_script(script),
+                    )
+                )
+            # A real, spendable, token-bearing output. Without this branch a gated
+            # item in a wallet fell through to a silent skip — not even reported
+            # as unknown — so `pyrxd glyph list` simply did not show a token its
+            # holder owns. `_inspect_script` knew the shape and this classifier
+            # did not, which is the two-classifier divergence this repo has been
+            # bitten by before.
+            #
+            # Walrus, not predicate-then-parse: that form needed an
+            # `assert gate is not None` to narrow, and `python -O` strips
+            # asserts — so the narrowing would be gone in exactly the build where
+            # a surprise matters.
+            elif (gate := parse_authority_gated_script(script)) is not None:
+                authority_ref, item_ref, gated_pkh = gate
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="authority-gated-nft",
+                        ref=item_ref,
+                        metadata=None,
+                        script=script,
+                        owner_pkh=gated_pkh,
+                        authority_ref=authority_ref,
+                    )
+                )
+            elif is_delegate_token_script(script_hex):
+                # Also spendable and token-bearing, and the SAME 63 bytes as an
+                # NFT singleton with one opcode changed — so the `is_nft_script`
+                # branch above correctly does not claim it, and nothing else did.
+                # A holder needs to see these: they authorise mints against the base.
+                # NOT a per-mint tally — the covenant requires exactly one burn output per
+                # REVEAL, and one reveal can carry several commits, so counting burn markers
+                # undercounts mints by an arbitrary factor.
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="delegate-token",
+                        ref=GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH]),
+                        metadata=None,
+                        script=script,
+                        owner_pkh=Hex20(script[41:61]),
                     )
                 )
             elif is_legacy_container_script(script_hex):
@@ -241,9 +294,13 @@ class GlyphInspector:
         for i, item in enumerate(items):
             if item != GLY_MARKER:
                 continue
-            if i + 1 >= len(items):
-                return GlyphEnvelope(kind="unreadable", reason="'gly' marker is the last push — no payload follows")
-            blob = items[i + 1]
+            payload_index = self._payload_index_after_marker(items, i)
+            if payload_index is None:
+                return GlyphEnvelope(
+                    kind="unreadable",
+                    reason="nothing follows the 'gly' marker (or the 'dat' marker after it) — no payload",
+                )
+            blob = items[payload_index]
             try:
                 return GlyphEnvelope(kind="payload", metadata=decode_payload(blob))
             except Exception as payload_exc:
@@ -406,6 +463,31 @@ class GlyphInspector:
         items, complete = GlyphInspector._walk_pushes(scriptsig)
         return items if complete else None
 
+    @staticmethod
+    def _payload_index_after_marker(items: list[bytes], marker_index: int) -> int | None:
+        """Which push is the PAYLOAD, given the ``gly`` marker at *marker_index*. ``None`` if none.
+
+        ONE DEFINITION, because there are TWO readers that find ``gly`` and take what follows —
+        :meth:`_parse_reveal_scriptsig` and :meth:`classify_glyph_scriptsig` — and they fed the
+        same screen with opposite answers. A DAT reveal pushes a SECOND marker between the two:
+        ``gly``, ``dat``, payload (``payload.py``'s DAT builder emits exactly that, because the
+        commit pops ``"dat"`` as well). The skip was added to the reveal reader only, so for a DAT
+        glyph minted by pyrxd the metadata block decoded and rendered while the envelope block
+        below it said "UNREADABLE — a 'gly' marker with content neither reader accepted", about
+        the same bytes. Measured, not theorised.
+
+        That is the guard-universality failure in miniature: the question is not "does the fix
+        have a caller" but "what are all the ways to reach this, and does each cross the fix".
+        Both callers now cross this one function, so there is no second door to remember.
+
+        ONLY the one known marker is skipped. Skipping any short item would let a crafted
+        scriptSig push filler between the marker and a payload of its choosing.
+        """
+        nxt = marker_index + 1
+        if nxt < len(items) and items[nxt] == DAT_MARKER:
+            nxt += 1
+        return nxt if nxt < len(items) else None
+
     def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
         """Walk the scriptSig push-data stack to find 'gly' marker + CBOR.
 
@@ -427,7 +509,26 @@ class GlyphInspector:
         marker-then-CBOR search are unchanged; only the duplicated walking is gone.
         """
         items, _complete = self._walk_pushes(scriptsig)
+
+        # Look for the 'gly' marker, then the payload.
+        #
+        # A DAT reveal pushes a SECOND marker between them — `gly`, `dat`, payload — because its
+        # commit pops `"dat"` as well (see `build_dat_commit_locking_script`). Taking
+        # `items[i + 1]` unconditionally hands `decode_payload` the four bytes `b"dat"`, it raises,
+        # and the caller sees `None`: a DAT glyph minted by pyrxd was unreadable BY pyrxd, which
+        # for DAT means the entire content was unreachable, since a DAT reveal has no token output
+        # and the payload is all there is.
+        #
+        # Only the one known marker is skipped. Skipping any short item would let a crafted
+        # scriptSig push filler between the marker and a payload of its choosing.
+        #
+        # THIS SKIP AND THE SHARED WALKER ARE INDEPENDENT FIXES to the same function and the merge
+        # keeps both: the walker decides which pushes exist, this decides which of them is the
+        # payload. Dropping either one reintroduces a defect the other does not cover.
         for i, item in enumerate(items):
-            if item == GLY_MARKER and i + 1 < len(items):
-                return decode_payload(items[i + 1])
+            if item != GLY_MARKER:
+                continue
+            payload_index = self._payload_index_after_marker(items, i)
+            if payload_index is not None:
+                return decode_payload(items[payload_index])
         return None

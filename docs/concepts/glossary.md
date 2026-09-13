@@ -29,8 +29,12 @@ those for depth; use this page to look something up mid-task.
 - **AUTHORITY** — a Glyph protocol type (`GlyphProtocol.AUTHORITY = 10`,
   [`src/pyrxd/glyph/types.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/types.py))
   marking issuer-authority metadata. pyrxd **decodes and classifies** it
-  (`_inspect_core.py`, `wave.py`) but ships no `prepare_authority_*` builder —
-  you cannot mint one with pyrxd today.
+  (`_inspect_core.py`, `wave.py`) and now BUILDS one:
+  `GlyphBuilder.prepare_authority_gated_reveal` mints an item under an issuer's
+  gate, and `verify_authority_gate` answers the consensus-backed question about a
+  given item's genesis output. Both are **builder-level** — no `GlyphClient`
+  method and no CLI command mints one, so a caller drives `GlyphBuilder` and
+  assembles the transaction itself.
 
 ## B
 
@@ -132,8 +136,10 @@ those for depth; use this page to look something up mid-task.
   historically common one on mainnet) are always plain sha256d with no DAA
   at all. See [V1 dMint deploys](dmint-v1-deploy.md).
 - **DAT** — a Glyph protocol type (`GlyphProtocol.DAT = 3`, `glyph/types.py`)
-  for data storage. Like AUTHORITY, this is **decode/classify-only** in
-  pyrxd — no builder ships for it.
+  for data storage. Like AUTHORITY, pyrxd now builds it —
+  `GlyphBuilder.prepare_dat_commit` and `prepare_dat_reveal` — at
+  **builder-level** only; no `GlyphClient` method or CLI command mints a DAT
+  glyph.
 - **dead-man's switch** — the independent watchtower process
   (`pyrxd-watchtower-deadman`) that watches the *tower's own* heartbeat file
   and pages the operator the instant it goes stale or absent. Answers "is

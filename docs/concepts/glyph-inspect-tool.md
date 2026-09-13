@@ -162,9 +162,11 @@ row of the `outputs[]` list on a fetched transaction. Every value
 `_inspect_core` can emit:
 
 `p2pkh`, `p2pkh-cltv`, `p2pkh-csv`, `p2sh`, `nft`, `ft`, `mut`,
-`commit-nft`, `commit-ft`, `dmint`, `container-legacy`,
+`commit-nft`, `commit-ft`, `commit-dat`, `dmint`, `container-legacy`,
+`delegate-token`, `delegate-burn`, `authority-gated-nft`,
 `soulbound-covenant`, `self-replicating-covenant`, `op_return`,
 `op_return-msg`, `op_return-hashmark-v1`, `op_return-hashmark-v2`,
+`op_return-burn`,
 `unknown`.
 
 Plus one that only ever appears in a fetched transaction's `outputs[]`
@@ -172,6 +174,57 @@ row, never from a pasted script: `error`, when classifying that one
 output raised. The row keeps its `vout` and `satoshis`, and the `error`
 field is the exception's class name and nothing more. The remaining
 rows are unaffected, which is the point of the per-output `try`.
+
+`commit-dat` is the commit half of a DAT (data-storage) glyph. It
+differs from `commit-nft` / `commit-ft` by having **no**
+`OP_REFTYPE_OUTPUT` block, which is the whole point: its reveal obliges
+no token output and mints nothing. What survives is the payload in the
+reveal's scriptSig. It also carries an extra `dat` marker push, so
+every field after the payload hash sits at a different offset than in
+the other two commits.
+
+`op_return-burn` is a Glyph BURN proof — an `OP_RETURN` declaring that a
+token was destroyed. Read the `note` on that row before believing it:
+anyone can write one, about any token, in a transaction that never held
+it. The proof is a claim, and it becomes a burn only when the
+transaction also **spent** the token and no output carries its ref.
+`verify_burn` reports which of those two it could establish, and it
+cannot establish the first from the burning transaction alone — the
+spent outputs live in earlier transactions.
+
+`authority-gated-nft` is a 101-byte item whose script carries
+`OP_REQUIREINPUTREF` on an issuer's authority ref ahead of its own
+singleton. Consensus refuses to create such an output unless the
+transaction holds the authority token, so it cannot be minted by a
+counterfeiter.
+
+The label answers "is this output gated **now**", which is weaker than
+it sounds and is why the row carries a `note`. Measured on a node
+(`tests/test_authority_regtest_e2e.py`): the holder can transfer the
+item to a plain 63-byte `nft` script — same ref, no gate, nobody's
+permission needed — so a live UTXO's gatedness is whatever its holder
+last chose. Authority gating is a claim about an item's **genesis**, and
+only the transaction that minted it establishes one. What the gate does
+buy is real: minting a *further* gated item from an existing one is
+rejected, so the issuer's authority is a genuine supply cap.
+
+`delegate-token` and `delegate-burn` are the two halves of a delegate,
+which is how a token's `in`/`by` claim can be authorised without the
+minter holding the parent singleton. A `delegate-token` output is the
+**same 63 bytes as `nft`**, differing only in the opcode (`0xd0`
+`OP_PUSHINPUTREF` rather than `0xd8` `OP_PUSHINPUTREFSINGLETON`), so
+anything classifying by length alone gets it wrong; it is token-bearing
+either way, and spending one as ordinary funding destroys it. A
+`delegate-burn` is the unspendable 42-byte marker a mint emits to prove
+it consumed one.
+
+Both name a **base** ref, not a container or author ref. The base is
+where the authorisation actually lives, and the inspector cannot follow
+it from the transaction in front of it — resolving a delegated claim
+means fetching the base transaction, which `glyph inspect --fetch`
+does and a pasted script cannot. A relationship that reads
+`UNRESOLVED` alongside a `delegate_burns` entry means exactly that: the
+lookup did not happen, **not** that the claim was forged.
 
 The three `op_return-*` values are refinements of `op_return`, added
 when the data carrier self-identifies (see "OP_RETURN data carriers"

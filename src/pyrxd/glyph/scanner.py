@@ -216,6 +216,34 @@ class GlyphScanner:
                 if g.glyph_type == "nft":
                     pkh = extract_owner_pkh_from_nft_script(script)
                     results.append(GlyphNft(ref=g.ref, owner_pkh=pkh, metadata=metadata))
+                elif g.glyph_type == "authority-gated-nft":
+                    # A gated item IS an NFT its holder owns — same singleton ref,
+                    # spendable, transferable (to a plain NFT script; keeping the
+                    # gate needs the issuer). Returning it is the point: without
+                    # this branch it fell through the dispatch below and vanished
+                    # from holdings, exactly as it vanished from `find_glyphs`
+                    # before that was fixed.
+                    #
+                    # `g.owner_pkh`, NOT `extract_owner_pkh_from_nft_script`: the
+                    # gated script is 101 bytes with the pkh at a different offset,
+                    # so the plain-NFT extractor would refuse it.
+                    if g.owner_pkh is None:  # pragma: no cover - set by find_glyphs
+                        raise ValueError("authority-gated output has no owner pkh")
+                    results.append(GlyphNft(ref=g.ref, owner_pkh=g.owner_pkh, metadata=metadata))
+                elif g.glyph_type == "delegate-token":
+                    # NOT a GlyphNft — it is a mint authorisation, not a
+                    # collectible, and handing it back as an NFT would invite a
+                    # holder to transfer it like one. But it must not be SILENT
+                    # either: they authorise mints against the base, so a holder
+                    # counting them needs to know they are there.
+                    logger.info(
+                        "Holding a delegate token at %s:%d (base ref %s:%d) — a mint authorisation, "
+                        "not a transferable token; it is not returned as a GlyphNft",
+                        utxo.tx_hash,
+                        utxo.tx_pos,
+                        g.ref.txid,
+                        g.ref.vout,
+                    )
                 elif g.glyph_type == "ft":
                     pkh = extract_owner_pkh_from_ft_script(script)
                     results.append(

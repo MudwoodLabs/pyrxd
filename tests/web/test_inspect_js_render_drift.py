@@ -94,6 +94,17 @@ _SHAPE_NAMES = (
     "mut",
     "commit-nft",
     "commit-ft",
+    "commit-dat",
+    "op_return-burn",
+    "delegate-token",
+    "delegate-burn",
+    # A commit output carrying the 56-byte delegate prefix. Same emitted TYPE as
+    # "commit-nft", deliberately: what it exercises is that every offset in the
+    # classifier is taken from the CORE rather than from the start of the
+    # script. Built without it, a delegate commit is 131 bytes with each field
+    # shifted by 56 and reads as an unrecognised output.
+    "commit-nft-delegate",
+    "authority-gated-nft",
     "container-legacy",
     "dmint-v1",
     "dmint-v2",
@@ -121,10 +132,15 @@ def _corpus() -> dict[str, bytes]:
     Built lazily; see the import note at the top of the module.
     """
     from pyrxd.constants import SEQUENCE_LOCKTIME_DISABLE_FLAG
+    from pyrxd.glyph.burn import build_burn_proof_script
     from pyrxd.glyph.dmint.builders import build_dmint_contract_script, build_dmint_v1_contract_script
     from pyrxd.glyph.dmint.types import DmintDeployParams
     from pyrxd.glyph.script import (
+        build_authority_gated_nft_script,
         build_commit_locking_script,
+        build_dat_commit_locking_script,
+        build_delegate_burn_script,
+        build_delegate_token_script,
         build_ft_locking_script,
         build_mutable_nft_script,
         build_nft_locking_script,
@@ -193,6 +209,18 @@ def _corpus() -> dict[str, bytes]:
         "mut": build_mutable_nft_script(ref, payload_hash),
         "commit-nft": build_commit_locking_script(payload_hash, pkh, is_nft=True),
         "commit-ft": build_commit_locking_script(payload_hash, pkh, is_nft=False),
+        # No OP_REFTYPE_OUTPUT block and an extra "dat" push: every offset after
+        # the payload hash shifts relative to the two commits above.
+        "commit-dat": build_dat_commit_locking_script(payload_hash, pkh),
+        "op_return-burn": build_burn_proof_script(ref, amount=250, burn_reason="redeemed"),
+        # A delegate token is the SAME 63 bytes as "nft" above with a different
+        # opcode (0xd0 vs 0xd8), which is exactly why it gets its own shape.
+        "delegate-token": build_delegate_token_script(pkh, ref2),
+        "delegate-burn": build_delegate_burn_script(ref2),
+        "commit-nft-delegate": build_commit_locking_script(payload_hash, pkh, is_nft=True, delegate_ref=ref2),
+        # 101 bytes: the item's singleton behind an OP_REQUIREINPUTREF on the
+        # issuer's authority ref. ref2 is the authority, ref the item.
+        "authority-gated-nft": build_authority_gated_nft_script(pkh, ref, ref2),
         # The dead pre-0.15.0 CONTAINER-with-child-ref output: OP_PUSHINPUTREF
         # <child> then a plain NFT script. Built the way it used to be built.
         "container-legacy": b"\xd0" + ref2.to_bytes() + build_nft_locking_script(pkh, ref),
@@ -251,6 +279,16 @@ _PROSE_EVIDENCE = {
     "relative_lock_disabled": {True: "DISABLED", False: None},
     # A walk that could not finish reports "unknown", not the literal null.
     "token_bearing": {None: "does not decode"},
+    # Both renderers use the reader-facing words for a relationship's kind, and
+    # the CLI does the same — the protocol says `in`/`by`, a person reads
+    # "collection"/"creator". The value is TRANSLATED, not dropped.
+    "kind": {"container": "collection claim", "author": "creator claim"},
+    # The verdict word is prose, not the enum value: `direct` renders as
+    # "spent in this tx", `delegated` as "via delegate", `none` as part of
+    # whichever refusal line applies. `ok` carries the same information and is
+    # asserted through the VERIFIED/UNVERIFIED/UNRESOLVED wording.
+    "basis": {"direct": "spent in this tx", "delegated": "via delegate", "none": None},
+    "ok": {True: "VERIFIED", False: None},
 }
 
 
@@ -275,6 +313,10 @@ _OMITTED_NESTED_KEYS = {
     "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
     "recovered_hash160": "identical to the committed signer whenever it is set, and "
     "the signer is already rendered; printing both invites reading them as two facts",
+    "reason": "a relationship verdict's machine-readable explanation. Both renderers "
+    "write their own, better-worded sentence for the same fact ('VERIFIED via delegate "
+    "... not spent here'); printing the library's string beside it would say the thing "
+    "twice, in two voices",
 }
 
 
@@ -301,7 +343,18 @@ def _required_evidence(key: str, value) -> list[str]:
         evidence: list[str] = []
         for entry in value:
             if isinstance(entry, dict):
-                evidence.extend(str(field) for field in entry.values() if str(field))
+                # RECURSE, rather than taking `entry.values()` raw. The nested-dict
+                # branch above already routes through `_required_evidence`, so
+                # `_PROSE_EVIDENCE` applied to a field inside a dict but NOT to the
+                # same field inside a list of dicts — an inconsistency that made a
+                # translated value (`kind: "container"` rendered as "collection")
+                # look like a dropped one.
+                evidence.extend(
+                    ev
+                    for sub_key, sub_value in entry.items()
+                    if sub_key not in _OMITTED_NESTED_KEYS
+                    for ev in _required_evidence(sub_key, sub_value)
+                )
             else:
                 evidence.extend(_required_evidence("", entry))
         return evidence
@@ -849,6 +902,37 @@ def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> di
     return result["payload"]
 
 
+def _tx_payload_delegated(
+    scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], delegated_refs: list[bytes]
+) -> dict:
+    """Classify with resolved delegate refs — the shape the CLI produces.
+
+    The browser page does not resolve delegate bases today, so this goes through
+    the core classifier rather than the glue. It is still the real classifier
+    with a real transaction; only the resolution step is supplied, exactly as
+    ``_inspect_txid_inner`` supplies it after fetching the base.
+    """
+    from pyrxd.glyph._inspect_core import _classify_raw_tx
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    tx = Transaction(
+        tx_inputs=[
+            TransactionInput(source_txid="ab" * 32, source_output_index=i, unlocking_script=Script(ss))
+            for i, ss in enumerate(scriptsigs)
+        ],
+        tx_outputs=[
+            TransactionOutput(locking_script=Script(spk, allow_malformed=True), satoshis=value)
+            for spk, value in outputs
+        ],
+    )
+    raw = tx.serialize()
+    return _classify_raw_tx(hash256(raw)[::-1].hex(), raw, delegated_refs=delegated_refs)
+
+
 def _tx_payload_single_vout(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], vout: int) -> dict:
     """The same transaction classified with ``only_vout`` — one output row while
     ``output_count`` still reports the whole transaction.
@@ -888,6 +972,7 @@ def _tx_payloads() -> dict[str, dict]:
     from pyrxd.glyph.dmint.builders import build_dmint_v1_contract_script
     from pyrxd.glyph.script import (
         build_commit_locking_script,
+        build_delegate_burn_script,
         build_ft_locking_script,
         build_nft_locking_script,
     )
@@ -899,6 +984,7 @@ def _tx_payloads() -> dict[str, dict]:
     op_return = b"\x6a\x04test"
     token_ref = GlyphRef(txid=os.urandom(32).hex(), vout=0)
     other_token_ref = GlyphRef(txid=os.urandom(32).hex(), vout=1)
+    container_ref = GlyphRef(txid=os.urandom(32).hex(), vout=2)
     ft = build_ft_locking_script(pkh, token_ref)
     nft = build_nft_locking_script(pkh, token_ref)
     commit_ft = build_commit_locking_script(os.urandom(32), pkh, is_nft=False)
@@ -1000,6 +1086,36 @@ def _tx_payloads() -> dict[str, dict]:
         "op-return-values": _tx_payload([empty], [(op_return, 0), (op_return, 777), (p2pkh, 546)]),
         # Per-character Latin mimicry: Cyrillic "С" (U+0421) inside ASCII "USD".
         "homoglyph-mixed": _tx_payload([_reveal_scriptsig("USDС")], [(nft, 546)]),
+        # RELATIONSHIP VERDICTS. No case emitted `relationships` at all, so the
+        # field guard was structurally correct and TRUE AND EMPTY over it — which
+        # is how the browser kept rendering a delegated claim as "spent in this
+        # tx" while the CLI had been fixed. One case per verdict state.
+        #
+        # Backed DIRECTLY: the reveal re-creates the container, so its ref is
+        # among the output refs.
+        "relationship-direct": _tx_payload(
+            [_reveal_scriptsig("MEMBER", extra={"in": [container_ref.to_bytes()]})],
+            [(nft, 546), (build_nft_locking_script(pkh, container_ref), 546)],
+        ),
+        # A claim with NOTHING behind it — the honest "CLAIMED ONLY".
+        "relationship-unbacked": _tx_payload(
+            [_reveal_scriptsig("MEMBER", extra={"in": [container_ref.to_bytes()]})],
+            [(nft, 546)],
+        ),
+        # A delegate WAS burned but not resolved (the classifier cannot fetch).
+        # Must render UNRESOLVED, never "nothing authorises it".
+        "relationship-unresolved": _tx_payload(
+            [_reveal_scriptsig("MEMBER", extra={"in": [container_ref.to_bytes()]})],
+            [(nft, 546), (build_delegate_burn_script(other_token_ref), 0)],
+        ),
+        # Resolved through a delegate — the shape the CLI produces once it has
+        # fetched the base. `backing: "delegated"`, which must NOT render as
+        # "spent in this tx".
+        "relationship-delegated": _tx_payload_delegated(
+            [_reveal_scriptsig("MEMBER", extra={"in": [container_ref.to_bytes()]})],
+            [(nft, 546), (build_delegate_burn_script(other_token_ref), 0)],
+            [container_ref.to_bytes()],
+        ),
         # An honest Japanese name. `_suspicious_reason` flags it "non-Latin
         # script" from a pure category test — no confusability check runs — and
         # the banner used to tell this token's holder it mimicked Latin letters.
@@ -1069,6 +1185,10 @@ class TestTheTxCardRendersEveryFieldToo:
         }
         assert {"metadata", "metadata_inputs", "mint_scriptsig"} <= top
         assert {"of_n_payloads", "classification", "display_warnings", "timelock"} <= meta
+        # `relationships` and `delegate_burns` were absent from every case, so
+        # the field guard above passed vacuously over them while the browser
+        # rendered a delegated claim as "spent in this tx".
+        assert {"relationships", "delegate_burns"} <= meta
 
 
 class TestTheBurnBannerStopsAssertingAnOutcome:
