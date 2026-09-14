@@ -218,3 +218,20 @@ def test_the_trivial_size_check_actually_fires() -> None:
     )
     msg = _oversized_trivial_reason("utils", "trivial helpers")
     assert msg is not None, "the trivial-size check no longer fires on a real oversized module"
+
+
+def test_a_genuinely_trivial_module_is_not_refused() -> None:
+    """The honest-path pair for the refusal above: a module that really is small must not be
+    flagged just because its reason contains the word "trivial". `script/unlocking_template.py`
+    is one of this repo's real, currently-exempt-by-rule trivial re-export files (17 lines,
+    called "trivial re-exports" in scripts/mutation_test.sh's own comment) — the check must let
+    an honest case like it through, or the ceiling would refuse legitimate exemptions and someone
+    would end up raising `_TRIVIAL_LINE_LIMIT` to make the false alarm go away rather than fixing
+    a real one."""
+    path = _SRC / "script" / "unlocking_template.py"
+    lines = path.read_text(encoding="utf-8").count("\n") + 1
+    assert lines <= _TRIVIAL_LINE_LIMIT, (
+        f"script/unlocking_template.py is now {lines} lines — pick a different genuinely small "
+        "module to prove the honest path"
+    )
+    assert _oversized_trivial_reason("script/unlocking_template", "trivial re-exports") is None
