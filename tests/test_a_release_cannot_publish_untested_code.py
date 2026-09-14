@@ -80,7 +80,15 @@ def test_verify_refuses_a_commit_that_is_not_on_main() -> None:
         "Without it a tag on an arbitrary commit — one that never crossed a PR, so never "
         "crossed the required status checks — can still be released."
     )
-    assert "refs/remotes/origin/main" in body, (
+    # Check the COMMAND, not the block. A substring search over the whole `run:` scalar is
+    # satisfied by any COMMENT mentioning the ref — which is how the first version of this
+    # assertion passed while the command itself used the bare, ambiguous name. Planting the
+    # regression is what exposed it.
+    ancestry_cmds = [
+        line for line in body.splitlines() if "merge-base --is-ancestor" in line and not line.lstrip().startswith("#")
+    ]
+    assert ancestry_cmds, "the ancestry check command is gone entirely"
+    assert all("refs/remotes/origin/main" in line for line in ancestry_cmds), (
         "the ancestry check no longer uses a FULLY QUALIFIED ref. A bare `origin/main` is "
         "ambiguous: gitrevisions checks refs/tags/<name> BEFORE refs/remotes/<name>, and "
         "actions/checkout with fetch-depth: 0 fetches all tags — so a tag named `origin/main` "
