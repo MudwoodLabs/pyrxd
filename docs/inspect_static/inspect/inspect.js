@@ -1216,6 +1216,15 @@ function renderOutputRow(row) {
   if (type === "error") {
     dl.appendChild(kv("error", row.error || "(unknown)"));
   }
+  // The delegate base this row is bound to, for EVERY row that carries one.
+  // The classifier recovers it from all three commit types, but only emitted it
+  // for the DAT branch and only the delegate-token/delegate-burn rows rendered
+  // it — so a delegate-bound NFT or FT commit, whose reveal the covenant rejects
+  // without a burn output naming that base, looked exactly like a plain commit
+  // here. Generic, because hand-keeping which types show it is what lost it.
+  if (row.delegate_base_ref && type !== "delegate-token" && type !== "delegate-burn") {
+    dl.appendChild(kv("delegate_base_ref", row.delegate_base_ref));
+  }
   wrapper.appendChild(dl);
 
   // The classifier's own caveat for the shapes where naming them is only
@@ -1770,6 +1779,12 @@ function renderScriptCard(payload) {
   if (payload.ref_txid) dl.appendChild(kv("ref txid", payload.ref_txid));
   if (payload.ref_vout !== undefined) dl.appendChild(kv("ref vout", payload.ref_vout));
   if (payload.ref_outpoint) dl.appendChild(kv("ref outpoint", payload.ref_outpoint));
+  // TWO sibling renderers read these rows — this one and renderOutputRow. The first
+  // fix for the dropped delegate base only patched the other, and the drift guard
+  // caught it. A delegate-bound commit's reveal is rejected by the covenant without a
+  // burn output naming this base, so omitting it here showed a script that cannot be
+  // spent as it stands as though it were an ordinary commit.
+  if (payload.delegate_base_ref) dl.appendChild(kv("delegate base ref", payload.delegate_base_ref));
   if (payload.child_ref_outpoint) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
   }
