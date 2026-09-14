@@ -163,9 +163,15 @@ def test_a_nonce_congruent_to_zero_is_refused(bad_k: int) -> None:
     """``k`` is reduced mod n before the check, so n and 2n are the same defect as 0.
 
     A signature made with k = 0 is not a signature; ``r`` would be the point at infinity.
+
+    ``match="Invalid nonce k"`` is load-bearing, not decoration. Deleting the explicit
+    ``if k == 0: raise ValueError("Invalid nonce k")`` guard in ``_sign_custom_k`` still
+    raises ``ValueError`` for every case here — ``if R is None`` and Python's own
+    ``pow(k, -1, n)`` both refuse k ≡ 0 (mod n) on their own — so a bare
+    ``pytest.raises(ValueError)`` cannot tell "the guard works" from "the guard is absent".
     """
     key = PrivateKey()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Invalid nonce k"):
         key.sign(_MESSAGE, k=bad_k)
 
 
@@ -233,3 +239,51 @@ def test_a_leading_zero_in_s_is_encoded_minimally() -> None:
             assert signature[s_off] != 0x00 or (signature[s_off + 1] & 0x80), "s retains a non-minimal zero byte"
             return
     raise AssertionError("no k in 1..19999 produced an s with a leading zero byte")
+
+
+# --------------------------------------------------------------------------------------
+# The low-S boundary itself: `if s > curve.n // 2:` in `utils.serialize_ecdsa_der`.
+#
+# A `>=` mutant here survives every test above: raw s == n // 2 exactly requires z and d to
+# collide on one specific residue, which does not happen by chance with a random key and a
+# hashed message (probability 2^-256). It is a live defect if introduced — n is prime hence
+# odd, so n - n // 2 == n // 2 + 1, and a signature with s == n // 2 + 1 is HIGH-S, which
+# libsecp256k1 (and this project's own `require_low_s=True` decoder) rejects.
+# --------------------------------------------------------------------------------------
+
+
+def _identity_hasher(message: bytes) -> bytes:
+    """Pass the digest straight through, so the caller controls z exactly."""
+    return message
+
+
+def test_the_low_s_boundary_normalises_exactly_at_n_over_2() -> None:
+    """Force s to land exactly on, and one past, the low-S boundary for a REAL random key.
+
+    ``_sign_custom_k`` computes ``s = k^-1 * (z + r*d) mod n``. Solving for z given a chosen
+    k and a target s — ``z = (target_s * k - r * d) mod n`` — lands s exactly where wanted for
+    whatever key ``PrivateKey()`` happened to draw, because z is free: it comes from the
+    message via ``hasher``, and the identity hasher below lets this test supply the raw digest
+    directly instead of hashing arbitrary text and hoping for a collision.
+
+    Both raw s == n // 2 and s == n // 2 + 1 must normalise to s == n // 2 — the first
+    unchanged (already low), the second flipped via ``n - s``. A `>` -> `>=` mutant instead
+    flips the FIRST case too, emitting n // 2 + 1 (HIGH-S), which is what this test exists to
+    catch: not a value derived from the random key, but the curve's own public constant.
+    """
+    key = PrivateKey()
+    d = int.from_bytes(key.serialize(), "big")
+    k = 1
+    r = _r_of(k)
+
+    for target_s in (curve.n // 2, curve.n // 2 + 1):
+        z = (target_s * k - r * d) % curve.n
+        message = z.to_bytes(32, "big")
+        signature = key.sign(message, hasher=_identity_hasher, k=k)
+
+        r_out, s_out = deserialize_ecdsa_der(signature, require_low_s=True)
+        assert r_out == r
+        assert s_out == curve.n // 2, f"raw s={target_s} did not normalise to the low-S boundary"
+        assert key.public_key().verify(signature, message, _identity_hasher), (
+            "the honest path must still verify — a boundary-correct signature is not a broken one"
+        )
