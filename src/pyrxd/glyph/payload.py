@@ -137,9 +137,38 @@ _MAX_MIME_TYPE_CHARS = 256
 _MAX_ATTRS_LIST_LEN = 64
 
 #: Widest integer preserved in an ``attrs`` value. Beyond this it becomes a short
-#: descriptive string — see :func:`_decode_attr_value` for why an unbounded one
+#: descriptive string — see :func:`_decode_attr_scalar` for why an unbounded one
 #: is a live exception in every consumer that stringifies the metadata.
 _MAX_ATTRS_INT_BITS = 512
+
+
+def _decode_attr_scalar(value: bool | int | float | str) -> object:
+    """Bound ONE ``attrs`` scalar so a consumer can stringify the result.
+
+    Split out of :func:`_decode_attr_value` because the bounds were applied at
+    the top level only. The list branch kept any ``int``/``float`` unchecked, so
+    ``{"a": [1 << 20000], "b": [float("nan")]}`` decoded cleanly and then
+    ``json.dumps(metadata.attrs)`` raised ``ValueError: Exceeds the limit (4300
+    digits)``, and ``[nan]`` reached JSON as a bare ``NaN`` that no strict parser
+    reads back — exactly the failure the comments below say this prevents, one
+    nesting level down. The values are attacker-authored chain data, so the
+    guard has to be on the value, not on where in the shape it was found.
+    """
+    if isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        # A CBOR bignum decodes fine and then breaks the consumer: CPython
+        # refuses `str()` on an integer over ~4300 digits (ValueError), and
+        # `json.dumps` inherits that. Widening this decoder to preserve ints
+        # therefore handed library callers an uncaught exception where the old
+        # blanket `str()` had merely mangled the value. Anything an `attrs`
+        # field legitimately carries fits far inside this bound.
+        if value.bit_length() > _MAX_ATTRS_INT_BITS:
+            return f"<oversized integer: {value.bit_length()} bits>"
+        return value
+    # float — NaN/Infinity are valid CBOR and are NOT valid JSON: `json.dumps`
+    # emits a bare `NaN`, which no strict parser will read back.
+    return value if math.isfinite(value) else f"<non-finite: {'nan' if math.isnan(value) else 'inf'}>"
 
 
 def _decode_attr_value(value: object) -> object:
@@ -156,26 +185,17 @@ def _decode_attr_value(value: object) -> object:
 
     Nested maps and deeper structures are still flattened to ``str``: nothing in
     the protocol needs them, and preserving arbitrary nesting from untrusted
-    CBOR widens the surface for no gain.
+    CBOR widens the surface for no gain. Note that the list branch does NOT
+    recurse — a list element that is itself a list or map is dropped, as before
+    — so the work this decoder does stays bounded by the payload size rather
+    than by the publisher's choice of nesting depth.
     """
-    if isinstance(value, bool) or value is None or isinstance(value, str):
+    if value is None:
         return value
-    if isinstance(value, int):
-        # A CBOR bignum decodes fine and then breaks the consumer: CPython
-        # refuses `str()` on an integer over ~4300 digits (ValueError), and
-        # `json.dumps` inherits that. Widening this decoder to preserve ints
-        # therefore handed library callers an uncaught exception where the old
-        # blanket `str()` had merely mangled the value. Anything an `attrs`
-        # field legitimately carries fits far inside this bound.
-        if value.bit_length() > _MAX_ATTRS_INT_BITS:
-            return f"<oversized integer: {value.bit_length()} bits>"
-        return value
-    if isinstance(value, float):
-        # NaN/Infinity are valid CBOR and are NOT valid JSON — `json.dumps`
-        # emits a bare `NaN`, which no strict parser will read back.
-        return value if math.isfinite(value) else f"<non-finite: {'nan' if math.isnan(value) else 'inf'}>"
+    if isinstance(value, (bool, int, float, str)):
+        return _decode_attr_scalar(value)
     if isinstance(value, (list, tuple)):
-        return [x for x in value[:_MAX_ATTRS_LIST_LEN] if isinstance(x, (bool, int, float, str))]
+        return [_decode_attr_scalar(x) for x in value[:_MAX_ATTRS_LIST_LEN] if isinstance(x, (bool, int, float, str))]
     return str(value)
 
 
