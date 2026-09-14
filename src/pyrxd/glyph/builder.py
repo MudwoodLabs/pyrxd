@@ -1242,7 +1242,8 @@ class GlyphBuilder:
         cbor_bytes: bytes,
         owner_pkh: Hex20,
         container_ref: GlyphRef,
-        container_owner_pkh: Hex20,
+        *,
+        container_script: bytes,
     ) -> ContainerChildRevealScripts:
         """Prepare scripts for revealing a token **into** a container.
 
@@ -1265,9 +1266,20 @@ class GlyphBuilder:
         ``1``       :attr:`~ContainerChildRevealScripts.container_script`
         =========  ==================================================
 
-        (plus any change). The container output is byte-identical to the one
-        being spent when ``container_owner_pkh`` is unchanged, so the container
-        neither moves nor changes hands.
+        (plus any change). ``container_script`` is the container's OWN current
+        locking script and is re-emitted VERBATIM, so output ``1`` is
+        byte-identical to the UTXO being spent by construction rather than by
+        assumption. It previously took a ``Hex20`` and rebuilt the container with
+        ``build_nft_locking_script``, which silently returned an
+        authority-gated, mutable or soulbound container as a plain 63-byte NFT —
+        same ref, covenant gone — in the one transaction whose purpose is to
+        leave the container untouched. Re-gating needs the issuer, so the loss
+        was not recoverable by the holder.
+
+        To re-own the container deliberately, pass the script you want it to
+        have; that keeps the intent visible at the call site instead of hiding
+        it behind a PKH argument that sat next to ``owner_pkh`` and could be
+        transposed with it.
 
         ``cbor_bytes`` MUST already declare the membership — encode the child's
         metadata with ``container_refs=[container_ref]``. This method
@@ -1303,11 +1315,19 @@ class GlyphBuilder:
                 "entry with no matching ref in the reveal's outputs is discarded by indexers."
             )
 
+        if not script_carries_ref(container_script, container_ref.to_bytes()):
+            raise ValidationError(
+                f"container_script does not carry {container_ref.txid}:{container_ref.vout}. Pass the "
+                "container's OWN current locking script — re-creating it from a pubkey hash strips "
+                "whatever covenant it carried (gated, mutable, soulbound) while keeping the ref, so "
+                "the reveal that was supposed to leave the container untouched silently downgrades it."
+            )
+
         ref = GlyphRef(txid=commit_txid, vout=commit_vout)
         return ContainerChildRevealScripts(
             ref=ref,
             nft_script=build_nft_locking_script(owner_pkh, ref),
-            container_script=build_nft_locking_script(container_owner_pkh, container_ref),
+            container_script=container_script,
             scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
             container_ref=container_ref,
         )

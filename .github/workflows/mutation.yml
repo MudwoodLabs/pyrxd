@@ -99,8 +99,17 @@ jobs:
         # The `groups` dispatch input was DECLARED and read nowhere: `-f groups=fee` was
         # silently ignored and the operator got the whole matrix. Same class as a CLI flag
         # with no caller, in YAML, where no scan reaches. Now it filters.
+        #
+        # `${{ inputs.groups }}` is passed through `env:` rather than interpolated straight
+        # into the `run:` script: the Actions runner substitutes `${{ }}` TEXTUALLY before the
+        # shell ever sees the line, so a `groups` value like `'; id; echo '` would break out of
+        # the quotes and execute on the runner — downstream validation in
+        # scripts/mutation_groups.py never gets a chance to see the injected text. Quoting the
+        # shell variable keeps the value as data. Matches the idiom in combine-prs.yml.
+        env:
+          GROUPS: ${{ inputs.groups }}
         run: |
-          echo "matrix=$(python3 scripts/mutation_groups.py --only '${{ inputs.groups }}')" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python3 scripts/mutation_groups.py --only "$GROUPS")" >> "$GITHUB_OUTPUT"
 
   mutate:
     needs: discover
@@ -139,10 +148,17 @@ jobs:
           # they are what a reviewer re-queries when a row needs more context than the table.
           MUTATION_SESSION_DIR: ${{ github.workspace }}/.mutation-sessions
           MUTATION_REPORT_DIR: ${{ github.workspace }}/.mutation-reports
+          # `matrix.group`/`matrix.min_kill` are bounded to the identifiers scripts/mutation_groups.py
+          # emits (VALUE_GROUPS entries and integer floors), so there's no untrusted-text path here
+          # today — but routed through env: rather than interpolated into `run:` anyway, so this
+          # step doesn't become the next place a future matrix source has to be re-audited for the
+          # same textual-substitution hazard fixed above in the `groups` step.
+          MATRIX_GROUP: ${{ matrix.group }}
+          MATRIX_MIN_KILL: ${{ matrix.min_kill }}
         run: |
           mkdir -p "$MUTATION_SESSION_DIR" "$MUTATION_REPORT_DIR"
-          MUTATION_MIN_KILL_PCT="${{ matrix.min_kill }}" \
-            poetry run bash scripts/mutation_test.sh "${{ matrix.group }}" | tee mutation-${{ matrix.group }}.log
+          MUTATION_MIN_KILL_PCT="$MATRIX_MIN_KILL" \
+            poetry run bash scripts/mutation_test.sh "$MATRIX_GROUP" | tee "mutation-${MATRIX_GROUP}.log"
       - name: Upload survivor list and session databases
         # `always()`: a timed-out or failed group still produced partial sessions, and the
         # survivors found before it stopped are still real.

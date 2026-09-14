@@ -47,9 +47,16 @@ those for depth; use this page to look something up mid-task.
   [`src/pyrxd/hd/bip44.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/bip44.py)).
   See **coin_type** below for where Radiant wallets disagree on the path.
 - **BURN** — a Glyph protocol type (`GlyphProtocol.BURN = 6`, `glyph/types.py`)
-  for explicit token burns. Appears only in the enum and in covenant-script
-  comments (`soulbound_covenant.py`) — **no burn builder exists** in pyrxd
-  today; don't assume it's mintable.
+  for explicit token burns. pyrxd **decodes and classifies** it and now BUILDS one:
+  `GlyphBuilder.prepare_burn_proof` writes the `OP_RETURN` proof output, and
+  `verify_burn` answers whether a transaction spent an output carrying the ref while
+  leaving none carrying it. Both are **builder-level** — no `GlyphClient` method or CLI
+  command writes a burn proof. Note what the verdict does and does not establish: it
+  binds the outputs and spent outputs it was handed, not a transaction, and for a
+  **fungible** token an `ok` verdict means the units in the spent output are gone, not
+  that the supply is. The proof's `amount` and `action` are operator-authored text that
+  nothing verifies. Anyone can write a burn proof about any token, so a proof is a
+  claim until `verify_burn` has checked it.
 
 ## C
 
@@ -135,6 +142,18 @@ those for depth; use this page to look something up mid-task.
   dMint contracts (the only format that predates 0.9.0, and still the
   historically common one on mainnet) are always plain sha256d with no DAA
   at all. See [V1 dMint deploys](dmint-v1-deploy.md).
+- **delegate ref** — the mechanism behind a `by` (and `in`) claim when the minter does not
+  hold the parent singletons. The parents are spent **once** into a base output under
+  `OP_REQUIREINPUTREF`; disposable delegate tokens then point at that base, and the covenant
+  requires each reveal to carry exactly one burn output naming it.
+  `GlyphBuilder.prepare_delegate_setup` builds the base and its tokens, and
+  `RelationshipVerdict.basis` distinguishes `DIRECT` (the reveal spent the parent itself)
+  from `DELEGATED` (one step removed). **Builder-level** — no `GlyphClient` method or CLI
+  command mints through a delegate.
+  ⚠️ A delegate token is a **bearer credential for the whole collection**, not for one mint:
+  the commit that spends one is under no covenant, so whoever holds it can mint into the
+  collection without limit until the base is retired. Keep them in the minting service.
+
 - **DAT** — a Glyph protocol type (`GlyphProtocol.DAT = 3`, `glyph/types.py`)
   for data storage. Like AUTHORITY, pyrxd now builds it —
   `GlyphBuilder.prepare_dat_commit` and `prepare_dat_reveal` — at

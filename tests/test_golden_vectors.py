@@ -345,7 +345,7 @@ class TestFrozenContainerVectors:
             encode_payload(_frozen_child_metadata())[0],
             _CONTAINER_OWNER_PKH,
             _CONTAINER_REF,
-            _CONTAINER_OWNER_PKH,
+            container_script=build_nft_locking_script(_CONTAINER_OWNER_PKH, _CONTAINER_REF),
         )
         assert result.nft_script.hex() == _FROZEN_CONTAINER_CHILD_NFT_SCRIPT_HEX
         # Output 1 re-creates the container byte-for-byte — minting a member must
