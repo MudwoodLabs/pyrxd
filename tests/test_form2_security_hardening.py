@@ -288,8 +288,35 @@ async def test_the_fold_output_preserves_types_rather_than_stringifying() -> Non
     readers disagreed on type and the fold hid the seam. They agree now — `_decode_attr_value`
     stopped coercing, since the blanket `str()` INVERTED meaning (an authority token's
     `revocable: false` became the truthy string `'False'`). Coercing in the fold would put that
-    same inversion back one layer down, in the record a consumer actually reads."""
-    folded = fold_chain(await _walk())
+    same inversion back one layer down, in the record a consumer actually reads.
+
+    THE FULL WALK ALONE DOES NOT EXERCISE `_decode_attr_value`. On this mainnet chain, the final
+    `expires` and `target` are both written by the chain's last UPDATE step, and
+    `decode_update_payload`/`_as_attrs` never call `_decode_attr_value` at all — `cbor2` already
+    hands back a native `int` for an update's `expires` regardless of what that function does. A
+    reviewer forced `_decode_attr_value` back to a blanket `str(value)` and every assertion below
+    on the full fold still passed for exactly that reason.
+
+    Folding through the MINT step ALONE (`through_index=0`) is what actually observes
+    `_decode_attr_value`'s output: the mint's attrs come from `decode_payload` ->
+    `_decode_attrs` -> `_decode_attr_value`, per key, and nothing else touches them before they
+    reach `fold_chain`. The full-walk assertions stay below too, as real (if coincidental)
+    coverage of the fold's shallow-merge behaviour — but the mint-only assertions are the ones
+    that fail when `_decode_attr_value` regresses.
+
+    This pins the mainnet WAVE chain specifically; the coercion regression itself is covered
+    independently, and more directly, by `tests/test_authority_tokens.py` (a `revocable: False`
+    authority token) and `tests/test_wave_fold_fixture_discriminates.py`.
+    """
+    walk = await _walk()
+
+    mint_only = fold_chain(walk, through_index=0)
+    assert isinstance(mint_only.attrs["expires"], int), (
+        f"_decode_attr_value coerced the mint's `expires` to {type(mint_only.attrs['expires']).__name__}"
+    )
+    assert isinstance(mint_only.attrs["target"], str), "a real string must survive as a string"
+
+    folded = fold_chain(walk)
     assert folded.attrs
     assert isinstance(folded.attrs["expires"], int), (
         f"the fold coerced `expires` to {type(folded.attrs['expires']).__name__}"
