@@ -80,7 +80,30 @@ def test_verify_refuses_a_commit_that_is_not_on_main() -> None:
         "Without it a tag on an arbitrary commit — one that never crossed a PR, so never "
         "crossed the required status checks — can still be released."
     )
-    assert "origin/main" in body, "the ancestry check no longer compares against origin/main"
+    assert "refs/remotes/origin/main" in body, (
+        "the ancestry check no longer uses a FULLY QUALIFIED ref. A bare `origin/main` is "
+        "ambiguous: gitrevisions checks refs/tags/<name> BEFORE refs/remotes/<name>, and "
+        "actions/checkout with fetch-depth: 0 fetches all tags — so a tag named `origin/main` "
+        "shadows the remote-tracking branch and this gate passes for a commit that never "
+        "reached main. git only warns; it does not fail. Tags are unprotected here."
+    )
+
+
+def test_the_release_gate_checks_the_same_types_as_the_pr_gate() -> None:
+    """A release must not be refused for something no PR gate could have caught.
+
+    `verify` runs `task typecheck` (10 paths). CI's Type check ran mypy over 3 of them, so
+    7 were checked only AFTER the tag was cut — and retrying a refused release needs a new
+    tag. `poetry.lock` is gitignored, so `verify` also resolves dependencies fresh at release
+    time, and the typecheck of `network/electrumx.py` is documented as sensitive to which
+    `websockets` major gets resolved. Both now run the same task, so the release gate is a
+    no-op rather than a surprise.
+    """
+    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "task typecheck" in ci, (
+        "ci.yml no longer runs `task typecheck`, so the release-time typecheck covers paths "
+        "no PR gate does — a release can be refused for a regression every PR let through"
+    )
 
 
 def test_verify_actually_runs_the_tests() -> None:
