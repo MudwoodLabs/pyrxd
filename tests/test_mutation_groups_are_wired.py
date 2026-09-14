@@ -31,11 +31,18 @@ _WORKFLOW = _ROOT / ".github" / "workflows" / "mutation.yml"
 
 
 def _script_groups() -> set[str]:
-    """Every group `group_files()` can resolve — the source of truth for what exists."""
+    """Every group `group_files()` can resolve — the source of truth for what exists.
+
+    `[a-z0-9_]+`, not `[a-z]+`: a group named with a digit or underscore (`spv2`, `eth_leg`)
+    would be invisible to this parser while matching `group_files()` itself — the same blind
+    spot `scripts/derive_mutation_test_lists.py`'s parser had, until both were widened together.
+    `test_the_derivation_and_this_guard_parse_the_same_group_names` below pins that they stay in
+    sync.
+    """
     body = _SCRIPT.read_text()
     start = body.index("group_files()")
     end = body.index("}", body.index("case", start))
-    return set(re.findall(r"^\s{4}([a-z]+)\)", body[start:end], re.M))
+    return set(re.findall(r"^\s{4}([a-z0-9_]+)\)", body[start:end], re.M))
 
 
 def _meta_groups() -> set[str]:
@@ -101,6 +108,58 @@ def test_every_group_is_reachable_through_a_META_group() -> None:
     )
 
 
+def _derived_groups() -> set[str]:
+    """Every group name `scripts/derive_mutation_test_lists.py` sees, by actually RUNNING it —
+    not by re-typing its regex here, which would just be a second hand-kept copy that could drift
+    from the real one exactly as the two regexes already had.
+
+    It needs a coverage.py sqlite database to open; a real one records real test executions this
+    guard does not need, so a schema-only, all-empty one is created instead — the derivation only
+    consults `file`/`context`/`arc` for their COLUMNS, and an empty `arc` table simply means every
+    module gets no coverage-ranked tests, which is irrelevant to what this test checks: the SET OF
+    GROUP NAMES the derivation's parser extracts from `scripts/mutation_test.sh`, which is exactly
+    the top-level keys of its JSON output (see the unconditional `out[g] = {...}` in that file).
+    """
+    import json
+    import sqlite3
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        db_path = str(Path(d) / "empty-coverage.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE file (id INTEGER, path TEXT)")
+        conn.execute("CREATE TABLE context (id INTEGER, context TEXT)")
+        conn.execute("CREATE TABLE arc (file_id INTEGER, context_id INTEGER, tono INTEGER)")
+        conn.commit()
+        conn.close()
+        r = subprocess.run(
+            [sys.executable, str(_ROOT / "scripts" / "derive_mutation_test_lists.py"), db_path, str(_ROOT), "14"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return set(json.loads(r.stdout).keys())
+
+
+def test_the_derivation_and_this_guard_parse_the_same_group_names() -> None:
+    """`scripts/derive_mutation_test_lists.py` and this file's `_script_groups()` each parse
+    `scripts/mutation_test.sh`'s `group_files()` case statement with their OWN regex, and until
+    both were widened together, a group named with a digit or underscore (`spv2`, `eth_leg`) was
+    invisible to BOTH — the mechanism built to catch a gap shared the exact gap it existed to
+    catch. Run the real derivation (rather than re-implementing its regex here) and assert its
+    group names match this file's independent parse, so the two cannot silently drift apart
+    again — whichever one is right, a difference means one of them stopped seeing a group."""
+    derived = _derived_groups()
+    wired = _script_groups()
+    assert derived, "the derivation produced no groups at all — it is broken, not empty by design"
+    assert derived == wired, (
+        f"derive_mutation_test_lists.py and _script_groups() disagree on what groups exist: "
+        f"only in the deriver: {sorted(derived - wired)}; only in _script_groups(): "
+        f"{sorted(wired - derived)}"
+    )
+
+
 def test_a_threshold_names_a_group_that_exists() -> None:
     """The generator refuses to emit a floor for a group that is not in VALUE_GROUPS, because a
     `MUTATION_MIN_KILL_PCT` attached to a name nothing matches is silently no-op: the group runs
@@ -136,7 +195,7 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
     """
     doc = _ROOT / "docs" / "how-to" / "mutation-testing.md"
     body = doc.read_text()
-    documented = set(re.findall(r"^poetry run task mutate ([a-z]+)", body, re.M))
+    documented = set(re.findall(r"^poetry run task mutate ([a-z0-9_]+)", body, re.M))
     expected = _script_groups()
     assert expected, "no groups parsed from mutation_test.sh — the derivation broke, not the doc"
 
@@ -212,7 +271,7 @@ def test_every_mutated_module_runs_its_own_dedicated_test() -> None:
     """
     mods, tests = {}, {}
     for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
-        m = re.match(r'\s*([a-z]+)\)\s+echo "([^"]*)" ;;', line)
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', line)
         if not m:
             continue
         items = m.group(2).split()
@@ -269,7 +328,7 @@ def test_every_test_file_a_group_names_actually_EXISTS() -> None:
     missing: list[str] = []
     checked = 0
     for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
-        m = re.match(r'\s*([a-z]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "(tests/[^"]*)" ;;', line)
         if not m:
             continue
         group = m.group(1)
