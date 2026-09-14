@@ -502,7 +502,7 @@ def test_the_claim_verifies_as_DELEGATED_from_chain_data_alone(node, base, deleg
     assert found is not None, "no Glyph envelope on the confirmed reveal"
     metadata = found[1]
 
-    verdicts = {v.kind: v for v in verify_relationship_claims(metadata, reveal_outputs, delegated_refs=authorised)}
+    verdicts = {v.kind: v for v in verify_relationship_claims(metadata, reveal_outputs, delegated_refs={base["ref"].to_bytes(): authorised})}
     for kind in (RelationshipKind.CONTAINER, RelationshipKind.AUTHOR):
         assert verdicts[kind].ok is True, f"{kind} unbacked on a real delegated mint"
         assert verdicts[kind].basis is RelationshipBasis.DELEGATED

@@ -901,7 +901,14 @@ def test_relationship_verdicts_never_raise_and_never_invent_backing(scripts, del
     claimed = GlyphRef(txid="c0" * 32, vout=0)
     metadata = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x", container_refs=(claimed,))
     try:
-        verdicts = verify_relationship_claims(metadata, list(scripts), delegated_refs=[bytes(d) for d in delegated])
+        # Keyed by the bases these scripts actually burn — the verifier now binds each
+        # ref to its originating base, so a flat list would authorise nothing and the
+        # property below ("basis comes from a real match") would pass vacuously.
+        from pyrxd.glyph.relationships import delegate_burn_refs
+
+        _burned = delegate_burn_refs(list(scripts))
+        _delegated_map = {b: [bytes(d) for d in delegated] for b in _burned}
+        verdicts = verify_relationship_claims(metadata, list(scripts), delegated_refs=_delegated_map)
         direct = output_ref_operands(list(scripts))
     except Exception as exc:
         _fail_unexpected("verify_relationship_claims", exc, (scripts, delegated))

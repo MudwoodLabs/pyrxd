@@ -221,7 +221,7 @@ def test_by_is_backable_by_delegate_which_is_the_whole_point():
     reveal_outputs = [build_nft_locking_script(PKH, MINTED), build_delegate_burn_script(BASE)]
     authorised = parse_delegate_base_script(build_delegate_base_script(PKH, [CONTAINER, AUTHOR]))
 
-    verdicts = verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs=authorised)
+    verdicts = verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs={BASE.to_bytes(): authorised})
 
     by_kind = {v.kind: v for v in verdicts}
     assert by_kind[RelationshipKind.AUTHOR].ok is True
@@ -244,7 +244,10 @@ def test_a_delegate_does_not_back_a_ref_its_base_never_authorised():
     # Base authorises the CONTAINER only. The AUTHOR claim must not ride along.
     authorised = parse_delegate_base_script(build_delegate_base_script(PKH, [CONTAINER]))
 
-    verdicts = {v.kind: v for v in verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs=authorised)}
+    verdicts = {
+        v.kind: v
+        for v in verify_relationship_claims(_metadata(), reveal_outputs, delegated_refs={BASE.to_bytes(): authorised})
+    }
 
     assert verdicts[RelationshipKind.CONTAINER].ok is True
     assert verdicts[RelationshipKind.AUTHOR].ok is False
@@ -756,12 +759,44 @@ def test_delegated_refs_are_ignored_when_the_tx_burned_no_delegate():
     authorised = parse_delegate_base_script(build_delegate_base_script(PKH, [CONTAINER, AUTHOR]))
     no_burn = [build_nft_locking_script(PKH, MINTED)]
 
-    verdicts = verify_relationship_claims(_metadata(), no_burn, delegated_refs=authorised)
+    verdicts = verify_relationship_claims(_metadata(), no_burn, delegated_refs={BASE.to_bytes(): authorised})
     assert all(v.ok is False for v in verdicts), "delegated refs were honoured for a transaction that burned nothing"
 
     # With the burn present, the same refs do back the claim.
     with_burn = [*no_burn, build_delegate_burn_script(BASE)]
-    assert all(v.ok is True for v in verify_relationship_claims(_metadata(), with_burn, delegated_refs=authorised))
+    assert all(
+        v.ok is True
+        for v in verify_relationship_claims(_metadata(), with_burn, delegated_refs={BASE.to_bytes(): authorised})
+    )
+
+
+def test_a_burn_of_a_DIFFERENT_base_does_not_authorise_these_refs():
+    """The case the test above claims to cover and does not.
+
+    Its docstring says refs "passed from anywhere at all" are refused, but it only
+    contrasts NO burn against a burn of the right base. The gate used to be
+    `if delegate_burn_refs(output_scripts)` — a truthy test that SOME burn exists —
+    so a reveal burning an unrelated base vouched for refs resolved from another one.
+    Measured before the fix: ok=True, basis=DELEGATED, under a reason claiming "a
+    delegate whose base held the parent was burned by the reveal".
+
+    A self-minted base costs nothing, which is what made this worth closing.
+    """
+    other_base = GlyphRef(txid="ab" * 32, vout=7)  # type: ignore[arg-type]  # coerced by __post_init__
+    assert other_base.to_bytes() != BASE.to_bytes(), "fixture no longer discriminates"
+    authorised = parse_delegate_base_script(build_delegate_base_script(PKH, [CONTAINER, AUTHOR]))
+
+    # The reveal burns `other_base`; the refs were resolved from `BASE`.
+    outputs = [build_nft_locking_script(PKH, MINTED), build_delegate_burn_script(other_base)]
+    verdicts = verify_relationship_claims(_metadata(), outputs, delegated_refs={BASE.to_bytes(): authorised})
+    assert all(v.ok is False for v in verdicts), "refs were honoured by a burn of a base they did not come from"
+
+    # Honest path: same refs, burn of the base they DID come from.
+    honest = [build_nft_locking_script(PKH, MINTED), build_delegate_burn_script(BASE)]
+    assert all(
+        v.ok is True
+        for v in verify_relationship_claims(_metadata(), honest, delegated_refs={BASE.to_bytes(): authorised})
+    )
 
 
 def test_an_ok_verdict_cannot_carry_basis_NONE():

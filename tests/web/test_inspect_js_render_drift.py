@@ -931,7 +931,7 @@ def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> di
 
 
 def _tx_payload_delegated(
-    scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], delegated_refs: list[bytes]
+    scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], delegated_refs: dict[bytes, list[bytes]]
 ) -> dict:
     """Classify with resolved delegate refs — the shape the CLI produces.
 
@@ -1142,7 +1142,9 @@ def _tx_payloads() -> dict[str, dict]:
         "relationship-delegated": _tx_payload_delegated(
             [_reveal_scriptsig("MEMBER", extra={"in": [container_ref.to_bytes()]})],
             [(nft, 546), (build_delegate_burn_script(other_token_ref), 0)],
-            [container_ref.to_bytes()],
+            # Keyed by the base this reveal burns: the verifier binds each ref to the
+            # base it came from, so the fixture must say which one that is.
+            {other_token_ref.to_bytes(): [container_ref.to_bytes()]},
         ),
         # An honest Japanese name. `_suspicious_reason` flags it "non-Latin
         # script" from a pure category test — no confusability check runs — and

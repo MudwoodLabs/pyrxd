@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import click
@@ -123,7 +123,7 @@ def _classify_raw_tx(
     *,
     only_vout: int | None = None,
     network: str = "mainnet",
-    delegated_refs: Iterable[bytes] = (),
+    delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
 ) -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
@@ -220,7 +220,7 @@ async def _inspect_txid_inner(
     # user's ElectrumX endpoint rate-limited. Resolve a prefix and say what was
     # left; an unresolved claim already renders honestly as UNRESOLVED.
     unresolved_over_cap = max(0, len(burns) - _MAX_DELEGATE_BASES)
-    resolved: list[bytes] = []
+    resolved: dict[bytes, tuple[bytes, ...]] = {}
     for outpoint in burns[:_MAX_DELEGATE_BASES]:
         base_txid, _, vout_str = str(outpoint).rpartition(":")
         try:
@@ -246,7 +246,10 @@ async def _inspect_txid_inner(
             # and whoever is debugging that needs to know which it was.
             _log.debug("could not resolve delegate base %s: %s", outpoint, exc)
             continue
-        resolved.extend(resolve_delegated_refs(base_ref.to_bytes(), base_outputs))
+        # Keyed by base, NOT flattened. Flattening threw away which base each ref
+        # came from, which is exactly the binding the verifier needs: without it a
+        # reveal that burned any base at all vouched for refs resolved from another.
+        resolved[base_ref.to_bytes()] = resolve_delegated_refs(base_ref.to_bytes(), base_outputs)
 
     if resolved:
         payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network, delegated_refs=resolved)

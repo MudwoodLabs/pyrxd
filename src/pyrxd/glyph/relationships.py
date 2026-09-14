@@ -65,7 +65,7 @@ UNBACKED, which is why the verdict records HOW it was backed.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -236,7 +236,7 @@ def verify_relationship_claims(
     metadata: Any,
     output_scripts: list[bytes],
     *,
-    delegated_refs: Iterable[bytes] = (),
+    delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
 ) -> list[RelationshipVerdict]:
     """Check each declared container/author ref against what the transaction carries.
 
@@ -254,12 +254,21 @@ def verify_relationship_claims(
     if metadata is None:
         return []
     direct = output_ref_operands(output_scripts)
-    # Delegated refs are honoured ONLY if this transaction actually burned a
-    # delegate. They are caller-supplied, and without this a caller who resolved
-    # a base for some other transaction — or who passed refs from anywhere —
-    # could produce DELEGATED for a mint that consumed no authorisation at all.
-    # The burn is the on-chain evidence, and it is right here in the outputs.
-    delegated = {bytes(r) for r in delegated_refs} if delegate_burn_refs(output_scripts) else set()
+    # Delegated refs are honoured only if THE BASE THEY CAME FROM was burned by
+    # this transaction. The previous version tested `if delegate_burn_refs(...)`
+    # — that some burn exists — and so honoured refs resolved from a DIFFERENT
+    # base entirely. Measured: a reveal burning base B, with refs resolved from
+    # base A, returned ok=True basis=DELEGATED, under a reason sentence claiming
+    # "a delegate whose base held the parent was burned by the reveal" — which
+    # the code had not established. Safe only because `glyph inspect --fetch`
+    # pooled its resolutions per transaction; an indexer caching base→refs across
+    # transactions is the obvious shape, and it got a forgeable verdict.
+    #
+    # Keyed by base wire-ref, so the mismatch is not expressible: the caller must
+    # say which base each ref came from, and a base this reveal did not burn
+    # contributes nothing.
+    burned = delegate_burn_refs(output_scripts)
+    delegated = {bytes(r) for base, refs in (delegated_refs or {}).items() if bytes(base) in burned for r in refs}
     verdicts: list[RelationshipVerdict] = []
     for kind, refs in (
         (RelationshipKind.CONTAINER, getattr(metadata, "container_refs", ()) or ()),

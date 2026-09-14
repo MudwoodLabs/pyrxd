@@ -34,7 +34,7 @@ its structured-dict response.
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Mapping, Sequence
 
 from ..hash import hash256
 from ..script.hashmark import (
@@ -936,7 +936,7 @@ def _classify_raw_tx(
     *,
     only_vout: int | None = None,
     network: str = "mainnet",
-    delegated_refs: Iterable[bytes] = (),
+    delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
 ) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
