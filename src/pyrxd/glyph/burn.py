@@ -307,8 +307,25 @@ def verify_burn(
         genuinely mean "this transaction spent nothing relevant", which is a
         refusal.
 
-    An ``ok`` verdict never means "the owner intended this"; it means the token
-    is gone and something recorded that it was meant to be.
+    **What an ``ok`` verdict binds, stated exactly.** One output parses as a Glyph
+    burn proof naming *token_ref*; no script in ``output_scripts`` pushes that ref
+    under ``0xd0``/``0xd8``; and some script in ``spent_output_scripts`` does.
+
+    What it does NOT bind:
+
+    * **Any transaction.** No txid appears anywhere here, and the two lists are
+      never cross-checked against each other — "these outputs and these spent
+      outputs belong to one transaction" is the caller's assertion, not a finding.
+    * **The supply, for a FUNGIBLE token.** This used to say "it means the token is
+      gone", which is false for an FT: one spent FT UTXO with no FT output
+      satisfies every check above while the rest of the supply sits in other
+      UTXOs. It means the units in the spent output are gone.
+    * **``proof.amount`` or ``proof.action``.** Both are operator-authored CBOR
+      that nothing verifies, and they ride out attached to an ``ok`` verdict.
+      Anyone can write a burn proof about any token; metering supply from
+      ``ok`` plus ``amount`` takes an attacker-chosen number as consensus-backed.
+
+    It never means "the owner intended this" either.
     """
     wire = token_ref.to_bytes()
     # Select the proof that names THIS token, not the first parseable one. A

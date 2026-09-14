@@ -363,6 +363,16 @@ def _render_txid_human(payload: dict) -> str:
             #
             # Generic because the alternative is hand-keeping a list of which types have notes,
             # and the next type added would repeat this.
+            # Same reasoning as `note` below: generic, not per-branch. `delegate_base_ref`
+            # was emitted only from the `delegate-token`/`delegate-burn` branch, so a
+            # delegate-BOUND commit — whose reveal the covenant rejects without a burn
+            # output naming that base — rendered identically to a plain one. The classifier
+            # recovers it for all three commit types; hand-keeping which branches print it
+            # is what lost it.
+            delegate_base = row.get("delegate_base_ref")
+            if delegate_base and type_ not in ("delegate-token", "delegate-burn"):
+                lines.append(f"            delegate_base_ref={delegate_base}")
+
             note = row.get("note")
             if note:
                 lines.append(f"            {_truncate_for_human(str(note))}")

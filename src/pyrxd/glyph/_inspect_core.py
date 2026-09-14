@@ -676,20 +676,33 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         return row
 
     if is_commit_nft_script(script_hex):
-        return {
+        # `split_delegate_commit_prefix` recovers the base ref from ALL THREE commit
+        # types, but only the DAT branch used to emit it — the one commit type whose
+        # reveal mints nothing. So a 131-byte delegate-bound NFT commit, whose reveal
+        # the covenant REJECTS without a burn output naming that base, rendered
+        # identically to a plain 75-byte one on both surfaces.
+        _dnft, _ = split_delegate_commit_prefix(script)
+        row = {
             **base,
             "type": "commit-nft",
             "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
             "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
         }
+        if _dnft is not None:
+            row["delegate_base_ref"] = f"{_dnft.txid}:{_dnft.vout}"
+        return row
 
     if is_commit_ft_script(script_hex):
-        return {
+        _dft, _ = split_delegate_commit_prefix(script)
+        row = {
             **base,
             "type": "commit-ft",
             "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
             "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
         }
+        if _dft is not None:
+            row["delegate_base_ref"] = f"{_dft.txid}:{_dft.vout}"
+        return row
 
     # Time-locked P2PKH (CLTV absolute / CSV relative). Exact template parse
     # against pyrxd.script.timelock's builders — these are the HTLC refund
