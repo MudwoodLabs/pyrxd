@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
@@ -56,12 +56,31 @@ class GlyphRef:
         #     different tokens where the chain sees one.
         #
         # Coercing through `Txid` here puts the guard inside the constructor instead of
-        # beside it, so no caller has to remember. mypy flagged 14 call sites passing a
-        # raw `str`; they are typed correctly now, but this is what makes them safe.
+        # beside it, so no caller has to remember. That matters here because the call
+        # sites were NOT changed and are still annotated `str`: mypy reports 15 of them
+        # (14 in glyph/builder.py, 1 in gravity/htlc_covenant.py), and neither file is in
+        # the `task typecheck` scope, so nothing in CI would notice if that grew. This
+        # coercion is the only thing making them safe. An earlier version of this comment
+        # claimed the sites were "typed correctly now" — they are not, and no test could
+        # have caught that sentence being false.
         if not isinstance(self.txid, Txid):
             object.__setattr__(self, "txid", Txid(self.txid))
         if self.vout < 0 or self.vout > 0xFFFFFFFF:
             raise ValidationError("vout must be 0..2^32-1")
+
+    def __reduce__(self) -> tuple[Any, tuple[str, int]]:
+        """Rebuild through ``__init__`` so unpickling re-validates.
+
+        A frozen, non-slots dataclass unpickles via ``__newobj__`` + ``__dict__.update``:
+        ``__post_init__`` is never called. Measured before this existed — a ref pickled by
+        pyrxd <= 0.23.0, holding a raw uppercase ``str``, came back with the identity fork
+        intact: byte-identical ``to_bytes()``, ``==`` False against the canonical ref. The
+        constructor refused the very value ``pickle.loads`` had just resurrected.
+
+        ``copy.copy`` and ``copy.deepcopy`` honour ``__reduce__`` too, so all three routes
+        now converge on the one validating path instead of three different answers.
+        """
+        return (self.__class__, (self.txid, self.vout))
 
     def to_bytes(self) -> bytes:
         """Encode as 36-byte wire format: txid_reversed + vout_le."""
