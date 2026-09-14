@@ -155,7 +155,7 @@ Wallets and explorers display a token's genesis ref as:
 <txid in DISPLAY order:64 hex> || <vout as uint32 BIG-endian:8 hex>   = 72 hex chars
 ```
 
-`src/pyrxd/glyph/types.py:56-95`. Both halves are in human-readable order, so the
+`src/pyrxd/glyph/types.py:80-118`. Both halves are in human-readable order, so the
 trailing `00000004` reads as `4`. This form is **not** the wire form: the txid is
 not reversed and the vout is big-endian. Confusing the two silently produces a
 wrong-vout ref; `tests/test_glyph.py:299` pins that the two encodings differ.
@@ -932,7 +932,7 @@ following as guarantees:
 5. Store the DER hex in `creator.sig`.
 
 `creator.pubkey` MUST be a 33-byte compressed secp256k1 public key, hex-encoded
-with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:160-168`).
+with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:178-186`).
 
 ### 10.2 The canonicalisation rule
 

@@ -42,6 +42,24 @@ class GlyphRef:
     vout: int  # output index
 
     def __post_init__(self) -> None:
+        # `txid: Txid` is a TYPE annotation, and a dataclass does not enforce one at
+        # runtime — so `GlyphRef(txid=<raw str>, ...)` stored whatever it was given and
+        # skipped `Txid.__new__` entirely. Two consequences, both demonstrated:
+        #
+        #   * a non-hex string was accepted here and failed far away in `to_bytes()` with
+        #     a bare `ValueError` rather than a `ValidationError` — the wrong error class,
+        #     raised at a distance from the cause;
+        #   * `Txid` requires LOWERCASE hex, so an uppercase txid that `Txid()` refuses
+        #     outright was accepted here, producing a ref whose `to_bytes()` is byte-
+        #     identical to the lowercase one while `==` and `hash()` differ. Two GlyphRefs
+        #     for one outpoint: set membership and every `ref == other` check see two
+        #     different tokens where the chain sees one.
+        #
+        # Coercing through `Txid` here puts the guard inside the constructor instead of
+        # beside it, so no caller has to remember. mypy flagged 14 call sites passing a
+        # raw `str`; they are typed correctly now, but this is what makes them safe.
+        if not isinstance(self.txid, Txid):
+            object.__setattr__(self, "txid", Txid(self.txid))
         if self.vout < 0 or self.vout > 0xFFFFFFFF:
             raise ValidationError("vout must be 0..2^32-1")
 
