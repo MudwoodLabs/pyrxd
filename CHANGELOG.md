@@ -29,6 +29,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retryable; the `r` half is not. `RPuzzle` has no caller inside `src/`, so the exposure is SDK
   consumers driving it directly rather than anything the CLI does.
 
+  **If you never call `sign(k=...)`, you were never affected.** That is worth stating plainly,
+  because "every release from 0.2.0 to 0.23.0" reads like a fleet-wide problem and it is not.
+  `Transaction.sign()` — which is what the CLI, the wallet, every glyph mint and commit/reveal,
+  the swap legs and every `unlocking_script_template` go through — takes the other branch:
+  coincurve/libsecp256k1 with RFC 6979 deterministic nonces, which produces minimal DER and
+  normalises low-s itself. Exactly one line in `src/` passes a custom `k` (`script/type.py`, in
+  `RPuzzle.unlock`), and nothing in `src/` calls `RPuzzle`. Upgrading is still worth doing; it
+  is not an emergency unless you drive R-puzzles yourself.
+
   The fix DELETES the duplicate rather than patching it: `utils.serialize_ecdsa_der` already
   enforces low-s *and* minimal integer encoding, and was already imported in `keys.py` — two
   lines above a hand-rolled encoder that had been wrong since the first public release.
@@ -163,6 +172,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Each fix is pinned by a test that was verified two-sided — asserted to pass with the fix and to
   FAIL with the original defect planted back. The first harness written for this reported one
   false survival, so it was rebuilt to check both directions and purge bytecode between them.
+
+### Changed (breaking)
+
+- **`GlyphRef` now refuses a txid its own type refuses.** `GlyphRef.txid` is annotated `Txid` —
+  which requires 64 LOWERCASE hex characters — but a dataclass does not enforce an annotation at
+  runtime, so `GlyphRef(txid=<raw str>, ...)` stored whatever it was given and skipped
+  `Txid.__new__` entirely. mypy reports 15 call sites doing exactly that, in modules that had
+  never been inside the typecheck scope.
+
+  The consequence was a silent identity fork, not a crash: an uppercase txid produced a ref whose
+  `to_bytes()` is BYTE-IDENTICAL to the lowercase one while `==` and `hash()` differ. Set
+  membership, dict keys and every `ref == other` check then saw two different tokens where
+  consensus sees one — a membership test quietly returning `False`. A non-hex string was accepted
+  too, and failed far away inside `to_bytes()` with a bare `ValueError` rather than a
+  `ValidationError`, which matters because only `RxdSdkError` subclasses are mapped by the CLI.
+
+  `__post_init__` now coerces through `Txid`, and `__reduce__` routes `pickle`/`copy`/`deepcopy`
+  back through `__init__` — a frozen non-slots dataclass otherwise rebuilds via `__dict__.update`
+  and skips validation, so a ref pickled by an older pyrxd resurrected with the fork intact.
+
+  **UPGRADING.** The full test suite passes unchanged, because every value that reaches a
+  `GlyphRef` inside pyrxd is already lowercase: the CLI parses txids through `Txid`, and
+  `GlyphRef.from_bytes` builds from `.hex()`, which is lowercase by definition.
+
+  That is NOT the same as saying the constructions are guarded. A dozen sites pass a raw `str`
+  straight into `GlyphRef`, and those parameters are PUBLIC API. Derived from the source, not
+  recalled — every public entry point that takes a `str` txid and builds a ref from it:
+
+  | entry point | parameter |
+  |---|---|
+  | `GlyphBuilder.prepare_reveal` | `RevealParams.commit_txid` |
+  | `GlyphBuilder.prepare_mutable_reveal` | `commit_txid` |
+  | `GlyphBuilder.prepare_container_reveal` | `commit_txid` |
+  | `GlyphBuilder.prepare_container_child_reveal` | `commit_txid` |
+  | `GlyphBuilder.prepare_authority_gated_reveal` | `commit_txid` |
+  | `build_reveal_outputs` (dMint V1 and V2) | `commit_txid` |
+  | `build_htlc_covenant_ft` / `build_htlc_covenant_nft` | `genesis_txid` |
+
+  If you hand one of those an uppercase or mixed-case txid — from an indexer response, a stored
+  record, a block explorer, user input — the call now raises `ValidationError` where it previously
+  succeeded and produced a ref that did not compare equal to itself.
+
+  Lowercase at your boundary, or wrap in `Txid(...)` and handle the refusal where the data
+  arrives rather than where it is used.
 
 ### Added
 
