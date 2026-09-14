@@ -307,7 +307,7 @@ def member(node, container):  # noqa: F811
         commit.cbor_bytes,
         owner_pkh,
         container["ref"],
-        container["pkh"],
+        container_script=container["script"],
     )
     reveal = Transaction(
         tx_inputs=[
