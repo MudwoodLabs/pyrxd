@@ -177,7 +177,7 @@ bytes and is **not** covered by the payload hash
 (`src/pyrxd/glyph/payload.py:16, 22-24`).
 
 The push opcode for the CBOR body MUST be selected by length
-(`src/pyrxd/glyph/payload.py:210-220`; pinned across boundary lengths at
+(`src/pyrxd/glyph/payload.py:504-519`; pinned across boundary lengths at
 `tests/test_glyph_cbor_roundtrip.py:184-232`):
 
 | CBOR length `n` | Push encoding |
@@ -584,7 +584,7 @@ PUSH3 "gly" PUSH <cbor> PUSH <op> <contract_output_index> <ref_hash_index> <ref_
 
 where `op` is `"mod"` (update the payload hash) or `"sl"` (seal — burn the
 contract). Index integers use minimal push encoding
-(`src/pyrxd/glyph/payload.py:436-470`).
+(`src/pyrxd/glyph/payload.py:522-541`).
 
 This specification reproduces the body as a constant and does not restate a
 stack-level derivation of it. Note that pyrxd's own size constant is **174**
