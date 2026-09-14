@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SRC = _ROOT / "src" / "pyrxd"
@@ -70,16 +71,63 @@ def test_the_write_sides_are_still_builder_only() -> None:
         )
 
 
+def _glossary_entry(glossary: str, term: str) -> str:
+    """The flattened text of the top-level ``- **term**`` glossary bullet, and NOTHING past the
+    next top-level bullet.
+
+    Bounding the match is the whole point. Matching over the entire flattened page let a claim
+    reverted in one bullet hide behind unrelated wording surviving in a DIFFERENT bullet two
+    paragraphs away — see the docstring on the test below for the exact case a reviewer found.
+    """
+    pattern = re.compile(rf"^- \*\*{re.escape(term)}\*\*.*?(?=\n- \*\*|\Z)", re.MULTILINE | re.DOTALL)
+    match = pattern.search(glossary)
+    assert match is not None, f"no top-level glossary bullet for {term!r} — did its heading move?"
+    return " ".join(match.group(0).split())
+
+
+#: Glossary bullets that make a specific "used to say this could not be built; now says
+#: builder-level" claim about one write side — checked against THAT bullet's own text, never the
+#: page as a whole. Reviewed, not derived: matching English prose is a judgement call, not
+#: something to derive from source.
+#:
+#: Only AUTHORITY and DAT are here, not all four write sides in `_BUILDER_ONLY_WRITE_SIDES` above.
+#: #634 shipped `prepare_delegate_setup` (delegate/`by`) and `prepare_burn_proof` (BURN) too, but
+#: never gave either an equivalent glossary claim: BURN's bullet still reads "no burn builder
+#: exists ... don't assume it's mintable", which `prepare_burn_proof` already contradicts, and
+#: delegate/`by` has no bullet discussing it at all. That is a real, separate doc-staleness bug —
+#: this test does not cover it, and its absence here is not evidence the other two are fine.
+_MARKER_CLAIMS = {
+    "AUTHORITY": "ships no `prepare_authority_*` builder",
+    "DAT": "no builder ships for it",
+}
+
+
 def test_the_docs_say_so_where_a_user_would_look() -> None:
-    """The scope is only honest if it reaches the reader. The glossary claimed the opposite —
-    'ships no prepare_authority_* builder — you cannot mint one with pyrxd today' — which this
-    branch made false, and DAT was described as decode/classify-only."""
+    """The scope is only honest if it reaches the reader, IN THE BULLET ABOUT THAT MARKER — not
+    merely somewhere on a 300-line page. The glossary claimed the opposite of reality for both —
+    'ships no `prepare_authority_*` builder — you cannot mint one with pyrxd today' for AUTHORITY,
+    'no builder ships for it' for DAT — which this branch made false for both.
+
+    A reviewer reverted the DAT bullet to that pre-fix claim and the OLD file-wide version of this
+    assertion (`"builder-level" in flat.lower() or "GlyphBuilder" in flat` over the whole
+    flattened glossary) still passed, because the word "GlyphBuilder" survives in the unrelated
+    AUTHORITY bullet two paragraphs away. Checking each marker's own bullet text is what catches
+    that revert.
+    """
+    assert set(_MARKER_CLAIMS) == {"AUTHORITY", "DAT"}, (
+        "the set of markers this test checks changed size — re-read the module docstring comment "
+        "above _MARKER_CLAIMS before editing it; a marker gaining or losing a glossary claim needs "
+        "a human look, not a silent update"
+    )
     glossary = (_ROOT / "docs" / "concepts" / "glossary.md").read_text(encoding="utf-8")
-    flat = " ".join(glossary.split())
-    assert "ships no `prepare_authority_*` builder" not in flat, (
-        "the glossary still says pyrxd cannot build an authority-gated mint; this branch added "
-        "prepare_authority_gated_reveal"
-    )
-    assert "builder-level" in flat.lower() or "GlyphBuilder" in flat, (
-        "the glossary should say where these live — a user told 'you cannot' will not go looking"
-    )
+    for marker, old_false_claim in sorted(_MARKER_CLAIMS.items()):
+        entry = _glossary_entry(glossary, marker)
+        assert old_false_claim not in entry, (
+            f"the {marker} glossary bullet reverted to its pre-#634 claim ({old_false_claim!r}); "
+            f"pyrxd now builds {marker} via GlyphBuilder"
+        )
+        assert "builder-level" in entry.lower() or "GlyphBuilder" in entry, (
+            f"the {marker} bullet should say where its write side lives — a user told 'you cannot' "
+            "will not go looking — and that must be true IN THIS BULLET, not merely somewhere else "
+            "on the page"
+        )
