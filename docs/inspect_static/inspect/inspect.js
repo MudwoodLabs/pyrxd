@@ -2072,7 +2072,14 @@ function fetchRawTxFromElectrumx(txid) {
       try {
         frame = JSON.parse(data);
       } catch (err) {
-        settle(reject, new Error(`server returned non-JSON: ${err.message}`));
+        // err.message is a V8 SyntaxError that echoes a slice of the
+        // unparsed frame verbatim — attacker-controlled up to ~20 chars.
+        // Sanitise it the same way frame.error below is sanitised: this
+        // path has strictly fewer preconditions to reach (no id===1
+        // match needed), so it must not be the unguarded sibling.
+        settle(reject, new Error(
+          `server returned non-JSON: ${stripControlChars(err.message)}`
+        ));
         return;
       }
       if (frame.id !== 1) {
