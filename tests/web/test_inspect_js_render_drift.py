@@ -754,9 +754,37 @@ class TestTheCorpusCoversEveryShapeTheClassifierCanEmit:
         )
 
     def test_the_extraction_is_not_vacuous(self) -> None:
-        """A parser returning an empty set would make the check above pass forever."""
+        """A parser returning an empty set would make the check above pass forever.
+
+        The floor inside ``_emitted_by_the_source`` (``len(found) < 10``) only catches
+        TOTAL breakage. The classifier emits 22 types today (measured by this same
+        extraction), more than double that floor — so a regression silently dropping
+        a third of them would still read as a healthy 14+ and clear both that internal
+        floor and every per-type check below, which only ever complains about a type
+        that went missing, never about how many survived. This asserts a tighter floor
+        without pinning the exact count, which would break on every legitimate new type.
+        """
         emitted = self._emitted_by_the_source()
         assert {"p2pkh", "op_return", "op_return-hashmark-v"} <= emitted
+        assert len(emitted) >= 15, (
+            f"only {len(emitted)} type values derived (22 measured at the time this floor "
+            f"was written) — close enough to the internal >10 floor inside "
+            f"`_emitted_by_the_source` that a real regression could clear both and still "
+            f"read as success. Derived: {sorted(emitted)}"
+        )
+
+    def test_the_unreachable_set_is_pinned(self) -> None:
+        """`_UNREACHABLE` is itself a hand-kept exemption list: every entry in it is
+        SKIPPED by `test_every_emitted_type_has_a_corpus_shape`, so a type added there
+        without scrutiny would silently stop being guarded — the same shape this whole
+        class exists to catch, one level up. Pinning the membership means a change to
+        the set forces a reviewer to look at this line rather than inheriting it.
+        """
+        assert set(self._UNREACHABLE) == {"error"}, (
+            f"_UNREACHABLE now exempts {sorted(self._UNREACHABLE)}, not just {{'error'}}. "
+            f"Each entry silently opts a type out of every test in this file — update this "
+            f"pin only after confirming the new entry's reason is real."
+        )
 
     def test_no_corpus_shape_is_unreachable_from_the_classifier(self, payloads) -> None:
         """The other direction: a shape whose type no longer exists is a test that
