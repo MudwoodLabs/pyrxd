@@ -8,6 +8,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`sign(k=...)` emitted DER a Radiant node cannot accept, and every release from 0.2.0 to
+  0.23.0 shipped it.** `_sign_custom_k` carried a second, private copy of the DER encoder that
+  wrote `r` and `s` as FIXED 32-byte integers with no `lstrip(b"\x00")`. DER forbids a leading
+  zero byte that is not needed to keep the integer positive, so below 2**247 — about 1 in 512
+  for `r`, 1 in 256 for `s` once low-s halves its range, roughly 1 signature in 171 — the
+  encoding is non-minimal. Radiant applies `SCRIPT_VERIFY_STRICTENC`, mandatory under FORKID,
+  so such a signature is not merely unusual: **it cannot confirm.**
+
+  Measured against this project's own strict decoder, which documents itself as applying every
+  rule Radiant applies when it validates a signature: **14 of 2,000** signatures over random `k`
+  rejected before the fix, **0 of 2,000** after. Two independent re-measurements agree — 22 of
+  4,000 → 0, and 12 of 2,000 → 0.
+
+  The rate understates it, because the only production call site is `RPuzzle.unlock`
+  (`script/type.py`) and **an R-puzzle pins `k`, so it pins `r`.** For the ~1/512 of puzzles
+  whose `r` carries a redundant leading zero, EVERY unlock a released pyrxd builds is
+  node-rejected: that puzzle is unspendable through this SDK and retrying cannot help, because
+  nothing about the retry changes `r`. The `s` half varies with the transaction and is
+  retryable; the `r` half is not. `RPuzzle` has no caller inside `src/`, so the exposure is SDK
+  consumers driving it directly rather than anything the CLI does.
+
+  The fix DELETES the duplicate rather than patching it: `utils.serialize_ecdsa_der` already
+  enforces low-s *and* minimal integer encoding, and was already imported in `keys.py` — two
+  lines above a hand-rolled encoder that had been wrong since the first public release.
+
+  **Correcting the record, which is the reason this entry is long.** The commit that removed it
+  (57466cd, #669) states in its message: *"No live defect: the shipped implementation is
+  correct."* That is false. The sentence was written before the defect was found, during the same
+  review that found it; the correction was posted as a PR comment, and a PR comment does not reach
+  a commit message. The message is now permanent in the git record and cannot be amended, so the
+  correction lives here. Anyone reading 57466cd should read this entry instead.
+
 - **A seven-reviewer panel over the Glyph write sides, and the fixes it forced.** As with the
   form-2 stack, NONE OF THIS REACHED A RELEASE — the write sides are unreleased. Recorded because
   the shape of the mistakes is reusable.
@@ -254,6 +286,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the chain previously raised `AttributeError`.
 
 ### Fixed
+
+- **A counterparty's malformed signature made pyrxd report an internal bug.** `PublicKey.verify`
+  returned coincurve's result straight through, and coincurve's strict DER parser raises a bare
+  `ValueError` for bytes it cannot parse. A bare `ValueError` is not an `RxdSdkError`, so it
+  escaped `swap.partial._verify_owner_signature` — the maker-signature re-check every
+  `accept_offer` and `take_rswp_order` crosses — whose CLI caller maps only `RxdSdkError`. It
+  landed on `cli/main.py`'s catch-all and printed `error: unexpected failure (ValueError)` with
+  exit 4: pyrxd blaming itself for hostile input it had in fact handled correctly. Unparseable
+  DER is now a `False` verification result, and the swap path raises the `ValidationError` it
+  was always supposed to.
+
+  The catch is scoped to the DER parse alone, not wrapped around `key.verify`: that call raises
+  the SAME exception type for a message hash of the wrong width, which is a caller mistake (a
+  `hasher` that does not return 32 bytes) and must keep escaping. Swallowing it would turn a
+  programming error into a silent `False` — the bug such an exception exists to surface.
+
+- **`attrs` bounded its scalars at the top level only, so a list one step down evaded them.**
+  `_decode_attr_value` checks an integer's bit length and a float's finiteness, and its own
+  comments say why: CPython refuses `str()` on an integer over ~4,300 digits and `json.dumps`
+  inherits that, while a bare `NaN` is not JSON any strict parser reads back. The list branch
+  then kept any `int` or `float` unchecked. `{"a": [1 << 20000], "b": [float("nan")]}` — ordinary
+  CBOR anyone can mint — decoded cleanly and handed an SDK consumer the exact exception the guard
+  exists to prevent. The bound is now one function applied at both positions rather than two
+  spellings, one of which was empty.
+
+  No human-facing crash path in this repo (the inspect payload does not emit raw `attrs`), so the
+  reach is library callers that JSON-encode `GlyphMetadata.attrs`. Real lists still decode with
+  their types and ordering intact — Photonic's authority tokens carry `permissions: string[]`,
+  and refusing those is the defect the list branch was added to fix.
 
 - **The repo's own git tooling did not work from a git worktree** — the workflow it asks agents
   to use. Two instances of one blindness, both hit rather than reviewed: `scripts/git-hooks/
