@@ -90,15 +90,17 @@ def _glossary_entry(glossary: str, term: str) -> str:
 #: page as a whole. Reviewed, not derived: matching English prose is a judgement call, not
 #: something to derive from source.
 #:
-#: Only AUTHORITY and DAT are here, not all four write sides in `_BUILDER_ONLY_WRITE_SIDES` above.
-#: #634 shipped `prepare_delegate_setup` (delegate/`by`) and `prepare_burn_proof` (BURN) too, but
-#: never gave either an equivalent glossary claim: BURN's bullet still reads "no burn builder
-#: exists ... don't assume it's mintable", which `prepare_burn_proof` already contradicts, and
-#: delegate/`by` has no bullet discussing it at all. That is a real, separate doc-staleness bug —
-#: this test does not cover it, and its absence here is not evidence the other two are fine.
+#: All FOUR write sides are here. #634 corrected the AUTHORITY and DAT bullets and left the other
+#: two — BURN's still read "no burn builder exists ... don't assume it's mintable" while
+#: `prepare_burn_proof` shipped in that same PR, and delegate/`by` had no bullet at all. The same
+#: instance-not-class pattern the code had, in the docs. Both are fixed now and all four are
+#: checked, so a fifth write side is the only way this can go stale again — which the membership
+#: assertion below forces someone to look at.
 _MARKER_CLAIMS = {
     "AUTHORITY": "ships no `prepare_authority_*` builder",
     "DAT": "no builder ships for it",
+    "BURN": "no burn builder exists",
+    "delegate ref": "",
 }
 
 
@@ -114,7 +116,7 @@ def test_the_docs_say_so_where_a_user_would_look() -> None:
     AUTHORITY bullet two paragraphs away. Checking each marker's own bullet text is what catches
     that revert.
     """
-    assert set(_MARKER_CLAIMS) == {"AUTHORITY", "DAT"}, (
+    assert set(_MARKER_CLAIMS) == {"AUTHORITY", "DAT", "BURN", "delegate ref"}, (
         "the set of markers this test checks changed size — re-read the module docstring comment "
         "above _MARKER_CLAIMS before editing it; a marker gaining or losing a glossary claim needs "
         "a human look, not a silent update"
@@ -122,7 +124,11 @@ def test_the_docs_say_so_where_a_user_would_look() -> None:
     glossary = (_ROOT / "docs" / "concepts" / "glossary.md").read_text(encoding="utf-8")
     for marker, old_false_claim in sorted(_MARKER_CLAIMS.items()):
         entry = _glossary_entry(glossary, marker)
-        assert old_false_claim not in entry, (
+        assert entry, (
+            f"the glossary has no bullet for {marker}. A write side nobody documents is one a user "
+            "will not know exists — delegate/`by` had none at all until this was widened."
+        )
+        assert not old_false_claim or old_false_claim not in entry, (
             f"the {marker} glossary bullet reverted to its pre-#634 claim ({old_false_claim!r}); "
             f"pyrxd now builds {marker} via GlyphBuilder"
         )
