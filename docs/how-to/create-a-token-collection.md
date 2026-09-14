@@ -69,7 +69,11 @@ scripts = builder.prepare_container_child_reveal(
     cbor_bytes,
     owner_pkh=member_owner_pkh,
     container_ref=collection_ref,
-    container_owner_pkh=collection_owner_pkh,
+    # The container's OWN current locking script, re-emitted verbatim. Pass the
+    # real script, not a rebuild: a collection that is authority-gated, mutable
+    # or soulbound would otherwise come back as a plain NFT — same ref, covenant
+    # gone — in the transaction that is supposed to leave it untouched.
+    container_script=collection_locking_script,
 )
 ```
 
