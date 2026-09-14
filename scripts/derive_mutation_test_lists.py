@@ -46,16 +46,23 @@ for fid, cid, n in rows:
     weight[mod][test_file] += n
 
 # group -> modules, from the script that actually runs them
+#
+# `[a-z0-9_]+`, not `[a-z]+`: a group named with a digit or underscore (`spv2`, `eth_leg`) would
+# be invisible to this parser while matching every other one — tests/test_mutation_groups_are_
+# wired.py's `_script_groups()` parses the same case statement and MUST use the identical
+# character class (a guard there asserts the two agree), or the derivation and the guard written
+# to catch its own gaps would share the one blind spot neither could see.
 script = (ROOT / "scripts" / "mutation_test.sh").read_text()
 groups: dict[str, list[str]] = {}
 for line in script.split("\n"):
-    m = re.match(r'\s*([a-z]+)\)\s+echo "([^"]*)" ;;', line)
+    m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', line)
     if not m:
         continue
     items = m.group(2).split()
     if not items or items[0].startswith("tests/") or all(re.fullmatch(r"[\d.]+", i) for i in items):
         continue
     groups[m.group(1)] = items
+
 
 # A THIRD SIGNAL, because the other two provably cannot see this one.
 #

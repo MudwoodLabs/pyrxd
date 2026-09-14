@@ -46,10 +46,17 @@ _OUT_OF_SCOPE_PREFIXES = (
     "gravity/watch/",  # watchtower daemons, ditto
     "contrib/",  # sample miner shipped as an example, not a library surface
 )
+#: module -> reason, not a bare set: a reason of "trivial" is a checkable CLAIM (see
+#: `_oversized_trivial_reason` below), and a claim written as an inline `#` comment cannot be
+#: read by any test. `utils` used to carry `# trivial helpers` here — PR #669 moved
+#: `serialize_ecdsa_der`/`deserialize_ecdsa_der` (the consensus-strict DER parser every
+#: signature now goes through), `decode_address`, `decode_wif`, `encode_script_num`/
+#: `decode_script_num` and `encode_pushdata` into it, growing it to 794 lines, and the reason
+#: went stale without anyone touching this line. It is now mutation-tested in the `cryptoprim`
+#: group instead (scripts/mutation_test.sh) and has no entry here at all.
 _OUT_OF_SCOPE_MODULES = {
-    "__main__",  # `python -m pyrxd` entry point
-    "devnet",  # local dev helper, never on a value path
-    "utils",  # trivial helpers
+    "__main__": "`python -m pyrxd` entry point",
+    "devnet": "local dev helper, never on a value path",
 }
 
 #: The backlog, not an exemption list. See the module docstring. MAY SHRINK, MUST NOT GROW.
@@ -151,3 +158,63 @@ def test_the_documented_exclusion_is_still_true() -> None:
         "mutation_test.sh excludes spv/proof and spv/witness because tests/test_fuzz_spv_parsers.py "
         "covers them; that file no longer exists, so the exclusion now protects nothing"
     )
+
+
+#: Below this line count, calling a module "trivial" is plausible on its face. The genuinely
+#: trivial modules elsewhere in this repo sit far under it — script/unlocking_template.py is 17
+#: lines, __main__.py is 8 — so 100 is a generous ceiling, not a tight one, and still catches
+#: utils.py's actual size (794 lines, measured 2026-09-13) by a wide margin.
+_TRIVIAL_LINE_LIMIT = 100
+
+
+def _oversized_trivial_reason(module: str, reason: str) -> str | None:
+    """Return a failure message if `reason` calls `module` trivial but its line count says
+    otherwise, else None.
+
+    A standalone function, not inlined in a test loop, so its correctness can be demonstrated
+    directly (see `test_the_trivial_size_check_actually_fires` below) independent of whatever
+    `_OUT_OF_SCOPE_MODULES` happens to hold today — a check whose only evidence is an empty loop
+    over the current entries is indistinguishable from a check that can never fail.
+    """
+    if "trivial" not in reason.lower():
+        return None
+    path = _SRC / f"{module}.py"
+    if not path.exists():
+        return f"{module} is out of scope but src/pyrxd/{module}.py does not exist"
+    lines = path.read_text(encoding="utf-8").count("\n") + 1
+    if lines <= _TRIVIAL_LINE_LIMIT:
+        return None
+    return (
+        f"{module} is exempted from mutation testing as trivial ({reason!r}) but is {lines} "
+        f"lines — over the {_TRIVIAL_LINE_LIMIT}-line ceiling this repo's genuinely trivial "
+        "modules sit well under (script/unlocking_template.py: 17 lines, __main__.py: 8 lines). "
+        "Either the module shrank back down and the ceiling is fine, or the reason is stale and "
+        "the module needs a real entry in scripts/mutation_test.sh."
+    )
+
+
+def test_a_trivial_exemption_reason_is_still_a_small_module() -> None:
+    """The backlog ratchet (above) catches a module with NO stated reason. This catches the
+    quieter version: a reason that WAS true and silently stopped being true, because nothing
+    re-checks prose after it is written. `utils` carried exactly this — "trivial helpers" — for
+    however long it took to grow from a handful of re-exports to 794 lines including the DER
+    encoder every signature now goes through, and no test here would have said so."""
+    bad = [
+        msg for module, reason in _OUT_OF_SCOPE_MODULES.items() if (msg := _oversized_trivial_reason(module, reason))
+    ]
+    assert not bad, "\n".join(bad)
+
+
+def test_the_trivial_size_check_actually_fires() -> None:
+    """Non-vacuity for the test above: `_OUT_OF_SCOPE_MODULES` currently exempts nothing as
+    'trivial' (the fix for this exact finding removed the one entry that did), so that test
+    passes over zero iterations — output identical to a check that cannot fail at all. Call the
+    same function directly against `utils.py`, a real file this repo ships, to prove it still
+    catches an oversized 'trivial' claim rather than having quietly stopped checking anything."""
+    utils_lines = (_SRC / "utils.py").read_text(encoding="utf-8").count("\n") + 1
+    assert utils_lines > _TRIVIAL_LINE_LIMIT, (
+        f"utils.py is now only {utils_lines} lines, at or under the {_TRIVIAL_LINE_LIMIT}-line "
+        "ceiling — pick a different real, oversized module to prove this check fires"
+    )
+    msg = _oversized_trivial_reason("utils", "trivial helpers")
+    assert msg is not None, "the trivial-size check no longer fires on a real oversized module"
