@@ -28,7 +28,10 @@ would be its own bug.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import os
+import pickle
 
 import pytest
 
@@ -51,19 +54,65 @@ def test_an_uppercase_txid_is_refused_exactly_as_Txid_refuses_it() -> None:
         GlyphRef(txid=raw, vout=0)  # type: ignore[arg-type]
 
 
-def test_two_refs_for_one_outpoint_cannot_disagree() -> None:
-    """Before the fix these compared unequal while encoding to identical wire bytes.
+def test_a_raw_lowercase_str_agrees_with_the_Txid_built_ref() -> None:
+    """The honest path, and NOT the identity fork.
 
-    That is the dangerous shape — not a crash, but a silent identity fork that only shows
-    up as a membership test quietly returning False.
+    This test was originally named `test_two_refs_for_one_outpoint_cannot_disagree` and
+    claimed to pin the fork. It did not: it compared a raw LOWERCASE str against a `Txid`,
+    which `str.__eq__` already makes equal, so it passed against the unfixed code. Verified
+    by running it on the pre-fix tree. The fork needs UPPERCASE, which the constructor now
+    refuses outright — so the fork is unreachable through `__init__`, and the test for it is
+    `test_a_pickled_pre_fix_ref_cannot_resurrect_the_fork` below.
     """
     lower = _hex_txid()
     a = GlyphRef(txid=Txid(lower), vout=7)
-    b = GlyphRef(txid=lower, vout=7)  # type: ignore[arg-type]  # raw str: the flagged shape
+    b = GlyphRef(txid=lower, vout=7)  # type: ignore[arg-type]
     assert a == b
     assert hash(a) == hash(b)
-    assert {a} == {a, b}, "a set must not hold two entries for one outpoint"
+    assert {a} == {a, b}
     assert a.to_bytes() == b.to_bytes()
+
+
+def _pre_fix_ref(txid: str, vout: int) -> GlyphRef:
+    """A `GlyphRef` as pyrxd <= 0.23.0 could hold one: constructed without `__post_init__`.
+
+    This is exactly what `pickle.loads` produced before `__reduce__` existed — a frozen,
+    non-slots dataclass is rebuilt via `__newobj__` + `__dict__.update`, so no validation
+    runs. Building it here the same way lets the test reach a state the constructor can no
+    longer create.
+    """
+    ghost = object.__new__(GlyphRef)
+    ghost.__dict__.update({"txid": txid, "vout": vout})
+    return ghost
+
+
+def test_a_pickled_pre_fix_ref_cannot_resurrect_the_fork() -> None:
+    """THE fork test. `__post_init__` alone did not close this.
+
+    A ref pickled by an older pyrxd carries a raw uppercase `str`. Unpickling skips
+    `__post_init__` entirely, so before `__reduce__` it came back with the fork intact:
+    byte-identical `to_bytes()`, `==` False against the canonical ref — while the
+    constructor refused the very value `pickle.loads` had just handed back.
+    """
+    h = _hex_txid()
+    ghost = _pre_fix_ref(h.upper(), 0)
+    assert not isinstance(ghost.txid, Txid), "fixture no longer reproduces the pre-fix shape"
+
+    with pytest.raises(ValidationError):
+        pickle.loads(pickle.dumps(ghost))
+    with pytest.raises(ValidationError):
+        copy.deepcopy(ghost)
+
+
+def test_pickling_a_valid_ref_still_round_trips() -> None:
+    """A guard that refuses valid work is a bug — `__reduce__` must not break normal use."""
+    ref = GlyphRef(txid=Txid(_hex_txid()), vout=9)
+    back = pickle.loads(pickle.dumps(ref))
+    assert back == ref
+    assert hash(back) == hash(ref)
+    assert isinstance(back.txid, Txid)
+    assert copy.deepcopy(ref) == ref
+    assert dataclasses.replace(ref, vout=10).vout == 10
 
 
 def test_a_non_hex_txid_fails_HERE_with_the_right_error_class() -> None:
