@@ -75,7 +75,7 @@ gh release view vX.Y.Z --repo MudwoodLabs/pyrxd --json assets --jq '.assets[].na
 
 # PyPI has the version, with wheel + sdist.
 # USE THE SIMPLE INDEX, not the JSON API — see the note below.
-curl -s https://pypi.org/simple/pyrxd/ | grep -o 'pyrxd-X\.Y\.Z[^"#]*' | sort -u
+curl -s https://pypi.org/simple/pyrxd/ | grep -o 'pyrxd-X\.Y\.Z[^"#<]*' | sort -u
 
 # clean-venv install actually works
 python3 -m venv /tmp/verify && /tmp/verify/bin/pip install -q --no-cache-dir pyrxd==X.Y.Z
