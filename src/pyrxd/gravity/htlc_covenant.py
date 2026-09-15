@@ -50,7 +50,7 @@ from pyrxd.glyph.types import GlyphRef
 from pyrxd.hash import hash256
 from pyrxd.script.consensus import has_valid_ops
 from pyrxd.security.errors import ValidationError
-from pyrxd.security.types import Hex20
+from pyrxd.security.types import Hex20, Txid
 from pyrxd.utils import decode_script_num, encode_data_push, encode_int, encode_script_num
 
 __all__ = [
@@ -420,7 +420,7 @@ def _validate_common(
 
 
 def _ref_wire(genesis_txid: str, genesis_vout: int) -> bytes:
-    return GlyphRef(txid=genesis_txid, vout=genesis_vout).to_bytes()
+    return GlyphRef(txid=Txid(genesis_txid), vout=genesis_vout).to_bytes()
 
 
 # --------------------------------------------------------------------------- builders
