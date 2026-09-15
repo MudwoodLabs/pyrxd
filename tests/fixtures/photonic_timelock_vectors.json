@@ -3,7 +3,9 @@
     "generated_by": "pyrxd-timelock bridge script (Photonic interop)",
     "photonic_lib_path": "Photonic-Wallet/packages/lib",
     "generated_at": "2026-05-18T04:35:37.104Z",
-    "notes": "All vectors produced by calling Photonic's actual source files (not a re-implementation). Inputs are deterministic; outputs are recorded for pyrxd to assert byte-equality. Regenerate when Photonic's spec changes."
+    "notes": "All vectors produced by calling Photonic's actual source files (not a re-implementation). Inputs are deterministic; outputs are recorded for pyrxd to assert byte-equality. Regenerate when scripts/check_photonic_drift.py reports that a cited Photonic file moved.",
+    "photonic_commit": "UNKNOWN",
+    "provenance_warning": "The commit that produced these vectors was NOT recorded at generation time, and the generator reads a LOCAL Photonic checkout's working tree (see scripts/gen-photonic-vectors/README.md). A tree sitting on a feature branch or a fork produces vectors that are not upstream's, and nothing here would show it. Byte-equality against these vectors therefore proves pyrxd matches SOME Photonic tree, not necessarily Radiant-Core/Photonic-Wallet@main. On the next regeneration, check out a known upstream commit and record it in photonic_commit; that commit should also appear in tests/fixtures/photonic_upstream_pin.json."
   },
   "xchacha20_poly1305": {
     "key": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",

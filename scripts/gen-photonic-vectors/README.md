@@ -46,6 +46,22 @@ are two ways to validate that:
 ## Running
 
 ```bash
+# 0. FIRST: check out a known UPSTREAM commit, and write it down.
+#    This script reads the checkout's WORKING TREE. That checkout has an
+#    `upstream` remote (Radiant-Core) and an `origin` fork remote, and it is
+#    routinely left on a feature branch — measured 2026-09-07, its tree was
+#    44 files and 5,941 deletions away from upstream/main in packages/lib/src.
+#    Generating from that tree yields vectors that are not upstream's, and
+#    nothing downstream would reveal it: the interop test would still pass,
+#    proving only that pyrxd matches whatever tree happened to be checked out.
+#
+#      git -C ../../../../Photonic-Wallet fetch upstream
+#      git -C ../../../../Photonic-Wallet checkout upstream/main
+#      git -C ../../../../Photonic-Wallet rev-parse HEAD   # record this
+#
+#    Put that sha in the fixture's meta.photonic_commit, and make sure it
+#    matches tests/fixtures/photonic_upstream_pin.json.
+#
 # 1. Confirm Photonic-Wallet is checked out at the expected location
 #    (defaults to ../../../../Photonic-Wallet/packages/lib relative to
 #    this script — adjust via PHOTONIC_LIB env var)
