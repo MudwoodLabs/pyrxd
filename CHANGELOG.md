@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-09-14
+
 ### Security
 
 - **`sign(k=...)` emitted DER a Radiant node cannot accept, and every release from 0.2.0 to
