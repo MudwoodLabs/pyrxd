@@ -6,7 +6,242 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **`sign(k=...)` emitted DER a Radiant node cannot accept, and every release from 0.2.0 to
+  0.23.0 shipped it.** `_sign_custom_k` carried a second, private copy of the DER encoder that
+  wrote `r` and `s` as FIXED 32-byte integers with no `lstrip(b"\x00")`. DER forbids a leading
+  zero byte that is not needed to keep the integer positive, so below 2**247 — about 1 in 512
+  for `r`, 1 in 256 for `s` once low-s halves its range, roughly 1 signature in 171 — the
+  encoding is non-minimal. Radiant applies `SCRIPT_VERIFY_STRICTENC`, mandatory under FORKID,
+  so such a signature is not merely unusual: **it cannot confirm.**
+
+  Measured against this project's own strict decoder, which documents itself as applying every
+  rule Radiant applies when it validates a signature: **14 of 2,000** signatures over random `k`
+  rejected before the fix, **0 of 2,000** after. Two independent re-measurements agree — 22 of
+  4,000 → 0, and 12 of 2,000 → 0.
+
+  The rate understates it, because the only production call site is `RPuzzle.unlock`
+  (`script/type.py`) and **an R-puzzle pins `k`, so it pins `r`.** For the ~1/512 of puzzles
+  whose `r` carries a redundant leading zero, EVERY unlock a released pyrxd builds is
+  node-rejected: that puzzle is unspendable through this SDK and retrying cannot help, because
+  nothing about the retry changes `r`. The `s` half varies with the transaction and is
+  retryable; the `r` half is not. `RPuzzle` has no caller inside `src/`, so the exposure is SDK
+  consumers driving it directly rather than anything the CLI does.
+
+  The fix DELETES the duplicate rather than patching it: `utils.serialize_ecdsa_der` already
+  enforces low-s *and* minimal integer encoding, and was already imported in `keys.py` — two
+  lines above a hand-rolled encoder that had been wrong since the first public release.
+
+  **Correcting the record, which is the reason this entry is long.** The commit that removed it
+  (57466cd, #669) states in its message: *"No live defect: the shipped implementation is
+  correct."* That is false. The sentence was written before the defect was found, during the same
+  review that found it; the correction was posted as a PR comment, and a PR comment does not reach
+  a commit message. The message is now permanent in the git record and cannot be amended, so the
+  correction lives here. Anyone reading 57466cd should read this entry instead.
+
+- **A seven-reviewer panel over the Glyph write sides, and the fixes it forced.** As with the
+  form-2 stack, NONE OF THIS REACHED A RELEASE — the write sides are unreleased. Recorded because
+  the shape of the mistakes is reusable.
+
+  The finding worth reading is about testing, not code. **The delegate commit prefix — the only
+  consensus enforcement in the whole delegate scheme — had no byte-level test.** The single
+  assertion anywhere was `len(...) == 56`, and `split_delegate_commit_prefix` validated a prefix by
+  REBUILDING it with the same builder, which proves self-consistency, not correctness. Measured:
+  changing the `OP_1` at offset 54 to `OP_2`, so the covenant demands TWO burn outputs, kept the
+  length at 56 and **passed 12,490 tests** — while making every honest delegate mint node-rejected
+  and stranding both the commit photons and the delegate token spent to create it. The other two
+  scripts added by the same feature each had a regex pinning their bytes and the equivalent plants
+  against them DO fail; the prefix was the one with no second spelling. It now has a
+  hand-written byte literal, a per-opcode assertion naming which consensus rule each byte carries,
+  and `DELEGATE_COMMIT_PREFIX_RE` that the splitter matches instead of rebuilding.
+
+  - **`verify_burn` refused every burn proof Photonic Wallet has ever written.** pyrxd wrote
+    `"<txid>:<vout>"`; Photonic writes `Outpoint.toString()` — txid hex then the vout as 8
+    big-endian hex digits, no separator — on both sides, in `createBurnProof` and in `validateBurn`.
+    Neither project emitted the other's form, so every real proof was rejected with a sentence that
+    was itself false: "the burn proof names X, not Y", about a proof naming the same token. Both
+    spellings are accepted now; a proof naming a DIFFERENT token is still refused in either.
+  - **`verify_authority_gate` answered about whichever item the caller passed.** It took only
+    (script, authority), so handing it item B's genesis output while asking about item A returned
+    `ok=True` with basis GATE. No forgery — a substitution was enough, and the function could not
+    notice although B's ref was in the bytes it was given. `item_ref` is now keyword-only and
+    REQUIRED, so the unbound call is not expressible.
+  - **`prepare_delegate_setup` stripped covenants from the parents it was re-creating.** It rebuilt
+    each parent with `build_nft_locking_script(parent_owner_pkh, ref)` — the exact hazard
+    `prepare_authority_gated_reveal` documents forty lines away and refuses, because rebuilding
+    from a PKH strips whatever the parent carried. A container or author that is itself
+    authority-gated, mutable, or soulbound came back as a plain 63-byte NFT (ref preserved,
+    covenant gone) in the one transaction whose purpose is to leave the parents untouched before
+    they return to cold storage. It now takes `parent_scripts` — the parents' own current scripts —
+    and cross-checks each against its ref. That also makes the older hazard the removed
+    `parent_owner_pkh` guarded against unrepresentable: a parent keeps paying whoever it paid.
+  - **The CLI printed none of the caveats.** Five new row types had no branch in the human
+    renderer, so `pyrxd glyph inspect` showed `type: op_return-burn` and nothing else — while the
+    browser rendered the claims and the note in full. The sentences that exist to stop over-trust
+    ("anyone can write one about any token"; "gated on this authority NOW — the holder can transfer
+    to a plain NFT script and drop the gate") reached no terminal. The `note` is now printed
+    generically for every row that carries one, so the next type added cannot repeat this.
+  - **An expired authority was indistinguishable from a live one, on BOTH surfaces.**
+    `metadata.authority` — issuer, scope, permissions, expiry, `expired`, and the `problems` list
+    saying the expiry did not even parse — was computed by the classifier and rendered by nobody.
+    Both renderers show it now, and `problems` goes through the sanitiser its siblings already
+    crossed (measured: `repr()` escapes bidi overrides but NOT combining marks, 40 of which
+    survived).
+  - The three regtest suites proving these on a node were in **no CI workflow** — so "measured on a
+    node" was true only of hand runs. They are in `integration.yml` and the `test-regtest` task now.
+
+  **Scope, stated plainly rather than implied:** the four write sides are **builder-level**.
+  `GlyphClient` and the CLI cannot mint a delegated, authority-gated, DAT or burn transaction, and
+  the glossary said the opposite ("ships no `prepare_authority_*` builder — you cannot mint one
+  with pyrxd today"). `tests/test_glyph_write_sides_are_builder_only.py` pins that scope in both
+  directions, so if one gains a production caller the claim fails rather than rotting.
+
+  Also corrected: the CHANGELOG listed `has_permission` as shipped when the spec deliberately
+  records that pyrxd ships none, and "each mint burns one" was wrong in three places — the covenant
+  requires exactly one burn output per REVEAL and does not count mints, so N commits can share one
+  reveal and one burn marker. Anyone metering a delegated collection by counting them undercounts.
+
+
+- **The HashMark §7.6 form-2 stack was re-attacked before it shipped, and the walker was reading
+  the wrong bytes.** NONE OF THIS EVER REACHED A RELEASE — every defect below is in unreleased
+  code from the same branch, found by a seven-reviewer panel across two model families and fixed
+  here. It is recorded because the shape of the mistakes is reusable, not because a published
+  version was affected.
+
+  The keystone: a mutable output's script commits to `payload_hash`, and measured on every real
+  mainnet step of two WAVE chains that is exactly `sha256d` of the step's envelope CBOR. The
+  walker had been reading "the first `gly` push in any input" instead, which let the publisher
+  choose the record — a decoy envelope in an earlier input replaced it wholesale, and a readable
+  decoy in front of an unreadable envelope flipped `complete` False→True, defeating the degrade
+  the module advertises. `walk_mutable_chain` now accepts only the envelope the covenant commits
+  to.
+
+  - **Two claimants for one outpoint now degrade instead of racing.** The spender was chosen with
+    `sorted(pool)`, so one fabricated conflicting txid ground to sort first hijacked the chain —
+    and the real confirmed update was then reported in `excluded`, i.e. the walk asserted the
+    truth did not belong to the token. Nothing in the walk can tell a real spend from a forged
+    one, so two claimants is an ambiguity it refuses to resolve.
+  - **One source may no longer supply both the candidate set and the tip proof.** Omitting the
+    later updates AND certifying the earlier tip takes two lies from one endpoint and produced
+    `complete=True` over a stale record with an empty reason. Unattributed sources count as
+    possibly-identical.
+  - **Block heights are validated and required to be non-decreasing.** `(h or 0)` turned `False`
+    into height 0 — before any mark — and a JSON string raised `TypeError` out of a function
+    documented as always degrading. Heights along a spend-ordered chain cannot decrease, so a
+    decrease now degrades; enforcing it also makes the in-range filter a genuine prefix, which is
+    what `fold_chain(through_index=...)` folds. Previously a step the range calculation had
+    EXCLUDED was folded in anyway and its target reported authoritatively.
+  - **"The record is not known" is now one derived set, not three hand-kept tuples.** They had
+    already drifted: `fold_chain` listed only `unreadable`, so an `unbound` step folded as a
+    readable no-op; and a step whose output commits to a payload nobody revealed was in no list at
+    all, folding as "unchanged" and reporting the previous target as current.
+  - **Form 2 refuses an ambiguously encoded envelope.** `cbor2` silently discards trailing bytes
+    and takes the LAST of a repeated key, so one committed blob had two readings — a
+    cross-implementation split on exactly the question form 2 answers. This narrows the CLAIM, not
+    the decoder: `decode_payload` is unchanged, because six real envelopes is not evidence enough
+    to start refusing mints.
+  - **A walk no longer costs `steps x candidates` round trips.** Measured on the three-step
+    mainnet chain with a 1,000-txid discovery hint: 3,007 fetches before, 1,004 after. `max_steps`
+    is validated too — a cap below 1 made the loop body unreachable, so the walk returned the mint
+    as the tip with an empty reason.
+  - **Publisher-chosen envelope text can no longer own the screen.** Values were truncated and
+    KEYS were not, so a 100,000-character key rendered in full — a 200,004-character line,
+    measured — and nothing capped how many entries an envelope may list. Both the CLI and the
+    `docs/inspect_static` page now cap length and count, and state what was dropped. The page had
+    never rendered the envelope block at all, so on the web a mutable glyph's UPDATE showed as an
+    ordinary transfer and an unreadable envelope showed as nothing.
+  - **There is now actually one push walker.** `_scriptsig_pushes` claimed in its own docstring
+    that there was "one walker rather than two that can drift" while `_parse_reveal_scriptsig`
+    kept a hand-rolled copy — and the two had drifted in both directions: the copy bailed at
+    `OP_0` (which every real MUT unlock ends with) and clamped truncated pushes into
+    plausible-looking short items.
+  - `MAX_CHAIN_STEPS`, `RECORD_UNKNOWN_KINDS`, `EXPIRY_UNKNOWN` and `UNVERIFIED_CAVEAT` are
+    exported from `pyrxd.glyph`. Comparing `verdict.expiry` previously meant importing a private
+    module or retyping the string, which is how "unknown" quietly becomes "not expired".
+
+  Each fix is pinned by a test that was verified two-sided — asserted to pass with the fix and to
+  FAIL with the original defect planted back. The first harness written for this reported one
+  false survival, so it was rebuilt to check both directions and purge bytecode between them.
+
 ### Added
+
+- **Every Glyph protocol marker that had a classifier label and no way to write one
+  now has a write side** — `by` (via delegate refs), `AUTHORITY` (10), `BURN` (6) and
+  `DAT` (3). The classifier was built from the full protocol table so every marker got
+  a label; the build side was built consumer-by-consumer, so a marker only got a
+  builder when someone asked. Nothing surfaces that asymmetry until you try to *write*
+  one. Each write side is byte-matched to Photonic Wallet and proven against a Radiant
+  Core v3.1.1 regtest node.
+
+  - **Delegate refs** authorise a token's `in`/`by` claim without the minter holding
+    the parent singletons. `GlyphMetadata.author_refs` previously had exactly one
+    producer — the CBOR emit — so a `by` claim could be declared and never authorised,
+    and `relationships.py` reported every one of them `UNBACKED`. The parents are spent
+    **once** into a base output under `OP_REQUIREINPUTREF`; disposable delegate tokens
+    point at that base. The covenant requires the reveal to carry EXACTLY ONE burn output naming
+    the base — it does not count mints, and N commits spending N tokens can share a single
+    reveal and a single burn output, so burn markers are not a per-mint tally.
+    `GlyphBuilder.prepare_delegate_setup`,
+    `CommitParams.delegate_ref`, `RevealScripts.delegate_burn_script`, and
+    `delegate_burn_refs` / `resolve_delegated_refs` on the read side.
+  - **`RelationshipVerdict.backing`** distinguishes `DIRECT` (the reveal spent the
+    parent itself) from `DELEGATED` (one step removed) rather than flattening both to
+    "backed". Canon (`canon.rxd.zone`), an independent verifier, draws the same
+    distinction — read from its `/protocol` rules 2026-09-05.
+  - ⚠️ **A delegate token is a bearer credential for the collection, not one mint.**
+    Measured on a node: the commit transaction that spends a delegate token is under
+    no covenant, so one token was spent into three. Whoever holds one can mint into
+    the collection without limit until the base is retired. Keep them in the minting
+    service; do not distribute them.
+  - ⚠️ **Authority gating is not durable.** Measured: a holder can transfer a gated
+    item to a plain NFT script — same ref, no gate, nobody's permission — and cannot
+    transfer it while KEEPING the gate without the issuer. It IS a real supply cap
+    (minting a second gated item from an existing one is refused), and it is a claim
+    about an item's GENESIS, not a property of a live UTXO. `verify_authority_gate`
+    takes the genesis output for that reason.
+  - **Every verdict in the SDK has one shape: `ok` / `basis` / `reason`.**
+    `RelationshipVerdict`, `AuthorityVerdict` and `BurnVerdict` previously answered
+    "is this good, and why" three different ways, including a two-valued
+    `RelationshipOutcome` enum that duplicated a boolean. That enum is gone, `valid`
+    is now `ok`, and every verdict carries a `reason`. The inspect payload's
+    relationship entries are correspondingly `{kind, ref, ok, basis, reason}`.
+  - `verify_burn` **requires** `spent_output_scripts`. Absence from a transaction's
+    outputs is a condition every unrelated transaction satisfies, so there is no
+    useful verdict without them — and while the parameter was optional, omitting it
+    returned `ok=False` for a genuine burn. Requiring it means that answer cannot
+    arise: you either have the evidence or you cannot ask.
+  - **AUTHORITY**: `build_authority_metadata`, `verify_authority_gate`,
+    `verify_authority_claim`, and the 101-byte
+    `build_authority_gated_nft_script` covenant with
+    `GlyphBuilder.prepare_authority_gated_reveal`.
+  - **BURN**: `build_burn_proof_script` / `parse_burn_proof` / `verify_burn`, and
+    `GlyphBuilder.prepare_burn_proof`.
+  - **DAT**: `build_dat_commit_locking_script` (70 bytes, no `OP_REFTYPE_OUTPUT` block —
+    its reveal mints nothing), `build_dat_reveal_scriptsig_suffix`,
+    `GlyphBuilder.prepare_dat_commit` / `.prepare_dat_reveal`.
+  - The inspector emits `delegate-token`, `delegate-burn`, `authority-gated-nft`,
+    `commit-dat` and `op_return-burn`, each carrying what it does **not** establish, and
+    `glyph inspect --fetch` resolves a delegated claim rather than printing
+    `CLAIMED ONLY — nothing authorised it` at an honest token.
+
+- **Two verifiers deliberately refuse what the reference implementation accepts.**
+  Photonic's `verifyAuthorityChain` matches a token's `by` field against a candidate
+  authority's ref and reports success on a string match; `by` is operator CBOR, so a
+  forger writes a real issuer's ref into their own token and passes. Photonic's
+  `validateBurn` checks only that the ref is absent from the outputs — a condition
+  every unrelated transaction on the chain satisfies. pyrxd's equivalents take the
+  relationship verdicts, and the spent outputs, respectively. **Measured on a node: a
+  transaction emitting a burn proof for a token it never held is relayed happily and
+  the victim's token stays spendable.**
+
+  What the authority gate does and does not bind was also measured, and it is not what
+  the name suggests: minting a gated item without the authority is rejected, and so is
+  minting a *second* gated item from an existing one (so it is a real supply cap) — but
+  a holder **cannot** transfer a gated item while keeping the gate, and **can** strip
+  the gate entirely by transferring to a plain NFT script, same ref, nobody's
+  permission. "Authority-gated" is a claim about an item's genesis, not a durable
+  property of a live UTXO.
 
 - **Timelocked Glyph content can now be minted and revealed** (#556). The feature had
   ~700 lines and three test files and no way for a user to reach any of it; the
@@ -52,6 +287,201 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A counterparty's malformed signature made pyrxd report an internal bug.** `PublicKey.verify`
+  returned coincurve's result straight through, and coincurve's strict DER parser raises a bare
+  `ValueError` for bytes it cannot parse. A bare `ValueError` is not an `RxdSdkError`, so it
+  escaped `swap.partial._verify_owner_signature` — the maker-signature re-check every
+  `accept_offer` and `take_rswp_order` crosses — whose CLI caller maps only `RxdSdkError`. It
+  landed on `cli/main.py`'s catch-all and printed `error: unexpected failure (ValueError)` with
+  exit 4: pyrxd blaming itself for hostile input it had in fact handled correctly. Unparseable
+  DER is now a `False` verification result, and the swap path raises the `ValidationError` it
+  was always supposed to.
+
+  The catch is scoped to the DER parse alone, not wrapped around `key.verify`: that call raises
+  the SAME exception type for a message hash of the wrong width, which is a caller mistake (a
+  `hasher` that does not return 32 bytes) and must keep escaping. Swallowing it would turn a
+  programming error into a silent `False` — the bug such an exception exists to surface.
+
+- **`attrs` bounded its scalars at the top level only, so a list one step down evaded them.**
+  `_decode_attr_value` checks an integer's bit length and a float's finiteness, and its own
+  comments say why: CPython refuses `str()` on an integer over ~4,300 digits and `json.dumps`
+  inherits that, while a bare `NaN` is not JSON any strict parser reads back. The list branch
+  then kept any `int` or `float` unchecked. `{"a": [1 << 20000], "b": [float("nan")]}` — ordinary
+  CBOR anyone can mint — decoded cleanly and handed an SDK consumer the exact exception the guard
+  exists to prevent. The bound is now one function applied at both positions rather than two
+  spellings, one of which was empty.
+
+  No human-facing crash path in this repo (the inspect payload does not emit raw `attrs`), so the
+  reach is library callers that JSON-encode `GlyphMetadata.attrs`. Real lists still decode with
+  their types and ordering intact — Photonic's authority tokens carry `permissions: string[]`,
+  and refusing those is the defect the list branch was added to fix.
+
+- **The repo's own git tooling did not work from a git worktree** — the workflow it asks agents
+  to use. Two instances of one blindness, both hit rather than reviewed: `scripts/git-hooks/
+  pre-push` located the venv with `git rev-parse --show-toplevel`, which is the CURRENT worktree,
+  and a linked worktree has no `.venv` (it lives in the main checkout), so every push from one
+  aborted with a bare "task not found". And `scripts/install-git-hooks.sh` targeted
+  `${REPO_ROOT}/.git/hooks`, but in a linked worktree `.git` is a FILE pointing at the real repo,
+  so the installer refused with "are you inside the pyrxd git repo?" — from inside the repo.
+  `--git-common-dir` answers both: it resolves to the one shared git directory from any worktree.
+
+  Re-attacking the fix found a defect it would have added: the installer symlinks the SHARED hook
+  to `${REPO_ROOT}/scripts/git-hooks/…`, so merely letting it succeed from a worktree would have
+  pointed every checkout's hook into an ephemeral directory — dangling the moment that worktree
+  was removed, silently disabling pre-push checks repo-wide. Both the source and the destination
+  now derive from the main checkout, and it warns when run from a worktree.
+
+  Also corrected: `install-git-hooks.sh` advertised that pre-push "runs the full local-CI matrix
+  (`task ci`)". It runs `task ci-fast`, and the hook it installs explains at length why the full
+  suite there is actively wrong — git opens the remote connection before the hook runs and GitHub
+  drops an idle receive-pack after ~5 minutes, so a long hook makes the push die with SIGPIPE
+  having transferred nothing. The installer was telling you your pushes were covered by a check
+  that deliberately does not run.
+
+- **The changelog claimed 0.23.0 shipped seven things it did not.** Entries kept landing under
+  `## [0.23.0]` after v0.23.0 was tagged — the released section sits directly below
+  `## [Unreleased]`, both carry a `### Fixed`, and in a diff appending to the wrong one looks
+  exactly like appending to the right one. Seven reached it, from six PRs — #655, #656, #661,
+  #662 (two), #665 and #666 — every one of them mine, each a public statement that a shipped
+  release contained work that came after it. #665 moved four of the seven; this change moves the
+  remaining three, keeping each in its original subsection (`### Changed` did not become
+  `### Fixed`). `[0.23.0]` again matches the v0.23.0 tag exactly: 29 entries, none lost, none
+  extra, compared section-to-section rather than against the whole tagged file.
+
+  A guard stops it recurring: `tests/test_released_changelog_sections_are_frozen.py` digests
+  every `## [x.y.z]` section against a committed manifest, so editing a released section fails
+  the build and says to use `[Unreleased]` instead. It compares the FILE against a manifest
+  rather than against `git show v<version>:CHANGELOG.md`, because CI checks out at depth 1 with
+  no tags — a tag-based check would have skipped in CI and passed locally, which is worse than
+  no check. It prevents recurrence and did not detect these seven; the manifest was generated
+  after they were moved by hand.
+
+- **A Glyph token anyone could mint crashed the inspect path.** `crypto.recipients`
+  is operator-authored CBOR read off the chain, and every `from_dict` in
+  `glyph/encrypted_content.py` was annotated `d: dict` without being handed one it
+  could trust — `CryptoRecipient.from_dict` calls `d.get("mlkem_ct")` first, so a
+  recipient that was a string, an int, a list or null raised **AttributeError**. That
+  is not in `payload._DECODE_REFUSALS`, so it escaped the decoder's "log the malformed
+  field and degrade" contract and came out of `GlyphInspector.extract_reveal_metadata`.
+  Four shapes reached it.
+
+  All five parsers now refuse a non-map with `ValidationError` — at the boundary, not
+  at the four reachable sites. Widening the catch to swallow `AttributeError` was the
+  alternative and is worse: it would also swallow a genuine typo in pyrxd's own parser,
+  which is the bug such a catch exists to surface.
+
+  **Neither fuzzer could have found this**, and that is the more useful half. Both feed
+  the decoder random bytes — `tests/test_fuzz_parsers.py` uses `st.binary()` and the
+  atheris harness mutates raw input — so reaching the field parsers requires
+  synthesising a well-formed CBOR map carrying `p`, then `crypto`, then `recipients`,
+  then a non-map inside it. Every defect behind a well-formed envelope was structurally
+  unreachable, not merely unlikely. The new suite generates *structure*: valid
+  envelopes with hostile values at the nested positions the decoder walks.
+
+  A first draft of that generator made `crypto` and `recipients` optional and **passed
+  against the planted defect** — 400 examples seldom produced the one crashing shape. A
+  generator that reaches the interesting position only sometimes reports "no defect" for
+  the wrong reason, and reads as thorough because it is random. The position is now
+  guaranteed and the value randomised.
+
+- **A WAVE name that had been repointed still inspected as its mint-time target.** A mutable
+  Glyph is changed by publishing a second `gly` envelope carrying only the mutated fields — no
+  `p`, no `name`, no `type`. `decode_payload` refuses that shape (`CBOR payload missing 'p'
+  field`) and is right to; `p` is what identifies a glyph payload. Nothing else read it, so
+  every update on the chain was invisible.
+
+  Measured on mainnet — `custodian-gate-x7f3.rxd`, whose target moved from
+  `1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7` to `14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i` at height
+  458591. Three of that name's four transactions carry the `gly` marker; the inspect path
+  rendered one, and the two that MOVED where the name points rendered blank.
+
+  `decode_update_payload` reads the partial envelope, and
+  `GlyphInspector.classify_glyph_scriptsig` returns a three-state answer: a full payload, an
+  update, or **unreadable**. The third state is the point. `extract_reveal_metadata` returns
+  `None` both for "no glyph here" and "a glyph I could not parse", and those are opposite facts
+  — a reader that cannot see updates does not report an error, it reports "nothing changed",
+  which is the more confident answer and the wrong one.
+
+  Two supporting changes fall out. The push walker now has a **prefix** view alongside the
+  strict one: a MUT-contract unlock ends in real opcodes (`OP_1 OP_1 OP_0 OP_0` on those
+  transactions), so the pure-push walker reported `None` for the whole script and discarded the
+  envelope it had already read. And an update's CBOR **keys** are publisher-chosen just like its
+  values, so both are sanitised before display.
+
+  Scoped deliberately: this reads an update. It does not fold a chain of them into the state at
+  a past block — that merge rule belongs to the WAVE protocol, not to pyrxd's guess at it — and
+  it makes no claim about who held a name when (#598).
+
+- **HashMark §7.6 form 2: what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.**
+  `judge_name_at_mark` composes a chain walk with a block anchor and answers the question form 1
+  refuses — verified on the real mainnet chain for `custodian-gate-x7f3.rxd`, which distinguishes
+  the eras a present-tense lookup conflates: a mark at 458586 resolves to `1CPfirXZ…`, one at
+  458595 to `14XmXG3d…`.
+
+  The verdict is **structurally** narrow rather than narrow by docstring: `form` is an int so no
+  caller can read a single flag optimistically, `expiry` is a string state so nothing can compare
+  it to a clock, and `binding_verified` stays False until something checks the name→glyph binding
+  on chain. It degrades to form 1 **with a reason** when the mark has no block, is too shallow,
+  when the walk is incomplete, when a step cannot be placed against the mark — and when the height
+  and the binding came from the **same source**, since one endpoint supplying both can choose the
+  block and then choose what the name said at it.
+
+  `resolve_mark_anchor` supplies the block, which nothing did before: `_classify_raw_tx` returns no
+  height, blockhash or confirmations. It takes a **required** `min_confirmations` with no default,
+  following the registry's own rule that depth is value-scaled per chain and that "'6 confirmations'
+  folklore transfers across chains even less than it transfers across values".
+
+  **The height is the endpoint's claim, not a proof**, and every anchor and verdict says so.
+  `pyrxd.spv` is Bitcoin-only; there is no Radiant header, proof-of-work or merkle check. Fetching a
+  merkle path would not help — with no work check, fabricating a header whose root commits to the
+  transaction is free, so inclusion-without-work buys nothing against a hostile endpoint while
+  looking exactly like security.
+
+  Exported as consumer API. The CLI cannot drive form 2 yet: it needs a token's transaction list and
+  `RxinDexerClient` has no history method, so wiring a caller that always degrades would be a
+  wrapper around dead code.
+
+- **A mutable glyph's history can now be walked, and the walk proves it reached the tip.**
+  `pyrxd.glyph.walk_mutable_chain` follows a mutable glyph along its OWN spend chain — one
+  mutable output at a time — and reports `complete` only when every link verified *and* the
+  final output is proved unspent. Anything else returns the walked prefix with a reason.
+
+  That distinction is the point: a truncated history is how a superseded value becomes
+  authoritative. Stop one transaction early and a naive walker reports the previous target with
+  no sign anything is missing, which is exactly what an index was observed doing to a live WAVE
+  name.
+
+  **The chain is the singleton, not an index's history list.** Measured on mainnet,
+  `custodian-gate-x7f3.rxd`'s history contains a transaction that shares a block with a real
+  update and is spent *from* by the next one — and never touches the token. It is reported as
+  `excluded`, not folded and not allowed to order anything. Height cannot order a chain either:
+  two of that name's transactions share height 458591, and another name has two update envelopes
+  at one height.
+
+  A step whose mutable output carries a **different ref** raises rather than degrades — following
+  it would splice two tokens' histories together. Absence degrades; contradiction raises.
+
+- **That fix only reached `--output json`.** #661 taught the classifier to read a glyph update
+  and put it in `glyph_envelopes`, which was then read by **nothing** — three references
+  repo-wide, all of them the write. So the default terminal output still rendered the mainnet
+  update `315b4630…` as `type=unknown / type=mut / type=p2pkh`, with no mention of the change
+  and no sight of the new target: the same blindness that PR's subject line is about, one layer
+  up. `pyrxd glyph inspect` now names the update and its target, and says what it does **not**
+  establish — that an envelope changes a *glyph's* fields, not which name resolves to it.
+
+  An `unreadable` envelope is named just as loudly, because "I could not read this" and "there
+  is nothing here" are opposite facts and the blind one reads as reassuring.
+
+- **`WaveAttrs` silently dropped `attrs.expires`.** Measured, a real mainnet record round-tripped
+  `[domain, expires, name, target, target_type]` back out as `[domain, name, target,
+  target_type]`. It is now carried, refused rather than dropped when unusable (`True` included —
+  `isinstance(True, int)` is True in Python, so a bool would have become a 1970 timestamp), and
+  emitted only when set, so a mint that never asked for it publishes the same four keys as before.
+
+  Carried is not consumed: Photonic's own source says the indexer is authoritative on renewals
+  and `attrs.expires` is "display-level", so nothing may read it as an expiry. An AST scan pins
+  that nothing does.
+
 - **`pyrxd-watchtower` paged `PAGE_SQUEEZED` on every tick of a healthy ETH swap**, because
   `MarginPolicy.eth_finalization_window_s` was unreachable from the tower. The finality gate
   RAISES on a depth-less (finalized-checkpoint) verdict without it, `_decide_eth` catches
@@ -89,6 +519,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   neither `block` nor `time` reported "no `current_time` was supplied" while the caller had
   supplied `current_block`; the refusal now names the mode. Neither change blocks
   `--allow-early`, and nothing was ever broadcast on these paths.
+- **`attrs` values did not survive a round trip through the chain.** `_decode_attrs`
+  coerced every value with `str()` and `GlyphMetadata.attrs` was typed `dict[str, str]`.
+  Harmless while nothing wrote non-string attrs — but Photonic's authority tokens carry
+  `revocable: boolean` and `permissions: string[]`, so reading a real one gave the
+  string `"False"` (truthy: a **non-revocable authority read back as revocable**) and
+  `"['mint']"` (parsed as empty: **every permission silently lost**). Scalars and lists
+  of scalars are now preserved; anything nested is still flattened to `str`, since
+  nothing in the protocol needs it. Spec §5's `attrs` row, which said "Free-form string
+  attributes", was the claim the bug was built on and is corrected.
+- **A DAT glyph minted by pyrxd was unreadable by pyrxd.** `_parse_reveal_scriptsig`
+  took the push immediately after the `gly` marker, which for a DAT reveal is the `dat`
+  marker rather than the payload — `decode_payload` raised and the caller got `None`.
+  A DAT reveal has no token output, so the entire content was unreachable. Only the one
+  known marker is skipped; skipping any short item would let a crafted scriptSig push
+  filler ahead of a payload of its choosing.
 - **A TIMELOCK mint could go on chain carrying no CEK commitment at all.**
   `GlyphMetadata.to_cbor_dict` emitted no `crypto` key under any circumstance, so metadata
   declaring `p = [NFT, ENCRYPTED, TIMELOCK]` produced a token that said it was sealed and
@@ -132,6 +577,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the dataclass** rather than typed out beside the check.
 
 ### Changed
+
+- **Creator signatures are now made over the canonical encoding, and signatures
+  made by earlier versions do not verify.** Signing used `cbor2.dumps(d)` while
+  `encode_payload` published `canonical=True`, so the bytes signed were not the
+  bytes published: measured against the previous code, a single-field NFT verified
+  after a round trip through the envelope and an NFT carrying a `description` did
+  not. The two now use one encoder. This is a behavioural change to a published
+  signature scheme and it was not previously recorded here. No conformance vector,
+  pinned mainnet anchor or checked-in fixture in this repository carries a creator
+  signature, and `verify_creator_signature` has no internal caller — it is exported
+  API — so no signature this project can point at was invalidated, but a third
+  party holding one produced by an earlier version must re-sign.
 
 - **`pyrxd-watchtower` now refuses a policy flag it cannot honour instead of dropping it.**
   Without `--measured`, twelve flags — including `--rxd-claim-inclusion`,
@@ -331,6 +788,28 @@ settled.
   claims, four comments resting on a standardness rule Radiant does not execute,
   and a guide telling readers to hand-roll an adapter for a class that ships and
   is used by the real-value runners.
+
+  **Glyph spec §10.2 told a second implementer to build a verifier that rejects
+  valid pyrxd signatures.** It stated that the creator-signature encoder omits
+  `canonical=True` and that an implementation "MUST reproduce the insertion order
+  of pyrxd's `to_cbor_dict` … using a canonical encoder here produces a different
+  message and the signature fails". Signing became canonical in the same cycle
+  (below), so every clause was false, in the direction that breaks interoperation —
+  the 0.22.0 shape, where a published artifact teaches a rule the code does not
+  implement. The same claim was mirrored twice in `security-audit-scope.md`, once
+  as an accepted residual asserting the encoding was a *permanent compatibility
+  constraint*.
+
+  It also survived a mechanical repair: a citation sweep re-pointed the sentence
+  from `creator.py:43` to `creator.py:117` — onto `return cbor2.dumps(d,
+  canonical=True)`, the line that refutes it. A citation checker asks whether a
+  pointer lands on code, never whether the code says what the prose claims.
+
+  §10.2 now gives the recipe that works, and
+  `tests/test_spec_10_2_recipe_verifies_a_creator_signature.py` **executes** it
+  rather than reading it: it verifies an honest token the way an outside
+  implementation would, and asserts that the reconstruction the section forbids
+  really does fail.
 
 ### Internal
 

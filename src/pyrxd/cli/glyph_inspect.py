@@ -23,10 +23,13 @@ for splitting a group's subcommands across modules.
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import click
 
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -34,16 +37,23 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
-from ..glyph._inspect_core import _truncate_for_human
+from ..glyph.relationships import resolve_delegated_refs
+from ..glyph.types import GlyphRef
 from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
+from ..transaction.transaction import Transaction
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
+
+_log = logging.getLogger(__name__)
+
+#: Most delegate bases one `inspect --fetch` will resolve. See the loop below.
+_MAX_DELEGATE_BASES = 25
 
 __all__ = [
     "inspect_cmd",
@@ -107,7 +117,14 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         raise UserError(str(exc)) from exc
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
+def _classify_raw_tx(
+    txid_hex: str,
+    raw: bytes,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
+) -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
 
@@ -116,7 +133,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
     CLI's three-line ``error / cause / fix`` formatting so existing
     test assertions (e.g. on ``"--electrumx"``) keep matching."""
     try:
-        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network)
+        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network, delegated_refs=delegated_refs)
     except ValidationError as exc:
         msg = str(exc)
         if "raw bytes too short" in msg:
@@ -188,7 +205,57 @@ async def _inspect_txid_inner(
         raise UserError("invalid txid", cause=str(exc)) from exc
 
     raw = await client.get_transaction(txid)
-    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+    payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+
+    # DELEGATED CLAIMS. A token may authorise its `in`/`by` through a delegate
+    # rather than by spending the parent here, and `_classify_raw_tx` cannot see
+    # that: resolving it means fetching the base transaction the burn points at.
+    # Skipping the fetch would render an honest token as "CLAIMED ONLY —
+    # nothing authorised it", which is a false accusation, not a safe default.
+    burns = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}).get("delegate_burns") or []
+    # BOUNDED. Each entry costs a `blockchain.transaction.get` round trip, and
+    # the burn output that produces one is 42 bytes — a single transaction
+    # within the 4 MB / 100,000-output classifier caps can name ~78,000 distinct
+    # bases, so an unbounded loop lets one crafted txid hang the CLI and get the
+    # user's ElectrumX endpoint rate-limited. Resolve a prefix and say what was
+    # left; an unresolved claim already renders honestly as UNRESOLVED.
+    unresolved_over_cap = max(0, len(burns) - _MAX_DELEGATE_BASES)
+    resolved: dict[bytes, tuple[bytes, ...]] = {}
+    for outpoint in burns[:_MAX_DELEGATE_BASES]:
+        base_txid, _, vout_str = str(outpoint).rpartition(":")
+        try:
+            base_ref = GlyphRef(txid=Txid(base_txid.lower()), vout=int(vout_str))
+            base_raw = await client.get_transaction(Txid(base_txid.lower()))
+            # INSIDE the try. This was `Transaction.from_bytes`, which does not
+            # exist, and it sat outside — so every transaction carrying a
+            # delegate burn raised AttributeError out of a block whose stated
+            # contract is that a failed resolution never fails the inspect.
+            # Anyone could crash `inspect --fetch` by emitting one.
+            base_tx = Transaction.from_hex(bytes(base_raw))
+            if base_tx is None:
+                raise ValidationError(f"base tx {base_txid} did not decode")
+            base_outputs = [bytes(o.locking_script.serialize()) for o in base_tx.outputs]
+        except (ValidationError, ValueError):
+            continue
+        except Exception as exc:
+            # An unreachable or unknown base leaves the claim UNRESOLVED rather
+            # than failing the whole inspect — the rest of the report is still
+            # true, and the renderer says the resolution did not happen.
+            # Logged, not swallowed: a claim that reads UNRESOLVED because a
+            # fetch failed looks identical to one whose base does not exist,
+            # and whoever is debugging that needs to know which it was.
+            _log.debug("could not resolve delegate base %s: %s", outpoint, exc)
+            continue
+        # Keyed by base, NOT flattened. Flattening threw away which base each ref
+        # came from, which is exactly the binding the verifier needs: without it a
+        # reveal that burned any base at all vouched for refs resolved from another.
+        resolved[base_ref.to_bytes()] = resolve_delegated_refs(base_ref.to_bytes(), base_outputs)
+
+    if resolved:
+        payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network, delegated_refs=resolved)
+    if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
+        payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
+    return payload
 
 
 def _render_txid_human(payload: dict) -> str:
@@ -272,8 +339,43 @@ def _render_txid_human(payload: dict) -> str:
                     )
                 if row.get("token_bearing") is None:
                     lines.append("            token-bearing UNKNOWN (does not decode) — treat as token-bearing")
+            elif type_ == "authority-gated-nft":
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            authority_ref={row.get('authority_ref', '')}")
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ in ("delegate-token", "delegate-burn"):
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            delegate_base_ref={row.get('delegate_base_ref', '')}")
+                if row.get("owner_pkh"):
+                    lines.append(f"            owner_pkh={row['owner_pkh']}")
+                if row.get("spendable") is False:
+                    lines.append("            *** UNSPENDABLE *** (OP_RETURN — the value on it is gone)")
             elif type_ == "error":
                 lines.append(f"            (classifier error: {row.get('error')})")
+
+            # THE CAVEAT, FOR EVERY TYPE THAT HAS ONE — printed generically rather than per
+            # branch. The classifier attaches `note` to say what a row does NOT establish
+            # ("gated on this authority NOW — the holder can transfer to a plain NFT script and
+            # drop the gate"; "anyone can write one about any token"). Five new row types had no
+            # branch here at all, so on the CLI the affirmative type label survived and every one
+            # of those sentences was dropped, while the browser rendered them in full. That is
+            # exactly the failure `_op_return_payload_lines` was written to fix one level down.
+            #
+            # Generic because the alternative is hand-keeping a list of which types have notes,
+            # and the next type added would repeat this.
+            # Same reasoning as `note` below: generic, not per-branch. `delegate_base_ref`
+            # was emitted only from the `delegate-token`/`delegate-burn` branch, so a
+            # delegate-BOUND commit — whose reveal the covenant rejects without a burn
+            # output naming that base — rendered identically to a plain one. The classifier
+            # recovers it for all three commit types; hand-keeping which branches print it
+            # is what lost it.
+            delegate_base = row.get("delegate_base_ref")
+            if delegate_base and type_ not in ("delegate-token", "delegate-burn"):
+                lines.append(f"            delegate_base_ref={delegate_base}")
+
+            note = row.get("note")
+            if note:
+                lines.append(f"            {_truncate_for_human(str(note))}")
     metadata = payload.get("metadata")
     if metadata is not None:
         lines.append("")
@@ -307,10 +409,29 @@ def _render_txid_human(payload: dict) -> str:
         # "in collection X" without saying whether anything authorised it is the
         # defect this exists to fix — the same shape as showing a WAVE name for
         # an unverified HashMark signer.
+        # Four verdicts, not two. "spent in this tx" is FALSE for a delegated
+        # claim — the parent was spent when the delegate BASE was created, by
+        # someone who need not be this minter — and "nothing authorised it" is
+        # false when a delegate was burned and simply could not be resolved.
+        # Both wrong strings are the confident kind, which is the kind people
+        # act on.
+        burned = metadata.get("delegate_burns") or []
         for rel in metadata.get("relationships") or []:
             label = "collection" if rel["kind"] == "container" else "creator"
-            if rel["outcome"] == "backed":
+            basis = rel.get("basis")
+            if rel["ok"] and basis == "delegated":
+                via = f" via delegate {burned[0]}" if len(burned) == 1 else " via delegate"
+                lines.append(f"  {label}: {rel['ref']}  [VERIFIED{via} — authorised by its base, not spent here]")
+            elif rel["ok"]:
                 lines.append(f"  {label}: {rel['ref']}  [VERIFIED — spent in this tx]")
+            elif burned:
+                # Name a specific delegate ONLY when there is exactly one. With
+                # two burns, `burned[0]` pointed at a delegate that may have
+                # nothing to do with this particular claim.
+                which = f" {burned[0]}" if len(burned) == 1 else ""
+                lines.append(
+                    f"  {label}: {rel['ref']}  [UNRESOLVED — this tx burned a delegate{which}; fetch it to check]"
+                )
             else:
                 lines.append(f"  {label}: {rel['ref']}  [CLAIMED ONLY — nothing authorised it]")
 
@@ -329,6 +450,34 @@ def _render_txid_human(payload: dict) -> str:
             # and for mode="block" it would be meaningless.
             lines.append("            (unlocked? pass this token's metadata and your chain tip to")
             lines.append("             pyrxd.is_unlocked / pyrxd.get_unlock_remaining)")
+        # AUTHORITY — the claims, whether it has EXPIRED, and anything `validate_authority` could
+        # not read. The classifier computed all of this and neither renderer read it, so an
+        # authority token that expired years ago printed identically to a live one, on both the
+        # terminal and the browser. The one signal that flags an unparseable expiry — `problems` —
+        # was the one nobody could see.
+        auth = metadata.get("authority")
+        if auth:
+            claims = auth.get("claims") or {}
+            lines.append("  authority:")
+            for key in ("issuer", "scope", "expires"):
+                if claims.get(key):
+                    lines.append(f"            {key}: {_truncate_for_human(str(claims[key]))}")
+            perms = claims.get("permissions") or []
+            if perms:
+                shown = ", ".join(_truncate_for_human(str(x)) for x in perms[:_HUMAN_ENTRY_CAP])
+                lines.append(f"            permissions: {shown}")
+                if len(perms) > _HUMAN_ENTRY_CAP:
+                    lines.append(f"            ... and {len(perms) - _HUMAN_ENTRY_CAP} more not shown")
+            if claims.get("revocable") is False:
+                lines.append("            revocable: false")
+            if auth.get("expired"):
+                lines.append("            *** EXPIRED *** (by the `expires` claim above)")
+            for problem in auth.get("problems") or []:
+                lines.append(f"            unreadable: {_truncate_for_human(str(problem))}")
+            # WHAT THIS IS NOT. The marker says the token calls itself an authority; it does not
+            # establish that anything was minted under it, nor that the issuer still honours it.
+            lines.append("            (a marker and its claims — NOT proof any item was minted")
+            lines.append("             under it; see verify_authority_gate for that question)")
     # THE OTHER GLYPHS IN A MULTI-GLYPH REVEAL (#577). Pointing at a JSON key is
     # no use to someone reading the terminal, which is where this renderer is read.
     others = [
@@ -342,6 +491,65 @@ def _render_txid_human(payload: dict) -> str:
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
             lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
+
+    # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
+    # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —
+    # `type=unknown / type=mut / type=p2pkh` and no mention of the change. #661 taught the
+    # classifier to read those envelopes and put them in the JSON, and stopped there: nothing
+    # consumed `glyph_envelopes`, so the default terminal output stayed exactly as blind as
+    # before. A production caller is necessary and not sufficient; the result has to reach a
+    # human, and this is the surface humans read.
+    envelopes = payload.get("glyph_envelopes") or []
+    if envelopes:
+        lines.append("")
+        lines.append(f"Glyph envelopes carrying no full payload ({len(envelopes)}):")
+        for env in envelopes:
+            idx = env.get("input_index")
+            if env.get("kind") == "update":
+                lines.append(f"  input {idx:>3}: UPDATE — a mutable glyph's fields are being changed here")
+                fields = env.get("fields") or {}
+                attrs = fields.get("attrs")
+                if isinstance(attrs, dict):
+                    # `target` FIRST and on its own line: for a WAVE name it is where the name
+                    # will point, which is the one value a reader is here for.
+                    if "target" in attrs:
+                        lines.append(f"           attrs.target = {_truncate_for_human(str(attrs['target']))}")
+                    # KEYS ARE TRUNCATED TOO. They are as publisher-chosen as the values, and
+                    # capping only the value left a 100,000-character key rendering in full - a
+                    # 200,004-character line, measured.
+                    others = [(k, v) for k, v in sorted(attrs.items()) if k != "target"]
+                    rest = ", ".join(
+                        f"{_truncate_for_human(str(k))}={_truncate_for_human(str(v))}"
+                        for k, v in others[:_HUMAN_ENTRY_CAP]
+                    )
+                    if rest:
+                        lines.append(f"           attrs: {rest}")
+                    if len(others) > _HUMAN_ENTRY_CAP:
+                        lines.append(f"           ... and {len(others) - _HUMAN_ENTRY_CAP} more attrs not shown")
+                top = [(k, v) for k, v in sorted(fields.items()) if k != "attrs"]
+                for key, value in top[:_HUMAN_ENTRY_CAP]:
+                    lines.append(f"           {_truncate_for_human(str(key))} = {_truncate_for_human(str(value))}")
+                if len(top) > _HUMAN_ENTRY_CAP:
+                    lines.append(f"           ... and {len(top) - _HUMAN_ENTRY_CAP} more fields not shown")
+                # WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether that
+                # glyph is the name someone means is an index's answer, not this transaction's,
+                # and the gap between the two is the whole of HashMark §7.6.
+                lines.append("           (changes this glyph's fields — does NOT establish which")
+                lines.append("            name resolves to it, nor who held that name when)")
+            elif env.get("kind") == "payload_unrendered":
+                # A DISAGREEMENT, not an unreadable envelope. One reader decoded a full payload
+                # here and the other did not, so neither "rendered above" nor "could not be read"
+                # is true — and silently trusting the reveal reader made the glyph vanish.
+                lines.append(f"  input {idx:>3}: PAYLOAD the reveal reader did not return")
+                lines.append("           the two glyph readers disagree about these bytes — treat")
+                lines.append("           the metadata section above as incomplete for this input")
+            else:
+                # NOT SILENTLY DROPPED. "I could not read this" and "there is nothing here" are
+                # opposite facts, and the blind one reads as reassuring.
+                lines.append(f"  input {idx:>3}: UNREADABLE — a 'gly' marker with content neither reader accepted")
+                reason = env.get("reason") or ""
+                if reason:
+                    lines.append(f"           {_truncate_for_human(reason)}")
 
     # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
     # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
@@ -502,6 +710,21 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
             out.extend(_wave_context_lines(hm.get("wave_identity"), indent))
         else:
             out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
+
+    # BURN — the claims AND the note. The browser prints both (`inspect.js`); the CLI printed
+    # neither, so a burn proof rendered as the bare label `type: op_return-burn` and the sentence
+    # that stops a reader believing it ("anyone can write one about any token") reached nobody.
+    # Every value is CLAIMED: the proof is an OP_RETURN, so it is whatever its author typed.
+    burn = payload.get("burn")
+    if burn:
+        claims = burn.get("claims") or {}
+        out.append(f"{indent}burn proof (CLAIMED — an OP_RETURN, not a verdict):")
+        for key in ("token_ref", "action", "amount", "reason"):
+            value = claims.get(key)
+            if value not in (None, ""):
+                out.append(f"{indent}  {key}: {_truncate_for_human(str(value))}")
+        if burn.get("note"):
+            out.append(f"{indent}  {_truncate_for_human(str(burn['note']))}")
 
     return out
 

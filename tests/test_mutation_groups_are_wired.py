@@ -31,11 +31,18 @@ _WORKFLOW = _ROOT / ".github" / "workflows" / "mutation.yml"
 
 
 def _script_groups() -> set[str]:
-    """Every group `group_files()` can resolve — the source of truth for what exists."""
+    """Every group `group_files()` can resolve — the source of truth for what exists.
+
+    `[a-z0-9_]+`, not `[a-z]+`: a group named with a digit or underscore (`spv2`, `eth_leg`)
+    would be invisible to this parser while matching `group_files()` itself — the same blind
+    spot `scripts/derive_mutation_test_lists.py`'s parser had, until both were widened together.
+    `test_the_derivation_and_this_guard_parse_the_same_group_names` below pins that they stay in
+    sync.
+    """
     body = _SCRIPT.read_text()
     start = body.index("group_files()")
     end = body.index("}", body.index("case", start))
-    return set(re.findall(r"^\s{4}([a-z]+)\)", body[start:end], re.M))
+    return set(re.findall(r"^\s{4}([a-z0-9_]+)\)", body[start:end], re.M))
 
 
 def _meta_groups() -> set[str]:
@@ -101,6 +108,58 @@ def test_every_group_is_reachable_through_a_META_group() -> None:
     )
 
 
+def _derived_groups() -> set[str]:
+    """Every group name `scripts/derive_mutation_test_lists.py` sees, by actually RUNNING it —
+    not by re-typing its regex here, which would just be a second hand-kept copy that could drift
+    from the real one exactly as the two regexes already had.
+
+    It needs a coverage.py sqlite database to open; a real one records real test executions this
+    guard does not need, so a schema-only, all-empty one is created instead — the derivation only
+    consults `file`/`context`/`arc` for their COLUMNS, and an empty `arc` table simply means every
+    module gets no coverage-ranked tests, which is irrelevant to what this test checks: the SET OF
+    GROUP NAMES the derivation's parser extracts from `scripts/mutation_test.sh`, which is exactly
+    the top-level keys of its JSON output (see the unconditional `out[g] = {...}` in that file).
+    """
+    import json
+    import sqlite3
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        db_path = str(Path(d) / "empty-coverage.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE file (id INTEGER, path TEXT)")
+        conn.execute("CREATE TABLE context (id INTEGER, context TEXT)")
+        conn.execute("CREATE TABLE arc (file_id INTEGER, context_id INTEGER, tono INTEGER)")
+        conn.commit()
+        conn.close()
+        r = subprocess.run(
+            [sys.executable, str(_ROOT / "scripts" / "derive_mutation_test_lists.py"), db_path, str(_ROOT), "14"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return set(json.loads(r.stdout).keys())
+
+
+def test_the_derivation_and_this_guard_parse_the_same_group_names() -> None:
+    """`scripts/derive_mutation_test_lists.py` and this file's `_script_groups()` each parse
+    `scripts/mutation_test.sh`'s `group_files()` case statement with their OWN regex, and until
+    both were widened together, a group named with a digit or underscore (`spv2`, `eth_leg`) was
+    invisible to BOTH — the mechanism built to catch a gap shared the exact gap it existed to
+    catch. Run the real derivation (rather than re-implementing its regex here) and assert its
+    group names match this file's independent parse, so the two cannot silently drift apart
+    again — whichever one is right, a difference means one of them stopped seeing a group."""
+    derived = _derived_groups()
+    wired = _script_groups()
+    assert derived, "the derivation produced no groups at all — it is broken, not empty by design"
+    assert derived == wired, (
+        f"derive_mutation_test_lists.py and _script_groups() disagree on what groups exist: "
+        f"only in the deriver: {sorted(derived - wired)}; only in _script_groups(): "
+        f"{sorted(wired - derived)}"
+    )
+
+
 def test_a_threshold_names_a_group_that_exists() -> None:
     """The generator refuses to emit a floor for a group that is not in VALUE_GROUPS, because a
     `MUTATION_MIN_KILL_PCT` attached to a name nothing matches is silently no-op: the group runs
@@ -136,7 +195,7 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
     """
     doc = _ROOT / "docs" / "how-to" / "mutation-testing.md"
     body = doc.read_text()
-    documented = set(re.findall(r"^poetry run task mutate ([a-z]+)", body, re.M))
+    documented = set(re.findall(r"^poetry run task mutate ([a-z0-9_]+)", body, re.M))
     expected = _script_groups()
     assert expected, "no groups parsed from mutation_test.sh — the derivation broke, not the doc"
 
@@ -153,11 +212,197 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
 
     # The prose count is a fourth statement of the same fact, and it is the one that read
     # "eight" against twelve for four groups' worth of drift.
-    stated = re.search(r"the ([a-z]+) value-moving groups", body)
+    # `[a-z-]+`, with the hyphen: the count passed fourteen and the spellings became compound
+    # ("twenty-three"), which `[a-z]+` cannot match — so the guard reported "the page no longer
+    # states how many" when the page stated it perfectly well. A pattern that stops matching as
+    # the thing it guards grows is a guard with an expiry date.
+    stated = re.search(r"the ([a-z-]+) value-moving groups", body)
     assert stated, "the page no longer states how many value-moving groups there are"
-    words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen"}
+    words = {
+        8: "eight",
+        9: "nine",
+        10: "ten",
+        11: "eleven",
+        12: "twelve",
+        13: "thirteen",
+        14: "fourteen",
+        15: "fifteen",
+        16: "sixteen",
+        17: "seventeen",
+        18: "eighteen",
+        19: "nineteen",
+        20: "twenty",
+        21: "twenty-one",
+        22: "twenty-two",
+        23: "twenty-three",
+        24: "twenty-four",
+        25: "twenty-five",
+        26: "twenty-six",
+        27: "twenty-seven",
+        28: "twenty-eight",
+        29: "twenty-nine",
+        30: "thirty",
+    }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
     assert stated.group(1) == want, (
         f"the page says '{stated.group(1)} value-moving groups'; VALUE_GROUPS holds {len(_value_groups())} ({want})"
+    )
+
+
+def test_every_mutated_module_runs_its_own_dedicated_test() -> None:
+    """A group's test list must include each module's OWN test file, if one exists.
+
+    THE FAILURE THIS CATCHES COST EIGHTEEN HOURS OF COMPUTE. The ten newest groups had their test
+    lists derived by counting how many of the group's modules each test file imports and taking
+    the top N. That ranking is exactly backwards for relevance: a single-purpose test like
+    `test_glyph_royalty.py` imports ONE module and scores 1, while a broad one like
+    `test_fuzz_parsers.py` imports five and scores 5 — so the cap dropped precisely the tests that
+    constrain a module best. 27 modules lost their own test that way.
+
+    The results looked like devastating coverage findings and were measurement artifacts:
+    `hash` scored 0% killed over 1,400 mutants because `tests/test_hash.py` never ran;
+    `glyph/royalty` and `glyph/credential_binding` scored 0% for the same reason. A mutation score
+    is only a statement about the tests you actually ran.
+
+    Derived, not hand-kept: the pairing is "a test whose filename stem contains the module's leaf
+    name", computed from the tree. A module with no such file is not an error — plenty are covered
+    only by broader suites — this asserts that where a dedicated test EXISTS, it is in the list.
+    """
+    mods, tests = {}, {}
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', line)
+        if not m:
+            continue
+        items = m.group(2).split()
+        if not items or all(re.fullmatch(r"[\d.]+", i) for i in items):
+            continue
+        (tests if items[0].startswith("tests/") else mods)[m.group(1)] = items
+
+    assert mods, "no module lists parsed — the derivation broke, not the script"
+    test_files = {p.as_posix() for p in (_ROOT / "tests").rglob("test_*.py")}
+    assert len(test_files) > 100, f"only {len(test_files)} test files found — the scan is wrong"
+
+    missing = []
+    for group, modules in mods.items():
+        listed = set(tests.get(group, ()))
+        for module in modules:
+            parts = module.split("/")
+            leaf = parts[-1]
+            wanted = (
+                {f"tests/test_{leaf}.py"}
+                if len(parts) == 1
+                else {
+                    f"tests/test_{'_'.join(parts[:-1])}_{leaf}.py",
+                    f"tests/{'/'.join(parts[:-1])}/test_{leaf}.py",
+                    f"tests/test_{parts[-2]}_{leaf}.py",
+                }
+            )
+            dedicated = {t.replace(f"{_ROOT.as_posix()}/", "") for t in test_files} & wanted
+            if dedicated and not (dedicated & listed):
+                missing.append(f"{group}: {module} (has {sorted(dedicated)[0]})")
+
+    assert not missing, (
+        "these mutation groups do not run the module's own test file, so the module is mutated "
+        "against tests that were never written for it — a low kill rate would be an artifact, not "
+        "a finding:\n  " + "\n  ".join(sorted(missing))
+    )
+
+
+def test_every_test_file_a_group_names_actually_EXISTS() -> None:
+    """`tests/test_htlc_spend.py` was deleted by #518 and stayed in the `script` and `transaction`
+    lists for four months. Nothing said so: every other guard here checks that GROUPS line up with
+    each other, and none checked that the paths resolve to files on disk.
+
+    It fails closed rather than silently — `pytest` answers a missing path with **exit 4, a usage
+    error, even when real files are named alongside it**, so the harness's clean-suite baseline
+    refuses the group. That is the right direction (cosmic-ray reads a non-zero exit as "mutant
+    killed", so a collectable-but-red list would have scored 100% and been a complete fiction) but
+    it is only discovered by trying to run the group, and these two had not been run since.
+
+    Derived from the script, so a new group is covered the moment it is added."""
+    gaps_m = re.search(r'^GAPS="([^"]*)"', _SCRIPT.read_text(encoding="utf-8"), re.M)
+    assert gaps_m, "GAPS is no longer a simple double-quoted assignment; this expansion is stale"
+    expansions = {"$GAPS": gaps_m.group(1).split()}
+
+    missing: list[str] = []
+    checked = 0
+    for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        if not m:
+            continue
+        group = m.group(1)
+        for token in m.group(2).split():
+            for path in expansions.get(token, [token]):
+                if not path.startswith("tests/"):
+                    continue
+                checked += 1
+                if not (_ROOT / path).exists():
+                    missing.append(f"{group}: {path}")
+
+    # Non-vacuity: if the parse stops matching, "no missing files" must not read as success.
+    assert checked > 100, (
+        f"only {checked} test paths parsed out of scripts/mutation_test.sh — the case-line regex "
+        "has stopped matching and this guard is passing over nothing"
+    )
+    assert not missing, (
+        "these mutation groups name test files that do not exist, so `pytest` exits 4 and the "
+        "group cannot run at all:\n  " + "\n  ".join(sorted(missing))
+    )
+
+
+def _declared_mutation_targets() -> dict[str, set[str]]:
+    """test file -> modules it declares via a module-level ``MUTATION_TARGETS`` list."""
+    import ast
+
+    out: dict[str, set[str]] = {}
+    for path in sorted((_ROOT / "tests").rglob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - unreadable test file
+            continue
+        for node in tree.body:  # module level only
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "MUTATION_TARGETS" for t in node.targets):
+                continue
+            if isinstance(node.value, ast.List | ast.Tuple | ast.Set):
+                mods = {e.value for e in node.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+                if mods:
+                    out[path.relative_to(_ROOT).as_posix()] = mods
+    return out
+
+
+def test_a_declared_mutation_target_names_a_module_that_EXISTS() -> None:
+    """``MUTATION_TARGETS`` exists because neither derivation signal can see some tests: one
+    named after a function, whose coverage is unremarkable because a weaker test already runs
+    the same lines. Coverage cannot observe assertions, so such a test must declare itself.
+
+    A declaration pointing at a module that was renamed or deleted is a check that has
+    silently stopped running — the deriver would add the test to no group at all."""
+    declared = _declared_mutation_targets()
+    assert declared, (
+        "no test declares MUTATION_TARGETS any more. Either the convention was removed (then "
+        "delete this guard and the deriver's scanner) or the declarations were lost."
+    )
+    bad = [
+        f"{test} -> {mod}"
+        for test, mods in declared.items()
+        for mod in sorted(mods)
+        if not (_ROOT / "src" / "pyrxd" / f"{mod}.py").exists()
+    ]
+    assert not bad, "MUTATION_TARGETS naming modules that do not exist:\n  " + "\n  ".join(bad)
+
+
+def test_a_declared_test_actually_REACHES_a_mutation_group() -> None:
+    """The other direction. Declaring a target is pointless if the module belongs to no group,
+    or if the regenerated lists were never applied to the script — the declaration would look
+    like protection while changing nothing."""
+    declared = _declared_mutation_targets()
+    script = _SCRIPT.read_text(encoding="utf-8")
+    missing = [f"{test} (declares {sorted(mods)})" for test, mods in declared.items() if test not in script]
+    assert not missing, (
+        "these tests declare MUTATION_TARGETS but no group's test list names them, so the "
+        "declaration does nothing. Re-run scripts/derive_mutation_test_lists.py and apply the "
+        "result to scripts/mutation_test.sh:\n  " + "\n  ".join(missing)
     )

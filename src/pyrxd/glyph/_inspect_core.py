@@ -34,6 +34,7 @@ its structured-dict response.
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Mapping, Sequence
 
 from ..hash import hash256
 from ..script.hashmark import (
@@ -46,7 +47,7 @@ from ..script.message import MessageOutcome, decode_message
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
-from .relationships import verify_relationship_claims
+from .relationships import delegate_burn_refs, verify_relationship_claims
 from .types import GlyphProtocol
 
 # --- Length / shape constants ----------------------------------------------
@@ -84,6 +85,13 @@ _MAX_OUTPUT_COUNT = 100_000
 # JSON mode preserves the full string (still ASCII-safe via ensure_ascii).
 _HUMAN_STRING_CAP = 200
 
+#: How many publisher-chosen entries one envelope may render before the rest are summarised.
+#: An update envelope's KEY SET is chosen by whoever published the transaction, and nothing caps
+#: it: a 256 KB payload of one-byte keys renders tens of thousands of lines, pushing the verified
+#: facts above it off the operator's screen. The cap is on the count only - what is dropped is
+#: always stated, because a silent truncation reads as "that was everything".
+_HUMAN_ENTRY_CAP = 32
+
 
 # Unicode general categories that must NOT reach a terminal: control (Cc),
 # format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
@@ -91,6 +99,27 @@ _HUMAN_STRING_CAP = 200
 # marks (Mn/Me — overlay glyphs onto the previous char). This subsumes the
 # explicit bidi-override / BOM allow-list the previous version maintained.
 _UNICODE_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Zl", "Zp", "Mn", "Me"})
+
+
+def _sanitize_update_fields(fields: dict) -> dict:
+    """Sanitise a partial-update CBOR map for display — KEYS as well as values.
+
+    An update envelope's keys are chosen by whoever published the transaction, exactly like its
+    values, and they land in terminal output beside verified facts. Sanitising only the values
+    would leave the ANSI injection in the key.
+
+    Nested one level, because that is where the interesting content is (`attrs.target`). Deeper
+    structures are rendered as their repr and sanitised whole rather than walked — an attacker
+    choosing the nesting depth should not choose how much work this does.
+    """
+    out: dict = {}
+    for k, v in fields.items():
+        key = _sanitize_display_string(str(k))
+        if isinstance(v, dict):
+            out[key] = {_sanitize_display_string(str(ik)): _sanitize_display_string(str(iv)) for ik, iv in v.items()}
+        else:
+            out[key] = _sanitize_display_string(str(v))
+    return out
 
 
 def _sanitize_display_string(s: str) -> str:
@@ -351,7 +380,13 @@ def _address_for(hash160_hex: str | None, network: str) -> str | None:
 
 def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
+    from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
+
+    # Function-local for the same reason as the authority import below: the
+    # Pyodide module budget covers what `pyrxd.glyph.inspect` loads at IMPORT,
+    # and burn decoding is only needed once an output turns out to be one.
+    from .burn import parse_burn_proof
     from .dmint import DmintState
     from .script import (
         MUTABLE_NFT_SCRIPT_RE,
@@ -361,13 +396,20 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
         extract_payload_hash_from_commit_script,
         extract_ref_from_ft_script,
         extract_ref_from_nft_script,
+        is_authority_gated_script,
         is_commit_ft_script,
         is_commit_nft_script,
+        is_delegate_token_script,
         is_ft_script,
         is_nft_script,
+        parse_authority_gated_script,
+        parse_dat_commit_script,
+        parse_delegate_burn_script,
         parse_legacy_container_script,
         parse_mutable_nft_script,
+        split_delegate_commit_prefix,
     )
+    from .types import GlyphRef
 
     try:
         script = bytes.fromhex(script_hex)
@@ -425,6 +467,27 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
             }
             if msg.ok:
                 out["type"] = "op_return-msg"
+
+        # A Glyph BURN proof. Refines `op_return` the way the message and
+        # HashMark decoders do. Everything in it is operator CBOR — the ref it
+        # names, the amount, the reason — so it is emitted under `claims` and
+        # the note says what is missing to turn it into a verdict.
+        proof = parse_burn_proof(script)
+        if proof is not None:
+            out["type"] = "op_return-burn"
+            out["burn"] = {
+                "claims": {
+                    "token_ref": _sanitize_display_string(proof.token_ref),
+                    "action": _sanitize_display_string(proof.action),
+                    "amount": proof.amount,
+                    "reason": _sanitize_display_string(proof.reason) if proof.reason else "",
+                },
+                "note": (
+                    "a burn proof is an OP_RETURN and anyone can write one about any token — "
+                    "it is only a burn if this transaction also SPENT that token and no output "
+                    "carries it; see verify_burn"
+                ),
+            }
 
         mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
@@ -496,6 +559,59 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
             "owner_pkh": bytes(pkh).hex(),
         }
 
+    # An authority-gated NFT: 101 bytes, the item's singleton behind an
+    # OP_REQUIREINPUTREF on the issuer's authority ref. Without this branch it
+    # reads as "unknown", and the note below is the part that matters — the gate
+    # is strippable by the holder, so seeing one here says the item is gated NOW,
+    # not that it was minted under that authority.
+    if is_authority_gated_script(script_hex):
+        gate_ref, item_ref, gate_pkh = parse_authority_gated_script(script)  # type: ignore[misc]
+        return {
+            **base,
+            "type": "authority-gated-nft",
+            "ref_txid": item_ref.txid,
+            "ref_vout": item_ref.vout,
+            "ref_outpoint": f"{item_ref.txid}:{item_ref.vout}",
+            "owner_pkh": bytes(gate_pkh).hex(),
+            "authority_ref": f"{gate_ref.txid}:{gate_ref.vout}",
+            "note": (
+                "gated on this authority NOW — the holder can transfer to a plain NFT script and "
+                "drop the gate, so this is not proof it was MINTED under that authority; read the "
+                "genesis transaction for that"
+            ),
+        }
+
+    # A delegate token is 63 bytes of <ref opcode> <ref> OP_DROP + P2PKH — the
+    # SAME shape as the NFT singleton above, differing only in the opcode
+    # (0xd0 vs 0xd8). Without this branch it falls through to "unknown", and a
+    # holder inspecting their own wallet cannot tell a mint authorisation from
+    # an unrecognised output. It is token-bearing: spending it as ordinary
+    # funding destroys the delegate.
+    if is_delegate_token_script(script_hex):
+        ref = GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH])
+        return {
+            **base,
+            "type": "delegate-token",
+            "ref_txid": ref.txid,
+            "ref_vout": ref.vout,
+            "ref_outpoint": f"{ref.txid}:{ref.vout}",
+            "owner_pkh": script[41:61].hex(),
+            "delegate_base_ref": f"{ref.txid}:{ref.vout}",
+        }
+
+    burned = parse_delegate_burn_script(script)
+    if burned is not None:
+        burned_ref = GlyphRef.from_bytes(burned)
+        return {
+            **base,
+            "type": "delegate-burn",
+            "spendable": False,
+            "ref_txid": burned_ref.txid,
+            "ref_vout": burned_ref.vout,
+            "ref_outpoint": f"{burned_ref.txid}:{burned_ref.vout}",
+            "delegate_base_ref": f"{burned_ref.txid}:{burned_ref.vout}",
+        }
+
     if is_ft_script(script_hex):
         ref = extract_ref_from_ft_script(script)
         pkh = extract_owner_pkh_from_ft_script(script)
@@ -541,21 +657,52 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 "payload_hash": payload_hash.hex(),
             }
 
+    # DAT commit: no OP_REFTYPE_OUTPUT block, so its reveal mints nothing. It is
+    # checked BEFORE the NFT/FT commit branches only for readability — the three
+    # regexes are disjoint, and the test suite pins that they are.
+    parsed_dat = parse_dat_commit_script(script)
+    if parsed_dat is not None:
+        dat_hash, dat_pkh = parsed_dat
+        _delegate_ref, _core = split_delegate_commit_prefix(script)
+        row = {
+            **base,
+            "type": "commit-dat",
+            "payload_hash": dat_hash.hex(),
+            "owner_pkh": bytes(dat_pkh).hex(),
+            "note": "a DAT reveal creates no token — the payload in its scriptSig is the whole point",
+        }
+        if _delegate_ref is not None:
+            row["delegate_base_ref"] = f"{_delegate_ref.txid}:{_delegate_ref.vout}"
+        return row
+
     if is_commit_nft_script(script_hex):
-        return {
+        # `split_delegate_commit_prefix` recovers the base ref from ALL THREE commit
+        # types, but only the DAT branch used to emit it — the one commit type whose
+        # reveal mints nothing. So a 131-byte delegate-bound NFT commit, whose reveal
+        # the covenant REJECTS without a burn output naming that base, rendered
+        # identically to a plain 75-byte one on both surfaces.
+        _dnft, _ = split_delegate_commit_prefix(script)
+        row = {
             **base,
             "type": "commit-nft",
             "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
             "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
         }
+        if _dnft is not None:
+            row["delegate_base_ref"] = f"{_dnft.txid}:{_dnft.vout}"
+        return row
 
     if is_commit_ft_script(script_hex):
-        return {
+        _dft, _ = split_delegate_commit_prefix(script)
+        row = {
             **base,
             "type": "commit-ft",
             "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
             "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
         }
+        if _dft is not None:
+            row["delegate_base_ref"] = f"{_dft.txid}:{_dft.vout}"
+        return row
 
     # Time-locked P2PKH (CLTV absolute / CSV relative). Exact template parse
     # against pyrxd.script.timelock's builders — these are the HTLC refund
@@ -796,7 +943,14 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
-def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None, network: str = "mainnet") -> dict:
+def _classify_raw_tx(
+    txid_hex: str,
+    raw: bytes,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
+) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
     Synchronous, network-free core. The CLI's ``--fetch`` path wraps this
@@ -905,6 +1059,50 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
     mint_scriptsig: dict | None = None
     if scriptsigs:
         mint_scriptsig = inspector.parse_mint_scriptsig(scriptsigs[0])
+    # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
+    # token payload here", and returns None both for "no glyph" and for "a glyph I could not
+    # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on
+    # mainnet (`custodian-gate-x7f3.rxd`): three of its four transactions carry the `gly` marker
+    # and this path rendered one, while the two that MOVED where the name points rendered blank.
+    #
+    # Reported for every input, not just the first, and an envelope that neither reader accepts
+    # is reported as UNREADABLE rather than omitted — "I cannot read this" and "there is nothing
+    # here" are opposite facts and the blind one is the more reassuring.
+    glyph_envelopes: list[dict] = []
+    for idx, ss in enumerate(scriptsigs):
+        env = inspector.classify_glyph_scriptsig(ss)
+        if env is None:
+            continue
+        if env.kind == "payload":
+            # ONLY when the OTHER reader actually rendered it. `find_reveal_metadata` walks
+            # `_parse_reveal_scriptsig`, which was NOT unified with `_walk_pushes` - it breaks on
+            # `OP_0` where the new walker treats it as an empty push. So for a push-only scriptSig
+            # with one leading zero byte, classify sees a payload, extract sees nothing, and
+            # skipping here on the assumption that the metadata block will render it meant a glyph
+            # reveal rendered as NOTHING AT ALL - the blindness this whole surface exists to end,
+            # reintroduced one layer up. When the two disagree, say so rather than trusting either.
+            if found is not None and found[0] == idx:
+                continue
+            glyph_envelopes.append(
+                {
+                    "input_index": idx,
+                    "kind": "payload_unrendered",
+                    "reason": _sanitize_display_string(
+                        "this input carries a full glyph payload that the reveal reader did not "
+                        "return — the two readers disagree about these bytes"
+                    ),
+                }
+            )
+            continue
+        entry: dict = {"input_index": idx, "kind": env.kind}
+        if env.kind == "update":
+            # Attacker-authored CBOR landing in terminal output: same sanitisation rule as every
+            # other indexer/chain string here, applied to keys AND values.
+            entry["fields"] = _sanitize_update_fields(env.fields or {})
+        else:
+            entry["reason"] = _sanitize_display_string(env.reason)
+        glyph_envelopes.append(entry)
+
     metadata_payload: dict | None = None
     if found is not None:
         input_idx, metadata = found
@@ -942,16 +1140,33 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
         # parent appearing under one of those means the transaction spent it. The
         # other two operand-carrying opcodes prove nothing and are discarded — see
         # `output_ref_operands`.
-        rel = verify_relationship_claims(metadata, [bytes(o.locking_script.serialize()) for o in tx.outputs])
+        output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
+        rel = verify_relationship_claims(metadata, output_scripts, delegated_refs=delegated_refs)
         if rel:
             metadata_payload["relationships"] = [
                 {
                     "kind": v.kind.value,
                     "ref": f"{v.ref.txid}:{v.ref.vout}",
-                    "outcome": v.outcome.value,
+                    "ok": v.ok,
+                    "basis": v.basis.value,
+                    "reason": v.reason,
                 }
                 for v in rel
             ]
+        # A claim may instead be authorised by a DELEGATE, which this function
+        # cannot resolve: it is handed a pre-fetched transaction and has no way
+        # to fetch the base whose refs the burn points at. So report what is
+        # visible rather than letting "unbacked" stand as the whole story — an
+        # UNBACKED verdict beside a burned base ref means "not resolved here",
+        # not "forged", and a reader who cannot see the second fact will draw
+        # the wrong conclusion from the first.
+        from .types import GlyphRef
+
+        burns = delegate_burn_refs(output_scripts)
+        if burns:
+            metadata_payload["delegate_burns"] = sorted(
+                f"{GlyphRef.from_bytes(b).txid}:{GlyphRef.from_bytes(b).vout}" for b in burns
+            )
 
         # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
         # something to say. Emitting an empty dict unconditionally made "flagged" and
@@ -977,6 +1192,44 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
                 "cek_hash": _sanitize_display_string(tl.cek_hash),
                 "hint": _sanitize_display_string(tl.hint) if tl.hint else "",
             }
+        # Imported HERE, not at module scope. `pyrxd.glyph.inspect` is loaded in
+        # the browser under Pyodide and `test_inspect_imports_pyodide_clean`
+        # holds it to a module budget; authority decoding is not needed to
+        # import the facade, only to classify a token that declares it.
+        from .authority import is_authority, is_authority_expired, read_authority_attrs, validate_authority
+
+        # AUTHORITY: report the issuer and permissions, and say what they are.
+        # The classifier already labelled this "authority"; that label is a
+        # protocol MARKER, which anyone can write. Everything here is likewise
+        # operator CBOR, so it is emitted under `claims` and paired with the
+        # metadata problems `validate_authority` found — an authority whose
+        # issuer is missing or whose expiry does not parse still classifies as
+        # one, and a reader shown only the label would not know.
+        if is_authority(metadata):
+            attrs = read_authority_attrs(metadata)
+            problems = validate_authority(metadata)
+            authority_payload: dict = {
+                "claims": {
+                    "issuer": _sanitize_display_string(attrs.issuer) if attrs else "",
+                    "scope": _sanitize_display_string(attrs.scope) if attrs and attrs.scope else "",
+                    "permissions": [_sanitize_display_string(p) for p in (attrs.permissions if attrs else ())],
+                    "expires": _sanitize_display_string(attrs.expires) if attrs and attrs.expires else "",
+                    "revocable": attrs.revocable if attrs else True,
+                },
+                "expired": is_authority_expired(metadata),
+            }
+            if problems:
+                # SANITISED LIKE EVERY SIBLING IN `claims`. `validate_authority` embeds the raw
+                # attacker-chosen `expires` with `!r`, and `repr()` escapes format characters but
+                # NOT combining marks — measured, 40 of them survive a repr that strips the bidi
+                # override beside them. This was the one field in the block that skipped the
+                # sanitiser, harmless only because nothing rendered it; rendering it makes that
+                # live, so it is fixed in the same change.
+                authority_payload["problems"] = [
+                    _truncate_for_human(_sanitize_display_string(str(p))) for p in problems
+                ]
+            metadata_payload["authority"] = authority_payload
+
         if metadata.main is not None:
             from ..hash import sha256
 
@@ -1024,6 +1277,9 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None,
         "output_count": len(tx.outputs),
         "outputs": output_rows,
         "metadata": metadata_payload,
+        # Glyph envelopes that are NOT full payloads: updates, and envelopes that
+        # could not be read. Empty list when the transaction carries neither.
+        "glyph_envelopes": glyph_envelopes,
         "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }

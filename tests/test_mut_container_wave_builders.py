@@ -19,6 +19,7 @@ from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import encode_payload
 from pyrxd.glyph.script import (
     MUTABLE_NFT_SCRIPT_RE,
+    build_authority_gated_nft_script,
     build_mutable_nft_script,
     build_nft_locking_script,
     is_legacy_container_script,
@@ -56,6 +57,11 @@ CONTAINER_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.CONTAINER], "container-
 WAVE_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], "myname.rxd")
 
 BUILDER = GlyphBuilder()
+#: The container's own current locking script. A plain NFT here; the gated case is
+#: exercised by test_a_gated_container_is_re_emitted_verbatim below.
+CONTAINER_SCRIPT = build_nft_locking_script(PKH, REF)
+#: An issuer authority the gated-container fixture points at.
+AUTHORITY_REF = GlyphRef(txid=Txid("ab" * 32), vout=0)
 INSPECTOR = GlyphInspector()
 
 
@@ -234,11 +240,15 @@ class TestPrepareContainerChildReveal:
     """
 
     def test_returns_container_child_reveal_scripts(self):
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, PKH)
+        result = BUILDER.prepare_container_child_reveal(
+            TXID2, 1, CHILD_CBOR, PKH, REF, container_script=CONTAINER_SCRIPT
+        )
         assert isinstance(result, ContainerChildRevealScripts)
 
     def test_child_script_is_a_plain_63_byte_nft_on_its_own_ref(self):
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, PKH)
+        result = BUILDER.prepare_container_child_reveal(
+            TXID2, 1, CHILD_CBOR, PKH, REF, container_script=CONTAINER_SCRIPT
+        )
         assert result.nft_script == build_nft_locking_script(PKH, GlyphRef(txid=Txid(TXID2), vout=1))
 
     def test_container_output_recreates_the_container_unchanged(self):
@@ -246,13 +256,45 @@ class TestPrepareContainerChildReveal:
 
         If it were not, the reveal would move or re-own the collection as a side
         effect of minting a member.
+
+        This assertion used to compare the rebuilt script against THE SAME
+        REBUILD, with a plain-NFT fixture — self-consistent, and unable to fail.
+        It now compares against the script handed in.
         """
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, PKH)
-        assert result.container_script == build_nft_locking_script(PKH, REF)
+        result = BUILDER.prepare_container_child_reveal(
+            TXID2, 1, CHILD_CBOR, PKH, REF, container_script=CONTAINER_SCRIPT
+        )
+        assert result.container_script == CONTAINER_SCRIPT
+
+    def test_a_gated_container_is_re_emitted_VERBATIM_not_rebuilt(self):
+        """The defect the plain-NFT fixture could not express.
+
+        A container that carries a covenant — authority-gated here, but mutable
+        and soulbound have the same shape — used to come back as a plain 63-byte
+        NFT: same ref, covenant gone, in the one transaction whose stated purpose
+        is to leave the container untouched. Re-gating needs the issuer, so a
+        holder could not undo it.
+        """
+        gated = build_authority_gated_nft_script(PKH, REF, AUTHORITY_REF)
+        assert len(gated) != len(build_nft_locking_script(PKH, REF)), (
+            "fixture no longer discriminates: the gated script must differ from a plain NFT"
+        )
+        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, container_script=gated)
+        assert result.container_script == gated, "the container's covenant was stripped"
+
+    def test_a_container_script_that_does_not_carry_the_ref_is_refused(self):
+        """Passing the wrong script is the same loss by a different route, so the
+        cross-check is on the ref the script must actually HOLD (0xd0/0xd8), not
+        on its length or shape."""
+        wrong = build_nft_locking_script(PKH, GlyphRef(txid=Txid("cc" * 32), vout=3))
+        with pytest.raises(ValidationError, match="does not carry"):
+            BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, container_script=wrong)
 
     def test_container_output_can_be_re_owned_deliberately(self):
         other = Hex20(bytes.fromhex("dd" * 20))
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, other)
+        result = BUILDER.prepare_container_child_reveal(
+            TXID2, 1, CHILD_CBOR, PKH, REF, container_script=build_nft_locking_script(other, REF)
+        )
         assert result.container_script == build_nft_locking_script(other, REF)
 
     def test_refuses_an_envelope_that_does_not_declare_the_container(self):
@@ -261,23 +303,23 @@ class TestPrepareContainerChildReveal:
         screen."""
         plain = _cbor([GlyphProtocol.NFT], "no-membership")
         with pytest.raises(ValidationError, match="does not contain the container ref"):
-            BUILDER.prepare_container_child_reveal(TXID2, 1, plain, PKH, REF, PKH)
+            BUILDER.prepare_container_child_reveal(TXID2, 1, plain, PKH, REF, container_script=CONTAINER_SCRIPT)
 
     def test_refuses_an_envelope_declaring_a_different_container(self):
         elsewhere = _cbor_child([GlyphProtocol.NFT], "other", container_refs=[CHILD_REF])
         with pytest.raises(ValidationError, match="does not contain the container ref"):
-            BUILDER.prepare_container_child_reveal(TXID2, 1, elsewhere, PKH, REF, PKH)
+            BUILDER.prepare_container_child_reveal(TXID2, 1, elsewhere, PKH, REF, container_script=CONTAINER_SCRIPT)
 
     def test_refuses_a_non_nft_envelope(self):
         ft = _cbor([GlyphProtocol.FT], "ft")
         with pytest.raises(ValidationError, match="NFT"):
-            BUILDER.prepare_container_child_reveal(TXID2, 1, ft, PKH, REF, PKH)
+            BUILDER.prepare_container_child_reveal(TXID2, 1, ft, PKH, REF, container_script=CONTAINER_SCRIPT)
 
     def test_accepts_a_tag64_wrapped_membership_entry(self):
         """Some cbor-x producers tag byte strings; the cross-check must see
         through that rather than reject a valid envelope."""
         payload = cbor2.dumps({"p": [int(GlyphProtocol.NFT)], "in": [cbor2.CBORTag(64, REF.to_bytes())]})
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, PKH)
+        result = BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, container_script=CONTAINER_SCRIPT)
         assert result.container_ref == REF
 
     @pytest.mark.parametrize(
@@ -297,10 +339,12 @@ class TestPrepareContainerChildReveal:
         contract is ValidationError — either way the caller learns nothing."""
         payload = cbor2.dumps({"p": [int(GlyphProtocol.NFT)], "in": bad_in})
         with pytest.raises(ValidationError, match="does not contain the container ref"):
-            BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, PKH)
+            BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, container_script=CONTAINER_SCRIPT)
 
     def test_scriptsig_suffix_contains_gly(self):
-        result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, PKH)
+        result = BUILDER.prepare_container_child_reveal(
+            TXID2, 1, CHILD_CBOR, PKH, REF, container_script=CONTAINER_SCRIPT
+        )
         assert b"gly" in result.scriptsig_suffix
 
 

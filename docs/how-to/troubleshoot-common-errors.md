@@ -96,7 +96,7 @@ error: Could not decrypt wallet file
 ```
 
 — `WalletDecryptError`'s default message
-([`src/pyrxd/cli/errors.py:120-125`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
+([`src/pyrxd/cli/errors.py:126-131`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
 **Verified:** the CLI's wallet loader deliberately discards the library's
 more specific decrypt-failure message (which, called directly, includes an
 NFKD hint pointing at this exact cause) and always re-raises this generic
@@ -164,7 +164,7 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
   fix: shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:239-258`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
+— [`src/pyrxd/cli/glyph_cmds.py:283-290`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
 (`src/pyrxd/glyph/fees.py:208-241`).
@@ -235,7 +235,7 @@ error: funding can't cover the mint reward + fee
   fix: fund the reward address with more plain RXD, or lower --fee-rate
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:1737-1742`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
+— [`src/pyrxd/cli/glyph_cmds.py:2670-2675`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
 Same caveat as item 4: `claim-dmint` has no `--fee-rate` flag either
 (verified) — the fix is really "fund more RXD," or lower the global fee rate
 via config/env.

@@ -298,7 +298,9 @@ class TestTheIntervalThatReachesTheGate:
             ),
         )
         coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # pre-fund ordering gate
-        coord._assert_eth_lock_timing_still_safe(now_unix_s=_NOW)  # post-confirm recheck
+        # `elapsed_blocks` is REQUIRED on the post-confirm recheck (#564) — production reads the
+        # covenant's real depth; 0 here because this probe is only about which INTERVAL arrives.
+        coord._assert_eth_lock_timing_still_safe(now_unix_s=_NOW, elapsed_blocks=0)
         return captured
 
     def test_both_coordinator_gate_calls_receive_the_fast_tail(self, monkeypatch) -> None:

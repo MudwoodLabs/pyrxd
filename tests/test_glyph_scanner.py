@@ -21,8 +21,8 @@ transaction named by ``ref.txid`` is modelling a chain that cannot exist.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -653,11 +653,26 @@ class TestRevealMetadataConcurrency:
     async def test_reveal_metadata_lookups_run_in_parallel(self):
         """Five distinct tokens, each needing a two-hop reveal lookup.
 
-        Parallel: 1 round of UTXO fetches + (commit fetch → history →
-        reveal fetch) all overlapping ≈ 3×latency. Serial: 1 + 5×2
-        ≈ 11×latency. The threshold sits between the two.
+        WHAT CHANGED AND WHY. This used to inject a 50 ms sleep per fetch and assert
+        ``elapsed < 6 * delay``. That measures the MACHINE, not the code: the ideal parallel
+        time is ~3x delay, so the threshold carried 150 ms of slack, and a loaded CI runner
+        spent it — the assertion failed at 830 ms on a green branch whose only change was to a
+        record sink. A check that fails for environmental reasons teaches people to re-run CI
+        without reading it, which is worse than not having it.
+
+        The property was never "it finishes quickly"; it was "the lookups OVERLAP". That is
+        directly observable: count how many fetches are in flight at once. No clock, no
+        threshold, and ``asyncio.sleep(0)`` — a bare yield — is enough for overlap to appear,
+        so the test also drops from ~155 ms to ~2 ms.
+
+        MEASURED PER PHASE, and that detail is load-bearing. A first version counted concurrency
+        across ALL fetches and **passed against the planted regression**: serialising the reveal
+        stage still leaves the earlier source-transaction ``gather`` fetching five at once, so
+        the whole-set peak stays at 5 either way. Split by phase, the regression is unmistakable:
+
+            shipped:  source=5  commit=5  reveal=5
+            serial:   source=5  commit=1  reveal=1
         """
-        delay = 0.05
         mints = [
             _Mint(
                 name=f"Parallel{i}",
@@ -673,28 +688,45 @@ class TestRevealMetadataConcurrency:
             tx_map[transfer_txid] = mint.transfer_tx_hex()
             utxos.append(UtxoRecord(tx_hash=transfer_txid, tx_pos=0, value=546, height=100))
 
+        # Derived from the fixture, not from hex prefixes: the phase a fetch belongs to is a
+        # fact about which mint it names, and a prefix rule would silently mis-bucket if the
+        # fixture's txids ever changed.
+        commit_txids = {m.commit_txid for m in mints}
+        reveal_txids = {m.reveal_txid for m in mints}
+
         base = _mock_client(utxos, tx_map, history_map)
         plain_get_transaction = base.get_transaction
+        in_flight: collections.Counter[str] = collections.Counter()
+        peak: collections.Counter[str] = collections.Counter()
 
-        async def _slow_get_transaction(txid):
-            await asyncio.sleep(delay)
-            return await plain_get_transaction(txid)
+        async def _tracking_get_transaction(txid):
+            phase = "commit" if txid in commit_txids else "reveal" if txid in reveal_txids else "source"
+            in_flight[phase] += 1
+            peak[phase] = max(peak[phase], in_flight[phase])
+            try:
+                await asyncio.sleep(0)  # yield only — overlap, not duration, is the signal
+                return await plain_get_transaction(txid)
+            finally:
+                in_flight[phase] -= 1
 
-        base.get_transaction = _slow_get_transaction
+        base.get_transaction = _tracking_get_transaction
 
         scanner = GlyphScanner(base)
-        t0 = time.monotonic()
         result = await scanner.scan_script_hash("cc" * 32)
-        elapsed = time.monotonic() - t0
 
         assert len(result) == 5
         assert all(r.metadata is not None for r in result)
-        assert elapsed < 6 * delay, (
-            f"scan_script_hash took {elapsed * 1000:.0f}ms for 5 glyphs at "
-            f"{delay * 1000:.0f}ms latency each; expected ~{3 * delay * 1000:.0f}ms "
-            "from overlapping gather() rounds. Reveal resolution may have "
-            "regressed to serial."
+        assert peak["source"] >= 2, (
+            "the source-transaction fetches did not overlap — the fixture is not exercising "
+            "the batched path at all, so the reveal assertions below would prove nothing"
         )
+        for phase in ("commit", "reveal"):
+            assert peak[phase] >= 2, (
+                f"{phase} lookups never overlapped (peak in flight: {peak[phase]}). "
+                "Reveal resolution has regressed to one-await-per-glyph; it must batch into a "
+                f"single gather() so latency is bounded by the slowest single resolution. "
+                f"Peaks by phase: {dict(peak)}"
+            )
 
     @pytest.mark.asyncio
     async def test_metadata_fetch_failure_does_not_break_other_glyphs(self):

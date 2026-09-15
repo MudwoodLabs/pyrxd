@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from coincurve import PrivateKey as CcPrivateKey
 from coincurve import PublicKey as CcPublicKey
+from coincurve.ecdsa import der_to_cdata
 
 from .aes_cbc import aes_decrypt_with_iv, aes_encrypt_with_iv
 from .base58 import base58check_encode
@@ -78,7 +79,28 @@ class PublicKey:
     def verify(self, signature: bytes, message: bytes, hasher: Callable[[bytes], bytes] | None = hash256) -> bool:
         """
         verify serialized ECDSA signature in bitcoin strict DER (low-s) format
+
+        A signature that is not parseable strict DER is a FALSE verification
+        result, not a crash. coincurve's parser raises a bare ``ValueError``
+        for one, and a bare ``ValueError`` is not an ``RxdSdkError`` — so it
+        escaped ``swap.partial._verify_owner_signature``, the maker-signature
+        re-check that ``accept_offer`` and ``take_rswp_order`` both cross, whose
+        CLI caller (``cli/swap_book_cmds._finish``) maps only ``RxdSdkError``.
+        It landed on ``cli/main.py``'s catch-all, so a counterparty sending
+        rubbish made pyrxd report an internal bug (exit 4) instead of
+        "this signature is invalid".
+
+        The catch is scoped to the DER parse ALONE rather than wrapped around
+        ``key.verify``, because that call raises the same ``ValueError`` type
+        for a message hash of the wrong width — a caller mistake (a ``hasher``
+        that does not return 32 bytes), not hostile input, and one that must
+        keep escaping. ``der_to_cdata`` is the exact function ``key.verify``
+        parses with, so this cannot refuse anything ``key.verify`` would accept.
         """
+        try:
+            der_to_cdata(signature)
+        except ValueError:
+            return False
         return self.key.verify(signature, message, hasher)
 
     def verify_recoverable(
@@ -254,33 +276,17 @@ class PrivateKey:
         if s == 0:
             raise ValueError("Invalid s value")
 
-        # Ensure the signature is canonical (low S value)
-        if s > curve.n // 2:
-            s = curve.n - s
-
-        # Convert r and s to bytes
-        r_bytes = r.to_bytes(32, "big")
-        s_bytes = s.to_bytes(32, "big")
-
-        # Add prefix if the MSB is set
-        if r_bytes[0] & 0x80:
-            r_bytes = b"\x00" + r_bytes
-        if s_bytes[0] & 0x80:
-            s_bytes = b"\x00" + s_bytes
-
-        # Serialize the signature in DER format
-        signature = (
-            b"\x30"
-            + (4 + len(r_bytes) + len(s_bytes)).to_bytes(1, "big")
-            + b"\x02"
-            + len(r_bytes).to_bytes(1, "big")
-            + r_bytes
-            + b"\x02"
-            + len(s_bytes).to_bytes(1, "big")
-            + s_bytes
-        )
-
-        return signature
+        # `serialize_ecdsa_der` enforces low-s AND minimal DER integer encoding, and it was
+        # already imported here. This function used to re-implement both and got the second
+        # one wrong: it encoded r and s as fixed 32-byte integers with no `lstrip(b"\x00")`.
+        # A redundant leading zero byte appears below 2**248 - but DER only FORBIDS it below
+        # 2**247, because the zero is legal (required, in fact) when the next byte has its
+        # high bit set. 2**247 is the threshold, not 2**248 as this comment first said:
+        # ~1/512 for r and ~1/256 for s (low-s halves s's range), about 1 signature in 171.
+        # Radiant applies SCRIPT_VERIFY_STRICTENC, mandatory under FORKID, so such a
+        # signature is not merely unusual - it cannot confirm. Measured against this
+        # project's own strict parser: 14 of 2000 rejected on the old code, 0 of 2000 here.
+        return serialize_ecdsa_der((r, s))
 
     def verify(self, signature: bytes, message: bytes, hasher: Callable[[bytes], bytes] | None = hash256) -> bool:
         """

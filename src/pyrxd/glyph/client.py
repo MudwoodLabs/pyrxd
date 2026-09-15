@@ -839,9 +839,13 @@ class GlyphClient:
         What the reveal path does with that is show it. The returned plan carries
         :attr:`~pyrxd.glyph.timelock_reveal_tx.TimelockRevealPlan.judged_at` — the reading
         actually compared against — and ``pyrxd glyph timelock-reveal`` prints it beside
-        ``opens at`` in the confirmation prompt, so the operator can disagree with a number
-        that would otherwise never have been on screen. An SDK caller who needs more than
-        that should pass a clock they trust to
+        ``opens at`` in the pre-broadcast summary, so the operator can disagree with a number
+        that would otherwise never have been on screen. "Summary", not "prompt": under
+        ``--yes`` there is no question, and for a while that meant no summary either, which
+        made this whole sentence true only of the interactive run. It is now printed on every
+        path that can broadcast — stdout in human mode, stderr under ``--json``/``--quiet`` —
+        and recorded again on the receipt afterwards. An SDK caller who needs more than that
+        should pass a clock they trust to
         :func:`~pyrxd.glyph.timelock_reveal_tx.plan_timelock_reveal` directly.
 
         Everything the plan is checked for happens in the underlying function; see its

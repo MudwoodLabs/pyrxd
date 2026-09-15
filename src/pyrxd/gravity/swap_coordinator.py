@@ -2269,7 +2269,7 @@ class SwapCoordinator:
         return self.record
 
     # -- post-asset-lock re-validation (H4 b) -------------------------------
-    def _assert_eth_lock_timing_still_safe(self, *, now_unix_s: int | None) -> None:
+    def _assert_eth_lock_timing_still_safe(self, *, now_unix_s: int | None, elapsed_blocks: int) -> None:
         """Post-confirm cross-clock recheck (audit re-verify HIGH) — the bridge's prescribed
         SECOND run (:func:`assert_covenant_confirms_before_eth_deadline` docstring).
 
@@ -2300,12 +2300,28 @@ class SwapCoordinator:
         opens the refund LATER and is strictly SAFER — it costs the maker lock time and takes
         nothing from the taker. What robs the taker is a covenant that mined EARLY.
 
-        WHICH LEAVES THIS CHECK WEAKLY DISCRIMINATING, tracked separately: it is anchored on the
-        caller's revalidation clock rather than the covenant's actual mining time, and a later
-        anchor only makes the inverted invariant easier to satisfy. The pre-fund path covers the
-        early-mining case at step 7 of :meth:`pre_btc_lock_check`, which subtracts the covenant's
-        elapsed confirmations; this second run has no equivalent. Corrected here rather than left
-        to be cited — prose asserting an invariant becomes evidence for the next reader.
+        THE COVENANT'S REAL DEPTH IS WHAT MAKES IT DISCRIMINATE (#564). Anchored on the caller's
+        revalidation clock with NO elapsed depth — which is how it shipped — a later anchor only
+        makes the inverted invariant easier to satisfy, and the run was not merely weak but
+        VACUOUS: brute-forced against the real gate over 12,010 points (covenant depth 0..1200 x
+        ten realised Radiant intervals from 1 s to 2,325 s) it refused on ZERO of them.
+        ``elapsed_blocks`` is REQUIRED rather than defaulted precisely so no caller can reproduce
+        that by omission; :meth:`_covenant_elapsed_blocks` reads it off the chain, the same
+        quantity step 7 of :meth:`pre_btc_lock_check` takes from the taker's funding verification.
+
+        WHAT IT REFUSES, measured against the real gate at the sizer's own output (``t_rxd`` 2,597
+        blocks at the 36 s measured p10, ``eth_timeout`` 24 h out, margin 7,068 s): only a realised
+        interval below 12.00 s/blk at depth 1, 32.00 at depth 6, 34.00 at depth 12, 35.52 at depth
+        50, 35.92 at depth 300 and 35.99 at depth 2,596 — converging on the fast tail from below
+        and never reaching it. At the p10 itself (36 s), the measured median (221 s), the mean
+        (296 s) and the p90 (671 s) it refuses at NO depth in 1..2,596, so it does not refuse
+        honest work: it refuses only when Radiant ran FASTER than the tail the terms were sized
+        with, which is the direction that eats the taker's window. At 18 s/blk it refuses from
+        depth 10 up, where the shipped form passes at every depth.
+
+        THIS HAS NO BTC TWIN, and the asymmetry is deliberate rather than an oversight — see
+        :meth:`_assert_btc_counter_funding_verified` for the measurement, and
+        ``tests/test_post_confirm_ordering_recheck.py`` for the executable form of the reason.
         """
         policy = self.config.margin_policy
         terms = self.record.terms
@@ -2336,7 +2352,48 @@ class SwapCoordinator:
             # no longer makes, because it is only ever true of a t_rxd the sizer itself produced.
             rxd_block_interval_s=_dividing_interval_s(policy),
             max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
+            # THE COVENANT'S REAL DEPTH. `t_rxd` is a relative CSV counted from MINING, so the
+            # refund opens `t_rxd - elapsed` blocks from this anchor; passing the negotiated value
+            # is what made this run vacuous (see the docstring's grid).
+            elapsed_blocks=elapsed_blocks,
         )
+
+    async def _covenant_elapsed_blocks(self) -> int:
+        """How many blocks of the covenant's RELATIVE CSV have ALREADY elapsed, read from chain.
+
+        ``t_rxd`` counts from the covenant's MINING, so any gate judging the ordering AFTER the
+        covenant is on chain must subtract this. :meth:`pre_btc_lock_check` step 7 takes it from
+        :meth:`taker_verify_asset_funding`'s third return value; the post-confirm recheck cannot,
+        because in the two-host flow the only caller of :meth:`post_asset_lock_revalidate` is the
+        MAKER's process and that process never ran the taker's pre-fund gate.
+
+        ``min_confirmations=0`` because this is a MEASUREMENT, not a depth gate. The burial
+        requirement belongs to the taker and is enforced before it funds
+        (:meth:`_asset_funding_depth`); re-imposing it on the transition into BOTH_LOCKED would
+        add an unrelated refusal to a fund-safety path, and refusing honest work is a defect in
+        its own right. The read itself still fails closed — an unfunded or mis-valued covenant, or
+        a depth the node cannot report, raises rather than reading as zero elapsed, which is the
+        PERMISSIVE direction for every gate that consumes this number.
+
+        Deliberately NOT routed through :meth:`taker_verify_asset_funding`: that method's contract
+        includes the taker's depth requirement, and the two differ in exactly the parameter that
+        would make this refuse. The leg call and its fail-closed guard are the same.
+        """
+        verify = getattr(self.radiant_leg, "verify_maker_asset_funded", None)
+        if not callable(verify):
+            raise ValidationError(
+                "radiant_leg does not implement verify_maker_asset_funded, so the covenant's "
+                "elapsed CSV depth cannot be read and the post-confirm ordering recheck would be "
+                "judging the NEGOTIATED window rather than the one that remains; fail-closed "
+                "(refuse BOTH_LOCKED). Wire a RadiantCovenantLeg, or a leg exposing that read."
+            )
+        _outpoint, _value, confs = await verify(self.record.terms, min_confirmations=0)
+        if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
+            raise ValidationError(
+                f"the Radiant leg reported {confs!r} as the covenant's confirmation depth, which is "
+                "not a non-negative int; fail-closed"
+            )
+        return int(confs)
 
     @_serialized_step
     async def post_asset_lock_revalidate(
@@ -2351,9 +2408,15 @@ class SwapCoordinator:
         timelock leg (see :meth:`taker_refund_btc`).
 
         ``now_unix_s`` is the caller's wall-clock at the moment the covenant lock is observed —
-        REQUIRED for an ETH swap (the post-confirm cross-clock recheck against a stalled maker
-        lock; audit re-verify HIGH), ignored for BTC. On an ETH timing failure this refuses to
-        advance to BOTH_LOCKED (raises) so the taker refunds the counter leg.
+        REQUIRED for an ETH swap (the post-confirm cross-clock recheck; audit re-verify HIGH),
+        ignored for BTC. On an ETH timing failure this refuses to advance to BOTH_LOCKED (raises).
+
+        THAT SENTENCE USED TO NAME BOTH THE WRONG HAZARD AND THE WRONG PARTY — "against a stalled
+        maker lock ... so the taker refunds the counter leg". #482 inverted the relation, so a
+        LATE covenant lock is now strictly safer, and #628 corrected the same two claims on
+        :meth:`_assert_eth_lock_timing_still_safe` while this copy kept them. The caller here is
+        the MAKER's process (the taker phase never calls this method), so a refusal stops the
+        MAKER advancing and its recovery is the CSV refund of its own covenant.
 
         Async because the Radiant leg reads chain state (expected-SPK derivation +
         covenant outpoint lookup) over the async indexer/node.
@@ -2514,7 +2577,40 @@ class SwapCoordinator:
         between the maker's verify and its own asset lock, and a one-shot verify would never see it.
         The record's locator is then REPLACED with the leg's own re-derivation, so nothing
         counterparty-supplied survives into ``maker_claims_btc``. Any failure persists for recovery
-        and raises (fail-closed) — the maker refunds the covenant via CSV rather than revealing p."""
+        and raises (fail-closed) — the maker refunds the covenant via CSV rather than revealing p.
+
+        THERE IS DELIBERATELY NO POST-CONFIRM ORDERING RECHECK HERE, and the reason is a
+        MEASUREMENT, not a preference. #564 proposed the ETH recheck's BTC twin — re-run
+        :func:`assert_timelock_margin` with the covenant's real depth — on the argument that
+        fixing the ETH instance and not the class is the failure this repo keeps recording. Both
+        shapes of that twin were swept against the real gate and the real production derivation
+        (``scripts/_dust_swap_shared.derive_counter_timelock``), and both refuse honest swaps:
+
+        * ``t_btc`` is a RELATIVE CSV counted from the TAKER's BTC funding, not an absolute
+          deadline like ``eth_timeout_unix_s``. Subtracting only the covenant's elapsed depth
+          shrinks the maker's side of the comparison while leaving the taker's side anchored at a
+          funding that has itself aged, so the check tightens by roughly a second per second of
+          wall clock. At the runner's own defaults (``t_rxd`` 120, margin 36, 300/600 s, elapsed
+          reserve 12 -> derived ``t_btc`` 18) it accepts elapsed <= 12 and refuses from 13, while
+          an honest maker that funds at the reserve depth and then waits its
+          ``btc_claim_reorg_depth`` of 6 BTC blocks arrives at depth 24-28. Refused, on every
+          parameter set swept.
+        * Subtracting BOTH legs' elapsed depths is the arithmetically correct form, and it still
+          refuses 64 of 126 honest timelines over the realistic band (covenant depth at funding
+          from the burial to the reserve, 0-30 min of mempool wait, 1/2/6 BTC blocks of maker
+          wait, realised Radiant 221 s median and 296 s mean). The cause is upstream:
+          ``derive_counter_timelock`` solves the gate to EQUALITY at ``elapsed = reserve``, so
+          production terms carry ZERO headroom for any post-fund drift.
+
+        The ETH corridor escapes this because its counter deadline is absolute AND its gate
+        divides by the measured FAST TAIL (36 s) while the chain runs at ~221 s, which is a ~6x
+        cushion; the BTC gate prices Radiant at the 300 s nominal with no cushion at all. So the
+        honest sentence is that the BTC corridor's post-fund ordering coverage ends at step 7 of
+        :meth:`pre_btc_lock_check`, and giving it a second run is blocked on
+        ``derive_counter_timelock`` growing a drift reserve — a change to the TERMS, not to a
+        gate. ``tests/test_post_confirm_ordering_recheck.py`` derives that zero-headroom property
+        from the production code rather than restating it here, so this paragraph cannot go stale
+        in silence."""
         locator = self.record.counterchain_locator
         if not isinstance(locator, BtcHtlcLocator):
             await self._persist_record(self.record, shield=True)
@@ -2565,8 +2661,13 @@ class SwapCoordinator:
         try:
             reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
             self.record = self.record.with_counter_lock(reverified)
-            self._assert_eth_lock_timing_still_safe(now_unix_s=now_unix_s)
-        except ValidationError:
+            # THE COVENANT'S REAL DEPTH, read here rather than assumed (#564). NetworkError joins
+            # the caught set because this read touches the chain and a failure must persist for
+            # recovery before it propagates — the same discipline as the BTC twin below.
+            self._assert_eth_lock_timing_still_safe(
+                now_unix_s=now_unix_s, elapsed_blocks=await self._covenant_elapsed_blocks()
+            )
+        except (ValidationError, NetworkError):
             await self._persist_record(self.record, shield=True)
             raise
 

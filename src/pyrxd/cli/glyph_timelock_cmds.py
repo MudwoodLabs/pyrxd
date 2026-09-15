@@ -52,7 +52,7 @@ from .prompts import _load_wallet
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..glyph.timelock import TimelockMintBuild
-    from ..glyph.timelock_reveal_tx import TimelockRevealBuild
+    from ..glyph.timelock_reveal_tx import TimelockRevealBuild, TimelockRevealPlan
     from .context import CliContext
 
 #: Cap on the operator ``--hint``. The hint rides in the reveal's OP_RETURN, whose size is
@@ -63,20 +63,85 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _MAX_HINT_BYTES = 200
 
 
-def _write_secret(path: Path, data: str) -> None:
-    """Write ``data`` to ``path`` with mode 0600, creating it exclusively.
+def _fsync_dir(directory: Path) -> None:
+    """Flush the DIRECTORY ENTRY, so the file's *name* survives a crash and not just its bytes.
 
-    ``O_EXCL``, so an existing file is a refusal rather than an overwrite: the file this
-    writes is the only copy of a key, and clobbering the previous mint's key while reporting
-    success is the failure this whole command exists to avoid.
+    ``fsync`` on a file guarantees that file's contents. On POSIX it says nothing about the
+    directory entry naming it, so a freshly created file can come back absent — or present
+    and zero-length, under ext4's delayed allocation — after a power loss even though its own
+    data was flushed. ``timelock-mint`` broadcasts within milliseconds of writing these files
+    and then blocks for 10+ minutes, so the window is real rather than theoretical.
 
-    The mode is set in ``os.open`` rather than with a later ``chmod`` — between the two there
-    is a window in which the key sits world-readable, and on a shared host that window is the
-    vulnerability.
+    **A failure here is not fatal, and that asymmetry is deliberate.** Not every platform or
+    filesystem offers this: ``os.open`` on a directory raises on Windows, and ``fsync`` on a
+    directory descriptor raises on some network filesystems. The file's own bytes are already
+    flushed by the time this is called, so what is missing on those hosts is the weaker half of
+    the guarantee — and aborting a mint that cannot be redone, over a call the host was never
+    going to honour, is the larger bug. An earlier draft of this let the error propagate and
+    would have refused an otherwise perfectly good mint on exactly those filesystems.
+    :meth:`pyrxd.glyph.mint.JsonFilePendingStore._fsync_dir` made the same call for the same
+    reason on the same kind of file; the two agree on purpose.
+
+    The FILE fsync in :func:`_write_new_file` does NOT get this treatment. That one failing
+    means the bytes may not be on disk at all, which is the whole guarantee, and it propagates
+    into "nothing was broadcast".
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as fh:
+    if os.name != "posix":  # pragma: no cover - CI and the dev hosts are POSIX
+        return
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:  # pragma: no cover - platforms without directory descriptors
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:  # pragma: no cover - e.g. some network filesystems
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _write_new_file(path: Path, data: bytes, *, mode: int) -> None:
+    """Create ``path`` exclusively, write ``data``, and make both the file and its name durable.
+
+    Three properties, none of them what ``Path.write_bytes`` gives you, and each load-bearing
+    on a command whose outputs cannot be regenerated:
+
+    * ``O_EXCL`` — an existing file is a refusal, never an overwrite. ``timelock-mint`` does
+      check all three paths up front, but minutes of interactive prompting sit between that
+      check and these writes; the check alone is a TOCTOU race, and losing it would mean
+      truncating another mint's only key while reporting success.
+    * ``mode`` at creation rather than a later ``chmod`` — between the two there is a window
+      in which a key sits world-readable, and on a shared host that window is the
+      vulnerability.
+    * ``fsync``, of the file and then of its directory. The ordering fix that put these writes
+      before the broadcast reasoned about the PROCESS dying — a kill during the confirmation
+      wait — and against that, ordering is enough. Against the HOST dying it is only
+      advisory: a buffered write is still nothing but page cache when the commit relays, so a
+      power loss in that window leaves exactly the outcome the ordering was written to
+      prevent, a confirmed commit whose key exists nowhere. Reading the file back proves
+      nothing here; it is served from the same cache.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        fh = os.fdopen(fd, "wb")
+    except BaseException:  # pragma: no cover - fdopen fails only on a bad descriptor
+        os.close(fd)
+        raise
+    with fh:
         fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    _fsync_dir(path.parent)
+
+
+def _write_secret(path: Path, data: str) -> None:
+    """Write ``data`` to ``path`` with mode 0600 — exclusively created, and fsynced.
+
+    The secret-specific part is the mode; the exclusivity and the durability are
+    :func:`_write_new_file`'s, and are wanted for the ciphertext and the envelope too. See
+    that function for why each of the three matters.
+    """
+    _write_new_file(path, data.encode("utf-8"), mode=0o600)
 
 
 def _read_cek_file(path: Path) -> bytes:
@@ -325,13 +390,21 @@ def timelock_mint_cmd(
     # unmodified, and a re-encode from anything else is exactly the drift that strands it.
     try:
         _write_secret(cek_out, build.cek.hex() + "\n")
-        ciphertext_out.write_text(_ciphertext_json(build))
-        envelope_out.write_bytes(encode_payload(build.metadata)[0])
+        # 0600, not 0644. Both are safe to PUBLISH — the envelope is the CBOR that goes on
+        # chain, and the ciphertext is sealed by the CEK — but that is an argument about
+        # what may be shared, not about what a CLI should write into an operator's
+        # directory by default. World-readable buys nobody anything here and costs a
+        # shared host; an operator who wants to publish them can chmod. CodeQL flagged
+        # `_write_new_file` for exactly this, and it was right to.
+        _write_new_file(ciphertext_out, _ciphertext_json(build).encode("utf-8"), mode=0o600)
+        _write_new_file(envelope_out, encode_payload(build.metadata)[0], mode=0o600)
     except OSError as exc:
         raise UserError(
             "could not write the key, ciphertext or envelope file — nothing was broadcast",
             cause=str(exc),
-            fix="fix the path or permissions and re-run; no funds and no token were committed",
+            fix="fix the path or permissions and re-run; no funds and no token were committed. "
+            "`File exists` here means a file appeared at one of those paths after the up-front "
+            "check and while you were being prompted — nothing was overwritten",
         ) from exc
 
     from .glyph_cmds import _mint_nft_inner
@@ -389,6 +462,25 @@ def timelock_mint_cmd(
 # ---------------------------------------------------------------------------
 
 
+def _judged_clock_phrase(plan: TimelockRevealPlan) -> str:
+    """How the clock the gate compared against is described, wherever it is shown.
+
+    One function because the sentence is shown twice — on the confirmation prompt, and on
+    the receipt after the key is public — and two copies of a sentence about an
+    unauthenticated number are two chances for one of them to stop being true.
+
+    Built as a branch, not as an f-string chosen by one: ``judged_at`` is None whenever the
+    token's mode is neither ``"block"`` nor ``"time"``, or whenever no clock for that mode
+    reached the planner, and ``f"{None:,}"`` is a ``TypeError``. That is a reachable prompt —
+    a third-party token with mode ``"BLOCK"`` plus ``--allow-early`` gets here — so
+    formatting it eagerly would turn a visibility fix into a traceback.
+    """
+    if plan.judged_at is None:
+        return f"(no clock for lock mode {plan.mode!r} — the gate could not evaluate it)"
+    clock_units = "block" if plan.mode == "block" else "unix time"
+    return f"{plan.judged_at:,} ({clock_units}, as reported by the node — unverified)"
+
+
 def _reveal_lines(build: TimelockRevealBuild, *, network: str, fee_rate: int) -> list[str]:
     """The human-readable account of what a reveal would publish.
 
@@ -407,16 +499,7 @@ def _reveal_lines(build: TimelockRevealBuild, *, network: str, fee_rate: int) ->
     """
     plan = build.plan
     raw = build.serialize()
-    # Built as a branch, not as an f-string chosen by one: `judged_at` is None whenever the
-    # token's mode is neither "block" nor "time", and `f"{None:,}"` is a TypeError. That is a
-    # reachable prompt — a third-party token with mode "BLOCK" plus --allow-early gets here —
-    # so formatting it eagerly would have turned this very fix into the traceback-instead-of-a-
-    # message defect it was written beside.
-    if plan.judged_at is None:
-        judged = f"(no clock for lock mode {plan.mode!r} — the gate could not evaluate it)"
-    else:
-        clock_units = "block" if plan.mode == "block" else "unix time"
-        judged = f"{plan.judged_at:,} ({clock_units}, as reported by the node — unverified)"
+    judged = _judged_clock_phrase(plan)
     lines = [
         f"token:       {plan.token_ref}",
         f"opens at:    {plan.unlock_at:,} ({plan.mode})",
@@ -432,8 +515,22 @@ def _reveal_lines(build: TimelockRevealBuild, *, network: str, fee_rate: int) ->
         lines.append(f"hint:        {plan.proof.hint}")
     if plan.early_override:
         lines.append("")
-        lines.append(f"*** EARLY REVEAL: {plan.remaining:,} {'blocks' if plan.mode == 'block' else 'seconds'} short of")
-        lines.append("*** the unlock point. Publishing now ends the timelock permanently, for everyone.")
+        if plan.judged_at is None:
+            # NOT `plan.remaining`. `spec_unlock_remaining` returns 0 both for a lock that has
+            # expired and for one it cannot judge at all, so on this branch the 0 is a default,
+            # not a measurement — and "0 short of the unlock point" reads as "you are exactly on
+            # time", which is the opposite of what the line above just said. Worse, the units
+            # word is picked by `mode == "block"`, and the modes that land here are by definition
+            # not "block", so the old banner called an unjudgeable BLOCK lock "0 seconds" short.
+            # Where the honest sentence is weaker than the impressive one, ship the weaker
+            # sentence: there is no number here, and saying so is the point.
+            lines.append("*** EARLY REVEAL: how far short of the unlock point this is is UNKNOWN —")
+            lines.append("*** the gate could not evaluate this lock at all (see `chain says` above).")
+        else:
+            units = "blocks" if plan.mode == "block" else "seconds"
+            lines.append(f"*** EARLY REVEAL: {plan.remaining:,} {units} short of")
+            lines.append("*** the unlock point.")
+        lines.append("*** Publishing now ends the timelock permanently, for everyone.")
     lines.append("")
     lines.append("This cannot be undone. Once the transaction relays the key is public forever.")
     return lines
@@ -609,6 +706,14 @@ def timelock_reveal_cmd(
         click.echo(f"  key (now public): {receipt.cek}")
         click.echo(f"  commitment: {receipt.commitment}")
         click.echo(f"  fee:        {receipt.fee:,} photons")
+        # On the receipt as well as on the prompt. The confirmation summary is the place to
+        # DISAGREE with this number and the receipt is far too late for that — but the JSON
+        # payload has carried `judged_at` for a scripted caller since the field existed while
+        # the human path recorded nothing, so an operator who later suspects the endpoint had
+        # no way to find out what it actually said. `opens at` is here for the same reason:
+        # one of these two numbers alone is not a comparison.
+        click.echo(f"  opens at:   {plan.unlock_at:,} ({plan.mode})")
+        click.echo(f"  chain said: {_judged_clock_phrase(plan)}")
 
 
 __all__ = ["timelock_mint_cmd", "timelock_reveal_cmd"]

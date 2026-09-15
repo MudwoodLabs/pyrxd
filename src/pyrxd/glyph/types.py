@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
@@ -42,8 +42,45 @@ class GlyphRef:
     vout: int  # output index
 
     def __post_init__(self) -> None:
+        # `txid: Txid` is a TYPE annotation, and a dataclass does not enforce one at
+        # runtime — so `GlyphRef(txid=<raw str>, ...)` stored whatever it was given and
+        # skipped `Txid.__new__` entirely. Two consequences, both demonstrated:
+        #
+        #   * a non-hex string was accepted here and failed far away in `to_bytes()` with
+        #     a bare `ValueError` rather than a `ValidationError` — the wrong error class,
+        #     raised at a distance from the cause;
+        #   * `Txid` requires LOWERCASE hex, so an uppercase txid that `Txid()` refuses
+        #     outright was accepted here, producing a ref whose `to_bytes()` is byte-
+        #     identical to the lowercase one while `==` and `hash()` differ. Two GlyphRefs
+        #     for one outpoint: set membership and every `ref == other` check see two
+        #     different tokens where the chain sees one.
+        #
+        # Coercing through `Txid` here puts the guard inside the constructor instead of
+        # beside it, so no caller has to remember. That matters here because the call
+        # sites were NOT changed and are still annotated `str`: mypy reports 15 of them
+        # (14 in glyph/builder.py, 1 in gravity/htlc_covenant.py), and neither file is in
+        # the `task typecheck` scope, so nothing in CI would notice if that grew. This
+        # coercion is the only thing making them safe. An earlier version of this comment
+        # claimed the sites were "typed correctly now" — they are not, and no test could
+        # have caught that sentence being false.
+        if not isinstance(self.txid, Txid):
+            object.__setattr__(self, "txid", Txid(self.txid))
         if self.vout < 0 or self.vout > 0xFFFFFFFF:
             raise ValidationError("vout must be 0..2^32-1")
+
+    def __reduce__(self) -> tuple[Any, tuple[str, int]]:
+        """Rebuild through ``__init__`` so unpickling re-validates.
+
+        A frozen, non-slots dataclass unpickles via ``__newobj__`` + ``__dict__.update``:
+        ``__post_init__`` is never called. Measured before this existed — a ref pickled by
+        pyrxd <= 0.23.0, holding a raw uppercase ``str``, came back with the identity fork
+        intact: byte-identical ``to_bytes()``, ``==`` False against the canonical ref. The
+        constructor refused the very value ``pickle.loads`` had just resurrected.
+
+        ``copy.copy`` and ``copy.deepcopy`` honour ``__reduce__`` too, so all three routes
+        now converge on the one validating path instead of three different answers.
+        """
+        return (self.__class__, (self.txid, self.vout))
 
     def to_bytes(self) -> bytes:
         """Encode as 36-byte wire format: txid_reversed + vout_le."""
@@ -317,7 +354,13 @@ class GlyphMetadata:
     description: str = ""
     token_type: str = ""  # NFT type tag
     main: GlyphMedia | None = None
-    attrs: dict[str, str] = field(default_factory=dict)
+    #: ``dict[str, object]``, not ``dict[str, str]``: Glyph ``attrs`` carry
+    #: non-strings in the wild (Photonic authority tokens use a boolean
+    #: ``revocable`` and a ``permissions`` list). Values are scalars or lists of
+    #: scalars; :func:`~pyrxd.glyph.payload._decode_attr_value` flattens
+    #: anything deeper. Consumers expecting text should ``str()`` what they
+    #: read, as ``WaveAttrs.from_dict`` does.
+    attrs: dict[str, object] = field(default_factory=dict)
     loc: str = ""  # IPFS or external URI
     loc_hash: str = ""  # integrity hash
     decimals: int = 0  # FT decimals (display only — consensus is 1 photon = 1 unit)
@@ -341,9 +384,14 @@ class GlyphMetadata:
     # `get_unlock_remaining` had nothing to be called WITH — which is why they had no caller.
     # The unreachability was a parser gap, not a missing convenience method.
     #
-    # Only the timelock spec is carried, not the whole `crypto` block: the wraps and the key
-    # format are mint-side concerns, and surfacing per-recipient key material through the
-    # inspect path is not something to do incidentally.
+    # Populated INDEPENDENTLY of `crypto` below, and that independence is load-bearing: a
+    # token whose `crypto.recipients` is malformed still declares a real unlock height, and
+    # dropping the whole block with it would tell the holder nothing about WHEN it opens.
+    # `decode_payload` parses the two separately for exactly that reason.
+    #
+    # This comment used to say only the timelock spec was carried, "not the whole `crypto`
+    # block". That stopped being true when #632 made decode fill `crypto` as well, to stop
+    # decode -> re-encode silently dropping the commitment (#626).
     timelock: TimelockSpec | None = None
     # CBOR ``crypto`` and the ENCRYPTED form of ``main`` — the WRITE side of the same block
     # ``timelock`` above reads (#556).
@@ -363,11 +411,19 @@ class GlyphMetadata:
     # PLAINTEXT that was encrypted while the ciphertext itself lives off chain. Only one of the
     # two may be set; ``__post_init__`` refuses both.
     #
-    # WRITE-SIDE ONLY, deliberately asymmetric with the decoder: ``decode_payload`` fills
-    # ``timelock`` and leaves these ``None``. The per-recipient wraps in ``crypto.recipients``
-    # are key material, and surfacing them through the inspect path is not something to do
-    # incidentally — the note on ``timelock`` above records that decision. A caller that needs
-    # the exact bytes a token was decoded from has ``source_cbor``.
+    # NO LONGER WRITE-SIDE ONLY. This comment claimed ``decode_payload`` "fills ``timelock``
+    # and leaves these ``None``" — measured on the tree that shipped it, decode fills
+    # ``crypto`` too, recipients included. #632 made it do so because the round trip needs it:
+    # ``to_cbor_dict`` emits from ``crypto``, so decoding into ``timelock`` alone turned a
+    # sealed token into a marker with nothing behind it on re-encode (#626).
+    #
+    # The wraps in ``crypto.recipients`` are therefore reachable from a decoded object. That
+    # is not a disclosure — they are public bytes, already on chain — and no render path
+    # prints them: the CLI shows recipient KIDs at MINT time and nothing reads
+    # ``metadata.crypto.recipients`` for display. The original concern was about what the
+    # inspect surface volunteers, and that part still holds; it is just no longer enforced by
+    # the field being empty. A caller that needs the exact bytes a token was decoded from
+    # still has ``source_cbor``.
     encrypted_main: EncryptionMetadata | None = None
     crypto: CryptoMetadata | None = None
     # The EXACT CBOR these fields were decoded from, when they came off a chain.

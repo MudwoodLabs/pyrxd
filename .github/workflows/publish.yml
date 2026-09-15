@@ -15,9 +15,10 @@ name: Publish to PyPI
 #        - Repository:      pyrxd
 #        - Workflow:        publish.yml
 #        - Environment:     pypi
-#   3. Optional but recommended: configure the `pypi` environment in
-#      GitHub repo settings with required reviewers, so a second pair
-#      of eyes approves each publish.
+#   3. The `pypi` environment is CONFIGURED (verified 2026-09-13): a required
+#      reviewer, deployments restricted to `v*` TAGS, and admin bypass disabled.
+#      Note what that is and is not — with a single maintainer who is also the
+#      reviewer, it is a deliberate-confirmation step, not two-person control.
 
 on:
   release:
@@ -27,8 +28,56 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: The tagged commit is on main and its tests pass
+    runs-on: ubuntu-latest
+    # A release can be cut from ANY tag on ANY commit — tags are not branches, and
+    # branch protection does not apply to them. Before this job existed, `build` ran
+    # first and nothing between a tag and PyPI executed a single test: the whole
+    # workflow was build -> publish. The `pypi` environment gates WHO publishes; it
+    # cannot tell an approver that the commit was never on main or never tested.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history: the ancestry check below needs main and the tag together.
+          fetch-depth: 0
+      - name: The tagged commit must be an ancestor of main
+        run: |
+          git fetch --no-tags origin main
+          # FULLY QUALIFIED, deliberately. `gitrevisions` resolves a bare name by checking
+          # refs/tags/<name> BEFORE refs/remotes/<name>, and actions/checkout with
+          # fetch-depth: 0 fetches +refs/tags/*:refs/tags/*. So a tag literally named
+          # `origin/main` lands on the runner and shadows the remote-tracking branch —
+          # git only warns ("refname 'origin/main' is ambiguous"), it does not fail, and
+          # this gate then passes for a commit that never reached main. Demonstrated.
+          # Tags are not protected here (no rulesets), and both combine-prs.yml and this
+          # workflow's own build job hold `contents: write`, so the tag need not come from
+          # a human. `refs/remotes/origin/main` cannot be shadowed by a tag.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$GITHUB_SHA is not an ancestor of origin/main."
+            echo "A release tag must point at a commit that reached main through a PR," \
+                 "so that branch protection and its required checks actually applied to it." >&2
+            exit 1
+          fi
+          echo "$GITHUB_SHA is on main"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install project
+        run: poetry install --no-interaction --with dev
+      - name: Lint, format, typecheck
+        run: poetry run task lint && poetry run task format-check && poetry run task typecheck
+      - name: Tests
+        # The offline suite. Node-backed proof lives in integration.yml and is not
+        # re-run here; this is the gate that the artifact about to be uploaded is the
+        # code whose tests pass, not merely a tag someone pushed.
+        run: poetry run pytest -q
+
   build:
     name: Build sdist + wheel
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       # contents: write attaches the CycloneDX SBOM to the GitHub Release.
@@ -134,9 +183,10 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    # The `pypi` environment is the second-factor: configure required
-    # reviewers under repo Settings → Environments → pypi to gate
-    # publishes on a manual approval click.
+    # The `pypi` environment gates WHO can publish: a required reviewer must
+    # approve, only `v*` tags may deploy, and admins cannot bypass. It says
+    # nothing about WHETHER the code works — that is the `verify` job above,
+    # which this depends on transitively through `build`.
     environment:
       name: pypi
       url: https://pypi.org/p/pyrxd

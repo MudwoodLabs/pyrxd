@@ -724,6 +724,21 @@ function renderFetchedTxCard(payload) {
       mdl.appendChild(kv("decimals", metadata.decimals));
     }
     if (metadata.main) mdl.appendChild(kv("main", metadata.main));
+    // The claim AND its verdict. This card showed protocol, name, ticker,
+    // description and timelock, and dropped `relationships` and
+    // `delegate_burns` entirely — so a token's collection and creator claims
+    // reached nobody here at all.
+    appendRelationshipVerdicts(mdl, metadata.relationships, metadata.delegate_burns);
+    if (Array.isArray(metadata.delegate_burns) && metadata.delegate_burns.length > 1) {
+      mdl.appendChild(kv("delegate burns", metadata.delegate_burns.join(", ")));
+    }
+    if (metadata.delegate_bases_unresolved) {
+      mdl.appendChild(kv(
+        "delegate bases not resolved",
+        `${metadata.delegate_bases_unresolved} more — capped to bound the fetches`,
+        "kv-warning",
+      ));
+    }
     // TIMELOCK: WHEN it opens (#556). The page already carried a banner saying a
     // TIMELOCK marker means "the reveal is subject to a time-based condition",
     // and then showed nothing about what the condition IS — the decoded spec was
@@ -740,7 +755,44 @@ function renderFetchedTxCard(payload) {
       if (tl.hint) mdl.appendChild(kv("timelock hint", tl.hint));
       mdl.appendChild(kv("timelock cek commitment", tl.cek_hash));
     }
+
+    // AUTHORITY — claims, EXPIRED, and anything validate_authority could not read.
+    //
+    // The Python computed this whole block and NEITHER renderer read it, so an authority that
+    // expired years ago looked identical to a live one on both surfaces — while the AUTHORITY
+    // banner on this page affirmatively told the reader the holder "can authorize operations".
+    // `problems` is the signal that the expiry did not even parse, and it was the least visible
+    // of the lot. Every value goes through `kv`, which assigns to textContent.
+    const authority = metadata.authority;
+    if (authority) {
+      const claims = authority.claims || {};
+      if (claims.issuer) mdl.appendChild(kv("authority issuer", _capText(claims.issuer)));
+      if (claims.scope) mdl.appendChild(kv("authority scope", _capText(claims.scope)));
+      if (Array.isArray(claims.permissions) && claims.permissions.length > 0) {
+        const shown = claims.permissions.slice(0, _ENTRY_CAP).map((p) => _capText(p)).join(", ");
+        mdl.appendChild(kv("authority permissions", shown));
+        if (claims.permissions.length > _ENTRY_CAP) {
+          mdl.appendChild(kv("", `… and ${claims.permissions.length - _ENTRY_CAP} more not shown`));
+        }
+      }
+      if (claims.expires) mdl.appendChild(kv("authority expires", _capText(claims.expires)));
+      if (claims.revocable === false) mdl.appendChild(kv("authority revocable", "false"));
+      if (authority.expired) mdl.appendChild(kv("authority status", "*** EXPIRED ***"));
+      for (const problem of authority.problems || []) {
+        mdl.appendChild(kv("authority unreadable", _capText(problem)));
+      }
+    }
     wrapper.appendChild(mdl);
+    if (authority) {
+      // WHAT THE MARKER IS NOT. It says the token calls itself an authority; it does not
+      // establish that any item was minted under it, nor that the issuer still honours it.
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: "These are the token's own claims, not a verdict — the AUTHORITY marker does not " +
+              "establish that any item was minted under this authority. That question is " +
+              "verify_authority_gate's, and it needs the item's genesis output.",
+      }));
+    }
     if (metadata.timelock) {
       wrapper.appendChild(el("p", {
         class: "card-note",
@@ -810,7 +862,99 @@ function renderFetchedTxCard(payload) {
     wrapper.appendChild(odl);
   }
 
+  // Glyph envelopes carrying no full payload.
+  //
+  // EMITTED BY THE PYTHON AND READ BY NOBODY HERE. `glyph_envelopes` reached the
+  // JSON and the CLI's human mode and this card rendered none of it, so on the
+  // web page a mutable glyph's UPDATE — the transaction that changes where a
+  // WAVE name points — showed as an ordinary transfer, and an envelope neither
+  // reader could parse showed as nothing at all. "I could not read this" and
+  // "there is nothing here" are opposite facts, and the blind one reads as
+  // reassuring.
+  //
+  // Every value goes through `kv`, which assigns to textContent, so an
+  // attacker-authored key or value cannot become markup. Keys are truncated as
+  // well as values: they are as publisher-chosen as the values, and capping only
+  // the value left a 100,000-character key rendering in full.
+  const envelopes = Array.isArray(payload.glyph_envelopes) ? payload.glyph_envelopes : [];
+  if (envelopes.length > 0) {
+    wrapper.appendChild(el("h3", {
+      class: "result-subhead",
+      text: `Glyph envelopes carrying no full payload (${envelopes.length})`,
+    }));
+    for (const env of envelopes) {
+      const edl = el("dl", { class: "kv-list" });
+      if (env.kind === "update") {
+        edl.appendChild(kv(`input ${env.input_index}`, "UPDATE — a mutable glyph's fields are being changed here"));
+        const fields = env.fields || {};
+        const attrs = fields.attrs;
+        if (attrs && typeof attrs === "object" && !Array.isArray(attrs)) {
+          // `target` first and on its own row: for a WAVE name it is where the
+          // name will point, which is the one value a reader is here for.
+          if (attrs.target !== undefined) edl.appendChild(kv("attrs.target", _capText(attrs.target)));
+          const others = Object.keys(attrs).filter((k) => k !== "target").sort();
+          for (const k of others.slice(0, _ENTRY_CAP)) {
+            edl.appendChild(kv(`attrs.${_capText(k)}`, _capText(attrs[k])));
+          }
+          if (others.length > _ENTRY_CAP) {
+            edl.appendChild(kv("", `… and ${others.length - _ENTRY_CAP} more attrs not shown`));
+          }
+        }
+        const top = Object.keys(fields).filter((k) => k !== "attrs").sort();
+        for (const k of top.slice(0, _ENTRY_CAP)) {
+          edl.appendChild(kv(_capText(k), _capText(fields[k])));
+        }
+        if (top.length > _ENTRY_CAP) {
+          edl.appendChild(kv("", `… and ${top.length - _ENTRY_CAP} more fields not shown`));
+        }
+        wrapper.appendChild(edl);
+        // WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether
+        // that glyph is the name someone means is an index's answer, not this
+        // transaction's, and the gap between the two is the whole of HashMark §7.6.
+        wrapper.appendChild(el("p", {
+          class: "card-note",
+          text: "Changes this glyph's fields — does NOT establish which name resolves " +
+                "to it, nor who held that name when.",
+        }));
+        continue;
+      }
+      if (env.kind === "payload_unrendered") {
+        // A DISAGREEMENT, not an unreadable envelope. One reader decoded a full
+        // payload here and the other did not, so neither "rendered above" nor
+        // "could not be read" is true.
+        edl.appendChild(kv(`input ${env.input_index}`, "payload_unrendered — PAYLOAD the reveal reader did not return"));
+        // The classifier's own reason, not a re-description of it. It names which
+        // reader saw what, and re-wording it here is how the rendered sentence
+        // drifts from the fact it claims to report.
+        if (env.reason) edl.appendChild(kv("reason", _capText(env.reason)));
+        wrapper.appendChild(edl);
+        wrapper.appendChild(el("p", {
+          class: "card-note",
+          text: "The two glyph readers disagree about these bytes — treat the reveal " +
+                "metadata above as incomplete for this input.",
+        }));
+        continue;
+      }
+      edl.appendChild(kv(`input ${env.input_index}`, "UNREADABLE — a 'gly' marker with content neither reader accepted"));
+      if (env.reason) edl.appendChild(kv("reason", _capText(env.reason)));
+      wrapper.appendChild(edl);
+    }
+  }
+
   return wrapper;
+}
+
+// Display caps for publisher-chosen text, mirroring `_HUMAN_STRING_CAP` and
+// `_HUMAN_ENTRY_CAP` on the Python side. The count cap matters as much as the
+// length one: a 256 KB envelope of one-byte keys renders tens of thousands of
+// rows and pushes every verified fact off the screen, and no single row is long
+// enough for a length cap to notice.
+const _STRING_CAP = 200;
+const _ENTRY_CAP = 32;
+
+function _capText(value) {
+  const text = value === null || value === undefined ? "" : String(value);
+  return text.length <= _STRING_CAP ? text : text.slice(0, _STRING_CAP - 1) + "…";
 }
 
 // The OP_RETURN payload decoders (HashMark, the Photonic `msg` convention) and
@@ -841,6 +985,23 @@ function appendOpReturnPayload(dl, row) {
     } else {
       dl.appendChild(kv("message", msg.detail ? `${msg.outcome} — ${msg.detail}` : msg.outcome));
     }
+  }
+
+  // A Glyph BURN proof. Every field is operator CBOR, so the header says
+  // "claims" and the caveat travels with them: without it a reader sees
+  // "token_ref: <X>  action: burn" and concludes X was burned, which this
+  // output alone does not establish.
+  const burn = row.burn;
+  if (burn) {
+    const c = burn.claims || {};
+    dl.appendChild(kv("burn proof", "CLAIMED — operator-supplied, see note", "kv-warning"));
+    if (c.token_ref) dl.appendChild(kv("token ref (claimed)", c.token_ref));
+    if (c.action) dl.appendChild(kv("action (claimed)", c.action));
+    if (c.amount !== undefined && c.amount !== null) {
+      dl.appendChild(kv("amount (claimed)", c.amount));
+    }
+    if (c.reason) dl.appendChild(kv("reason (claimed)", c.reason));
+    if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));
   }
 
   const hm = row.hashmark;
@@ -890,16 +1051,48 @@ function appendOpReturnPayload(dl, row) {
   // Declared container/creator membership, WITH its verdict. `in` and `by` are
   // operator-supplied CBOR — anyone can name any collection — so the claim is
   // never shown without whether the transaction was authorised to carry it.
-  const rels = (row.metadata && row.metadata.relationships) || row.relationships;
-  if (Array.isArray(rels)) {
-    for (const rel of rels) {
-      const backed = rel.outcome === "backed";
-      dl.appendChild(kv(
-        rel.kind === "author" ? "creator claim" : "collection claim",
-        `${rel.ref} — ${backed ? "VERIFIED (spent in this tx)" : "UNVERIFIED CLAIM (nothing in this tx authorises it)"}`,
-        backed ? undefined : "kv-warning",
-      ));
+  appendRelationshipVerdicts(
+    dl,
+    (row.metadata && row.metadata.relationships) || row.relationships,
+    (row.metadata && row.metadata.delegate_burns) || [],
+  );
+}
+
+// FOUR verdicts, not two, and ONE definition of them.
+//
+// This logic lived only in the output-row renderer and had two states: `backed`
+// → "spent in this tx", everything else → "nothing in this tx authorises it".
+// BOTH are false for a delegated mint. A DELEGATED claim was spent when the
+// delegate BASE was created, by someone who need not be this minter; and a claim
+// whose base could not be resolved is "we did not look", not "nobody authorised
+// it" — the exact false accusation the CLI change existed to stop.
+//
+// It was also absent from the fetched-tx card entirely, which is the surface
+// most people meet. That card's own comment above records this same shape
+// happening before ("The CLI was fixed; this page was not"). Hence one function,
+// called from both.
+function appendRelationshipVerdicts(dl, rels, burnedRefs) {
+  if (!Array.isArray(rels) || rels.length === 0) return;
+  const burned = Array.isArray(burnedRefs) ? burnedRefs : [];
+  for (const rel of rels) {
+    const label = rel.kind === "author" ? "creator claim" : "collection claim";
+    const backed = rel.ok === true;
+    let verdict;
+    let cls = "kv-warning";
+    if (backed && rel.basis === "delegated") {
+      const via = burned.length === 1 ? ` ${burned[0]}` : "";
+      verdict = `VERIFIED via delegate${via} — authorised by its base, not spent here`;
+      cls = undefined;
+    } else if (backed) {
+      verdict = "VERIFIED (spent in this tx)";
+      cls = undefined;
+    } else if (burned.length) {
+      const which = burned.length === 1 ? ` (${burned[0]})` : "";
+      verdict = `UNRESOLVED — this tx burned a delegate${which}; fetch it to check`;
+    } else {
+      verdict = "UNVERIFIED CLAIM (nothing in this tx authorises it)";
     }
+    dl.appendChild(kv(label, `${rel.ref} — ${verdict}`, cls));
   }
 }
 
@@ -936,6 +1129,10 @@ function renderOutputRow(row) {
   // row rather than left to the note the reader may not open. CLI parity:
   // `child_ref=` + `UNSPENDABLE`.
   if (row.child_ref_outpoint) dl.appendChild(kv("child ref", row.child_ref_outpoint));
+  // The authority an item is gated on. It is a DIFFERENT ref from the item's
+  // own, so unlike the delegate rows it is not covered by printing `ref` —
+  // dropping it would leave the reader unable to tell WHICH issuer gates this.
+  if (row.authority_ref) dl.appendChild(kv("authority ref", row.authority_ref));
   if (row.spendable === false) {
     dl.appendChild(kv("spendable", "*** UNSPENDABLE ***", "kv-warning"));
   }
@@ -1018,6 +1215,15 @@ function renderOutputRow(row) {
   }
   if (type === "error") {
     dl.appendChild(kv("error", row.error || "(unknown)"));
+  }
+  // The delegate base this row is bound to, for EVERY row that carries one.
+  // The classifier recovers it from all three commit types, but only emitted it
+  // for the DAT branch and only the delegate-token/delegate-burn rows rendered
+  // it — so a delegate-bound NFT or FT commit, whose reveal the covenant rejects
+  // without a burn output naming that base, looked exactly like a plain commit
+  // here. Generic, because hand-keeping which types show it is what lost it.
+  if (row.delegate_base_ref && type !== "delegate-token" && type !== "delegate-burn") {
+    dl.appendChild(kv("delegate_base_ref", row.delegate_base_ref));
   }
   wrapper.appendChild(dl);
 
@@ -1573,8 +1779,17 @@ function renderScriptCard(payload) {
   if (payload.ref_txid) dl.appendChild(kv("ref txid", payload.ref_txid));
   if (payload.ref_vout !== undefined) dl.appendChild(kv("ref vout", payload.ref_vout));
   if (payload.ref_outpoint) dl.appendChild(kv("ref outpoint", payload.ref_outpoint));
+  // TWO sibling renderers read these rows — this one and renderOutputRow. The first
+  // fix for the dropped delegate base only patched the other, and the drift guard
+  // caught it. A delegate-bound commit's reveal is rejected by the covenant without a
+  // burn output naming this base, so omitting it here showed a script that cannot be
+  // spent as it stands as though it were an ordinary commit.
+  if (payload.delegate_base_ref) dl.appendChild(kv("delegate base ref", payload.delegate_base_ref));
   if (payload.child_ref_outpoint) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
+  }
+  if (payload.authority_ref) {
+    dl.appendChild(kv("authority ref", payload.authority_ref));
   }
   // The dead pre-0.15.0 container. The title and the note both say so, but
   // the verdict also belongs in the field list where a reader scanning
@@ -1743,6 +1958,13 @@ function scriptBadgeKind(type) {
   if (type === "p2pkh-cltv" || type === "p2pkh-csv") return "p2pkh";
   // The covenant shapes bind an NFT singleton; borrow the NFT colour.
   if (type === "soulbound-covenant" || type === "self-replicating-covenant") return "nft";
+  // An authority-gated item and a delegate token are both NFT-shaped singletons
+  // wearing an extra ref opcode; borrow the NFT colour rather than reading as
+  // "unknown", which is what the classifier says when it could not tell.
+  if (type === "authority-gated-nft" || type === "delegate-token") return "nft";
+  // A burn proof is an OP_RETURN refinement, like the message and hashmark
+  // variants; a DAT commit is a commit variant.
+  if (type === "op_return-burn") return "unknown";
   // No badge colour is defined for the dead container shape or for P2SH;
   // reuse the `unknown` styling rather than emitting a class the stylesheet
   // lacks.
@@ -1865,7 +2087,14 @@ function fetchRawTxFromElectrumx(txid) {
       try {
         frame = JSON.parse(data);
       } catch (err) {
-        settle(reject, new Error(`server returned non-JSON: ${err.message}`));
+        // err.message is a V8 SyntaxError that echoes a slice of the
+        // unparsed frame verbatim — attacker-controlled up to ~20 chars.
+        // Sanitise it the same way frame.error below is sanitised: this
+        // path has strictly fewer preconditions to reach (no id===1
+        // match needed), so it must not be the unguarded sibling.
+        settle(reject, new Error(
+          `server returned non-JSON: ${stripControlChars(err.message)}`
+        ));
         return;
       }
       if (frame.id !== 1) {

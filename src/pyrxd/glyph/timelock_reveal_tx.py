@@ -465,6 +465,12 @@ class TimelockRevealPlan:
     #: publication, and a server that lags refuses an honest holder — and neither shows up in
     #: ``unlocked`` alone. An operator who can see "tip 812,340" against "opens at 900,000"
     #: can notice; one shown only "opens at 900,000" cannot.
+    #:
+    #: ``None`` is not a stand-in for 0, and a renderer must not turn it into a distance. It
+    #: means the gate could not evaluate this lock at all, in which case ``remaining`` is 0 by
+    #: default rather than by measurement — and "0 blocks short of the unlock point" is not a
+    #: hedge but the strongest possible claim, that you are exactly on time. Anything shown to
+    #: a person from this field says which of the two it is.
     judged_at: int | None = None
 
 

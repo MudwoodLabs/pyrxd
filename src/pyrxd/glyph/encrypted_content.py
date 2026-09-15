@@ -54,6 +54,41 @@ KEY_FORMAT_WRAPPED = "wrapped"
 KEY_FORMAT_PASSPHRASE = "passphrase"  # nosec B105 — wire-format constant name from REP-3006, not a credential
 
 
+def _require_mapping(value: object, what: str) -> dict:
+    """Refuse a non-map before any ``.get`` or ``[...]`` reaches it.
+
+    Every ``from_dict`` here is annotated ``d: dict`` and none of them was given one it
+    could trust: they parse ATTACKER-AUTHORED on-chain CBOR, where a key the writer
+    declared as a map can hold a string, an int, or null. `d.get(...)` on those raises
+    **AttributeError**, which is not in ``payload._DECODE_REFUSALS`` — so it escaped
+    ``decode_payload``'s "log and degrade" contract and reached
+    :func:`~pyrxd.glyph.inspector` as a crash. A token whose ``crypto.recipients`` was
+    ``"x"``, ``[1]``, ``[[]]`` or ``[None]`` took the inspect path down, and anyone could
+    mint one.
+
+    Raising ``ValidationError`` — which IS refused there — turns the whole class into the
+    ordinary degrade path, at the boundary rather than at each of the four reachable
+    sites. The alternative, widening ``_DECODE_REFUSALS`` to catch ``AttributeError``,
+    would also swallow a genuine typo in pyrxd's own parser, which is precisely the bug
+    such a catch exists to surface.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError(f"{what} must be a CBOR map, got {type(value).__name__}")
+    return value
+
+
+def _require_sequence(value: object, what: str) -> list:
+    """Refuse a non-sequence where the wire declares a list.
+
+    Separate from :func:`_require_mapping` because a STRING is iterable: ``for r in "xy"``
+    yields characters, so a string here would otherwise be reported as two malformed
+    recipients rather than as the one malformed ``recipients`` it is.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValidationError(f"{what} must be a CBOR array, got {type(value).__name__}")
+    return list(value)
+
+
 def _sha256_prefix(hex_or_prefixed: str) -> str:
     """Normalize a hash string to ``"sha256:<lowercase hex>"`` form."""
     s = hex_or_prefixed.strip()
@@ -89,6 +124,7 @@ class EncryptionMetadata:
 
     @classmethod
     def from_dict(cls, d: dict) -> EncryptionMetadata:
+        d = _require_mapping(d, "main (encrypted)")
         # A byte count and a chunk count cannot be negative, and this parses ATTACKER-AUTHORED
         # on-chain bytes. `int(-1)` succeeds, so a negative size used to sail through and reach
         # consumers as a real value — the same malformed-number class as the CBOR Infinity that
@@ -141,6 +177,7 @@ class CryptoRecipient:
     def from_dict(cls, d: dict) -> CryptoRecipient:
         import base64
 
+        d = _require_mapping(d, "crypto.recipients[]")
         mlkem_ct = None
         if d.get("mlkem_ct"):
             mlkem_ct = base64.b64decode(d["mlkem_ct"])
@@ -179,6 +216,7 @@ class TimelockSpec:
 
     @classmethod
     def from_dict(cls, d: dict) -> TimelockSpec:
+        d = _require_mapping(d, "crypto.timelock")
         return cls(
             mode=str(d["mode"]),  # type: ignore[arg-type]
             unlock_at=int(d["unlock_at"]),
@@ -223,7 +261,10 @@ class CryptoMetadata:
 
     @classmethod
     def from_dict(cls, d: dict) -> CryptoMetadata:
-        recipients = [CryptoRecipient.from_dict(r) for r in d.get("recipients", [])]
+        d = _require_mapping(d, "crypto")
+        recipients = [
+            CryptoRecipient.from_dict(r) for r in _require_sequence(d.get("recipients", []), "crypto.recipients")
+        ]
         timelock = TimelockSpec.from_dict(d["timelock"]) if "timelock" in d else None
         return cls(
             mode=str(d.get("mode", "encrypted")),  # type: ignore[arg-type]
@@ -274,6 +315,7 @@ class EncryptedContentStub:
 
     @classmethod
     def from_dict(cls, d: dict) -> EncryptedContentStub:
+        d = _require_mapping(d, "encrypted content stub")
         return cls(
             p=[int(x) for x in d["p"]],
             type=str(d["type"]),
