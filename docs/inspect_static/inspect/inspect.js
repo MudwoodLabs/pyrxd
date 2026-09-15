@@ -708,6 +708,21 @@ function renderFetchedTxCard(payload) {
     const mdl = el("dl", { class: "kv-list" });
     const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
+    // WHAT THE ATTRIBUTION IS WORTH. Both readers take the first `gly` push in the
+    // first input that decodes, so the name shown need not be the one the commit
+    // committed to. `mismatch` means it demonstrably is not. Rendered for every
+    // state, because "not checked" and "checked and held" are opposite facts and
+    // omitting the weak one leaves the confident reading in place.
+    if (metadata.payload_binding) {
+      const pb = metadata.payload_binding;
+      const cls = pb.state === "mismatch" ? "kv-warning" : undefined;
+      mdl.appendChild(kv("payload binding", `${pb.state} — ${pb.reason}`, cls));
+    }
+    // Named whatever the verdict. On `unchecked` it is the outpoint someone would
+    // fetch to settle it; on `mismatch` it is where the committed payload lives.
+    if (metadata.input_outpoint) {
+      mdl.appendChild(kv("spent outpoint", metadata.input_outpoint));
+    }
     if (Array.isArray(metadata.protocol) && metadata.protocol.length > 0) {
       mdl.appendChild(kvWithWarning("protocol", metadata.protocol.join(", "), warnings.protocol));
     }
@@ -2181,11 +2196,39 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
 
   statusEl.textContent = "classifying…";
 
+  // PAYLOAD BINDING — a SECOND fetch. The first pass classifies the transaction and,
+  // if it carries a reveal, names the outpoint that reveal's attributed input spent.
+  // That output is the commit whose `payload_hash` is the only thing binding the
+  // displayed name/attrs to anything, and the classifier is network-free, so without
+  // this the verdict can only ever read "unchecked".
+  //
+  // BOUNDED BY CONSTRUCTION: one attributed input, one prevout, one extra round trip.
+  // Best-effort throughout — a failure here leaves the first pass standing and the
+  // verdict degrades to its own stated "unchecked" reason rather than erroring out.
   let result;
   try {
-    const pyResult = pyGlueFetch(txid, rawHex);
+    let pyResult = pyGlueFetch(txid, rawHex);
     result = pyResult.toJs({ dict_converter: Object.fromEntries });
     pyResult.destroy();
+
+    const outpoint = result && result.payload && result.payload.metadata
+      ? result.payload.metadata.input_outpoint
+      : null;
+    if (outpoint) {
+      statusEl.textContent = "checking payload binding…";
+      const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
+      let prevRawHex = null;
+      try {
+        prevRawHex = await fetchRawTxFromElectrumx(prevTxid);
+      } catch {
+        prevRawHex = null;  // stays "unchecked", with its own reason
+      }
+      if (prevRawHex) {
+        pyResult = pyGlueFetch(txid, rawHex, prevRawHex);
+        result = pyResult.toJs({ dict_converter: Object.fromEntries });
+        pyResult.destroy();
+      }
+    }
   } catch (err) {
     fetchBtn.disabled = false;
     statusEl.textContent = "";
