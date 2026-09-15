@@ -124,6 +124,7 @@ def _classify_raw_tx(
     only_vout: int | None = None,
     network: str = "mainnet",
     delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
+    spent_scripts: Mapping[int, bytes] | None = None,
 ) -> dict:
     """CLI wrapper: translate ``ValidationError`` to ``UserError`` with
     the historic CLI-formatted cause/fix decorations.
@@ -133,7 +134,14 @@ def _classify_raw_tx(
     CLI's three-line ``error / cause / fix`` formatting so existing
     test assertions (e.g. on ``"--electrumx"``) keep matching."""
     try:
-        return _classify_raw_tx_core(txid_hex, raw, only_vout=only_vout, network=network, delegated_refs=delegated_refs)
+        return _classify_raw_tx_core(
+            txid_hex,
+            raw,
+            only_vout=only_vout,
+            network=network,
+            delegated_refs=delegated_refs,
+            spent_scripts=spent_scripts,
+        )
     except ValidationError as exc:
         msg = str(exc)
         if "raw bytes too short" in msg:
@@ -251,8 +259,45 @@ async def _inspect_txid_inner(
         # reveal that burned any base at all vouched for refs resolved from another.
         resolved[base_ref.to_bytes()] = resolve_delegated_refs(base_ref.to_bytes(), base_outputs)
 
-    if resolved:
-        payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network, delegated_refs=resolved)
+    # PAYLOAD BINDING. The metadata above is whatever envelope the first decodable
+    # input carried. What actually commits to a payload is the `payload_hash` in the
+    # commit output that input SPENT — and the classifier is network-free, so without
+    # this fetch `payload_binding` can only ever read "unchecked". That silent state
+    # is the thing the report exists to eliminate, so resolve it here, where a network
+    # connection is already in hand.
+    #
+    # EXACTLY ONE round trip, bounded by construction rather than by a cap: there is
+    # one attributed input and it has one prevout. No loop, so nothing to bound.
+    spent_scripts: dict[int, bytes] = {}
+    meta = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}) or {}
+    outpoint = meta.get("input_outpoint")
+    if outpoint:
+        prev_txid, _, prev_vout = str(outpoint).rpartition(":")
+        try:
+            prev_raw = await client.get_transaction(Txid(prev_txid.lower()))
+            prev_tx = Transaction.from_hex(bytes(prev_raw))
+            if prev_tx is None:
+                raise ValidationError(f"prevout tx {prev_txid} did not decode")
+            spent_scripts[int(meta["input_index"])] = bytes(prev_tx.outputs[int(prev_vout)].locking_script.serialize())
+        except (ValidationError, ValueError, IndexError, KeyError):
+            pass
+        except Exception as exc:
+            # Same contract as the delegate block above: a failed resolution leaves
+            # the verdict "unchecked" — with its own stated reason — rather than
+            # failing the whole inspect. Logged, not swallowed: "unchecked because
+            # the server was unreachable" and "unchecked because nobody asked" render
+            # identically, and whoever is debugging that needs to know which it was.
+            _log.debug("could not resolve the attributed input's prevout %s: %s", outpoint, exc)
+
+    if resolved or spent_scripts:
+        payload = _classify_raw_tx(
+            str(txid),
+            bytes(raw),
+            only_vout=only_vout,
+            network=network,
+            delegated_refs=resolved or None,
+            spent_scripts=spent_scripts or None,
+        )
     if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
@@ -391,6 +436,15 @@ def _render_txid_human(payload: dict) -> str:
             )
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        _pb = metadata.get("payload_binding")
+        if _pb:
+            # Same reasoning as the browser: every state, including "unchecked".
+            _mark = "  *** " if _pb.get("state") == "mismatch" else "  "
+            lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
+            # Named whatever the verdict. On `unchecked` it is what someone would
+            # fetch to settle it; on `mismatch` it is where the real payload is.
+            if metadata.get("input_outpoint"):
+                lines.append(f"    spent outpoint: {metadata['input_outpoint']}")
         lines.append(f"  protocol: {metadata['protocol']}")
         # BEFORE the fields themselves. A look-alike warning printed after the name
         # it applies to is a warning the reader has already acted on — and the whole

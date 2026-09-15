@@ -943,6 +943,58 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
+def _payload_binding(metadata_cbor: bytes | None, spent_script: bytes | None) -> dict:
+    """Did the commit this input spent actually commit to THIS payload?
+
+    A commit output's locking script carries ``sha256d(envelope CBOR)`` as its
+    ``payload_hash``. Nothing checked the reveal's envelope against it, and both
+    readers take the FIRST ``gly`` push in the FIRST input that decodes — so the
+    name, attrs and creator shown to a human need not be the ones the commit
+    committed to. Demonstrated at library level: inputs ``[decoy, real]`` attribute
+    the decoy; ``[real, decoy]`` attribute the real one. Whichever is first wins.
+
+    On the commit input itself a second envelope is unreachable — ``CLEANSTACK``
+    and ``SIGPUSHONLY`` are set unconditionally for block connection
+    (``tests/vendor/radiant_core/validation.cpp``), and the commit script's stack
+    arithmetic is fixed. The vector is a SECOND input whose locking script consumes
+    the extra items, placed first.
+
+    This is deliberately a REPORT, not a refusal. The classifier is network-free,
+    so the spent script is only present when a fetching caller supplied it; a
+    verdict that silently means "I could not check" is the thing being fixed, so
+    every state is named. ``mismatch`` is the one that matters.
+    """
+    from .script import extract_payload_hash_from_commit_script
+
+    if spent_script is None:
+        return {
+            "state": "unchecked",
+            "reason": "the spent output of the attributed input was not supplied, so the "
+            "payload was not checked against the commit that committed to it",
+        }
+    try:
+        expected = extract_payload_hash_from_commit_script(spent_script)
+    except (ValidationError, ValueError, IndexError):
+        return {
+            "state": "not-a-commit",
+            "reason": "the attributed input did not spend a commit output, so no payload hash "
+            "binds this envelope to anything",
+        }
+    if metadata_cbor is None:
+        return {
+            "state": "unchecked",
+            "reason": "the envelope CBOR was not recoverable for hashing",
+        }
+    actual = hash256(metadata_cbor)
+    if actual == expected:
+        return {"state": "bound", "reason": "the spent commit committed to exactly this payload"}
+    return {
+        "state": "mismatch",
+        "reason": "THE SPENT COMMIT COMMITTED TO A DIFFERENT PAYLOAD than the envelope shown "
+        "here — treat this metadata as unattributed",
+    }
+
+
 def _classify_raw_tx(
     txid_hex: str,
     raw: bytes,
@@ -950,6 +1002,7 @@ def _classify_raw_tx(
     only_vout: int | None = None,
     network: str = "mainnet",
     delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
+    spent_scripts: Mapping[int, bytes] | None = None,
 ) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
@@ -1106,8 +1159,21 @@ def _classify_raw_tx(
     metadata_payload: dict | None = None
     if found is not None:
         input_idx, metadata = found
+        # WHAT THIS ATTRIBUTION IS WORTH. Reported for every inspect, because
+        # "I did not check" and "I checked and it held" are opposite facts and the
+        # silent one reads as the reassuring one.
+        _cbor = inspector.extract_reveal_cbor(scriptsigs[input_idx]) if scriptsigs else None
+        _src = tx.inputs[input_idx]
         metadata_payload = {
             "input_index": input_idx,
+            # THE OUTPOINT THAT WOULD SETTLE IT. The classifier is network-free by
+            # design, so `payload_binding` can only read `unchecked` unless someone
+            # fetches this. Naming it is what makes the check REACHABLE from outside
+            # this module — the CLI's --fetch path and the browser page both resolve
+            # it from here — and it is also the outpoint a human would go and look
+            # at by hand.
+            "input_outpoint": (f"{_src.source_txid}:{_src.source_output_index}" if _src.source_txid else None),
+            "payload_binding": _payload_binding(_cbor, (spent_scripts or {}).get(input_idx)),
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             # Human-friendly highest-specificity protocol label (e.g. "wave",
             # "container", "timelock", "authority", "dat"). Computed from the

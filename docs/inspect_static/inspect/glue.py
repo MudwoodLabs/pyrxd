@@ -178,8 +178,43 @@ def _inspect_txid_offline(value: str) -> dict:
     }
 
 
-def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
+def _reclassify_with_spent(txid: str, raw: bytes, payload: dict, prev_raw_hex: str) -> dict:
+    """Re-run the classifier with the attributed input's spent locking script.
+
+    Mirrors the CLI ``--fetch`` path. Kept separate so the failure contract is
+    obvious: every step here is best-effort, and the caller keeps the first
+    payload if any of it raises.
+    """
+    from pyrxd.transaction import Transaction
+
+    metadata = payload.get("metadata") or {}
+    outpoint = metadata.get("input_outpoint")
+    input_index = metadata.get("input_index")
+    if not outpoint or input_index is None:
+        return payload
+    _, _, vout_str = str(outpoint).rpartition(":")
+    prev_tx = Transaction.from_hex(bytes.fromhex(prev_raw_hex.strip()))
+    if prev_tx is None:
+        return payload
+    script = bytes(prev_tx.outputs[int(vout_str)].locking_script.serialize())
+    return _inspect.classify_raw_tx(
+        txid,
+        raw,
+        network=_PAGE_NETWORK,
+        spent_scripts={int(input_index): script},
+    )
+
+
+def inspect_txid_with_raw(txid: str, raw_hex: str, prev_raw_hex: str = "") -> dict:
     """Classify a transaction whose raw bytes JS already fetched.
+
+    *prev_raw_hex*, when given, is the raw transaction containing the output that
+    the attributed reveal input SPENT — the commit whose ``payload_hash`` is the
+    only thing that binds the displayed envelope to anything. The page fetches it
+    on a second round trip after reading ``metadata.input_outpoint`` out of the
+    first pass. Without it ``payload_binding`` can only read ``unchecked``, so this
+    parameter is what makes the check reachable in the browser at all rather than
+    only from a library caller.
 
     The JS side opens a WebSocket to the configured ElectrumX server,
     sends ``blockchain.transaction.get`` for ``txid``, and hands the
@@ -227,6 +262,15 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
 
     try:
         payload = _inspect.classify_raw_tx(txid, raw, network=_PAGE_NETWORK)
+        # SECOND PASS, only when the page supplied the spent transaction. A failure
+        # here must leave the FIRST payload standing: the rest of the report is
+        # still true, and `payload_binding` degrades to its own stated `unchecked`
+        # reason rather than taking the whole inspect down.
+        if prev_raw_hex:
+            try:
+                payload = _reclassify_with_spent(txid, raw, payload, prev_raw_hex)
+            except Exception:
+                pass
     except Exception as exc:
         return _err(
             _safe_error(exc),

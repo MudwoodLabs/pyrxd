@@ -532,3 +532,24 @@ class GlyphInspector:
             if payload_index is not None:
                 return decode_payload(items[payload_index])
         return None
+
+    def extract_reveal_cbor(self, scriptsig: bytes) -> bytes | None:
+        """The RAW envelope bytes this scriptSig carries, or ``None``.
+
+        Selected by exactly the same walk and marker rule as
+        :meth:`_parse_reveal_scriptsig`, deliberately: a caller hashing these bytes
+        against a commit's ``payload_hash`` must hash the push that
+        :meth:`extract_reveal_metadata` actually decoded, or the check answers about
+        a different payload than the one on screen. Sharing the selection is what
+        makes the two agree; two walkers here have already drifted once.
+
+        Returns the bytes undecoded, because the check is over the wire form.
+        """
+        items, _complete = self._walk_pushes(scriptsig)
+        for i, item in enumerate(items):
+            if item != GLY_MARKER:
+                continue
+            payload_index = self._payload_index_after_marker(items, i)
+            if payload_index is not None:
+                return items[payload_index]
+        return None
