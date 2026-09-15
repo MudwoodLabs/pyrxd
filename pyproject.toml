@@ -302,6 +302,13 @@ test = "pytest"
 # this branch; re-verify with a cold cache before ever reverting this scope again — do
 # not trust the previous state of this comment over a fresh run.
 #
+# `gravity/htlc_covenant.py` is here for one specific reason: it holds the 15th
+# `GlyphRef(txid=<str>)` site, and `glyph/types.py`'s comment states that running mypy
+# over builder.py AND htlc_covenant.py is what would catch that comment going stale
+# again. Leaving it out of the scope would make that sentence name a check nobody runs,
+# which is the failure the sentence is about. Verified clean with a cold cache when
+# added.
+#
 # scripts/ is in scope on purpose: `radiant_mainnet_chainio.py` is the mainnet transport that
 # produced the height/confs conflation, and `_dust_swap_shared.py` holds the reorg-gate anchor
 # that consumed it. Excluding them would leave the type-checked boundary short of where the bug
@@ -315,6 +322,7 @@ typecheck = """mypy \
   src/pyrxd/glyph/script.py \
   src/pyrxd/glyph/builder.py \
   src/pyrxd/glyph/relationships.py \
+  src/pyrxd/gravity/htlc_covenant.py \
   src/pyrxd/network/electrumx.py \
   src/pyrxd/gravity/radiant_leg.py \
   src/pyrxd/gravity/swap_state.py \

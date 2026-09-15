@@ -2,8 +2,9 @@
 
 ``GlyphRef.txid`` is annotated ``Txid``, but an annotation is not a runtime check: a
 dataclass stores whatever it is handed. So ``GlyphRef(txid=<raw str>, vout=...)`` skipped
-``Txid.__new__`` entirely — and mypy found **14 call sites** doing exactly that, in code
-that had never been inside the typecheck scope.
+``Txid.__new__`` entirely — and mypy found **15 call sites** doing exactly that (14 in
+``glyph/builder.py``, 1 in ``gravity/htlc_covenant.py``), in code that had never been
+inside the typecheck scope. #649 put all three files in it and wrapped every site.
 
 Two demonstrated consequences:
 
