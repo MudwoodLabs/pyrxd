@@ -73,14 +73,31 @@ gh run list --workflow publish.yml --repo MudwoodLabs/pyrxd --limit 1
 # SBOM attached to the release
 gh release view vX.Y.Z --repo MudwoodLabs/pyrxd --json assets --jq '.assets[].name'
 
-# PyPI has the version, with wheel + sdist
-curl -s https://pypi.org/pypi/pyrxd/json | python3 -c \
-  "import json,sys; d=json.load(sys.stdin); print(d['info']['version'])"
+# PyPI has the version, with wheel + sdist.
+# USE THE SIMPLE INDEX, not the JSON API — see the note below.
+curl -s https://pypi.org/simple/pyrxd/ | grep -o 'pyrxd-X\.Y\.Z[^"#<]*' | sort -u
 
 # clean-venv install actually works
-python3 -m venv /tmp/verify && /tmp/verify/bin/pip install -q pyrxd==X.Y.Z
+python3 -m venv /tmp/verify && /tmp/verify/bin/pip install -q --no-cache-dir pyrxd==X.Y.Z
 /tmp/verify/bin/python -c "import pyrxd; print(pyrxd.__version__)"
 ```
+
+**PyPI's JSON API lags a publish; the simple index does not.** Measured cutting
+0.24.0: several minutes after a fully successful upload,
+`https://pypi.org/pypi/pyrxd/json` still reported `info.version` as the PREVIOUS
+release and listed **zero** files under the new one, while
+`https://pypi.org/simple/pyrxd/` already showed both the wheel and the sdist and
+the job log confirmed both uploads with attestations.
+
+They are different cache paths. Following the old version of this step exactly
+would have produced a confident "the publish failed" for a release that had in
+fact succeeded — a check whose stale answer is indistinguishable from a real
+failure. Verify with the simple index, and treat a stale JSON answer as expected
+rather than as evidence.
+
+The clean-venv install below is the check that actually settles it: it installs
+the published artifact and runs it. Prefer `--no-cache-dir`, or a local pip cache
+can serve you the previous version and report success.
 
 `publish.yml` targets the `pypi` environment. If that environment is configured
 with required reviewers, the run parks awaiting approval — it has not failed.
