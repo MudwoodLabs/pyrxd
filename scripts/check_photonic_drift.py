@@ -44,7 +44,14 @@ from typing import Any
 
 REPO = "Radiant-Core/Photonic-Wallet"
 PIN_PATH = Path("tests/fixtures/photonic_upstream_pin.json")
-SEARCH_ROOTS = ("src", "tests", "docs", "scripts")
+#: DERIVED, not listed. This was an allowlist of four top-level directories, which
+#: made the scan structural about WHICH FILES it read and hand-kept about WHERE it
+#: looked — the same shape this script exists to avoid. It missed `ci`,
+#: `conformance`, `docker`, `examples` and `guides`; none cite Photonic today, but
+#: `conformance/` is exactly where a reference-implementation citation would appear,
+#: and the watcher would have gone blind to it with nothing saying so. Scanning from
+#: the repo root and subtracting SKIP_DIRS means a new directory is covered the day
+#: it is created.
 SEARCH_SUFFIXES = {".py", ".md", ".ts", ".json", ".yml", ".yaml", ".rst", ".toml"}
 
 #: A Photonic source path as pyrxd writes it in prose and code comments.
@@ -76,26 +83,22 @@ def _urlopen(req: urllib.request.Request, what: str) -> Any:
 def cited_paths(root: Path) -> dict[str, list[str]]:
     """Every Photonic path this repo cites -> the pyrxd files citing it."""
     found: dict[str, list[str]] = {}
-    for sub in SEARCH_ROOTS:
-        base = root / sub
-        if not base.is_dir():
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in SEARCH_SUFFIXES:
             continue
-        for path in base.rglob("*"):
-            if not path.is_file() or path.suffix not in SEARCH_SUFFIXES:
-                continue
-            if SKIP_DIRS & set(path.relative_to(root).parts):
-                continue
-            # The pin lists every watched path, so scanning it would make each
-            # entry "cited" by the pin itself and turn the completeness test
-            # vacuously true — a guard passing because it reads its own answer.
-            if path.resolve() == (root / PIN_PATH).resolve():
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for hit in CITATION_RE.findall(text):
-                found.setdefault(hit, []).append(str(path.relative_to(root)))
+        if SKIP_DIRS & set(path.relative_to(root).parts):
+            continue
+        # The pin lists every watched path, so scanning it would make each
+        # entry "cited" by the pin itself and turn the completeness test
+        # vacuously true — a guard passing because it reads its own answer.
+        if path.resolve() == (root / PIN_PATH).resolve():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for hit in CITATION_RE.findall(text):
+            found.setdefault(hit, []).append(str(path.relative_to(root)))
     return found
 
 
