@@ -1,0 +1,105 @@
+# Keep GitHub's traffic numbers past the 14 days GitHub keeps them.
+#
+# The traffic API returns AT MOST 14 days and is not retroactive — a day that
+# falls off is gone from the API and from the Insights page alike, and no
+# parameter widens it. So the only way to have a year of history is to have been
+# saving it all year. This job is that.
+#
+# Measured 2026-09-15: the window held exactly 14 entries, 2026-09-01..09-14.
+#
+# WHERE IT WRITES. An orphan `traffic-data` branch, not main — a daily commit to
+# main would add ~365 commits a year of noise to a history people read.
+#
+# THE TOKEN IS NOT GITHUB_TOKEN. These endpoints need repository Administration
+# (read), which is not among the permissions `GITHUB_TOKEN` can be granted
+# (there is no `administration` key). A PAT in TRAFFIC_TOKEN is required; the
+# collector exits 2 with the remediation text if it is missing or wrong.
+#
+# FAILURE IS RED, NOT QUIET. An auth failure and a genuinely idle fortnight both
+# produce "no new rows". The collector treats a non-200, a shape change and an
+# empty day list as errors and writes nothing, so a broken run can never be
+# committed as a quiet week. Guarded by
+# tests/test_traffic_history_is_never_silently_shortened.py, which runs in
+# ordinary CI.
+
+name: Traffic history
+
+on:
+  schedule:
+    # Daily, 07:00 UTC. GitHub's traffic data rolls at UTC midnight; running a
+    # few hours later means the previous day is complete when it is captured.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    # Exercise the mechanism on the PR that changes it.
+    paths:
+      - "scripts/collect_traffic.py"
+      - ".github/workflows/traffic.yml"
+
+concurrency:
+  # Never two writers on the data branch at once.
+  group: traffic-history
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: Append today's traffic to the kept history
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check out the data branch
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: traffic-data
+          path: data
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # On a pull_request the secret is not available to forks and we do not
+      # want to write anyway, so the PR run only proves the script imports and
+      # its guards behave — the real coverage is the test file, in normal CI.
+      - name: Dry run (pull_request only)
+        if: github.event_name == 'pull_request'
+        run: |
+          python -c "
+          import importlib.util, pathlib
+          spec = importlib.util.spec_from_file_location('ct', 'scripts/collect_traffic.py')
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          print('collector imports cleanly; merge() is pure:', m.merge({}, {})[1] == 0)
+          "
+
+      - name: Collect
+        if: github.event_name != 'pull_request'
+        env:
+          # A PAT with Administration:read. GITHUB_TOKEN cannot do this.
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          TRAFFIC_REPO: ${{ github.repository }}
+          TRAFFIC_FILE: data/traffic.json
+        run: python scripts/collect_traffic.py
+
+      # Only reached when the collector exited 0, so there is no path on which a
+      # failed fetch gets committed.
+      - name: Commit if anything changed
+        if: github.event_name != 'pull_request'
+        working-directory: data
+        run: |
+          if git diff --quiet -- traffic.json; then
+            echo "no change today"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add traffic.json
+          git commit -m "traffic: $(date -u +%Y-%m-%d)"
+          git push origin HEAD:traffic-data
+          echo "committed $(git rev-parse --short HEAD)"
