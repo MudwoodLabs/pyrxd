@@ -271,31 +271,43 @@ test = "pytest"
 # green. A gate that fails on hundreds of pre-existing errors gets switched off. To widen it,
 # clear a module's errors FIRST, then add its path here.
 #
-# WIDENING THIS IS WORTH MORE THAN TIDINESS, and is currently BLOCKED. `python_version`
-# below is 3.10 — the floor in `requires-python` — so mypy reports a 3.11+ stdlib symbol
-# as an error (`Module "datetime" has no attribute "UTC"`). Exactly that defect shipped
-# to CI from a 3.12 dev machine and failed only the 3.10 job; it would have been caught
-# here had the file been in scope.
+# `python_version` below is 3.10 — the floor in `requires-python` — so mypy reports a
+# 3.11+ stdlib symbol as an error (`Module "datetime" has no attribute "UTC"`). Exactly
+# that defect shipped to CI from a 3.12 dev machine and failed only the 3.10 job; it
+# would have been caught here had the file been in scope.
 #
-# `glyph/relationships.py`, `glyph/authority.py` and `glyph/burn.py` ARE now --strict
-# clean and were tried here. Adding them was REVERTED, for a reason worth writing down
-# because it will look like a mistake otherwise:
+# `glyph/relationships.py`, `glyph/authority.py` and `glyph/burn.py` were --strict clean
+# and tried here once before; adding them was REVERTED because past some point mypy
+# stopped treating `websockets` as `Any` and reported
+# `network/electrumx.py:766: Module has no attribute "connect"` — a STATIC-only issue:
+# `web3` 7.x caps `websockets<16.0.0`, so anyone who installs the `[eth]` extra got 15.x,
+# where `connect` is reached through a lazy `__getattr__` mypy would not follow, while CI
+# resolved higher and saw a real attribute. That would have been a gate GREEN IN CI and
+# RED for any developer with the eth extra.
 #
-# Those files grow the module graph mypy analyses, and past some point mypy stops
-# treating `websockets` as `Any` and reports
-# `network/electrumx.py:766: Module has no attribute "connect"`. It is a STATIC issue
-# only — `websockets.connect` is callable at runtime on the installed version, and CI's
-# Type check step passes on the branch that added them.
+# #649 claimed this was still blocking and that widening surfaced the same
+# `electrumx.py` error. Neither half reproduced when checked: `mypy
+# src/pyrxd/network/electrumx.py` alone is "Success: no issues found" with web3 7.16.0 /
+# websockets 15.0.1 installed (the exact `[eth]`-extra combination described above), and
+# running the full command below — with a cold `.mypy_cache` — reports no
+# `electrumx.py` error either. Whatever changed `websockets`' stub resolution between
+# the original attempt and now, it no longer happens. Widening picked up 25 REAL errors
+# instead, all ordinary type debt in the 5 files being added (14 `GlyphRef(txid=...)`
+# call sites accepting `str` where `GlyphRef.__post_init__` expects `Txid` — safe at
+# runtime since that constructor coerces, but not typed correctly; missing generic type
+# args; two return-type annotations; one `typing.assert_never` needing
+# `typing_extensions` on the 3.10 floor; and two Optional mismatches that were traced to
+# unreachable `None`s, not real bugs — see `glyph/burn.py`'s `_is_int` and
+# `glyph/builder.py`'s `prepare_ft_deploy_reveal` for how each was resolved). Fixed on
+# this branch; re-verify with a cold cache before ever reverting this scope again — do
+# not trust the previous state of this comment over a fresh run.
 #
-# It reproduces locally with a cold cache, and the difference is the environment:
-# `web3` 7.x caps `websockets<16.0.0`, so anyone who installs the `[eth]` extra (which
-# the ETH-leg suites need) gets 15.x, where `connect` is reached through a lazy
-# `__getattr__` mypy will not follow. CI resolves higher and sees a real attribute.
-#
-# So widening here would produce a gate that is GREEN IN CI and RED for any developer
-# with the eth extra — the precise way a gate gets switched off, which is what the note
-# above is guarding against. Fix `electrumx.py` to import `connect` from its real module
-# first (verifying runtime behaviour on both websockets majors), then add these three.
+# `gravity/htlc_covenant.py` is here for one specific reason: it holds the 15th
+# `GlyphRef(txid=<str>)` site, and `glyph/types.py`'s comment states that running mypy
+# over builder.py AND htlc_covenant.py is what would catch that comment going stale
+# again. Leaving it out of the scope would make that sentence name a check nobody runs,
+# which is the failure the sentence is about. Verified clean with a cold cache when
+# added.
 #
 # scripts/ is in scope on purpose: `radiant_mainnet_chainio.py` is the mainnet transport that
 # produced the height/confs conflation, and `_dust_swap_shared.py` holds the reorg-gate anchor
@@ -305,6 +317,12 @@ typecheck = """mypy \
   src/pyrxd/security/ \
   src/pyrxd/glyph/transfer.py \
   src/pyrxd/glyph/client.py \
+  src/pyrxd/glyph/authority.py \
+  src/pyrxd/glyph/burn.py \
+  src/pyrxd/glyph/script.py \
+  src/pyrxd/glyph/builder.py \
+  src/pyrxd/glyph/relationships.py \
+  src/pyrxd/gravity/htlc_covenant.py \
   src/pyrxd/network/electrumx.py \
   src/pyrxd/gravity/radiant_leg.py \
   src/pyrxd/gravity/swap_state.py \

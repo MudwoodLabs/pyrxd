@@ -16,7 +16,7 @@ from pyrxd.fee_sizing import (
     trial_size_with_slack,
 )
 from pyrxd.security.errors import ValidationError
-from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
+from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20, Txid
 
 from .burn import build_burn_proof_script
 from .dmint import (
@@ -59,7 +59,7 @@ MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons per byte
 _MAX_PHOTONS = RADIANT_MAX_PHOTONS
 
 
-def _assert_declared_dmint_matches(decoded_cbor: dict, params: Any) -> None:
+def _assert_declared_dmint_matches(decoded_cbor: dict[str, Any], params: Any) -> None:
     """Refuse a deploy whose metadata advertises numbers it does not emit.
 
     The token body can carry a ``dmint`` object (Photonic ``DmintPayload``);
@@ -429,7 +429,7 @@ class GlyphBuilder:
             raise ValidationError(f"Could not parse CBOR payload for protocol cross-check: {e}") from e
 
         ref = GlyphRef(
-            txid=params.commit_txid,
+            txid=Txid(params.commit_txid),
             vout=params.commit_vout,
         )
         if params.is_nft:
@@ -518,6 +518,21 @@ class GlyphBuilder:
                 is_nft=False,
             )
         )
+        if scripts.locking_script is None:
+            # Unreachable via this call: `RevealScripts.locking_script` is only
+            # ever `None` on the DAT path (`prepare_dat_reveal`, which this
+            # method never calls). `prepare_reveal` above takes `is_nft=False`
+            # and always returns a real `build_ft_locking_script(...)` result.
+            # Guarded (not cast/ignored) so a future change to `prepare_reveal`
+            # that starts returning `None` for an FT reveal fails loudly here
+            # instead of handing `FtDeployRevealScripts` a script-less token —
+            # exactly the "anyone-can-spend output" failure the `None` sentinel
+            # exists to prevent on the DAT path.
+            raise ValidationError(
+                "prepare_reveal returned no locking_script for an FT deploy reveal "
+                "(is_nft=False) — this should be unreachable; only the DAT reveal "
+                "path leaves it None."
+            )
         return FtDeployRevealScripts(
             locking_script=scripts.locking_script,
             scriptsig_suffix=scripts.scriptsig_suffix,
@@ -576,7 +591,11 @@ class GlyphBuilder:
         if isinstance(params, DmintV2DeployParams):
             return self._prepare_dmint_v2_deploy(params, allow_v2_deploy=allow_v2_deploy)
         # Unreachable per the type union — exhaustive-narrowing for mypy strict.
-        from typing import assert_never
+        # `typing.assert_never` is 3.11+; the floor here is 3.10
+        # (`requires-python = ">=3.10"`), so `typing_extensions` (an unconditional
+        # transitive dep via `aiohttp`'s `typing_extensions>=4.4; python_version <
+        # "3.13"` requirement, covering every classifier-listed version) supplies it.
+        from typing_extensions import assert_never
 
         assert_never(params)
 
@@ -657,7 +676,7 @@ class GlyphBuilder:
         # estimate fees before broadcasting the commit. Each is the
         # full 241-byte V1 layout (state + epilogue); only the txid
         # component of contractRef/tokenRef changes at reveal time.
-        placeholder_txid = "00" * 32
+        placeholder_txid = Txid("00" * 32)
         placeholder_token_ref = GlyphRef(txid=placeholder_txid, vout=0)
         target = difficulty_to_target(params.difficulty, params.algo)
         placeholder_contract_scripts = tuple(
@@ -738,7 +757,7 @@ class GlyphBuilder:
         # 3. Pre-build placeholder V2 contract scripts (height=0) so the caller can
         # estimate the reveal fee before the commit txid is known. Each is the full
         # V2 layout; only the txid component of contractRef/tokenRef changes at reveal.
-        placeholder_txid = "00" * 32
+        placeholder_txid = Txid("00" * 32)
         placeholder_token_ref = GlyphRef(txid=placeholder_txid, vout=0)
         placeholder_contract_scripts = tuple(
             build_dmint_contract_script(
@@ -870,11 +889,11 @@ class GlyphBuilder:
         except Exception as exc:
             raise ValidationError(f"Could not parse CBOR for MUT cross-check: {exc}") from exc
 
-        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        ref = GlyphRef(txid=Txid(commit_txid), vout=commit_vout)
         # NOT ``ref`` — see the docstring. The contract's singleton must be a
         # different outpoint, and specifically the next one: its own body
         # recomputes the token ref as ``mutable_ref.vout - 1``.
-        mutable_ref = GlyphRef(txid=commit_txid, vout=commit_vout + 1)
+        mutable_ref = GlyphRef(txid=Txid(commit_txid), vout=commit_vout + 1)
         payload_hash = hash_payload(cbor_bytes)
         nft_script = build_nft_locking_script(owner_pkh, ref)
         contract_script = build_mutable_nft_script(mutable_ref, payload_hash)
@@ -955,7 +974,7 @@ class GlyphBuilder:
             )
         self._assert_protocol(cbor_bytes, GlyphProtocol.CONTAINER, "CONTAINER")
 
-        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        ref = GlyphRef(txid=Txid(commit_txid), vout=commit_vout)
         return ContainerRevealScripts(
             ref=ref,
             locking_script=build_nft_locking_script(owner_pkh, ref),
@@ -1091,7 +1110,7 @@ class GlyphBuilder:
                 f"authority_script does not carry {authority_ref.txid}:{authority_ref.vout} — pass the "
                 "authority UTXO's own locking script, so it is re-created exactly as it is being spent"
             )
-        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        ref = GlyphRef(txid=Txid(commit_txid), vout=commit_vout)
         return AuthorityGatedRevealScripts(
             ref=ref,
             item_script=build_authority_gated_nft_script(owner_pkh, ref, authority_ref),
@@ -1323,7 +1342,7 @@ class GlyphBuilder:
                 "the reveal that was supposed to leave the container untouched silently downgrades it."
             )
 
-        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        ref = GlyphRef(txid=Txid(commit_txid), vout=commit_vout)
         return ContainerChildRevealScripts(
             ref=ref,
             nft_script=build_nft_locking_script(owner_pkh, ref),
@@ -2077,12 +2096,12 @@ class DmintV1DeployResult:
             difficulty_to_target,
         )
 
-        token_ref = GlyphRef(txid=commit_txid, vout=0)
+        token_ref = GlyphRef(txid=Txid(commit_txid), vout=0)
         target = difficulty_to_target(self.difficulty, self.algo)
         contract_scripts = tuple(
             build_dmint_v1_contract_script(
                 height=0,
-                contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
+                contract_ref=GlyphRef(txid=Txid(commit_txid), vout=i + 1),
                 token_ref=token_ref,
                 max_height=self.max_height,
                 reward=self.reward_photons,
@@ -2168,11 +2187,11 @@ class DmintV2DeployResult:
         optional OP_RETURN. The returned :class:`DmintV1RevealScripts` bag has
         the same shape — and the same output-ordering rule — for V1 and V2.
         """
-        token_ref = GlyphRef(txid=commit_txid, vout=0)
+        token_ref = GlyphRef(txid=Txid(commit_txid), vout=0)
         contract_scripts = tuple(
             build_dmint_contract_script(
                 DmintDeployParams(
-                    contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
+                    contract_ref=GlyphRef(txid=Txid(commit_txid), vout=i + 1),
                     token_ref=token_ref,
                     max_height=self.max_height,
                     reward=self.reward_photons,
@@ -2365,11 +2384,11 @@ class FtTransferParams:
     """
 
     ref: GlyphRef
-    utxos: list  # list[FtUtxo] — can't use generic here without Python 3.9+ runtime guards already in place; mirror existing style.
+    utxos: list[FtUtxo]
     amount: int
     new_owner_pkh: Hex20
     private_key: Any
-    funding: list = dc_field(default_factory=list)  # list[AirdropFunding]
+    funding: list[AirdropFunding] = dc_field(default_factory=list)
     fee_rate: int = MIN_FEE_RATE
     change_pkh: Hex20 | None = None
     dust_limit: int = FT_DUST_LIMIT
@@ -2410,10 +2429,10 @@ class FtAirdropParams:
     """
 
     ref: GlyphRef
-    utxos: list  # list[FtUtxo] — mirrors FtTransferParams' style.
-    recipients: list  # list[AirdropRecipient]
+    utxos: list[FtUtxo]
+    recipients: list[AirdropRecipient]
     private_key: Any
-    funding: list = dc_field(default_factory=list)  # list[AirdropFunding]
+    funding: list[AirdropFunding] = dc_field(default_factory=list)
     fee_rate: int = MIN_FEE_RATE
     change_pkh: Hex20 | None = None
     dust_limit: int = FT_DUST_LIMIT

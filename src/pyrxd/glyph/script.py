@@ -129,11 +129,11 @@ See ``examples/ft_transfer_demo.py`` for the canonical filter pattern.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 from pyrxd.constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
 from pyrxd.hash import hash256
-from pyrxd.script.consensus import get_script_op
+from pyrxd.script.consensus import ScriptOp, get_script_op
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
@@ -1078,7 +1078,7 @@ class TruncatedScriptError(ValidationError):
     """
 
 
-def iter_script_ops_strict(script: bytes):
+def iter_script_ops_strict(script: bytes) -> Iterator[ScriptOp]:
     """Yield every :class:`~pyrxd.script.consensus.ScriptOp` in *script*,
     raising :class:`TruncatedScriptError` at the first instruction that will
     not decode.
@@ -1111,7 +1111,7 @@ def iter_script_ops_strict(script: bytes):
         pos = op.next_pos
 
 
-def iter_input_refs(script: bytes):
+def iter_input_refs(script: bytes) -> Iterator[tuple[int, bytes]]:
     """Yield ``(opcode, ref_operand)`` for each OP_PUSHINPUTREF-family opcode
     in *script*, walking it as an opcode stream the way Radiant consensus does
     (``GetScriptOp`` / ``CScript::GetPushRefs``).

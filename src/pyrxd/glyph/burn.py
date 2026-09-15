@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeGuard
 
 import cbor2
 
@@ -150,8 +151,19 @@ def build_burn_proof_script(
     )
 
 
-def _is_int(value: object) -> bool:
-    """A real integer — NOT a bool, which `isinstance(x, int)` accepts."""
+def _is_int(value: object) -> TypeGuard[int]:
+    """A real integer — NOT a bool, which `isinstance(x, int)` accepts.
+
+    `TypeGuard[int]`, not a plain `bool` return: at `version=cbor_version if
+    _is_int(cbor_version) else 0` below, `cbor_version` comes from
+    `dict.get()` and is statically `Any | None`. Without the guard mypy
+    cannot see that a `None` value falls through to `_is_int(None) ->
+    False` and never reaches the `int`-typed branch, and reports
+    `BurnProof.version` (declared `int`, no default reachable as None) as
+    receiving `Any | int | None`. The `None` arm is genuinely unreachable —
+    this annotation tells mypy what the isinstance check already proves at
+    runtime, it does not change which values pass.
+    """
     return isinstance(value, int) and not isinstance(value, bool)
 
 

@@ -56,13 +56,23 @@ class GlyphRef:
         #     different tokens where the chain sees one.
         #
         # Coercing through `Txid` here puts the guard inside the constructor instead of
-        # beside it, so no caller has to remember. That matters here because the call
-        # sites were NOT changed and are still annotated `str`: mypy reports 15 of them
-        # (14 in glyph/builder.py, 1 in gravity/htlc_covenant.py), and neither file is in
-        # the `task typecheck` scope, so nothing in CI would notice if that grew. This
-        # coercion is the only thing making them safe. An earlier version of this comment
-        # claimed the sites were "typed correctly now" — they are not, and no test could
-        # have caught that sentence being false.
+        # beside it, so no caller has to remember. When this comment was written, the
+        # call sites that pass a raw `str` (14 in glyph/builder.py, 1 in
+        # gravity/htlc_covenant.py, all internal — `commit_txid`/`genesis_txid` params
+        # that are public API and stay `str` on purpose) were NOT wrapped in `Txid(...)`,
+        # and neither file was in the `task typecheck` scope, so mypy caught none of
+        # them and this coercion was the only thing making them safe. #649 widened the
+        # scope to include glyph/builder.py's neighbours and, while there, wrapped all
+        # 15 sites with `Txid(...)` explicitly — mypy now passes on them directly. This
+        # `__post_init__` coercion stays: it is still what protects every OTHER caller
+        # (external users constructing `GlyphRef` directly with a raw `str`,
+        # `pickle`/`copy` producers, anything that skips the type checker). An earlier
+        # version of this comment claimed the sites were "typed correctly now" before
+        # that was true — they are now, but the check that would have caught the false
+        # claim is running `mypy` over `glyph/builder.py` and `gravity/htlc_covenant.py`
+        # (a grep for the raw call text is not reliable here: several sites pass a local
+        # already narrowed to `Txid` a few lines up, so the text `GlyphRef(txid=<name>,`
+        # with no `Txid(` on the same line is not itself evidence of a bug).
         if not isinstance(self.txid, Txid):
             object.__setattr__(self, "txid", Txid(self.txid))
         if self.vout < 0 or self.vout > 0xFFFFFFFF:

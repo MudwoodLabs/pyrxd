@@ -932,7 +932,7 @@ following as guarantees:
 5. Store the DER hex in `creator.sig`.
 
 `creator.pubkey` MUST be a 33-byte compressed secp256k1 public key, hex-encoded
-with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:197-205`).
+with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:207-215`).
 
 ### 10.2 The canonicalisation rule
 
