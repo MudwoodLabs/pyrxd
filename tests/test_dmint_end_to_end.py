@@ -748,12 +748,16 @@ class TestBuildDmintMintTx:
             _mint(_make_contract_utxo(), funding=_funding(value=10_000))  # << fee + reward
 
     def test_asert_daa_updates_target(self):
-        # Redesign: ASERT is mintable. A slow block (delta=2*targetTime over the
-        # half-life worth of excess) eases difficulty → target grows.
+        # Redesign: ASERT is mintable. A slow block eases difficulty → target grows.
+        # The fixture bakes half_life 3600 and, since the 2026-09-16 resync to Photonic's
+        # ASERT-v2 (ed53cd41), the mint builder defaults to DEFAULT_ASERT_HALFLIFE (240) and
+        # refuses a half-life the contract does not bake — so the baked value is passed
+        # explicitly. Under ASERT-v2 the 7140 s excess clamps to +25% of min(target, MAX/4).
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.ASERT)
         last_time = utxo.state.last_time
-        result = _mint(utxo, current_time=last_time + 7200)  # excess 7140, drift +1
+        result = _mint(utxo, current_time=last_time + 7200, half_life=3_600)
         assert result.updated_state.target > utxo.state.target
+        assert result.updated_state.target == utxo.state.target + (utxo.state.target // 65536) * 16384
         assert result.updated_state.last_time == last_time + 7200
 
     def test_epoch_mint_retargets_at_boundary(self):
