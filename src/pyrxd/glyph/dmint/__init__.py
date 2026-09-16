@@ -45,6 +45,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "MAX_SHA256D_TARGET": ("pyrxd.glyph.dmint.types", "MAX_SHA256D_TARGET"),
     "MAX_V2_TARGET_256": ("pyrxd.glyph.dmint.types", "MAX_V2_TARGET_256"),
     "V2UnvalidatedWarning": ("pyrxd.glyph.dmint.types", "V2UnvalidatedWarning"),
+    # ASERT-v2 / LWMA-v2 retarget constants + the bytecode-generation discriminator
+    "ASERT_V2_RADIX": ("pyrxd.glyph.dmint.types", "ASERT_V2_RADIX"),
+    "ASERT_V2_DRIFT_CLAMP": ("pyrxd.glyph.dmint.types", "ASERT_V2_DRIFT_CLAMP"),
+    "ASERT_V2_MAX_TARGET_DIV4": ("pyrxd.glyph.dmint.types", "ASERT_V2_MAX_TARGET_DIV4"),
+    "DEFAULT_ASERT_HALFLIFE": ("pyrxd.glyph.dmint.types", "DEFAULT_ASERT_HALFLIFE"),
+    "DaaBytecodeVersion": ("pyrxd.glyph.dmint.types", "DaaBytecodeVersion"),
+    "DetectedDaaBytecode": ("pyrxd.glyph.dmint.builders", "DetectedDaaBytecode"),
+    "detect_daa_bytecode": ("pyrxd.glyph.dmint.builders", "detect_daa_bytecode"),
+    "detect_contract_daa_bytecode": ("pyrxd.glyph.dmint.miner", "detect_contract_daa_bytecode"),
     # Public — builders bucket
     "build_dmint_code_script": (
         "pyrxd.glyph.dmint.builders",
@@ -129,13 +138,32 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.glyph.dmint.miner",
         "build_pow_preimage",
     ),
+    # Retarget mirrors. The bare names are the LEGACY formulas (unchanged numbers for
+    # existing callers); `_v2` is what the current builder deploys; `_legacy` is the
+    # explicit spelling. build_dmint_mint_tx dispatches on detect_contract_daa_bytecode.
     "compute_next_target_asert": (
         "pyrxd.glyph.dmint.miner",
         "compute_next_target_asert",
     ),
+    "compute_next_target_asert_legacy": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_asert_legacy",
+    ),
+    "compute_next_target_asert_v2": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_asert_v2",
+    ),
     "compute_next_target_linear": (
         "pyrxd.glyph.dmint.miner",
         "compute_next_target_linear",
+    ),
+    "compute_next_target_linear_legacy": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_linear_legacy",
+    ),
+    "compute_next_target_linear_v2": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_linear_v2",
     ),
     "compute_next_target_epoch": (
         "pyrxd.glyph.dmint.miner",

@@ -46,11 +46,13 @@ from pyrxd.security.errors import (
 
 from .builders import (
     _PART_A,
+    DetectedDaaBytecode,
     _build_part_b,
     _push_4bytes_le,
     _push_minimal,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
+    detect_daa_bytecode,
 )
 from .chain import (
     DmintContractUtxo,
@@ -60,9 +62,14 @@ from .chain import (
 )
 from .types import (
     _OP_STATESEPARATOR,
+    ASERT_V2_DRIFT_CLAMP,
+    ASERT_V2_MAX_TARGET_DIV4,
+    ASERT_V2_RADIX,
+    DEFAULT_ASERT_HALFLIFE,
     EPOCH_MAX_SAFE_TARGET,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
+    DaaBytecodeVersion,
     DaaMode,
     DmintAlgo,
     DmintMintResult,
@@ -233,14 +240,23 @@ def _trunc_div(a: int, b: int) -> int:
     return -q if (a < 0) != (b < 0) else q
 
 
-def compute_next_target_asert(
+def compute_next_target_asert_legacy(
     current_target: int,
     last_time: int,
     current_time: int,
     target_time: int,
     half_life: int,
 ) -> int:
-    """Compute next ASERT-lite target (mirrors the redesigned on-chain bytecode).
+    """LEGACY ASERT target — the integer power-of-2 stepper baked into pre-resync contracts.
+
+    Off-chain mirror of :func:`pyrxd.glyph.dmint.builders._build_asert_daa_legacy`, the
+    ASERT bytecode pyrxd emitted before 2026-09-16 (upstream replaced it with ASERT-v2
+    on 2026-06-19, ``ed53cd41``). A contract deployed under it MUST keep being mined
+    with THIS formula — the covenant recomputes the next target with the bytecode it
+    was born with, and rejects any other value. ``build_dmint_mint_tx`` dispatches
+    here when :func:`detect_contract_daa_bytecode` reports
+    ``DaaBytecodeVersion.LEGACY``; new deploys use
+    :func:`compute_next_target_asert_v2`.
 
     The redesign replaced OP_LSHIFT/OP_RSHIFT (which Radiant evaluates as a
     big-endian bit-string shift — wrong on the LE target encoding) with an
@@ -272,13 +288,23 @@ def compute_next_target_asert(
     return max(1, new_target)
 
 
-def compute_next_target_linear(
+def compute_next_target_linear_legacy(
     current_target: int,
     last_time: int,
     current_time: int,
     target_time: int,
 ) -> int:
-    """Compute next linear/LWMA target (mirrors the redesigned on-chain bytecode).
+    """LEGACY LWMA target — the unity-gain single-sample retarget of pre-resync contracts.
+
+    Off-chain mirror of :func:`pyrxd.glyph.dmint.builders._build_linear_daa_legacy`
+    (with the ``OP_0 OP_MAX`` timeDelta floor) AND of
+    :func:`~pyrxd.glyph.dmint.builders._build_linear_daa_legacy_prefloor` (without
+    it) for every ``current_time >= last_time`` — the only inputs the mint builder
+    accepts; on a negative delta the pre-floor bytecode aborts on chain instead of
+    flooring. This is the LWMA bytecode pyrxd emitted before 2026-09-16 (upstream
+    replaced it with LWMA-v2 on 2026-06-20, ``c90e6506``); the mainnet LWMA deploy
+    ``dea3beb9…`` carries the pre-floor variant and is mined with this formula.
+    New deploys use :func:`compute_next_target_linear_v2`.
 
     Divide-first with caps so the on-chain OP_MUL never overflows int64::
 
@@ -301,6 +327,138 @@ def compute_next_target_linear(
     new_target = (target_capped // target_time) * time_delta_capped
     new_target = min(new_target, MAX_SHA256D_TARGET)
     return max(1, new_target)
+
+
+#: Historical names. They compute EXACTLY what they computed before 2026-09-16 — the
+#: legacy formulas — so no existing caller's numbers change silently. They are NOT the
+#: formula a contract deployed by the current builder carries: for that use the ``_v2``
+#: functions, or let ``build_dmint_mint_tx`` dispatch on
+#: :func:`detect_contract_daa_bytecode`. Kept as aliases rather than repointed at v2
+#: because repointing would change results for legacy contracts without a trace.
+compute_next_target_asert = compute_next_target_asert_legacy
+compute_next_target_linear = compute_next_target_linear_legacy
+
+#: The int64 range Radiant's ``CScriptNum`` arithmetic accepts. ``valid64BitRange``
+#: (Radiant Core ``script.h``) EXCLUDES ``INT64_MIN``: ``safeAdd``/``safeSub``/``safeMul``
+#: return nullopt for it and the opcode aborts with INVALID_NUMBER_RANGE_64_BIT, so the
+#: representable range is symmetric, ``[-(2^63 - 1), 2^63 - 1]``.
+_SCRIPT_INT64_MAX = (1 << 63) - 1
+
+
+def _script_int64(value: int, op: str) -> int:
+    """Return ``value`` if a Radiant ``OP_ADD``/``OP_SUB``/``OP_MUL`` could produce it, else raise.
+
+    The on-chain arithmetic aborts the script (INVALID_NUMBER_RANGE_64_BIT) instead of
+    wrapping or saturating, so an off-chain mirror that returned a number here would be
+    predicting a target the covenant can never produce — after the PoW grind. Raise
+    before the grind instead, naming the operation.
+    """
+    if -_SCRIPT_INT64_MAX <= value <= _SCRIPT_INT64_MAX:
+        return value
+    raise ValidationError(
+        f"on-chain {op} would leave the int64 range ({value}); the covenant aborts with "
+        "INVALID_NUMBER_RANGE_64_BIT, so this mint cannot be built"
+    )
+
+
+def compute_next_target_asert_v2(
+    current_target: int,
+    last_time: int,
+    current_time: int,
+    target_time: int,
+    half_life: int,
+) -> int:
+    """ASERT-v2 next target — the fractional, symmetric, damped retarget of CURRENT deploys.
+
+    Off-chain mirror of :func:`pyrxd.glyph.dmint.builders._build_asert_daa_v2`, which is
+    the canonical Photonic ``buildAsertDaaBytecode`` (``script.ts`` at ``becf41a``), and
+    an exact port of the reference ``computeAsertV2Target`` in
+    ``packages/lib/src/dmintDaaV2.ts`` (same commit) — bigint arithmetic there, so the
+    only semantic to carry over is that BigInt and OP_DIV both truncate toward zero::
+
+        excess    = (current_time - last_time) - target_time
+        driftFp   = trunc((excess * RADIX) / half_life)        # RADIX = 2^16, signed
+        driftFp   = clamp(driftFp, -RADIX/4, +RADIX/4)         # ±25%/mint damping
+        t         = min(current_target, MAX_TARGET/4)          # difficulty floor 4
+        new       = clamp(t + (t / RADIX) * driftFp, 1, MAX_TARGET/4)
+
+    ``_trunc_div`` is load-bearing: OP_DIV truncates toward zero while Python ``//``
+    floors, and they differ for the negative ``excess`` of an early block (e.g.
+    ``excess = -1, half_life = 240`` → trunc(-65536/240) = -273; floor gives -274). A
+    floor here would recreate a target the covenant does not, and the mint is rejected.
+
+    **int64 bounds, every intermediate** (the covenant aborts, not wraps, outside
+    ``[-(2^63-1), 2^63-1]``; this mirror raises ``ValidationError`` at the same points
+    via :func:`_script_int64` so it never predicts an unmineable state):
+
+    * ``timeDelta = current_time - last_time``: both are block locktimes the builder
+      bounds to ``[0, 0x7FFFFFFF]``, so ``|timeDelta| < 2^31``.
+    * ``excess = timeDelta - target_time``: ``target_time`` is a state script number,
+      so ``|excess| < 2^31 + 2^63`` — checked; a target_time near 2^63 is the only way
+      this can fail.
+    * ``excess * RADIX``: overflows iff ``|excess| >= 2^47`` (≈ 1.4e14 s, 4.5 Myr), i.e.
+      only for a ``target_time >= 2^47 - 2^31``. For any deploy with a sane target
+      time ``|excess * RADIX| < 2^47`` — this is where Photonic's proof
+      (``|excess| <= ~4.3e9`` → ``< 2.8e14``) lives.
+    * ``driftFp = trunc(excess*RADIX / half_life)``: ``|driftFp| <= |excess*RADIX|``
+      since ``half_life >= 1``; then clamped to ``|driftFp| <= 2^14``.
+    * ``t = min(current_target, MAX/4) <= 2^61 - 1``; ``t / RADIX <= 2^45 - 1``.
+    * ``delta = (t/RADIX) * driftFp``: ``|delta| < 2^45 * 2^14 = 2^59`` — cannot overflow.
+    * ``t + delta < 2^61 + 2^59 < 2^63`` — cannot overflow.
+
+    So the only reachable abort is the ``excess`` chain for an absurd ``target_time``,
+    and it is reported rather than mis-predicted.
+
+    .. note::
+       V2-only DAA. ``current_target`` must itself be a valid script number
+       (``1..MAX_SHA256D_TARGET``): the covenant compares it with CScriptNum ops, so a
+       256-bit blake3/k12 target cannot run through any DAA on chain.
+    """
+    if half_life < 1:
+        raise ValidationError(f"ASERT-v2: half_life must be >= 1 (got {half_life}); the bytecode bakes a >= 1 constant")
+    if not 1 <= current_target <= MAX_SHA256D_TARGET:
+        raise ValidationError(
+            f"ASERT-v2: current_target {current_target} is not a valid 8-byte script number in "
+            f"[1, {MAX_SHA256D_TARGET}]; the on-chain retarget cannot evaluate it"
+        )
+    time_delta = _script_int64(current_time - last_time, "OP_SUB (currentTime - lastTime)")
+    excess = _script_int64(time_delta - target_time, "OP_SUB (timeDelta - targetTime)")
+    scaled = _script_int64(excess * ASERT_V2_RADIX, "OP_MUL (excess * RADIX)")
+    drift_fp = _trunc_div(scaled, half_life)
+    drift_fp = max(-ASERT_V2_DRIFT_CLAMP, min(ASERT_V2_DRIFT_CLAMP, drift_fp))
+    t = min(current_target, ASERT_V2_MAX_TARGET_DIV4)
+    # t >= 1 so trunc == floor here; spelled with _trunc_div to keep the OP_DIV semantics visible.
+    delta = _script_int64(_trunc_div(t, ASERT_V2_RADIX) * drift_fp, "OP_MUL ((t/RADIX) * driftFp)")
+    new_target = _script_int64(t + delta, "OP_ADD (t + delta)")
+    new_target = min(new_target, ASERT_V2_MAX_TARGET_DIV4)
+    return max(1, new_target)
+
+
+def compute_next_target_linear_v2(
+    current_target: int,
+    last_time: int,
+    current_time: int,
+    target_time: int,
+) -> int:
+    """LWMA-v2 next target — the damped fractional retarget of CURRENT LWMA deploys.
+
+    Off-chain mirror of :func:`pyrxd.glyph.dmint.builders._build_linear_daa_v2` (canonical
+    Photonic ``buildLinearDaaBytecode`` at ``becf41a``) and a port of
+    ``computeLwmaV2Target`` in ``packages/lib/src/dmintDaaV2.ts``: exactly
+    :func:`compute_next_target_asert_v2` with the responsiveness gain auto-set to
+    ``target_time`` — ``driftFp = (excess * RADIX) / target_time`` — so a block twice
+    the target time hits the ±25% clamp. Same int64 proof (``target_time >= 1`` is
+    deploy-enforced, so the OP_DIV never divides by zero).
+
+    The old unity-gain LWMA (:func:`compute_next_target_linear_legacy`) could jump
+    difficulty 4× in one block and slam the target to 1 on a zero-delta block; this
+    caps each step at ±25% and is stable on-target.
+
+    .. note:: V2-only DAA.
+    """
+    if target_time < 1:
+        raise ValidationError(f"LWMA-v2: target_time must be >= 1 (got {target_time}); it is the OP_DIV divisor")
+    return compute_next_target_asert_v2(current_target, last_time, current_time, target_time, target_time)
 
 
 def compute_next_target_epoch(
@@ -386,6 +544,48 @@ def _v2_state_script_bytes(st: DmintState) -> bytes:
         + _push_4bytes_le(st.last_time)
         + _push_minimal(st.target)
     )
+
+
+def _v2_code_section(contract_script: bytes, state: DmintState) -> bytes:
+    """The code bytes of a V2 contract script (everything after the 0xbd separator).
+
+    Locates the separator by rebuilding the parsed state's exact bytes and requiring
+    them to prefix the script — which both finds the boundary and guards against a
+    contract whose on-chain encoding diverges from what was parsed.
+    """
+    state_bytes = _v2_state_script_bytes(state)
+    if not contract_script.startswith(state_bytes) or contract_script[len(state_bytes) : len(state_bytes) + 1] != (
+        _OP_STATESEPARATOR
+    ):
+        raise ValidationError(
+            "V2 mint: parsed state does not round-trip to the contract UTXO script "
+            "(non-canonical encoding or unexpected layout); cannot safely recreate."
+        )
+    return contract_script[len(state_bytes) + 1 :]
+
+
+def detect_contract_daa_bytecode(contract_script: bytes) -> DetectedDaaBytecode:
+    """Which ASERT/LWMA retarget-formula generation a V2 dMint contract script bakes.
+
+    Parses the state (for the declared ``daa_mode`` and the state/code boundary) and
+    classifies the code section with
+    :func:`pyrxd.glyph.dmint.builders.detect_daa_bytecode`. For ASERT the result also
+    carries the ``half_life`` read out of the bytecode — the value a miner MUST use.
+
+    :raises ValidationError: not a V2 contract script, or its DAA mode is not ASERT/LWMA
+        (FIXED/EPOCH/SCHEDULE have a single generation; ``build_dmint_mint_tx``
+        byte-verifies those by rebuilding Part B from the deploy parameters).
+    :raises UnrecognizedDaaBytecodeError: the fragment matches no known generation.
+    """
+    state = DmintState.from_script(contract_script)
+    if state.is_v1:
+        raise ValidationError("detect_contract_daa_bytecode: V1 contracts have no DAA bytecode")
+    if state.daa_mode not in (DaaMode.ASERT, DaaMode.LWMA):
+        raise ValidationError(
+            f"detect_contract_daa_bytecode: {state.daa_mode.name} has a single bytecode generation "
+            "(only ASERT and LWMA changed formula upstream)"
+        )
+    return detect_daa_bytecode(_v2_code_section(contract_script, state), state.daa_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1356,7 +1556,7 @@ def build_dmint_mint_tx(
     *,
     funding_utxo: DmintMinerFundingUtxo | None = None,
     op_return_msg: bytes | None = None,
-    half_life: int = 3600,
+    half_life: int = DEFAULT_ASERT_HALFLIFE,
     epoch_length: int | None = None,
     max_adjustment_log2: int | None = None,
     schedule: tuple[tuple[int, int], ...] | None = None,
@@ -1397,6 +1597,19 @@ def build_dmint_mint_tx(
        passes ``epoch_length``/``max_adjustment_log2`` or ``schedule`` (and
        ``half_life`` for ASERT) matching the deployed contract — a mismatch is caught
        before the PoW grind.
+
+    .. note::
+       **Two generations of ASERT/LWMA retarget bytecode exist on chain.** Upstream
+       moved to the fractional ASERT-v2 / LWMA-v2 formulas on 2026-06-19/20 and pyrxd
+       followed on 2026-09-16; contracts pyrxd deployed in between bake the legacy
+       formulas. This builder reads the contract's own bytecode
+       (:func:`detect_contract_daa_bytecode`) and recomputes the target with the
+       matching mirror — ``compute_next_target_*_v2`` or ``*_legacy`` — then
+       byte-verifies the supplied ``half_life`` against the baked Part B for BOTH
+       generations. A contract carrying bytecode of neither generation is refused
+       (``UnrecognizedDaaBytecodeError``) rather than mined under a guessed formula.
+       ``half_life`` defaults to the canonical ``DEFAULT_ASERT_HALFLIFE`` (240); a
+       contract baked with another value fails fast naming the baked value.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -1562,6 +1775,29 @@ def build_dmint_mint_tx(
             "This is an encoder limit, not a Radiant relay or consensus limit."
         )
 
+    # Locate the code section now (it is needed to detect the DAA generation BEFORE
+    # the target is computed, and later to graft the rebuilt state onto). The
+    # reconstruction guards against a contract whose on-chain encoding diverges
+    # from what we parsed.
+    code = _v2_code_section(contract_utxo.script, state)
+    code_with_separator = _OP_STATESEPARATOR + code
+
+    # Which retarget FORMULA does this contract bake? ASERT and LWMA changed formula
+    # upstream (ASERT-v2 2026-06-19, LWMA-v2 2026-06-20; pyrxd resynced 2026-09-16), so
+    # a contract deployed in between must be mined with the legacy mirror. Read it off
+    # the bytecode; refuse (before the grind) anything that matches neither.
+    daa_bytecode_version = DaaBytecodeVersion.V2
+    detected: DetectedDaaBytecode | None = None
+    if state.daa_mode in (DaaMode.ASERT, DaaMode.LWMA):
+        detected = detect_daa_bytecode(code, state.daa_mode)
+        daa_bytecode_version = detected.version
+        if detected.half_life is not None and detected.half_life != half_life:
+            raise ValidationError(
+                f"V2 ASERT mint: the contract bakes half_life={detected.half_life} ({detected.version.name} "
+                f"bytecode) but half_life={half_life} was supplied. Pass the contract's own value — a "
+                "different one recreates a target the covenant rejects, after the PoW grind."
+            )
+
     # --- Updated state (redesign): height += 1, lastTime = locktime, target via
     # the DAA mirror (unchanged for FIXED). The covenant's Part C rebuilds this
     # exact next state from MINIMAL_PUSH(height) || <middle literal> ||
@@ -1569,15 +1805,25 @@ def build_dmint_mint_tx(
     # off-chain reconstruction must byte-match.
     new_height = state.height + 1
     if state.daa_mode == DaaMode.ASERT:
-        new_target = compute_next_target_asert(
+        _asert = (
+            compute_next_target_asert_v2
+            if daa_bytecode_version == DaaBytecodeVersion.V2
+            else compute_next_target_asert_legacy
+        )
+        new_target = _asert(
             current_target=state.target,
             last_time=state.last_time,
             current_time=current_time,
             target_time=state.target_time,
-            half_life=half_life,  # the value baked into the contract's ASERT bytecode
+            half_life=half_life,  # byte-verified above against the contract's ASERT bytecode
         )
     elif state.daa_mode == DaaMode.LWMA:
-        new_target = compute_next_target_linear(
+        _linear = (
+            compute_next_target_linear_v2
+            if daa_bytecode_version == DaaBytecodeVersion.V2
+            else compute_next_target_linear_legacy  # LEGACY and LEGACY_LWMA_PREFLOOR agree for delta >= 0
+        )
+        new_target = _linear(
             current_target=state.target,
             last_time=state.last_time,
             current_time=current_time,
@@ -1617,21 +1863,8 @@ def build_dmint_mint_tx(
     )
 
     # Recreate the contract output script. The code section (Part A/B/C, after
-    # the 0xbd separator) is invariant across mints \u2014 slice it from the spent
-    # UTXO and graft the rebuilt state prefix. We reconstruct the spent state
-    # bytes from the parsed state and assert they prefix the UTXO script, which
-    # both locates the separator and guards against a contract whose on-chain
-    # encoding diverges from what we parsed.
-    old_state_bytes = _v2_state_script_bytes(state)
-    if (
-        not contract_utxo.script.startswith(old_state_bytes)
-        or contract_utxo.script[len(old_state_bytes) : len(old_state_bytes) + 1] != _OP_STATESEPARATOR
-    ):
-        raise ValidationError(
-            "V2 mint: parsed state does not round-trip to the contract UTXO script "
-            "(non-canonical encoding or unexpected layout); cannot safely recreate."
-        )
-    code_with_separator = contract_utxo.script[len(old_state_bytes) :]
+    # the 0xbd separator) is invariant across mints \u2014 it was sliced from the spent
+    # UTXO above; graft the rebuilt state prefix onto it.
     contract_script = _v2_state_script_bytes(updated_state) + code_with_separator
 
     # Guard the caller-supplied DAA params against the contract's BAKED bytecode.
@@ -1639,8 +1872,10 @@ def build_dmint_mint_tx(
     # the Part B bytecode, NOT in the parsed state \u2014 so a wrong value would silently
     # diverge new_target from what the covenant recomputes, and the mint would be
     # rejected on-chain AFTER a multi-minute PoW grind. Rebuild Part B from the caller's
-    # params and check it byte-matches the baked Part B (at its fixed offset in the
-    # spliced code: after 0xbd + Part A + the 1-byte powHashOp), failing fast instead.
+    # params \u2014 under the DAA bytecode GENERATION detected above, so a legacy contract is
+    # checked against the legacy template it actually carries \u2014 and check it byte-matches
+    # the baked Part B (at its fixed offset in the spliced code: after 0xbd + Part A + the
+    # 1-byte powHashOp), failing fast instead.
     if state.daa_mode != DaaMode.FIXED:
         expected_part_b = _build_part_b(
             state.daa_mode,
@@ -1648,13 +1883,15 @@ def build_dmint_mint_tx(
             epoch_length=epoch_length if epoch_length is not None else 2016,
             max_adjustment_log2=max_adjustment_log2 if max_adjustment_log2 is not None else 2,
             schedule=schedule if schedule is not None else (),
+            daa_bytecode_version=daa_bytecode_version,
         )
         part_b_start = 1 + len(_PART_A) + 1  # 0xbd + Part A + powHashOp
         if code_with_separator[part_b_start : part_b_start + len(expected_part_b)] != expected_part_b:
             raise ValidationError(
                 f"V2 {state.daa_mode.name} mint: the supplied DAA params (half_life/epoch_length/"
-                "max_adjustment_log2/schedule) do not reproduce the contract's baked bytecode. They must "
-                "match the values used at deploy, or the recreated target diverges and the mint is rejected."
+                "max_adjustment_log2/schedule) do not reproduce the contract's baked bytecode "
+                f"({daa_bytecode_version.name} generation). They must match the values used at deploy, "
+                "or the recreated target diverges and the mint is rejected."
             )
 
     # The 75-byte FT-wrapped reward \u2014 load-bearing for the covenant's

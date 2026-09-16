@@ -17,10 +17,12 @@ imports them from ``builders.py`` via the allowed ``chain → builders``
 edge. The ``_match_v1_epilogue`` function (which also uses them) is in
 ``chain.py`` and imports them from here.
 
-Symbols (17 + 4 epilogue constants shared with chain):
+Symbols (23 + 4 epilogue constants shared with chain):
     _push_minimal, _push_4bytes_le,
     _PART_A, _POW_HASH_OP,
-    _build_asert_daa, _build_linear_daa, _build_part_b,
+    _build_asert_daa_legacy, _build_linear_daa_legacy, _build_linear_daa_legacy_prefloor,
+    _build_asert_daa_v2, _build_linear_daa_v2, _build_epoch_daa, _build_schedule_daa,
+    _build_part_b, DetectedDaaBytecode, detect_daa_bytecode,
     build_dmint_state_script, build_dmint_code_script,
     build_dmint_contract_script,
     _V1_ALGO_BYTE_TO_ENUM, _V1_ENUM_TO_ALGO_BYTE,
@@ -34,8 +36,9 @@ Symbols (17 + 4 epilogue constants shared with chain):
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import UnrecognizedDaaBytecodeError, ValidationError
 
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 from .types import (
@@ -43,7 +46,11 @@ from .types import (
     _PART_B1,
     _PART_B2,
     _PART_B4,
+    ASERT_V2_DRIFT_CLAMP,
+    ASERT_V2_RADIX,
+    DEFAULT_ASERT_HALFLIFE,
     MAX_SHA256D_TARGET,
+    DaaBytecodeVersion,
     DaaMode,
     DmintAlgo,
     DmintDeployParams,
@@ -152,28 +159,69 @@ _POW_HASH_OP: dict[DmintAlgo, bytes] = {
 
 
 # ---------------------------------------------------------------------------
-# DAA bytecode builders (byte-identical to the canonical Photonic redesign)
+# DAA bytecode builders
 # ---------------------------------------------------------------------------
 #
-# The pre-redesign ASERT used OP_LSHIFT/OP_RSHIFT (0x98/0x99), which Radiant
-# Core evaluates as a big-endian bit-string shift — wrong for the 8-byte LE
-# target encoding, so every nonzero drift diverged from the miner's bigint
-# shift. It also used 0x81 (OP_BIN2NUM) where it meant 0x8f (OP_NEGATE). The
-# redesign replaces the shift with an UNROLLED OP_2MUL/OP_2DIV loop (4 steps)
-# that operates correctly on multi-byte LE script numbers, with per-step
-# overflow caps. The linear/LWMA DAA divides-first with timeDelta and target
-# caps so OP_MUL never overflows int64. Both are transcribed verbatim from
-# Radiant-Core/Photonic-Wallet ``buildAsertDaaBytecode`` / ``buildLinearDaaBytecode``
-# and validated against golden vectors (tests/test_dmint_v2_canonical.py).
+# TWO GENERATIONS of ASERT/LWMA retarget bytecode exist on chain, and both are
+# built here (``DaaBytecodeVersion`` in ``.types`` names them):
+#
+# * ``_build_asert_daa_v2`` / ``_build_linear_daa_v2`` — the CURRENT canonical
+#   fractional fixed-point retarget. Byte-for-byte transcriptions of
+#   ``buildAsertDaaBytecode`` / ``buildLinearDaaBytecode`` in
+#   Radiant-Core/Photonic-Wallet ``packages/lib/src/script.ts`` at commit
+#   ``becf41a731e78ab98fdd88652527d7dda12784c6`` (upstream landed ASERT-v2 on
+#   2026-06-19, ``ed53cd41``, and LWMA-v2 on 2026-06-20, ``c90e6506``; pyrxd
+#   resynced on 2026-09-16). Every new deploy gets these.
+# * ``_build_asert_daa_legacy`` / ``_build_linear_daa_legacy`` /
+#   ``_build_linear_daa_legacy_prefloor`` — FROZEN. They are the bytecode pyrxd
+#   emitted before the resync (the integer power-of-2 ASERT stepper; the
+#   unity-gain LWMA with, and on 2026-06-16 without, the ``OP_0 OP_MAX``
+#   timeDelta floor). They exist ONLY so a contract deployed under them can be
+#   recognised (``detect_daa_bytecode``) and mined under the formula baked into
+#   it. A covenant's bytecode is immutable: "fixing" these functions cannot
+#   change any deployed contract, it can only make pyrxd unable to mine one.
+#   ``tests/test_dmint_daa_v2_resync.py`` pins their bytes.
+#
+# Both generations share the Part B1/B2 prologue and the Part B4 epilogue and the
+# same stack contract (entry ``[..., daaMode, targetTime, lastTime, target]`` with
+# ``target`` on top; exit with ``newTarget`` in its place), so Part C is unchanged.
+#
+# Why the legacy ASERT shape looks the way it does: the pre-redesign ASERT used
+# OP_LSHIFT/OP_RSHIFT (0x98/0x99), which Radiant Core evaluates as a big-endian
+# bit-string shift — wrong for the 8-byte LE target encoding — so the 2026-05-26
+# redesign replaced the shift with an UNROLLED OP_2MUL/OP_2DIV loop (4 steps) with
+# per-step overflow caps. The legacy LWMA divides first with timeDelta and target
+# caps so OP_MUL never overflows int64 (Radiant-Core/Photonic-Wallet#2 added the
+# timeDelta floor). Both were validated against Photonic golden vectors at the time
+# (tests/test_dmint_v2_canonical.py history) and are consensus-proven on regtest
+# and mainnet.
 
 # 8-byte LE pushes of MAX_TARGET and its /2, /4 (used as overflow caps).
 _PUSH_MAX_TARGET = bytes.fromhex("08ffffffffffffff7f")  # 0x7fff_ffff_ffff_ffff
 _PUSH_HALF_MAX_TARGET = bytes.fromhex("08ffffffffffffff3f")  # MAX/2
+# Photonic ``PUSH_QUARTER_MAX_TARGET = "08ffffffffffffff1f"`` — MAX_TARGET/4 as 8-byte LE.
 _PUSH_QUARTER_MAX_TARGET = bytes.fromhex("08ffffffffffffff1f")  # MAX/4
 # Minimal push of EPOCH_MAX_SAFE_TARGET (2^48). 7-byte minimal LE (07 + 6×00 + 01).
 # EPOCH clamps the target to this on BOTH sides of the retarget multiply so it
 # can never overflow int64 (Radiant-Core/Photonic-Wallet#2).
 _PUSH_EPOCH_MAX_SAFE_TARGET = bytes.fromhex("0700000000000001")  # 2^48
+
+# ASERT-v2 / LWMA-v2 constant pushes — Photonic ``pushMinimal`` of the constants
+# (script.ts comments: 65536 → "03000001"; the clamps are the 2-byte LE pushes
+# 16384 → "020040" and -16384 → "0200c0", sign bit on the high byte).
+_PUSH_ASERT_V2_RADIX = _push_minimal(ASERT_V2_RADIX)  # 03 00 00 01
+_PUSH_ASERT_V2_CLAMP = _push_minimal(ASERT_V2_DRIFT_CLAMP)  # 02 00 40  (+16384)
+_PUSH_ASERT_V2_NEG_CLAMP = _push_minimal(-ASERT_V2_DRIFT_CLAMP)  # 02 00 c0  (-16384)
+
+# The 7-byte ``excess`` preamble every ASERT generation (and LWMA-v2) opens with:
+# OP_TXLOCKTIME, OP_2 PICK lastTime, OP_SUB, OP_3 PICK targetTime, OP_SUB.
+_V2_EXCESS_PREAMBLE = bytes.fromhex("c5527994537994")
+# v2 discriminator right after the preamble: ``<RADIX push> OP_MUL``. The legacy
+# ASERT goes straight to ``<halfLife push> OP_DIV`` there (its 5th byte is OP_DIV
+# 0x96, never OP_MUL 0x95 — even for halfLife 65536, whose push is the same
+# ``03000001`` bytes), and the legacy LWMA never computes ``excess`` at all: its
+# 7th byte is OP_4 (``…5379 54 95 a3`` = OP_3 PICK OP_4 OP_MUL OP_MIN), not OP_SUB.
+_ASERT_V2_SIGNATURE = _PUSH_ASERT_V2_RADIX + b"\x95"  # 03 00 00 01 95
 
 # One unrolled positive-drift step: if drift_rem>0 then target = (target>MAX/2 ?
 # MAX : target*2), drift_rem -= 1. Entry stack [drift_rem, target, ...].
@@ -199,8 +247,19 @@ _ASERT_2MUL_STEP = (
 _ASERT_2DIV_STEP = bytes.fromhex("7600a0638c7c8e7c68")
 
 
-def _build_asert_daa(half_life: int) -> bytes:
-    """ASERT-lite DAA bytecode (§4.5). half_life embedded as a constant.
+def _build_asert_daa_legacy(half_life: int) -> bytes:
+    """LEGACY integer power-of-2 ASERT DAA bytecode — FROZEN, pre-2026-06-19 formula.
+
+    Retained ONLY so contracts deployed before the ASERT-v2 resync keep mining
+    under the exact formula baked into their codescript: ``detect_daa_bytecode``
+    recognises them and the mint builder recomputes their target with
+    :func:`pyrxd.glyph.dmint.miner.compute_next_target_asert_legacy`. **Never emit
+    for a new deploy** — this is the structurally broken stepper the v2 redesign
+    replaced (dead zone for ``|excess| < halfLife``; one-sided when
+    ``halfLife >= targetTime``, so difficulty can only ratchet down or freeze;
+    ≥2× lurches off a single miner-chosen nLockTime). Its bytes are pinned by
+    ``tests/test_dmint_daa_v2_resync.py``; changing them makes every legacy
+    ASERT contract unmineable by pyrxd and fixes nothing on chain.
 
     Entry stack: ``[target, lastTime, targetTime, daaMode, ...]``. Computes
     ``drift = (currentTime - lastTime - targetTime) / halfLife`` clamped to
@@ -249,18 +308,23 @@ def _build_asert_daa(half_life: int) -> bytes:
     )
 
 
-def _build_linear_daa() -> bytes:
-    """Linear/LWMA DAA bytecode (§4.6). ``new_target = target * timeDelta / targetTime``.
+def _build_linear_daa_legacy() -> bytes:
+    """LEGACY unity-gain LWMA DAA bytecode WITH the timeDelta floor — FROZEN.
 
-    Divide-first with caps so OP_MUL never overflows int64: timeDelta is capped
-    to ``4×targetTime`` (upper) and floored at 0, and target to ``MAX_TARGET/4``
-    (so LWMA contracts need difficulty ≥ 4), then
-    ``(target_capped / targetTime) × timeDelta_capped``, final MIN against
-    MAX_TARGET, clamp ≥ 1. The 0-floor (``OP_0 OP_MAX``) is required because a
-    block's nLockTime may be earlier than the previous mint's (it need only
-    exceed the 11-block median-time-past), making ``timeDelta`` negative; without
-    the floor ``(target/targetTime) × negativeDelta`` underflows int64 and
-    OP_MUL aborts (Radiant-Core/Photonic-Wallet#2).
+    ``new_target = (min(target, MAX/4) / targetTime) × clamp(timeDelta, 0, 4×targetTime)``,
+    then ``min(MAX)`` and ``≥ 1``. This is what pyrxd emitted from 2026-06-17
+    (the Radiant-Core/Photonic-Wallet#2 ``OP_0 OP_MAX`` floor) to 2026-09-15, and
+    what ``tests/test_dmint_v2_regtest_e2e.py`` proved on consensus in that window.
+    Retained ONLY for ``detect_daa_bytecode`` and the legacy mint path
+    (:func:`pyrxd.glyph.dmint.miner.compute_next_target_linear_legacy`); **never
+    emit for a new deploy** — upstream replaced it with the damped LWMA-v2 on
+    2026-06-20 because it could jump difficulty 4× in one block and slam the target
+    to 1 on a zero-delta block. Bytes pinned by ``tests/test_dmint_daa_v2_resync.py``.
+
+    The 0-floor (``OP_0 OP_MAX``) is required because a block's nLockTime may be
+    earlier than the previous mint's (it need only exceed the 11-block
+    median-time-past), making ``timeDelta`` negative; without the floor
+    ``(target/targetTime) × negativeDelta`` underflows int64 and OP_MUL aborts.
     """
     return (
         b"\xc5"  # OP_TXLOCKTIME → currentTime
@@ -282,6 +346,149 @@ def _build_linear_daa() -> bytes:
         + b"\xa3"  # OP_MIN (defensive cap)
         # clamp newTarget to minimum 1
         + bytes.fromhex("76519f")  # DUP 1 LESSTHAN
+        + b"\x63"  # IF
+        + bytes.fromhex("7551")  #   DROP 1
+        + b"\x68"  # ENDIF
+    )
+
+
+def _build_linear_daa_legacy_prefloor() -> bytes:
+    """LEGACY unity-gain LWMA DAA bytecode WITHOUT the timeDelta floor — FROZEN.
+
+    Identical to :func:`_build_linear_daa_legacy` minus the two ``OP_0 OP_MAX``
+    bytes. This is what pyrxd emitted on 2026-06-16 (commit ``d75dec5``), before
+    Radiant-Core/Photonic-Wallet#2 added the floor — and therefore the bytecode of
+    the mainnet LWMA deploy ``dea3beb9…`` whose mint ``e7b52f16…`` lowered the
+    target on chain. That contract MUST stay mineable, so the template is kept and
+    ``detect_daa_bytecode`` classifies it as ``DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR``.
+    For every ``timeDelta >= 0`` (which the mint builder already requires) it
+    computes exactly what the floored variant computes; for a negative delta the
+    on-chain OP_MUL aborts instead of flooring. Bytes reconstructed from the
+    ``d75dec5`` builder and pinned by ``tests/test_dmint_daa_v2_resync.py``.
+    """
+    floored = _build_linear_daa_legacy()
+    floor = b"\x00\xa4"  # OP_0 OP_MAX — the #2 floor, inserted after the upper cap
+    idx = floored.index(b"\xa3" + floor)
+    return floored[: idx + 1] + floored[idx + 1 + len(floor) :]
+
+
+def _build_asert_daa_v2(half_life: int) -> bytes:
+    """ASERT-v2 DAA bytecode — fractional, symmetric, damped (the CURRENT formula).
+
+    Byte-for-byte transcription of canonical Photonic ``buildAsertDaaBytecode``
+    (``packages/lib/src/script.ts`` at ``becf41a``; upstream commit ``ed53cd41``,
+    2026-06-19) and the on-chain half of
+    :func:`pyrxd.glyph.dmint.miner.compute_next_target_asert_v2` /
+    ``packages/lib/src/dmintDaaV2.ts`` ``computeAsertV2Target``. Golden
+    byte-match: ``tests/test_dmint_daa_v2_resync.py``.
+
+    Entry stack ``[target, lastTime, targetTime, daaMode, ...]`` (target on top)::
+
+        excess    = (currentTime - lastTime) - targetTime
+        driftFp   = (excess * RADIX) / halfLife            # signed, OP_DIV trunc toward 0
+        driftFp   = clamp(driftFp, -RADIX/4, +RADIX/4)     # ±25%/mint damping
+        t         = min(target, MAX_TARGET/4)              # difficulty floor 4 (as LWMA)
+        newTarget = clamp(t + (t / RADIX) * driftFp, 1, MAX_TARGET/4)
+
+    Divide-first keeps every intermediate inside int64 (proof in
+    ``compute_next_target_asert_v2``), so unlike the legacy stepper there is no
+    INVALID_NUMBER_RANGE_64_BIT risk, no dead zone, no one-sided ratchet and no 2×
+    lurch. Uses only opcodes already present in deployed dMint contracts
+    (OP_MUL/DIV/MIN/MAX/ROT). The stack contract is identical to the legacy
+    builder, so Part B2/B4 and Part C are unchanged.
+    """
+    if isinstance(half_life, bool) or not isinstance(half_life, int) or half_life < 1:
+        # Mirrors the canonical builder's guard (``halfLife must be an integer >= 1``);
+        # DmintDeployParams enforces it too. A 0 here would bake OP_DIV by zero.
+        raise ValidationError(f"ASERT: half_life must be an integer >= 1 (got {half_life!r})")
+    half_life_push = _push_minimal(half_life)
+    return (
+        b"\xc5"  # OP_TXLOCKTIME → currentTime
+        + b"\x52\x79"  # OP_2 PICK lastTime
+        + b"\x94"  # OP_SUB → timeDelta = currentTime - lastTime
+        + b"\x53\x79"  # OP_3 PICK targetTime
+        + b"\x94"  # OP_SUB → excess = timeDelta - targetTime
+        + _PUSH_ASERT_V2_RADIX  # push RADIX
+        + b"\x95"  # OP_MUL → excess * RADIX
+        + half_life_push  # push halfLife
+        + b"\x96"  # OP_DIV → driftFp  (truncates toward zero)
+        # Clamp driftFp to [-RADIX/4, +RADIX/4] via OP_MIN / OP_MAX.
+        + _PUSH_ASERT_V2_CLAMP  # push +16384
+        + b"\xa3"  # OP_MIN → min(driftFp, +16384)
+        + _PUSH_ASERT_V2_NEG_CLAMP  # push -16384
+        + b"\xa4"  # OP_MAX → driftFp clamped
+        # t = min(target, MAX_TARGET/4). Bring target to top first.
+        + b"\x7c"  # OP_SWAP → [target, driftFp, ...]
+        + _PUSH_QUARTER_MAX_TARGET  # push MAX_TARGET/4
+        + b"\xa3"  # OP_MIN → t
+        # newTarget = t + (t / RADIX) * driftFp   (divide-first ⇒ overflow-safe)
+        + b"\x76"  # OP_DUP t → [t, t, driftFp, ...]
+        + _PUSH_ASERT_V2_RADIX  # push RADIX
+        + b"\x96"  # OP_DIV → t / RADIX
+        + b"\x7b"  # OP_ROT → bring driftFp to top: [driftFp, tdiv, t, ...]
+        + b"\x95"  # OP_MUL → delta = (t/RADIX) * driftFp
+        + b"\x93"  # OP_ADD → newTarget = t + delta
+        # Clamp newTarget to [1, MAX_TARGET/4].
+        + _PUSH_QUARTER_MAX_TARGET  # push MAX_TARGET/4
+        + b"\xa3"  # OP_MIN
+        + bytes.fromhex("76519f")  # DUP OP_1 LT
+        + b"\x63"  # IF
+        + bytes.fromhex("7551")  #   DROP, push 1
+        + b"\x68"  # ENDIF
+    )
+
+
+def _build_linear_daa_v2() -> bytes:
+    """LWMA-v2 DAA bytecode — fractional, symmetric, damped (the CURRENT formula).
+
+    Byte-for-byte transcription of canonical Photonic ``buildLinearDaaBytecode``
+    (``packages/lib/src/script.ts`` at ``becf41a``; upstream commit ``c90e6506``,
+    2026-06-20) and the on-chain half of
+    :func:`pyrxd.glyph.dmint.miner.compute_next_target_linear_v2` /
+    ``packages/lib/src/dmintDaaV2.ts`` ``computeLwmaV2Target``. It is the ASERT-v2
+    template with the responsiveness gain auto-set to ``targetTime`` — ``OP_3 PICK
+    targetTime`` where ASERT pushes its ``halfLife`` constant — so a 2×-target block
+    hits the ±25%/mint clamp::
+
+        excess    = (currentTime - lastTime) - targetTime
+        driftFp   = (excess * RADIX) / targetTime          # gain = 1/targetTime
+        driftFp   = clamp(driftFp, -RADIX/4, +RADIX/4)      # ±25%/block damping
+        t         = min(target, MAX_TARGET/4)               # diff floor 4
+        newTarget = clamp(t + (t / RADIX) * driftFp, 1, MAX_TARGET/4)
+
+    ``targetTime >= 1`` is deploy-enforced, so the OP_DIV never divides by zero.
+    Golden byte-match: ``tests/test_dmint_daa_v2_resync.py``.
+    """
+    return (
+        b"\xc5"  # OP_TXLOCKTIME → currentTime
+        + b"\x52\x79"  # OP_2 PICK lastTime
+        + b"\x94"  # OP_SUB → timeDelta = currentTime - lastTime
+        + b"\x53\x79"  # OP_3 PICK targetTime
+        + b"\x94"  # OP_SUB → excess = timeDelta - targetTime
+        + _PUSH_ASERT_V2_RADIX  # push RADIX
+        + b"\x95"  # OP_MUL → excess * RADIX
+        + b"\x53\x79"  # OP_3 PICK targetTime  (the gain divisor — distinguishes LWMA from ASERT)
+        + b"\x96"  # OP_DIV → driftFp = (excess * RADIX) / targetTime
+        # Clamp driftFp to [-RADIX/4, +RADIX/4].
+        + _PUSH_ASERT_V2_CLAMP  # push +16384
+        + b"\xa3"  # OP_MIN
+        + _PUSH_ASERT_V2_NEG_CLAMP  # push -16384
+        + b"\xa4"  # OP_MAX → driftFp clamped
+        # t = min(target, MAX_TARGET/4). Bring target to top first.
+        + b"\x7c"  # OP_SWAP → [target, driftFp, ...]
+        + _PUSH_QUARTER_MAX_TARGET  # push MAX_TARGET/4
+        + b"\xa3"  # OP_MIN → t
+        # newTarget = t + (t / RADIX) * driftFp   (divide-first ⇒ overflow-safe)
+        + b"\x76"  # OP_DUP t
+        + _PUSH_ASERT_V2_RADIX  # push RADIX
+        + b"\x96"  # OP_DIV → t / RADIX
+        + b"\x7b"  # OP_ROT → bring driftFp to top
+        + b"\x95"  # OP_MUL → delta = (t/RADIX) * driftFp
+        + b"\x93"  # OP_ADD → newTarget = t + delta
+        # Clamp newTarget to [1, MAX_TARGET/4].
+        + _PUSH_QUARTER_MAX_TARGET  # push MAX_TARGET/4
+        + b"\xa3"  # OP_MIN
+        + bytes.fromhex("76519f")  # DUP 1 LT
         + b"\x63"  # IF
         + bytes.fromhex("7551")  #   DROP 1
         + b"\x68"  # ENDIF
@@ -372,27 +579,232 @@ def _build_schedule_daa(schedule: tuple[tuple[int, int], ...]) -> bytes:
     return body
 
 
+def _daa_bytes_for(
+    daa_mode: DaaMode,
+    half_life: int,
+    *,
+    epoch_length: int,
+    max_adjustment_log2: int,
+    schedule: tuple[tuple[int, int], ...],
+    daa_bytecode_version: DaaBytecodeVersion,
+) -> bytes:
+    """The DAA fragment of Part B for ``daa_mode`` under ``daa_bytecode_version``.
+
+    FIXED has no fragment. EPOCH and SCHEDULE have a single generation, so the
+    version is ignored for them. ASERT and LWMA route on the version:
+    ``V2`` → the canonical fractional builders (every new deploy); ``LEGACY`` →
+    the frozen pre-resync builders; ``LEGACY_LWMA_PREFLOOR`` → the 2026-06-16 LWMA
+    (an ASERT request under that version is an error — no such contract exists).
+    """
+    if daa_mode == DaaMode.FIXED:
+        return b""  # fixed difficulty — no DAA bytecode
+    if daa_mode == DaaMode.ASERT:
+        if daa_bytecode_version == DaaBytecodeVersion.V2:
+            return _build_asert_daa_v2(half_life)
+        if daa_bytecode_version == DaaBytecodeVersion.LEGACY:
+            return _build_asert_daa_legacy(half_life)
+        raise ValueError(f"no ASERT bytecode exists for {daa_bytecode_version!r}")
+    if daa_mode == DaaMode.LWMA:
+        if daa_bytecode_version == DaaBytecodeVersion.V2:
+            return _build_linear_daa_v2()
+        if daa_bytecode_version == DaaBytecodeVersion.LEGACY:
+            return _build_linear_daa_legacy()
+        if daa_bytecode_version == DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR:
+            return _build_linear_daa_legacy_prefloor()
+        raise ValueError(f"unknown DaaBytecodeVersion: {daa_bytecode_version!r}")
+    if daa_mode == DaaMode.EPOCH:
+        return _build_epoch_daa(epoch_length, max_adjustment_log2)
+    if daa_mode == DaaMode.SCHEDULE:
+        return _build_schedule_daa(schedule)
+    raise ValueError(f"unknown DaaMode: {daa_mode!r}")
+
+
 def _build_part_b(
     daa_mode: DaaMode,
-    half_life: int = 3600,
+    half_life: int = DEFAULT_ASERT_HALFLIFE,
     *,
     epoch_length: int = 2016,
     max_adjustment_log2: int = 2,
     schedule: tuple[tuple[int, int], ...] = (),
+    daa_bytecode_version: DaaBytecodeVersion = DaaBytecodeVersion.V2,
 ) -> bytes:
-    if daa_mode == DaaMode.FIXED:
-        daa_bytes = b""  # fixed difficulty — no DAA bytecode
-    elif daa_mode == DaaMode.ASERT:
-        daa_bytes = _build_asert_daa(half_life)
-    elif daa_mode == DaaMode.LWMA:
-        daa_bytes = _build_linear_daa()
-    elif daa_mode == DaaMode.EPOCH:
-        daa_bytes = _build_epoch_daa(epoch_length, max_adjustment_log2)
-    elif daa_mode == DaaMode.SCHEDULE:
-        daa_bytes = _build_schedule_daa(schedule)
-    else:
-        raise ValueError(f"unknown DaaMode: {daa_mode!r}")
+    """Assemble Part B: PoW extract (B1) + target compare (B2) + DAA + stack cleanup (B4).
+
+    ``daa_bytecode_version`` defaults to ``V2`` — the canonical fractional
+    ASERT-v2 / LWMA-v2 retarget every NEW deploy must carry. The legacy versions
+    exist ONLY so the mint builder can rebuild — and byte-verify against — the Part
+    B of a contract deployed before the 2026-09-16 resync
+    (:func:`detect_daa_bytecode` says which one a contract has). Ignored for
+    FIXED/EPOCH/SCHEDULE, which have a single generation.
+    """
+    daa_bytes = _daa_bytes_for(
+        daa_mode,
+        half_life,
+        epoch_length=epoch_length,
+        max_adjustment_log2=max_adjustment_log2,
+        schedule=schedule,
+        daa_bytecode_version=daa_bytecode_version,
+    )
     return _PART_B1 + _PART_B2 + daa_bytes + _PART_B4
+
+
+# ---------------------------------------------------------------------------
+# DAA bytecode-generation detection (which formula a deployed contract bakes)
+# ---------------------------------------------------------------------------
+
+#: Byte offset of the DAA fragment inside a V2 code section (the bytes AFTER the
+#: 0xbd separator): Part A (16) + the 1-byte powHashOp + Part B1 (18) + Part B2 (5).
+#: Derived from the constants, not typed; ``tests/test_dmint_daa_v2_resync.py``
+#: checks it against the bytes ``build_dmint_code_script`` actually emits.
+_DAA_BODY_OFFSET_IN_CODE = len(_PART_A) + 1 + len(_PART_B1) + len(_PART_B2)
+
+
+@dataclass(frozen=True)
+class DetectedDaaBytecode:
+    """What :func:`detect_daa_bytecode` found baked into a contract's Part B.
+
+    :param daa_mode:  The mode that was asked about (ASERT or LWMA).
+    :param version:   Which retarget-formula generation the bytecode is.
+    :param daa_bytes: The exact DAA fragment that matched, byte-for-byte.
+    :param half_life: ASERT only — the half-life constant READ OUT OF the bytecode
+                      (``None`` for LWMA, which bakes no parameter). This is the
+                      ground truth a miner must use; a caller-supplied value that
+                      differs from it produces a target the covenant rejects.
+    """
+
+    daa_mode: DaaMode
+    version: DaaBytecodeVersion
+    daa_bytes: bytes
+    half_life: int | None = None
+
+
+def _read_minimal_int_push(data: bytes, pos: int) -> tuple[int, int]:
+    """Read one MINIMALLY-encoded script-number push at ``pos`` → ``(value, next_pos)``.
+
+    Accepts exactly the encodings Photonic ``pushMinimal`` / :func:`_push_minimal`
+    produce — OP_0, OP_1NEGATE, OP_1..OP_16, or a 1..8-byte direct push whose payload
+    is a minimal CScriptNum — and refuses anything else with ``ValidationError``.
+    Strictness is the point: Radiant runs with SCRIPT_VERIFY_MINIMALDATA mandatory
+    (``policy.h`` MANDATORY_SCRIPT_VERIFY_FLAGS), so a non-minimal number push inside
+    a covenant makes the CScriptNum constructor throw and the contract unmineable;
+    such a contract must be reported, not mined.
+    """
+    if pos >= len(data):
+        raise ValidationError(f"script-number push expected at offset {pos}, but the code ends there")
+    op = data[pos]
+    if op == 0x00:
+        return 0, pos + 1
+    if op == 0x4F:
+        return -1, pos + 1
+    if 0x51 <= op <= 0x60:
+        return op - 0x50, pos + 1
+    if not 1 <= op <= 8:
+        raise ValidationError(f"opcode 0x{op:02x} at offset {pos} is not a minimal script-number push")
+    payload = data[pos + 1 : pos + 1 + op]
+    if len(payload) != op:
+        raise ValidationError(f"script-number push at offset {pos} is truncated")
+    # CScriptNum::IsMinimallyEncoded: the top byte may be 0x00/0x80 only to carry a
+    # sign bit the byte below could not; and values in [-1, 16] must use the opcodes.
+    if (payload[-1] & 0x7F) == 0 and (len(payload) == 1 or not (payload[-2] & 0x80)):
+        raise ValidationError(f"non-minimal script-number push {payload.hex()} at offset {pos}")
+    value = int.from_bytes(payload, "little")
+    if payload[-1] & 0x80:
+        value = -(value ^ (0x80 << (8 * (len(payload) - 1))))
+    if -1 <= value <= 16:
+        raise ValidationError(f"script number {value} at offset {pos} must be pushed as an opcode, not data")
+    return value, pos + 1 + op
+
+
+def _unrecognized(daa_mode: DaaMode, body: bytes, why: str) -> UnrecognizedDaaBytecodeError:
+    return UnrecognizedDaaBytecodeError(
+        f"{daa_mode.name} contract carries retarget bytecode pyrxd does not recognise ({why}); "
+        f"DAA fragment starts {body[:24].hex()!r}. Known generations: "
+        f"{', '.join(v.name for v in DaaBytecodeVersion)}. Refusing to guess a formula — a "
+        "wrong one produces a next state the covenant rejects after the PoW grind."
+    )
+
+
+def detect_daa_bytecode(code: bytes, daa_mode: DaaMode) -> DetectedDaaBytecode:
+    """Classify which ASERT/LWMA retarget-formula generation a V2 contract bakes.
+
+    ``code`` is the contract's code section — the bytes AFTER the ``0xbd``
+    OP_STATESEPARATOR (what ``build_dmint_code_script`` returns and what follows
+    the parsed state in a UTXO script). ``daa_mode`` is the mode the state script
+    declares (item 6); this function checks the CODE agrees with it.
+
+    Recognition is rebuild-and-compare, not a prefix sniff: the half-life constant is
+    read out of the bytecode, the candidate template is rebuilt from it with the
+    same builder a deploy would use, and the whole fragment (plus the Part B4 that
+    must follow it) has to match byte-for-byte. So a contract is classified only if
+    pyrxd can reproduce its exact bytes, which is also the condition under which
+    the mint builder can recompute its target. The discriminators, verified against
+    the bytes the builders emit (``tests/test_dmint_daa_v2_resync.py``):
+
+    * ASERT: after the 7-byte ``excess`` preamble ``c5 5279 94 5379 94``, v2 has
+      ``<RADIX push> OP_MUL`` = ``03000001 95``; legacy has ``<halfLife push> OP_DIV``
+      (5th byte ``96``, never ``95`` — even for halfLife 65536).
+    * LWMA: v2 shares the preamble and signature, then ``5379 96`` (OP_3 PICK OP_DIV)
+      as the gain divisor; legacy has no ``excess`` at all — ``c5 5279 94 5379 54 95
+      a3`` (OP_4 OP_MUL OP_MIN), with (``LEGACY``) or without
+      (``LEGACY_LWMA_PREFLOOR``) the ``00 a4`` timeDelta floor.
+
+    Mirrors Photonic's Glyph-miner ``extractDaaParamsFromCodeScript`` in intent;
+    unlike the fork this was ported from, an unrecognised fragment is REPORTED with
+    :class:`~pyrxd.security.errors.UnrecognizedDaaBytecodeError` (naming the bytes)
+    rather than defaulting to v2.
+
+    :raises ValueError: ``daa_mode`` is not ASERT or LWMA — FIXED/EPOCH/SCHEDULE
+        have a single generation and are byte-verified by rebuilding Part B from
+        the deploy parameters instead.
+    :raises UnrecognizedDaaBytecodeError: the code is not a V2 dMint template, or
+        its DAA fragment matches no known generation of ``daa_mode``.
+    """
+    if daa_mode not in (DaaMode.ASERT, DaaMode.LWMA):
+        raise ValueError(
+            f"detect_daa_bytecode: {daa_mode.name} has a single bytecode generation; rebuild Part B from the "
+            "deploy params to verify it"
+        )
+    body = code[_DAA_BODY_OFFSET_IN_CODE:]
+    pow_op = code[len(_PART_A) : len(_PART_A) + 1]
+    template_ok = (
+        code[: len(_PART_A)] == _PART_A
+        and pow_op in _POW_HASH_OP.values()
+        and code[len(_PART_A) + 1 : _DAA_BODY_OFFSET_IN_CODE] == _PART_B1 + _PART_B2
+    )
+    if not template_ok:
+        raise _unrecognized(daa_mode, code, "the code section does not open with the V2 Part A/B1/B2 template")
+
+    if daa_mode == DaaMode.ASERT:
+        try:
+            if body.startswith(_V2_EXCESS_PREAMBLE + _ASERT_V2_SIGNATURE):
+                version = DaaBytecodeVersion.V2
+                half_life, _ = _read_minimal_int_push(body, len(_V2_EXCESS_PREAMBLE) + len(_ASERT_V2_SIGNATURE))
+                candidate = _build_asert_daa_v2(half_life)
+            elif body.startswith(_V2_EXCESS_PREAMBLE):
+                version = DaaBytecodeVersion.LEGACY
+                half_life, _ = _read_minimal_int_push(body, len(_V2_EXCESS_PREAMBLE))
+                if half_life < 1:
+                    raise ValidationError(f"legacy ASERT half-life {half_life} < 1")
+                candidate = _build_asert_daa_legacy(half_life)
+            else:
+                raise _unrecognized(daa_mode, body, "no ASERT excess preamble")
+        except UnrecognizedDaaBytecodeError:
+            raise
+        except ValidationError as exc:
+            raise _unrecognized(daa_mode, body, f"half-life push unreadable: {exc}") from exc
+        if not body.startswith(candidate + _PART_B4):
+            raise _unrecognized(daa_mode, body, f"fragment diverges from the {version.name} ASERT template")
+        return DetectedDaaBytecode(daa_mode, version, candidate, half_life)
+
+    # LWMA bakes no parameter: compare against each generation's whole fragment.
+    for version, candidate in (
+        (DaaBytecodeVersion.V2, _build_linear_daa_v2()),
+        (DaaBytecodeVersion.LEGACY, _build_linear_daa_legacy()),
+        (DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR, _build_linear_daa_legacy_prefloor()),
+    ):
+        if body.startswith(candidate + _PART_B4):
+            return DetectedDaaBytecode(daa_mode, version, candidate, None)
+    raise _unrecognized(daa_mode, body, "fragment matches no LWMA generation")
 
 
 # ---------------------------------------------------------------------------

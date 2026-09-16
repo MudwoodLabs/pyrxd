@@ -47,6 +47,7 @@ __all__ = [
     "RxdSdkError",
     "SpvVerificationError",
     "TlsPinMismatchError",
+    "UnrecognizedDaaBytecodeError",
     "UnsupportedScriptError",
     "ValidationError",
     "redact",
@@ -576,6 +577,17 @@ class InvalidFundingUtxoError(DmintError):
     Spending an FT or dMint UTXO as fee silently destroys the token. Callers
     assembling miner inputs must filter out token UTXOs and surface this
     error if no plain-RXD candidates remain.
+    """
+
+
+class UnrecognizedDaaBytecodeError(DmintError, ValidationError):
+    """Raised when a V2 dMint contract's retarget bytecode matches NO known template.
+
+    The miner must recompute the next target with the exact formula baked into the
+    contract (legacy stepper vs the fractional v2 retarget — see
+    ``pyrxd.glyph.dmint.types.DaaBytecodeVersion``). A contract whose Part B matches
+    neither is reported with this error rather than mined under a guessed formula:
+    a guessed target produces a next state the covenant rejects, after the PoW grind.
     """
 
 

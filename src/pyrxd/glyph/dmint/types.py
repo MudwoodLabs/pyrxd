@@ -5,10 +5,12 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (15):
+Symbols (20):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
-    DmintAlgo, DaaMode,
+    ASERT_V2_RADIX, ASERT_V2_DRIFT_CLAMP, ASERT_V2_MAX_TARGET_DIV4,
+    DEFAULT_ASERT_HALFLIFE,
+    DmintAlgo, DaaMode, DaaBytecodeVersion,
     _PART_B1, _PART_B2, _PART_B4,
     DmintDeployParams, DmintCborPayload, DmintMintResult,
     DmintV1ContractInitialState
@@ -68,12 +70,33 @@ MAX_V2_TARGET_256 = (1 << 256) - 1
 # EPOCH DAA: allowed max-adjustment factors and their log2 (shift count). Restricted
 # to powers of 2 so the boundary clamp uses bit-shifts (N× OP_2MUL / OP_2DIV).
 EPOCH_MAX_ADJUSTMENT_LOG2_VALUES = (1, 2, 3, 4)  # → 2× / 4× / 8× / 16×
+# The same set as the MULTIPLIER Photonic's ``DmintPayload.daa.maxAdjustment`` carries
+# (2/4/8/16). Derived, so the two spellings cannot drift apart.
+EPOCH_MAX_ADJUSTMENT_VALUES = tuple(1 << n for n in EPOCH_MAX_ADJUSTMENT_LOG2_VALUES)
 # EPOCH target ceiling: target > 2^48 risks overflow in `target × clampedDelta`
 # (clampedDelta ≤ targetTime × 2^N). Enforced at deploy when daa_mode == EPOCH.
 EPOCH_MAX_SAFE_TARGET = 1 << 48
 
 # SCHEDULE DAA: maximum number of (height, target) entries in a baked schedule.
 SCHEDULE_MAX_ENTRIES = 10
+
+# ASERT-v2 / LWMA-v2 fixed-point retarget constants. Transcribed from canonical
+# Radiant-Core/Photonic-Wallet ``packages/lib/src/script.ts`` (``ASERT_V2_RADIX``,
+# ``ASERT_V2_DRIFT_CLAMP``, ``DEFAULT_ASERT_HALFLIFE``) and
+# ``packages/lib/src/dmintDaaV2.ts`` (``ASERT_V2_MAX_TARGET_DIV4``) at commit
+# becf41a731e78ab98fdd88652527d7dda12784c6. Both v2 modes carry the per-mint drift
+# as ``drift × 2^16`` and clamp it to ±RADIX/4, so the target moves at most ±25% per
+# mint; the pre-cap at MAX_TARGET/4 is the difficulty floor of 4 (as LWMA had).
+ASERT_V2_RADIX = 1 << 16  # 65536 — fixed-point scale
+ASERT_V2_DRIFT_CLAMP = ASERT_V2_RADIX >> 2  # 16384 — ±RADIX/4 per-mint drift clamp
+ASERT_V2_MAX_TARGET_DIV4 = MAX_SHA256D_TARGET >> 2  # 0x1FFF_FFFF_FFFF_FFFF — headroom + floor 4
+
+# Canonical default ASERT half-life in seconds when a deploy omits it — script.ts
+# ``DEFAULT_ASERT_HALFLIFE = 240`` (≈ 4× the default 60 s target block time). Photonic's
+# Mint UI and its Glyph-miner fallback use the SAME value, so a deploy that omits the
+# half-life and the miner that later mines it agree. Before 2026-09-16 pyrxd defaulted to
+# 3600 (the pre-v2 stepper's default), which a Photonic miner would not have assumed.
+DEFAULT_ASERT_HALFLIFE = 240
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +116,36 @@ class DaaMode(IntEnum):
     ASERT = 2
     LWMA = 3
     SCHEDULE = 4
+
+
+class DaaBytecodeVersion(IntEnum):
+    """Which GENERATION of ASERT/LWMA retarget bytecode a deployed contract carries.
+
+    This is orthogonal to the dMint contract format (V1 vs V2 state layout): every
+    member here is a V2-format contract. The retarget *formula* baked into Part B
+    changed upstream on 2026-06-19 (ASERT, Photonic ``ed53cd41``) and 2026-06-20
+    (LWMA, Photonic ``c90e6506``); pyrxd did not follow until 2026-09-16, so contracts
+    deployed by pyrxd in between carry the older formula and MUST keep being mined
+    under it — a covenant's bytecode is immutable, and a miner that recomputes the
+    next target with the wrong formula produces a state the covenant rejects.
+
+    * ``V2`` — the current canonical fractional fixed-point retarget
+      (``_build_asert_daa_v2`` / ``_build_linear_daa_v2``). Every new deploy.
+    * ``LEGACY`` — the integer power-of-2 ASERT stepper (``_build_asert_daa_legacy``)
+      or the unity-gain LWMA WITH the ``OP_0 OP_MAX`` timeDelta floor
+      (``_build_linear_daa_legacy``); what pyrxd emitted from 2026-06-17 to 2026-09-15.
+    * ``LEGACY_LWMA_PREFLOOR`` — LWMA only: the unity-gain retarget WITHOUT the
+      timeDelta floor (``_build_linear_daa_legacy_prefloor``), as pyrxd emitted on
+      2026-06-16 — the bytecode of the mainnet LWMA deploy ``dea3beb9…``.
+
+    Detected from a contract's code section by
+    :func:`pyrxd.glyph.dmint.builders.detect_daa_bytecode`; a contract matching no
+    known template is REPORTED (``UnrecognizedDaaBytecodeError``), never guessed.
+    """
+
+    LEGACY_LWMA_PREFLOOR = 0
+    LEGACY = 1
+    V2 = 2
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +193,7 @@ class DmintDeployParams:
     algo: DmintAlgo = DmintAlgo.SHA256D
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60  # seconds between mints (for DAA modes)
-    half_life: int = 3600  # ASERT half-life in seconds
+    half_life: int = DEFAULT_ASERT_HALFLIFE  # ASERT half-life in seconds (canonical default, script.ts)
     height: int = 0  # current mint height (0 at deploy)
     last_time: int = 0  # timestamp of last mint (0 at deploy)
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
@@ -209,7 +262,23 @@ class DmintCborPayload:
     Indexers read this to discover dMint contracts and display mining
     parameters in wallets/explorers without parsing the contract script.
 
-    Field names mirror Photonic Wallet ``DmintPayload`` type in types.ts.
+    Field names mirror Photonic Wallet's ``DmintPayload`` type
+    (``packages/lib/src/types.ts`` at ``becf41a``)::
+
+        daa?: { mode, targetBlockTime,
+                halfLife?, asymptote?,        // ASERT
+                windowSize?,                  // LWMA
+                epochLength?, maxAdjustment?, // EPOCH
+                schedule?: { height, difficulty }[] }  // SCHEDULE
+
+    Every optional key is emitted ONLY when set (non-zero / non-empty), so a
+    payload that does not use one is byte-identical to what pyrxd emitted before
+    the key existed (2026-09-16: ``asymptote``, ``epochLength``, ``maxAdjustment``,
+    ``schedule`` were added; FIXED/ASERT/LWMA payloads that do not set them are
+    unchanged). ``max_adjustment`` is the adjustment MULTIPLIER (2/4/8/16, i.e.
+    ``2 ** DmintDeployParams.max_adjustment_log2``) as Photonic's payload carries
+    it; ``schedule`` entries are ``(height, difficulty)`` — difficulty, not target,
+    is what the payload type declares.
     """
 
     algo: DmintAlgo  # 0=sha256d, 1=blake3, 2=k12
@@ -222,6 +291,10 @@ class DmintCborPayload:
     target_block_time: int = 60  # seconds between mints (ignored for FIXED)
     half_life: int = 0  # ASERT half-life seconds (0 = N/A)
     window_size: int = 0  # LWMA window size (0 = N/A)
+    asymptote: int = 0  # ASERT asymptote (0 = N/A; declared by Photonic, not read by any bytecode)
+    epoch_length: int = 0  # EPOCH retarget interval in mints (0 = N/A)
+    max_adjustment: int = 0  # EPOCH max adjustment MULTIPLIER 2/4/8/16 (0 = N/A)
+    schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: (height, difficulty) entries
 
     def __post_init__(self) -> None:
         if self.num_contracts < 1:
@@ -234,6 +307,22 @@ class DmintCborPayload:
             raise ValidationError("premine must be >= 0")
         if self.diff < 1:
             raise ValidationError("diff must be >= 1")
+        if self.asymptote < 0:
+            raise ValidationError("asymptote must be >= 0")
+        if self.epoch_length < 0:
+            raise ValidationError("epoch_length must be >= 0")
+        if self.max_adjustment < 0:
+            raise ValidationError("max_adjustment must be >= 0")
+        if self.max_adjustment and self.max_adjustment not in EPOCH_MAX_ADJUSTMENT_VALUES:
+            raise ValidationError(
+                f"max_adjustment must be one of {EPOCH_MAX_ADJUSTMENT_VALUES} (a power of 2, the EPOCH "
+                f"clamp is a shift), got {self.max_adjustment}"
+            )
+        for i, (height, difficulty) in enumerate(self.schedule):
+            if height < 0:
+                raise ValidationError(f"schedule entry {i}: height must be >= 0, got {height}")
+            if difficulty < 1:
+                raise ValidationError(f"schedule entry {i}: difficulty must be >= 1, got {difficulty}")
 
     def to_cbor_dict(self) -> dict:
         """Encode to the dict that becomes the ``dmint`` CBOR value."""
@@ -252,8 +341,16 @@ class DmintCborPayload:
             }
             if self.half_life:
                 daa["halfLife"] = self.half_life
+            if self.asymptote:
+                daa["asymptote"] = self.asymptote
             if self.window_size:
                 daa["windowSize"] = self.window_size
+            if self.epoch_length:
+                daa["epochLength"] = self.epoch_length
+            if self.max_adjustment:
+                daa["maxAdjustment"] = self.max_adjustment
+            if self.schedule:
+                daa["schedule"] = [{"height": h, "difficulty": diff} for h, diff in self.schedule]
             d["daa"] = daa
         return d
 
@@ -269,12 +366,20 @@ class DmintCborPayload:
             target_block_time = 60
             half_life = 0
             window_size = 0
+            asymptote = 0
+            epoch_length = 0
+            max_adjustment = 0
+            schedule: tuple[tuple[int, int], ...] = ()
             if "daa" in d:
                 daa = d["daa"]
                 daa_mode = DaaMode(int(daa.get("mode", 0)))
                 target_block_time = int(daa.get("targetBlockTime", 60))
                 half_life = int(daa.get("halfLife", 0))
                 window_size = int(daa.get("windowSize", 0))
+                asymptote = int(daa.get("asymptote", 0))
+                epoch_length = int(daa.get("epochLength", 0))
+                max_adjustment = int(daa.get("maxAdjustment", 0))
+                schedule = _schedule_from_cbor(daa.get("schedule"))
             return cls(
                 algo=algo,
                 num_contracts=int(d.get("numContracts", 1)),
@@ -286,9 +391,38 @@ class DmintCborPayload:
                 target_block_time=target_block_time,
                 half_life=half_life,
                 window_size=window_size,
+                asymptote=asymptote,
+                epoch_length=epoch_length,
+                max_adjustment=max_adjustment,
+                schedule=schedule,
             )
         except KeyError as e:
             raise ValidationError(f"dmint CBOR missing required field: {e}") from e
+
+
+def _schedule_from_cbor(raw: object) -> tuple[tuple[int, int], ...]:
+    """Decode a Photonic ``schedule: { height, difficulty }[]`` payload array.
+
+    Absent / ``None`` → empty. Anything else must be a list of objects each carrying
+    a numeric ``height`` and ``difficulty`` — the shape ``DmintPayload`` declares. An
+    entry carrying only a ``target`` (which Photonic's *script builder* also accepts
+    from its wallet UI) is refused by name rather than silently dropped or coerced:
+    a target is not a difficulty, and the payload type does not declare it.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValidationError(f"dmint.daa.schedule must be a list, got {type(raw).__name__}")
+    entries: list[tuple[int, int]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValidationError(f"dmint.daa.schedule[{i}] must be an object, got {type(entry).__name__}")
+        if "height" not in entry or "difficulty" not in entry:
+            raise ValidationError(
+                f"dmint.daa.schedule[{i}] needs numeric 'height' and 'difficulty' (got keys {sorted(entry)})"
+            )
+        entries.append((int(entry["height"]), int(entry["difficulty"])))
+    return tuple(entries)
 
 
 @dataclass

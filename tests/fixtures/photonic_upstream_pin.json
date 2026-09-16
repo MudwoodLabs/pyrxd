@@ -26,6 +26,7 @@
     "packages/lib/src/__tests__/protocols.test.ts": "6e021ac157f88e7de0218968c63d0464fd0cec5e19a32245a04c0a371c2a852a",
     "packages/lib/src/authority.ts": "95cedf777a4d484e8ec8e16ffdcb461abcbcaf813375cda5c447cff1187c1ff8",
     "packages/lib/src/burn.ts": "997c032f3b5492616055bc56f4896677ebe1647f2768726babc837fdbc78ef5f",
+    "packages/lib/src/dmintDaaV2.ts": "ca2c52ca3e5f4ae91bf5488e16c75150ef749f7c0b4639b76ce428c5e2dec332",
     "packages/lib/src/encryption.ts": "958ad4ca762f71d1afa917da2feab3a5a1e083dc02da87ee230ef1db13b5c1b6",
     "packages/lib/src/mint.ts": "81251d0e7bc54f651488f27f29a4fd835ae1aeb7058d8dc0b89073e30c0f15b7",
     "packages/lib/src/protocols.ts": "4e1e74fc80943dee1b85a445e5ab9418718b892318d6b74b94a6f32e93de0aee",

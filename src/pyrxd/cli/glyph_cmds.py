@@ -60,6 +60,7 @@ from ..glyph.builder import (
 )
 from ..glyph.client import BroadcastEchoMismatch, _confirmed_txid
 from ..glyph.dmint import (
+    DEFAULT_ASERT_HALFLIFE,
     DEFAULT_MAX_ATTEMPTS,
     MAX_SHA256D_TARGET,
     DaaMode,
@@ -1894,7 +1895,13 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     help="Initial PoW difficulty (1 = easiest; EPOCH needs >= 32768).",
 )
 @click.option("--target-time", type=int, default=60, show_default=True, help="V2 DAA: target seconds between mints.")
-@click.option("--half-life", type=int, default=3600, show_default=True, help="V2 ASERT: half-life in seconds.")
+@click.option(
+    "--half-life",
+    type=int,
+    default=DEFAULT_ASERT_HALFLIFE,
+    show_default=True,
+    help="V2 ASERT: half-life in seconds (canonical Photonic default; was 3600 before 2026-09-16).",
+)
 @click.option("--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH: retarget every N blocks.")
 @click.option(
     "--max-adjustment",
@@ -2524,7 +2531,15 @@ def _mine_claim_v2(
     "--schedule", default=None, help="V2 SCHEDULE claim: the contract's schedule as JSON [[height, difficulty], ...]."
 )
 @click.option(
-    "--half-life", type=int, default=3600, show_default=True, help="V2 ASERT claim: the contract's half-life (s)."
+    "--half-life",
+    type=int,
+    default=DEFAULT_ASERT_HALFLIFE,
+    show_default=True,
+    help=(
+        "V2 ASERT claim: the contract's half-life (s). Must equal the value baked into the contract "
+        "(the claim fails fast naming the baked value if not); contracts deployed before 2026-09-16 "
+        "defaulted to 3600."
+    ),
 )
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
