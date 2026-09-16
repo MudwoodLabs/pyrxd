@@ -20,6 +20,7 @@ from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20, Txid
 
 from .burn import build_burn_proof_script
 from .dmint import (
+    DEFAULT_ASERT_HALFLIFE,
     DmintDeployParams,
     build_dmint_contract_script,
 )
@@ -1892,7 +1893,10 @@ class DmintV2DeployParams:
     :param algo:            PoW algorithm (default SHA256d; only SHA256D is mined).
     :param daa_mode:        Must be ``DaaMode.FIXED`` (the only mintable mode).
     :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED).
-    :param half_life:       Echoed into the code (DAA-only; vestigial for FIXED).
+    :param half_life:       Baked into the ASERT-v2 bytecode (ASERT only; vestigial
+        otherwise). Defaults to the canonical Photonic ``DEFAULT_ASERT_HALFLIFE`` (240 s)
+        so an omitted value deploys what a Photonic miner assumes; before 2026-09-16 the
+        default was 3600.
     """
 
     metadata: GlyphMetadata
@@ -1906,7 +1910,7 @@ class DmintV2DeployParams:
     algo: DmintAlgo = DmintAlgo.SHA256D
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60
-    half_life: int = 3600
+    half_life: int = DEFAULT_ASERT_HALFLIFE  # canonical Photonic default (240 s); was 3600 before 2026-09-16
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
     max_adjustment_log2: int = 2  # EPOCH: max 2^N adjustment per epoch (1..4)
     schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries
