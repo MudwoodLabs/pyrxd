@@ -391,15 +391,20 @@ def compute_next_target_asert_v2(
     ``[-(2^63-1), 2^63-1]``; this mirror raises ``ValidationError`` at the same points
     via :func:`_script_int64` so it never predicts an unmineable state):
 
-    * ``timeDelta = current_time - last_time``: both are block locktimes the builder
-      bounds to ``[0, 0x7FFFFFFF]``, so ``|timeDelta| < 2^31``.
-    * ``excess = timeDelta - target_time``: ``target_time`` is a state script number,
-      so ``|excess| < 2^31 + 2^63`` — checked; a target_time near 2^63 is the only way
-      this can fail.
-    * ``excess * RADIX``: overflows iff ``|excess| >= 2^47`` (≈ 1.4e14 s, 4.5 Myr), i.e.
-      only for a ``target_time >= 2^47 - 2^31``. For any deploy with a sane target
-      time ``|excess * RADIX| < 2^47`` — this is where Photonic's proof
-      (``|excess| <= ~4.3e9`` → ``< 2.8e14``) lives.
+    * ``timeDelta = current_time - last_time``: ``build_dmint_mint_tx`` bounds
+      ``current_time`` to ``[0, 0x7FFFFFFF]`` (the NUM2BIN(4) sign-bit cliff) and requires
+      ``current_time >= last_time``, so within the builder's domain both lie in
+      ``[0, 2^31 - 1]`` and ``0 <= timeDelta <= 2^31 - 1``. (The state's 4-byte lastTime
+      push would read as NEGATIVE on chain above 2^31 - 1; the builder never gets there.)
+    * ``excess = timeDelta - target_time``: ``target_time`` is a state script number in
+      ``[1, 2^63 - 1]``, so ``excess`` is in ``[-(2^63 - 1) - 0, 2^31 - 2]`` and the OP_SUB
+      underflows only for ``target_time > 2^63 - 1 - timeDelta`` — checked.
+    * ``excess * RADIX``: ``|excess| <= 2^47 - 1`` ⇒ ``|excess * 2^16| <= 2^63 - 2^16``,
+      representable; ``|excess| >= 2^47`` ⇒ ``|product| >= 2^63``, which OP_MUL aborts.
+      Positive excess never reaches it (``excess <= 2^31 - 2``); negative excess reaches
+      it only for ``target_time >= 2^47 + timeDelta`` (≈ 1.4e14 s ≈ 4.5 Myr) — checked.
+      Photonic's proof (``|excess| <= ~4.3e9`` → ``|product| <= ~2.8e14 < 2^63``) is
+      the realistic-deploy case of the same bound.
     * ``driftFp = trunc(excess*RADIX / half_life)``: ``|driftFp| <= |excess*RADIX|``
       since ``half_life >= 1``; then clamped to ``|driftFp| <= 2^14``.
     * ``t = min(current_target, MAX/4) <= 2^61 - 1``; ``t / RADIX <= 2^45 - 1``.

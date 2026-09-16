@@ -748,10 +748,12 @@ def detect_daa_bytecode(code: bytes, daa_mode: DaaMode) -> DetectedDaaBytecode:
       a3`` (OP_4 OP_MUL OP_MIN), with (``LEGACY``) or without
       (``LEGACY_LWMA_PREFLOOR``) the ``00 a4`` timeDelta floor.
 
-    Mirrors Photonic's Glyph-miner ``extractDaaParamsFromCodeScript`` in intent;
-    unlike the fork this was ported from, an unrecognised fragment is REPORTED with
-    :class:`~pyrxd.security.errors.UnrecognizedDaaBytecodeError` (naming the bytes)
-    rather than defaulting to v2.
+    Mirrors Photonic's Glyph-miner ``extractDaaParamsFromCodeScript`` in intent, with
+    one deliberate difference from the Radiant-Core fork this was ported from: that
+    fork's ``_asert_version_of_code`` classified ANY fragment lacking the v2 signature
+    as legacy (``return 2 if sig else 1``), so a corrupt or unknown contract would be
+    mined under a guessed formula. Here an unrecognised fragment is REPORTED with
+    :class:`~pyrxd.security.errors.UnrecognizedDaaBytecodeError` (naming the bytes).
 
     :raises ValueError: ``daa_mode`` is not ASERT or LWMA — FIXED/EPOCH/SCHEDULE
         have a single generation and are byte-verified by rebuilding Part B from
