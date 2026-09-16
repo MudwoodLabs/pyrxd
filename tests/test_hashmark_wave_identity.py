@@ -48,28 +48,39 @@ class _FakeIndexer:
     """
 
     def __init__(self, names: dict[str, list[str]] | None = None) -> None:
+        # Keyed by the ELECTRUM SCRIPTHASH of an address, because that is what the indexer's
+        # `reverse_lookup(scripthash: bytes)` takes. This fake used to be keyed by the address
+        # itself, which is what pyrxd used to send — and what the real indexer refuses with
+        # "non-hexadecimal number found in fromhex() arg" (measured 2026-09-16).
         self.names = names or {}
         self.asked: list[str] = []
 
     async def call_extension(self, method: str, params: list):
         assert method == "wave.reverse_lookup", method
-        address = params[0]
-        self.asked.append(address)
-        return self.names.get(address, [])
+        script_hash = params[0]
+        self.asked.append(script_hash)
+        return self.names.get(script_hash, [])
 
 
 class TestTheKeyToNameBridge:
     @pytest.mark.asyncio
     async def test_it_looks_up_the_signers_own_address(self) -> None:
-        """The join is hash160 -> address -> names, and the address must be the
-        one the signing key actually encodes."""
+        """The join is hash160 -> address -> scripthash -> names, and the scripthash must be
+        the one the signing key's OWN address hashes to. The indexer is keyed by scripthash, not
+        by address (RXinDexer `reverse_lookup(scripthash: bytes)`), so the address is derived
+        and then hashed; asserting on the address alone would pass a call the server refuses."""
+        from pyrxd.network.electrumx import script_hash_for_address
+
         key = PrivateKey()
         addr = key.public_key().address()
-        idx = _FakeIndexer({addr: ["company.rxd", "invoices.company.rxd"]})
+        expected = script_hash_for_address(addr).hex()
+        idx = _FakeIndexer({expected: ["company.rxd", "invoices.company.rxd"]})
 
         names = await wave_names_for_hash160(idx, key.public_key().hash160())
 
-        assert idx.asked == [addr], "must derive the signer's own address"
+        assert idx.asked == [expected], (
+            "must derive the signer's own address and hash it the way the indexer keys owners"
+        )
         assert names == ["company.rxd", "invoices.company.rxd"]
 
     @pytest.mark.asyncio

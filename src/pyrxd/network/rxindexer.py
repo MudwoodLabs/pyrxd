@@ -87,13 +87,46 @@ class RxinDexerClient:
         return bool(result)
 
     async def wave_reverse_lookup(self, address: str) -> list[str]:
-        """All WAVE names that resolve to `address`."""
-        result = await self._call("wave.reverse_lookup", [address])
+        """All WAVE names whose OWNER holds the token at `address`, qualified (``alice.rxd``).
+
+        THE INDEXER TAKES A SCRIPTHASH, NOT AN ADDRESS. RXinDexer's ``reverse_lookup(scripthash:
+        bytes)`` accepts a 32-byte Electrum scripthash (or its 11-byte hashX) and indexes owners
+        by it. This method sent the base58 address and was answered with ``{"error":
+        "non-hexadecimal number found in fromhex() arg at position 2"}`` — measured against
+        ``electrumx.radiantcore.org`` 2026-09-16, confirmed in ``wave_index.py`` upstream. And it
+        returns a list of DICTS (``ref``, ``name``, ``full_name``, ``status``, ``zone``,
+        ``owner``), not a list of names, so even a lucky answer would have been rendered as
+        ``str(dict)``. Both halves are fixed here.
+
+        Entries flagged ``status == "expired"`` are dropped: upstream keeps a lapsed name listed
+        so the owner can see it needs renewal, but it no longer RESOLVES, and this method's
+        contract is names that resolve.
+        """
+        from .electrumx import script_hash_for_address
+
+        script_hash = script_hash_for_address(address)
+        result = await self._call("wave.reverse_lookup", [script_hash.hex()])
         if result is None:
             return []
+        if isinstance(result, dict) and "error" in result:
+            raise RxinDexerError(f"wave.reverse_lookup was refused by the indexer: {result['error']}")
         if not isinstance(result, list):
             raise RxinDexerError(f"wave.reverse_lookup returned {type(result).__name__}, expected list")
-        return [str(n) for n in result]
+        names: list[str] = []
+        for item in result:
+            if isinstance(item, dict):
+                if str(item.get("status") or "").lower() == "expired":
+                    continue
+                full = item.get("full_name") or item.get("name")
+                if not full:
+                    continue
+                full = str(full)
+                names.append(full if "." in full else f"{full}.rxd")
+            elif isinstance(item, str):  # an older indexer that returned bare names
+                names.append(item if "." in item else f"{item}.rxd")
+            else:
+                raise RxinDexerError(f"wave.reverse_lookup entry has unexpected shape: {type(item).__name__}")
+        return names
 
     async def wave_get_subdomains(self, name: str) -> list[str]:
         """Subdomains of `name`. Returns empty list if none."""

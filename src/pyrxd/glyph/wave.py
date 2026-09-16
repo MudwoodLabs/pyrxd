@@ -299,13 +299,24 @@ class WaveResolver:
 
         Raises :class:`WaveNameNotFound` if the name is not registered.
         Raises :class:`WaveResolverError` on transport / parse failures.
+
+        THE INDEXER WANTS THE LABEL, NOT THE QUALIFIED NAME. RXinDexer's ``resolve()`` runs
+        ``validate_wave_name`` before anything else, and ``.`` is not in its ``WAVE_CHARS``, so
+        ``"alice.rxd"`` is answered with ``{"error": "Invalid character: ."}`` — measured against
+        the public ``electrumx.radiantcore.org`` indexer 2026-09-16 and confirmed in
+        ``electrumx/server/wave_index.py`` upstream. This method sent the qualified name, so it
+        never resolved a real name against the canonical indexer. The label is sent now, and an
+        ``error`` key in the answer is raised rather than parsed as a record.
         """
+        label, _domain = split_qualified_name(name)
         try:
-            result = await self.client.wave_resolve(name)
+            result = await self.client.wave_resolve(label.strip().lower())
         except Exception as exc:
             raise WaveResolverError(f"wave.resolve({name!r}) failed: {exc}") from exc
         if result is None:
             raise WaveNameNotFound(name)
+        if isinstance(result, dict) and "error" in result and "name" not in result:
+            raise WaveResolverError(f"wave.resolve({name!r}) was refused by the indexer: {result['error']}")
         return WaveRecord.from_indexer_response(result)
 
     async def check_available(self, name: str) -> bool:
@@ -345,6 +356,26 @@ class WaveRecord:
     target_type: str  # typically "address"
     claim_txid: str  # the on-chain registration tx
     block_height: int  # height at which the name was first claimed
+    #: The indexer's ref string, verbatim (RXinDexer: ``"<reveal_txid>_0"``). A WAVE ref is the
+    #: REVEAL outpoint — upstream's own comment: "a WAVE ref is the *reveal* outpoint
+    #: (reveal_txid:0)" — so its txid is the mint a mutable-chain walk starts from.
+    ref: str = ""
+    #: Lifecycle as the indexer reports it: ``"active"``, ``"grace"``, or absent. A lapsed name
+    #: does not resolve at all (the indexer returns ``None``), so this is never ``"expired"`` here.
+    status: str = ""
+
+    @property
+    def reveal_txid(self) -> str:
+        """The txid half of ``ref``, or ``""`` if the indexer gave no usable ref.
+
+        Accepts ``txid_vout`` (RXinDexer) and ``txid:vout``. Anything that is not 64 hex
+        characters before the separator is reported as absent rather than passed on to a
+        network fetch that would then fail somewhere less legible.
+        """
+        head = self.ref.replace(":", "_").split("_", 1)[0].strip().lower()
+        if len(head) == 64 and all(c in "0123456789abcdef" for c in head):
+            return head
+        return ""
 
     @classmethod
     def from_indexer_response(cls, data: dict[str, Any]) -> WaveRecord:
@@ -353,18 +384,35 @@ class WaveRecord:
         Tolerant of field naming — RXinDexer's response wraps things in
         ``attrs`` or surfaces them top-level depending on version. Tries
         both shapes before erroring.
+
+        Measured shape from the public indexer, 2026-09-16::
+
+            {"name": "custodian-gate-x7f3", "ref": "<reveal_txid>_0", "target": "14Xm…",
+             "zone": {"address": "14Xm…"}, "owner": "<11-byte hashX hex>", "available": false,
+             "canonical": true, "has_duplicates": false, "expires": 1850744391, "status": "active"}
+
+        ``name`` comes back as the bare label; it is re-qualified here so callers see the same
+        ``alice.rxd`` they asked for. ``claim_txid`` falls back to the ref's txid, which IS the
+        registration transaction.
         """
         if not isinstance(data, dict):
             raise WaveResolverError(f"expected dict, got {type(data).__name__}")
         # Some indexer versions wrap the data under "attrs".
         attrs = data.get("attrs") if isinstance(data.get("attrs"), dict) else data
         try:
+            name = str(attrs["name"])
+            if "." not in name:
+                name = f"{name}.rxd"
+            ref = str(data.get("ref") or "")
+            ref_txid = ref.replace(":", "_").split("_", 1)[0] if ref else ""
             return cls(
-                name=str(attrs["name"]),
+                name=name,
                 target=str(attrs["target"]),
                 target_type=str(attrs.get("target_type", SCHEME_ADDRESS)),
-                claim_txid=str(data.get("claim_txid") or data.get("txid") or ""),
+                claim_txid=str(data.get("claim_txid") or data.get("txid") or ref_txid or ""),
                 block_height=int(data.get("block_height") or data.get("height") or 0),
+                ref=ref,
+                status=str(data.get("status") or ""),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WaveResolverError(f"could not parse indexer response: {exc}") from exc
