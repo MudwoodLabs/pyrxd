@@ -192,9 +192,17 @@ _POW_HASH_OP: dict[DmintAlgo, bytes] = {
 # redesign replaced the shift with an UNROLLED OP_2MUL/OP_2DIV loop (4 steps) with
 # per-step overflow caps. The legacy LWMA divides first with timeDelta and target
 # caps so OP_MUL never overflows int64 (Radiant-Core/Photonic-Wallet#2 added the
-# timeDelta floor). Both were validated against Photonic golden vectors at the time
-# (tests/test_dmint_v2_canonical.py history) and are consensus-proven on regtest
-# and mainnet.
+# timeDelta floor). What is actually established about each, as of 2026-09-16:
+#   - pre-floor LWMA: MAINNET-proven — deploy dea3beb9… and its mint e7b52f16… are
+#     pinned from the chain and the mint builder recreates the mint byte-for-byte
+#     (tests/test_dmint_daa_v2_resync.py::TestMainnetLwmaAnchor).
+#   - floored LWMA: byte-matched to the Photonic vectors of 2026-06-17 and pinned to
+#     origin/main @ 90550df; the regtest LWMA test targeted it until 2026-09-16.
+#   - legacy ASERT: byte-matched to the Photonic vectors of 2026-06-16 and pinned to
+#     origin/main @ 90550df. It was NEVER mined on a node by this project's tests
+#     (no ASERT regtest test existed before the resync); its mirror is checked
+#     against the bytecode only by the int64 evaluator in
+#     tests/test_dmint_daa_offchain_onchain_differential.py.
 
 # 8-byte LE pushes of MAX_TARGET and its /2, /4 (used as overflow caps).
 _PUSH_MAX_TARGET = bytes.fromhex("08ffffffffffffff7f")  # 0x7fff_ffff_ffff_ffff
@@ -313,8 +321,10 @@ def _build_linear_daa_legacy() -> bytes:
 
     ``new_target = (min(target, MAX/4) / targetTime) × clamp(timeDelta, 0, 4×targetTime)``,
     then ``min(MAX)`` and ``≥ 1``. This is what pyrxd emitted from 2026-06-17
-    (the Radiant-Core/Photonic-Wallet#2 ``OP_0 OP_MAX`` floor) to 2026-09-15, and
-    what ``tests/test_dmint_v2_regtest_e2e.py`` proved on consensus in that window.
+    (the Radiant-Core/Photonic-Wallet#2 ``OP_0 OP_MAX`` floor) to 2026-09-15; its
+    bytes are pinned to origin/main @ 90550df and its mirror is differential-tested
+    against them (``tests/test_dmint_daa_offchain_onchain_differential.py``). The
+    mainnet-proven LWMA deploy predates the floor (see ``_build_linear_daa_legacy_prefloor``).
     Retained ONLY for ``detect_daa_bytecode`` and the legacy mint path
     (:func:`pyrxd.glyph.dmint.miner.compute_next_target_linear_legacy`); **never
     emit for a new deploy** — upstream replaced it with the damped LWMA-v2 on
