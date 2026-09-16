@@ -728,15 +728,25 @@ not cross-implementation agreement, and MUST NOT be cited as such.
 
 #### 7.6.3 The `dmint` envelope object
 
-Field names mirror Photonic's `DmintPayload`
-(`src/pyrxd/glyph/dmint/types.py:238-291`):
+Field names mirror Photonic's `DmintPayload` (`packages/lib/src/types.ts`;
+`src/pyrxd/glyph/dmint/types.py` `DmintCborPayload`):
 
 ```
 { "algo": uint, "numContracts": uint, "maxHeight": uint, "reward": uint,
   "premine": uint, "diff": uint,
   "daa": { "mode": uint, "targetBlockTime": uint,
-           "halfLife": uint?, "windowSize": uint? }? }
+           "halfLife": uint?, "asymptote": uint?,           // ASERT
+           "windowSize": uint?,                              // LWMA
+           "epochLength": uint?, "maxAdjustment": uint?,     // EPOCH
+           "schedule": [{ "height": uint, "difficulty": uint }]? }? }  // SCHEDULE
 ```
+
+Every optional `daa` key is emitted only when set, so a payload that does not use
+one is byte-identical to what pyrxd emitted before 2026-09-16, when `asymptote`,
+`epochLength`, `maxAdjustment` and `schedule` were added. `maxAdjustment` is
+carried as the raw payload number: Photonic's builder reads 1..4 as a log2 shift
+count and 8/16 as multipliers (`script.ts` `maxAdjustmentToLog2`), so the value
+alone does not determine the clamp a contract bakes — the bytecode does.
 
 `daa` is omitted when the mode is `FIXED`. **Nothing on chain reconciles
 `premine` against the photons a deploy actually emits.** pyrxd refuses a deploy
@@ -1303,8 +1313,8 @@ behaviour stay on chain and a reader still has to handle them.
 | `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:36-57`). |
 | Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:332-335`). |
 | V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py:112-144`). |
-| V2 EPOCH / LWMA difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply; LWMA floors `timeDelta` at 0 | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py:291-311, 252-264`). The mainnet LWMA deploy `dea3beb9…` predates it and is deliberately **not** used as a golden anchor. |
-| ASERT shift | `OP_LSHIFT`/`OP_RSHIFT`, which Radiant evaluates as big-endian bit-string shifts — wrong for the 8-byte little-endian target | Unrolled `OP_2MUL`/`OP_2DIV` steps with per-step overflow caps | The shift opcodes diverge from the miner's bigint arithmetic for any nonzero drift (`src/pyrxd/glyph/dmint/builders.py:158-167`). |
+| V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
+| V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
 | WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:686-734`). |
 | Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
 | Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
