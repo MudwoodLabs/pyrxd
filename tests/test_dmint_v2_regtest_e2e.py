@@ -101,6 +101,7 @@ from pyrxd.glyph.dmint import (
     detect_contract_daa_bytecode,
     mine_solution_dispatch,
 )
+from pyrxd.glyph.dmint.miner import _v2_code_section
 from pyrxd.glyph.dmint.types import ASERT_V2_MAX_TARGET_DIV4, ASERT_V2_RADIX, MAX_SHA256D_TARGET
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
@@ -450,8 +451,11 @@ def _mint_on_chain(
     state = DmintState.from_script(spk)
     assert state.height == contract.state.height + 1
     assert state.last_time == current_time
-    # The code section is immutable across mints: only the state prefix moved.
-    assert spk[spk.index(b"\xbd") :] == contract.script[contract.script.index(b"\xbd") :]
+    # The code section is immutable across mints: only the state prefix moved. The boundary is
+    # found by re-serialising the parsed state (the production builder's own method) — NOT by
+    # searching for the first 0xbd byte, which can occur inside a ref: the first run of this
+    # test failed exactly that way after consensus had accepted the mint (token ref 8e04bd41…).
+    assert _v2_code_section(spk, state) == _v2_code_section(contract.script, contract.state)
     return DmintContractUtxo(txid=mtxid, vout=0, value=_CONTRACT_VALUE, script=spk, state=state)
 
 

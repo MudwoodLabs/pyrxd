@@ -313,7 +313,7 @@ _DELTAS = [-1_000_000, -300, -1, 0, 1, 15, 30, 60, 240, 3600, 1 << 30, 1 << 40]
 _LAST = 1_700_000_000
 #: The locktime domain ``build_dmint_mint_tx`` accepts: ``[0, 0x7FFFFFFF]`` (Part C's
 #: NUM2BIN(4) cannot encode a locktime with bit 31 set) and ``current_time >= last_time``.
-_LOCKTIME_MAX = (1 << 31) - 1
+_LOCKTIME_MAX = 0x7FFFFFFF  # spelled as the mint builder spells its own bound
 
 
 def test_epoch_offchain_matches_onchain() -> None:
