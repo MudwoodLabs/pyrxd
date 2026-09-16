@@ -2,6 +2,7 @@
 
 **Date:** 2026-04-22
 **Source:** `RadiantBlockchain-Community/photonic-wallet` (master, shallow clone to `/tmp/photonic-wallet`)
+**Repository note (2026-09-16):** Photonic Wallet is now maintained as [`Radiant-Core/Photonic-Wallet`](https://github.com/Radiant-Core/Photonic-Wallet) (`main`), the repository pyrxd pins in `tests/fixtures/photonic_upstream_pin.json`. The Community repository this document was researched from has not moved since 2026-04-11; its only commits absent from Radiant-Core `main` are two merges pulling Radiant-Core's own branch. The ASERT/LWMA bytecode described below is the pre-2026-06-19 form — Photonic replaced both with fractional "v2" bytecode on 2026-06-19/20 (`ed53cd41`, `c90e6506`).
 **Purpose:** concrete reference for implementing `GlyphProtocol.DMINT = 4` in pyrxd.
 
 ---

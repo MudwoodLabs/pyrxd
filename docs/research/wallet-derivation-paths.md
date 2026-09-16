@@ -8,7 +8,7 @@
 
 ## Summary
 
-The Radiant ecosystem has at least five different BIP44 derivation path implementations across major wallets and SDKs. Per the SatoshiLabs SLIP-0044 registry, Radiant's officially registered coin type is **512**. **Only Tangem (the hardware wallet) follows the spec.** Every Radiant-native software wallet checked uses coin type 0 (Bitcoin's number, presumably copy-pasted from upstream Bitcoin code). The pyrxd Python SDK has historically used 236 (which is BSV's coin type, presumably copy-pasted from BSV-related code). Radiant Core (the node software) doesn't use BIP44 at all.
+The Radiant ecosystem has at least five different BIP44 derivation path implementations across major wallets and SDKs. Per the SatoshiLabs SLIP-0044 registry, Radiant's officially registered coin type is **512**. **Only Tangem (the hardware wallet) follows the spec.** Every Radiant-native software wallet checked uses coin type 0 (Bitcoin's number, presumably copy-pasted from upstream Bitcoin code). *Update 2026-09-16: that was true of the repository this document inspected, which had already stopped being the maintained one — Photonic Wallet v3.0.0 (2026-05-09) moved to coin type 512; see its section below.* The pyrxd Python SDK has historically used 236 (which is BSV's coin type, presumably copy-pasted from BSV-related code). Radiant Core (the node software) doesn't use BIP44 at all.
 
 This fragmentation means a single BIP39 mnemonic produces **completely different addresses** depending on which wallet derives the keys. Users switching between wallets see "missing" funds because their addresses live on a different derivation path than the new wallet looks at. This is silent and confusing — there's no error message, just a zero balance where funds should be.
 
@@ -65,16 +65,23 @@ Searching all of these for "glyph", "token", "OP_RETURN", "FT", or "NFT" returne
 
 This is a serious safety concern for any user who might assume "hardware wallet support" implies "safe storage for everything on the chain." A separate ecosystem coordination effort to add Glyph protocol awareness to Tangem's Radiant integration would be valuable.
 
-### Photonic Wallet — `m/44'/0'/0'/0/0`
+### Photonic Wallet — `m/44'/512'/0'/0/0` since v3.0.0; `m/44'/0'/0'/0/0` legacy
 
-Source: [packages/app/src/keys.ts line 16](https://github.com/RadiantBlockchain-Community/photonic-wallet/blob/master/packages/app/src/keys.ts)
+**Corrected 2026-09-16.** The May 2026 text below this note read `RadiantBlockchain-Community/photonic-wallet` (`master`), which hardcoded `m/44'/0'/0'/0/0` in `packages/app/src/keys.ts`. That repository had stopped moving on 2026-04-11; the maintained one is [`Radiant-Core/Photonic-Wallet`](https://github.com/Radiant-Core/Photonic-Wallet), and its v3.0.0 release (2026-05-09, `73df0e49`) moved new wallets to SLIP-0044 coin type **512**, with dual-path restore added 2026-05-12 (`b3a3af8f`): a restored wallet is derived at 512 first and falls back to 0 when the saved address matches the legacy path.
+
+Source: [packages/lib/src/wallet.ts lines 39–68](https://github.com/Radiant-Core/Photonic-Wallet/blob/becf41a731e78ab98fdd88652527d7dda12784c6/packages/lib/src/wallet.ts#L39-L68) (constants and path template) and [packages/app/src/keys.ts](https://github.com/Radiant-Core/Photonic-Wallet/blob/becf41a731e78ab98fdd88652527d7dda12784c6/packages/app/src/keys.ts) (legacy detection), at `becf41a7`, the commit pyrxd pins in `tests/fixtures/photonic_upstream_pin.json`.
 
 ```typescript
-const derivationPath = "m/44'/0'/0'/0/0";
-const swapDerivationPath = "m/44'/0'/0'/0/1";
+export const RADIANT_COIN_TYPE = 512;
+export const LEGACY_COIN_TYPE = 0;
+export const DEFAULT_COIN_TYPE = RADIANT_COIN_TYPE;
+// ...
+derivationPath: `m/44'/${coinType}'/0'/0/0`,
+swapDerivationPath: `m/44'/${coinType}'/0'/0/1`,
+encryptionDerivationPath: `m/44'/${coinType}'/0'/2/0`,
 ```
 
-Uses **Bitcoin's coin type 0**, not Radiant's. Hardcoded as a string constant; no comment justifying the choice. Most likely an unfixed copy-paste from upstream Bitcoin code.
+Wallets created before v3.0.0 remain at **coin type 0**; pyrxd's `hd/discovery.py` scans coin types 0, 512 and 236, so a mnemonic from either Photonic generation is found on recovery.
 
 ### Electron-Radiant — `m/44'/0'/...`
 
@@ -135,14 +142,15 @@ Radiant Core doesn't use BIP44 at all. It uses the older Bitcoin Core HD scheme 
 |---|---|---|---|---|
 | **SLIP-0044 official spec** | 512 | `m/44'/512'/0'/0/0` | (defines spec) | n/a |
 | **Tangem** (hardware) | **512** | `m/44'/512'/0'/0/0` | ✓ Yes | ✗ No |
-| Photonic Wallet | 0 | `m/44'/0'/0'/0/0` | ✗ No | ✓ Yes |
+| Photonic Wallet ≥ v3.0.0 (2026-05-09) | **512** (0 retained for pre-v3 wallets) | `m/44'/512'/0'/0/0` | ✓ Yes | ✓ Yes |
+| Photonic Wallet < v3.0.0 | 0 | `m/44'/0'/0'/0/0` | ✗ No | ✓ Yes |
 | Electron-Radiant | 0 | `m/44'/0'/0'/...` | ✗ No | partial |
 | Radiant Orbital | 0 | `m/44'/0'/0'/0/0` | ✗ No | ✓ Yes |
 | pyrxd SDK (after this PR) | 512 | `m/44'/512'/0'/0/0` | ✓ Yes | ✓ Yes |
 | pyrxd SDK (before this PR) | 236 (BSV's) | `m/44'/236'/0'/0/0` | ✗ No | ✓ Yes |
 | Radiant Core | n/a (not BIP44) | `m/0'/0'/...` | ✗ No | ✗ No |
 
-**No two of these are interoperable from the same mnemonic** (other than pyrxd-after-this-PR matching Tangem). A user who created a wallet in Photonic and tries to recover into pyrxd will see zero balance — their funds live at a different derivation path than pyrxd looks at.
+**No two of these are interoperable from the same mnemonic** (other than pyrxd-after-this-PR, Tangem and Photonic ≥ v3.0.0, which all use 512). A user who created a wallet in pre-v3 Photonic and recovers into pyrxd at the default path alone would see zero balance — their funds live at coin type 0; `pyrxd.hd.discovery` exists to scan the other paths for exactly this case.
 
 The split is even more painful than just "different paths": the only spec-compliant implementation (Tangem) is also the only one that doesn't understand Glyph tokens. The Glyph-aware implementations all use non-spec paths. After this PR, pyrxd is both spec-compliant AND Glyph-aware — the first implementation in the ecosystem to be both.
 
@@ -211,7 +219,7 @@ All paths and code references verified via direct curl against public GitHub raw
 - [SLIP-0044 registry](https://github.com/satoshilabs/slips/blob/master/slip-0044.md)
 - [Tangem blockchain-sdk-swift DerivationConfigV3.swift (develop branch)](https://github.com/tangem/blockchain-sdk-swift/blob/develop/BlockchainSdk/Common/Derivations/DerivationConfigV3.swift)
 - [Tangem Radiant integration directory](https://github.com/tangem/blockchain-sdk-swift/tree/develop/BlockchainSdk/Blockchains/Radiant)
-- [Photonic Wallet keys.ts](https://github.com/RadiantBlockchain-Community/photonic-wallet/blob/master/packages/app/src/keys.ts)
+- [Photonic Wallet wallet.ts (coin types, path template)](https://github.com/Radiant-Core/Photonic-Wallet/blob/becf41a731e78ab98fdd88652527d7dda12784c6/packages/lib/src/wallet.ts#L39-L68) and [keys.ts (legacy detection)](https://github.com/Radiant-Core/Photonic-Wallet/blob/becf41a731e78ab98fdd88652527d7dda12784c6/packages/app/src/keys.ts) — Radiant-Core/Photonic-Wallet at `becf41a7`
 - [Electron-Radiant keystore.py](https://github.com/RadiantBlockchain-Community/electron-radiant/blob/master/electroncash/keystore.py)
 - [Radiant Orbital Wallet constants.ts](https://github.com/RadiantBlockchain-Community/radiant-orbital-wallet/blob/main/src/utils/constants.ts)
 - [Radiant Core wallet.cpp](https://github.com/RadiantBlockchain-Community/radiant-node/blob/master/src/wallet/wallet.cpp)
