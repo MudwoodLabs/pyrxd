@@ -338,15 +338,54 @@ class TestWaveResolverResolve:
 
 
 class TestWaveResolverOther:
-    async def test_check_available_true(self):
-        client = FakeElectrumXClient({"wave.check_available": True})
+    """`wave.check_available` answers with a DICT, and these fixtures used to hand it a bool.
+
+    Upstream's `check_available` (RXinDexer `electrumx/server/wave_index.py`) returns a mapping
+    on every path: `{'available': True, 'name': ...}` when free, `{'available': False, 'ref':
+    ..., 'name': ...}` when TAKEN, `{'available': False, 'error': ...}` when the name fails
+    `validate_wave_name`. A bare `True`/`False` is a shape the server cannot emit, so the old
+    fixtures proved the wrapper against a scenario that cannot occur — while the wrapper did
+    `bool(result)`, which reports a TAKEN name as available. The fiction in the fixture and the
+    defect in the code hid each other.
+    """
+
+    async def test_a_free_name_is_available(self):
+        client = FakeElectrumXClient({"wave.check_available": {"available": True, "name": "new"}})
         resolver = WaveResolver(client)
         assert await resolver.check_available("new.rxd") is True
 
-    async def test_check_available_false(self):
-        client = FakeElectrumXClient({"wave.check_available": False})
+    async def test_a_taken_name_is_not_available(self):
+        """The fail-open case: `bool({'available': False, ...})` is True, so the old code said
+        a registered name was free — the one answer that lets a caller mint over someone else."""
+        client = FakeElectrumXClient(
+            {"wave.check_available": {"available": False, "ref": "ab" * 32 + "_0", "name": "taken"}}
+        )
         resolver = WaveResolver(client)
         assert await resolver.check_available("taken.rxd") is False
+
+    async def test_the_bare_label_is_sent_not_the_qualified_name(self):
+        """`validate_wave_name` rejects `.`, so `"alice.rxd"` was answered with an error dict —
+        which `bool()` then reported as available. `resolve` was fixed for this in #695; this
+        twin was not."""
+        client = FakeElectrumXClient({"wave.check_available": {"available": True, "name": "alice"}})
+        resolver = WaveResolver(client)
+        assert await resolver.check_available("Alice.RXD") is True
+        assert client.calls == [("wave.check_available", ["alice"])]
+
+    async def test_an_indexer_refusal_is_raised_not_reported_as_available(self):
+        client = FakeElectrumXClient({"wave.check_available": {"available": False, "error": "Invalid character: ."}})
+        resolver = WaveResolver(client)
+        with pytest.raises(WaveResolverError, match="refused by the indexer"):
+            await resolver.check_available("alice.rxd")
+
+    async def test_an_unrecognised_shape_is_refused_rather_than_guessed(self):
+        """Including the bool these tests used to pass: a shape we cannot read must not be
+        coerced into an answer, because the coercion direction is fail-open."""
+        for answer in (True, False, None, [], "yes", {"name": "alice"}):
+            client = FakeElectrumXClient({"wave.check_available": answer})
+            resolver = WaveResolver(client)
+            with pytest.raises(WaveResolverError):
+                await resolver.check_available("alice.rxd")
 
     async def test_reverse_lookup(self):
         """The indexer returns a list of DICTS keyed by owner scripthash — measured against the

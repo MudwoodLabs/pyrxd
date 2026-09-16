@@ -82,9 +82,36 @@ class RxinDexerClient:
         return await self._call("wave.resolve", [name])
 
     async def wave_check_available(self, name: str) -> bool:
-        """True if `name` is not yet registered on-chain."""
+        """True if `name` is not yet registered on-chain. Takes the BARE LABEL.
+
+        THE ANSWER IS A DICT, AND EVERY DICT IS TRUTHY. Upstream's ``check_available``
+        (``electrumx/server/wave_index.py``) always returns a mapping carrying an
+        ``available`` key — ``{'available': False, 'ref': ..., 'name': ...}`` for a name that
+        is TAKEN, ``{'available': False, 'error': ...}`` for one that fails
+        ``validate_wave_name``, ``{'available': True, ...}`` when it is genuinely free. This
+        method did ``return bool(result)``, so it answered **True for every one of those** —
+        reporting a registered name as available, which is the fail-open direction for a
+        method whose entire job is to stop a caller minting over someone else's name.
+
+        Like ``wave.resolve``, the RPC wants the label: ``validate_wave_name`` runs first and
+        ``.`` is not in its ``WAVE_CHARS``. Callers passing ``"alice.rxd"`` were answered with
+        an error dict — which the old ``bool()`` then reported as *available*. Stripping to the
+        label is done by :meth:`pyrxd.glyph.wave.WaveResolver.check_available`; a bare label is
+        what this method expects.
+        """
         result = await self._call("wave.check_available", [name])
-        return bool(result)
+        if not isinstance(result, dict):
+            raise RxinDexerError(
+                f"wave.check_available returned {type(result).__name__}, expected dict — refusing to guess"
+            )
+        if "error" in result:
+            raise RxinDexerError(f"wave.check_available({name!r}) was refused by the indexer: {result['error']}")
+        available = result.get("available")
+        if not isinstance(available, bool):
+            raise RxinDexerError(
+                f"wave.check_available answer has no boolean 'available' key (got {available!r}) — refusing to guess"
+            )
+        return available
 
     async def wave_reverse_lookup(self, address: str) -> list[str]:
         """All WAVE names whose OWNER holds the token at `address`, qualified (``alice.rxd``).

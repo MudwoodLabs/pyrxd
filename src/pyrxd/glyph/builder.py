@@ -1375,13 +1375,20 @@ class GlyphBuilder:
         cbor_bytes: bytes,
         owner_pkh: Hex20,
         name: str,
+        allow_confusable: bool = False,
     ) -> MutableRevealScripts:
         """Prepare scripts for a WAVE (on-chain naming) reveal.
 
         WAVE extends MUT with a ``name`` field in the CBOR payload.
         Protocol field must include ``GlyphProtocol.WAVE`` (11).
 
-        ``name`` must be non-empty printable ASCII, max 255 characters.
+        ``name`` must be non-empty, printable, at most 255 characters, and must not
+        impersonate Latin text — see :func:`pyrxd.glyph.wave.validate_wave_text`, which is
+        the single definition of that rule and is applied here and in
+        :func:`~pyrxd.glyph.wave.build_wave_metadata`. This method is the funnel every WAVE
+        registration crosses, whatever built its CBOR, so the check belongs here rather than
+        only in the metadata helper a caller may not have used. Pass
+        ``allow_confusable=True`` to register a look-alike deliberately.
         The name is validated here but must already be embedded in
         ``cbor_bytes`` by the caller via either ``attrs["name"]`` (the
         Photonic-compatible canonical shape — required for resolution against
@@ -1414,8 +1421,9 @@ class GlyphBuilder:
         seed input is rejected by consensus, as every one built through 0.15.0
         was.
         """
-        if not name or not name.isprintable() or len(name) > 255:
-            raise ValidationError("WAVE name must be non-empty printable ASCII, max 255 characters")
+        from .wave import validate_wave_text
+
+        validate_wave_text(name, field="WAVE name", allow_confusable=allow_confusable)
         try:
             cbor_data = cbor2.loads(cbor_bytes)
             protocol = cbor_data.get("p", [])
