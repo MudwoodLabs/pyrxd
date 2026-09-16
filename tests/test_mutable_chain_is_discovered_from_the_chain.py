@@ -60,6 +60,21 @@ def _sh_of(txid: str, vout: int) -> str:
     return _sh(script_hash_for_script(bytes(tx.outputs[vout].locking_script.serialize())))
 
 
+def _derived(txid: str, edit) -> tuple[str, bytes]:
+    """A transaction DERIVED from a fixture one by a structural edit, re-serialized.
+
+    Its txid is the hash of the bytes a `FakeChainServer(extra=...)` will serve, so the txid-bound
+    fetch accepts it — which is the point: the lies below are about which transactions EXIST and
+    what they spend, never about forged bytes. Nothing is typed by hand; the edit is one field.
+    """
+    tx = Transaction.from_hex(RAW[txid])
+    edit(tx)
+    raw = bytes(tx.serialize())
+    derived = Transaction.from_hex(raw).txid()
+    assert derived != txid, "the edit changed nothing"
+    return derived, raw
+
+
 class FakeChainServer:
     """ElectrumX as a function of the transactions it holds. See the module docstring."""
 
@@ -73,20 +88,34 @@ class FakeChainServer:
         mark_heights: dict[str, int] | None = None,
         utxos_fail: bool = False,
         tip: int = TIP_HEIGHT,
+        extra: dict[str, tuple[bytes, int]] | None = None,
+        claim_unspent: dict[str, list[tuple[str, int]]] | None = None,
     ) -> None:
-        self.txs = {t: Transaction.from_hex(b) for t, b in RAW.items()}
+        # `extra`: transactions this server holds BESIDES the fixture — txid -> (raw, height).
+        # Built by `_derived` from fixture bytes, so their txids are the hash of what is served
+        # and `_fetch_bound` accepts them; their inputs and outputs enter the derived history and
+        # spent set like any other. This is how a server that has indexed a conflicting or
+        # non-mutable spend is modelled without typing a transaction by hand.
+        # `claim_unspent`: scripthash -> outpoints this server ASSERTS are unspent under that
+        # script, whatever the chain says. A lying tip server, and nothing else.
+        self.raw = dict(RAW)
+        self.heights = dict(HEIGHTS)
+        for txid, (raw, height) in (extra or {}).items():
+            self.raw[txid], self.heights[txid] = raw, height
+        self.txs = {t: Transaction.from_hex(b) for t, b in self.raw.items()}
         self.hide, self.unconfirmed, self.tip = hide, unconfirmed, tip
         self.inject = inject_history or {}
         self.corrupt = corrupt or {}
         self.mark_heights = mark_heights or {}
         self.utxos_fail = utxos_fail
+        self.claim_unspent = claim_unspent or {}
         self.calls: list[tuple[str, str]] = []
         self._history: dict[str, list[dict]] = {}
         self._spent: set[tuple[str, int]] = set()
         for txid, tx in self.txs.items():
             if txid in hide:
                 continue  # a stale or lying server: the transaction is not in ITS index
-            height = 0 if txid in unconfirmed else HEIGHTS[txid]
+            height = 0 if txid in unconfirmed else self.heights[txid]
             for out in tx.outputs:
                 key = _sh(script_hash_for_script(bytes(out.locking_script.serialize())))
                 self._history.setdefault(key, []).append({"tx_hash": txid, "height": height})
@@ -104,7 +133,7 @@ class FakeChainServer:
         # Served even when hidden from history — a stale index still answers a direct fetch.
         key = str(txid).lower()
         self.calls.append(("get_transaction", key))
-        return self.corrupt.get(key) or RAW[key]
+        return self.corrupt.get(key) or self.raw[key]
 
     async def get_history(self, script_hash) -> list[dict]:
         key = _sh(script_hash)
@@ -126,6 +155,9 @@ class FakeChainServer:
                     out.append(
                         SimpleNamespace(tx_hash=entry["tx_hash"], tx_pos=vout, value=o.satoshis, height=entry["height"])
                     )
+        for txid, vout in self.claim_unspent.get(key, []):
+            o = self.txs[txid].outputs[vout]
+            out.append(SimpleNamespace(tx_hash=txid, tx_pos=vout, value=o.satoshis, height=self.heights[txid]))
         return out
 
     async def get_tip_height(self) -> int:
@@ -133,7 +165,7 @@ class FakeChainServer:
 
     async def get_transaction_verbose(self, txid) -> dict:
         key = str(txid).lower()
-        height = self.mark_heights.get(key) or HEIGHTS.get(key)
+        height = self.mark_heights.get(key) or self.heights.get(key)
         return {"txid": key, "confirmations": (self.tip - height + 1) if height else 0}
 
 
@@ -406,3 +438,248 @@ async def test_a_mark_before_the_mint_degrades_with_the_reason() -> None:
     v = await _verdict_at(458580)
     assert v.form == 1
     assert "did not exist when the mark was made" in v.degraded_reason
+
+
+# ---------------------------------------------------------------------------
+# Mutant killers. cosmic-ray on main@86c276f (2026-09-16) left 49 non-annotation survivors in
+# this module; the ones below are the verdict-relevant ones. Each docstring names the mutant and
+# what a hostile server could have done under it. Scenarios are derived from the fixture bytes:
+# `_derived` edits one field of a real transaction, `inject_history`/`claim_unspent` are the
+# server's lies about the truth the fixture defines.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_spender_must_spend_this_outpoint_not_another_output_of_the_same_transaction() -> None:
+    """Kills line 216 `and` -> `or`, `source_output_index == cur_vout` -> `>=` and `<=`.
+
+    The sibling spends UPDATE_A:0 and UPDATE_A:2 — the SAME transaction as the mutable output
+    UPDATE_A:1, other outputs. Listed in UPDATE_A:1's history by a padding server, it matches the
+    txid half of the check and the vout half on either side of 1 (0 <= 1, 2 >= 1). Under any of
+    the three rewrites it becomes a second claimant, discovery stops at hop 1 reporting an
+    ambiguity that does not exist, and the verdict degrades on a chain that is whole — one
+    injected history entry silences a name."""
+    server = FakeChainServer(inject_history={_sh_of(UPDATE_A, 1): [(SIBLING, 458591)]})
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 2
+    assert "claim to spend" not in d.stopped and "tip" in d.stopped
+    assert set(d.candidates) == {UPDATE_A, UPDATE_B, SIBLING}
+    walk = (
+        await walk_discovered_chain(
+            mint_txid=MINT, discovery_client=server, tip_client=FakeChainServer(), discovery_source="A", tip_source="B"
+        )
+    ).walk
+    assert walk.complete and walk.tip_txid == UPDATE_B
+    assert walk.excluded == (SIBLING,)
+
+
+async def test_a_spender_must_spend_this_outpoint_not_the_same_index_of_another_transaction() -> None:
+    """Kills line 216 `and` -> `or`, `source_txid == cur_txid` -> `>=`, `<=` and `is not`.
+
+    UPDATE_B spends 315b4630:1 and 60562394:1 — index 1, the mutable output's index, of OTHER
+    transactions. Listed in MINT:1's history it matches the vout half; its `315b…` sorts below
+    the mint's `f644…` so it also passes a `<=` on the txid, and `is not` passes for every
+    string. The mint itself spends 78e25bdc:1, which sorts ABOVE UPDATE_A's `315b…`; listed in
+    UPDATE_A:1's history it passes a `>=`. Under each rewrite a padded history manufactures a
+    second claimant and the walk stops early on a chain that is whole."""
+    server = FakeChainServer(
+        inject_history={_sh_of(MINT, 1): [(UPDATE_B, 458601)], _sh_of(UPDATE_A, 1): [(MINT, 458585)]}
+    )
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 2
+    assert "claim to spend" not in d.stopped and "tip" in d.stopped
+    assert set(d.candidates) == {UPDATE_A, UPDATE_B}, "the mint is never a candidate for its own chain"
+
+
+async def test_a_server_that_hides_the_real_update_and_offers_a_later_one_gets_a_dead_end() -> None:
+    """Kills line 216 `and` -> `or` from the other side: the direction that shortens a chain.
+
+    Hide UPDATE_A from MINT:1's history and list UPDATE_B there instead. UPDATE_B carries the
+    ref's mutable output and has an input at index 1 — so under `or` discovery follows it as the
+    spender of MINT:1, hops once, and hands the walker a chain that skips the update in the
+    middle. The honest answer is that nothing in that history spends MINT:1: the server has
+    presented a dead end, and the walker will find no link for UPDATE_B either."""
+    server = FakeChainServer(hide=frozenset({UPDATE_A}), inject_history={_sh_of(MINT, 1): [(UPDATE_B, 458601)]})
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 0
+    assert "no spender" in d.stopped
+    assert d.candidates == (UPDATE_B,)
+    result = await walk_discovered_chain(
+        mint_txid=MINT, discovery_client=server, tip_client=FakeChainServer(), discovery_source="A", tip_source="B"
+    )
+    assert not result.walk.complete
+    assert [s.txid for s in result.walk.steps] == [MINT]
+
+
+async def test_two_claimed_spenders_stop_discovery_naming_the_ambiguity() -> None:
+    """Kills line 226 `len(spenders) > 1` -> `> 2` and `< 1`, and line 231 `break` -> `continue`.
+
+    A second transaction with UPDATE_A's inputs — UPDATE_A re-serialized with its locktime moved,
+    so a different txid over the same outpoints — is a conflicting spend of MINT:1 that
+    consensus forbids and an index can still hold (a reorg read mid-flight, or an invented one).
+    Under `> 2` / `< 1` discovery would pick `spenders[0]` and walk on as if the conflict were
+    not there, so a server that ORDERS its history could choose which of two claimants becomes
+    the chain. Under `continue` it would loop on the same history until the fetch cap and report
+    a cap instead of the ambiguity. The honest answer is to stop, say `2 … claim to spend`, and
+    let the walker degrade — which it does, in its own words."""
+    double_txid, double_raw = _derived(UPDATE_A, lambda tx: setattr(tx, "locktime", tx.locktime + 1))
+    assert Transaction.from_hex(double_raw).inputs[1].source_txid == MINT
+    server = FakeChainServer(extra={double_txid: (double_raw, 458592)})
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 0
+    assert not d.capped
+    assert d.stopped == f"2 transactions in history claim to spend {MINT}:1"
+    assert set(d.candidates) == {UPDATE_A, double_txid}
+    assert d.fetches == 3, "the mint and the two claimants — not a loop to the fetch cap"
+    result = await walk_discovered_chain(
+        mint_txid=MINT, discovery_client=server, tip_client=FakeChainServer(), discovery_source="A", tip_source="B"
+    )
+    assert not result.walk.complete
+    assert "claim to spend" in result.walk.reason
+
+
+async def test_a_spender_that_carries_no_mutable_output_ends_the_chain_there() -> None:
+    """Kills line 236 `break` -> `continue`.
+
+    The sibling, with its first input's index moved from 0 to 1, spends UPDATE_A:1 — the mutable
+    output — into two ordinary outputs: the singleton is gone. With UPDATE_B hidden, that is the
+    only spender the server knows. Discovery must report the end and stop; under `continue` it
+    would re-read the same history until the fetch cap and report a cap over a prefix, which the
+    walker reads as "cannot prove the tip" rather than "the token was spent out"."""
+    burn_txid, burn_raw = _derived(SIBLING, lambda tx: setattr(tx.inputs[0], "source_output_index", 1))
+    burn = Transaction.from_hex(burn_raw)
+    assert (burn.inputs[0].source_txid, burn.inputs[0].source_output_index) == (UPDATE_A, 1)
+    server = FakeChainServer(hide=frozenset({UPDATE_B}), extra={burn_txid: (burn_raw, 458601)})
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 1
+    assert not d.capped
+    assert d.stopped.startswith(f"{burn_txid} spends the mutable output and carries none for")
+    assert d.candidates == (UPDATE_A, burn_txid)
+    assert d.fetches == 3
+
+
+async def test_the_hop_cap_stops_at_exactly_max_steps() -> None:
+    """Kills line 198 `hops >= max_steps` -> `>` and line 200 `break` -> `continue`.
+
+    With one hop allowed the walk follows MINT:1 to UPDATE_A:1, reads that output's history (so
+    UPDATE_B is still offered as a candidate) and stops. `>` would take a second hop past the
+    cap; `continue` would never leave the loop. With zero hops the mint's own history is read and
+    nothing is followed."""
+    d = await discover_mutable_chain(FakeChainServer(), MINT, source="A", max_steps=1)
+    assert d.hops == 1
+    assert d.stopped == "stopped at the 1-hop cap — the chain may continue"
+    assert d.candidates == (UPDATE_A, UPDATE_B)
+    d0 = await discover_mutable_chain(FakeChainServer(), MINT, source="A", max_steps=0)
+    assert (d0.hops, d0.candidates) == (0, (UPDATE_A,))
+
+
+async def test_a_non_mutable_mint_is_not_reported_as_capped() -> None:
+    """Kills line 173 `capped=False` -> `True`. `capped` means "the candidate set is a prefix
+    because the fetch budget ran out". A mint with nothing to follow spent one fetch; reporting
+    it capped would tell a reader there was more to find."""
+    d = await discover_mutable_chain(FakeChainServer(), SIBLING, source="A")
+    assert d.capped is False
+    assert d.fetches == 1
+
+
+async def test_a_substituted_transaction_is_refused_whichever_way_its_hash_sorts() -> None:
+    """Kills line 84 `tx.txid() != str(wanted)` -> `>`.
+
+    The existing refusal test serves UPDATE_B's bytes for UPDATE_A: the hash `3c7b…` sorts ABOVE
+    the requested `315b…`, so an ordering comparison still refuses it. Serve UPDATE_A's bytes
+    for UPDATE_B and the hash sorts BELOW — under `>` the substitution is accepted, UPDATE_A's
+    inputs do not spend UPDATE_A:1, and the chain "ends" at UPDATE_A. A server could then roll
+    a name back one step for half of all txid pairs, silently."""
+    server = FakeChainServer(corrupt={UPDATE_B: RAW[UPDATE_A]})
+    with pytest.raises(ValidationError, match="hash != requested"):
+        await discover_mutable_chain(server, MINT, source="A")
+
+
+async def test_minus_one_is_not_a_height_and_one_is() -> None:
+    """Kills line 193 `height > 0` -> `!= 0` and `> 1`.
+
+    ElectrumX reports -1 (not only 0) for a mempool transaction whose parent is also unconfirmed.
+    Stored, -1 would place the update BEFORE THE GENESIS BLOCK — before any mark — so a
+    present-tense record would be certified as the state at every past height. Height 1 is a
+    real height and is kept; the boundary is exactly `> 0`."""
+    unconfirmed = FakeChainServer(hide=frozenset({UPDATE_B}), inject_history={_sh_of(UPDATE_A, 1): [(UPDATE_B, -1)]})
+    d = await discover_mutable_chain(unconfirmed, MINT, source="A")
+    assert d.hops == 2, "the entry is still followed; only its height is unknown"
+    assert UPDATE_B in d.candidates and UPDATE_B not in d.heights
+
+    early = FakeChainServer(hide=frozenset({UPDATE_B}), inject_history={_sh_of(UPDATE_A, 1): [(UPDATE_B, 1)]})
+    assert (await discover_mutable_chain(early, MINT, source="A")).heights[UPDATE_B] == 1
+
+
+async def test_candidate_membership_does_not_depend_on_how_a_txid_sorts() -> None:
+    """Kills line 195 `txid != mint_txid` -> `<`.
+
+    Every update in the fixture happens to sort below the mint's `f644…`, so on this chain the
+    rewrite is invisible — but txids are hashes, so on mainnet half of all updates sort above
+    their mint and `<` would drop them from the candidate set. Start discovery from UPDATE_A,
+    whose successor `3c7b…` sorts above its `315b…`: the successor must still be offered."""
+    d = await discover_mutable_chain(FakeChainServer(), UPDATE_A, source="A")
+    assert UPDATE_B > UPDATE_A, "the fixture no longer has a successor sorting above its start; pick another"
+    assert d.candidates == (UPDATE_B,)
+    assert d.hops == 1
+
+
+async def test_the_tip_prover_refuses_an_unspent_claim_that_matches_only_half_the_outpoint() -> None:
+    """Kills line 274 `and` -> `or`, `tx_hash == want` -> `>=`, `<=`, `is not`, and
+    `tx_pos == vout` -> `>=`, `<=`.
+
+    THE FORM-2 CASE. A tip server that asserts, under UPDATE_A:1's script, that UPDATE_A:0 or
+    UPDATE_A:2 (same txid, other index) or UPDATE_B:1 / MINT:1 / SIBLING:1 (same index, other
+    txid — `3c7b…` and `f644…` sort above `315b…`, `2cee…` below) is unspent. None of those is
+    UPDATE_A:1. Under any rewrite the prover answers True, the walker takes UPDATE_A:1 as the
+    proved tip, and a stale discovery server that omitted UPDATE_B gets its truncation certified
+    `complete` — a name's OLD target, reported as current, with an empty reason.
+
+    (Planting `<=` found the first draft of this list had no claim sorting BELOW UPDATE_A with
+    index 1 — the docstring said MINT was it, and MINT sorts above. SIBLING:1 is the one.)"""
+    sh = _sh_of(UPDATE_A, 1)
+    liar = FakeChainServer(claim_unspent={sh: [(UPDATE_A, 0), (UPDATE_A, 2), (UPDATE_B, 1), (MINT, 1), (SIBLING, 1)]})
+    assert UPDATE_B > UPDATE_A and MINT > UPDATE_A and SIBLING < UPDATE_A, "the claims must straddle UPDATE_A"
+    prover = electrumx_tip_prover(liar, fetch_tx=cached_fetcher(FakeChainServer()))
+    assert await prover(UPDATE_A, 1) is False
+    assert await prover(UPDATE_B, 1) is True, "the honest tip is still proved"
+
+    result = await walk_discovered_chain(
+        mint_txid=MINT,
+        discovery_client=FakeChainServer(hide=frozenset({UPDATE_B})),
+        tip_client=liar,
+        discovery_source="A",
+        tip_source="B",
+    )
+    assert not result.walk.complete
+    assert f"{UPDATE_A}:1 is not proved unspent" in result.walk.reason
+
+
+def test_the_fetch_cap_is_the_trackers_cap_on_purpose() -> None:
+    """Kills line 63 `MAX_DISCOVERY_FETCHES = 256` -> 255 / 257.
+
+    The constant's own comment says it follows `swap/rswp/tracker.py`'s `_MAX_HISTORY_FETCHES`:
+    the same bound on the same attack (a padded history that costs a fetch per entry). Pinning
+    the two together is the reason 256 is 256; if one moves, decide about both."""
+    from pyrxd.glyph.mutable_chain_discovery import MAX_DISCOVERY_FETCHES
+    from pyrxd.swap.rswp.tracker import _MAX_HISTORY_FETCHES
+
+    assert MAX_DISCOVERY_FETCHES == _MAX_HISTORY_FETCHES == 256
+
+
+async def test_discovery_results_are_frozen() -> None:
+    """Kills lines 106 and 279 `frozen=True` -> `False`. A `ChainDiscovery` is handed to the
+    walker and its heights to the judge; a `DiscoveredWalk` carries both verdict inputs to the
+    CLI. Evidence that can be edited between its producer and its consumers is not evidence."""
+    import dataclasses
+
+    result = await walk_discovered_chain(
+        mint_txid=MINT,
+        discovery_client=FakeChainServer(),
+        tip_client=FakeChainServer(),
+        discovery_source="A",
+        tip_source="B",
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.discovery.capped = True  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.walk = None  # type: ignore[misc]
