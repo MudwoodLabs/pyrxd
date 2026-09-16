@@ -131,7 +131,17 @@ def merge(existing: dict, fresh: dict) -> tuple[dict, int]:
 def main() -> int:
     token = os.environ.get("TRAFFIC_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     if not token:
-        print("error: no TRAFFIC_TOKEN or GITHUB_TOKEN in the environment", file=sys.stderr)
+        # This is how the job fails FIRST in production — before any HTTP call —
+        # so the remediation has to live here, not only on the 401/403 branch.
+        # Observed 2026-09-16: the first dispatched run printed only "no token"
+        # and left the operator to find the fix in a comment.
+        print(
+            "error: no TRAFFIC_TOKEN in the environment. The traffic endpoints need "
+            "repository Administration (read) access, which the Actions GITHUB_TOKEN "
+            "cannot be granted. Set a TRAFFIC_TOKEN repository secret to a PAT with that "
+            "permission (classic: `repo`; fine-grained: Administration -> Read-only).",
+            file=sys.stderr,
+        )
         return 2
 
     try:

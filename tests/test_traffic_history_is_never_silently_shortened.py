@@ -176,8 +176,16 @@ def test_a_corrupt_existing_file_is_not_overwritten(tmp_path: pathlib.Path, monk
     assert out.read_text() == "{ this is not json"
 
 
-def test_no_token_at_all_exits_nonzero(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_token_at_all_exits_nonzero_and_names_the_fix(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The FIRST production failure is a missing secret, before any HTTP call. The
+    first dispatched run (2026-09-16) hit exactly this and printed only "no token" —
+    the remediation lived on the 401/403 branch it never reached. An operator reading
+    the run log must be told what to set, from this branch too."""
     mod = _load(tmp_path, monkeypatch)
     monkeypatch.delenv("TRAFFIC_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     assert mod.main() == 2
+    err = capsys.readouterr().err
+    assert "TRAFFIC_TOKEN" in err and "Administration" in err, err
