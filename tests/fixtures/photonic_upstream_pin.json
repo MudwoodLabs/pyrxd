@@ -40,6 +40,7 @@
     "packages/lib/src/transfer.tsx": "5ec4508f6720252e7aeee3dd7589b208e9b7416e86752f65103093f575cf6681",
     "packages/lib/src/types.ts": "e63dc369ea41a8289b683792543bfb6ba49b637c2c68ab11c7c3250fc6311fe8",
     "packages/lib/src/vault.ts": "53c25f5f9f303de3daa0c38df1cc6c0144973342ed9ad10f2af220f25eff1844",
+    "packages/lib/src/wallet.ts": "4cc9975e0fae3d15afbd865fb54b6ffb2ed86c064bd0a681d3a6c5771493e11a",
     "packages/lib/src/wave.ts": "54e8bc423da63b745b701c92404425b6626ee1f397e897ae28f6291b1c33add0"
   }
 }

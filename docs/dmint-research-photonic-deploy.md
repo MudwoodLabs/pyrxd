@@ -11,6 +11,8 @@ public RXD ElectrumX server. **Photonic source citations** point to
 `/tmp/photonic-wallet`. **Unverified assumptions** are called out where
 they remain.
 
+**Repository note (2026-09-16):** Photonic Wallet is now maintained as [`Radiant-Core/Photonic-Wallet`](https://github.com/Radiant-Core/Photonic-Wallet) (`main`), which pyrxd pins; the Community repository cited above has not moved since 2026-04-11.
+
 This doc is the Phase 2a deliverable for the M2 plan
 (`docs/plans/2026-05-08-feat-dmint-v1-deploy-plan.md`). Phase 2b
 (implementation) starts only after these findings are reviewed.

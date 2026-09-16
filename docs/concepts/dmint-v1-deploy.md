@@ -212,9 +212,11 @@ It DRY-RUNs by default; broadcasting requires the three-key handshake
 
 ## Photonic divergences
 
-Photonic Wallet's master branch (`RadiantBlockchain-Community/photonic-wallet`)
-is the canonical reference for the Glyph protocols — pyrxd matches its
-shape wherever sensible. There are five places M2 deviates intentionally:
+Photonic Wallet ([`Radiant-Core/Photonic-Wallet`](https://github.com/Radiant-Core/Photonic-Wallet), `main`) is the canonical
+reference for the Glyph protocols — pyrxd matches its shape wherever sensible.
+This section was written against the `RadiantBlockchain-Community/photonic-wallet`
+master branch that repository was forked from; the Community repository has not
+moved since 2026-04-11. There are five places M2 deviates intentionally:
 
 1. **V1 contract output layout.** Photonic's `dMintScript()` in master
    only emits the V2 10-state-item shape; V1 (the only mainnet format)
