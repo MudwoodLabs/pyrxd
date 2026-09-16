@@ -72,6 +72,14 @@ fails CI if the builder ever diverges from the published hex — so the JSON can
 regenerate after an intentional builder change, rebuild each vector with `build_dmint_contract_script`
 and bump the schema if the *format* changes (not just the bytes).
 
-> Note: the mainnet **LWMA** deploy (`dea3beb9…`) is **not** an anchor — it predates the upstream
-> int64-overflow fix (it lacks the `OP_0 OP_MAX` timeDelta floor), so the current builder correctly emits
-> 2 bytes more. Only FIXED is mainnet-anchored; the other modes are reference vectors.
+> Note: the mainnet **LWMA** deploy (`dea3beb9…`) is **not** an anchor for the *current* builder — it
+> bakes the 2026-06-16 unity-gain LWMA without the `OP_0 OP_MAX` timeDelta floor, superseded upstream
+> twice since (the floor, Radiant-Core/Photonic-Wallet#2; then the damped LWMA-v2, `c90e6506`, which
+> pyrxd emits since 2026-09-16). It IS the anchor for the frozen legacy path: `tests/test_dmint_daa_v2_resync.py`
+> pins its vout[0] script and proves the mint builder recreates its on-chain mint `e7b52f16…` byte-for-byte.
+> Only FIXED is mainnet-anchored here; the other modes are reference vectors.
+>
+> The `v2-asert-ref` and `v2-lwma-ref` vectors were regenerated on 2026-09-16 for the ASERT-v2 / LWMA-v2
+> bytecode (Photonic `ed53cd41` / `c90e6506`, byte-matched at `becf41a7`); see the `history` array in the
+> JSON. Contracts deployed with the previous ASERT/LWMA bytecode remain mineable (pyrxd detects the
+> generation from the code section).
