@@ -26,9 +26,16 @@ name: Traffic history
 
 on:
   schedule:
-    # Daily, 07:00 UTC. GitHub's traffic data rolls at UTC midnight; running a
+    # Daily, 07:23 UTC. GitHub's traffic data rolls at UTC midnight; running a
     # few hours later means the previous day is complete when it is captured.
-    - cron: "0 7 * * *"
+    #
+    # NOT ON THE HOUR. This was `0 7 * * *` and the first scheduled run
+    # (2026-09-16) never fired at all — 52 minutes past the slot there was no
+    # run of any kind. GitHub's scheduler is most congested at :00 and is
+    # documented to delay or drop runs under load; an odd minute avoids the
+    # crowd. A missed day is the one failure the collector cannot detect from
+    # inside, because "no run" produces no error.
+    - cron: "23 7 * * *"
   workflow_dispatch:
   pull_request:
     # Exercise the mechanism on the PR that changes it.
