@@ -23,11 +23,15 @@ Mint UI and miner assume when a deploy omits it (240). This file guards the resy
   pyrxd and repairs nothing on chain.
 * **Detection** — every legacy and v2 fragment is classified from the code bytes; a
   contract matching neither is REPORTED (``UnrecognizedDaaBytecodeError``), not guessed
-  (the Radiant-Core fork this was ported from defaulted an unknown fragment to v2).
+  (the Radiant-Core fork this was ported from classified anything without the v2
+  signature as legacy: ``_asert_version_of_code`` was ``return 2 if sig else 1``).
 * **No-brick** — legacy ASERT and legacy LWMA contracts (both LWMA variants, including the
   2026-06-16 pre-floor bytecode of the mainnet deploy ``dea3beb9…``) are detected as legacy
   and the PRODUCTION mint builder recomputes their target with the legacy formula, on inputs
-  where legacy and v2 give different answers.
+  where legacy and v2 give different answers. The mainnet LWMA deploy is anchored to the
+  CHAIN: its vout[0] script (fetched from a Radiant mainnet node on 2026-09-16) and the
+  vout[0] script of its on-chain mint ``e7b52f16…`` are pinned, and ``build_dmint_mint_tx``
+  on the deploy UTXO at that mint's nLockTime must recreate the mint's script byte-for-byte.
 * **Mint-builder byte-verify** — the supplied ``half_life`` is checked against the bytecode
   baked into the contract for BOTH generations, before any PoW grind; the honest path passes.
 * **Defaults** — ``half_life`` defaults to 240 (``DEFAULT_ASERT_HALFLIFE``) everywhere it used
@@ -562,7 +566,8 @@ class TestDetection:
 
     def test_contract_with_neither_signature_is_reported_not_guessed(self) -> None:
         """A fragment that is not any known generation must raise, naming the bytes — the fork
-        this was ported from returned v2 for anything without the legacy marker."""
+        this was ported from returned LEGACY for anything without the v2 signature, so a
+        corrupt contract would have been mined under a guessed formula."""
         prefix = _PART_A + b"\xaa" + _PART_B1 + _PART_B2
         bogus = prefix + bytes.fromhex("c5527994537994") + bytes.fromhex("5395") + _PART_B4 + b"\x51"  # OP_3 OP_MUL
         with pytest.raises(UnrecognizedDaaBytecodeError, match="does not recognise") as exc:
@@ -586,7 +591,9 @@ class TestDetection:
         """Rebuild-and-compare, not a prefix sniff: flipping ONE byte past the signature
         (the drift clamp's OP_MIN → OP_MAX) is refused, though the signature still matches."""
         code = bytearray(build_dmint_code_script(_params(DaaMode.ASERT, half_life=240)))
-        clamp_min_at = _DAA_BODY_OFFSET_IN_CODE + 12 + 3 + 3  # preamble+sig(12) + <240>(3) + OP_DIV, <16384>(3)
+        # preamble+signature (12) + <240> push (3) + OP_DIV (1) + <16384> push (3) → the OP_MIN.
+        clamp_min_at = _DAA_BODY_OFFSET_IN_CODE + 12 + 3 + 1 + 3
+        assert code[clamp_min_at - 4 : clamp_min_at] == bytes.fromhex("96020040")  # OP_DIV <16384>
         assert code[clamp_min_at] == 0xA3
         code[clamp_min_at] = 0xA4
         with pytest.raises(UnrecognizedDaaBytecodeError, match="diverges"):
@@ -632,7 +639,8 @@ class TestNoBrick:
 
     Inputs are chosen where the two formulas DISAGREE, so a dispatch to the wrong one is
     visible: a 30 s-early block under half_life 3600 is inside the legacy dead zone
-    (drift = trunc(-30/3600) = 0 → unchanged) while v2 lowers the target by 1/8.
+    (drift = trunc(-30/3600) = 0 → unchanged) while v2 lowers the target by
+    driftFp = trunc(-30·65536/3600) = -546 sixty-five-thousand-five-hundred-and-thirty-sixths.
     """
 
     def test_legacy_asert_contract_mints_under_legacy_formula(self) -> None:
@@ -654,7 +662,9 @@ class TestNoBrick:
         res = build_dmint_mint_tx(utxo, b"\x00" * 8, _PKH, ct, funding_utxo=_FUNDING, half_life=3600)
         v2 = compute_next_target_asert_v2(p.initial_target, _LAST, ct, 60, 3600)
         assert res.updated_state.target == v2 != compute_next_target_asert_legacy(p.initial_target, _LAST, ct, 60, 3600)
-        assert v2 == p.initial_target - (p.initial_target // 65536) * 8192  # -30 s → driftFp -8192/65536 → -1/8
+        # -30 s under half_life 3600 → driftFp = trunc(-30·65536/3600) = trunc(-546.13) = -546
+        # (a floor would give -547 and a different target). t = MAX/8 is below the MAX/4 cap.
+        assert v2 == p.initial_target - (p.initial_target // 65536) * 546
 
     @pytest.mark.parametrize("version", [DaaBytecodeVersion.LEGACY, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR])
     def test_legacy_lwma_contracts_mint_under_legacy_formula(self, version: DaaBytecodeVersion) -> None:
@@ -678,6 +688,98 @@ class TestNoBrick:
         """No silent change for existing callers: the historical names ARE the legacy functions."""
         assert compute_next_target_asert is compute_next_target_asert_legacy
         assert compute_next_target_linear is compute_next_target_linear_legacy
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# No-brick, anchored to Radiant MAINNET: the dea3beb9… LWMA deploy and its e7b52f16… mint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: vout[0] scriptPubKey of mainnet tx dea3beb9fc0387128d03457b3e07a143a06ec4e567f5a2b13e3648e73f9144f3
+#: (block 438485, 2026-06-16) — the first adaptive-difficulty V2 dMint deploy on Radiant mainnet,
+#: made by pyrxd @ d75dec5 with the pre-floor LWMA bytecode. Fetched 2026-09-16 via
+#: ``radiant-cli getrawtransaction <txid> 1`` on a mainnet node (Radiant Core 3.1.x).
+_MAINNET_LWMA_DEPLOY_TXID = "dea3beb9fc0387128d03457b3e07a143a06ec4e567f5a2b13e3648e73f9144f3"
+_MAINNET_LWMA_DEPLOY_SPK_HEX = (
+    "00d8fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c14001000000d0fd010ccf424b"
+    "f79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c140000000005a02e8030053013c0400f1536508ff"
+    "ffffffffffff7fbdc0c859797ea85d795d797ea87e5e7a7eaabc01147f77587f040000000088817600a2695179"
+    "7ca269c552799453795495a37c08ffffffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b"
+    "75757575577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76"
+    "537a9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c63750100677660"
+    "a163015093518067827c7e68684c52d8fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715"
+    "f7c14001000000d0fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c140000000005a"
+    "02e8030053013c7ec55480547c7e7e6c76009c63750100677660a163015093518067827c7e68687e5379ec7888"
+    "5379eac0e9885379cc519d75686d7551"
+)
+#: The mint that spent it: tx e7b52f169b74759f018f9eb00ce44eb7e0f04eb4ef17629f3d60c090054e9d73
+#: (same block), nLockTime 1700000030 against the deploy's lastTime 1700000000 (a 30 s "block"
+#: under targetTime 60). Its vout[0] is the recreated contract at height 1 with the target the
+#: covenant computed ON CHAIN: 1152921504606846960 = (MAX/4 // 60) × 30 — the legacy formula.
+_MAINNET_LWMA_MINT_TXID = "e7b52f169b74759f018f9eb00ce44eb7e0f04eb4ef17629f3d60c090054e9d73"
+_MAINNET_LWMA_MINT_LOCKTIME = 1_700_000_030
+_MAINNET_LWMA_MINT_SPK_HEX = (
+    "51d8fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c14001000000d0fd010ccf424b"
+    "f79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c140000000005a02e8030053013c041ef1536508f0"
+    "ffffffffffff0fbdc0c859797ea85d795d797ea87e5e7a7eaabc01147f77587f040000000088817600a2695179"
+    "7ca269c552799453795495a37c08ffffffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b"
+    "75757575577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76"
+    "537a9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c63750100677660"
+    "a163015093518067827c7e68684c52d8fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715"
+    "f7c14001000000d0fd010ccf424bf79fcd05dd49101597276dc7a1dd475ad9550bad71b715f7c140000000005a"
+    "02e8030053013c7ec55480547c7e7e6c76009c63750100677660a163015093518067827c7e68687e5379ec7888"
+    "5379eac0e9885379cc519d75686d7551"
+)
+
+
+class TestMainnetLwmaAnchor:
+    """The one adaptive-difficulty contract pyrxd has on mainnet, verified against the chain.
+
+    Every other legacy fixture in this file is DERIVED from git history; this one is the
+    bytes a Radiant node served. If detection or the legacy mirror ever drifts, this is the
+    test that says a real, funded contract became unmineable.
+    """
+
+    _deploy = bytes.fromhex(_MAINNET_LWMA_DEPLOY_SPK_HEX)
+    _mint = bytes.fromhex(_MAINNET_LWMA_MINT_SPK_HEX)
+
+    def test_deploy_is_the_prefloor_legacy_lwma_byte_for_byte(self) -> None:
+        st = DmintState.from_script(self._deploy)
+        assert (st.daa_mode, st.height, st.target_time, st.last_time, st.target) == (DaaMode.LWMA, 0, 60, _LAST, _MAX)
+        d = detect_contract_daa_bytecode(self._deploy)
+        assert d.version == DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR
+        # The whole code section is what the frozen builders emit — not just the DAA fragment.
+        params = DmintDeployParams(
+            contract_ref=st.contract_ref,
+            token_ref=st.token_ref,
+            max_height=st.max_height,
+            reward=st.reward,
+            difficulty=1,
+            algo=st.algo,
+            daa_mode=st.daa_mode,
+            target_time=st.target_time,
+            height=st.height,
+            last_time=st.last_time,
+        )
+        assert _contract_script(params, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR) == self._deploy
+        # ...and is NOT what the current builder emits (LWMA-v2) nor the floored legacy variant.
+        assert build_dmint_contract_script(params) != self._deploy
+        assert _contract_script(params, DaaBytecodeVersion.LEGACY) != self._deploy
+
+    def test_mint_builder_recreates_the_on_chain_mint_byte_for_byte(self) -> None:
+        """PRODUCTION path: ``build_dmint_mint_tx`` on the deploy UTXO at the real mint's
+        nLockTime must produce exactly the contract script the mainnet mint carries."""
+        st = DmintState.from_script(self._deploy)
+        utxo = DmintContractUtxo(txid=_MAINNET_LWMA_DEPLOY_TXID, vout=0, value=1, script=self._deploy, state=st)
+        res = build_dmint_mint_tx(utxo, b"\x00" * 8, _PKH, _MAINNET_LWMA_MINT_LOCKTIME, funding_utxo=_FUNDING)
+        assert res.contract_script == self._mint
+        on_chain = DmintState.from_script(self._mint)
+        assert (on_chain.height, on_chain.last_time) == (1, _MAINNET_LWMA_MINT_LOCKTIME)
+        assert on_chain.target == res.updated_state.target == 1152921504606846960
+        # The inputs separate the formulas: v2 would have recreated a different state.
+        legacy = compute_next_target_linear_legacy(_MAX, _LAST, _MAINNET_LWMA_MINT_LOCKTIME, 60)
+        v2 = compute_next_target_linear_v2(_MAX, _LAST, _MAINNET_LWMA_MINT_LOCKTIME, 60)
+        assert on_chain.target == legacy == (_MAX // 4 // 60) * 30
+        assert v2 != legacy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -712,7 +814,8 @@ class TestMintBuilderVerifiesHalfLifeAgainstBytecode:
         p = _params(DaaMode.ASERT, half_life=240)
         script = bytearray(build_dmint_contract_script(p))
         state_len = script.index(_OP_STATESEPARATOR)
-        at = state_len + 1 + _DAA_BODY_OFFSET_IN_CODE + 12 + 3 + 3  # the clamp OP_MIN
+        at = state_len + 1 + _DAA_BODY_OFFSET_IN_CODE + 12 + 3 + 1 + 3  # the clamp OP_MIN (after <240> OP_DIV <16384>)
+        assert script[at - 4 : at] == bytes.fromhex("96020040")
         assert script[at] == 0xA3
         script[at] = 0xA4
         with pytest.raises(UnrecognizedDaaBytecodeError):
@@ -836,11 +939,17 @@ class TestDmintCborPayloadMirrorsPhotonic:
         with pytest.raises(ValidationError, match=r"schedule\[0\]"):
             DmintCborPayload.from_cbor_dict(d)
 
-    def test_max_adjustment_must_be_a_photonic_multiplier(self) -> None:
-        for ok in (2, 4, 8, 16):
-            DmintCborPayload(**self._BASE, daa_mode=DaaMode.EPOCH, epoch_length=10, max_adjustment=ok)
-        with pytest.raises(ValidationError, match="power of 2"):
-            DmintCborPayload(**self._BASE, daa_mode=DaaMode.EPOCH, epoch_length=10, max_adjustment=3)
+    def test_max_adjustment_accepts_exactly_what_photonic_accepts(self) -> None:
+        """``script.ts`` ``maxAdjustmentToLog2`` (becf41a7) accepts 1..4 as a log2 shift count and
+        8/16 as multipliers and throws on anything else, so a Photonic-built token can carry
+        {1, 2, 3, 4, 8, 16} and nothing else. A payload read off chain with 3 (= 8× there) must
+        PARSE — refusing it would make ``decode_payload`` choke on a valid foreign token."""
+        for ok in (1, 2, 3, 4, 8, 16):
+            p = DmintCborPayload(**self._BASE, daa_mode=DaaMode.EPOCH, epoch_length=10, max_adjustment=ok)
+            assert DmintCborPayload.from_cbor_dict(p.to_cbor_dict()).max_adjustment == ok
+        for bad in (5, 6, 32, 7):
+            with pytest.raises(ValidationError, match="maxAdjustmentToLog2"):
+                DmintCborPayload(**self._BASE, daa_mode=DaaMode.EPOCH, epoch_length=10, max_adjustment=bad)
         with pytest.raises(ValidationError, match="difficulty must be >= 1"):
             DmintCborPayload(**self._BASE, daa_mode=DaaMode.SCHEDULE, schedule=((0, 0),))
 

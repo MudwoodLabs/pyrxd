@@ -70,9 +70,13 @@ MAX_V2_TARGET_256 = (1 << 256) - 1
 # EPOCH DAA: allowed max-adjustment factors and their log2 (shift count). Restricted
 # to powers of 2 so the boundary clamp uses bit-shifts (N× OP_2MUL / OP_2DIV).
 EPOCH_MAX_ADJUSTMENT_LOG2_VALUES = (1, 2, 3, 4)  # → 2× / 4× / 8× / 16×
-# The same set as the MULTIPLIER Photonic's ``DmintPayload.daa.maxAdjustment`` carries
-# (2/4/8/16). Derived, so the two spellings cannot drift apart.
-EPOCH_MAX_ADJUSTMENT_VALUES = tuple(1 << n for n in EPOCH_MAX_ADJUSTMENT_LOG2_VALUES)
+# The ``maxAdjustment`` values Photonic's builder ACCEPTS from a ``DmintPayload.daa``
+# (``packages/lib/src/script.ts`` ``maxAdjustmentToLog2`` at becf41a7): 1..4 are read as
+# the log2 shift count itself and 8/16 as multipliers — so a payload ``maxAdjustment`` of
+# 2 or 4 bakes a 4× or 16× clamp there, not 2× or 4×. The Mint UI passes its "4" default
+# straight through to both the payload and the builder (``pages/Mint.tsx``). Anything
+# outside this set throws in that builder, so no Photonic-built token carries another value.
+EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES = (*EPOCH_MAX_ADJUSTMENT_LOG2_VALUES, 8, 16)
 # EPOCH target ceiling: target > 2^48 risks overflow in `target × clampedDelta`
 # (clampedDelta ≤ targetTime × 2^N). Enforced at deploy when daa_mode == EPOCH.
 EPOCH_MAX_SAFE_TARGET = 1 << 48
@@ -275,10 +279,17 @@ class DmintCborPayload:
     payload that does not use one is byte-identical to what pyrxd emitted before
     the key existed (2026-09-16: ``asymptote``, ``epochLength``, ``maxAdjustment``,
     ``schedule`` were added; FIXED/ASERT/LWMA payloads that do not set them are
-    unchanged). ``max_adjustment`` is the adjustment MULTIPLIER (2/4/8/16, i.e.
-    ``2 ** DmintDeployParams.max_adjustment_log2``) as Photonic's payload carries
-    it; ``schedule`` entries are ``(height, difficulty)`` — difficulty, not target,
-    is what the payload type declares.
+    unchanged). ``schedule`` entries are ``(height, difficulty)`` — difficulty, not
+    target, is what the payload type declares.
+
+    ``max_adjustment`` is stored as the RAW payload number and is informational only:
+    Photonic's builder reads a payload value of 1..4 as the log2 shift count and 8/16
+    as multipliers (``script.ts`` ``maxAdjustmentToLog2``; its Mint UI passes the same
+    number to the payload and the builder), while pyrxd's ``deploy-dmint
+    --max-adjustment`` is a multiplier baked as ``DmintDeployParams.max_adjustment_log2``.
+    So the payload value alone does not say which clamp a contract bakes — only the
+    contract bytecode does. Validation accepts exactly the values Photonic's builder
+    accepts (``EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES``); pyrxd does not reinterpret them.
     """
 
     algo: DmintAlgo  # 0=sha256d, 1=blake3, 2=k12
@@ -293,7 +304,7 @@ class DmintCborPayload:
     window_size: int = 0  # LWMA window size (0 = N/A)
     asymptote: int = 0  # ASERT asymptote (0 = N/A; declared by Photonic, not read by any bytecode)
     epoch_length: int = 0  # EPOCH retarget interval in mints (0 = N/A)
-    max_adjustment: int = 0  # EPOCH max adjustment MULTIPLIER 2/4/8/16 (0 = N/A)
+    max_adjustment: int = 0  # EPOCH maxAdjustment as the payload carries it (0 = N/A; see class docstring)
     schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: (height, difficulty) entries
 
     def __post_init__(self) -> None:
@@ -313,10 +324,10 @@ class DmintCborPayload:
             raise ValidationError("epoch_length must be >= 0")
         if self.max_adjustment < 0:
             raise ValidationError("max_adjustment must be >= 0")
-        if self.max_adjustment and self.max_adjustment not in EPOCH_MAX_ADJUSTMENT_VALUES:
+        if self.max_adjustment and self.max_adjustment not in EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES:
             raise ValidationError(
-                f"max_adjustment must be one of {EPOCH_MAX_ADJUSTMENT_VALUES} (a power of 2, the EPOCH "
-                f"clamp is a shift), got {self.max_adjustment}"
+                f"max_adjustment must be one of {EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES} (the values Photonic's "
+                f"maxAdjustmentToLog2 accepts: log2 counts 1..4 or multipliers 8/16), got {self.max_adjustment}"
             )
         for i, (height, difficulty) in enumerate(self.schedule):
             if height < 0:
