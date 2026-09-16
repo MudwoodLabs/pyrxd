@@ -167,6 +167,52 @@ class RxinDexerClient:
         """``glyph.get_metadata`` — decoded CBOR metadata for a token."""
         return await self._call("glyph.get_metadata", [ref])
 
+    # ──────────────────────────── discovery (indexer schema v4) ──
+    #
+    # Global newest-first asset lists. Cursor-paginated: feed the previous
+    # page's ``next_cursor`` back as ``cursor``; cursors are opaque and
+    # order-specific. Enables incremental watermark sync — walk once, save the
+    # newest ``deploy_height`` seen, then on later runs page newest-first and
+    # stop once ``deploy_height`` drops below the watermark.
+
+    async def glyph_get_recent(
+        self,
+        limit: int = 100,
+        cursor: str | None = None,
+        token_type: int | None = None,
+    ) -> dict[str, Any]:
+        """``glyph.get_recent`` — newest-deployed tokens, newest-first.
+
+        Across every type by default; pass ``token_type`` (1=FT, 2=NFT,
+        3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority) to filter.
+        Returns ``{"tokens": [...], "next_cursor": str | None}``.
+        """
+        result = await self._call("glyph.get_recent", [limit, cursor, token_type])
+        if not isinstance(result, dict):
+            raise RxinDexerError(f"glyph.get_recent returned {type(result).__name__}, expected dict")
+        return result
+
+    async def glyph_get_tokens_by_type(
+        self,
+        token_type: int,
+        limit: int = 100,
+        cursor: str | None = None,
+        order: str = "ref",
+    ) -> dict[str, Any]:
+        """``glyph.get_tokens_by_type`` — tokens of one type.
+
+        ``order="recent"`` = newest-deployed first (v4 index);
+        ``order="ref"`` (default) = legacy stable ref-hash order. Cursors must
+        not be reused across a change of ``order``.
+        Returns ``{"tokens": [...], "next_cursor": str | None}``.
+        """
+        if order not in ("ref", "recent"):
+            raise ValueError(f"order must be 'ref' or 'recent', got {order!r}")
+        result = await self._call("glyph.get_tokens_by_type", [token_type, limit, cursor, order])
+        if not isinstance(result, dict):
+            raise RxinDexerError(f"glyph.get_tokens_by_type returned {type(result).__name__}, expected dict")
+        return result
+
     # ─────────────────────────────────────────── Swap (RSWP) ──
     #
     # Verified 2026-07-05 against ``Radiant-Core/RXinDexer`` (upstream ``main``,
