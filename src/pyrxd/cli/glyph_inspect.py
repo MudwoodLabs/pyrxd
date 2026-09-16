@@ -695,6 +695,280 @@ def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
     ]
 
 
+def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
+    """§7.6 form 2 rendered — and, far more often, its degrade to form 1 WITH THE REASON.
+
+    Sits where the present-tense name context sits: after the mark's own statement closes,
+    at the outer indent, never between the signature and what the signature proves. A form-2
+    sentence reads as authoritative, so every qualifier the verdict carries is printed with it;
+    the honest sentence is the weaker one, and it ships.
+    """
+    if not nam:
+        return []
+    name = nam.get("name", "?")
+    if not nam.get("resolved"):
+        return [f"{indent}at the mark's block — {name}: not established ({nam.get('reason')})"]
+    if nam.get("form") != 2:
+        return [
+            f"{indent}at the mark's block — {name}: not established ({nam.get('degraded_reason')})",
+            f"{indent}  (form 1 only: nothing beyond the present-tense lookup can be said)",
+        ]
+    chain = nam.get("chain") or {}
+    same = nam.get("signer_is_target_at_height")
+    lines = [
+        f"{indent}at the mark's block ({nam.get('height')}), {name} pointed at {nam.get('target_at_height')}",
+        (
+            f"{indent}  the signing key IS that address — key custody at that block; not authorship, not location"
+            if same
+            else f"{indent}  the signing key is NOT that address"
+        ),
+        f"{indent}  glyph {nam.get('ref')}; {chain.get('steps')} step(s) walked, tip {chain.get('tip')} proved unspent",
+    ]
+    if nam.get("provisional"):
+        lines.append(f"{indent}  PROVISIONAL: the mark is below the confirmation floor you set")
+    lines.append(f"{indent}  ({nam.get('caveat')})")
+    lines.append(f"{indent}  (name→glyph binding is {nam.get('binding_source')}'s claim, not verified on chain)")
+    return lines
+
+
+def _require_min_confirmations(min_confirmations: int | None) -> None:
+    """``--wave-name`` without ``--min-confirmations`` is refused, not defaulted.
+
+    The depth registry (``btc_wallet/chains.py``) states the rule: confirmation depth is
+    value-scaled per chain, and a shipped default would be folklore. ``resolve_mark_anchor``
+    enforces the same at the library layer; this is the CLI-shaped refusal that names the flag.
+    """
+    if min_confirmations is None:
+        raise UserError(
+            "--wave-name needs --min-confirmations",
+            cause="confirmation depth is value-scaled per chain and deliberately has no default",
+            fix="pass --min-confirmations N, the depth below which the mark's block is treated as provisional",
+        )
+
+
+def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
+    """Two clients pinned to two DIFFERENT configured endpoints, each labelled by its URL.
+
+    Form 2 needs two independent sources twice over: the walker refuses a tip proof from the
+    server that supplied the candidates, and the judge refuses a block height from the server
+    that supplied the name→glyph binding. With ONE configured endpoint both clients are that
+    endpoint and both labels are equal, so each of those rules degrades with its reason — which
+    is the truth of a single-server configuration, and is the shipped default. A second server
+    under ``electrumx_servers`` (pyrxd ships two independent mainnet operators in
+    ``network/registry.py``) is what makes form 2 reachable.
+
+    Tests patch this to hand in fakes.
+    """
+    if ctx.client_factory is not None:
+        client = ctx.client_factory()
+        return client, "factory", client, "factory"
+    from ..network.failover import FailoverElectrumXClient
+    from ..network.registry import NetworkProfile
+
+    profile = ctx.config.require_profile()
+    first = profile.endpoints[0]
+    second = profile.endpoints[1] if len(profile.endpoints) > 1 else profile.endpoints[0]
+
+    def _one(endpoint: object) -> FailoverElectrumXClient:
+        return FailoverElectrumXClient(
+            NetworkProfile(network=profile.network, endpoints=(endpoint,), genesis_hash=profile.genesis_hash)  # type: ignore[arg-type]
+        )
+
+    return _one(first), first.url, _one(second), second.url
+
+
+def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confirmations: int) -> None:
+    """Attach a §7.6 form-2 verdict (or its degrade) to every VERIFIED HashMark record.
+
+    Same two shapes as :func:`_attach_wave_identity` — a pasted script carries one record at the
+    top level, a fetched transaction one per output — and the same contract: errors are attached
+    with a reason, never raised, because a failed name resolution is not a reason to lose the
+    classification the user asked for. The mark's txid comes from the fetched transaction; a
+    pasted script has none, and form 2 is then unavailable by construction.
+    """
+    records = (
+        [payload["hashmark"]]
+        if payload.get("hashmark")
+        else [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]
+    )
+    mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
+    for hm in records:
+        _judge_one_name_at_mark(ctx, hm, mark_txid=mark_txid, name=name, min_confirmations=min_confirmations)
+
+
+def _judge_one_name_at_mark(
+    ctx: CliContext, hm: dict, *, mark_txid: str | None, name: str, min_confirmations: int
+) -> None:
+    if not hm:
+        return
+    att = hm.get("attestation") or {}
+    shown = _sanitize_display_string(name)
+    if att.get("outcome") != "valid":
+        hm["name_at_mark"] = {
+            "resolved": False,
+            "name": shown,
+            "reason": (
+                "signature did not verify; refusing to place an unproven signer at any block"
+                if att.get("outcome") == "invalid_signature"
+                else "no verified v2 signature on this record"
+            ),
+        }
+        return
+    try:
+        hm["name_at_mark"] = asyncio.run(
+            _name_at_mark(
+                ctx,
+                name=name,
+                mark_txid=mark_txid,
+                min_confirmations=min_confirmations,
+                signer_hash160=bytes.fromhex(att["recovered_hash160"]),
+            )
+        )
+    except Exception as exc:
+        # The exception text can contain a server-controlled response body.
+        hm["name_at_mark"] = {
+            "resolved": False,
+            "name": shown,
+            "reason": _sanitize_display_string(f"lookup failed: {exc}"),
+        }
+
+
+async def _name_at_mark(
+    ctx: CliContext, *, name: str, mark_txid: str | None, min_confirmations: int, signer_hash160: bytes
+) -> dict:
+    """Binding from one endpoint, height from the other; candidates from one, tip proof from
+    the other. Then the pure judge. Every source is labelled by URL so the two rules that refuse
+    a shared source can see when it IS shared."""
+    from contextlib import AsyncExitStack
+
+    from ..base58 import base58check_encode
+    from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+    from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
+    from ..glyph.mutable_chain_discovery import walk_discovered_chain
+    from ..glyph.wave import WaveNameNotFound, WaveResolver
+    from ..glyph.wave_identity import judge_name_at_mark
+
+    san = _sanitize_display_string
+    shown = san(name)
+    client_a, label_a, client_b, label_b = _endpoint_pair(ctx)
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(client_a)  # type: ignore[arg-type]
+        if client_b is not client_a:
+            await stack.enter_async_context(client_b)  # type: ignore[arg-type]
+
+        # 1. THE BINDING, name -> reveal txid, from whichever endpoint runs the indexer
+        #    extension. Tried second-first so that, when both do, the binding and the anchor
+        #    still land on different servers.
+        record = None
+        binding_label = ""
+        failures: list[str] = []
+        for client, label in ((client_b, label_b), (client_a, label_a)):
+            try:
+                record = await WaveResolver(client).resolve(name)  # type: ignore[arg-type]
+                binding_label = label
+                break
+            except WaveNameNotFound:
+                return {
+                    "resolved": False,
+                    "name": shown,
+                    "reason": "the indexer has no registration for this name (unregistered, or lapsed)",
+                }
+            except Exception as exc:
+                failures.append(f"{label}: {exc}")
+            if client_b is client_a:
+                break
+        if record is None:
+            return {
+                "resolved": False,
+                "name": shown,
+                "reason": san("no configured endpoint answered wave.resolve — " + "; ".join(failures)),
+            }
+        mint = record.reveal_txid
+        if not mint:
+            return {
+                "resolved": False,
+                "name": shown,
+                "reason": san(
+                    f"the indexer's record carries no usable ref ({record.ref!r}); cannot locate the registration"
+                ),
+            }
+
+        # 2. THE ANCHOR, from the endpoint that did NOT supply the binding. The label is the
+        #    URL, the same string the binding is labelled with, so `judge_name_at_mark` can see
+        #    when they are one server.
+        anchor_client, anchor_label = (client_a, label_a) if binding_label == label_b else (client_b, label_b)
+        if mark_txid:
+            tip_height = await anchor_client.get_tip_height()  # type: ignore[attr-defined]
+            anchor = await resolve_mark_anchor(
+                txid=mark_txid,
+                fetch_verbose=anchor_client.get_transaction_verbose,  # type: ignore[attr-defined]
+                source=anchor_label,
+                min_confirmations=min_confirmations,
+                tip_height=int(tip_height),
+            )
+        else:
+            anchor = MarkAnchor(
+                txid="", height=None, confirmations=0, min_confirmations=min_confirmations, source=anchor_label
+            )
+
+        # 3. THE CHAIN: discovered on A, tip proved on B.
+        found = await walk_discovered_chain(
+            mint_txid=mint,
+            discovery_client=client_a,
+            tip_client=client_b,
+            discovery_source=label_a,
+            tip_source=label_b,
+        )
+
+    walk, discovery = found.walk, found.discovery
+    # 4. THE VERDICT — pure. `ref` is the walk's own, so the "walk is of another ref" rule can
+    #    never fire here; what the binding asserts is that THIS chain is the name, and that stays
+    #    `binding_verified=False` because nothing checked it on chain.
+    verdict = judge_name_at_mark(
+        ref=walk.ref or mint,
+        binding_source=binding_label,
+        anchor=anchor,
+        walk=walk,
+        step_heights=discovery.heights,
+    )
+    network = Network(ctx.network) if ctx.network in {n.value for n in Network} else Network.TESTNET
+    signer_address = base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[network] + signer_hash160)
+    same: bool | None = (verdict.target_at_height == signer_address) if verdict.form == 2 else None
+    return {
+        "resolved": True,
+        "name": san(record.name),
+        "ref": san(verdict.ref),
+        "reveal_txid": mint,
+        "form": verdict.form,
+        "point_in_time": verdict.form == 2,
+        "height": verdict.height,
+        "target_at_height": san(verdict.target_at_height) if verdict.target_at_height else None,
+        "target_now": san(record.target),
+        "signer_address": signer_address,
+        "signer_is_target_at_height": same,
+        "provisional": verdict.provisional,
+        "expiry": verdict.expiry,
+        "degraded_reason": san(verdict.degraded_reason),
+        "caveat": verdict.caveat,
+        "binding_source": san(verdict.binding_source),
+        "binding_via": "indexer",
+        "binding_verified": verdict.binding_verified,
+        "anchor_source": san(anchor_label),
+        "chain": {
+            "steps": len(walk.steps),
+            "complete": walk.complete,
+            "tip": f"{walk.tip_txid}:{walk.tip_vout}",
+            "reason": san(walk.reason),
+            "discovery_source": san(label_a),
+            "tip_source": san(label_b),
+            "hops": discovery.hops,
+            "fetches": discovery.fetches,
+            "capped": discovery.capped,
+        },
+    }
+
+
 def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
     """The `msg` and HashMark rendering, for EVERY human surface that shows one.
 
@@ -762,6 +1036,7 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
             # though it were part of it", so it does not sit inside the block or
             # between the signature and what that signature proves.
             out.extend(_wave_context_lines(hm.get("wave_identity"), indent))
+            out.extend(_name_at_mark_lines(hm.get("name_at_mark"), indent))
         else:
             out.append(f"{indent}HashMark: {hm['outcome']}" + (f" — {hm['detail']}" if hm.get("detail") else ""))
 
@@ -1025,8 +1300,39 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
         "key owns. Needs the network. Never runs on an unverified signature."
     ),
 )
+@click.option(
+    "--wave-name",
+    "wave_name",
+    default=None,
+    metavar="NAME",
+    help=(
+        "HashMark §7.6 form 2: what did NAME (e.g. company.rxd) point at AT THE BLOCK THAT "
+        "CARRIED THIS MARK, and was it the signing key? Needs --min-confirmations and two "
+        "configured ElectrumX servers; with one it degrades to the present-tense answer and "
+        "says why. Never runs on an unverified signature."
+    ),
+)
+@click.option(
+    "--min-confirmations",
+    "min_confirmations",
+    type=click.IntRange(min=1),
+    default=None,
+    metavar="N",
+    help=(
+        "Depth below which the mark's block is too shallow to build a form-2 claim on. "
+        "Required with --wave-name; deliberately has no default (depth is value-scaled)."
+    ),
+)
 @click.pass_obj
-def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool, verify_wave: bool) -> None:
+def inspect_cmd(
+    ctx: CliContext,
+    inspect_input: str,
+    fetch: bool,
+    resolve: bool,
+    verify_wave: bool,
+    wave_name: str | None,
+    min_confirmations: int | None,
+) -> None:
     """Classify a Glyph input.
 
     INPUT can be:
@@ -1155,6 +1461,9 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool,
 
     if verify_wave:
         _attach_wave_identity(ctx, payload)
+    if wave_name:
+        _require_min_confirmations(min_confirmations)
+        _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 
     mode = ctx.output_mode
     if mode == "json":

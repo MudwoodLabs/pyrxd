@@ -18,7 +18,10 @@ from pyrxd.glyph.wave import (
 )
 from pyrxd.security.errors import ValidationError
 
-ADDR = "1JsKDV4xV8FXZjLDLcLvLY1aWCKBKt8XnQ"
+# A REAL mainnet address (a WAVE target from the mainnet fixture), because `reverse_lookup` now
+# decodes it to a scripthash. The previous value here had an INVALID base58 checksum and nothing
+# noticed for as long as the address was forwarded verbatim — the old code never looked at it.
+ADDR = "14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i"
 
 
 # ─────────────────────────────────────────────── split_qualified_name ──
@@ -346,14 +349,37 @@ class TestWaveResolverOther:
         assert await resolver.check_available("taken.rxd") is False
 
     async def test_reverse_lookup(self):
+        """The indexer returns a list of DICTS keyed by owner scripthash — measured against the
+        public `electrumx.radiantcore.org` indexer 2026-09-16 and confirmed in RXinDexer's
+        `wave_index.py`. Names come back qualified; an `expired` entry is listed by the indexer
+        so the owner sees it, but it no longer resolves and is dropped here."""
+        from pyrxd.network.electrumx import script_hash_for_address
+
         client = FakeElectrumXClient(
             {
-                "wave.reverse_lookup": ["alice.rxd", "alice.dev"],
+                "wave.reverse_lookup": [
+                    {"ref": "ab" * 32 + "_0", "name": "alice", "full_name": "alice.rxd", "status": "active"},
+                    {"ref": "cd" * 32 + "_0", "name": "old", "full_name": "old.rxd", "status": "expired"},
+                    {"ref": "ef" * 32 + "_0", "name": "bare"},
+                ],
             }
         )
         resolver = WaveResolver(client)
         names = await resolver.reverse_lookup(ADDR)
-        assert names == ["alice.rxd", "alice.dev"]
+        assert names == ["alice.rxd", "bare.rxd"]
+        # THE ARGUMENT IS A SCRIPTHASH, NOT THE ADDRESS. The address was forwarded verbatim before,
+        # and the indexer answered "non-hexadecimal number found in fromhex() arg".
+        assert client.calls == [("wave.reverse_lookup", [script_hash_for_address(ADDR).hex()])]
+
+    async def test_reverse_lookup_still_accepts_bare_names(self):
+        """An older indexer that returned plain strings keeps working."""
+        client = FakeElectrumXClient({"wave.reverse_lookup": ["alice.rxd", "alice.dev"]})
+        assert await WaveResolver(client).reverse_lookup(ADDR) == ["alice.rxd", "alice.dev"]
+
+    async def test_reverse_lookup_refuses_an_error_answer(self):
+        client = FakeElectrumXClient({"wave.reverse_lookup": {"error": "non-hexadecimal number found"}})
+        with pytest.raises(WaveResolverError, match="refused"):
+            await WaveResolver(client).reverse_lookup(ADDR)
 
     async def test_reverse_lookup_unexpected_shape(self):
         client = FakeElectrumXClient({"wave.reverse_lookup": "not a list"})
@@ -367,11 +393,34 @@ class TestWaveResolverOther:
         s = await resolver.stats()
         assert s["total_names"] == 1234
 
-    async def test_passes_name_to_rpc(self):
-        client = FakeElectrumXClient({"wave.resolve": {"name": "x", "target": ADDR}})
+    async def test_passes_the_label_not_the_qualified_name_to_rpc(self):
+        """RXinDexer's `resolve()` runs `validate_wave_name` first and `.` is not in its
+        `WAVE_CHARS`: `"alice.rxd"` is answered `{"error": "Invalid character: ."}` (measured
+        2026-09-16). The qualified name the caller uses must reach the server as its label."""
+        client = FakeElectrumXClient({"wave.resolve": {"name": "alice", "target": ADDR}})
         resolver = WaveResolver(client)
-        await resolver.resolve("alice.rxd")
-        assert client.calls == [("wave.resolve", ["alice.rxd"])]
+        record = await resolver.resolve("alice.rxd")
+        assert client.calls == [("wave.resolve", ["alice"])]
+        assert record.name == "alice.rxd", "the bare label the indexer returns is re-qualified for the caller"
+
+    async def test_resolve_refuses_an_error_answer_instead_of_parsing_it(self):
+        client = FakeElectrumXClient({"wave.resolve": {"error": "Invalid character: ."}})
+        with pytest.raises(WaveResolverError, match="refused"):
+            await WaveResolver(client).resolve("alice.rxd")
+
+    async def test_record_carries_the_ref_and_derives_the_reveal_txid(self):
+        """`ref` is `<reveal_txid>_0` — the registration transaction, which is where a
+        mutable-chain walk starts. It doubles as `claim_txid` when the indexer sends none."""
+        client = FakeElectrumXClient(
+            {"wave.resolve": {"name": "alice", "target": ADDR, "ref": "ab" * 32 + "_0", "status": "active"}}
+        )
+        record = await WaveResolver(client).resolve("alice.rxd")
+        assert record.ref == "ab" * 32 + "_0"
+        assert record.reveal_txid == "ab" * 32
+        assert record.claim_txid == "ab" * 32
+        assert record.status == "active"
+        bad = WaveRecord(name="x.rxd", target=ADDR, target_type="address", claim_txid="", block_height=0, ref="junk_0")
+        assert bad.reveal_txid == "", "an unusable ref is reported absent, not passed on to a fetch"
 
     async def test_accepts_rxindexer_client_directly(self):
         from pyrxd.network.rxindexer import RxinDexerClient

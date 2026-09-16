@@ -2,10 +2,12 @@
 title: "Resolve a WAVE name at the mark's own block (HashMark §7.6 form 2)"
 type: feat
 date: 2026-09-09
-status: BUILT (phases 0-4) — SDK surface only; CLI wiring is blocked on candidate enumeration
-  and deliberately not faked (see Phase 4). A seven-reviewer security panel was run against the
-  built stack afterwards and its findings folded in; every fix is pinned by a two-sided test
-  (passes with the fix, fails with the defect planted back).
+status: BUILT (phases 0-5) and reachable from the CLI. Phases 0-4 were SDK surface only, blocked
+  on candidate enumeration and deliberately not faked; Phase 5 (2026-09-16) discovers candidates
+  from the chain itself and wires `pyrxd glyph inspect --wave-name NAME --min-confirmations N`.
+  Verified live on mainnet against two public servers (see Phase 5). A seven-reviewer security
+  panel was run against the phase 0-4 stack; every fix is pinned by a two-sided test (passes with
+  the fix, fails with the defect planted back).
 issue: 598
 depends_on: 661
 ---
@@ -325,6 +327,49 @@ The way to remove that dependency entirely: discover candidates from the chain r
 — hash the current mutable output's script and ask `get_history` who spent it, one hop at a time,
 which is exactly the shape `dmint/chain.py` already uses. Needs a live Radiant ElectrumX to verify,
 so it is not built on assumption.
+
+### Phase 5 — candidates from the chain, and the CLI  ✅ BUILT 2026-09-16
+
+`src/pyrxd/glyph/mutable_chain_discovery.py` — `discover_mutable_chain`, `electrumx_tip_prover`,
+`walk_discovered_chain`. Follows the mutable output's scripthash history hop by hop. Measured live
+first, on both shipped public servers, for `custodian-gate-x7f3.rxd`::
+
+    hop 0  f644794b:1  history=[f644794b@458585, 315b4630@458591]  unspent=[]
+    hop 1  315b4630:1  history=[315b4630@458591, 3c7b43df@458601]  unspent=[]
+    hop 2  3c7b43df:1  history=[3c7b43df@458601]                   unspent=[3c7b43df:1]
+    -> 3 hops, 6 fetches, 2.8 s (radiant4people) / 1.2 s (radiantcore)
+
+Two things the measurement settled. The sibling `2cee4847` never appears — a mutable output's
+scripthash history holds the transactions that touch THAT OUTPUT, so discovery by scripthash is
+narrower than discovery by name and `excluded` is normally empty. And heights ride along with every
+history entry, which is the `step_heights` input nothing had been supplying.
+
+**The two-source rule survives.** A scripthash history is still one server's claim about which
+transactions exist, so `walk_discovered_chain` takes a discovery client and a tip client and labels
+each by URL. The same endpoint twice is allowed and degrades honestly — which is the shipped default
+config, since it names one server. pyrxd ships two independent mainnet operators
+(`network/registry.py`); `electrumx_servers = [both]` is what makes form 2 reachable.
+
+**The binding came from the indexer, and the indexer contract was wrong in pyrxd.** RXinDexer's
+`resolve()` wants the bare label (its validator rejects `.` before anything else) and
+`reverse_lookup()` wants a 32-byte scripthash and returns a list of dicts — confirmed in upstream
+`wave_index.py` and against the live `electrumx.radiantcore.org` indexer. pyrxd sent the qualified
+name and a base58 address, so form 1 (`--verify-wave`) could not have worked against either public
+server. Both fixed; `WaveRecord` now carries `ref` (`<reveal_txid>_0`, the walk's starting point).
+Of the two public servers only `radiantcore` runs the extension; `radiant4people` answers `-32601`.
+
+**CLI**: `--wave-name NAME --min-confirmations N` (the floor is required and has no default, per
+`btc_wallet/chains.py`). Binding from whichever endpoint runs the indexer, anchor from the other;
+candidates from one, tip proof from the other; then the pure judge. The verdict adds
+`signer_is_target_at_height` — the §7.6 sentence itself — and renders after the mark's own
+statement closes, with every qualifier. Verified live through the CLI's own `_name_at_mark`:
+
+    mark at 458601 -> form 2, 14XmXG3d…, signing key IS that address
+    mark at 458585 -> form 2, 1CPfirXZ…, signing key is NOT that address
+
+Acceptance for Phase 4 is therefore met on the CLI path as well: every degrade lands on form 1 with
+a reason (single server, unverified signature, pasted script, unregistered name, no indexer, shallow
+mark — each pinned), and no output claims authorship or location.
 
 ---
 
