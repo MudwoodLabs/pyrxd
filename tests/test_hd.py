@@ -563,3 +563,35 @@ def test_bip44_range_and_deprecated_aliases_forward_normalize():
     expected = [canonical.ckd(0).ckd(i) for i in range(2)]
     assert ranged == expected
     assert ranged_deprecated == expected
+
+
+class TestEmptyEntropyIsRefusedNotRandomised:
+    """`mnemonic_from_entropy` tested `if entropy:`, not `if entropy is None:`.
+
+    So b"" and "" — what an entropy source returns when it has failed — fell into the
+    `else` branch and were answered with a mnemonic built from a FRESH RANDOM seed. The
+    caller got a valid-looking 12 words unrelated to the material it meant to commit to,
+    with no error, and could not reproduce it. Present since v0.2.0 and covered by nothing:
+    every existing call site passes `os.urandom(16)`, which is never falsy.
+
+    The refusal comes free from the length check that was always there — 0 bits is not in
+    BIP39_ENTROPY_BIT_LENGTH_LIST — so the fix is the comparison, not a new branch.
+    """
+
+    @pytest.mark.parametrize("empty", [b"", ""], ids=["bytes", "str"])
+    def test_empty_entropy_raises(self, empty):
+        with pytest.raises(ValidationError):
+            mnemonic_from_entropy(empty)
+
+    def test_omitting_entropy_still_generates(self):
+        """The honest path. `None` means "pick for me" and must keep working, or this
+        guard has broken the common case to close the rare one."""
+        first = mnemonic_from_entropy()
+        second = mnemonic_from_entropy()
+        assert len(first.split()) == 12
+        assert first != second, "two generated mnemonics should differ"
+
+    def test_supplied_entropy_is_still_deterministic(self):
+        """The control that proves the test above is measuring randomness and not noise."""
+        assert mnemonic_from_entropy(bytes(16)) == mnemonic_from_entropy(bytes(16))
+        assert mnemonic_from_entropy(bytes(16)).startswith("abandon abandon")
