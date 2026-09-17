@@ -758,9 +758,7 @@ async def maker_phase_envelope(args) -> None:
             rxd_block_interval_s=args.rxd_block_interval_s,
             btc_block_interval_s=args.btc_block_interval_s,
             # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
-            elapsed_reserve_blocks=elapsed_reserve_blocks(
-                rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS
-            ),
+            elapsed_reserve_blocks=elapsed_reserve_blocks(rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS),
         ),
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,

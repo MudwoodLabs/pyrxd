@@ -154,10 +154,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "verify_tx_in_block": ("pyrxd.spv", "verify_tx_in_block"),
     # Content encryption primitives — pyrxd.crypto (#556).
     #
-    # These are BYTE-COMPATIBLE WITH PHOTONIC WALLET (`packages/lib/src/encryption.ts`), which is
-    # what makes them worth a public export rather than an internal detail: a caller encrypting
-    # Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the actual use
-    # case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1 vector.
+    # These target BYTE-COMPATIBILITY WITH PHOTONIC WALLET (`packages/lib/src/encryption.ts`),
+    # which is what makes them worth a public export rather than an internal detail: a caller
+    # encrypting Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the
+    # actual use case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1
+    # vector — an independent published vector, so that half of the claim is falsifiable.
+    #
+    # The KEM half was NOT, and was false for four months. This comment said "BYTE-COMPATIBLE"
+    # flatly while `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"` and Photonic had
+    # moved to `b"glyph-kek-classical-v1"` on 2026-05-22 — so wrap/unwrap could not interoperate
+    # at all from v0.6.0 through 0.24.0. The interop fixture could not catch it: it was generated
+    # four days before the upstream change and records `photonic_commit: "UNKNOWN"`. The Appendix
+    # A.3.1 vector never covered the KEM path, only the raw AEAD. Fixed; the claim is now scoped
+    # to what a vector actually checks.
     #
     # These were exported rather than wired when #560 landed: #556 had found them unreachable
     # alongside the timelocked-content feature, and nothing in `src/` imported them at all. That

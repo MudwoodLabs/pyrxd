@@ -111,6 +111,26 @@ def _cbor_str(d: dict, key: str, max_len: int) -> str:
     return v
 
 
+def _cbor_loc_vout(d: dict) -> int | None:
+    """An INTEGER ``loc`` is a ref-vout pointer, not a URI — keep it instead of dropping it.
+
+    Photonic treats ``loc`` exclusively as an index into the token's own refs and merges the
+    payload it points at (``packages/app/src/electrum/worker/NFT.ts:988-1010``). pyrxd reads
+    ``loc`` as text, so ``_cbor_str`` logged the integer form and returned "" — leaving a token
+    whose metadata lives in a second payload looking identical to one with no ``loc`` at all.
+
+    Bounds are deliberate: a vout is a non-negative output index, and ``bool`` is rejected
+    explicitly because it is an ``int`` subclass and ``loc: True`` is not vout 1.
+    """
+    v = d.get("loc")
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    if v < 0 or v > 0xFFFFFFFF:
+        _log.warning("decode_payload: integer 'loc' %d is not a plausible vout; dropped", v)
+        return None
+    return v
+
+
 _MAX_CBOR_PAYLOAD_BYTES = 262_144  # 256 KB hard cap — protects against DoS on decode
 # Why 256 KB and not 64 KB: real V1 dMint deploys carry embedded media in the
 # CBOR `main` field. The Radiant Glyph Protocol deploy
@@ -451,7 +471,11 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         main=main,
         encrypted_main=encrypted_main,
         attrs=_decode_attrs(d.get("attrs", {})),
-        loc=_cbor_str(d, "loc", 512),
+        # `loc` is text to pyrxd and a ref-vout to Photonic. Resolve which one this is ONCE:
+        # asking _cbor_str for a value we are about to keep would log "dropped" about a field
+        # that was not dropped, and a log line that contradicts the code is worse than silence.
+        loc="" if _cbor_loc_vout(d) is not None else _cbor_str(d, "loc", 512),
+        loc_vout=_cbor_loc_vout(d),
         loc_hash=_cbor_str(d, "loc_hash", 128),
         decimals=_decode_decimals(d.get("decimals", 0)),
         image_url=_cbor_str(d, "image", 512),
