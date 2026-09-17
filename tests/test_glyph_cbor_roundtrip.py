@@ -235,6 +235,15 @@ _NOT_GENERATED = {
         "to end; generating it HERE would need a strategy that never sets plain `main` at the "
         "same time, since setting both raises."
     ),
+    "loc_vout": (
+        "READ-PATH ONLY and deliberately not round-trippable: it carries an INTEGER `loc`, "
+        "which Photonic means as a ref-vout pointer and pyrxd does not resolve. `to_cbor_dict` "
+        "never emits it — writing a pointer pyrxd cannot follow would be worse than dropping "
+        "it — so a round-trip could only assert that it vanishes, which is the encoder's "
+        "documented behaviour rather than a property worth generating. Its decode direction is "
+        "covered by TestAnIntegerLocIsKeptNotDropped in tests/test_glyph_v2_metadata.py, "
+        "including that a bool is not a vout and vout 0 is distinct from absent."
+    ),
 }
 
 

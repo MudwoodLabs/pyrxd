@@ -242,7 +242,7 @@ Three normative consequences follow:
 All fields are OPTIONAL except `p`. Unknown fields MUST be ignored by a decoder
 rather than treated as an error (see §16.1 for what pyrxd does with them today).
 Field names, decoder types, and limits are from
-`src/pyrxd/glyph/payload.py:95-241` and `src/pyrxd/glyph/types.py:314-408`.
+`src/pyrxd/glyph/payload.py:95-261` and `src/pyrxd/glyph/types.py:314-408`.
 
 | Key | CBOR type | Required | Max length | Meaning |
 |---|---|---|---|---|
@@ -324,7 +324,7 @@ over it.** The cap is gone; this sentence is restored.
 
 ### 4.5 What a decoder MUST reject
 
-`src/pyrxd/glyph/payload.py:95-241`:
+`src/pyrxd/glyph/payload.py:95-261`:
 
 - A body larger than 262,144 bytes.
 - Bytes that are not decodable CBOR.
@@ -345,7 +345,7 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:304-331`). A malformed
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:324-351`). A malformed
 `dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:297-302`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
