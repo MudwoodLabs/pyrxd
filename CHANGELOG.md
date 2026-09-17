@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
+  `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
+  `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-22 (`6e235207`) as downgrade
+  protection — binding the HKDF info to the mode so stripping the ML-KEM ciphertext cannot still
+  decrypt. From that day, pyrxd and Photonic derived different KEKs and could not exchange
+  encrypted Glyph content, while `pyrxd/__init__.py` and the 0.22.0 entry below both stated
+  byte-compatibility flatly. **The 0.22.0 claim is wrong as written and is corrected here rather
+  than edited, since released sections are frozen:** the draft-irtf-cfrg-xchacha-03 Appendix
+  A.3.1 vector it cites covers the raw AEAD only and never touched the KEM path, and the
+  Photonic interop fixture that appeared to cover it was generated 2026-05-18 — four days before
+  the upstream change — recording `photonic_commit: "UNKNOWN"`.
+
+  pyrxd now emits `glyph-kek-classical-v1`, the correct string for the X25519-only path it
+  implements. `unwrap_cek_x25519` still reads the legacy spelling, so content pyrxd sealed in
+  that window stays readable; `unwrap_cek_x25519_detailed` reports which derivation succeeded so
+  a caller can re-wrap it, and `allow_legacy_info=False` refuses the fallback. The retry is not a
+  downgrade hole: both values are fixed constants, the AEAD tag still has to verify, and neither
+  is Photonic's hybrid string.
+
 ### Added
 
 - **`RxinDexerClient` discovery wrappers** (`glyph_get_recent`,
