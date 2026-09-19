@@ -385,7 +385,12 @@ class TestTheSignature:
             return base64.b64encode(bytes(out)).decode("ascii")
 
         monkeypatch.setattr(utils, "stringify_ecdsa_recoverable", high_s)
-        with pytest.raises(ValidationError, match="low-S"):
+        # Matched on "(spec 5.6)", which only `_sign_statement`'s own refusal
+        # carries. High-S is caught twice — the sign-then-verify guard rejects it
+        # too — and a looser pattern passed with this check deleted, so the test
+        # said "the encoder refuses high-S" while proving nothing about the check
+        # it was written for. Found by planting exactly that deletion.
+        with pytest.raises(ValidationError, match=r"not low-S \(spec 5\.6\)"):
             encode_hashmark(_DIGEST, key)
 
     def test_the_encoder_refuses_a_signature_that_recovers_to_another_key(self, key: PrivateKey, monkeypatch) -> None:
