@@ -56,6 +56,7 @@ from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
+from pyrxd.devnet import RegtestNode
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
@@ -78,7 +79,10 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-_RXD_IMAGE = "radiant-core:v3.1.1-amd64"
+#: Derived, never spelled. `scripts/refresh_radiant_core_vendor.py --check` reads
+#: `DEFAULT_RADIANT_VERSION`; a literal here could drift from it and the check would
+#: still pass while this lane ran a different node.
+_RXD_IMAGE = RegtestNode.IMAGE
 # Bitcoin-family chain knob (Tier 2.3): XCHAIN_BTC_FAMILY=ltc runs this SAME coordinator
 # e2e with Litecoin Core as the counter chain (the Taproot-HTLC leg is chain-agnostic
 # across the family; counter_chain stays "btc" — the PoW-depth FAMILY — and the network

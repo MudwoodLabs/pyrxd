@@ -256,7 +256,7 @@ this commit, not against a plan:
    `tests/test_xchain_eth_active_adversary_e2e.py`,
    `tests/test_xchain_eth_glyph_real_rxindexer_e2e.py`,
    `tests/test_xchain_eth_tierb_isolated_e2e.py`. They still fund the covenant *after*
-   `taker_funds_btc` (verified: `test_xchain_swap_regtest_e2e.py:554-560`) — the pre-HZ-1 order
+   `taker_funds_btc` (verified: `test_xchain_swap_regtest_e2e.py:558-564`) — the pre-HZ-1 order
    the hazard names as unsafe — so the fail-closed gate refuses them. They are opt-in
    (env-gated) and deselected from `task ci` (`pyproject.toml:432`, `-m 'not integration'`), so
    default CI is green; the reordering is a tracked follow-up (CHANGELOG 0.14.0).

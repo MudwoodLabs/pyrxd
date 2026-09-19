@@ -9,8 +9,8 @@
 #
 # Build (pin to the latest Radiant-Core release):
 #     docker build -f docker/regtest.Dockerfile \
-#         --build-arg RADIANT_VERSION=v3.1.1 \
-#         -t radiant-core:v3.1.1-amd64 .
+#         --build-arg RADIANT_VERSION=v3.1.2 \
+#         -t radiant-core:v3.1.2-amd64 .
 #
 # `pyrxd regtest setup` builds this for you; `pyrxd regtest up` then runs it.
 # The container is regtest-only, binds RPC to 127.0.0.1, and is reached solely
@@ -23,7 +23,7 @@
 
 FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d
 
-ARG RADIANT_VERSION=v3.1.1
+ARG RADIANT_VERSION=v3.1.2
 ARG RADIANT_TARBALL=radiant-${RADIANT_VERSION}-linux-x64.tar.gz
 ARG RADIANT_BASEURL=https://github.com/Radiant-Core/Radiant-Core/releases/download/${RADIANT_VERSION}
 

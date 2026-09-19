@@ -37,6 +37,7 @@ pytest.importorskip("web3")
 pytest.importorskip("eth_keys")
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.devnet import RegtestNode
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
@@ -76,7 +77,10 @@ from tests.test_xchain_swap_regtest_e2e import (
 
 pytestmark = pytest.mark.integration
 
-_RXD_IMAGE = "radiant-core:v3.1.1-amd64"
+#: Derived, never spelled. `scripts/refresh_radiant_core_vendor.py --check` reads
+#: `DEFAULT_RADIANT_VERSION`; a literal here could drift from it and the check would
+#: still pass while this lane ran a different node.
+_RXD_IMAGE = RegtestNode.IMAGE
 _RXD_CT = "xchain-eth-rxd-pytest"
 # The anvil chain id. Default 31337; override to run the SAME coordinator suite as another
 # EVM-family chain (Tier 2.3) — e.g. XCHAIN_ETH_CHAIN_ID=84532 runs it as Base Sepolia,
