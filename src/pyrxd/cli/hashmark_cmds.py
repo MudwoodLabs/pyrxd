@@ -519,6 +519,18 @@ def _signature_check(records: list[dict]) -> tuple[str, str]:
     also carrying a good one, and a single verified record is enough to say a verified record
     is here. In practice a mark transaction carries exactly one.
     """
+    # THE STATUS WORDS ARE LITERALS HERE ON PURPOSE, and they are not free-floating.
+    # `_inspect_core._ATTESTATION_VERDICTS` is the one definition of what each
+    # attestation outcome is CALLED — `glyph inspect` and the browser panel read it
+    # directly — and `test_the_status_words_match_the_shared_table` below pins every
+    # literal below to it, so the three surfaces cannot come to describe one record
+    # differently.
+    #
+    # Why a pin rather than reading the table here: `test_every_state_the_checks_can_emit
+    # _is_classified` derives the emitted set by AST-scanning THESE returns for string
+    # constants, and routing them through a call made the set invisible — the guard then
+    # correctly reported that `_CHECK_HOLDS` named states nothing emits. Keeping the
+    # literals keeps that derivation working; the pin keeps them true.
     outcomes = [(r.get("attestation") or {}).get("outcome") for r in records]
     if any(r.get("outcome") == "invalid" for r in records):
         detail = next(r.get("detail") for r in records if r.get("outcome") == "invalid")

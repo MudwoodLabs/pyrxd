@@ -138,7 +138,7 @@ group_files() {
     walletcore)  echo "constants swap/partial swap/resolve" ;;
     swap)        echo "gravity/htlc_spend swap/rswp/orders" ;;
     coordinator) echo "gravity/swap_coordinator" ;;
-    network)     echo "network/bitcoin network/electrumx network/failover network/confirm network/_guards network/tls_pin network/registry network/rxindexer network/chaintracker" ;;
+    network)     echo "network/bitcoin network/electrumx network/failover network/confirm security/json_guards network/tls_pin network/registry network/rxindexer network/chaintracker" ;;
     keys)        echo "security/errors security/secrets base58 hd/bip32 hd/descriptor gravity/watch/cli_secrets" ;;
     # The EVM counter leg. Added 2026-08-27 after a six-reviewer panel found that essentially every
     # defect of that review lived in these 3,593 lines — and that they had ZERO mutation coverage,

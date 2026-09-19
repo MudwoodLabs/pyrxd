@@ -373,11 +373,27 @@ For a well-formed HashMark the classifier goes one step further and
 **verifies the v2 signature**: `verify_attestation` recovers the signing
 key from the signature over the canonical statement and requires it to
 hash to the signer committed in the record. The result lands in
-`hashmark.attestation` as `valid`, `invalid_signature`, or
-`not_attested`. Radiant mainnet's genesis hash is part of the signed
+`hashmark.attestation` as `valid`, `invalid_signature`, `unverifiable`,
+or `not_attested`. Radiant mainnet's genesis hash is part of the signed
 statement and a pasted script carries no chain context, so mainnet is
 **assumed**, and the assumption is reported in the output rather than
 hidden — the same bytes on another chain are a different statement.
+
+`unverifiable` is the one to understand, because it is the **normal**
+outcome in the browser and was missing from this list until W8. Verifying
+needs secp256k1, and the Pyodide page installs pyrxd without it
+(`coincurve` ships no pure-Python wheel), so every v2 record pasted into
+`/inspect/` comes back unverifiable. That is a missing capability of the
+reader, not a fact about the record: the digest, the label and the signer
+the record names all still reach you, and only the verdict is withheld.
+Both surfaces render it as **NOT CHECKED**, never as a failure — telling
+someone an honest mark's claim does not hold, on the strength of an
+absent dependency, would be the worst thing either tool could do.
+
+Note the asymmetry with the write side, which is deliberate: `MarkPlan`
+treats `unverifiable` as a **refusal**, because funding a transaction
+needs the same curve that signs it and there is no honest way to proceed
+without it. Reading, there is.
 
 Two consequences worth stating plainly:
 
@@ -386,7 +402,16 @@ Two consequences worth stating plainly:
   means a signature checked out. It still does not establish authorship,
   ownership, originality, or the truth of the marked file's contents —
   only that whoever holds that key made this statement about this digest
-  no later than the confirming block.
+  no later than the confirming block. The claim it reaches is **key
+  custody at that block**, and nothing wider: not who wrote the file, not
+  who owns it, and not where anyone was.
+- The browser page adds one thing the CLI cannot: it will **hash a file
+  you choose and compare it against the record's digest**, using the
+  algorithm the record's own `algorithm_id` names. The file is read
+  inside the browser and never leaves the machine — the same promise
+  `pyrxd mark` makes from the other end, where the digest goes on chain
+  and the contents do not. A match says the bytes in front of you are the
+  bytes the record commits to. It says nothing about who made them.
 - Anything that does not carry one of the two markers stays plain
   `op_return`, deliberately. A scanner meets thousands of other
   protocols' data outputs, and treating them as errors buries the real

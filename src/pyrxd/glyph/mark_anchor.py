@@ -48,8 +48,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from pyrxd.network._guards import nonneg_int
 from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.json_guards import nonneg_int
 
 #: Text attached to every anchor. Deliberately not optional and deliberately blunt: the whole
 #: value of form 2 rests on this height, and a reader who does not know it is unverified will
@@ -176,4 +176,30 @@ async def resolve_mark_anchor(
     )
 
 
-__all__ = ["UNVERIFIED_CAVEAT", "MarkAnchor", "resolve_mark_anchor"]
+def mark_anchor_dict(anchor) -> dict:
+    """The display shape of a :class:`~pyrxd.glyph.mark_anchor.MarkAnchor`.
+
+    ``caveat`` and ``height_is_verified`` are carried, never dropped: the height is one
+    endpoint's claim and pyrxd has no Radiant header, proof-of-work or merkle check to
+    hold it to. A consumer that shows the number and not the caveat has published the
+    unqualified sentence this module exists to prevent.
+    """
+    # Function-local: `_inspect_core` is a far larger module than this one, and a
+    # top-level import would make every consumer of a dataclass pay for the whole
+    # classifier. It is Pyodide-clean either way — that is what
+    # `tests/web/test_mark_anchor_bridge.py` measures.
+    from ._inspect_core import _sanitize_display_string
+
+    return {
+        "height": anchor.height,
+        "confirmations": anchor.confirmations,
+        "min_confirmations": anchor.min_confirmations,
+        "provisional": anchor.provisional,
+        "deep_enough": anchor.usable_for_point_in_time,
+        "source": _sanitize_display_string(anchor.source),
+        "height_is_verified": anchor.height_is_verified,
+        "caveat": anchor.caveat,
+    }
+
+
+__all__ = ["UNVERIFIED_CAVEAT", "MarkAnchor", "mark_anchor_dict", "resolve_mark_anchor"]

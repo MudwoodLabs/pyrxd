@@ -1,6 +1,13 @@
 // Drive inspect.js's ElectrumX fetch error path under Node against a stub
 // WebSocket, to prove `stripControlChars` actually runs on both sibling
-// error paths in `fetchRawTxFromElectrumx`'s "message" handler.
+// error paths in the shared "message" handler.
+//
+// That handler now lives in `electrumxRpc`, which `fetchRawTxFromElectrumx`
+// wraps — the wire half was split out when the verdict view needed two more
+// calls over the same socket loop. This harness still drives it through
+// `fetchRawTxFromElectrumx` DELIBERATELY: that is the production entry point
+// the page actually calls, and a probe that reached the private wire function
+// directly would stop proving the errors survive the wrapper.
 //
 // Why this exists
 // ----------------
@@ -29,7 +36,7 @@
 //     "stripControlCharsDirect": "<stripControlChars() called directly>"
 //   }
 //
-// `fetchRawTxFromElectrumx`'s WebSocket construction, listener registration
+// `electrumxRpc`'s WebSocket construction, listener registration
 // and settle() are all synchronous within the Promise executor (no `await`
 // before them), so a stub WebSocket that records `addEventListener`
 // callbacks and exposes a `dispatch()` method can drive both branches of the
