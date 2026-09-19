@@ -381,7 +381,11 @@ class TestTheCeilingIsReal:
         _vout, script, record = _record_from_chain(node, payload["txid"])
         assert len(script) == 223
         assert record.label == label
-        assert verify_attestation(record, network_genesis=REGTEST_GENESIS).valid
+        # Genesis from the NODE, not from the constant. Attesting against the same constant
+        # the command signed with is circular: a wrong constant would satisfy both sides and
+        # this case would stay green — measured, by planting one wrong nibble in
+        # GENESIS_BLOCK_HASHES["regtest"] and watching only the node-sourced cases fail.
+        assert verify_attestation(record, network_genesis=str(node.cli("getblockhash", "0"))).valid
         print(f"\n223-byte record relayed: {payload['txid']}")
 
     def test_an_unlabelled_record_is_the_specs_133_bytes(self, node, tmp_path, monkeypatch) -> None:  # noqa: F811
