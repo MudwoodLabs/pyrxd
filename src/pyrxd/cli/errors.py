@@ -11,6 +11,10 @@ Exit codes (per docs/wallet-cli-plan.md §"Exit codes"):
   2   network error
   3   wallet decryption failed
   4   unexpected error (bug)
+  5   a verdict that does not hold (`pyrxd verify`) — the report is still
+      printed in full; only the exit status says no. Distinct from 1 on
+      purpose: a gate whose "no" is spelled the same as "you typed it
+      wrong" cannot be scripted. See `hashmark_cmds.EXIT_VERDICT_DOES_NOT_HOLD`.
 
 Debug traceback handling
 ------------------------

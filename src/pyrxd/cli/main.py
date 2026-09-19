@@ -20,6 +20,9 @@ Global options apply to every subcommand:
 Cut 1 commands: wallet (group), address, balance.
 Cut 2 commands: glyph (group).
 Cut 3 commands: setup, utxos, wallet export-xpub.
+
+Exit codes are 0-4 as documented in ``errors.py``, plus 5 — a verdict that does
+not hold, raised only by ``verify``. See ``hashmark_cmds.EXIT_VERDICT_DOES_NOT_HOLD``.
 """
 
 from __future__ import annotations
@@ -213,6 +216,10 @@ cli.add_command(glyph_cmds.glyph_group)
 # Top level, not under `glyph`: HashMark is a third-party OP_RETURN format, not a Glyph
 # protocol, and filing it under `glyph` would imply pyrxd owns it. See script/hashmark.py.
 cli.add_command(hashmark_cmds.mark_cmd)
+# The read half of the same pair, and top level for the same reason. `verify` is a new entry
+# point onto the verdict `glyph inspect` already computes, plus the file-matching half inspect
+# never had — not a second implementation of it.
+cli.add_command(hashmark_cmds.verify_cmd)
 cli.add_command(query_cmds.address_cmd)
 cli.add_command(query_cmds.balance_cmd)
 cli.add_command(query_cmds.utxos_cmd)
