@@ -122,13 +122,16 @@ class _MarkHarness:
             async def collect_spendable(self, client):
                 return triples
 
+            # A different key at every path but 0/0, rather than an assertion that 0/0 was
+            # asked for. An assertion here would catch a moved default through the STUB,
+            # which proves the stub; returning a distinct key lets the test catch it
+            # through the signer committed in the published record, which is the fact
+            # that matters.
             def derive_address(self, change: int, index: int) -> str:
-                assert (change, index) == (0, 0), "mark must sign with the wallet's FIRST receive key"
-                return signer_address
+                return signer_address if (change, index) == (0, 0) else other_key.address()
 
             def privkey_for(self, change: int, index: int) -> PrivateKey:
-                assert (change, index) == (0, 0)
-                return signer_key
+                return signer_key if (change, index) == (0, 0) else other_key
 
             def privkey_for_address(self, address: str) -> PrivateKey:
                 if address == signer_address:
