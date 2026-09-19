@@ -206,8 +206,9 @@ def mark_cmd(
         raise UserError(
             f"cannot sign with {signer_address}",
             cause=str(exc),
-            fix="pass an address this wallet derived (`pyrxd wallet addresses`), or omit "
-            "--signer-address to use the wallet's first receive address",
+            fix="pass an address this wallet derived — `pyrxd address --index N` prints one "
+            "by index, `pyrxd address` the next unused receive address — or omit "
+            "--signer-address to use the wallet's first receive address (index 0)",
         ) from exc
 
     # Hash, sign and self-verify BEFORE the network is touched. A label over the cap or a

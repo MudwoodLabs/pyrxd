@@ -5,10 +5,12 @@ format. The node has NO opinion about its contents: not the magic, not the versi
 the digest width, not the label's canonicality, and above all not the signature. Every
 sentence below is labelled with which side enforces it, because a regtest suite for a
 data-carrier format is exactly where a reader will otherwise assume consensus is doing
-work it is not. This is the same finding
-``tests/test_glyph_timelock_regtest_e2e.py`` records for TIMELOCK, and it is not a
-weakness of either: a mark's claim is "someone knew this digest by this block", and the
-block is the only part the chain has to supply.
+work it is not. It is the same finding ``tests/test_glyph_timelock_regtest_e2e.py``
+records for TIMELOCK — NOT a file in this tree: it lives on the unmerged branch
+``test/timelock-lifecycle-regtest`` (commit ``f050527``), which is where
+``docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md`` §2 got the finding that
+narrowed this plan to HashMark. Neither is a weakness: a mark's claim is "someone knew
+this digest by this block", and the block is the only part the chain has to supply.
 
 * **NODE-ENFORCED** — that a mark transaction is standard, relays, and confirms; that it
   pays for its own size at mainnet's relay floor; that an underpaid one is refused. These
