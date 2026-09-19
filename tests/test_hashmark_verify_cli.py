@@ -46,7 +46,7 @@ from pyrxd.cli.main import cli
 from pyrxd.constants import genesis_hash_for
 from pyrxd.hashmark_tx import digest_file, plan_hashmark
 from pyrxd.keys import PrivateKey
-from pyrxd.script.hashmark import decode_hashmark
+from pyrxd.script.hashmark import _ALGORITHMS, decode_hashmark
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -239,6 +239,26 @@ class TestTheFileMatchingHalf:
         rec = json.loads(r.stdout)["records"][0]
         assert rec["algorithm_id"] == 0x01
         assert rec["digest_match"]["expected"] == digest_file(marked["file"], algorithm_id=rec["algorithm_id"]).hex()
+        # AND WHAT THIS ASSERTION CANNOT SEE, said out loud rather than left as a false
+        # comfort. `_ALGORITHMS` has exactly one entry, so "hashed with the algorithm the
+        # record names" and "hashed with sha256" produce identical bytes and no assertion
+        # over this fixture can tell them apart. The membership is pinned instead: when a
+        # second algorithm lands, this fails and forces the real differential test.
+        assert set(_ALGORITHMS) == {0x01}, (
+            "a second hash algorithm is implemented — this test is now vacuous and must be "
+            "re-written to mark under one algorithm and verify the file is not hashed with the other"
+        )
+
+    def test_it_says_so_when_no_record_names_an_algorithm_to_hash_with(self, tmp_path) -> None:
+        """Proves the algorithm id is READ rather than assumed: with no id there is nothing to
+        hash the file with, and that is reported rather than guessed at."""
+        target = tmp_path / "f.bin"
+        target.write_bytes(os.urandom(64))
+        expected, why = hashmark_cmds._digest_expectation(
+            [{"outcome": "invalid", "algorithm_id": None}], file_path=target, digest_hex=None
+        )
+        assert expected is None
+        assert "names a hash algorithm" in why
 
     def test_a_wrong_width_digest_says_why_rather_than_only_no(self) -> None:
         record = {"outcome": "ok", "digest": "ab" * 32, "algorithm": "sha256"}
@@ -283,7 +303,10 @@ class TestEveryRefusal:
             tmp_path=tmp_path,
         )
         assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
-        assert "DOES NOT VERIFY" in r.output
+        summary, detail = r.output.split("HashMark record at vout", 1)
+        assert "signature:  DOES NOT VERIFY" in summary, "the summary must not read VERIFIED over a forgery"
+        assert "signature DOES NOT VERIFY" in detail
+        assert "VERIFIED" not in summary.replace("DOES NOT VERIFY", "")
 
     def test_a_transaction_with_no_mark_names_the_txid_digest_ambiguity(self, monkeypatch, tmp_path) -> None:
         """A digest and a txid are the same shape. Whoever pasted the wrong one needs telling."""
