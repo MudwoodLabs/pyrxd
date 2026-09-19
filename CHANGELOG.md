@@ -8,6 +8,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HashMark v2 encoder** (`pyrxd.script.encode_hashmark`) — pyrxd could verify
+  HashMark records other people wrote and could not write one. Takes a digest, a
+  signing key and an optional label; returns a 133-byte signed `OP_RETURN`
+  scriptPubKey (223 with a label at the derived 88-byte cap). Minimal pushes,
+  low-S enforced, a non-canonical label refused rather than silently trimmed,
+  and the record verified through `verify_attestation` before it is returned.
+  `canonicalize_label` and `max_label_bytes` are exported alongside it, with
+  `decode_hashmark` and `verify_attestation`, so a consumer can encode and read
+  back without reaching into the submodule.
+  Written from `HASHMARK_PROTOCOL.md` alone, without reading the reference
+  implementation's encoder, and checked against it: at the pinned upstream commit
+  `866f2b9c`, its decoder accepted ten records ours produced, its
+  `canonicalAttestationMessage` rebuilt our statement byte for byte, its verifier
+  recovered every committed signer, and its encoder re-emitted all ten scripts
+  byte for byte — §4.1's requirement that two independent encoders produce
+  identical bytes. 127 assertions, 0 failures, plus five negative controls it
+  refused. Eight of those records ship as
+  `tests/fixtures/hashmark_cross_implementation_vectors.json`.
+  No CLI command and no broadcast path yet.
+
 - **`RxinDexerClient` discovery wrappers** (`glyph_get_recent`,
   `glyph_get_tokens_by_type`) — global newest-first asset lists over the
   RXinDexer v4 discovery indexes (Glyph DB schema 4, live on

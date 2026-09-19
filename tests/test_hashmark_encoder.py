@@ -27,7 +27,10 @@ confirmed clean by ``git status --porcelain``:
 6. the rejected-codepoint scan moved to run over the TRIMMED label;
 7. every push emitted as ``OP_PUSHDATA1``;
 8. the pin naming a different upstream owner;
-9. the empty-label refusal removed.
+9. the empty-label refusal removed;
+10. the lazy export pointing at a misspelled symbol;
+11. ``pyrxd.script`` importing ``pyrxd.keys`` at module top;
+12. one byte flipped in a cross-implementation vector's signature.
 
 Plant 1 is the reason this note is here. It passed first time: high-S is caught
 twice, and with the specific check gone the sign-then-verify guard refused the
