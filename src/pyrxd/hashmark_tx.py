@@ -258,6 +258,13 @@ def plan_hashmark_for_file(
 #: an upper bound on this template (the real script is 105-107 B), so this models the
 #: largest transaction the builder can produce.
 #:
+#: READ THAT 107 PRECISELY: it is the COMPRESSED-key figure. ``P2PKH.unlock`` returns 139
+#: for an uncompressed key (``script/type.py``), which this model would be 32 bytes short
+#: of. Every key an ``HdWallet`` derives is compressed, so the gap is not reachable from
+#: the shipped wallet — and if it ever were, the consequence is a refusal rather than an
+#: under-paying broadcast: ``assert_pays_for_its_size`` measures the SIGNED bytes after
+#: the fact and raises. The bar is a funding threshold, not the fee.
+#:
 #: The same number as :data:`pyrxd.glyph.timelock_reveal_tx.TIMELOCK_REVEAL_MODELLED_BYTES`
 #: because it is the same transaction shape, spelled out again rather than imported: a
 #: mark is not a Glyph operation, and borrowing a constant across that line would make a
