@@ -192,6 +192,16 @@ wallet*.dat
 # something that could happen via `git add .`
 docs/design/
 
+# Operational handoff notes written for a future session (HANDOFF-<topic>-<date>.md
+# at the repo root) are private working documents, not project documentation. They
+# routinely quote unreviewed findings, internal severities and branch state, and this
+# repo is public and published to PyPI — so the same reasoning as docs/design/ above
+# applies, and they were untracked-but-committable until now.
+#
+# To publish one deliberately:
+#   git add -f HANDOFF-<name>.md
+HANDOFF-*.md
+
 # ===== Local-only dev environment =====
 # Machine-local tooling state and generated output. None of this is
 # portable or meaningful to another contributor; keeping it untracked
