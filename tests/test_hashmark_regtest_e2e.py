@@ -413,17 +413,31 @@ class TestTheNodeHasNoOpinionAboutTheRecord:
         monkeypatch,
     ) -> None:
         payload, _client, _signer = _mark_via_cli(node, tmp_path, monkeypatch, content=b"honest", label="honest")
-        _vout, honest, _record = _record_from_chain(node, payload["txid"])
+        _vout, honest, record = _record_from_chain(node, payload["txid"])
 
-        # Flip one bit inside the signature's r. Still a well-formed record; the CLAIM is
-        # what breaks, and nothing in the bytes announces that.
+        # Flip one bit of the DIGEST, not of the signature, and the choice is load-bearing.
+        # A bit flipped in the signature refuses for whichever check happens to trip first
+        # — an out-of-range r, a non-low s, a point that will not recover — and WHICH of
+        # those fires depends on the key, so a bit-flipped signature refuses for a
+        # different reason on each run. Measured: with the recovered-key-versus-commitment
+        # comparison deleted from `verify_attestation`, a signature flip still refused
+        # (recovery failed on that run) and this case passed with the check GONE.
+        # A flipped digest cannot do that. The record stays perfectly well-formed, the
+        # signature stays a valid signature, the statement it covers simply changes — so
+        # recovery succeeds and yields a DIFFERENT key, and the commitment comparison is
+        # the only thing that can refuse it. It is also the forgery that matters: this is
+        # someone claiming the mark was about a different file.
         forged = bytearray(honest)
-        forged[-40] ^= 0x01
-        assert decode_hashmark(bytes(forged)).ok, "must stay WELL-FORMED, or this tests the decoder"
-        assert not verify_attestation(
-            bytes_record := decode_hashmark(bytes(forged)), network_genesis=REGTEST_GENESIS
-        ).valid
-        assert bytes_record.digest_hex == decode_hashmark(honest).digest_hex
+        # The digest push runs 14..45: OP_RETURN, the 9-byte magic push, the 3-byte
+        # header push, then 0x20 and the 32 bytes. Asserted below rather than trusted.
+        forged[20] ^= 0x01
+        forged_record = decode_hashmark(bytes(forged))
+        assert forged_record.ok, "must stay WELL-FORMED, or this tests the decoder"
+        assert forged_record.digest_hex != record.digest_hex
+        assert forged_record.signature_hex == record.signature_hex, "the signature bytes are untouched"
+        verdict = verify_attestation(forged_record, network_genesis=REGTEST_GENESIS)
+        assert not verdict.valid
+        assert verdict.detail == "recovered key does not match the committed signer", verdict
 
         tx = _funded_tx(node, bytes(forged), fee=20_000_000)
         verdict = node.accepts(tx.serialize().hex())
@@ -432,10 +446,10 @@ class TestTheNodeHasNoOpinionAboutTheRecord:
         node.mine(1)
 
         # And it is on chain, indistinguishable to the node from the honest one above.
-        _v, on_chain, record = _record_from_chain(node, txid)
+        _v, on_chain, mined = _record_from_chain(node, txid)
         assert on_chain == bytes(forged)
-        assert record.ok, "the decoder calls it well-formed — only attestation refuses it"
-        assert not verify_attestation(record, network_genesis=REGTEST_GENESIS).valid
+        assert mined.ok, "the decoder calls it well-formed — only attestation refuses it"
+        assert not verify_attestation(mined, network_genesis=str(node.cli("getblockhash", "0"))).valid
         print(f"\nforged record MINED at {txid}: node allowed={verdict.get('allowed')}, attestation=INVALID")
 
     def test_the_forged_record_could_not_have_been_built_by_the_production_path(self) -> None:
@@ -448,7 +462,7 @@ class TestTheNodeHasNoOpinionAboutTheRecord:
 
         plan = plan_hashmark(hashlib.sha256(b"honest").digest(), PrivateKey(), network_genesis=REGTEST_GENESIS)
         forged = bytearray(plan.op_return_script)
-        forged[-40] ^= 0x01
+        forged[20] ^= 0x01  # the digest again, for the reason the case above gives
         with pytest.raises(ValidationError, match="signature does not verify"):
             MarkPlan(op_return_script=bytes(forged), network_genesis=REGTEST_GENESIS)
 
