@@ -15,20 +15,36 @@ produced last time". It is:
 * the byte counts and shapes the spec states outright (§3.2's 223, §13.5's 133);
 * and the reference TypeScript decoder, run out-of-band (see that class).
 
-Plants run against this file while writing it, each restored afterwards:
-returning the digest push as ``OP_PUSHDATA1`` broke the minimal-push class;
-dropping the low-S check in ``_sign_statement`` broke the high-S refusal;
-signing the statement of the UNLABELLED record while writing a labelled one
-broke ``test_editing_the_label_breaks_the_attestation``; and omitting the label
-from ``canonical_statement`` broke the statement class.
+Nine defects were planted against this suite and each broke the test it was
+written for, restored afterwards by line-anchored inverse edit with the tree
+confirmed clean by ``git status --porcelain``:
+
+1. the low-S range check deleted from ``_sign_statement``;
+2. the sign-then-verify guard in ``encode_hashmark`` replaced by a VALID result;
+3. ``compressed`` hardcoded to ``True`` instead of read from the key;
+4. the label cap read as ``_MAX_RECORD_BYTES`` rather than the derived share;
+5. the signed statement built with ``label=None`` while writing a labelled record;
+6. the rejected-codepoint scan moved to run over the TRIMMED label;
+7. every push emitted as ``OP_PUSHDATA1``;
+8. the pin naming a different upstream owner;
+9. the empty-label refusal removed.
+
+Plant 1 is the reason this note is here. It passed first time: high-S is caught
+twice, and with the specific check gone the sign-then-verify guard refused the
+record with a message that still contained "low-S". The test said the right
+thing about behaviour and proved nothing about the check it was written for.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 
 import pytest
 
+from pyrxd.base58 import base58check_encode
+from pyrxd.constants import NETWORK_ADDRESS_PREFIX_DICT, Network
 from pyrxd.keys import PrivateKey
 from pyrxd.script.hashmark import (
     HASHMARK_MAGIC,
@@ -466,3 +482,147 @@ class TestTheNetworkBinding:
     def test_the_default_is_mainnet(self, key: PrivateKey) -> None:
         record = decode_hashmark(encode_hashmark(_DIGEST, key))
         assert verify_attestation(record, network_genesis=RADIANT_MAINNET_GENESIS).valid
+
+
+class TestTheReferenceDecoderAcceptsOurRecords:
+    """The cross-implementation result, our writer -> his reader.
+
+    ``tests/fixtures/hashmark_cross_implementation_vectors.json`` holds records
+    this encoder produced that the REFERENCE TypeScript implementation accepted,
+    at the commit ``tests/fixtures/hashmark_upstream_pin.json`` names, with every
+    pinned file digest verified against the clone first. What was run, on
+    2026-09-18, is recorded in that fixture's own header: his
+    ``decodeHashMarkScript`` returned every field identically, his
+    ``canonicalAttestationMessage`` rebuilt our statement byte for byte, his
+    ``verifyAttestation`` recovered the committed signer with ``@noble/curves``,
+    and his ``encodeHashMarkScript`` re-emitted the same script bytes — §4.1's
+    "two independent encoders given the same inputs must produce identical
+    bytes". 127 assertions, 0 failures, alongside five negative controls his
+    decoder refused, which is what says the harness could have failed.
+
+    BE CLEAR ABOUT WHAT THIS FILE IS. The bytes are OUR output, so on their own
+    they would be a self-generated conformance vector — the thing this repository
+    has published before with an exploitable ordering baked into it. Their value
+    is entirely that a DIFFERENT implementation, by a different author, accepted
+    and re-derived them at a named commit. Regenerating them from pyrxd without
+    re-running his decoder would quietly convert this back into pyrxd agreeing
+    with pyrxd, so do not.
+
+    Running the reference implementation needs node and a network clone, so it is
+    not in this suite. What IS asserted here, offline and every run: our own
+    decoder and verifier still accept the exact bytes he accepted. A change to
+    the encoder that breaks these is a change away from records a third party has
+    verified.
+    """
+
+    VECTORS = json.loads(
+        (pathlib.Path(__file__).resolve().parent / "fixtures/hashmark_cross_implementation_vectors.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def test_the_fixture_is_not_empty(self) -> None:
+        """Non-vacuity: every parametrised test below iterates this list."""
+        assert len(self.VECTORS["records"]) >= 6, "the cross-implementation vectors have gone missing"
+
+    def test_the_fixture_names_the_same_upstream_commit_as_the_pin(self) -> None:
+        pin = json.loads(
+            (pathlib.Path(__file__).resolve().parent / "fixtures/hashmark_upstream_pin.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert self.VECTORS["upstream_commit"] == pin["commit"]
+        assert self.VECTORS["upstream_repo"] == pin["repo"]
+
+    @pytest.mark.parametrize("vector", VECTORS["records"], ids=lambda v: v["name"])
+    def test_a_record_his_decoder_accepted_still_decodes_here(self, vector: dict) -> None:
+        script = bytes.fromhex(vector["script_hex"])
+        assert len(script) == vector["script_bytes"]
+        record = decode_hashmark(script)
+        assert record.outcome is HashMarkOutcome.OK
+        assert record.version == vector["version"]
+        assert record.algorithm_id == vector["algorithm_id"]
+        assert record.algorithm == vector["algorithm"]
+        assert record.digest_hex == vector["digest_hex"]
+        assert record.label == vector["label"]
+        assert record.signer_hash160_hex == vector["signer_hash160_hex"]
+        assert record.signature_hex == vector["signature_hex"]
+
+    @pytest.mark.parametrize("vector", VECTORS["records"], ids=lambda v: v["name"])
+    def test_the_statement_his_implementation_rebuilt_is_still_ours(self, vector: dict) -> None:
+        record = decode_hashmark(bytes.fromhex(vector["script_hex"]))
+        assert (
+            canonical_statement(record, network_genesis=self.VECTORS["network_genesis"])
+            == (vector["canonical_statement"])
+        )
+
+    @pytest.mark.parametrize("vector", VECTORS["records"], ids=lambda v: v["name"])
+    def test_a_signature_his_verifier_accepted_still_verifies_here(self, vector: dict) -> None:
+        result = verify_attestation(
+            decode_hashmark(bytes.fromhex(vector["script_hex"])),
+            network_genesis=self.VECTORS["network_genesis"],
+        )
+        assert result.outcome is AttestationOutcome.VALID
+        assert result.recovered_hash160_hex == vector["signer_hash160_hex"]
+
+    @pytest.mark.parametrize("vector", VECTORS["records"], ids=lambda v: v["name"])
+    def test_the_address_he_displayed_is_the_one_we_derive(self, vector: dict) -> None:
+        """§6.3 step 6: the displayed signer is base58check of the COMMITTED
+        bytes, never of the recovered key. His verifier returned these strings."""
+        assert (
+            base58check_encode(
+                NETWORK_ADDRESS_PREFIX_DICT[Network.MAINNET] + bytes.fromhex(vector["signer_hash160_hex"])
+            )
+            == vector["signer_address"]
+        )
+
+
+class TestTheEncoderIsReachableAsConsumerSurface:
+    """The write side has no in-repo caller, and that is its shape, not an omission.
+
+    pyrxd is a published library; writing a mark is something a CONSUMER does,
+    not something the SDK does to itself, and the `mark` CLI that will call it
+    from inside this repo is a later work item. So the production entry point for
+    this capability today is the package export, and this is the test that reaches
+    it through that door rather than by importing the module directly like every
+    other test in this file.
+
+    Without it, `pyrxd.script.encode_hashmark` could be misspelled in the lazy
+    export map, point at a moved symbol, or drag `coincurve` in at import time —
+    and the whole suite above would stay green, because it never goes through
+    that path.
+    """
+
+    def test_the_whole_round_trip_works_through_the_package_export(self) -> None:
+        import pyrxd.script as script_package
+
+        assert {
+            "canonicalize_label",
+            "decode_hashmark",
+            "encode_hashmark",
+            "max_label_bytes",
+            "verify_attestation",
+        } <= set(script_package.__all__)
+
+        label = script_package.canonicalize_label("  Q3 accounts  ")
+        assert label == "Q3 accounts"
+        assert len(label.encode("utf-8")) <= script_package.max_label_bytes()
+
+        record = script_package.decode_hashmark(script_package.encode_hashmark(_DIGEST, _key(), label=label))
+        assert record.outcome is HashMarkOutcome.OK and record.label == label
+        assert script_package.verify_attestation(record).outcome is AttestationOutcome.VALID
+
+    def test_importing_the_script_package_does_not_pull_coincurve(self) -> None:
+        """``pyrxd.script``'s reason for being lazy: the inspect tool's parser
+        imports it, and the browser's Pyodide runtime has no ``coincurve``.
+        Naming the hashmark module here must not change that."""
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-c", "import pyrxd.script, sys; print('coincurve' in sys.modules)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert proc.stdout.strip() == "False", "importing pyrxd.script now pulls coincurve"
