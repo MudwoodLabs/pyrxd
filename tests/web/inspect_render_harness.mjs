@@ -110,6 +110,27 @@ function renderedLines(node) {
   return out.join("\n");
 }
 
+// Every `class` attribute in the rendered tree, in document order.
+//
+// `renderedLines` returns TEXT, and text is not the whole claim a page makes. The
+// verdict blocks carry their meaning in a CLASS: `verdict-unchecked` is neutral,
+// `verdict-bad` is the error colour. A change that rendered an honest, merely
+// unchecked mark with `verdict-bad` would keep every text assertion green while
+// painting the signer red — which is the one thing this page must never do.
+function renderedClasses(node) {
+  const out = [];
+  const walk = (n) => {
+    if (n instanceof StubText) return;
+    // `el()` assigns `node.className` as a PROPERTY; it never calls setAttribute,
+    // so reading only the attribute returns null for every element on the page.
+    const cls = n.className || (n.getAttribute ? n.getAttribute("class") : null);
+    if (cls) out.push(cls);
+    for (const child of n.childNodes) walk(child);
+  };
+  walk(node);
+  return out;
+}
+
 function makeSandbox() {
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -166,11 +187,21 @@ function main() {
     // need not carry a fake script and vice versa. A case carrying NONE of them
     // is a typo in the caller, and returning `{}` for it would look like a
     // renderer that produced nothing — throw instead.
-    if (payloads.script) out.script_card = renderedLines(renderer.renderScriptCard(payloads.script));
-    if (payloads.row) {
-      out.output_row = renderedLines(renderer.renderOutputRow(payloads.row, payloads.row_opts));
+    if (payloads.script) {
+      const card = renderer.renderScriptCard(payloads.script);
+      out.script_card = renderedLines(card);
+      out.script_card_classes = renderedClasses(card);
     }
-    if (payloads.tx) out.fetched_tx_card = renderedLines(renderer.renderFetchedTxCard(payloads.tx));
+    if (payloads.row) {
+      const row = renderer.renderOutputRow(payloads.row, payloads.row_opts);
+      out.output_row = renderedLines(row);
+      out.output_row_classes = renderedClasses(row);
+    }
+    if (payloads.tx) {
+      const tx = renderer.renderFetchedTxCard(payloads.tx);
+      out.fetched_tx_card = renderedLines(tx);
+      out.fetched_tx_card_classes = renderedClasses(tx);
+    }
     if (Object.keys(out).length === 0) {
       throw new Error(
         `case ${JSON.stringify(name)} has none of "script", "row", "tx" — nothing to render`

@@ -134,6 +134,11 @@ def _both_surfaces(payload: dict, *, row_opts: dict | None = None) -> dict[str, 
 # ───────────────────────────────── the outcome the corpus cannot reach ──
 
 
+def _classes(payload: dict) -> list[str]:
+    """Every `class` attribute the script card renders, in document order."""
+    return _render({"case": {"script": payload}})["case"]["script_card_classes"]
+
+
 class TestAMissingCurveIsNotAVerdict:
     """The single most important property on this page."""
 
@@ -177,6 +182,40 @@ class TestAMissingCurveIsNotAVerdict:
         text = _both_surfaces(payload)[surface]
         assert "DOES NOT VERIFY" not in text
         assert "INVALID" not in text.upper().replace("UNVERIFIABLE", "")
+
+    def test_it_is_not_painted_with_the_error_colour(self, payload: dict) -> None:
+        """THE PIXELS, NOT THE WORDS.
+
+        Every other assertion here reads TEXT. The verdict blocks carry their colour in
+        a class — `verdict-unchecked` takes the normal foreground, `verdict-bad` takes
+        the error colour. Nothing pinned that, so a one-word change in `_verdictClass`
+        could paint an honest signer's mark red while "NOT CHECKED" still appeared and
+        every test above stayed green.
+
+        A forgery shown as unchecked is a nuisance. An honest mark shown in the error
+        colour because the READER's browser has no curve library is an accusation the
+        page has no basis for, and it is the failure this whole surface exists to avoid.
+        """
+        classes = _classes(payload)
+        assert any("verdict-unchecked" in c for c in classes), (
+            f"expected a neutral verdict block, got classes: {classes}"
+        )
+        assert not any("verdict-bad" in c for c in classes), (
+            f"an unverifiable mark was painted with the error class: {classes}"
+        )
+
+    def test_the_class_assertion_can_actually_see_a_bad_verdict(self, payload: dict) -> None:
+        """The control: prove `verdict-bad` IS reachable, so the check above is not vacuous.
+
+        Without this, a renderer that emitted no classes at all would satisfy the
+        "no verdict-bad" half for the wrong reason.
+        """
+        forged = json.loads(json.dumps(payload))
+        forged["hashmark"]["attestation"]["outcome"] = "invalid_signature"
+        forged["hashmark"]["attestation"]["status"] = "DOES NOT VERIFY"
+        assert any("verdict-bad" in c for c in _classes(forged)), (
+            "the harness never reports verdict-bad, so the absence check above proves nothing"
+        )
 
     @pytest.mark.parametrize("surface", ["script_card", "output_row"])
     def test_the_evidence_a_reader_can_act_on_still_reaches_them(self, payload, surface) -> None:
