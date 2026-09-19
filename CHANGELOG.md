@@ -8,6 +8,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd mark <file>`** — the write side reaches a chain. Hashes a file (streamed,
+  sha256), signs a v2 HashMark record with the wallet's first receive key, funds it
+  from plain RXD and broadcasts. `--dry-run` prints the record hex, its decoded
+  fields and its byte size and sends nothing; `--label` is canonicalised per §5.4
+  and, when the canonical spelling differs from what was typed, BOTH are shown in
+  the confirmation summary under their own banner — the label is inside the signed
+  statement, so a silently trimmed one would mean the string the operator believes
+  they published is not the string anyone reads back. `--network` selects what is
+  SIGNED, not merely where it is sent: the genesis hash is part of the statement and
+  is not carried by the record, so an unknown network is refused rather than assumed.
+  Top level rather than under `glyph`, because HashMark is a third-party format.
+
+  New `pyrxd.hashmark_tx`: `plan_hashmark` / `plan_hashmark_for_file` / `MarkPlan` /
+  `build_hashmark_mark` / `broadcast_hashmark_mark` / `hashmark_mark_funding_bar`.
+  `build_hashmark_mark` takes a `MarkPlan`, never a `script: bytes`, following
+  `build_timelock_reveal` — a bytes parameter would let a caller skip label
+  canonicalisation and the signature check and still get signed bytes back.
+  `MarkPlan` decodes and attests its own bytes in `__post_init__`, so an unchecked
+  one cannot exist; `record` and `attestation` are derived, not constructor
+  arguments. Funding uses `find_plain_rxd_utxo`, so a token-bearing UTXO is never
+  spent to publish a mark. This also closes the encoder's reachability gap:
+  `encode_hashmark` previously had no caller in shipped code outside
+  `pyrxd.script`'s lazy-export map.
+
+  Proved on a node: `tests/test_hashmark_regtest_e2e.py`, 19 cases against a
+  throwaway `radiant-core:v3.1.1` container at MAINNET's relay floor. Measured —
+  an unlabelled record is 133 B and a label at the 88-byte cap gives exactly 223 B,
+  both relayed and mined; a labelled mark transaction was 357 B paying 3,570,000
+  photons at 10,000 photons/B; the funding bar for a 133-byte record is 3,000,000
+  photons, bytes built at exactly that bar are accepted and one photon under is
+  refused before anything is signed; an underpaid mark is refused with "min relay
+  fee not met". The record is read back with `getrawtransaction` and decoded and
+  attested from THOSE bytes, against the genesis hash read from the node.
+  **The node enforces none of the format**: a one-bit-forged record was broadcast
+  and mined, and only `verify_attestation` refuses it.
+
 - **HashMark v2 encoder** (`pyrxd.script.encode_hashmark`) — pyrxd could verify
   HashMark records other people wrote and could not write one. Takes a digest, a
   signing key and an optional label; returns a 133-byte signed `OP_RETURN`
