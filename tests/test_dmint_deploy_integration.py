@@ -354,14 +354,16 @@ def _build_real_bundle() -> _DeployBundle:
     hot_key = PrivateKey(hot_wif)
     hot_pkh = Hex20(hot_key.public_key().hash160())
 
-    # Fetch UTXOs from VPS node
+    # Fetch UTXOs from the node named by PYRXD_NODE_SSH_TARGET.
+    if not _ssh_target():
+        pytest.skip(f"set {_SSH_TARGET_ENV} to reach a node for this check")
     result = subprocess.run(
         [
             "ssh",
             "-o",
             "ConnectTimeout=10",
-            "ericadmin@89.117.20.219",
-            "sudo docker exec radiant-mainnet radiant-cli" + " -datadir=/home/radiant/.radiant listunspent",
+            _ssh_target(),
+            f"{_ssh_container_cmd()} listunspent",
         ],
         capture_output=True,
         text=True,
@@ -485,12 +487,37 @@ def _build_real_bundle() -> _DeployBundle:
     return b
 
 
+#: Environment variable naming the ssh destination for the node this check queries.
+#:
+#: THIS USED TO BE A LITERAL, AND THIS REPOSITORY IS PUBLIC. The value was an admin
+#: username and a public IPv4, alongside a command naming the container and confirming
+#: it was a MAINNET node — infrastructure disclosure, shipped in the initial public
+#: release and present in the git history ever since. Removing it here stops it being
+#: republished; it does NOT unpublish what is already in history, so the host itself is
+#: the thing that has to be treated as known.
+#:
+#: Supply an ssh alias from your own ~/.ssh/config rather than a host and user, so the
+#: destination stays on the machine that runs the test and never in the repository.
+_SSH_TARGET_ENV = "PYRXD_NODE_SSH_TARGET"
+#: Command run on that host. Also configurable, because its default names a container.
+_SSH_CONTAINER_CMD_ENV = "PYRXD_NODE_SSH_COMMAND"
+_DEFAULT_CONTAINER_CMD = "radiant-cli"
+
+
+def _ssh_target() -> str:
+    return os.environ.get(_SSH_TARGET_ENV, "").strip()
+
+
+def _ssh_container_cmd() -> str:
+    return os.environ.get(_SSH_CONTAINER_CMD_ENV, "").strip() or _DEFAULT_CONTAINER_CMD
+
+
 @pytest.mark.integration
 class TestTestMempoolAccept:
     """Sends commit+reveal to VPS node's testmempoolaccept.
 
     Requires:
-    - SSH access to ericadmin@89.117.20.219
+    - SSH access to a node, named by the PYRXD_NODE_SSH_TARGET env var
     - RADIANT_HOT_WIF env var — the hot wallet WIF (skipped if unset, so CI stays clean)
     - RADIANT_INTEGRATION env var — opt-in gate (skipped if unset)
 
@@ -506,16 +533,20 @@ class TestTestMempoolAccept:
     def real_bundle(self):
         if not os.environ.get("RADIANT_INTEGRATION"):
             pytest.skip("RADIANT_INTEGRATION not set")
+        if not _ssh_target():
+            pytest.skip(f"set {_SSH_TARGET_ENV} (e.g. an ssh alias) to reach a node for this check")
         return _build_real_bundle()
 
     def _rpc(self, cmd: str) -> str:
+        target = _ssh_target()
+        assert target, f"{_SSH_TARGET_ENV} is unset — the fixture should have skipped"
         result = subprocess.run(
             [
                 "ssh",
                 "-o",
                 "ConnectTimeout=10",
-                "ericadmin@89.117.20.219",
-                f"sudo docker exec radiant-mainnet radiant-cli -datadir=/home/radiant/.radiant {cmd}",
+                target,
+                f"{_ssh_container_cmd()} {cmd}",
             ],
             capture_output=True,
             text=True,
