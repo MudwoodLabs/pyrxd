@@ -495,6 +495,12 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 "outcome": mark.outcome.value,
                 "version": mark.version,
                 "algorithm": mark.algorithm,
+                # THE ID, not only the name. Whoever re-hashes a local file to compare it
+                # against this digest has to run the algorithm the RECORD names, and
+                # `algorithm_for` is explicit that a caller spelling "sha256" itself has
+                # created a second source of truth for what was hashed. `digest_file` takes
+                # the id, so carrying it is what lets `pyrxd verify` stay on the one table.
+                "algorithm_id": mark.algorithm_id,
                 "digest": mark.digest_hex,
                 # SANITISED, like every other display string on this renderer. The
                 # decoder now refuses a non-canonical label outright (spec 5.4), so

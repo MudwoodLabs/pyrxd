@@ -235,6 +235,10 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
 2   network error (couldn't reach ElectrumX, broadcast rejected)
 3   wallet decryption failed
 4   unexpected error (bug — should not happen)
+5   a verdict that does not hold (`pyrxd verify`): a signature that does not verify, a file
+    that is not what was marked, a block shallower than the floor the caller set, or a
+    `--wave-name` question that was asked and could not be answered. The full report is still
+    printed on stdout; only the status says no.
 ```
 
 ## Configuration
