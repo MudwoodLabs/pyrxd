@@ -195,8 +195,14 @@ class TestTheHonestPath:
         )
         assert r.exit_code == 0, r.output
         assert f"block:        {TIP - 99}" in r.output
-        assert "NOT verified" in r.output
         assert "wss://only" in r.output
+        # THE WHOLE CAVEAT, not its first 200 characters. It ran past `_truncate_for_human`'s
+        # cap and was cut mid-word, dropping the half that says why the number is unverified —
+        # a safety qualifier that stops halfway still reads as complete.
+        from pyrxd.glyph.mark_anchor import UNVERIFIED_CAVEAT
+
+        assert " ".join(r.output.split()).count(" ".join(UNVERIFIED_CAVEAT.split())) == 1
+        assert "…" not in r.output
 
     def test_quiet_mode_prints_the_answer_not_the_question(self, monkeypatch, tmp_path, marked) -> None:
         r = _run(
@@ -473,6 +479,40 @@ class TestFormTwoThroughTheCommand:
         state, reason = _name_check([record], asked=True)
         assert state == "NOT THE SIGNER" and state not in hashmark_cmds._CHECK_HOLDS
         assert "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7" in reason
+
+    def test_resolved_implies_an_anchor_which_is_what_makes_inheriting_it_SAFE(self) -> None:
+        """The invariant `_verify_anchor` rests on, checked rather than asserted in prose.
+
+        Inheriting the anchor is only safe because `resolved: True` cannot occur without one —
+        otherwise `verify` would fall back to its own lookup on a run where a binding HAD been
+        obtained, and could land on the very endpoint that supplied it. The sentence saying so
+        sits in a docstring, which no test evaluates and which rots in silence. This is that
+        sentence as a scan: every `resolved: False` return must come before the anchor is
+        resolved, and every `resolved: True` return after it.
+        """
+        import ast
+        import inspect
+
+        src = inspect.getsource(glyph_inspect._name_at_mark)
+        tree = ast.parse(src.lstrip())
+        anchor_line = min(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "resolve_anchor_from"
+        )
+        false_returns, true_returns = [], []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)):
+                continue
+            for key, value in zip(node.value.keys, node.value.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == "resolved":
+                    (true_returns if value.value else false_returns).append(node.lineno)
+        assert anchor_line and false_returns and true_returns, "the scan found nothing — it is broken"
+        assert all(ln < anchor_line for ln in false_returns), (
+            f"a `resolved: False` return at {[ln for ln in false_returns if ln > anchor_line]} now sits AFTER "
+            "the anchor step — `_verify_anchor` may inherit nothing on a run that DID obtain a binding"
+        )
+        assert all(ln > anchor_line for ln in true_returns)
 
     def test_the_block_is_inherited_from_the_name_lookup_not_asked_again(self, monkeypatch, tmp_path) -> None:
         """A HOSTILE SOURCE MUST NOT MOVE BOTH THE NAME BINDING AND THE BLOCK. The rule lives in

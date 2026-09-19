@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import textwrap
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -740,11 +741,19 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
         ]
     depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
     verdict = "PROVISIONAL — below the floor you set" if a.get("provisional") else "at or past the floor you set"
-    return [
-        f"{indent}block:        {a['height']}  ({depth}) — {verdict}",
-        f"{indent}              {_truncate_for_human(str(a.get('caveat') or ''))}",
-        f"{indent}              (source: {a.get('source')})",
-    ]
+    lines = [f"{indent}block:        {a['height']}  ({depth}) — {verdict}"]
+    # WRAPPED, NOT TRUNCATED. `_truncate_for_human` caps at 200 characters and this caveat is
+    # longer, so it cut mid-word — and the half it dropped is the half that says WHY the number
+    # is unverified. Truncation is the right default for publisher-chosen text, where the risk
+    # is a hostile 100,000-character field; this string is a constant in `mark_anchor.py`, and
+    # a safety qualifier that stops halfway is worse than no qualifier because it still reads
+    # as complete. Sanitised anyway, so a future caveat from elsewhere cannot carry control
+    # bytes, and bounded by line count rather than by cutting the sentence.
+    caveat = _sanitize_display_string(str(a.get("caveat") or ""))
+    for chunk in textwrap.wrap(caveat, width=92)[:6]:
+        lines.append(f"{indent}              {chunk}")
+    lines.append(f"{indent}              (source: {_truncate_for_human(str(a.get('source') or ''))})")
+    return lines
 
 
 def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:

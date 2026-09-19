@@ -32,7 +32,6 @@ publish a permanent claim about a chain nobody chose.
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -703,12 +702,15 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int) ->
         # be a second, independently-patchable copy of it — so a test (or a later change) could
         # move one endpoint and not the other, which is exactly the split this function exists
         # to prevent.
+        #
+        # ONE endpoint, pinned to ONE URL — not `ctx.make_client()`. A failover client retries
+        # across endpoints, so the label it carries would name the configured primary rather
+        # than whoever actually answered, and `MarkAnchor.source` is the field the independence
+        # rule is checked against. A source label that is a guess is worse than no label.
         client_a, label_a, _client_b, _label_b = _inspect._endpoint_pair(ctx)
-        async with AsyncExitStack() as stack:
-            await stack.enter_async_context(client_a)  # type: ignore[arg-type]
+        async with client_a:  # type: ignore[attr-defined]
             anchor = await resolve_anchor_from(client_a, label_a, mark_txid=txid, min_confirmations=min_confirmations)
-            return mark_anchor_dict(anchor)
-        raise AssertionError("unreachable")  # pragma: no cover - AsyncExitStack always returns
+        return mark_anchor_dict(anchor)
 
     try:
         return asyncio.run(_do())
