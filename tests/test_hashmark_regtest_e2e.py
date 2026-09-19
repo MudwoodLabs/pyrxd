@@ -46,7 +46,7 @@ import json
 from pathlib import Path
 
 import pytest
-from test_container_regtest_e2e import _confirmed, _out_spk
+from test_container_regtest_e2e import _confirmed, _mint_nft, _out_spk
 from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
     _biggest_utxo,
     _p2pkh_unlock,
@@ -313,9 +313,15 @@ class TestTheMarkIsAcceptedByTheNode:
             f"fee {marked['payload']['fee']:,} photons at {_MIN_FEE_RATE:,}/B"
         )
 
-    def test_no_token_bearing_utxo_was_spent(self, node, marked) -> None:  # noqa: F811
-        """PYRXD-ENFORCED, by ``find_plain_rxd_utxo`` reading each candidate's ON-CHAIN
-        script. The node would have relayed a mark funded by burning an NFT."""
+    def test_every_input_it_spent_was_a_bare_p2pkh_on_chain(self, node, marked) -> None:  # noqa: F811
+        """A property of the published transaction, read back off the chain.
+
+        NOT a test of ``find_plain_rxd_utxo``: this wallet holds nothing but plain RXD, so
+        it would pass with that guard disabled — measured, by replacing the guard's
+        condition with ``True``. :class:`TestTheMarkNeverSpendsAToken` is the
+        non-vacuous one; this is here because a mark that spent something exotic would be
+        worth knowing about however it got there.
+        """
         confirmed = _confirmed(node, marked["payload"]["txid"])
         for vin in confirmed["vin"]:
             parent = _confirmed(node, vin["txid"])
@@ -323,6 +329,52 @@ class TestTheMarkIsAcceptedByTheNode:
             assert len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:] == b"\x88\xac", (
                 f"the mark spent a non-P2PKH output: {spk.hex()}"
             )
+
+
+class TestTheMarkNeverSpendsAToken:
+    """PYRXD-ENFORCED, against a REAL minted singleton sitting on this chain.
+
+    The node would happily relay a mark funded by burning an NFT — consensus has no
+    opinion about why an output was spent — so the only thing between an operator and a
+    destroyed token is ``find_plain_rxd_utxo`` checking each candidate's ON-CHAIN script.
+    The token here is minted, mined, and deliberately FATTER than the plain UTXO, because
+    selection is value-descending: it is the first candidate the builder looks at.
+    """
+
+    def test_a_minted_nft_is_passed_over_and_survives_the_mark(self, node) -> None:  # noqa: F811
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+        token = _mint_nft(node, GlyphMetadata(protocol=[GlyphProtocol.NFT], name="REGTEST-NOT-FEE"))
+        assert token["value"] > _FUND, "the token must outrank the plain UTXO, or this proves nothing"
+
+        signer = PrivateKey()
+        plain = _fund(node, PrivateKey())
+        triples = [
+            (
+                UtxoRecord(tx_hash=token["reveal_txid"], tx_pos=token["vout"], value=token["value"], height=1),
+                token["key"].public_key().address(),
+                token["key"],
+            ),
+            *plain,
+        ]
+        client = _NodeClient(node)
+        plan = plan_hashmark(hashlib.sha256(b"not the token").digest(), signer, network_genesis=REGTEST_GENESIS)
+        build = asyncio.run(
+            build_hashmark_mark(_NodeWallet(triples, signer), plan, client=client, fee_rate=_MIN_FEE_RATE)
+        )
+
+        spent = {(i.source_txid, i.source_output_index) for i in build.tx.inputs}
+        assert spent == {(plain[0][0].tx_hash, plain[0][0].tx_pos)}
+        assert (token["reveal_txid"], token["vout"]) not in spent
+
+        txid = asyncio.run(client.broadcast(build.serialize()))
+        node.mine(1)
+        assert _confirmed(node, txid)["confirmations"] >= 1
+        # And the token is still there — the strongest form of "it was not spent".
+        assert node.cli("gettxout", token["reveal_txid"], str(token["vout"])), (
+            "the singleton was consumed by a mark about a different thing entirely"
+        )
+        print(f"\nNFT {token['value']:,} photons passed over; mark funded from {_FUND:,}-photon plain UTXO")
 
 
 class TestAStrangerCanVerifyFromChainBytesAlone:
