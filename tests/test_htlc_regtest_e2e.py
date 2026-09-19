@@ -43,8 +43,8 @@ import time
 
 import pytest
 
-from pyrxd.gravity.fee_policy import photons_per_kb_from_rxd_per_kb
 from pyrxd.devnet import RegtestNode
+from pyrxd.gravity.fee_policy import photons_per_kb_from_rxd_per_kb
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey

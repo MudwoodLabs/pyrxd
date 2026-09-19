@@ -53,10 +53,10 @@ import coincurve
 import pytest
 
 from pyrxd.btc_wallet import taproot as bt
-from pyrxd.devnet import RegtestNode
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
+from pyrxd.devnet import RegtestNode
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg

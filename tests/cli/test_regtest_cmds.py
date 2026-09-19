@@ -13,8 +13,7 @@ import pytest
 from click.testing import CliRunner
 
 from pyrxd.cli.main import cli
-from pyrxd.devnet import DEFAULT_RADIANT_VERSION
-from pyrxd.devnet import DevKey, DevnetError
+from pyrxd.devnet import DEFAULT_RADIANT_VERSION, DevKey, DevnetError
 
 
 def _extract_json(output: str) -> dict:
