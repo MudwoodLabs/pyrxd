@@ -616,6 +616,57 @@ class TestTheNetworkIsPartOfWhatIsSigned:
         assert verify_attestation(decode_hashmark(_published_script(h))).valid
 
 
+class TestTheOtherTwoOutputModesAndTheOverpayFlag:
+    """The paths a scripted caller takes, and the one flag that lets a refusal through.
+
+    ``--quiet`` and ``--allow-overpay`` are pass-throughs, which is exactly why they go
+    untested: nothing about them looks like new logic. A ``quiet_field`` naming a key the
+    payload does not have prints an EMPTY LINE and exits 0 — a scripted caller reads that
+    as "no txid" and cannot tell it from a failure, and no assertion about the payload
+    dict would notice.
+    """
+
+    def test_quiet_mode_prints_the_txid_and_nothing_else(self, runner, tmp_path, monkeypatch) -> None:
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--quiet", "--yes"])
+        assert result.exit_code == 0, result.output
+        txid = Transaction.from_hex(h.broadcast_calls[0].hex()).txid()
+        assert result.stdout.strip() == txid, f"quiet stdout was {result.stdout!r}"
+
+    def test_a_quiet_dry_run_prints_the_digest_instead(self, runner, tmp_path, monkeypatch) -> None:
+        """Nothing was broadcast, so there is no txid; printing an empty line would be the
+        same output as a broken run."""
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--quiet"], extra=["--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.strip() == hashlib.sha256(b"the advisory text").hexdigest()
+        assert h.broadcast_calls == []
+
+    def test_the_overpay_bound_is_the_shared_one(self) -> None:
+        """What ``--allow-overpay`` forwards to, asserted at the seam rather than through
+        the CLI: the CLI has no fee-rate option of its own — the rate comes from the
+        config — so driving the bound through ``mark`` would mean writing a config file to
+        test somebody else's gate. Named here so the flag is not silently decorative."""
+        import inspect
+
+        from pyrxd.hashmark_tx import build_hashmark_mark
+
+        src = inspect.getsource(build_hashmark_mark)
+        assert "assert_fee_rate_clears_relay_floor(" in src
+        assert "allow_overpay=allow_overpay" in src
+
+    def test_an_overpaying_rate_is_refused_and_the_flag_lets_it_through(self) -> None:
+        from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        over = relay_floor_photons_per_byte() * (MAX_FEE_OVERPAY_MULTIPLE + 1)
+        h = _MarkHarness(fund_value=50_000_000 * (MAX_FEE_OVERPAY_MULTIPLE + 1))
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)
+        with pytest.raises(ValidationError):
+            asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over))
+        build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over, allow_overpay=True))
+        assert build.fee >= len(build.serialize()) * over
+
+
 class TestTheWalletContractHoldsAgainstARealHdWallet:
     """Every case above stubs the wallet, so every case above proves the STUB.
 
