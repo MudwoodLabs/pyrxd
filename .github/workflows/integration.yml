@@ -161,6 +161,7 @@ jobs:
             tests/test_remaining_builder_floors_regtest_e2e.py \
             tests/test_fee_floor_boundary_regtest_e2e.py \
             tests/test_authority_regtest_e2e.py \
+            tests/test_hashmark_regtest_e2e.py \
             tests/test_dat_and_burn_regtest_e2e.py \
             tests/test_delegate_regtest_e2e.py
 
