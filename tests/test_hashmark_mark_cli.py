@@ -616,6 +616,116 @@ class TestTheNetworkIsPartOfWhatIsSigned:
         assert verify_attestation(decode_hashmark(_published_script(h))).valid
 
 
+class TestTheWalletContractHoldsAgainstARealHdWallet:
+    """Every case above stubs the wallet, so every case above proves the STUB.
+
+    ``mark`` asks a wallet for four things — ``collect_spendable``,
+    ``derive_address``, ``privkey_for`` and ``privkey_for_address`` — and a stub
+    answering all four says nothing about whether :class:`~pyrxd.hd.wallet.HdWallet`
+    has them, with those names and those signatures. That gap is the one where a
+    command ships and fails on first contact with a real wallet: the tests are green
+    because they never called the thing under test.
+
+    So this drives the command against a REAL ``HdWallet`` built from a generated
+    mnemonic, with only the UTXO source and the node swapped. The funding key is the
+    wallet's own change key, so ``collect_spendable``'s triple shape is the real one
+    too.
+    """
+
+    def test_the_command_signs_and_funds_through_a_real_hd_wallet(self, runner, tmp_path, monkeypatch) -> None:
+        import pyrxd.cli.hashmark_cmds as hc
+        from pyrxd.cli.main import cli
+        from pyrxd.hd.bip39 import mnemonic_from_entropy
+        from pyrxd.hd.wallet import HdWallet
+
+        wallet = HdWallet.from_mnemonic(mnemonic_from_entropy(os.urandom(32)))
+        fund_key = wallet.privkey_for(1, 0)  # a real change key, not a loose PrivateKey
+        fund_addr = wallet.derive_address(1, 0)
+        fund_spk = P2PKH().lock(fund_addr).serialize()
+        fund_utxo = UtxoRecord(tx_hash="cc" * 32, tx_pos=1, value=50_000_000, height=100)
+        txmap = {"cc" * 32: _source_tx(1, fund_spk, fund_utxo.value)}
+
+        async def _collect(_client):
+            return [(fund_utxo, fund_addr, fund_key)]
+
+        monkeypatch.setattr(wallet, "collect_spendable", _collect, raising=False)
+
+        sent: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            sent.append(raw)
+            return Transaction.from_hex(raw.hex()).txid()
+
+        client = MagicMock()
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        client.broadcast = _bcast
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        target = tmp_path / "advisory.txt"
+        target.write_bytes(b"real wallet")
+        monkeypatch.setattr(hc, "_load_wallet", lambda ctx, **kw: wallet)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: client)
+        result = runner.invoke(
+            cli, ["--wallet", str(tmp_path / "w.dat"), "--yes", "mark", str(target), "--label", "real"]
+        )
+        assert result.exit_code == 0, result.output
+
+        record = decode_hashmark(bytes(Transaction.from_hex(sent[0].hex()).outputs[0].locking_script.serialize()))
+        assert record.ok and verify_attestation(record).valid
+        # The signer is the wallet's own 0/0 key, derived here the same way the command
+        # derives it — and NOT the change key that paid the fee.
+        signer = wallet.privkey_for(0, 0)
+        assert record.signer_hash160_hex == signer.public_key().hash160(signer.compressed).hex()
+        assert record.signer_hash160_hex != fund_key.public_key().hash160(fund_key.compressed).hex()
+        assert wallet.derive_address(0, 0) in result.output
+
+    def test_signer_address_resolves_against_a_real_hd_wallet(self, runner, tmp_path, monkeypatch) -> None:
+        """``privkey_for_address`` is the fourth method, and the only one the default
+        path never touches — so without this it would be unexercised outside the stub."""
+        import pyrxd.cli.hashmark_cmds as hc
+        from pyrxd.cli.main import cli
+        from pyrxd.hd.bip39 import mnemonic_from_entropy
+        from pyrxd.hd.wallet import HdWallet
+
+        wallet = HdWallet.from_mnemonic(mnemonic_from_entropy(os.urandom(32)))
+        chosen = wallet.next_receive_address()  # registers it in wallet.addresses
+        fund_key = wallet.privkey_for(1, 0)
+        fund_addr = wallet.derive_address(1, 0)
+        fund_utxo = UtxoRecord(tx_hash="cc" * 32, tx_pos=1, value=50_000_000, height=100)
+        txmap = {"cc" * 32: _source_tx(1, P2PKH().lock(fund_addr).serialize(), fund_utxo.value)}
+
+        async def _collect(_client):
+            return [(fund_utxo, fund_addr, fund_key)]
+
+        monkeypatch.setattr(wallet, "collect_spendable", _collect, raising=False)
+        sent: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            sent.append(raw)
+            return Transaction.from_hex(raw.hex()).txid()
+
+        client = MagicMock()
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        client.broadcast = _bcast
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        target = tmp_path / "advisory.txt"
+        target.write_bytes(b"real wallet")
+        monkeypatch.setattr(hc, "_load_wallet", lambda ctx, **kw: wallet)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: client)
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_path / "w.dat"), "--yes", "mark", str(target), "--signer-address", chosen],
+        )
+        assert result.exit_code == 0, result.output
+        record = decode_hashmark(bytes(Transaction.from_hex(sent[0].hex()).outputs[0].locking_script.serialize()))
+        key = wallet.privkey_for_address(chosen)
+        assert record.signer_hash160_hex == key.public_key().hash160(key.compressed).hex()
+        assert verify_attestation(record).valid
+
+
 class TestTheCommandIsWiredIn:
     def test_mark_is_registered_at_the_top_level(self) -> None:
         """Top level rather than under ``glyph``: HashMark is a third-party format and
