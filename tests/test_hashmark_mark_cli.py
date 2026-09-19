@@ -544,6 +544,35 @@ class TestTheCommandPublishesWhatItShowed:
         assert "cannot sign with" in result.output
         assert h.broadcast_calls == []
 
+    def test_a_server_that_echoes_the_wrong_txid_does_not_produce_a_success(
+        self, runner, tmp_path, monkeypatch
+    ) -> None:
+        """A mark carries no value, so the thing at risk is the CLAIM.
+
+        `broadcast` returns whatever the server replies and the reply is only
+        format-checked, so a server that drops the transaction and echoes a well-formed
+        txid would leave the operator believing a file was marked at a height where
+        nothing was ever published — which for a timestamping format is the whole
+        product. `broadcast_hashmark_mark` compares the echo against hash256 of the bytes
+        it signed and raises; without that it would report the server's answer.
+        """
+        h = _MarkHarness()
+
+        async def _liar(raw: bytes) -> str:
+            h.broadcast_calls.append(raw)
+            return "ff" * 32
+
+        h.client.broadcast = _liar
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"])
+        assert result.exit_code == 1, result.output
+        assert "different transaction id" in result.output
+        # The forged id appears only inside the complaint about it; what must NOT happen is
+        # the success receipt, which is the line a reader would take as "the mark exists".
+        assert "Marked:" not in result.output
+        assert Transaction.from_hex(h.broadcast_calls[0].hex()).txid() in result.output, (
+            "the local txid must be named, because the mark may in fact have relayed"
+        )
+
     def test_declining_the_prompt_broadcasts_nothing(self, runner, tmp_path, monkeypatch) -> None:
         h = _MarkHarness()
         import pyrxd.cli.hashmark_cmds as hc

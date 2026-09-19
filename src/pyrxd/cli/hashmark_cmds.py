@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from ..constants import genesis_hash_for
+from ..glyph.client import BroadcastEchoMismatch
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from .errors import NetworkBoundaryError, UserError
@@ -260,6 +261,18 @@ def mark_cmd(
 
     try:
         build, txid = asyncio.run(_do_build())
+    except BroadcastEchoMismatch as exc:
+        # NOT a "nothing was broadcast" refusal, and the wording has to say so: the
+        # transaction may well have relayed and only the reply was wrong. The same
+        # handler shape as `glyph transfer-nft`'s, for the same reason — printing the
+        # server's txid would report a mark that may not exist.
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the mark was "
+            "published and only the server's reply was wrong. Do NOT re-run blindly: a "
+            "second mark is a second permanent record, not a retry.",
+        ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
             "no plain-RXD UTXO large enough to fund the mark",
