@@ -600,6 +600,25 @@ class TestTheVerdictTable:
             f"_CHECK_HOLDS names states nothing emits: {hashmark_cmds._CHECK_HOLDS - emitted}"
         )
 
+    def test_the_failure_exit_code_is_not_success_and_not_one_of_the_others(self) -> None:
+        """MEASURED GAP, closed here. Every case in this file spells its expectation as
+        ``r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD`` — which is tautological in the constant's
+        VALUE. Planting ``EXIT_VERDICT_DOES_NOT_HOLD = 0`` broke nothing: 14 tests passed with
+        the gate waving every forged mark and mismatched file straight through, and nothing in
+        the output looked wrong. A command that does nothing exits 0, and so did this one.
+        """
+        assert EXIT_VERDICT_DOES_NOT_HOLD == 5
+        assert EXIT_VERDICT_DOES_NOT_HOLD != 0, "a verdict that does not hold must not exit success"
+        assert EXIT_VERDICT_DOES_NOT_HOLD not in (1, 2, 3, 4), "must not collide with the documented codes"
+
+    def test_the_documented_exit_code_table_names_it(self) -> None:
+        """The code and the contract, kept together. Flattened before searching: this file's
+        prose is hard-wrapped, and a line-oriented grep for a wrapped phrase finds nothing while
+        every word is present."""
+        doc = (Path(__file__).resolve().parents[1] / "docs" / "wallet-cli-plan.md").read_text()
+        flat = " ".join(doc.split())
+        assert f"{EXIT_VERDICT_DOES_NOT_HOLD} a verdict that does not hold" in flat
+
     def test_a_confirmed_block_holds_and_a_shallow_one_does_not(self) -> None:
         deep = {"height": 5, "confirmations": 9, "min_confirmations": 6, "provisional": False}
         shallow = {"height": 5, "confirmations": 2, "min_confirmations": 6, "provisional": True}
