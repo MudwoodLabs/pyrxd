@@ -545,3 +545,180 @@ def _sanitize_payload_strings(value, *, key=None):
     if isinstance(value, tuple):
         return tuple(_sanitize_payload_strings(v, key=key) for v in value)
     return value
+
+
+# ---------------------------------------------------------------------------
+# W8 — the verdict view's two extra inputs: the BLOCK, and the FILE.
+#
+# Both are deliberately thin. Everything a reader could be misled by — how a
+# height is derived from a confirmation count, what a digest match is allowed to
+# mean, which hash a record actually names — is computed by the same pyrxd code
+# the CLI runs, and this module only carries values across the bridge.
+# ---------------------------------------------------------------------------
+
+#: What the page asks of a mark's burial before it will call it anchored.
+#:
+#: ONE, and one means "it is in a block at all" — the boundary between a mark that
+#: fixes a time and a mempool entry that fixes nothing. It is not a depth policy and
+#: must not be read as one. ``resolve_mark_anchor`` deliberately ships no default
+#: because, as the depth registry puts it, depth "buys reorg-resistance priced in that
+#: chain's hashrate" and a shipped number is folklore — so this page does not invent
+#: one either. It publishes the confirmation count as a FACT and says, on screen, that
+#: the judgement of whether that is enough is the reader's.
+_ANCHOR_FLOOR = 1
+
+#: Who the anchor came from. The CLI compares this label against the source of the
+#: name→glyph binding so one hostile endpoint cannot move both answers; this page has
+#: only the one endpoint, so the label exists to SAY that rather than to imply
+#: independence it does not have.
+_ANCHOR_SOURCE = "the single ElectrumX endpoint this page is allowed to talk to"
+
+
+def _run_sync(coro):
+    """Run a coroutine that never actually suspends, without an event loop.
+
+    Pyodide's main thread already has a running loop, so ``asyncio.run`` is not
+    available here. ``resolve_mark_anchor`` has exactly one ``await``, on the
+    ``fetch_verbose`` callable we supply — and ours returns a value the page has
+    already fetched, so the coroutine runs to completion on the first ``send`` and
+    raises ``StopIteration`` carrying the result.
+
+    If it ever DOES suspend, that is a real change in the function's contract and
+    this raises rather than returning a half-built anchor.
+    """
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    coro.close()
+    raise RuntimeError(
+        "resolve_mark_anchor suspended on an await this bridge cannot drive; "
+        "the page fetches over its own WebSocket and has no event loop to yield to"
+    )
+
+
+#: Cap on the verbose reply the page may hand across. A confirmation depth and an
+#: echoed txid are a few hundred bytes; anything approaching this is a server
+#: answering a question nobody asked.
+_MAX_VERBOSE_JSON_CHARS = 8_000_000
+
+
+def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
+    """Where the mark's transaction sits in the chain, per the endpoint that was asked.
+
+    *verbose_json* is the ``blockchain.transaction.get(txid, verbose=True)`` reply as a
+    JSON **string** and *tip_height* the ``blockchain.headers.subscribe`` height, both
+    fetched by the page. A string rather than a JS object because that makes the
+    boundary one this module can define and test on its own terms, instead of one whose
+    shape depends on how Pyodide happens to proxy a plain object today.
+    Handing them to :func:`pyrxd.glyph.mark_anchor.resolve_mark_anchor` rather than
+    reading ``confirmations`` in JS is the whole point: that function binds the echoed
+    txid, refuses an unreadable depth instead of reading it as zero, derives the height
+    as ``tip - confirmations + 1`` (measured: the verbose reply carries NEITHER
+    ``height`` NOR ``blockheight``), and carries the caveat saying the height is the
+    endpoint's claim and nothing here verified it.
+
+    Never raises. A failure is a dict with ``resolved: False`` and the reason, because
+    losing the block must not lose the record.
+    """
+    import json
+
+    from pyrxd.glyph.mark_anchor import mark_anchor_dict, resolve_mark_anchor
+
+    if not isinstance(verbose_json, str):
+        verbose_json = str(verbose_json)
+    if len(verbose_json) > _MAX_VERBOSE_JSON_CHARS:
+        return {
+            "resolved": False,
+            "reason": f"the endpoint's reply is {len(verbose_json):,} chars, over the cap; refusing to parse it",
+        }
+    try:
+        verbose = json.loads(verbose_json)
+    except ValueError as exc:
+        return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(f"unreadable reply: {exc}"))}
+    if not isinstance(verbose, dict):
+        return {"resolved": False, "reason": "the endpoint's reply was not an object"}
+
+    async def _fetch(_requested: str) -> dict:
+        return verbose
+
+    try:
+        anchor = _run_sync(
+            resolve_mark_anchor(
+                txid=txid,
+                fetch_verbose=_fetch,
+                source=_ANCHOR_SOURCE,
+                min_confirmations=_ANCHOR_FLOOR,
+                tip_height=int(tip_height) if tip_height is not None else None,
+            )
+        )
+    except Exception as exc:
+        return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(_safe_error(exc)))}
+
+    # THE SHAPE IS `mark_anchor_dict`'s, not this module's. It was factored out so a
+    # height never reaches a screen without the caveat that it is one endpoint's
+    # unverified claim, and a page assembling its own dict of the same fields would be
+    # the second display shape that helper exists to prevent.
+    shape = mark_anchor_dict(anchor)
+
+    # THREE KEYS DROPPED, DELIBERATELY, and this is the only place it happens.
+    #
+    # `provisional` and `deep_enough` are verdicts ON THE DEPTH, computed against
+    # `min_confirmations` — and the floor this page passes is 1, which means "it is in a
+    # block at all" and is NOT a depth policy. Rendering "deep_enough: true" from it
+    # would turn "this is in a block" into "this is buried enough", a judgement nobody
+    # here has made. `pyrxd verify` keeps all three because it REQUIRES the operator to
+    # name a floor and then gates an exit code on it; a display with no such input must
+    # not answer the question by default. `min_confirmations` goes with them, because
+    # publishing the floor invites reading the two numbers against each other.
+    #
+    # Popped rather than never-built, so a field added to `mark_anchor_dict` later
+    # arrives here automatically and only these three are ever silently absent.
+    for dropped in ("provisional", "deep_enough", "min_confirmations"):
+        shape.pop(dropped, None)
+    shape["caveat"] = _inspect.sanitize_display_string(str(shape.get("caveat") or ""))
+    return {
+        "resolved": True,
+        "txid": anchor.txid,
+        **shape,
+        "no_depth_policy": (
+            "This page sets no confirmation-depth requirement: the count above is the fact, "
+            "and how much burial is enough depends on what this mark is worth to you"
+        ),
+    }
+
+
+def file_check_plan(algorithm_id: object) -> dict:
+    """Which hash to run over a chosen file, per the record's own header byte.
+
+    Forwards to :func:`pyrxd.glyph.inspect.file_check_plan`. The page must NOT pick
+    ``"sha256"`` for itself: the record names the algorithm, and a checking surface
+    that chose its own would produce a well-formed, signature-verifying, completely
+    false answer that nothing downstream could detect.
+    """
+    try:
+        return _inspect.file_check_plan(int(algorithm_id) if algorithm_id is not None else None)
+    except Exception as exc:
+        return {"ok": False, "reason": _truncate(_inspect.sanitize_display_string(_safe_error(exc)))}
+
+
+def judge_file_digest(expected_hex: object, computed_hex: object, algorithm: object = None) -> dict:
+    """The verdict on a digest the page computed locally, in the record's own terms.
+
+    The comparison is one line; the WORDS are not, and they are what a reader acts on.
+    They live in :mod:`pyrxd.glyph._inspect_core` beside the attestation's, so the two
+    verdicts on one screen come out of one vocabulary instead of two.
+    """
+    try:
+        return _inspect.judge_file_digest(
+            str(expected_hex) if expected_hex is not None else None,
+            str(computed_hex) if computed_hex is not None else "",
+            algorithm=str(algorithm) if algorithm else None,
+        )
+    except Exception as exc:
+        return {
+            "checked": False,
+            "match": None,
+            "status": "NOT CHECKED",
+            "meaning": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
+        }

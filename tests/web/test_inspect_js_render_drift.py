@@ -186,8 +186,16 @@ def _corpus() -> dict[str, bytes]:
         # The OP_RETURN payload shapes. Built here rather than imported from a
         # fixture because the point is what the CLASSIFIER emits for real bytes.
         "op_return-msg": b"\x6a\x03msg\x0bhello there",
+        # `\x0a`, not `\x0b`. "report.pdf" is TEN bytes, and the push opcode said
+        # eleven — so the walker read past the end of the script, refused the record
+        # as non-minimal, and `decode_hashmark` returned NOT_HASHMARK. This shape
+        # classified as a plain `op_return` with no `hashmark` key at all, and had
+        # done since it was written: the corpus entry named `op_return-hashmark-v1`
+        # was exercising nothing about v1, and every v1 assertion in this file was
+        # true and empty. `test_a_family_member_stays_in_its_family` below is the
+        # derived check that makes the same mistake fail instead of passing.
         "op_return-hashmark-v1": (
-            b"\x6a\x08HASHMARK\x02" + bytes([1, 1]) + b"\x20" + os.urandom(32) + b"\x0breport.pdf"
+            b"\x6a\x08HASHMARK\x02" + bytes([1, 1]) + b"\x20" + os.urandom(32) + b"\x0areport.pdf"
         ),
         # v2 carries a signer and a signature, so it is the shape whose ATTESTATION
         # VERDICT must reach the reader. The signature here is random, so the record
@@ -289,7 +297,44 @@ _PROSE_EVIDENCE = {
     # asserted through the VERIFIED/UNVERIFIED/UNRESOLVED wording.
     "basis": {"direct": "spent in this tx", "delegated": "via delegate", "none": None},
     "ok": {True: "VERIFIED", False: None},
+    # The header BYTE, rendered as the hex it is ("algorithm id 0x01") rather than as
+    # the decimal `1`. Translated, like `kind` above — and it has to be declared here
+    # because the decimal spelling never appears on the card, so the generic rule
+    # would demand a string the renderer correctly does not print.
+    "algorithm_id": {1: "0x01"},
+    # Rendered as "HashMark v2", never as a bare "2" — the same translation as
+    # `algorithm_id` above, and declared for the same reason: the generic short-value
+    # rule would demand a standalone token the renderer correctly does not print.
+    "version": {1: "v1", 2: "v2"},
 }
+
+#: Below this length, "is the evidence in the text" stops being a question about the
+#: renderer.
+#:
+#: MEASURED, not guessed: dropping ``algorithm_id`` from the panel entirely changed
+#: nothing in this file, because the required evidence was the string ``"1"`` and a
+#: rendered card is full of digits — inside a digest, a byte count, an address. The
+#: guard passed VACUOUSLY for the exact field that had just been dropped, and would
+#: do the same for any field whose whole value is a small number.
+#:
+#: Short evidence is therefore required to appear as a standalone token, bounded by
+#: something that is neither a letter nor a digit. Letters matter as much as digits
+#: here: a first attempt excluded only adjacent DIGITS, and ``version: 2`` still
+#: passed after the version was deleted from the card — because a 64-character hex
+#: digest is full of digits sitting between LETTERS ("…e2c5…"), and every one of them
+#: looked like a standalone 2.
+#:
+#: A value genuinely rendered in another spelling belongs in ``_PROSE_EVIDENCE``
+#: above, where the translation is declared and a reader can see it.
+_SUBSTRING_FLOOR = 4
+
+
+def _shows(evidence: str, text: str) -> bool:
+    """Is *evidence* actually visible in *text*, rather than coincidentally inside it?"""
+    lowered, wanted = text.lower(), evidence.lower()
+    if len(wanted) >= _SUBSTRING_FLOOR:
+        return wanted in lowered
+    return re.search(rf"(?<![0-9a-z]){re.escape(wanted)}(?![0-9a-z])", lowered) is not None
 
 
 def _js_string(value) -> str:
@@ -468,7 +513,7 @@ class TestEveryFieldIsRendered:
             if key in _OMITTED_FROM_SCRIPT_CARD:
                 continue
             for evidence in _required_evidence(key, value):
-                assert evidence.lower() in lowered, (
+                assert _shows(evidence, lowered), (
                     f"renderScriptCard dropped {key!r}={value!r} for shape {shape!r}. "
                     f"Expected {evidence!r} in the rendered card.\n"
                     f"If the omission is deliberate, add {key!r} to "
@@ -484,7 +529,7 @@ class TestEveryFieldIsRendered:
             if key in _OMITTED_FROM_OUTPUT_ROW:
                 continue
             for evidence in _required_evidence(key, value):
-                assert evidence.lower() in lowered, (
+                assert _shows(evidence, lowered), (
                     f"renderOutputRow dropped {key!r}={value!r} for shape {shape!r}. "
                     f"This is the fetched-transaction path — the way most people meet "
                     f"the tool. Expected {evidence!r} in the rendered row.\n"
@@ -784,6 +829,43 @@ class TestTheCorpusCoversEveryShapeTheClassifierCanEmit:
             f"_UNREACHABLE now exempts {sorted(self._UNREACHABLE)}, not just {{'error'}}. "
             f"Each entry silently opts a type out of every test in this file — update this "
             f"pin only after confirming the new entry's reason is real."
+        )
+
+    def test_a_family_member_stays_in_its_family(self, payloads) -> None:
+        """A shape named after a VERSIONED family must still classify into it.
+
+        The check above passes for a family as soon as ONE member of it produces a
+        matching type, because an f-string type contributes only its literal prefix
+        (``op_return-hashmark-v``). So ``op_return-hashmark-v2`` satisfied the whole
+        family and ``op_return-hashmark-v1`` was free to silently classify as
+        something else — which it did, for its entire life: its label push declared
+        eleven bytes for a ten-byte label, the minimal-push walker refused the record,
+        and the shape decoded as a plain ``op_return`` carrying no ``hashmark`` key.
+        Every v1 assertion in this file was true and empty, and nothing said so.
+
+        DERIVED, not a list: the family prefixes come from the classifier's own
+        f-strings, the same extraction the sibling checks use. Any future versioned
+        family gets this for free, and a member that degrades out of its family fails
+        here instead of passing vacuously.
+        """
+        families = [t for t in self._emitted_by_the_source() if t.endswith("-v")]
+        assert families, "no versioned type family was extracted — the check is vacuous"
+        checked = 0
+        for name in _SHAPE_NAMES:
+            for family in families:
+                if not name.startswith(family):
+                    continue
+                checked += 1
+                produced = payloads[name]["script"].get("type", "")
+                assert produced.startswith(family), (
+                    f"corpus shape {name!r} is named for the {family!r} family but classifies "
+                    f"as {produced!r}. Its bytes are not what its name says they are, so every "
+                    f"assertion in this file about that family member is passing on the wrong "
+                    f"input."
+                )
+        assert checked >= 2, (
+            f"only {checked} shape(s) were matched to a versioned family, so this check is "
+            f"nearly vacuous — families derived: {sorted(families)}"
         )
 
     def test_no_corpus_shape_is_unreachable_from_the_classifier(self, payloads) -> None:
@@ -1194,7 +1276,7 @@ class TestTheTxCardRendersEveryFieldToo:
             if key in _OMITTED_FROM_TX_CARD:
                 continue
             for evidence in _required_evidence(key, value):
-                assert evidence.lower() in lowered, (
+                assert _shows(evidence, lowered), (
                     f"renderFetchedTxCard dropped {key!r}={value!r} for case {case!r}. "
                     f"Expected {evidence!r} in the rendered card.\n"
                     f"If the omission is deliberate, add {key!r} to "

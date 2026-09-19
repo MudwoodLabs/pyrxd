@@ -665,3 +665,79 @@ class TestTheVerdictTable:
         assert _block_check(deep)[0] == "CONFIRMED"
         assert _block_check(shallow)[0] == "PROVISIONAL"
         assert _block_check(None)[0] == "NO BLOCK"
+
+
+_ROOT_FOR_GUARD_CHECK = Path(__file__).resolve().parent.parent
+
+
+class TestOneVocabularyAcrossEverySurface:
+    """Three surfaces name a HashMark's signature state: this command, ``glyph
+    inspect``'s terminal output, and the browser panel at
+    ``docs/inspect_static/inspect/``. All three describe THE SAME RECORD, and a reader
+    who checks one against another must not find two different words for it.
+
+    ``_inspect_core._ATTESTATION_VERDICTS`` is the one definition. ``glyph inspect``
+    and the panel read it directly; this command keeps literals, because
+    ``test_every_state_the_checks_can_emit_is_classified`` derives its emitted set by
+    AST-scanning these returns for string constants and an indirection makes that set
+    invisible — measured: routing them through the table turned that guard's own
+    non-vacuity check red.
+
+    So the literals stay and this pins them. If someone changes a word in either
+    place, this fails rather than letting the surfaces drift apart silently.
+    """
+
+    @pytest.mark.parametrize(
+        "outcome,expected_literal",
+        [
+            ("valid", "VERIFIED"),
+            ("invalid_signature", "DOES NOT VERIFY"),
+            ("unverifiable", "NOT CHECKED"),
+            ("not_attested", "NO SIGNATURE"),
+        ],
+    )
+    def test_the_status_words_match_the_shared_table(self, outcome: str, expected_literal: str) -> None:
+        from pyrxd.glyph._inspect_core import _attestation_verdict
+
+        assert _attestation_verdict(outcome)[0] == expected_literal, (
+            f"the shared table calls {outcome!r} {_attestation_verdict(outcome)[0]!r} while "
+            f"pyrxd verify spells it {expected_literal!r}. One record, two words, depending on "
+            f"which surface the reader happens to be looking at."
+        )
+
+    def test_every_pinned_word_is_actually_emitted_by_this_command(self) -> None:
+        """The other direction, and the one that rots quietly: a pin naming a word this
+        command no longer produces is a check that has stopped checking anything."""
+        import ast
+        import inspect as _i
+
+        from pyrxd.cli import hashmark_cmds
+
+        emitted: set[str] = set()
+        tree = ast.parse(_i.getsource(hashmark_cmds._signature_check).lstrip())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                first = node.value.elts[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    emitted.add(first.value)
+        assert emitted, "the scan found nothing — it is broken, not the code"
+        pinned = {"VERIFIED", "DOES NOT VERIFY", "NOT CHECKED", "NO SIGNATURE"}
+        assert pinned <= emitted, f"pinned words this command no longer emits: {sorted(pinned - emitted)}"
+
+    def test_the_third_surface_is_guarded_elsewhere(self) -> None:
+        """The browser panel's half of this is asserted where it can actually be
+        rendered: ``tests/web/test_hashmark_panel_verdict.py``'s
+        ``TestTheTerminalAndThePageUseOneVocabulary`` runs the real ``inspect.js``
+        under Node and reads the status word off the rendered card.
+
+        Stated here rather than re-asserted here on purpose. A version of this written
+        in this file compared ``_attestation_verdict(outcome)[0]`` against itself —
+        tautological in the value, green forever, and proving nothing about the page.
+        """
+        guard = _ROOT_FOR_GUARD_CHECK / "tests" / "web" / "test_hashmark_panel_verdict.py"
+        assert guard.exists(), "the panel-side vocabulary guard is gone"
+        text = guard.read_text(encoding="utf-8")
+        assert "def test_the_browser_prints_the_same_status_word" in text, (
+            "the test this one defers to no longer exists, so nothing is checking that the "
+            "browser panel uses the shared vocabulary"
+        )

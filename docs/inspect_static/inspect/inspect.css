@@ -566,3 +566,154 @@ textarea#paste-input:disabled {
   margin-top: 0.5rem;
   font-size: 0.8rem;
 }
+
+/* --- HashMark verdict panel ------------------------------------------
+   The verdict is the headline of a card that carries a mark, so it sits
+   above the field list and is sized to be read rather than scanned past.
+
+   COLOUR IS NEVER THE ONLY SIGNAL. Each verdict prints its status in words
+   (VERIFIED / NOT CHECKED / DOES NOT VERIFY / MATCHES / DOES NOT MATCH), so a
+   reader who cannot separate the greens from the reds — or who is looking at a
+   screenshot, or a printout — loses nothing. The palette is Okabe-Ito, already
+   colourblind-safe, and the neutral state is deliberately the DEFAULT: an
+   unrecognised status lands there rather than on either verdict. */
+
+.badge-hashmark { background: var(--color-commit); }
+
+.mark-panel {
+  margin: 0.9rem 0;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+}
+
+.mark-title {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+  letter-spacing: 0.01em;
+}
+
+.verdict {
+  margin: 0 0 0.6rem;
+  padding: 0.55rem 0.7rem;
+  border-left: 5px solid var(--color-p2pkh);
+  background: var(--bg);
+  border-radius: 3px;
+}
+
+.verdict-label {
+  display: block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.verdict-status {
+  display: block;
+  font-size: 1.15rem;
+  line-height: 1.25;
+  /* The status can be three words ("DOES NOT VERIFY"); let it wrap on a phone
+     rather than forcing the card wider than the screen. */
+  overflow-wrap: break-word;
+}
+
+.verdict-detail,
+.verdict-meaning {
+  margin: 0.3rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.verdict-ok        { border-left-color: var(--color-ft); }
+.verdict-ok .verdict-status { color: var(--color-ft); }
+.verdict-bad       { border-left-color: var(--error-border); }
+.verdict-bad .verdict-status { color: var(--error-fg); }
+.verdict-unchecked { border-left-color: var(--color-p2pkh); }
+.verdict-unchecked .verdict-status { color: var(--fg); }
+
+/* Prose, not a hex blob. `.kv-value` sets `word-break: break-all` because most of
+   what it holds is a 64-character identifier that must wrap somewhere — but applied
+   to a sentence it breaks words mid-syllable ("so there is no block to pla / ce it
+   in"), which reads as a rendering fault and costs the sentence its authority.
+   `anywhere` keeps normal word boundaries for prose and still breaks an unbreakable
+   64-char digest rather than letting it push the card off the screen. */
+.mark-panel .kv-value {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+/* A fact that is simply unavailable, as against something that went wrong. */
+.kv-muted {
+  color: var(--muted);
+}
+
+.mark-caveat {
+  margin: 0 0 0.6rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.mark-proves {
+  margin: 0.8rem 0 0;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* --- the file check --------------------------------------------------- */
+
+.filecheck {
+  margin-top: 0.9rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--border);
+}
+
+.filecheck-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+}
+
+.filecheck-privacy {
+  margin: 0 0 0.6rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.filecheck-input {
+  display: block;
+  max-width: 100%;
+  font-size: 0.85rem;
+}
+
+.filecheck-status {
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.filecheck-result {
+  margin-top: 0.7rem;
+}
+
+.filecheck-result .kv-list {
+  margin-top: 0.4rem;
+}
+
+/* Phone width. The kv grid's `max-content` label column can be wider than a
+   narrow screen once a label is long, which pushes the whole card into a
+   horizontal scroll; below 480px the pairs stack instead. */
+@media (max-width: 480px) {
+  .mark-panel .kv-list {
+    grid-template-columns: 1fr;
+    gap: 0.1rem 0;
+  }
+  .mark-panel .kv-label {
+    margin-top: 0.35rem;
+  }
+  .mark-panel {
+    padding: 0.7rem 0.6rem;
+  }
+}

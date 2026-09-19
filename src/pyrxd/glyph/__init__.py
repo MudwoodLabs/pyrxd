@@ -108,6 +108,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # candidate set has to come from the consumer's own index for now.
     "MarkAnchor": ("pyrxd.glyph.mark_anchor", "MarkAnchor"),
     "resolve_mark_anchor": ("pyrxd.glyph.mark_anchor", "resolve_mark_anchor"),
+    # The display shape of an anchor, moved here from `cli.glyph_inspect` so the
+    # browser panel can reach it without importing click. It carries the caveat
+    # that the height is one endpoint's unverified claim, which is the whole reason
+    # there is one shape rather than one per surface.
+    "mark_anchor_dict": ("pyrxd.glyph.mark_anchor", "mark_anchor_dict"),
     "WaveIdentityVerdict": ("pyrxd.glyph.wave_identity", "WaveIdentityVerdict"),
     "judge_name_at_mark": ("pyrxd.glyph.wave_identity", "judge_name_at_mark"),
     # The two sentinels a consumer has to be able to COMPARE AGAINST rather than retype. Without

@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _truncate_for_human
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -38,6 +38,7 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
+from ..glyph.mark_anchor import mark_anchor_dict
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
 from ..script.timelock import LOCKTIME_THRESHOLD
@@ -704,24 +705,15 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     )
 
 
-def mark_anchor_dict(anchor) -> dict:
-    """The display shape of a :class:`~pyrxd.glyph.mark_anchor.MarkAnchor`.
-
-    ``caveat`` and ``height_is_verified`` are carried, never dropped: the height is one
-    endpoint's claim and pyrxd has no Radiant header, proof-of-work or merkle check to
-    hold it to. A consumer that shows the number and not the caveat has published the
-    unqualified sentence this module exists to prevent.
-    """
-    return {
-        "height": anchor.height,
-        "confirmations": anchor.confirmations,
-        "min_confirmations": anchor.min_confirmations,
-        "provisional": anchor.provisional,
-        "deep_enough": anchor.usable_for_point_in_time,
-        "source": _sanitize_display_string(anchor.source),
-        "height_is_verified": anchor.height_is_verified,
-        "caveat": anchor.caveat,
-    }
+# `mark_anchor_dict` moved to `pyrxd.glyph.mark_anchor`, beside the dataclass it
+# describes, and is re-exported above so every caller here is unchanged.
+#
+# WHY IT MOVED: the browser panel needs the same display shape, and it cannot import
+# this module — `glyph_inspect` imports click, and the Pyodide page has none. Left
+# here, the page would have had to build its own dict of height/confirmations/caveat,
+# which is exactly the second display shape this helper was factored out to prevent:
+# a number reaching a screen without the caveat saying it is one endpoint's unverified
+# claim. One definition, three surfaces (this terminal, `pyrxd verify`, the panel).
 
 
 def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> list[str]:
@@ -1102,26 +1094,38 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                 # v1 keeps its timestamp evidence; the label is withheld WITH a reason,
                 # because silently showing nothing looks like a record that had no label.
                 out.append(f"{indent}  label:   [withheld — {hm['label_withheld']}]")
+            att = hm.get("attestation") or {}
+            outcome = att.get("outcome")
             if hm.get("signer_hash160"):
                 out.append(f"{indent}  signer:  {hm['signer_hash160']}")
-                att = hm.get("attestation") or {}
-                if att.get("outcome") == "valid":
-                    out.append(f"{indent}  signature VERIFIED — recovers to the committed signer")
+                # THE WORDS COME FROM `_attestation_verdict`, not from here. Both this
+                # terminal and the browser panel used to spell the verdict themselves,
+                # which is exactly how the page ended up with no branch at all for
+                # `unverifiable`: this file grew one, `inspect.js` did not, and nothing
+                # could notice because the two copies were unrelated strings in
+                # unrelated languages. One table, three surfaces.
+                status, meaning = _attestation_verdict(outcome or "")
+                if outcome == "valid":
+                    out.append(f"{indent}  signature {status} — {meaning}")
                     if att.get("signer_address"):
                         out.append(f"{indent}    signer address: {att['signer_address']}")
                     out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
                     out.append(f"{indent}     the signed statement and a pasted script carries no context)")
-                elif att.get("outcome") == "unverifiable":
-                    # Withheld, not decided. Falling through silently would leave a
-                    # v2 record showing a signer and no word about its signature —
-                    # which reads as "fine" far more than it reads as "unchecked".
-                    out.append(f"{indent}  signature NOT CHECKED — {att.get('detail', 'no detail')}")
-                    out.append(f"{indent}    (the record is well-formed; this is not a verdict on it)")
-                elif att.get("outcome") == "invalid_signature":
-                    # The bytes decoded; the CLAIM does not hold. Saying "malformed"
-                    # here would send whoever is debugging it after the wrong problem.
-                    out.append(f"{indent}  signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
-                    out.append(f"{indent}    (the record is well-formed; its claim is not supported)")
+                else:
+                    # Withheld or refused — either way SAY SO. Falling through silently
+                    # would leave a v2 record showing a signer and no word about its
+                    # signature, which reads as "fine" far more than as "unchecked".
+                    # `else` rather than a list of known outcomes, so an outcome added
+                    # upstream is still announced; `_attestation_verdict` fails toward
+                    # "we do not know" rather than toward either verdict.
+                    out.append(f"{indent}  signature {status} — {att.get('detail') or meaning}")
+                    out.append(f"{indent}    ({meaning})")
+            elif outcome == "not_attested":
+                # v1. There IS no signature, and the absence is the finding: a v1 mark
+                # fixes a time and names nobody. Printing nothing here left the reader
+                # to infer that from a missing line.
+                status, meaning = _attestation_verdict(outcome)
+                out.append(f"{indent}  signature {status} — {meaning}")
             out.append(f"{indent}  (proves someone knew this digest no later than the confirming")
             out.append(f"{indent}   block — not authorship, ownership, originality or contents)")
             # AFTER the mark's own statement closes, and at the outer indent. §7.6
