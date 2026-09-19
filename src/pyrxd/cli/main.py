@@ -198,6 +198,7 @@ def run() -> None:
 from . import (  # noqa: E402
     agent_cmds,
     glyph_cmds,
+    hashmark_cmds,
     query_cmds,
     regtest_cmds,
     setup_cmd,
@@ -209,6 +210,9 @@ from . import (  # noqa: E402
 
 cli.add_command(agent_cmds.agent_group)
 cli.add_command(glyph_cmds.glyph_group)
+# Top level, not under `glyph`: HashMark is a third-party OP_RETURN format, not a Glyph
+# protocol, and filing it under `glyph` would imply pyrxd owns it. See script/hashmark.py.
+cli.add_command(hashmark_cmds.mark_cmd)
 cli.add_command(query_cmds.address_cmd)
 cli.add_command(query_cmds.balance_cmd)
 cli.add_command(query_cmds.utxos_cmd)

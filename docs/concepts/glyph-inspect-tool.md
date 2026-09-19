@@ -394,8 +394,10 @@ Two consequences worth stating plainly:
   them out-of-band.
 
 HashMark is a third-party format (MIT,
-`github.com/cdonnachie/hashmark.rxd`); pyrxd implements the read side
-only and never writes one.
+`github.com/cdonnachie/hashmark.rxd`). The inspector is read-only, and
+that is the whole of what this page describes; pyrxd can also WRITE a v2
+record (`script/hashmark.py`, `encode_hashmark`), but nothing on this
+page does.
 
 The signature check is also why HashMark decoding is a **CLI-only**
 capability today: it reaches for `coincurve`, which is not installed in
