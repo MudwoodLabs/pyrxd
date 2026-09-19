@@ -131,6 +131,19 @@ class _NodeClient:
             raise _NodeRefused(f"node refused: {self.verdict}")
         return str(self.node.cli("sendrawtransaction", raw.hex()))
 
+    # The two calls the READ half adds. `pyrxd verify` must place the mark in a block, and
+    # `resolve_mark_anchor` derives the height from `tip - confirmations + 1` rather than from
+    # a height field, because neither the node nor either shipped ElectrumX server returns one
+    # — measured, and recorded in `glyph/mark_anchor.py`. These two answers come from the node
+    # itself, so the derivation is exercised against the shape production really sees.
+    async def get_transaction_verbose(self, txid: object) -> dict:
+        info = self.node.cli("getrawtransaction", str(txid), "true")
+        assert isinstance(info, dict)
+        return info
+
+    async def get_tip_height(self) -> int:
+        return int(self.node.cli("getblockcount"))  # type: ignore[arg-type]
+
 
 class _NodeWallet:
     """The three methods ``pyrxd mark`` asks a wallet for, over one funded UTXO.
@@ -204,6 +217,26 @@ def _mark_via_cli(rt: _RegtestNode, tmp_path: Path, monkeypatch, *, content: byt
     assert result.exit_code == 0, result.output
     rt.mine(1)
     return json.loads(result.stdout), client, signer
+
+
+def _verify_via_cli(rt: _RegtestNode, monkeypatch, txid: str, *extra: str, json_mode: bool = False):
+    """Run the real ``pyrxd verify`` against the node. Returns the click result.
+
+    ONLY THE TRANSPORT IS SWAPPED. The transaction is fetched back off the chain, the record is
+    decoded from those bytes, the signature is attested against this node's own genesis, and
+    the height is derived from the node's own confirmation count — exactly the path a stranger
+    with nothing but a txid would take.
+    """
+    from click.testing import CliRunner
+
+    from pyrxd.cli import glyph_inspect
+    from pyrxd.cli.main import cli
+
+    client = _NodeClient(rt)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: client)
+    monkeypatch.setattr(glyph_inspect, "_endpoint_pair", lambda ctx: (client, "regtest-node", client, "regtest-node"))
+    head = ["--network", "regtest"] + (["--json"] if json_mode else [])
+    return CliRunner().invoke(cli, [*head, "verify", txid, *extra])
 
 
 def _record_from_chain(rt: _RegtestNode, txid: str):
@@ -590,6 +623,79 @@ class TestTheFundingBarAgreesWithTheNode:
         under = _NodeWallet(_fund(node, PrivateKey(), bar - 1), signer)
         with pytest.raises(NoFeeFundingError, match="no plain-RXD UTXO large enough"):
             asyncio.run(build_hashmark_mark(under, probe, client=_NodeClient(node), fee_rate=_MIN_FEE_RATE))
+
+
+class TestAStrangerCanVerifyWithOneCommand:
+    """The read half, end to end: ``pyrxd verify <txid> --file <path>`` over a confirmed mark.
+
+    :class:`TestAStrangerCanVerifyFromChainBytesAlone` proves the LIBRARY can do it. This proves
+    a PERSON can — that the answer reaches a terminal, that the block reaches it with the caveat
+    that the height is unverified, and that a file which is NOT what was marked is refused
+    loudly rather than quietly.
+
+    The height is cross-checked against the node's own block rather than against the number the
+    command printed back at itself: a figure computed from `tip - confirmations + 1` and then
+    compared to `tip - confirmations + 1` would agree with itself while being about nothing.
+    """
+
+    def test_the_marked_file_verifies_through_the_command(self, node, tmp_path, monkeypatch) -> None:  # noqa: F811
+        payload, _client, signer = _mark_via_cli(node, tmp_path, monkeypatch, content=b"the advisory", label="adv")
+        target = tmp_path / "advisory.txt"
+        node.mine(5)
+
+        result = _verify_via_cli(node, monkeypatch, payload["txid"], "--file", str(target), "--min-confirmations", "3")
+        assert result.exit_code == 0, result.output
+        assert "MATCHES" in result.output
+        assert "signature VERIFIED" in result.output
+        assert payload["digest"] in result.output
+        assert signer.public_key().address() in result.output, "the identity the mark actually carries"
+
+    def test_the_height_it_reports_is_the_block_the_node_put_it_in(self, node, tmp_path, monkeypatch) -> None:  # noqa: F811
+        """NODE-MEASURED. The command derives a height from a confirmation count; the node is
+        asked, independently, which block hash sits at that height and whether it is the one the
+        transaction is in."""
+        payload, _client, _signer = _mark_via_cli(node, tmp_path, monkeypatch, content=b"dated", label=None)
+        node.mine(4)
+
+        machine = _verify_via_cli(node, monkeypatch, payload["txid"], "--min-confirmations", "3", json_mode=True)
+        assert machine.exit_code == 0, machine.output
+        reported = json.loads(machine.stdout)["mark_anchor"]["height"]
+
+        confirmed = _confirmed(node, payload["txid"])
+        assert str(node.cli("getblockhash", str(reported))) == confirmed["blockhash"], (
+            f"verify placed the mark at height {reported}, which is not the block the node has it in"
+        )
+
+        # And the same number reaches a terminal, with the caveat that it is unverified.
+        human = _verify_via_cli(node, monkeypatch, payload["txid"], "--min-confirmations", "3")
+        assert f"block:        {reported}" in human.output
+        assert "NOT verified" in human.output, "the height is the endpoint's claim and must say so"
+
+    def test_a_file_that_was_not_marked_is_refused_with_a_nonzero_status(self, node, tmp_path, monkeypatch) -> None:  # noqa: F811
+        payload, _client, _signer = _mark_via_cli(node, tmp_path, monkeypatch, content=b"the advisory", label="adv")
+        node.mine(5)
+        impostor = tmp_path / "impostor.txt"
+        impostor.write_bytes(b"the advisory, quietly edited")
+
+        result = _verify_via_cli(
+            node, monkeypatch, payload["txid"], "--file", str(impostor), "--min-confirmations", "3"
+        )
+        assert result.exit_code == 5, result.output
+        assert "DOES NOT MATCH" in result.output
+        assert payload["digest"] in result.output, "the digest that WAS marked is shown beside the one supplied"
+
+    def test_a_mark_still_in_the_mempool_fixes_no_time(self, node, tmp_path, monkeypatch) -> None:  # noqa: F811
+        """The claim is "no later than the block that confirms it". Without a block there is no
+        claim, and `pyrxd mark` says so on its own last line — this is the read half agreeing."""
+        payload, _client, _signer = _mark_via_cli(node, tmp_path, monkeypatch, content=b"unmined", label=None)
+        # `_mark_via_cli` mines one block; undo it so the transaction is back in the mempool.
+        node.cli("invalidateblock", str(node.cli("getbestblockhash")))
+        assert payload["txid"] in [str(t) for t in node.cli("getrawmempool")]  # type: ignore[union-attr]
+
+        result = _verify_via_cli(node, monkeypatch, payload["txid"], "--min-confirmations", "3")
+        assert result.exit_code == 5, result.output
+        assert "NO BLOCK" in result.output
+        assert "fixes no time" in result.output
 
 
 def test_nothing_in_this_file_touched_anything_but_regtest(node) -> None:  # noqa: F811
