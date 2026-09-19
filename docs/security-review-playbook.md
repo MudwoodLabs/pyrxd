@@ -409,7 +409,7 @@ public on `origin/main` for over a week:
 - About fifteen `/home/<user>/apps/…` paths, several pointing into
   a private sibling-project group (leaking the existence of those
   private projects via the path name alone).
-- A VPS IP and a full `ssh ericadmin@<ip> -- sudo docker exec ...`
+- A VPS IP and a full `ssh <user>@<ip> -- sudo docker exec ...`
   line — username + IP + the fact the VPS runs docker as sudo.
 
 Every leak was old. None had been caught by review. None had been
