@@ -28,7 +28,22 @@ from pathlib import Path
 # The Radiant-Core release the regtest image is built from. Bump this (and rebuild
 # via `pyrxd regtest setup`) to track the latest release; see docs/ROADMAP.md and
 # the bump plan for the revalidation the version pin carries.
-DEFAULT_RADIANT_VERSION = "v3.1.1"
+#
+# THIS IS THE ONLY PLACE THE RUNNING NODE'S VERSION IS DECIDED. Every regtest fixture
+# derives its image from `RegtestNode.IMAGE` rather than spelling the tag itself. It
+# used to be spelled independently in five test modules, which meant
+# `scripts/refresh_radiant_core_vendor.py --check` — which reads THIS constant — could
+# pass while the lane ran a different node. A drift check that reads one source while
+# the lane uses another measures nothing.
+#
+# It must also stay consensus-identical with `tests/vendor/radiant_core/MANIFEST.json`'s
+# `tag`, which is the oracle the parity tests assert against. The two are allowed to be
+# different releases, but only while the vendored consensus files are byte-identical
+# between them; `--check` fails when they are not. v3.1.1 -> v3.1.2 was forced by exactly
+# that: v3.1.2 changed `src/validation.h` (DEFAULT_MAX_REORG_DEPTH 6 -> 69 and
+# DEFAULT_FINALIZE_HEADERS_PENALTY 100 -> 0, both fixes for the 2026-06-15 mainnet split),
+# so the oracle described an interpreter the lane did not run.
+DEFAULT_RADIANT_VERSION = "v3.1.2"
 
 #: Radiant MAINNET's minimum relay fee, in RXD per kB — what ``-minrelaytxfee`` and
 #: ``-fallbackfee`` are set to below. A default ``radiantd -regtest`` runs a tenth of
@@ -50,8 +65,8 @@ _REGTEST_DOCKERFILE = """\
 #
 # Build (pin to the latest Radiant-Core release):
 #     docker build -f docker/regtest.Dockerfile \\
-#         --build-arg RADIANT_VERSION=v3.1.1 \\
-#         -t radiant-core:v3.1.1-amd64 .
+#         --build-arg RADIANT_VERSION=v3.1.2 \\
+#         -t radiant-core:v3.1.2-amd64 .
 #
 # `pyrxd regtest setup` builds this for you; `pyrxd regtest up` then runs it.
 # The container is regtest-only, binds RPC to 127.0.0.1, and is reached solely
@@ -64,7 +79,7 @@ _REGTEST_DOCKERFILE = """\
 
 FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d
 
-ARG RADIANT_VERSION=v3.1.1
+ARG RADIANT_VERSION=v3.1.2
 ARG RADIANT_TARBALL=radiant-${RADIANT_VERSION}-linux-x64.tar.gz
 ARG RADIANT_BASEURL=https://github.com/Radiant-Core/Radiant-Core/releases/download/${RADIANT_VERSION}
 

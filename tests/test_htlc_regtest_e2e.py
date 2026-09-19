@@ -44,6 +44,7 @@ import time
 import pytest
 
 from pyrxd.gravity.fee_policy import photons_per_kb_from_rxd_per_kb
+from pyrxd.devnet import RegtestNode
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
@@ -56,7 +57,10 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-_IMAGE = "radiant-core:v3.1.1-amd64"
+#: Derived, never spelled. `scripts/refresh_radiant_core_vendor.py --check` reads
+#: `DEFAULT_RADIANT_VERSION`; a literal here could drift from it and the check would
+#: still pass while this lane ran a different node.
+_IMAGE = RegtestNode.IMAGE
 _CONTAINER = "gravity-regtest-pytest"
 
 #: Radiant MAINNET's relay floor, spelled the way ``-minrelaytxfee`` wants it (RXD/kB).

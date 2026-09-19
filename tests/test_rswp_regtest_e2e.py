@@ -38,6 +38,7 @@ import time
 import pytest
 
 from pyrxd.constants import Network
+from pyrxd.devnet import RegtestNode
 from pyrxd.glyph.script import build_ft_locking_script
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.fee_policy import DeadlineFeePolicy
@@ -61,7 +62,10 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-_IMAGE = "radiant-core:v3.1.1-amd64"
+#: Derived, never spelled. `scripts/refresh_radiant_core_vendor.py --check` reads
+#: `DEFAULT_RADIANT_VERSION`; a literal here could drift from it and the check would
+#: still pass while this lane ran a different node.
+_IMAGE = RegtestNode.IMAGE
 _CONTAINER = "rswp-regtest-pytest"
 _FEE = 1_000_000  # 0.01 RXD — comfortably above THIS node's relay floor for sub-kB txs
 

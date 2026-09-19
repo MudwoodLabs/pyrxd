@@ -13,6 +13,7 @@ import pytest
 from click.testing import CliRunner
 
 from pyrxd.cli.main import cli
+from pyrxd.devnet import DEFAULT_RADIANT_VERSION
 from pyrxd.devnet import DevKey, DevnetError
 
 
@@ -24,7 +25,7 @@ def _extract_json(output: str) -> dict:
 
 _INFO = {
     "container": "pyrxd-devnet",
-    "image": "radiant-core:v3.1.1-amd64",
+    "image": f"radiant-core:{DEFAULT_RADIANT_VERSION}-amd64",
     "rpc_user": "pyrxd",
     "rpc_password": "pyrxd",
     "wallet": "devnet",
@@ -66,7 +67,7 @@ class _FakeNode:
         self.calls.append(("fund", address, amount_rxd))
         return "ab" * 32
 
-    def build_image(self, version: str = "v3.1.1", *, no_cache: bool = False) -> str:
+    def build_image(self, version: str = DEFAULT_RADIANT_VERSION, *, no_cache: bool = False) -> str:
         self.calls.append(("build_image", version, no_cache))
         return f"radiant-core:{version}-amd64"
 
@@ -92,8 +93,12 @@ class TestSetup:
         node = patch_node(_FakeNode())
         result = runner.invoke(cli, ["regtest", "setup"])
         assert result.exit_code == 0, result.output
-        assert "built radiant-core:v3.1.1-amd64" in result.output
-        assert ("build_image", "v3.1.1", False) in node.calls
+        # Derived: this asserts setup PASSES THE DEFAULT THROUGH, not what the
+        # default happens to be. The value itself is pinned independently by
+        # scripts/refresh_radiant_core_vendor.py --check, against the vendored
+        # consensus manifest — so a silent bump still fails something.
+        assert f"built radiant-core:{DEFAULT_RADIANT_VERSION}-amd64" in result.output
+        assert ("build_image", DEFAULT_RADIANT_VERSION, False) in node.calls
 
     def test_setup_honours_version_and_no_cache(self, runner, patch_node):
         node = patch_node(_FakeNode())
@@ -105,11 +110,14 @@ class TestSetup:
         patch_node(_FakeNode())
         result = runner.invoke(cli, ["regtest", "setup", "--json"])
         assert result.exit_code == 0, result.output
-        assert _extract_json(result.output) == {"image": "radiant-core:v3.1.1-amd64", "version": "v3.1.1"}
+        assert _extract_json(result.output) == {
+            "image": f"radiant-core:{DEFAULT_RADIANT_VERSION}-amd64",
+            "version": DEFAULT_RADIANT_VERSION,
+        }
 
     def test_setup_build_failure_is_clean_error(self, runner, monkeypatch):
         class _BuildFails(_FakeNode):
-            def build_image(self, version: str = "v3.1.1", *, no_cache: bool = False) -> str:
+            def build_image(self, version: str = DEFAULT_RADIANT_VERSION, *, no_cache: bool = False) -> str:
                 raise DevnetError("docker build failed: no space left on device")
 
         monkeypatch.setattr("pyrxd.cli.regtest_cmds.RegtestNode", lambda: _BuildFails())
