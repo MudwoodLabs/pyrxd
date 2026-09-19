@@ -60,6 +60,7 @@ __all__ = [
     "AttestationResult",
     "HashMarkOutcome",
     "HashMarkRecord",
+    "algorithm_for",
     "canonical_statement",
     "canonicalize_label",
     "decode_hashmark",
@@ -516,6 +517,25 @@ def max_label_bytes(algorithm_id: int = 0x01) -> int:
     if algorithm_id not in _ALGORITHMS:
         raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
     return _max_label_bytes(_ALGORITHMS[algorithm_id][1])
+
+
+def algorithm_for(algorithm_id: int = 0x01) -> str:
+    """The hash algorithm *algorithm_id* names (§5.3), or raise if unimplemented.
+
+    Public because whoever is about to mark a file has to run the right hash over it,
+    and the only authority on which one that is is the table the encoder writes into the
+    record's header byte. A caller that spells ``"sha256"`` itself has created a second
+    source of truth for what a record CLAIMS versus what was actually hashed, and
+    nothing downstream can detect the disagreement: both halves are well-formed, the
+    signature verifies, and the record is simply false.
+
+    The name is the one :mod:`hashlib` knows, which is what makes
+    :func:`pyrxd.hashmark_tx.digest_file` able to derive its hasher from the id rather
+    than from a second table.
+    """
+    if algorithm_id not in _ALGORITHMS:
+        raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
+    return _ALGORITHMS[algorithm_id][0]
 
 
 def canonicalize_label(label: str) -> str:

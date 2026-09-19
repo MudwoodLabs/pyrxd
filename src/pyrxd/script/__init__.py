@@ -30,17 +30,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.script.timelock",
         "build_p2pkh_with_csv_script",
     ),
-    # HashMark, a third-party OP_RETURN format (see `hashmark.py`). The READ side
-    # has in-repo callers through the inspector; the WRITE side has none, and that
-    # is the shape rather than an omission — pyrxd is a published library and
-    # writing a mark is something a consumer does, not something the SDK does to
-    # itself. Exported as a pair so a consumer who encodes can decode back without
-    # reaching into the submodule. (`docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md`
-    # W5 adds the in-repo caller, a `mark` CLI command.)
+    # HashMark, a third-party OP_RETURN format (see `hashmark.py`). Both sides now
+    # have in-repo callers: the READ side through the inspector, the WRITE side
+    # through `pyrxd.hashmark_tx` and `pyrxd mark` (W5 of
+    # `docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md`). They stay exported
+    # as a set because pyrxd is a published library and writing a mark is mostly
+    # something a consumer does — one that encodes should be able to decode back
+    # without reaching into the submodule.
     #
     # Safe to list here despite this module's no-coincurve rule: `hashmark.py`
     # imports `pyrxd.keys` lazily INSIDE the functions that sign, so importing it
     # pulls no curve binding.
+    "algorithm_for": ("pyrxd.script.hashmark", "algorithm_for"),
     "canonicalize_label": ("pyrxd.script.hashmark", "canonicalize_label"),
     "decode_hashmark": ("pyrxd.script.hashmark", "decode_hashmark"),
     "encode_hashmark": ("pyrxd.script.hashmark", "encode_hashmark"),
