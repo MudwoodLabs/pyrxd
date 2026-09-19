@@ -32,8 +32,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     ),
     # HashMark, a third-party OP_RETURN format (see `hashmark.py`). Both sides now
     # have in-repo callers: the READ side through the inspector, the WRITE side
-    # through `pyrxd.hashmark_tx` and `pyrxd mark` (W5 of
-    # `docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md`). They stay exported
+    # through `pyrxd.hashmark_tx` and `pyrxd mark`. They stay exported
     # as a set because pyrxd is a published library and writing a mark is mostly
     # something a consumer does — one that encodes should be able to decode back
     # without reaching into the submodule.

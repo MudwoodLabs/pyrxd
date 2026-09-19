@@ -55,8 +55,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #:
 #: A FIXED path rather than "whichever UTXO funded this", because the signature is the
 #: identity. §14.1: it permanently links this mark to that key and to every other mark
-#: it signed, and `docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md` builds the
-#: whole product on that binding — a name resolved at a block is a claim about a key. If
+#: it signed, and the attestation work this belongs to rests on that binding — a name
+#: resolved at a block is a claim about a key. If
 #: the signer drifted with the funding UTXO, two marks by one person would be two
 #: strangers, and no amount of later tooling could stitch them back together.
 _DEFAULT_SIGNER_CHANGE, _DEFAULT_SIGNER_INDEX = 0, 0

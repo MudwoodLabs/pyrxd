@@ -7,9 +7,10 @@ sentence below is labelled with which side enforces it, because a regtest suite 
 data-carrier format is exactly where a reader will otherwise assume consensus is doing
 work it is not. It is the same finding ``tests/test_glyph_timelock_regtest_e2e.py``
 records for TIMELOCK — NOT a file in this tree: it lives on the unmerged branch
-``test/timelock-lifecycle-regtest`` (commit ``f050527``), which is where
-``docs/plans/2026-09-18-feat-sealed-attestation-poc-plan.md`` §2 got the finding that
-narrowed this plan to HashMark. Neither is a weakness: a mark's claim is "someone knew
+``test/timelock-lifecycle-regtest`` (commit ``f050527``). That finding — a TIMELOCK
+reveal is a value-0 ``OP_RETURN`` with ``nLockTime == 0`` and no CLTV, so early, wrong-key
+and duplicate reveals all relay and mine — is why this module attests in pyrxd rather than
+leaning on the node. Neither is a weakness: a mark's claim is "someone knew
 this digest by this block", and the block is the only part the chain has to supply.
 
 * **NODE-ENFORCED** — that a mark transaction is standard, relays, and confirms; that it
