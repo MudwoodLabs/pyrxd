@@ -629,3 +629,72 @@ class TestTheEncoderIsReachableAsConsumerSurface:
             check=True,
         )
         assert proc.stdout.strip() == "False", "importing pyrxd.script now pulls coincurve"
+
+
+class TestTheRefusalsAnHonestRunCannotReach:
+    """Guards that cannot fire on valid input — so nothing else proves they work.
+
+    Every check here sits behind something libsecp256k1, the algorithm registry or
+    ``_label_defect`` makes impossible today. That is precisely why each needs a
+    test of its own: a guard with no case that reaches it is indistinguishable
+    from a guard that does not work, and these are the ones that would matter on
+    the day the thing behind them changes.
+    """
+
+    def test_an_empty_push_is_refused_rather_than_written_as_op_0(self) -> None:
+        """``encode_data_push`` answers an empty payload with ``OP_0``, which §4.1
+        rejects outright. No HashMark field is ever empty, so this can only fire on
+        a bug — and if it did not fire, that bug would reach the chain as a record
+        with a second valid spelling."""
+        from pyrxd.script.hashmark import _minimal_push
+
+        assert _minimal_push(b"x") == b"\x01x"
+        with pytest.raises(ValidationError, match="OP_0"):
+            _minimal_push(b"")
+
+    def test_the_223_byte_ceiling_catches_a_field_the_label_cap_cannot(self, key: PrivateKey, monkeypatch) -> None:
+        """For sha256 the label cap is DERIVED from 223, so it always fires first
+        and this check is dead. Register a wider digest and it is the only thing
+        standing between an over-long record and a node that will not relay it."""
+        from pyrxd.script import hashmark
+
+        monkeypatch.setitem(hashmark._ALGORITHMS, 0x7F, ("longhash", 300))
+        with pytest.raises(ValidationError, match=r"403 bytes, over the 223-byte ceiling"):
+            hashmark.encode_hashmark(os.urandom(300), key, algorithm_id=0x7F)
+
+    @pytest.mark.parametrize(
+        ("mutate", "expected"),
+        [
+            (lambda b: bytes([26]) + b[1:], "header 26 outside 27..34"),
+            (lambda b: bytes([35]) + b[1:], "header 35 outside 27..34"),
+            (lambda b: b[:1] + bytes(32) + b[33:], "r out of range"),
+        ],
+    )
+    def test_a_signature_outside_the_specs_ranges_is_refused(
+        self, key: PrivateKey, monkeypatch, mutate, expected: str
+    ) -> None:
+        """§5.6's range rules applied to what we are about to WRITE. libsecp256k1
+        cannot produce any of these, so only a changed curve binding could — and
+        then every conforming verifier would reject the record."""
+        import base64
+
+        import pyrxd.utils as utils
+
+        real = utils.stringify_ecdsa_recoverable
+
+        def mutated(signature: bytes, compressed: bool = True) -> str:
+            return base64.b64encode(mutate(base64.b64decode(real(signature, compressed)))).decode("ascii")
+
+        monkeypatch.setattr(utils, "stringify_ecdsa_recoverable", mutated)
+        with pytest.raises(ValidationError, match=expected):
+            encode_hashmark(_DIGEST, key)
+
+    def test_canonicalize_label_refuses_a_defect_it_cannot_itself_repair(self, monkeypatch) -> None:
+        """The belt in ``canonicalize_label``: ``_label_defect`` is the authority on
+        what canonical means, so if a rule is added there and not here, this raises
+        instead of handing back a label the decoder will reject."""
+        from pyrxd.script import hashmark
+
+        monkeypatch.setattr(hashmark, "_label_defect", lambda label: "fails a rule added later")
+        with pytest.raises(ValidationError, match="canonicalising did not fix it"):
+            hashmark.canonicalize_label("Contract draft")
