@@ -106,14 +106,34 @@ diff in a pull request rather than a silent fetch.
 
 It also does not prove these sources describe the node the integration lane runs. `MANIFEST.json`
 pins the tag the SOURCE came from; `pyrxd.devnet.DEFAULT_RADIANT_VERSION` pins the release the
-regtest image's BINARY is built from, and the two are bumped on different schedules — today the
-source is at `v3.1.2` and the image at `v3.1.1`. That gap is fine only while the two releases share
-these files, so `--check` verifies exactly that and fails if they ever diverge. (They are currently
-byte-identical: `script.h` `3de78962…` and `script.cpp` `759ab524…` at both tags, and likewise the
-two most recently added — `consensus.h` `c344ba58…` and `uint256.h` `e4cc8933…`, checked at `v3.1.1`
-and `v3.1.2` when they were vendored.) If they do diverge, every parity assertion would be
-describing a different script interpreter than the one the lane asks — bump the image, or pin the
-source to the image's tag.
+regtest image's BINARY is built from. The two were bumped on different schedules, and `--check`
+exists to verify that the consensus files are byte-identical between them.
+
+**They diverged, and the check caught it — on 2026-09-16.** The source was at `v3.1.2`, the image
+at `v3.1.1`, and `validation.h` is not shared between those releases: v3.1.2 raised
+`DEFAULT_MAX_REORG_DEPTH` from 6 to 69 and dropped `DEFAULT_FINALIZE_HEADERS_PENALTY` from 100 to 0,
+both fixes for the 2026-06-15 mainnet split. For three nights every parity assertion in the lane was
+checked against an oracle describing a node the lane did not run.
+
+Two things made that survivable for three nights rather than one, and both are worth remembering:
+
+* **The failure was invisible on every push.** `--check` runs only in the scheduled nightly job, and
+  a push-triggered Integration run SKIPS it. So the workflow showed green continuously while the
+  scheduled run failed every night. A green check that does not include the failing job is not
+  evidence about it.
+* **Bumping the constant alone would have looked like a fix and not been one.** Five test modules
+  each spelled `radiant-core:vX.Y.Z-amd64` as their own constant while `--check` reads
+  `DEFAULT_RADIANT_VERSION`. Moving the constant would have turned the check green while those lanes
+  kept starting the old container. The tag is now derived from `RegtestNode.IMAGE` everywhere, and
+  `tests/test_regtest_image_is_derived_not_spelled.py` fails if a module-level constant spells one
+  again.
+
+Both tags are now `v3.1.2`, so `--check` skips the cross-tag comparison entirely rather than passing
+it. If they are ever deliberately separated again, that comparison resumes. When it fails, the
+remedy is to move the IMAGE to the pinned release and revalidate the lane against it — re-pinning
+the source cannot fix an image divergence, because the pin is already where it should be. Pinning
+the source DOWN to the image's tag is the other option, but it gives up a released consensus fix,
+so it is a decision to make deliberately rather than default into.
 
 ## Refreshing
 
