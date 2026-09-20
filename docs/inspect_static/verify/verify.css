@@ -17,9 +17,12 @@
       enough to threaten that are 64-character hex identifiers, and `.mono` breaks
       them anywhere rather than pushing the page wider.
 
-   Shares the inspect tool's tokens deliberately — same project, same colours —
-   but not its stylesheet: /inspect/ is dense and field-oriented, and importing it
-   would drag a hundred rules this page has no elements for. */
+   The two VERDICT colours are the inspect tool's exact values (--color-ft #0072b2
+   and --color-p2pkh #595959), so a verdict a reader checks on one page against the
+   other looks the same on both. The rest of the palette is this page's own and is
+   deliberately not a copy: /inspect/ is a dense field-oriented diagnostic, and
+   importing its stylesheet would drag a hundred rules this page has no elements
+   for. */
 
 :root {
   color-scheme: light dark;
@@ -67,8 +70,10 @@ html, body {
                "Helvetica Neue", Arial, sans-serif;
   font-size: 17px;
   line-height: 1.6;
-  /* Hyphenation off: a broken word inside a sentence about whether two things are
-     identical reads as a rendering fault and costs the sentence authority. */
+  /* No `hyphens: auto` anywhere in this file, and that is the decision rather than an
+     omission: a word broken mid-syllable inside a sentence about whether two things
+     are identical reads as a rendering fault and costs the sentence its authority.
+     The CSS default is `manual`, so leaving it alone is what achieves that. */
   -webkit-text-size-adjust: 100%;
 }
 

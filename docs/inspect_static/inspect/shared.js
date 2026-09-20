@@ -34,10 +34,11 @@
 // `<script src="…/shared.js"></script>`; a classic script runs before any deferred
 // module, so the bindings exist by the time a page script's top level runs.
 //
-// If this ever becomes an ES module, three harnesses break at once
-// (`inspect_render_harness.mjs`, `inspect_fetch_error_harness.mjs`,
-// `verify_render_harness.mjs`) and each of them says so in its own error message
-// rather than silently testing nothing.
+// If this ever becomes an ES module, every harness under tests/web/ that loads this
+// file breaks at once, and each says so in its own named error rather than silently
+// testing nothing. Deliberately not a COUNT here: a number in a comment is recomputed
+// by nobody, and the one this sentence used to carry was already wrong one commit
+// after it was written. `grep -l shared.js tests/web/*.mjs` is the answer.
 
 "use strict";
 
@@ -71,8 +72,12 @@ const MAX_FETCHED_TX_HEX_LEN = 8_000_000;
 // take the tab down instead of answering.
 const MAX_FILE_CHECK_BYTES = 256 * 1024 * 1024;
 
-// Pyodide's CDN base. Kept beside the SRI-pinned <script> tags in the two
-// index.html files; `scripts/refresh-pyodide.sh` bumps all three together.
+// Pyodide's CDN base. It must name the SAME version as the SRI-pinned <script> tags
+// in both index.html files, or a page fetches a matching pyodide.js and then pulls its
+// WASM and stdlib from a different release. `scripts/refresh-pyodide.sh` updates all
+// three and refuses to write a file its pattern did not match;
+// `test_facade_smoke.py` derives the set of files that pin a version and checks both
+// that the script covers every one and that they currently agree.
 const PYODIDE_INDEX_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
 
 // ---------------------------------------------------------------------

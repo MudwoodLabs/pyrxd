@@ -276,6 +276,66 @@ class TestStaticPagePresent:
         # And is executable.
         assert script.stat().st_mode & 0o111, f"{script} is not executable"
 
+    def test_the_refresh_script_names_paths_that_exist(self):
+        """The assertion above tested the WRONG PROPERTY for as long as it existed.
+
+        The script named ``docs/inspect/index.html``, which has never been the page's
+        location — Sphinx's ``html_extra_path`` copies the CONTENTS of
+        ``inspect_static/`` to the site root, so the source is
+        ``docs/inspect_static/inspect/index.html``. Every run exited 1 with "not
+        found", and "the file exists and is executable" stayed true throughout. A
+        guard that cannot tell a working script from a broken one is not a guard.
+        """
+        import re
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        text = (repo_root / "scripts" / "refresh-pyodide.sh").read_text(encoding="utf-8")
+        named = set(re.findall(r'"(docs/[A-Za-z0-9_./-]+)"', text))
+        assert named, "the script names no files at all — this scan is broken, not the script"
+        missing = sorted(rel for rel in named if not (repo_root / rel).is_file())
+        assert not missing, f"refresh-pyodide.sh operates on paths that do not exist: {missing}"
+
+    def test_the_refresh_script_covers_every_file_that_pins_pyodide(self):
+        """DERIVED, in both directions.
+
+        A bump script that updates one of two pages leaves them on two Pyodide
+        versions, with an SRI hash and a CSP that disagree — and the symptom is a
+        page that silently refuses to execute, which looks like nothing. The set of
+        files that pin a version comes from the filesystem here, not from a list
+        somebody has to remember to extend.
+        """
+        import re
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        static = repo_root / "docs" / "inspect_static"
+        pinned = sorted(
+            path.relative_to(repo_root).as_posix()
+            for path in [*static.rglob("*.html"), *static.rglob("*.js")]
+            if re.search(r"cdn\.jsdelivr\.net/pyodide/v[\d.]+/full/", path.read_text(encoding="utf-8"))
+        )
+        assert pinned, "no file pins a Pyodide version — this scan is broken, not the pages"
+        script = (repo_root / "scripts" / "refresh-pyodide.sh").read_text(encoding="utf-8")
+        unhandled = [rel for rel in pinned if rel not in script]
+        assert not unhandled, (
+            f"these files pin a Pyodide version and refresh-pyodide.sh does not touch them: {unhandled}"
+        )
+
+    def test_every_page_pins_the_same_pyodide_version(self):
+        """The property the script exists to maintain, checked directly rather than
+        by trusting that it ran. Two pages on two versions is the state a partial
+        bump leaves behind."""
+        import re
+        from pathlib import Path
+
+        static = Path(__file__).resolve().parents[2] / "docs" / "inspect_static"
+        versions = set()
+        for path in [*static.rglob("*.html"), *static.rglob("*.js")]:
+            versions.update(re.findall(r"cdn\.jsdelivr\.net/pyodide/v([\d.]+)/full/", path.read_text(encoding="utf-8")))
+        assert versions, "no Pyodide version found anywhere — this scan is broken"
+        assert len(versions) == 1, f"the browser pages disagree about which Pyodide they load: {sorted(versions)}"
+
 
 @pytest.mark.skipif(
     not (lambda: __import__("pathlib").Path("docs/inspect_static/inspect/wheels/manifest.json").exists())(),

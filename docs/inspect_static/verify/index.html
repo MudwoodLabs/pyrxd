@@ -73,8 +73,9 @@
         <p>
           A short record published on the Radiant blockchain. It carries a
           <strong>fingerprint</strong> of a file — not the file itself — and, in most
-          cases, a signature. Publishing it puts that fingerprint in a block, and a
-          block's place in the chain cannot be moved afterwards.
+          cases, a signature. Publishing it puts that fingerprint in a block, and the
+          further down the chain that block ends up, the harder its place in the
+          order is to change.
         </p>
       </div>
       <div class="primer-block">
@@ -173,7 +174,8 @@
       <a href="https://mudwoodlabs.github.io/pyrxd/">docs</a>
     </p>
     <p class="footer-note">
-      The same four answers are available offline from a terminal:
+      The same record can be checked from a terminal, where the signature check
+      does run:
       <code>pyrxd verify &lt;transaction&gt; --min-confirmations N</code>.
     </p>
   </footer>
