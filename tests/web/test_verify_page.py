@@ -505,13 +505,26 @@ class TestThePageIsWiredTheWayTheSiteExpects:
         stray = [p.name for p in _STATIC.iterdir() if p.is_file()]
         assert not stray, f"files at the top of inspect_static/ land at the SITE ROOT: {stray}"
 
-    def test_conf_py_names_both_pages(self) -> None:
+    def test_conf_py_names_every_page_that_will_be_published(self) -> None:
         """The comment in ``conf.py`` is the only place the layout rule is written
-        down, and it named exactly one subfolder until this page existed. Flattened
-        before searching: that prose is hard-wrapped, and a line-oriented grep for a
-        wrapped phrase finds nothing while every word is present."""
+        down, and it named exactly one subfolder until this page existed.
+
+        THE SET IS DERIVED FROM THE FILESYSTEM, not typed here. A version of this that
+        pinned the literal ``inspect/`` and ``verify/`` would go stale in exactly the
+        way the comment it guards just did — silently, on the next page. What is
+        asserted is that every directory that Sphinx will publish is mentioned.
+
+        Flattened before searching: that prose is hard-wrapped, and a line-oriented
+        grep for a wrapped phrase finds nothing while every word is present.
+        """
         flat = " ".join((_REPO_ROOT / "docs" / "conf.py").read_text(encoding="utf-8").split())
-        assert "``inspect/`` and ``verify/``" in flat
+        published = sorted(p.name for p in _STATIC.iterdir() if p.is_dir())
+        assert published, "no pages found under inspect_static/ — this scan is broken, not conf.py"
+        missing = [name for name in published if f"``{name}/``" not in flat]
+        assert not missing, (
+            f"conf.py's html_extra_path comment does not mention {missing}, which will be "
+            f"published at the site root anyway"
+        )
 
     def test_the_page_loads_the_shared_script_before_its_own(self) -> None:
         """``verify.js`` resolves ``verdictClass``, ``stripControlChars`` and the two
