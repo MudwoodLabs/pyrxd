@@ -33,8 +33,14 @@ The bridge is reached through ``tests/web/secp256k1_backend_harness.mjs``, which
 imports it verbatim by the same relative path the browser resolves, and through
 ``glue.py``'s ``_recovered_key_bytes``, which is the same result-to-outcome mapping
 the page uses. Nothing here re-implements or stubs the curve: a test that stubbed
-``@noble/secp256k1`` would prove the stub, and planting into the vendored file (see
-``TestThePlantsThatProveThisRuns``) is how that is kept honest.
+``@noble/secp256k1`` would prove the stub, so ``TestTheSecondImplementationIsReallyReached``
+asserts the import path is still the real one and the corpus is still populated.
+
+WHAT THAT CLASS DOES AND DOES NOT DO, since the distinction is the whole reason it is
+worth having. It is a NON-VACUITY check, not a plant: it proves the differential has
+records to run and a real curve to run them against. Whether the ASSERTIONS bite was
+established by planting, and those plants are recorded in the commit message rather
+than here, because a plant is an act and a test is a fixture.
 """
 
 from __future__ import annotations
@@ -397,13 +403,13 @@ class TestTheRegistryStaysOutOfTheShippedLibrary:
         assert recovery_backend() is None
 
 
-class TestThePlantsThatProveThisRuns:
+class TestTheSecondImplementationIsReallyReached:
     """A differential passes trivially when nothing reaches the second implementation.
 
-    These two assert the corpus is real, so a green run above cannot mean "the loop
-    had nothing to iterate" or "the bridge was never imported". The plants that prove
-    the ASSERTIONS bite are recorded in the commit message; these are the ones that
-    can be made permanent.
+    These two assert the corpus is real and the curve behind it is the vendored one, so
+    a green run above cannot mean "the loop had nothing to iterate" or "the bridge was
+    never imported". Neither is a plant — they are the non-vacuity half that can be made
+    permanent; the plants that showed the assertions bite are in the commit message.
     """
 
     def test_the_corpus_is_not_empty(self) -> None:
