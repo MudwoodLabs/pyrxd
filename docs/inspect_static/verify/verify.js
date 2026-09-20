@@ -156,6 +156,9 @@ let inFlight = 0;
 async function onCheck() {
   const text = (INPUT_BOX.value || "").trim();
   if (!text) {
+    // BUMP THE TOKEN even here. Submitting nothing is still a new intention, and a
+    // lookup already in flight must not land on a screen the reader has just emptied.
+    inFlight += 1;
     renderEmpty();
     setFormStatus("Paste a transaction number first.");
     return;
@@ -326,9 +329,15 @@ function bridgeError(err) {
 }
 
 function onClear() {
+  // "START OVER" MUST ACTUALLY STOP. Without this the token of an in-flight lookup
+  // still matches, so a result the reader asked to be rid of appears a second later
+  // and the button reads as broken — a correct answer to a question that was
+  // withdrawn is still the wrong thing on screen.
+  inFlight += 1;
   INPUT_BOX.value = "";
   renderEmpty();
   setFormStatus("");
+  CHECK_BTN.disabled = false;
   const url = new URL(window.location.href);
   url.searchParams.delete("input");
   window.history.replaceState({}, "", url.toString());
