@@ -289,6 +289,38 @@ class TestTheHeadlineAndTheAnswerAgree:
         assert "key custody and nothing more" in text
         assert "does not say they wrote the file, own it, or were first to it" in text
 
+    def test_a_failed_signature_says_recovers_to_rather_than_belongs_to(self) -> None:
+        """THE PARENTHETICAL UNDER A RESULT, which is where this page's riskiest text
+        lives: it inherits the authority of the verdict above it while asserting
+        something nobody checked.
+
+        Recovery on this curve returns a key for ANY well-formed signature, including
+        bytes nobody ever signed with anything. So "the signature belongs to a
+        different key" asserts an OWNER the arithmetic did not find, and invites a
+        reader to go looking for whoever that other key is on the strength of a number
+        that may be an artefact. The honest sentence is weaker, and it is the one that
+        ships.
+
+        The label is also the inspector's own ("recovered from the signature"), so the
+        same number is not described two ways across the two pages.
+        """
+        payload = _payload_with_status("invalid_signature")
+        payload["hashmark"]["attestation"]["recovered_hash160"] = "cd" * 20
+        payload["hashmark"]["attestation"]["signer_address"] = "1SomeOtherKeyEntirely"
+        text = _page(_as_script_result(payload))["text"]
+        assert "recovered from the signature" in text
+        assert "Recovering a key from the signature gives a different one" in text
+        assert "does not tell you who, if anyone, made it" in text
+        assert "belongs to" not in text, "the page claims the signature has an owner; recovery does not establish one"
+
+    def test_the_recovered_key_is_shown_only_when_it_disagrees(self) -> None:
+        """Paired with the test above so the row cannot simply be deleted to satisfy
+        it. When the signature verifies, recovered and committed are the same value by
+        construction and a second row for it would read as a second piece of evidence.
+        """
+        verified = _page(_as_script_result(_payload_with_status("valid")))["text"]
+        assert "recovered from the signature" not in verified
+
     def test_a_v1_record_says_nobody_rather_than_going_quiet(self) -> None:
         """A record with no signer is not a record with an unchecked signer. Rendering
         the two the same way would let "nobody signed this" read as "we did not look"."""

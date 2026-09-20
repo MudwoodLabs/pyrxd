@@ -652,9 +652,15 @@ function answerWhoSigned(hm, att, status) {
       "carries does not come from that key.",
     ));
     if (att.signer_address || att.recovered_hash160) {
+      // "RECOVERS TO", never "belongs to". Recovery on this curve returns a key for
+      // ANY well-formed signature, including bytes nobody ever signed with anything —
+      // so "the signature belongs to a different key" asserts an owner that the
+      // arithmetic did not find. It also invites a reader to go looking for whoever
+      // that other key is, on the strength of a number that may be an artefact.
       sec.appendChild(para(
-        "The signature belongs to a different key than the one the record names, which " +
-        "is why it does not hold.",
+        "Recovering a key from the signature gives a different one from the key the " +
+        "record names, which is what a signature that does not hold looks like. It does " +
+        "not tell you who, if anyone, made it.",
         "answer-body muted",
       ));
     }
@@ -683,8 +689,11 @@ function answerWhoSigned(hm, att, status) {
     "mono",
   ));
   if (att.recovered_hash160 && att.recovered_hash160 !== hm.signer_hash160) {
+    // The inspector's own label for this row is "recovered from the signature". Same
+    // words here on purpose: it is the same number, and a reader checking one page
+    // against the other must not meet two descriptions of it.
     dl.appendChild(fact(
-      "the key the signature belongs to",
+      "recovered from the signature",
       `${att.signer_address || att.recovered_hash160} — not the key this record names`,
       "mono warn",
     ));
