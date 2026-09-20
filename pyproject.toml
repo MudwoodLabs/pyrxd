@@ -218,6 +218,16 @@ include = [
     { path = "docs/inspect_static/*/*.html", format = ["sdist"] },
     { path = "docs/inspect_static/*/*.css", format = ["sdist"] },
     { path = "docs/inspect_static/*/*.js", format = ["sdist"] },
+    # One segment deeper, and named rather than wildcarded: the vendored secp256k1
+    # the pages install so a browser can check a signature, plus the MIT notice that
+    # must travel with it. A `*/*/*.js` rule would have covered it, but it would also
+    # cover whatever anyone ever drops into a new subdirectory, and the rule directly
+    # above exists BECAUSE an over-broad include once packaged un-reviewed binaries.
+    # Naming `vendor/` cannot silently stop covering a third page's copy either --
+    # check-manifest derives the truth from git and fails on any tracked file that
+    # does not ship, which is how the last hand-kept list here was caught.
+    { path = "docs/inspect_static/*/vendor/*.js", format = ["sdist"] },
+    { path = "docs/inspect_static/*/vendor/*.txt", format = ["sdist"] },
 ]
 
 # `check-manifest` (run in CI's `test` job, see

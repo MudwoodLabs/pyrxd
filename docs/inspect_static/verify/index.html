@@ -7,8 +7,9 @@
 
   <!-- Content-Security-Policy — IDENTICAL to /inspect/'s, deliberately.
        This page loads exactly the same things: Pyodide from jsdelivr with SRI,
-       its own CSS, the same-origin wheels + glue.py served from /inspect/, and
-       the one ElectrumX server. It whitelists nothing the inspector does not.
+       its own CSS, the same-origin wheels + glue.py + secp256k1 curve served
+       from /inspect/, and the one ElectrumX server. It whitelists nothing the
+       inspector does not.
 
        default-src 'none'        — deny everything not whitelisted below
        script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net
@@ -16,6 +17,10 @@
                                   'unsafe-eval' is required by Pyodide internals (it
                                   uses eval() in the Python-to-JS bridge); cost is
                                   documented in docs/threat-model.md.
+                                  'self' also covers the vendored secp256k1 the page
+                                  imports to check signatures: it is same-origin, so
+                                  giving this page a curve ADDED NOTHING to this
+                                  policy. No new host, no new directive.
        style-src 'self'          — only our own CSS
        connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
                                 — page-relative (the wheels and glue.py this page
@@ -174,8 +179,8 @@
       <a href="https://mudwoodlabs.github.io/pyrxd/">docs</a>
     </p>
     <p class="footer-note">
-      The same record can be checked from a terminal, where the signature check
-      does run:
+      The signature check runs in this browser. The same record can also be checked
+      from a terminal, if you would rather not take a web page's word for it:
       <code>pyrxd verify &lt;transaction&gt; --min-confirmations N</code>.
     </p>
   </footer>

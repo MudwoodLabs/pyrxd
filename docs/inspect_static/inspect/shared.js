@@ -164,6 +164,15 @@ async function loadManifest(manifestUrl) {
   _assertSafeBasename(manifest.cbor2_wheel, "cbor2_wheel");
   _assertHexSha256(manifest.cbor2_sha256, "cbor2_sha256");
   _assertHexSha256(manifest.glue_sha256, "glue_sha256");
+  // THE CURVE DIGESTS ARE VALIDATED HERE, LOUDLY, and not left to fail inside
+  // `installSignatureBackend`. That function swallows everything by design so a
+  // missing curve can never produce a verdict — which means a manifest with no
+  // digest for the curve would silently turn signature checking off for every
+  // visitor and look completely normal. A broken docs build gets a page that
+  // refuses to start and is fixed the same day; a page quietly reporting "not
+  // checked" on every mark is the failure that sits for a year.
+  _assertHexSha256(manifest.curve_sha256, "curve_sha256");
+  _assertHexSha256(manifest.curve_bridge_sha256, "curve_bridge_sha256");
   return manifest;
 }
 
@@ -196,6 +205,71 @@ async function fetchAndVerify(url, expectedSha256, label) {
 }
 
 // ---------------------------------------------------------------------
+// secp256k1 — the one thing pyrxd cannot do in this tab
+// ---------------------------------------------------------------------
+
+// Give the Python side a curve, so the signature check can actually run.
+//
+// WHAT WAS BROKEN. pyrxd installs here with `deps=False` (see the install block
+// below for why), and `coincurve` is one of the five dependencies that skips.
+// `verify_attestation` therefore returned UNVERIFIABLE for EVERY record, and both
+// pages told every reader the signature "was NOT checked here". On /inspect/ that is
+// a developer shrugging; on /verify/, whose entire purpose is letting a stranger
+// check somebody's claim, it is the product not working.
+//
+// WHAT CROSSES INTO JAVASCRIPT, and it is deliberately one operation: recover a
+// public key from (message hash, r, s, recovery id). The canonical statement's
+// byte-exact JSON, the varint framing, the double-SHA256, low-S, hash160 and the
+// comparison against the committed signer all stay in the one Python implementation
+// `pyrxd verify` uses. See `secp256k1-bridge.js` for why that split is the whole
+// point rather than a shortcut.
+//
+// FAILURE IS SILENT AND SAFE, BY CONSTRUCTION. Anything that goes wrong here —
+// a SHA mismatch, a missing file, an old browser without dynamic `import()` — means
+// no backend is registered, and `verify_attestation` returns the UNVERIFIABLE it
+// returned before by exactly the path it already had. There is no branch in which a
+// curve that failed to load can produce a FAILING verdict, because the code that
+// would have to decide that never runs. Painting an honest signer's mark red because
+// of a script missing from the READER's machine is the worst thing either page could
+// do, and this is what makes it unrepresentable rather than merely avoided.
+//
+// WHAT THE SHA-256 CHECK IS AND IS NOT. The bytes are fetched and verified BEFORE
+// the module is imported, so a deploy whose curve does not match what CI built is
+// never executed. That is a deploy-integrity check — it catches drift and a
+// tampered Pages deploy. It is NOT a sandbox: `script-src 'self'` is what bounds
+// what can run here at all, and an origin serving hostile JavaScript is already
+// serving this file. The provenance of the vendored bytes — which upstream release
+// they are and how that was established — lives in
+// `tests/fixtures/noble_secp256k1_upstream_pin.json` and is asserted in CI by
+// `tests/test_noble_secp256k1_pin.py`, not at runtime.
+//
+// Returns { installed: bool, reason: string|null }. Never throws.
+async function installCurveBackend(bridges, manifest, curveUrl) {
+  if (!curveUrl) {
+    return { installed: false, reason: "this page did not point at a curve bridge" };
+  }
+  try {
+    const bridgeUrl = new URL(curveUrl, document.baseURI);
+    const vendorUrl = new URL("./vendor/noble-secp256k1.js", bridgeUrl);
+    // Verify BOTH, then import. Order matters: `import()` is what executes them.
+    await fetchAndVerify(bridgeUrl.toString(), manifest.curve_bridge_sha256, "secp256k1 bridge");
+    await fetchAndVerify(vendorUrl.toString(), manifest.curve_sha256, "vendored secp256k1");
+    const module = await import(bridgeUrl.toString());
+    if (typeof module.recoverPublicKeySec1 !== "function") {
+      return { installed: false, reason: "the curve bridge exported no recoverPublicKeySec1" };
+    }
+    // `install_signature_backend` returns False rather than raising if anything on
+    // the Python side goes wrong, for the same reason this function does.
+    const ok = bridges.installSignatureBackend(module.recoverPublicKeySec1);
+    return ok
+      ? { installed: true, reason: null }
+      : { installed: false, reason: "pyrxd would not register the curve backend" };
+  } catch (err) {
+    return { installed: false, reason: String((err && err.message) || err) };
+  }
+}
+
+// ---------------------------------------------------------------------
 // Boot — Pyodide, the pyrxd wheel, and the glue module's entry points
 // ---------------------------------------------------------------------
 
@@ -206,11 +280,13 @@ async function fetchAndVerify(url, expectedSha256, label) {
 // its own page renders errors. That split is why one boot can serve two pages
 // whose loading screens look nothing alike.
 //
-// `wheelsBase` and `glueUrl` are absolute URLs the caller resolves against its
-// own `document.baseURI`. /verify/ points BOTH at /inspect/'s copies on purpose:
-// the wheel, the manifest and glue.py are built and SHA-pinned once by the docs
-// CI step, and a second copy would be a second thing to keep in step — and the
-// one most likely to go stale is the one nobody is looking at.
+// `wheelsBase`, `glueUrl` and `curveUrl` are absolute URLs the caller resolves
+// against its own `document.baseURI`. /verify/ points ALL THREE at /inspect/'s
+// copies on purpose: the wheel, the manifest, glue.py and the curve bridge are
+// built and SHA-pinned once by the docs CI step, and a second copy would be a
+// second thing to keep in step — and the one most likely to go stale is the one
+// nobody is looking at. Here that would mean a public page checking strangers'
+// signatures with a curve the developer tool had already replaced.
 async function bootPyrxdRuntime(options) {
   const opts = options || {};
   const wheelsBase = opts.wheelsBase;
@@ -265,9 +341,15 @@ async function bootPyrxdRuntime(options) {
     // declares five runtime deps (aiohttp, coincurve, base58,
     // pycryptodomex, websockets) for the full SDK surface; most have
     // no pure-Python wheels. Neither page needs them — see
-    // ``tests/web/test_inspect_imports_pyodide_clean.py``. It is also
-    // WHY `unverifiable` is the normal signature outcome in a browser:
-    // coincurve is one of the five, and there is no secp256k1 here.
+    // ``tests/web/test_inspect_imports_pyodide_clean.py``.
+    //
+    // coincurve is one of the five, so there is no secp256k1 in the
+    // Python interpreter here and `verify_attestation` would return
+    // UNVERIFIABLE for every record. `installSignatureBackend` above
+    // supplies the one curve operation it needs from vendored
+    // JavaScript, which is why a signature check now runs in this tab.
+    // When that install fails, UNVERIFIABLE is still what comes back
+    // and it still means "not checked here".
     //
     // Re-assert the basename invariant at the install site. ``loadManifest``
     // already validates these, but the FS path concat (``/tmp/${name}``)
@@ -302,6 +384,7 @@ await micropip.install("emfs:/tmp/${manifest.wheel}", deps=False)
   // aes_cbc) resolves cleanly. Every entry point comes back as a PyProxy.
   let bridges;
   let versionText;
+  let signatureCheck = { installed: false, reason: "the runtime did not finish loading" };
   try {
     const glueBuffer = await fetchAndVerify(glueUrl, manifest.glue_sha256, "glue.py");
     const glueSrc = new TextDecoder("utf-8").decode(glueBuffer);
@@ -323,14 +406,32 @@ _pyrxd_version_blob = (
       markAnchor: glue.mark_anchor,
       fileCheckPlan: glue.file_check_plan,
       judgeFileDigest: glue.judge_file_digest,
+      // Not a per-check bridge: called once, just below, to hand the Python side
+      // a curve. It is bound here anyway so it is reached the same way every
+      // other entry point is — `tests/web/test_mark_anchor_bridge.py` derives its
+      // universe from glue.py's public functions, and a boot that called this one
+      // off the module object would be the one glue function nothing could see.
+      installSignatureBackend: glue.install_signature_backend,
     };
     versionText = String(pyodide.globals.get("_pyrxd_version_blob"));
+    // AFTER the glue is importable and BEFORE the page is told it is ready, so the
+    // first mark a reader checks already has a curve behind it. Not inside the try's
+    // failure path: a curve that will not load must not stop the page loading.
+    signatureCheck = await installCurveBackend(bridges, manifest, opts.curveUrl);
   } catch (err) {
     throw new Error(`Could not load inspect glue: ${err.message}`);
   }
 
+  if (!signatureCheck.installed) {
+    // Console only. The READER is told by the verdict itself, which says NOT CHECKED
+    // and why, in words that come out of `_inspect_core` — a second explanation
+    // written here could drift from it, and a banner about a library is not what
+    // someone who was handed a transaction number came to read.
+    console.warn(`signature checking is off in this tab: ${signatureCheck.reason}`);
+  }
+
   onProgress(100);
-  return { pyodide, bridges, versionText, gitSha: manifest.git_sha };
+  return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck };
 }
 
 // Convert a Pyodide return value to a plain JS object and release the proxy.
@@ -552,13 +653,16 @@ function stripControlChars(s) {
 // than on either verdict — a new outcome rendered green is a forgery shown as
 // genuine, and one rendered red is an honest mark shown as a lie.
 //
-// `verdict-unchecked` IS THE IMPORTANT ONE, and it is the browser's normal case.
-// `verify_attestation` returns UNVERIFIABLE when secp256k1 is absent, and in a
-// browser it is ALWAYS absent (pyrxd installs here with `deps=False` and coincurve
-// has no pure-Python wheel). Painting an honest signer's mark with the error colour
-// because the READER's browser lacks a curve library is the single worst thing
-// either of these pages could do, so "not checked" is neutral and says whose
-// limitation it is.
+// `verdict-unchecked` IS STILL THE IMPORTANT ONE, even though it is no longer the
+// browser's normal case. `verify_attestation` returns UNVERIFIABLE when it has no
+// secp256k1, and pyrxd installs here with `deps=False` so coincurve is absent —
+// `installSignatureBackend` supplies a vendored curve instead, and when it does the
+// verdict is a real VERIFIED or DOES NOT VERIFY. When it does NOT (a SHA mismatch,
+// a blocked file, a browser with no dynamic import), UNVERIFIABLE comes back and
+// must stay NEUTRAL: painting an honest signer's mark with the error colour because
+// the READER's machine could not load a library is the single worst thing either of
+// these pages could do, so "not checked" says whose limitation it is and judges
+// nobody.
 function verdictClass(status) {
   if (status === "VERIFIED" || status === "MATCHES") return "verdict-ok";
   if (status === "DOES NOT VERIFY" || status === "DOES NOT MATCH") return "verdict-bad";
