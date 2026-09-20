@@ -179,10 +179,26 @@ class TestAMissingCurveIsNotAVerdict:
     def test_it_names_whose_limitation_it_is(self, payload) -> None:
         """ "Not checked" with no reason invites the reader to assume the record is at
         fault. The reason is their own browser, and it says so twice: once in the
-        payload's own detail, once in this page's plain-language paragraph."""
+        payload's own detail, once in this page's plain-language paragraph.
+
+        The wording changed when the page gained a curve: this is no longer the
+        ordinary path, and a sentence implying no browser can do this maths would now
+        be false. What must not change is that the reason names the READER's machine."""
         text = _page(_as_script_result(payload))["text"]
         assert "secp256k1" in text
-        assert "this browser has no library for the maths involved" in text
+        assert "the code that does the maths did not load" in text
+        assert "this page normally does check it" in text
+
+    def test_it_does_not_claim_a_browser_CANNOT_check_a_signature(self, payload) -> None:
+        """The page checks signatures now, so every sentence that said otherwise is a
+        false claim sitting under a verdict. These are the exact phrasings this page
+        shipped with; none may come back, here or in the ordinary path."""
+        text = _page(_as_script_result(payload))["text"]
+        for stale in (
+            "this browser has no library for the maths involved",
+            "where the signature check does run",
+        ):
+            assert stale not in text, f"a sentence the page outgrew is back: {stale!r}"
 
     def test_it_never_says_the_signature_failed(self, payload) -> None:
         """THE WHOLE POINT. A red cross beside an honest signer's mark because the
@@ -581,7 +597,37 @@ class TestThePageIsWiredTheWayTheSiteExpects:
         source = (_VERIFY_DIR / "verify.js").read_text(encoding="utf-8")
         assert '"../inspect/wheels/"' in source
         assert '"../inspect/glue.py"' in source
+        assert '"../inspect/secp256k1-bridge.js"' in source
         assert not (_VERIFY_DIR / "wheels").exists(), "a second wheel directory has appeared under /verify/"
+        assert not (_VERIFY_DIR / "vendor").exists(), "a second vendored curve has appeared under /verify/"
+
+    def test_the_PAGE_CHROME_does_not_say_the_signature_is_unchecked(self) -> None:
+        """THE SENTENCES THE RENDER HARNESS CANNOT SEE.
+
+        Every other prose guard here drives ``verify.js`` and reads what it emitted.
+        ``index.html``'s own copy — the primer, the footer — is never rendered by that
+        harness, so a claim there can go false and stay false with a completely green
+        suite. It did: the footer said the check "does run" in a terminal, meaning it
+        did not run here, and that stopped being true the day the page got a curve.
+
+        Searched with the newlines squeezed out, because this text is hard-wrapped and
+        a line-oriented grep cannot see a sentence that wraps.
+        """
+        flat = " ".join((_VERIFY_DIR / "index.html").read_text(encoding="utf-8").split())
+        for stale in (
+            "where the signature check does run",
+            "has no library for the maths",
+            "there never will be",
+        ):
+            assert stale not in flat, (
+                f"index.html still tells a reader the signature is not checked here: {stale!r}. "
+                f"The page checks it now; this sentence is a false claim under a real verdict."
+            )
+        assert "The signature check runs in this browser" in flat, (
+            "index.html no longer says the check runs here — if that became untrue, the "
+            "asymmetry test above should have caught it first; if it is merely reworded, "
+            "reword this guard deliberately."
+        )
 
     def test_its_content_security_policy_whitelists_nothing_new(self) -> None:
         """DERIVED, not retyped. The public page must stay inside the policy the

@@ -42,6 +42,7 @@ must be labelled as such by any caller that surfaces it.
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NoReturn
@@ -60,12 +61,15 @@ __all__ = [
     "AttestationResult",
     "HashMarkOutcome",
     "HashMarkRecord",
+    "RecoveryUnavailable",
     "algorithm_for",
     "canonical_statement",
     "canonicalize_label",
     "decode_hashmark",
     "encode_hashmark",
     "max_label_bytes",
+    "recovery_backend",
+    "set_recovery_backend",
     "verify_attestation",
 ]
 
@@ -332,6 +336,70 @@ RADIANT_MAINNET_GENESIS = "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7
 _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
+class RecoveryUnavailable(Exception):
+    """A registered recovery backend could not run — NOT a verdict on the signature.
+
+    The distinction is the whole reason this exception exists. Everything else that
+    goes wrong during recovery is a statement about the BYTES ("r is not the
+    x-coordinate of any point"), and becomes ``INVALID_SIGNATURE``. This one is a
+    statement about the MACHINE, and becomes ``UNVERIFIABLE`` — "not checked here",
+    which is what a reader must be told when an honest mark met a broken verifier.
+    """
+
+
+#: What :func:`set_recovery_backend` accepts, and the only secp256k1 operation a
+#: HashMark verifier needs: recover the public key from an ECDSA signature.
+#:
+#: ``(message_hash, r, s, rec_id, compressed) -> bytes``
+#:
+#: * ``message_hash`` — 32 bytes, ALREADY hashed. This is the ECDSA ``z``, i.e.
+#:   ``hash256(text_digest(statement))``. A backend must not hash it again.
+#: * ``r``, ``s`` — 32 bytes each, big-endian. Range and low-S checks have already
+#:   run; a backend is arithmetic, not policy.
+#: * ``rec_id`` — 0..3, derived from the signature header.
+#: * ``compressed`` — whether to return the 33-byte SEC1 form. This decides the
+#:   bytes the signer's hash160 was taken over, so it is the caller's to choose.
+#:
+#: Returns the SEC1 public key. Raises :class:`RecoveryUnavailable` if it could not
+#: run at all; any other exception is read as "these bytes recover to nothing".
+RecoveryBackend = Callable[[bytes, bytes, bytes, int, bool], bytes]
+
+#: The registered backend, or ``None`` for "use coincurve".
+#:
+#: WHY A MODULE-LEVEL REGISTRY rather than a parameter threaded through callers.
+#: The environment that needs this is the browser: pyrxd installs under Pyodide with
+#: ``deps=False`` and ``coincurve`` has no pure-Python wheel, so every mark on the
+#: public /verify/ page read NOT CHECKED. A parameter would have to be passed by
+#: every surface that inspects a mark, and the surface that forgets is the one that
+#: quietly goes on saying "not checked" while looking finished. Registering once at
+#: page boot means /inspect/, /verify/ and anything added later get the real verdict
+#: without anyone remembering to ask for it.
+#:
+#: It is deliberately NOT a fallback-when-coincurve-is-missing: a registered backend
+#: wins outright, so a test can pin one implementation against the other over the
+#: same records. Nothing in ``src/`` calls the setter — ``tests/
+#: test_signature_backend_differential.py`` asserts that, so the CLI and SDK keep
+#: using coincurve and this value keeps being ``None`` everywhere but the browser.
+_recovery_backend: RecoveryBackend | None = None
+
+
+def set_recovery_backend(backend: RecoveryBackend | None) -> None:
+    """Register (or clear, with ``None``) the secp256k1 recovery this module uses.
+
+    For environments with no ``coincurve``. See :data:`RecoveryBackend` for the
+    contract, and :data:`_recovery_backend` for why this is a registry.
+    """
+    global _recovery_backend
+    if backend is not None and not callable(backend):
+        raise ValidationError("a recovery backend must be callable")
+    _recovery_backend = backend
+
+
+def recovery_backend() -> RecoveryBackend | None:
+    """The currently registered backend, or ``None`` when coincurve is in use."""
+    return _recovery_backend
+
+
 class AttestationOutcome(Enum):
     """Whether a decoded v2 record's signature actually holds."""
 
@@ -427,13 +495,27 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # the reader, and only the verdict is withheld, with the reason. Reporting
     # INVALID_SIGNATURE here would be far worse: it would tell a reader a genuine
     # mark's claim does not hold, on the strength of a missing dependency.
-    try:
-        from ..keys import recover_public_key
-    except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
-        return AttestationResult(
-            AttestationOutcome.UNVERIFIABLE,
-            detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
-        )
+    # A REGISTERED BACKEND WINS, and when there is one the coincurve import is not
+    # attempted at all — under Pyodide it would only raise. See `set_recovery_backend`.
+    backend: RecoveryBackend | None = _recovery_backend
+    if backend is None:
+        try:
+            from ..keys import recover_public_key
+        except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
+            return AttestationResult(
+                AttestationOutcome.UNVERIFIABLE,
+                detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
+            )
+
+        def backend(message_hash: bytes, r_b: bytes, s_b: bytes, rid: int, is_compressed: bool) -> bytes:
+            # `hasher=None` because the caller below has already applied `hash256`.
+            # Byte-identical to the older `hasher=hash256` form over the preimage —
+            # coincurve applies the hasher itself and this just applies it one line
+            # earlier, so BOTH backends receive the same ECDSA `z` and the two paths
+            # differ in nothing but the curve arithmetic.
+            return recover_public_key(r_b + s_b + bytes([rid]), message_hash, hasher=None).serialize(
+                compressed=is_compressed
+            )
 
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")
@@ -473,9 +555,32 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="s is not low-S")
 
     statement = canonical_statement(record, network_genesis=network_genesis)
+    # §5.6: the header's +4 says the signer's hash160 was taken over the COMPRESSED
+    # form. It selects how the recovered key is serialised before hashing; it is not
+    # an input to the recovery, and swapping the two produces a wrong hash160 and a
+    # confident DOES NOT VERIFY on an honest mark.
+    compressed = header >= 31
+    message = text_digest(statement)
+    # ONE CALL SITE FOR BOTH CURVES. coincurve and a registered backend reach this
+    # through the same signature, the same arguments and the same exception mapping,
+    # so the only thing that can differ between the CLI and the browser is the
+    # arithmetic itself — which is what `tests/test_signature_backend_differential.py`
+    # pins. A second call shape here would be a second set of edges to get wrong.
+    #
+    # The backend is handed the ECDSA `z`, not the preimage: a backend that is not
+    # coincurve has no `hasher=` argument to be told about, and "already hashed" is
+    # the one thing about this call a JavaScript implementation can get wrong in a
+    # way that still returns a key.
     try:
-        pub = recover_public_key(r_bytes + s_bytes + bytes([rec_id]), text_digest(statement), hasher=hash256)
-        recovered = hash160(pub.serialize(compressed=header >= 31)).hex()
+        recovered = hash160(backend(hash256(message), r_bytes, s_bytes, rec_id, compressed)).hex()
+    except RecoveryUnavailable as exc:
+        # NOT a verdict. The backend could not run; the record is untouched by that,
+        # and telling a reader an honest mark's claim does not hold on the strength of
+        # a broken verifier is the worst outcome this function has.
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"the signature was not checked here: {exc}",
+        )
     except Exception as exc:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail=f"recovery failed: {exc}")
 

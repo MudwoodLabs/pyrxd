@@ -688,6 +688,96 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
     }
 
 
+def _recovered_key_bytes(result: object) -> bytes:
+    """Turn what ``secp256k1-bridge.js`` returned into public key bytes, or raise.
+
+    THE ONE PLACE THE BRIDGE'S RETURN SHAPE IS INTERPRETED, and it is here rather
+    than inline in :func:`install_signature_backend` so that
+    ``tests/test_signature_backend_differential.py`` — which reaches the same
+    JavaScript over a subprocess instead of a Pyodide proxy — reads it through this
+    function too. A second copy of this mapping is a second opinion about whether a
+    stranger's mark is forged.
+
+    The asymmetry lives in which exception comes out:
+
+    * ``RecoveryUnavailable`` — we could not check. Becomes ``NOT CHECKED``.
+    * ``ValueError`` — the curve says these bytes recover to nothing. Becomes
+      ``DOES NOT VERIFY``, which is the same verdict coincurve's own refusal earns.
+
+    Anything unrecognised fails toward ``RecoveryUnavailable``: a shape this build
+    does not understand is ignorance, not evidence.
+    """
+    from pyrxd.script.hashmark import RecoveryUnavailable
+
+    # A Pyodide `JsProxy` for a plain JS object answers `to_py`; a dict (the test's
+    # transport, and any future one) is already there.
+    if hasattr(result, "to_py"):
+        result = result.to_py()
+    if not isinstance(result, dict):
+        raise RecoveryUnavailable(f"the curve bridge returned {type(result).__name__}, not a result object")
+
+    if result.get("ok") is True:
+        key_hex = result.get("publicKey")
+        if not isinstance(key_hex, str):
+            raise RecoveryUnavailable("the curve bridge reported success without a key")
+        try:
+            key = bytes.fromhex(key_hex)
+        except ValueError as exc:
+            raise RecoveryUnavailable(f"the curve bridge returned an unreadable key ({exc})") from exc
+        # 33 compressed or 65 uncompressed. A length nothing on this curve produces
+        # would hash160 to a perfectly well-formed wrong answer, so refuse it here
+        # rather than let it become a verdict.
+        if len(key) not in (33, 65):
+            raise RecoveryUnavailable(f"the curve bridge returned a {len(key)}-byte key")
+        return key
+
+    kind = result.get("kind")
+    reason = str(result.get("reason") or "no reason given")
+    if kind == "no-key":
+        raise ValueError(f"no key recovers from these bytes ({reason})")
+    raise RecoveryUnavailable(f"the curve bridge refused the request ({kind}): {reason}")
+
+
+def install_signature_backend(js_recover: object) -> bool:
+    """Route ``verify_attestation``'s secp256k1 recovery through ``js_recover``.
+
+    THE REASON THIS PAGE CAN CHECK A SIGNATURE AT ALL. pyrxd installs here with
+    ``deps=False`` because most of its runtime dependencies have no pure-Python
+    wheel, and ``coincurve`` is one of them — so until this is called, every mark on
+    the public /verify/ page reports NOT CHECKED and the page's headline question
+    goes unanswered. ``js_recover`` is ``recoverPublicKeySec1`` from
+    ``secp256k1-bridge.js``, which the loader SHA-256 verifies before importing.
+
+    Registering it is all it takes: :mod:`pyrxd.script.hashmark` prefers a registered
+    backend over coincurve, so /inspect/ and /verify/ both get a real verdict from
+    the one Python implementation the CLI uses — the canonical statement, the varint
+    framing, low-S, hash160 and the comparison against the committed signer all stay
+    where they already were.
+
+    :returns: True once the backend is installed. Never raises: a page that could
+        not install one must fall back to the honest NOT CHECKED it had before, not
+        fail to load.
+    """
+    try:
+        from pyrxd.script.hashmark import RecoveryUnavailable, recovery_backend, set_recovery_backend
+
+        def _backend(message_hash: bytes, r: bytes, s: bytes, rec_id: int, compressed: bool) -> bytes:
+            try:
+                result = js_recover(message_hash.hex(), r.hex(), s.hex(), int(rec_id), bool(compressed))
+            except Exception as exc:  # the JS call itself failed — not a verdict
+                raise RecoveryUnavailable(f"the curve bridge could not be called ({_safe_error(exc)})") from exc
+            return _recovered_key_bytes(result)
+
+        set_recovery_backend(_backend)
+        # ASK THE REGISTRY, do not assume. "the setter did not raise" and "a curve is
+        # installed" are different facts, and the caller acts on the second: a False
+        # here leaves both pages on the honest NOT CHECKED, while a True that was not
+        # true would leave them waiting for verdicts that never come.
+        return recovery_backend() is _backend
+    except Exception:  # pragma: no cover - nothing here should raise; see the docstring
+        return False
+
+
 def file_check_plan(algorithm_id: object) -> dict:
     """Which hash to run over a chosen file, per the record's own header byte.
 

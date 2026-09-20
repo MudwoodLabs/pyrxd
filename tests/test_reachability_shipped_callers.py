@@ -44,6 +44,19 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _SRC = _ROOT / "src" / "pyrxd"
 _SCRIPTS = _ROOT / "scripts"
+#: The Pyodide bridge behind the two browser pages. It is DEPLOYED Python — GitHub
+#: Pages serves it and `shared.js` fetches, SHA-256 checks and executes it — so a
+#: symbol only it calls has a production caller by any honest reading. This scan
+#: could not see that: its universe was src/ plus scripts/, and glue.py was the one
+#: shipped Python file outside both. The first symbol to expose the gap was
+#: `set_recovery_backend`, whose entire purpose is to be called from a browser.
+#:
+#: It contributes REFERENCES only, never DEFINITIONS, exactly like scripts/: its own
+#: public functions are called from JavaScript, which no AST scan here can see, and
+#: requiring them to have Python callers would flag every one of them. They have
+#: their own derived guard — `tests/web/test_mark_anchor_bridge.py` checks each is
+#: bound by the shared boot AND read by a page, in both directions.
+_WEB_GLUE = _ROOT / "docs" / "inspect_static" / "inspect" / "glue.py"
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +134,9 @@ _KNOWN_UNREACHED: dict[str, str] = {
 
 @lru_cache(maxsize=1)
 def _shipped_trees() -> tuple[tuple[Path, ast.Module], ...]:
-    """Parse every shipped module once: src/pyrxd/**/*.py plus the top-level scripts/*.py."""
-    files = sorted(_SRC.rglob("*.py")) + sorted(_SCRIPTS.glob("*.py"))
+    """Parse every shipped module once: src/pyrxd/**/*.py, the top-level scripts/*.py,
+    and the deployed Pyodide glue (see :data:`_WEB_GLUE`)."""
+    files = sorted(_SRC.rglob("*.py")) + sorted(_SCRIPTS.glob("*.py")) + [_WEB_GLUE]
     return tuple((p, ast.parse(p.read_text(), filename=str(p))) for p in files)
 
 
@@ -205,7 +219,7 @@ def _unreached_public_symbols() -> dict[str, str]:
     consumer = _consumer_surface()
     out: dict[str, str] = {}
     for p, tree in _shipped_trees():
-        if p.name == "__init__.py" or _SCRIPTS in p.parents:
+        if p.name == "__init__.py" or _SCRIPTS in p.parents or p == _WEB_GLUE:
             continue
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):

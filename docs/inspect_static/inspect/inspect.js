@@ -68,6 +68,9 @@ const EXAMPLE_CHIPS = document.querySelectorAll(".example-chip");
 // discover it at runtime via the `manifest.json` written next to it.
 const WHEELS_BASE = new URL("./wheels/", document.baseURI).toString();
 const GLUE_URL = new URL("./glue.py", document.baseURI).toString();
+// The secp256k1 the Python side does not have under Pyodide. Without it this
+// page reported "not checked" for every signed record too.
+const CURVE_URL = new URL("./secp256k1-bridge.js", document.baseURI).toString();
 
 // Module-scope handles to the Python entry points once boot completes.
 // Keeping these on the module rather than `window` avoids polluting the
@@ -134,6 +137,7 @@ async function boot() {
     runtime = await bootPyrxdRuntime({
       wheelsBase: WHEELS_BASE,
       glueUrl: GLUE_URL,
+      curveUrl: CURVE_URL,
       onProgress: setProgress,
     });
   } catch (err) {
@@ -852,7 +856,9 @@ function appendOpReturnPayload(dl, row) {
 // MISSING CAPABILITY OF THE READER on the read side. Painting a red cross beside
 // an honest signer's mark because this browser has no secp256k1 would be the
 // single worst thing this page could do, so "not checked here" is said in as many
-// words, and whose limitation it is is named.
+// words, and whose limitation it is is named. `shared.js` installs a vendored
+// curve at boot, so that branch is now the exception rather than the rule — but it
+// is still reachable, and it still must not read as a verdict.
 //
 // Every sentence below that judges anything comes from the payload, which got it
 // from `_inspect_core._ATTESTATION_VERDICTS` — the same table `pyrxd glyph

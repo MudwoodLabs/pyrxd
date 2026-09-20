@@ -18,11 +18,14 @@
 //     and this key vouched for it. Never authorship, never ownership, never
 //     location, and never evidence that the document is true.
 //   * `UNVERIFIABLE` — rendered NOT CHECKED — is "this browser did not check",
-//     never "the claim failed". It is the NORMAL outcome here: pyrxd installs under
-//     Pyodide with `deps=False` and coincurve has no pure-Python wheel, so there is
-//     no secp256k1 in this tab and there never will be. Painting an honest signer's
-//     mark with the error colour because of a library missing from the READER's
-//     machine is the single worst thing this page could do.
+//     never "the claim failed". It used to be the ONLY outcome here: pyrxd installs
+//     under Pyodide with `deps=False` and coincurve has no pure-Python wheel, so
+//     every mark read "not checked" and this page's headline question went
+//     unanswered. `shared.js` now installs a vendored secp256k1 as a recovery
+//     backend, so the verdict is a real VERIFIED or DOES NOT VERIFY. NOT CHECKED
+//     remains for the tab where that curve does not load, and it must stay neutral:
+//     painting an honest signer's mark with the error colour because of a library
+//     missing from the READER's machine is the single worst thing this page could do.
 //   * Every status word and every sentence that judges anything comes out of
 //     `pyrxd.glyph._inspect_core` through `glue.py` — the same table `pyrxd glyph
 //     inspect` and `pyrxd verify` print from. Nothing here decides what a verdict
@@ -62,6 +65,10 @@ const EXAMPLE_CHIPS = document.querySelectorAll(".example-chip");
 // marks with an old decoder while the developer tool used a current one.
 const WHEELS_BASE = new URL("../inspect/wheels/", document.baseURI).toString();
 const GLUE_URL = new URL("../inspect/glue.py", document.baseURI).toString();
+// The secp256k1 the Python side does not have. Same copy as /inspect/, for the
+// same reason as the wheel: two curves deciding whether a stranger's mark is
+// genuine is one curve too many.
+const CURVE_URL = new URL("../inspect/secp256k1-bridge.js", document.baseURI).toString();
 
 // Bridge handles, filled in by boot. `bridges` is passed whole to the shared file
 // check; the two this file calls directly are pulled out for readability.
@@ -102,6 +109,7 @@ async function boot() {
     runtime = await bootPyrxdRuntime({
       wheelsBase: WHEELS_BASE,
       glueUrl: GLUE_URL,
+      curveUrl: CURVE_URL,
       onProgress: setProgress,
     });
   } catch (err) {
@@ -674,19 +682,21 @@ function answerWhoSigned(hm, att, status) {
       ));
     }
   } else {
-    // NOT CHECKED — and in a browser this is the ordinary path, not a fault. Say
-    // whose limitation it is, and say it before the reader can supply the
-    // affirmative sentence themselves.
+    // NOT CHECKED — and this is no longer the ordinary path. The page installs a
+    // curve at boot and normally reaches a real verdict; landing here means that
+    // failed in THIS tab. Say whose limitation it is, and say it before the reader
+    // can supply the affirmative sentence themselves.
     sec.appendChild(para(
       "The record names a key. Whether the signature really comes from that key was " +
-      "NOT checked here — this browser has no library for the maths involved, so the " +
-      "check was withheld rather than guessed at.",
+      "NOT checked here — this page normally does check it, and in this browser the " +
+      "code that does the maths did not load, so the check was withheld rather than " +
+      "guessed at.",
     ));
     sec.appendChild(para(
       "Read the key below as something the record claims, not as something this page " +
       "confirmed. It is not evidence that the mark is bad: an honest mark and a forged " +
-      "one look exactly the same until that check runs. To run it, use " +
-      "`pyrxd verify` from a terminal.",
+      "one look exactly the same until that check runs. Reloading the page may be " +
+      "enough; otherwise run `pyrxd verify` from a terminal.",
       "answer-body muted",
     ));
   }

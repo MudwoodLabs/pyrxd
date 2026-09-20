@@ -406,16 +406,36 @@ statement and a pasted script carries no chain context, so mainnet is
 **assumed**, and the assumption is reported in the output rather than
 hidden — the same bytes on another chain are a different statement.
 
-`unverifiable` is the one to understand, because it is the **normal**
-outcome in the browser and was missing from this list until W8. Verifying
-needs secp256k1, and the Pyodide page installs pyrxd without it
-(`coincurve` ships no pure-Python wheel), so every v2 record pasted into
-`/inspect/` comes back unverifiable. That is a missing capability of the
-reader, not a fact about the record: the digest, the label and the signer
-the record names all still reach you, and only the verdict is withheld.
-Both surfaces render it as **NOT CHECKED**, never as a failure — telling
-someone an honest mark's claim does not hold, on the strength of an
-absent dependency, would be the worst thing either tool could do.
+`unverifiable` is the one to understand. Verifying needs secp256k1, and
+the Pyodide page installs pyrxd without it (`coincurve` ships no
+pure-Python wheel), so for a long time **every** v2 record pasted into
+`/inspect/` — and every mark checked on `/verify/` — came back
+unverifiable, and the public page's headline question went permanently
+unanswered.
+
+Both pages now install a vendored `@noble/secp256k1` as a *recovery
+backend* (`docs/inspect_static/inspect/secp256k1-bridge.js`, pinned in
+`tests/fixtures/noble_secp256k1_upstream_pin.json`), so the browser
+reaches a real `valid` or `invalid_signature`. Only one operation crosses
+into JavaScript — recover a public key from a message hash, `r`, `s` and
+a recovery id. The canonical statement, the varint framing, the
+double-SHA256, the low-S and range checks, `hash160`, and the comparison
+against the committed signer all stay in this one Python implementation,
+which is what stops the browser and `pyrxd verify` ever disagreeing about
+a rule. `tests/test_signature_backend_differential.py` runs both curves
+over the same records and fails if their verdicts diverge.
+
+`unverifiable` therefore now means the curve did not load *in that tab* —
+a SHA mismatch against the manifest, a blocked file, a browser without
+dynamic `import()`. It remains a missing capability of the reader, not a
+fact about the record: the digest, the label and the signer the record
+names all still reach you, and only the verdict is withheld. Both
+surfaces render it as **NOT CHECKED**, never as a failure — telling
+someone an honest mark's claim does not hold, on the strength of a
+library that did not load on their machine, would be the worst thing
+either tool could do. Nothing in the load path can reach a *failing*
+verdict: if the curve does not arrive, no backend is registered and
+`verify_attestation` returns `unverifiable` by the path it already had.
 
 Note the asymmetry with the write side, which is deliberate: `MarkPlan`
 treats `unverifiable` as a **refusal**, because funding a transaction
@@ -544,13 +564,16 @@ code rather than assumed:
   above proves that *importing* the façade pulls in no heavy dependency.
   It does not constrain what a classifier call reaches for later, and
   the HashMark branch does: `verify_attestation` imports
-  `pyrxd.keys` — and so `coincurve` — inside the function body. Nothing
-  installs `coincurve` under Pyodide, so in the browser a well-formed
-  HashMark OP_RETURN does not classify: pasted on its own it comes back
-  as an error, and inside a fetched transaction that one row degrades to
-  `type=error` while the rest of the transaction renders normally. The
-  CLI, which has `coincurve`, decodes and verifies it. This is a known
-  gap, not a design intent.
+  `pyrxd.keys` — and so `coincurve` — inside the function body, and
+  nothing installs `coincurve` under Pyodide. That import failure used to
+  escape the function, so a well-formed HashMark OP_RETURN did not
+  classify at all in the browser; it is caught now and becomes
+  `unverifiable`, and the pages supply a vendored curve so the ordinary
+  answer is a real verdict. Two things follow that are still worth
+  knowing: an import guard is what stands between a missing dependency
+  and a row that reads `type=error`, and a registered backend takes
+  precedence over `coincurve` for **every** caller in the process, which
+  is why nothing in `src/` registers one.
 
 ---
 

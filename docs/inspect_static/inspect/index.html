@@ -12,6 +12,10 @@
                                   'unsafe-eval' is required by Pyodide internals (it
                                   uses eval() in the Python-to-JS bridge); cost is
                                   documented in docs/threat-model.md.
+                                  'self' also covers the vendored secp256k1 the page
+                                  imports to check signatures: it is same-origin, so
+                                  giving this page a curve ADDED NOTHING to this
+                                  policy. No new host, no new directive.
        style-src 'self'          — only our own CSS
        connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
                                 — page-relative (for vendored wheels in
