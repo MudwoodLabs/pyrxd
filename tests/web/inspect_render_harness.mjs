@@ -35,9 +35,9 @@
 // "the freshly-minted FT lives in a separate ft output" — and no per-output row
 // can carry them, so nothing reached them until this key existed.
 //
-// inspect.js is loaded VERBATIM in a `vm` context. It is not modified, not
-// wrapped and not preprocessed: a guard that tests a rewritten copy of the
-// file guards the rewrite. The module's top level touches `document` and ends
+// inspect.js and shared.js are loaded VERBATIM in a `vm` context, in the order
+// index.html loads them. Neither is modified, wrapped or preprocessed: a guard
+// that tests a rewritten copy of the file guards the rewrite. The module's top level touches `document` and ends
 // with `boot()`; boot's first statement is a `typeof loadPyodide !== "function"`
 // bail-out, so with no `loadPyodide` in the context it calls `showError` and
 // returns without a pending promise.
@@ -48,6 +48,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
 
 // --- stub DOM ---------------------------------------------------------
@@ -157,10 +158,14 @@ function makeSandbox() {
 }
 
 function loadRenderer() {
-  const source = readFileSync(INSPECT_JS, "utf8");
   const sandbox = makeSandbox();
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: INSPECT_JS });
+  // shared.js FIRST, exactly as index.html loads it. Both are classic scripts, so
+  // their top-level declarations land in the same context and inspect.js resolves
+  // `verdictClass`, `stripControlChars`, `hashFileWithRecordAlgorithm` and the rest
+  // by name — the same way the browser does.
+  vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
+  vm.runInContext(readFileSync(INSPECT_JS, "utf8"), sandbox, { filename: INSPECT_JS });
   for (const name of ["renderScriptCard", "renderOutputRow", "renderFetchedTxCard"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
