@@ -644,3 +644,113 @@ class TestTheTwoShapeWalkersAgree:
         assert "This transaction carries 2 marks" in text
         assert "Mark 1 of 2" in text and "Mark 2 of 2" in text
         assert text.count("Who vouched for it?") == 2
+
+
+# ───────────────────────────── "no such transaction" is not "the server is down" ──
+
+
+def _wire_failure(kind: str | None, message: str) -> dict:
+    """Render what a reader sees for a rejected ElectrumX promise of this kind.
+
+    Goes through ``lookupFailure`` — the production function ``lookUp`` calls — not
+    through a hand-built result dict, because the translation from a rejection to a
+    sentence is the half that was wrong.
+    """
+    spec: dict = {"message": message}
+    if kind is not None:
+        spec["kind"] = kind
+    return _render({"case": {"wire_error": spec}})["case"]
+
+
+class TestALookupThatFailedSaysWhichWayItFailed:
+    """FOUND BY LOOKING AT THE PAGE, not by a test — so it gets a test.
+
+    A server that answers "I have no such transaction" and a server nobody can
+    reach arrive here as the same rejected promise. The first version of this page
+    rendered both as "the server did not answer — try again in a moment", which is
+    the wrong advice for the case a reader will actually hit: a mistyped or wrong
+    number, where retrying can never help and the sentence sends them away from the
+    one thing that would.
+
+    It is the same shape as a search fallback where "no matches" and "the upstream
+    is gone" are both an empty array. The branch you did not build for is the one
+    that ships broken, and here the branch real users take is the wrong-number one.
+    """
+
+    def test_a_server_that_refused_does_not_tell_the_reader_to_retry(self) -> None:
+        rendered = _wire_failure("refused", "server error: No such mempool or blockchain transaction")
+        assert "did not give back a transaction for that number" in rendered["text"]
+        assert "retrying will not change this answer" in rendered["text"]
+        assert "Trying again in a moment" not in rendered["text"]
+
+    def test_a_server_nobody_could_reach_does_tell_the_reader_to_retry(self) -> None:
+        """The OTHER branch, in the app rather than only in a test of the first."""
+        rendered = _wire_failure("unreachable", "WebSocket error connecting to ElectrumX")
+        assert "could not be reached" in rendered["text"]
+        assert "Trying again in a moment" in rendered["text"]
+        assert "retrying will not change this answer" not in rendered["text"]
+
+    def test_the_two_are_not_the_same_words(self) -> None:
+        """The property itself, stated once rather than inferred from the two above:
+        a reader must be able to tell which happened."""
+        refused = _wire_failure("refused", "server error: nope")["text"]
+        unreachable = _wire_failure("unreachable", "WebSocket closed before any response")["text"]
+        assert refused != unreachable
+
+    def test_neither_blames_the_record(self) -> None:
+        """A failed lookup says nothing about the mark. A page that let a reader come
+        away thinking otherwise would have turned its own outage into an accusation."""
+        for kind, message in (("refused", "server error: nope"), ("unreachable", "timed out after 10000ms")):
+            text = _wire_failure(kind, message)["text"]
+            assert "DOES NOT VERIFY" not in text
+            assert "forged" not in text
+
+    def test_the_servers_own_words_are_never_dropped(self) -> None:
+        """Leading with plain language is not the same as hiding the reason. The
+        verbatim text is the least readable line on the page and the most
+        load-bearing one when something is really wrong."""
+        detail = "server error: DaemonError({'code': -5, 'message': 'No such ...'})"
+        assert detail in _wire_failure("refused", detail)["text"]
+
+    def test_an_unusable_answer_says_what_was_wrong_with_it(self) -> None:
+        """The third tagged case: something arrived and could not be read as a
+        transaction. That IS a checked fact about the reply, so the page may say it."""
+        rendered = _wire_failure("malformed", "server returned a non-hex string")
+        assert "could not be used" in rendered["text"]
+        assert "did not have the shape a transaction has" in rendered["text"]
+
+    def test_an_untagged_rejection_claims_less_than_a_malformed_one(self) -> None:
+        """A rejection from a path that tags nothing must not borrow the sentence
+        above it. "The reply did not have the shape a transaction has" is a claim
+        about what arrived — checked for a `malformed` rejection, and unchecked for
+        one nobody classified. Reusing it would be the same conflation this class is
+        about, one level further down: two facts told in the confident set of words.
+        """
+        rendered = _wire_failure(None, "something nobody has classified")
+        assert "The lookup did not finish" in rendered["text"]
+        assert "could not tell why, so it is not going to guess" in rendered["text"]
+        assert "did not have the shape a transaction has" not in rendered["text"]
+        assert "something nobody has classified" in rendered["text"]
+        assert "retrying will not change this answer" not in rendered["text"]
+        assert "Trying again in a moment" not in rendered["text"]
+
+    def test_the_page_reads_the_tag_the_wire_actually_sets(self) -> None:
+        """THE JOIN, and the reason this is not two tests that pass past each other.
+
+        ``test_inspect_fetch_error_sanitizer`` proves the WIRE tags its rejections;
+        the cases above prove the PAGE branches on tags. Neither proves the two use
+        the same vocabulary — a wire emitting "server-refused" and a page switching
+        on "refused" would leave both files green and every real failure landing on
+        the cautious branch. So: derive the page's vocabulary from its own source and
+        require the wire's to be a subset of it.
+        """
+        page = (_VERIFY_DIR / "verify.js").read_text(encoding="utf-8")
+        shared = (_INSPECT_DIR / "shared.js").read_text(encoding="utf-8")
+        page_kinds = set(re.findall(r'kind === "([a-z]+)"', page))
+        wire_kinds = set(re.findall(r'wireError\("([a-z]+)"', shared))
+        assert page_kinds, "the page branches on no kinds at all — this scan is broken"
+        assert wire_kinds, "the wire tags nothing at all — this scan is broken"
+        unhandled = wire_kinds - page_kinds
+        assert not unhandled, f"the wire emits kinds the page has no branch for: {sorted(unhandled)}"
+        stale = page_kinds - wire_kinds
+        assert not stale, f"the page branches on kinds nothing emits: {sorted(stale)}"

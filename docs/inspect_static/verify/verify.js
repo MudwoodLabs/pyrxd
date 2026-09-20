@@ -282,13 +282,30 @@ function lookupFailure(err) {
       detail,
     };
   }
+  if (kind === "malformed") {
+    return {
+      ok: false,
+      form: "error",
+      error: "The blockchain server's answer could not be used.",
+      hint:
+        "The reply did not have the shape a transaction has, so it was refused rather than " +
+        "read. Nothing was learned about the mark either way.",
+      detail,
+    };
+  }
+  // AN UNTAGGED REJECTION GETS THE WEAKER SENTENCE, and this branch exists precisely
+  // so it cannot borrow the one above. "The reply did not have the shape a transaction
+  // has" is a CLAIM about what arrived — true for a `malformed` rejection, and
+  // something nobody checked for a rejection from a path that tags nothing. Reusing
+  // it here would be the same conflation this function was written to fix, one level
+  // further down: two different facts told in one set of words, the confident set.
   return {
     ok: false,
     form: "error",
-    error: "The blockchain server's answer could not be used.",
+    error: "The lookup did not finish.",
     hint:
-      "The reply did not have the shape a transaction has, so it was refused rather than " +
-      "read. Nothing was learned about the mark either way.",
+      "This page could not tell why, so it is not going to guess. Nothing was learned " +
+      "about the mark either way — the text below is what came back.",
     detail,
   };
 }

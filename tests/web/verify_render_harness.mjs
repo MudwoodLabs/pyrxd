@@ -154,7 +154,7 @@ function loadRenderer() {
   // and the rest by name — the same way the browser does.
   vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
   vm.runInContext(readFileSync(VERIFY_JS, "utf8"), sandbox, { filename: VERIFY_JS });
-  for (const name of ["renderReport", "verdictClass", "hashmarkRecords"]) {
+  for (const name of ["renderReport", "verdictClass", "hashmarkRecords", "lookupFailure"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
         `${name} is not reachable after loading shared.js + verify.js. Both were ` +
@@ -196,10 +196,21 @@ function main() {
     __constants__: renderer.__constants__,
   };
   for (const [name, spec] of Object.entries(cases)) {
-    if (!spec || !spec.result) {
-      throw new Error(`case ${JSON.stringify(name)} has no "result" — nothing to render`);
+    // A case is EITHER a classification to render, or a wire failure to render —
+    // and the second goes through `lookupFailure`, the production function that
+    // turns a rejected ElectrumX promise into what the reader sees. Reaching the
+    // page with a hand-built error dict would prove the renderer and leave the
+    // translation, which is the half that was wrong, untested.
+    let node;
+    if (spec && spec.wire_error) {
+      const err = new Error(spec.wire_error.message || "");
+      if (spec.wire_error.kind !== undefined) err.kind = spec.wire_error.kind;
+      node = renderer.renderReport(renderer.lookupFailure(err));
+    } else if (spec && spec.result) {
+      node = renderer.renderReport(spec.result);
+    } else {
+      throw new Error(`case ${JSON.stringify(name)} has neither "result" nor "wire_error" — nothing to render`);
     }
-    const node = renderer.renderReport(spec.result);
     results[name] = { text: renderedLines(node), classes: renderedClasses(node) };
   }
   process.stdout.write(JSON.stringify(results));

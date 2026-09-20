@@ -141,7 +141,26 @@ async function probeRejection(sandbox, frameData) {
   try {
     await promise;
   } catch (err) {
-    return err.message;
+    // `kind` alongside the message. "The server said no" and "nobody answered"
+    // arrive as the same rejected promise, and the public /verify/ page gives
+    // OPPOSITE advice for them — retrying fixes one and can never fix the other.
+    // The tag is how a caller tells them apart without matching on a daemon's
+    // English, so it is part of this wire's contract and is probed here.
+    return { message: err.message, kind: err.kind };
+  }
+  throw new Error("expected fetchRawTxFromElectrumx to reject, but it resolved");
+}
+
+// The no-answer half, which no FRAME can produce: drive the socket's own "error"
+// listener instead of delivering a message.
+async function probeUnreachable(sandbox) {
+  const promise = sandbox.fetchRawTxFromElectrumx("deadbeef".repeat(8));
+  const ws = StubWebSocket.lastInstance;
+  ws.dispatch("error", {});
+  try {
+    await promise;
+  } catch (err) {
+    return { message: err.message, kind: err.kind };
   }
   throw new Error("expected fetchRawTxFromElectrumx to reject, but it resolved");
 }
@@ -170,9 +189,18 @@ async function main() {
   // site — pins the function's own behaviour.
   const stripControlCharsDirect = sandbox.stripControlChars(`gly${BIDI}bar${ZWSP}baz`);
 
+  // Branch 3: nothing answers at all. The SAME rejected promise as the two above,
+  // and the public /verify/ page gives the OPPOSITE advice for it — retrying fixes
+  // this one and can never fix a server that answered "no such transaction".
+  const fromUnreachable = await probeUnreachable(sandbox);
+
   process.stdout.write(JSON.stringify({
-    fromMalformedJson,
-    fromFrameError,
+    fromMalformedJson: fromMalformedJson.message,
+    fromFrameError: fromFrameError.message,
+    messageFromUnreachable: fromUnreachable.message,
+    kindFromMalformedJson: fromMalformedJson.kind,
+    kindFromFrameError: fromFrameError.kind,
+    kindFromUnreachable: fromUnreachable.kind,
     stripControlCharsDirect,
   }));
 }
