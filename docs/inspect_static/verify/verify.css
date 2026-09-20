@@ -1,0 +1,505 @@
+/* verify.css — the public HashMark check.
+
+   This is an EVIDENCE page, not a marketing page and not a developer tool. So:
+   calm, typographic, one column, generous measure, and no decoration that competes
+   with the verdict. A reader arrives from a link, reads four answers, and leaves.
+
+   THREE RULES THIS FILE IS ACCOUNTABLE FOR:
+
+   1. COLOUR IS NEVER THE ONLY SIGNAL. Every verdict prints its status in words as
+      well, so a screenshot, a printout, or a reader who cannot separate greens from
+      reds loses nothing. The palette is Okabe-Ito, already colourblind-safe.
+   2. THE NEUTRAL STATE IS THE DEFAULT. `.verdict` starts grey; the error colour is
+      opt-in via `.verdict-bad`. `verdict-unchecked` is the ordinary outcome in a
+      browser (no secp256k1 here, ever), and an honest signer must never be painted
+      red because of a library missing from the reader's machine.
+   3. NO HORIZONTAL SCROLL AT PHONE WIDTH. Everything wraps. The only values long
+      enough to threaten that are 64-character hex identifiers, and `.mono` breaks
+      them anywhere rather than pushing the page wider.
+
+   Shares the inspect tool's tokens deliberately — same project, same colours —
+   but not its stylesheet: /inspect/ is dense and field-oriented, and importing it
+   would drag a hundred rules this page has no elements for. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Okabe-Ito, colourblind-safe. */
+  --accent: #0072b2;   /* blue — a verdict that holds */
+  --neutral: #595959;  /* grey — withheld, the ordinary case here */
+
+  /* Light theme. */
+  --bg: #ffffff;
+  --panel: #f7f7f5;
+  --fg: #1a1a1a;
+  --muted: #5c5c5c;
+  --border: #dedede;
+  --error-fg: #b31414;
+  --error-border: #b31414;
+  --warn-fg: #8a5300;
+  --link: #0058a8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a;
+    --panel: #202225;
+    --fg: #ececec;
+    --muted: #a3a3a3;
+    --border: #35373b;
+    --accent: #56b4e9;
+    --neutral: #9a9a9a;
+    --error-fg: #ff7b72;
+    --error-border: #ff7b72;
+    --warn-fg: #e0a458;
+    --link: #79b8ff;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.6;
+  /* Hyphenation off: a broken word inside a sentence about whether two things are
+     identical reads as a rendering fault and costs the sentence authority. */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* ~66 characters at this size. Long enough for the prose, short enough to read. */
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.15rem 3rem;
+}
+
+a { color: var(--link); }
+
+/* --- header ------------------------------------------------------------- */
+
+header {
+  padding-bottom: 1.25rem;
+  margin-bottom: 1.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.85rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+
+.tagline {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.02rem;
+}
+
+/* --- the primer --------------------------------------------------------- */
+
+.primer {
+  display: grid;
+  gap: 1.1rem 1.5rem;
+  grid-template-columns: 1fr;
+  margin-bottom: 2rem;
+}
+
+@media (min-width: 40rem) {
+  .primer { grid-template-columns: 1fr 1fr; }
+}
+
+.primer-block h2 {
+  margin: 0 0 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+
+.primer-block p {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* The limits are the half a reader skips, so they get a rule of their own rather
+   than more colour — an emphasis that survives a greyscale printout. */
+.primer-limits {
+  border-left: 3px solid var(--border);
+  padding-left: 0.85rem;
+  margin-left: -0.85rem;
+}
+
+/* --- loading / errors --------------------------------------------------- */
+
+p.status {
+  margin: 0 0 0.5rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+progress {
+  width: 100%;
+  height: 0.4rem;
+  border: none;
+  border-radius: 2px;
+}
+
+#error-content h2 {
+  font-size: 1.15rem;
+  margin: 0 0 0.5rem;
+}
+
+#error-block {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem;
+  font-size: 0.85rem;
+  /* A stack trace is the one thing on this page allowed its own scrollbar; the
+     page body must never get one. */
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+p.note {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin: 0.6rem 0;
+}
+
+/* --- the form ----------------------------------------------------------- */
+
+.verify-form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem;
+  margin-bottom: 1.75rem;
+}
+
+.form-label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+
+.form-hint {
+  margin: 0 0 0.7rem;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+#tx-input {
+  width: 100%;
+  padding: 0.6rem 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.95rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+#tx-input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+button {
+  font: inherit;
+  font-size: 0.92rem;
+  padding: 0.5rem 0.9rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  /* Fixed rather than a token: this is text ON the accent, and both the light and
+     dark accents are mid-tone blues that white reads on. */
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.form-status {
+  margin: 0.6rem 0 0;
+  min-height: 1.2em;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+/* --- onboarding --------------------------------------------------------- */
+
+.onboarding h2 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+  margin: 0 0 0.3rem;
+}
+
+.example-chip {
+  font-size: 0.88rem;
+}
+
+/* --- the report --------------------------------------------------------- */
+
+.report { margin-top: 0.5rem; }
+
+.mark {
+  margin: 1.5rem 0 0;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.mark:first-child { border-top: none; padding-top: 0; }
+
+.mark-heading {
+  font-size: 1.1rem;
+  margin: 0 0 0.1rem;
+}
+
+.mark-subheading {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.multi-note {
+  font-weight: 600;
+}
+
+/* --- verdict ------------------------------------------------------------ */
+
+.verdict {
+  margin: 0.5rem 0 1.5rem;
+  padding: 0.85rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 5px solid var(--neutral);
+  border-radius: 5px;
+}
+
+.verdict-label {
+  display: block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+
+.verdict-status {
+  display: block;
+  font-size: 1.45rem;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-top: 0.1rem;
+  /* The status can be three words ("DOES NOT VERIFY"); let it wrap on a phone
+     rather than forcing the card wider than the screen. */
+  overflow-wrap: break-word;
+}
+
+.verdict-detail,
+.verdict-meaning {
+  margin: 0.4rem 0 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.verdict-ok { border-left-color: var(--accent); }
+.verdict-ok .verdict-status { color: var(--accent); }
+.verdict-bad { border-left-color: var(--error-border); }
+.verdict-bad .verdict-status { color: var(--error-fg); }
+/* THE ORDINARY CASE. Neutral, and it takes the normal foreground — a withheld
+   check is not a finding against anyone. */
+.verdict-unchecked { border-left-color: var(--neutral); }
+.verdict-unchecked .verdict-status { color: var(--fg); }
+
+/* --- the four questions ------------------------------------------------- */
+
+.qa {
+  margin: 0 0 1.6rem;
+}
+
+.qa-question {
+  margin: 0 0 0.4rem;
+  font-size: 1.05rem;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+.answer-body {
+  margin: 0 0 0.55rem;
+  overflow-wrap: anywhere;
+}
+
+.answer-body.muted {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.answer-body.privacy {
+  color: var(--muted);
+  font-size: 0.92rem;
+  border-left: 3px solid var(--border);
+  padding-left: 0.75rem;
+}
+
+/* --- facts -------------------------------------------------------------- */
+
+.facts {
+  margin: 0.75rem 0 0;
+  padding: 0;
+}
+
+.fact {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.1rem 1rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+}
+
+@media (min-width: 34rem) {
+  .fact {
+    grid-template-columns: 12rem 1fr;
+    /* Baseline, not start: the label is 0.8rem and a mono value is 0.86rem, so
+       aligning the boxes leaves the two texts visibly off each other. */
+    align-items: baseline;
+  }
+}
+
+.fact-label {
+  margin: 0;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  /* Grid handles alignment; a self-aligned label would drift from its value when
+     the value wraps to three lines. */
+}
+
+.fact-value {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.fact-value.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86rem;
+  /* A 64-character identifier must break somewhere, and the only honest place is
+     anywhere — it has no word boundaries. */
+  word-break: break-all;
+}
+
+.fact-value.warn { color: var(--warn-fg); }
+
+/* --- file input --------------------------------------------------------- */
+
+.file-input {
+  display: block;
+  margin: 0.4rem 0 0;
+  font-size: 0.9rem;
+  /* Chrome's file control has an intrinsic minimum that can exceed a narrow
+     viewport; this is the line that keeps the page from scrolling sideways on a
+     phone when the chosen filename is long. */
+  max-width: 100%;
+}
+
+.file-status {
+  margin: 0.6rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.file-result { margin-top: 0.6rem; }
+.file-result .verdict { margin-bottom: 0.5rem; }
+
+/* --- problems (no mark, lookup failed) ---------------------------------- */
+
+.problem {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem;
+}
+
+.problem-title {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.problem-detail-label {
+  margin: 0.9rem 0 0.2rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+
+/* Verbatim server text. Quiet, monospaced so it reads as a quotation rather than as
+   this page's own voice, and breakable so a long daemon blob cannot widen the page. */
+.problem-detail {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* --- the closing claim -------------------------------------------------- */
+
+.mark-proves {
+  margin: 1.5rem 0 0;
+  padding: 0.9rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.92rem;
+  color: var(--fg);
+}
+
+/* --- footer ------------------------------------------------------------- */
+
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+footer p { margin: 0.25rem 0; }
+
+.footer-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}

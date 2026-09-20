@@ -86,7 +86,9 @@ The static page at
 Python code** into Pyodide and runs the entire classifier in-browser.
 Source lives in the repo at `docs/inspect_static/inspect/` —
 `index.html` is the page shell, `inspect.js` is the boot + DOM glue,
-`glue.py` runs inside Pyodide and calls into `pyrxd.glyph.inspect`.
+`shared.js` is the part a second page also needs (runtime boot,
+ElectrumX wire, verdict colour, file-check mechanics), and `glue.py`
+runs inside Pyodide and calls into `pyrxd.glyph.inspect`.
 
 What runs server-side: nothing. GitHub Pages serves static bytes;
 there is no application backend. ElectrumX is only contacted for the
@@ -96,6 +98,31 @@ Content-Security-Policy `connect-src`.
 
 No key material is ever loaded. No transactions are ever signed or
 broadcast. The page is a diagnostic, not a wallet.
+
+### The other browser page: `/verify/`
+
+<https://mudwoodlabs.github.io/pyrxd/verify/> is the same runtime
+aimed at a different reader. `/inspect/` assumes you know what a Glyph
+script is and shows you every field of one; `/verify/` assumes nothing
+and answers the four questions `pyrxd verify` answers about a HashMark
+— who vouched for it, what was fingerprinted, which block carried it,
+and whether a file you have matches — in plain language, for someone
+who arrived from a link with no context.
+
+It is not a second implementation of anything. Both pages read the one
+wheel, the one `glue.py` and the one manifest built by the docs CI
+step, and every verdict on both comes out of the same Python. The
+split is presentation only, which is why `shared.js` holds everything
+a reader could check one page against the other on — including the two
+sentences that are *claims* rather than facts: what a mark proves, and
+the promise that a chosen file never leaves the machine.
+
+Its normal signature outcome is `NOT CHECKED`, on both pages and for
+every v2 record, because pyrxd installs under Pyodide with
+`deps=False` and coincurve ships no pure-Python wheel. That is a
+missing capability of the reader's browser and never a verdict on the
+record — it is rendered neutral, says whose limitation it is, and
+points at the CLI, which has the curve library.
 
 ---
 

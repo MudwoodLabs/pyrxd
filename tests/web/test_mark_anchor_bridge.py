@@ -59,6 +59,28 @@ def glue():
         sys.modules.pop("glue", None)
 
 
+def _camel(snake: str) -> str:
+    """``inspect_txid_with_raw`` -> ``inspectTxidWithRaw`` — the naming rule
+    ``bootPyrxdRuntime`` applies when it hands a Python entry point to JS."""
+    head, *rest = snake.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+def _glue_bridge_names(module) -> list[str]:
+    """Every public entry point ``glue.py`` DEFINES, derived from the module.
+
+    Functions it imported from elsewhere are excluded by ``__module__``: the page
+    calls what glue defines, and a re-exported helper is not a bridge.
+    """
+    import inspect as _i
+
+    return sorted(
+        name
+        for name, obj in vars(module).items()
+        if not name.startswith("_") and _i.isfunction(obj) and obj.__module__ == module.__name__
+    )
+
+
 def _verbose(**over) -> str:
     reply = {
         "txid": _TXID,
@@ -121,13 +143,48 @@ class TestTheAnchorIsReachableFromTheBrowser:
         for fn in (finite_int, hex_str, merkle_branch, nonneg_int, require_bool):
             assert fn is getattr(json_guards, fn.__name__), f"{fn.__name__} is a copy, not a re-export"
 
-    def test_the_bridge_is_reachable_from_the_page(self, glue) -> None:
-        """A bridge function nothing calls is a bridge to nowhere. ``inspect.js`` must
-        bind all three, and bind them to THESE names."""
-        source = (_GLUE_DIR / "inspect.js").read_text(encoding="utf-8")
-        for name in ("mark_anchor", "file_check_plan", "judge_file_digest"):
+    def test_every_bridge_is_bound_by_the_shared_boot(self, glue) -> None:
+        """A bridge function nothing calls is a bridge to nowhere.
+
+        THE SET IS DERIVED, NOT TYPED. This guard used to name three functions and read
+        one file, and both halves have since been wrong: the binding moved to
+        ``shared.js`` when the public ``/verify/`` page needed the same runtime, and a
+        hand-kept tuple of three would have gone on passing over a fourth bridge nobody
+        had wired up. The universe here is whatever ``glue`` actually exposes.
+        """
+        import inspect as _i
+
+        bridges = _glue_bridge_names(glue)
+        assert bridges, "no public entry points found in glue.py — this scan is broken, not the page"
+        boot = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
+        for name in bridges:
             assert callable(getattr(glue, name)), f"glue.{name} is missing"
-            assert f'_pyrxd_glue").{name}' in source, f"inspect.js never binds glue.{name}"
+            assert f"glue.{name}," in boot, (
+                f"shared.js's bootPyrxdRuntime never binds glue.{name}, so no page can call it"
+            )
+        assert _i.ismodule(glue)
+
+    def test_every_bound_bridge_reaches_a_page(self, glue) -> None:
+        """The other direction, and the one that rots quietly: a bridge bound in the
+        boot and called by nothing is a capability with no production caller. Each
+        JS-side handle must appear in at least one shipped page script."""
+        pages = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(_GLUE_DIR.parent.glob("*/[a-z]*.js"))
+            if path.name != "shared.js"
+        }
+        assert pages, "no page scripts found — this scan is broken, not the pages"
+        # shared.js counts as a consumer: `hashFileWithRecordAlgorithm` calls two of
+        # these itself, and a page reaches them through it. What must not happen is a
+        # bridge that nothing anywhere reads off the `bridges` object.
+        pages["shared.js"] = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
+        for name in _glue_bridge_names(glue):
+            # `bridges.<handle>`, not the bare handle: a substring search for `run`
+            # matches `runtime` and `runPython` and would pass on a page that never
+            # touched the bridge at all.
+            needle = f"bridges.{_camel(name)}"
+            users = sorted(fname for fname, text in pages.items() if needle in text)
+            assert users, f"glue.{name} is bound as `{needle}` and no shipped script reads it"
 
 
 # ───────────────────────────────────────────── what the bridge answers ──

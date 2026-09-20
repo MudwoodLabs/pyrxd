@@ -24,9 +24,10 @@
 // `stripControlChars` had exactly one call site and zero tests before this,
 // so nothing proved either branch actually worked.
 //
-// Like inspect_render_harness.mjs, inspect.js is loaded VERBATIM in a Node
-// `vm` context — not modified, not wrapped, not preprocessed. A guard that
-// tests a rewritten copy of the file guards the rewrite.
+// Like inspect_render_harness.mjs, shared.js and inspect.js are loaded VERBATIM
+// in a Node `vm` context, in the order index.html loads them — not modified, not
+// wrapped, not preprocessed. A guard that tests a rewritten copy of the file
+// guards the rewrite.
 //
 // Contract:
 //   node inspect_fetch_error_harness.mjs
@@ -48,6 +49,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
 
 // Attacker-controlled bytes: U+202E (RIGHT-TO-LEFT OVERRIDE, the headline
@@ -106,16 +108,21 @@ function makeSandbox() {
 }
 
 function loadModule() {
-  const source = readFileSync(INSPECT_JS, "utf8");
   const sandbox = makeSandbox();
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: INSPECT_JS });
+  // shared.js FIRST, as index.html loads it. `fetchRawTxFromElectrumx` and
+  // `stripControlChars` moved there when the public /verify/ page needed the same
+  // wire; inspect.js is still loaded after it because THE PRODUCTION PAGE loads
+  // both, and a harness that exercised the wire alone would stop proving the page
+  // it is a guard for can reach it.
+  vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
+  vm.runInContext(readFileSync(INSPECT_JS, "utf8"), sandbox, { filename: INSPECT_JS });
   for (const name of ["fetchRawTxFromElectrumx", "stripControlChars"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
-        `${name} is not reachable after loading inspect.js. It was a top-level ` +
-        `function declaration; if it moved into a block or a module scope, this ` +
-        `harness needs updating — do NOT delete the guard.`
+        `${name} is not reachable after loading shared.js + inspect.js. Both were ` +
+        `top-level declarations in classic scripts; if either moved into a block or ` +
+        `became an ES module, this harness needs updating — do NOT delete the guard.`
       );
     }
   }

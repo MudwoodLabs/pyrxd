@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+
+  <!-- Content-Security-Policy — IDENTICAL to /inspect/'s, deliberately.
+       This page loads exactly the same things: Pyodide from jsdelivr with SRI,
+       its own CSS, the same-origin wheels + glue.py served from /inspect/, and
+       the one ElectrumX server. It whitelists nothing the inspector does not.
+
+       default-src 'none'        — deny everything not whitelisted below
+       script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net
+                                — Pyodide loads from jsdelivr CDN with SRI; runs WASM.
+                                  'unsafe-eval' is required by Pyodide internals (it
+                                  uses eval() in the Python-to-JS bridge); cost is
+                                  documented in docs/threat-model.md.
+       style-src 'self'          — only our own CSS
+       connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
+                                — page-relative (the wheels and glue.py this page
+                                  fetches live at /inspect/, same origin), the
+                                  Pyodide CDN, and the one ElectrumX server we
+                                  trust. PyPI hosts are intentionally NOT
+                                  whitelisted — the cbor2 wheel is vendored
+                                  same-origin and SHA-256 verified via
+                                  manifest.json so the install path has no
+                                  off-origin trust.
+       img-src 'self' data:      — favicons + inline data: URIs only
+       font-src 'self'           — bundled fonts only (none today)
+       base-uri 'none'           — block <base> tag injection
+       form-action 'none'        — no form posts
+       object-src 'none'         — no plugins
+       Note: frame-ancestors is intentionally absent — meta-tag CSP cannot
+       enforce it; documented as a known limitation. Read-only tool with no
+       keys; clickjacking has no payload to steal.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'none';
+    script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net;
+    style-src 'self';
+    connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022;
+    img-src 'self' data:;
+    font-src 'self';
+    base-uri 'none';
+    form-action 'none';
+    object-src 'none';
+  " />
+
+  <title>Check a HashMark</title>
+  <meta name="description" content="Check a HashMark published on the Radiant blockchain: who signed it, what was fingerprinted, which block carried it, and whether a file you have matches." />
+  <link rel="stylesheet" href="verify.css" />
+</head>
+<body>
+  <header>
+    <h1>Check a HashMark</h1>
+    <p class="tagline">
+      Someone gave you a transaction number. This page reads the record inside it
+      and says, in plain words, what that record does and does not establish.
+    </p>
+  </header>
+
+  <main>
+    <!-- THE PRIMER IS NOT BEHIND THE LOADING GATE.
+         The runtime is a ~12 MB download and the reader arrived from a link with
+         no context. Hiding the explanation until Pyodide finishes would show a
+         stranger a progress bar and nothing else for several seconds — so what
+         this is, and what it can and cannot show, is readable immediately and
+         only the INPUT waits for the runtime. -->
+    <section id="primer" class="primer">
+      <div class="primer-block">
+        <h2>What a HashMark is</h2>
+        <p>
+          A short record published on the Radiant blockchain. It carries a
+          <strong>fingerprint</strong> of a file — not the file itself — and, in most
+          cases, a signature. Publishing it puts that fingerprint in a block, and a
+          block's place in the chain cannot be moved afterwards.
+        </p>
+      </div>
+      <div class="primer-block">
+        <h2>What checking one can establish</h2>
+        <p>
+          That the fingerprint existed no later than the block that carried it, so
+          whoever published it knew the file by then. If the record is signed and the
+          signature checks out, that the holder of a particular key made that
+          statement.
+        </p>
+      </div>
+      <div class="primer-block primer-limits">
+        <h2>What it cannot establish</h2>
+        <p>
+          Not who wrote the file. Not who owns it. Not that they were first to it.
+          Not where anyone was. And nothing whatever about whether what the file
+          says is true.
+        </p>
+      </div>
+      <div class="primer-block">
+        <h2>Nothing here is uploaded</h2>
+        <p>
+          The record is read from a public blockchain server. If you check a file
+          against it, the file is hashed inside this browser and never leaves this
+          machine.
+        </p>
+      </div>
+    </section>
+
+    <section id="loading-status" aria-live="polite">
+      <p class="status">Getting ready — a one-time ~12&nbsp;MB download, cached for next time…</p>
+      <progress id="load-progress" max="100" value="0"></progress>
+    </section>
+
+    <section id="ready-content" hidden>
+      <form id="verify-form" class="verify-form" autocomplete="off">
+        <label for="tx-input" class="form-label">Transaction number</label>
+        <p class="form-hint" id="tx-hint">
+          64 letters and numbers, from whoever gave you the mark. If what you have is
+          the record itself rather than a transaction, you can paste that here too.
+        </p>
+        <input
+          id="tx-input"
+          type="text"
+          spellcheck="false"
+          autocapitalize="off"
+          autocorrect="off"
+          aria-describedby="tx-hint"
+          placeholder="64 letters and numbers"
+          disabled
+        />
+        <div class="form-actions">
+          <button type="button" id="check-btn" class="primary" disabled>Check this mark</button>
+          <button type="button" id="clear-btn" disabled>Start over</button>
+          <button type="button" id="share-btn" disabled>Copy link to this result</button>
+        </div>
+        <p class="form-status" id="form-status" aria-live="polite"></p>
+      </form>
+
+      <section id="onboarding" class="onboarding">
+        <h2>Nothing to check yet?</h2>
+        <p class="note">
+          This is a real signed mark on the Radiant main chain. Open it to see what
+          the answers look like.
+        </p>
+        <button
+          type="button"
+          class="example-chip"
+          data-input="a1a86ab4503901af4df3d092fcf668b07c03c5cd89240fe918ae70e02e045916"
+        >Open an example mark</button>
+      </section>
+
+      <section id="result-block" class="result-block" hidden aria-live="polite"></section>
+    </section>
+
+    <section id="error-content" hidden>
+      <h2>This page could not start</h2>
+      <p class="note">
+        The check runs entirely in your browser, and the code it needs did not load.
+        Nothing about the mark itself is implied by this.
+      </p>
+      <pre id="error-block"></pre>
+      <p class="note">
+        If it keeps happening, please
+        <a href="https://github.com/MudwoodLabs/pyrxd/issues/new">open an issue</a>
+        with the text above.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <span id="build-version">build: (loading)</span> ·
+      <a href="../inspect/">developer inspector</a> ·
+      <a href="https://github.com/MudwoodLabs/pyrxd">source</a> ·
+      <a href="https://mudwoodlabs.github.io/pyrxd/">docs</a>
+    </p>
+    <p class="footer-note">
+      The same four answers are available offline from a terminal:
+      <code>pyrxd verify &lt;transaction&gt; --min-confirmations N</code>.
+    </p>
+  </footer>
+
+  <!-- Pyodide loaded from jsdelivr with Subresource Integrity (SRI).
+       The integrity hash and version are kept in sync via scripts/refresh-pyodide.sh
+       on maintainer bumps — it rewrites BOTH index.html files and PYODIDE_INDEX_URL
+       in shared.js together. If a CDN compromise serves different bytes, the browser
+       refuses to execute the script. -->
+  <script
+    src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"
+    integrity="sha384-i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB"
+    crossorigin="anonymous"
+  ></script>
+  <!-- shared.js FIRST, and as a classic script, exactly as /inspect/ loads it.
+       It carries the runtime boot, the ElectrumX wire, the display sanitiser, the
+       verdict colour mapping, the file-check mechanics and the two sentences that
+       are CLAIMS. One copy, so this page and the inspector cannot come to describe
+       the same record differently. A classic script runs before a deferred module,
+       so its bindings exist by the time verify.js's top level does. -->
+  <script src="../inspect/shared.js"></script>
+  <script src="verify.js" type="module"></script>
+</body>
+</html>
