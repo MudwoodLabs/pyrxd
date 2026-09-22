@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **CEK wraps from this release cannot be opened by pyrxd 0.24.0 or earlier, and the reverse needs
+  a recipe.** Two wire-format changes land together, and either alone breaks old readers: the
+  KEK is now derived under `glyph-kek-classical-v1` (was `glyph-kek-v1`), and a recipient wrap
+  made by `build_timelock_mint` is bound to the UTF-8 text of `crypto.cek_hash` (was the raw
+  32-byte digest). Both follow Photonic; see Fixed. Measured: of 10 recipient wraps minted by
+  this release, pyrxd 0.24.0 opened 0 under the raw-digest AAD and 0 under the text AAD (it
+  knows only the old KEK string).
+
+  Who is affected:
+  - a SENDER on this release cannot reach a recipient still running pyrxd 0.24.0 or earlier.
+    The recipient has to upgrade.
+  - READER code written against 0.24.0 that passes the raw digest
+    (`compute_cek_hash(cek)` / `parse_cek_hash(cek_hash)`) as the AAD fails on every new mint.
+    Pass `pyrxd.glyph.timelock.cek_wrap_aad(stub.crypto.cek_hash)` instead.
+
+  Opening a wrap 0.24.0 made, on this release: pass the raw digest as the AAD with
+  `allow_legacy_info=True` (the default):
+  `pyrxd.crypto.kem.unwrap_cek_x25519_detailed(wrapped_cek, epk, sk, parse_cek_hash(stub.crypto.cek_hash))`.
+  `legacy_info` comes back `True`, which marks the content for re-wrapping. Measured: 10 of 10
+  v0.24.0 recipient wraps (0 B to 70,000 B payloads) open this way and decrypt; each is refused
+  under the text AAD and under `allow_legacy_info=False`.
+
 ### Fixed
 
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
@@ -40,12 +64,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the content AEAD, and REP-3008's wrap publishes its own `aad` field — so the wallet is the
   reference. Measured against Photonic's own `decryptContent`: 0 of 8 pyrxd mints opened
   before, 16 of 16 after, with Photonic → pyrxd 16 of 16 the other way. The mint now wraps
-  under `pyrxd.glyph.timelock.cek_wrap_aad(cek_hash)`. The comments that called the raw digest
-  "per REP-3006 and Photonic's encryption.ts" are corrected; neither said so. Content minted by
-  0.24.0 with recipients opens with the raw digest as the AAD plus `allow_legacy_info=True`,
-  since that release also used the old KEK info string. Pinned by a vector generated through
-  Photonic's APP service (`scripts/gen-photonic-vectors/gen-app-path-vector.ts`), which pyrxd's
-  mint reproduces byte-for-byte from the same randomness.
+  under `pyrxd.glyph.timelock.cek_wrap_aad(cek_hash)`. The old comment cited "REP-3006 and
+  Photonic's encryption.ts". It paraphrased Photonic's LIBRARY doc, which at `becf41a7` says
+  "@param aad ... (REP-3006: use cek_hash bytes)". That phrase is ambiguous (the digest's bytes or
+  the string's bytes) and its REP citation is unsupported: no REP mentions `cek_hash`. Photonic's
+  APP resolves it as the UTF-8 string, and the ambiguity is the likely origin of pyrxd's
+  raw-digest choice. Pinned by a vector generated through Photonic's APP service
+  (`scripts/gen-photonic-vectors/gen-app-path-vector.ts`), which pyrxd's mint reproduces
+  byte-for-byte from the same randomness. This is a wire-format change; see Changed (breaking).
+
+  What this does NOT fix: Photonic's unlock SCREEN still cannot fetch pyrxd-minted ciphertext.
+  Before it calls `decryptContent` it requires `main.b`, or both `crypto.locator` and
+  `crypto.locator_nonce` (`EncryptedContentUnlock.tsx`, `assertStorageAvailable`), and pyrxd
+  writes neither `main.b` nor `locator_nonce`. Per that source a pyrxd timelock mint stops at
+  "Storage Locator Missing" there (read from the source, not rendered). The interop proved here
+  is the `decryptContent` step, handed the ciphertext. The storage gap predates this release and
+  is not addressed in it.
 
 - **`verify_burn` reported valid Photonic burns as "no burn proof output found".** The read cap
   on a burn proof's CBOR was 8,192 bytes; Photonic builds proofs up to 131,072

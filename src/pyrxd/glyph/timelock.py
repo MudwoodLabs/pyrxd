@@ -120,7 +120,8 @@ def cek_wrap_aad(cek_hash: str) -> bytes:
     Radiant-Core/Photonic-Wallet ``becf41a7``, where ``packages/app/src/shareLink.ts`` also types
     ``cek_hash`` as the string "also used as AAD". No REP specifies it: REP-3006 defines AAD
     only for the content AEAD, and REP-3008's wrap carries a separately published ``aad``
-    field. The wallet that mints and opens this content is therefore the definition.
+    field. Photonic's LIBRARY doc says only "use cek_hash bytes", which does not say whose
+    bytes; the app is where that is decided, so the app is the definition.
 
     Pass the string EXACTLY as it appears in the metadata being read. Do not round-trip it
     through :func:`parse_cek_hash` / :func:`format_cek_hash` first: those normalise case and
@@ -414,10 +415,14 @@ def build_timelock_mint(
         # a wrap lifted off one token cannot be replayed onto another whose commitment differs:
         # unwrapping fails the tag check rather than returning a key for the wrong content.
         #
-        # This passed the raw 32-byte digest through 0.24.0. The comment here then said that was
-        # "per REP-3006 and Photonic's `encryption.ts`"; neither says so — REP-3006 has no rule
-        # for the wrap AAD, and `encryption.ts` takes whatever AAD its caller supplies. Photonic's
-        # wallet could not open a single recipient wrap pyrxd produced.
+        # This passed the raw 32-byte digest through 0.24.0, under a comment citing "REP-3006 and
+        # Photonic's `encryption.ts`". That comment paraphrased Photonic's LIBRARY doc, which at
+        # `becf41a7` reads "@param aad Additional authenticated data bound to the wrap (REP-3006:
+        # use cek_hash bytes)" (`packages/lib/src/encryption.ts` wrapCEK). The phrase is ambiguous
+        # — the digest's bytes, or the string's bytes — and its REP citation is unsupported: no
+        # REP mentions `cek_hash` at all. Photonic's APP resolves the ambiguity as the UTF-8
+        # string, and that ambiguity is the likely origin of pyrxd's raw-digest choice. The
+        # result: Photonic's `decryptContent` opened none of pyrxd's recipient wraps.
         wrapped = wrap_cek_x25519(cek, r.public_key, cek_wrap_aad(cek_hash_str))
         wraps.append(
             CryptoRecipient(

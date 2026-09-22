@@ -99,7 +99,8 @@ const roleChecks: [string, boolean][] = [
 ];
 for (const [role, ok] of roleChecks) if (!ok) throw new Error(`RNG draw role '${role}' does not match the output`);
 
-// The app must open its own output through the unlock path, or the vector records nothing useful.
+// The app's decryptContent (the step its unlock screen calls once it has the ciphertext) must
+// open its own output, or the vector records nothing useful.
 const opened = await svc.decryptContent(res.encryptedContent, { metadata: res.metadata, privateKey: RECIPIENT_SK });
 if (hex(opened) !== hex(PLAINTEXT)) throw new Error("Photonic could not decrypt its own vector");
 

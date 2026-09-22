@@ -476,7 +476,7 @@ class TestARecipientCanOpenItWithoutWaiting:
 
         stub = EncryptedContentStub.from_dict(decoded_dict)
         # The AAD is the on-chain `cek_hash` TEXT, read back off the decoded envelope — the
-        # value Photonic's unlock path binds. This test passed the raw digest through 0.24.0,
+        # value Photonic's `decryptContent` binds. This test passed the raw digest through 0.24.0,
         # which is how it agreed with a mint Photonic could not open.
         recovered_cek = pyrxd.unwrap_cek_x25519(
             stub.crypto.recipients[0].wrapped_cek,

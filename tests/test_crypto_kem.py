@@ -300,17 +300,26 @@ class TestTheAppPathVector:
     from its caller. The wallet's caller is `encryptContent` in
     `packages/app/src/encryptionService.ts`, and it binds the UTF-8 TEXT of
     `crypto.cek_hash`. pyrxd's `build_timelock_mint` bound the raw 32-byte digest, so even
-    with the KEK info fixed, Photonic could not open a single pyrxd recipient wrap, and the
-    library-level vectors were structurally unable to show it.
+    with the KEK info fixed, Photonic's `decryptContent` could not open a pyrxd recipient
+    wrap, and the library-level vectors were structurally unable to show it.
 
     `app_encrypt_content_recipient` was generated through `encryptContent` itself
     (`scripts/gen-photonic-vectors/gen-app-path-vector.ts`), with every RNG draw recorded in
-    order and checked against the output by role, and Photonic opened it through
-    `decryptContent` before it was written. So:
+    order and checked against the output by role, and Photonic's `decryptContent` opened it,
+    handed the ciphertext directly, before it was written. So:
 
     - pyrxd opening it STRICTLY under `cek_wrap_aad` is the Photonic -> pyrxd direction;
     - pyrxd's own mint, fed the same randomness, reproducing it BYTE FOR BYTE is the
-      pyrxd -> Photonic direction: the bytes are the ones Photonic's unlock path already opened.
+      pyrxd -> Photonic direction for the decryptContent step Photonic's unlock screen calls
+      once it has the ciphertext.
+
+    WHAT THIS DOES NOT SHOW: that Photonic's unlock SCREEN reaches that step for a pyrxd
+    mint. Before it calls `decryptContent` it must fetch the ciphertext, and
+    `EncryptedContentUnlock.tsx` (`assertStorageAvailable`) refuses unless the envelope
+    carries `main.b` or both `crypto.locator` and `crypto.locator_nonce`. pyrxd writes
+    neither `main.b` nor `locator_nonce`, so per that source a pyrxd timelock mint stops at
+    "Storage Locator Missing" in Photonic's UI. That gap predates this change and is not
+    closed by it.
     """
 
     @pytest.fixture()

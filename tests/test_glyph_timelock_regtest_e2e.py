@@ -404,7 +404,7 @@ class TestTheSealIsAcceptedByTheNode:
         assert len(wraps) == 1 and wraps[0].kid == "auctioneer-1"
 
         # The wrap's AAD is the on-chain `crypto.cek_hash` TEXT, read off the chain copy — what
-        # Photonic's unlock path binds (see `cek_wrap_aad`). This test was written against the
+        # Photonic's `decryptContent` binds (see `cek_wrap_aad`). This test was written against the
         # raw 32-byte digest, which is what pyrxd 0.24.0 wrapped under and Photonic cannot open.
         cek = unwrap_cek_x25519(
             wraps[0].wrapped_cek,
