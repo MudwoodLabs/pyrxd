@@ -7,20 +7,31 @@
 # file, or a pushed branch that was not checked out all passed — and a contributor
 # without the hook was never scanned at all. A push publishes commits, not a tree.
 #
-# This job runs two scans:
-#   1. the checked-out tree (for a PR, the merge result), and
-#   2. every line ADDED by every commit in the PR (base..head) or push (before..after;
-#      for a new branch, the commits not already on the default branch), merges included.
+# This job runs:
+#   1. the checked-out tree (for a PR, the merge result);
+#   2. what every commit in the PR (base..head) or push (before..after) publishes — added
+#      lines, added FILE NAMES and the commit MESSAGE (a squash-merge's message is the PR
+#      body) — merges included; and a pushed tag's name and annotated message;
+#   3. the baseline pin: history published before this scan existed holds known findings,
+#      listed in scripts/leak-scan-baseline.json and suppressed only by exact commit
+#      identity. This step rescans that history and fails on ANY difference, so the list
+#      cannot silently drift from what the scanner finds.
 #
-# WHAT IT DOES NOT COVER. The private-project-NAME check reads a local, gitignored
-# `.private-names` file, which no CI clone has, so that check never runs here. The
-# scanner prints a note saying so. It runs locally (task ci-fast, pre-push hook) for
-# anyone who keeps the file.
+# WHAT IT DOES NOT COVER.
+#   * The private-project-NAME check reads a local, gitignored `.private-names` file,
+#     which no CI clone has, so that check never runs here. The scanner prints a note
+#     saying so. It runs locally (task ci-fast, pre-push hook) for anyone who keeps it.
+#   * A pull request that edits the scanner, this workflow or the baseline. A
+#     pull_request run executes the PR's OWN copies of all three, so such a PR can make
+#     every step here pass, the self-test included — the self-test catches a scanner
+#     that is accidentally broken, not one written to pass it. The protection against
+#     that is human review of those files (.github/CODEOWNERS requests it; it only
+#     BLOCKS a merge if branch protection requires code-owner review).
 #
-# OUTPUT IS REDACTED. This log is public. A finding is printed as file:line and the
-# check name only; echoing the matched text would republish the leak it caught.
-# (`--redact` is passed explicitly, and the scanner also forces it when
-# GITHUB_ACTIONS=true.)
+# OUTPUT IS REDACTED. This log is public. A finding is printed as its location and the
+# check name only (a leak in a file name is shown as a digest of the name); echoing
+# the matched text would republish the leak it caught. (`--redact` is passed
+# explicitly, and the scanner also forces it when GITHUB_ACTIONS=true.)
 
 name: leak-scan
 
@@ -35,9 +46,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # PR runs only. A newer PR run re-scans base..head, which covers the cancelled one. A
-  # push run scans before..after, so cancelling one would leave its commits unscanned.
+  # PR runs share one group per PR and cancel each other: the newest run scans the PR's
+  # current base..head. That is NOT the same as re-scanning what the cancelled run would
+  # have — after a force-push the dropped commits are no longer in base..head — which is
+  # why push runs are the backstop for published commits.
+  #
+  # Push runs get a group of their own per ref AND commit, so no push run is ever
+  # cancelled or displaced: GitHub keeps only one PENDING run per group and cancels the
+  # older pending one even with cancel-in-progress false, and a push run scans
+  # before..after, so a displaced one would leave that push's commits unscanned.
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request'
+    && format('pr-{0}', github.event.pull_request.number)
+    || format('push-{0}-{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -50,15 +71,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Full history: the range scan needs every commit in base..head / before..after.
+          # Full history: the range scan needs every commit in base..head / before..after,
+          # and the baseline pin rescans the history the baseline was generated from.
           fetch-depth: 0
           persist-credentials: false
 
       - name: Self-test — the scanner must catch a known leak
         # A scanner that silently scans nothing exits 0, which is also what a clean
         # repo does. So first prove, in a throwaway repo, that it FAILS on a leak in
-        # the tree and on a leak that exists only in history, and passes once the tree
-        # is clean — and that its output does not echo the leak.
+        # the tree, on a leak that exists only in history, and on a leak that exists
+        # only in a commit MESSAGE — and passes once the tree is clean, without echoing
+        # the leak. This catches a scanner that is BROKEN. It does not catch one that a
+        # pull request rewrote to recognise this sample; see the header.
         run: |
           set -euo pipefail
           scanner="$GITHUB_WORKSPACE/scripts/check-no-private-links.py"
@@ -82,35 +106,39 @@ jobs:
           git rm -q deploy.sh guide.md && git commit -q -m "remove the leak"
           clean_rc=0; python3 "$scanner" --redact || clean_rc=$?
           range_rc=0; range_out="$(python3 "$scanner" --redact --no-tree --range "$base..HEAD" 2>&1)" || range_rc=$?
+          msg_base="$(git rev-parse HEAD)"
+          git commit -q --allow-empty -m "restarted it" -m "$(printf 'via ssh %s@%s' "deploy" "$ip")"
+          msg_rc=0; msg_out="$(python3 "$scanner" --redact --no-tree --range "$msg_base..HEAD" 2>&1)" || msg_rc=$?
 
-          printf '%s\n' "$tree_out" "$range_out"
-          echo "self-test exits: tree-with-leak=$tree_rc tree-cleaned=$clean_rc history-range=$range_rc (want 1 0 1)"
-          if [ "$tree_rc" != 1 ] || [ "$clean_rc" != 0 ] || [ "$range_rc" != 1 ]; then
+          printf '%s\n' "$tree_out" "$range_out" "$msg_out"
+          echo "self-test exits: tree-with-leak=$tree_rc tree-cleaned=$clean_rc history-range=$range_rc commit-message=$msg_rc (want 1 0 1 1)"
+          if [ "$tree_rc" != 1 ] || [ "$clean_rc" != 0 ] || [ "$range_rc" != 1 ] || [ "$msg_rc" != 1 ]; then
             echo "::error::leak-scan self-test: the scanner did not behave on a known sample — its verdict below means nothing"
             exit 1
           fi
-          case "$tree_out$range_out" in
+          case "$tree_out$range_out$msg_out" in
             *"$ip"*|*selftest*)
               echo "::error::leak-scan self-test: redacted output echoed the matched text"
               exit 1 ;;
           esac
-          echo "LEAK-SCAN SELF-TEST PASSED: tree and history scans both caught the sample, the cleaned tree passed, nothing was echoed"
+          echo "LEAK-SCAN SELF-TEST PASSED: the tree, history and commit-message scans each caught the sample, the cleaned tree passed, nothing was echoed"
 
       - name: Scan the checked-out tree
         run: python3 scripts/check-no-private-links.py --redact
 
-      - name: Scan every line this PR or push adds
+      - name: Scan what this PR or push publishes
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.event.after }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PUSH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           have() { git cat-file -e "$1^{commit}" 2>/dev/null; }
           all_zero() { case "$1" in *[!0]*) return 1 ;; *) return 0 ;; esac; }
+          tag_args=()
           if [ "$EVENT" = pull_request ]; then
             # Missing ends are an ERROR, not an empty range: scanning nothing and
             # printing a green tick is the failure this workflow exists to end.
@@ -120,9 +148,18 @@ jobs:
           elif ! all_zero "$PUSH_BEFORE" && have "$PUSH_BEFORE"; then
             revs="$PUSH_BEFORE..$PUSH_AFTER"
           else
-            # A new branch or tag (before is all zeros), or a force-push whose old tip
-            # was not fetched: every commit not already on the default branch.
-            revs="$PUSH_AFTER --not origin/$DEFAULT_BRANCH"
+            # A new branch or tag (before is all zeros), or a force-push whose old tip is
+            # gone. Excluding the default branch here would scan NOTHING for a force-push
+            # to the default branch itself, so the whole history of the new tip is
+            # scanned; the baseline suppresses exactly the known historical findings.
+            revs="$PUSH_AFTER"
+          fi
+          if [ "$EVENT" = push ]; then
+            case "$PUSH_REF" in refs/tags/*) tag_args=(--tag "$PUSH_REF") ;; esac
           fi
           echo "range: $revs"
-          python3 scripts/check-no-private-links.py --redact --no-tree --range "$revs"
+          python3 scripts/check-no-private-links.py --redact --no-tree --range "$revs" \
+            --baseline scripts/leak-scan-baseline.json ${tag_args[@]+"${tag_args[@]}"}
+
+      - name: Baseline pin — the known historical findings, exactly
+        run: python3 scripts/check-no-private-links.py --redact --check-baseline scripts/leak-scan-baseline.json

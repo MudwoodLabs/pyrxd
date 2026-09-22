@@ -8,8 +8,8 @@ Four checks:
    break in any clone and leak the existence of private files via the
    link text.
 2. **Bare home-directory paths** — an absolute ``/home/<user>/`` or
-   ``/Users/<user>/`` path *anywhere* in the doc body: link, prose, or
-   code block. These leak the author's username and local layout,
+   ``/Users/<user>/`` path *anywhere* in any tracked text file: link, prose,
+   code or config. These leak the author's username and local layout,
    break in every other clone, and — when they point into a sibling
    project — leak that project's existence. Username-agnostic forms
    like ``~/.pyrxd/config.toml`` are NOT flagged: that's the correct
@@ -24,8 +24,12 @@ Usage
     scripts/check-no-private-links.py            # scan the tracked tree
     scripts/check-no-private-links.py --verbose  # show what's being checked
     scripts/check-no-private-links.py --no-tree --range BASE..HEAD
-                                                 # scan every line those commits ADD
-    scripts/check-no-private-links.py --redact   # report file:line and check only
+                                                 # scan what those commits publish
+    scripts/check-no-private-links.py --no-tree --tag refs/tags/v1
+                                                 # scan a tag's name and message
+    scripts/check-no-private-links.py --redact   # report location and check only
+    scripts/check-no-private-links.py --check-baseline scripts/leak-scan-baseline.json
+                                                 # pin the known-historical list
 
 WHAT IS SCANNED. By default, the tracked tree — and "tracked" means BOTH the
 index (what the next commit records) and the working-tree copy where the two
@@ -35,21 +39,29 @@ the index, and would be committed from there.
 That is not what gets published, though: a push publishes COMMITS. A leak
 committed and removed in a later commit, or sitting on a branch that is not
 checked out, is in every clone and invisible to any tree scan. ``--range``
-scans the added lines of every commit that ``git log`` selects with the given
-revision arguments (``BASE..HEAD``, or ``SHA --not --remotes=origin`` for a
-branch the remote has never seen), merges included. The CI workflow
-``.github/workflows/leak-scan.yml`` and the pre-push hook
-``scripts/git-hooks/pre-push`` both use it.
+scans what every commit ``git log`` selects with the given revision arguments
+(``BASE..HEAD``, or ``SHA --not --remotes`` for commits no remote has) publishes:
+its added lines, the NAMES of the files it adds, and its MESSAGE — a squash-merge's
+message is the PR body. Merges included. ``--tag`` does the same for a tag's name and
+an annotated tag's message. The CI workflow ``.github/workflows/leak-scan.yml`` and
+the pre-push hook ``scripts/git-hooks/pre-push`` both use them.
 
-Scope, per check. The tree and range scans apply the SAME scope:
+History published before this scan existed already holds findings. They are listed in
+``scripts/leak-scan-baseline.json`` and suppressed only by exact commit identity, so no new
+commit can match one; ``--check-baseline`` fails if that list and the history ever differ.
 
-    private links   .md / .rst only
-    home paths      .md / .rst only
-    private names   .md / .rst only (and only with a local .private-names)
-    ssh targets     EVERY text file
+Scope, per check. Every scan applies the SAME scope:
 
-The ssh-target check reads everything because the leak it was written for lived
-in a .py file, where a doc-only scan could never have seen it.
+    private links   .md / .rst, commit and tag messages
+    home paths      EVERY text file, file names, commit and tag messages
+    private names   .md / .rst, file names, commit and tag messages
+                    (only with a local .private-names)
+    ssh targets     EVERY text file, file names, commit and tag messages
+
+The ssh-target and home-path checks read everything because the leaks they were written
+for lived in a .py file and in config, where a doc-only scan could never have seen them.
+A file containing a NUL byte is also read as UTF-16, where every ASCII character carries
+a zero byte and a leak read as UTF-8 noise.
 
 Output. Each finding is reported as ``path:line`` (prefixed with the commit for
 a range finding) under the check that found it, followed by the matched text.
@@ -87,6 +99,8 @@ Design notes
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -110,7 +124,7 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 # clone, and (when they point into a sibling private project) leak that
 # project's existence. The link-target checks above only catch the
 # `](path)` form; this catches the rest. A ``file://`` prefix is
-# matched too, so ``file:///home/alice/...`` is caught.
+# matched too, so a ``file://`` URL of a home path is caught.
 #
 # Matches: /home/<concrete-user>/..., /Users/<concrete-user>/...
 # where the username segment is constrained to characters POSIX
@@ -127,7 +141,15 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 #   - /root/... — no username embedded; rare and not a personal leak
 #   - /tmp/... — scratch paths carry no username and are a normal way
 #     to describe a throwaway clone or fixture dump
-_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/[a-zA-Z0-9._-]+/[^\s`)\"'<>]+")
+_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)/[^\s`)\"'<>]+")
+
+#: Home directories that name no person. Each is an exemption, so the membership is pinned by
+#: ``tests/test_leak_scan_covers_what_is_published.py`` rather than trusted as prose.
+#:
+#: ``pyodide``: the in-browser filesystem Pyodide mounts is rooted at ``/home/pyodide``, and the
+#: browser inspect page writes its glue module there (``docs/inspect_static/inspect/shared.js``).
+#: It was the one hit in a non-doc file when this check was widened to every file.
+_NON_PERSONAL_HOMES = frozenset({"pyodide"})
 
 #: Check names, as printed. `--redact` prints these and a location, nothing else.
 CHECK_PRIVATE_LINK = "private-link"
@@ -136,10 +158,21 @@ CHECK_PRIVATE_NAME = "private-name"
 CHECK_SSH_TARGET = "ssh-target"
 
 
+#: Where in a published object a finding sits. The file's CONTENT is only one of them: a
+#: commit's MESSAGE is published too (a squash-merge's message is the PR body), and so are the
+#: NAMES of the files it adds and the message of an annotated TAG.
+PART_CONTENT = "content"
+PART_FILE_NAME = "file name"
+PART_COMMIT_MESSAGE = "commit message"
+PART_TAG_MESSAGE = "tag message"
+PART_TAG_NAME = "tag name"
+
+
 @dataclass(frozen=True)
 class Finding:
     """One leak, located. ``where`` is ``""`` for the working tree, ``"staged"`` for an
-    index version that differs from it, or a commit id for a ``--range`` finding."""
+    index version that differs from it, or the full commit id for a ``--range`` finding
+    (a tag's ref name for a tag finding)."""
 
     check: str
     path: Path
@@ -147,6 +180,7 @@ class Finding:
     match: str
     where: str = ""
     detail: str = ""
+    part: str = PART_CONTENT
 
 
 def _git(repo_root: Path, *args: str, stdin: bytes | None = None) -> bytes:
@@ -304,7 +338,7 @@ def find_home_paths(content: str) -> list[str]:
     ``/root/`` and ``/tmp/`` are intentionally not flagged (see the
     module docstring for why).
     """
-    return _HOME_PATH_RE.findall(content)
+    return [m.group(0) for m in _HOME_PATH_RE.finditer(content) if m.group(1) not in _NON_PERSONAL_HOMES]
 
 
 def looks_like_url(target: str) -> bool:
@@ -425,33 +459,44 @@ def scan_text(
     repo_root: Path,
     private_names: list[str],
     where: str = "",
+    part: str = PART_CONTENT,
+    doc: bool | None = None,
 ) -> list[Finding]:
     """Every finding in *content*, which is *path*'s text starting at line *first_line*.
 
     THE ONE DEFINITION of what a leak is, per file type. The tree scan hands it a
-    whole file; the range scan hands it each block of lines a commit added. Keeping
-    the scope rules here is what stops the two scans from disagreeing about the
-    same line.
+    whole file; the range scan hands it each block of lines a commit added, and each
+    commit message. Keeping the scope rules here is what stops the scans from
+    disagreeing about the same line.
+
+    *doc* overrides the file-type scope: a commit or tag message is read as a doc.
     """
-    if path.suffix in _BINARY_SUFFIXES:
+    if part == PART_CONTENT and path.suffix in _BINARY_SUFFIXES:
         return []
+    is_doc = is_doc_file(path) if doc is None else doc
 
     def line_of(offset: int) -> int:
         # Counted per FINDING, not precomputed per file: findings are rare and files are not.
         return first_line + content.count("\n", 0, offset)
 
+    def hit(check: str, m: re.Match[str], detail: str = "") -> Finding:
+        return Finding(check, path, line_of(m.start()), m.group(0), where, detail=detail, part=part)
+
     found: list[Finding] = []
     for m in _SSH_TARGET_RE.finditer(content):
         if _is_routable(m.group(2)):
-            found.append(Finding(CHECK_SSH_TARGET, path, line_of(m.start()), m.group(0), where))
-    if not is_doc_file(path):
+            found.append(hit(CHECK_SSH_TARGET, m))
+    # EVERY file, not only docs — the scope the ssh-target check was widened to for the same
+    # reason: a home path in a .py, .yml, .toml or .sh file is exactly as public.
+    for m in _HOME_PATH_RE.finditer(content):
+        if m.group(1) not in _NON_PERSONAL_HOMES:
+            found.append(hit(CHECK_HOME_PATH, m))
+    if not is_doc:
         return found
 
-    for m in _HOME_PATH_RE.finditer(content):
-        found.append(Finding(CHECK_HOME_PATH, path, line_of(m.start()), m.group(0), where))
     for name in private_names:
         for m in re.finditer(rf"\b{re.escape(name)}\b", content, re.IGNORECASE):
-            found.append(Finding(CHECK_PRIVATE_NAME, path, line_of(m.start()), m.group(0), where))
+            found.append(hit(CHECK_PRIVATE_NAME, m))
 
     candidates: list[tuple[re.Match[str], Path]] = []
     for m in _link_matches(content, path.suffix):
@@ -466,14 +511,86 @@ def scan_text(
         for m, resolved in candidates:
             if resolved in ignored:
                 found.append(
-                    Finding(CHECK_PRIVATE_LINK, path, line_of(m.start()), m.group(1), where, detail=str(resolved))
+                    Finding(
+                        CHECK_PRIVATE_LINK,
+                        path,
+                        line_of(m.start()),
+                        m.group(1),
+                        where,
+                        detail=str(resolved),
+                        part=part,
+                    )
                 )
     return found
 
 
-def _decode(data: bytes) -> str:
-    """Text for scanning. ``errors="replace"``: one bad byte must not hide the rest of a file."""
-    return data.decode("utf-8", errors="replace")
+def scan_name(path: Path, *, private_names: list[str], where: str = "") -> list[Finding]:
+    """Findings in a FILE NAME. A tracked path is published exactly like the file's content."""
+    return [
+        Finding(f.check, path, 0, f.match, where, part=PART_FILE_NAME)
+        for f in scan_text(
+            path,
+            str(path),
+            first_line=1,
+            repo_root=Path("."),
+            private_names=private_names,
+            doc=True,
+            part=PART_FILE_NAME,
+        )
+        if f.check != CHECK_PRIVATE_LINK
+    ]
+
+
+def _decodings(data: bytes) -> list[str]:
+    """Every reading of *data* worth scanning. ``errors="replace"`` throughout: one bad byte
+    must not hide the rest of a file.
+
+    UTF-8 always. And when the bytes contain a NUL, UTF-16 too, little- and big-endian, from
+    both byte alignments: in UTF-16 every ASCII character carries a zero byte, so a UTF-16 file
+    (a PowerShell script, a Windows-saved doc) reads as UTF-8 noise and hid every leak in it.
+    Both alignments because the range scan meets a UTF-16 file as runs of added lines that git
+    split at the ``0a`` byte, so a run can start on the second byte of a character. For ASCII
+    and Latin-1 text the OTHER endianness happens to read such a run correctly; for a character
+    past U+00FF — which only a private name can contain — only the realigned read does.
+    """
+    texts = [data.decode("utf-8", errors="replace")]
+    if b"\x00" in data:
+        for codec in ("utf-16-le", "utf-16-be"):
+            for offset in (0, 1):
+                texts.append(data[offset:].decode(codec, errors="replace"))
+    return texts
+
+
+def scan_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    first_line: int,
+    repo_root: Path,
+    private_names: list[str],
+    where: str = "",
+    part: str = PART_CONTENT,
+    doc: bool | None = None,
+) -> list[Finding]:
+    """:func:`scan_text` over every reading :func:`_decodings` gives, de-duplicated."""
+    seen: set[tuple[str, int, str]] = set()
+    found: list[Finding] = []
+    for text in _decodings(data):
+        for f in scan_text(
+            path,
+            text,
+            first_line=first_line,
+            repo_root=repo_root,
+            private_names=private_names,
+            where=where,
+            part=part,
+            doc=doc,
+        ):
+            key = (f.check, f.line, f.match)
+            if key not in seen:
+                seen.add(key)
+                found.append(f)
+    return found
 
 
 def scan_tree(repo_root: Path, private_names: list[str]) -> tuple[list[Finding], list[tuple[Path, str]], int]:
@@ -491,6 +608,8 @@ def scan_tree(repo_root: Path, private_names: list[str]) -> tuple[list[Finding],
     unreadable: list[tuple[Path, str]] = []
     scanned = 0
     for path in sorted(set(index) | set(git_ls_files(repo_root))):
+        # The NAME first, and for every path, binary or not: a file name is published as-is.
+        findings.extend(scan_name(path, private_names=private_names))
         if path.suffix in _BINARY_SUFFIXES:
             continue
         entries = [(mode, blob) for mode, blob in index.get(path, []) if mode != "160000"]
@@ -515,14 +634,14 @@ def scan_tree(repo_root: Path, private_names: list[str]) -> tuple[list[Finding],
         scanned += 1
         seen: set[tuple[str, int, str]] = set()
         if worktree is not None:
-            for f in scan_text(path, _decode(worktree), first_line=1, repo_root=repo_root, private_names=private_names):
+            for f in scan_bytes(path, worktree, first_line=1, repo_root=repo_root, private_names=private_names):
                 seen.add((f.check, f.line, f.match))
                 findings.append(f)
         for data in readable:
             if data == worktree:
                 continue
-            for f in scan_text(
-                path, _decode(data), first_line=1, repo_root=repo_root, private_names=private_names, where="staged"
+            for f in scan_bytes(
+                path, data, first_line=1, repo_root=repo_root, private_names=private_names, where="staged"
             ):
                 if (f.check, f.line, f.match) not in seen:
                     seen.add((f.check, f.line, f.match))
@@ -584,8 +703,11 @@ def _unparseable(commit: str, path: Path | None, what: str) -> None:
     sys.exit(2)
 
 
-def iter_added_blocks(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, Path, int, list[str]]]:
+def iter_added_blocks(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, Path, int, list[bytes]]]:
     """``(commit, path, first_line, lines)`` for every run of lines a selected commit ADDS.
+
+    The lines are RAW BYTES, decoded by the caller, so a UTF-16 file's run can be rejoined
+    at the ``0a`` bytes git split it on and read as UTF-16 (see :func:`_decodings`).
 
     One ``git log -p`` over the range. The options are there to make the output a
     format this parser owns, whatever the user's config says:
@@ -639,7 +761,7 @@ def iter_added_blocks(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, P
             removed = int(m.group(1)) if m.group(1) is not None else 1
             first = int(m.group(2))
             added = int(m.group(3)) if m.group(3) is not None else 1
-            block: list[str] = []
+            block: list[bytes] = []
             while (removed or added) and i < len(lines):
                 body = lines[i]
                 i += 1
@@ -649,7 +771,7 @@ def iter_added_blocks(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, P
                     removed -= 1
                 elif body.startswith(b"+"):
                     added -= 1
-                    block.append(_decode(body[1:]))
+                    block.append(body[1:])
                 elif body.startswith(b" "):
                     removed -= 1  # context, counted on both sides; -U0 should emit none
                     added -= 1
@@ -661,8 +783,42 @@ def iter_added_blocks(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, P
                 yield commit, path, first, block
 
 
+def _commit_messages(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, bytes]]:
+    """``(commit, message)`` for every commit *revs* selects. A squash-merge's message is the
+    PR body, and it is published exactly like the diff."""
+    for record in _git(repo_root, "log", "-z", "--no-color", "--format=%H%n%B", *revs, "--").split(b"\0"):
+        if record.strip():
+            sha, _, message = record.partition(b"\n")
+            yield sha.decode(), message
+
+
+def _added_names(repo_root: Path, revs: list[str]) -> Iterator[tuple[str, Path]]:
+    """``(commit, path)`` for every file a selected commit adds or changes, merges included.
+
+    From ``--name-only``, not from the patch's ``+++`` headers: an EMPTY new file has no hunk
+    and no ``+++`` line, so its name appeared nowhere a patch parser looks.
+    """
+    raw = _git(
+        repo_root, "log", "-m", "-z", "--no-renames", "--diff-filter=d", "--name-only", "--format=%x01%H", *revs, "--"
+    )
+    seen: set[tuple[str, bytes]] = set()
+    for chunk in raw.split(b"\x01"):
+        parts = chunk.split(b"\0")
+        if not parts or not parts[0]:
+            continue
+        sha = parts[0].decode()
+        for name in (item.lstrip(b"\n") for item in parts[1:]):
+            if name and (sha, name) not in seen:
+                seen.add((sha, name))
+                yield sha, Path(os.fsdecode(name))
+
+
 def scan_range(repo_root: Path, revs: list[str], private_names: list[str]) -> tuple[list[Finding], int, int]:
-    """Scan every added line in *revs*. Returns ``(findings, commits, lines)``."""
+    """Scan every added line, every added file NAME and every commit MESSAGE in *revs*.
+
+    Returns ``(findings, commits, lines)``. Range findings carry the FULL commit id in
+    ``where`` (the baseline keys on it); the report shortens it.
+    """
     commits: set[str] = set()
     n_lines = 0
     findings: list[Finding] = []
@@ -670,19 +826,130 @@ def scan_range(repo_root: Path, revs: list[str], private_names: list[str]) -> tu
         commits.add(commit)
         n_lines += len(block)
         findings.extend(
-            scan_text(
+            scan_bytes(
                 path,
-                "\n".join(block),
+                b"\n".join(block),
                 first_line=first,
                 repo_root=repo_root,
                 private_names=private_names,
-                where=commit[:12],
+                where=commit,
             )
         )
-    # Commits that added no lines (empty, deletion-only) still count as scanned.
-    listed = _git(repo_root, "rev-list", *revs, "--").split()
-    commits.update(c.decode() for c in listed)
+    for commit, path in _added_names(repo_root, revs):
+        findings.extend(scan_name(path, private_names=private_names, where=commit))
+    for commit, message in _commit_messages(repo_root, revs):
+        commits.add(commit)
+        findings.extend(
+            scan_bytes(
+                Path("(commit message)"),
+                message,
+                first_line=1,
+                repo_root=repo_root,
+                private_names=private_names,
+                where=commit,
+                part=PART_COMMIT_MESSAGE,
+                doc=True,
+            )
+        )
     return findings, len(commits), n_lines
+
+
+def scan_tags(repo_root: Path, refs: list[str], private_names: list[str]) -> list[Finding]:
+    """The NAME of each tag in *refs*, and the MESSAGE of each annotated one.
+
+    A tag push publishes both, and neither is in any commit's diff or message.
+    """
+    findings: list[Finding] = []
+    for ref in refs:
+        sha = _git(repo_root, "rev-parse", "--verify", "--end-of-options", ref).decode().strip()
+        name = ref.removeprefix("refs/tags/")
+        findings.extend(
+            Finding(f.check, Path(name), 0, f.match, ref, part=PART_TAG_NAME)
+            for f in scan_name(Path(name), private_names=private_names)
+        )
+        if _git(repo_root, "cat-file", "-t", sha).strip() != b"tag":
+            continue  # a lightweight tag: a name and nothing else
+        body = _git(repo_root, "cat-file", "tag", sha)
+        _headers, _, message = body.partition(b"\n\n")
+        findings.extend(
+            scan_bytes(
+                Path("(tag message)"),
+                message,
+                first_line=1,
+                repo_root=repo_root,
+                private_names=private_names,
+                where=ref,
+                part=PART_TAG_MESSAGE,
+                doc=True,
+            )
+        )
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────── baseline ──
+#
+# THE HISTORY ALREADY HOLDS LEAKS, published before any of this ran. A scan that reaches them
+# (a clone with no remote-tracking refs pushing a new branch, a force-push to the default
+# branch) would refuse every honest push forever — a guard refusing valid work. So the known
+# historical findings are listed, and suppressed ONLY by exact identity:
+# (commit, part, path, check). A commit id is immutable, so no new commit can ever match an
+# entry; a new leak always fails.
+#
+# The file stores SHA-256 digests of those keys, not the keys. It is public, and a readable list
+# of where the old leaks are would be an index to them.
+#
+# EXACT MEMBERSHIP, EXECUTED: `--check-baseline` rescans the full history of the commit the
+# baseline was generated from and fails on ANY difference — a finding not listed, or an entry
+# nothing matches. Change a detection rule and the check fails until the baseline is
+# regenerated, so an exemption cannot outlive the reason it was written.
+
+
+def _is_commit_id(value: str) -> bool:
+    return len(value) == 40 and all(c in "0123456789abcdef" for c in value)
+
+
+def baseline_key(f: Finding) -> str | None:
+    """The digest a finding is suppressed by, or ``None`` for one that is not in a commit."""
+    if not _is_commit_id(f.where):
+        return None
+    path = "" if f.part == PART_COMMIT_MESSAGE else str(f.path)
+    return hashlib.sha256(f"{f.where}\0{f.part}\0{path}\0{f.check}".encode()).hexdigest()
+
+
+def load_baseline(path: Path) -> tuple[str, frozenset[str]]:
+    """``(commit it was generated from, digests)``. A malformed file is an invocation error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        commit = data["meta"]["commit"]
+        entries = frozenset(data["entries"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"error: cannot read baseline {path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if not _is_commit_id(commit) or not all(isinstance(e, str) and len(e) == 64 for e in entries):
+        print(f"error: baseline {path} is malformed", file=sys.stderr)
+        sys.exit(2)
+    return commit, entries
+
+
+def write_baseline(path: Path, commit: str, findings: list[Finding]) -> int:
+    entries = sorted({k for k in (baseline_key(f) for f in findings) if k is not None})
+    document = {
+        "meta": {
+            "format": 1,
+            "commit": commit,
+            "entries": len(entries),
+            "about": (
+                "Known leak-scan findings in history published before the scan ran, as SHA-256 "
+                "digests of (commit, part, path, check). Suppressed only by exact identity; checked "
+                "for exact membership by `scripts/check-no-private-links.py --check-baseline`. "
+                "Regenerate with `--no-tree --range <commit> --write-baseline <this file>`, and say "
+                "in the commit message why every added entry is historical."
+            ),
+        },
+        "entries": entries,
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return len(entries)
 
 
 # ─────────────────────────────────────────────────────────────── reporting ──
@@ -703,7 +970,7 @@ _EXPLANATIONS = {
         'genericise it ("another project"). See docs/CONTRIBUTING.md.',
     ),
     CHECK_HOME_PATH: (
-        "error: tracked docs contain bare home-directory paths:",
+        "error: tracked files contain bare home-directory paths:",
         "An absolute /home/<user>/ or /Users/<user>/ path leaks the author's\n"
         "username and local layout, breaks in every other clone, and if it\n"
         "points into a sibling project leaks that project's existence.\n"
@@ -733,10 +1000,24 @@ _LABELS = {
 }
 
 
-def _location(f: Finding) -> str:
-    if f.where and f.where != "staged":
-        return f"{f.where} {f.path}:{f.line}"
-    return f"{f.path}:{f.line}" + (" (staged version)" if f.where == "staged" else "")
+def _location(f: Finding, *, redact: bool) -> str:
+    """Where a finding is. Redacted, it never includes text the leak could be IN: a file name
+    or a tag name that carries the leak is replaced by a digest of it."""
+    commit = f.where[:12] if _is_commit_id(f.where) else ""
+    prefix = f"{commit} " if commit else ""
+    if f.part in (PART_FILE_NAME, PART_TAG_NAME):
+        kind = "a file name" if f.part == PART_FILE_NAME else "a tag name"
+        if redact:
+            digest = hashlib.sha256(str(f.path).encode()).hexdigest()[:12]
+            return f"{prefix}({kind}, sha256:{digest})"
+        return f"{prefix}{f.path} ({kind})"
+    if f.part == PART_COMMIT_MESSAGE:
+        return f"{prefix}(commit message):{f.line}"
+    if f.part == PART_TAG_MESSAGE:
+        return f"(tag message):{f.line}" if redact else f"(tag message of {f.where}):{f.line}"
+    if f.where == "staged":
+        return f"{f.path}:{f.line} (staged version)"
+    return f"{prefix}{f.path}:{f.line}"
 
 
 def report(findings: list[Finding], *, redact: bool) -> None:
@@ -758,9 +1039,9 @@ def report(findings: list[Finding], *, redact: bool) -> None:
         print("", file=sys.stderr)
         for f in group:
             if redact:
-                print(f"  {_location(f)}: {f.check}", file=sys.stderr)
+                print(f"  {_location(f, redact=True)}: {f.check}", file=sys.stderr)
                 continue
-            print(f"  {_location(f)}", file=sys.stderr)
+            print(f"  {_location(f, redact=False)}", file=sys.stderr)
             print(f"    {_LABELS[check]}: {f.match}", file=sys.stderr)
             if f.detail:
                 print(f"    resolves to: {f.detail} (gitignored)", file=sys.stderr)
@@ -783,29 +1064,58 @@ def main() -> int:
     parser.add_argument(
         "--range",
         metavar="REVS",
-        help="also scan every line ADDED by the commits these git-log revision arguments select, "
-        "e.g. 'BASE..HEAD' or 'SHA --not --remotes=origin' (whitespace-separated)",
+        help="also scan every line ADDED, every file NAME added and every commit MESSAGE in the commits "
+        "these git-log revision arguments select, e.g. 'BASE..HEAD' or 'SHA --not --remotes' "
+        "(whitespace-separated)",
+    )
+    parser.add_argument(
+        "--tag",
+        metavar="REF",
+        action="append",
+        default=[],
+        help="also scan this tag's name and, if it is annotated, its message (repeatable)",
     )
     parser.add_argument(
         "--no-tree",
         action="store_true",
-        help="skip the tracked-tree scan (use with --range)",
+        help="skip the tracked-tree scan (use with --range or --tag)",
+    )
+    parser.add_argument(
+        "--baseline",
+        metavar="FILE",
+        help="suppress --range findings listed in this baseline of known historical findings",
+    )
+    parser.add_argument(
+        "--check-baseline",
+        metavar="FILE",
+        help="rescan the full history of the commit this baseline was generated from and fail on ANY "
+        "difference from it (a finding it does not list, or an entry nothing matches)",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        metavar="FILE",
+        help="write the --range findings as a baseline (use with --no-tree and a single-commit --range)",
     )
     parser.add_argument(
         "--redact",
         action="store_true",
-        help="report only file:line and the check name, never the matched text "
+        help="report only the location and the check name, never the matched text "
         "(always on when GITHUB_ACTIONS=true: a public log must not republish a leak)",
     )
     args = parser.parse_args()
     redact = args.redact or os.environ.get("GITHUB_ACTIONS") == "true"
-    if args.no_tree and not args.range:
-        print("error: --no-tree without --range scans nothing", file=sys.stderr)
+    if args.no_tree and not (args.range or args.tag):
+        print("error: --no-tree without --range or --tag scans nothing", file=sys.stderr)
         return 2
 
     repo_root = find_repo_root()
+    if args.check_baseline:
+        return _check_baseline(repo_root, Path(args.check_baseline))
     revs = parse_range(args.range) if args.range else None
-    private_names = load_private_names(repo_root)
+    # The baseline describes the CI view — no local `.private-names` list — so writing one
+    # reads no private names. Otherwise a developer's local list would end up in a public file.
+    private_names = [] if args.write_baseline else load_private_names(repo_root)
+    baseline = load_baseline(Path(args.baseline))[1] if args.baseline else frozenset()
 
     findings: list[Finding] = []
     if not args.no_tree:
@@ -822,11 +1132,26 @@ def main() -> int:
         print(f"leak scan: tree — {scanned} tracked file(s) scanned, {len(tree_findings)} finding(s)")
     if revs is not None:
         range_findings, n_commits, n_lines = scan_range(repo_root, revs, private_names)
+        if args.write_baseline:
+            if len(revs) != 1:
+                print("error: --write-baseline needs a --range of exactly one commit", file=sys.stderr)
+                return 2
+            commit = _git(repo_root, "rev-parse", "--verify", f"{revs[0]}^{{commit}}").decode().strip()
+            count = write_baseline(Path(args.write_baseline), commit, range_findings)
+            print(f"leak scan: wrote {count} baseline entr(ies) for the full history of {commit[:12]}")
+            return 0
+        known = [f for f in range_findings if baseline_key(f) in baseline]
+        range_findings = [f for f in range_findings if baseline_key(f) not in baseline]
         findings.extend(range_findings)
         print(
             f"leak scan: range {' '.join(revs)} — {n_commits} commit(s), {n_lines} added line(s), "
             f"{len(range_findings)} finding(s)"
+            + (f", {len(known)} known historical finding(s) suppressed by the baseline" if known else "")
         )
+    if args.tag:
+        tag_findings = scan_tags(repo_root, args.tag, private_names)
+        findings.extend(tag_findings)
+        print(f"leak scan: {len(args.tag)} tag(s) — {len(tag_findings)} finding(s)")
     if not private_names:
         print(
             f"note: private-name check NOT run — no {_PRIVATE_NAMES_FILE} file (it is local and "
@@ -838,6 +1163,32 @@ def main() -> int:
         return 1
     if args.verbose:
         print("OK — no private-path links, home-directory paths, private names or ssh targets.")
+    return 0
+
+
+def _check_baseline(repo_root: Path, path: Path) -> int:
+    """Exact membership: the baseline must equal the findings of its commit's full history."""
+    commit, entries = load_baseline(path)
+    if subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True, check=False
+    ).returncode:
+        print(f"error: the baseline's commit {commit[:12]} is not in this clone (a shallow checkout?)", file=sys.stderr)
+        return 2
+    findings, n_commits, _lines = scan_range(repo_root, [commit], [])
+    found = {k for k in (baseline_key(f) for f in findings) if k is not None}
+    unlisted, unmatched = found - entries, entries - found
+    print(
+        f"leak scan: baseline {path} — {len(entries)} entr(ies) for the {n_commits}-commit history of "
+        f"{commit[:12]}; {len(unlisted)} finding(s) not listed, {len(unmatched)} entr(ies) matching nothing"
+    )
+    if unlisted or unmatched:
+        print(
+            "error: the baseline no longer equals what the scan finds in that history. A detection rule "
+            "changed, or the file was edited by hand. Regenerate it and say in the commit why every "
+            "entry is historical.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

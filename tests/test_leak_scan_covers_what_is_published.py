@@ -24,6 +24,7 @@ honest-path controls ARE literal, because the scanner allows them by design.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
@@ -382,9 +383,11 @@ def hook_env(repo: pathlib.Path, tmp_path: pathlib.Path) -> dict[str, str]:
     return _env(PATH=f"{stub_bin}:{os.environ['PATH']}")
 
 
-def _push(repo: pathlib.Path, env: dict[str, str], *lines: str) -> subprocess.CompletedProcess[str]:
+def _push(
+    repo: pathlib.Path, env: dict[str, str], *lines: str, remote: str = "origin"
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(_HOOK), "origin", "git@example.invalid:owner/repo.git"],
+        ["bash", str(_HOOK), remote, "git@example.invalid:owner/repo.git"],
         cwd=repo,
         env=env,
         input="".join(line + "\n" for line in lines),
@@ -492,7 +495,7 @@ def test_the_workflow_self_test_step_passes_against_the_real_scanner(tmp_path) -
         env=_env(GITHUB_ACTIONS="true", RUNNER_TEMP=str(tmp_path), GITHUB_WORKSPACE=str(_REPO)),
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "self-test exits: tree-with-leak=1 tree-cleaned=0 history-range=1" in proc.stdout
+    assert "self-test exits: tree-with-leak=1 tree-cleaned=0 history-range=1 commit-message=1" in proc.stdout
     assert "LEAK-SCAN SELF-TEST PASSED" in proc.stdout
 
 
@@ -515,7 +518,8 @@ def test_the_workflow_range_step_scans_the_pull_requests_commits(repo, hook_env)
     _commit(repo, _leaky_files(), "leak")
     _git(repo, "rm", "-q", "deploy.sh", "guide.md")
     head = _commit(repo, {"README.md": "still clean\n"}, "remove it again")
-    step = _step_named("Scan every line")
+    _write_baseline(repo, [])
+    step = _step_named("Scan what this PR or push publishes")
     event = {"GITHUB_ACTIONS": "true", "EVENT": "pull_request", "PR_BASE": base, "PR_HEAD": head}
     proc = _run_step(step, cwd=repo, env={**hook_env, **event})
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -523,3 +527,278 @@ def test_the_workflow_range_step_scans_the_pull_requests_commits(repo, hook_env)
 
     missing = _run_step(step, cwd=repo, env={**hook_env, **event, "PR_BASE": "ab" * 20})
     assert missing.returncode == 1 and "is not in the checkout" in missing.stdout
+
+
+# ───────────────────────────────────────────── what a commit publishes besides lines ──
+
+
+def test_a_leak_in_a_commit_message_is_caught(repo) -> None:
+    """A squash-merge's message is the PR body, and it is published like the diff."""
+    base = _git(repo, "rev-parse", "HEAD")
+    _write(repo, {"a.txt": "ok\n"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "fix deploy", "-m", f"was run as: ssh {_SSH_LEAK} restart")
+    assert _scan(repo).returncode == 0, "control: the tree is clean"
+    proc = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    sha = _git(repo, "rev-parse", "HEAD")[:12]
+    assert f"{sha} (commit message):3" in proc.stderr
+    redacted = _scan(repo, "--redact", "--no-tree", "--range", f"{base}..HEAD")
+    assert f"{sha} (commit message):3: ssh-target" in redacted.stderr
+    assert _ROUTABLE_IP not in redacted.stdout + redacted.stderr
+
+
+@pytest.mark.parametrize("content", ["x\n", ""], ids=["with-content", "empty"])
+def test_a_leak_in_a_file_name_is_caught_by_both_scans(repo, content) -> None:
+    """An EMPTY new file has no hunk and no `+++` header, so a patch parser never saw its name."""
+    base = _git(repo, "rev-parse", "HEAD")
+    name = f"logs/ssh-{_SSH_LEAK}.log"
+    _commit(repo, {name: content}, "add a log")
+    for proc in (_scan(repo), _scan(repo, "--no-tree", "--range", f"{base}..HEAD")):
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert f"{name} (a file name)" in proc.stderr
+    redacted = _scan(repo, "--redact", "--no-tree", "--range", f"{base}..HEAD")
+    # The location IS the leak here, so the redacted report names a digest of it.
+    assert "(a file name, sha256:" in redacted.stderr and ": ssh-target" in redacted.stderr
+    assert _ROUTABLE_IP not in redacted.stdout + redacted.stderr
+
+
+def test_an_annotated_tag_message_and_a_tag_name_are_caught(repo) -> None:
+    _git(repo, "tag", "-a", "v0.0.1", "-m", f"deployed via {_SSH_LEAK}")
+    _git(repo, "tag", f"built-on-{_ROUTABLE_IP.replace('.', '-')}")  # a clean lightweight tag
+    _git(repo, "tag", f"deploy@{_ROUTABLE_IP}")  # a lightweight tag whose NAME leaks
+    annotated = _scan(repo, "--no-tree", "--tag", "refs/tags/v0.0.1")
+    assert annotated.returncode == 1 and "(tag message of refs/tags/v0.0.1):1" in annotated.stderr
+    named = _scan(repo, "--redact", "--no-tree", "--tag", f"refs/tags/deploy@{_ROUTABLE_IP}")
+    assert named.returncode == 1 and "(a tag name, sha256:" in named.stderr
+    assert _ROUTABLE_IP not in named.stdout + named.stderr
+    clean = _scan(repo, "--no-tree", "--tag", f"refs/tags/built-on-{_ROUTABLE_IP.replace('.', '-')}")
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+
+
+# ─────────────────────────────────────────────────────── scope and encodings ──
+
+
+@pytest.mark.parametrize("name", ["settings.py", "deploy.yml", "conf.toml", "run.sh"])
+def test_a_home_path_in_any_text_file_is_caught(repo, name) -> None:
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, {name: f"data = '{_HOME_LEAK}'\n"}, "config")
+    for proc in (_scan(repo), _scan(repo, "--no-tree", "--range", f"{base}..HEAD")):
+        assert proc.returncode == 1 and f"{name}:1" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_the_non_personal_home_exemption_is_pinned(repo) -> None:
+    """An exemption is a claim; pinning its MEMBERSHIP means any change is re-read, not inherited."""
+    spec = importlib.util.spec_from_file_location("check_no_private_links_scope", _SCANNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    assert frozenset({"pyodide"}) == module._NON_PERSONAL_HOMES
+    _commit(repo, {"shared.js": 'fs.writeFile("/home/pyodide/glue.py", src);\n'}, "pyodide")
+    assert _scan(repo).returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [("deploy.ps1", f"ssh {_SSH_LEAK}\r\n"), ("notes.md", f"see {_HOME_LEAK}\r\n")],
+)
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be"])
+def test_a_utf16_file_does_not_hide_a_leak(repo, name, text, encoding) -> None:
+    """UTF-16 gives every ASCII character a zero byte, so read as UTF-8 it was noise."""
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, {name: ("first line\r\n" + text).encode(encoding)}, "utf-16")
+    for proc in (_scan(repo), _scan(repo, "--no-tree", "--range", f"{base}..HEAD")):
+        assert proc.returncode == 1 and f"{name}:2" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_a_utf16_leak_added_mid_file_is_caught_by_the_range_scan(repo) -> None:
+    """The range scan sees a UTF-16 file as runs of added lines split at `0a` bytes, so a run
+    can start on the second byte of a character — which is why both alignments are read."""
+    lines = [f"line {i}\r\n" for i in range(5)]
+    _commit(repo, {"notes.ps1": "".join(lines).encode("utf-16-le")}, "clean")
+    base = _git(repo, "rev-parse", "HEAD")
+    lines.insert(3, f"ssh {_SSH_LEAK}\r\n")
+    _commit(repo, {"notes.ps1": "".join(lines).encode("utf-16-le")}, "leak mid-file")
+    proc = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+def test_a_utf16_run_starting_mid_character_is_realigned(repo) -> None:
+    """The case the second byte alignment exists for. An ASCII leak in such a run happens to read
+    correctly as the OTHER endianness, so the test above passes without it; a name past U+00FF
+    does not. Only a private name can be one, so this uses a local `.private-names` list."""
+    (repo / ".private-names").write_text("\u03a9mega-\u0444\n")  # Omega and Cyrillic ef: past Latin-1
+    lines = [f"line {i}\r\n" for i in range(5)]
+    _commit(repo, {"notes.md": "".join(lines).encode("utf-16-le")}, "clean")
+    base = _git(repo, "rev-parse", "HEAD")
+    lines.insert(3, "credit to \u03a9mega-\u0444\r\n")
+    _commit(repo, {"notes.md": "".join(lines).encode("utf-16-le")}, "name mid-file")
+    proc = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
+    assert proc.returncode == 1 and "notes.md:4" in proc.stderr, proc.stdout + proc.stderr
+
+
+# ───────────────────────────────────────────────────────────────── the baseline ──
+
+
+def _write_baseline(repo: pathlib.Path, entries: list[str], commit: str | None = None) -> pathlib.Path:
+    path = repo / "scripts" / "leak-scan-baseline.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"meta": {"commit": commit or _git(repo, "rev-parse", "HEAD")}, "entries": entries}))
+    return path
+
+
+def _historical_leak(repo: pathlib.Path) -> tuple[str, str]:
+    """A leak committed and removed: ``(commit before it, commit after its removal)``."""
+    before = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, _leaky_files(), "leak")
+    _git(repo, "rm", "-q", "deploy.sh", "guide.md")
+    _git(repo, "commit", "-qm", "remove it again")
+    return before, _git(repo, "rev-parse", "HEAD")
+
+
+def test_the_baseline_suppresses_exactly_the_known_findings(repo, tmp_path) -> None:
+    _before, after = _historical_leak(repo)
+    baseline = tmp_path / "baseline.json"
+    wrote = _scan(repo, "--no-tree", "--range", after, "--write-baseline", str(baseline))
+    assert wrote.returncode == 0 and "wrote 2 baseline" in wrote.stdout, wrote.stdout + wrote.stderr
+    assert _scan(repo, "--no-tree", "--range", "HEAD").returncode == 1, "control: without it, history fails"
+
+    known = _scan(repo, "--no-tree", "--range", "HEAD", "--baseline", str(baseline))
+    assert known.returncode == 0, known.stdout + known.stderr
+    assert "2 known historical finding(s) suppressed by the baseline" in known.stdout
+
+    # The SAME file, path and check in a NEW commit is a new finding: the key is the commit.
+    _commit(repo, _leaky_files(), "the same leak again")
+    again = _scan(repo, "--no-tree", "--range", "HEAD", "--baseline", str(baseline))
+    assert again.returncode == 1 and "deploy.sh:1" in again.stderr
+
+
+def test_the_baseline_check_is_exact_in_both_directions(repo, tmp_path) -> None:
+    _before, after = _historical_leak(repo)
+    baseline = tmp_path / "baseline.json"
+    _scan(repo, "--no-tree", "--range", after, "--write-baseline", str(baseline))
+    exact = _scan(repo, "--check-baseline", str(baseline))
+    assert exact.returncode == 0 and "0 finding(s) not listed, 0 entr(ies) matching nothing" in exact.stdout
+
+    document = json.loads(baseline.read_text())
+    assert document["meta"]["commit"] == after
+    for label, entries in (
+        ("an entry that matches nothing", [*document["entries"], "ab" * 32]),
+        ("a finding that is not listed", document["entries"][1:]),
+    ):
+        edited = tmp_path / f"{label}.json"
+        edited.write_text(json.dumps({**document, "entries": entries}))
+        proc = _scan(repo, "--check-baseline", str(edited))
+        assert proc.returncode == 1, (label, proc.stdout)
+
+
+def test_the_committed_baseline_holds_digests_not_locations() -> None:
+    """The file is public. A readable list of where the old leaks are would be an index to them."""
+    document = json.loads((_REPO / "scripts" / "leak-scan-baseline.json").read_text())
+    assert len(document["meta"]["commit"]) == 40
+    assert document["meta"]["entries"] == len(document["entries"]) > 0
+    assert all(len(e) == 64 and set(e) <= set("0123456789abcdef") for e in document["entries"])
+
+
+# ──────────────────────────────────────────────── the hook refuses no honest push ──
+
+
+def test_a_push_to_a_second_remote_does_not_rescan_what_another_remote_has(repo, hook_env) -> None:
+    """The history `origin` already has is not rescanned when pushing to a fork that has no
+    tracking refs — it was refusing honest pushes over findings published long ago."""
+    _historical_leak(repo)
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "remote", "add", "fork", "git@example.invalid:someone/fork.git")  # no tracking refs
+    clean = _commit(repo, {"new.txt": "clean\n"}, "new work")
+    proc = _push(repo, hook_env, f"refs/heads/main {clean} refs/heads/main {_ZERO}", remote="fork")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 commit(s)" in proc.stdout
+
+    leaky = _commit(repo, {"more.sh": f"ssh {_SSH_LEAK}\n"}, "new leak")
+    assert _push(repo, hook_env, f"refs/heads/main {leaky} refs/heads/main {_ZERO}", remote="fork").returncode == 1
+
+
+def test_a_locally_tagged_unpushed_leak_is_still_scanned(repo, hook_env) -> None:
+    """Why the hook excludes `--remotes` and NOT `--tags`: a tag made locally and never pushed
+    would otherwise hide the commits under it from the push that publishes them."""
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    leaky = _commit(repo, {"deploy.sh": f"ssh {_SSH_LEAK}\n"}, "leak")
+    _git(repo, "tag", "local-only", leaky)
+    proc = _push(repo, hook_env, f"refs/heads/main {leaky} refs/heads/main {_ZERO}")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+def test_a_pushed_tag_is_scanned_for_its_message(repo, hook_env) -> None:
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "tag", "-a", "v1", "-m", f"released from {_HOME_LEAK}")
+    tag = _git(repo, "rev-parse", "refs/tags/v1")
+    proc = _push(repo, hook_env, f"refs/tags/v1 {tag} refs/tags/v1 {_ZERO}")
+    assert proc.returncode == 1 and "(tag message of refs/tags/v1)" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_the_hook_runs_the_scanner_beside_it_not_the_checked_out_one(repo, hook_env, tmp_path) -> None:
+    """A worktree branched before the scanner learned --range carries a scanner that refuses
+    those arguments. Run through a SYMLINK, the way the installer installs the hook."""
+    (repo / "scripts" / "check-no-private-links.py").write_text(
+        "import sys\nprint('an old scanner: unrecognized arguments', file=sys.stderr)\nsys.exit(2)\n"
+    )
+    installed = tmp_path / "hooks" / "pre-push"
+    installed.parent.mkdir()
+    installed.symlink_to(_HOOK)
+    clean = _git(repo, "rev-parse", "HEAD")
+    proc = subprocess.run(
+        ["bash", str(installed), "origin", "git@example.invalid:owner/repo.git"],
+        cwd=repo,
+        env=hook_env,
+        input=f"refs/heads/main {clean} refs/heads/main {_ZERO}\n",
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "old scanner" not in proc.stderr
+
+
+# ─────────────────────────────────────────────────────────── the workflow, again ──
+
+
+def test_a_force_push_to_the_default_branch_scans_the_new_history(repo, hook_env) -> None:
+    """`after --not origin/<default>` is EMPTY by construction for a push to the default branch
+    itself, so a force-push there scanned nothing. It now scans the new tip's whole history,
+    with the baseline suppressing exactly the known historical findings."""
+    _before, after = _historical_leak(repo)
+    baseline = _write_baseline(repo, [])
+    _scan(repo, "--no-tree", "--range", after, "--write-baseline", str(baseline))
+    step = _step_named("Scan what this PR or push publishes")
+    event = {
+        "GITHUB_ACTIONS": "true",
+        "EVENT": "push",
+        "PUSH_BEFORE": "ab" * 20,  # the overwritten tip: gone from the checkout
+        "PUSH_AFTER": after,
+        "PUSH_REF": "refs/heads/main",
+    }
+    clean = _run_step(step, cwd=repo, env={**hook_env, **event})
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+    assert "range: " + after in clean.stdout and "known historical finding(s) suppressed" in clean.stdout
+
+    leaky = _commit(repo, {"new.sh": f"ssh {_SSH_LEAK}\n"}, "rewritten history, new leak")
+    proc = _run_step(step, cwd=repo, env={**hook_env, **event, "PUSH_AFTER": leaky})
+    assert proc.returncode == 1 and "new.sh:1: ssh-target" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_push_runs_are_never_cancelled_or_displaced() -> None:
+    concurrency = _workflow()["concurrency"]
+    group = concurrency["group"]
+    assert "github.sha" in group and "github.ref" in group, group
+    assert "pull_request.number" in group
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def test_the_workflow_pins_the_baseline_against_full_history() -> None:
+    runs = [s.get("run", "") for s in _steps()]
+    assert any("--check-baseline scripts/leak-scan-baseline.json" in run for run in runs)
+    checkout = next(s for s in _steps() if str(s.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"]["fetch-depth"] == 0, "the pin rescans history a shallow clone does not have"

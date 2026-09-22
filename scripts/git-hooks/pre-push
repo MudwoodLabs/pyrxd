@@ -28,18 +28,30 @@
 # WHAT IS PUSHED, NOT WHAT IS CHECKED OUT. `task ci-fast` scans the working tree.
 # A push publishes COMMITS: a leak committed and removed in a later commit, or on a
 # branch that is not checked out (`git push origin other-branch`), is in every clone
-# and invisible to a tree scan. So after ci-fast this hook scans every line the
-# pushed commits ADD, using the refs git passes on stdin:
+# and invisible to a tree scan. So after ci-fast this hook scans what the pushed
+# commits publish — added lines, added file names, commit messages — using the refs
+# git passes on stdin:
 #
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
 #
 #   existing remote ref  -> <remote_sha>..<local_sha>
-#   new remote ref       -> <local_sha> --not --remotes=<remote>   (commits the remote
-#                           does not already have; the whole branch if it has none)
+#   new remote ref       -> <local_sha> --not --remotes   (commits NO remote-tracking
+#                           ref has — for a push to a second remote, like a fork, the
+#                           history origin already has is not rescanned)
+#   a tag                -> the same, plus the tag's name and annotated message
 #   deletion             -> nothing is published, nothing to scan
 #
 # If <remote_sha> is not in this clone (someone else pushed since your last fetch),
-# the new-ref form is used, which scans more, never less.
+# the new-ref form is used, which scans more, never less. NOT `--not --tags`: a tag
+# created locally and never pushed would then hide the unpublished commits under it.
+#
+# Where the range still reaches history published before this scan existed (a clone
+# with no remote-tracking refs at all), the known findings there are suppressed by
+# the committed baseline — by exact commit identity, so no new commit can match one.
+#
+# THE SCANNER NEXT TO THIS HOOK is what runs, not the pushing worktree's copy. The hook
+# is installed as a symlink into the main checkout, and a worktree branched before the
+# scanner learned --range carries a scanner that refuses those arguments.
 
 set -euo pipefail
 
@@ -50,7 +62,6 @@ fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; exit 1; }
 # FIRST, before anything that might read stdin: the refs being pushed. `task ci-fast`
 # inherits stdin, and a child that read it would leave this hook nothing to scan.
 pushed_refs="$(cat)"
-remote_name="${1:-origin}"
 
 # Make sure we're using the project's Python environment so `task` resolves.
 # The venv is a sibling of this script's repo root, so find it rather than
@@ -99,17 +110,17 @@ else
   fail "pre-push: local checks failed — fix before pushing (or --no-verify for WIP)"
 fi
 
-say "Scanning every line the pushed commits add (leak scan)"
-scanner="$(git rev-parse --show-toplevel)/scripts/check-no-private-links.py"
-# `--remotes=<name>` only means something for a configured remote. Pushing to a bare
-# URL passes the URL as $1, so fall back to every remote-tracking ref. A loop, not
-# `git remote | grep -q`: under pipefail that pipeline can report a MATCH as failure.
-known="--remotes"
-while IFS= read -r configured; do
-  if [ "$configured" = "$remote_name" ]; then known="--remotes=$remote_name"; fi
-done <<EOF
-$(git remote)
-EOF
+say "Scanning what the pushed commits publish (leak scan)"
+hook_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+scanner="$hook_dir/../check-no-private-links.py"
+if [ ! -f "$scanner" ]; then
+  # A hook COPIED into .git/hooks rather than symlinked has no scanner beside it.
+  scanner="$(git rev-parse --show-toplevel)/scripts/check-no-private-links.py"
+  echo "  note: no scanner beside this hook; using the checked-out one ($scanner)"
+fi
+baseline="$(dirname "$scanner")/leak-scan-baseline.json"
+baseline_args=()
+if [ -f "$baseline" ]; then baseline_args=(--baseline "$baseline"); fi
 scanned=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_sha:-}" ] || continue
@@ -119,13 +130,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       if git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
         revs="${remote_sha}..${local_sha}"
       else
-        revs="${local_sha} --not ${known}"
+        revs="${local_sha} --not --remotes"
       fi ;;
-    *) revs="${local_sha} --not ${known}" ;;
+    *) revs="${local_sha} --not --remotes" ;;
   esac
+  tag_args=()
+  case "$local_ref" in refs/tags/*) tag_args=(--tag "$local_ref") ;; esac
   echo "  ${local_ref} -> ${remote_ref}"
   rc=0
-  python3 "$scanner" --no-tree --range "$revs" </dev/null || rc=$?   # stdin is the ref list
+  # `${a[@]+...}`: an empty array under `set -u` is an error in bash before 4.4.
+  python3 "$scanner" --no-tree --range "$revs" ${baseline_args[@]+"${baseline_args[@]}"} \
+    ${tag_args[@]+"${tag_args[@]}"} </dev/null || rc=$?   # stdin is the ref list
   case "$rc" in
     0) ;;
     1) fail "pre-push: a pushed commit adds a leak — rewrite that commit before pushing (removing it in a later commit still publishes it)" ;;
@@ -135,4 +150,4 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done <<EOF
 $pushed_refs
 EOF
-ok "pre-push: ${scanned} pushed ref(s) scanned, no leaks in the lines they add"
+ok "pre-push: ${scanned} pushed ref(s) scanned, no leaks in what they publish"

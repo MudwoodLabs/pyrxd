@@ -421,27 +421,43 @@ Four checks:
 
 1. Link-target check — link is gitignored (tracked docs).
 2. Home-path regex check — `/home/<user>/...` or
-   `/Users/<user>/...` in any tracked doc.
+   `/Users/<user>/...` in any tracked text file.
 3. Private-project-name check — names listed in a local, gitignored
    `.private-names` file. It runs only where that file exists, so
    never in CI.
 4. ssh-target check — `user@<routable IPv4>` in any tracked text file.
 
-Where it runs, and what it reads:
+What it reads: file contents (a file with a NUL byte is also read as
+UTF-16), file NAMES, commit MESSAGES — a squash-merge's message is the
+PR body — and a pushed tag's name and annotated message.
+
+Where it runs:
 
 - **CI, on every pull request and every push** (`.github/workflows/leak-scan.yml`,
-  no branch or path filter). It scans the checked-out tree AND every
-  line added by every commit in the PR or push, so a leak committed and
+  no branch or path filter). It scans the checked-out tree AND what
+  every commit in the PR or push publishes, so a leak committed and
   then removed in a later commit fails the job too. Output is
-  redacted to `file:line` and the check name, because the log is
+  redacted to a location and the check name, because the log is
   public. A self-test step first proves the scanner fails on a known
-  sample, so a scanner that silently scans nothing turns the job red.
+  sample, so an accidentally broken scanner turns the job red. It does
+  NOT protect against a pull request that edits the scanner, the
+  workflow or the baseline: a `pull_request` run executes the PR's own
+  copies, so such a PR can make every step pass. That protection is
+  review of those files — `.github/CODEOWNERS` requests it, and it
+  blocks a merge only if branch protection requires code-owner review.
 - **`task ci` / `task ci-fast`** — the tracked tree: every file's index
   copy, and its working-tree copy where that differs.
 - **The pre-push hook, if installed** (`scripts/install-git-hooks.sh`;
-  it is opt-in per clone) — after `task ci-fast`, every line the pushed
-  commits add, read from the refs git passes the hook. That includes a
-  pushed branch that is not checked out.
+  it is opt-in per clone) — after `task ci-fast`, what the pushed
+  commits publish, read from the refs git passes the hook. That
+  includes a pushed branch that is not checked out.
+
+History published before the scan existed already holds findings.
+They are listed in `scripts/leak-scan-baseline.json` — as digests, so
+the file is not an index to them — and suppressed only by exact commit
+identity, so no new commit can match one. A CI step rescans that
+history and fails on any difference, so the list cannot drift from
+what the scanner finds.
 
 Until the workflow existed the scan ran only locally, only over the
 working tree, and only for contributors who had installed the hook. So
