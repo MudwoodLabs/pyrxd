@@ -190,7 +190,18 @@ def _oversized_int_text(value: int) -> str:
     return f"<oversized integer: {value.bit_length()} bits>"
 
 
-def _render_safe(value: object, _depth: int = 0) -> object:
+#: How many times :func:`_render_safe` will re-walk a container it has ALREADY rendered, before
+#: every further repeat is replaced by a statement. A tree — which is what every payload this
+#: module builds is — never repeats, so it never spends any of this; only a value that shares
+#: structure does. A budget on ALL nodes would instead truncate honest output: a 1,000-output
+#: transaction's payload is over 12,000 nodes.
+_RENDER_REPEAT_BUDGET = 10_000
+
+_CYCLE_TEXT = "<cycle: this value contains itself>"
+_REPEAT_TEXT = f"<not rendered: shared structure repeated past {_RENDER_REPEAT_BUDGET} times>"
+
+
+def _render_safe(value: object) -> object:
     """*value* with every integer wider than :data:`_MAX_RENDERED_INT_BITS` replaced by text.
 
     THE ONE BOUNDED FORMATTER both output modes use. The classifier's two entry points
@@ -201,36 +212,68 @@ def _render_safe(value: object, _depth: int = 0) -> object:
     exactly what went stale: the burn amount, the TIMELOCK ``unlock_at`` and the update
     envelope were three unrelated fields with the same defect.
 
+    THE WALK IS BOUNDED IN EVERY DIRECTION AN INPUT CAN CHOOSE. Depth is capped at
+    :data:`_MAX_RENDER_DEPTH`. A container already on the current path is a cycle, rendered as
+    a fixed marker. A container reached a second time by another path costs one unit of
+    :data:`_RENDER_REPEAT_BUDGET`, and past it renders as a marker. Without the last two, nine
+    bytes of CBOR (``d8 1c 82 d8 1d 00 d8 1d 00``, a list containing itself twice) made this
+    walk build 2**32 lists and die with ``MemoryError``. ``loads_chain_cbor`` now refuses such
+    values at decode, so this is the second line, for values that did not come from there.
+
     Containers come back as their BASE type — a tuple stays a tuple, so it stays hashable for
     use as a key — because rebuilding a subclass (a ``namedtuple``, a ``defaultdict``) from an
-    iterable is not a constructor call they all accept. Anything nested past
-    :data:`_MAX_RENDER_DEPTH` is replaced by a statement that it was not walked.
+    iterable is not a constructor call they all accept.
     """
+    return _render_walk(value, 0, set(), set(), [_RENDER_REPEAT_BUDGET])
+
+
+def _render_walk(value: object, depth: int, on_path: set[int], seen: set[int], repeats_left: list[int]) -> object:
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
         return value if value.bit_length() <= _MAX_RENDERED_INT_BITS else _oversized_int_text(value)
-    if isinstance(value, (dict, list, tuple, set, frozenset)):
-        if _depth >= _MAX_RENDER_DEPTH:
-            return f"<{type(value).__name__} nested more than {_MAX_RENDER_DEPTH} levels deep — not rendered>"
+    if not isinstance(value, (dict, list, tuple, set, frozenset)):
+        return value
+    ident = id(value)
+    if ident in on_path:
+        return _CYCLE_TEXT
+    if depth >= _MAX_RENDER_DEPTH:
+        return f"<{type(value).__name__} nested more than {_MAX_RENDER_DEPTH} levels deep — not rendered>"
+    # Empty containers are skipped: `()` and `frozenset()` are interned, so an honest payload
+    # holding two of them would otherwise look like shared structure.
+    if value and ident in seen:
+        if repeats_left[0] <= 0:
+            return _REPEAT_TEXT
+        repeats_left[0] -= 1
+    seen.add(ident)
+    on_path.add(ident)
+    try:
         if isinstance(value, dict):
-            return {_render_safe(k, _depth + 1): _render_safe(v, _depth + 1) for k, v in value.items()}
-        items = [_render_safe(item, _depth + 1) for item in value]
-        if isinstance(value, tuple):
-            return tuple(items)
-        if isinstance(value, frozenset):
-            return frozenset(items)
-        return set(items) if isinstance(value, set) else items
-    return value
+            return {
+                _render_walk(k, depth + 1, on_path, seen, repeats_left): _render_walk(
+                    v, depth + 1, on_path, seen, repeats_left
+                )
+                for k, v in value.items()
+            }
+        items = [_render_walk(item, depth + 1, on_path, seen, repeats_left) for item in value]
+    finally:
+        on_path.discard(ident)
+    if isinstance(value, tuple):
+        return tuple(items)
+    if isinstance(value, frozenset):
+        return frozenset(items)
+    return set(items) if isinstance(value, set) else items
 
 
 def _display_text(value: object) -> str:
-    """``str(value)`` for an arbitrary decoded CBOR value, without ever raising.
+    """``str(value)`` for an arbitrary decoded CBOR value, bounded, and never ``ValueError``.
 
-    :func:`_render_safe` bounds the integers it can SEE, inside plain containers. A CBOR
-    value can also hide one inside an object whose ``str()`` prints it — an unknown tag
-    (``CBORTag(40404, <bignum>)``) or a tag-30 rational (``Fraction``) — so the conversion
-    itself is guarded too, and what it could not render is named rather than dropped.
+    :func:`_render_safe` bounds the integers it can SEE inside plain containers, and bounds the
+    walk itself (depth, cycles, repeated structure), so the string built from its result is
+    bounded by the value's distinct content. A CBOR value can also hide a bignum inside an object
+    whose ``str()`` prints it — an unknown tag (``CBORTag(40404, <bignum>)``) or a tag-30 rational
+    (``Fraction``) — so the conversion itself is guarded too, and what it could not render is
+    named rather than dropped.
     """
     try:
         return str(_render_safe(value))
@@ -254,8 +297,9 @@ def _sanitize_update_fields(fields: dict) -> dict:
     would leave the ANSI injection in the key.
 
     Nested one level, because that is where the interesting content is (`attrs.target`). Deeper
-    structures are rendered as their repr and sanitised whole rather than walked — an attacker
-    choosing the nesting depth should not choose how much work this does.
+    structures are rendered through :func:`_display_text` and sanitised whole. That IS a walk —
+    :func:`_render_safe` visits every nested value — and it is bounded by depth, by cycle
+    detection and by a repeat budget, because a publisher chooses the nesting and the sharing.
 
     Every ``str()`` here is :func:`_display_text`, not the builtin. These values are raw CBOR,
     so any of them can be a bignum, and a bare ``str()`` of one raised ``ValueError`` out of the
@@ -275,7 +319,7 @@ def _sanitize_update_fields(fields: dict) -> dict:
     return out
 
 
-def _sanitize_display_string(s: str) -> str:
+def _sanitize_display_string(s: object) -> str:
     """Strip control + invisible + combining codepoints from a string before printing.
 
     Defense against terminal-injection / homoglyph / bidi-override attacks via
@@ -298,11 +342,17 @@ def _sanitize_display_string(s: str) -> str:
     Replaces each stripped char with a literal "?" so the user sees that
     something was filtered.
 
-    Non-`str` input is returned unchanged (defensive — the type signature
-    forbids it but the type system doesn't enforce that at runtime).
+    NON-STRING INPUT IS STRINGIFIED, not passed through. ``None`` stays ``None`` (an absent
+    field stays absent); anything else goes through :func:`_display_text` first, which is
+    bounded and cannot raise ``ValueError``. It used to be returned unchanged, so a value this
+    function's name promises is a safe string could be a 40,000-bit integer or a list that
+    contains itself — and ``glyph inspect --wave-name`` / ``pyrxd verify --wave-name`` passed a
+    WAVE update's ``attrs.target`` through it into ``json.dumps`` and the terminal, and crashed.
     """
-    if not isinstance(s, str):
+    if s is None:
         return s
+    if not isinstance(s, str):
+        s = _display_text(s)
     out: list[str] = []
     for ch in s:
         if unicodedata.category(ch) in _UNICODE_STRIP_CATEGORIES:

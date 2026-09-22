@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ..security.errors import ValidationError
+from ..security.json_guards import cbor_int
 
 # Wire constants matching Photonic exactly.
 SCHEME_CHUNKED_AEAD_V1 = "chunked-aead-v1"
@@ -130,8 +131,8 @@ class EncryptionMetadata:
         # consumers as a real value — the same malformed-number class as the CBOR Infinity that
         # raised OverflowError here, except silent. Both are now refused, and `decode_payload`
         # logs and drops the field exactly as it does for every other malformed input.
-        size = int(d.get("size", 0))
-        chunks = int(d.get("chunks", 1))
+        size = cbor_int(d.get("size", 0))
+        chunks = cbor_int(d.get("chunks", 1))
         if size < 0 or chunks < 1:
             raise ValidationError(f"encrypted main has a nonsensical size/chunks: {size}/{chunks}")
         return cls(
@@ -219,7 +220,9 @@ class TimelockSpec:
         d = _require_mapping(d, "crypto.timelock")
         return cls(
             mode=str(d["mode"]),  # type: ignore[arg-type]
-            unlock_at=int(d["unlock_at"]),
+            # `cbor_int`, not `int()`: `int()` of a CBOR decimal fraction takes minutes, and it
+            # also silently truncated a float and parsed a string.
+            unlock_at=cbor_int(d["unlock_at"]),
             cek_hash=str(d["cek_hash"]),
             hint=str(d.get("hint", "")),
         )
@@ -317,7 +320,7 @@ class EncryptedContentStub:
     def from_dict(cls, d: dict) -> EncryptedContentStub:
         d = _require_mapping(d, "encrypted content stub")
         return cls(
-            p=[int(x) for x in d["p"]],
+            p=[cbor_int(x) for x in d["p"]],
             type=str(d["type"]),
             name=str(d["name"]),
             main=EncryptionMetadata.from_dict(d["main"]),

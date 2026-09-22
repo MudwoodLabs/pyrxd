@@ -16,6 +16,7 @@ from pyrxd.fee_sizing import (
     trial_size_with_slack,
 )
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.json_guards import cbor_int
 from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20, Txid
 
 from .burn import build_burn_proof_script
@@ -109,8 +110,8 @@ def _assert_declared_dmint_matches(decoded_cbor: dict[str, Any], params: Any) ->
         if cbor_key not in declared:
             continue
         try:
-            declared_value = int(declared[cbor_key])
-        except (TypeError, ValueError) as exc:
+            declared_value = cbor_int(declared[cbor_key])
+        except ValueError as exc:
             raise ValidationError(f"metadata dmint.{cbor_key}={declared[cbor_key]!r} is not an integer") from exc
         if declared_value != actual:
             mismatches.append(f"dmint.{cbor_key}: metadata says {declared_value}, deploy emits {actual}")

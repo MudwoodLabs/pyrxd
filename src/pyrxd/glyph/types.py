@@ -282,12 +282,14 @@ class GlyphRoyalty:
     @classmethod
     def from_cbor_dict(cls, d: dict) -> GlyphRoyalty:
         splits_raw = d.get("splits", [])
-        splits = tuple((str(s["address"]), int(s["bps"])) for s in splits_raw if isinstance(s, dict))
+        from ..security.json_guards import cbor_int
+
+        splits = tuple((str(s["address"]), cbor_int(s["bps"])) for s in splits_raw if isinstance(s, dict))
         return cls(
-            bps=int(d["bps"]),
+            bps=cbor_int(d["bps"]),
             address=str(d["address"]),
             enforced=bool(d.get("enforced", False)),
-            minimum=int(d.get("minimum", 0)),
+            minimum=cbor_int(d.get("minimum", 0)),
             splits=splits,
         )
 

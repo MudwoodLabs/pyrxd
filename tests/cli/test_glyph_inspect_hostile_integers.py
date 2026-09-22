@@ -24,12 +24,27 @@ The guards, and the test that fails when each is removed:
   ``TestUpdateEnvelopeValues``.
 * the human dMint renderer computes the cap only from integers —
   ``test_an_oversized_dmint_state_renders_without_a_cap``.
+* ``loads_chain_cbor`` refuses shared or cyclic CBOR, and ``_render_safe`` marks cycles and
+  bounds repeated structure — ``TestSharedAndCyclicCbor``.
+* every integer decoded from CBOR goes through ``cbor_int`` before any coercion —
+  ``TestDecimalFractionsAreRefusedBeforeAnyCoercion``.
+* a whole float up to 2**53 is read as the integer cbor-x meant —
+  ``TestPhotonicAmountsAsCborXWritesThem``.
+* ``main.b`` must be bytes-shaped before ``bytes()`` — ``TestMediaBytesMustBeBytes``.
+
+The resource tests run the CLI in a SUBPROCESS under a 2 GB memory ceiling and a timeout, so a
+regression fails the test instead of hanging the suite or exhausting the machine.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import resource
+import subprocess
 import sys
+import time
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -38,18 +53,20 @@ import cbor2
 import pytest
 from click.testing import CliRunner
 
+import pyrxd
 from pyrxd.cli.config import Config
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.glyph_cmds import inspect_cmd
 from pyrxd.cli.main import cli
-from pyrxd.glyph._inspect_core import _MAX_RENDERED_INT_BITS
+from pyrxd.glyph._inspect_core import _MAX_RENDERED_INT_BITS, _render_safe
 from pyrxd.glyph.burn import MAX_BURN_AMOUNT, build_burn_proof_script, parse_burn_proof
 from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
-from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
+from pyrxd.glyph.payload import _encode_payload_push, build_reveal_scriptsig_suffix, decode_payload, loads_chain_cbor
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.json_guards import cbor_int
 from pyrxd.security.types import RawTx
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -196,9 +213,11 @@ class TestTheBurnAmountIsARangeCheckedCount:
             (-(2**63), "negative"),
             (2**63, "above 2**63 - 1"),
             pytest.param(-_BIG, "40001-bit integer (negative)", id="negative-bignum"),
-            (1.5, "it is a float, not an integer"),
-            (True, "it is a boolean, not an integer"),
-            ("250", "it is a str, not an integer"),
+            (1.5, "a float with a fractional part is not an integer"),
+            (float("inf"), "a non-finite float"),
+            (float(2**53 + 2), "a float above 2**53 cannot hold an exact integer"),
+            (True, "a boolean is not an integer"),
+            ("250", "a str is not an integer"),
         ],
     )
     def test_every_value_that_is_not_a_count_is_withheld(self, runner, amount, reason_fragment) -> None:
@@ -209,8 +228,9 @@ class TestTheBurnAmountIsARangeCheckedCount:
 
     @pytest.mark.parametrize("amount", [0, 1, 250, 2**53, MAX_BURN_AMOUNT])
     def test_every_honest_count_is_kept_exactly(self, runner, amount) -> None:
-        """The honest path. Photonic writes a JS number (so <= 2**53); pyrxd's own writer
-        allows up to 2**63 - 1. Both must read back as the number they are."""
+        """The honest path for pyrxd's own writer, which takes an int up to 2**63 - 1: every one
+        must read back as the number it is. Photonic's side of the honest path — cbor-x writes a
+        JS number of 2**32 or more as a FLOAT — is `TestPhotonicAmountsAsCborXWritesThem`."""
         script = build_burn_proof_script(_TOKEN, amount=amount)
         payload = json.loads(_ok(_inspect_script(runner, script, "json")))
         assert payload["burn"]["claims"]["amount"] == amount
@@ -235,8 +255,10 @@ class TestTheWriterAndReaderAgree:
     """`build_burn_proof_script` refuses what `parse_burn_proof` withholds, so pyrxd cannot
     write a proof pyrxd will not read back. The crash reproducer was built with the writer."""
 
-    @pytest.mark.parametrize("amount", [-1, MAX_BURN_AMOUNT + 1, pytest.param(_BIG, id="bignum"), True])
+    @pytest.mark.parametrize("amount", [-1, MAX_BURN_AMOUNT + 1, pytest.param(_BIG, id="bignum"), True, 5e9])
     def test_the_writer_refuses_what_the_reader_withholds(self, amount) -> None:
+        """A float too: the reader accepts whole floats only because cbor-x writes them, and a
+        Python caller of the writer passing one has a bug the writer should name."""
         with pytest.raises(ValidationError, match="must be >= 0"):
             build_burn_proof_script(_TOKEN, amount=amount)
 
@@ -370,3 +392,344 @@ class TestUpdateEnvelopeValues:
         assert env["fields"] == {"attrs": {"target": "an honest target", "n": "5"}, "desc": "renamed"}
         out = _ok(_inspect_fetch(runner, "human", inputs=[_reveal_input(envelope)]))
         assert "attrs.target = an honest target" in out and "n=5" in out and "desc = renamed" in out
+
+
+# --------------------------------------------------------------------------- Photonic amounts
+
+
+_PHOTONIC_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[1] / "fixtures" / "photonic_burn_proofs_cbor_x.json").read_text()
+)
+
+
+class TestPhotonicAmountsAsCborXWritesThem:
+    """An honest Photonic burn of 2**32 units or more arrives as a FLOAT.
+
+    cbor-x — Photonic's encoder — writes every JS number of 2**32 or more as a float64. The
+    bytes here were produced by cbor-x itself (`tests/fixtures/photonic_burn_proofs_cbor_x.json`
+    records how), not typed by hand. Reading an integral float up to 2**53 as the integer it is
+    keeps these honest; past 2**53 the JS number was rounded before it was encoded.
+    """
+
+    @staticmethod
+    def _script(cbor_hex: str) -> bytes:
+        cbor = bytes.fromhex(cbor_hex)
+        return b"\x6a\x03gly\x01\x02\x01\x06" + _encode_payload_push(cbor)
+
+    def test_the_fixture_really_holds_floats_where_the_claim_says(self) -> None:
+        """Non-vacuity: without this, a fixture that encoded every amount as an integer would
+        make the honest-path test below pass for the wrong reason."""
+        kinds = {
+            v["amount_js"]: type(cbor2.loads(bytes.fromhex(v["cbor_hex"]))["amount"]).__name__
+            for v in _PHOTONIC_VECTORS["vectors"]
+        }
+        assert kinds["4294967295"] == "int" and kinds["250"] == "int"
+        assert kinds["4294967296"] == kinds["5000000000"] == kinds["9007199254740992"] == "float"
+
+    @pytest.mark.parametrize(
+        "vector",
+        [v for v in _PHOTONIC_VECTORS["vectors"] if v["amount_js"] not in ("9007199254740994", "1.5")],
+        ids=lambda v: v["amount_js"],
+    )
+    def test_an_honest_photonic_amount_is_kept_exactly(self, runner, vector) -> None:
+        expected = int(vector["amount_js"])
+        script = self._script(vector["cbor_hex"])
+        payload = json.loads(_ok(_inspect_script(runner, script, "json")))
+        assert payload["burn"]["claims"]["amount"] == expected
+        assert "amount_withheld" not in payload["burn"]
+        assert f"amount: {expected}" in _ok(_inspect_script(runner, script, "human"))
+
+    @pytest.mark.parametrize(
+        ("amount_js", "reason"),
+        [
+            ("9007199254740994", "a float above 2**53 cannot hold an exact integer"),
+            ("1.5", "a float with a fractional part is not an integer"),
+        ],
+    )
+    def test_a_photonic_float_that_is_not_an_exact_count_is_withheld(self, runner, amount_js, reason) -> None:
+        (vector,) = [v for v in _PHOTONIC_VECTORS["vectors"] if v["amount_js"] == amount_js]
+        payload = json.loads(_ok(_inspect_script(runner, self._script(vector["cbor_hex"]), "json")))
+        assert payload["burn"]["claims"]["amount"] is None
+        assert reason in payload["burn"]["amount_withheld"]
+
+
+# --------------------------------------------------------------------------- bounded subprocess runs
+
+#: Every run below that exercises a resource bug runs in a SUBPROCESS with a memory ceiling and a
+#: wall-clock timeout. In-process, a regression would not fail the test — it would hang the suite
+#: or exhaust the machine. The ceilings are generous for the fixed code (each run takes a second or
+#: two, most of it interpreter start-up) and far below what the unfixed code needed.
+_MEMORY_CEILING = 2 * 1024**3
+_TIMEOUT_S = 45
+_PYRXD_ROOT = str(Path(pyrxd.__file__).resolve().parents[1])
+
+_FETCH_DRIVER = """
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+from click.testing import CliRunner
+from pyrxd.cli.config import Config
+from pyrxd.cli.context import CliContext
+from pyrxd.cli.glyph_cmds import inspect_cmd
+from pyrxd.hash import hash256
+from pyrxd.security.types import RawTx
+
+mode, raw = sys.argv[1], bytes.fromhex(sys.stdin.read().strip())
+client = MagicMock()
+client.get_transaction = AsyncMock(return_value=RawTx(raw))
+client.__aenter__ = AsyncMock(return_value=client)
+client.__aexit__ = AsyncMock(return_value=None)
+wallet = Path("/nonexistent/wallet.dat")
+ctx = CliContext(
+    config=Config(network="mainnet", electrumx="wss://example.invalid/", fee_rate=10_000, wallet_path=wallet),
+    network="mainnet", electrumx_url="wss://example.invalid/", fee_rate=10_000, wallet_path=wallet,
+    output_mode=mode, client_factory=lambda: client,
+)
+r = CliRunner().invoke(inspect_cmd, [hash256(raw)[::-1].hex(), "--fetch"], obj=ctx)
+print(f"EXIT={r.exit_code} EXC={type(r.exception).__name__ if r.exception else None}")
+print(r.output)
+"""
+
+
+def _bounded(code: str, *args: str, stdin: str = "") -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run *code* in a fresh interpreter under the memory ceiling and the timeout."""
+
+    def _limit() -> None:  # pragma: no cover - runs in the child
+        resource.setrlimit(resource.RLIMIT_AS, (_MEMORY_CEILING, _MEMORY_CEILING))
+
+    env = dict(os.environ, PYTHONPATH=_PYRXD_ROOT, PYTHONDONTWRITEBYTECODE="1")
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(  # nosec B603 - fixed interpreter, code from this file
+            [sys.executable, "-c", code, *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_S,
+            preexec_fn=_limit,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"did not finish within {_TIMEOUT_S}s — the unbounded work this test guards against")
+    return proc, time.monotonic() - started
+
+
+def _bounded_fetch(mode: str, *, inputs=()) -> tuple[str, float]:
+    tx = Transaction(tx_inputs=list(inputs), tx_outputs=[TransactionOutput(Script(_P2PKH), 1000)])
+    proc, elapsed = _bounded(_FETCH_DRIVER, mode, stdin=bytes(tx.serialize()).hex())
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.startswith("EXIT=0 EXC=None"), (proc.stdout[:500], proc.stderr[-1500:])
+    return proc.stdout, elapsed
+
+
+def _raw_reveal_input(cbor: bytes) -> TransactionInput:
+    suffix = build_reveal_scriptsig_suffix(cbor)
+    scriptsig = bytes([0x47]) + bytes(71) + bytes([0x21]) + bytes(33) + suffix
+    return TransactionInput(source_txid="aa" * 32, source_output_index=0, unlocking_script=Script(scriptsig))
+
+
+# --------------------------------------------------------------------------- shared structure
+
+#: Nine bytes: tag 28 (shareable) around a 2-array of two tag-29 references to itself — a list
+#: that contains itself twice. `_render_safe` walked it into 2**32 lists (MemoryError, 5.2 s).
+_CYCLIC_CBOR = bytes([0xD8, 0x1C, 0x82, 0xD8, 0x1D, 0x00, 0xD8, 0x1D, 0x00])
+
+
+def _shared_chain(depth: int) -> object:
+    """``[x, x]`` nested *depth* times, the same object twice at every level: 2**depth paths."""
+    value: object = 1
+    for _ in range(depth):
+        value = [value, value]
+    return value
+
+
+def _shared_cbor(document: object) -> bytes:
+    return cbor2.dumps(document, value_sharing=True)
+
+
+class TestSharedAndCyclicCbor:
+    """CBOR value-sharing (tags 28/29) turns a few bytes into a graph, and every reader that
+    prints or walks the result repeats its work per path. Refused at decode; the payload walk
+    is bounded too, as the second line."""
+
+    @pytest.mark.parametrize("mode", ["human", "json"])
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "cyclic update value",
+            "shared-chain update value",
+            "shared-chain creator",
+            "shared-chain protocol entry",
+        ],
+    )
+    def test_inspect_fetch_stays_bounded(self, mode, case) -> None:
+        """Through the real CLI, in a subprocess under a 2 GB ceiling and a timeout.
+
+        The last two predate this branch: `decode_payload` itself ran `str()` / `repr()` over a
+        26-level chain (MemoryError from 168 bytes), so they fail without the decode refusal
+        even with `_render_safe` bounded.
+        """
+        cbor = {
+            "cyclic update value": b"\xa1\x61x" + _CYCLIC_CBOR,
+            "shared-chain update value": _shared_cbor({"x": _shared_chain(30)}),
+            "shared-chain creator": _shared_cbor({"p": [2], "creator": _shared_chain(30)}),
+            "shared-chain protocol entry": _shared_cbor({"p": [2, _shared_chain(30)]}),
+        }[case]
+        assert len(cbor) < 300, "the point is that a few hundred bytes are enough"
+        out, elapsed = _bounded_fetch(mode, inputs=[_raw_reveal_input(cbor)])
+        assert "value-sharing" in out, out[:2000]
+        assert elapsed < _TIMEOUT_S
+
+    def test_the_decoder_refuses_a_shared_or_cyclic_value(self) -> None:
+        for blob in (_CYCLIC_CBOR, _shared_cbor(_shared_chain(3)), _shared_cbor({"a": (s := [1]), "b": s})):
+            with pytest.raises(ValidationError, match="value-sharing"):
+                loads_chain_cbor(blob)
+
+    def test_the_decoder_accepts_honest_values(self) -> None:
+        """The honest path: repeated EMPTY containers (interned by CPython, so they share an id)
+        and real mainnet bytes — the GLYPH deploy reveal's 65 KB payload — decode unchanged."""
+        honest = {"a": [], "b": [], (): 1, ("k",): [[], []], "m": {"x": [1, 2], "y": [1, 2]}}
+        assert loads_chain_cbor(cbor2.dumps(honest)) == honest
+        mainnet = (Path(__file__).resolve().parents[1] / "fixtures" / "glyph_reveal_cbor.bin").read_bytes()
+        assert loads_chain_cbor(mainnet) == cbor2.loads(mainnet)
+
+    def test_the_payload_walk_marks_a_cycle(self) -> None:
+        cyclic: list = [1]
+        cyclic.append(cyclic)
+        assert _render_safe({"x": cyclic}) == {"x": [1, "<cycle: this value contains itself>"]}
+
+    def test_the_payload_walk_bounds_shared_structure(self) -> None:
+        """A 30-level shared chain has 2**30 paths. In a subprocess under the ceiling."""
+        proc, elapsed = _bounded(
+            "from pyrxd.glyph._inspect_core import _render_safe\n"
+            "v = 1\n"
+            "for _ in range(30):\n"
+            "    v = [v, v]\n"
+            "print('REPEAT-MARKER' if 'shared structure repeated past' in str(_render_safe(v)) else 'NO MARKER')\n"
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip() == "REPEAT-MARKER"
+        assert elapsed < _TIMEOUT_S
+
+    def test_an_honest_large_payload_is_not_truncated(self) -> None:
+        """The honest path for the budget: a tree of 60,000 containers — more than a 1,000-output
+        transaction produces — renders unchanged, because a tree never repeats a container."""
+        tree = {"outputs": [{"vout": i, "refs": [{"n": i}]} for i in range(20_000)]}
+        assert _render_safe(tree) == tree
+
+
+# --------------------------------------------------------------------------- decimal fractions
+
+#: A CBOR decimal fraction (tag 4) meaning 10**1_000_000. `cbor2` decodes it in constant time;
+#: `int()` of the result took 69.9 s through `inspect --fetch` (measured by review).
+_DECIMAL = cbor2.CBORTag(4, [1_000_000, 1])
+
+
+class TestDecimalFractionsAreRefusedBeforeAnyCoercion:
+    """Every `int()` of a decoded CBOR value became `cbor_int`, which types the value first.
+    One case per coercion site; each runs in a bounded subprocess, so a site that regresses to
+    `int()` fails on the timeout instead of stalling the suite for minutes."""
+
+    @pytest.mark.parametrize(
+        ("site", "document", "evidence"),
+        [
+            ("payload v", {"p": [2], "v": _DECIMAL}, "CBOR field 'v' must be an integer"),
+            (
+                "timelock unlock_at",
+                {
+                    "p": [2],
+                    "name": "t",
+                    "crypto": {"timelock": {"mode": "block", "unlock_at": _DECIMAL, "cek_hash": _CEK_HASH}},
+                },
+                '"name": "t"',
+            ),
+            (
+                "encrypted main size",
+                {"p": [2], "name": "t", "main": {"type": "x", "hash": "h", "size": _DECIMAL}},
+                '"name": "t"',
+            ),
+            (
+                "dmint maxHeight",
+                {"p": [1, 4], "dmint": {"algo": 0, "maxHeight": _DECIMAL, "reward": 1, "diff": 1}},
+                "dmint CBOR field is not usable",
+            ),
+            ("royalty bps", {"p": [2], "name": "t", "royalty": {"bps": _DECIMAL, "address": "a"}}, '"name": "t"'),
+        ],
+        ids=lambda v: v if isinstance(v, str) else "",
+    )
+    def test_inspect_fetch_refuses_it_promptly(self, site, document, evidence) -> None:
+        out, elapsed = _bounded_fetch("json", inputs=[_raw_reveal_input(cbor2.dumps(document))])
+        assert evidence in out, (site, out[:2000])
+        assert elapsed < _TIMEOUT_S
+
+    @pytest.mark.parametrize("site", ["burn amount", "reveal proof v", "builder declared dmint"])
+    def test_the_other_decoders_refuse_it_promptly(self, site) -> None:
+        code = {
+            "burn amount": (
+                "import cbor2\nfrom pyrxd.glyph.burn import parse_burn_proof\n"
+                "from pyrxd.glyph.payload import _encode_payload_push\n"
+                "c = cbor2.dumps({'v': 2, 'p': [6], 'action': 'burn', 'token_ref': 'ab' * 32 + ':0',"
+                " 'amount': cbor2.CBORTag(4, [1_000_000, 1])})\n"
+                "p = parse_burn_proof(b'\\x6a\\x03gly\\x01\\x02\\x01\\x06' + _encode_payload_push(c))\n"
+                "print('REFUSED' if p.amount is None and 'Decimal' in p.amount_withheld else 'KEPT')\n"
+            ),
+            "reveal proof v": (
+                "import cbor2\nfrom pyrxd.glyph.timelock_reveal_tx import parse_reveal_proof_script\n"
+                "from pyrxd.utils import encode_pushdata\n"
+                "def script(v):\n"
+                "    c = cbor2.dumps({'v': v, 'p': [9], 'action': 'reveal', 'token_ref': 'x', 'cek': 'y',"
+                " 'cek_hash': 'z'})\n"
+                "    push = lambda b: encode_pushdata(b, minimal_push=False)\n"
+                "    return b'\\x6a' + push(b'gly') + push(b'\\x02') + push(b'\\x09') + push(c)\n"
+                # NON-VACUITY: the same construction with an honest `v` must parse, or a `None`
+                # below would mean "not a reveal proof at all", not "refused".
+                "assert parse_reveal_proof_script(script(2)) is not None, 'fixture does not parse'\n"
+                "p = parse_reveal_proof_script(script(cbor2.CBORTag(4, [1_000_000, 1])))\n"
+                "print('REFUSED' if p is None else 'KEPT')\n"
+            ),
+            "builder declared dmint": (
+                "import cbor2\nfrom types import SimpleNamespace\n"
+                "from pyrxd.glyph.builder import _assert_declared_dmint_matches\n"
+                "from pyrxd.security.errors import ValidationError\n"
+                "declared = cbor2.loads(cbor2.dumps({'dmint': {'reward': cbor2.CBORTag(4, [1_000_000, 1])}}))\n"
+                "params = SimpleNamespace(premine_amount=0, reward_photons=1, max_height=1, num_contracts=1,"
+                " difficulty=1, algo=0)\n"
+                "try:\n"
+                "    _assert_declared_dmint_matches(declared, params)\n"
+                "    print('KEPT')\n"
+                "except ValidationError:\n"
+                "    print('REFUSED')\n"
+            ),
+        }[site]
+        proc, elapsed = _bounded(code)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip() == "REFUSED", (site, proc.stdout)
+        assert elapsed < _TIMEOUT_S
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(7, 7), (-7, -7), (5e9, 5_000_000_000), (float(2**53), 2**53)],
+    )
+    def test_cbor_int_accepts_integers_and_whole_floats_up_to_2_53(self, value, expected) -> None:
+        assert cbor_int(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, 1.5, float("nan"), float(2**53 + 2), "7", b"7", Decimal(7), Fraction(7), None, [7]],
+        ids=repr,
+    )
+    def test_cbor_int_refuses_everything_else(self, value) -> None:
+        with pytest.raises(ValueError, match="not an integer|cannot hold an exact integer"):
+            cbor_int(value)
+
+
+class TestMediaBytesMustBeBytes:
+    def test_an_integer_media_body_is_refused_not_allocated(self) -> None:
+        """`bytes(n)` of an int allocates n zero bytes: 30 bytes of CBOR became 300 MB of media."""
+        with pytest.raises(ValidationError, match="must be a byte string"):
+            decode_payload(cbor2.dumps({"p": [2], "main": {"t": "image/png", "b": 300_000_000}}))
+
+    def test_honest_media_bodies_still_decode(self) -> None:
+        for body in (b"\x89PNG", cbor2.CBORTag(64, b"\x89PNG"), [0x89, 0x50, 0x4E, 0x47]):
+            meta = decode_payload(cbor2.dumps({"p": [2], "main": {"t": "image/png", "b": body}}))
+            assert meta.main is not None and meta.main.data == b"\x89PNG"

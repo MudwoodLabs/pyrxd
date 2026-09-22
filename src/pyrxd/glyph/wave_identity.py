@@ -227,12 +227,30 @@ def judge_name_at_mark(
     if folded.incomplete:
         return _degrade(ref=ref, binding_source=binding_source, reason=folded.reason, anchor=anchor)
 
+    # THE TARGET IS WHATEVER THE NAME'S OWNER PUBLISHED. The fold preserves values rather than
+    # stringifying them (see `fold_chain`), so `attrs.target` can be any CBOR value — an integer
+    # of 40,000 bits, a map, a list. A form-2 sentence says "the name pointed at <target>" and a
+    # caller compares it with the signer's address, and neither means anything unless it is
+    # text. So a non-text target degrades, with its type named, instead of being handed on to
+    # every renderer and `json.dumps` downstream — which is where it crashed.
+    target = folded.attrs.get("target")
+    if target is not None and not isinstance(target, str):
+        return _degrade(
+            ref=ref,
+            binding_source=binding_source,
+            reason=(
+                f"the name's `target` at that block is not text (it is {type(target).__name__}), so not an address — "
+                "there is nothing to compare the signing key with"
+            ),
+            anchor=anchor,
+        )
+
     return WaveIdentityVerdict(
         form=2,
         ref=ref,
         binding_source=binding_source,
         binding_verified=False,
-        target_at_height=folded.attrs.get("target"),
+        target_at_height=target,
         height=anchor.height,
         provisional=False,
         expiry=EXPIRY_UNKNOWN,

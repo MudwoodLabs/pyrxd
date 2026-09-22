@@ -133,7 +133,7 @@ those for depth; use this page to look something up mid-task.
 
 - **DAA modes** — the five difficulty-adjustment-algorithm modes a dMint V2
   contract can choose (`DaaMode` enum,
-  [`src/pyrxd/glyph/dmint/types.py:90`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)):
+  [`src/pyrxd/glyph/dmint/types.py:91`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)):
   `FIXED` (no retarget), `EPOCH` (retarget every N blocks, capped
   adjustment), `ASERT` (continuous retarget on a half-life), `LWMA` (linear
   weighted moving average), `SCHEDULE` (a baked ascending height→target
