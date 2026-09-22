@@ -99,6 +99,7 @@ from pyrxd.glyph.dmint import (
     compute_next_target_linear_legacy,
     compute_next_target_linear_v2,
     detect_contract_daa_bytecode,
+    is_minimal_4byte_scriptnum,
     mine_solution_dispatch,
 )
 from pyrxd.glyph.dmint.miner import _v2_code_section
@@ -333,11 +334,25 @@ def _commit_reveal_unlock(key: PrivateKey, suffix: bytes):
     return to_unlock_script_template(_u, lambda: 110 + len(suffix))
 
 
-def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUtxo:
+def _deploy_v2_via_api(
+    node: _RegtestNode,
+    owner: PrivateKey,
+    *,
+    daa_mode: DaaMode = DaaMode.FIXED,
+    target_time: int = 60,
+    half_life: int = DEFAULT_ASERT_HALFLIFE,
+) -> tuple[DmintContractUtxo, int]:
     """Deploy a 1-contract V2 dMint via the real API (prepare_dmint_deploy +
     commit -> reveal + build_reveal_outputs) and return the live value-1 singleton
-    contract UTXO. Mirrors the V1 deploy; asserts the reveal is accepted by
-    consensus before the caller spends minutes mining.
+    contract UTXO together with the ``last_time`` the API stamped. Mirrors the V1
+    deploy; asserts the reveal is accepted by consensus before the caller spends
+    minutes mining.
+
+    ``last_time`` is deliberately NOT passed: the point of the adaptive cases is that
+    the shipped path stamps a mineable one by itself. Before 2026-09-22 it had no such
+    field, every ASERT/LWMA contract it built carried ``04 00000000``, and that is not
+    a minimal CScriptNum — so the first retarget aborted under MINIMALDATA, which is
+    consensus on Radiant, not policy.
     """
     owner_pkh = Hex20(owner.public_key().hash160())
     owner_spk = _p2pkh(owner_pkh)
@@ -357,6 +372,9 @@ def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUt
                 max_height=1000,
                 reward_photons=1000,
                 difficulty=1,
+                daa_mode=daa_mode,
+                target_time=target_time,
+                half_life=half_life,
             ),
             allow_v2_deploy=True,
         )
@@ -424,7 +442,9 @@ def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUt
     node.mine(1)
     state = DmintState.from_script(contract_script)
     assert state.is_v1 is False and state.height == 0
-    return DmintContractUtxo(txid=reveal_txid, vout=0, value=rev.contract_value, script=contract_script, state=state)
+    assert state.last_time == deploy.last_time, "the reveal script does not carry the lastTime the API resolved"
+    utxo = DmintContractUtxo(txid=reveal_txid, vout=0, value=rev.contract_value, script=contract_script, state=state)
+    return utxo, deploy.last_time
 
 
 def _mint_on_chain(
@@ -620,8 +640,74 @@ class TestRadiantDmintV2OnConsensus:
         commit -> reveal -> build_reveal_outputs) produces a value-1 V2 singleton
         that the real mint builder can spend and consensus accepts."""
         owner = PrivateKey(secrets.token_bytes(32))
-        contract = _deploy_v2_via_api(node, owner)
+        contract, _stamped = _deploy_v2_via_api(node, owner)
         assert contract.value == 1 and contract.state.is_v1 is False
         tx, _nonce = _build_signed_v2_mint(node, contract)
         res = node.accepts(tx.serialize().hex())
         assert res["allowed"] is True, f"mint of API-deployed V2 contract rejected: {res}"
+
+    @pytest.mark.parametrize("daa_mode", [DaaMode.ASERT, DaaMode.LWMA])
+    def test_v2_adaptive_deploy_via_api_is_mineable_and_the_old_shape_is_not(self, node, daa_mode):
+        """The shipped deploy path, with NO last_time given, produces an ASERT/LWMA
+        contract the NODE will let a miner spend — and the shape it used to produce does not.
+
+        Before this fix, `DmintV2DeployParams` had no `last_time` field at all, so both
+        conversion sites built `DmintDeployParams` on its default 0 and every adaptive
+        contract the library deployed carried the state item `04 00000000`. That is not a
+        minimally encoded CScriptNum, the retarget reads it with `OP_2 OP_PICK; OP_SUB` on
+        the FIRST mint, and SCRIPT_VERIFY_MINIMALDATA is in radiant-core's
+        MANDATORY_SCRIPT_VERIFY_FLAGS — consensus, not policy. The contract was unmineable
+        from birth and unfixable once revealed.
+
+        The CONTROL is what makes the acceptance evidence rather than a covenant that
+        accepts anything: a contract in the SAME mode, carrying the SAME retarget bytecode
+        and the same state everywhere the refusal could otherwise be blamed on, but with
+        lastTime 0. It is built through the byte-level mirror, which still accepts any
+        lastTime because it has to be able to reproduce contracts other implementations
+        have already deployed. The node is asked to accept a fully-mined mint of it, and
+        must refuse. (It cannot be byte-identical to the subject: a ref is inducted by
+        spending a particular outpoint, so two live contracts always differ in their
+        contractRef/tokenRef. The assertions below pin what IS held equal.)
+        """
+        owner = PrivateKey(secrets.token_bytes(32))
+        contract, stamped = _deploy_v2_via_api(node, owner, daa_mode=daa_mode)
+        assert contract.value == 1 and contract.state.is_v1 is False
+        assert contract.state.daa_mode == daa_mode
+        # The API stamped a real timestamp and the state carries it, minimally encoded.
+        assert contract.state.last_time == stamped >= (1 << 23)
+        assert is_minimal_4byte_scriptnum(stamped)
+        assert b"\x04" + stamped.to_bytes(4, "little") in contract.script
+
+        # --- the fixed path: consensus accepts the first mint -------------------
+        tx, _nonce = _build_signed_v2_mint(node, contract, current_time=stamped + 120)
+        res = node.accepts(tx.serialize().hex())
+        assert res["allowed"] is True, f"{daa_mode.name} mint of the API-deployed contract rejected: {res}"
+        mtxid = node.cli("sendrawtransaction", tx.serialize().hex())
+        assert isinstance(mtxid, str), mtxid
+        node.mine(1)
+        out = node.cli("gettxout", mtxid, "0")
+        assert out and round(out["value"] * 1e8) == _CONTRACT_VALUE
+        assert DmintState.from_script(bytes.fromhex(out["scriptPubKey"]["hex"])).height == 1
+
+        # --- the control: the pre-fix shape, same bytes but lastTime = 0 --------
+        dead = _deploy_v2_contract(node, max_height=1000, reward=1000, daa_mode=daa_mode, last_time=0)
+        assert dead.state.last_time == 0
+        assert b"\x04\x00\x00\x00\x00" in dead.script
+        # The control cannot be byte-identical to the contract above: a ref is inducted by
+        # spending a particular outpoint, so two live contracts necessarily carry different
+        # contractRef/tokenRef. What CAN be held equal is everything the refusal could
+        # otherwise be blamed on — the retarget bytecode and every other state field.
+        subject_daa = detect_contract_daa_bytecode(contract.script)
+        control_daa = detect_contract_daa_bytecode(dead.script)
+        assert (control_daa.daa_bytes, control_daa.version) == (subject_daa.daa_bytes, subject_daa.version), (
+            "control and subject bake different retarget bytecode; the refusal would prove nothing"
+        )
+        for field in ("max_height", "reward", "algo", "daa_mode", "target_time", "target", "height"):
+            assert getattr(dead.state, field) == getattr(contract.state, field), field
+        dead_tx, _n = _build_signed_v2_mint(node, dead, current_time=stamped + 120)
+        dead_res = node.accepts(dead_tx.serialize().hex())
+        assert dead_res.get("allowed") is not True, (
+            f"CONTROL FAILED: the node accepted a mint of a {daa_mode.name} contract whose lastTime "
+            f"is the non-minimal 00000000 — the whole premise of this fix is wrong: {dead_res}"
+        )
+        print(f"\n[{daa_mode.name}] control refusal: {dead_res.get('reject-reason')}")

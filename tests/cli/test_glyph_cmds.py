@@ -2361,3 +2361,172 @@ class TestTheCliWaitPollsAtAnIntervalItChose:
         finally:
             gc.wait_for_confirmation = real
         assert seen == [0.125], f"the wrapper dropped the interval: {seen}"
+
+
+# ---------------------------------------------------------------------------
+# dMint DAA: the CLI must report the cause it actually hit
+# ---------------------------------------------------------------------------
+
+
+class TestDeployDmintLastTime:
+    """A deploy whose lastTime is non-minimal is unmineable from birth (MINIMALDATA is
+    consensus, not policy), so the CLI has to refuse it BEFORE any network work."""
+
+    def _args(self, wallet: Path, meta: Path, *extra: str) -> list[str]:
+        return [
+            "--wallet",
+            str(wallet),
+            "glyph",
+            "deploy-dmint",
+            str(meta),
+            "--v2",
+            "--max-height",
+            "100",
+            "--reward",
+            "1000",
+            *extra,
+        ]
+
+    def test_dead_last_time_refused_for_asert(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(cli, self._args(tmp_wallet_path, meta, "--daa-mode", "asert", "--last-time", "0"))
+        assert result.exit_code != 0
+        assert "invalid dMint deploy parameters" in result.output
+        assert "NON-MINIMAL" in result.output
+
+    def test_a_real_timestamp_is_accepted_for_asert(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        """Honest-path pair: the same command with a usable timestamp must get PAST the
+        parameter gate. Asserted positively as well as negatively — a test that only checks
+        two strings are ABSENT would also pass if the command died earlier for some other
+        reason, which is the shape of a guard that refuses valid work and is never noticed.
+        The next stage after the gate is loading the wallet, and there is none here."""
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(
+            cli, self._args(tmp_wallet_path, meta, "--daa-mode", "asert", "--last-time", "1700000000")
+        )
+        assert "invalid dMint deploy parameters" not in result.output
+        assert "NON-MINIMAL" not in result.output
+        assert "no wallet at" in result.output, result.output
+
+    def test_last_time_requires_v2(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        args = [
+            "--wallet",
+            str(tmp_wallet_path),
+            "glyph",
+            "deploy-dmint",
+            str(meta),
+            "--max-height",
+            "100",
+            "--reward",
+            "1000",
+            "--last-time",
+            "1700000000",
+        ]
+        result = runner.invoke(cli, args)
+        assert result.exit_code != 0
+        assert "--last-time requires --v2" in result.output
+
+
+class TestClaimDmintReportsUnrecognizedBytecode:
+    """`UnrecognizedDaaBytecodeError` is BOTH a DmintError and a ValidationError, and
+    except clauses are tried in source order — so before this was fixed, claim-dmint
+    reported an unrecognised retarget formula as "funding can't cover the mint reward +
+    fee" and told the user to add RXD or lower the fee rate. Both wrong."""
+
+    def _asert_contract(self, *, corrupt: bool, height: int = 0):
+        from pyrxd.glyph.dmint import DaaMode, DmintDeployParams, build_dmint_contract_script
+        from pyrxd.glyph.dmint.builders import _DAA_BODY_OFFSET_IN_CODE
+        from pyrxd.glyph.dmint.types import _OP_STATESEPARATOR
+
+        params = DmintDeployParams(
+            contract_ref=GlyphRef(txid="ab" * 32, vout=1),
+            token_ref=GlyphRef(txid="cd" * 32, vout=0),
+            max_height=100,
+            reward=1000,
+            difficulty=1,
+            daa_mode=DaaMode.ASERT,
+            target_time=60,
+            last_time=1_700_000_000,
+            height=height,
+        )
+        script = bytearray(build_dmint_contract_script(params))
+        if corrupt:
+            # Flip one byte inside the ASERT fragment: still a V2 dMint template, but no
+            # generation pyrxd knows. Detection catches this BEFORE the PoW grind.
+            at = script.index(_OP_STATESEPARATOR) + 1 + _DAA_BODY_OFFSET_IN_CODE + 12 + 3 + 1 + 3
+            assert script[at] == 0xA3
+            script[at] = 0xA4
+        spk = bytes(script)
+        return DmintContractUtxo(txid="ab" * 32, vout=0, value=1, script=spk, state=DmintState.from_script(spk))
+
+    def _patch_prepare(self, monkeypatch, *, corrupt: bool = True, height: int = 0):
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.keys import PrivateKey
+
+        contract = self._asert_contract(corrupt=corrupt, height=height)
+        funding = _dmint_funding()
+        key = PrivateKey()  # a fresh random key; never hand-written material
+        pkh = bytes(key.public_key().hash160())
+
+        async def _fake_prepare(ctx, wallet, contract_arg, token_ref_arg, reward_address, client):
+            return contract, funding, key, pkh
+
+        monkeypatch.setattr(glyph_cmds, "_claim_prepare", _fake_prepare)
+        # Wallet loading and the ElectrumX read are NOT the subject here and are the only
+        # things between the command and the builder; the builder itself, its bytecode
+        # detection and the CLI's exception mapping all run for real.
+        monkeypatch.setattr(glyph_cmds, "_load_wallet", lambda ctx, **kw: object())
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: _FakeClient())
+
+    def _invoke(self, runner: CliRunner, tmp_wallet_path: Path):
+        return runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--yes",
+                "glyph",
+                "claim-dmint",
+                "--contract",
+                "ab" * 32 + ":0",
+                "--current-time",
+                "1700000090",
+                "--no-progress",
+            ],
+        )
+
+    def test_names_the_bytecode_not_the_funding(self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        self._patch_prepare(monkeypatch, corrupt=True)
+        result = self._invoke(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "matches no DAA generation" in result.output
+        # The wrong diagnosis AND the wrong remedy must both be gone.
+        assert "funding can't cover" not in result.output
+        assert "lower --fee-rate" not in result.output
+
+    def test_a_plain_dmint_error_still_reaches_the_funding_clause(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """The honest-path pair for the reordering: inserting a clause ABOVE
+        `except DmintError` must not shadow it. An exhausted contract raises
+        ContractExhaustedError — a plain DmintError — and must still land there."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        self._patch_prepare(monkeypatch, corrupt=False, height=100)
+        result = self._invoke(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "funding can't cover the mint reward + fee" in result.output
+        assert "matches no DAA generation" not in result.output

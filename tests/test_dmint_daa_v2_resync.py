@@ -48,14 +48,16 @@ failed, the plant was removed) before this file was committed.
 from __future__ import annotations
 
 import inspect
+import time
 
 import pytest
 
-from pyrxd.glyph.builder import DmintV2DeployParams
+from pyrxd.glyph.builder import DmintV2DeployParams, GlyphBuilder
 from pyrxd.glyph.dmint import (
     ASERT_V2_DRIFT_CLAMP,
     ASERT_V2_MAX_TARGET_DIV4,
     ASERT_V2_RADIX,
+    DAA_MODES_READING_DEPLOY_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
@@ -77,6 +79,7 @@ from pyrxd.glyph.dmint import (
     compute_next_target_linear_v2,
     detect_contract_daa_bytecode,
     detect_daa_bytecode,
+    is_minimal_4byte_scriptnum,
 )
 from pyrxd.glyph.dmint.builders import (
     _DAA_BODY_OFFSET_IN_CODE,
@@ -84,6 +87,7 @@ from pyrxd.glyph.dmint.builders import (
     _PART_B1,
     _PART_B2,
     _PART_B4,
+    _V2_EXCESS_PREAMBLE,
     _build_asert_daa_legacy,
     _build_asert_daa_v2,
     _build_linear_daa_legacy,
@@ -91,12 +95,15 @@ from pyrxd.glyph.dmint.builders import (
     _build_linear_daa_v2,
     _build_part_b,
     _build_part_c,
+    _daa_bytes_for,
     _middle_literal,
+    _push_minimal,
     build_dmint_state_script,
 )
 from pyrxd.glyph.dmint.types import _OP_STATESEPARATOR
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import UnrecognizedDaaBytecodeError, ValidationError
+from pyrxd.security.types import Hex20
 
 #: Radiant-Core/Photonic-Wallet commit the transcriptions below were copied from. The on-disk
 #: sources were sha256-verified against raw.githubusercontent.com at this commit before use.
@@ -803,12 +810,36 @@ class TestMintBuilderVerifiesHalfLifeAgainstBytecode:
         assert "half_life=240 was supplied" in str(exc.value)
         assert version.name in str(exc.value)
 
-    def test_default_half_life_refused_for_a_3600_contract(self) -> None:
-        """The default moved 3600 → 240; a pre-resync contract deployed on the old default now
-        fails fast with the baked value in the message instead of grinding to a rejection."""
-        utxo = _utxo(_contract_script(_params(DaaMode.ASERT, half_life=3600), DaaBytecodeVersion.LEGACY))
-        with pytest.raises(ValidationError, match="bakes half_life=3600"):
-            build_dmint_mint_tx(utxo, b"\x00" * 8, _PKH, _LAST + 90, funding_utxo=_FUNDING)
+    @pytest.mark.parametrize(
+        ("version", "delta"),
+        # The delta has to be one at which 3600 and 240 actually disagree, and that is a
+        # DIFFERENT delta per generation: the v2 fractional drift saturates its ±16384 clamp
+        # long before the legacy integer stepper leaves 0. Picking one number for both makes
+        # the test vacuous for one of them — the non-vacuity assertion below caught exactly
+        # that when this test was first written with delta=90 for both.
+        [(DaaBytecodeVersion.V2, 120), (DaaBytecodeVersion.LEGACY, 3660)],
+    )
+    def test_omitted_half_life_uses_the_contracts_own_baked_value(
+        self, version: DaaBytecodeVersion, delta: int
+    ) -> None:
+        """The HONEST path for a contract on the retired 3600 default: omitting half_life mints.
+
+        The builder has already read 3600 out of the bytecode by the time it needs the value,
+        so demanding the caller restate it could only refuse work that is legitimate — which
+        is what happened when the deploy-side default moved 3600 → 240 and every previously
+        working invocation against an older contract began failing.
+
+        The assertion that carries the weight is the TARGET: it must equal the 3600 mirror and
+        differ from the 240 one, which proves the detected value was used rather than a default
+        that happened to be harmless.
+        """
+        utxo = _utxo(_contract_script(_params(DaaMode.ASERT, half_life=3600), version))
+        res = build_dmint_mint_tx(utxo, b"\x00" * 8, _PKH, _LAST + delta, funding_utxo=_FUNDING)
+        mirror = compute_next_target_asert_v2 if version is DaaBytecodeVersion.V2 else compute_next_target_asert_legacy
+        baked = mirror(utxo.state.target, _LAST, _LAST + delta, 60, 3600)
+        default_240 = mirror(utxo.state.target, _LAST, _LAST + delta, 60, 240)
+        assert baked != default_240, "fixture is vacuous: 3600 and 240 retarget to the same value here"
+        assert res.updated_state.target == baked
 
     def test_unrecognized_bytecode_refused_before_grind(self) -> None:
         p = _params(DaaMode.ASERT, half_life=240)
@@ -841,18 +872,31 @@ class TestHalfLifeDefaultIsCanonical:
         assert p.half_life == 240
 
     def test_mint_builder_and_part_b_defaults(self) -> None:
-        assert inspect.signature(build_dmint_mint_tx).parameters["half_life"].default == 240
+        # The MINT builder's default is None — "read it off the contract", not "assume 240".
+        # A concrete default there is a guard refusing honest work (see
+        # TestMintBuilderVerifiesHalfLifeAgainstBytecode). _build_part_b has no contract to
+        # read, so the canonical constant stays its default.
+        assert inspect.signature(build_dmint_mint_tx).parameters["half_life"].default is None
         assert inspect.signature(_build_part_b).parameters["half_life"].default == 240
         assert _build_part_b(DaaMode.ASERT) == _build_part_b(DaaMode.ASERT, 240)
         assert _build_part_b(DaaMode.ASERT) != _build_part_b(DaaMode.ASERT, 3600)
 
-    @pytest.mark.parametrize("command", ["deploy_dmint_cmd", "claim_dmint_cmd"])
-    def test_cli_half_life_option_default(self, command: str) -> None:
+    def test_deploy_cli_half_life_default_is_canonical(self) -> None:
         from pyrxd.cli import glyph_cmds
 
-        cmd = getattr(glyph_cmds, command)
-        (opt,) = [p for p in cmd.params if p.name == "half_life"]
+        (opt,) = [p for p in glyph_cmds.deploy_dmint_cmd.params if p.name == "half_life"]
         assert opt.default == 240
+
+    def test_claim_cli_half_life_default_is_read_from_the_contract(self) -> None:
+        """The CLAIM side must not default to a number: the contract's bytecode decides.
+
+        A concrete default here is what broke every claim against a contract deployed on the
+        retired 3600 default — the user was asked to restate a value pyrxd had already read.
+        """
+        from pyrxd.cli import glyph_cmds
+
+        (opt,) = [p for p in glyph_cmds.claim_dmint_cmd.params if p.name == "half_life"]
+        assert opt.default is None
 
     def test_default_deploy_bakes_240_and_the_default_claim_mints_it(self) -> None:
         """Round trip through the two production entry points with NO half_life anywhere."""
@@ -1016,3 +1060,158 @@ class TestV2MirrorsByHand:
             compute_next_target_linear_v2(1000, _LAST, _LAST, 0)
         with pytest.raises(ValidationError, match="script number"):
             compute_next_target_asert_v2(_MAX + 1, _LAST, _LAST, 60, 240)  # a 256-bit target cannot run on chain
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# lastTime: the deploy path must not emit a contract that is unmineable from birth
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The V2 state pushes lastTime as a fixed `04 <4B LE>`, and ASERT/LWMA read it back as
+# a script number on the FIRST mint. MINIMALDATA sits in radiant-core's
+# MANDATORY_SCRIPT_VERIFY_FLAGS, so a non-minimal operand is a CONSENSUS abort, not a
+# standardness complaint — and `00000000` (the old implicit default) is non-minimal.
+# Measured on a real node: last_time=8388608 accepted, 8388607 rejected.
+
+
+def _v2_deploy_params(**kw) -> DmintV2DeployParams:
+    base = dict(
+        metadata=GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="t", ticker="T", decimals=0),
+        owner_pkh=Hex20(bytes(20)),
+        num_contracts=1,
+        max_height=100,
+        reward_photons=1_000,
+        difficulty=8,
+        target_time=60,
+    )
+    base.update(kw)
+    return DmintV2DeployParams(**base)
+
+
+class TestLastTimeMinimalityIsDerived:
+    def test_the_threshold_is_derived_from_the_cscriptnum_rule_not_typed(self) -> None:
+        """2**23 is a RESULT of the minimality rule, not a constant anyone wrote down.
+
+        Exhaustive below 2**24; sampled above. The node agreed: 8388608 accepted,
+        8388607 rejected with mandatory-script-verify-flag-failed.
+        """
+        assert min(n for n in range(1 << 24) if is_minimal_4byte_scriptnum(n)) == 1 << 23
+        # Nothing in the rest of the locktime range is non-minimal, so a guard keyed to
+        # this predicate cannot refuse a plausible timestamp — the honest-path half.
+        assert all(is_minimal_4byte_scriptnum(n) for n in range(1 << 23, 0x7FFFFFFF, 7919))
+        assert is_minimal_4byte_scriptnum(0x7FFFFFFF)
+        # Bit 31 set encodes a negative script number whose top byte is bare sign.
+        assert not is_minimal_4byte_scriptnum(0x80000000)
+        assert not is_minimal_4byte_scriptnum(-1)
+
+    def test_the_guarded_mode_set_is_derived_from_the_bytecode_each_mode_emits(self) -> None:
+        """Which modes need the guard is read OUT of the fragments, not hand-kept.
+
+        A mode qualifies when its DAA fragment opens with the excess preamble
+        (OP_TXLOCKTIME OP_2 OP_PICK OP_SUB …), i.e. reads lastTime unconditionally on the
+        first mint. EPOCH also reads lastTime, but only inside a branch gated on
+        `height > 0`, which height 0 cannot take; SCHEDULE and FIXED never read it. If a
+        future mode starts reading it unconditionally, this fails until it is listed.
+        """
+        examined = {}
+        for mode in DaaMode:
+            frag = _daa_bytes_for(
+                mode,
+                DEFAULT_ASERT_HALFLIFE,
+                epoch_length=2016,
+                max_adjustment_log2=2,
+                schedule=((100, 4),),
+                daa_bytecode_version=DaaBytecodeVersion.V2,
+            )
+            examined[mode] = frag.startswith(_V2_EXCESS_PREAMBLE)
+        assert len(examined) == 5, "the derivation must see every DaaMode, not a subset"
+        derived = frozenset(m for m, unconditional in examined.items() if unconditional)
+        assert derived, "derivation found nothing — the preamble constant or the builders moved"
+        assert derived == DAA_MODES_READING_DEPLOY_LAST_TIME
+        # EPOCH reads lastTime too, just not at height 0; that is the exemption being
+        # claimed, so pin the shape it rests on rather than only the prose.
+        epoch = _daa_bytes_for(
+            DaaMode.EPOCH,
+            DEFAULT_ASERT_HALFLIFE,
+            epoch_length=2016,
+            max_adjustment_log2=2,
+            schedule=(),
+            daa_bytecode_version=DaaBytecodeVersion.V2,
+        )
+        assert _V2_EXCESS_PREAMBLE[:3] in epoch, "EPOCH stopped reading lastTime — re-check the exemption"
+        assert not epoch.startswith(_V2_EXCESS_PREAMBLE), "EPOCH now reads lastTime unconditionally"
+        assert epoch.index(_V2_EXCESS_PREAMBLE[:3]) > epoch.index(b"\x63"), "the OP_IF gate is gone from EPOCH"
+
+
+class TestDeployRefusesAnUnmineableLastTime:
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    @pytest.mark.parametrize("bad", [0, 1, (1 << 23) - 1])
+    def test_refused_on_the_params_the_caller_typed(self, mode: DaaMode, bad: int) -> None:
+        with pytest.raises(ValidationError, match="NON-MINIMAL"):
+            _v2_deploy_params(daa_mode=mode, last_time=bad)
+
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    def test_accepted_at_the_threshold_and_at_a_real_timestamp(self, mode: DaaMode) -> None:
+        """The honest half: the guard must not refuse work that mines."""
+        assert _v2_deploy_params(daa_mode=mode, last_time=1 << 23).last_time == 1 << 23
+        assert _v2_deploy_params(daa_mode=mode, last_time=_LAST).last_time == _LAST
+
+    @pytest.mark.parametrize("mode", [DaaMode.FIXED, DaaMode.EPOCH, DaaMode.SCHEDULE])
+    def test_modes_that_never_read_it_at_height_zero_still_accept_zero(self, mode: DaaMode) -> None:
+        """The other honest half: these three do not read lastTime at height 0, so
+        refusing 0 for them would be a guard refusing valid work (and would break the
+        conformance vectors, which carry 0 for exactly these three)."""
+        kw = {"difficulty": 32768} if mode is DaaMode.EPOCH else {}
+        if mode is DaaMode.SCHEDULE:
+            kw["schedule"] = ((100, 4),)
+        params = _v2_deploy_params(daa_mode=mode, last_time=0, **kw)
+        result = GlyphBuilder().prepare_dmint_deploy(params)
+        state = DmintState.from_script(result.build_reveal_outputs("dd" * 32).contract_scripts[0])
+        assert state.last_time == 0
+
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    def test_the_production_deploy_path_emits_a_mineable_last_time(self, mode: DaaMode) -> None:
+        """Through the SHIPPED entry point, with no last_time supplied at all.
+
+        This is the case the branch's own regtest could not see: its helper set a
+        timestamp the production path had no field for, so every contract the shipped
+        API actually produced carried `04 00000000` and aborted on its first retarget.
+        """
+        before = int(time.time())
+        result = GlyphBuilder().prepare_dmint_deploy(_v2_deploy_params(daa_mode=mode))
+        after = int(time.time())
+        assert before <= result.last_time <= after
+
+        scripts = result.build_reveal_outputs("dd" * 32).contract_scripts
+        assert len(scripts) == 1
+        state_script = build_dmint_state_script(
+            DmintDeployParams(
+                contract_ref=GlyphRef(txid="dd" * 32, vout=1),
+                token_ref=GlyphRef(txid="dd" * 32, vout=0),
+                max_height=100,
+                reward=1_000,
+                difficulty=8,
+                daa_mode=mode,
+                target_time=60,
+                last_time=result.last_time,
+            )
+        )
+        assert scripts[0].startswith(state_script)
+        # And the bytes themselves, not just the parse: the lastTime push must be a
+        # minimal script number, which is what the covenant's CScriptNum demands.
+        parsed = DmintState.from_script(scripts[0])
+        assert parsed.last_time == result.last_time
+        assert is_minimal_4byte_scriptnum(parsed.last_time)
+        assert state_script[-len(_push_minimal(parsed.target)) - 5 :][:5] == b"\x04" + parsed.last_time.to_bytes(
+            4, "little"
+        )
+        assert parsed.last_time.to_bytes(4, "little") != b"\x00\x00\x00\x00"
+
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    def test_build_reveal_outputs_refuses_a_result_rebuilt_with_a_dead_last_time(self, mode: DaaMode) -> None:
+        """The second door. Commit and reveal are separate transactions, so a caller may
+        rebuild the result object in a later process rather than keep the one
+        prepare_dmint_deploy returned — that path must not be able to emit the bytes."""
+        result = GlyphBuilder().prepare_dmint_deploy(_v2_deploy_params(daa_mode=mode))
+        result.last_time = 0  # what a hand-rebuilt / deserialized result would carry
+        with pytest.raises(ValidationError, match="NON-MINIMAL"):
+            result.build_reveal_outputs("dd" * 32)

@@ -1163,6 +1163,7 @@ class TestDeprecationAliases:
                 algo=_Algo.SHA256D,
                 op_return_msg=None,
                 daa_mode=DaaMode.FIXED,
+                last_time=1_700_000_000,
                 target_time=60,
                 half_life=3600,
             )

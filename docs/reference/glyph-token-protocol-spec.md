@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:337-344`), and reads it back with
+(`src/pyrxd/glyph/builder.py:340-347`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:295-301`).
+(`src/pyrxd/glyph/builder.py:298-304`).
 
 ### 6.2 Phase 2 — reveal
 
@@ -594,7 +594,7 @@ the regex and the built script (`src/pyrxd/glyph/script.py:332-335`).
 ### 7.5 CONTAINER
 
 A container's locking script is the **63-byte NFT singleton of §7.1, unchanged**
-(`src/pyrxd/glyph/builder.py:778-842`). There is no container script shape.
+(`src/pyrxd/glyph/builder.py:995-1000`). There is no container script shape.
 Container-ness is the `7` marker in the envelope's `p` field, and it is invisible
 on chain — exactly as in Photonic Wallet, which has a single `nftScript` and no
 container variant (`packages/lib/src/script.ts`).
@@ -1389,7 +1389,7 @@ for such a script is undefined.
 No consensus rule fixes the photon value of a commit, contract, or NFT carrier
 output. Radiant-Core has no dust threshold — `GetDustThreshold` returns 1 and
 `IsDust` is `nValue <= 0` — so any output worth at least one photon is standard
-(`src/pyrxd/glyph/builder.py:1280-1292`, citing `src/policy/policy.cpp:19-25` at
+(`src/pyrxd/glyph/builder.py:1296-1308`, citing `src/policy/policy.cpp:19-25` at
 `afdf57b1`). The 1-photon value on dMint contract outputs is pinned by the
 **covenant** (`OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`,
 `src/pyrxd/glyph/dmint/builders.py:872`), not by the chain. The 546-photon floors

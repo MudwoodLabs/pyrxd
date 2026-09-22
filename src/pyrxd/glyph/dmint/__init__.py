@@ -51,6 +51,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ASERT_V2_MAX_TARGET_DIV4": ("pyrxd.glyph.dmint.types", "ASERT_V2_MAX_TARGET_DIV4"),
     "DEFAULT_ASERT_HALFLIFE": ("pyrxd.glyph.dmint.types", "DEFAULT_ASERT_HALFLIFE"),
     "DaaBytecodeVersion": ("pyrxd.glyph.dmint.types", "DaaBytecodeVersion"),
+    "DAA_MODES_READING_DEPLOY_LAST_TIME": ("pyrxd.glyph.dmint.types", "DAA_MODES_READING_DEPLOY_LAST_TIME"),
+    "is_minimal_4byte_scriptnum": ("pyrxd.glyph.dmint.types", "is_minimal_4byte_scriptnum"),
     "DetectedDaaBytecode": ("pyrxd.glyph.dmint.builders", "DetectedDaaBytecode"),
     "detect_daa_bytecode": ("pyrxd.glyph.dmint.builders", "detect_daa_bytecode"),
     "detect_contract_daa_bytecode": ("pyrxd.glyph.dmint.miner", "detect_contract_daa_bytecode"),

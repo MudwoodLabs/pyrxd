@@ -334,3 +334,83 @@ class TestEveryCliFlagIsRead:
         assert not stale, "delete these now-read (or removed) flags from _KNOWN_DEAD_FLAGS:\n  " + "\n  ".join(
             sorted(stale)
         )
+
+
+# ---------------------------------------------------------------------------
+# Universality, not existence: every way to BUILD a dMint contract must cross
+# the lastTime check
+# ---------------------------------------------------------------------------
+#
+# The caller grep above asks "does this have *a* caller?". For a GUARD that is the
+# wrong question — a half-applied guard has real callers in shipped code, exercised
+# by passing tests, and greps clean. The right question is "what are all the ways to
+# do the dangerous thing, and does each one cross the check?".
+#
+# The dangerous thing here is emitting a V2 dMint contract script for a deploy. A
+# contract whose `lastTime` state item is not a minimally encoded script number is
+# unmineable from birth under MINIMALDATA — which is consensus on Radiant, not mempool
+# policy — and unfixable once the reveal confirms. `build_dmint_contract_script` is the
+# single encoder every such script comes out of, so the set of ITS shipped callers is
+# the set of ways to deploy, derived rather than typed.
+
+_CONTRACT_ENCODER = "build_dmint_contract_script"
+_LAST_TIME_GUARD = "require_mineable_last_time"
+
+
+def _enclosing_function_calls() -> dict[str, set[str]]:
+    """``"<file>::<function>" -> {names it calls}``, innermost function wins."""
+    out: dict[str, set[str]] = {}
+
+    def called_name(node: ast.AST) -> str | None:
+        if not isinstance(node, ast.Call):
+            return None
+        f = node.func
+        if isinstance(f, ast.Name):
+            return f.id
+        if isinstance(f, ast.Attribute):
+            return f.attr
+        return None
+
+    def visit(node: ast.AST, where: str | None, rel: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                visit(child, f"{rel}::{child.name}", rel)
+                continue
+            name = called_name(child)
+            if name is not None and where is not None:
+                out.setdefault(where, set()).add(name)
+            visit(child, where, rel)
+
+    for path, tree in _shipped_trees():
+        visit(tree, None, path.relative_to(_ROOT).as_posix())
+    return out
+
+
+class TestEveryShippedDmintDeployCrossesTheLastTimeGuard:
+    def test_every_caller_of_the_contract_encoder_also_calls_the_guard(self) -> None:
+        calls = _enclosing_function_calls()
+        deployers = sorted(where for where, names in calls.items() if _CONTRACT_ENCODER in names)
+        # Non-vacuity: if the derivation stops finding the encoder at all (renamed,
+        # re-exported, called through an alias) this check would pass by having nothing
+        # to iterate, which is indistinguishable from passing correctly.
+        assert deployers, (
+            f"derived NO shipped caller of {_CONTRACT_ENCODER}() — the scan is broken, not the code. "
+            "A V2 dMint contract script cannot reach a transaction without it."
+        )
+        unguarded = [w for w in deployers if _LAST_TIME_GUARD not in calls.get(w, set())]
+        assert not unguarded, (
+            f"these shipped functions build a V2 dMint contract script without crossing "
+            f"{_LAST_TIME_GUARD}(): {unguarded}. A lastTime that is not a minimal script number "
+            "makes the contract unmineable from birth (MINIMALDATA is consensus on Radiant) and "
+            "nothing can fix it after the reveal confirms — so every deploy path has to cross it, "
+            "not just the ones someone remembered."
+        )
+
+    def test_the_guard_is_not_dead_code(self) -> None:
+        """The other direction: the guard must still have callers at all."""
+        calls = _enclosing_function_calls()
+        guarded = sorted(where for where, names in calls.items() if _LAST_TIME_GUARD in names)
+        assert len(guarded) >= 2, (
+            f"{_LAST_TIME_GUARD}() is called from {guarded} — it is supposed to sit on the deploy "
+            "params, on prepare_dmint_deploy, on build_reveal_outputs and in the mainnet ops harness."
+        )

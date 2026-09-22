@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -20,9 +21,11 @@ from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20, Txid
 
 from .burn import build_burn_proof_script
 from .dmint import (
+    DAA_MODES_READING_DEPLOY_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     DmintDeployParams,
     build_dmint_contract_script,
+    is_minimal_4byte_scriptnum,
 )
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
@@ -737,6 +740,17 @@ class GlyphBuilder:
                 stacklevel=2,
             )
 
+        # 0. Resolve lastTime ONCE, here, and carry the resolved int on the result. The
+        # placeholder scripts (fee estimate) and the real reveal scripts are built at
+        # different moments; calling time.time() at each site would put two different
+        # timestamps in two scripts that are supposed to describe the same contract.
+        # None -> now mirrors Photonic's deploy (`Math.floor(Date.now() / 1000)`).
+        # Checked FIRST, before the CBOR is encoded and before a commit script the caller
+        # might broadcast exists — a refusal after the commit is on chain would strand its
+        # value in a hashlock whose only reveal builds a contract nobody can ever mine.
+        last_time = params.last_time if params.last_time is not None else int(time.time())
+        require_mineable_last_time(last_time, params.daa_mode, stage="prepare_dmint_deploy")
+
         # 1. Encode the CBOR token body and pin the FT+DMINT protocol shape.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
         decoded = cbor2.loads(cbor_bytes)
@@ -772,6 +786,7 @@ class GlyphBuilder:
                     daa_mode=params.daa_mode,
                     target_time=params.target_time,
                     half_life=params.half_life,
+                    last_time=last_time,
                     epoch_length=params.epoch_length,
                     max_adjustment_log2=params.max_adjustment_log2,
                     schedule=params.schedule,
@@ -795,6 +810,7 @@ class GlyphBuilder:
             daa_mode=params.daa_mode,
             target_time=params.target_time,
             half_life=params.half_life,
+            last_time=last_time,
             epoch_length=params.epoch_length,
             max_adjustment_log2=params.max_adjustment_log2,
             schedule=params.schedule,
@@ -1724,6 +1740,45 @@ class GlyphBuilder:
 from .dmint import DaaMode, DmintAlgo  # noqa: E402 (after class def — no circular dep)
 
 
+def require_mineable_last_time(last_time: int, daa_mode: DaaMode, *, stage: str) -> None:
+    """Refuse a ``last_time`` that would make the deployed contract unmineable.
+
+    The V2 state pushes ``lastTime`` as a fixed ``04 <4B LE>``. ASERT and LWMA open
+    their retarget with ``OP_TXLOCKTIME OP_2 OP_PICK OP_SUB``, so the FIRST mint builds a
+    ``CScriptNum`` from whatever the deploy put there — and ``SCRIPT_VERIFY_MINIMALDATA``
+    is in radiant-core's ``MANDATORY_SCRIPT_VERIFY_FLAGS``, i.e. CONSENSUS, not mempool
+    policy. A non-minimal 4-byte value (anything below ``2**23``, and the default 0 above
+    all) aborts that script: the contract can never be mined, and nothing can fix it once
+    the reveal is confirmed. The 2**23 boundary was measured against a real radiant-core
+    node by the 2026-09-21 review (``8388608`` accepted, ``8388607`` rejected with
+    ``mandatory-script-verify-flag-failed``); the ``lastTime = 0`` half is re-proved on
+    every regtest run by the control in ``tests/test_dmint_v2_regtest_e2e.py``.
+
+    This is enforced on the DEPLOY path rather than in
+    :class:`~pyrxd.glyph.dmint.types.DmintDeployParams`, because that type is the argument
+    to pyrxd's byte-level mirror of Photonic ``dMintScript`` — which accepts any
+    ``lastTime`` — and the mirror has to stay able to reproduce contracts that already
+    exist on chain. ``GlyphBuilder.prepare_dmint_deploy`` and
+    ``DmintV2DeployResult.build_reveal_outputs`` are the only shipped callers of
+    ``build_dmint_contract_script``, so guarding those two guards every shipped deploy —
+    and that "only two" is not prose: it is derived from the source and asserted in
+    ``tests/test_reachability_shipped_callers.py``.
+    """
+    if daa_mode not in DAA_MODES_READING_DEPLOY_LAST_TIME:
+        return
+    if is_minimal_4byte_scriptnum(last_time):
+        return
+    encoded = last_time.to_bytes(4, "little").hex() if 0 <= last_time <= 0xFFFFFFFF else "out of 4-byte range"
+    raise ValidationError(
+        f"{stage}: last_time={last_time} pushes as the NON-MINIMAL 4-byte script number {encoded}, "
+        f"and a {daa_mode.name} contract reads lastTime as a number on its FIRST mint. MINIMALDATA is "
+        "consensus on Radiant (MANDATORY_SCRIPT_VERIFY_FLAGS), not mempool policy, so the retarget "
+        "aborts and the contract is unmineable from birth — unfixable once the reveal confirms. Pass a "
+        "real Unix timestamp (>= 2**23 and <= 0x7FFFFFFF), or leave last_time unset to stamp the "
+        "deploy time the way Photonic's dMintScript call site does."
+    )
+
+
 def _validate_premine(premine_amount: int | None, premine_pkh: Hex20 | None) -> None:
     """Shared V1/V2 bound-check for the dMint deploy premine fields.
 
@@ -1905,6 +1960,13 @@ class DmintV2DeployParams:
         otherwise). Defaults to the canonical Photonic ``DEFAULT_ASERT_HALFLIFE`` (240 s)
         so an omitted value deploys what a Photonic miner assumes; before 2026-09-16 the
         default was 3600.
+    :param last_time:       Unix timestamp written into the deployed state's ``lastTime``
+        slot — the baseline the FIRST mint's retarget measures against. ``None`` (the
+        default) stamps the build time, which is what Photonic's ``dMintScript`` call site
+        passes (``Math.floor(Date.now() / 1000)``). For ASERT and LWMA this value is read
+        as a script number on the first mint, so a non-minimal 4-byte encoding (anything
+        below ``2**23``, including the old implicit 0) makes the contract **unmineable from
+        birth** — such a value is refused here rather than deployed.
     """
 
     metadata: GlyphMetadata
@@ -1919,6 +1981,7 @@ class DmintV2DeployParams:
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60
     half_life: int = DEFAULT_ASERT_HALFLIFE  # canonical Photonic default (240 s); was 3600 before 2026-09-16
+    last_time: int | None = None  # None = stamp the build time, as Photonic's deploy does
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
     max_adjustment_log2: int = 2  # EPOCH: max 2^N adjustment per epoch (1..4)
     schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries
@@ -1945,6 +2008,15 @@ class DmintV2DeployParams:
         # retarget multiply) and pyrxd byte-matches it, so EPOCH deploy is re-enabled.
         # Per-mode parameter validation (EPOCH 2^48 target cap + power-of-2 adjustment,
         # SCHEDULE entry shape) is enforced by DmintDeployParams when the scripts are built.
+        #
+        # last_time: refused here so an explicitly-supplied value fails on the object the
+        # caller actually constructed, naming their own argument. prepare_dmint_deploy
+        # re-checks the RESOLVED value as its first act, and build_reveal_outputs re-checks
+        # again immediately before the on-chain bytes are emitted; see
+        # require_mineable_last_time for why the refusal is not in DmintDeployParams.
+        # An omitted value (None) is stamped at prepare time and cannot be wrong.
+        if self.last_time is not None:
+            require_mineable_last_time(self.last_time, self.daa_mode, stage="DmintV2DeployParams")
 
 
 class DmintFullDeployParams(DmintV2DeployParams):
@@ -2168,6 +2240,9 @@ class DmintV2DeployResult:
         fee estimation before the commit txid is known.
     :param max_height, reward_photons, difficulty, algo, op_return_msg, daa_mode,
         target_time, half_life:  Echoed from params for :meth:`build_reveal_outputs`.
+    :param last_time:  The RESOLVED deploy timestamp (``params.last_time``, or the build
+        time when that was ``None``). Resolved once in ``prepare_dmint_deploy`` and carried
+        here so the placeholder scripts and the real reveal scripts agree.
     """
 
     commit_result: CommitResult
@@ -2184,6 +2259,7 @@ class DmintV2DeployResult:
     daa_mode: DaaMode
     target_time: int
     half_life: int
+    last_time: int
     epoch_length: int = 2016
     max_adjustment_log2: int = 2
     schedule: tuple[tuple[int, int], ...] = ()
@@ -2200,6 +2276,10 @@ class DmintV2DeployResult:
         the same shape — and the same output-ordering rule — for V1 and V2.
         """
         token_ref = GlyphRef(txid=Txid(commit_txid), vout=0)
+        # The last point the deploy crosses before the contract bytes exist. A result
+        # object can be rebuilt in a later process (commit and reveal are separate
+        # transactions), so this method must not assume prepare_dmint_deploy ran here.
+        require_mineable_last_time(self.last_time, self.daa_mode, stage="build_reveal_outputs")
         contract_scripts = tuple(
             build_dmint_contract_script(
                 DmintDeployParams(
@@ -2212,6 +2292,7 @@ class DmintV2DeployResult:
                     daa_mode=self.daa_mode,
                     target_time=self.target_time,
                     half_life=self.half_life,
+                    last_time=self.last_time,
                     epoch_length=self.epoch_length,
                     max_adjustment_log2=self.max_adjustment_log2,
                     schedule=self.schedule,

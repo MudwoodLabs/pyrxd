@@ -89,6 +89,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "compute_next_target_linear_legacy": ("pyrxd.glyph.dmint", "compute_next_target_linear_legacy"),
     "compute_next_target_linear_v2": ("pyrxd.glyph.dmint", "compute_next_target_linear_v2"),
     "detect_contract_daa_bytecode": ("pyrxd.glyph.dmint", "detect_contract_daa_bytecode"),
+    "require_mineable_last_time": ("pyrxd.glyph.builder", "require_mineable_last_time"),
     "DaaBytecodeVersion": ("pyrxd.glyph.dmint", "DaaBytecodeVersion"),
     "DEFAULT_ASERT_HALFLIFE": ("pyrxd.glyph.dmint", "DEFAULT_ASERT_HALFLIFE"),
     "difficulty_to_target": ("pyrxd.glyph.dmint", "difficulty_to_target"),

@@ -5,14 +5,18 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (20):
+Symbols (25 — every module-level name, so the count is checkable rather than
+decorative; it read "20" while listing 17 before 2026-09-22):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
+    EPOCH_MAX_ADJUSTMENT_LOG2_VALUES, EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES,
+    EPOCH_MAX_SAFE_TARGET, SCHEDULE_MAX_ENTRIES,
     ASERT_V2_RADIX, ASERT_V2_DRIFT_CLAMP, ASERT_V2_MAX_TARGET_DIV4,
     DEFAULT_ASERT_HALFLIFE,
     DmintAlgo, DaaMode, DaaBytecodeVersion,
-    _PART_B1, _PART_B2, _PART_B4,
-    DmintDeployParams, DmintCborPayload, DmintMintResult,
+    _OP_STATESEPARATOR, _PART_B1, _PART_B2, _PART_B4,
+    is_minimal_4byte_scriptnum, DAA_MODES_READING_DEPLOY_LAST_TIME,
+    DmintDeployParams, DmintCborPayload, _schedule_from_cbor, DmintMintResult,
     DmintV1ContractInitialState
 """
 
@@ -181,6 +185,57 @@ _PART_B4 = bytes.fromhex("6b75757575")
 
 
 # ---------------------------------------------------------------------------
+# Script-number minimality (consensus, not policy)
+# ---------------------------------------------------------------------------
+
+
+def is_minimal_4byte_scriptnum(n: int) -> bool:
+    """Is ``n``'s FIXED 4-byte little-endian push a minimally encoded ``CScriptNum``?
+
+    The V2 dMint state script pushes ``lastTime`` as a fixed ``04 <4B LE>`` (see
+    ``builders._push_4bytes_le``), and the ASERT/LWMA/EPOCH retarget fragments read
+    that item back as a NUMBER (``OP_2 OP_PICK; OP_SUB`` — see
+    ``builders._V2_EXCESS_PREAMBLE``). Radiant-Core builds the operand with
+    ``CScriptNum(vch, fRequireMinimal=true)`` because ``SCRIPT_VERIFY_MINIMALDATA`` is
+    in ``MANDATORY_SCRIPT_VERIFY_FLAGS`` (``policy.h``) — so this is CONSENSUS, not
+    mempool policy, and a non-minimal operand aborts the script rather than being
+    merely non-standard.
+
+    The rule, transcribed from ``CScriptNum``'s constructor: the encoding is minimal
+    unless the most-significant byte has nothing but the sign bit, with one exception
+    — if the second-most-significant byte already has its high bit set, the extra byte
+    is carrying the sign and IS minimal (this is how ``+255`` encodes as ``ff00``).
+
+    Over the range a locktime can occupy (``[0, 0x7FFFFFFF]``) this is exactly
+    ``n >= 2**23``; that equality is not hard-coded here, it is derived by this
+    predicate and pinned in ``tests/test_dmint_daa_v2_resync.py``. The 2026-09-21 review
+    measured the same boundary against a real radiant-core node: ``last_time=8388608``
+    accepted, ``8388607`` rejected with ``mandatory-script-verify-flag-failed``.
+    """
+    if not 0 <= n <= 0xFFFFFFFF:
+        return False  # outside what a 4-byte push can carry at all
+    vch = n.to_bytes(4, "little")
+    if vch[-1] & 0x7F:
+        return True
+    return bool(vch[-2] & 0x80)
+
+
+#: The DAA modes whose retarget fragment reads ``lastTime`` on the **first** mint,
+#: i.e. while the state still carries the value chosen at deploy.
+#:
+#: ASERT and LWMA open their fragment with the unconditional "excess" preamble
+#: (``OP_TXLOCKTIME OP_2 OP_PICK OP_SUB …``), so the very first mint constructs a
+#: ``CScriptNum`` from the deploy's ``lastTime``. EPOCH reads it too, but only inside
+#: a branch gated on ``height > 0`` — never at height 0 — and SCHEDULE/FIXED never
+#: read it at all, so a deploy-time ``lastTime`` of 0 is harmless for those three.
+#:
+#: This membership is DERIVED from the emitted bytecode and checked against this
+#: constant in ``tests/test_dmint_daa_v2_resync.py`` (a mode whose fragment starts
+#: reading ``lastTime`` unconditionally must appear here, or that test fails).
+DAA_MODES_READING_DEPLOY_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA})
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -199,7 +254,16 @@ class DmintDeployParams:
     target_time: int = 60  # seconds between mints (for DAA modes)
     half_life: int = DEFAULT_ASERT_HALFLIFE  # ASERT half-life in seconds (canonical default, script.ts)
     height: int = 0  # current mint height (0 at deploy)
-    last_time: int = 0  # timestamp of last mint (0 at deploy)
+    # Unix timestamp of the last mint. NOT validated for script-number minimality here,
+    # deliberately: this type is the argument to the byte-level mirror of Photonic's
+    # `dMintScript`, which accepts any lastTime, and pyrxd has to stay able to reproduce
+    # the exact bytes of a contract that already exists on chain (including one another
+    # implementation deployed with lastTime=0) for inspection and conformance. Refusing
+    # here would break that and the byte-parity goldens with it. The refusal lives where
+    # the dangerous thing happens instead — the deploy funnel in glyph/builder.py, which
+    # is the ONLY shipped caller of build_dmint_contract_script — and uses
+    # is_minimal_4byte_scriptnum + DAA_MODES_READING_DEPLOY_LAST_TIME from this module.
+    last_time: int = 0
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
     max_adjustment_log2: int = 2  # EPOCH: max adjustment 2^N per epoch (1..4 → 2×..16×)
     schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries

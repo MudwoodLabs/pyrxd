@@ -223,9 +223,9 @@ funding_utxo (<value> photons) too small to cover reward (<reward>) + fee (<fee>
 change would be <change> photons, below 546 dust limit.
 ```
 
-— [`src/pyrxd/glyph/dmint/miner.py:1982`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+— [`src/pyrxd/glyph/dmint/miner.py:2000`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
 and
-[`:2223`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+[`:2241`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
 (the V1 and V2 mining paths). The CLI reframes any `DmintError` from mining
 as:
 

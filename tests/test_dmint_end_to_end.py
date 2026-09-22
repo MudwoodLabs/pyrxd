@@ -69,7 +69,10 @@ _LWMA_PARAMS = DmintDeployParams(
     daa_mode=DaaMode.LWMA,
     target_time=60,
     height=0,
-    last_time=0,
+    # Deliberately NOT 0, and deliberately different from _ASERT_PARAMS: an LWMA state
+    # whose lastTime pushes non-minimally is one radiant-core refuses to run (MINIMALDATA
+    # is consensus), so a fixture built with 0 describes a contract that cannot exist.
+    last_time=1_699_000_000,
 )
 
 

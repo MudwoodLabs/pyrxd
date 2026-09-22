@@ -1561,7 +1561,7 @@ def build_dmint_mint_tx(
     *,
     funding_utxo: DmintMinerFundingUtxo | None = None,
     op_return_msg: bytes | None = None,
-    half_life: int = DEFAULT_ASERT_HALFLIFE,
+    half_life: int | None = None,
     epoch_length: int | None = None,
     max_adjustment_log2: int | None = None,
     schedule: tuple[tuple[int, int], ...] | None = None,
@@ -1613,8 +1613,13 @@ def build_dmint_mint_tx(
        byte-verifies the supplied ``half_life`` against the baked Part B for BOTH
        generations. A contract carrying bytecode of neither generation is refused
        (``UnrecognizedDaaBytecodeError``) rather than mined under a guessed formula.
-       ``half_life`` defaults to the canonical ``DEFAULT_ASERT_HALFLIFE`` (240); a
-       contract baked with another value fails fast naming the baked value.
+       ``half_life`` defaults to ``None`` — **use the value detected in the contract**.
+       Detection has already read the baked half-life at that point, so requiring the
+       caller to restate it could only refuse honest work: when the deploy-side default
+       moved 3600 → 240 on 2026-09-16, every previously-working invocation against a
+       3600 contract started failing on a value the builder already knew. Supplying
+       ``half_life`` explicitly still byte-verifies it against the baked Part B and fails
+       fast, naming the baked value, if the two disagree.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -1796,12 +1801,25 @@ def build_dmint_mint_tx(
     if state.daa_mode in (DaaMode.ASERT, DaaMode.LWMA):
         detected = detect_daa_bytecode(code, state.daa_mode)
         daa_bytecode_version = detected.version
-        if detected.half_life is not None and detected.half_life != half_life:
-            raise ValidationError(
-                f"V2 ASERT mint: the contract bakes half_life={detected.half_life} ({detected.version.name} "
-                f"bytecode) but half_life={half_life} was supplied. Pass the contract's own value — a "
-                "different one recreates a target the covenant rejects, after the PoW grind."
-            )
+        if detected.half_life is not None:
+            if half_life is None:
+                # The bytecode is the ground truth and we have just read it. Demanding the
+                # caller repeat a value we already know prevents nothing and refuses honest
+                # work — which is exactly what happened when the deploy-side default moved
+                # 3600 -> 240 and every mint against an older contract began failing.
+                half_life = detected.half_life
+            elif detected.half_life != half_life:
+                raise ValidationError(
+                    f"V2 ASERT mint: the contract bakes half_life={detected.half_life} ({detected.version.name} "
+                    f"bytecode) but half_life={half_life} was supplied. Pass the contract's own value, or omit "
+                    "half_life entirely to use the baked one — a different value recreates a target the "
+                    "covenant rejects, after the PoW grind."
+                )
+    if half_life is None:
+        # Reached for LWMA (bakes no half-life), and for EPOCH/SCHEDULE/FIXED, which never
+        # consult it. _build_part_b and the retarget mirrors below want an int; for these
+        # modes the value is inert, so the canonical constant is as good as any.
+        half_life = DEFAULT_ASERT_HALFLIFE
 
     # --- Updated state (redesign): height += 1, lastTime = locktime, target via
     # the DAA mirror (unchanged for FIXED). The covenant's Part C rebuilds this

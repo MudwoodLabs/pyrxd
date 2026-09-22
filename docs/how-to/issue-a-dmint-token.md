@@ -115,11 +115,27 @@ pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 
 > multiply) and pyrxd byte-matches it, so EPOCH deploy is re-enabled. EPOCH
 > requires `--difficulty >= 32768` (the 2^48 target cap).
 
+> **`--last-time` (ASERT and LWMA).** The deployed state carries a `lastTime`
+> slot — the baseline the first retarget measures against — and those two modes
+> read it as a script number on the very first mint. `deploy-dmint` stamps the
+> deploy time by default, which is what Photonic's own deploy does, so you
+> normally never pass `--last-time`. If you do pass it, it must be a real Unix
+> timestamp: the state pushes it as a fixed four-byte value, and anything below
+> 2^23 (including 0) is not a *minimally encoded* script number. MINIMALDATA is
+> in Radiant's mandatory script-verify flags — consensus, not mempool policy —
+> so such a contract aborts on its first retarget and can never be mined. The
+> deploy is refused rather than built, because nothing can fix it once the
+> reveal confirms.
+
 `claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
 **SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`
 or `--schedule` you deployed with (those parameters live in the contract code,
 not the on-chain state), plus `--current-time <ts>` if you want real
-difficulty tracking (default 0 = always-final locktime).
+difficulty tracking (default 0 = always-final locktime). You do **not** need to
+pass `--half-life` for an ASERT contract: the claim reads the baked half-life
+out of the contract's own bytecode. Pass it only to assert what you expect —
+a value that disagrees with the baked one fails fast, naming the baked value,
+before the PoW grind.
 
 The command builds a **commit** transaction (an FT-commit hashlock plus
 `K` ref-seed outputs), waits for it to confirm, then builds the
