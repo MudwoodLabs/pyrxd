@@ -65,11 +65,12 @@ X25519_KEY_SIZE = 32
 #: classical path, so this is the only info string it may emit.
 KEK_DERIVATION_INFO = b"glyph-kek-classical-v1"
 
-#: The pre-2026-05-22 spelling, accepted on UNWRAP ONLY and never emitted.
+#: The pre-split spelling, accepted on UNWRAP ONLY and never emitted.
 #:
 #: pyrxd shipped ``b"glyph-kek-v1"`` from v0.6.0 (#106) through 0.24.0. That was correct when
-#: written — Photonic used the same string until it split classical from hybrid on 2026-05-22
-#: (``6e235207``) — so every CEK pyrxd wrapped in that window is recoverable only with this
+#: written. Upstream had ALREADY split classical from hybrid in ``8e6bb6e`` (2026-05-16), two
+#: days before this module was first committed, so pyrxd never matched upstream on this path —
+#: every CEK pyrxd wrapped in that window is recoverable only with this
 #: value, and dropping it would strand content pyrxd itself encrypted. It is tried only after
 #: the current derivation fails its AEAD tag, and :func:`unwrap_cek_x25519` reports which one
 #: succeeded rather than hiding it, because "this ciphertext is legacy" is a fact the caller
@@ -226,7 +227,7 @@ def unwrap_cek_x25519(
 class UnwrappedCEK:
     """A recovered CEK plus the fact of HOW it was recovered.
 
-    ``legacy_info`` is True when the CEK only decrypted under the pre-2026-05-22 info string,
+    ``legacy_info`` is True when the CEK only decrypted under the pre-split info string,
     which means these bytes were wrapped by pyrxd v0.6.0-0.24.0 and will stop being readable
     if the fallback is ever retired. Returned rather than logged so a caller can act on it.
     """

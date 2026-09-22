@@ -93,9 +93,7 @@ class TestPhotonicInterop:
         aad = bytes.fromhex(v["aad"])
         expected_cek = bytes.fromhex(v["original_cek"])
 
-        detailed = unwrap_cek_x25519_detailed(
-            wrapped, ephemeral_pub, recipient_sk, aad, allow_legacy_info=False
-        )
+        detailed = unwrap_cek_x25519_detailed(wrapped, ephemeral_pub, recipient_sk, aad, allow_legacy_info=False)
         assert detailed.cek == expected_cek
         assert detailed.legacy_info is False, (
             "this vector must unwrap under the CURRENT derivation; if it only works "

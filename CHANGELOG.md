@@ -10,14 +10,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
-  `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-22 (`6e235207`) as downgrade
+  `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit
+  titled "C4: Add transaction confirmation modal") as downgrade
   protection — binding the HKDF info to the mode so stripping the ML-KEM ciphertext cannot still
-  decrypt. From that day, pyrxd and Photonic derived different KEKs and could not exchange
+  decrypt. pyrxd's `kem.py` was first committed 2026-05-18, AFTER that split, so the two sides
+  NEVER derived the same KEK on this path and could not exchange
   encrypted Glyph content, while `pyrxd/__init__.py` and the 0.22.0 entry below both stated
   byte-compatibility flatly. **The 0.22.0 claim is wrong as written and is corrected here rather
   than edited, since released sections are frozen:** the draft-irtf-cfrg-xchacha-03 Appendix
   A.3.1 vector it cites covers the raw AEAD only and never touched the KEM path, and the
-  Photonic interop fixture that appeared to cover it was generated 2026-05-18 — four days before
+  Photonic interop fixture that appeared to cover it was generated 2026-05-18 — two days AFTER
   the upstream change — recording `photonic_commit: "UNKNOWN"`.
 
   pyrxd now emits `glyph-kek-classical-v1`, the correct string for the X25519-only path it

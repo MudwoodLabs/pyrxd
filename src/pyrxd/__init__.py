@@ -162,9 +162,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     #
     # The KEM half was NOT, and was false for four months. This comment said "BYTE-COMPATIBLE"
     # flatly while `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"` and Photonic had
-    # moved to `b"glyph-kek-classical-v1"` on 2026-05-22 — so wrap/unwrap could not interoperate
+    # moved to `b"glyph-kek-classical-v1"` on 2026-05-16 (`8e6bb6e`) — so wrap/unwrap could not interoperate
     # at all from v0.6.0 through 0.24.0. The interop fixture could not catch it: it was generated
-    # four days before the upstream change and records `photonic_commit: "UNKNOWN"`. The Appendix
+    # two days AFTER the upstream change, from a checkout that did not carry it. The Appendix
     # A.3.1 vector never covered the KEM path, only the raw AEAD. Fixed; the claim is now scoped
     # to what a vector actually checks.
     #
