@@ -20,8 +20,19 @@ careless manual edits) referencing local-only paths.
 
 Usage
 -----
-    scripts/check-no-private-links.py            # check all tracked files
+    scripts/check-no-private-links.py            # run every check
     scripts/check-no-private-links.py --verbose  # show what's being checked
+
+Scope, per check — these differ, and the line above used to say "check all
+tracked files", which was not true of any of them:
+
+    private links   tracked .md / .rst only
+    home paths      tracked .md / .rst only
+    private names   tracked .md / .rst only
+    ssh targets     EVERY tracked text file
+
+The ssh-target check reads everything because the leak it was written for lived
+in a .py file, where a doc-only scan could never have seen it.
 
 Exit codes
 ----------
@@ -129,6 +140,56 @@ def git_ls_files(repo_root: Path) -> list[Path]:
         if line:
             paths.add(Path(line))
     return sorted(paths)
+
+
+#: A `user@host` ssh destination whose host is a literal, routable IPv4.
+#:
+#: WHY THIS AXIS EXISTS. This script already caught `file://` links into a private
+#: memory directory and bare `/home/<user>/…` paths. It did not catch an ssh
+#: destination — username plus public IP, next to a command naming a container and
+#: showing it was a MAINNET node — which sat in `tests/` from the initial public
+#: release until 2026-09-19. Two reasons, both scope rather than logic:
+#:
+#:   1. The scan only ever read `.md` and `.rst`. A `.py` file was invisible to it.
+#:   2. It had no pattern for a host at all, only for links and home paths.
+#:
+#: The write-up describing that leak, in docs/security-review-playbook.md, itself
+#: still spelled the username while redacting the IP. A guard written from one
+#: example generalises over the axis it was shown.
+_SSH_TARGET_RE = re.compile(r"\b([A-Za-z_][\w.-]{0,31})@((?:\d{1,3}\.){3}\d{1,3})\b")
+
+#: Addresses that are NOT a disclosure: loopback, link-local, RFC1918 private space,
+#: and the RFC 5737 documentation ranges that exist precisely to appear in examples.
+_NON_ROUTABLE = (
+    ("0.",), ("127.",), ("10.",), ("192.168.",), ("169.254.",),
+    ("192.0.2.",), ("198.51.100.",), ("203.0.113.",),
+)
+
+
+def _is_routable(ip: str) -> bool:
+    octets = ip.split(".")
+    if len(octets) != 4 or any(not o.isdigit() or int(o) > 255 for o in octets):
+        return False  # not an address at all
+    for prefixes in _NON_ROUTABLE:
+        if any(ip.startswith(pref) for pref in prefixes):
+            return False
+    # 172.16.0.0/12 is the one private range that needs an arithmetic test.
+    return not (octets[0] == "172" and 16 <= int(octets[1]) <= 31)
+
+
+def find_ssh_targets(content: str) -> list[str]:
+    """Every `user@<routable ipv4>` in the content. Placeholders do not match.
+
+    `<user>@<ip>` and `user@example.com` are both fine — the first has no literal
+    address, the second no IPv4 — so a doc can still describe the shape of a command
+    without naming a machine.
+    """
+    return [m.group(0) for m in _SSH_TARGET_RE.finditer(content) if _is_routable(m.group(2))]
+
+
+_BINARY_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".whl", ".gz", ".zip", ".wasm", ".so", ".dylib"}
+)
 
 
 def is_doc_file(path: Path) -> bool:
@@ -278,6 +339,19 @@ def main() -> int:
     tracked = git_ls_files(repo_root)
     docs = [p for p in tracked if is_doc_file(p)]
 
+    # Check 3 runs over EVERY tracked text file, not just docs — the leak this was
+    # added for lived in a .py file, which the doc-only scan could never see.
+    host_leaks: list[tuple[Path, str]] = []
+    for tracked_path in tracked:
+        if tracked_path.suffix in _BINARY_SUFFIXES:
+            continue
+        try:
+            body = (repo_root / tracked_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for hit in find_ssh_targets(body):
+            host_leaks.append((tracked_path, hit))
+
     if args.verbose:
         print(f"Scanning {len(docs)} tracked doc files for private-path links...")
 
@@ -388,6 +462,33 @@ def main() -> int:
             "points into a sibling project leaks that project's existence.\n"
             "Rewrite as a repo-relative path, a bare project/file reference, or a\n"
             "username-agnostic ~/ path. See docs/CONTRIBUTING.md.",
+            file=sys.stderr,
+        )
+
+    if host_leaks:
+        failed = True
+        if leaks or home_path_leaks:
+            print("", file=sys.stderr)
+        print(
+            "error: tracked files name a machine by user and routable IP:",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        for source, matched in host_leaks:
+            print(f"  {source}", file=sys.stderr)
+            print(f"    target: {matched}", file=sys.stderr)
+            print("", file=sys.stderr)
+        print(
+            "A `user@<public ip>` ssh destination discloses an account and a reachable\n"
+            "host, and the command beside it usually names the service too. One sat in\n"
+            "tests/ from this package's first public release until 2026-09-19, invisible\n"
+            "because this scan read only .md and .rst files and had no pattern for a\n"
+            "host. Take the destination from an env var naming an ssh alias, so it lives\n"
+            "on the machine running the test. Private, loopback and RFC 5737\n"
+            "documentation addresses are allowed, as is a `<user>@<ip>` placeholder.\n"
+            "\n"
+            "NOTE: removing it here stops REPUBLICATION. It does not unpublish what is\n"
+            "already in git history — treat the host as known and secure it there.",
             file=sys.stderr,
         )
 

@@ -72,18 +72,21 @@ html_theme = "furo"
 html_title = f"pyrxd {version}"
 html_static_path = ["_static"]
 # ``html_extra_path`` directories have their *contents* copied verbatim
-# into the built site root without Sphinx parsing. We want the inspect
-# page to land at ``/inspect/index.html`` (not ``/index.html`` — that
-# would overwrite the docs landing page!), so the source path is
-# ``docs/inspect_static/`` and that directory contains exactly one
-# subfolder, ``inspect/``. Sphinx's contents-copy then reproduces
-# ``inspect/`` at the site root.
+# into the built site root without Sphinx parsing. Every page under
+# ``docs/inspect_static/`` must therefore live in a SUBFOLDER: a file at
+# the top level of that directory lands at the site root, and an
+# ``index.html`` there would overwrite the docs landing page. Today the
+# subfolders are ``inspect/`` and ``verify/``, reproduced at the site
+# root as ``/inspect/`` and ``/verify/``.
 #
-# The browser-hosted inspect tool lives at ``inspect_static/inspect/``
-# and loads Pyodide + imports pyrxd at runtime. The CI step that builds
-# the docs (``docs.yml``) additionally writes a wheel into
-# ``inspect_static/inspect/wheels/`` before ``sphinx-build`` runs, so
-# the page can install pyrxd-from-the-current-commit at runtime.
+# ``inspect/`` is the developer tool — paste anything, see every field.
+# ``verify/`` is the public HashMark check — one input, four questions,
+# plain language, for someone who arrived from a link. Both load Pyodide
+# and import pyrxd at runtime, and both read the SAME wheel, manifest and
+# ``glue.py``: the CI step that builds the docs (``docs.yml``) writes a
+# wheel into ``inspect_static/inspect/wheels/`` before ``sphinx-build``
+# runs, and ``verify/`` fetches it from there rather than having a second
+# copy staged for it. One artefact, SHA-256 pinned once.
 html_extra_path = ["inspect_static"]
 html_theme_options = {
     "source_repository": "https://github.com/MudwoodLabs/pyrxd",

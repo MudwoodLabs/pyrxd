@@ -12,6 +12,10 @@
                                   'unsafe-eval' is required by Pyodide internals (it
                                   uses eval() in the Python-to-JS bridge); cost is
                                   documented in docs/threat-model.md.
+                                  'self' also covers the vendored secp256k1 the page
+                                  imports to check signatures: it is same-origin, so
+                                  giving this page a curve ADDED NOTHING to this
+                                  policy. No new host, no new directive.
        style-src 'self'          — only our own CSS
        connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
                                 — page-relative (for vendored wheels in
@@ -143,6 +147,14 @@
     integrity="sha384-i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB"
     crossorigin="anonymous"
   ></script>
+  <!-- shared.js FIRST, and as a classic script on purpose.
+       It carries the runtime boot, the ElectrumX wire, the display sanitiser,
+       the verdict colour mapping and the file-check mechanics — everything the
+       public page at /verify/ also needs, kept in one copy so the two surfaces
+       cannot drift on anything a reader could check one against the other.
+       A classic script runs before a deferred module, so its bindings exist by
+       the time inspect.js's top level does. -->
+  <script src="shared.js"></script>
   <script src="inspect.js" type="module"></script>
 </body>
 </html>

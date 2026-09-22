@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Baseline for the HashMark protocol pyrxd implements a DECODER for, and is about to",
+    "implement an ENCODER for. Each digest is the sha256 of that file in the repo below at",
+    "the commit below. Do NOT hand-edit.",
+    "",
+    "WHY THIS EXISTS. pyrxd's decoder was written from HASHMARK_PROTOCOL.md ALONE, without",
+    "reading the reference source \u2014 that independence is what makes",
+    "tests/test_hashmark_mainnet_vectors.py a real cross-implementation proof rather than",
+    "pyrxd agreeing with pyrxd. A spec that moves under a decoder is a quiet problem; a spec",
+    "that moves under an ENCODER puts wrong bytes on chain under someone's signature.",
+    "",
+    "The packages/protocol/src files are pinned because they are the reference implementation",
+    "our encoder is verified against. They are NOT to be read while writing the encoder \u2014",
+    "doing so would destroy the independence the proof rests on."
+  ],
+  "repo": "cdonnachie/hashmark.rxd",
+  "commit": "866f2b9c1bd3b3069290b6c73a8fd69430fe1042",
+  "license": "MIT",
+  "spec": "HASHMARK_PROTOCOL.md",
+  "files": {
+    "HASHMARK_PROTOCOL.md": "699122459a0d61e471538b85febe6eff719e53248b44736387dbbb5fb6f9c197",
+    "packages/protocol/src/encode.ts": "336e16ceea5e42448b54646f049614267222e835364dc474b5a19751a2ba2b89",
+    "packages/protocol/src/decode.ts": "0753e95cf0f63a73ff5fe2d757cd71a532eba95561bd1aa3fe522fb14ca52195",
+    "packages/protocol/src/script.ts": "74721214e2c4f882bd8661ea0604c5ae3801f9330e3241363efe438788a54883",
+    "packages/protocol/src/constants.ts": "37b7fff690efb22cf8cd95bdd45c7be460904657a65c665a40e5abb0642c759d",
+    "packages/protocol/src/bytes.ts": "7b85e334e2d1a1626b8e9067c5075f48b6d06082df7db163b5f593ae9182ee01"
+  }
+}

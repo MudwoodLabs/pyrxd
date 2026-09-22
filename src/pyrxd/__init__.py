@@ -218,6 +218,26 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "parse_reveal_proof_script": ("pyrxd.glyph.timelock_reveal_tx", "parse_reveal_proof_script"),
     "plan_timelock_reveal": ("pyrxd.glyph.timelock_reveal_tx", "plan_timelock_reveal"),
     "validate_reveal_proof": ("pyrxd.glyph.timelock_reveal_tx", "validate_reveal_proof"),
+    # HashMark — publishing a record, as opposed to reading one. The record BYTES live in
+    # `pyrxd.script` (`encode_hashmark` / `decode_hashmark` / `canonicalize_label` /
+    # `verify_attestation`); these are the pieces that put one in a transaction.
+    #
+    # ONE NAME IS DELIBERATELY ABSENT, for the same reason `create_reveal_proof` is above:
+    # there is no exported way to hand a funded builder raw script bytes. `MarkPlan` is the
+    # only argument `build_hashmark_mark` accepts, and it decodes and attests its own bytes
+    # on construction — so an SDK caller assembling a different workflow still cannot publish
+    # a record with a non-canonical label or a signature that does not verify, which are the
+    # two mistakes that are permanent once a transaction relays.
+    #
+    # `pyrxd.hashmark_tx.digest_file` is not here either: `plan_hashmark_for_file` is the
+    # ergonomic door, and a bare `pyrxd.digest_file` says nothing about which digest or why.
+    "MarkBuild": ("pyrxd.hashmark_tx", "MarkBuild"),
+    "MarkPlan": ("pyrxd.hashmark_tx", "MarkPlan"),
+    "broadcast_hashmark_mark": ("pyrxd.hashmark_tx", "broadcast_hashmark_mark"),
+    "build_hashmark_mark": ("pyrxd.hashmark_tx", "build_hashmark_mark"),
+    "hashmark_mark_funding_bar": ("pyrxd.hashmark_tx", "hashmark_mark_funding_bar"),
+    "plan_hashmark": ("pyrxd.hashmark_tx", "plan_hashmark"),
+    "plan_hashmark_for_file": ("pyrxd.hashmark_tx", "plan_hashmark_for_file"),
     "ChunkedCiphertext": ("pyrxd.crypto.aead", "ChunkedCiphertext"),
     "EncryptedChunk": ("pyrxd.crypto.aead", "EncryptedChunk"),
     "WrappedCEK": ("pyrxd.crypto.kem", "WrappedCEK"),

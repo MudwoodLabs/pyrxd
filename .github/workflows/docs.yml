@@ -105,11 +105,22 @@ jobs:
           # YAML doesn't try to parse the colons in the dict literal.
           wheel_sha=$(sha256sum "$wheel" | awk '{print $1}')
           glue_sha=$(sha256sum ../glue.py | awk '{print $1}')
+          # The secp256k1 the pages install as a recovery backend, because
+          # coincurve skips with deps=False and without a curve the
+          # signature check on /verify/ cannot run at all. Both files are
+          # fetched and SHA-verified in JS BEFORE they are imported.
+          # `loadManifest` asserts both keys are present, so dropping
+          # either of these two lines stops the page loading rather than
+          # silently turning signature checking off for every visitor.
+          curve_sha=$(sha256sum ../vendor/noble-secp256k1.js | awk '{print $1}')
+          curve_bridge_sha=$(sha256sum ../secp256k1-bridge.js | awk '{print $1}')
           git_sha="${GITHUB_SHA:-unknown}"
           export WHEEL="$wheel"
           export WHEEL_SHA="$wheel_sha"
           export CBOR2_SHA="$cbor2_expected_sha"
           export GLUE_SHA="$glue_sha"
+          export CURVE_SHA="$curve_sha"
+          export CURVE_BRIDGE_SHA="$curve_bridge_sha"
           export GIT_SHA="$git_sha"
           script=$(mktemp)
           cat > "$script" <<'PY'
@@ -120,6 +131,8 @@ jobs:
               "cbor2_wheel": "cbor2-5.4.6-py3-none-any.whl",
               "cbor2_sha256": os.environ["CBOR2_SHA"],
               "glue_sha256": os.environ["GLUE_SHA"],
+              "curve_sha256": os.environ["CURVE_SHA"],
+              "curve_bridge_sha256": os.environ["CURVE_BRIDGE_SHA"],
               "git_sha": os.environ["GIT_SHA"][:7],
               "git_sha_full": os.environ["GIT_SHA"],
           }

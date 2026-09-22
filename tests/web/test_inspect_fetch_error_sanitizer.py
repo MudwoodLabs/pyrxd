@@ -59,7 +59,7 @@ def _require_node() -> str:
             )
         pytest.fail(
             "node is required to run the fetch-error sanitiser guard (it loads "
-            "docs/inspect_static/inspect/inspect.js in a Node vm). Install node, "
+            "docs/inspect_static/inspect/{shared,inspect}.js in a Node vm). Install node, "
             "or set PYRXD_SKIP_JS_RENDER_GUARD=1 to skip it deliberately and "
             "accept that inspect.js's error-sanitising is unverified in this run."
         )
@@ -126,6 +126,37 @@ class TestHarnessIntegrity:
         assert probe["fromMalformedJson"]
         assert probe["fromFrameError"]
         assert probe["stripControlCharsDirect"]
+
+
+class TestEveryRejectionSaysWhichWayItFailed:
+    """The wire's other contract, added when the public page needed it.
+
+    ``electrumxRpc`` rejects for three different reasons and a caller cannot tell
+    them apart from the message without matching on a daemon's English, which varies
+    by server and version. ``/verify/`` gives OPPOSITE advice for two of them —
+    retrying fixes an unreachable server and can never fix one that answered "no
+    such transaction" — so the tag is load-bearing, not decorative.
+
+    Driven through ``fetchRawTxFromElectrumx``, the production entry point, against
+    the same stub socket the sanitiser tests use.
+    """
+
+    def test_a_server_that_answered_with_an_error_is_tagged_refused(self, probe) -> None:
+        assert probe["kindFromFrameError"] == "refused"
+
+    def test_a_socket_that_never_answered_is_tagged_unreachable(self, probe) -> None:
+        assert probe["kindFromUnreachable"] == "unreachable"
+        assert probe["messageFromUnreachable"], "the unreachable probe produced no error at all"
+
+    def test_an_unusable_answer_is_tagged_malformed(self, probe) -> None:
+        assert probe["kindFromMalformedJson"] == "malformed"
+
+    def test_the_three_tags_are_actually_distinct(self, probe) -> None:
+        """Non-vacuity. Three assertions against three constants would all pass if
+        every rejection carried the same tag and this file happened to name it three
+        times; this is the one that notices."""
+        tags = {probe["kindFromFrameError"], probe["kindFromUnreachable"], probe["kindFromMalformedJson"]}
+        assert len(tags) == 3, f"the wire collapses its failure modes to {sorted(tags)}"
 
 
 if __name__ == "__main__":  # pragma: no cover

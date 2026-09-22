@@ -198,3 +198,61 @@ class TestEveryEmittedScriptTypeIsDocumented:
         assert pattern.search(_doc_text()), (
             f"the classifier emits types starting {prefix!r}, and the concept doc names none of them"
         )
+
+
+class TestEveryAttestationOutcomeIsDocumented:
+    """The same rule, one level down, on the set that actually caught someone out.
+
+    The page listed the attestation outcomes as "``valid``, ``invalid_signature``,
+    or ``not_attested``" — a hand-typed set of three, missing ``unverifiable``, which
+    is the outcome EVERY v2 record produces in the browser. The sibling check above
+    derives the script ``type`` values from the classifier and so could not see this:
+    it is structural about one enumeration and was silent about the other.
+
+    So this derives the set from :class:`AttestationOutcome` itself. A future outcome
+    that the page does not name fails here rather than leaving a reader with a list
+    that quietly stopped being complete — and the omission is not cosmetic, because
+    a reader who has never heard of ``unverifiable`` reads a withheld verdict as a
+    decided one.
+    """
+
+    @staticmethod
+    def _outcomes() -> set[str]:
+        from pyrxd.script.hashmark import AttestationOutcome
+
+        return {member.value for member in AttestationOutcome}
+
+    def test_the_enumeration_is_not_empty(self) -> None:
+        """A scanner that runs over nothing passes exactly like one that runs over
+        everything."""
+        outcomes = self._outcomes()
+        assert len(outcomes) >= 4, f"only derived {sorted(outcomes)} — the enum moved"
+
+    @staticmethod
+    def _the_list() -> str:
+        """The paragraph that ENUMERATES the outcomes, not the whole page.
+
+        Scoped deliberately. A page-wide search is satisfied by any mention anywhere,
+        so once the page gained a paragraph explaining ``unverifiable``, deleting the
+        word from the enumeration stopped failing — measured, by planting exactly
+        that. The defect being guarded is a reader handed an incomplete LIST, and the
+        list is the unit to look in.
+        """
+        anchor = "`hashmark.attestation` as"
+        blocks = [b for b in _doc_text().split("\n\n") if anchor in b]
+        assert len(blocks) == 1, (
+            f"expected exactly one paragraph containing {anchor!r}, found {len(blocks)}. "
+            f"If the enumeration moved or was reworded, point this anchor at it — do NOT "
+            f"widen the search back to the whole page, which is what made this vacuous."
+        )
+        return blocks[0]
+
+    @pytest.mark.parametrize("outcome", sorted(_outcomes.__func__()))
+    def test_the_outcome_is_named_in_the_list(self, outcome: str) -> None:
+        pattern = re.compile(r"`" + re.escape(outcome) + r"`")
+        assert pattern.search(self._the_list()), (
+            f"verify_attestation can return {outcome!r} and the concept doc's list of "
+            f"outcomes does not include it. That page is the public explanation of what "
+            f"this tool proves; a list missing one is a reader told the wrong set.\n"
+            f"--- the list ---\n{self._the_list()}"
+        )

@@ -1,6 +1,13 @@
 // Drive inspect.js's ElectrumX fetch error path under Node against a stub
 // WebSocket, to prove `stripControlChars` actually runs on both sibling
-// error paths in `fetchRawTxFromElectrumx`'s "message" handler.
+// error paths in the shared "message" handler.
+//
+// That handler now lives in `electrumxRpc`, which `fetchRawTxFromElectrumx`
+// wraps — the wire half was split out when the verdict view needed two more
+// calls over the same socket loop. This harness still drives it through
+// `fetchRawTxFromElectrumx` DELIBERATELY: that is the production entry point
+// the page actually calls, and a probe that reached the private wire function
+// directly would stop proving the errors survive the wrapper.
 //
 // Why this exists
 // ----------------
@@ -17,9 +24,10 @@
 // `stripControlChars` had exactly one call site and zero tests before this,
 // so nothing proved either branch actually worked.
 //
-// Like inspect_render_harness.mjs, inspect.js is loaded VERBATIM in a Node
-// `vm` context — not modified, not wrapped, not preprocessed. A guard that
-// tests a rewritten copy of the file guards the rewrite.
+// Like inspect_render_harness.mjs, shared.js and inspect.js are loaded VERBATIM
+// in a Node `vm` context, in the order index.html loads them — not modified, not
+// wrapped, not preprocessed. A guard that tests a rewritten copy of the file
+// guards the rewrite.
 //
 // Contract:
 //   node inspect_fetch_error_harness.mjs
@@ -29,7 +37,7 @@
 //     "stripControlCharsDirect": "<stripControlChars() called directly>"
 //   }
 //
-// `fetchRawTxFromElectrumx`'s WebSocket construction, listener registration
+// `electrumxRpc`'s WebSocket construction, listener registration
 // and settle() are all synchronous within the Promise executor (no `await`
 // before them), so a stub WebSocket that records `addEventListener`
 // callbacks and exposes a `dispatch()` method can drive both branches of the
@@ -41,6 +49,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
 
 // Attacker-controlled bytes: U+202E (RIGHT-TO-LEFT OVERRIDE, the headline
@@ -99,16 +108,21 @@ function makeSandbox() {
 }
 
 function loadModule() {
-  const source = readFileSync(INSPECT_JS, "utf8");
   const sandbox = makeSandbox();
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: INSPECT_JS });
+  // shared.js FIRST, as index.html loads it. `fetchRawTxFromElectrumx` and
+  // `stripControlChars` moved there when the public /verify/ page needed the same
+  // wire; inspect.js is still loaded after it because THE PRODUCTION PAGE loads
+  // both, and a harness that exercised the wire alone would stop proving the page
+  // it is a guard for can reach it.
+  vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
+  vm.runInContext(readFileSync(INSPECT_JS, "utf8"), sandbox, { filename: INSPECT_JS });
   for (const name of ["fetchRawTxFromElectrumx", "stripControlChars"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
-        `${name} is not reachable after loading inspect.js. It was a top-level ` +
-        `function declaration; if it moved into a block or a module scope, this ` +
-        `harness needs updating — do NOT delete the guard.`
+        `${name} is not reachable after loading shared.js + inspect.js. Both were ` +
+        `top-level declarations in classic scripts; if either moved into a block or ` +
+        `became an ES module, this harness needs updating — do NOT delete the guard.`
       );
     }
   }
@@ -127,7 +141,26 @@ async function probeRejection(sandbox, frameData) {
   try {
     await promise;
   } catch (err) {
-    return err.message;
+    // `kind` alongside the message. "The server said no" and "nobody answered"
+    // arrive as the same rejected promise, and the public /verify/ page gives
+    // OPPOSITE advice for them — retrying fixes one and can never fix the other.
+    // The tag is how a caller tells them apart without matching on a daemon's
+    // English, so it is part of this wire's contract and is probed here.
+    return { message: err.message, kind: err.kind };
+  }
+  throw new Error("expected fetchRawTxFromElectrumx to reject, but it resolved");
+}
+
+// The no-answer half, which no FRAME can produce: drive the socket's own "error"
+// listener instead of delivering a message.
+async function probeUnreachable(sandbox) {
+  const promise = sandbox.fetchRawTxFromElectrumx("deadbeef".repeat(8));
+  const ws = StubWebSocket.lastInstance;
+  ws.dispatch("error", {});
+  try {
+    await promise;
+  } catch (err) {
+    return { message: err.message, kind: err.kind };
   }
   throw new Error("expected fetchRawTxFromElectrumx to reject, but it resolved");
 }
@@ -156,9 +189,18 @@ async function main() {
   // site — pins the function's own behaviour.
   const stripControlCharsDirect = sandbox.stripControlChars(`gly${BIDI}bar${ZWSP}baz`);
 
+  // Branch 3: nothing answers at all. The SAME rejected promise as the two above,
+  // and the public /verify/ page gives the OPPOSITE advice for it — retrying fixes
+  // this one and can never fix a server that answered "no such transaction".
+  const fromUnreachable = await probeUnreachable(sandbox);
+
   process.stdout.write(JSON.stringify({
-    fromMalformedJson,
-    fromFrameError,
+    fromMalformedJson: fromMalformedJson.message,
+    fromFrameError: fromFrameError.message,
+    messageFromUnreachable: fromUnreachable.message,
+    kindFromMalformedJson: fromMalformedJson.kind,
+    kindFromFrameError: fromFrameError.kind,
+    kindFromUnreachable: fromUnreachable.kind,
     stripControlCharsDirect,
   }));
 }

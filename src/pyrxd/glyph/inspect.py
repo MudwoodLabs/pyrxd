@@ -12,6 +12,12 @@ Public surface:
 
 * :func:`classify_input` — dispatch a raw string to its form
   (``"txid" | "contract" | "outpoint" | "script"``)
+* :func:`file_check_plan` — which hash a HashMark record's ``algorithm_id``
+  requires, and the WebCrypto spelling of it, so a browser hashes with the
+  algorithm the RECORD names rather than a hardcoded one
+* :func:`judge_file_digest` — the verdict on a locally-computed digest against
+  a record's. The comparison and the words for it live on the Python side so no
+  surface invents its own wording for "this is the file"
 * :func:`classify_raw_tx` — classify every output (and reveal CBOR) for
   a pre-fetched raw transaction. Synchronous; takes pre-fetched bytes
   rather than an ElectrumXClient, so the browser tool can fetch via the
@@ -56,6 +62,9 @@ from ._inspect_core import (
     _classify_raw_tx as classify_raw_tx,
 )
 from ._inspect_core import (
+    _file_check_plan as file_check_plan,
+)
+from ._inspect_core import (
     _inspect_contract as inspect_contract,
 )
 from ._inspect_core import (
@@ -63,6 +72,9 @@ from ._inspect_core import (
 )
 from ._inspect_core import (
     _inspect_script as inspect_script,
+)
+from ._inspect_core import (
+    _judge_file_digest as judge_file_digest,
 )
 from ._inspect_core import (
     _sanitize_display_string as sanitize_display_string,
@@ -84,9 +96,11 @@ from .confusables import looks_confusable_with_latin, skeleton
 __all__ = [
     "classify_input",
     "classify_raw_tx",
+    "file_check_plan",
     "inspect_contract",
     "inspect_outpoint",
     "inspect_script",
+    "judge_file_digest",
     "looks_confusable_with_latin",
     "sanitize_display_string",
     "skeleton",

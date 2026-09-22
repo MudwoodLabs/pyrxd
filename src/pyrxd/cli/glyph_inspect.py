@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import textwrap
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _truncate_for_human
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -37,6 +38,7 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
+from ..glyph.mark_anchor import mark_anchor_dict
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
 from ..script.timelock import LOCKTIME_THRESHOLD
@@ -56,7 +58,11 @@ _log = logging.getLogger(__name__)
 _MAX_DELEGATE_BASES = 25
 
 __all__ = [
+    "hashmark_records",
     "inspect_cmd",
+    "mark_anchor_dict",
+    "mark_anchor_lines",
+    "resolve_anchor_from",
 ]
 
 
@@ -654,6 +660,94 @@ def _render_inspect_human(payload: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in payload.items())
 
 
+def hashmark_records(payload: Mapping[str, object]) -> list[dict]:
+    """Every HashMark record in an inspect payload, in BOTH shapes it comes in.
+
+    A pasted script carries one record at the top level; a fetched transaction carries
+    one per output. Three callers needed this and two of them had open-coded the same
+    five lines — which is how `--verify-wave <txid> --fetch` once attached nothing at
+    all and never said why. ``pyrxd verify`` is the third, so the expression is written
+    once here rather than a third time there.
+    """
+    top = payload.get("hashmark")
+    if top:
+        return [top]  # type: ignore[list-item]
+    return [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]  # type: ignore[union-attr,index]
+
+
+async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | None, min_confirmations: int):
+    """The mark's block, asked of ONE named endpoint — or the empty anchor when there is no block.
+
+    Lifted out of :func:`_name_at_mark` so ``pyrxd verify`` reports the block from the same
+    code the §7.6 judge is handed. Two resolutions of "which block is this mark in" is how
+    one surface ends up naming a height the other contradicts, and the height is the whole
+    load-bearing input of form 2.
+
+    A pasted script has no transaction and therefore no block. That is not an error and not
+    silence: it returns an anchor with ``height=None``, which every consumer must render as
+    "form 2 is unavailable by construction", with the reason.
+
+    ``label`` is the endpoint's URL, carried into :attr:`MarkAnchor.source` so the caller's
+    independence rules — the height must not come from whoever supplied the name binding —
+    are checkable rather than assumed.
+    """
+    from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
+
+    if not mark_txid:
+        return MarkAnchor(txid="", height=None, confirmations=0, min_confirmations=min_confirmations, source=label)
+    tip_height = await client.get_tip_height()  # type: ignore[attr-defined]
+    return await resolve_mark_anchor(
+        txid=mark_txid,
+        fetch_verbose=client.get_transaction_verbose,  # type: ignore[attr-defined]
+        source=label,
+        min_confirmations=min_confirmations,
+        tip_height=int(tip_height),
+    )
+
+
+# `mark_anchor_dict` moved to `pyrxd.glyph.mark_anchor`, beside the dataclass it
+# describes, and is re-exported above so every caller here is unchanged.
+#
+# WHY IT MOVED: the browser panel needs the same display shape, and it cannot import
+# this module — `glyph_inspect` imports click, and the Pyodide page has none. Left
+# here, the page would have had to build its own dict of height/confirmations/caveat,
+# which is exactly the second display shape this helper was factored out to prevent:
+# a number reaching a screen without the caveat saying it is one endpoint's unverified
+# claim. One definition, three surfaces (this terminal, `pyrxd verify`, the panel).
+
+
+def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> list[str]:
+    """A block, its depth against the floor the caller set, and what the number is worth.
+
+    Never prints a bare height. ``height_is_verified`` is ``False`` for every anchor this
+    codebase can build, so the caveat is unconditional rather than conditional on a flag
+    that is always the same — a conditional would read as though the other branch existed.
+    """
+    if not a:
+        return []
+    if a.get("height") is None:
+        return [
+            f"{indent}block:        none — this transaction is not in a block "
+            f"(unconfirmed, or the endpoint reports no depth)",
+            f"{indent}              a mark in the mempool fixes no time; nothing below is anchored",
+        ]
+    depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
+    verdict = "PROVISIONAL — below the floor you set" if a.get("provisional") else "at or past the floor you set"
+    lines = [f"{indent}block:        {a['height']}  ({depth}) — {verdict}"]
+    # WRAPPED, NOT TRUNCATED. `_truncate_for_human` caps at 200 characters and this caveat is
+    # longer, so it cut mid-word — and the half it dropped is the half that says WHY the number
+    # is unverified. Truncation is the right default for publisher-chosen text, where the risk
+    # is a hostile 100,000-character field; this string is a constant in `mark_anchor.py`, and
+    # a safety qualifier that stops halfway is worse than no qualifier because it still reads
+    # as complete. Sanitised anyway, so a future caveat from elsewhere cannot carry control
+    # bytes, and bounded by line count rather than by cutting the sentence.
+    caveat = _sanitize_display_string(str(a.get("caveat") or ""))
+    for chunk in textwrap.wrap(caveat, width=92)[:6]:
+        lines.append(f"{indent}              {chunk}")
+    lines.append(f"{indent}              (source: {_truncate_for_human(str(a.get('source') or ''))})")
+    return lines
+
+
 def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
     """Names resolving to the signer's key NOW — as context, never as part of the mark.
 
@@ -786,13 +880,8 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
     classification the user asked for. The mark's txid comes from the fetched transaction; a
     pasted script has none, and form 2 is then unavailable by construction.
     """
-    records = (
-        [payload["hashmark"]]
-        if payload.get("hashmark")
-        else [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]
-    )
     mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
-    for hm in records:
+    for hm in hashmark_records(payload):
         _judge_one_name_at_mark(ctx, hm, mark_txid=mark_txid, name=name, min_confirmations=min_confirmations)
 
 
@@ -843,7 +932,6 @@ async def _name_at_mark(
 
     from ..base58 import base58check_encode
     from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
-    from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
     from ..glyph.mutable_chain_discovery import walk_discovered_chain
     from ..glyph.wave import WaveNameNotFound, WaveResolver
     from ..glyph.wave_identity import judge_name_at_mark
@@ -898,19 +986,9 @@ async def _name_at_mark(
         #    URL, the same string the binding is labelled with, so `judge_name_at_mark` can see
         #    when they are one server.
         anchor_client, anchor_label = (client_a, label_a) if binding_label == label_b else (client_b, label_b)
-        if mark_txid:
-            tip_height = await anchor_client.get_tip_height()  # type: ignore[attr-defined]
-            anchor = await resolve_mark_anchor(
-                txid=mark_txid,
-                fetch_verbose=anchor_client.get_transaction_verbose,  # type: ignore[attr-defined]
-                source=anchor_label,
-                min_confirmations=min_confirmations,
-                tip_height=int(tip_height),
-            )
-        else:
-            anchor = MarkAnchor(
-                txid="", height=None, confirmations=0, min_confirmations=min_confirmations, source=anchor_label
-            )
+        anchor = await resolve_anchor_from(
+            anchor_client, anchor_label, mark_txid=mark_txid, min_confirmations=min_confirmations
+        )
 
         # 3. THE CHAIN: discovered on A, tip proved on B.
         found = await walk_discovered_chain(
@@ -955,6 +1033,13 @@ async def _name_at_mark(
         "binding_via": "indexer",
         "binding_verified": verdict.binding_verified,
         "anchor_source": san(anchor_label),
+        # THE ANCHOR ITSELF, not only its height and source. `pyrxd verify` has to report a
+        # block too, and the one rule that matters is that the block must NOT come from
+        # whoever supplied the name binding. That rule is enforced four lines above, once.
+        # Handing the resulting anchor out means the second surface inherits it instead of
+        # re-deriving it from a server it picked on its own — where a hostile endpoint that
+        # had already supplied the binding could move the block as well.
+        "anchor": mark_anchor_dict(anchor),
         "chain": {
             "steps": len(walk.steps),
             "complete": walk.complete,
@@ -1009,26 +1094,38 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                 # v1 keeps its timestamp evidence; the label is withheld WITH a reason,
                 # because silently showing nothing looks like a record that had no label.
                 out.append(f"{indent}  label:   [withheld — {hm['label_withheld']}]")
+            att = hm.get("attestation") or {}
+            outcome = att.get("outcome")
             if hm.get("signer_hash160"):
                 out.append(f"{indent}  signer:  {hm['signer_hash160']}")
-                att = hm.get("attestation") or {}
-                if att.get("outcome") == "valid":
-                    out.append(f"{indent}  signature VERIFIED — recovers to the committed signer")
+                # THE WORDS COME FROM `_attestation_verdict`, not from here. Both this
+                # terminal and the browser panel used to spell the verdict themselves,
+                # which is exactly how the page ended up with no branch at all for
+                # `unverifiable`: this file grew one, `inspect.js` did not, and nothing
+                # could notice because the two copies were unrelated strings in
+                # unrelated languages. One table, three surfaces.
+                status, meaning = _attestation_verdict(outcome or "")
+                if outcome == "valid":
+                    out.append(f"{indent}  signature {status} — {meaning}")
                     if att.get("signer_address"):
                         out.append(f"{indent}    signer address: {att['signer_address']}")
                     out.append(f"{indent}    (assuming {att.get('assumed_network')}; the chain is part of")
                     out.append(f"{indent}     the signed statement and a pasted script carries no context)")
-                elif att.get("outcome") == "unverifiable":
-                    # Withheld, not decided. Falling through silently would leave a
-                    # v2 record showing a signer and no word about its signature —
-                    # which reads as "fine" far more than it reads as "unchecked".
-                    out.append(f"{indent}  signature NOT CHECKED — {att.get('detail', 'no detail')}")
-                    out.append(f"{indent}    (the record is well-formed; this is not a verdict on it)")
-                elif att.get("outcome") == "invalid_signature":
-                    # The bytes decoded; the CLAIM does not hold. Saying "malformed"
-                    # here would send whoever is debugging it after the wrong problem.
-                    out.append(f"{indent}  signature DOES NOT VERIFY — {att.get('detail', 'no detail')}")
-                    out.append(f"{indent}    (the record is well-formed; its claim is not supported)")
+                else:
+                    # Withheld or refused — either way SAY SO. Falling through silently
+                    # would leave a v2 record showing a signer and no word about its
+                    # signature, which reads as "fine" far more than as "unchecked".
+                    # `else` rather than a list of known outcomes, so an outcome added
+                    # upstream is still announced; `_attestation_verdict` fails toward
+                    # "we do not know" rather than toward either verdict.
+                    out.append(f"{indent}  signature {status} — {att.get('detail') or meaning}")
+                    out.append(f"{indent}    ({meaning})")
+            elif outcome == "not_attested":
+                # v1. There IS no signature, and the absence is the finding: a v1 mark
+                # fixes a time and names nobody. Printing nothing here left the reader
+                # to infer that from a missing line.
+                status, meaning = _attestation_verdict(outcome)
+                out.append(f"{indent}  signature {status} — {meaning}")
             out.append(f"{indent}  (proves someone knew this digest no later than the confirming")
             out.append(f"{indent}   block — not authorship, ownership, originality or contents)")
             # AFTER the mark's own statement closes, and at the outer indent. §7.6
@@ -1527,16 +1624,7 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     Errors are attached rather than raised: a name lookup failing is not a reason
     to lose the classification the user asked for.
     """
-    # BOTH shapes. A pasted script puts the record at the top level; a txid puts one
-    # per output. Reading only the first meant `--verify-wave <txid> --fetch` attached
-    # nothing and never said why — a flag that silently does nothing on the form most
-    # people use it with.
-    records = (
-        [payload["hashmark"]]
-        if payload.get("hashmark")
-        else [row["hashmark"] for row in (payload.get("outputs") or []) if row.get("hashmark")]
-    )
-    for hm in records:
+    for hm in hashmark_records(payload):
         _resolve_one_wave_identity(ctx, hm)
 
 

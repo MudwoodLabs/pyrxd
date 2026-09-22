@@ -1,4 +1,4 @@
-"""Decode HashMark records — a THIRD-PARTY ``OP_RETURN`` format on Radiant.
+"""Read and write HashMark records — a THIRD-PARTY ``OP_RETURN`` format on Radiant.
 
 HashMark records a file's digest on chain so anyone can later prove the file
 existed no later than the block that confirmed the transaction. It is not ours:
@@ -8,8 +8,20 @@ https://github.com/cdonnachie/hashmark.rxd — written, in its own words, "so th
 a developer with no access to the HashMark codebase can implement a complete,
 independent verifier".
 
-This module is that independent implementation, for the READ side only. pyrxd
-never writes a HashMark.
+This module is that independent implementation. The decoder
+(:func:`decode_hashmark`) was written from ``HASHMARK_PROTOCOL.md`` ALONE,
+without reading the reference source, and :func:`encode_hashmark` was written
+the same way — that independence is what makes
+``tests/test_hashmark_mainnet_vectors.py`` (his writer, our reader) and
+``tests/test_hashmark_encoder.py`` (our writer, his reader) a real
+cross-implementation proof rather than pyrxd agreeing with pyrxd. The upstream
+commit both were read against is pinned in
+``tests/fixtures/hashmark_upstream_pin.json``; do not read
+``packages/protocol/src/encode.ts`` while changing the encoder.
+
+pyrxd writes **v2 only**. v1 carries no signature, so a v1 mark says WHEN and
+never WHO; reading v1 stays supported because the chain already has v1 records
+on it.
 
 **What a HashMark does not prove.** The spec makes this normative for any UI
 built on it, and repeating it here is deliberate — a decoder that returns a
@@ -30,12 +42,17 @@ must be labelled as such by any caller that surfaces it.
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING, NoReturn
 
 from ..constants import OpCode
 from ..security.errors import ValidationError
 from .script import data_pushes_after_op_return
+
+if TYPE_CHECKING:  # pragma: no cover - import only for the annotation
+    from ..keys import PrivateKey
 
 __all__ = [
     "HASHMARK_MAGIC",
@@ -44,8 +61,15 @@ __all__ = [
     "AttestationResult",
     "HashMarkOutcome",
     "HashMarkRecord",
+    "RecoveryUnavailable",
+    "algorithm_for",
     "canonical_statement",
+    "canonicalize_label",
     "decode_hashmark",
+    "encode_hashmark",
+    "max_label_bytes",
+    "recovery_backend",
+    "set_recovery_backend",
     "verify_attestation",
 ]
 
@@ -312,6 +336,70 @@ RADIANT_MAINNET_GENESIS = "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7
 _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
+class RecoveryUnavailable(Exception):
+    """A registered recovery backend could not run — NOT a verdict on the signature.
+
+    The distinction is the whole reason this exception exists. Everything else that
+    goes wrong during recovery is a statement about the BYTES ("r is not the
+    x-coordinate of any point"), and becomes ``INVALID_SIGNATURE``. This one is a
+    statement about the MACHINE, and becomes ``UNVERIFIABLE`` — "not checked here",
+    which is what a reader must be told when an honest mark met a broken verifier.
+    """
+
+
+#: What :func:`set_recovery_backend` accepts, and the only secp256k1 operation a
+#: HashMark verifier needs: recover the public key from an ECDSA signature.
+#:
+#: ``(message_hash, r, s, rec_id, compressed) -> bytes``
+#:
+#: * ``message_hash`` — 32 bytes, ALREADY hashed. This is the ECDSA ``z``, i.e.
+#:   ``hash256(text_digest(statement))``. A backend must not hash it again.
+#: * ``r``, ``s`` — 32 bytes each, big-endian. Range and low-S checks have already
+#:   run; a backend is arithmetic, not policy.
+#: * ``rec_id`` — 0..3, derived from the signature header.
+#: * ``compressed`` — whether to return the 33-byte SEC1 form. This decides the
+#:   bytes the signer's hash160 was taken over, so it is the caller's to choose.
+#:
+#: Returns the SEC1 public key. Raises :class:`RecoveryUnavailable` if it could not
+#: run at all; any other exception is read as "these bytes recover to nothing".
+RecoveryBackend = Callable[[bytes, bytes, bytes, int, bool], bytes]
+
+#: The registered backend, or ``None`` for "use coincurve".
+#:
+#: WHY A MODULE-LEVEL REGISTRY rather than a parameter threaded through callers.
+#: The environment that needs this is the browser: pyrxd installs under Pyodide with
+#: ``deps=False`` and ``coincurve`` has no pure-Python wheel, so every mark on the
+#: public /verify/ page read NOT CHECKED. A parameter would have to be passed by
+#: every surface that inspects a mark, and the surface that forgets is the one that
+#: quietly goes on saying "not checked" while looking finished. Registering once at
+#: page boot means /inspect/, /verify/ and anything added later get the real verdict
+#: without anyone remembering to ask for it.
+#:
+#: It is deliberately NOT a fallback-when-coincurve-is-missing: a registered backend
+#: wins outright, so a test can pin one implementation against the other over the
+#: same records. Nothing in ``src/`` calls the setter — ``tests/
+#: test_signature_backend_differential.py`` asserts that, so the CLI and SDK keep
+#: using coincurve and this value keeps being ``None`` everywhere but the browser.
+_recovery_backend: RecoveryBackend | None = None
+
+
+def set_recovery_backend(backend: RecoveryBackend | None) -> None:
+    """Register (or clear, with ``None``) the secp256k1 recovery this module uses.
+
+    For environments with no ``coincurve``. See :data:`RecoveryBackend` for the
+    contract, and :data:`_recovery_backend` for why this is a registry.
+    """
+    global _recovery_backend
+    if backend is not None and not callable(backend):
+        raise ValidationError("a recovery backend must be callable")
+    _recovery_backend = backend
+
+
+def recovery_backend() -> RecoveryBackend | None:
+    """The currently registered backend, or ``None`` when coincurve is in use."""
+    return _recovery_backend
+
+
 class AttestationOutcome(Enum):
     """Whether a decoded v2 record's signature actually holds."""
 
@@ -407,13 +495,27 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # the reader, and only the verdict is withheld, with the reason. Reporting
     # INVALID_SIGNATURE here would be far worse: it would tell a reader a genuine
     # mark's claim does not hold, on the strength of a missing dependency.
-    try:
-        from ..keys import recover_public_key
-    except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
-        return AttestationResult(
-            AttestationOutcome.UNVERIFIABLE,
-            detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
-        )
+    # A REGISTERED BACKEND WINS, and when there is one the coincurve import is not
+    # attempted at all — under Pyodide it would only raise. See `set_recovery_backend`.
+    backend: RecoveryBackend | None = _recovery_backend
+    if backend is None:
+        try:
+            from ..keys import recover_public_key
+        except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
+            return AttestationResult(
+                AttestationOutcome.UNVERIFIABLE,
+                detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
+            )
+
+        def backend(message_hash: bytes, r_b: bytes, s_b: bytes, rid: int, is_compressed: bool) -> bytes:
+            # `hasher=None` because the caller below has already applied `hash256`.
+            # Byte-identical to the older `hasher=hash256` form over the preimage —
+            # coincurve applies the hasher itself and this just applies it one line
+            # earlier, so BOTH backends receive the same ECDSA `z` and the two paths
+            # differ in nothing but the curve arithmetic.
+            return recover_public_key(r_b + s_b + bytes([rid]), message_hash, hasher=None).serialize(
+                compressed=is_compressed
+            )
 
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")
@@ -453,9 +555,32 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="s is not low-S")
 
     statement = canonical_statement(record, network_genesis=network_genesis)
+    # §5.6: the header's +4 says the signer's hash160 was taken over the COMPRESSED
+    # form. It selects how the recovered key is serialised before hashing; it is not
+    # an input to the recovery, and swapping the two produces a wrong hash160 and a
+    # confident DOES NOT VERIFY on an honest mark.
+    compressed = header >= 31
+    message = text_digest(statement)
+    # ONE CALL SITE FOR BOTH CURVES. coincurve and a registered backend reach this
+    # through the same signature, the same arguments and the same exception mapping,
+    # so the only thing that can differ between the CLI and the browser is the
+    # arithmetic itself — which is what `tests/test_signature_backend_differential.py`
+    # pins. A second call shape here would be a second set of edges to get wrong.
+    #
+    # The backend is handed the ECDSA `z`, not the preimage: a backend that is not
+    # coincurve has no `hasher=` argument to be told about, and "already hashed" is
+    # the one thing about this call a JavaScript implementation can get wrong in a
+    # way that still returns a key.
     try:
-        pub = recover_public_key(r_bytes + s_bytes + bytes([rec_id]), text_digest(statement), hasher=hash256)
-        recovered = hash160(pub.serialize(compressed=header >= 31)).hex()
+        recovered = hash160(backend(hash256(message), r_bytes, s_bytes, rec_id, compressed)).hex()
+    except RecoveryUnavailable as exc:
+        # NOT a verdict. The backend could not run; the record is untouched by that,
+        # and telling a reader an honest mark's claim does not hold on the strength of
+        # a broken verifier is the worst outcome this function has.
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"the signature was not checked here: {exc}",
+        )
     except Exception as exc:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail=f"recovery failed: {exc}")
 
@@ -466,3 +591,274 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
             detail="recovered key does not match the committed signer",
         )
     return AttestationResult(AttestationOutcome.VALID, recovered_hash160_hex=recovered)
+
+
+# ---------------------------------------------------------------------------
+# Encoding — the WRITE side.
+#
+# Written from HASHMARK_PROTOCOL.md alone, like the decoder above, and for the
+# same reason: `tests/test_hashmark_encoder.py` runs the reference TypeScript
+# decoder over records this function produced, and that proof is worth nothing
+# if both sides came from the same reading of the same source. The upstream
+# commit is pinned in `tests/fixtures/hashmark_upstream_pin.json`.
+#
+# A spec that moves under a decoder is a quiet problem. A spec that moves under
+# an ENCODER puts wrong bytes on chain under someone's signature, permanently.
+# ---------------------------------------------------------------------------
+
+#: The only version pyrxd writes (§4). See the module docstring for why not v1.
+_ENCODER_VERSION = 2
+
+
+def max_label_bytes(algorithm_id: int = 0x01) -> int:
+    """The v2 label cap in BYTES for *algorithm_id*, derived per §5.4 (88 for sha256).
+
+    Public because it is a number a caller has to show a user BEFORE they type a
+    label — "up to 88 bytes" is useful, "your label was rejected" after the fact
+    is not. Derived from the record ceiling rather than tabulated, so registering
+    a longer digest shrinks the label visibly instead of silently producing
+    records that stop relaying.
+    """
+    if algorithm_id not in _ALGORITHMS:
+        raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
+    return _max_label_bytes(_ALGORITHMS[algorithm_id][1])
+
+
+def algorithm_for(algorithm_id: int = 0x01) -> str:
+    """The hash algorithm *algorithm_id* names (§5.3), or raise if unimplemented.
+
+    Public because whoever is about to mark a file has to run the right hash over it,
+    and the only authority on which one that is is the table the encoder writes into the
+    record's header byte. A caller that spells ``"sha256"`` itself has created a second
+    source of truth for what a record CLAIMS versus what was actually hashed, and
+    nothing downstream can detect the disagreement: both halves are well-formed, the
+    signature verifies, and the record is simply false.
+
+    The name is the one :mod:`hashlib` knows, which is what makes
+    :func:`pyrxd.hashmark_tx.digest_file` able to derive its hasher from the id rather
+    than from a second table.
+    """
+    if algorithm_id not in _ALGORITHMS:
+        raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
+    return _ALGORITHMS[algorithm_id][0]
+
+
+def canonicalize_label(label: str) -> str:
+    """The canonical spelling of *label* per §5.4 — trimmed and NFC — or raise.
+
+    §5.4 makes this an encoder obligation: "Encoders must trim leading and
+    trailing whitespace and normalize to Unicode NFC before measuring, signing
+    and writing, and must show the user the resulting canonical label, because
+    that is what will be published."
+
+    It is DELIBERATELY not folded into :func:`encode_hashmark`, which refuses a
+    non-canonical label instead. A library function cannot "show the user"
+    anything, and in v2 the label is inside the signed statement — so an encoder
+    that silently trimmed would sign a string its caller never saw. Splitting it
+    means the transformation happens where a human can be shown the result, and
+    the signing path only ever handles a label that is already final.
+
+    Rejected codepoints (§5.4's table) are refused BEFORE trimming rather than
+    after. Python's ``str.strip()`` treats U+2028 and U+2029 as whitespace, so
+    trimming first would silently swallow a line separator sitting at either
+    end — a codepoint the spec lists precisely because it hides what is
+    rendered. Refusing costs a caller one edit; swallowing costs a reader the
+    truth.
+    """
+    for ch in label:
+        cp = ord(ch)
+        if cp in _LABEL_REJECTED_CHARS or any(lo <= cp <= hi for lo, hi in _LABEL_REJECTED_RANGES):
+            return _raise_label(f"contains U+{cp:04X}")
+    canonical = unicodedata.normalize("NFC", label.strip())
+    if not canonical:
+        # A label that trims away to nothing is not a label. §5.4: "An empty
+        # label is not representable. Omit the push entirely rather than writing
+        # a zero-length one." Returning "" here would hand a caller a string to
+        # show the user and then refuse it one call later, which reads as a bug
+        # in the encoder rather than as an answer about the label.
+        raise ValidationError(
+            "label is only whitespace, so its canonical form is empty and not "
+            "representable (spec 5.4) — omit the label instead"
+        )
+    # Belt: the decoder's own predicate is the authority on what "canonical"
+    # means, so assert against IT rather than trusting that the two steps above
+    # are the whole of §5.4. If someone adds a rule to `_label_defect` and not
+    # here, this raises instead of writing a label the decoder will reject.
+    defect = _label_defect(canonical)
+    if defect is not None:
+        return _raise_label(f"{defect}, and canonicalising did not fix it")
+    return canonical
+
+
+def _raise_label(defect: str) -> NoReturn:
+    raise ValidationError(f"label {defect} (HashMark 5.4)")
+
+
+def _minimal_push(data: bytes) -> bytes:
+    """One minimally-encoded data push (§4.1), never ``OP_0``.
+
+    ``encode_data_push`` returns ``OP_0`` for an empty payload, which §4.1
+    explicitly rejects — it would give a field a second spelling. No HashMark
+    field is ever empty (an absent label is no push at all, not a zero-length
+    one), so an empty payload here is a bug in the caller, and refusing it is
+    what stops that bug reaching the one thing §4.1 exists to guarantee: every
+    record has exactly one valid serialization.
+    """
+    from ..utils import encode_data_push
+
+    if not data:
+        raise ValidationError("a HashMark push is never empty (spec 4.1 rejects OP_0)")
+    return encode_data_push(data)
+
+
+def encode_hashmark(
+    digest: bytes,
+    private_key: PrivateKey,
+    *,
+    label: str | None = None,
+    algorithm_id: int = 0x01,
+    network_genesis: str = RADIANT_MAINNET_GENESIS,
+) -> bytes:
+    """Build a signed v2 HashMark ``scriptPubKey`` committing to *digest*.
+
+    :param digest: the raw digest bytes. Its length must equal the width
+        *algorithm_id* declares (§5.3) — a 31-byte sha256 digest is refused
+        here, not padded.
+    :param private_key: the key that makes the statement. Its ``compressed``
+        flag drives BOTH the committed ``hash160`` and the signature header's
+        compression bit; they are read from one local so they cannot diverge,
+        because a record whose header disagrees with its commitment recovers a
+        different key and can never verify.
+    :param label: an optional public caption, already canonical — pass it
+        through :func:`canonicalize_label` first and show the user the result.
+    :param network_genesis: the genesis hash of the chain this will be
+        broadcast to, in RPC/display order. It is NOT carried by the record: it
+        is part of the signed statement, so the same bytes on another chain make
+        a different statement and will not verify there (§5.6, §2.10). Defaulting
+        to mainnet is deliberate — a testnet mark must be an explicit act.
+
+    The label is **permanently public** and the signature permanently links this
+    mark to that key and to every other mark it signed (§5.4, §14.1). A caller
+    with a user in front of it must say so before this is broadcast.
+    """
+    if algorithm_id not in _ALGORITHMS:
+        raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
+    algorithm, digest_len = _ALGORITHMS[algorithm_id]
+    if len(digest) != digest_len:
+        raise ValidationError(f"{algorithm} digest is {len(digest)} bytes, expected {digest_len} (spec 5.3)")
+
+    if label is not None:
+        # §5.4: an empty label is not representable. Omitting the push is the
+        # spec's answer, but doing that silently would publish an unlabelled
+        # mark to a caller who believes they labelled it — and in v2 the absent
+        # label is a DIFFERENT signed statement. So refuse and say so.
+        if not label:
+            raise ValidationError("an empty label is not representable (spec 5.4) — omit the label instead")
+        defect = _label_defect(label)
+        if defect is not None:
+            raise ValidationError(
+                f"label {defect} (spec 5.4) — canonicalize_label() gives the spelling that can be signed"
+            )
+        cap = _max_label_bytes(digest_len)
+        encoded_label = label.encode("utf-8")
+        if len(encoded_label) > cap:
+            # Bytes, not characters: §5.4's own example is a 43-character emoji
+            # string that occupies 172 bytes.
+            raise ValidationError(
+                f"label is {len(encoded_label)} UTF-8 bytes, over the {cap}-byte cap for "
+                f"{algorithm} (spec 5.4); it is {len(label)} characters"
+            )
+
+    # ORDER IS FORCED. The signed statement contains the signer hash160 (§5.5:
+    # committed twice, in the record and inside the statement), so the key's
+    # hash must exist before the statement, and the statement before the
+    # signature that goes in the record.
+    compressed = private_key.compressed
+    signer = private_key.public_key().hash160(compressed)
+    unsigned = HashMarkRecord(
+        HashMarkOutcome.OK,
+        version=_ENCODER_VERSION,
+        algorithm_id=algorithm_id,
+        algorithm=algorithm,
+        digest_hex=digest.hex(),  # .hex() is lowercase; §5.3's one accepted spelling
+        label=label,
+        signer_hash160_hex=signer.hex(),
+    )
+    signature = _sign_statement(
+        canonical_statement(unsigned, network_genesis=network_genesis), private_key, compressed=compressed
+    )
+
+    record = HashMarkRecord(
+        HashMarkOutcome.OK,
+        version=unsigned.version,
+        algorithm_id=unsigned.algorithm_id,
+        algorithm=unsigned.algorithm,
+        digest_hex=unsigned.digest_hex,
+        label=unsigned.label,
+        signer_hash160_hex=unsigned.signer_hash160_hex,
+        signature_hex=signature.hex(),
+    )
+
+    # SIGN, THEN VERIFY — through the very function a stranger will run (§6.3),
+    # not a re-derivation of it. Everything above is one-way: a wrong recovery
+    # id, a header whose compression bit disagrees with the committed hash, a
+    # curve that stopped normalising s. None of those raises, all of them
+    # produce a well-formed record whose claim does not hold, and on chain that
+    # is permanent. The check costs one key recovery.
+    attested = verify_attestation(record, network_genesis=network_genesis)
+    if not attested.valid:
+        raise ValidationError(
+            f"refusing to emit a record whose own signature does not verify: "
+            f"{attested.outcome.value} ({attested.detail})"
+        )
+
+    script = bytes([_OP_RETURN]) + b"".join(
+        _minimal_push(push)
+        for push in (
+            HASHMARK_MAGIC,
+            bytes([_ENCODER_VERSION, algorithm_id]),
+            digest,
+            signer,
+            signature,
+            *([label.encode("utf-8")] if label is not None else []),
+        )
+    )
+
+    # §3.2: the whole-record ceiling, checked over the ASSEMBLED bytes. The label
+    # cap above is derived from this number, so for sha256 this cannot fire on a
+    # label that passed — but it is the one place every field's cost is actually
+    # summed, so a future algorithm or field lands here rather than on a node.
+    if len(script) > _MAX_RECORD_BYTES:
+        raise ValidationError(f"record is {len(script)} bytes, over the {_MAX_RECORD_BYTES}-byte ceiling (spec 3.2)")
+    return script
+
+
+def _sign_statement(statement: str, private_key: PrivateKey, *, compressed: bool) -> bytes:
+    """The 65-byte ``header || r || s`` of §5.6 over *statement*.
+
+    ``stringify_ecdsa_recoverable`` is the one place in pyrxd that knows the
+    header byte is ``27 + recoveryId (+4 if compressed)``; it happens to emit
+    base64, which §5.6 does not use, so the base64 is undone rather than the
+    header arithmetic re-typed here. Two spellings of that byte is exactly how
+    an encoder and a verifier drift apart.
+    """
+    from base64 import b64decode
+
+    from ..utils import stringify_ecdsa_recoverable, text_digest
+
+    signature = b64decode(stringify_ecdsa_recoverable(private_key.sign_recoverable(text_digest(statement)), compressed))
+    if len(signature) != 65:  # pragma: no cover - structurally impossible, asserted anyway
+        raise ValidationError(f"signature is {len(signature)} bytes, expected 65 (spec 5.6)")
+
+    # §5.6's own range rules, applied to what we are about to WRITE. libsecp256k1
+    # normalises s, so honest signatures already satisfy this — which is the
+    # point: if it ever fires, the curve binding changed under us and the record
+    # would be rejected by every conforming verifier.
+    header, r, s = signature[0], int.from_bytes(signature[1:33], "big"), int.from_bytes(signature[33:65], "big")
+    if not 27 <= header <= 34:
+        raise ValidationError(f"signature header {header} outside 27..34 (spec 5.6)")
+    if not 1 <= r < _SECP256K1_N:
+        raise ValidationError("signature r out of range (spec 5.6)")
+    if not 1 <= s <= _SECP256K1_N // 2:
+        raise ValidationError("signature is not low-S (spec 5.6) — every conforming verifier would reject it")
+    return signature
