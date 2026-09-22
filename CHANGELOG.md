@@ -81,6 +81,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is the `decryptContent` step, handed the ciphertext. The storage gap predates this release and
   is not addressed in it.
 
+- **A Photonic-minted token with EMPTY encrypted content lost its `encrypted_main` on decode.**
+  Photonic encodes zero bytes as zero chunks (`Math.ceil(0 / CHUNK_SIZE)`), so its app records
+  `main: {size: 0, chunks: 0}`. `EncryptionMetadata.from_dict` refused any `chunks < 1`, and
+  `decode_payload` drops a field that fails to parse, so such a token read as having no encrypted
+  main at all. `{size: 0, chunks: 0}` is now accepted; zero chunks with nonzero size, and any
+  negative count, are still refused. Measured against Photonic's app service: of 12 random 0-byte
+  mints, pyrxd kept the field, unwrapped strictly and decrypted to empty 0 of 12 times before,
+  12 of 12 after. Pinned by `app_encrypt_content_recipient_empty`, Photonic's real output.
+
 - **`verify_burn` reported valid Photonic burns as "no burn proof output found".** The read cap
   on a burn proof's CBOR was 8,192 bytes; Photonic builds proofs up to 131,072
   (`MAX_CBOR_SIZE = 128 * 1024`, `burn.ts`), so any proof between the two parsed as absent. The

@@ -13,8 +13,9 @@
  *
  * Run (Photonic checked out at a known upstream commit, dependencies installed):
  *   PHOTONIC_ROOT=/abs/path/to/Photonic-Wallet npx tsx gen-app-path-vector.ts
- * and paste the printed object into tests/fixtures/photonic_timelock_vectors.json under
- * `app_encrypt_content_recipient`, recording the commit in `photonic_commit`.
+ * It prints an object with two keys, `app_encrypt_content_recipient` and
+ * `app_encrypt_content_recipient_empty` (zero bytes of content); merge both into
+ * tests/fixtures/photonic_timelock_vectors.json, setting PHOTONIC_COMMIT so each records it.
  */
 
 import * as path from "node:path";
@@ -55,18 +56,12 @@ function x25519Pub(sk: Uint8Array): Uint8Array {
   return new Uint8Array(spki.subarray(spki.length - 32));
 }
 
-// Fixed inputs.
+// Fixed inputs. The recipient is shared; each vector has its own plaintext and RNG draws.
 const RECIPIENT_SK = fill(32, 29, 11);
-const PLAINTEXT = new TextEncoder().encode("sealed bid: 4200 RXD (Photonic app-path wrap vector)");
-const DRAWS: { role: string; bytes: Uint8Array }[] = [
-  { role: "cek", bytes: fill(32, 7, 3) },
-  { role: "chunk_nonce_0", bytes: fill(24, 13, 5) },
-  { role: "ephemeral_x25519_priv", bytes: fill(32, 19, 23) },
-  { role: "wrap_nonce", bytes: fill(24, 37, 41) },
-  { role: "locator_key", bytes: fill(32, 43, 47) },
-];
 
-const queue = DRAWS.map((d) => d.bytes);
+type Draw = { role: string; bytes: Uint8Array };
+
+let queue: Uint8Array[] = [];
 (globalThis.crypto as any).getRandomValues = (arr: Uint8Array) => {
   const next = queue.shift();
   if (!next) throw new Error(`RNG queue exhausted (asked for ${arr.length})`);
@@ -76,53 +71,95 @@ const queue = DRAWS.map((d) => d.bytes);
 };
 
 const svc = await import(SERVICE);
-const res = await svc.encryptContent(PLAINTEXT, {
-  mode: "recipient",
-  recipientPublicKeys: [x25519Pub(RECIPIENT_SK)],
-  contentType: "text/plain",
-  name: "app-path-vector",
-});
-if (queue.length !== 0) throw new Error(`${queue.length} RNG draw(s) unconsumed: the app's draw order changed`);
 
-// Check every draw's role against the output instead of trusting the order read from source.
-const rec = res.metadata.crypto.recipients;
-if (rec.length !== 1) throw new Error(`expected one recipient slot, got ${rec.length}`);
-const wrapped = Buffer.from(rec[0].wrapped_cek, "base64");
-const epk = Buffer.from(rec[0].epk, "base64");
-const enc = Buffer.from(res.encryptedContent);
-const roleChecks: [string, boolean][] = [
-  ["cek", hex(res.cek) === hex(DRAWS[0].bytes)],
-  ["chunk_nonce_0", hex(enc.subarray(0, 24)) === hex(DRAWS[1].bytes)],
-  ["ephemeral_x25519_priv", hex(epk) === hex(x25519Pub(DRAWS[2].bytes))],
-  ["wrap_nonce", hex(wrapped.subarray(0, 24)) === hex(DRAWS[3].bytes)],
-  ["locator_key", hex(res.locatorKey) === hex(DRAWS[4].bytes)],
-];
-for (const [role, ok] of roleChecks) if (!ok) throw new Error(`RNG draw role '${role}' does not match the output`);
+async function vector(name: string, plaintext: Uint8Array, draws: Draw[], notes: string) {
+  queue = draws.map((d) => d.bytes);
+  const res = await svc.encryptContent(plaintext, {
+    mode: "recipient",
+    recipientPublicKeys: [x25519Pub(RECIPIENT_SK)],
+    contentType: "text/plain",
+    name,
+  });
+  if (queue.length !== 0) throw new Error(`${name}: ${queue.length} RNG draw(s) unconsumed: the app's draw order changed`);
+  if (res.metadata.main.chunks > 1) throw new Error(`${name}: role checks below cover at most one chunk`);
 
-// The app's decryptContent (the step its unlock screen calls once it has the ciphertext) must
-// open its own output, or the vector records nothing useful.
-const opened = await svc.decryptContent(res.encryptedContent, { metadata: res.metadata, privateKey: RECIPIENT_SK });
-if (hex(opened) !== hex(PLAINTEXT)) throw new Error("Photonic could not decrypt its own vector");
+  // Check every draw's role against the output instead of trusting the order read from source.
+  const rec = res.metadata.crypto.recipients;
+  if (rec.length !== 1) throw new Error(`${name}: expected one recipient slot, got ${rec.length}`);
+  const wrapped = Buffer.from(rec[0].wrapped_cek, "base64");
+  const epk = Buffer.from(rec[0].epk, "base64");
+  const enc = Buffer.from(res.encryptedContent);
+  const actual: Record<string, string> = {
+    cek: hex(res.cek),
+    chunk_nonce_0: hex(enc.subarray(0, 24)),
+    wrap_nonce: hex(wrapped.subarray(0, 24)),
+    locator_key: hex(res.locatorKey),
+  };
+  for (const d of draws) {
+    const ok =
+      d.role === "ephemeral_x25519_priv" ? hex(epk) === hex(x25519Pub(d.bytes)) : actual[d.role] === hex(d.bytes);
+    if (!ok) throw new Error(`${name}: RNG draw role '${d.role}' does not match the output`);
+  }
+
+  // The app's decryptContent (the step its unlock screen calls once it has the ciphertext) must
+  // open its own output, or the vector records nothing useful.
+  const opened = await svc.decryptContent(res.encryptedContent, { metadata: res.metadata, privateKey: RECIPIENT_SK });
+  if (hex(opened) !== hex(plaintext)) throw new Error(`${name}: Photonic could not decrypt its own vector`);
+
+  return {
+    notes,
+    photonic_commit: process.env.PHOTONIC_COMMIT ?? "UNRECORDED",
+    recipient_sk: hex(RECIPIENT_SK),
+    recipient_pk: hex(x25519Pub(RECIPIENT_SK)),
+    plaintext: hex(plaintext),
+    content_type: "text/plain",
+    name,
+    rng_draws: draws.map((d) => ({ role: d.role, hex: hex(d.bytes) })),
+    metadata: res.metadata,
+    encrypted_content: hex(res.encryptedContent),
+  };
+}
+
+const COMMON_NOTES =
+  "Generated by scripts/gen-photonic-vectors/gen-app-path-vector.ts through Photonic's APP " +
+  "service (packages/app/src/encryptionService.ts encryptContent, recipient mode), which " +
+  "computes the wrap AAD itself: the UTF-8 bytes of metadata.crypto.cek_hash. Every RNG " +
+  "draw is recorded in order and checked against the output by role, so the vector " +
+  "regenerates byte-for-byte. Photonic decrypted it through decryptContent before it was written.";
+
+const withContent = await vector(
+  "app-path-vector",
+  new TextEncoder().encode("sealed bid: 4200 RXD (Photonic app-path wrap vector)"),
+  [
+    { role: "cek", bytes: fill(32, 7, 3) },
+    { role: "chunk_nonce_0", bytes: fill(24, 13, 5) },
+    { role: "ephemeral_x25519_priv", bytes: fill(32, 19, 23) },
+    { role: "wrap_nonce", bytes: fill(24, 37, 41) },
+    { role: "locator_key", bytes: fill(32, 43, 47) },
+  ],
+  COMMON_NOTES,
+);
+
+// Zero bytes of content: Photonic's encryptChunked does Math.ceil(0 / CHUNK_SIZE) = 0 chunks, so
+// there is no chunk nonce to draw and main records {size: 0, chunks: 0}.
+const empty = await vector(
+  "app-path-vector-empty",
+  new Uint8Array(0),
+  [
+    { role: "cek", bytes: fill(32, 11, 17) },
+    { role: "ephemeral_x25519_priv", bytes: fill(32, 23, 29) },
+    { role: "wrap_nonce", bytes: fill(24, 31, 37) },
+    { role: "locator_key", bytes: fill(32, 41, 43) },
+  ],
+  COMMON_NOTES + " EMPTY content: Photonic records main {size: 0, chunks: 0} and no ciphertext bytes.",
+);
+if (empty.metadata.main.chunks !== 0 || empty.metadata.main.size !== 0 || empty.encrypted_content !== "") {
+  throw new Error("expected Photonic to encode empty content as zero chunks and zero bytes");
+}
 
 console.log(
   JSON.stringify(
-    {
-      notes:
-        "Generated by scripts/gen-photonic-vectors/gen-app-path-vector.ts through Photonic's APP " +
-        "service (packages/app/src/encryptionService.ts encryptContent, recipient mode), which " +
-        "computes the wrap AAD itself: the UTF-8 bytes of metadata.crypto.cek_hash. Every RNG " +
-        "draw is recorded in order and checked against the output by role, so the vector " +
-        "regenerates byte-for-byte. Photonic decrypted it through decryptContent before it was written.",
-      photonic_commit: process.env.PHOTONIC_COMMIT ?? "UNRECORDED",
-      recipient_sk: hex(RECIPIENT_SK),
-      recipient_pk: hex(x25519Pub(RECIPIENT_SK)),
-      plaintext: hex(PLAINTEXT),
-      content_type: "text/plain",
-      name: "app-path-vector",
-      rng_draws: DRAWS.map((d) => ({ role: d.role, hex: hex(d.bytes) })),
-      metadata: res.metadata,
-      encrypted_content: hex(res.encryptedContent),
-    },
+    { app_encrypt_content_recipient: withContent, app_encrypt_content_recipient_empty: empty },
     null,
     2,
   ),

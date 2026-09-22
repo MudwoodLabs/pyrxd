@@ -62,9 +62,11 @@ PHOTONIC_COMMIT=$(git -C /abs/path/to/Photonic-Wallet rev-parse HEAD) \
   npx tsx gen-app-path-vector.ts
 ```
 
-Paste the output into `tests/fixtures/photonic_timelock_vectors.json` under
-`app_encrypt_content_recipient`. It regenerates byte-for-byte for a given
-Photonic commit.
+It prints two vectors, `app_encrypt_content_recipient` and
+`app_encrypt_content_recipient_empty` (zero bytes of content, which Photonic
+records as `{size: 0, chunks: 0}`); merge both keys into
+`tests/fixtures/photonic_timelock_vectors.json`. They regenerate byte-for-byte
+for a given Photonic commit.
 
 ## Running
 
