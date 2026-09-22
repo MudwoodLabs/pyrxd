@@ -116,11 +116,11 @@ def cek_wrap_aad(cek_hash: str) -> bytes:
     opens an on-chain RECIPIENT slot (its passphrase slots, and ``timelock.ts``'s local-storage
     wrap, use no AAD) — ``new TextEncoder().encode(metadata.crypto.cek_hash)`` in
     ``packages/app/src/encryptionService.ts`` (``encryptContent`` / ``decryptContent``) and in
-    the unlock screen, ``components/EncryptedContentUnlock.tsx`` — at
-    Radiant-Core/Photonic-Wallet ``becf41a7``, where ``shareLink.ts`` also types ``cek_hash`` as
-    the string "also used as AAD". No REP specifies it: REP-3006 defines AAD only for the
-    content AEAD, and REP-3008's wrap carries a separately published ``aad`` field. The
-    wallet that mints and opens this content is therefore the definition.
+    the unlock screen, ``packages/app/src/components/EncryptedContentUnlock.tsx`` — at
+    Radiant-Core/Photonic-Wallet ``becf41a7``, where ``packages/app/src/shareLink.ts`` also types
+    ``cek_hash`` as the string "also used as AAD". No REP specifies it: REP-3006 defines AAD
+    only for the content AEAD, and REP-3008's wrap carries a separately published ``aad``
+    field. The wallet that mints and opens this content is therefore the definition.
 
     Pass the string EXACTLY as it appears in the metadata being read. Do not round-trip it
     through :func:`parse_cek_hash` / :func:`format_cek_hash` first: those normalise case and

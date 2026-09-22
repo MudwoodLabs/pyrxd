@@ -34,7 +34,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `GlyphClient.mint_timelocked_nft` and `pyrxd glyph timelock-mint --recipient` — bound the raw
   32-byte `sha256(cek)`. Photonic's app binds the UTF-8 TEXT of the on-chain `crypto.cek_hash`
   (`"sha256:<hex>"`, 71 bytes) everywhere it wraps or opens a recipient slot
-  (`packages/app/src/encryptionService.ts`, `EncryptedContentUnlock.tsx`, at `becf41a7`), and
+  (`packages/app/src/encryptionService.ts`,
+  `packages/app/src/components/EncryptedContentUnlock.tsx`, at `becf41a7`), and
   has since before pyrxd's `kem.py` existed. No REP settles it — REP-3006 defines AAD only for
   the content AEAD, and REP-3008's wrap publishes its own `aad` field — so the wallet is the
   reference. Measured against Photonic's own `decryptContent`: 0 of 8 pyrxd mints opened
