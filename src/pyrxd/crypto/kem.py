@@ -38,7 +38,7 @@ Library choice (per the planning triage, see
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -236,9 +236,16 @@ class UnwrappedCEK:
     ``legacy_info`` is True when the CEK only decrypted under the pre-split info string,
     which means these bytes were wrapped by pyrxd v0.6.0-0.24.0 and will stop being readable
     if the fallback is ever retired. Returned rather than logged so a caller can act on it.
+
+    ``cek`` is ``repr=False``. This is the one object in the module whose whole purpose is to
+    hold a recovered content key, and a default dataclass ``repr`` printed it verbatim into any
+    log line, f-string or exception message that touched the result — for a caller holding a
+    recipient wrap before the reveal, that is the pre-reveal secret the timelock exists to
+    keep. Same rule as ``TimelockMintBuild.cek``; the derived guard in
+    ``tests/security/test_no_dataclass_prints_a_secret.py`` now enforces it package-wide.
     """
 
-    cek: bytes
+    cek: bytes = field(repr=False)
     legacy_info: bool
 
 
