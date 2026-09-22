@@ -665,7 +665,20 @@ function stripControlChars(s) {
 // nobody.
 function verdictClass(status) {
   if (status === "VERIFIED" || status === "MATCHES") return "verdict-ok";
-  if (status === "DOES NOT VERIFY" || status === "DOES NOT MATCH") return "verdict-bad";
+  // A MALFORMED RECORD IS NOT A NEUTRAL ONE. `/verify/` calls it RECORD DOES NOT DECODE
+  // (the word `pyrxd verify` uses, and fails its verdict on); `/inspect/` shows the
+  // decoder's own outcome name, INVALID. Both were grey, the colour of "not checked", so
+  // one extra defect in a forged record's bytes moved it from the error colour here to
+  // the neutral one. An unknown VERSION or ALGORITHM stays grey: that record is from the
+  // future, not broken.
+  if (
+    status === "DOES NOT VERIFY" ||
+    status === "DOES NOT MATCH" ||
+    status === "RECORD DOES NOT DECODE" ||
+    status === "INVALID"
+  ) {
+    return "verdict-bad";
+  }
   return "verdict-unchecked";
 }
 
@@ -679,10 +692,11 @@ function verdictClass(status) {
 // from two string literals is how one of them eventually says something stronger
 // than the other about the same record.
 //
-// It is deliberately the weaker sentence. A signature reaches KEY CUSTODY AT A
-// BLOCK — that the holder of that key made this statement by then. Not authorship,
-// not ownership, not originality, not location, and nothing at all about whether
-// the marked content is true.
+// It is deliberately the weaker sentence. A signature reaches this: the holder of that
+// key made this statement, by the block that carries it. NOT that they put it in that
+// block — the statement does not bind the transaction, so a genuine record can be
+// copied into anyone's. Not authorship, not ownership, not originality, not location,
+// and nothing at all about whether the marked content is true.
 const WHAT_A_MARK_PROVES =
   "What a mark proves: someone knew this digest no later than the block that " +
   "confirms it. A verified signature adds that the holder of that key made the " +

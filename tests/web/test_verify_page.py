@@ -47,6 +47,8 @@ from pathlib import Path
 
 import pytest
 
+from pyrxd.script.hashmark import HashMarkOutcome
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HARNESS = _REPO_ROOT / "tests" / "web" / "verify_render_harness.mjs"
 _STATIC = _REPO_ROOT / "docs" / "inspect_static"
@@ -845,3 +847,344 @@ class TestALookupThatFailedSaysWhichWayItFailed:
         assert not unhandled, f"the wire emits kinds the page has no branch for: {sorted(unhandled)}"
         stale = page_kinds - wire_kinds
         assert not stale, f"the page branches on kinds nothing emits: {sorted(stale)}"
+
+
+# ───────────────────── every decode outcome, in the words `pyrxd verify` uses ──
+
+
+def _push(b: bytes) -> bytes:
+    return bytes([len(b)]) + b
+
+
+def _record_script(header: bytes, digest: bytes) -> bytes:
+    return b"\x6a" + _push(b"HASHMARK") + _push(header) + _push(digest)
+
+
+def _signed_script(content: bytes) -> bytes:
+    """A real v2 record over ``content``, signed by a key generated here."""
+    import hashlib
+
+    from pyrxd.constants import genesis_hash_for
+    from pyrxd.hashmark_tx import plan_hashmark
+    from pyrxd.keys import PrivateKey
+
+    digest = hashlib.sha256(content).digest()
+    return plan_hashmark(
+        digest, PrivateKey(), label="quarterly report", network_genesis=genesis_hash_for("mainnet")
+    ).op_return_script
+
+
+def _with_bad_label(script: bytes) -> bytes:
+    """The same record with a control character in its label. §5.4 makes that non-canonical,
+    and the label is inside the signed statement, so the decoder refuses the whole record."""
+    hostile = b"quarterly\x1breport"[: len(b"quarterly report")]
+    assert len(hostile) == len(b"quarterly report")
+    out = bytearray(script)
+    at = out.rfind(b"quarterly report")
+    out[at : at + len(hostile)] = hostile
+    return bytes(out)
+
+
+#: One REAL script per decode outcome. Keyed by the enum member, and compared against the
+#: enum in both directions below, so an outcome added upstream fails here instead of being
+#: silently left out of the parametrisation.
+_OUTCOME_SCRIPTS = {
+    "ok": lambda: _signed_script(b"the advisory, as published\n"),
+    "not_hashmark": lambda: b"\x6a" + _push(b"NOTAMARK") + _push(b"\x01" * 8),
+    "invalid": lambda: _record_script(bytes([1, 1]), b"\x22" * 20),  # sha256 names 32 bytes; 20 here
+    "unknown_version": lambda: _record_script(bytes([9, 1]), b"\x11" * 32),
+    "unknown_algorithm": lambda: _record_script(bytes([1, 0x7F]), b"\x11" * 32),
+}
+
+
+def _glue():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pyrxd_inspect_glue", _INSPECT_DIR / "glue.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pyrxd_inspect_glue"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tx_result(*scripts: bytes) -> tuple[str, bytes, dict]:
+    """A real transaction carrying ``scripts``, classified by the page's own Python entry point
+    (``glue.inspect_txid_with_raw``) — the exact dict ``verify.js`` receives in the browser."""
+    from tests.test_hashmark_verify_cli import _tx_with
+
+    txid, raw = _tx_with(*scripts)
+    result = _glue().inspect_txid_with_raw(txid, raw.hex())
+    assert result["ok"], result
+    return txid, raw, result
+
+
+def _cli_word(monkeypatch, tmp_path, txid: str, raw: bytes) -> str | None:
+    """What `pyrxd verify` — the real command — calls this record. ``None`` when it finds no
+    record at all. Read from ``--json``, so a change to the human layout cannot move it."""
+    from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+    r = _run(
+        monkeypatch,
+        _FakeServer({txid: raw}),
+        ["--json", "verify", txid, "--min-confirmations", "1"],
+        tmp_path=tmp_path,
+    )
+    if r.exit_code == 1 and "no HashMark record" in r.output:
+        return None
+    return json.loads(r.stdout)["checks"]["signature"]["state"]
+
+
+def _first_verdict_class(classes: list[str]) -> str:
+    return next(c for c in classes if c.split()[0] == "verdict")
+
+
+class TestEveryDecodeOutcomeReadsAsPyrxdVerifyReadsIt:
+    """A record the decoder calls malformed was a grey "NOT CHECKED" here, with "That is not a
+    sign that anything is wrong with it", while `pyrxd verify` called the same bytes RECORD
+    DOES NOT DECODE and failed its verdict. The page and the command a reader is pointed to must
+    not describe one record two ways — so this runs BOTH, over one real script per outcome."""
+
+    def test_there_is_a_script_for_every_outcome_and_no_other(self) -> None:
+        """NON-VACUITY, both directions. The parametrisation below is the enum itself; this is
+        what makes a missing script fail loudly rather than skip."""
+        assert set(_OUTCOME_SCRIPTS) == {o.value for o in HashMarkOutcome}
+        assert len(HashMarkOutcome) >= 5, "the enum shrank — re-read what this test is for"
+
+    @pytest.mark.parametrize("outcome", [o.value for o in HashMarkOutcome])
+    def test_the_page_prints_the_word_the_command_prints(self, monkeypatch, tmp_path, outcome) -> None:
+        from pyrxd.cli.hashmark_cmds import _CHECK_HOLDS
+        from pyrxd.script.hashmark import decode_hashmark
+
+        script = _OUTCOME_SCRIPTS[outcome]()
+        assert decode_hashmark(script).outcome.value == outcome, "the premise: these bytes reach this outcome"
+        txid, raw, result = _tx_result(script)
+        cli = _cli_word(monkeypatch, tmp_path, txid, raw)
+        rendered = _page(result)
+
+        if outcome == "not_hashmark":
+            assert cli is None, "the command found a record the decoder says is not one"
+            assert rendered["panels"] == [] and "There is no HashMark here" in rendered["text"]
+            return
+
+        assert cli, "the command printed no signature state — this comparison is vacuous"
+        assert rendered["statuses"], "the page printed no verdict — this comparison is vacuous"
+        assert rendered["statuses"][0] == cli, (
+            f"{outcome}: the page says {rendered['statuses'][0]!r} and `pyrxd verify` says {cli!r} "
+            "about the same record"
+        )
+        # AND THE COLOUR AGREES WITH THE COMMAND'S VERDICT. A word the command fails on must
+        # not be painted in the colour of "nothing wrong"; a word it holds on must not be red.
+        painted = _first_verdict_class(rendered["classes"])
+        assert ("verdict-bad" in painted) == (cli not in _CHECK_HOLDS), (outcome, cli, painted)
+
+
+class TestAMalformedRecordIsNotAFutureRecord:
+    def test_it_says_malformed_in_the_error_colour_and_does_not_reassure(self) -> None:
+        _txid, _raw, result = _tx_result(_OUTCOME_SCRIPTS["invalid"]())
+        rendered = _page(result)
+        assert rendered["statuses"][0] == "RECORD DOES NOT DECODE"
+        assert "verdict-bad" in _first_verdict_class(rendered["classes"])
+        flat = " ".join(rendered["text"].split())
+        assert "is malformed" in flat and "nothing in them" in flat and "can be relied on" in flat
+        for reassurance in ("That is not a sign that anything is wrong", "newer version"):
+            assert reassurance not in flat, f"a malformed record is told {reassurance!r}"
+
+    @pytest.mark.parametrize("outcome", ["unknown_version", "unknown_algorithm"])
+    def test_a_record_from_the_future_keeps_the_neutral_panel(self, outcome) -> None:
+        """The honest pair: these ARE well-formed and newer, and the reassurance is true of them."""
+        _txid, _raw, result = _tx_result(_OUTCOME_SCRIPTS[outcome]())
+        rendered = _page(result)
+        assert rendered["statuses"][0] == "NOT CHECKED"
+        assert "verdict-unchecked" in _first_verdict_class(rendered["classes"])
+        flat = " ".join(rendered["text"].split())
+        assert "newer version" in flat and "not a sign that anything is wrong" in flat
+        # And not an endorsement: a forged record with its algorithm byte changed lands here.
+        assert "it is not evidence of anything either" in flat
+
+    def test_one_more_defect_does_not_move_a_forgery_out_of_the_error_colour(self) -> None:
+        """THE DOWNGRADE. A forged record is red. Add one decode defect to its bytes and it used
+        to become the grey "cannot read this — nothing is wrong with it" panel."""
+        forged = bytearray(_signed_script(b"the advisory, as published\n"))
+        forged[20] ^= 0x01  # one bit of the digest: well-formed, and the signature no longer holds
+        _t, _r, as_forged = _tx_result(bytes(forged))
+        _t, _r, as_broken = _tx_result(_with_bad_label(bytes(forged)))
+        first, second = _page(as_forged), _page(as_broken)
+        assert first["statuses"][0] == "DOES NOT VERIFY", "the premise: the forgery reaches the red verdict"
+        assert second["statuses"][0] == "RECORD DOES NOT DECODE", "the premise: the label defect breaks the decode"
+        for rendered in (first, second):
+            assert "verdict-bad" in _first_verdict_class(rendered["classes"])
+        assert "not a sign that anything is wrong" not in second["text"]
+
+    def test_an_outcome_nobody_has_heard_of_is_neutral_and_does_not_reassure(self) -> None:
+        payload = {"type": "op_return", "hashmark": {"outcome": "from_the_year_3000", "detail": "?"}}
+        rendered = _page(_as_script_result(payload))
+        assert rendered["statuses"][0] == "NOT CHECKED"
+        assert "verdict-unchecked" in _first_verdict_class(rendered["classes"])
+        assert "not a sign that anything is wrong" not in rendered["text"]
+        assert "from_the_year_3000" in rendered["text"], "it says what the decoder reported"
+
+
+class TestTheInspectorDoesNotGreyOutAMalformedRecordEither:
+    """THE SIBLING. /inspect/ renders the decoder's own outcome name, INVALID, through the same
+    `verdictClass` — and it was grey there too. Its word stays (the developer view shows the
+    decoder's vocabulary); its colour is the one that must not reassure."""
+
+    def test_invalid_is_red_and_a_future_record_is_not(self) -> None:
+        node = shutil.which("node") or _require_node()
+        script = (
+            "const fs=require('node:fs'),vm=require('node:vm');"
+            "const s={console,document:{getElementById:()=>({}),querySelectorAll:()=>[]}};"
+            "s.globalThis=s;vm.createContext(s);"
+            f"vm.runInContext(fs.readFileSync({str(_INSPECT_DIR / 'shared.js')!r},'utf8'),s);"
+            "console.log(JSON.stringify(['INVALID','UNKNOWN VERSION','UNKNOWN ALGORITHM','RECORD DOES NOT DECODE']"
+            ".map((w)=>s.verdictClass(w))))"
+        )
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)  # nosec B603
+        assert json.loads(out.stdout) == ["verdict-bad", "verdict-unchecked", "verdict-unchecked", "verdict-bad"]
+
+    def test_the_inspector_really_passes_the_decoder_word_to_that_function(self) -> None:
+        """The premise of the test above: /inspect/ builds its word from the outcome and hands
+        it to `verdictBlock`, which is `verdictClass`. If that path changes, re-derive this."""
+        source = (_INSPECT_DIR / "inspect.js").read_text(encoding="utf-8")
+        assert 'String(hm.outcome || "").toUpperCase().replace(/_/g, " ")' in source
+        assert "class: `verdict ${verdictClass(status)}`" in source
+
+
+# ───────────────────────────────────── a transaction cannot flood the page ──
+
+
+def _v1_rows(count: int) -> list[dict]:
+    """``count`` output rows exactly as the classifier emits them, from ONE real classified v1
+    record — the size of the transaction is the point here, not the variety of its records."""
+    _t, _r, result = _tx_result(_record_script(bytes([1, 1]), b"\x33" * 32))
+    template = result["payload"]["outputs"][0]
+    assert template["hashmark"]["outcome"] == "ok"
+    return [{**template, "vout": i} for i in range(count)]
+
+
+def _many(count: int) -> dict:
+    return {
+        "ok": True,
+        "form": "txid",
+        "input": "ab" * 32,
+        "payload": {"txid": "ab" * 32, "outputs": _v1_rows(count), "output_count": count},
+    }
+
+
+@pytest.fixture(scope="module")
+def limit() -> int:
+    """``MAX_MARK_PANELS``, read from verify.js through the harness rather than retyped here."""
+    n = _render({})["__constants__"]["max_mark_panels"]
+    assert isinstance(n, int), f"verify.js exposes no MAX_MARK_PANELS (got {n!r})"
+    return n
+
+
+class TestATransactionOfManyMarksCannotFloodThePage:
+    """One broadcastable transaction of ~72,000 minimal marks rendered every one of them. The
+    page now renders a bounded number and says, before and after, how many it left out."""
+
+    def test_the_limit_is_small_and_positive(self, limit) -> None:
+        assert 1 <= limit <= 100
+
+    def test_real_marks_past_the_limit_are_counted_not_rendered(self, limit) -> None:
+        scripts = [_record_script(bytes([1, 1]), bytes([i % 256]) * 32) for i in range(limit + 7)]
+        _t, _r, result = _tx_result(*scripts)
+        rendered = _page(result)
+        assert len(rendered["panels"]) == limit and rendered["file_inputs"] == limit
+        total = limit + 7
+        assert f"Mark {limit} of {total}" in rendered["text"]
+        assert f"Mark {limit + 1} of" not in rendered["text"]
+        flat = " ".join(rendered["text"].split())
+        assert f"This transaction carries {total} marks." in flat
+        assert f"The first {limit} are shown below; the other 7 are not shown on this page." in flat
+        assert "7 more marks are in this transaction and are not shown here" in flat
+        assert "a mark that does not verify could be among them" in flat
+        assert "`pyrxd verify <transaction number>` in a terminal checks every mark" in flat
+        # ORDER: the count before the first panel, the remainder after the last one.
+        assert flat.index("The first") < flat.index("Mark 1 of") < flat.index("7 more marks")
+
+    def test_the_page_does_not_grow_with_the_transaction(self, limit) -> None:
+        """THE BOUND ITSELF, at the size of the attack. 72,000 rows render exactly as much page
+        as limit+1 rows do — the same number of elements, only different numbers in the text."""
+        both = _render({"small": {"result": _many(limit + 1)}, "huge": {"result": _many(72_000)}})
+        small, huge = both["small"], both["huge"]
+        assert len(huge["panels"]) == limit == len(small["panels"])
+        assert len(huge["classes"]) == len(small["classes"]), "the page grew with the transaction"
+        assert f"{72_000 - limit} more marks are in this transaction" in " ".join(huge["text"].split())
+
+    def test_exactly_the_limit_is_all_shown_with_no_remainder_line(self, limit) -> None:
+        """The honest edge: nothing was left out, so nothing may say something was."""
+        rendered = _page(_many(limit))
+        assert len(rendered["panels"]) == limit
+        assert "more mark" not in rendered["text"] and "not shown" not in rendered["text"]
+        assert "and is checked separately below." in rendered["text"]
+
+    def test_one_past_the_limit_says_one_in_the_singular(self, limit) -> None:
+        flat = " ".join(_page(_many(limit + 1))["text"].split())
+        assert "1 more mark is in this transaction and is not shown here" in flat
+        assert "nothing on this page says anything about it" in flat
+
+
+# ─────────────────────────────────── each panel's file check is ITS record's ──
+
+
+class TestEachPanelComparesAFileAgainstItsOwnRecord:
+    """Three marks, three file choosers. A file chosen in panel k must be compared against
+    record k's fingerprint — not the first record's, not the last one's. Driven through the
+    page's OWN change listeners, with the file really hashed by WebCrypto and the real plan
+    from Python; only the judge is a recorder, so what is asserted is what the page hands it."""
+
+    CONTENTS = (b"first file\n", b"second file\n", b"third file\n")
+
+    def test_the_file_is_compared_with_the_panel_it_was_chosen_in(self) -> None:
+        import hashlib
+
+        from pyrxd.glyph.inspect import file_check_plan
+
+        digests = [hashlib.sha256(c).hexdigest() for c in self.CONTENTS]
+        _t, _r, result = _tx_result(*(_record_script(bytes([1, 1]), bytes.fromhex(d)) for d in digests))
+        a, _b, c = (x.decode() for x in self.CONTENTS)
+        case = {
+            "result": result,
+            "file_check_plan": file_check_plan(0x01),
+            # A in panel 0 (its own), A in panel 1 (not its own), C in panel 2 (its own).
+            "choose_files": [{"input": 0, "text": a}, {"input": 1, "text": a}, {"input": 2, "text": c}],
+        }
+        rendered = _render({"case": case})["case"]
+        assert rendered["file_inputs"] == 3 and len(rendered["panels"]) == 3
+
+        expected = [digests[0], digests[1], digests[2]]
+        computed = [digests[0], digests[0], digests[2]]
+        assert [j["expected"] for j in rendered["judged"]] == expected, "a panel compared against another's record"
+        assert [j["computed"] for j in rendered["judged"]] == computed, "the file was not really hashed"
+        assert digests[0] != digests[1], "the premise: the two records differ"
+
+        for k, panel in enumerate(rendered["panels"]):
+            lines = panel.split("\n")
+            shown = lines[lines.index("the fingerprint in the record") + 1]
+            assert shown == digests[k], f"panel {k} showed another record's fingerprint beside the file"
+        assert "MATCHES" in rendered["panels"][0] and "DOES NOT MATCH" in rendered["panels"][1]
+        assert "MATCHES" in rendered["panels"][2] and "DOES NOT MATCH" not in rendered["panels"][2]
+
+
+class TestTheBlockShowsTheFingerprintWasKnownNotTheFile:
+    """ "Whoever published it knew the file by then" claimed more than a mark supports: a signed
+    record can be copied into anyone's transaction, and a v1 record carries whatever fingerprint
+    its publisher was given. What the block shows is that the FINGERPRINT was known by then."""
+
+    def test_the_rendered_answer_says_fingerprint(self) -> None:
+        from pyrxd.glyph.mark_anchor import UNVERIFIED_CAVEAT
+
+        anchor = {"resolved": True, "height": 460572, "confirmations": 9, "caveat": UNVERIFIED_CAVEAT, "source": "s"}
+        flat = " ".join(_page(_as_tx_result(_payload_with_status("valid"), anchor=anchor))["text"].split())
+        assert "whoever published it knew that fingerprint by then" in flat
+        assert "which is not the same as having had the file" in flat
+        assert "knew the file" not in flat
+
+    def test_the_page_chrome_says_it_too(self) -> None:
+        """The primer is never rendered by the harness, so it is read directly — flattened,
+        because it is hard-wrapped and a sentence can straddle a line break."""
+        flat = " ".join((_VERIFY_DIR / "index.html").read_text(encoding="utf-8").split())
+        assert "whoever published it knew that fingerprint by then" in flat
+        assert "knew the file" not in flat
