@@ -385,8 +385,9 @@ it for the moments where the signal-to-noise actually warrants it.
 
 ## §5 — Mechanical leak-checking
 
-**What it does.** A `task ci` check that scans every tracked
-markdown/RST file for two leak classes:
+**What it does.** A mechanical scan of what the repo publishes. It
+began as a `task ci` check over every tracked markdown/RST file for
+two leak classes:
 
 1. **Markdown link targets pointing into `.gitignore`d paths**
    (`[text](docs/design/foo.md)` when `docs/design/` is private).
@@ -416,14 +417,37 @@ Every leak was old. None had been caught by review. None had been
 caught by CI. The mechanical scan ran in 60 ms.
 
 **Where pyrxd carries this.** `scripts/check-no-private-links.py`.
-Two checks, both run on every invocation:
+Four checks:
 
-1. Link-target check — link is gitignored.
+1. Link-target check — link is gitignored (tracked docs).
 2. Home-path regex check — `/home/<user>/...` or
    `/Users/<user>/...` in any tracked doc.
+3. Private-project-name check — names listed in a local, gitignored
+   `.private-names` file. It runs only where that file exists, so
+   never in CI.
+4. ssh-target check — `user@<routable IPv4>` in any tracked text file.
 
-Wired into `task ci` so the pre-push hook catches new leaks before
-they reach `origin`. The hardened version was deliberately narrow:
+Where it runs, and what it reads:
+
+- **CI, on every pull request and every push** (`.github/workflows/leak-scan.yml`,
+  no branch or path filter). It scans the checked-out tree AND every
+  line added by every commit in the PR or push, so a leak committed and
+  then removed in a later commit fails the job too. Output is
+  redacted to `file:line` and the check name, because the log is
+  public. A self-test step first proves the scanner fails on a known
+  sample, so a scanner that silently scans nothing turns the job red.
+- **`task ci` / `task ci-fast`** — the tracked tree: every file's index
+  copy, and its working-tree copy where that differs.
+- **The pre-push hook, if installed** (`scripts/install-git-hooks.sh`;
+  it is opt-in per clone) — after `task ci-fast`, every line the pushed
+  commits add, read from the refs git passes the hook. That includes a
+  pushed branch that is not checked out.
+
+Until the workflow existed the scan ran only locally, only over the
+working tree, and only for contributors who had installed the hook. So
+history, staged-then-cleaned files and non-checked-out branches were
+never scanned. Files with a non-UTF-8 byte or a non-ASCII path were
+also skipped silently. The hardened version was deliberately narrow:
 it does **not** flag `~/...` (username-agnostic — the correct way
 to document `~/.pyrxd/config.toml`), `/root/...` (no username),
 or `/tmp/...` (scratch paths carry no user identity).
@@ -431,9 +455,11 @@ or `/tmp/...` (scratch paths carry no user identity).
 **Mechanics — porting to another repo.** The script is portable
 as-is. Drop `scripts/check-no-private-links.py` into the target
 repo, add it to `task ci` (or whatever the equivalent test
-runner is), and add a `.gitignore` block for repo-specific private
-paths (most repos want at least `.claude/`, `.worktrees/`,
-`logs/`). Done.
+runner is), copy `.github/workflows/leak-scan.yml` so it runs on
+every PR and push over the commits as well as the tree, and add a
+`.gitignore` block for repo-specific private paths (most repos want
+at least `.claude/`, `.worktrees/`, `logs/`). A local-only step
+is not enough: it never sees a contributor who skipped it.
 
 **When it applies.** Every public repo. Even when the techniques in
 §1–§4 don't fit (frontend-only, doc-only), this one always does.
