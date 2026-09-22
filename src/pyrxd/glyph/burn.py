@@ -69,11 +69,13 @@ BURN_PROOF_VERSION = 0x02
 BURN_MARKER_BYTE = int(GlyphProtocol.BURN)  # 6
 
 #: Upper bound on a burn proof's CBOR. A burn proof is parsed from an arbitrary chain output,
-#: so an unbounded decode here is a DoS surface — which is why Photonic caps it too.
+#: so an unbounded decode here is a DoS surface. (Photonic caps only what it WRITES — its
+#: ``parseBurnProof`` decodes without a limit — so this read cap is pyrxd's own policy.)
 #:
 #: MATCHED TO PHOTONIC, WHICH IS THE POINT OF A CAP ON SOMEONE ELSE'S BYTES. Photonic's
 #: ``packages/lib/src/burn.ts:19`` sets ``MAX_CBOR_SIZE = 128 * 1024`` and builds proofs up to
-#: it. pyrxd capped at 8_192 and, in ``parse_burn_proof``, returned ``None`` above that — so a
+#: and INCLUDING it (``burn.ts:66`` refuses only ``length > MAX_CBOR_SIZE``), so both sides here
+#: compare with ``>`` too: a proof of exactly 131_072 bytes is one Photonic builds. pyrxd capped at 8_192 and, in ``parse_burn_proof``, returned ``None`` above that — so a
 #: valid Photonic burn between 8 KiB and 128 KiB was reported by ``verify_burn`` as "no burn
 #: proof output found". A guard that refuses honest work, and one that reports the refusal as
 #: absence rather than as a limit.
@@ -203,8 +205,10 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
             # PUSHDATA4. Required, not optional: the cap above is 131_072 and
             # `payload._encode_payload_push` emits 0x4E above 65_535, so without this branch
             # pyrxd would write burn proofs it could not read back. The `start + size >
-            # len(script)` bound below still rejects an operand the script cannot hold, so a
-            # hostile 4-byte length cannot make this allocate.
+            # len(script)` bound below rejects a length that runs past the end of the script.
+            # That is a correctness check, not an allocation guard: a slice past the end just
+            # truncates, so without it a 4-byte length of 10**9 would be "satisfied" by whatever
+            # short operand is present and parsed as if the push were complete.
             size, start = int.from_bytes(script[pos + 1 : pos + 5], "little"), pos + 5
         else:
             return None
