@@ -2541,9 +2541,8 @@ def _mine_claim_v2(
     default=None,
     help=(
         "V2 only: the mint's locktime, written into the recreated state's lastTime and used by the "
-        "DAA retarget. Default: the wall-clock time when the claim is built. ASERT, LWMA and EPOCH "
-        "contracts read lastTime back as a script number, so a value below 2^23 (e.g. 0) is refused "
-        "for them; values above 0x7FFFFFFF are refused for every mode."
+        "DAA retarget. Default: the wall-clock time when the claim is built — leave it unset. If you "
+        "pass it, pass a real Unix timestamp at or after the contract's lastTime."
     ),
 )
 @click.option(
@@ -2706,8 +2705,7 @@ def claim_dmint_cmd(
             )
             if current_time is None:
                 # The wall clock at claim, the way a deploy stamps its own lastTime. The old
-                # default, 0, wrote `04 00000000` into the recreated state — a lastTime the
-                # retarget of an ASERT/LWMA/EPOCH contract cannot read back.
+                # default, 0, wrote a lastTime the contract's next retarget could not read.
                 current_time = int(time.time())
             mint, pre, nonce = _mine_claim_v2(
                 contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, current_time, daa_kwargs, mine=_mine

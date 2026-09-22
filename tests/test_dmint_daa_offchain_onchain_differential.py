@@ -69,6 +69,7 @@ from pyrxd.glyph.dmint.builders import (
     build_dmint_state_script,
 )
 from pyrxd.glyph.dmint.miner import (
+    _v2_state_script_bytes,
     compute_next_target_asert_legacy,
     compute_next_target_asert_v2,
     compute_next_target_epoch,
@@ -338,8 +339,8 @@ _DELTAS = [-1_000_000, -300, -1, 0, 1, 15, 30, 60, 240, 3600, 1 << 30, 1 << 40]
 _LAST = 1_700_000_000
 #: The top of the locktime domain ``build_dmint_mint_tx`` accepts (Part C's NUM2BIN(4) cannot
 #: encode a locktime with bit 31 set). The mirrors below are swept over ``[0, _LOCKTIME_MAX]``
-#: in BOTH directions from ``_LAST``: the builder additionally requires ``>= 2**23`` for the
-#: modes that read lastTime, and refuses a backwards locktime only for the pre-floor LWMA.
+#: in BOTH directions from ``_LAST``; ``build_dmint_mint_tx`` adds its own refusals on top
+#: (see the mint-time section at the end of this file).
 _LOCKTIME_MAX = 0x7FFFFFFF  # spelled as the mint builder spells its own bound
 
 
@@ -694,8 +695,8 @@ def test_evaluator_rejects_non_minimal_push_and_number() -> None:
 
 
 # ---------------------------------------------------------------------------------------
-# lastTime at MINT time: which fragments read it, what they can read, and which
-# backwards locktimes the bytecode really survives — each tied to build_dmint_mint_tx
+# lastTime at MINT time: which fragments read it, what they can read, and what the
+# builder builds or refuses — each tied to build_dmint_mint_tx
 # ---------------------------------------------------------------------------------------
 #
 # The V2 state carries lastTime as a fixed ``04 <4B LE>`` push, and Part C writes the mint's
@@ -853,8 +854,7 @@ def test_the_builder_accepts_the_backward_locktimes_the_bytecode_accepts(
     """A locktime EARLIER than the state's lastTime, through ``build_dmint_mint_tx``: the
     builder builds it, and the contract's own fragment, run under int64 + MINIMALDATA,
     neither aborts nor disagrees with the target the builder wrote. (EPOCH is taken at a
-    boundary height, where the delta is actually read.) The old builder refused all of
-    these, saying the retarget overflows."""
+    boundary height.) The seeded sweep below covers the wider parameter space."""
     height = _EPOCH_L if mode is DaaMode.EPOCH else 3
     utxo = _contract(mode, version, height=height, last_time=_LAST)
     locktime = _LAST - back
@@ -864,14 +864,14 @@ def test_the_builder_accepts_the_backward_locktimes_the_bytecode_accepts(
 
 
 def test_the_prefloor_lwma_backward_locktime_is_refused_and_the_bytecode_shows_why() -> None:
-    """The one generation that does not survive a backwards locktime. The builder refuses
-    it; the evaluator shows both outcomes the refusal names — a clamp to target 1 for a
-    small negative product, an int64 abort for a large one."""
+    """The pre-floor LWMA: pyrxd does not build a backwards mint of it. The evaluator shows
+    why the mirror is not asked to: target 1 for a small negative product, an int64 abort
+    for a large one."""
     utxo = _contract(DaaMode.LWMA, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR, height=3, last_time=_LAST)
-    with pytest.raises(ValidationError, match="does not floor the time delta"):
+    with pytest.raises(ValidationError, match="does not build a backwards mint"):
         _build_mint(utxo, _LAST - 30)
     assert _onchain_next_target(utxo, _LAST - 30, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR) == 1
-    with pytest.raises(ValidationError, match="does not floor the time delta"):
+    with pytest.raises(ValidationError, match="does not build a backwards mint"):
         _build_mint(utxo, _LAST - 1_000_000)
     stack = _daa_stack(3, 60, _LAST, MAX_SHA256D_TARGET)
     with pytest.raises(_Abort, match="OP_MUL"):
@@ -898,3 +898,291 @@ def test_a_legacy_lwma_mint_that_would_set_target_1_is_refused(version: DaaBytec
     # Honest neighbour: one second later is an ordinary, mineable retarget.
     res = _build_mint(utxo, _LAST + 1)
     assert res.updated_state.target == _onchain_next_target(utxo, _LAST + 1, version) > 1
+
+
+# ---------------------------------------------------------------------------------------
+# Any state, any parameters: the builder's refusals line up with the bytecode's outcomes
+# ---------------------------------------------------------------------------------------
+
+
+def _any_contract(
+    mode: DaaMode,
+    version: DaaBytecodeVersion,
+    *,
+    height: int,
+    last_time: int,
+    target: int,
+    target_time: int = 60,
+    half_life: int = 240,
+    n: int = 2,
+    epoch_length: int = _EPOCH_L,
+    schedule: tuple[tuple[int, int], ...] = ((5, 1 << 40),),
+) -> tuple[DmintContractUtxo, bytes, dict]:
+    """A contract of ``version`` in an ARBITRARY state (height, lastTime, target), plus its DAA
+    fragment and the kwargs a mint of it needs.
+
+    pyrxd no longer DEPLOYS an EPOCH contract with ``target_time < 2**n``, but one can exist
+    on chain, so the params are built with a legal target_time and the real one is set
+    afterwards: what is exercised is the MINT builder, not the deploy refusal.
+    """
+    sched = schedule if mode is DaaMode.SCHEDULE else ()
+    legal_tt = max(target_time, 1 << n) if mode is DaaMode.EPOCH else target_time
+    params = DmintDeployParams(
+        contract_ref=GlyphRef(txid="aa" * 32, vout=1),
+        token_ref=GlyphRef(txid="bb" * 32, vout=0),
+        max_height=1_000_000,
+        reward=1000,
+        difficulty=32768 if mode is DaaMode.EPOCH else 1,
+        daa_mode=mode,
+        target_time=legal_tt,
+        half_life=half_life,
+        epoch_length=epoch_length,
+        max_adjustment_log2=n,
+        schedule=sched,
+    )
+    object.__setattr__(params, "target_time", target_time)
+    part_b = _build_part_b(
+        mode, half_life, epoch_length=epoch_length, max_adjustment_log2=n, schedule=sched, daa_bytecode_version=version
+    )
+    state = DmintState(
+        height=height,
+        contract_ref=params.contract_ref,
+        token_ref=params.token_ref,
+        max_height=params.max_height,
+        reward=params.reward,
+        algo=params.algo,
+        daa_mode=mode,
+        target_time=target_time,
+        last_time=last_time,
+        target=target,
+        is_v1=False,
+    )
+    script = _v2_state_script_bytes(state) + _OP_STATESEPARATOR + _PART_A + b"\xaa" + part_b
+    script += _build_part_c(_middle_literal(params))
+    utxo = DmintContractUtxo(txid="dd" * 32, vout=0, value=1, script=script, state=DmintState.from_script(script))
+    frag = _daa_bytes_for(
+        mode, half_life, epoch_length=epoch_length, max_adjustment_log2=n, schedule=sched, daa_bytecode_version=version
+    )
+    kw: dict = {}
+    if mode is DaaMode.EPOCH:
+        kw = {"epoch_length": epoch_length, "max_adjustment_log2": n}
+    elif mode is DaaMode.SCHEDULE:
+        kw = {"schedule": sched}
+    return utxo, frag, kw
+
+
+def _mint_of(utxo: DmintContractUtxo, locktime: int, kw: dict) -> int:
+    return build_dmint_mint_tx(utxo, b"\x00" * 8, b"\x22" * 20, locktime, funding_utxo=_FUND, **kw).updated_state.target
+
+
+def _bytecode_of(utxo: DmintContractUtxo, frag: bytes, locktime: int):
+    """The contract's own fragment over its own state (raw 4-byte lastTime), or _ABORT."""
+    st = utxo.state
+    stack = _state_stack(st.daa_mode, last_time_item=_raw(st.last_time), height=st.height, target=st.target)
+    stack[7] = _cs_encode(st.target_time)
+    try:
+        _run(frag, stack, locktime)
+    except _Abort:
+        return _ABORT
+    return _result(stack)
+
+
+@pytest.mark.parametrize(("tt", "n"), [(1, 1), (3, 2), (15, 4)])
+def test_an_epoch_contract_with_target_time_below_2_pow_n_never_gets_target_1(tt: int, n: int) -> None:
+    """At an epoch boundary of such a contract, a locktime at or before lastTime makes the
+    retarget compute 1 — the builder refuses it; a later one builds and matches."""
+    utxo, frag, kw = _any_contract(
+        DaaMode.EPOCH, DaaBytecodeVersion.V2, height=_EPOCH_L, last_time=_LAST, target=1 << 48, target_time=tt, n=n
+    )
+    for locktime in (_LAST - 5, _LAST):
+        assert _bytecode_of(utxo, frag, locktime) == 1
+        with pytest.raises(ValidationError, match="target would be 1"):
+            _mint_of(utxo, locktime, kw)
+    assert _mint_of(utxo, _LAST + 5, kw) == _bytecode_of(utxo, frag, _LAST + 5) > 1
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_an_epoch_contract_at_target_time_2_pow_n_still_builds_backwards(n: int) -> None:
+    """The honest neighbour at the deploy boundary: target_time == 2**n is deployable, and its
+    lower clamp is 1, so the same locktimes build."""
+    utxo, frag, kw = _any_contract(
+        DaaMode.EPOCH, DaaBytecodeVersion.V2, height=_EPOCH_L, last_time=_LAST, target=1 << 48, target_time=1 << n, n=n
+    )
+    for locktime in (_LAST - 5, _LAST, _LAST + 5):
+        assert _mint_of(utxo, locktime, kw) == _bytecode_of(utxo, frag, locktime) > 1
+
+
+def test_target_1_is_refused_in_every_mode_that_can_reach_it() -> None:
+    """Not only legacy LWMA: a SCHEDULE step to target 1 and a legacy-ASERT halving to 1 are
+    refused too; a contract ALREADY at target 1 is not this refusal's business."""
+    sched, frag, kw = _any_contract(
+        DaaMode.SCHEDULE, DaaBytecodeVersion.V2, height=7, last_time=_LAST, target=1 << 40, schedule=((5, 1),)
+    )
+    assert _bytecode_of(sched, frag, _LAST + 60) == 1
+    with pytest.raises(ValidationError, match="No current_time avoids it"):
+        _mint_of(sched, _LAST + 60, kw)
+    asert, frag, kw = _any_contract(
+        DaaMode.ASERT, DaaBytecodeVersion.LEGACY, height=3, last_time=_LAST, target=2, target_time=600, half_life=1
+    )
+    assert _bytecode_of(asert, frag, _LAST) == 1
+    with pytest.raises(ValidationError, match="target would be 1"):
+        _mint_of(asert, _LAST, kw)
+    at_one, frag, kw = _any_contract(DaaMode.LWMA, DaaBytecodeVersion.LEGACY, height=3, last_time=_LAST, target=1)
+    assert _mint_of(at_one, _LAST + 60, kw) == _bytecode_of(at_one, frag, _LAST + 60) == 1
+
+
+def test_the_legacy_and_epoch_mirrors_refuse_what_the_bytecode_cannot_evaluate() -> None:
+    """int64 edges the bytecode aborts on, now refused by the builder instead of built: the
+    legacy ASERT OP_SUBs, the legacy LWMA ``4 x targetTime`` OP_MUL and EPOCH's
+    ``targetTime << N``. The honest neighbours on the same contracts build and match."""
+    huge = (1 << 63) - 1 - 100
+    asert, frag, kw = _any_contract(
+        DaaMode.ASERT, DaaBytecodeVersion.LEGACY, height=3, last_time=_LAST, target=1 << 40, target_time=huge
+    )
+    assert _bytecode_of(asert, frag, _LAST - 1000) is _ABORT
+    with pytest.raises(ValidationError, match="int64"):
+        _mint_of(asert, _LAST - 1000, kw)
+    assert _mint_of(asert, _LAST + 1000, kw) == _bytecode_of(asert, frag, _LAST + 1000)
+
+    lwma, frag, kw = _any_contract(
+        DaaMode.LWMA, DaaBytecodeVersion.LEGACY, height=3, last_time=_LAST, target=1, target_time=1 << 62
+    )
+    assert _bytecode_of(lwma, frag, _LAST + 60) is _ABORT
+    with pytest.raises(ValidationError, match="int64"):
+        _mint_of(lwma, _LAST + 60, kw)
+
+    for height, aborts in ((_EPOCH_L, True), (_EPOCH_L + 1, False)):
+        epoch, frag, kw = _any_contract(
+            DaaMode.EPOCH,
+            DaaBytecodeVersion.V2,
+            height=height,
+            last_time=_LAST,
+            target=1 << 40,
+            target_time=1 << 62,
+            n=1,
+        )
+        if aborts:
+            assert _bytecode_of(epoch, frag, _LAST + 60) is _ABORT
+            with pytest.raises(ValidationError, match="int64"):
+                _mint_of(epoch, _LAST + 60, kw)
+        else:  # off a boundary the retarget branch never runs
+            assert _mint_of(epoch, _LAST + 60, kw) == _bytecode_of(epoch, frag, _LAST + 60) == 1 << 40
+
+
+_SWEEP_GENS = [
+    (DaaMode.FIXED, DaaBytecodeVersion.V2),
+    (DaaMode.ASERT, DaaBytecodeVersion.V2),
+    (DaaMode.ASERT, DaaBytecodeVersion.LEGACY),
+    (DaaMode.LWMA, DaaBytecodeVersion.V2),
+    (DaaMode.LWMA, DaaBytecodeVersion.LEGACY),
+    (DaaMode.LWMA, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR),
+    (DaaMode.EPOCH, DaaBytecodeVersion.V2),
+    (DaaMode.SCHEDULE, DaaBytecodeVersion.V2),
+]
+_SWEEP_TTS = [
+    1,
+    2,
+    3,
+    7,
+    15,
+    30,
+    60,
+    600,
+    86400,
+    2**31,
+    1 << 40,
+    1 << 47,
+    1 << 62,
+    INT64_MAX - (2**31) + 5,
+    INT64_MAX,
+]
+_SWEEP_HLS = [1, 2, 240, 3600, 65536, 2**31]
+_SWEEP_TARGETS = [
+    1,
+    2,
+    1000,
+    1 << 20,
+    1 << 40,
+    1 << 48,
+    MAX_SHA256D_TARGET // 8,
+    MAX_SHA256D_TARGET // 4,
+    MAX_SHA256D_TARGET,
+]
+#: Every reason the builder may give for refusing a mint in this sweep, and what the
+#: contract's own fragment must show for that refusal to be true of it.
+_REFUSALS = {
+    "is below 2**23": None,  # pyrxd's own write rule: the fragment itself may run fine
+    "<= 0x7FFFFFFF": None,  # Part C's NUM2BIN(4), outside the fragment
+    "does not build a backwards mint": "prefloor",
+    "target would be 1": "one",
+    "would leave the int64 range": "abort",
+    "can no longer be minted": "abort",
+}
+
+
+def test_a_seeded_sweep_builds_only_what_the_bytecode_computes() -> None:
+    """Every generation of every mode, target times up to the int64 limit, half-lives, targets,
+    readable and unreadable lastTimes, locktimes in both directions and at the edges. Whatever
+    the builder builds, the contract's own fragment computes, and it is never a fresh target 1;
+    whatever it refuses, it refuses for a reason the fragment bears out."""
+    rnd = random.Random(20260922)
+    built = {"back": 0, "fwd": 0}
+    refused: dict[str, int] = dict.fromkeys(_REFUSALS, 0)
+    for _ in range(2500):
+        mode, version = rnd.choice(_SWEEP_GENS)
+        n = rnd.choice([1, 2, 3, 4])
+        el = rnd.choice([1, 2, 10, 2016])
+        tgt = rnd.choice(_SWEEP_TARGETS)
+        if mode is DaaMode.EPOCH:
+            tgt = min(tgt, 1 << 48)
+        lt = rnd.choice([1 << 23, 0x7FFFFFFF, rnd.randint(1 << 23, 0x7FFFFFFF), _LAST, 0])
+        lo = max(lt, 1 << 23)
+        ct = rnd.choice(
+            [
+                rnd.randint(1 << 23, lo),
+                1 << 23,
+                (1 << 23) - 1,
+                lt - 1,
+                lt,
+                lt + 1,
+                rnd.randint(lo, 0x7FFFFFFF),
+                0x7FFFFFFF,
+            ]
+        )
+        ct = max(ct, 0)
+        height = rnd.choice([el, 2 * el, 3, el + 1]) if mode is DaaMode.EPOCH else rnd.choice([0, 1, 3, 7])
+        utxo, frag, kw = _any_contract(
+            mode,
+            version,
+            height=height,
+            last_time=lt,
+            target=tgt,
+            target_time=rnd.choice(_SWEEP_TTS),
+            half_life=rnd.choice(_SWEEP_HLS),
+            n=n,
+            epoch_length=el,
+            schedule=((5, rnd.choice([1, 2, 1 << 40])),),
+        )
+        on = _bytecode_of(utxo, frag, ct)
+        try:
+            got = _mint_of(utxo, ct, kw)
+        except ValidationError as exc:
+            reason = next((r for r in _REFUSALS if r in str(exc)), None)
+            assert reason is not None, f"unexpected refusal: {exc}"
+            refused[reason] += 1
+            kind = _REFUSALS[reason]
+            if kind == "one":
+                assert on == 1, (mode, version, str(exc)[:80])
+            elif kind == "abort":
+                assert on is _ABORT, (mode, version, str(exc)[:80])
+            elif kind == "prefloor":
+                assert version is DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR and ct < lt
+                assert on is _ABORT or on == 1
+            continue
+        assert on is not _ABORT, f"built a mint the bytecode aborts on: {mode.name}/{version.name} ct-lt={ct - lt}"
+        assert on == got, f"{mode.name}/{version.name} ct-lt={ct - lt}: bytecode {on} != built {got}"
+        assert not (got == 1 and utxo.state.target > 1), f"{mode.name}/{version.name} wrote a fresh target 1"
+        built["back" if ct < lt else "fwd"] += 1
+    # Non-vacuity: both directions built, and every refusal kind that can occur here did.
+    assert built["back"] > 200 and built["fwd"] > 400, built
+    assert all(refused[r] > 0 for r in _REFUSALS), refused

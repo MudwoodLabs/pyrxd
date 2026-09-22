@@ -2037,7 +2037,28 @@ class DmintV2DeployParams:
         # require_mineable_last_time for why the refusal is not in DmintDeployParams.
         # An omitted value (None) is stamped from the clock at prepare time and checked there.
         if self.last_time is not None:
+            if not 0 <= self.last_time <= 0xFFFFFFFF:
+                # Every mode: the state's lastTime is a fixed 4-byte push.
+                raise ValidationError(
+                    f"DmintV2DeployParams: last_time must fit the state's 4-byte lastTime push "
+                    f"(0..0xFFFFFFFF), got {self.last_time}"
+                )
             require_mineable_last_time(self.last_time, self.daa_mode, stage="DmintV2DeployParams")
+        # EPOCH: DmintDeployParams refuses this too when the scripts are built; refusing it
+        # here names the caller's own argument before any CBOR is encoded. An invalid
+        # max_adjustment_log2 is left to DmintDeployParams, which names that instead.
+        from .dmint.types import EPOCH_MAX_ADJUSTMENT_LOG2_VALUES
+
+        if (
+            self.daa_mode == DaaMode.EPOCH
+            and self.max_adjustment_log2 in EPOCH_MAX_ADJUSTMENT_LOG2_VALUES
+            and self.target_time < 1 << self.max_adjustment_log2
+        ):
+            raise ValidationError(
+                f"EPOCH target_time ({self.target_time}) must be >= 2**max_adjustment_log2 "
+                f"({1 << self.max_adjustment_log2}): below that the retarget's lower clamp, "
+                "target_time >> max_adjustment_log2, is 0 and can set the target to 1"
+            )
 
 
 class DmintFullDeployParams(DmintV2DeployParams):

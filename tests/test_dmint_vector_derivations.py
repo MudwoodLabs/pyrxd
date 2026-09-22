@@ -139,6 +139,9 @@ def _deploy_params(draw) -> DmintDeployParams:
     else:
         schedule = ()
     max_height = draw(st.integers(min_value=1, max_value=10**9))
+    max_adjustment_log2 = draw(st.sampled_from([1, 2, 3, 4]))
+    # EPOCH refuses target_time < 2**max_adjustment_log2 (its lower retarget clamp would be 0).
+    min_target_time = 1 << max_adjustment_log2 if daa_mode == DaaMode.EPOCH else 1
     return DmintDeployParams(
         contract_ref=draw(_ref),
         token_ref=draw(_ref),
@@ -147,12 +150,12 @@ def _deploy_params(draw) -> DmintDeployParams:
         difficulty=difficulty,
         algo=algo,
         daa_mode=daa_mode,
-        target_time=draw(st.integers(min_value=1, max_value=86_400)),
+        target_time=draw(st.integers(min_value=min_target_time, max_value=86_400)),
         half_life=draw(st.integers(min_value=1, max_value=10**6)),
         height=draw(st.integers(min_value=0, max_value=max_height)),
         last_time=draw(st.integers(min_value=0, max_value=0x7FFFFFFF)),
         epoch_length=draw(st.integers(min_value=1, max_value=10**5)),
-        max_adjustment_log2=draw(st.sampled_from([1, 2, 3, 4])),
+        max_adjustment_log2=max_adjustment_log2,
         schedule=schedule,
     )
 

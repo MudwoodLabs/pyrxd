@@ -320,8 +320,13 @@ class DmintDeployParams:
             raise ValidationError("half_life must be >= 1 second")
         if self.height < 0:
             raise ValidationError("height must be >= 0")
-        if self.last_time < 0:
-            raise ValidationError("last_time must be >= 0")
+        if not 0 <= self.last_time <= 0xFFFFFFFF:
+            # The state carries lastTime as a fixed 4-byte push; nothing outside this range
+            # can be encoded, in any mode. (Whether a value in range is one a retarget can READ
+            # is a separate, deploy-path question: see require_mineable_last_time.)
+            raise ValidationError(
+                f"last_time must fit the state's 4-byte lastTime push (0..0xFFFFFFFF), got {self.last_time}"
+            )
         if self.daa_mode == DaaMode.EPOCH:
             if self.epoch_length < 1:
                 raise ValidationError("epoch_length must be >= 1 for EPOCH")
@@ -329,6 +334,12 @@ class DmintDeployParams:
                 raise ValidationError(
                     f"max_adjustment_log2 must be one of {EPOCH_MAX_ADJUSTMENT_LOG2_VALUES} for EPOCH "
                     f"(got {self.max_adjustment_log2})"
+                )
+            if self.target_time < 1 << self.max_adjustment_log2:
+                raise ValidationError(
+                    f"EPOCH target_time ({self.target_time}) must be >= 2**max_adjustment_log2 "
+                    f"({1 << self.max_adjustment_log2}): below that the retarget's lower clamp, "
+                    "target_time >> max_adjustment_log2, is 0 and can set the target to 1"
                 )
             # target × clampedDelta must not overflow int64 → cap target at 2^48.
             if self.initial_target > EPOCH_MAX_SAFE_TARGET:

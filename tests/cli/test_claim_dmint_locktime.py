@@ -4,13 +4,11 @@ The V2 covenant writes the mint's locktime back into the recreated contract as `
 (``04 || NUM2BIN(locktime, 4)``), and ASERT, LWMA and EPOCH read that item back as a script
 number when they retarget. Two things went wrong together before this file:
 
-* ``--current-time`` defaulted to ``0``, so the default claim wrote ``04 00000000`` — a
-  non-minimal script number the next ASERT/LWMA mint, or the next EPOCH boundary mint,
-  cannot read (MINIMALDATA is a mandatory script-verify flag on Radiant).
+* ``--current-time`` defaulted to ``0``, so the default claim wrote a lastTime the
+  contract's next retarget could not read.
 * once deploy started stamping ``lastTime = now``, the mint builder's old "backwards"
   refusal turned the claim hint ``deploy-dmint`` prints into a command that always failed
-  for every non-FIXED mode — with a reason ("the retarget overflows") that was false for
-  every generation except the 2026-06-16 pre-floor LWMA.
+  for every non-FIXED mode, with a reason that did not describe those contracts.
 
 Everything here runs the real ``claim-dmint`` (and, for the hint, the real ``deploy-dmint``)
 through click's CliRunner. What is stubbed, and why:
@@ -253,7 +251,7 @@ class TestEpochDefaultClaim:
         result = CliRunner().invoke(cli, _claim_args(tmp_path / "w.dat", *self._EPOCH, "--current-time", "0"))
         assert result.exit_code != 0
         assert "could not build a valid mint" in result.output
-        assert "not a minimally encoded script number" in result.output
+        assert "is below 2**23" in result.output
         assert "funding can't cover" not in result.output
         assert grinds == [] and net.broadcasts == []
 
@@ -301,3 +299,102 @@ class TestAnUnmineableContractIsNotGroundAgainst:
         result, grinds, net = self._run(tmp_path, monkeypatch, self._asert(1 << 23))
         assert result.exit_code == 0, result.output
         assert len(grinds) == 1 and len(net.broadcasts) == 1
+
+
+# ---------------------------------------------------------------------------
+# An EPOCH contract whose lower retarget clamp is 0 (pyrxd no longer deploys one)
+# ---------------------------------------------------------------------------
+
+
+def _small_target_time_epoch(*, last_time: int) -> DmintContractUtxo:
+    """EPOCH, target_time 2 with a 4x clamp, at an epoch boundary. The params refuse
+    target_time 2 now, so they are built legal and the real value is set afterwards — such a
+    contract can still exist on chain, and the claim path is what is under test."""
+    params = DmintDeployParams(
+        contract_ref=GlyphRef(txid="ab" * 32, vout=1),
+        token_ref=GlyphRef(txid="cd" * 32, vout=0),
+        max_height=1000,
+        reward=1000,
+        difficulty=32768,
+        daa_mode=DaaMode.EPOCH,
+        target_time=4,
+        height=10,
+        last_time=last_time,
+        epoch_length=10,
+        max_adjustment_log2=2,
+    )
+    object.__setattr__(params, "target_time", 2)
+    spk = build_dmint_contract_script(params)
+    return DmintContractUtxo(txid="ab" * 32, vout=0, value=1, script=spk, state=DmintState.from_script(spk))
+
+
+class TestTheDefaultClaimNeverWritesTargetOne:
+    _EPOCH = ("--contract", "ab" * 32 + ":0", "--epoch-length", "10", "--max-adjustment", "4")
+
+    def _run(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: DmintContractUtxo):
+        net = _Net()
+        monkeypatch.setattr(glyph_cmds, "_load_wallet", lambda ctx, **kw: object())
+        monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: net)
+        grinds: list[int] = []
+        _patch_claim(monkeypatch, contract, grinds)
+        return CliRunner().invoke(cli, _claim_args(tmp_path / "w.dat", *self._EPOCH)), grinds, net
+
+    def test_a_contract_last_time_ahead_of_the_local_clock_is_refused_not_mined_to_target_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, grinds, net = self._run(
+            tmp_path, monkeypatch, _small_target_time_epoch(last_time=int(time.time()) + 30)
+        )
+        assert result.exit_code != 0
+        assert "could not build a valid mint" in result.output
+        assert "target would be 1" in result.output
+        assert "funding can't cover" not in result.output
+        assert grinds == [] and net.broadcasts == []
+
+    def test_the_honest_neighbour_mints(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same contract with its lastTime in the past: the default claim builds."""
+        result, grinds, net = self._run(
+            tmp_path, monkeypatch, _small_target_time_epoch(last_time=int(time.time()) - 600)
+        )
+        assert result.exit_code == 0, result.output
+        _tx, state = _minted_state(net)
+        assert state.target > 1 and len(grinds) == 1
+
+
+# ---------------------------------------------------------------------------
+# deploy-dmint: parameter refusals surface as CLI errors, not tracebacks
+# ---------------------------------------------------------------------------
+
+
+class TestDeployDmintParameterRefusals:
+    def _deploy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *extra: str):
+        net = _Net()
+        _patch_network_and_wallet(monkeypatch, net, PrivateKey())
+        meta = _write_dmint_meta(tmp_path / "m.json")
+        args = ["--wallet", str(tmp_path / "w.dat"), "--yes", "glyph", "deploy-dmint", str(meta), "--v2"]
+        return CliRunner().invoke(cli, [*args, "--max-height", "100", "--reward", "1000", *extra]), net
+
+    @pytest.mark.parametrize(("mode", "extra"), [("fixed", ()), ("epoch", ("--difficulty", "32768"))])
+    def test_a_last_time_outside_four_bytes_is_a_parameter_error(
+        self, mode: str, extra: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, net = self._deploy(tmp_path, monkeypatch, "--daa-mode", mode, *extra, "--last-time", str(1 << 32))
+        assert result.exit_code != 0
+        assert "invalid dMint deploy parameters" in result.output
+        assert "4-byte lastTime push" in result.output
+        # A UserError exits through SystemExit (a BaseException); a raw struct.error would not.
+        assert not isinstance(result.exception, Exception), repr(result.exception)
+        assert net.broadcasts == []
+
+    def test_an_epoch_target_time_below_2_pow_n_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        flags = ("--daa-mode", "epoch", "--difficulty", "32768", "--max-adjustment", "4")
+        result, net = self._deploy(tmp_path, monkeypatch, *flags, "--target-time", "3")
+        assert result.exit_code != 0
+        assert "invalid dMint deploy parameters" in result.output
+        assert net.broadcasts == []
+        # Honest neighbour: target_time 4 == 2**2 deploys.
+        ok, net_ok = self._deploy(tmp_path, monkeypatch, *flags, "--target-time", "4")
+        assert ok.exit_code == 0, ok.output
+        assert len(net_ok.broadcasts) == 2  # commit + reveal
