@@ -16,8 +16,14 @@
 //
 // Contract:
 //   node inspect_render_harness.mjs [payloads.json|-]
-//   stdin/file: JSON — {"name": {"script": {...}, "row": {...}, "tx": {...}}, ...}
-//               each of the three keys optional; at least one required.
+//   stdin/file: JSON — {"name": {"script": {...}, "row": {...}, "tx": {...},
+//                                  "row_opts": {...}}, ...}
+//               each of the three RENDER keys optional; at least one required.
+//               `row_opts` is not a render key: it is the optional second argument
+//               to `renderOutputRow`, which carries facts about the TRANSACTION that
+//               no output row can hold on its own — today the mark's block anchor.
+//               `renderFetchedTxCard` supplies it in production; a case that omits
+//               it gets the same "no block was looked up" degrade a caller would.
 //   stdout:     JSON — {"name": {"script_card": "…", "output_row": "…",
 //                                "fetched_tx_card": "…"}}
 //               where each value is the rendered text, one text node per line,
@@ -29,9 +35,9 @@
 // "the freshly-minted FT lives in a separate ft output" — and no per-output row
 // can carry them, so nothing reached them until this key existed.
 //
-// inspect.js is loaded VERBATIM in a `vm` context. It is not modified, not
-// wrapped and not preprocessed: a guard that tests a rewritten copy of the
-// file guards the rewrite. The module's top level touches `document` and ends
+// inspect.js and shared.js are loaded VERBATIM in a `vm` context, in the order
+// index.html loads them. Neither is modified, wrapped or preprocessed: a guard
+// that tests a rewritten copy of the file guards the rewrite. The module's top level touches `document` and ends
 // with `boot()`; boot's first statement is a `typeof loadPyodide !== "function"`
 // bail-out, so with no `loadPyodide` in the context it calls `showError` and
 // returns without a pending promise.
@@ -42,6 +48,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
 
 // --- stub DOM ---------------------------------------------------------
@@ -104,6 +111,27 @@ function renderedLines(node) {
   return out.join("\n");
 }
 
+// Every `class` attribute in the rendered tree, in document order.
+//
+// `renderedLines` returns TEXT, and text is not the whole claim a page makes. The
+// verdict blocks carry their meaning in a CLASS: `verdict-unchecked` is neutral,
+// `verdict-bad` is the error colour. A change that rendered an honest, merely
+// unchecked mark with `verdict-bad` would keep every text assertion green while
+// painting the signer red — which is the one thing this page must never do.
+function renderedClasses(node) {
+  const out = [];
+  const walk = (n) => {
+    if (n instanceof StubText) return;
+    // `el()` assigns `node.className` as a PROPERTY; it never calls setAttribute,
+    // so reading only the attribute returns null for every element on the page.
+    const cls = n.className || (n.getAttribute ? n.getAttribute("class") : null);
+    if (cls) out.push(cls);
+    for (const child of n.childNodes) walk(child);
+  };
+  walk(node);
+  return out;
+}
+
 function makeSandbox() {
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -130,10 +158,14 @@ function makeSandbox() {
 }
 
 function loadRenderer() {
-  const source = readFileSync(INSPECT_JS, "utf8");
   const sandbox = makeSandbox();
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: INSPECT_JS });
+  // shared.js FIRST, exactly as index.html loads it. Both are classic scripts, so
+  // their top-level declarations land in the same context and inspect.js resolves
+  // `verdictClass`, `stripControlChars`, `hashFileWithRecordAlgorithm` and the rest
+  // by name — the same way the browser does.
+  vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
+  vm.runInContext(readFileSync(INSPECT_JS, "utf8"), sandbox, { filename: INSPECT_JS });
   for (const name of ["renderScriptCard", "renderOutputRow", "renderFetchedTxCard"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
@@ -160,12 +192,31 @@ function main() {
     // need not carry a fake script and vice versa. A case carrying NONE of them
     // is a typo in the caller, and returning `{}` for it would look like a
     // renderer that produced nothing — throw instead.
-    if (payloads.script) out.script_card = renderedLines(renderer.renderScriptCard(payloads.script));
-    if (payloads.row) out.output_row = renderedLines(renderer.renderOutputRow(payloads.row));
-    if (payloads.tx) out.fetched_tx_card = renderedLines(renderer.renderFetchedTxCard(payloads.tx));
+    if (payloads.script) {
+      const card = renderer.renderScriptCard(payloads.script);
+      out.script_card = renderedLines(card);
+      out.script_card_classes = renderedClasses(card);
+    }
+    if (payloads.row) {
+      const row = renderer.renderOutputRow(payloads.row, payloads.row_opts);
+      out.output_row = renderedLines(row);
+      out.output_row_classes = renderedClasses(row);
+    }
+    if (payloads.tx) {
+      const tx = renderer.renderFetchedTxCard(payloads.tx);
+      out.fetched_tx_card = renderedLines(tx);
+      out.fetched_tx_card_classes = renderedClasses(tx);
+    }
     if (Object.keys(out).length === 0) {
       throw new Error(
         `case ${JSON.stringify(name)} has none of "script", "row", "tx" — nothing to render`
+      );
+    }
+    // `row_opts` without a `row` renders nothing and silently proves nothing — the
+    // caller meant to drive the output row and did not.
+    if (payloads.row_opts && !payloads.row) {
+      throw new Error(
+        `case ${JSON.stringify(name)} has "row_opts" but no "row", so the options were never used`
       );
     }
     results[name] = out;

@@ -1,4 +1,15 @@
-"""Unit tests for the untrusted-JSON coercions in :mod:`pyrxd.network._guards`.
+"""Unit tests for the untrusted-JSON coercions, imported the way callers import them.
+
+The functions themselves now live in :mod:`pyrxd.security.json_guards` — they moved
+out of ``pyrxd.network`` because importing anything under that package executes its
+``__init__``, which eagerly pulls ``coincurve``, ``aiohttp`` and ``websockets``, none
+of which has a pure-Python wheel. That made every module using them unreachable from
+the Pyodide inspect page, ``pyrxd.glyph.mark_anchor`` included.
+
+These tests deliberately keep importing through :mod:`pyrxd.network._guards`, because
+that is still the path ~30 call sites use and a re-export that silently stopped
+re-exporting the right objects would be invisible to a test that bypassed it.
+``tests/web/test_mark_anchor_bridge.py`` asserts the two names are the same objects.
 
 These four functions are now the single choke point through which every server-supplied
 number, boolean and hash passes. ``tests/security/test_hostile_server_responses.py``

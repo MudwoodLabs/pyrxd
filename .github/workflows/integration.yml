@@ -81,7 +81,7 @@ env:
   # Must equal `pyrxd.devnet.DEFAULT_RADIANT_VERSION` — `pyrxd regtest up` resolves its
   # image tag from that constant, so a drift here means the quickstart looks for an image
   # this workflow never built. `regtest-core` asserts the two agree.
-  RADIANT_VERSION: v3.1.1
+  RADIANT_VERSION: v3.1.2
 
 jobs:
   # ---------------------------------------------------------------- per push
@@ -161,6 +161,7 @@ jobs:
             tests/test_remaining_builder_floors_regtest_e2e.py \
             tests/test_fee_floor_boundary_regtest_e2e.py \
             tests/test_authority_regtest_e2e.py \
+            tests/test_hashmark_regtest_e2e.py \
             tests/test_dat_and_burn_regtest_e2e.py \
             tests/test_delegate_regtest_e2e.py
 

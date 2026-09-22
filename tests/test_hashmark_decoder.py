@@ -1,9 +1,13 @@
-"""HashMark decoding — a THIRD-PARTY OP_RETURN format we read but never write.
+"""HashMark decoding — a THIRD-PARTY OP_RETURN format, read side.
 
 Spec: HASHMARK_PROTOCOL.md in github.com/cdonnachie/hashmark.rxd (MIT). It is
 written to be implementable without access to its codebase, and this suite is
 the check on whether we managed that: the cases below are the spec's own rules,
 not our implementation's shape.
+
+The write side lives in ``tests/test_hashmark_encoder.py``. Keep these separate:
+a decoder test that builds its input with our own encoder would stop testing the
+spec and start testing that we agree with ourselves.
 """
 
 from __future__ import annotations

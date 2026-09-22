@@ -160,12 +160,51 @@ def split_qualified_name(qualified: str) -> tuple[str, str]:
     return label, domain
 
 
+def validate_wave_text(text: str, *, field: str = "WAVE label", allow_confusable: bool = False) -> None:
+    """Refuse WAVE text that is empty, unprintable, over-long, or impersonating Latin.
+
+    THE ONE PLACE THIS RULE LIVES. It was written out twice — here and in
+    :meth:`GlyphBuilder.prepare_wave_reveal` — with the same three clauses and the same
+    wrong error message, which said "printable ASCII" while :meth:`str.isprintable` accepts
+    any printable Unicode. Two copies of a rule is how one of them gets a check the other
+    does not; the homograph clause below is exactly that check.
+
+    ON THE HOMOGRAPH CLAUSE. ``looks_confusable_with_latin`` has shipped since before
+    v0.18.0 and was wired into the INSPECT path only — a reader was told a name mimics Latin
+    letters, while the mint path that creates such a name accepted it without comment. For a
+    name registry that asymmetry is backwards: refusing to create a spoof is worth more than
+    labelling one after it is on-chain and someone else owns it.
+
+    It flags impersonation, NOT non-Latin script. ``"トークン"``, ``"中文"``, ``"Café"``,
+    ``"Łódź"`` and ``"Œuf"`` all pass; ``"casіno"`` (Cyrillic і), ``"USDС"`` (Cyrillic С),
+    ``"𝐔𝐒𝐃𝐂"`` (Mathematical Bold) and a string carrying a bidi override do not. Set
+    ``allow_confusable=True`` to mint one deliberately — a registrar reclaiming a spoof of
+    its own brand is honest work, and a guard that cannot be overridden becomes a reason to
+    route around the guard.
+    """
+    if not text or not text.isprintable() or len(text) > 255:
+        raise ValidationError(f"{field} {text!r} must be non-empty, printable, and at most 255 characters")
+    if allow_confusable:
+        return
+    # Lazy: confusables.py carries a vendored TR39 table, and wave metadata is built in
+    # contexts (the Pyodide inspect build) that should not pay for it unless they mint.
+    from .confusables import looks_confusable_with_latin
+
+    if looks_confusable_with_latin(text):
+        raise ValidationError(
+            f"{field} {text!r} contains characters that mimic Latin letters, so it can be "
+            f"mistaken on sight for a different name. Pass allow_confusable=True if this is "
+            f"deliberate."
+        )
+
+
 def build_wave_metadata(
     *,
     qualified_name: str,
     target: str,
     target_type: str = SCHEME_ADDRESS,
     description: str = "",
+    allow_confusable: bool = False,
 ) -> GlyphMetadata:
     """Construct a Photonic-compatible WAVE :class:`GlyphMetadata`.
 
@@ -186,10 +225,8 @@ def build_wave_metadata(
     and emitting both would create ambiguity if they ever disagree.
     """
     label, domain = split_qualified_name(qualified_name)
-    if not label or not label.isprintable() or len(label) > 255:
-        raise ValidationError(f"WAVE label {label!r} must be non-empty printable ASCII, max 255 chars")
-    if not domain or not domain.isprintable() or len(domain) > 255:
-        raise ValidationError(f"WAVE domain {domain!r} must be non-empty printable ASCII, max 255 chars")
+    validate_wave_text(label, field="WAVE label", allow_confusable=allow_confusable)
+    validate_wave_text(domain, field="WAVE domain", allow_confusable=allow_confusable)
     if not target:
         raise ValidationError("WAVE target must not be empty")
 
@@ -320,9 +357,17 @@ class WaveResolver:
         return WaveRecord.from_indexer_response(result)
 
     async def check_available(self, name: str) -> bool:
-        """Return True if `name` is not yet registered."""
+        """Return True if `name` is not yet registered.
+
+        SENDS THE LABEL, NOT THE QUALIFIED NAME — the same rule :meth:`resolve` documents.
+        ``resolve`` was corrected in #695 and this twin was left sending ``"alice.rxd"``, which
+        ``validate_wave_name`` refuses; the refusal came back as an ``{"error": ...}`` dict,
+        which the client then reported as *available*. Fixing one caller of a shared rule and
+        not the other is how that gap survived.
+        """
+        label, _domain = split_qualified_name(name)
         try:
-            return await self.client.wave_check_available(name)
+            return await self.client.wave_check_available(label.strip().lower())
         except Exception as exc:
             raise WaveResolverError(f"wave.check_available({name!r}) failed: {exc}") from exc
 

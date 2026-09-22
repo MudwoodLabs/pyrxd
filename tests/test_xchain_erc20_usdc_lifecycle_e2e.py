@@ -64,6 +64,7 @@ pytest.importorskip("web3")
 pytest.importorskip("eth_keys")
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.devnet import RegtestNode
 from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import token_for
@@ -87,7 +88,10 @@ from tests.test_xchain_swap_regtest_e2e import (
 
 pytestmark = pytest.mark.integration
 
-_RXD_IMAGE = "radiant-core:v3.1.1-amd64"
+#: Derived, never spelled. `scripts/refresh_radiant_core_vendor.py --check` reads
+#: `DEFAULT_RADIANT_VERSION`; a literal here could drift from it and the check would
+#: still pass while this lane ran a different node.
+_RXD_IMAGE = RegtestNode.IMAGE
 #: Which chain to fork. Defaults to Ethereum; set PYRXD_ETH_FORK_CHAIN_ID=8453 with a Base RPC in
 #: PYRXD_ETH_FORK_RPC to run the same lifecycle against Base's pinned tokens. That matters because
 #: Base USDT is the has_blacklist=False branch of the pre-reveal gate — a different path from L1

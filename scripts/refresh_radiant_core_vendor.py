@@ -157,6 +157,9 @@ def check() -> int:
     print(f"image  : {image_tag or '(DEFAULT_RADIANT_VERSION not found in src/pyrxd/devnet.py)'}")
 
     drift = 0
+    upstream_drift = 0
+    image_drift = 0
+    local_drift = 0
     for name, upstream_path in FILES.items():
         local = (VENDOR_DIR / name).read_bytes()
         recorded = manifest["files"][name]["sha256"]
@@ -164,11 +167,13 @@ def check() -> int:
         if actual != recorded:
             print(f"  ! {name}: local bytes do NOT match MANIFEST.json (hand-edited?)")
             drift = 1
+            local_drift = 1
             continue
         remote = _fetch(upstream_path, latest)
         if hashlib.sha256(remote).hexdigest() != actual:
             print(f"  ! {name}: changed upstream between {pinned_tag} and {latest}")
             drift = 1
+            upstream_drift = 1
         else:
             print(f"  = {name}: unchanged upstream at {latest}")
 
@@ -190,12 +195,38 @@ def check() -> int:
                     "describes a different interpreter than the lane runs"
                 )
                 drift = 1
+                image_drift = 1
             else:
                 print(f"  = {name}: identical at the regtest image tag {image_tag}")
 
-    if drift:
-        print(f"\nUpstream moved. Refresh with:\n  python {Path(__file__).name} --tag {latest}")
-    else:
+    # Name the remedy for the failure that actually happened. This used to print the
+    # refresh command for every kind of drift, which for an image divergence is a no-op:
+    # the pin is ALREADY at `latest`, so re-pinning changes nothing and the check fails
+    # again identically. A remediation line that cannot fix the failure it is printed for
+    # is worse than none — it costs a reader a full cycle before they doubt it.
+    if local_drift:
+        print(
+            "\nThe vendored bytes do not match MANIFEST.json — someone edited the oracle by hand."
+            f"\n  Restore them:  python {Path(__file__).name} --tag {pinned_tag}"
+        )
+    if upstream_drift:
+        print(
+            f"\nUpstream moved between {pinned_tag} and {latest}."
+            f"\n  Re-pin:  python {Path(__file__).name} --tag {latest}"
+        )
+    if image_drift:
+        print(
+            f"\nThe oracle ({pinned_tag}) and the regtest image ({image_tag}) do not share a\n"
+            "consensus file, so every parity assertion describes a node the lane does not run.\n"
+            "RE-PINNING THE SOURCE CANNOT FIX THIS — the pin is already where it should be.\n"
+            "Move the IMAGE to the pinned release, then revalidate the lane against it:\n"
+            f"  1. edit DEFAULT_RADIANT_VERSION in src/pyrxd/devnet.py to {pinned_tag}\n"
+            f"  2. python -c \"from pyrxd.devnet import RegtestNode; RegtestNode.build_image('{pinned_tag}')\"\n"
+            "  3. RADIANT_REGTEST=1 pytest -m integration   (the bump carries revalidation)\n"
+            "Keeping the OLD image instead means lowering the pin, which gives up a\n"
+            "released consensus fix — decide that deliberately, do not default to it."
+        )
+    if not drift:
         print("\nVendored consensus sources are current.")
     return drift
 

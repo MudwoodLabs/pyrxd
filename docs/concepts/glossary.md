@@ -343,7 +343,7 @@ those for depth; use this page to look something up mid-task.
   `## [0.12.0]` entry and
   [Recover funds across wallet paths](../how-to/recover-funds-across-wallet-paths.md).
   Code:
-  [`src/pyrxd/hd/bip39.py:110`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/bip39.py).
+  [`src/pyrxd/hd/bip39.py:144`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/bip39.py).
 - **NFT** — non-fungible singleton, one of the three Glyph token kinds
   (`GlyphProtocol.NFT = 2`). A 63-byte locking script with a singleton ref.
   The script itself is `OP_PUSHINPUTREFSINGLETON <ref> OP_DROP` plus a bare

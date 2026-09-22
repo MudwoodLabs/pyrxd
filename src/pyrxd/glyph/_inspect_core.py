@@ -40,6 +40,7 @@ from ..hash import hash256
 from ..script.hashmark import (
     RADIANT_MAINNET_GENESIS,
     HashMarkOutcome,
+    algorithm_for,
     decode_hashmark,
     verify_attestation,
 )
@@ -49,6 +50,66 @@ from ..security.types import Txid
 from ..transaction.transaction import Transaction
 from .relationships import delegate_burn_refs, verify_relationship_claims
 from .types import GlyphProtocol
+
+# --- The attestation verdict, in words, ONCE ---------------------------------
+#
+# Three surfaces render this verdict — ``pyrxd glyph inspect``'s terminal output,
+# the browser panel at ``docs/inspect_static/inspect/``, and any SDK caller reading
+# the payload — and each of them used to spell it itself. That is how the browser
+# ended up with no branch at all for ``unverifiable``: the CLI grew one, the page
+# did not, and nothing could notice because the two prose copies were unrelated
+# strings in unrelated languages.
+#
+# So the words live here, beside the outcome they describe, and every surface reads
+# them out of the payload. `status` is the headline a reader scans for; `meaning` is
+# what that headline is allowed to be taken to mean, and is deliberately the WEAKER
+# sentence in every case.
+#
+# THE ASYMMETRY THAT MATTERS, and the reason ``unverifiable`` is not a failure here:
+# on the WRITE side a missing curve is a refusal, because funding a transaction needs
+# the same curve that signs it and there is no honest way to proceed without it. On
+# the READ side it is a MISSING CAPABILITY OF THE READER — the record is untouched and
+# unjudged. Painting a red cross beside an honest signer's mark because the reader's
+# browser has no secp256k1 would be the single worst thing either surface could do,
+# so the withheld verdict says NOT CHECKED and says whose limitation it is.
+_ATTESTATION_VERDICTS: dict[str, tuple[str, str]] = {
+    "valid": ("VERIFIED", "recovers to the committed signer"),
+    "invalid_signature": (
+        "DOES NOT VERIFY",
+        "the record is well-formed; its claim is not supported",
+    ),
+    "unverifiable": (
+        "NOT CHECKED",
+        "the record is well-formed; this is not a verdict on it",
+    ),
+    # "NO SIGNATURE", not "NOT ATTESTED" — `pyrxd verify` already shipped that spelling
+    # and it is the plainer of the two for a reader who is not holding the spec. The
+    # point of this table is that one record cannot be described two ways depending on
+    # which surface you happen to be looking at, so where a spelling already exists it
+    # wins over a new one.
+    "not_attested": (
+        "NO SIGNATURE",
+        "a v1 record carries no signer, so it says WHEN and never WHO",
+    ),
+}
+
+#: ``meaning`` is the READ-SURFACE elaboration — what `glyph inspect` and the browser
+#: panel print under the status. ``pyrxd verify`` keeps its own reason strings, because
+#: its context differs (it aggregates across every record in a transaction and quotes the
+#: failing one's detail). What must NEVER differ between surfaces is the STATUS word, and
+#: that is what this table owns: the claim is shared, the elaboration is local.
+#:
+#: What a reader is shown when the outcome is one this table has never heard of.
+#: Fails toward "we do not know" rather than toward either verdict, because a new
+#: outcome defaulting to VERIFIED is a forgery rendered as genuine and one
+#: defaulting to DOES NOT VERIFY is an honest mark rendered as a lie.
+_UNKNOWN_VERDICT = ("NOT CHECKED", "this build does not know how to read that outcome")
+
+
+def _attestation_verdict(outcome: str) -> tuple[str, str]:
+    """``(status, meaning)`` for an :class:`AttestationOutcome` value."""
+    return _ATTESTATION_VERDICTS.get(outcome, _UNKNOWN_VERDICT)
+
 
 # --- Length / shape constants ----------------------------------------------
 #
@@ -378,6 +439,133 @@ def _address_for(hash160_hex: str | None, network: str) -> str | None:
         return None
 
 
+# --- Checking a file against a record ----------------------------------------
+#
+# A mark commits to a DIGEST. "Is this the file?" is therefore answerable by anyone
+# holding the file, with no network, no key and no permission — and the file itself
+# never has to move. That is the whole of the check, and it is why the browser panel
+# can offer it honestly: `pyrxd mark` promises ITS CONTENTS DO NOT GO ON CHAIN, and a
+# checking surface that uploaded the file to answer would break that promise from the
+# other end.
+#
+# The hashing happens in whatever surface holds the bytes (the browser's WebCrypto, the
+# CLI's hashlib). What lives here is the part that must not be re-decided per surface:
+# WHICH algorithm, and what a match is allowed to mean.
+
+
+def _webcrypto_name(algorithm: str) -> str | None:
+    """The WebCrypto spelling of a hashlib digest name, or ``None`` if there is none.
+
+    DERIVED, not tabulated. ``hashlib`` spells the SHA-2 family ``sha256`` and
+    SubtleCrypto spells it ``SHA-256``; a hand-kept map of the one entry that exists
+    today would go stale the moment a second algorithm id is registered, and would go
+    stale SILENTLY — the panel would fall back to whatever it had hardcoded and check
+    the file against the wrong hash while every other field on screen stayed correct.
+
+    Returning ``None`` rather than guessing is the point: SubtleCrypto implements a
+    closed set, so an algorithm a record names and browsers cannot compute has to
+    degrade with a reason.
+    """
+    import re
+
+    match = re.fullmatch(r"sha(1|256|384|512)", algorithm or "")
+    return f"SHA-{match.group(1)}" if match else None
+
+
+def _file_check_plan(algorithm_id: int | None) -> dict:
+    """How to hash a file so it can be compared against a record of this algorithm.
+
+    ``algorithm_for`` is the authority on WHICH algorithm an id names — the same table
+    the decoder read the record's header byte through, and the same one
+    ``pyrxd.hashmark_tx.digest_file`` derives its hasher from. Nothing here re-spells
+    "sha256"; a surface that did would have created a second source of truth for what a
+    record CLAIMS versus what was actually hashed, and no downstream check could detect
+    the disagreement.
+    """
+    if algorithm_id is None:
+        return {"ok": False, "reason": "this record names no algorithm, so there is nothing to hash with"}
+    try:
+        algorithm = algorithm_for(algorithm_id)
+    except ValidationError:
+        return {
+            "ok": False,
+            "reason": (
+                f"this record names algorithm id {algorithm_id:#04x}, which this build does not "
+                f"implement — it may be newer than this build"
+            ),
+        }
+    subtle = _webcrypto_name(algorithm)
+    if subtle is None:
+        return {
+            "ok": False,
+            "reason": f"{algorithm} is not one of the hashes a browser can compute (WebCrypto has a closed set)",
+        }
+    return {"ok": True, "algorithm": algorithm, "webcrypto_name": subtle}
+
+
+def _judge_file_digest(expected_hex: str | None, computed_hex: str, *, algorithm: str | None = None) -> dict:
+    """Compare a locally-computed digest against the one a record commits to.
+
+    Returns the same ``status`` / ``meaning`` shape the attestation verdict uses, so a
+    surface renders both through one component and cannot give them two different
+    voices.
+
+    ``meaning`` is the weaker sentence on purpose. A digest match says the bytes in
+    front of you are the bytes the record commits to — it says nothing whatever about
+    who wrote them, who owned them, or whether the signer had ever seen them. That
+    claim belongs to the signature, and even the signature only reaches key custody.
+    """
+    name = algorithm or "the record's algorithm"
+    if not isinstance(expected_hex, str) or not expected_hex:
+        return {
+            "checked": False,
+            "match": None,
+            "status": "NOT CHECKED",
+            "meaning": "this record carries no digest to compare against",
+        }
+    computed = (computed_hex or "").strip().lower()
+    if not computed:
+        return {
+            "checked": False,
+            "match": None,
+            "status": "NOT CHECKED",
+            "meaning": "no digest was computed for the file",
+        }
+    if len(computed) != len(expected_hex):
+        # A different width is not a mismatch verdict — it means the two values are not
+        # comparable at all, and calling it "DOES NOT MATCH" would tell someone their
+        # file is the wrong file when what actually happened is that the wrong hash ran.
+        return {
+            "checked": False,
+            "match": None,
+            "status": "NOT CHECKED",
+            "meaning": (
+                f"the digest computed here is {len(computed) // 2} bytes and the record's is "
+                f"{len(expected_hex) // 2} — these were not produced by the same hash, so they "
+                f"cannot be compared"
+            ),
+        }
+    if computed != expected_hex.lower():
+        return {
+            "checked": True,
+            "match": False,
+            "status": "DOES NOT MATCH",
+            "meaning": (
+                "this file is not the file this record commits to — one byte different is enough, "
+                "so an edited copy, a re-export or a different version all land here"
+            ),
+        }
+    return {
+        "checked": True,
+        "match": True,
+        "status": "MATCHES",
+        "meaning": (
+            f"this file's {name} is the digest in the record — the record commits to THESE bytes. "
+            "It does not say who made them, who owns them, or that anything in them is true"
+        ),
+    }
+
+
 def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
     from ..constants import REF_OPERAND_WIDTH
@@ -495,6 +683,16 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 "outcome": mark.outcome.value,
                 "version": mark.version,
                 "algorithm": mark.algorithm,
+                # THE ID, not only the name. Whoever re-hashes a local file to compare it
+                # against this digest has to run the algorithm the RECORD names, and
+                # `algorithm_for` is explicit that a caller spelling "sha256" itself has
+                # created a second source of truth for what was hashed. `digest_file` takes
+                # the id, so carrying it is what lets `pyrxd verify` stay on the one table.
+                # And it is the only way to name the algorithm of a record this build
+                # cannot read: `algorithm` is None for an `unknown_algorithm` outcome,
+                # so without the id the panel can say a record names something unknown
+                # and never say WHICH.
+                "algorithm_id": mark.algorithm_id,
                 "digest": mark.digest_hex,
                 # SANITISED, like every other display string on this renderer. The
                 # decoder now refuses a non-canonical label outright (spec 5.4), so
@@ -506,6 +704,18 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 # v2 only, and NOT verified here — verifying needs secp256k1 and
                 # the chain the tx was found on. Well-formed is not believed.
                 "signer_hash160": mark.signer_hash160_hex,
+                # The SAME hash160, base58check-encoded — a re-encoding of a value the
+                # record itself holds, not a second piece of evidence, and emphatically
+                # not the RECOVERED key (that is `attestation.signer_address`, and the
+                # two are equal only when the signature verifies).
+                #
+                # It exists because the browser's normal outcome is `unverifiable`, where
+                # nothing is recovered and so no address was available at all — leaving a
+                # non-developer a 20-byte hex string to compare against a wallet that
+                # shows addresses. The honest answer to "who signed" when nothing was
+                # checked is "the record NAMES this key", and this is that answer in a
+                # form a person can act on.
+                "committed_signer_address": _address_for(mark.signer_hash160_hex, network),
                 "signature_unverified": mark.signature_hex,
                 "detail": mark.detail,
             }
@@ -535,8 +745,13 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 genesis = genesis_hash_for(network)
                 assumed = network if genesis else "mainnet"
                 att = verify_attestation(mark, network_genesis=genesis or RADIANT_MAINNET_GENESIS)
+                status, meaning = _attestation_verdict(att.outcome.value)
                 out["hashmark"]["attestation"] = {
                     "outcome": att.outcome.value,
+                    # THE WORDS, from the one table above, so the terminal and the
+                    # browser panel cannot say different things about the same record.
+                    "status": status,
+                    "meaning": meaning,
                     "recovered_hash160": att.recovered_hash160_hex,
                     # The address form of the recovered key. §7.6's sound statement
                     # LEADS with this — it is the only identity fact the mark itself

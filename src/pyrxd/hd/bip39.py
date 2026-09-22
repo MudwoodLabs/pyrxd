@@ -71,7 +71,15 @@ class WordList:
 
 def mnemonic_from_entropy(entropy: bytes | str | None = None, lang: str = "en") -> str:
     # SECURITY: mnemonic is sensitive — caller must not log or store the result unprotected
-    if entropy:
+    #
+    # ``is None``, not a falsy test. ``if entropy:`` treated b"" and "" as "no entropy
+    # supplied" and silently generated a RANDOM seed instead — so a caller whose entropy
+    # source returned empty got a mnemonic that looked fine, was unrelated to the material
+    # it meant to commit to, and was unreproducible. Measured before the fix: two calls with
+    # b"" returned two different 12-word mnemonics. Empty entropy is now carried through to
+    # the length check below, which refuses it (0 bits is not in BIP39_ENTROPY_BIT_LENGTH_LIST).
+    # Present since v0.2.0 and covered by no test.
+    if entropy is not None:
         if type(entropy).__name__ not in ["bytes", "str"]:
             raise TypeError("unsupported entropy type")
         entropy_bytes = entropy if isinstance(entropy, bytes) else bytes.fromhex(entropy)

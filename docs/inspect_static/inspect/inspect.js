@@ -1,11 +1,18 @@
 // inspect.js — pyrxd inspect tool: boot + classifier UI.
 //
+// LOADED SECOND. `shared.js` must already have run: the runtime boot, the
+// ElectrumX wire, `stripControlChars`, `verdictClass` and the file-check
+// mechanics live there because the public page at /verify/ needs the same ones,
+// and a second copy of a supply-chain guard or a verdict colour is the copy that
+// a later fix misses. index.html loads it with a plain <script> tag, which runs
+// before this deferred module.
+//
 // Two phases:
 //
-//  1. Boot — load Pyodide, install the same-origin pyrxd wheel, and
-//     load the Pyodide-side glue (`glue.py`). This phase ends when
-//     `pyodide` and a callable `pyGlue` reference are stashed on
-//     module-scope and the form is enabled.
+//  1. Boot — `bootPyrxdRuntime` (shared.js) loads Pyodide, installs the
+//     same-origin pyrxd wheel and loads the Pyodide-side glue (`glue.py`).
+//     This phase ends when the bridge handles are stashed on module-scope
+//     and the form is enabled.
 //
 //  2. Interactive — wire the paste box, classify button, share button,
 //     clear button, and `?input=` URL hydration. Each classification
@@ -60,36 +67,31 @@ const EXAMPLE_CHIPS = document.querySelectorAll(".example-chip");
 // before ``sphinx-build``. The wheel's filename embeds the version, so we
 // discover it at runtime via the `manifest.json` written next to it.
 const WHEELS_BASE = new URL("./wheels/", document.baseURI).toString();
-const WHEELS_MANIFEST = new URL("./manifest.json", WHEELS_BASE).toString();
 const GLUE_URL = new URL("./glue.py", document.baseURI).toString();
+// The secp256k1 the Python side does not have under Pyodide. Without it this
+// page reported "not checked" for every signed record too.
+const CURVE_URL = new URL("./secp256k1-bridge.js", document.baseURI).toString();
 
 // Module-scope handles to the Python entry points once boot completes.
 // Keeping these on the module rather than `window` avoids polluting the
 // global namespace and keeps the surface explicit.
 let pyGlue = null;          // glue.run(text) -> dict
 let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex) -> dict
+// The verdict view's three extra bridges. Each is a thin forward to pyrxd: the
+// block comes from `resolve_mark_anchor`, the hash choice from `algorithm_for`,
+// and the digest comparison and its wording from `_inspect_core`. None of the
+// three is reimplemented here, which is the point of routing them through Python
+// at all rather than doing the obvious one-liners in JS.
+let pyMarkAnchor = null;      // glue.mark_anchor(txid, verbose_json, tip) -> dict
+let pyFileCheckPlan = null;   // glue.file_check_plan(algorithm_id) -> dict
+let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo) -> dict
 
-// ElectrumX WebSocket endpoint. Hard-coded to the one URL the page's
-// CSP whitelists in ``connect-src``. Changing this also requires
-// updating the CSP meta-tag in index.html.
-const ELECTRUMX_WSS_URL = "wss://electrumx.radiant4people.com:50022";
-// MAINNET. glue.py's `_PAGE_NETWORK` is bound to this and passes it to the
-// classifier, because a HashMark v2 signature covers the chain's genesis hash —
-// the same bytes on another chain verify against a different key. Changing this
-// endpoint to another chain without changing `_PAGE_NETWORK` would make the page
-// report attestations against the wrong one.
-
-// Hard cap on a fetched transaction's hex length. Mirrors the cap
-// glue.py applies on the Python side (8 MB hex = 4 MB binary, the
-// Radiant policy maximum). Clipping in JS too means a hostile server
-// can't make us spend memory holding a multi-gigabyte response while
-// the Python guard rejects it.
-const MAX_FETCHED_TX_HEX_LEN = 8_000_000;
-
-// Per-fetch timeout. Real ElectrumX servers respond in <1s; 10 seconds
-// is generous and bounds the worst case where the connection succeeds
-// but the server hangs without responding.
-const FETCH_TIMEOUT_MS = 10_000;
+// The ElectrumX endpoint, the wire timeout and the transaction size cap are
+// `ELECTRUMX_WSS_URL` / `FETCH_TIMEOUT_MS` / `MAX_FETCHED_TX_HEX_LEN` in shared.js,
+// which this page loads first. MAINNET is not incidental: glue.py's `_PAGE_NETWORK`
+// is bound to that endpoint and passes it to the classifier, because a HashMark v2
+// signature covers the chain's genesis hash — the same bytes on another chain verify
+// against a different key.
 
 // ---------------------------------------------------------------------
 // Status / error helpers
@@ -123,242 +125,33 @@ function setProgress(pct) {
 // Boot
 // ---------------------------------------------------------------------
 
-// Validate a filename field from manifest.json is a bare basename
-// — not an absolute URL, not a path traversal, not a scheme. Defends
-// against an attacker-poisoned manifest redirecting wheel installs
-// to a CSP-allowed origin (e.g. PyPI hosts) where they've staged a
-// hostile wheel.
-//
-// LOAD-BEARING INVARIANT: this function's regex is also the only
-// guard between manifest.{wheel,cbor2_wheel} and:
-//   - ``new URL(value, WHEELS_BASE)``  — absolute-URL escape
-//   - ``"/tmp/" + value``              — Pyodide FS path-traversal escape
-//   - ``"emfs:/tmp/" + value``         — Python-string interpolation
-//     into ``runPythonAsync(`...`)``
-// If the alphabet is ever widened to include ``/`` ``\`` ``:`` ``"`` ``\``
-// ``$``, EACH of those sinks becomes a vulnerability simultaneously.
-// Audit findings HIGH-1, NEW-1, NEW-2, NEW-5.
-function _assertSafeBasename(value, fieldName) {
-  if (typeof value !== "string" || !value) {
-    throw new Error(`manifest.${fieldName} missing or empty`);
-  }
-  // Reject any character that could change URL resolution or escape
-  // a string-concatenated path: ``/`` and ``\\`` for path traversal,
-  // ``:`` to defeat scheme prefixes (``data:``, ``https:``), ``?``
-  // and ``#`` for query / fragment tricks, ``"`` and ``\\`` to escape
-  // Python-string interpolation. Allowed alphabet matches the
-  // wheel-filename convention: ``pyrxd-0.3.0-py3-none-any.whl``.
-  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
-    throw new Error(
-      `manifest.${fieldName}=${JSON.stringify(value)} is not a bare ` +
-      `filename (allowed: alphanumerics, '.', '-', '_'). This is a ` +
-      `defence against a poisoned manifest redirecting installs ` +
-      `off-origin.`
-    );
-  }
-  // Explicit reject of dot-only names: ``.`` resolves to the current
-  // directory under ``new URL`` and ``..`` to the parent. Fail-closed
-  // here rather than relying on the downstream SHA-256 check to catch
-  // a directory-listing fetch — defence in depth, audit finding NEW-1.
-  if (/^\.+$/.test(value)) {
-    throw new Error(
-      `manifest.${fieldName}=${JSON.stringify(value)} is a dot-only ` +
-      `path; rejecting to prevent directory traversal.`
-    );
-  }
-}
-
-// Validate a SHA-256 field from manifest.json is exactly 64 lowercase
-// hex characters. Anything else is a deploy bug — better to fail loud
-// than silently accept and skip the verify step downstream.
-function _assertHexSha256(value, fieldName) {
-  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
-    throw new Error(
-      `manifest.${fieldName} must be 64 lowercase hex chars (SHA-256), ` +
-      `got ${JSON.stringify(value)}`
-    );
-  }
-}
-
-async function loadManifest() {
-  setProgress(5);
-  let manifest;
-  try {
-    const resp = await fetch(WHEELS_MANIFEST, { cache: "no-cache" });
-    if (!resp.ok) {
-      throw new Error(`manifest HTTP ${resp.status}`);
-    }
-    manifest = await resp.json();
-  } catch (err) {
-    throw new Error(
-      `Could not load wheel manifest from ${WHEELS_MANIFEST}: ${err.message}. ` +
-      `This usually means the docs CI step that builds the wheel failed.`
-    );
-  }
-  // Validate the manifest fields the boot path will trust. If the
-  // deploy ever produces a malformed or hostile manifest, fail closed
-  // here rather than at the Python install step (where the failure
-  // mode is harder to diagnose).
-  _assertSafeBasename(manifest.wheel, "wheel");
-  _assertHexSha256(manifest.wheel_sha256, "wheel_sha256");
-  _assertSafeBasename(manifest.cbor2_wheel, "cbor2_wheel");
-  _assertHexSha256(manifest.cbor2_sha256, "cbor2_sha256");
-  _assertHexSha256(manifest.glue_sha256, "glue_sha256");
-  return manifest;
-}
-
-// Fetch a same-origin URL, verify its SHA-256 against the expected
-// hex digest, return the bytes. The hash is the trust boundary —
-// even if the GitHub Pages deploy is compromised, a mismatch fails
-// closed before any wheel byte reaches the Pyodide interpreter.
-async function fetchAndVerify(url, expectedSha256, label) {
-  const resp = await fetch(url, { cache: "no-cache" });
-  if (!resp.ok) {
-    throw new Error(`${label} HTTP ${resp.status}`);
-  }
-  const buffer = await resp.arrayBuffer();
-  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
-  // Convert to lowercase hex.
-  const hashArr = new Uint8Array(hashBuffer);
-  let hashHex = "";
-  for (const b of hashArr) {
-    hashHex += b.toString(16).padStart(2, "0");
-  }
-  if (hashHex !== expectedSha256) {
-    throw new Error(
-      `${label} SHA-256 mismatch — expected ${expectedSha256}, ` +
-      `got ${hashHex}. The deployed bytes don't match the manifest. ` +
-      `This is the integrity check refusing to proceed; do NOT ` +
-      `install the wheel by other means.`
-    );
-  }
-  return buffer;
-}
-
-async function fetchGlueSource(expectedSha256) {
-  const buffer = await fetchAndVerify(GLUE_URL, expectedSha256, "glue.py");
-  return new TextDecoder("utf-8").decode(buffer);
-}
-
+// `bootPyrxdRuntime` lives in shared.js. The manifest fetch, the SHA-256
+// pinning of both wheels and of glue.py, the Pyodide install and the bridge
+// handles are identical on the public /verify/ page, and a second copy of a
+// supply-chain guard is the copy a later fix misses. What stays here is the
+// half that is about THIS page: which element shows progress, which shows the
+// error, and what to do once the form is live.
 async function boot() {
-  if (typeof loadPyodide !== "function") {
-    showError(
-      "Pyodide failed to load. This is most often a Subresource Integrity " +
-      "mismatch (the CDN served bytes that don't match the pinned SHA-384 " +
-      "hash in index.html). Open the browser console for the underlying error."
-    );
-    return;
-  }
-
-  let manifest;
+  let runtime;
   try {
-    manifest = await loadManifest();
+    runtime = await bootPyrxdRuntime({
+      wheelsBase: WHEELS_BASE,
+      glueUrl: GLUE_URL,
+      curveUrl: CURVE_URL,
+      onProgress: setProgress,
+    });
   } catch (err) {
     showError(err.message);
     return;
   }
 
-  setProgress(15);
+  pyGlue = runtime.bridges.run;
+  pyGlueFetch = runtime.bridges.inspectTxidWithRaw;
+  pyMarkAnchor = runtime.bridges.markAnchor;
+  pyFileCheckPlan = runtime.bridges.fileCheckPlan;
+  pyJudgeFileDigest = runtime.bridges.judgeFileDigest;
 
-  let pyodide;
-  try {
-    pyodide = await loadPyodide({
-      indexURL: "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/",
-    });
-  } catch (err) {
-    showError(`Pyodide runtime failed to initialise: ${err.message}`);
-    return;
-  }
-
-  setProgress(60);
-
-  try {
-    // Load Pyodide-bundled support packages first.
-    //   - ``micropip`` — for installing the vendored wheels from FS.
-    //   - ``pycryptodome`` — pyrxd imports ``Cryptodome.Cipher.AES`` in
-    //     the encrypted-wallet path. The inspect tool doesn't actually
-    //     reach that path, but the lazy ``__getattr__``s in pyrxd's
-    //     package ``__init__``s might if a downstream caller touches
-    //     it. Cheap to load preemptively (the glue.py shim aliases
-    //     ``Cryptodome`` → ``Crypto`` so the import resolves).
-    await pyodide.loadPackage(["micropip", "pycryptodome"]);
-
-    // Both wheels are vendored same-origin (under /inspect/wheels/)
-    // and SHA-256 pinned in manifest.json. Fetch each, verify the
-    // hash with crypto.subtle.digest, write the bytes to Pyodide FS,
-    // and install from there. This:
-    //   - Closes the supply-chain gap from PyPI fetches (audit
-    //     finding HIGH-1, MEDIUM-2, MEDIUM-3): no off-origin install
-    //     paths remain, and CSP can drop ``pypi.org`` /
-    //     ``files.pythonhosted.org``.
-    //   - Defends against a poisoned manifest redirecting wheel
-    //     installs to attacker-staged URLs: ``loadManifest`` already
-    //     validates ``wheel`` / ``cbor2_wheel`` are bare basenames.
-    //   - Defends against a compromised GitHub Pages deploy: even
-    //     same-origin bytes are SHA-checked before micropip sees them.
-    //
-    // We use ``deps=False`` for the pyrxd wheel because its METADATA
-    // declares five runtime deps (aiohttp, coincurve, base58,
-    // pycryptodomex, websockets) for the full SDK surface; most have
-    // no pure-Python wheels. The inspect tool needs none of them —
-    // see ``tests/web/test_inspect_imports_pyodide_clean.py``.
-    // Re-assert the basename invariant at the install site. ``loadManifest``
-    // already validates these, but the FS path concat (``/tmp/${name}``)
-    // and Python-string interpolation (``emfs:/tmp/${name}``) below are
-    // load-bearing on the regex's alphabet — explicit defence in depth
-    // against a future refactor that bypasses ``loadManifest``.
-    _assertSafeBasename(manifest.cbor2_wheel, "cbor2_wheel");
-    _assertSafeBasename(manifest.wheel, "wheel");
-
-    const cbor2URL = new URL(manifest.cbor2_wheel, WHEELS_BASE).toString();
-    const cbor2Bytes = await fetchAndVerify(cbor2URL, manifest.cbor2_sha256, "cbor2 wheel");
-    pyodide.FS.writeFile("/tmp/" + manifest.cbor2_wheel, new Uint8Array(cbor2Bytes));
-
-    const pyrxdURL = new URL(manifest.wheel, WHEELS_BASE).toString();
-    const pyrxdBytes = await fetchAndVerify(pyrxdURL, manifest.wheel_sha256, "pyrxd wheel");
-    pyodide.FS.writeFile("/tmp/" + manifest.wheel, new Uint8Array(pyrxdBytes));
-
-    await pyodide.runPythonAsync(`
-import micropip
-await micropip.install("emfs:/tmp/${manifest.cbor2_wheel}")
-await micropip.install("emfs:/tmp/${manifest.wheel}", deps=False)
-`);
-  } catch (err) {
-    showError(`Could not install pyrxd: ${err.message}`);
-    return;
-  }
-
-  setProgress(85);
-
-  // Load the Pyodide-side glue. The glue module installs the
-  // Cryptodome→Crypto shim at import time and then imports pyrxd, so
-  // pyrxd's import chain (which references Cryptodome.Cipher.AES via
-  // aes_cbc) resolves cleanly. Both entry points come back as PyProxy
-  // references stashed on the JS module.
-  let versionText;
-  try {
-    const glueSrc = await fetchGlueSource(manifest.glue_sha256);
-    pyodide.FS.writeFile("/home/pyodide/glue.py", glueSrc);
-    pyodide.runPython(`
-import sys
-sys.path.insert(0, "/home/pyodide")
-import glue as _pyrxd_glue
-import pyrxd
-_pyrxd_version_blob = (
-    f"pyrxd {getattr(pyrxd, '__version__', 'unknown')} "
-    f"loaded under Python {sys.version.split()[0]}"
-)
-`);
-    pyGlue = pyodide.globals.get("_pyrxd_glue").run;
-    pyGlueFetch = pyodide.globals.get("_pyrxd_glue").inspect_txid_with_raw;
-    versionText = String(pyodide.globals.get("_pyrxd_version_blob"));
-  } catch (err) {
-    showError(`Could not load inspect glue: ${err.message}`);
-    return;
-  }
-
-  setProgress(100);
-  showReady(versionText, manifest.git_sha);
+  showReady(runtime.versionText, runtime.gitSha);
   enableForm();
   hydrateFromUrl();
 }
@@ -649,7 +442,12 @@ function renderFetchedTxCard(payload) {
     wrapper.appendChild(el("h3", { class: "result-subhead", text: "Outputs" }));
     const outList = el("div", { class: "output-rows" });
     for (const row of outputs) {
-      outList.appendChild(renderOutputRow(row));
+      // The block is a fact about the TRANSACTION, so it is resolved once and handed
+      // to every row that carries a mark rather than looked up per output.
+      outList.appendChild(renderOutputRow(row, {
+        anchor: payload.mark_anchor,
+        anchorReason: "the block was not looked up for this transaction",
+      }));
     }
     wrapper.appendChild(outList);
   }
@@ -1019,49 +817,12 @@ function appendOpReturnPayload(dl, row) {
     if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));
   }
 
-  const hm = row.hashmark;
-  if (hm) {
-    if (hm.outcome !== "ok") {
-      dl.appendChild(kv("hashmark", hm.detail ? `${hm.outcome} — ${hm.detail}` : hm.outcome, "kv-warning"));
-    } else {
-      dl.appendChild(kv("hashmark", `v${hm.version} (${hm.algorithm})`));
-      dl.appendChild(kv("digest", hm.digest));
-      if (hm.label) {
-        dl.appendChild(kv("label", hm.label));
-      } else if (hm.label_withheld) {
-        // v1 keeps its timestamp evidence; the label is withheld WITH a reason,
-        // because showing nothing looks like a record that carried no label.
-        dl.appendChild(kv("label", `[withheld — ${hm.label_withheld}]`, "kv-warning"));
-      }
-      if (hm.signer_hash160) {
-        dl.appendChild(kv("signer", hm.signer_hash160));
-        const att = hm.attestation || {};
-        // The recovered key in the form a person can compare against a wallet. Added
-        // to the payload with the signer-address work and rendered nowhere here, which
-        // the structural guard caught the moment the two branches met.
-        if (att.signer_address) dl.appendChild(kv("signer address", att.signer_address));
-        if (att.outcome === "valid") {
-          dl.appendChild(kvWithWarning(
-            "signature",
-            "VERIFIED — recovers to the committed signer",
-            `assuming ${att.assumed_network}; the chain is part of the signed statement`,
-          ));
-        } else if (att.outcome === "invalid_signature") {
-          // The bytes decoded; the CLAIM does not hold. Calling it "malformed"
-          // would send a reader after the wrong problem.
-          dl.appendChild(kv(
-            "signature",
-            `DOES NOT VERIFY — ${att.detail || "no detail"} (the record is well-formed; its claim is not supported)`,
-            "kv-warning",
-          ));
-        }
-      }
-      dl.appendChild(kv(
-        "what this proves",
-        "someone knew this digest no later than the confirming block — not authorship, ownership, originality or contents",
-      ));
-    }
-  }
+  // A HashMark record is NOT rendered here. It has its own panel, on the card
+  // wrapper rather than inside this field list — see `appendMarkVerdict`. Two
+  // reasons, and the second is the one that matters: the verdict is the headline
+  // and must not sit below a scroll of kv pairs, and there is exactly ONE element
+  // on the screen describing a mark, so the script card and the tx row cannot
+  // drift into contradicting each other about the same record.
 
   // Declared container/creator membership, WITH its verdict. `in` and `by` are
   // operator-supplied CBOR — anyone can name any collection — so the claim is
@@ -1071,6 +832,271 @@ function appendOpReturnPayload(dl, row) {
     (row.metadata && row.metadata.relationships) || row.relationships,
     (row.metadata && row.metadata.delegate_burns) || [],
   );
+}
+
+// ──────────────────────────────────────── HashMark: the verdict view ──
+//
+// The ONE place a HashMark record is rendered.
+//
+// It used to be a handful of kv rows inside `appendOpReturnPayload`, and the
+// branch that matters most on this page was missing from them. `verify_attestation`
+// returns UNVERIFIABLE when secp256k1 is absent, and in the browser it is ALWAYS
+// absent: pyrxd installs here with `deps=False` and coincurve has no pure-Python
+// wheel. So the commonest outcome on this surface had no branch at all.
+//
+// Measured before this change, on the real mainnet record in
+// a1a86ab4503901af4df3d092fcf668b07c03c5cd89240fe918ae70e02e045916 (height
+// 460,572), whose signature genuinely verifies: the card printed
+// `signer 26ba…95d2` and then went straight to "what this proves". Not a wrong
+// verdict — NO verdict, which is worse, because a reader supplies the missing
+// sentence themselves and supplies the affirmative one.
+//
+// THE ASYMMETRY THIS PANEL EXISTS TO KEEP. A missing curve is a REFUSAL on the
+// write side (`MarkPlan` will not fund a transaction it cannot self-verify) and a
+// MISSING CAPABILITY OF THE READER on the read side. Painting a red cross beside
+// an honest signer's mark because this browser has no secp256k1 would be the
+// single worst thing this page could do, so "not checked here" is said in as many
+// words, and whose limitation it is is named. `shared.js` installs a vendored
+// curve at boot, so that branch is now the exception rather than the rule — but it
+// is still reachable, and it still must not read as a verdict.
+//
+// Every sentence below that judges anything comes from the payload, which got it
+// from `_inspect_core._ATTESTATION_VERDICTS` — the same table `pyrxd glyph
+// inspect` prints from. Nothing here decides what a verdict means.
+
+// `verdictClass` lives in shared.js: one status-word-to-colour mapping for both
+// pages, so a reader who checks the public page against the inspector cannot find
+// an honest mark neutral on one and red on the other.
+function verdictBlock(label, status, meaning, detail) {
+  const box = el("div", { class: `verdict ${verdictClass(status)}` });
+  box.appendChild(el("span", { class: "verdict-label", text: label }));
+  box.appendChild(el("strong", { class: "verdict-status", text: status || "NOT CHECKED" }));
+  if (detail) box.appendChild(el("p", { class: "verdict-detail", text: detail }));
+  if (meaning) box.appendChild(el("p", { class: "verdict-meaning", text: meaning }));
+  return box;
+}
+
+// The block a mark's transaction sits in, or the reason there isn't one.
+//
+// `resolve_mark_anchor` produced this, not JS: it binds the echoed txid, refuses an
+// unreadable depth rather than reading it as zero, and derives the height from the
+// chain tip because the verbose reply carries no height field of its own (measured
+// against both shipped public servers). What is rendered here is that result plus
+// the caveat it carries — the height is the endpoint's CLAIM, and pyrxd has no
+// Radiant header, proof-of-work or merkle check to test it with.
+function appendAnchor(dl, caveats, anchor, anchorReason) {
+  if (!anchor) {
+    // NOT a warning. Nothing went wrong: this input never had a transaction to look
+    // one up for, so form 2 is unavailable BY CONSTRUCTION. Painting it red would
+    // make the ordinary case of pasting a script look like a fault, and a warning
+    // colour that fires on the common path is a warning nobody reads by the time a
+    // real one appears.
+    dl.appendChild(kv("block", `not established — ${anchorReason}`, "kv-muted"));
+    return;
+  }
+  if (!anchor.resolved) {
+    dl.appendChild(kv("block", `not established — ${anchor.reason || "no reason given"}`, "kv-warning"));
+    return;
+  }
+  if (anchor.height === null || anchor.height === undefined) {
+    // Unconfirmed. A mark in the mempool fixes no time at all, and saying
+    // "0 confirmations" without saying what that costs invites the reader to
+    // treat it as a mark that is merely young.
+    dl.appendChild(kv(
+      "block",
+      "none yet — this transaction is unconfirmed, and a mark in the mempool fixes no time. " +
+      "It proves nothing about when until a block carries it.",
+      "kv-warning",
+    ));
+    return;
+  }
+  dl.appendChild(kv("block", `${anchor.height} — ${anchor.confirmations} confirmation(s) deep`));
+  // The caveat is COLLECTED, not appended here: it qualifies the row above and has to
+  // be rendered after the field list, not before it. Printed first it read as a
+  // preamble to a block nobody had been shown yet.
+  caveats.push(`About that block: ${anchor.caveat}. The source is ${anchor.source}.`);
+  caveats.push(`Depth: ${anchor.confirmations} confirmation(s). ${anchor.no_depth_policy}.`);
+}
+
+// The file check. Hashed HERE, in this page, with the algorithm the RECORD names.
+function appendFileCheck(panel, hm) {
+  if (!hm.digest || !hm.algorithm) return;
+  const box = el("div", { class: "filecheck" });
+  box.appendChild(el("h4", { class: "filecheck-title", text: "Do you have the file?" }));
+  box.appendChild(el("p", {
+    class: "filecheck-privacy",
+    text:
+      `Choose a file and this page hashes it with ${hm.algorithm} — the algorithm this ` +
+      `record names — and compares the result with the digest above. ` +
+      // The PROMISE comes from shared.js. Both pages make it, and a promise a reader
+      // relies on before pointing this at a private file must not be two strings.
+      `${FILE_NEVER_LEAVES_THIS_MACHINE} That is the same promise from the other ` +
+      `side that pyrxd mark makes when it publishes one — the digest goes on chain, the ` +
+      `contents do not.`,
+  }));
+  const input = el("input", { class: "filecheck-input" });
+  input.type = "file";
+  input.setAttribute("aria-label", "File to check against this digest");
+  box.appendChild(input);
+  const out = el("div", { class: "filecheck-result" });
+  out.hidden = true;
+  box.appendChild(out);
+  input.addEventListener("change", () => onFileChosen(input, out, hm));
+  panel.appendChild(box);
+}
+
+// The file check's MECHANICS — which hash, the size cap, the secure-context
+// check, the digest, and the comparison — are `hashFileWithRecordAlgorithm` in
+// shared.js, so this page and /verify/ cannot come to disagree about whether a
+// file is the marked one. What is left here is this page's rendering of the
+// answer it gets back.
+function _fileCheckDegrade(out, reason, algorithm) {
+  out.hidden = false;
+  out.replaceChildren(verdictBlock("file", "NOT CHECKED", fileCheckFallback(algorithm), reason));
+}
+
+async function onFileChosen(input, out, hm) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  // The user's own filename, but it can still carry a bidi override that makes the
+  // rendered name differ from the real one. Same treatment as a server string.
+  const name = stripControlChars(file.name || "(unnamed)");
+  out.hidden = false;
+  out.replaceChildren(el("p", { class: "filecheck-status", text: `Hashing ${name}…` }));
+
+  const result = await hashFileWithRecordAlgorithm(file, hm, {
+    fileCheckPlan: pyFileCheckPlan,
+    judgeFileDigest: pyJudgeFileDigest,
+  });
+  if (!result.ok) {
+    _fileCheckDegrade(out, result.reason, result.algorithm);
+    return;
+  }
+
+  // The label is styled uppercase, and a FILENAME is not something to case-fold: it
+  // would show MARKED.TXT for a file called marked.txt, on a page whose whole job is
+  // telling a reader whether two things are the same. The name goes in a value.
+  const block = verdictBlock("file", result.verdict.status, result.verdict.meaning);
+  const dl = el("dl", { class: "kv-list" });
+  dl.appendChild(kv("file", name));
+  dl.appendChild(kv(`${result.algorithm} of your file`, result.computed));
+  dl.appendChild(kv("digest in the record", hm.digest));
+  out.replaceChildren(block, dl);
+}
+
+// The panel itself. Called by BOTH card renderers, from one definition, so the
+// pasted-script view and the fetched-transaction view cannot describe one record
+// two ways.
+function appendMarkVerdict(wrapper, row, opts) {
+  const hm = row && row.hashmark;
+  if (!hm) return;
+  const options = opts || {};
+  const panel = el("section", { class: "mark-panel" });
+
+  if (hm.outcome !== "ok") {
+    // Claims to be a HashMark and is not readable as one. This is a statement
+    // about the BYTES, not about any signature — an unknown version or algorithm
+    // is a record from the future, not a forgery, and must not read as one.
+    panel.appendChild(el("h3", { class: "mark-title", text: "HashMark record — not readable here" }));
+    panel.appendChild(verdictBlock(
+      "record",
+      String(hm.outcome || "").toUpperCase().replace(/_/g, " "),
+      "this is a verdict on the BYTES, not on anyone's signature: nothing here was checked against a key",
+      hm.detail || "",
+    ));
+    const dl = el("dl", { class: "kv-list" });
+    if (hm.version !== null && hm.version !== undefined) dl.appendChild(kv("version", hm.version));
+    if (hm.algorithm_id !== null && hm.algorithm_id !== undefined) {
+      dl.appendChild(kv("algorithm id", `0x${Number(hm.algorithm_id).toString(16).padStart(2, "0")}`));
+    }
+    panel.appendChild(dl);
+    wrapper.appendChild(panel);
+    return;
+  }
+
+  const algoId = hm.algorithm_id === null || hm.algorithm_id === undefined
+    ? "?"
+    : `0x${Number(hm.algorithm_id).toString(16).padStart(2, "0")}`;
+  panel.appendChild(el("h3", {
+    class: "mark-title",
+    text: `HashMark v${hm.version} · ${hm.algorithm} (algorithm id ${algoId})`,
+  }));
+
+  const att = hm.attestation || {};
+  // Sentences that qualify a row. Gathered as the rows are built and rendered AFTER
+  // the field list, so each caveat sits below the fact it is about.
+  const caveats = [];
+  // `status` and `meaning` are the payload's, from the one table in `_inspect_core`.
+  // The fallbacks are for a payload built before those fields existed, and they fail
+  // toward "we do not know" rather than toward either verdict.
+  const status = att.status || "NOT CHECKED";
+  const meaning = att.meaning || "this build could not read the outcome of the signature check";
+  if (hm.signer_hash160) {
+    panel.appendChild(verdictBlock("signature", status, meaning, att.detail || ""));
+    if (status === "VERIFIED" && att.assumed_network) {
+      // The assumption is load-bearing exactly where the verdict is affirmative: the
+      // chain's genesis hash is inside the signed statement, so the same bytes on
+      // another chain are a different statement and recover a different key.
+      caveats.push(
+        `Checked against ${att.assumed_network}. The chain is part of the signed ` +
+        `statement, so the same bytes read against another chain recover a different key.`
+      );
+    }
+  } else {
+    // v1: there is no signature to check, and the absence IS the finding.
+    panel.appendChild(verdictBlock("signature", status, meaning, att.detail || ""));
+  }
+
+  const dl = el("dl", { class: "kv-list mark-fields" });
+  dl.appendChild(kv("digest", hm.digest));
+  if (hm.label) {
+    dl.appendChild(kv("label", hm.label));
+  } else if (hm.label_withheld) {
+    // v1 keeps its timestamp evidence; the label is withheld WITH a reason, because
+    // showing nothing looks like a record that carried no label.
+    dl.appendChild(kv("label", `[withheld — ${hm.label_withheld}]`, "kv-warning"));
+  }
+  if (hm.signer_hash160) {
+    // WHOSE ADDRESS IS THIS? The page used to print `att.signer_address` under the
+    // label "signer address" for EVERY outcome. That field is the key the signature
+    // RECOVERS TO — which, on a forged record, is whatever key the attacker's
+    // signature happens to recover, and it was being labelled as the signer directly
+    // below a line saying the signature does not verify. The CLI never did this: it
+    // prints that address only when the outcome is `valid`, where recovered and
+    // committed are the same value by construction.
+    //
+    // So the two are now told apart by name. The COMMITTED key is what the record
+    // says and is always shown; the RECOVERED key is shown only when it means
+    // something, and when it disagrees it is labelled as the disagreement it is.
+    dl.appendChild(kv(
+      status === "VERIFIED" ? "signer address" : "signer address (committed, unverified here)",
+      hm.committed_signer_address || hm.signer_hash160,
+    ));
+    dl.appendChild(kv("signer hash160", hm.signer_hash160));
+    if (att.recovered_hash160 && att.recovered_hash160 !== hm.signer_hash160) {
+      dl.appendChild(kv(
+        "recovered from the signature",
+        `${att.signer_address || att.recovered_hash160} — NOT the signer this record names`,
+        "kv-warning",
+      ));
+    }
+  }
+  appendAnchor(dl, caveats, options.anchor, options.anchorReason || "no block was looked up for this record");
+  panel.appendChild(dl);
+  for (const text of caveats) panel.appendChild(el("p", { class: "mark-caveat", text }));
+
+  appendFileCheck(panel, hm);
+
+  // LAST, and deliberately after everything a reader might have taken further than
+  // it goes. A verified signature reaches KEY CUSTODY at a block: the key that made
+  // this statement, at that time. Never authorship, never ownership, never location.
+  // FROM shared.js, not from a literal here. This is the sentence that says what a
+  // verified result MEANS, and the public page at /verify/ prints it too — two
+  // copies is how one surface eventually claims more than the other about the same
+  // record.
+  panel.appendChild(el("p", { class: "mark-proves", text: WHAT_A_MARK_PROVES }));
+
+  wrapper.appendChild(panel);
 }
 
 // FOUR verdicts, not two, and ONE definition of them.
@@ -1111,7 +1137,7 @@ function appendRelationshipVerdicts(dl, rels, burnedRefs) {
   }
 }
 
-function renderOutputRow(row) {
+function renderOutputRow(row, opts) {
   const type = String(row.type || "unknown").toLowerCase();
   const wrapper = el("section", { class: "output-row" });
   const head = el("header", { class: "output-row-head" });
@@ -1240,6 +1266,13 @@ function renderOutputRow(row) {
   if (row.delegate_base_ref && type !== "delegate-token" && type !== "delegate-burn") {
     dl.appendChild(kv("delegate_base_ref", row.delegate_base_ref));
   }
+  // THE MARK'S VERDICT, above the field list and on the wrapper. `appendOpReturnPayload`
+  // no longer renders one: both card renderers call this, so there is exactly one element
+  // on screen describing a record and the two surfaces cannot contradict each other.
+  appendMarkVerdict(wrapper, row, {
+    anchor: opts && opts.anchor,
+    anchorReason: (opts && opts.anchorReason) || "no block was looked up for this transaction",
+  });
   wrapper.appendChild(dl);
 
   // The classifier's own caveat for the shapes where naming them is only
@@ -1776,6 +1809,12 @@ function renderScriptCard(payload) {
     "soulbound-covenant": "Soulbound NFT covenant",
     "self-replicating-covenant": "Self-replicating covenant",
     op_return: "OP_RETURN data output",
+    // A HashMark is a READABLE data output, and calling it "OP_RETURN data output"
+    // under an `UNKNOWN` badge sat directly above a panel saying VERIFIED. Two
+    // elements on one card, describing the same output, disagreeing about whether
+    // anything had been understood.
+    "op_return-hashmark-v1": "HashMark record (v1 — a time, and no signer)",
+    "op_return-hashmark-v2": "HashMark record (v2 — signed)",
     unknown: "Unrecognised script",
   };
   // `type` is now `op_return-hashmark-v2` / `op_return-msg` for a recognised
@@ -1914,6 +1953,16 @@ function renderScriptCard(payload) {
     }));
   }
 
+  // A PASTED SCRIPT HAS NO TRANSACTION, so it has no block — not because this page
+  // declined to look, but because there is nothing to look up. HashMark 7.6's
+  // point-in-time form needs the block that carried the mark, so it is unavailable
+  // here by construction. Saying that beats an empty row, which reads as "we did not
+  // bother" and invites the reader to assume it would have been fine.
+  appendMarkVerdict(wrapper, payload, {
+    anchorReason:
+      "a pasted script carries no transaction, so there is no block to place it in. " +
+      "Paste the transaction id instead and this page will fetch one.",
+  });
   wrapper.appendChild(dl);
 
   if (type === "unknown") {
@@ -1962,7 +2011,7 @@ function renderScriptCard(payload) {
 // `.badge-*`). Anything outside this set would emit a class with no rule
 // and render unstyled, so `scriptBadgeKind` maps to the nearest one that
 // exists instead of passing the raw type through.
-const _BADGE_KINDS = new Set(["ft", "nft", "mut", "dmint", "commit", "p2pkh", "unknown"]);
+const _BADGE_KINDS = new Set(["ft", "nft", "mut", "dmint", "commit", "p2pkh", "hashmark", "unknown"]);
 
 // Map a script `type` value (which may include a hyphen, e.g. "commit-ft")
 // to a CSS-safe badge kind. Hyphenated commit variants share the
@@ -1977,6 +2026,9 @@ function scriptBadgeKind(type) {
   // wearing an extra ref opcode; borrow the NFT colour rather than reading as
   // "unknown", which is what the classifier says when it could not tell.
   if (type === "authority-gated-nft" || type === "delegate-token") return "nft";
+  // A HashMark IS recognised — by the same classifier that produced the verdict
+  // beside the badge — so it must not wear the colour that means "could not tell".
+  if (type.startsWith("op_return-hashmark")) return "hashmark";
   // A burn proof is an OP_RETURN refinement, like the message and hashmark
   // variants; a DAT commit is a commit variant.
   if (type === "op_return-burn") return "unknown";
@@ -2036,138 +2088,12 @@ function renderJsonDrawer(result) {
   return details;
 }
 
-// ---------------------------------------------------------------------
-// WebSocket fetch — pulls raw bytes for a txid from the configured
-// ElectrumX server. Returns a Promise<string> of the hex-encoded raw
-// transaction or rejects with an Error on any failure mode.
-//
-// Wire protocol: ElectrumX uses JSON-RPC 2.0 over WebSocket with
-// newline-delimited frames. We send one request, await the matching
-// response by id, and close. No long-lived connection — this is a
-// "fetch and forget" pattern, simpler than maintaining the kind of
-// reader loop the Python ElectrumXClient uses.
-// ---------------------------------------------------------------------
-
-function fetchRawTxFromElectrumx(txid) {
-  return new Promise((resolve, reject) => {
-    let ws;
-    try {
-      ws = new WebSocket(ELECTRUMX_WSS_URL);
-    } catch (err) {
-      reject(new Error(`could not open WebSocket: ${err.message || err}`));
-      return;
-    }
-
-    let settled = false;
-    let timer = null;
-    const settle = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) clearTimeout(timer);
-      try { ws.close(); } catch { /* already closed */ }
-      fn(value);
-    };
-
-    timer = setTimeout(() => {
-      settle(reject, new Error(`timed out after ${FETCH_TIMEOUT_MS}ms`));
-    }, FETCH_TIMEOUT_MS);
-
-    ws.addEventListener("open", () => {
-      const req = JSON.stringify({
-        id: 1,
-        method: "blockchain.transaction.get",
-        params: [txid, false],
-      });
-      // ElectrumX expects newline-terminated frames.
-      ws.send(req + "\n");
-    });
-
-    ws.addEventListener("message", (ev) => {
-      // Cap raw frame size BEFORE JSON.parse so a hostile server
-      // can't make us allocate a multi-GB string in the parser. The
-      // hex cap below is a downstream sanity check on the parsed
-      // result; this one is the actual memory guard.
-      const data = typeof ev.data === "string" ? ev.data : "";
-      if (data.length > MAX_FETCHED_TX_HEX_LEN + 4096) {
-        settle(reject, new Error(
-          `frame is ${data.length.toLocaleString()} chars; over the hex cap`
-        ));
-        return;
-      }
-
-      // NOTE: do not clearTimeout here. Mismatched-id frames are
-      // silently discarded (see below), so we must keep the timer
-      // armed until we actually settle. settle() clears the timer.
-      let frame;
-      try {
-        frame = JSON.parse(data);
-      } catch (err) {
-        // err.message is a V8 SyntaxError that echoes a slice of the
-        // unparsed frame verbatim — attacker-controlled up to ~20 chars.
-        // Sanitise it the same way frame.error below is sanitised: this
-        // path has strictly fewer preconditions to reach (no id===1
-        // match needed), so it must not be the unguarded sibling.
-        settle(reject, new Error(
-          `server returned non-JSON: ${stripControlChars(err.message)}`
-        ));
-        return;
-      }
-      if (frame.id !== 1) {
-        // Unexpected id — discard and keep waiting (cheap defence
-        // against a server that buffers other clients' responses).
-        // The 10s timer keeps running, so an attacker drip-feeding
-        // mismatched-id frames cannot hold the connection forever.
-        return;
-      }
-      if (frame.error) {
-        const rawMsg = (frame.error && frame.error.message) || JSON.stringify(frame.error);
-        settle(reject, new Error(`server error: ${stripControlChars(rawMsg)}`));
-        return;
-      }
-      const result = frame.result;
-      if (typeof result !== "string") {
-        settle(reject, new Error("server returned non-string result"));
-        return;
-      }
-      if (result.length > MAX_FETCHED_TX_HEX_LEN) {
-        settle(reject, new Error(
-          `response is ${result.length.toLocaleString()} chars; cap is ` +
-          `${MAX_FETCHED_TX_HEX_LEN.toLocaleString()}`
-        ));
-        return;
-      }
-      // Light hex sanity check — Python side does the real validation.
-      if (!/^[0-9a-fA-F]*$/.test(result)) {
-        settle(reject, new Error("server returned a non-hex string"));
-        return;
-      }
-      settle(resolve, result);
-    });
-
-    ws.addEventListener("error", () => {
-      settle(reject, new Error("WebSocket error connecting to ElectrumX"));
-    });
-
-    ws.addEventListener("close", () => {
-      settle(reject, new Error("WebSocket closed before any response"));
-    });
-  });
-}
-
-// Strip control / format codepoints from server-supplied strings
-// before they reach the DOM. textContent makes XSS impossible, but
-// a hostile ElectrumX server could still embed bidi overrides or
-// zero-width characters into an error message that would render
-// visually misleading text inside the error card. Mirrors the
-// Python side's _sanitize_display_string for messages that don't
-// cross the bridge.
-function stripControlChars(s) {
-  if (typeof s !== "string") return String(s);
-  // \p{C} = control + format + surrogate + private + unassigned.
-  // \p{M} = combining marks. Both trimmed for parity with the
-  // Python side's category list.
-  return s.replace(/[\p{C}\p{M}]/gu, "?");
-}
+// `electrumxRpc`, `fetchRawTxFromElectrumx`, `resolveMarkAnchor` and
+// `stripControlChars` live in shared.js. The socket loop carries four guards a
+// second copy would eventually be missing one of — a frame cap before JSON.parse,
+// a mismatched-id frame discarded without disarming the timeout, a sanitised
+// server error string, and a hard timeout — and the public /verify/ page makes
+// exactly the same three calls over it.
 
 async function onFetchTxid(txid, fetchBtn, statusEl) {
   if (!pyGlueFetch) {
@@ -2239,6 +2165,15 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
       hint: "",
     });
     return;
+  }
+
+  // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole
+  // claim is "no later than the block that confirms this", so the block is not
+  // decoration — but it costs two more round trips, and an ordinary transfer has
+  // nothing to gain from them.
+  if (carriesAMark(result)) {
+    statusEl.textContent = "placing the mark in a block…";
+    result.payload.mark_anchor = await resolveMarkAnchor(pyMarkAnchor, txid);
   }
 
   renderResult(result);

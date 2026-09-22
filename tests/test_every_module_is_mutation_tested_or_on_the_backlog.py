@@ -57,6 +57,15 @@ _OUT_OF_SCOPE_PREFIXES = (
 _OUT_OF_SCOPE_MODULES = {
     "__main__": "`python -m pyrxd` entry point",
     "devnet": "local dev helper, never on a value path",
+    # A pure re-export of `security/json_guards`, which IS mutation-tested in the
+    # `network` group. There is no behaviour here to mutate: five import bindings and
+    # an `__all__`. The reason is not prose anyone has to keep believing —
+    # `tests/web/test_mark_anchor_bridge.py::
+    # TestTheAnchorIsReachableFromTheBrowser::test_the_old_location_re_exports_rather_
+    # than_redefines` asserts each name is the SAME OBJECT as the one in the real
+    # module, so the day this file grows a second definition that test fails and this
+    # entry stops being true out loud.
+    "network/_guards": "pure re-export of security/json_guards, which is mutated in the network group",
 }
 
 #: The backlog, not an exemption list. See the module docstring. MAY SHRINK, MUST NOT GROW.
