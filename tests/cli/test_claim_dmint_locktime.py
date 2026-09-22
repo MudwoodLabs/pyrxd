@@ -339,7 +339,7 @@ class TestTheDefaultClaimNeverWritesTargetOne:
         _patch_claim(monkeypatch, contract, grinds)
         return CliRunner().invoke(cli, _claim_args(tmp_path / "w.dat", *self._EPOCH)), grinds, net
 
-    def test_a_contract_last_time_ahead_of_the_local_clock_is_refused_not_mined_to_target_1(
+    def test_a_last_time_later_than_the_default_locktime_is_refused_not_mined_to_target_1(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         result, grinds, net = self._run(
