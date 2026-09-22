@@ -236,7 +236,11 @@ async function lookUp(text, token) {
   setFormStatus("Reading the record…");
   let result;
   try {
-    result = fromPy(pyFetch(txid, rawHex));
+    // THE PANEL LIMIT IS ALSO THE CHECKING LIMIT. The classifier checks the signatures of the
+    // first MAX_MARK_PANELS records only (and of any later byte-for-byte copy of one of them,
+    // which costs nothing), so a transaction of thousands of signed records costs this tab no
+    // more curve work than the page draws. One number, passed here, so the two cannot drift.
+    result = fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS));
   } catch (err) {
     return bridgeError(err);
   }
@@ -533,16 +537,66 @@ function renderReport(result) {
     }));
   });
   if (hidden > 0) {
-    wrap.appendChild(para(
-      `${hidden} more ${hidden === 1 ? "mark is" : "marks are"} in this transaction and ` +
-      `${hidden === 1 ? "is" : "are"} not shown here, so nothing on this page says anything ` +
-      `about ${hidden === 1 ? "it" : "them"} — a mark that does not verify could be among ` +
-      "them. `pyrxd verify <transaction number>` in a terminal checks every mark in the " +
-      "transaction.",
-      "answer-body multi-note",
-    ));
+    for (const line of hiddenMarksNote(records.slice(shown.length), payload.txid)) {
+      wrap.appendChild(para(line, "answer-body multi-note"));
+    }
   }
   return wrap;
+}
+
+// What this page can truthfully say about the marks it did not draw — EXACT counts, taken
+// from what the classifier actually did to each one, never inferred from the position.
+//
+// Past MAX_MARK_PANELS a signature is not checked, UNLESS the record is a byte-for-byte copy
+// of one that was (an attestation is a function of the bytes, so the copy's answer is known
+// and cost nothing). So "not shown" and "not checked" are different counts, and a forged
+// record past the limit is reported as NOT CHECKED — never folded into a total that reads as
+// clean. Worst first, in the page's own status words.
+function hiddenMarksNote(hiddenRecords, txid) {
+  const n = hiddenRecords.length;
+  const tally = new Map();
+  for (const entry of hiddenRecords) {
+    const word = hiddenStatus(entry.hashmark || {});
+    tally.set(word, (tally.get(word) || 0) + 1);
+  }
+  const order = [
+    "DOES NOT VERIFY", RECORD_DOES_NOT_DECODE, NOT_CHECKED_HERE_WORDS, "NOT CHECKED", "NO SIGNATURE", "VERIFIED",
+  ];
+  const parts = order.filter((w) => tally.has(w)).map((w) => `${tally.get(w)} ${w}`);
+  for (const [w, count] of tally) if (!order.includes(w)) parts.push(`${count} ${w}`);
+
+  const lines = [
+    `${n} more ${n === 1 ? "mark is" : "marks are"} in this transaction and ${n === 1 ? "is" : "are"} ` +
+    `not shown here. What this page knows about ${n === 1 ? "it" : "them"}: ${parts.join(", ")}.`,
+  ];
+  const unchecked = tally.get(NOT_CHECKED_HERE_WORDS) || 0;
+  if (unchecked > 0) {
+    lines.push(
+      `This page checks the signatures of the first ${MAX_MARK_PANELS} marks in a transaction, and of ` +
+      "any later mark that is a byte-for-byte copy of one of them. The " +
+      `${unchecked === 1 ? "one" : unchecked} ${NOT_CHECKED_HERE_WORDS} ${unchecked === 1 ? "was" : "were"} ` +
+      "past that, so nothing here says whether " + (unchecked === 1 ? "it verifies" : "they verify") +
+      " — a mark that does not verify could be among them.",
+    );
+  }
+  // THE WHOLE COMMAND, not a placeholder that the CLI then refuses. `pyrxd verify` has no
+  // default depth, on purpose, so the one thing a reader must supply is N — and what it means.
+  lines.push(
+    `To check every mark in it: pyrxd verify ${safeText(txid || "<transaction number>")} ` +
+    "--min-confirmations N — where N is how many blocks must be built on top of the mark's " +
+    "block before you rely on it. The command deliberately has no default for N.",
+  );
+  return lines;
+}
+
+// How the hidden-records note names one record, in the same words its panel would use.
+const NOT_CHECKED_HERE_WORDS = "not checked here";
+function hiddenStatus(hm) {
+  if (hm.outcome === "invalid") return RECORD_DOES_NOT_DECODE;
+  if (hm.outcome !== "ok") return "NOT CHECKED";
+  const att = hm.attestation || {};
+  if (att.outcome === "not_checked_here") return NOT_CHECKED_HERE_WORDS;
+  return att.status || "NOT CHECKED";
 }
 
 // Why there is no block to report, when there is none. NEVER SILENCE: a record with
@@ -746,9 +800,14 @@ function answerWhoSigned(hm, att, status) {
       "key made this statement.",
     ));
     sec.appendChild(para(
-      "That is key custody and nothing more. It does not say they wrote the file, own " +
-      "it, or were first to it — only that the holder of this key vouched for this " +
-      "fingerprint.",
+      // NOT "key custody". What a verified signature shows is that the key had signed this —
+      // NOT that its holder put it in this transaction: the signed statement does not bind the
+      // transaction, so a genuine record can be copied into anyone's. Same meaning as
+      // `pyrxd verify` prints.
+      "That is all it shows. It does not show that they put this mark here — a signed record " +
+      "can be copied, byte for byte, into anyone's transaction — and it does not say they " +
+      "wrote the file, own it, or were first to it: only that the holder of this key vouched " +
+      "for this fingerprint.",
       "answer-body muted",
     ));
   } else if (status === "DOES NOT VERIFY") {
@@ -769,6 +828,17 @@ function answerWhoSigned(hm, att, status) {
         "answer-body muted",
       ));
     }
+  } else if (att.outcome === "not_checked_here") {
+    // Not checked BY CHOICE, to bound the work: this record is past the number this page checks
+    // per transaction. Not the curve failing to load, which is what the branch below says — so
+    // it gets its own sentence. Unreachable while the panel limit and the checking limit are the
+    // one number `lookUp` passes, and kept true for the day they are not.
+    sec.appendChild(para(
+      "The record names a key. Whether the signature really comes from that key was NOT " +
+      "checked here: this page checks a limited number of marks per transaction, and this one " +
+      "is past that limit. It is not evidence either way. `pyrxd verify` in a terminal checks " +
+      "every mark.",
+    ));
   } else {
     // NOT CHECKED — and this is no longer the ordinary path. The page installs a
     // curve at boot and normally reaches a real verdict; landing here means that

@@ -513,7 +513,8 @@ def _judge_file_digest(expected_hex: str | None, computed_hex: str, *, algorithm
     ``meaning`` is the weaker sentence on purpose. A digest match says the bytes in
     front of you are the bytes the record commits to — it says nothing whatever about
     who wrote them, who owned them, or whether the signer had ever seen them. That
-    claim belongs to the signature, and even the signature only reaches key custody.
+    claim belongs to the signature, and even the signature only reaches "this key had signed it by
+    then" — not that its holder put it in that transaction.
     """
     name = algorithm or "the record's algorithm"
     if not isinstance(expected_hex, str) or not expected_hex:
@@ -566,8 +567,42 @@ def _judge_file_digest(expected_hex: str | None, computed_hex: str, *, algorithm
     }
 
 
-def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
-    """Classify a single hex-encoded locking script. Returns a flat dict."""
+#: The attestation outcome for a record whose signature was deliberately NOT checked, to bound
+#: the work one transaction can demand. NOT an :class:`AttestationOutcome`: nothing about the
+#: record decided it. It is the READER declining, so — like ``unverifiable`` — it is worded as
+#: "not checked here" and never as a verdict on the record.
+ATTESTATION_NOT_CHECKED_HERE = "not_checked_here"
+
+
+def _attestation_not_checked_here(network: str) -> dict:
+    # Function-local, like the attestation step's own import: the Pyodide import budget covers
+    # what `pyrxd.glyph.inspect` loads at module import.
+    from ..constants import genesis_hash_for
+
+    status = _attestation_verdict("unverifiable")[0]  # the shared word for "not checked", not a new one
+    return {
+        "outcome": ATTESTATION_NOT_CHECKED_HERE,
+        "status": status,
+        "meaning": (
+            "not checked here: only a limited number of records per transaction are checked, and "
+            "this one is past that limit. It is not a verdict on the record"
+        ),
+        "recovered_hash160": None,
+        "signer_address": None,
+        "assumed_network": f"radiant-{network if genesis_hash_for(network) else 'mainnet'}",
+        "detail": "",
+    }
+
+
+def _inspect_script(script_hex: str, *, network: str = "mainnet", attest: bool = True) -> dict:
+    """Classify a single hex-encoded locking script. Returns a flat dict.
+
+    ``attest=False`` decodes a HashMark record in full and SKIPS only its signature check, marking
+    a signed record :data:`ATTESTATION_NOT_CHECKED_HERE` (a v1 record has no signature, and its
+    NO SIGNATURE answer is free, so it is still given). Decoding is cheap; the check is a curve
+    recovery, and in the browser that is JavaScript on the page's main thread. See
+    :func:`_classify_raw_tx`'s ``attest_hashmark_limit``.
+    """
     from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
 
@@ -742,6 +777,11 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 # the code did not make, which is worse than the hardcoding this
                 # replaces: the reader could not tell the verdict was against a
                 # different chain.
+                # Skipped only where there is a SIGNATURE to check. A v1 record carries none, and
+                # its answer (NO SIGNATURE) costs nothing, so it is always given.
+                if not attest and mark.signer_hash160_hex:
+                    out["hashmark"]["attestation"] = _attestation_not_checked_here(network)
+                    return out
                 genesis = genesis_hash_for(network)
                 assumed = network if genesis else "mainnet"
                 att = verify_attestation(mark, network_genesis=genesis or RADIANT_MAINNET_GENESIS)
@@ -1218,6 +1258,7 @@ def _classify_raw_tx(
     network: str = "mainnet",
     delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
     spent_scripts: Mapping[int, bytes] | None = None,
+    attest_hashmark_limit: int | None = None,
 ) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
@@ -1252,8 +1293,34 @@ def _classify_raw_tx(
     :param raw: pre-fetched raw transaction bytes (NOT hex).
     :param only_vout: if not None, restrict the outputs list to a single
         vout — used by the ``--resolve`` outpoint flow.
+    :param attest_hashmark_limit: check the signatures of the first N HashMark records only;
+        later ones are decoded and marked :data:`ATTESTATION_NOT_CHECKED_HERE`. ``None`` (the
+        default, and what every CLI path passes) checks every record.
+
+    THE WORK ONE TRANSACTION CAN DEMAND IS BOUNDED HERE, not only what gets drawn. Nothing
+    limits how many HashMark outputs a transaction carries — about 26,000 signed records fit
+    under the 4 MB cap — and every one cost a curve recovery before a page could draw anything,
+    which in the browser is JavaScript on the main thread. A caller that renders a bounded number
+    of records passes that number, and pays for no more checks than it shows.
+
+    BYTE-IDENTICAL RECORDS SHARE ONE CHECK, with or without a limit. An attestation is a function
+    of the record's bytes and the network, both fixed here, so a copy of a record already checked
+    gets that record's answer (its own copy of it) without a second recovery. That is exact, not
+    an approximation, and it is what lets a limited caller still say something true about copies
+    past its limit.
     """
+    import copy
+
     from .inspector import GlyphInspector
+
+    if attest_hashmark_limit is not None and (
+        isinstance(attest_hashmark_limit, bool)
+        or not isinstance(attest_hashmark_limit, int)
+        or attest_hashmark_limit < 0
+    ):
+        raise ValidationError(
+            f"attest_hashmark_limit must be a non-negative int or None, got {attest_hashmark_limit!r}"
+        )
 
     txid = Txid(txid_hex.lower())  # raises ValidationError on bad shape
 
@@ -1289,10 +1356,22 @@ def _classify_raw_tx(
             raise ValidationError(f"vout {only_vout} is out of range (transaction has {len(tx.outputs)} output(s))")
         enumerated = [(only_vout, tx.outputs[only_vout])]
 
+    checked: dict[bytes, dict] = {}  # record bytes -> the attestation computed for them
+    hashmark_rows = 0
     for idx, out in enumerated:
         try:
-            script_bytes = out.locking_script.serialize()
-            row = _inspect_script(script_bytes.hex(), network=network)
+            script_bytes = bytes(out.locking_script.serialize())
+            known = checked.get(script_bytes)
+            within = attest_hashmark_limit is None or hashmark_rows < attest_hashmark_limit
+            row = _inspect_script(script_bytes.hex(), network=network, attest=within and known is None)
+            hm = row.get("hashmark")
+            if hm is not None:
+                hashmark_rows += 1
+                att = hm.get("attestation")
+                if att is not None and known is not None:
+                    hm["attestation"] = copy.deepcopy(known)
+                elif att is not None and att.get("outcome") != ATTESTATION_NOT_CHECKED_HERE:
+                    checked[script_bytes] = copy.deepcopy(att)
             row.pop("form", None)  # always "script" — redundant inside a tx listing
             row["vout"] = idx
             row["satoshis"] = out.satoshis

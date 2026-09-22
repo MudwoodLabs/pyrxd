@@ -699,9 +699,10 @@ function verdictClass(status) {
 // and nothing at all about whether the marked content is true.
 const WHAT_A_MARK_PROVES =
   "What a mark proves: someone knew this digest no later than the block that " +
-  "confirms it. A verified signature adds that the holder of that key made the " +
-  "statement — key custody, nothing more. It is not authorship, not ownership, " +
-  "not originality, not location, and says nothing about whether the contents are true.";
+  "confirms it. A verified signature adds that the key had signed it by then — not " +
+  "that the key's holder put it in that block: a signed record can be copied into " +
+  "anyone's transaction. It is not authorship, not ownership, not originality, not " +
+  "location, and says nothing about whether the contents are true.";
 
 // A PROMISE, which is the other kind of prose that must not drift between surfaces:
 // it is the sentence a reader relies on when deciding whether to point this page at
