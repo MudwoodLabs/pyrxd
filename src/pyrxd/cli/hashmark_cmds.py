@@ -465,26 +465,38 @@ def _digest_expectation(
         raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
 
 
-def judge_digest_match(record: dict, expected_hex: str | None, *, source: str, absent_reason: str = "") -> dict:
+def judge_digest_match(
+    record: dict, expected_hex: str | None, *, source: str, asked: bool, absent_reason: str = ""
+) -> dict:
     """Does this record commit to *expected_hex*? Pure, and never guesses.
 
-    Three outcomes, kept distinct because two of them are routinely conflated into the third:
+    Four outcomes, kept distinct because two of them are routinely conflated into the third:
 
     * ``MATCHES`` — the digests are equal. What that is worth is the caller's to render, and
-      it is LESS than it sounds: it says whoever signed knew this file's digest by the block
-      that confirmed the mark. Not that they wrote it, own it, or were first to it.
+      it is LESS than it sounds: it says someone knew this file's digest by the block that
+      confirmed the mark — the signer, if the record is signed and verifies. Not that they wrote
+      it, own it, or were first to it.
     * ``DOES NOT MATCH`` — the digests are both present and differ. A definite, checkable fact
       about the bytes in hand. A width difference lands here too, with its own reason: a 20-byte
       digest is not the 32-byte digest this record commits to, whatever produced it.
-    * ``NOT CHECKED`` — there was nothing to compare, or the record carries no digest. Reported
-      with the reason, never as a mismatch.
+    * ``NOT CHECKED`` — nothing was asked: no ``--file`` and no ``--digest``. Holds.
+    * ``CANNOT COMPARE`` — something WAS asked and there is nothing to compare it with: the
+      record is one this build cannot read, or no digest could be computed from the file. Never
+      a mismatch — it accuses nobody — but it FAILS the verdict, for the same reason an
+      unanswered ``--wave-name`` does. It used to be reported as ``NOT CHECKED``, which holds,
+      so ``verify <txid> --file ANYTHING`` exited 0 on a transaction whose only record had an
+      unknown version: the question was asked and never answered.
+
+    ``asked`` has NO DEFAULT on purpose. A default of ``False`` would hand every caller that
+    forgot it the passing state; and a non-``None`` *expected_hex* is itself proof something was
+    asked, so that case is ``CANNOT COMPARE`` whatever ``asked`` says.
     """
     have = (record.get("digest") or "").lower()
     if expected_hex is None:
-        return {"state": "NOT CHECKED", "reason": absent_reason, "source": source}
+        return {"state": "CANNOT COMPARE" if asked else "NOT CHECKED", "reason": absent_reason, "source": source}
     if record.get("outcome") != "ok" or not have:
         return {
-            "state": "NOT CHECKED",
+            "state": "CANNOT COMPARE",
             "reason": f"this record does not decode ({record.get('outcome')}), so it commits to no digest",
             "source": source,
             "expected": expected_hex,
@@ -511,13 +523,21 @@ def judge_digest_match(record: dict, expected_hex: str | None, *, source: str, a
     }
 
 
-def _signature_check(records: list[dict]) -> tuple[str, str]:
-    """The signature state ACROSS every record, and why.
+def _signature_check(record: dict) -> tuple[str, str]:
+    """The signature state of ONE record, and why.
 
-    Refusals are taken from ANY record; affirmations need at least one. Both directions are
-    the conservative one: a transaction carrying a forged mark is not made trustworthy by
-    also carrying a good one, and a single verified record is enough to say a verified record
-    is here. In practice a mark transaction carries exactly one.
+    ONE record, not a list, and that is the fix rather than a style choice. This used to take
+    every record in the transaction and affirm VERIFIED if ANY record verified — while
+    ``_digest_check`` affirmed MATCHES if any record matched and ``_name_check`` affirmed
+    ESTABLISHED if any record's name did. Three independent "any"s make a verdict true of no
+    single record: a victim's genuine v2 record copied verbatim beside an unsigned v1 record
+    over someone else's file printed VERIFIED + MATCHES + ESTABLISHED and exited 0. (The v2
+    statement binds network, algorithm, digest, label and version — NOT the transaction — so
+    anyone can copy one.) Taking a single record makes that composition unrepresentable here;
+    :func:`_record_checks` is where the three are combined, and only for one record.
+
+    The "a forged record anywhere fails the transaction" rule is kept, in
+    :func:`_tx_refusal`, which calls this once per record.
     """
     # THE STATUS WORDS ARE LITERALS HERE ON PURPOSE, and they are not free-floating.
     # `_inspect_core._ATTESTATION_VERDICTS` is the one definition of what each
@@ -531,76 +551,66 @@ def _signature_check(records: list[dict]) -> tuple[str, str]:
     # constants, and routing them through a call made the set invisible — the guard then
     # correctly reported that `_CHECK_HOLDS` named states nothing emits. Keeping the
     # literals keeps that derivation working; the pin keeps them true.
-    outcomes = [(r.get("attestation") or {}).get("outcome") for r in records]
-    if any(r.get("outcome") == "invalid" for r in records):
-        detail = next(r.get("detail") for r in records if r.get("outcome") == "invalid")
+    att = record.get("attestation") or {}
+    outcome = att.get("outcome")
+    if record.get("outcome") == "invalid":
         return "RECORD DOES NOT DECODE", _sanitize_display_string(
-            str(detail or "the bytes claim HashMark and are broken")
+            str(record.get("detail") or "the bytes claim HashMark and are broken")
         )
-    if "invalid_signature" in outcomes:
-        detail = next(
-            (r.get("attestation") or {}).get("detail")
-            for r in records
-            if (r.get("attestation") or {}).get("outcome") == "invalid_signature"
-        )
+    if outcome == "invalid_signature":
         return "DOES NOT VERIFY", _sanitize_display_string(
-            str(detail or "the recovered key is not the committed signer")
+            str(att.get("detail") or "the recovered key is not the committed signer")
         )
-    if "unverifiable" in outcomes:
-        detail = next(
-            (r.get("attestation") or {}).get("detail")
-            for r in records
-            if (r.get("attestation") or {}).get("outcome") == "unverifiable"
-        )
+    if outcome == "unverifiable":
         # A MISSING CAPABILITY ON THIS MACHINE, not a verdict on the record. Getting this
         # backwards accuses an honest signer, so it holds and says exactly what is absent.
-        return "NOT CHECKED", _sanitize_display_string(str(detail or "no curve library available here"))
-    if "valid" in outcomes:
+        return "NOT CHECKED", _sanitize_display_string(str(att.get("detail") or "no curve library available here"))
+    if outcome == "valid":
         return "VERIFIED", "the signature recovers to the hash160 committed in the record"
-    if any(r.get("outcome") == "ok" and not r.get("signer_hash160") for r in records):
+    if record.get("outcome") == "ok" and not record.get("signer_hash160"):
         return "NO SIGNATURE", "a v1 record carries no signer and makes no signature claim"
-    return "NOT CHECKED", "no record here carries a signature this tool reads"
+    return "NOT CHECKED", "this record carries no signature this tool reads"
 
 
-def _digest_check(records: list[dict]) -> tuple[str, str]:
-    """MATCHES if the expectation equals the digest of at least one record; the reason otherwise."""
-    verdicts = [r.get("digest_match") or {} for r in records]
-    states = [v.get("state") for v in verdicts]
-    if "MATCHES" in states:
-        return "MATCHES", next(
-            f"equals the digest in record {i}" for i, v in enumerate(verdicts) if v.get("state") == "MATCHES"
-        )
-    if "DOES NOT MATCH" in states:
-        return "DOES NOT MATCH", next(v.get("reason") or "" for v in verdicts if v.get("state") == "DOES NOT MATCH")
-    return "NOT CHECKED", next((v.get("reason") or "" for v in verdicts), "there are no records to compare against")
+def _digest_check(record: dict) -> tuple[str, str]:
+    """Whether the file or digest the caller supplied is the one THIS record commits to.
+
+    One record: a MATCHES taken from any record in the transaction is how an unsigned v1 record
+    over one file lent its MATCHES to a signed record that commits to a different one.
+    """
+    verdict = record.get("digest_match") or {}
+    state = verdict.get("state")
+    if state == "MATCHES":
+        return "MATCHES", "equals the digest in this record"
+    if state == "DOES NOT MATCH":
+        return "DOES NOT MATCH", verdict.get("reason") or ""
+    if state == "CANNOT COMPARE":
+        return "CANNOT COMPARE", verdict.get("reason") or ""
+    return "NOT CHECKED", verdict.get("reason") or "no --file or --digest was given"
 
 
-def _name_check(records: list[dict], *, asked: bool) -> tuple[str, str]:
-    """ESTABLISHED only for a form-2 verdict whose target at that height IS the signing key.
+def _name_check(record: dict, *, asked: bool) -> tuple[str, str]:
+    """ESTABLISHED only for a form-2 verdict whose target at that height is THIS record's signing key.
 
-    FAIL-CLOSED on a degrade. The shipped single-endpoint config cannot reach form 2, so
-    `--wave-name` on it lands here — correctly: the question was asked and not answered, and a
-    gate that passes on "not answered" is the quiet direction this codebase keeps finding.
+    FAIL-CLOSED on a degrade. With ONE configured endpoint (``--electrumx URL``,
+    ``PYRXD_ELECTRUMX``, or a config naming a single server) form 2 is unreachable, so
+    `--wave-name` lands here — correctly: the question was asked and not answered, and a gate
+    that passes on "not answered" is the quiet direction this codebase keeps finding. That is
+    NOT the shipped mainnet default: ``network/registry.py`` ships two independent endpoints, so
+    form 2 — and ESTABLISHED — is reachable with no configuration at all.
     """
     if not asked:
         return "NOT CHECKED", "--wave-name was not given"
-    for r in records:
-        nam = r.get("name_at_mark") or {}
-        if nam.get("form") == 2 and nam.get("signer_is_target_at_height") is True:
-            return "ESTABLISHED", f"{nam.get('name')} pointed at the signing key at block {nam.get('height')}"
-    for r in records:
-        nam = r.get("name_at_mark") or {}
-        if nam.get("form") == 2:
-            return (
-                "NOT THE SIGNER",
-                f"{nam.get('name')} pointed at {nam.get('target_at_height')}, which is not the signing key",
-            )
-    reasons = [
-        (r.get("name_at_mark") or {}).get("degraded_reason") or (r.get("name_at_mark") or {}).get("reason")
-        for r in records
-    ]
+    nam = record.get("name_at_mark") or {}
+    if nam.get("form") == 2 and nam.get("signer_is_target_at_height") is True:
+        return "ESTABLISHED", f"{nam.get('name')} pointed at the signing key at block {nam.get('height')}"
+    if nam.get("form") == 2:
+        return (
+            "NOT THE SIGNER",
+            f"{nam.get('name')} pointed at {nam.get('target_at_height')}, which is not the signing key",
+        )
     return "NOT ESTABLISHED", _sanitize_display_string(
-        str(next((x for x in reasons if x), "no name verdict was produced"))
+        str(nam.get("degraded_reason") or nam.get("reason") or "no name verdict was produced")
     )
 
 
@@ -631,15 +641,20 @@ def _digest_match_lines(dm: dict | None, indent: str = "  ") -> list[str]:
     if not dm:
         return []
     state = dm.get("state")
-    if state == "NOT CHECKED":
+    if state in ("NOT CHECKED", "CANNOT COMPARE"):
+        # Both are inabilities, never accusations. CANNOT COMPARE needs its own branch here or it
+        # falls through to the DOES NOT MATCH rendering below — a mismatch nobody measured.
         reason = dm.get("reason") or ""
-        return [f"{indent}file/digest: NOT CHECKED" + (f" — {_truncate_for_human(str(reason))}" if reason else "")]
+        return [f"{indent}file/digest: {state}" + (f" — {_truncate_for_human(str(reason))}" if reason else "")]
     if state == "MATCHES":
         return [
             f"{indent}file/digest: MATCHES — the {dm.get('algorithm')} you supplied IS the digest in this record",
             f"{indent}  {dm.get('expected')}",
-            f"{indent}  (so whoever signed knew THIS content's digest by the block above. Not that",
-            f"{indent}   they wrote it, own it, were first to it, or that its contents are true)",
+            # "someone", not "whoever signed": a v1 record has no signer, and in a transaction
+            # of several records this line sits under whichever record matched.
+            f"{indent}  (so someone knew THIS content's digest by the block above — the signer, if this",
+            f"{indent}   record is signed and verifies. Not that they wrote it, own it, were first to",
+            f"{indent}   it, or that its contents are true)",
         ]
     return [
         f"{indent}file/digest: DOES NOT MATCH — this is not what the record commits to",
@@ -664,6 +679,7 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
         f"  network:      {payload['network']}",
         "",
         "  VERDICT" + (" — holds" if payload["verdict_holds"] else " — DOES NOT HOLD"),
+        f"    record:     {'vout ' + str(payload['verdict_record']['vout']):<22} {_verdict_record_about(payload)}",
         f"    signature:  {checks['signature']['state']:<22} {_truncate_for_human(checks['signature']['reason'])}",
         f"    file:       {checks['digest']['state']:<22} {_truncate_for_human(checks['digest']['reason'])}",
         f"    name:       {checks['name']['state']:<22} {_truncate_for_human(checks['name']['reason'])}",
@@ -678,14 +694,114 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
         lines.extend(_op_return_payload_lines(row, indent="    "))
         lines.extend(_digest_match_lines(hm.get("digest_match"), indent="    "))
         lines.append("")
-    lines.append("  WHAT A MARK IS. A signature over a digest, published in a block. It establishes")
-    lines.append("  KEY CUSTODY AT THAT BLOCK — that the holder of that key knew that digest by then.")
-    lines.append("  It is not authorship, not ownership, not originality, not location, and not a")
-    lines.append("  statement that the marked content is true.")
+    # THE WEAKER SENTENCE, because it is the true one. This said "KEY CUSTODY AT THAT BLOCK", and
+    # a signed record supports less than that: the statement does not bind the transaction, so
+    # anyone can copy a genuine record into a transaction of their own, in a later block. What
+    # survives the copy is that the key had signed this digest by the block that carries it.
+    lines.append("  WHAT A MARK IS. A digest published in a block, usually with a signature over it.")
+    lines.append("  It establishes that the digest was known by that block and, if the signature")
+    lines.append("  verifies, that the key had signed it by then — NOT that the key's holder put it")
+    lines.append("  here: a signed record can be copied into anyone's transaction. It is not")
+    lines.append("  authorship, not ownership, not originality, not location, and not a statement")
+    lines.append("  that the marked content is true.")
     return lines
 
 
-def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int) -> dict:
+def _verdict_record_about(payload: dict) -> str:
+    """Which record the summary lines describe, in words — and when one of them does not.
+
+    Every summary line must be true of ONE record, and the reader has to be told which. The one
+    line that can come from elsewhere is the signature line, when another record is broken or
+    forged: that fails the whole transaction, and saying "all about THIS one" over it would put
+    two records' facts under one heading, which is the defect this line exists to prevent.
+    """
+    rec = payload["verdict_record"]
+    n = rec["records_in_tx"]
+    refused = rec.get("refusal_vout")
+    if n == 1:
+        return "the only HashMark record in this transaction"
+    if refused is not None and refused != rec["vout"]:
+        return (
+            f"one of {n} HashMark records; file and name are about THIS one, and the signature line is "
+            f"about the record at vout {refused}, because a broken or forged record anywhere fails the "
+            "whole transaction"
+        )
+    if rec["all_record_checks_hold"]:
+        return f"one of {n} HashMark records here; signature, file and name below are all about THIS one"
+    return (
+        f"of the {n} HashMark records here, none passes every check on its own; this is the closest, "
+        "and each record is shown separately below"
+    )
+
+
+def _as_check(state_reason: tuple[str, str]) -> dict:
+    state, reason = state_reason
+    return {"state": state, "reason": reason}
+
+
+def _record_checks(hm: dict, *, name_asked: bool) -> dict[str, dict]:
+    """The three checks that are facts about ONE record, each computed from that record ALONE.
+
+    THE VERDICT IS ABOUT ONE RECORD, and this is the one place the three checks are put
+    together — for a single record. Each of the check functions takes one record, so there is
+    no list to aggregate over by accident.
+    """
+    return {
+        "signature": _as_check(_signature_check(hm)),
+        "digest": _as_check(_digest_check(hm)),
+        "name": _as_check(_name_check(hm, asked=name_asked)),
+    }
+
+
+def _all_hold(checks: dict[str, dict]) -> bool:
+    return all(c["state"] in _CHECK_HOLDS for c in checks.values())
+
+
+def _choose_witness(per_record: list[tuple[Any, dict, dict]]) -> tuple[Any, dict, dict]:
+    """The record the summary is about: one that passes every check if any does, else the closest.
+
+    Choosing it cannot make a failing transaction hold: if any record passes all three checks,
+    the one chosen does too (the first sort key is how many hold), and if none does, the one
+    chosen does not either. What the choice decides is only which record's words are shown.
+
+    Among records that all pass, the STRONGEST is shown — a verified signature over a v1 record's
+    NO SIGNATURE, an established name over an unasked one — so a v1 record sharing a transaction
+    with a signed record over the same digest does not hide the signature. Ties go to the lowest
+    vout, so the answer does not depend on iteration order.
+    """
+
+    def rank(item: tuple[Any, dict, dict]) -> tuple:
+        vout, _hm, checks = item
+        return (
+            sum(c["state"] in _CHECK_HOLDS for c in checks.values()),
+            checks["signature"]["state"] == "VERIFIED",
+            checks["digest"]["state"] == "MATCHES",
+            checks["name"]["state"] == "ESTABLISHED",
+            -(vout if isinstance(vout, int) else 0),
+        )
+
+    return max(per_record, key=rank)
+
+
+def _tx_refusal(per_record: list[tuple[Any, dict, dict]]) -> tuple[Any, dict] | None:
+    """``(vout, signature check)`` of the first record that is broken or forged, or ``None``.
+
+    Kept from the old rule, and the conservative direction: a transaction carrying a forgery is
+    not made trustworthy by also carrying a good record. It refuses nothing an honest marker
+    publishes — nobody can add an output to someone else's transaction. Named by vout, because
+    the summary's record line may be about another record.
+    """
+    for vout, _hm, checks in per_record:
+        sig = checks["signature"]
+        if sig["state"] not in _CHECK_HOLDS:
+            return vout, {
+                "state": sig["state"],
+                "reason": f"the record at vout {vout}: {sig['reason']}",
+            }
+    return None
+
+
+def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer: dict | None = None) -> dict:
     """The mark's block — from the name lookup's own anchor when there was one, else our own.
 
     A HOSTILE SOURCE MUST NOT MOVE BOTH THE NAME BINDING AND THE BLOCK. That rule is enforced
@@ -700,8 +816,14 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int) ->
     after it raises into ``_judge_one_name_at_mark`` and also lands on ``resolved: False``.
     So ``resolved`` implies an anchor, and ``not resolved`` implies no binding was obtained —
     and with no binding there is no pair for one endpoint to move.
+
+    ``prefer`` is the record the verdict is about, and it is tried FIRST. Each record's name
+    lookup runs on its own and may take its binding from a different endpoint (a transient
+    failure on one), so an anchor inherited from ANOTHER record could have come from the very
+    endpoint that supplied THIS record's binding — the one pairing the rule above forbids.
     """
-    for hm in hashmark_records(payload):
+    ordered = ([prefer] if prefer is not None else []) + [hm for hm in hashmark_records(payload) if hm is not prefer]
+    for hm in ordered:
         nam = hm.get("name_at_mark") or {}
         if nam.get("resolved") and nam.get("anchor"):
             return dict(nam["anchor"])
@@ -801,17 +923,31 @@ def verify_cmd(
 
     \b
     What the four checks mean:
-      signature  VERIFIED / DOES NOT VERIFY / NOT CHECKED / NO SIGNATURE
-      file       MATCHES / DOES NOT MATCH / NOT CHECKED
+      signature  VERIFIED / DOES NOT VERIFY / RECORD DOES NOT DECODE / NOT CHECKED / NO SIGNATURE
+      file       MATCHES / DOES NOT MATCH / CANNOT COMPARE / NOT CHECKED
       name       ESTABLISHED / NOT THE SIGNER / NOT ESTABLISHED / NOT CHECKED
       block      CONFIRMED / PROVISIONAL / NO BLOCK
+
+    \b
+    THE VERDICT IS ABOUT ONE RECORD. A transaction can carry several HashMark outputs, and the
+    signature, file and name checks must all hold for the SAME one; the summary names its vout.
+    A record that does not decode, or whose signature does not verify, fails the whole
+    transaction wherever it sits.
+
+    \b
+    What HOLDS means, and no more: one record passes every check you asked for, no record in the
+    transaction is broken or forged, and the block is at or past your floor. It does not mean the
+    record says anything in particular. With no --file, --digest or --wave-name, a record this
+    build cannot read (a newer version, an unknown hash) holds with its checks reading NOT
+    CHECKED — nothing was asked of it, so nothing failed.
 
     \b
     Exit codes: 0 the verdict holds, 5 it does not, 1 bad input, 2 network.
     NOT CHECKED never fails the verdict — it means this tool did not check, most often because
     the curve library is absent, and failing on it would accuse an honest signer of forgery for
-    something missing on YOUR machine. NOT ESTABLISHED does fail it: you asked a question and it
-    could not be answered, and a gate that passes on "not answered" is worse than no gate.
+    something missing on YOUR machine. NOT ESTABLISHED and CANNOT COMPARE do fail it: you asked a
+    question and it could not be answered, and a gate that passes on "not answered" is worse
+    than no gate.
 
     Read-only: no wallet, no broadcast, no mnemonic prompt. Nothing is sent anywhere but the
     transaction id you typed.
@@ -848,7 +984,9 @@ def verify_cmd(
 
     payload = _run_fetch_inspect(ctx, form="txid", value=wanted)
     rows = [row for row in (payload.get("outputs") or []) if row.get("hashmark")]
-    records = hashmark_records(payload)
+    # FROM THE ROWS, so a record and its vout cannot come apart: every check below is attached
+    # to a record, and the summary names the record by the vout of the row it came from.
+    records = [row["hashmark"] for row in rows]
     if not records:
         raise UserError(
             "no HashMark record in that transaction",
@@ -862,20 +1000,32 @@ def verify_cmd(
     if wave_name:
         _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 
-    anchor = _verify_anchor(ctx, payload, min_confirmations=min_confirmations)  # type: ignore[arg-type]
-
     expected, absent_reason = _digest_expectation(records, file_path=file_path, digest_hex=digest_hex)
     source = "--digest" if digest_hex is not None else (str(file_path) if file_path else "")
     for hm in records:
         hm["digest_match"] = judge_digest_match(
-            hm, expected, source=_sanitize_display_string(source), absent_reason=absent_reason
+            hm,
+            expected,
+            source=_sanitize_display_string(source),
+            asked=file_path is not None or digest_hex is not None,
+            absent_reason=absent_reason,
         )
 
+    # ONE RECORD, EVERY CHECK. Each record is judged alone; the summary is ONE record's checks
+    # (the witness), plus the transaction-wide refusal and the block. See `_signature_check`.
+    per_record = [
+        (row.get("vout"), row["hashmark"], _record_checks(row["hashmark"], name_asked=bool(wave_name))) for row in rows
+    ]
+    w_vout, w_hm, w_checks = _choose_witness(per_record)
+    refusal = _tx_refusal(per_record)
+
+    anchor = _verify_anchor(ctx, payload, min_confirmations=min_confirmations, prefer=w_hm)  # type: ignore[arg-type]
+
     checks = {
-        "signature": dict(zip(("state", "reason"), _signature_check(records), strict=True)),
-        "digest": dict(zip(("state", "reason"), _digest_check(records), strict=True)),
-        "name": dict(zip(("state", "reason"), _name_check(records, asked=bool(wave_name)), strict=True)),
-        "block": dict(zip(("state", "reason"), _block_check(anchor), strict=True)),
+        "signature": refusal[1] if refusal else w_checks["signature"],
+        "digest": w_checks["digest"],
+        "name": w_checks["name"],
+        "block": _as_check(_block_check(anchor)),
     }
     failed = [f"{k}: {v['state']}" for k, v in checks.items() if v["state"] not in _CHECK_HOLDS]
 
@@ -883,8 +1033,18 @@ def verify_cmd(
         "txid": payload.get("txid"),
         "network": ctx.network,
         "mark_anchor": anchor,
-        "records": [{"vout": row.get("vout"), **(row.get("hashmark") or {})} for row in rows],
+        # Each record carries ITS OWN three checks, so a JSON consumer can see every record's
+        # answer rather than only the one the summary is about.
+        "records": [{"vout": vout, **hm, "checks": c} for vout, hm, c in per_record],
         "checks": checks,
+        # WHICH record `checks` describes. Without it a consumer cannot tell a verdict about one
+        # record from a collage of several — which is what `checks` used to be.
+        "verdict_record": {
+            "vout": w_vout,
+            "records_in_tx": len(per_record),
+            "all_record_checks_hold": _all_hold(w_checks),
+            "refusal_vout": refusal[0] if refusal else None,
+        },
         "verdict_holds": not failed,
         "verdict_failed_checks": failed,
     }

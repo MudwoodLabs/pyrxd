@@ -138,8 +138,10 @@ def test_form_2_before_the_move_says_the_signer_is_not_the_target(monkeypatch: p
 
 
 def test_one_configured_server_degrades_to_form_1_with_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The shipped default config. Binding and height from one server is the case the judge
-    refuses, and the CLI must carry that reason to the terminal rather than fall silent."""
+    """ONE configured server (`--electrumx URL`, or a config naming one). Binding and height from
+    one server is the case the judge refuses, and the CLI must carry that reason to the terminal
+    rather than fall silent. (Not the shipped mainnet default, which this used to say: that ships
+    two independent endpoints — pinned in `test_hashmark_verify_one_record.py`.)"""
     nam = _run(monkeypatch, _payload(MOVED_H160), _pair(458595, two=False, indexer_on="a"))
     assert nam["resolved"] and nam["form"] == 1 and nam["point_in_time"] is False
     assert "wss://only" in nam["degraded_reason"]
@@ -209,6 +211,8 @@ def test_the_human_renderer_prints_the_verdict_and_its_qualifiers(monkeypatch: p
     assert "at the mark's block (458595)" in text
     assert MOVED in text
     assert "the signing key IS that address" in text
+    assert "had signed this by that block" in text and "not that its holder put it here" in text
+    assert "custody" not in text, "the overstated claim is gone, not merely joined by a weaker one"
     assert "not authorship" in text
     assert "not verified on chain" in text, "the binding qualifier must be printed with the claim"
     assert "proved unspent" in text

@@ -809,13 +809,20 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
         ]
     chain = nam.get("chain") or {}
     same = nam.get("signer_is_target_at_height")
+    # THE WEAKER SENTENCE. This said "key custody at that block", and a matching name supports
+    # less: the signed statement does not bind the transaction, so a genuine record can be copied
+    # into anyone's transaction, in a later block. What the match shows is that the name pointed
+    # at a key that had signed this by that block — not that the key's holder published it here.
+    if same:
+        who = [
+            f"{indent}  the signing key IS that address — that key had signed this by that block;",
+            f"{indent}  not that its holder put it here, not authorship, not location",
+        ]
+    else:
+        who = [f"{indent}  the signing key is NOT that address"]
     lines = [
         f"{indent}at the mark's block ({nam.get('height')}), {name} pointed at {nam.get('target_at_height')}",
-        (
-            f"{indent}  the signing key IS that address — key custody at that block; not authorship, not location"
-            if same
-            else f"{indent}  the signing key is NOT that address"
-        ),
+        *who,
         f"{indent}  glyph {nam.get('ref')}; {chain.get('steps')} step(s) walked, tip {chain.get('tip')} proved unspent",
     ]
     if nam.get("provisional"):
@@ -847,9 +854,12 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     server that supplied the candidates, and the judge refuses a block height from the server
     that supplied the name→glyph binding. With ONE configured endpoint both clients are that
     endpoint and both labels are equal, so each of those rules degrades with its reason — which
-    is the truth of a single-server configuration, and is the shipped default. A second server
-    under ``electrumx_servers`` (pyrxd ships two independent mainnet operators in
-    ``network/registry.py``) is what makes form 2 reachable.
+    is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
+    config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
+    ships two independent operators, so with no configuration at all these are two different
+    endpoints and form 2 is reachable. (It used to say the default was single-server, which read
+    as though form 2 — and ``verify --wave-name``'s ESTABLISHED — needed opting into. It does not.
+    testnet and regtest ship no endpoint at all.)
 
     Tests patch this to hand in fakes.
     """
