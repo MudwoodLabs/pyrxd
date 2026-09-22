@@ -12,21 +12,35 @@ case — which is exactly how this one got through.
 So this file does not list the classes it checks. It imports every module in the package,
 finds every dataclass, and flags each field whose NAME looks secret and whose TYPE could hold
 text or bytes. Each flagged field is then checked BEHAVIOURALLY: an instance is built with a
-sentinel in that field and its ``repr()`` must not contain the sentinel. That tests the
-property rather than the mechanism, so ``field(repr=False)``, a hand-written ``__repr__`` and
-``@dataclass(repr=False)`` all pass, and a hand-written ``__repr__`` that prints the field
-anyway fails.
+sentinel in that field, and ``repr()``, ``str()`` and ``format()`` (what an f-string calls)
+must not contain ANY six-character run of the sentinel, as text or as hex — so a ``__repr__``
+that prints ``self.cek[:16]`` is a leak, not a pass. That tests the property rather than the
+mechanism, so ``field(repr=False)``, a hand-written ``__repr__`` and ``@dataclass(repr=False)``
+all pass, and a hand-written ``__repr__`` or ``__str__`` that prints the field anyway fails.
 
-What it cannot see, and what covers that
-----------------------------------------
-- A secret under a name the pattern does not recognise. The pattern is below; widen it when a
-  new spelling appears. ``test_the_name_pattern_catches_the_spellings_pyrxd_uses`` pins the
-  known ones.
+What it cannot see
+------------------
+Each of these is a real blind spot, not a solved one:
+
+- A secret under a name the pattern does not recognise — ``content_key``, ``key``, ``blob``,
+  ``k``. The pattern is below; widen it when a new spelling appears.
+  ``test_the_name_pattern_catches_the_spellings_pyrxd_uses`` pins the known ones.
+- A secret typed as something other than text or bytes — an ``int`` scalar, a ``list[int]``.
+  The sentinel is text or bytes, so those fields are not flagged at all.
 - A field typed as a key OBJECT (``PrivateKey``, ``SecretBytes``, ``PrivateKeyMaterial``).
-  Those types redact their own ``repr``, which ``test_the_key_types_redact_their_own_repr``
-  asserts, so a default dataclass ``repr`` of them is safe.
+  Not flagged either; those types redact their own ``repr``, which
+  ``test_the_key_types_redact_their_own_repr`` asserts, so a default dataclass ``repr`` of
+  them is safe.
+- A leak shorter than six characters, or transformed on the way out (base64, reversed,
+  interleaved), and any rendering other than ``repr`` / ``str`` / ``format`` — ``vars()``,
+  ``dataclasses.asdict``, ``json``, ``pickle``.
+- Anything that is not a dataclass: plain classes, ``NamedTuple``, ``__slots__`` classes with
+  their own ``repr`` (``GlyphClient``'s ``TimelockMintReceipt`` is one).
 - A dataclass that module import does not expose. ``test_every_dataclass_in_the_source_is_seen``
-  AST-scans the source and fails if any ``@dataclass`` class is missing from the runtime set.
+  AST-scans the source, resolving the module's own aliases for ``dataclass``, and fails if any
+  decorated class is missing from the runtime set. ``make_dataclass`` and a non-decorator
+  ``dataclass(...)`` call cannot be attributed to a class name from source, so each call site
+  must be listed in ``REVIEWED_DYNAMIC_DATACLASS_SITES`` (empty today) or the guard fails.
 
 The exemptions are REVIEWED, not derived: each says why the value is public. Membership is
 pinned exactly, in both directions — an exempt field that becomes hidden, or disappears, fails
@@ -75,8 +89,14 @@ _SECRET_TOKENS = frozenset(
 #: field typed ``Any`` will print a ``str`` it is handed exactly as a ``str`` field would.
 _TEXTUAL = re.compile(r"\b(bytes|bytearray|memoryview|str|Any)\b")
 
-_SENTINEL_STR = "Q7xSENTINELSECRETx7Q"
-_SENTINEL_BYTES = b"Q7xSENTINELBYTESx7Q"
+#: Not English words, so a redacting ``repr`` that prints "SECRET" or "<redacted>" cannot
+#: collide with a six-character window of either one.
+_SENTINEL_STR = "Qz7Xv9Kw3Jm8Rt2Pb5Lg"
+_SENTINEL_BYTES = b"Hn4Wq8Zc1Vx6Ty3Md7Sf"
+
+#: The shortest contiguous run of a sentinel that counts as a leak. Six characters of a
+#: 32-byte key's hex is 24 bits; six raw bytes is 48.
+_LEAK_WINDOW = 6
 
 
 def _looks_secret(name: str) -> bool:
@@ -124,23 +144,34 @@ def _owner_key(cls: type, field_name: str) -> str:
     raise AssertionError(f"{cls.__qualname__}.{field_name} has no declaring class in its MRO")
 
 
-def _repr_with_sentinel(cls: type, field_name: str, sentinel: object) -> str:
-    """``repr`` of an instance whose ``field_name`` holds ``sentinel`` and every other field ``None``.
+def _renderings_with_sentinel(cls: type, field_name: str, sentinel: object) -> str:
+    """``repr``, ``str`` and ``format`` of an instance whose ``field_name`` holds ``sentinel``
+    and every other field ``None``, joined with NULs so no window can span two of them.
+
+    ``format`` is what an f-string calls; ``str`` is what ``print`` and ``%s`` call. A
+    dataclass defines neither, so both normally fall back to ``__repr__`` — but a class that
+    defines its own ``__str__`` leaks through them while its ``repr`` stays clean.
 
     Built with ``object.__new__`` so no constructor validation runs: the question is only what
-    the class's ``repr`` does with the value, not whether the value is a valid key.
+    the class does with the value, not whether the value is a valid key.
     """
     obj = object.__new__(cls)
     for f in dataclasses.fields(cls):
         object.__setattr__(obj, f.name, sentinel if f.name == field_name else None)
-    return repr(obj)
+    return "\0".join((repr(obj), str(obj), format(obj, "")))
+
+
+#: Every six-character run of either sentinel, as text and as hex.
+_LEAK_WINDOWS = frozenset(
+    form[i : i + _LEAK_WINDOW]
+    for form in (_SENTINEL_STR, _SENTINEL_BYTES.decode(), _SENTINEL_STR.encode().hex(), _SENTINEL_BYTES.hex())
+    for i in range(len(form) - _LEAK_WINDOW + 1)
+)
 
 
 def _leaks(text: str) -> bool:
-    return any(
-        s in text
-        for s in (_SENTINEL_STR, _SENTINEL_BYTES.decode(), _SENTINEL_STR.encode().hex(), _SENTINEL_BYTES.hex())
-    )
+    """True if ANY six-character run of a sentinel appears — a prefix or a slice counts."""
+    return any(text[i : i + _LEAK_WINDOW] in _LEAK_WINDOWS for i in range(len(text) - _LEAK_WINDOW + 1))
 
 
 def _audit(classes: dict[str, type]) -> tuple[set[str], set[str], dict[str, str]]:
@@ -159,14 +190,19 @@ def _audit(classes: dict[str, type]) -> tuple[set[str], set[str], dict[str, str]
                 continue
             key = _owner_key(cls, f.name)
             seen.add(key)
+            # Both sentinel types are tried even if one raises: a __str__ calling
+            # `self.cek.hex()` fails on the str sentinel and leaks on the bytes one.
+            errors: list[str] = []
             for sentinel in (_SENTINEL_STR, _SENTINEL_BYTES):
                 try:
-                    text = _repr_with_sentinel(cls, f.name, sentinel)
-                except Exception as exc:  # a custom __repr__ that needs real values
-                    unevaluable[key] = f"{type(exc).__name__}: {exc}"
-                    break
+                    text = _renderings_with_sentinel(cls, f.name, sentinel)
+                except Exception as exc:  # a custom __repr__ / __str__ that needs real values
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                    continue
                 if _leaks(text):
                     exposed.add(key)
+            if len(errors) == 2:
+                unevaluable[key] = errors[-1]
     return seen - exposed - unevaluable.keys(), exposed, unevaluable
 
 
@@ -239,8 +275,9 @@ def test_every_module_imports_so_none_is_skipped() -> None:
 def test_no_dataclass_prints_a_secret_looking_field() -> None:
     unexplained = sorted(_EXPOSED - EXEMPT.keys())
     assert not unexplained, (
-        "these dataclass fields look like secret material and appear verbatim in repr(); give "
-        "them field(repr=False), or add an EXEMPT entry saying why the value is public:\n  " + "\n  ".join(unexplained)
+        "these dataclass fields look like secret material and appear, whole or in part, in "
+        "repr() / str() / format(); give them field(repr=False) (and no __str__ that prints them), "
+        "or add an EXEMPT entry saying why the value is public:\n  " + "\n  ".join(unexplained)
     )
 
 
@@ -263,37 +300,107 @@ def test_the_guard_is_not_passing_over_nothing() -> None:
     assert not missing, f"known secret fields not seen as hidden (discovery or the check broke): {missing}"
 
 
+#: ``make_dataclass`` / non-decorator ``dataclass(...)`` call sites that have been audited by
+#: hand, as ``"<module>:<first positional arg, or <dynamic>>"``. Empty today; a new site fails
+#: the guard until someone either makes the class reachable by name or reviews it here.
+REVIEWED_DYNAMIC_DATACLASS_SITES: frozenset[str] = frozenset()
+
+
+def _dataclass_sites(source: str, module: str) -> tuple[set[str], set[str]]:
+    """(qualnames of ``@dataclass``-decorated classes, dynamic creation sites) in ``source``.
+
+    Resolves the module's OWN spelling of the decorator: ``from dataclasses import dataclass
+    as _dc`` makes ``@_dc`` a dataclass decorator here, and ``import dataclasses as d`` makes
+    ``@d.dataclass`` one. Matching the literal name ``dataclass`` alone let an alias escape.
+
+    A dataclass built by ``make_dataclass(...)``, or by calling ``dataclass(...)`` on a class
+    outside a decorator, has no class statement to name it, so it is returned as a SITE —
+    ``"<module>:<name>"`` from the first positional argument when it is a string literal.
+    """
+    tree = ast.parse(source)
+    dc_names = {"dataclass"}
+    make_names = {"make_dataclass"}
+    dc_modules = {"dataclasses"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+            for alias in node.names:
+                if alias.name == "dataclass":
+                    dc_names.add(alias.asname or alias.name)
+                elif alias.name == "make_dataclass":
+                    make_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "dataclasses":
+                    dc_modules.add(alias.asname or alias.name)
+
+    def resolves_to(node: ast.expr, names: set[str], attr: str) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in names
+        return isinstance(node, ast.Attribute) and node.attr == attr
+
+    def is_decorator(node: ast.expr) -> bool:
+        return resolves_to(node.func if isinstance(node, ast.Call) else node, dc_names, "dataclass")
+
+    decorator_ids: set[int] = set()
+    classes: set[str] = set()
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                if any(is_decorator(d) for d in child.decorator_list):
+                    classes.add(f"{module}.{prefix}{child.name}")
+                for d in child.decorator_list:
+                    decorator_ids.update(id(n) for n in ast.walk(d))
+                walk(child, f"{prefix}{child.name}.")
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for d in child.decorator_list:
+                    decorator_ids.update(id(n) for n in ast.walk(d))
+                walk(child, f"{prefix}{child.name}.<locals>.")
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+
+    sites: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or id(node) in decorator_ids:
+            continue
+        if resolves_to(node.func, make_names, "make_dataclass") or resolves_to(node.func, dc_names, "dataclass"):
+            first = node.args[0] if node.args else None
+            label = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else "<dynamic>"
+            sites.add(f"{module}:{label}")
+    return classes, sites
+
+
+def _scan_package_source() -> tuple[set[str], set[str]]:
+    root = pathlib.Path(pyrxd.__file__).parent
+    classes: set[str] = set()
+    sites: set[str] = set()
+    for path in root.rglob("*.py"):
+        module = ".".join(("pyrxd", *path.relative_to(root).with_suffix("").parts)).removesuffix(".__init__")
+        c, s = _dataclass_sites(path.read_text(encoding="utf-8"), module)
+        classes |= c
+        sites |= s
+    return classes, sites
+
+
 def test_every_dataclass_in_the_source_is_seen() -> None:
     """Runtime discovery walks module attributes; a dataclass defined inside a function, or
     otherwise not reachable that way, would be skipped silently. The AST sees them all."""
-    root = pathlib.Path(pyrxd.__file__).parent
-
-    def is_dataclass_decorator(node: ast.expr) -> bool:
-        target = node.func if isinstance(node, ast.Call) else node
-        return (isinstance(target, ast.Name) and target.id == "dataclass") or (
-            isinstance(target, ast.Attribute) and target.attr == "dataclass"
-        )
-
-    in_source: set[str] = set()
-    for path in root.rglob("*.py"):
-        module = ".".join(("pyrxd", *path.relative_to(root).with_suffix("").parts)).removesuffix(".__init__")
-
-        def walk(node: ast.AST, prefix: str, module: str = module) -> None:
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, ast.ClassDef):
-                    if any(is_dataclass_decorator(d) for d in child.decorator_list):
-                        in_source.add(f"{module}.{prefix}{child.name}")
-                    walk(child, f"{prefix}{child.name}.")
-                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    walk(child, f"{prefix}{child.name}.<locals>.")
-                else:
-                    walk(child, prefix)
-
-        walk(ast.parse(path.read_text(encoding="utf-8")), "")
-
+    in_source, _sites = _scan_package_source()
     assert len(in_source) > 100, "the AST scan found almost nothing; it is broken, not the package"
     unseen = sorted(in_source - _CLASSES.keys())
     assert not unseen, f"@dataclass classes the runtime scan did not reach, so never checked: {unseen}"
+
+
+def test_no_dataclass_is_built_where_the_scan_cannot_name_it() -> None:
+    """``make_dataclass`` and ``dataclass(cls)`` produce classes no class statement names, so
+    neither the runtime walk nor the qualname check above can be trusted to have seen them."""
+    _classes, sites = _scan_package_source()
+    unreviewed = sorted(sites - REVIEWED_DYNAMIC_DATACLASS_SITES)
+    assert not unreviewed, f"dataclasses created dynamically, so never checked by this guard: {unreviewed}"
+    stale = sorted(REVIEWED_DYNAMIC_DATACLASS_SITES - sites)
+    assert not stale, f"REVIEWED_DYNAMIC_DATACLASS_SITES entries with no site any more: {stale}"
 
 
 # ── the checker itself, on cases whose answer is known ───────────────────────
@@ -320,10 +427,62 @@ def test_the_checker_catches_a_leak_and_passes_a_hidden_field() -> None:
         def __repr__(self) -> str:
             return f"CustomButLeaky(wif={self.wif})"
 
-    hidden, exposed, unevaluable = _audit({"t.Leaky": Leaky, "t.Hidden": Hidden, "t.CustomButLeaky": CustomButLeaky})
-    assert {k.rsplit(".", 2)[-2] for k in exposed} == {"Leaky", "CustomButLeaky"}
-    assert {k.rsplit(".", 2)[-2] for k in hidden} == {"Hidden"}
+    @dataclasses.dataclass(frozen=True)
+    class PartialLeak:
+        cek: bytes
+
+        def __repr__(self) -> str:  # "only a prefix" is still a leak
+            return f"PartialLeak(cek={self.cek[:16]!r}...)"
+
+    @dataclasses.dataclass(frozen=True)
+    class StrLeak:
+        cek: bytes = dataclasses.field(repr=False)
+
+        def __str__(self) -> str:  # repr is clean; print() and f-strings are not
+            return f"StrLeak({self.cek.hex()})"
+
+    @dataclasses.dataclass(frozen=True)
+    class RedactsHonestly:
+        cek: bytes
+
+        def __repr__(self) -> str:
+            return "RedactsHonestly(cek=<SECRET 32 bytes redacted>)"
+
+    hidden, exposed, unevaluable = _audit(
+        {
+            "t.Leaky": Leaky,
+            "t.Hidden": Hidden,
+            "t.CustomButLeaky": CustomButLeaky,
+            "t.PartialLeak": PartialLeak,
+            "t.StrLeak": StrLeak,
+            "t.RedactsHonestly": RedactsHonestly,
+        }
+    )
+    assert {k.rsplit(".", 2)[-2] for k in exposed} == {"Leaky", "CustomButLeaky", "PartialLeak", "StrLeak"}
+    assert {k.rsplit(".", 2)[-2] for k in hidden} == {"Hidden", "RedactsHonestly"}
     assert unevaluable == {}
+
+
+def test_the_source_scan_resolves_aliases_and_dynamic_creation() -> None:
+    source = (
+        "import dataclasses as dcs\n"
+        "from dataclasses import dataclass as _dc, make_dataclass as mk\n"
+        "@_dc\n"
+        "class Aliased:\n"
+        "    cek: bytes\n"
+        "def f():\n"
+        "    @dcs.dataclass(frozen=True)\n"
+        "    class Local:\n"
+        "        wif: str\n"
+        "    Made = mk('Made', [('seed', bytes)])\n"
+        "    Called = _dc(type('Called', (), {}))\n"
+        "    return Local, Made, Called\n"
+        "class NotOne:\n"
+        "    pass\n"
+    )
+    classes, sites = _dataclass_sites(source, "m")
+    assert classes == {"m.Aliased", "m.f.<locals>.Local"}
+    assert sites == {"m:Made", "m:<dynamic>"}
 
 
 def test_the_name_pattern_catches_the_spellings_pyrxd_uses() -> None:
