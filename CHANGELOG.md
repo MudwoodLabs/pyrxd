@@ -148,12 +148,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `is_readable_last_time` (minimal AND bit 31 clear); `is_minimal_4byte_scriptnum`
     still answers the encoding question alone.
   - A backwards `current_time` is refused only for the 2026-06-16 pre-floor LWMA, with the
-    true reason: that bytecode multiplies a negative delta into the target and either
-    aborts or writes target 1. Everywhere else it builds, and the int64/MINIMALDATA
+    true reason: that bytecode multiplies a negative delta into the target, so the mint
+    would either fail or write target 1. Everywhere else it builds, and the int64/MINIMALDATA
     evaluator confirms the contract's own fragment computes the target the builder wrote.
   - A legacy-LWMA mint whose next target would be 1 (a zero delta, or a negative one on
-    the floored variant) is refused: the covenant would accept it, and target 1 is the
-    hardest difficulty there is — no miner can realistically meet it.
+    the floored variant) is refused: target 1 is the hardest difficulty there is, and
+    pyrxd's miner does not write a target no miner can realistically meet.
 
   The regtest control that proves a `lastTime = 0` contract is refused by a real node now
   first asserts pyrxd refuses to build that mint, then patches the refusal out so the node

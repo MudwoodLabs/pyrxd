@@ -884,8 +884,9 @@ def test_the_prefloor_lwma_backward_locktime_is_refused_and_the_bytecode_shows_w
 @pytest.mark.parametrize("version", [DaaBytecodeVersion.LEGACY, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR])
 def test_a_legacy_lwma_mint_that_would_set_target_1_is_refused(version: DaaBytecodeVersion) -> None:
     """Legacy LWMA multiplies the target by the time since the last mint: a zero delta (and,
-    for the floored variant, any negative one) makes the covenant write target 1. The
-    evaluator confirms the covenant would ACCEPT that mint — so only pyrxd can stop it."""
+    for the floored variant, any negative one) gives target 1. The evaluator confirms the
+    contract's own fragment computes 1 for these inputs, so the builder's refusal rests on
+    the bytecode, not on a mirror disagreeing with it."""
     utxo = _contract(DaaMode.LWMA, version, height=3, last_time=_LAST)
     assert _onchain_next_target(utxo, _LAST, version) == 1
     with pytest.raises(ValidationError, match="target would be 1"):

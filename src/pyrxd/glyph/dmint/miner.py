@@ -305,8 +305,8 @@ def compute_next_target_linear_legacy(
     :func:`~pyrxd.glyph.dmint.builders._build_linear_daa_legacy_prefloor` (without
     it) for every ``current_time >= last_time``. On a negative delta the two variants
     part: the floored one treats it as 0 (this mirror's answer), while the pre-floor one
-    multiplies it into the target and either aborts on chain (the product leaves int64)
-    or clamps the target to 1 — so ``build_dmint_mint_tx`` refuses a backwards
+    multiplies it into the target, so such a mint either fails (the product leaves int64)
+    or writes target 1 — so ``build_dmint_mint_tx`` refuses a backwards
     ``current_time`` for a pre-floor contract, and refuses ANY legacy-LWMA mint whose next
     target would be 1. This is the LWMA bytecode pyrxd emitted before 2026-09-16 (upstream
     replaced it with LWMA-v2 on 2026-06-20, ``c90e6506``); the mainnet LWMA deploy
@@ -2011,8 +2011,8 @@ def build_dmint_mint_tx(
         raise ValidationError(
             f"current_time ({current_time}) is earlier than the contract's last_time ({state.last_time}). This "
             "contract carries the 2026-06-16 LWMA retarget, which does not floor the time delta at zero: a "
-            "negative delta multiplies into the target, so the covenant either aborts (the product leaves the "
-            "int64 range) or clamps the next target to 1, which no miner can realistically meet. Pass a "
+            "negative delta multiplies into the target, so this mint would either fail (the product leaves the "
+            "int64 range) or write a next target of 1, which no miner can realistically meet. Pass a "
             "current_time at or after the previous mint's."
         )
     if state.daa_mode == DaaMode.LWMA and daa_bytecode_version != DaaBytecodeVersion.V2 and new_target == 1:
