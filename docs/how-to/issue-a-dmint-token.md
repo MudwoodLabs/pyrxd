@@ -113,7 +113,8 @@ pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 
 > now merged upstream ([`Radiant-Core/Photonic-Wallet#2`](https://github.com/Radiant-Core/Photonic-Wallet/pull/2)
 > — divide-first with the target clamped to 2^48 on both sides of the retarget
 > multiply) and pyrxd byte-matches it, so EPOCH deploy is re-enabled. EPOCH
-> requires `--difficulty >= 32768` (the 2^48 target cap).
+> requires `--difficulty >= 32768` (the 2^48 target cap) and a `--target-time` at
+> least the `--max-adjustment` factor (e.g. `>= 4` for the default `4`).
 
 > **`--last-time` (ASERT and LWMA).** The deployed state carries a `lastTime`
 > slot — the baseline the first retarget measures against — and those two modes
@@ -125,8 +126,7 @@ pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 
 > in Radiant's mandatory script-verify flags — consensus, not mempool policy —
 > so such a contract aborts on its first retarget and can never be mined. The
 > deploy is refused rather than built, because nothing can fix it once the
-> reveal confirms. Values above `0x7FFFFFFF` are refused too: bit 31 is the
-> script-number sign, so the contract would read a negative `lastTime`.
+> reveal confirms. Values above `0x7FFFFFFF` are refused too.
 
 `claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
 **SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`
@@ -137,17 +137,11 @@ the claim reads the baked half-life out of the contract's own bytecode. Pass it
 only to assert what you expect — a value that disagrees with the baked one fails
 fast, naming the baked value, before the PoW grind.
 
-`--current-time` is the mint's locktime, and the covenant writes it into the
-recreated contract as the next `lastTime`. It defaults to the wall-clock time
-when the claim is built, which is what you want. For ASERT, LWMA and EPOCH
-contracts, which read `lastTime` back as a number, a value below 2^23 is refused
-for the same MINIMALDATA reason as above; a value above `0x7FFFFFFF` is refused
-for every mode. A time earlier than the contract's `lastTime` is accepted for
-ASERT, EPOCH and current LWMA contracts, whose retargets clamp a negative delta.
-On an LWMA contract deployed before 2026-09-16 a time at or before `lastTime` is
-refused: that older retarget would abort or set the next target to 1. The claim
-also refuses, before any mining, a contract whose `lastTime` this mint's
-retarget cannot read — such a contract can no longer be minted at all.
+`--current-time` is the mint's locktime; leave it unset. It defaults to the
+wall-clock time when the claim is built, which is what you want. If you do pass
+it, pass a real Unix timestamp at or after the contract's `lastTime`. The claim
+refuses, before any mining, a mint pyrxd will not build — for example one whose
+contract can no longer be minted — and says why.
 
 The command builds a **commit** transaction (an FT-commit hashlock plus
 `K` ref-seed outputs), waits for it to confirm, then builds the
