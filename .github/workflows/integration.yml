@@ -140,15 +140,21 @@ jobs:
           poetry run pyrxd regtest down
       # The Radiant suites that are cheap enough to run on every push. Each module
       # stands up its own container (the shared harness force-removes by name), so this
-      # is deliberately sequential. Measured on this runner: 78 passed, 2 skipped in
-      # 135 s; 3 m 31 s for the whole job including the image build and the quickstart.
-      # The 2 skips are the BTC half of test_remaining_builder_floors_regtest_e2e, which
-      # runs in `nightly-btc-family` where a bitcoind exists.
+      # is deliberately sequential. The 2 skips are the BTC half of
+      # test_remaining_builder_floors_regtest_e2e, which runs in `nightly-btc-family`
+      # where a bitcoind exists.
+      #
+      # `-rap` lists every PASSED and SKIPPED test by node id at the end of the log. Under
+      # a bare `-q` this step printed only dots and a total, so the one place a module's
+      # filename appeared was the echo of this command — a grep for it came back
+      # "present" whether or not a single one of its tests ran, and a module whose node
+      # fixture skipped (e.g. "image not available") was indistinguishable from one that
+      # passed. With the summary, "does this lane run X?" is answerable from the log.
       - name: Radiant covenant + builder suites under consensus
         env:
           RADIANT_REGTEST: "1"
         run: |
-          poetry run pytest -o "addopts=" -m integration -q \
+          poetry run pytest -o "addopts=" -m integration -q -rap \
             tests/test_htlc_regtest_e2e.py \
             tests/test_soulbound_covenant_regtest.py \
             tests/test_wallet_send_regtest_e2e.py \
@@ -162,6 +168,7 @@ jobs:
             tests/test_fee_floor_boundary_regtest_e2e.py \
             tests/test_authority_regtest_e2e.py \
             tests/test_hashmark_regtest_e2e.py \
+            tests/test_glyph_timelock_regtest_e2e.py \
             tests/test_dat_and_burn_regtest_e2e.py \
             tests/test_delegate_regtest_e2e.py
 
