@@ -172,7 +172,7 @@ class TestRoundTrip:
 
 class TestFootguns:
     """Unwrap now tries two known KEK derivations before giving up (the current
-    mode-bound info string, then the pre-2026-05-22 one pyrxd emitted through 0.24.0),
+    mode-bound info string, then the pre-split one pyrxd emitted through 0.24.0),
     so a failure is no longer a single AEAD tag failure and no longer says so. The
     property under test is unchanged: every one of these must still be refused, and the
     message must not distinguish WHICH input was wrong — wrong key, wrong AAD and
@@ -235,15 +235,16 @@ class TestFootguns:
 class TestTheKekInfoStringMatchesPhotonicAgain:
     """pyrxd wrapped CEKs under `b"glyph-kek-v1"` from v0.6.0 to 0.24.0.
 
-    That was correct when written — Photonic used the same string — but Photonic split
-    classical from hybrid on 2026-05-22 (6e235207) as a downgrade-protection fix, binding
-    the HKDF info to the mode so stripping the ML-KEM ciphertext cannot still decrypt. From
-    then on pyrxd and Photonic derived different KEKs and could not exchange content, while
-    the docstrings, CHANGELOG and `pyrxd/__init__.py` all still claimed byte-compatibility.
+    That is the string Photonic used before `8e6bb6e` (2026-05-16), which split classical from
+    hybrid as a downgrade-protection fix, binding the HKDF info to the mode so stripping the
+    ML-KEM ciphertext cannot still decrypt. pyrxd's `kem.py` was first committed on
+    2026-05-18, two days AFTER that split, so it was never correct against the upstream code
+    of its day: pyrxd and Photonic derived different KEKs and could not exchange content,
+    while the docstrings, CHANGELOG and `pyrxd/__init__.py` all claimed byte-compatibility.
 
-    The interop fixture could not catch it: it was generated 2026-05-18, four days BEFORE
-    the upstream change, and records `photonic_commit: "UNKNOWN"`. It asserted agreement
-    with a Photonic that no longer exists.
+    The interop fixture could not catch it: it was generated 2026-05-18 -- also AFTER the
+    split -- from an unrecorded checkout (`photonic_commit: "UNKNOWN"`) that evidently did not
+    carry the change, since its wrap only opens under the pre-split string.
     """
 
     def test_wrap_emits_the_mode_bound_classical_string(self):
@@ -288,3 +289,153 @@ class TestTheKekInfoStringMatchesPhotonicAgain:
         wrap that did would be claiming post-quantum protection it does not implement."""
         assert b"hybrid" not in KEK_DERIVATION_INFO
         assert b"hybrid" not in LEGACY_KEK_DERIVATION_INFO
+
+
+class TestTheAppPathVector:
+    """A recipient wrap Photonic's WALLET made, not one its library was handed an AAD for.
+
+    Every other wrap vector in the fixture was produced by calling `wrapCEK` from
+    `packages/lib/src/encryption.ts` with an AAD the generator chose. That proves the KEM
+    matches and says nothing about what the wallet binds, because the library takes the AAD
+    from its caller. The wallet's caller is `encryptContent` in
+    `packages/app/src/encryptionService.ts`, and it binds the UTF-8 TEXT of
+    `crypto.cek_hash`. pyrxd's `build_timelock_mint` bound the raw 32-byte digest, so even
+    with the KEK info fixed, Photonic could not open a single pyrxd recipient wrap, and the
+    library-level vectors were structurally unable to show it.
+
+    `app_encrypt_content_recipient` was generated through `encryptContent` itself
+    (`scripts/gen-photonic-vectors/gen-app-path-vector.ts`), with every RNG draw recorded in
+    order and checked against the output by role, and Photonic opened it through
+    `decryptContent` before it was written. So:
+
+    - pyrxd opening it STRICTLY under `cek_wrap_aad` is the Photonic -> pyrxd direction;
+    - pyrxd's own mint, fed the same randomness, reproducing it BYTE FOR BYTE is the
+      pyrxd -> Photonic direction: the bytes are the ones Photonic's unlock path already opened.
+    """
+
+    @pytest.fixture()
+    def v(self, photonic_vectors) -> dict:
+        return photonic_vectors["app_encrypt_content_recipient"]
+
+    @staticmethod
+    def _draw(v: dict, role: str) -> bytes:
+        (hit,) = [d["hex"] for d in v["rng_draws"] if d["role"] == role]
+        return bytes.fromhex(hit)
+
+    def test_the_vector_is_what_it_says(self, v):
+        """The roles the generator recorded, re-derived here from the vector's own bytes."""
+        from pyrxd.glyph.encrypted_content import EncryptedContentStub
+        from pyrxd.glyph.timelock import compute_cek_hash, format_cek_hash
+
+        stub = EncryptedContentStub.from_dict(v["metadata"])
+        (rec,) = stub.crypto.recipients
+        assert v["photonic_commit"] == "becf41a731e78ab98fdd88652527d7dda12784c6"
+        assert x25519_public_key(bytes.fromhex(v["recipient_sk"])).hex() == v["recipient_pk"]
+        assert stub.crypto.cek_hash == format_cek_hash(compute_cek_hash(self._draw(v, "cek")))
+        assert rec.epk == x25519_public_key(self._draw(v, "ephemeral_x25519_priv"))
+        assert rec.wrapped_cek[:24] == self._draw(v, "wrap_nonce")
+        assert bytes.fromhex(v["encrypted_content"])[:24] == self._draw(v, "chunk_nonce_0")
+        # And pyrxd reads Photonic's metadata without losing or reshaping a field.
+        assert stub.to_dict() == v["metadata"]
+
+    def test_pyrxd_opens_the_app_wrap_strictly_under_the_text_aad(self, v):
+        from pyrxd.crypto.aead import ChunkedCiphertext, EncryptedChunk, decrypt_chunked
+        from pyrxd.glyph.encrypted_content import EncryptedContentStub
+        from pyrxd.glyph.timelock import cek_wrap_aad, parse_cek_hash
+
+        stub = EncryptedContentStub.from_dict(v["metadata"])
+        (rec,) = stub.crypto.recipients
+        aad = cek_wrap_aad(stub.crypto.cek_hash)
+        assert aad == stub.crypto.cek_hash.encode() and len(aad) == 71
+
+        detailed = unwrap_cek_x25519_detailed(
+            rec.wrapped_cek, rec.epk, bytes.fromhex(v["recipient_sk"]), aad, allow_legacy_info=False
+        )
+        assert detailed.cek == self._draw(v, "cek")
+        assert detailed.legacy_info is False
+
+        # One chunk: Photonic's layout is nonce(24) || ciphertext+tag.
+        blob = bytes.fromhex(v["encrypted_content"])
+        assert stub.main.chunks == 1
+        plaintext_hash = parse_cek_hash(stub.main.hash)
+        chunked = ChunkedCiphertext(
+            chunks=[EncryptedChunk(ciphertext=blob[24:], nonce=blob[:24])], plaintext_hash=plaintext_hash
+        )
+        assert decrypt_chunked(chunked, detailed.cek, plaintext_hash) == bytes.fromhex(v["plaintext"])
+
+    def test_the_raw_digest_aad_does_not_open_it(self, v):
+        """The control: if the raw digest also opened it, the AAD would not be load-bearing and
+        the test above would prove nothing about which one the wallet binds."""
+        from pyrxd.glyph.encrypted_content import EncryptedContentStub
+        from pyrxd.glyph.timelock import parse_cek_hash
+
+        stub = EncryptedContentStub.from_dict(v["metadata"])
+        (rec,) = stub.crypto.recipients
+        with pytest.raises(ValueError, match="could not unwrap CEK"):
+            unwrap_cek_x25519(
+                rec.wrapped_cek,
+                rec.epk,
+                bytes.fromhex(v["recipient_sk"]),
+                parse_cek_hash(stub.crypto.cek_hash),
+                allow_legacy_info=True,
+            )
+
+    def test_pyrxds_mint_reproduces_the_app_wrap_byte_for_byte(self, v, monkeypatch):
+        """Through the production entry point. Only the RNG is replayed; the wrap, its AAD and
+        the chunk encryption all run for real, so a different AAD is a different ciphertext."""
+        import secrets as secrets_module
+
+        from pyrxd.glyph.timelock import (
+            TimelockParams,
+            TimelockRecipient,
+            build_timelock_mint,
+            cek_wrap_aad,
+        )
+
+        # pyrxd draws in this order: the chunk nonce (encrypt_chunked), then the wrap's
+        # ephemeral key and nonce. Photonic's CEK and locator draws have no pyrxd counterpart.
+        queue = [self._draw(v, "chunk_nonce_0"), self._draw(v, "ephemeral_x25519_priv"), self._draw(v, "wrap_nonce")]
+
+        def replay(n: int) -> bytes:
+            nxt = queue.pop(0)
+            assert len(nxt) == n, f"pyrxd asked for {n} random bytes where the vector recorded {len(nxt)}"
+            return nxt
+
+        monkeypatch.setattr(secrets_module, "token_bytes", replay)
+        build = build_timelock_mint(
+            name=v["name"],
+            content_type=v["content_type"],
+            plaintext=bytes.fromhex(v["plaintext"]),
+            params=TimelockParams(mode="block", unlock_at=1),
+            cek=self._draw(v, "cek"),
+            recipients=[TimelockRecipient(kid="x25519", public_key=bytes.fromhex(v["recipient_pk"]))],
+        )
+        monkeypatch.undo()
+        assert queue == [], "pyrxd consumed fewer random draws than the vector recorded"
+
+        mine, theirs = build.stub.to_dict(), v["metadata"]
+        assert mine["crypto"]["cek_hash"] == theirs["crypto"]["cek_hash"]
+        assert mine["main"] == theirs["main"]
+        assert mine["crypto"]["recipients"] == theirs["crypto"]["recipients"], (
+            "pyrxd's recipient wrap differs from the one Photonic's app made from the same inputs"
+        )
+        blob = b"".join(c.nonce + c.ciphertext for c in build.ciphertext.chunks)
+        assert blob.hex() == v["encrypted_content"]
+
+        # Said directly as well as by equality: the mint's wrap opens strictly under the text AAD.
+        (rec,) = build.stub.crypto.recipients
+        opened = unwrap_cek_x25519_detailed(
+            rec.wrapped_cek,
+            rec.epk,
+            bytes.fromhex(v["recipient_sk"]),
+            cek_wrap_aad(build.cek_hash),
+            allow_legacy_info=False,
+        )
+        assert opened.cek == build.cek
+
+    def test_cek_wrap_aad_refuses_the_digest(self):
+        """Handing it the 32-byte digest is exactly the 0.24.0 mistake; it must not be encoded."""
+        from pyrxd.glyph.timelock import cek_wrap_aad
+
+        with pytest.raises(TypeError, match="STRING"):
+            cek_wrap_aad(bytes(32))  # type: ignore[arg-type]

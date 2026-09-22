@@ -108,6 +108,42 @@ def format_cek_hash(cek_hash_bytes: bytes) -> str:
     return f"{SHA256_PREFIX}{cek_hash_bytes.hex()}"
 
 
+def cek_wrap_aad(cek_hash: str) -> bytes:
+    """The AAD a recipient's CEK wrap is bound to: the UTF-8 bytes of ``crypto.cek_hash``.
+
+    That is the on-chain TEXT, ``"sha256:<64 hex>"`` (71 bytes for the canonical form), not
+    the 32-byte digest it spells. Photonic's app computes exactly this wherever it wraps or
+    opens an on-chain RECIPIENT slot (its passphrase slots, and ``timelock.ts``'s local-storage
+    wrap, use no AAD) — ``new TextEncoder().encode(metadata.crypto.cek_hash)`` in
+    ``packages/app/src/encryptionService.ts`` (``encryptContent`` / ``decryptContent``) and in
+    the unlock screen, ``components/EncryptedContentUnlock.tsx`` — at
+    Radiant-Core/Photonic-Wallet ``becf41a7``, where ``shareLink.ts`` also types ``cek_hash`` as
+    the string "also used as AAD". No REP specifies it: REP-3006 defines AAD only for the
+    content AEAD, and REP-3008's wrap carries a separately published ``aad`` field. The
+    wallet that mints and opens this content is therefore the definition.
+
+    Pass the string EXACTLY as it appears in the metadata being read. Do not round-trip it
+    through :func:`parse_cek_hash` / :func:`format_cek_hash` first: those normalise case and
+    whitespace, and Photonic encodes the field verbatim, so a normalised AAD fails the tag
+    on any non-canonical spelling a writer happened to emit.
+
+    pyrxd 0.24.0 wrapped under the raw digest (``compute_cek_hash(cek)``, i.e.
+    ``parse_cek_hash(cek_hash)``) instead, which Photonic cannot open. A reader holding a wrap
+    from that release passes the raw digest as the AAD — together with
+    ``allow_legacy_info=True``, since the same release also used the legacy KEK info string.
+
+    Raises:
+        TypeError: ``cek_hash`` is not a ``str``. Passing the 32-byte digest here is the
+            0.24.0 mistake, and silently encoding a ``bytes`` repr would repeat it.
+    """
+    if not isinstance(cek_hash, str):
+        raise TypeError(
+            f"cek_wrap_aad takes the on-chain cek_hash STRING ('sha256:<hex>'), got {type(cek_hash).__name__}; "
+            "the raw 32-byte digest is the pre-fix AAD Photonic cannot open"
+        )
+    return cek_hash.encode("utf-8")
+
+
 def parse_cek_hash(formatted: str) -> bytes:
     """Parse the on-chain ``"sha256:<hex>"`` string back to 32 raw bytes."""
     s = formatted.strip()
@@ -324,8 +360,8 @@ def build_timelock_mint(
     Steps, all Photonic-compatible:
 
     1. encrypt with ``chunked-aead-v1`` (:func:`~pyrxd.crypto.aead.encrypt_chunked`)
-    2. wrap the CEK to each recipient over X25519, with the CEK-hash commitment as AAD
-       (REP-3006 — :func:`~pyrxd.crypto.kem.wrap_cek_x25519`)
+    2. wrap the CEK to each recipient over X25519 (:func:`~pyrxd.crypto.kem.wrap_cek_x25519`),
+       bound to the ``crypto.cek_hash`` string as AAD (:func:`cek_wrap_aad`)
     3. assemble the ``[NFT, ENCRYPTED]`` stub
     4. add the timelock through :func:`add_timelock_to_metadata`, which appends TIMELOCK and
        writes the commitment
@@ -373,11 +409,16 @@ def build_timelock_mint(
 
     wraps: list[CryptoRecipient] = []
     for r in recipients:
-        # The commitment is the AAD, per REP-3006 and Photonic's `encryption.ts`. Binding the
-        # wrap to it means a wrap lifted off one token cannot be replayed onto another whose
-        # commitment differs — unwrapping fails the tag check rather than returning a key for
-        # the wrong content.
-        wrapped = wrap_cek_x25519(cek, r.public_key, commitment_bytes)
+        # The AAD is the commitment STRING that goes on chain as `crypto.cek_hash`, as UTF-8 —
+        # what Photonic's app binds and checks (see `cek_wrap_aad`). Binding the wrap to it means
+        # a wrap lifted off one token cannot be replayed onto another whose commitment differs:
+        # unwrapping fails the tag check rather than returning a key for the wrong content.
+        #
+        # This passed the raw 32-byte digest through 0.24.0. The comment here then said that was
+        # "per REP-3006 and Photonic's `encryption.ts`"; neither says so — REP-3006 has no rule
+        # for the wrap AAD, and `encryption.ts` takes whatever AAD its caller supplies. Photonic's
+        # wallet could not open a single recipient wrap pyrxd produced.
+        wrapped = wrap_cek_x25519(cek, r.public_key, cek_wrap_aad(cek_hash_str))
         wraps.append(
             CryptoRecipient(
                 kid=r.kid,
@@ -565,6 +606,7 @@ __all__ = [
     "TimelockRecipient",
     "add_timelock_to_metadata",
     "build_timelock_mint",
+    "cek_wrap_aad",
     "compute_cek_hash",
     "format_cek_hash",
     "get_unlock_remaining",

@@ -17,8 +17,10 @@ The wrap protocol:
    through 0.24.0, which no longer interoperates; see
    :data:`LEGACY_KEK_DERIVATION_INFO` for how that content is still read.
 4. Sender encrypts the 32-byte CEK with XChaCha20-Poly1305 under ``kek``
-   with a random 24-byte nonce, binding the AAD (typically the CEK hash
-   commitment bytes per REP-3006)
+   with a random 24-byte nonce, binding a caller-supplied AAD. For a Glyph
+   recipient slot that is the UTF-8 text of ``crypto.cek_hash``
+   (``"sha256:<hex>"``), which is what Photonic's app binds — see
+   ``pyrxd.glyph.timelock.cek_wrap_aad``. This module does not choose it.
 5. Wire format: ``wrapped_cek = nonce(24) || ciphertext(32) || tag(16)`` = 72 bytes
 6. Sender publishes ``(wrapped_cek, ephemeral_pubkey)``; recipient computes
    the same shared secret via ECDH and unwraps
@@ -67,10 +69,11 @@ KEK_DERIVATION_INFO = b"glyph-kek-classical-v1"
 
 #: The pre-split spelling, accepted on UNWRAP ONLY and never emitted.
 #:
-#: pyrxd shipped ``b"glyph-kek-v1"`` from v0.6.0 (#106) through 0.24.0. That was correct when
-#: written. Upstream had ALREADY split classical from hybrid in ``8e6bb6e`` (2026-05-16), two
-#: days before this module was first committed, so pyrxd never matched upstream on this path —
-#: every CEK pyrxd wrapped in that window is recoverable only with this
+#: pyrxd shipped ``b"glyph-kek-v1"`` from v0.6.0 (#106) through 0.24.0. It is the spelling
+#: Photonic used BEFORE ``8e6bb6e`` (2026-05-16), which split classical from hybrid two days
+#: before this module was first committed (2026-05-18) — so it was already stale when written,
+#: and pyrxd never matched the upstream code of its own day on this path. Every CEK pyrxd
+#: wrapped in that window is recoverable only with this
 #: value, and dropping it would strand content pyrxd itself encrypted. It is tried only after
 #: the current derivation fails its AEAD tag, and :func:`unwrap_cek_x25519` reports which one
 #: succeeded rather than hiding it, because "this ciphertext is legacy" is a fact the caller
@@ -162,8 +165,11 @@ def wrap_cek_x25519(
     using their X25519 private key.
 
     ``aad`` is bound to the AEAD wrap — passing different ``aad`` to unwrap
-    fails decryption. Photonic uses the on-chain CEK hash commitment bytes
-    here per REP-3006.
+    fails decryption. For a Glyph recipient slot, Photonic's app binds the
+    UTF-8 bytes of the on-chain ``crypto.cek_hash`` STRING (``"sha256:<hex>"``,
+    71 bytes), not the 32-byte digest; build it with
+    ``pyrxd.glyph.timelock.cek_wrap_aad``. No REP fixes this value — REP-3006
+    defines AAD only for the content AEAD — so the wallet is the reference.
     """
     if len(cek) != XCHACHA20_KEY_SIZE:
         raise ValueError(f"cek must be {XCHACHA20_KEY_SIZE} bytes, got {len(cek)}")
