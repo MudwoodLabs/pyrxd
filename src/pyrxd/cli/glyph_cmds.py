@@ -38,6 +38,7 @@ import asyncio
 import json
 import shlex
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1911,7 +1912,8 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
         "V2 DAA: Unix timestamp written into the deployed state's lastTime — the baseline the "
         "FIRST mint retargets against. Default: the deploy time (what Photonic passes). ASERT and "
         "LWMA read it as a script number on the first mint, so values below 2^23 (including 0) "
-        "build a contract no miner can ever spend and are refused."
+        "build a contract no miner can ever spend and are refused, as are values above 0x7FFFFFFF "
+        "(bit 31 is the script-number sign)."
     ),
 )
 @click.option("--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH: retarget every N blocks.")
@@ -2536,9 +2538,13 @@ def _mine_claim_v2(
 @click.option(
     "--current-time",
     type=int,
-    default=0,
-    show_default=True,
-    help="V2 only: block locktime written into the recreated state's lastTime (and the DAA retarget). 0 = always-final; for real DAA tracking pass a timestamp <= the chain's median-time-past.",
+    default=None,
+    help=(
+        "V2 only: the mint's locktime, written into the recreated state's lastTime and used by the "
+        "DAA retarget. Default: the wall-clock time when the claim is built. ASERT, LWMA and EPOCH "
+        "contracts read lastTime back as a script number, so a value below 2^23 (e.g. 0) is refused "
+        "for them; values above 0x7FFFFFFF are refused for every mode."
+    ),
 )
 @click.option(
     "--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH claim: the contract's epoch length."
@@ -2578,7 +2584,7 @@ def claim_dmint_cmd(
     max_attempts: int | None,
     max_rerolls: int,
     reward_address: str | None,
-    current_time: int,
+    current_time: int | None,
     epoch_length: int,
     max_adjustment: str,
     schedule: str | None,
@@ -2698,6 +2704,11 @@ def claim_dmint_cmd(
             daa_kwargs = _v2_claim_daa_kwargs(
                 contract_utxo.state.daa_mode, epoch_length, max_adjustment, schedule, half_life
             )
+            if current_time is None:
+                # The wall clock at claim, the way a deploy stamps its own lastTime. The old
+                # default, 0, wrote `04 00000000` into the recreated state — a lastTime the
+                # retarget of an ASERT/LWMA/EPOCH contract cannot read back.
+                current_time = int(time.time())
             mint, pre, nonce = _mine_claim_v2(
                 contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, current_time, daa_kwargs, mine=_mine
             )

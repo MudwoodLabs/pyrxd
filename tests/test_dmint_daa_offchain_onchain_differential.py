@@ -45,14 +45,28 @@ from collections.abc import Callable
 
 import pytest
 
+from pyrxd.glyph.dmint import (
+    DmintContractUtxo,
+    DmintDeployParams,
+    DmintMinerFundingUtxo,
+    DmintState,
+    build_dmint_contract_script,
+    build_dmint_mint_tx,
+)
 from pyrxd.glyph.dmint.builders import (
+    _PART_A,
     _build_asert_daa_legacy,
     _build_asert_daa_v2,
     _build_epoch_daa,
     _build_linear_daa_legacy,
     _build_linear_daa_legacy_prefloor,
     _build_linear_daa_v2,
+    _build_part_b,
+    _build_part_c,
+    _daa_bytes_for,
+    _middle_literal,
     _push_minimal,
+    build_dmint_state_script,
 )
 from pyrxd.glyph.dmint.miner import (
     compute_next_target_asert_legacy,
@@ -61,7 +75,18 @@ from pyrxd.glyph.dmint.miner import (
     compute_next_target_linear_legacy,
     compute_next_target_linear_v2,
 )
-from pyrxd.glyph.dmint.types import ASERT_V2_MAX_TARGET_DIV4, ASERT_V2_RADIX, MAX_SHA256D_TARGET
+from pyrxd.glyph.dmint.types import (
+    _OP_STATESEPARATOR,
+    ASERT_V2_MAX_TARGET_DIV4,
+    ASERT_V2_RADIX,
+    DAA_MODES_READING_DEPLOY_LAST_TIME,
+    DAA_MODES_READING_LAST_TIME,
+    MAX_SHA256D_TARGET,
+    DaaBytecodeVersion,
+    DaaMode,
+    is_readable_last_time,
+)
+from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import ValidationError
 
 INT64_MAX = (1 << 63) - 1
@@ -311,8 +336,10 @@ _TARGETS = [
 _TTS = [1, 2, 30, 60, 600, 2048, 86400]
 _DELTAS = [-1_000_000, -300, -1, 0, 1, 15, 30, 60, 240, 3600, 1 << 30, 1 << 40]
 _LAST = 1_700_000_000
-#: The locktime domain ``build_dmint_mint_tx`` accepts: ``[0, 0x7FFFFFFF]`` (Part C's
-#: NUM2BIN(4) cannot encode a locktime with bit 31 set) and ``current_time >= last_time``.
+#: The top of the locktime domain ``build_dmint_mint_tx`` accepts (Part C's NUM2BIN(4) cannot
+#: encode a locktime with bit 31 set). The mirrors below are swept over ``[0, _LOCKTIME_MAX]``
+#: in BOTH directions from ``_LAST``: the builder additionally requires ``>= 2**23`` for the
+#: modes that read lastTime, and refuses a backwards locktime only for the pre-floor LWMA.
 _LOCKTIME_MAX = 0x7FFFFFFF  # spelled as the mint builder spells its own bound
 
 
@@ -664,3 +691,209 @@ def test_evaluator_rejects_non_minimal_push_and_number() -> None:
     with pytest.raises(_Abort, match="non-minimal script number"):
         _run(bytes.fromhex("03f000005193"), [], 0)  # push 240 padded, OP_1, OP_ADD
     assert _num(_run(bytes.fromhex("02f0005193"), [], 0)[-1]) == 241  # the minimal spelling works
+
+
+# ---------------------------------------------------------------------------------------
+# lastTime at MINT time: which fragments read it, what they can read, and which
+# backwards locktimes the bytecode really survives — each tied to build_dmint_mint_tx
+# ---------------------------------------------------------------------------------------
+#
+# The V2 state carries lastTime as a fixed ``04 <4B LE>`` push, and Part C writes the mint's
+# locktime back the same way. So the item a retarget reads is the RAW 4-byte form of the
+# number, not ``_cs_encode(n)``. The two agree for every n in [2**23, 2**31 - 1]; below that
+# the raw form is not minimally encoded, which is what these tests exercise.
+
+_ALL_GENERATIONS = {
+    DaaMode.FIXED: [DaaBytecodeVersion.V2],
+    DaaMode.ASERT: [DaaBytecodeVersion.V2, DaaBytecodeVersion.LEGACY],
+    DaaMode.LWMA: [DaaBytecodeVersion.V2, DaaBytecodeVersion.LEGACY, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR],
+    DaaMode.EPOCH: [DaaBytecodeVersion.V2],
+    DaaMode.SCHEDULE: [DaaBytecodeVersion.V2],
+}
+_EPOCH_L = 10
+
+
+def _fragment(mode: DaaMode, version: DaaBytecodeVersion) -> bytes:
+    return _daa_bytes_for(
+        mode,
+        240,
+        epoch_length=_EPOCH_L,
+        max_adjustment_log2=2,
+        schedule=((5, 1 << 40),),
+        daa_bytecode_version=version,
+    )
+
+
+def _state_stack(mode: DaaMode, *, last_time_item: bytes, height: int, target: int = 1 << 40) -> list:
+    stack = _daa_stack(int(mode), 60, 0, target, height)
+    stack[8] = last_time_item  # the raw 4-byte lastTime push, exactly as the state carries it
+    return stack
+
+
+def _raw(n: int) -> bytes:
+    return n.to_bytes(4, "little")
+
+
+def _aborts_on_last_time(frag: bytes, mode: DaaMode, last_time_item: bytes, height: int) -> bool:
+    try:
+        _run(frag, _state_stack(mode, last_time_item=last_time_item, height=height), _LAST)
+    except _Abort as exc:
+        assert "non-minimal script number" in str(exc), f"aborted for another reason: {exc}"
+        return True
+    return False
+
+
+def test_the_modes_that_read_last_time_are_derived_by_running_every_fragment() -> None:
+    """DAA_MODES_READING_LAST_TIME is read out of the BYTECODE'S BEHAVIOUR, not typed.
+
+    Every generation of every mode runs with lastTime = ``00000000`` (non-minimal) at heights
+    0, 1, one epoch boundary and one past it. A mode reads lastTime iff some run aborts on
+    it. Also pinned: ASERT/LWMA read it at EVERY height (so the mint builder's "this state
+    can no longer be minted" check applies on every mint), and EPOCH exactly at its
+    boundaries (height > 0 and height % epochLength == 0) — the gate the builder mirrors.
+    """
+    heights = (0, 1, _EPOCH_L, _EPOCH_L + 1, 2 * _EPOCH_L)
+    reads: dict[DaaMode, set[int]] = {}
+    for mode, versions in _ALL_GENERATIONS.items():
+        for version in versions:
+            frag = _fragment(mode, version)
+            hit = {h for h in heights if _aborts_on_last_time(frag, mode, _raw(0), h)}
+            # Control: the same runs with a readable lastTime never abort on it.
+            assert not any(_aborts_on_last_time(frag, mode, _raw(1 << 23), h) for h in heights)
+            reads.setdefault(mode, set()).update(hit)
+            if mode in (DaaMode.ASERT, DaaMode.LWMA):
+                assert hit == set(heights), f"{mode.name}/{version.name} skipped a height: {sorted(hit)}"
+            if mode is DaaMode.EPOCH:
+                assert hit == {h for h in heights if h > 0 and h % _EPOCH_L == 0}, sorted(hit)
+    assert len(reads) == len(DaaMode), "the derivation must see every DaaMode"
+    derived = frozenset(m for m, hit in reads.items() if hit)
+    assert derived, "derivation found nothing — the evaluator or the builders moved"
+    assert derived == DAA_MODES_READING_LAST_TIME
+    # The deploy-time set is the subset that reads at height 0.
+    assert frozenset(m for m, hit in reads.items() if 0 in hit) == DAA_MODES_READING_DEPLOY_LAST_TIME
+
+
+@pytest.mark.parametrize(
+    ("mode", "version"),
+    [(m, v) for m in sorted(DAA_MODES_READING_LAST_TIME, key=int) for v in _ALL_GENERATIONS[m]],
+)
+def test_the_written_last_time_threshold_is_where_the_bytecode_starts_reading(
+    mode: DaaMode, version: DaaBytecodeVersion
+) -> None:
+    """The mint builder refuses to write a lastTime below 2**23. That bound is exactly where a
+    retarget stops aborting on the 4-byte item — checked here per fragment, and the top of
+    the locktime range (0x7FFFFFFF) reads fine too."""
+    frag = _fragment(mode, version)
+    h = _EPOCH_L  # a boundary, so EPOCH reads as well
+    assert _aborts_on_last_time(frag, mode, _raw((1 << 23) - 1), h)
+    assert not _aborts_on_last_time(frag, mode, _raw(1 << 23), h)
+    assert not _aborts_on_last_time(frag, mode, _raw(0x7FFFFFFF), h)
+    assert is_readable_last_time(1 << 23) and not is_readable_last_time((1 << 23) - 1)
+
+
+def _contract(mode: DaaMode, version: DaaBytecodeVersion, *, height: int, last_time: int) -> DmintContractUtxo:
+    params = DmintDeployParams(
+        contract_ref=GlyphRef(txid="aa" * 32, vout=1),
+        token_ref=GlyphRef(txid="bb" * 32, vout=0),
+        max_height=1000,
+        reward=1000,
+        difficulty=32768 if mode is DaaMode.EPOCH else 8,
+        daa_mode=mode,
+        target_time=60,
+        half_life=240,
+        height=height,
+        last_time=last_time,
+        epoch_length=_EPOCH_L,
+        max_adjustment_log2=2,
+    )
+    part_b = _build_part_b(
+        mode, 240, epoch_length=_EPOCH_L, max_adjustment_log2=2, schedule=(), daa_bytecode_version=version
+    )
+    code = _PART_A + b"\xaa" + part_b + _build_part_c(_middle_literal(params))
+    script = build_dmint_state_script(params) + _OP_STATESEPARATOR + code
+    if version == DaaBytecodeVersion.V2:
+        assert script == build_dmint_contract_script(params)  # the production encoder, for v2
+    return DmintContractUtxo(txid="dd" * 32, vout=0, value=1, script=script, state=DmintState.from_script(script))
+
+
+_FUND = DmintMinerFundingUtxo(
+    txid="cc" * 32, vout=0, value=50_000_000, script=b"\x76\xa9\x14" + b"\x11" * 20 + b"\x88\xac"
+)
+
+
+def _build_mint(utxo: DmintContractUtxo, current_time: int):
+    kw = {"epoch_length": _EPOCH_L, "max_adjustment_log2": 2} if utxo.state.daa_mode is DaaMode.EPOCH else {}
+    return build_dmint_mint_tx(utxo, b"\x00" * 8, b"\x22" * 20, current_time, funding_utxo=_FUND, **kw)
+
+
+def _onchain_next_target(utxo: DmintContractUtxo, locktime: int, version: DaaBytecodeVersion) -> int:
+    """Run THIS contract's own DAA fragment over its own state at ``locktime``."""
+    st = utxo.state
+    frag = _fragment(st.daa_mode, version)
+    assert frag in utxo.script, "the fragment run must be the one the contract bakes"
+    stack = _state_stack(st.daa_mode, last_time_item=_raw(st.last_time), height=st.height, target=st.target)
+    stack[7] = _cs_encode(st.target_time)
+    _run(frag, stack, locktime)
+    return _result(stack)
+
+
+@pytest.mark.parametrize(
+    ("mode", "version"),
+    [
+        (DaaMode.ASERT, DaaBytecodeVersion.V2),
+        (DaaMode.ASERT, DaaBytecodeVersion.LEGACY),
+        (DaaMode.LWMA, DaaBytecodeVersion.V2),
+        (DaaMode.EPOCH, DaaBytecodeVersion.V2),
+    ],
+)
+@pytest.mark.parametrize("back", [1, 59, 3600, _LAST - (1 << 23)])
+def test_the_builder_accepts_the_backward_locktimes_the_bytecode_accepts(
+    mode: DaaMode, version: DaaBytecodeVersion, back: int
+) -> None:
+    """A locktime EARLIER than the state's lastTime, through ``build_dmint_mint_tx``: the
+    builder builds it, and the contract's own fragment, run under int64 + MINIMALDATA,
+    neither aborts nor disagrees with the target the builder wrote. (EPOCH is taken at a
+    boundary height, where the delta is actually read.) The old builder refused all of
+    these, saying the retarget overflows."""
+    height = _EPOCH_L if mode is DaaMode.EPOCH else 3
+    utxo = _contract(mode, version, height=height, last_time=_LAST)
+    locktime = _LAST - back
+    res = _build_mint(utxo, locktime)
+    assert res.tx.locktime == locktime == res.updated_state.last_time
+    assert res.updated_state.target == _onchain_next_target(utxo, locktime, version)
+
+
+def test_the_prefloor_lwma_backward_locktime_is_refused_and_the_bytecode_shows_why() -> None:
+    """The one generation that does not survive a backwards locktime. The builder refuses
+    it; the evaluator shows both outcomes the refusal names — a clamp to target 1 for a
+    small negative product, an int64 abort for a large one."""
+    utxo = _contract(DaaMode.LWMA, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR, height=3, last_time=_LAST)
+    with pytest.raises(ValidationError, match="does not floor the time delta"):
+        _build_mint(utxo, _LAST - 30)
+    assert _onchain_next_target(utxo, _LAST - 30, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR) == 1
+    with pytest.raises(ValidationError, match="does not floor the time delta"):
+        _build_mint(utxo, _LAST - 1_000_000)
+    stack = _daa_stack(3, 60, _LAST, MAX_SHA256D_TARGET)
+    with pytest.raises(_Abort, match="OP_MUL"):
+        _run(_fragment(DaaMode.LWMA, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR), stack, _LAST - 1_000_000)
+    # The honest neighbour: a forward locktime on the same contract builds, and agrees.
+    res = _build_mint(utxo, _LAST + 30)
+    assert res.updated_state.target == _onchain_next_target(utxo, _LAST + 30, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR)
+
+
+@pytest.mark.parametrize("version", [DaaBytecodeVersion.LEGACY, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR])
+def test_a_legacy_lwma_mint_that_would_set_target_1_is_refused(version: DaaBytecodeVersion) -> None:
+    """Legacy LWMA multiplies the target by the time since the last mint: a zero delta (and,
+    for the floored variant, any negative one) makes the covenant write target 1. The
+    evaluator confirms the covenant would ACCEPT that mint — so only pyrxd can stop it."""
+    utxo = _contract(DaaMode.LWMA, version, height=3, last_time=_LAST)
+    assert _onchain_next_target(utxo, _LAST, version) == 1
+    with pytest.raises(ValidationError, match="target would be 1"):
+        _build_mint(utxo, _LAST)
+    if version == DaaBytecodeVersion.LEGACY:
+        assert _onchain_next_target(utxo, _LAST - 60, version) == 1
+        with pytest.raises(ValidationError, match="target would be 1"):
+            _build_mint(utxo, _LAST - 60)
+    # Honest neighbour: one second later is an ordinary, mineable retarget.
+    res = _build_mint(utxo, _LAST + 1)
+    assert res.updated_state.target == _onchain_next_target(utxo, _LAST + 1, version) > 1

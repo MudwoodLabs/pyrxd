@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:340-347`), and reads it back with
+(`src/pyrxd/glyph/builder.py:436-443`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:298-304`).
+(`src/pyrxd/glyph/builder.py:392-397`).
 
 ### 6.2 Phase 2 — reveal
 
@@ -751,7 +751,7 @@ alone does not determine the clamp a contract bakes — the bytecode does.
 `daa` is omitted when the mode is `FIXED`. **Nothing on chain reconciles
 `premine` against the photons a deploy actually emits.** pyrxd refuses a deploy
 whose metadata advertises a premine it does not emit
-(`src/pyrxd/glyph/builder.py:37-58`) — a deliberate addition, not shared with
+(`src/pyrxd/glyph/builder.py:67-130`) — a deliberate addition, not shared with
 Photonic, and therefore not something an implementation may rely on other
 producers to have done.
 
@@ -1310,7 +1310,7 @@ behaviour stay on chain and a reader still has to handle them.
 | Royalty `minimum` with `splits` | Each split computed independently; `minimum` never consulted, so a royalty declaring `bps=100, minimum=50000` pays the minimum with one recipient and ignores it with two | Total computed once, then divided | Photonic's version can pay the creator less than the recorded terms (`src/pyrxd/glyph/royalty.py:56-68`). |
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
-| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:37-58`). |
+| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:67-130`). |
 | Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:332-335`). |
 | V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py:119-151`). |
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |

@@ -65,6 +65,8 @@ from .types import (
     ASERT_V2_DRIFT_CLAMP,
     ASERT_V2_MAX_TARGET_DIV4,
     ASERT_V2_RADIX,
+    DAA_MODES_READING_DEPLOY_LAST_TIME,
+    DAA_MODES_READING_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     EPOCH_MAX_SAFE_TARGET,
     MAX_SHA256D_TARGET,
@@ -73,6 +75,8 @@ from .types import (
     DaaMode,
     DmintAlgo,
     DmintMintResult,
+    is_minimal_4byte_scriptnum,
+    is_readable_last_time,
 )
 
 #: Live-progress hook: ``callback(attempts, elapsed_s)``. Deliberately two
@@ -299,9 +303,12 @@ def compute_next_target_linear_legacy(
     Off-chain mirror of :func:`pyrxd.glyph.dmint.builders._build_linear_daa_legacy`
     (with the ``OP_0 OP_MAX`` timeDelta floor) AND of
     :func:`~pyrxd.glyph.dmint.builders._build_linear_daa_legacy_prefloor` (without
-    it) for every ``current_time >= last_time`` — the only inputs the mint builder
-    accepts; on a negative delta the pre-floor bytecode aborts on chain instead of
-    flooring. This is the LWMA bytecode pyrxd emitted before 2026-09-16 (upstream
+    it) for every ``current_time >= last_time``. On a negative delta the two variants
+    part: the floored one treats it as 0 (this mirror's answer), while the pre-floor one
+    multiplies it into the target and either aborts on chain (the product leaves int64)
+    or clamps the target to 1 — so ``build_dmint_mint_tx`` refuses a backwards
+    ``current_time`` for a pre-floor contract, and refuses ANY legacy-LWMA mint whose next
+    target would be 1. This is the LWMA bytecode pyrxd emitted before 2026-09-16 (upstream
     replaced it with LWMA-v2 on 2026-06-20, ``c90e6506``); the mainnet LWMA deploy
     ``dea3beb9…`` carries the pre-floor variant and is mined with this formula.
     New deploys use :func:`compute_next_target_linear_v2`.
@@ -391,14 +398,14 @@ def compute_next_target_asert_v2(
     ``[-(2^63-1), 2^63-1]``; this mirror raises ``ValidationError`` at the same points
     via :func:`_script_int64` so it never predicts an unmineable state):
 
-    * ``timeDelta = current_time - last_time``: ``build_dmint_mint_tx`` bounds
-      ``current_time`` to ``[0, 0x7FFFFFFF]`` (the NUM2BIN(4) sign-bit cliff) and requires
-      ``current_time >= last_time``, so within the builder's domain both lie in
-      ``[0, 2^31 - 1]`` and ``0 <= timeDelta <= 2^31 - 1``. (The state's 4-byte lastTime
-      push would read as NEGATIVE on chain above 2^31 - 1; the builder never gets there.)
+    * ``timeDelta = current_time - last_time``: for an ASERT/LWMA mint
+      ``build_dmint_mint_tx`` requires both ``current_time`` and the state's ``last_time``
+      to be readable lastTimes (``is_readable_last_time``: ``[2^23, 2^31 - 1]``), so
+      ``|timeDelta| <= 2^31 - 1``. A backwards ``current_time`` is accepted: the fragment
+      clamps the drift, so a negative delta is an ordinary input, not an abort.
     * ``excess = timeDelta - target_time``: ``target_time`` is a state script number in
-      ``[1, 2^63 - 1]``, so ``excess`` is in ``[-(2^63 - 1) - 0, 2^31 - 2]`` and the OP_SUB
-      underflows only for ``target_time > 2^63 - 1 - timeDelta`` — checked.
+      ``[1, 2^63 - 1]``, so ``excess`` is in ``[-(2^63 - 1) - (2^31 - 1), 2^31 - 2]`` and the
+      OP_SUB underflows only for ``target_time > 2^63 - 1 + timeDelta`` — checked.
     * ``excess * RADIX``: ``|excess| <= 2^47 - 1`` ⇒ ``|excess * 2^16| <= 2^63 - 2^16``,
       representable; ``|excess| >= 2^47`` ⇒ ``|product| >= 2^63``, which OP_MUL aborts.
       Positive excess never reaches it (``excess <= 2^31 - 2``); negative excess reaches
@@ -591,6 +598,53 @@ def detect_contract_daa_bytecode(contract_script: bytes) -> DetectedDaaBytecode:
             "(only ASERT and LWMA changed formula upstream)"
         )
     return detect_daa_bytecode(_v2_code_section(contract_script, state), state.daa_mode)
+
+
+def _state_last_time_read_by_this_mint(state: DmintState, epoch_length: int | None) -> bool:
+    """Does the retarget of the mint that SPENDS ``state`` read the state's own ``lastTime``?
+
+    ASERT and LWMA open their fragment with the unconditional excess preamble, so every
+    mint reads it (that is what :data:`DAA_MODES_READING_DEPLOY_LAST_TIME` is derived from:
+    a fragment that reads lastTime on the first mint reads it on all of them). EPOCH reads
+    it only behind its boundary gate — the same condition :func:`compute_next_target_epoch`
+    mirrors. SCHEDULE and FIXED never read it.
+    """
+    if state.daa_mode in DAA_MODES_READING_DEPLOY_LAST_TIME:
+        return True
+    if state.daa_mode == DaaMode.EPOCH and epoch_length is not None:
+        return state.height > 0 and state.height % epoch_length == 0
+    return False
+
+
+def _refuse_unreadable_state_last_time(state: DmintState, epoch_length: int | None) -> None:
+    """Refuse — before any grind — a mint whose retarget reads a lastTime pyrxd cannot mirror.
+
+    Non-minimal (``04 00000000`` and anything below ``2**23``): Radiant's consensus aborts
+    the retarget's number read, so no transaction can spend this state and the contract
+    can no longer be minted. Bit 31 set: the covenant reads a negative number that pyrxd's
+    mirrors (which parse the state unsigned) do not model. Called from
+    :func:`build_dmint_mint_tx` after the EPOCH parameters are byte-verified.
+    """
+    if not _state_last_time_read_by_this_mint(state, epoch_length):
+        return
+    last_time = state.last_time
+    if is_readable_last_time(last_time):
+        return
+    when = f"at this epoch boundary (height {state.height})" if state.daa_mode == DaaMode.EPOCH else "on every mint"
+    if not is_minimal_4byte_scriptnum(last_time):
+        raise ValidationError(
+            f"this dMint contract can no longer be minted. Its state carries lastTime={last_time}, pushed as the "
+            f"4-byte script number {last_time.to_bytes(4, 'little').hex()}, which is not minimally encoded, and "
+            f"its {state.daa_mode.name} retarget reads lastTime as a number {when}. Radiant's consensus refuses "
+            "a non-minimal number there (MINIMALDATA is a mandatory script-verify flag), so no transaction can "
+            "spend this state; pyrxd refuses rather than start a proof-of-work grind that cannot pay out."
+        )
+    raise ValidationError(
+        f"this contract's lastTime={last_time} (0x{last_time:08X}) has bit 31 set: its {state.daa_mode.name} "
+        f"retarget reads it {when} as the NEGATIVE script number {-(last_time & 0x7FFFFFFF)}, while pyrxd reads "
+        "the state unsigned. pyrxd's retarget mirrors do not model a negative lastTime, so it refuses to build "
+        "this mint rather than grind for a target the covenant may not compute."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1596,8 +1650,14 @@ def build_dmint_mint_tx(
        result on every mint, so ``current_time`` IS the block locktime: it is written
        into the recreated state's ``last_time`` AND set as the tx ``nLockTime`` (the
        two must agree), and for DAA modes it drives the target retarget.
-       ``current_time`` must be in ``[last_time, 0x7FFFFFFF]`` for DAA modes (a
-       backwards or post-2038 locktime is rejected on-chain). EPOCH/SCHEDULE bake
+       ``current_time`` must be ``<= 0x7FFFFFFF`` (Part C's ``NUM2BIN(_, 4)`` cannot write
+       a locktime with bit 31 set), and for the modes whose retarget reads ``lastTime``
+       (:data:`~pyrxd.glyph.dmint.types.DAA_MODES_READING_LAST_TIME`: ASERT, LWMA, EPOCH)
+       also ``>= 2**23``, so the lastTime it writes is a minimally encoded script number a
+       later retarget can read. A ``current_time`` EARLIER than the contract's
+       ``last_time`` is accepted wherever the bytecode accepts it — every generation of
+       ASERT and LWMA except the 2026-06-16 pre-floor LWMA, and EPOCH — because those
+       fragments clamp a negative delta. EPOCH/SCHEDULE bake
        their parameters into the contract code (not the parsed state), so the caller
        passes ``epoch_length``/``max_adjustment_log2`` or ``schedule`` (and
        ``half_life`` for ASERT) matching the deployed contract — a mismatch is caught
@@ -1620,6 +1680,14 @@ def build_dmint_mint_tx(
        3600 contract started failing on a value the builder already knew. Supplying
        ``half_life`` explicitly still byte-verifies it against the baked Part B and fails
        fast, naming the baked value, if the two disagree.
+
+    .. note::
+       **Refused before any PoW grind, because the covenant would reject the result or
+       the contract could not be mined afterwards:** a state whose ``lastTime`` this
+       mint's retarget reads and which is not a readable lastTime (``04 00000000`` on an
+       ASERT/LWMA contract, or on an EPOCH contract at an epoch boundary — that contract
+       can no longer be minted at all); a backwards ``current_time`` on a pre-floor LWMA
+       contract; and a legacy-LWMA mint whose next target would be 1.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -1650,9 +1718,9 @@ def build_dmint_mint_tx(
     :param nonce:          8-byte PoW nonce (use ``b'\\x00' * 8`` as placeholder
                            when building the tx shell; replace after mining).
     :param miner_pkh:      20-byte P2PKH hash of the miner's reward address.
-    :param current_time:   Unix timestamp of the block (used for DAA target
-                           computation).  Caller is responsible for supplying a
-                           value consistent with the transaction's locktime.
+    :param current_time:   Unix timestamp written as the tx ``nLockTime`` AND as the
+                           recreated state's ``lastTime`` (the covenant rebuilds it
+                           from ``OP_TXLOCKTIME``); drives the DAA retarget.
     :param fee_rate:       Photons per byte for fee calculation (default 10_000,
                            the Radiant post-V2 relay minimum).
     :raises ValidationError: ``contract_utxo.state.is_exhausted`` is True;
@@ -1739,17 +1807,27 @@ def build_dmint_mint_tx(
             f"current_time must be <= 0x7FFFFFFF (2038-01-19), got {current_time}; the covenant "
             "reconstructs lastTime via NUM2BIN(_,4), which rejects locktimes with bit 31 set"
         )
-    # DAA modes (ASERT/LWMA/EPOCH) retarget on (current_time - last_time). A BACKWARDS
-    # locktime (current_time < last_time — reachable via the current_time=0 default or
-    # clock skew) makes the on-chain DAA multiply a large negative operand → OP_MUL
-    # overflows int64 → INVALID_NUMBER_RANGE_64_BIT abort (verified in radiant-core
-    # interpreter.cpp), while the off-chain mirror clamps to a finite value: a silent
-    # off-chain↔on-chain DIVERGENCE that wastes the PoW grind. Refuse it here (fail-fast).
-    if state.daa_mode != DaaMode.FIXED and current_time < state.last_time:
+    # pyrxd's miner never writes a lastTime the next retarget cannot read. Part C writes
+    # current_time back as the fixed push `04 <4B LE>`; below 2**23 that is not a minimally
+    # encoded script number, and ASERT/LWMA (every mint) and EPOCH (every epoch boundary)
+    # read lastTime with CScriptNum(fRequireMinimal) — MINIMALDATA is a mandatory
+    # script-verify flag on Radiant, so the read aborts and the contract is never minted
+    # again. The upper half of is_readable_last_time (bit 31) is already refused above.
+    # This is THE place every V2 mint crosses, whichever entry point built it.
+    if state.daa_mode in DAA_MODES_READING_LAST_TIME and not is_readable_last_time(current_time):
+        reader = (
+            "reads lastTime as a number at every epoch boundary, and pyrxd refuses to write one it could "
+            "not read on any EPOCH mint"
+            if state.daa_mode == DaaMode.EPOCH
+            else "reads lastTime as a number on the very next mint"
+        )
         raise ValidationError(
-            f"current_time ({current_time}) must be >= the contract's last_time ({state.last_time}) for "
-            f"{state.daa_mode.name}: a backwards locktime makes the on-chain DAA retarget overflow and the "
-            "mint is rejected. Pass a current_time at or after the previous mint's time (and <= chain MTP)."
+            f"current_time={current_time} cannot be the locktime of a {state.daa_mode.name} mint: the covenant "
+            f"writes it into the recreated contract's lastTime as the 4-byte push "
+            f"{current_time.to_bytes(4, 'little').hex()}, which is not a minimally encoded script number, and a "
+            f"{state.daa_mode.name} contract {reader}. Radiant's consensus refuses a non-minimal number there "
+            "(MINIMALDATA is a mandatory script-verify flag), so the contract could never be minted again. "
+            "Pass a real Unix timestamp (>= 2**23) — normally the current time, which is claim-dmint's default."
         )
     if state.is_exhausted:
         raise ContractExhaustedError(
@@ -1916,6 +1994,42 @@ def build_dmint_mint_tx(
                 f"({daa_bytecode_version.name} generation). They must match the values used at deploy, "
                 "or the recreated target diverges and the mint is rejected."
             )
+
+    # The DAA params are verified against the bytecode now, so what the checks below
+    # derive from them (EPOCH's boundary, the legacy LWMA formula) is the contract's own.
+    _refuse_unreadable_state_last_time(state, epoch_length)
+    if (
+        state.daa_mode == DaaMode.LWMA
+        and daa_bytecode_version == DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR
+        and current_time < state.last_time
+    ):
+        # The only generation whose bytecode does not survive a backwards locktime. Every
+        # other one clamps the delta (v2: the ±RADIX/4 drift clamp; floored legacy LWMA:
+        # OP_0 OP_MAX; legacy ASERT: the ±4 drift clamp; EPOCH: the lower bound), which
+        # the int64 evaluator in tests/test_dmint_daa_offchain_onchain_differential.py
+        # checks against each mirror.
+        raise ValidationError(
+            f"current_time ({current_time}) is earlier than the contract's last_time ({state.last_time}). This "
+            "contract carries the 2026-06-16 LWMA retarget, which does not floor the time delta at zero: a "
+            "negative delta multiplies into the target, so the covenant either aborts (the product leaves the "
+            "int64 range) or clamps the next target to 1, which no miner can realistically meet. Pass a "
+            "current_time at or after the previous mint's."
+        )
+    if state.daa_mode == DaaMode.LWMA and daa_bytecode_version != DaaBytecodeVersion.V2 and new_target == 1:
+        factor = min(state.target, MAX_SHA256D_TARGET // 4) // state.target_time
+        span = max(0, min(current_time - state.last_time, 4 * state.target_time))
+        remedy = (
+            f"Pass a current_time later than the contract's last_time ({state.last_time})."
+            if factor > 0
+            else "Its target is already below its target_time, so no current_time avoids this."
+        )
+        raise ValidationError(
+            "V2 LWMA mint: the recreated contract's target would be 1 — the hardest possible difficulty — so "
+            "no miner would realistically find a nonce for it and the contract could never be minted again. "
+            "This contract carries the pre-2026-09-16 LWMA retarget: (min(target, MAX/4) // target_time) x "
+            f"max(0, min(current_time - last_time, 4 x target_time)) = {factor} x {span}, raised to the "
+            f"minimum of 1. {remedy}"
+        )
 
     # The 75-byte FT-wrapped reward \u2014 load-bearing for the covenant's
     # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check (_PART_C == V1 tail).

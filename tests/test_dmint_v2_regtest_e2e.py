@@ -102,6 +102,7 @@ from pyrxd.glyph.dmint import (
     is_minimal_4byte_scriptnum,
     mine_solution_dispatch,
 )
+from pyrxd.glyph.dmint import miner as dmint_miner
 from pyrxd.glyph.dmint.miner import _v2_code_section
 from pyrxd.glyph.dmint.types import ASERT_V2_MAX_TARGET_DIV4, ASERT_V2_RADIX, MAX_SHA256D_TARGET
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
@@ -647,7 +648,7 @@ class TestRadiantDmintV2OnConsensus:
         assert res["allowed"] is True, f"mint of API-deployed V2 contract rejected: {res}"
 
     @pytest.mark.parametrize("daa_mode", [DaaMode.ASERT, DaaMode.LWMA])
-    def test_v2_adaptive_deploy_via_api_is_mineable_and_the_old_shape_is_not(self, node, daa_mode):
+    def test_v2_adaptive_deploy_via_api_is_mineable_and_the_old_shape_is_not(self, node, daa_mode, monkeypatch):
         """The shipped deploy path, with NO last_time given, produces an ASERT/LWMA
         contract the NODE will let a miner spend — and the shape it used to produce does not.
 
@@ -704,6 +705,13 @@ class TestRadiantDmintV2OnConsensus:
         )
         for field in ("max_height", "reward", "algo", "daa_mode", "target_time", "target", "height"):
             assert getattr(dead.state, field) == getattr(contract.state, field), field
+        # pyrxd itself now refuses to build this mint ("can no longer be minted") — that is
+        # the point of the control's premise, so assert it first. The NODE is the judge the
+        # control exists for, though, so the refusal is patched out below to let the bytes
+        # reach it: without the node's own rejection, pyrxd's refusal would be a claim.
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _build_signed_v2_mint(node, dead, current_time=stamped + 120)
+        monkeypatch.setattr(dmint_miner, "_refuse_unreadable_state_last_time", lambda state, epoch_length: None)
         dead_tx, _n = _build_signed_v2_mint(node, dead, current_time=stamped + 120)
         dead_res = node.accepts(dead_tx.serialize().hex())
         assert dead_res.get("allowed") is not True, (

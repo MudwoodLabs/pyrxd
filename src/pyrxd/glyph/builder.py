@@ -26,6 +26,7 @@ from .dmint import (
     DmintDeployParams,
     build_dmint_contract_script,
     is_minimal_4byte_scriptnum,
+    is_readable_last_time,
 )
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
@@ -746,8 +747,10 @@ class GlyphBuilder:
         # timestamps in two scripts that are supposed to describe the same contract.
         # None -> now mirrors Photonic's deploy (`Math.floor(Date.now() / 1000)`).
         # Checked FIRST, before the CBOR is encoded and before a commit script the caller
-        # might broadcast exists — a refusal after the commit is on chain would strand its
-        # value in a hashlock whose only reveal builds a contract nobody can ever mine.
+        # might broadcast exists, so a bad value costs nothing. (The commit's hashlock binds
+        # the CBOR payload, not lastTime, so a later refusal would not strand the commit —
+        # the reveal could be rebuilt with a readable lastTime — but it would stop the
+        # deploy between two transactions.)
         last_time = params.last_time if params.last_time is not None else int(time.time())
         require_mineable_last_time(last_time, params.daa_mode, stage="prepare_dmint_deploy")
 
@@ -1754,21 +1757,37 @@ def require_mineable_last_time(last_time: int, daa_mode: DaaMode, *, stage: str)
     ``mandatory-script-verify-flag-failed``); the ``lastTime = 0`` half is re-proved on
     every regtest run by the control in ``tests/test_dmint_v2_regtest_e2e.py``.
 
+    A value with bit 31 set (above ``0x7FFFFFFF``) is refused too, although its encoding can
+    be minimal: the top bit of a script number is its sign, so the covenant's first
+    retarget would measure from a NEGATIVE lastTime while pyrxd's miner, which parses the
+    state unsigned, refuses to mine such a state rather than predict a target the covenant
+    does not compute (see :func:`pyrxd.glyph.dmint.types.is_readable_last_time`). pyrxd
+    does not deploy a contract its own miner would refuse.
+
     This is enforced on the DEPLOY path rather than in
     :class:`~pyrxd.glyph.dmint.types.DmintDeployParams`, because that type is the argument
     to pyrxd's byte-level mirror of Photonic ``dMintScript`` — which accepts any
     ``lastTime`` — and the mirror has to stay able to reproduce contracts that already
-    exist on chain. ``GlyphBuilder.prepare_dmint_deploy`` and
-    ``DmintV2DeployResult.build_reveal_outputs`` are the only shipped callers of
-    ``build_dmint_contract_script``, so guarding those two guards every shipped deploy —
-    and that "only two" is not prose: it is derived from the source and asserted in
-    ``tests/test_reachability_shipped_callers.py``.
+    exist on chain. Every shipped caller of ``build_dmint_contract_script`` must cross this
+    guard: ``tests/test_reachability_shipped_callers.py`` derives the set of those callers
+    from the source and fails if any one of them does not also call this function. (It
+    asserts that universality, not a count of callers.)
     """
     if daa_mode not in DAA_MODES_READING_DEPLOY_LAST_TIME:
         return
-    if is_minimal_4byte_scriptnum(last_time):
+    if is_readable_last_time(last_time):
         return
     encoded = last_time.to_bytes(4, "little").hex() if 0 <= last_time <= 0xFFFFFFFF else "out of 4-byte range"
+    if is_minimal_4byte_scriptnum(last_time):
+        # Minimal but bit 31 set: the push reads back as a NEGATIVE number.
+        raise ValidationError(
+            f"{stage}: last_time={last_time} (0x{last_time:08X}) has bit 31 set, so its 4-byte push "
+            f"{encoded} is the NEGATIVE script number {-(last_time & 0x7FFFFFFF)} to the covenant, and a "
+            f"{daa_mode.name} contract reads lastTime as a number on its first mint. pyrxd's miner reads the "
+            "state unsigned and refuses to mine such a contract rather than predict a target the covenant "
+            "does not compute, so pyrxd will not deploy one. Pass a Unix timestamp <= 0x7FFFFFFF "
+            "(2038-01-19), or leave last_time unset to stamp the deploy time."
+        )
     raise ValidationError(
         f"{stage}: last_time={last_time} pushes as the NON-MINIMAL 4-byte script number {encoded}, "
         f"and a {daa_mode.name} contract reads lastTime as a number on its FIRST mint. MINIMALDATA is "
@@ -1966,7 +1985,9 @@ class DmintV2DeployParams:
         passes (``Math.floor(Date.now() / 1000)``). For ASERT and LWMA this value is read
         as a script number on the first mint, so a non-minimal 4-byte encoding (anything
         below ``2**23``, including the old implicit 0) makes the contract **unmineable from
-        birth** — such a value is refused here rather than deployed.
+        birth** — such a value is refused here rather than deployed. A value above
+        ``0x7FFFFFFF`` is refused too: bit 31 is the script-number sign, so the covenant would
+        read it as negative (see :func:`require_mineable_last_time`).
     """
 
     metadata: GlyphMetadata
@@ -2014,7 +2035,7 @@ class DmintV2DeployParams:
         # re-checks the RESOLVED value as its first act, and build_reveal_outputs re-checks
         # again immediately before the on-chain bytes are emitted; see
         # require_mineable_last_time for why the refusal is not in DmintDeployParams.
-        # An omitted value (None) is stamped at prepare time and cannot be wrong.
+        # An omitted value (None) is stamped from the clock at prepare time and checked there.
         if self.last_time is not None:
             require_mineable_last_time(self.last_time, self.daa_mode, stage="DmintV2DeployParams")
 

@@ -5,7 +5,7 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (25 — every module-level name, so the count is checkable rather than
+Symbols (27 — every module-level name, so the count is checkable rather than
 decorative; it read "20" while listing 17 before 2026-09-22):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
@@ -15,7 +15,8 @@ decorative; it read "20" while listing 17 before 2026-09-22):
     DEFAULT_ASERT_HALFLIFE,
     DmintAlgo, DaaMode, DaaBytecodeVersion,
     _OP_STATESEPARATOR, _PART_B1, _PART_B2, _PART_B4,
-    is_minimal_4byte_scriptnum, DAA_MODES_READING_DEPLOY_LAST_TIME,
+    is_minimal_4byte_scriptnum, is_readable_last_time,
+    DAA_MODES_READING_DEPLOY_LAST_TIME, DAA_MODES_READING_LAST_TIME,
     DmintDeployParams, DmintCborPayload, _schedule_from_cbor, DmintMintResult,
     DmintV1ContractInitialState
 """
@@ -206,11 +207,18 @@ def is_minimal_4byte_scriptnum(n: int) -> bool:
     — if the second-most-significant byte already has its high bit set, the extra byte
     is carrying the sign and IS minimal (this is how ``+255`` encodes as ``ff00``).
 
-    Over the range a locktime can occupy (``[0, 0x7FFFFFFF]``) this is exactly
-    ``n >= 2**23``; that equality is not hard-coded here, it is derived by this
-    predicate and pinned in ``tests/test_dmint_daa_v2_resync.py``. The 2026-09-21 review
-    measured the same boundary against a real radiant-core node: ``last_time=8388608``
-    accepted, ``8388607`` rejected with ``mandatory-script-verify-flag-failed``.
+    Over ``[0, 0x7FFFFFFF]`` — the locktimes Part C's ``NUM2BIN(_, 4)`` can write back —
+    this is exactly ``n >= 2**23``; that equality is not hard-coded here, it is derived
+    by this predicate and pinned in ``tests/test_dmint_daa_v2_resync.py``. The 2026-09-21
+    review measured the same boundary against a real radiant-core node:
+    ``last_time=8388608`` accepted, ``8388607`` rejected with
+    ``mandatory-script-verify-flag-failed``.
+
+    This answers ONLY the encoding question. A value with bit 31 set (``0x80800000``,
+    ``0xFFFFFFFF``) can be minimally encoded and still not mean ``n``: its top bit is the
+    script-number SIGN, so the covenant reads it as a negative number while
+    :class:`~pyrxd.glyph.dmint.chain.DmintState` parses it unsigned. To ask whether a
+    lastTime reads back as the number pyrxd wrote, use :func:`is_readable_last_time`.
     """
     if not 0 <= n <= 0xFFFFFFFF:
         return False  # outside what a 4-byte push can carry at all
@@ -220,19 +228,49 @@ def is_minimal_4byte_scriptnum(n: int) -> bool:
     return bool(vch[-2] & 0x80)
 
 
+def is_readable_last_time(n: int) -> bool:
+    """Does a V2 state's fixed 4-byte ``lastTime`` push read back, as a number, as ``n``?
+
+    True exactly when the push is minimally encoded (:func:`is_minimal_4byte_scriptnum`)
+    AND bit 31 is clear, i.e. ``2**23 <= n <= 0x7FFFFFFF``. Below ``2**23`` the retarget's
+    ``CScriptNum`` read aborts the script (MINIMALDATA is consensus on Radiant); with
+    bit 31 set the covenant reads a negative number that pyrxd's off-chain mirrors,
+    which parse the state unsigned, would not reproduce. Both the deploy guard
+    (``pyrxd.glyph.builder.require_mineable_last_time``) and the mint builder
+    (``build_dmint_mint_tx``) refuse on this predicate, so pyrxd never writes a lastTime
+    a later retarget reads differently from — or cannot read at all.
+    """
+    return 0 <= n <= 0x7FFFFFFF and is_minimal_4byte_scriptnum(n)
+
+
 #: The DAA modes whose retarget fragment reads ``lastTime`` on the **first** mint,
 #: i.e. while the state still carries the value chosen at deploy.
 #:
 #: ASERT and LWMA open their fragment with the unconditional "excess" preamble
-#: (``OP_TXLOCKTIME OP_2 OP_PICK OP_SUB …``), so the very first mint constructs a
-#: ``CScriptNum`` from the deploy's ``lastTime``. EPOCH reads it too, but only inside
-#: a branch gated on ``height > 0`` — never at height 0 — and SCHEDULE/FIXED never
-#: read it at all, so a deploy-time ``lastTime`` of 0 is harmless for those three.
+#: (``OP_TXLOCKTIME OP_2 OP_PICK OP_SUB …``), so the very first mint — and every mint
+#: after it — constructs a ``CScriptNum`` from the state's ``lastTime``. EPOCH reads it
+#: only inside a branch gated on ``height > 0 and height % epochLength == 0``, which
+#: height 0 never takes; SCHEDULE/FIXED never read it at all. So the value chosen AT
+#: DEPLOY is never read by those three: every state above height 0 carries the
+#: ``lastTime`` its own mint wrote. (That second value IS read by EPOCH at each
+#: boundary — see :data:`DAA_MODES_READING_LAST_TIME`, which the mint builder guards.)
 #:
 #: This membership is DERIVED from the emitted bytecode and checked against this
 #: constant in ``tests/test_dmint_daa_v2_resync.py`` (a mode whose fragment starts
 #: reading ``lastTime`` unconditionally must appear here, or that test fails).
 DAA_MODES_READING_DEPLOY_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA})
+
+#: The DAA modes whose retarget fragment reads ``lastTime`` as a number on SOME mint —
+#: so a ``lastTime`` a mint WRITES for one of these can be read by a later mint.
+#:
+#: ASERT and LWMA read it on every mint; EPOCH reads it on every epoch-boundary mint
+#: (a state at ``height > 0`` with ``height % epochLength == 0``). SCHEDULE and FIXED
+#: never read it. ``build_dmint_mint_tx`` refuses to write an unreadable ``lastTime``
+#: (:func:`is_readable_last_time`) for these modes. Membership is DERIVED by running
+#: every generation of every mode's fragment under the int64/MINIMALDATA evaluator in
+#: ``tests/test_dmint_daa_offchain_onchain_differential.py`` with an unreadable lastTime,
+#: and checked against this constant there.
+DAA_MODES_READING_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA, DaaMode.EPOCH})
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +297,11 @@ class DmintDeployParams:
     # `dMintScript`, which accepts any lastTime, and pyrxd has to stay able to reproduce
     # the exact bytes of a contract that already exists on chain (including one another
     # implementation deployed with lastTime=0) for inspection and conformance. Refusing
-    # here would break that and the byte-parity goldens with it. The refusal lives where
-    # the dangerous thing happens instead — the deploy funnel in glyph/builder.py, which
-    # is the ONLY shipped caller of build_dmint_contract_script — and uses
-    # is_minimal_4byte_scriptnum + DAA_MODES_READING_DEPLOY_LAST_TIME from this module.
+    # here would break that and the byte-parity goldens with it. The refusal lives on the
+    # deploy paths instead — pyrxd.glyph.builder.require_mineable_last_time, which every
+    # shipped caller of build_dmint_contract_script crosses (the set of callers is derived
+    # from the source by tests/test_reachability_shipped_callers.py, not listed here) — and
+    # uses is_readable_last_time + DAA_MODES_READING_DEPLOY_LAST_TIME from this module.
     last_time: int = 0
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
     max_adjustment_log2: int = 2  # EPOCH: max adjustment 2^N per epoch (1..4 → 2×..16×)

@@ -806,14 +806,25 @@ class TestBuildDmintMintTx:
         with pytest.raises(ValidationError, match="0x7FFFFFFF"):
             _mint(_make_contract_utxo(), current_time=0x80000000)
 
-    def test_backwards_current_time_rejected_for_daa(self):
-        # LWMA negative-delta → on-chain OP_MUL overflows; off-chain would diverge.
+    def test_an_unreadable_current_time_is_refused_for_daa(self):
+        # current_time=0 used to be refused as "backwards" with a reason that was false for
+        # this contract (LWMA-v2 clamps a negative delta; nothing overflows). The real
+        # problem with 0 is what the covenant WRITES: `04 00000000` into the recreated
+        # lastTime, a non-minimal script number the next LWMA retarget cannot read.
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.LWMA, difficulty=1)
-        with pytest.raises(ValidationError, match="must be >= the contract's last_time"):
-            _mint(utxo, current_time=0)  # 0 < the contract's last_time (1.7e9)
+        with pytest.raises(ValidationError, match="not a minimally encoded script number"):
+            _mint(utxo, current_time=0)
+
+    def test_backwards_current_time_accepted_for_v2_lwma(self):
+        # The honest neighbour: a real timestamp one hour BEFORE the contract's last_time
+        # (1.7e9). LWMA-v2 clamps the drift, so the covenant accepts it; refusing it was a
+        # guard refusing valid work.
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.LWMA, difficulty=1)
+        result = _mint(utxo, current_time=utxo.state.last_time - 3600)
+        assert result.updated_state.last_time == utxo.state.last_time - 3600
 
     def test_backwards_current_time_allowed_for_fixed(self):
-        # FIXED has no DAA multiply → a backwards lastTime is harmless (no overflow).
+        # FIXED never reads lastTime, so neither a backwards nor a non-minimal one matters.
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.FIXED)
         _mint(utxo, current_time=0)  # must NOT raise
 

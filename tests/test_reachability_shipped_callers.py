@@ -414,3 +414,34 @@ class TestEveryShippedDmintDeployCrossesTheLastTimeGuard:
             f"{_LAST_TIME_GUARD}() is called from {guarded} — it is supposed to sit on the deploy "
             "params, on prepare_dmint_deploy, on build_reveal_outputs and in the mainnet ops harness."
         )
+
+
+# ---------------------------------------------------------------------------
+# The same question for MINTS: every way to write a recreated V2 state must cross
+# the lastTime guards
+# ---------------------------------------------------------------------------
+#
+# A mint writes its locktime into the recreated contract's lastTime, and ASERT/LWMA/EPOCH
+# read it back as a script number. `build_dmint_mint_tx` refuses an unreadable one, and
+# refuses to build a mint whose retarget reads an unreadable one from the spent state. That
+# only protects every mint if every mint goes through it — i.e. if it is the only shipped
+# code that encodes a V2 state from a parsed one. `_v2_state_script_bytes` is that encoder.
+
+_V2_STATE_ENCODER = "_v2_state_script_bytes"
+_MINT_BUILDER = "src/pyrxd/glyph/dmint/miner.py::build_dmint_mint_tx"
+
+
+class TestEveryShippedV2MintCrossesTheLastTimeGuards:
+    def test_the_only_shipped_state_writer_is_the_guarded_mint_builder(self) -> None:
+        calls = _enclosing_function_calls()
+        users = sorted(where for where, names in calls.items() if _V2_STATE_ENCODER in names)
+        assert users, f"derived NO shipped caller of {_V2_STATE_ENCODER}() — the scan is broken, not the code"
+        # Membership is PINNED, not derived: `_v2_code_section` only re-encodes the SPENT state
+        # to find where its code starts (it writes nothing). A new entry here is a new way to
+        # write a V2 state, and has to cross the guards below before it joins this list.
+        assert users == ["src/pyrxd/glyph/dmint/miner.py::_v2_code_section", _MINT_BUILDER], users
+
+    def test_the_mint_builder_crosses_both_last_time_guards(self) -> None:
+        names = _enclosing_function_calls()[_MINT_BUILDER]
+        assert "is_readable_last_time" in names, "the WRITE guard (current_time) is gone from the mint builder"
+        assert "_refuse_unreadable_state_last_time" in names, "the READ guard (the spent state) is gone"

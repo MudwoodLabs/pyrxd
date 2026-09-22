@@ -58,6 +58,7 @@ from pyrxd.glyph.dmint import (
     ASERT_V2_MAX_TARGET_DIV4,
     ASERT_V2_RADIX,
     DAA_MODES_READING_DEPLOY_LAST_TIME,
+    DAA_MODES_READING_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
@@ -80,6 +81,7 @@ from pyrxd.glyph.dmint import (
     detect_contract_daa_bytecode,
     detect_daa_bytecode,
     is_minimal_4byte_scriptnum,
+    is_readable_last_time,
 )
 from pyrxd.glyph.dmint.builders import (
     _DAA_BODY_OFFSET_IN_CODE,
@@ -1215,3 +1217,197 @@ class TestDeployRefusesAnUnmineableLastTime:
         result.last_time = 0  # what a hand-rebuilt / deserialized result would carry
         with pytest.raises(ValidationError, match="NON-MINIMAL"):
             result.build_reveal_outputs("dd" * 32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# lastTime at MINT time: pyrxd never writes one the next retarget cannot read, and never
+# grinds against a state whose lastTime this mint's retarget cannot read
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The evaluator-backed halves (which modes read lastTime, where the 2**23 threshold sits in
+# each fragment, which backwards locktimes the bytecode survives) live beside the int64
+# evaluator in tests/test_dmint_daa_offchain_onchain_differential.py. These are the
+# builder-level refusals and their honest neighbours, through build_dmint_mint_tx.
+
+
+def _mint(utxo: DmintContractUtxo, current_time: int):
+    st = utxo.state
+    kw: dict = {}
+    if st.daa_mode is DaaMode.EPOCH:
+        kw = {"epoch_length": 10, "max_adjustment_log2": 2}
+    elif st.daa_mode is DaaMode.SCHEDULE:
+        kw = {"schedule": ((100, 4),)}
+    return build_dmint_mint_tx(utxo, b"\x00" * 8, _PKH, current_time, funding_utxo=_FUNDING, **kw)
+
+
+def _mode_params(mode: DaaMode, **kw) -> DmintDeployParams:
+    extra: dict = {}
+    if mode is DaaMode.EPOCH:
+        extra = {"difficulty": 32768, "epoch_length": 10, "max_adjustment_log2": 2}
+    elif mode is DaaMode.SCHEDULE:
+        extra = {"schedule": ((100, 4),)}
+    extra.update(kw)
+    return _params(mode, **extra)
+
+
+def _reading_modes() -> list[DaaMode]:
+    return sorted(DAA_MODES_READING_LAST_TIME, key=int)
+
+
+class TestReadableLastTime:
+    def test_the_predicate_is_minimality_plus_a_clear_sign_bit(self) -> None:
+        assert min(n for n in range(1 << 24) if is_readable_last_time(n)) == 1 << 23
+        assert is_readable_last_time(0x7FFFFFFF)
+        # Minimal but NEGATIVE: the encoding rule alone says yes, the reader says no.
+        for n in (0x80800000, 0xFFFFFFFF):
+            assert is_minimal_4byte_scriptnum(n) and not is_readable_last_time(n)
+        for n in (-1, 0, (1 << 23) - 1, 0x80000000, 1 << 32):
+            assert not is_readable_last_time(n)
+
+
+class TestTheMintBuilderNeverWritesAnUnreadableLastTime:
+    @pytest.mark.parametrize("mode", _reading_modes())
+    @pytest.mark.parametrize("bad", [0, 1, (1 << 23) - 1])
+    def test_a_non_minimal_locktime_is_refused(self, mode: DaaMode, bad: int) -> None:
+        # EPOCH at height 5 of 10: not a boundary, so only the WRITE guard can refuse this.
+        utxo = _utxo(build_dmint_contract_script(_mode_params(mode, height=5)))
+        with pytest.raises(ValidationError, match="not a minimally encoded script number"):
+            _mint(utxo, bad)
+
+    @pytest.mark.parametrize("mode", _reading_modes())
+    def test_a_bit_31_locktime_is_refused(self, mode: DaaMode) -> None:
+        utxo = _utxo(build_dmint_contract_script(_mode_params(mode, height=5)))
+        with pytest.raises(ValidationError, match="0x7FFFFFFF"):
+            _mint(utxo, 0xFFFFFFFF)
+
+    @pytest.mark.parametrize("mode", _reading_modes())
+    @pytest.mark.parametrize("edge", [1 << 23, 0x7FFFFFFF])
+    def test_the_edges_of_the_readable_range_build(self, mode: DaaMode, edge: int) -> None:
+        """The honest neighbours: 2**23 exactly (a BACKWARDS locktime here — the state says
+        1.7e9 — which the v2 fragments and EPOCH clamp) and 0x7FFFFFFF exactly."""
+        utxo = _utxo(build_dmint_contract_script(_mode_params(mode, height=5)))
+        res = _mint(utxo, edge)
+        assert res.updated_state.last_time == res.tx.locktime == edge
+
+    @pytest.mark.parametrize("mode", [DaaMode.FIXED, DaaMode.SCHEDULE])
+    def test_modes_that_never_read_it_still_accept_zero(self, mode: DaaMode) -> None:
+        """Refusing 0 here would be a guard refusing valid work: neither fragment reads it."""
+        utxo = _utxo(build_dmint_contract_script(_mode_params(mode, height=5)))
+        assert _mint(utxo, 0).updated_state.last_time == 0
+
+
+class TestAContractThatCanNoLongerBeMintedIsNotGroundAgainst:
+    @pytest.mark.parametrize(
+        ("mode", "version"),
+        [
+            (DaaMode.ASERT, DaaBytecodeVersion.V2),
+            (DaaMode.ASERT, DaaBytecodeVersion.LEGACY),
+            (DaaMode.LWMA, DaaBytecodeVersion.V2),
+            (DaaMode.LWMA, DaaBytecodeVersion.LEGACY),
+            (DaaMode.LWMA, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR),
+        ],
+    )
+    @pytest.mark.parametrize("height", [0, 7])
+    def test_asert_and_lwma_with_last_time_zero(self, mode: DaaMode, version: DaaBytecodeVersion, height: int) -> None:
+        utxo = _utxo(_contract_script(_params(mode, height=height, last_time=0), version))
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _mint(utxo, _LAST + 60)
+
+    def test_epoch_at_a_boundary_with_last_time_zero(self) -> None:
+        utxo = _utxo(build_dmint_contract_script(_mode_params(DaaMode.EPOCH, height=10, last_time=0)))
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _mint(utxo, _LAST + 60)
+
+    @pytest.mark.parametrize("height", [0, 5, 9, 11])
+    def test_epoch_off_a_boundary_with_last_time_zero_still_mints(self, height: int) -> None:
+        """The honest neighbour, and the recovery path: an EPOCH contract deployed with
+        lastTime 0 (every pyrxd EPOCH deploy before 2026-09-22, and the conformance vector)
+        does not read it off a boundary, and the next mint writes a readable one."""
+        utxo = _utxo(build_dmint_contract_script(_mode_params(DaaMode.EPOCH, height=height, last_time=0)))
+        res = _mint(utxo, _LAST + 60)
+        assert is_readable_last_time(res.updated_state.last_time)
+
+    @pytest.mark.parametrize("mode", [DaaMode.FIXED, DaaMode.SCHEDULE])
+    def test_modes_that_never_read_it_mint_with_last_time_zero(self, mode: DaaMode) -> None:
+        utxo = _utxo(build_dmint_contract_script(_mode_params(mode, height=10, last_time=0)))
+        _mint(utxo, _LAST + 60)
+
+    @pytest.mark.parametrize("last_time", [0x80800000, 0xFFFFFFFF])
+    def test_a_negative_last_time_is_refused_not_mirrored(self, last_time: int) -> None:
+        utxo = _utxo(build_dmint_contract_script(_params(DaaMode.ASERT, last_time=last_time)))
+        with pytest.raises(ValidationError, match="bit 31 set"):
+            _mint(utxo, _LAST)
+
+    def test_negative_zero_is_non_minimal_and_reported_as_unmineable(self) -> None:
+        utxo = _utxo(build_dmint_contract_script(_params(DaaMode.ASERT, last_time=0x80000000)))
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _mint(utxo, _LAST)
+
+    @pytest.mark.parametrize("last_time", [1 << 23, 0x7FFFFFFF])
+    def test_the_edges_of_the_readable_range_mint(self, last_time: int) -> None:
+        utxo = _utxo(build_dmint_contract_script(_params(DaaMode.ASERT, last_time=last_time)))
+        _mint(utxo, _LAST)  # 0x7FFFFFFF -> a backwards locktime; ASERT-v2 clamps it
+
+
+class TestBackwardsIsRefusedOnlyWhereTheBytecodeFails:
+    def test_prefloor_lwma_backwards_is_refused_with_the_true_reason(self) -> None:
+        utxo = _utxo(_contract_script(_params(DaaMode.LWMA), DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR))
+        with pytest.raises(ValidationError, match="does not floor the time delta") as exc:
+            _mint(utxo, _LAST - 30)
+        assert "overflow" not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        ("mode", "version"),
+        [
+            (DaaMode.ASERT, DaaBytecodeVersion.V2),
+            (DaaMode.ASERT, DaaBytecodeVersion.LEGACY),
+            (DaaMode.LWMA, DaaBytecodeVersion.V2),
+        ],
+    )
+    def test_backwards_builds_for_the_generations_that_clamp(self, mode: DaaMode, version: DaaBytecodeVersion) -> None:
+        utxo = _utxo(_contract_script(_params(mode, half_life=240), version))
+        assert _mint(utxo, _LAST - 3600).updated_state.last_time == _LAST - 3600
+
+
+class TestLegacyLwmaNeverWritesTargetOne:
+    @pytest.mark.parametrize("version", [DaaBytecodeVersion.LEGACY, DaaBytecodeVersion.LEGACY_LWMA_PREFLOOR])
+    def test_a_zero_delta_is_refused(self, version: DaaBytecodeVersion) -> None:
+        utxo = _utxo(_contract_script(_params(DaaMode.LWMA), version))
+        assert compute_next_target_linear_legacy(utxo.state.target, _LAST, _LAST, 60) == 1
+        with pytest.raises(ValidationError, match="target would be 1") as exc:
+            _mint(utxo, _LAST)
+        assert "later than the contract's last_time" in str(exc.value)
+
+    def test_floored_legacy_backwards_is_refused_as_target_one(self) -> None:
+        utxo = _utxo(_contract_script(_params(DaaMode.LWMA), DaaBytecodeVersion.LEGACY))
+        with pytest.raises(ValidationError, match="target would be 1"):
+            _mint(utxo, _LAST - 30)
+
+    def test_a_target_already_below_target_time_says_no_time_helps(self) -> None:
+        utxo = _utxo(_contract_script(_params(DaaMode.LWMA, difficulty=_MAX // 59), DaaBytecodeVersion.LEGACY))
+        assert utxo.state.target < utxo.state.target_time
+        with pytest.raises(ValidationError, match="no current_time avoids this"):
+            _mint(utxo, _LAST + 60)
+
+    def test_v2_lwma_at_a_zero_delta_is_an_ordinary_retarget(self) -> None:
+        """The honest neighbour: the damped v2 formula moves the target 25%, not to 1."""
+        utxo = _utxo(build_dmint_contract_script(_params(DaaMode.LWMA)))
+        assert _mint(utxo, _LAST).updated_state.target > 1
+
+
+class TestDeployRefusesANegativeLastTime:
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    @pytest.mark.parametrize("bad", [0x80800000, 0xFFFFFFFF])
+    def test_refused_on_the_params_and_at_the_reveal(self, mode: DaaMode, bad: int) -> None:
+        with pytest.raises(ValidationError, match="bit 31 set"):
+            _v2_deploy_params(daa_mode=mode, last_time=bad)
+        result = GlyphBuilder().prepare_dmint_deploy(_v2_deploy_params(daa_mode=mode))
+        result.last_time = bad
+        with pytest.raises(ValidationError, match="bit 31 set"):
+            result.build_reveal_outputs("dd" * 32)
+
+    @pytest.mark.parametrize("mode", sorted(DAA_MODES_READING_DEPLOY_LAST_TIME, key=lambda m: m.value))
+    def test_0x7fffffff_is_accepted(self, mode: DaaMode) -> None:
+        result = GlyphBuilder().prepare_dmint_deploy(_v2_deploy_params(daa_mode=mode, last_time=0x7FFFFFFF))
+        state = DmintState.from_script(result.build_reveal_outputs("dd" * 32).contract_scripts[0])
+        assert state.last_time == 0x7FFFFFFF
