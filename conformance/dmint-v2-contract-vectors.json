@@ -178,6 +178,6 @@
     }
   ],
   "history": [
-    "2026-09-16: v2-asert-ref and v2-lwma-ref regenerated. Photonic replaced the ASERT retarget with the fractional ASERT-v2 formula on 2026-06-19 (ed53cd41) and LWMA with the damped LWMA-v2 on 2026-06-20 (c90e6506); pyrxd byte-matched both on 2026-09-16 against script.ts @ becf41a731e78ab98fdd88652527d7dda12784c6. Contracts deployed with the previous ASERT/LWMA bytecode remain mineable (pyrxd detects the generation from the code section: tests/test_dmint_daa_v2_resync.py pins the legacy bytes); this suite describes what a CURRENT builder must emit."
+    "2026-09-16: v2-asert-ref and v2-lwma-ref regenerated. Photonic replaced the ASERT retarget with the fractional ASERT-v2 formula on 2026-06-19 (ed53cd41) and LWMA with the damped LWMA-v2 on 2026-06-20 (c90e6506); pyrxd byte-matched both on 2026-09-16 against script.ts @ becf41a731e78ab98fdd88652527d7dda12784c6. pyrxd detects which generation a deployed contract bakes from its code section and mines it with that generation's formula (tests/test_dmint_daa_v2_resync.py pins the legacy bytes); a contract deployed through pyrxd's deploy API before the lastTime fix carries lastTime 0 and cannot be mined in either generation (see the CHANGELOG). This suite describes what a CURRENT builder must emit."
   ]
 }

@@ -125,17 +125,29 @@ pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 
 > in Radiant's mandatory script-verify flags — consensus, not mempool policy —
 > so such a contract aborts on its first retarget and can never be mined. The
 > deploy is refused rather than built, because nothing can fix it once the
-> reveal confirms.
+> reveal confirms. Values above `0x7FFFFFFF` are refused too: bit 31 is the
+> script-number sign, so the contract would read a negative `lastTime`.
 
 `claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
 **SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`
 or `--schedule` you deployed with (those parameters live in the contract code,
-not the on-chain state), plus `--current-time <ts>` if you want real
-difficulty tracking (default 0 = always-final locktime). You do **not** need to
-pass `--half-life` for an ASERT contract: the claim reads the baked half-life
-out of the contract's own bytecode. Pass it only to assert what you expect —
-a value that disagrees with the baked one fails fast, naming the baked value,
-before the PoW grind.
+not the on-chain state) — the `claim with:` line `deploy-dmint` prints already
+includes them. You do **not** need to pass `--half-life` for an ASERT contract:
+the claim reads the baked half-life out of the contract's own bytecode. Pass it
+only to assert what you expect — a value that disagrees with the baked one fails
+fast, naming the baked value, before the PoW grind.
+
+`--current-time` is the mint's locktime, and the covenant writes it into the
+recreated contract as the next `lastTime`. It defaults to the wall-clock time
+when the claim is built, which is what you want. For ASERT, LWMA and EPOCH
+contracts, which read `lastTime` back as a number, a value below 2^23 is refused
+for the same MINIMALDATA reason as above; a value above `0x7FFFFFFF` is refused
+for every mode. A time earlier than the contract's `lastTime` is accepted for
+ASERT, EPOCH and current LWMA contracts, whose retargets clamp a negative delta.
+On an LWMA contract deployed before 2026-09-16 a time at or before `lastTime` is
+refused: that older retarget would abort or set the next target to 1. The claim
+also refuses, before any mining, a contract whose `lastTime` this mint's
+retarget cannot read — such a contract can no longer be minted at all.
 
 The command builds a **commit** transaction (an FT-commit hashlock plus
 `K` ref-seed outputs), waits for it to confirm, then builds the

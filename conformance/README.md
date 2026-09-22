@@ -81,5 +81,7 @@ and bump the schema if the *format* changes (not just the bytes).
 >
 > The `v2-asert-ref` and `v2-lwma-ref` vectors were regenerated on 2026-09-16 for the ASERT-v2 / LWMA-v2
 > bytecode (Photonic `ed53cd41` / `c90e6506`, byte-matched at `becf41a7`); see the `history` array in the
-> JSON. Contracts deployed with the previous ASERT/LWMA bytecode remain mineable (pyrxd detects the
-> generation from the code section).
+> JSON. pyrxd detects which generation a deployed contract bakes from its code section and mines it with
+> that generation's own formula. That does not make every such contract mineable: one deployed through
+> pyrxd's deploy API before the lastTime fix carries `lastTime = 0`, which an ASERT or LWMA retarget of
+> either generation cannot read (see the CHANGELOG).

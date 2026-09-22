@@ -90,8 +90,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DmintV2DeployParams.last_time` and `deploy-dmint --last-time` now exist; omitting
   them stamps the deploy time, which is what Photonic's own `dMintScript` call site
   passes (`Math.floor(Date.now() / 1000)`). A `last_time` whose four-byte
-  little-endian form is not a minimal script number is REFUSED for the modes that read
-  it on the first mint, at three points: on the params object the caller constructed,
+  little-endian form is not a minimal script number — or that has bit 31 set, which a
+  script number reads as NEGATIVE — is REFUSED for the modes that read it on the first
+  mint, at three points: on the params object the caller constructed,
   as the first act of `prepare_dmint_deploy` (before the CBOR is encoded or a commit
   script exists), and again in `build_reveal_outputs`, which a caller may reach in a
   later process. `pyrxd.glyph.require_mineable_last_time` is public so code building
@@ -120,6 +121,43 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one deploy call site (`packages/lib/src/mint.ts` at `becf41a7`) passes
   `Math.floor(Date.now() / 1000)`, so Photonic never deploys that shape. pyrxd inherited
   the default and had no call site that could pass anything else.
+
+- **`claim-dmint`'s default locktime wrote a `lastTime` the next retarget cannot read, and
+  the claim `deploy-dmint` prints was refused for every adaptive mode.** The covenant
+  writes a mint's locktime back into the recreated contract as `04 || NUM2BIN(locktime,
+  4)`, and ASERT and LWMA read that item as a script number on every mint, EPOCH at every
+  epoch boundary. `--current-time` defaulted to `0`, so the default claim wrote the same
+  non-minimal `04 00000000` the deploy fix above removed — for an EPOCH contract, one
+  mint before a boundary, that left a state no transaction could spend. And since deploy
+  now stamps `lastTime = now`, the mint builder's refusal of any `current_time` earlier
+  than `last_time` rejected the printed `claim with:` command (no `--current-time`) for
+  ASERT, LWMA, EPOCH and SCHEDULE alike, saying "a backwards locktime makes the on-chain
+  DAA retarget overflow". That was false for every generation but one: the v2 formulas,
+  the floored legacy LWMA, legacy ASERT and EPOCH all clamp a negative delta, and
+  SCHEDULE never reads `lastTime` at all.
+
+  Now:
+  - `claim-dmint --current-time` defaults to the wall-clock time when the claim is built.
+  - `build_dmint_mint_tx` — which every mint path crosses (the CLI, the public API, the
+    example and the mainnet harness) — refuses, before any grind, a `current_time` below
+    `2**23` for ASERT/LWMA/EPOCH (`DAA_MODES_READING_LAST_TIME`), and a state whose own
+    `lastTime` this mint's retarget reads and cannot: an ASERT/LWMA contract with
+    `lastTime` 0, or an EPOCH contract at a boundary with it, is reported as one that "can
+    no longer be minted" instead of being ground against. A state `lastTime` with bit 31
+    set is refused as one pyrxd's mirrors do not model. New predicate:
+    `is_readable_last_time` (minimal AND bit 31 clear); `is_minimal_4byte_scriptnum`
+    still answers the encoding question alone.
+  - A backwards `current_time` is refused only for the 2026-06-16 pre-floor LWMA, with the
+    true reason: that bytecode multiplies a negative delta into the target and either
+    aborts or writes target 1. Everywhere else it builds, and the int64/MINIMALDATA
+    evaluator confirms the contract's own fragment computes the target the builder wrote.
+  - A legacy-LWMA mint whose next target would be 1 (a zero delta, or a negative one on
+    the floored variant) is refused: the covenant would accept it, and target 1 is the
+    hardest difficulty there is — no miner can realistically meet it.
+
+  The regtest control that proves a `lastTime = 0` contract is refused by a real node now
+  first asserts pyrxd refuses to build that mint, then patches the refusal out so the node
+  remains the judge.
 
 - **`claim-dmint` reported an unrecognised retarget formula as a funding shortfall.**
   `UnrecognizedDaaBytecodeError` is both a `DmintError` and a `ValidationError`, and
