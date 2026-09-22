@@ -80,13 +80,14 @@
     "shared_secret_a_to_b": "21603c730b0410cd4816c4a090e99ce62db3ecdf3c2b6bef879235508db2af33"
   },
   "wrap_cek_x25519": {
-    "notes": "Photonic-generated wrap. Pyrxd test unwraps with recipient_sk and asserts the recovered CEK matches the original input. Wrap output is not byte-deterministic (random ephemeral key + nonce).",
+    "notes": "Photonic-generated wrap, REGENERATED 2026-09-21 from Radiant-Core/Photonic-Wallet at becf41a731e78ab98fdd88652527d7dda12784c6 (the commit pinned in photonic_upstream_pin.json), by executing packages/lib/src/encryption.ts under its own pinned @noble versions. The PREVIOUS vector was generated 2026-05-18 from a checkout that predated upstream's classical/hybrid KEK split (8e6bb6e, 2026-05-16), so it could only be unwrapped through the LEGACY info string -- which made the interop test pass via the fallback and certify nothing about interop. Do NOT regenerate this from pyrxd.",
+    "photonic_commit": "becf41a731e78ab98fdd88652527d7dda12784c6",
+    "kek_info": "glyph-kek-classical-v1",
     "recipient_sk": "0d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6",
-    "recipient_pk": "9f55403a4e8a3fea6bad890add88d6a222e9fcc8009c638091bd81ab20704263",
-    "aad": "70686f746f6e69632d777261702d6161642d74657374",
+    "aad": "7265766965772d3639392d616164",
     "original_cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
-    "wrapped_cek": "194169161f0d6f8a951ae9e674d6ec280d053b62b82d604a7ae067a1c203c6d54421b1f5ee88f62883f0227827429f2b12c85af579bc48a0f10605a2cabde50ec848ed107cf1d390",
-    "ephemeral_x25519_pub": "f4095c4839f13a1afe009d24f6b25db04696d86b3a371f48aa5238e855b0e74c"
+    "wrapped_cek": "e84155b3fda8dfe1b9ce76e0a061d47ea935283df0edde407758cd576de814685818c34b7d33119957851f2101ead9825e2f09b0a83bdac23e110b177513d1b475c5dcf192100f6e",
+    "ephemeral_x25519_pub": "fb360392feee1c72b9ddc40cbc64cc316efead68cc72fb3e243a5115dac28d2e"
   },
   "hash_content": {
     "input": "68656c6c6f2c2070686f746f6e69632074696d656c6f636b20696e7465726f70",
@@ -229,5 +230,15 @@
       "hint": "demo hint string"
     },
     "op_return_script_hex": "6a03676c79010201094d1401b900076176026170810966616374696f6e6672657665616c69746f6b656e5f7265667842616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161613a306363656b7840303131323233333434353536363737383839396161626263636464656566303031313232333334343535363637373838393961616262636364646565666631306863656b5f6861736878477368613235363a386335303765373032633766383035623135623537303765386364313362373139396438396636313361313139383964663535333162326132643531306262376468696e747064656d6f2068696e7420737472696e67"
+  },
+  "wrap_cek_x25519_legacy_info": {
+    "notes": "The PRE-SPLIT vector (generated 2026-05-18 under 'glyph-kek-v1'). Kept deliberately so the legacy-retry path has a real regression case: it must still unwrap, and must report legacy_info=True. It must NOT be used to demonstrate Photonic interop.",
+    "kek_info": "glyph-kek-v1",
+    "recipient_sk": "0d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6",
+    "recipient_pk": "9f55403a4e8a3fea6bad890add88d6a222e9fcc8009c638091bd81ab20704263",
+    "aad": "70686f746f6e69632d777261702d6161642d74657374",
+    "original_cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "wrapped_cek": "194169161f0d6f8a951ae9e674d6ec280d053b62b82d604a7ae067a1c203c6d54421b1f5ee88f62883f0227827429f2b12c85af579bc48a0f10605a2cabde50ec848ed107cf1d390",
+    "ephemeral_x25519_pub": "f4095c4839f13a1afe009d24f6b25db04696d86b3a371f48aa5238e855b0e74c"
   }
 }

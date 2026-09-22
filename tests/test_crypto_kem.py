@@ -78,7 +78,14 @@ class TestPhotonicInterop:
     def test_unwrap_photonic_wrapped_cek(self, photonic_vectors):
         """The critical interop test: Photonic wrapped a CEK; pyrxd unwraps
         and recovers the same bytes. If this fails, pyrxd cannot decrypt
-        Photonic-encrypted Glyph payloads."""
+        Photonic-encrypted Glyph payloads.
+
+        ``allow_legacy_info=False`` IS THE POINT OF THIS TEST. Until 2026-09-21 the
+        fixture predated upstream's classical/hybrid KEK split, so this test passed
+        through the legacy retry and proved only that the fallback worked -- while
+        interop had in fact been broken for four months. A test that can be satisfied
+        by the compatibility shim cannot detect the incompatibility the shim exists for.
+        """
         v = photonic_vectors["wrap_cek_x25519"]
         recipient_sk = bytes.fromhex(v["recipient_sk"])
         wrapped = bytes.fromhex(v["wrapped_cek"])
@@ -86,8 +93,38 @@ class TestPhotonicInterop:
         aad = bytes.fromhex(v["aad"])
         expected_cek = bytes.fromhex(v["original_cek"])
 
-        recovered = unwrap_cek_x25519(wrapped, ephemeral_pub, recipient_sk, aad)
-        assert recovered == expected_cek
+        detailed = unwrap_cek_x25519_detailed(
+            wrapped, ephemeral_pub, recipient_sk, aad, allow_legacy_info=False
+        )
+        assert detailed.cek == expected_cek
+        assert detailed.legacy_info is False, (
+            "this vector must unwrap under the CURRENT derivation; if it only works "
+            "via the legacy retry the fixture is stale and proves nothing about interop"
+        )
+
+    def test_the_pre_split_vector_still_reads_and_reports_itself(self, photonic_vectors):
+        """The legacy retry has a real regression case, separate from the interop one.
+
+        Kept apart on purpose: mixing them is what made the interop test vacuous.
+        """
+        v = photonic_vectors["wrap_cek_x25519_legacy_info"]
+        detailed = unwrap_cek_x25519_detailed(
+            bytes.fromhex(v["wrapped_cek"]),
+            bytes.fromhex(v["ephemeral_x25519_pub"]),
+            bytes.fromhex(v["recipient_sk"]),
+            bytes.fromhex(v["aad"]),
+        )
+        assert detailed.cek == bytes.fromhex(v["original_cek"])
+        assert detailed.legacy_info is True
+
+        with pytest.raises(ValueError):
+            unwrap_cek_x25519_detailed(
+                bytes.fromhex(v["wrapped_cek"]),
+                bytes.fromhex(v["ephemeral_x25519_pub"]),
+                bytes.fromhex(v["recipient_sk"]),
+                bytes.fromhex(v["aad"]),
+                allow_legacy_info=False,
+            )
 
 
 # ────────────────────────────────────────────── round-trip ──
