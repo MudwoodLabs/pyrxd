@@ -120,10 +120,13 @@ class _Server:
         return {"name": LABEL, "ref": f"{self.mint}_0", "target": self.target} if label == LABEL else None
 
 
-def _fake_walk(monkeypatch, name_target: str | None) -> None:
-    """A complete walk whose one step folds ``target`` to ``name_target`` — the name pointed there."""
+def _fake_walk(monkeypatch, name_target: str | None, *, walks: list | None = None) -> None:
+    """A complete walk whose one step folds ``target`` to ``name_target`` — the name pointed there.
+    ``walks``, when given, records one entry per walk, so a test can count them."""
 
     async def walk(*, mint_txid, discovery_source, tip_source, **_):
+        if walks is not None:
+            walks.append(mint_txid)
         step = ChainStep(txid=mint_txid, mut_vout=1, kind="mint", attrs={"target": name_target})
         w = MutableChainWalk(
             ref=f"{mint_txid}:1",
@@ -153,13 +156,25 @@ def _invoke(tmp_path: Path, args: list[str]):
     return CliRunner().invoke(cli, ["--wallet", str(tmp_path / "w"), "--config", str(tmp_path / "c.toml"), *args])
 
 
-def _run(monkeypatch, raw: dict[str, bytes], args: list[str], tmp_path: Path, *, name_target: str | None = None):
-    """The real CLI over two DISTINCT endpoints (the shipped mainnet shape), handed in directly."""
+def _run(
+    monkeypatch,
+    raw: dict[str, bytes],
+    args: list[str],
+    tmp_path: Path,
+    *,
+    name_target: str | None = None,
+    probe: dict | None = None,
+):
+    """The real CLI over two DISTINCT endpoints (the shipped mainnet shape), handed in directly.
+    ``probe``, when given, is filled with the two servers and the list of chain walks run."""
     a = _Server(raw, indexer=False)
     b = _Server(raw, indexer=True, target=name_target, mint=a.mint)
+    walks: list = []
+    if probe is not None:
+        probe.update(a=a, b=b, walks=walks)
     monkeypatch.setattr(CliContext, "make_client", lambda self: a)
     monkeypatch.setattr(glyph_inspect, "_endpoint_pair", lambda ctx: (a, "wss://a", b, "wss://b"))
-    _fake_walk(monkeypatch, name_target)
+    _fake_walk(monkeypatch, name_target, walks=walks)
     return _invoke(tmp_path, args)
 
 
@@ -276,6 +291,21 @@ class TestTheShippedDefaultConfig:
         assert (label_a, label_b) == default_endpoints("mainnet")
         assert label_a != label_b
 
+    def test_the_threat_model_names_the_endpoints_the_registry_ships(self) -> None:
+        """The seventh copy of the single-endpoint claim was in docs/threat-model.md. The hosts are
+        DERIVED from the registry, so the document is checked against what ships, not a retyping.
+        Flattened first: that prose is hard-wrapped."""
+        from urllib.parse import urlparse
+
+        doc = (Path(__file__).resolve().parents[1] / "docs" / "threat-model.md").read_text(encoding="utf-8")
+        flat = " ".join(doc.split())
+        hosts = [urlparse(u).hostname for u in default_endpoints("mainnet")]
+        assert len(hosts) == 2 and all(hosts), hosts
+        for host in hosts:
+            assert host in flat, f"threat-model.md does not name the shipped endpoint {host}"
+        assert "uses one public ElectrumX server" not in flat
+        assert "failover, not a quorum" in flat, "what the second endpoint does NOT buy must be said"
+
     def test_the_replay_is_refused_through_the_real_endpoint_pair(self, monkeypatch, tmp_path, world) -> None:
         for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
             monkeypatch.delenv(var, raising=False)
@@ -343,6 +373,51 @@ class TestAQuestionAskedAndNotAnsweredFails:
         assert "What HOLDS means, and no more" in flat
         assert "a record this build cannot read" in flat and "holds with its checks reading NOT CHECKED" in flat
         assert "CANNOT COMPARE do fail it" in flat
+        # The batch consequence of the transaction-wide refusal, stated rather than implied away.
+        assert "including a BATCHED transaction" in flat and "fails the verdict for an honest one beside it" in flat
+
+    @pytest.mark.parametrize(
+        ("record", "says", "must_not_say"),
+        [
+            (_raw_record(9, 1, b"\x11" * 32), "cannot read a version-9 record", "malformed"),
+            (_raw_record(1, 0x7F, b"\x11" * 32), "names hash algorithm 0x7f", "malformed"),
+            (_raw_record(1, 1, b"\x22" * 20), "malformed", "cannot read a version"),
+        ],
+    )
+    def test_the_reason_a_file_cannot_be_compared_fits_the_record(
+        self, monkeypatch, tmp_path, record, says, must_not_say
+    ) -> None:
+        """CANNOT COMPARE used to say "this record does not decode (unknown_version), so it commits
+        to no digest" for every unreadable record. For a record from a newer version both halves
+        are wrong: "does not decode" is this command's word for a MALFORMED record, and such a
+        record may well commit to a digest this build cannot read."""
+        txid, raw = _tx(record)
+        args = ["--json", "verify", txid, "--digest", "00" * 32, "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path)
+        rec = json.loads(r.stdout)["records"][0]
+        reason = rec["digest_match"]["reason"]
+        assert rec["digest_match"]["state"] == "CANNOT COMPARE", rec["digest_match"]
+        assert says in reason and must_not_say not in reason, reason
+        assert "commits to no digest" not in reason
+        assert rec["checks"]["digest"]["reason"] == reason, "the summary and the record say the same thing"
+
+    def test_verify_without_a_floor_names_what_needs_it_and_the_command_to_fix(self, monkeypatch, tmp_path) -> None:
+        """`pyrxd verify <txid>` — the command the public verify page points people at — was
+        refused with "--wave-name needs --min-confirmations", naming a flag they had not passed."""
+        txid, raw = _tx(_raw_record(1, 1, b"\x11" * 32))
+        r = _run(monkeypatch, {txid: raw}, ["verify", txid.upper()], tmp_path)
+        assert r.exit_code == 1, r.output
+        flat = " ".join(r.output.split())
+        assert "pyrxd verify needs --min-confirmations" in flat
+        assert f"add --min-confirmations N to `pyrxd verify {txid}`" in flat, "the canonical txid, not the raw input"
+        assert "--wave-name" not in flat, "it named a flag the user never passed"
+
+    def test_inspect_still_says_it_is_the_name_question_that_needs_it(self, monkeypatch, tmp_path) -> None:
+        """The honest pair: for `glyph inspect`, --wave-name really is what needs the floor."""
+        txid, raw = _tx(_raw_record(1, 1, b"\x11" * 32))
+        r = _run(monkeypatch, {txid: raw}, ["glyph", "inspect", txid, "--fetch", "--wave-name", NAME], tmp_path)
+        assert r.exit_code == 1, r.output
+        assert "--wave-name needs --min-confirmations" in " ".join(r.output.split())
 
     def test_an_unreadable_record_beside_a_good_one_does_not_block_the_good_one(
         self, monkeypatch, tmp_path, world
@@ -465,6 +540,74 @@ class TestHonestWorkStillHolds:
         j = json.loads(r.stdout)
         assert j["checks"]["signature"]["state"] == "RECORD DOES NOT DECODE"
         assert j["verdict_record"]["vout"] == 0 and j["verdict_record"]["refusal_vout"] == 1
+
+
+class TestABatchWithOneBadRecordFailsTheHonestOnesToo:
+    """The DOCUMENTED cost of the transaction-wide refusal. A transaction can batch several
+    parties' records; one party's mis-signed record fails the verdict for an honest record beside
+    it. Pinned, so the help text and the behaviour cannot drift apart — and so is the part that
+    makes it bearable: the honest record's own checks are all there in --json."""
+
+    def test_it_does_not_hold_and_the_honest_record_says_it_passed_on_its_own(self, monkeypatch, tmp_path, world):
+        honest = _signed(_content(world, "victim"), world["victim"])
+        mis_signed = bytearray(_signed(b"a third party's document", world["attacker"]))
+        mis_signed[20] ^= 0x01  # well-formed, and its signature no longer holds
+        txid, raw = _tx(honest, _signed(b"another customer", PrivateKey()), bytes(mis_signed))
+        args = ["--json", "verify", txid, "--file", str(world["files"]["victim"]), "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path)
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        j = json.loads(r.stdout)
+        assert j["verdict_record"] == {"vout": 0, "records_in_tx": 3, "all_record_checks_hold": True, "refusal_vout": 2}
+        assert {k: v["state"] for k, v in j["records"][0]["checks"].items()} == {
+            "signature": "VERIFIED",
+            "digest": "MATCHES",
+            "name": "NOT CHECKED",
+        }
+
+
+class TestOneLookupPerSignerNotPerRecord:
+    """--wave-name and --verify-wave each ran a network lookup for EVERY verified record — for
+    --wave-name a name resolution, an anchor and a chain walk across two servers. Within one run
+    the name, txid and floor are fixed, so the answer depends only on the signer."""
+
+    def test_copies_of_one_signed_record_are_looked_up_once(self, monkeypatch, tmp_path, world) -> None:
+        copy = _signed(_content(world, "victim"), world["victim"])
+        other = _signed(b"someone else's document", world["attacker"])
+        txid, raw = _tx(*([copy] * 5), other)
+        probe: dict = {}
+        args = ["--json", *_replay_args(txid, world), "--verify-wave"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=world["victim_addr"], probe=probe)
+        j = json.loads(r.stdout)
+        # TWO signers, so two of each lookup — not six.
+        assert probe["b"].extension_calls.count("wave.resolve") == 2, probe["b"].extension_calls
+        assert len(probe["walks"]) == 2, probe["walks"]
+        assert probe["a"].extension_calls.count("wave.reverse_lookup") == 2, probe["a"].extension_calls
+        # And every record still carries ITS OWN signer's answer.
+        names = [rec["checks"]["name"]["state"] for rec in j["records"]]
+        assert names == ["ESTABLISHED"] * 5 + ["NOT THE SIGNER"], names
+        assert j["records"][0]["name_at_mark"] == j["records"][4]["name_at_mark"], "one signer, one answer"
+
+    def test_records_sharing_a_signer_get_separate_copies_of_the_answer(self, monkeypatch) -> None:
+        """Not one shared dict: `verify` writes into each record's dicts afterwards, and an edit to
+        one must not reach another. Driven at the attach function, with the judge replaced by a
+        counter — the judge itself runs for real in the test above."""
+        calls: list = []
+
+        def judge(ctx, hm, **_):
+            calls.append(hm)
+            hm["name_at_mark"] = {"resolved": True, "chain": {"steps": 1}}
+
+        monkeypatch.setattr(glyph_inspect, "_judge_one_name_at_mark", judge)
+        signed = {"attestation": {"outcome": "valid", "recovered_hash160": "ab" * 20}}
+        payload = {
+            "txid": "cd" * 32,
+            "outputs": [{"vout": i, "hashmark": json.loads(json.dumps(signed))} for i in range(3)],
+        }
+        glyph_inspect._attach_name_at_mark(object(), payload, name=NAME, min_confirmations=6)
+        got = [row["hashmark"]["name_at_mark"] for row in payload["outputs"]]
+        assert len(calls) == 1 and got[0] == got[1] == got[2]
+        assert len({id(x) for x in got}) == 3, "records share one mutable answer"
+        assert len({id(x["chain"]) for x in got}) == 3, "records share a nested mutable dict"
 
 
 def test_the_block_is_inherited_from_the_verdicts_own_record_first() -> None:

@@ -465,6 +465,30 @@ def _digest_expectation(
         raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
 
 
+def _why_no_digest_to_compare(record: dict) -> str:
+    """Why a record gave nothing to compare a file against — in words that fit THAT record.
+
+    It said "this record does not decode (unknown_version), so it commits to no digest" for every
+    unreadable record. Both halves were wrong for a record from a newer version: "does not
+    decode" is this command's word for a MALFORMED record (RECORD DOES NOT DECODE), and a
+    well-formed record of an unknown version or hash may very well commit to a digest — this
+    build just cannot read it.
+    """
+    outcome = record.get("outcome")
+    version, algorithm_id = record.get("version"), record.get("algorithm_id")
+    if outcome == "unknown_version":
+        return f"this build cannot read a version-{version} record, so its digest could not be compared"
+    if outcome == "unknown_algorithm":
+        named = f"0x{algorithm_id:02x}" if isinstance(algorithm_id, int) else "an algorithm"
+        return (
+            f"this record names hash algorithm {named}, which this build does not implement, "
+            "so its digest could not be compared"
+        )
+    if outcome == "invalid":
+        return "this record is malformed (RECORD DOES NOT DECODE), so no digest can be read from it"
+    return f"this record could not be read ({outcome}), so its digest could not be compared"
+
+
 def judge_digest_match(
     record: dict, expected_hex: str | None, *, source: str, asked: bool, absent_reason: str = ""
 ) -> dict:
@@ -497,7 +521,7 @@ def judge_digest_match(
     if record.get("outcome") != "ok" or not have:
         return {
             "state": "CANNOT COMPARE",
-            "reason": f"this record does not decode ({record.get('outcome')}), so it commits to no digest",
+            "reason": _why_no_digest_to_compare(record),
             "source": source,
             "expected": expected_hex,
         }
@@ -787,9 +811,17 @@ def _tx_refusal(per_record: list[tuple[Any, dict, dict]]) -> tuple[Any, dict] | 
     """``(vout, signature check)`` of the first record that is broken or forged, or ``None``.
 
     Kept from the old rule, and the conservative direction: a transaction carrying a forgery is
-    not made trustworthy by also carrying a good record. It refuses nothing an honest marker
-    publishes — nobody can add an output to someone else's transaction. Named by vout, because
-    the summary's record line may be about another record.
+    not made trustworthy by also carrying a good record.
+
+    IT DOES REFUSE HONEST WORK IN ONE CASE, and that is a choice, not an accident. A third party
+    cannot add an output to a transaction someone else signed — but a transaction can BATCH
+    several parties' records (a marking service publishing many customers' marks at once), and
+    then one party's broken or mis-signed record fails the verdict for every honest record beside
+    it. That is kept because `verify` is a gate that scripts run (`pyrxd verify … && deploy`), and
+    a gate should fail closed on a transaction that carries a forgery. The honest record is not
+    hidden: its own checks are in ``records[i].checks`` in ``--json``, and the summary names the
+    vout that failed. Stated in ``--help`` too. Named by vout, because the summary's record line
+    may be about another record.
     """
     for vout, _hm, checks in per_record:
         sig = checks["signature"]
@@ -932,7 +964,10 @@ def verify_cmd(
     THE VERDICT IS ABOUT ONE RECORD. A transaction can carry several HashMark outputs, and the
     signature, file and name checks must all hold for the SAME one; the summary names its vout.
     A record that does not decode, or whose signature does not verify, fails the whole
-    transaction wherever it sits.
+    transaction wherever it sits — including a BATCHED transaction that carries several
+    parties' records, where one bad record fails the verdict for an honest one beside it. That
+    is deliberate (a gate should fail closed on a transaction carrying a forgery); --json shows
+    each record's own checks under records[i].checks.
 
     \b
     What HOLDS means, and no more: one record passes every check you asked for, no record in the
@@ -965,11 +1000,6 @@ def verify_cmd(
                 cause=f"got {digest_hex!r}",
                 fix="pass the digest as hex, e.g. the output of `sha256sum <file>`",
             )
-    # The same refusal `glyph inspect --wave-name` raises, from the same function — one rule,
-    # one wording. Required here for EVERY run, not only the name ones: `verify` always places
-    # the mark at a height, and a height with no floor under it is a number nobody can act on.
-    _require_min_confirmations(min_confirmations)
-
     wanted = txid.strip().lower()
     try:
         Txid(wanted)
@@ -981,6 +1011,12 @@ def verify_cmd(
             "is the DIGEST (the same shape), it locates nothing on its own: pass it with --digest "
             "and give the mark's txid as the argument.",
         ) from exc
+    # The same refusal `glyph inspect --wave-name` raises, from the same function — one rule. The
+    # WORDING is this command's: required here for EVERY run, not only the name ones, because
+    # `verify` always places the mark at a height and a height with no floor under it is a number
+    # nobody can act on. Naming --wave-name here refused `pyrxd verify <txid>` over a flag the user
+    # had not passed. After the txid check, so the command it tells you to re-run is a valid one.
+    _require_min_confirmations(min_confirmations, needed_by="pyrxd verify", command=f"pyrxd verify {wanted}")
 
     payload = _run_fetch_inspect(ctx, form="txid", value=wanted)
     rows = [row for row in (payload.get("outputs") or []) if row.get("hashmark")]
