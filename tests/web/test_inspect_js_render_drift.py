@@ -1251,11 +1251,14 @@ def _tx_payloads() -> dict[str, dict]:
         # script" from a pure category test — no confusability check runs — and
         # the banner used to tell this token's holder it mimicked Latin letters.
         "homoglyph-non-latin": _tx_payload([_reveal_scriptsig("トークン")], [(nft, 546)]),
-        # EVERY LIST CUT SHORT, so every `*_not_listed` count the classifier emits reaches
-        # the field guard above: outputs (with HashMark records among the ones left out),
-        # envelopes, other glyphs, and the headline's relationship claims and delegate
-        # burns. A listing limit of 2 is not the page's; it keeps the case small, and the
-        # counts' wording is the same at any limit.
+        # EVERY LIST CUT SHORT, so every `*_not_listed` key the classifier emits reaches the
+        # field guard above: outputs (with HashMark records among the ones left out),
+        # envelopes, other glyphs, and the headline's relationship claims and delegate burns.
+        # A listing limit of 2 is not the page's; it keeps the case small. What this case
+        # CANNOT show is that a small count was drawn — the guard accepts a short number
+        # wherever it stands alone on the card, and single digits do (planting an undrawn
+        # envelope note passed here). `test_inspect_page_is_bounded.py` asserts each count's
+        # drawn sentence, and is what caught that plant.
         "bounded-lists": _tx_payload(
             [
                 _reveal_scriptsig(
