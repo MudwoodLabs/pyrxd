@@ -494,13 +494,14 @@ function renderFetchedTxCard(payload) {
   }
 
   // dMint mint-claim scriptSig (if present at vin[0]). Surfaces the four
-  // canonical pushes — nonce, inputHash, outputHash, OP_0 sentinel —
-  // and the V1/V2 hint that falls out of the nonce push width.
+  // canonical pushes — nonce, inputHash, outputHash, OP_0 sentinel — and the
+  // nonce's width, which is NOT a V1/V2 hint: neither covenant checks it, and
+  // V1 mints on mainnet use both 4 and 8 bytes. The contract script says which.
   const mintScriptsig = payload.mint_scriptsig;
   if (mintScriptsig) {
     wrapper.appendChild(el("h3", { class: "result-subhead", text: "dMint mint scriptSig (vin 0)" }));
     const mdl = el("dl", { class: "kv-list" });
-    mdl.appendChild(kv("version (by nonce width)", mintScriptsig.version_hint || "?"));
+    mdl.appendChild(kv("nonce width", mintScriptsig.nonce_width ? `${mintScriptsig.nonce_width} bytes` : "?"));
     mdl.appendChild(kv("scriptSig length", `${mintScriptsig.scriptsig_length} bytes`));
     mdl.appendChild(kv("nonce (LE)", mintScriptsig.nonce_hex));
     mdl.appendChild(kv("input hash (SHA256d funding script)", mintScriptsig.input_hash));
@@ -513,13 +514,13 @@ function renderFetchedTxCard(payload) {
             "of the OP_RETURN message script (at vout[2] in the canonical V1 " +
             "mint shape), and an OP_0 sentinel. The covenant recomputes " +
             "SHA256(inputHash || outputHash) from these literal pushes — they " +
-            "are not preimage halves. V1 uses a 4-byte nonce (72-byte " +
-            "scriptSig); V2 uses 8 bytes (76 bytes). V1 is verified on " +
-            "Radiant mainnet against two pinned golden vectors (the public " +
-            "snk-token mint 146a4d68…f3c and pyrxd's first successful mint " +
-            "c9fdcd34…e530 of the PXD token, 2026-05-11); no V2 contract " +
-            "has been observed on chain yet, so the V2 decode here is " +
-            "structurally correct by construction but not field-verified.",
+            "are not preimage halves. The nonce is 4 or 8 bytes. Its width " +
+            "does not say whether the contract is V1 or V2: neither covenant " +
+            "checks it, and V1 mints on mainnet use both widths. The " +
+            "contract script the input spends says which. This decode is " +
+            "checked against two V1 mainnet mints (the public snk-token mint " +
+            "146a4d68…f3c and pyrxd's first successful mint c9fdcd34…e530 of " +
+            "the PXD token, 2026-05-11).",
     }));
   }
 
@@ -1885,13 +1886,10 @@ function _detectTxShape(payload) {
     // outputHash), [3] P2PKH change. V2 originally shipped a 25-byte
     // plain-P2PKH reward — fixed pre-mainnet-V2-deploy so V1 and V2
     // are byte-identical at vout[1]. The mint scriptSig at vin[0] is
-    // decoded separately under "dMint mint scriptSig (vin 0)" above;
-    // the V1/V2 distinction is the nonce-push width there (4 vs 8 B),
-    // not the output layout here.
-    const versionHint = (payload.mint_scriptsig || {}).version_hint;
-    const versionNote = versionHint
-      ? ` Mint scriptSig at vin[0] is ${versionHint} shape (${versionHint === "v1" ? "4-byte nonce, 72 bytes" : "8-byte nonce, 76 bytes"}); the 4-output shape is identical across V1 and V2 by construction, but only V1 has been observed on Radiant mainnet (no V2 contract has been deployed yet).`
-      : "";
+    // decoded separately under "dMint mint scriptSig (vin 0)" above. Neither
+    // it nor the output layout here tells V1 from V2 (the nonce width does
+    // not: V1 mints use both 4 and 8 bytes); the dmint output's own version,
+    // read from its script, does.
     // "The freshly-minted FT lives in a separate ft output in this same tx" and
     // "the canonical mint tx has 4 outputs: …" were stated unconditionally, on
     // every tx carrying a dmint output at height > 0 — including one with no ft
@@ -1965,8 +1963,7 @@ function _detectTxShape(payload) {
       shapeNote +
       "V1 is verified on mainnet against pinned golden vectors; V2 is " +
       "byte-identical by construction (R1 fix) but untested on chain. " +
-      "Inspect the contract's deploy outpoint to see the original parameters." +
-      versionNote
+      "Inspect the contract's deploy outpoint to see the original parameters."
     );
   }
 

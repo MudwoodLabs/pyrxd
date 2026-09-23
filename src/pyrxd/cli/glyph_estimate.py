@@ -232,11 +232,23 @@ def _resolve_target(
             raise UserError(f"--target must be >= 1, got {target}")
         return target, None
 
+    from ..glyph.dmint.miner import _unmintable_reason  # after _fetch_contract: same import cost
+
     contract_utxo = _fetch_contract(ctx, contract_arg, token_ref_arg)
     state = contract_utxo.state
+    never = _unmintable_reason(contract_utxo.script)
+    if never is not None:
+        # No estimate at all: the covenant does not clamp a target it cannot read, it aborts,
+        # so any time-to-mint printed here would be the time to a mint that cannot happen.
+        raise UserError(
+            "pyrxd will not mint this contract, so there is no time to estimate",
+            cause=never,
+            fix="claim-dmint refuses it too",
+        )
     return state.target, {
         "contract": f"{contract_utxo.txid}:{contract_utxo.vout}",
         "version": "V1" if state.is_v1 else "V2",
+        "algo": state.algo.name,
         "height": state.height,
         "max_height": state.max_height,
         "reward": state.reward,
@@ -291,8 +303,15 @@ def _render_human(payload: dict) -> str:
     header = f"dMint mint estimate — difficulty {exact['difficulty']:,} (target {exact['effective_target']:#x})"
     lines.append(header)
     if exact["clamped"]:
+        # Only --target reaches here. A live contract's target is read as the signed script
+        # number the covenant sees: wider than 8 bytes, _resolve_target refuses it, and at most
+        # 8 bytes it cannot exceed the ceiling (V1 targets were read unsigned before 2026-09-23,
+        # so a top-bit-set one used to land here).
         lines.append(
-            f"  note: supplied target {exact['target']:#x} exceeds the ceiling and was clamped by the verifier"
+            f"  note: supplied target {exact['target']:#x} is above the ceiling (MAX_SHA256D_TARGET). No dMint"
+            " contract carrying it can be minted: the covenant reads the target as a signed script number"
+            " of at most 8 bytes, so such a target is unreadable or negative. The figures below are for"
+            " the ceiling, which pyrxd's own verifier clamps to."
         )
 
     contract = payload.get("contract")
@@ -300,6 +319,11 @@ def _render_human(payload: dict) -> str:
         lines.append("")
         lines.append("CONTRACT (from the network)")
         lines.append(_row("contract", f"{contract['contract']} ({contract['version']})"))
+        if contract["algo"] != "SHA256D":
+            lines.append(
+                f"  note: this contract's proof of work is {contract['algo']}. The rate and ETAs below are"
+                " SHA256d's, and pyrxd cannot mine this contract (claim-dmint refuses it)."
+            )
         lines.append(_row("height", f"{contract['height']:,} / {contract['max_height']:,}"))
         lines.append(_row("reward", f"{contract['reward']:,} photons per mint"))
 

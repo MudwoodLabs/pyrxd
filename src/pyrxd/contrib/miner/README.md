@@ -27,6 +27,7 @@ result = mine_solution_external(
     target=state.target,
     miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
     nonce_width=4,
+    algo=state.algo,  # the contract's: BLAKE3/K12 are refused, not ground as SHA256d
 )
 ```
 

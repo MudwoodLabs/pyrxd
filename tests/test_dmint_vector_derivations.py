@@ -54,8 +54,11 @@ _VECTORS = Path(__file__).resolve().parent.parent / "conformance" / "dmint-v2-co
 
 # Documented target formula constants (types.py cites the canonical redesign;
 # inlined here so the assertion does not route through the code under test).
+# ONE maximum for every algorithm: Photonic's dMintDiffToTarget is MAX_TARGET / difficulty
+# with no algorithm argument, and Part B1 compares the same 8-byte hash window whatever the
+# hash opcode. These tests once expected ``(2**256 - 1) // difficulty`` for BLAKE3/K12 — a
+# target no covenant can read — and so pinned the defect instead of catching it.
 _MAX_SHA256D_TARGET = 0x7FFFFFFFFFFFFFFF
-_MAX_256BIT_TARGET = (1 << 256) - 1
 _EPOCH_MAX_SAFE_TARGET = 1 << 48
 
 
@@ -102,8 +105,7 @@ def test_committed_vector_bytes_reparse_to_their_params():
         assert st_.daa_mode.name == p["daa_mode"], ctx
         assert st_.target_time == p["target_time"], ctx
         assert st_.last_time == p["last_time"], ctx
-        max_target = _MAX_SHA256D_TARGET if p["algo"] == "SHA256D" else _MAX_256BIT_TARGET
-        assert st_.target == max_target // p["difficulty"], ctx
+        assert st_.target == _MAX_SHA256D_TARGET // p["difficulty"], ctx
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -120,9 +122,8 @@ def _deploy_params(draw) -> DmintDeployParams:
     algo = draw(st.sampled_from(list(DmintAlgo)))
     if daa_mode == DaaMode.EPOCH:
         # EPOCH caps the initial target at 2^48 (OP_MUL overflow guard), so
-        # difficulty must be at least maxTarget / 2^48.
-        max_target = _MAX_SHA256D_TARGET if algo == DmintAlgo.SHA256D else _MAX_256BIT_TARGET
-        min_diff = max_target // _EPOCH_MAX_SAFE_TARGET + 1
+        # difficulty must be at least maxTarget / 2^48 — for every algorithm.
+        min_diff = _MAX_SHA256D_TARGET // _EPOCH_MAX_SAFE_TARGET + 1
         difficulty = draw(st.integers(min_value=min_diff, max_value=min_diff * 1024))
     else:
         difficulty = draw(st.integers(min_value=1, max_value=2**40))
@@ -177,8 +178,7 @@ def test_builder_parser_roundtrip(p):
     assert st_.daa_mode == p.daa_mode
     assert st_.target_time == p.target_time
     assert st_.last_time == p.last_time
-    max_target = _MAX_SHA256D_TARGET if p.algo == DmintAlgo.SHA256D else _MAX_256BIT_TARGET
-    assert st_.target == max_target // p.difficulty
+    assert st_.target == _MAX_SHA256D_TARGET // p.difficulty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -200,6 +200,9 @@ def _read_minimal_number(script: bytes, i: int) -> tuple[int, int]:
     if 0x51 <= op <= 0x60:
         return op - 0x50, i + 1
     assert 1 <= op <= 0x4B, f"expected direct push at offset {i}, got opcode {op:#x}"
+    # Radiant's CScriptNum reads at most 8 bytes (MAXIMUM_ELEMENT_SIZE_64_BIT); a wider state
+    # number aborts the covenant on every mint. A BLAKE3/K12 target was 33 bytes here once.
+    assert op <= 8, f"{op}-byte script number at offset {i}: wider than the 8 bytes the covenant can read"
     data = script[i + 1 : i + 1 + op]
     assert len(data) == op, "truncated push"
     # minimality: single bytes 1..16 / 0x81 must have used OP_N / OP_1NEGATE
@@ -242,8 +245,7 @@ def _read_state_slots(contract: bytes, p: DmintDeployParams) -> None:
     assert contract[i + 1 : i + 5] == struct.pack("<I", p.last_time)
     i += 5
     target, i = _read_minimal_number(contract, i)
-    max_target = _MAX_SHA256D_TARGET if p.algo == DmintAlgo.SHA256D else _MAX_256BIT_TARGET
-    assert target == max_target // p.difficulty
+    assert target == _MAX_SHA256D_TARGET // p.difficulty
     assert contract[i] == 0xBD, "state must end at OP_STATESEPARATOR"
 
 
