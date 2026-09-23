@@ -120,7 +120,7 @@ class TestTheCliSaysWhatHappenedToTheSpentTransaction:
         }
 
     def test_a_server_answering_with_another_transaction_is_not_called_not_supplied(self, transport) -> None:
-        """The review's case (``poc/cli_not_supplied.py``): asked for the commit, the server
+        """The review's case: asked for the commit, the server
         answers with a different transaction. The client refuses it by hash; the verdict used to
         say the spent output "was not supplied"."""
         from pyrxd.glyph._inspect_core import SPENT_TX_NOT_OBTAINED

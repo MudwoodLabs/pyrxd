@@ -246,7 +246,7 @@ class TestThePayloadIsBounded:
 
 
 def _mixed(limit: int) -> list[bytes]:
-    """The review's mixed remainder (``poc/mix.py``), placed past the listing limit: records of an
+    """The review's mixed remainder, placed past the listing limit: records of an
     unknown version, a forgery, signed records within and past the CHECKING limit (which counts
     HashMark records, not rows), v1 records, repeated forgeries (byte copies of one already
     checked), more forgeries of the same statement that are NOT byte copies, and plain outputs."""
@@ -420,7 +420,7 @@ class TestTheCardSaysExactlyWhatWasLeftOut:
         assert "not checked here" not in text, "a v1 record has no signature, and its NO SIGNATURE costs nothing"
 
     def test_the_review_mix_is_worded_from_the_classifiers_counts(self, limit) -> None:
-        """The review's check (``poc/mix.py``): what the note says equals what the classifier
+        """The review's check: what the note says equals what the classifier
         decided about every row left out — computed here from a FULL classification."""
         scripts = _mixed(limit)
         text = _flat(_card(_classified(*scripts, limit=limit))["fetched_tx_card"])
