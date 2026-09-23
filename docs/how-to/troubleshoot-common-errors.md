@@ -216,18 +216,21 @@ buffer, and dust for the change output. This scans for a UTXO that is
 **plain RXD only** (token-bearing UTXOs at the same address are excluded).
 
 **b) A funding UTXO exists but is too small** — the library's
-`PoolTooSmallError`, verbatim message shape:
+`PoolTooSmallError`, message shape:
 
 ```
 funding_utxo (<value> photons) too small to cover reward (<reward>) + fee (<fee>):
-change would be <change> photons, below 546 dust limit.
+change would be <change> photons, below pyrxd's 546-photon uneconomic-change floor
+(a pyrxd send policy, NOT a Radiant relay limit — Radiant's floor is 1 photon).
+Fund the mint from a larger UTXO.
 ```
 
-— [`src/pyrxd/glyph/dmint/miner.py:2140`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
-and
-[`:2397`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
-(the V1 and V2 mining paths). The CLI reframes any `DmintError` from mining
-as:
+— raised by `build_dmint_mint_tx` in
+[`src/pyrxd/glyph/dmint/miner.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+(both the V1 and V2 paths). It can happen even after (a) found a UTXO, because
+(a)'s `needed` allows a flat 10,000,000 photons for the fee while the mint pays
+`size x fee_rate`: a raised fee rate can outgrow that allowance. The CLI
+reframes any `DmintError` from mining as:
 
 ```
 error: funding can't cover the mint reward + fee

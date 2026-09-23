@@ -66,15 +66,24 @@ V1 mints have **two inputs** and a **four-output canonical shape**:
 |-----------:|---------------:|---------------------------------------------------------------------------------------|
 | vin[0]     |             72 | The contract UTXO being spent; unlocked by the V1 mint scriptSig (see next section).  |
 | vin[1]     |          ~106  | Plain-RXD P2PKH funding input — pays the FT reward photons + tx fee.                  |
-| vout[0]    |            241 | The re-created contract UTXO at `height+1`. Same 241-byte layout as the input, with the `height` field bumped. Singleton value preserved (typically 1 photon). |
+| vout[0]    |            241 | The re-created contract UTXO at `height+1`. Same 241-byte layout as the input, with the `height` field bumped. Singleton value preserved (typically 1 photon). **On the final mint** (`height + 1 == max_height`) it is instead the 38-byte burn `d8 <contractRef> 6a` at value 0; see below. |
 | vout[1]    |             75 | FT-wrapped reward output, value = `state.reward` photons. Same 75-byte FT shape covered in [Radiant FTs are on-chain](radiant-fts-are-on-chain.md); embeds the miner's `pkh` and the contract's `tokenRef`. |
 | vout[2]    |        variable | OP_RETURN message output. The covenant binds `outputHash` to `SHA256d(this script's bytes)`. The miner picks any message; the contract requires the output to exist with the chosen bytes. |
-| vout[3]    |             25 | P2PKH change to the miner — `funding − reward − fee`.                                 |
+| vout[3]    |             25 | P2PKH change to the miner — `funding − reward − fee`; on the final mint `funding + contract value − reward − fee`. |
 
-The contract input value is **preserved across mints**. V1 contracts
-are singletons (the on-chain reference deploys all use 1-photon
-contract outputs), not a value pool — the reward photons come from
-the funding input, not from the contract UTXO. See
+The contract input value is **preserved across mints**, every mint
+but the last. V1 contracts are singletons (the on-chain reference
+deploys all use 1-photon contract outputs), not a value pool — the
+reward photons come from the funding input, not from the contract UTXO.
+
+**The final mint** is the one whose new height equals `max_height`.
+The epilogue's final branch does not recreate the contract: it requires
+the output at the index the scriptSig names (pyrxd always names 0) to
+be exactly `d8 <contractRef> 6a`, the contract singleton pushed into an
+`OP_RETURN`. `build_dmint_mint_tx` puts that burn at vout[0] with value
+0; the contract's photon joins the change. vout[1..3] keep the shape
+above. Nothing can spend the burn, so nothing can mint the contract
+again. See
 [`_build_dmint_v1_mint_tx`](../../src/pyrxd/glyph/dmint/__init__.py) for the
 builder's output assembly.
 

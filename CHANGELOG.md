@@ -34,9 +34,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **pyrxd could not build the last mint of a dMint contract.** On the mint that takes a
   contract to `max_height`, the covenant's output-validation block (V2 Part C and the V1
-  epilogue carry the same bytes here) does not rebuild the contract: it requires output 0 to be
-  exactly `d8 <contractRef> 6a` — the contract singleton pushed into an `OP_RETURN` — and the
-  token ref in the FT reward outputs only. `build_dmint_mint_tx` recreated the contract anyway
+  epilogue carry the same bytes here) does not rebuild the contract: it requires the output at the
+  index the mint's scriptSig names (pyrxd always names 0) to be exactly `d8 <contractRef> 6a` —
+  the contract singleton pushed into an `OP_RETURN` — and the token ref in the FT reward outputs
+  only. `build_dmint_mint_tx` recreated the contract anyway
   on V2, a transaction the covenant rejects, and only after the proof-of-work grind; on V1 it
   asked the state builder for a contract at `height == max_height`, which refuses that as
   born-exhausted, so it built nothing. The final mint now puts the burn at output 0 (value 0;
@@ -47,10 +48,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   contract (its 1-photon value; on V2 a readable `lastTime` and a target above 1) are not
   applied to the final mint, which recreates none; everything the covenant still evaluates is.
   `pyrxd glyph claim-dmint` builds it through the same path, says in its pre-grind summary that
-  the claim burns the contract, and reports `final_mint` in `--json`. Proven on a Radiant Core
-  v3.1.2 regtest node for V1 and V2: the final mint is accepted and mined and the contract
-  output is gone; the same final mint recreating the contract instead, with the same nonce, is
-  rejected on the script.
+  the claim burns the contract, and reports `final_mint` in `--json`. Pointed at a contract's
+  outpoint after its final mint, `claim-dmint` and `dmint-estimate` now say it holds the burn
+  rather than "not a dMint contract", and `dmint-estimate` says when the next claim is the
+  final one. Proven on a Radiant Core v3.1.2 regtest node for V1, V2 FIXED, and V2 ASERT and
+  LWMA contracts whose first mint is their last: the final mint is accepted and mined and the
+  contract output is gone; the same final mint recreating the contract instead, with the same
+  nonce, is rejected on the script. Five mainnet V1 final mints, rebuilt from the contracts they
+  spent, match the chain byte for byte in every output but the change, which is the miner's own
+  choice of address and fee.
+
+- **The V1 mint builder trusted `contract_utxo.state` over the script it spends.** Nothing
+  checked the state against `contract_utxo.script`, so a V1 script at height 0 of 2 paired with
+  a state saying height 1 built the final mint's burn a mint early, which the covenant rejects
+  after the proof-of-work grind. V2 already refused a state its script does not carry. The V1
+  builder now parses the script and refuses a state that differs from it.
 
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
