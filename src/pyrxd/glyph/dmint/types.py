@@ -5,10 +5,12 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (27 — every module-level name, so the count is checkable rather than
+Symbols (31 — every module-level name, so the count is checkable rather than
 decorative; it read "20" while listing 17 before 2026-09-22):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
+    MAX_SCRIPT_NUM_BYTES, MAX_SCRIPT_NUM, MAX_V2_TARGET_TIME,
+    target_for_difficulty, check_v2_numeric_bounds,
     EPOCH_MAX_ADJUSTMENT_LOG2_VALUES, EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES,
     EPOCH_MAX_SAFE_TARGET, SCHEDULE_MAX_ENTRIES,
     ASERT_V2_RADIX, ASERT_V2_DRIFT_CLAMP, ASERT_V2_MAX_TARGET_DIV4,
@@ -66,12 +68,38 @@ class V2UnvalidatedWarning(UserWarning):
 # Constants
 # ---------------------------------------------------------------------------
 
-# Maximum SHA256d target (64-bit; first 4 bytes implicitly zero).
-# Valid: hash[0..4] == 0 AND hash[4..12] < MAX_SHA256D_TARGET.
+# Maximum dMint target, for EVERY hash algorithm (64-bit; first 4 bytes implicitly zero).
+# Valid: hash[0..4] == 0 AND hash[4..12] < MAX_SHA256D_TARGET. The name is historical: Part B1
+# (``_PART_B1``) cuts the same 8-byte window out of the PoW hash whichever hash opcode precedes
+# it, so a BLAKE3 or K12 contract compares against a target of exactly this width too.
 MAX_SHA256D_TARGET = 0x7FFFFFFFFFFFFFFF
 
-# Maximum V2 256-bit target for blake3 / k12.
+# NOT a dMint target bound — retained only so existing imports keep working. Until 2026-09-23
+# pyrxd derived BLAKE3/K12 deploy targets from it (``(2**256 - 1) // difficulty``), which for any
+# difficulty below 2**192 is wider than 8 bytes: Part B2 reads the target as a script number, and
+# an operand wider than 8 bytes aborts the script, so those contracts could never be minted. No
+# dMint target, for any algorithm, exceeds MAX_SHA256D_TARGET; nothing in pyrxd reads this
+# constant any more.
 MAX_V2_TARGET_256 = (1 << 256) - 1
+
+#: The widest numeric operand Radiant's interpreter reads: ``CScriptNum`` refuses an operand
+#: longer than ``MAXIMUM_ELEMENT_SIZE_64_BIT`` = 8 bytes (Radiant Core ``script.h``, vendored at
+#: ``tests/vendor/radiant_core/script.h``), so the largest script number is ``2**63 - 1``. Every
+#: number a dMint covenant reads as one — the state's height, maxHeight, reward and target on
+#: every mint, targetTime in the DAA modes, and the constants its DAA fragment bakes — has to
+#: fit, or the script aborts.
+MAX_SCRIPT_NUM_BYTES = 8
+MAX_SCRIPT_NUM = (1 << 63) - 1
+
+#: Upper bound on a V2 deploy's ``target_time`` (and the reason it is not ``MAX_SCRIPT_NUM``).
+#: ``target_time`` is a spacing in seconds that the ASERT/LWMA/EPOCH retarget compares with the
+#: difference of two 32-bit Unix timestamps (the state's ``lastTime`` is a 4-byte push), so no
+#: spacing wider than ``0xFFFFFFFF`` seconds can ever be observed. The bound also keeps every
+#: intermediate of those retargets inside int64 for any pair of such timestamps: ASERT and LWMA
+#: multiply ``(timeDelta - targetTime)`` by 2**16, which aborts the script once the difference
+#: reaches 2**47, and EPOCH doubles ``targetTime`` up to four times. (Photonic's Mint form offers
+#: 10..3600; ``tests/test_dmint_deploy_bounds.py`` pins the values mainnet deploys use.)
+MAX_V2_TARGET_TIME = 0xFFFFFFFF
 
 # EPOCH DAA: allowed max-adjustment factors and their log2 (shift count). Restricted
 # to powers of 2 so the boundary clamp uses bit-shifts (N× OP_2MUL / OP_2DIV).
@@ -275,6 +303,119 @@ DAA_MODES_READING_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA, DaaMode.EP
 
 
 # ---------------------------------------------------------------------------
+# Deploy-parameter arithmetic and bounds (shared by DmintDeployParams and
+# pyrxd.glyph.builder.DmintV2DeployParams)
+# ---------------------------------------------------------------------------
+
+
+def target_for_difficulty(difficulty: int) -> int:
+    """The PoW target a dMint contract is deployed with at ``difficulty``: ``MAX_SHA256D_TARGET // difficulty``.
+
+    The same formula for EVERY hash algorithm. Part B1 (``_PART_B1``, identical in V1 and V2
+    code) reverses the PoW hash, drops all but 12 bytes, requires 4 of them to be zero and reads
+    the other 8 as the number Part B2 compares with the target — whether the hash opcode before
+    it is OP_HASH256, OP_BLAKE3 or OP_K12. It is the formula of canonical Photonic
+    ``dMintDiffToTarget`` (``MAX_TARGET / BigInt(difficulty)``, ``packages/lib/src/script.ts`` at
+    becf41a7), which takes no algorithm argument, and the BLAKE3/K12 V2 contracts on mainnet
+    carry exactly these targets (e.g. a declared ``diff`` of 2 → ``0x3fffffffffffffff``).
+    """
+    if difficulty < 1:
+        raise ValidationError("difficulty must be >= 1")
+    return MAX_SHA256D_TARGET // difficulty
+
+
+def check_v2_numeric_bounds(
+    *,
+    stage: str,
+    max_height: int,
+    reward: int,
+    difficulty: int,
+    daa_mode: DaaMode,
+    target_time: int,
+    half_life: int,
+    epoch_length: int,
+    schedule: tuple[tuple[int, int], ...],
+    reward_name: str = "reward",
+) -> None:
+    """Refuse V2 deploy parameters no contract built from them could ever be minted with.
+
+    Upper bounds only; each type keeps its own lower-bound checks. Called from
+    ``DmintDeployParams.__post_init__`` (which both V2 deploy scripts — the fee placeholder and
+    the real reveal — are built from) and from ``DmintV2DeployParams.__post_init__`` (so the CLI
+    and API refuse on the caller's own object, naming the caller's argument, before any
+    network work). ``_push_minimal`` separately refuses to emit any number wider than
+    ``MAX_SCRIPT_NUM_BYTES``, whichever builder asks.
+
+    Each bound is the point past which the covenant cannot work, not a guess at what is
+    sensible; every value on a mainnet V2 deploy is far inside all of them
+    (``tests/test_dmint_deploy_bounds.py`` pins the observed values as accepted):
+
+    * ``max_height`` <= ``MAX_SCRIPT_NUM`` — Part C adds 1 to the height and compares it with
+      maxHeight as script numbers on every mint (``OP_1ADD`` … ``OP_NUMEQUAL``).
+    * ``reward`` <= ``RADIANT_MAX_PHOTONS`` — each mint's reward outputs must together hold
+      exactly ``reward`` photons (Part C: ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS … OP_NUMEQUALVERIFY``),
+      and Radiant consensus refuses a transaction whose outputs total more than ``MAX_MONEY``
+      (``bad-txns-txouttotal-toolarge``), so a larger reward could never be paid.
+    * ``difficulty`` <= ``MAX_SHA256D_TARGET`` — above it the target is 0, which only a hash
+      whose compared 8 bytes are all zero can meet.
+    * ``target_time`` <= ``MAX_V2_TARGET_TIME`` — see that constant.
+    * ``half_life`` <= ``MAX_SCRIPT_NUM`` (ASERT, where it is baked in) — only ever a divisor
+      (``OP_DIV``), so any readable number works; nothing narrower is imposed.
+    * ``epoch_length`` <= ``MAX_SCRIPT_NUM`` (EPOCH) — only ever a divisor (``OP_MOD``).
+    * each SCHEDULE height <= ``MAX_SCRIPT_NUM`` — compared with the height
+      (``OP_GREATERTHANOREQUAL``).
+    """
+    from pyrxd.security.types import RADIANT_MAX_PHOTONS
+
+    def _cap(name: str, value: int, cap: int, why: str) -> None:
+        if value > cap:
+            raise ValidationError(f"{stage}: {name} must be <= {cap:,} ({why}), got {value:,}")
+
+    _cap(
+        "max_height",
+        max_height,
+        MAX_SCRIPT_NUM,
+        "the covenant compares height+1 with maxHeight as an 8-byte script number on every mint",
+    )
+    _cap(
+        reward_name,
+        reward,
+        RADIANT_MAX_PHOTONS,
+        "Radiant's money supply: a mint's outputs must hold the whole reward, and no transaction's outputs may total more",
+    )
+    _cap(
+        "difficulty",
+        difficulty,
+        MAX_SHA256D_TARGET,
+        "above it the target MAX_SHA256D_TARGET // difficulty is 0, which no ordinary hash can meet",
+    )
+    _cap(
+        "target_time",
+        target_time,
+        MAX_V2_TARGET_TIME,
+        "the widest spacing two 32-bit timestamps can have; from about 2**47 on, the ASERT/LWMA "
+        "retarget's multiply would also overflow int64 and abort the mint",
+    )
+    if daa_mode == DaaMode.ASERT:
+        _cap("half_life", half_life, MAX_SCRIPT_NUM, "it is baked into the ASERT retarget as an 8-byte script number")
+    if daa_mode == DaaMode.EPOCH:
+        _cap(
+            "epoch_length",
+            epoch_length,
+            MAX_SCRIPT_NUM,
+            "it is baked into the EPOCH retarget as an 8-byte script number",
+        )
+    if daa_mode == DaaMode.SCHEDULE:
+        for i, (h, _t) in enumerate(schedule):
+            _cap(
+                f"schedule entry {i} height",
+                h,
+                MAX_SCRIPT_NUM,
+                "it is baked into the SCHEDULE retarget as an 8-byte script number",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -328,6 +469,17 @@ class DmintDeployParams:
             raise ValidationError(
                 f"last_time must fit the state's 4-byte lastTime push (0..0xFFFFFFFF), got {self.last_time}"
             )
+        check_v2_numeric_bounds(
+            stage="DmintDeployParams",
+            max_height=self.max_height,
+            reward=self.reward,
+            difficulty=self.difficulty,
+            daa_mode=self.daa_mode,
+            target_time=self.target_time,
+            half_life=self.half_life,
+            epoch_length=self.epoch_length,
+            schedule=self.schedule,
+        )
         if self.daa_mode == DaaMode.EPOCH:
             if self.epoch_length < 1:
                 raise ValidationError("epoch_length must be >= 1 for EPOCH")
@@ -368,10 +520,13 @@ class DmintDeployParams:
 
     @property
     def initial_target(self) -> int:
-        """Compute initial target from difficulty using the SHA256d formula."""
-        if self.algo == DmintAlgo.SHA256D:
-            return MAX_SHA256D_TARGET // self.difficulty
-        return MAX_V2_TARGET_256 // self.difficulty
+        """The deploy target for ``difficulty`` — :func:`target_for_difficulty`, for every ``algo``.
+
+        BLAKE3 and K12 used to get ``MAX_V2_TARGET_256 // difficulty`` here: a target wider than
+        the 8 bytes Part B2 can read, so the contract could never be minted. ``algo`` selects the
+        hash opcode (and the algoId the state records); it does not change the target formula.
+        """
+        return target_for_difficulty(self.difficulty)
 
 
 @dataclass(frozen=True)

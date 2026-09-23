@@ -29,6 +29,7 @@ from .dmint import (
     is_minimal_4byte_scriptnum,
     is_readable_last_time,
 )
+from .dmint.types import check_v2_numeric_bounds
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
@@ -1964,18 +1965,25 @@ class DmintV2DeployParams:
     :param owner_pkh:       20-byte PKH of the key that signs commit + the
         ref-seed reveal inputs.
     :param num_contracts:   Count of parallel V2 contract UTXOs (``[1, 250]``).
-    :param max_height:      Maximum mints per contract.
-    :param reward_photons:  Photons paid per successful mint.
-    :param difficulty:      Initial PoW difficulty (1 = easiest).
+    :param max_height:      Maximum mints per contract (``[1, 2**63 - 1]``: the covenant reads
+        it as a script number). Upper bounds on this and the other numeric parameters are the
+        points past which no contract built from them can be minted — see
+        :func:`pyrxd.glyph.dmint.types.check_v2_numeric_bounds`.
+    :param reward_photons:  Photons paid per successful mint (``[1, RADIANT_MAX_PHOTONS]``).
+    :param difficulty:      Initial PoW difficulty (1 = easiest; at most ``MAX_SHA256D_TARGET``).
+        The target is ``MAX_SHA256D_TARGET // difficulty`` for every ``algo``.
     :param premine_amount:  Photons emitted as an extra FT output on the reveal,
         on top of the mineable supply (mirrors V1 — see
         :class:`DmintV1DeployParams`). If ``metadata`` carries a ``dmint.premine``
         field, the two must agree or the deploy is refused.
     :param premine_pkh:     PKH receiving the premine; ``None`` = ``owner_pkh``.
     :param op_return_msg:   Optional OP_RETURN data carrier (raw bytes after 0x6a).
-    :param algo:            PoW algorithm (default SHA256d; only SHA256D is mined).
-    :param daa_mode:        Must be ``DaaMode.FIXED`` (the only mintable mode).
-    :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED).
+    :param algo:            PoW algorithm (default SHA256d). BLAKE3 and K12 deploy with the same
+        8-byte target formula as SHA256d, as Photonic does. pyrxd's miners grind SHA256d only,
+        so a BLAKE3/K12 contract has to be mined with a miner for that hash.
+    :param daa_mode:        Any :class:`DaaMode` (FIXED, ASERT, LWMA, EPOCH, SCHEDULE).
+    :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED). At most
+        ``MAX_V2_TARGET_TIME`` (``0xFFFFFFFF`` s).
     :param half_life:       Baked into the ASERT-v2 bytecode (ASERT only; vestigial
         otherwise). Defaults to the canonical Photonic ``DEFAULT_ASERT_HALFLIFE`` (240 s)
         so an omitted value deploys what a Photonic miner assumes; before 2026-09-16 the
@@ -2023,6 +2031,21 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
+        # Upper bounds, refused on the caller's own object (naming reward_photons, not the
+        # internal `reward`) so the CLI reports them before any wallet or network work.
+        # DmintDeployParams runs the SAME check when the scripts are built.
+        check_v2_numeric_bounds(
+            stage="DmintV2DeployParams",
+            max_height=self.max_height,
+            reward=self.reward_photons,
+            difficulty=self.difficulty,
+            daa_mode=self.daa_mode,
+            target_time=self.target_time,
+            half_life=self.half_life,
+            epoch_length=self.epoch_length,
+            schedule=self.schedule,
+            reward_name="reward_photons",
+        )
         # All five DAA modes are supported (FIXED/ASERT/LWMA/EPOCH/SCHEDULE). EPOCH was
         # temporarily refused here while its canonical bytecode had an int64-overflow that
         # bricked the contract on-chain; that fix is now merged upstream

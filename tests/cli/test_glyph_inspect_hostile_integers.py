@@ -61,6 +61,7 @@ from pyrxd.cli.main import cli
 from pyrxd.glyph._inspect_core import _MAX_RENDERED_INT_BITS, _render_safe
 from pyrxd.glyph.burn import MAX_BURN_AMOUNT, build_burn_proof_script, parse_burn_proof
 from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
+from pyrxd.glyph.dmint.builders import build_dmint_state_script
 from pyrxd.glyph.payload import _encode_payload_push, build_reveal_scriptsig_suffix, decode_payload, loads_chain_cbor
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.hash import hash256
@@ -103,17 +104,46 @@ def _reveal_input(envelope: object) -> TransactionInput:
     return TransactionInput(source_txid="aa" * 32, source_output_index=0, unlocking_script=Script(scriptsig))
 
 
+def _any_width_num_push(n: int) -> bytes:
+    """A minimal script-number push of ANY width (direct, or PUSHDATA1/PUSHDATA2 past 75 bytes)."""
+    if n == 0:
+        return b"\x00"
+    if 1 <= n <= 16:
+        return bytes([0x50 + n])
+    body = n.to_bytes((n.bit_length() + 7) // 8, "little")
+    if body[-1] & 0x80:
+        body += b"\x00"  # keep the sign bit clear: a positive number
+    if len(body) < 0x4C:
+        return bytes([len(body)]) + body
+    if len(body) <= 0xFF:
+        return b"\x4c" + bytes([len(body)]) + body
+    return b"\x4d" + len(body).to_bytes(2, "little") + body
+
+
 def _dmint_script(*, max_height: int, reward: int) -> bytes:
-    """A V2 dMint contract from the production builder, which accepts any width."""
-    return build_dmint_contract_script(
-        DmintDeployParams(
-            contract_ref=GlyphRef(txid="aa" * 32, vout=1),
-            token_ref=GlyphRef(txid="bb" * 32, vout=0),
-            max_height=max_height,
-            reward=reward,
-            difficulty=10,
-        )
-    )
+    """A V2 dMint contract script whose state carries ``max_height`` and ``reward``.
+
+    A script on chain carries whatever its deployer wrote, but pyrxd's own builder refuses a
+    number wider than the 8 bytes a covenant can read (that contract could never be minted).
+    So the values are spliced into the state of an honest contract the production builder
+    made; the inspector parses the state, and nothing it prints depends on the code section.
+    For values the builder accepts, the splice is checked against the builder's own bytes, so
+    the fixture cannot drift from what production emits.
+    """
+    params = {
+        "contract_ref": GlyphRef(txid="aa" * 32, vout=1),
+        "token_ref": GlyphRef(txid="bb" * 32, vout=0),
+        "difficulty": 10,
+    }
+    honest = build_dmint_contract_script(DmintDeployParams(max_height=1, reward=1, **params))
+    at = 1 + 37 + 37  # height (OP_0) | d8 + contractRef | d0 + tokenRef
+    assert honest[at : at + 2] == b"\x51\x51", "state layout moved: max_height/reward are no longer here"
+    spliced = honest[:at] + _any_width_num_push(max_height) + _any_width_num_push(reward) + honest[at + 2 :]
+    if max(max_height, reward) <= 2**63 - 1:  # the builder's own range: the two must agree there
+        # (Part C's middle literal repeats both values, so the STATE is what is compared)
+        built_state = build_dmint_state_script(DmintDeployParams(max_height=max_height, reward=reward, **params))
+        assert spliced.startswith(built_state + b"\xbd")
+    return spliced
 
 
 # --------------------------------------------------------------------------- CLI drivers

@@ -83,6 +83,7 @@ from pyrxd.glyph.dmint.types import (
     DAA_MODES_READING_DEPLOY_LAST_TIME,
     DAA_MODES_READING_LAST_TIME,
     MAX_SHA256D_TARGET,
+    MAX_V2_TARGET_TIME,
     DaaBytecodeVersion,
     DaaMode,
     is_readable_last_time,
@@ -921,12 +922,14 @@ def _any_contract(
     """A contract of ``version`` in an ARBITRARY state (height, lastTime, target), plus its DAA
     fragment and the kwargs a mint of it needs.
 
-    pyrxd no longer DEPLOYS an EPOCH contract with ``target_time < 2**n``, but one can exist
-    on chain, so the params are built with a legal target_time and the real one is set
-    afterwards: what is exercised is the MINT builder, not the deploy refusal.
+    pyrxd no longer DEPLOYS an EPOCH contract with ``target_time < 2**n``, nor any V2 contract
+    with ``target_time > MAX_V2_TARGET_TIME``, but either can exist on chain, so the params are
+    built with a legal target_time and the real one is set afterwards: what is exercised is the
+    MINT builder, not the deploy refusal.
     """
     sched = schedule if mode is DaaMode.SCHEDULE else ()
     legal_tt = max(target_time, 1 << n) if mode is DaaMode.EPOCH else target_time
+    legal_tt = min(legal_tt, MAX_V2_TARGET_TIME)
     params = DmintDeployParams(
         contract_ref=GlyphRef(txid="aa" * 32, vout=1),
         token_ref=GlyphRef(txid="bb" * 32, vout=0),

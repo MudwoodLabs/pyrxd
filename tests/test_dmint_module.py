@@ -12,7 +12,6 @@ from pyrxd.glyph.dmint import (
     _PART_B2,
     _PART_B4,
     MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
     DaaMode,
     DmintAlgo,
     DmintDeployParams,
@@ -107,16 +106,20 @@ class TestDmintDeployParamsValidation:
                 contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF, max_height=100, reward=10, difficulty=5, target_time=0
             )
 
-    def test_blake3_uses_256bit_target(self):
-        p = DmintDeployParams(
-            contract_ref=_CONTRACT_REF,
-            token_ref=_TOKEN_REF,
-            max_height=100,
-            reward=10,
-            difficulty=100,
-            algo=DmintAlgo.BLAKE3,
-        )
-        assert p.initial_target == MAX_V2_TARGET_256 // 100
+    def test_blake3_and_k12_use_the_same_8_byte_target_as_sha256d(self):
+        # Pinned MAX_V2_TARGET_256 // 100 until 2026-09-23: a 32-byte target that Part B2
+        # reads as a script number and aborts on. Photonic's dMintDiffToTarget is
+        # MAX_TARGET / difficulty with no algorithm argument.
+        for algo in (DmintAlgo.BLAKE3, DmintAlgo.K12):
+            p = DmintDeployParams(
+                contract_ref=_CONTRACT_REF,
+                token_ref=_TOKEN_REF,
+                max_height=100,
+                reward=10,
+                difficulty=100,
+                algo=algo,
+            )
+            assert p.initial_target == MAX_SHA256D_TARGET // 100
 
 
 class TestBuildDmintStateScript:
@@ -362,7 +365,8 @@ class TestDifficultyTargetConversion:
         assert difficulty_to_target(10) == MAX_SHA256D_TARGET // 10
 
     def test_blake3(self):
-        assert difficulty_to_target(100, DmintAlgo.BLAKE3) == MAX_V2_TARGET_256 // 100
+        assert difficulty_to_target(100, DmintAlgo.BLAKE3) == MAX_SHA256D_TARGET // 100
+        assert difficulty_to_target(100, DmintAlgo.K12) == MAX_SHA256D_TARGET // 100
 
     def test_round_trip(self):
         assert target_to_difficulty(difficulty_to_target(100)) == 100

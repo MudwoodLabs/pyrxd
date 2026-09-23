@@ -251,7 +251,9 @@ class DmintState:
           [6] daaMode     — ``_push_minimal``
           [7] targetTime  — ``_push_minimal``
           [8] lastTime    — ``_push_4bytes_le`` (opcode 0x04 + 4-byte LE uint32)
-          [9] target      — ``_push_minimal`` (may be large for 256-bit algos)
+          [9] target      — ``_push_minimal`` (<= 8 bytes for every algorithm as Photonic
+                            builds it, and as pyrxd has since 2026-09-23; a wider one — pyrxd
+                            built those for BLAKE3/K12 before then — parses, but cannot be minted)
           —— OP_STATESEPARATOR (0xbd) ——
           (code section follows; not parsed here)
         """
@@ -298,7 +300,7 @@ class DmintState:
         last_time = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
         pos += 5
 
-        # --- Item 9: target (variable length — large for 256-bit algos)
+        # --- Item 9: target (variable length; parsed at any width — see the layout above)
         target, pos = _parse_script_int(script_bytes, pos)
 
         # --- After 10 state items, the next byte MUST be OP_STATESEPARATOR.

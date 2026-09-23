@@ -49,6 +49,7 @@ from .types import (
     ASERT_V2_DRIFT_CLAMP,
     ASERT_V2_RADIX,
     DEFAULT_ASERT_HALFLIFE,
+    MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
     DaaMode,
@@ -62,7 +63,17 @@ from .types import (
 
 
 def _push_minimal(n: int) -> bytes:
-    """Encode integer n using Bitcoin script minimal push encoding."""
+    """Encode integer ``n`` as a minimal script-number push (Photonic ``pushMinimal``).
+
+    Refuses any ``n`` whose minimal encoding is wider than ``MAX_SCRIPT_NUM_BYTES`` (8) —
+    i.e. outside ``±(2**63 - 1)``. Every caller pushes a dMint script number (state items, DAA
+    constants, schedule entries), and the ones a covenant reads back — all of them but the
+    algoId/daaMode tags, which never approach 8 bytes — go through ``CScriptNum``, which aborts
+    the script on an operand wider than 8 bytes. A wider push can therefore only build a
+    contract that can never be minted. Photonic's ``pushMinimal`` would emit one; for every
+    value inside the range the bytes are identical to Photonic's (a 1..8-byte payload always
+    takes the direct-push opcode, so the PUSHDATA forms never arise).
+    """
     if n == 0:
         return b"\x00"  # OP_0
     if n == -1:
@@ -71,23 +82,22 @@ def _push_minimal(n: int) -> bytes:
         return bytes([0x50 + n])  # OP_1 .. OP_16
     # General case: little-endian with sign bit.
     negative = n < 0
-    n = abs(n)
+    magnitude = abs(n)
     result = []
-    while n > 0:
-        result.append(n & 0xFF)
-        n >>= 8
+    while magnitude > 0:
+        result.append(magnitude & 0xFF)
+        magnitude >>= 8
     if result[-1] & 0x80:
         result.append(0x80 if negative else 0x00)
     elif negative:
         result[-1] |= 0x80
-    payload = bytes(result)
-    # Prefix with length byte (PUSHDATA1 if needed)
-    length = len(payload)
-    if length < 0x4C:
-        return bytes([length]) + payload
-    if length <= 0xFF:
-        return b"\x4c" + bytes([length]) + payload
-    raise ValidationError(f"pushMinimal: number too large: {n}")
+    if len(result) > MAX_SCRIPT_NUM_BYTES:
+        raise ValidationError(
+            f"pushMinimal: {n} needs a {len(result)}-byte script number; Radiant reads at most "
+            f"{MAX_SCRIPT_NUM_BYTES} bytes as a number (|n| <= 2**63 - 1), so a covenant that reads "
+            "this push would abort on every spend"
+        )
+    return bytes([len(result)]) + bytes(result)
 
 
 def _push_4bytes_le(n: int) -> bytes:

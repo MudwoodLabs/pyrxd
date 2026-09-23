@@ -70,13 +70,13 @@ from .types import (
     DEFAULT_ASERT_HALFLIFE,
     EPOCH_MAX_SAFE_TARGET,
     MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
     DaaBytecodeVersion,
     DaaMode,
     DmintAlgo,
     DmintMintResult,
     is_minimal_4byte_scriptnum,
     is_readable_last_time,
+    target_for_difficulty,
 )
 
 #: Live-progress hook: ``callback(attempts, elapsed_s)``. Deliberately two
@@ -431,7 +431,7 @@ def compute_next_target_asert_v2(
     .. note::
        V2-only DAA. ``current_target`` must itself be a valid script number
        (``1..MAX_SHA256D_TARGET``): the covenant compares it with CScriptNum ops, so a
-       256-bit blake3/k12 target cannot run through any DAA on chain.
+       target wider than 8 bytes cannot run through any DAA on chain — for any algorithm.
     """
     if half_life < 1:
         raise ValidationError(f"ASERT-v2: half_life must be >= 1 (got {half_life}); the bytecode bakes a >= 1 constant")
@@ -659,21 +659,27 @@ def _refuse_unreadable_state_last_time(state: DmintState, epoch_length: int | No
 
 
 def difficulty_to_target(difficulty: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> int:
-    """Convert difficulty to PoW target."""
-    if difficulty < 1:
-        raise ValidationError("difficulty must be >= 1")
-    if algo == DmintAlgo.SHA256D:
-        return MAX_SHA256D_TARGET // difficulty
-    return MAX_V2_TARGET_256 // difficulty
+    """Convert difficulty to PoW target: ``MAX_SHA256D_TARGET // difficulty`` for every ``algo``.
+
+    ``algo`` is accepted for backward compatibility and does not change the result — see
+    :func:`~pyrxd.glyph.dmint.types.target_for_difficulty`, the single definition this and
+    ``DmintDeployParams.initial_target`` share. BLAKE3/K12 once got ``(2**256 - 1) //
+    difficulty`` here, a target no dMint covenant can read.
+    """
+    del algo  # every algorithm compares the same 8-byte hash window (Part B1)
+    return target_for_difficulty(difficulty)
 
 
 def target_to_difficulty(target: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> int:
-    """Convert PoW target to difficulty (approximate)."""
+    """Convert PoW target to difficulty (approximate): ``MAX_SHA256D_TARGET // target``.
+
+    The inverse of :func:`difficulty_to_target`, and like it independent of ``algo``
+    (accepted for backward compatibility only).
+    """
+    del algo
     if target < 1:
         raise ValidationError("target must be >= 1")
-    if algo == DmintAlgo.SHA256D:
-        return MAX_SHA256D_TARGET // target
-    return MAX_V2_TARGET_256 // target
+    return MAX_SHA256D_TARGET // target
 
 
 # ---------------------------------------------------------------------------

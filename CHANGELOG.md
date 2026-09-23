@@ -278,6 +278,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one still byte-verifies it against the baked Part B and fails fast, naming the baked
   value, before the PoW grind.
 
+- **Every V2 BLAKE3 or K12 dMint deploy was unmineable from birth.**
+  `DmintDeployParams.initial_target` gave BLAKE3 and K12 `(2**256 - 1) // difficulty` — for
+  any difficulty below 2**192 a number wider than 8 bytes. Part B2 reads the target as a
+  script number, and Radiant's `CScriptNum` aborts on an operand wider than 8 bytes, so no
+  mint of such a contract could ever be valid. The target is now `MAX_SHA256D_TARGET //
+  difficulty` for every algorithm, as canonical Photonic's `dMintDiffToTarget` computes it
+  (it takes no algorithm argument; Part B1 cuts the same 8-byte hash window whatever the
+  hash opcode). `difficulty_to_target` / `target_to_difficulty` follow; their `algo`
+  argument is kept but no longer changes the result. Measured against a transcription of
+  Photonic's `dMintScript`: 56 of 56 BLAKE3/K12 parameter sets diverged before, 0 after,
+  and the other 9,186 stayed byte-identical. Three BLAKE3/K12 V2 contracts on mainnet
+  (DM03, RXD2026, VGM) now rebuild byte for byte from their declared difficulty; DM03 and
+  VGM have been minted on chain. `MAX_V2_TARGET_256` is kept for imports but is no dMint
+  bound. pyrxd's own miners still grind SHA256d only.
+
+- **V2 deploy parameters had no upper bounds.** `max_height`, `reward`, `target_time`,
+  `half_life`, `epoch_length`, SCHEDULE heights and `difficulty` were accepted at any size,
+  so a deploy could bake a 9-byte number the covenant cannot read, a `target_time` large
+  enough to overflow the ASERT/LWMA retarget's int64 multiply, a reward no transaction can
+  pay, or a target of 0. `DmintDeployParams` and `DmintV2DeployParams` (and so
+  `deploy-dmint --v2`, before it loads a wallet) now refuse: `max_height`, `half_life`
+  (ASERT), `epoch_length` (EPOCH) and schedule heights above 2**63 - 1; `reward` above
+  Radiant's money supply; `difficulty` above `MAX_SHA256D_TARGET`; `target_time` above
+  0xFFFFFFFF seconds. Each bound is the point past which the contract cannot work, and every
+  value on the mainnet V2 deploys surveyed (and every value Photonic's Mint form offers)
+  is well inside it. Independently, the minimal-push encoder behind every dMint number now
+  refuses anything wider than 8 bytes, whichever builder asks — in-range output is
+  unchanged.
+
 ## [0.24.0] — 2026-09-14
 
 ### Security

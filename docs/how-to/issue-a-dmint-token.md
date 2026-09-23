@@ -84,10 +84,15 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 
 | Flag | Meaning |
 |------|---------|
-| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`) |
-| `--reward P` | photons of the FT paid per successful claim |
+| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`). V1: 1–0xFFFFFF (a 3-byte state field); V2: 1–2^63−1 |
+| `--reward P` | photons of the FT paid per successful claim. V1: 1–0xFFFFFF; V2: up to Radiant's money supply (2.1×10^18) |
 | `--num-contracts K` | parallel contracts to genesis (1–250); each is an independent mining lane |
 | `--difficulty D` | initial PoW difficulty (1 = easiest; start here on testnet) |
+
+The V2 upper bounds are the points past which a contract built from the value could never
+be minted — a state number the covenant cannot read (wider than 8 bytes), or a reward no
+transaction can pay — and `deploy-dmint` refuses anything outside them before it touches
+your wallet. `--target-time` is bounded the same way (at most 0xFFFFFFFF seconds).
 
 ### V1 vs V2 (adaptive difficulty)
 
