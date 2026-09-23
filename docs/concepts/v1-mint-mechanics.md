@@ -146,7 +146,7 @@ This is the load-bearing rule:
 ```python
 pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, unsigned_tx)
 # Mine using pow_result.preimage
-nonce = mine_solution(pow_result.preimage, target, nonce_width=4)
+nonce = mine_solution(pow_result.preimage, target, nonce_width=4, algo=contract_utxo.state.algo).nonce
 # Build scriptSig from the SAME PowPreimageResult
 scriptsig = build_mint_scriptsig(
     nonce, pow_result.input_hash, pow_result.output_hash, nonce_width=4,
@@ -359,7 +359,11 @@ result = build_dmint_mint_tx(
 pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
 
 # 5. Mine.
-nonce = mine_solution(pow_result.preimage, contract_utxo.state.target, nonce_width=4)
+# algo= is the contract's own: the miner grinds SHA256d only and refuses BLAKE3/K12
+# rather than grind the wrong hash. mine_solution returns a DmintMineResult.
+nonce = mine_solution(
+    pow_result.preimage, contract_utxo.state.target, nonce_width=4, algo=contract_utxo.state.algo
+).nonce
 
 # 6. Splice the real scriptSig in. Same .input_hash / .output_hash
 #    as the preimage was built from.
