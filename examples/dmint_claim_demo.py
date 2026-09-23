@@ -384,8 +384,9 @@ async def main() -> None:
         print(f"  fee:    {result.fee:,} photons")
         print(f"  inputs: {len(result.tx.inputs)}")
         print("  outputs:")
+        contract_kind = "contract burn (the final mint)" if result.is_final_mint else "contract"
         for i, out in enumerate(result.tx.outputs):
-            kind = {0: "contract", 1: "FT reward"}.get(i, f"vout[{i}]")
+            kind = {0: contract_kind, 1: "FT reward"}.get(i, f"vout[{i}]")
             print(f"    [{i}] {out.satoshis:>15,} photons  ({kind})")
         print()
 

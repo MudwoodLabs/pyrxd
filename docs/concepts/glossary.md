@@ -175,7 +175,7 @@ those for depth; use this page to look something up mid-task.
   - `p = target / 2**96`
   - **expected attempts** `= 2**96 / target`
   - `target_to_difficulty(target) = MAX_SHA256D_TARGET // target`
-    ([`src/pyrxd/glyph/dmint/miner.py:670`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py))
+    ([`src/pyrxd/glyph/dmint/miner.py:672`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py))
     is the **difficulty multiplier** — a completely different quantity.
 
   `MAX_SHA256D_TARGET / target` is low as an attempt estimate by a factor of

@@ -67,6 +67,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.glyph.dmint.builders",
         "build_dmint_contract_script",
     ),
+    "build_dmint_contract_burn_script": (
+        "pyrxd.glyph.dmint.builders",
+        "build_dmint_contract_burn_script",
+    ),
     "build_dmint_state_script": (
         "pyrxd.glyph.dmint.builders",
         "build_dmint_state_script",

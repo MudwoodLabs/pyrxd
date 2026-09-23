@@ -123,8 +123,8 @@ across all seven.
 | 148 | `01 d0 53 79 7e 0c dec0e9aa76e378e4a269e69d 7e aa` | | Build the expected code-script prefix bytes (prepends `0xd0`, appends the 12-byte fingerprint `dec0e9aa76e378e4a269e69d`) then HASH256 — this is the codescript-hash pre-image the FT output must carry |
 | 168 | `76 e4 7b 9d` | OP_DUP OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_ROT OP_NUMEQUALVERIFY | **FT conservation** — sum of output photons under this codescript must equal the value rolled from state (reward). This is the core covenant enforcing per-mint emission. |
 | 172 | `54 7a 81 8b` | OP_4 OP_ROLL OP_NEGATE OP_NUMEQUALVERIFY | Verify the new contract's height equals old-height + 1 (encoded as `-oldHeight` NUMEQUALVERIFY pattern after the +1 fold) |
-| 176 | `76 53 7a 9c 53 7a de 78 91 81 54 7a e6 93 9d 63` | | Branch: singleton‐continue (IF maxHeight not reached) vs burn (ELSE) — uses `OP_REFTYPE_UTXO` and `OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS` |
-| 191 | `63 … 67 … 68` | OP_IF / OP_ELSE / OP_ENDIF | The full branch is 46 bytes (offsets 191–236) and covers: if still mintable → require an output that re-pushes the contract's `d8` singleton and has the contract codescript; else → require the singleton to appear in an `OP_RETURN 0x6a` burn output. |
+| 176 | `76 53 7a 9c 53 7a de 78 91 81 54 7a e6 93 9d 63` | | `isFinal = (newHeight == maxHeight)`; the token ref must appear in exactly (FT outputs + `!isFinal`) outputs (`OP_REFOUTPUTCOUNT_OUTPUTS` = `OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS` + `!isFinal`), then `OP_IF isFinal` |
+| 191 | `63 … 67 … 68` | OP_IF / OP_ELSE / OP_ENDIF | The full branch is 46 bytes (offsets 191–236). IF — the final mint, `newHeight == maxHeight` — requires the output at the scriptSig's output index to be exactly `d8 <contractRef> 6a` (`OP_PUSHINPUTREFSINGLETON <contractRef> OP_RETURN`, a burn). ELSE — still mintable — requires the contract ref in exactly one output, whose state script is the spent one with the height replaced, whose codescript is the spent one's, and whose value is 1. |
 | 238 | `6d 75 51` | OP_2DROP OP_DROP OP_1 | Final cleanup, leave TRUE on stack |
 
 Total: **241 bytes**, **131 opcodes**.

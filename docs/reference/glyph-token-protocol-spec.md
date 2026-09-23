@@ -669,7 +669,7 @@ and `build_nft_transfer_tx` refuses it by name
 
 #### 7.6.1 V1 — 241 bytes for typical parameters
 
-State script (`src/pyrxd/glyph/dmint/builders.py:1015-1075`):
+State script (`src/pyrxd/glyph/dmint/builders.py:1034-1094`):
 
 ```
 04 <height:4 LE>
@@ -683,14 +683,14 @@ d0 <token_ref:36>
 followed by the 145-byte code epilogue, which begins with `0xbd`
 (`OP_STATESEPARATOR`) and is byte-identical across every V1 deployment except one
 selector byte at epilogue offset 19: `0xaa` = SHA256d, `0xee` = BLAKE3,
-`0xef` = K12 (`src/pyrxd/glyph/dmint/builders.py:972-1009`).
+`0xef` = K12 (`src/pyrxd/glyph/dmint/builders.py:991-1028`).
 
 `target` MUST be in `[1, 0x7fffffffffffffff]`. Script integers are signed, so a
 value with the high bit set is negative on the stack and the on-chain comparison
-misbehaves (`src/pyrxd/glyph/dmint/builders.py:1058-1063`).
+misbehaves (`src/pyrxd/glyph/dmint/builders.py:1077-1082`).
 
 The reward output a V1 mint pays is the 75-byte FT lock of §7.2, bound to
-`token_ref` (`src/pyrxd/glyph/dmint/builders.py:1107-1135`). Producing a plain
+`token_ref` (`src/pyrxd/glyph/dmint/builders.py:1126-1154`). Producing a plain
 P2PKH instead breaks the conservation check and the mint is rejected.
 
 #### 7.6.2 V2 — 10-item state
@@ -1112,7 +1112,7 @@ pyrxd refuses one at build time (`src/pyrxd/glyph/builder.py:411-419`).
 **dMint contract version.** V1 and V2 are distinguished structurally, not by a
 version field: V1's sixth state item is a fixed 8-byte target push (`0x08` + 8
 bytes), V2's is a minimal-push `algoId`
-(`src/pyrxd/glyph/dmint/builders.py:1030-1044`). In a mint scriptSig the
+(`src/pyrxd/glyph/dmint/builders.py:1049-1063`). In a mint scriptSig the
 discriminator is the nonce width, 4 vs 8 bytes (§7.7).
 
 **Relation to the pyrxd version.** This specification revision describes pyrxd

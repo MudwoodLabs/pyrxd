@@ -210,7 +210,7 @@ error: could not find a plain-RXD funding UTXO for the mint
   fix: fund <miner_address> with >= <needed> photons of plain RXD, or pass --reward-address
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:2818-2823`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
+— [`src/pyrxd/cli/glyph_cmds.py:2825-2830`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
 `needed = contract.reward + 10_000_000 + 546` photons — the reward, a fee
 buffer, and dust for the change output. This scans for a UTXO that is
 **plain RXD only** (token-bearing UTXOs at the same address are excluded).
@@ -223,9 +223,9 @@ funding_utxo (<value> photons) too small to cover reward (<reward>) + fee (<fee>
 change would be <change> photons, below 546 dust limit.
 ```
 
-— [`src/pyrxd/glyph/dmint/miner.py:2109`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+— [`src/pyrxd/glyph/dmint/miner.py:2140`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
 and
-[`:2350`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+[`:2397`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
 (the V1 and V2 mining paths). The CLI reframes any `DmintError` from mining
 as:
 
@@ -235,7 +235,7 @@ error: funding can't cover the mint reward + fee
   fix: fund the reward address with more plain RXD, or lower --fee-rate
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:2735-2740`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
+— [`src/pyrxd/cli/glyph_cmds.py:2733-2738`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
 Same caveat as item 4: `claim-dmint` has no `--fee-rate` flag either
 (verified) — the fix is really "fund more RXD," or lower the global fee rate
 via config/env.

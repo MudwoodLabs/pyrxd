@@ -32,6 +32,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **pyrxd could not build the last mint of a dMint contract.** On the mint that takes a
+  contract to `max_height`, the covenant's output-validation block (V2 Part C and the V1
+  epilogue carry the same bytes here) does not rebuild the contract: it requires output 0 to be
+  exactly `d8 <contractRef> 6a` — the contract singleton pushed into an `OP_RETURN` — and the
+  token ref in the FT reward outputs only. `build_dmint_mint_tx` recreated the contract anyway
+  on V2, a transaction the covenant rejects, and only after the proof-of-work grind; on V1 it
+  asked the state builder for a contract at `height == max_height`, which refuses that as
+  born-exhausted, so it built nothing. The final mint now puts the burn at output 0 (value 0;
+  the contract's photon joins the change) and leaves the FT reward, the OP_RETURN and the
+  change as on any other mint — the shape Glyph-miner builds. It is flagged
+  `DmintMintResult.is_final_mint`, `DmintState.next_mint_is_final` says ahead of time, and the
+  burn script is `build_dmint_contract_burn_script`. The checks that protect a RECREATED
+  contract (its 1-photon value; on V2 a readable `lastTime` and a target above 1) are not
+  applied to the final mint, which recreates none; everything the covenant still evaluates is.
+  `pyrxd glyph claim-dmint` builds it through the same path, says in its pre-grind summary that
+  the claim burns the contract, and reports `final_mint` in `--json`. Proven on a Radiant Core
+  v3.1.2 regtest node for V1 and V2: the final mint is accepted and mined and the contract
+  output is gone; the same final mint recreating the contract instead, with the same nonce, is
+  rejected on the script.
+
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
   `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit

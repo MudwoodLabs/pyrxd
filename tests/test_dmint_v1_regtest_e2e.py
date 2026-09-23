@@ -58,11 +58,12 @@ from pyrxd.glyph.dmint import (
     build_mint_scriptsig,
     mine_solution_dispatch,
 )
+from pyrxd.glyph.dmint import miner as dmint_miner
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import encode_pushdata, to_unlock_script_template
-from pyrxd.security.errors import MaxAttemptsError
+from pyrxd.security.errors import MaxAttemptsError, ValidationError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -116,7 +117,7 @@ def _commit_reveal_unlock(key: PrivateKey, suffix: bytes):
     return to_unlock_script_template(_u, lambda: 110 + len(suffix))
 
 
-def _deploy_v1_dmint(node: _RegtestNode, owner: PrivateKey) -> DmintContractUtxo:
+def _deploy_v1_dmint(node: _RegtestNode, owner: PrivateKey, *, max_height: int = _MAX_HEIGHT) -> DmintContractUtxo:
     """Deploy a 1-contract V1 dMint via commit -> reveal; return the live contract UTXO.
 
     Asserts the reveal is accepted by the node BEFORE the caller spends the
@@ -136,7 +137,7 @@ def _deploy_v1_dmint(node: _RegtestNode, owner: PrivateKey) -> DmintContractUtxo
             metadata=meta,
             owner_pkh=owner_pkh,
             num_contracts=1,
-            max_height=_MAX_HEIGHT,
+            max_height=max_height,
             reward_photons=_REWARD,
             difficulty=_DIFFICULTY,
             premine_amount=None,
@@ -306,3 +307,147 @@ class TestDmintV1OnConsensus:
         assert isinstance(recreated, dict), f"recreated contract UTXO missing: {recreated}"
         new_spk = bytes.fromhex(recreated["scriptPubKey"]["hex"])
         assert DmintState.from_script(new_spk).height == 1, "recreated contract not at height 1"
+
+
+# --------------------------------------------------------------------------- the final mint
+
+
+def _mine_v1(contract: DmintContractUtxo, funding: DmintMinerFundingUtxo, miner_pkh: bytes, tag: bytes):
+    """Build + grind a V1 mint of ``contract`` through the real builder, rerolling the OP_RETURN
+    on a swept nonce space exactly as the test above does. Returns ``(mint, pre, nonce, op_msg)``."""
+    for attempt in range(40):
+        op_msg = tag + attempt.to_bytes(2, "big")
+        mint = build_dmint_mint_tx(
+            contract, nonce=b"\x00" * 4, miner_pkh=miner_pkh, current_time=0, funding_utxo=funding, op_return_msg=op_msg
+        )
+        pre = build_dmint_v1_mint_preimage(contract, funding, mint.tx)
+        try:
+            result = mine_solution_dispatch(
+                pre.preimage,
+                target=contract.state.target,
+                nonce_width=4,
+                miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
+                timeout_s=1800,
+            )
+        except MaxAttemptsError:
+            print(f"[mine] reroll {attempt}: 2**32 nonce space exhausted; varying OP_RETURN", flush=True)
+            continue
+        rate = result.attempts / result.elapsed_s if result.elapsed_s > 0 else float("nan")
+        print(
+            f"\n[grind] V1 hit on reroll {attempt}: {result.attempts:,} attempts in {result.elapsed_s:.0f}s "
+            f"({rate / 1e6:.1f} M/s)",
+            flush=True,
+        )
+        return mint, pre, result.nonce, op_msg
+    raise AssertionError("no nonce found within 40 preimage rerolls (P < 1e-13 — investigate)")
+
+
+def _finish_v1(tx, pre, nonce: bytes, miner: PrivateKey) -> str:
+    """Attach the mined scriptSig and sign the funding input; return the raw hex."""
+    tx.inputs[0].unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=4))
+    fsig = miner.sign(tx.preimage(1))
+    fsh = tx.inputs[1].sighash.to_bytes(1, "little")
+    tx.inputs[1].unlocking_script = Script(
+        encode_pushdata(fsig + fsh) + encode_pushdata(miner.public_key().serialize())
+    )
+    return tx.serialize().hex()
+
+
+class TestDmintV1FinalMintOnConsensus:
+    def test_final_mint_burns_the_contract_and_is_accepted(self, node: _RegtestNode, monkeypatch) -> None:
+        """Deploy a ``max_height = 2`` V1 contract through the real deploy API and mint it out.
+
+        CONTROL: mint 1 (height 0 -> 1) is an ordinary mint through the same builder; the node
+        accepts it and it recreates the contract. Mint 2 (1 -> 2) is the final mint. Until this
+        fix pyrxd could not build it at all: the V1 builder asked the state builder for a
+        contract at height == max_height, which refuses that as born-exhausted. The V1
+        epilogue's final branch (``635279cd01d853797e016a7e88``) wants output 0 to be exactly
+        ``d8 <contractRef> 6a``; the node must accept that, mine it, and leave no contract.
+
+        The shape the builder would have needed is sent too, hand-assembled with the SAME
+        nonce (the V1 preimage binds the contract outpoint and ref, the funding script and the
+        OP_RETURN, not output 0): the contract recreated at height 2. The node must reject it
+        on the script.
+        """
+        owner = PrivateKey(os.urandom(32))
+        miner = PrivateKey(os.urandom(32))
+        miner_pkh = bytes(Hex20(miner.public_key().hash160()))
+        fund_spk = _p2pkh(miner_pkh)
+
+        contract = _deploy_v1_dmint(node, owner, max_height=2)
+        assert contract.state.is_v1 and (contract.state.height, contract.state.max_height) == (0, 2)
+
+        # --- CONTROL: the non-final mint --------------------------------------------------
+        fund1 = DmintMinerFundingUtxo(
+            txid=_pay_to_spk(node, fund_spk, _FUNDING), vout=0, value=_FUNDING, script=fund_spk
+        )
+        mint1, pre1, nonce1, _ = _mine_v1(contract, fund1, miner_pkh, b"v1c")
+        assert not mint1.is_final_mint
+        raw1 = _finish_v1(mint1.tx, pre1, nonce1, miner)
+        res1 = node.accepts(raw1)
+        print(f"[V1 control] non-final mint: {res1}")
+        assert res1.get("allowed") is True, f"the non-final V1 mint was rejected: {res1}"
+        txid1 = node.cli("sendrawtransaction", raw1)
+        assert isinstance(txid1, str), txid1
+        node.mine(1)
+        recreated = node.cli("gettxout", txid1, "0")
+        assert isinstance(recreated, dict), recreated
+        c1_script = bytes.fromhex(recreated["scriptPubKey"]["hex"])
+        c1 = DmintContractUtxo(
+            txid=txid1, vout=0, value=_CARRIER, script=c1_script, state=DmintState.from_script(c1_script)
+        )
+        assert (c1.state.height, c1.state.max_height) == (1, 2) and c1.state.next_mint_is_final
+
+        # --- the final mint ----------------------------------------------------------------
+        fund2 = DmintMinerFundingUtxo(
+            txid=_pay_to_spk(node, fund_spk, _FUNDING), vout=0, value=_FUNDING, script=fund_spk
+        )
+        final, pre2, nonce2, op_msg = _mine_v1(c1, fund2, miner_pkh, b"v1f")
+        assert final.is_final_mint and final.updated_state.is_exhausted
+        burn = b"\xd8" + c1.state.contract_ref.to_bytes() + b"\x6a"
+        assert final.tx.outputs[0].locking_script.script == burn
+        assert final.tx.outputs[0].satoshis == 0
+        assert final.tx.outputs[1].satoshis == _REWARD  # the FT reward is unchanged
+
+        # The old shape, same nonce: the contract recreated at height == max_height. The state
+        # builder refuses that height, so the recreated script is the spent one with its
+        # 4-byte height push replaced — the bytes the continue branch would rebuild.
+        assert c1.script[:5] == b"\x04" + (1).to_bytes(4, "little")
+        recreated_at_max = b"\x04" + (2).to_bytes(4, "little") + c1.script[5:]
+        monkeypatch.setattr(DmintState, "next_mint_is_final", property(lambda self: False))
+        monkeypatch.setattr(dmint_miner, "build_dmint_v1_contract_script", lambda **kw: recreated_at_max)
+        old = build_dmint_mint_tx(
+            c1, nonce=b"\x00" * 4, miner_pkh=miner_pkh, current_time=0, funding_utxo=fund2, op_return_msg=op_msg
+        )
+        monkeypatch.undo()
+        assert old.tx.outputs[0].locking_script.script == recreated_at_max and old.tx.outputs[0].satoshis == 1
+        old_pre = build_dmint_v1_mint_preimage(c1, fund2, old.tx)
+        assert old_pre.preimage == pre2.preimage, (
+            "the old shape must be the same PoW work, or the control proves nothing"
+        )
+        old_res = node.accepts(_finish_v1(old.tx, old_pre, nonce2, miner))
+        print(f"\n[V1 final] old shape (contract recreated at max_height), same nonce: {old_res}")
+        assert old_res.get("allowed") is False, f"the node accepted a final mint that recreates the contract: {old_res}"
+        assert "mandatory-script-verify-flag-failed" in old_res.get("reject-reason", ""), old_res
+
+        raw2 = _finish_v1(final.tx, pre2, nonce2, miner)
+        res2 = node.accepts(raw2)
+        print(f"[V1 final] burn shape: {res2}")
+        assert res2.get("allowed") is True, f"the final V1 mint was rejected: {res2}"
+        txid2 = node.cli("sendrawtransaction", raw2)
+        assert isinstance(txid2, str), txid2
+        node.mine(1)
+        confirmations = node.cli("getrawtransaction", txid2, "1")["confirmations"]
+        spent = node.cli("gettxout", c1.txid, "0")
+        burn_out = node.cli("gettxout", txid2, "0")
+        reward_out = node.cli("gettxout", txid2, "1")
+        print(f"[V1 final] txid {txid2}: confirmations={confirmations}; gettxout(contract)={spent!r}")
+        print(f"[V1 final] gettxout(final, 0) = {burn_out!r}")
+        assert confirmations >= 1
+        assert not spent, "the contract output is still unspent after the final mint"
+        assert reward_out and round(reward_out["value"] * 1e8) == _REWARD, reward_out
+        for i in range(len(final.tx.outputs)):
+            out = node.cli("gettxout", txid2, str(i))
+            if isinstance(out, dict):
+                with pytest.raises(ValidationError):
+                    DmintState.from_script(bytes.fromhex(out["scriptPubKey"]["hex"]))
