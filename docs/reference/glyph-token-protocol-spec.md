@@ -345,8 +345,8 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:324-351`). A malformed
-`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:297-302`) — an
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:450-477`). A malformed
+`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:443-448`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
 
