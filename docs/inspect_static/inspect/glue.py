@@ -214,8 +214,10 @@ def inspect_txid_with_raw(
 
     *max_rows*: list at most N entries of each list the transaction produces, and count the rest
     exactly under a ``*_not_listed`` key beside each list (see ``classify_raw_tx``). /inspect/
-    passes the number of rows it draws, so what crosses into JavaScript — and what the page then
-    converts, draws and puts in its raw-JSON drawer — is bounded by it. ``None`` lists everything.
+    passes the number of rows it draws, so the number of entries of each of those lists that
+    crosses into JavaScript — and that the page then converts, draws and puts in its raw-JSON
+    drawer — is bounded by it. The size of one entry is not (``classify_raw_tx`` says which
+    entries can be large). ``None`` lists everything.
 
     The payload binding is NOT decided here: :func:`spent_output_binding` does that, once the
     page has fetched the transaction the reveal spent.

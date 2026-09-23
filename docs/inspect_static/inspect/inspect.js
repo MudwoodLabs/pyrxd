@@ -775,6 +775,10 @@ function renderFetchedTxCard(payload) {
       if (env.kind === "update") {
         edl.appendChild(kv(`input ${env.input_index}`, "UPDATE — a mutable glyph's fields are being changed here"));
         const fields = env.fields || {};
+        // The classifier sends at most _ENTRY_CAP of each level — the ones drawn below — and
+        // counts the rest here, exactly, so "N more not shown" is the envelope's own N.
+        const fieldsNotListed = env.fields_not_listed || {};
+        const within = fieldsNotListed.within || {};
         const attrs = fields.attrs;
         if (attrs && typeof attrs === "object" && !Array.isArray(attrs)) {
           // `target` first and on its own row: for a WAVE name it is where the
@@ -784,16 +788,18 @@ function renderFetchedTxCard(payload) {
           for (const k of others.slice(0, _ENTRY_CAP)) {
             edl.appendChild(kv(`attrs.${_capText(k)}`, _capText(attrs[k])));
           }
-          if (others.length > _ENTRY_CAP) {
-            edl.appendChild(kv("", `… and ${others.length - _ENTRY_CAP} more attrs not shown`));
+          const moreAttrs = Math.max(0, others.length - _ENTRY_CAP) + (Number(within.attrs) || 0);
+          if (moreAttrs > 0) {
+            edl.appendChild(kv("", `… and ${moreAttrs} more attrs not shown`));
           }
         }
         const top = Object.keys(fields).filter((k) => k !== "attrs").sort();
         for (const k of top.slice(0, _ENTRY_CAP)) {
-          edl.appendChild(kv(_capText(k), _capText(fields[k])));
+          edl.appendChild(kv(_capText(k), _updateValueText(fields[k], Number(within[k]) || 0)));
         }
-        if (top.length > _ENTRY_CAP) {
-          edl.appendChild(kv("", `… and ${top.length - _ENTRY_CAP} more fields not shown`));
+        const moreTop = Math.max(0, top.length - _ENTRY_CAP) + (Number(fieldsNotListed.count) || 0);
+        if (moreTop > 0) {
+          edl.appendChild(kv("", `… and ${moreTop} more fields not shown`));
         }
         wrapper.appendChild(edl);
         // WHAT THIS DOES NOT SAY. The envelope changes a GLYPH's fields. Whether
@@ -958,6 +964,18 @@ const _ENTRY_CAP = 32;
 function _capText(value) {
   const text = value === null || value === undefined ? "" : String(value);
   return text.length <= _STRING_CAP ? text : text.slice(0, _STRING_CAP - 1) + "…";
+}
+
+// One field of an update envelope, as text. A field whose value is itself a map (the classifier
+// sanitises one level of nesting) was drawn as `String(value)` — "[object Object]" — so its
+// entries reached nobody; they are drawn as `key=value` pairs now, at most _ENTRY_CAP of them,
+// with `more` (the classifier's count of entries it did not send) said after them.
+function _updateValueText(value, more) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return _capText(value);
+  const keys = Object.keys(value).sort();
+  const text = keys.slice(0, _ENTRY_CAP).map((k) => `${_capText(k)}=${_capText(value[k])}`).join(", ");
+  const n = Math.max(0, keys.length - _ENTRY_CAP) + more;
+  return _capText(text) + (n > 0 ? ` … and ${n} more not shown` : "");
 }
 
 // The OP_RETURN payload decoders (HashMark, the Photonic `msg` convention) and
@@ -2442,9 +2460,11 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // THE ROW LIMIT IS ALSO THE CHECKING LIMIT: the classifier checks the signatures of the
   // first MAX_ROWS_SHOWN HashMark records only (and of any later byte-for-byte copy of one,
   // which costs nothing), and lists at most MAX_ROWS_SHOWN entries of each list, counting the
-  // rest. So what this call hands back — and what is converted, drawn and put in the drawer —
-  // does not grow with the transaction. What still does is Python's parse of it and its
-  // per-entry count.
+  // rest, and at most _ENTRY_CAP fields per level of an update envelope. So the NUMBER of
+  // entries this call hands back — and converts, draws and puts in the drawer — does not grow
+  // with the transaction. What still does: Python's parse of it and its per-entry count, and the
+  // size of one entry — a listed output's script hex and the refs it names, the headline
+  // payload's protocol list — which only the transaction's bytes bound.
   //
   // PAYLOAD BINDING — a SECOND fetch, and NOT a second classification. The first pass names
   // the outpoint the reveal's attributed input spent. That output is the commit whose

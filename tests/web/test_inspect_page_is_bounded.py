@@ -735,6 +735,94 @@ class TestTheInputListsAreBounded:
         assert f"The first {limit} are listed; 2 more are not shown here." in text
 
 
+def _update(fields: dict) -> bytes:
+    """An input carrying a PARTIAL update envelope — no ``p``, only the fields being changed."""
+    import cbor2
+
+    from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
+
+    return _SIG + build_reveal_scriptsig_suffix(cbor2.dumps(fields))
+
+
+class TestAnUpdatesFieldsAreBounded:
+    """An update envelope's key set is the publisher's to choose, and the classifier used to send
+    every field to the page, which draws at most 32 per level. Measured by the review under
+    Pyodide in Node (not a browser): 16 inputs each carrying a 21,000-field update took 13.11 s and
+    389 MB and made a 9.85M-character drawer, with nothing for `max_rows` to cut. A bounded call
+    now sends each envelope's fields as the page draws them and counts the rest."""
+
+    @staticmethod
+    def _envelopes(fields: dict, limit: int, n: int = 1) -> tuple[dict, dict]:
+        """(the page's payload, the same transaction unbounded) for *n* copies of an update."""
+        inputs = [_update(fields)] * n
+        bounded = _result(b"\x6a", limit=limit, inputs=inputs)["payload"]
+        whole = _result(b"\x6a", limit=limit, inputs=inputs, bounded=False)["payload"]
+        return bounded, whole
+
+    def test_a_flood_of_fields_is_cut_to_what_is_drawn_and_counted_exactly(self, limit) -> None:
+        fields = {f"k{i:05d}": i for i in range(3000)} | {
+            "attrs": {"target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"} | {f"a{i:05d}": i for i in range(3000)},
+            "a-meta": {f"m{i:05d}": i for i in range(3000)},
+        }
+        bounded, whole = self._envelopes(fields, limit, n=4)
+        for got, full in zip(bounded["glyph_envelopes"], whole["glyph_envelopes"], strict=True):
+            kept = got["fields"]
+            assert (
+                len([k for k in kept if k != "attrs"]) == 32 and len(kept["attrs"]) == 33 and len(kept["a-meta"]) == 32
+            )
+            assert kept["attrs"]["target"] == full["fields"]["attrs"]["target"]
+            assert got["fields_not_listed"] == {
+                "count": len(full["fields"]) - 1 - 32,
+                "within": {"attrs": len(full["fields"]["attrs"]) - 33, "a-meta": len(full["fields"]["a-meta"]) - 32},
+            }
+            for key, value in kept.items():  # what is sent is what the whole envelope says
+                if isinstance(value, dict):
+                    assert all(full["fields"][key][ik] == iv for ik, iv in value.items())
+                else:
+                    assert full["fields"][key] == value
+        assert len(json.dumps(bounded)) * 20 < len(json.dumps(whole)), "the premise: the bound is what shrank it"
+
+    def test_the_payload_does_not_grow_with_the_envelope(self, limit) -> None:
+        small, _ = self._envelopes({f"k{i:05d}": i for i in range(100)}, limit)
+        huge, _ = self._envelopes({f"k{i:05d}": i for i in range(20_000)}, limit)
+        assert len(json.dumps(huge)) - len(json.dumps(small)) < 100
+
+    def test_the_card_draws_what_it_would_have_drawn_from_the_whole_envelope(self, limit) -> None:
+        """The same fields, the same values, the same counts. Keys past U+FFFF are included:
+        JavaScript sorts by UTF-16 code unit, which puts "\U0001f600" before "\uff01" where a
+        Python sort by code point does not, and the classifier picks the fields the page's sort
+        would reach first."""
+        import random
+
+        rng = random.Random(5)
+        alphabet = ["a", "b", "Z", "é", "\uff01", "\U0001f600", "\u4e2d", "1", "10", "2"]
+
+        def key() -> str:
+            return "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 4)))
+
+        fields = {key(): key() for _ in range(90)} | {
+            "attrs": {"target": "t"} | {key(): rng.randint(0, 9) for _ in range(90)},
+            "meta": {key(): key() for _ in range(90)},
+        }
+        bounded, whole = self._envelopes(fields, limit)
+        assert bounded["glyph_envelopes"][0]["fields_not_listed"]["count"] > 0, "the premise: something was cut"
+        both = _render({"b": {"tx": bounded}, "w": {"tx": whole}})
+        assert both["b"]["fetched_tx_card"] == both["w"]["fetched_tx_card"]
+        assert "\U0001f600" in both["b"]["fetched_tx_card"], "the premise: an astral key was drawn"
+
+    def test_an_update_the_page_draws_whole_is_sent_whole(self, limit) -> None:
+        """The honest path: nothing past the cap, nothing cut, and no count."""
+        fields = {f"k{i}": i for i in range(32)} | {"attrs": {"target": "t"} | {f"a{i}": i for i in range(32)}}
+        bounded, whole = self._envelopes(fields, limit)
+        assert bounded == whole and "fields_not_listed" not in bounded["glyph_envelopes"][0]
+
+    def test_a_map_valued_field_is_drawn_rather_than_as_object_object(self, limit) -> None:
+        """A field whose value is a map was drawn as `String(value)`: "[object Object]"."""
+        bounded, _ = self._envelopes({"meta": {"x": "1", "y": "2"}}, limit)
+        text = _flat(_card(bounded)["fetched_tx_card"])
+        assert "meta x=1, y=2" in text and "[object Object]" not in text
+
+
 class TestTheRevealsOwnListsAreBounded:
     """A reveal's relationship claims and the delegate burns beside them. Both used to be drawn
     one row per entry, with nothing bounding how many a payload names — measured by the review, a

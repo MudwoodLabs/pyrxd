@@ -993,6 +993,16 @@ def _reveal_scriptsig(name: str, *, ticker: str = "", protocol=(2,), extra: dict
     return push(b"\x30" * 71) + push(PrivateKey().public_key().serialize()) + push(b"gly") + push(cbor2.dumps(body))
 
 
+def _update_scriptsig(fields: dict) -> bytes:
+    """``<sig> <pubkey> "gly" <CBOR>`` carrying a PARTIAL update — no ``p``, only the fields
+    being changed — which the envelope reader reads as ``kind: "update"``."""
+    import cbor2
+
+    from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
+
+    return b"\x47" + b"\x30" * 71 + b"\x21" + b"\x02" * 33 + build_reveal_scriptsig_suffix(cbor2.dumps(fields))
+
+
 def _mint_claim_scriptsig() -> bytes:
     """The 72-byte V1 dMint mint-claim scriptSig: nonce(4), inputHash(32),
     outputHash(32), OP_0. ``parse_mint_scriptsig`` decodes exactly this."""
@@ -1267,8 +1277,15 @@ def _tx_payloads() -> dict[str, dict]:
                 _reveal_scriptsig("Other1"),
                 _reveal_scriptsig("Other2"),
                 _reveal_scriptsig("Other3"),
-                # Three bare markers for a limit of 2, so the envelope list is cut too. The other
-                # payloads above are glyphs the reveal reader read, and are not envelopes.
+                # An update with more fields than the page draws at every level it draws — the
+                # top level, `attrs` and another map-valued field — so each is cut and counted.
+                _update_scriptsig(
+                    {f"f{i:02d}": i for i in range(40)}
+                    | {"attrs": {"target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"} | {f"a{i:02d}": i for i in range(40)}}
+                    | {"a-meta": {f"m{i:02d}": i for i in range(40)}}
+                ),
+                # Bare markers after it, for a limit of 2, so the envelope list is cut too. The
+                # other payloads above are glyphs the reveal reader read, and are not envelopes.
                 b"\x03gly",
                 b"\x03gly",
                 b"\x03gly",
@@ -1373,8 +1390,17 @@ class TestTheTxCardRendersEveryFieldToo:
             for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith("_not_listed")
         }
-        assert len(emitted) >= 5, f"only {sorted(emitted)} derived — the extraction is broken"
-        assert emitted <= top | meta, f"never exercised: {sorted(emitted - (top | meta))}"
+        # One of them sits INSIDE an envelope entry (an update's `fields_not_listed`), not beside
+        # a list at the top level or under `metadata`, so the entries are searched too.
+        in_envelopes = {
+            key
+            for payload in tx_payloads.values()
+            for entry in payload.get("glyph_envelopes") or []
+            for key, value in entry.items()
+            if value
+        }
+        assert len(emitted) >= 6, f"only {sorted(emitted)} derived — the extraction is broken"
+        assert emitted <= top | meta | in_envelopes, f"never exercised: {sorted(emitted - (top | meta | in_envelopes))}"
 
 
 class TestTheBurnBannerStopsAssertingAnOutcome:

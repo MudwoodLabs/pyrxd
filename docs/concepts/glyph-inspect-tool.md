@@ -162,12 +162,20 @@ each entry, never from its position — and the command that shows all of
 it: `pyrxd glyph inspect <txid> --fetch`, which lists everything and
 checks every record.
 
-What still grows with the transaction: fetching and parsing it, and the
+An update envelope's fields are cut the same way: at most 32 per level
+(its top level, `attrs` beside `attrs.target`, and any other map-valued
+field), the same ones the page draws, with the rest counted under the
+entry's `fields_not_listed`. An authority's permissions are at most 64,
+because the payload decoder keeps no more than 64 items of any `attrs`
+list; the page draws 32 and counts the rest.
+
+What still grows with the transaction: fetching and parsing it, the
 per-entry work behind the counts — each output's type, each input's
-envelope and payload, each relationship claim's verdict. Content inside
-one envelope — an update's fields, an authority's permissions — is drawn
-at most 32 entries per list, with the rest counted, but carried whole in
-the payload and the drawer. `/verify/` draws
+envelope and payload, each relationship claim's verdict — and the size
+of a single entry, which the listing limit does not touch. A listed
+output carries its script's hex and every ref the script names, and the
+reveal's headline payload carries its whole `protocol` list; only the
+transaction's own bytes bound those. `/verify/` draws
 and checks at most its own, smaller number of marks (`MAX_MARK_PANELS`
 in `verify.js`) and passes no listing limit, so it still receives a row
 for every output.

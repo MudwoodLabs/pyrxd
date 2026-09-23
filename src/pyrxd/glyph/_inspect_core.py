@@ -320,6 +320,63 @@ def _sanitize_update_fields(fields: dict) -> dict:
     return out
 
 
+def _utf16_order(text: str) -> bytes:
+    """A sort key that orders strings as JavaScript's default ``Array.prototype.sort`` does: by
+    UTF-16 code unit, which differs from Python's code-point order once a string has a character
+    past U+FFFF."""
+    return text.encode("utf-16-be", "surrogatepass")
+
+
+def _drawn_update_fields(fields: dict) -> tuple[dict, dict]:
+    """``(the fields a bounded caller draws, what it leaves out)`` for an update envelope.
+
+    The same sanitised keys and values :func:`_sanitize_update_fields` gives, cut to what
+    ``inspect.js`` draws of an update — at most :data:`_HUMAN_ENTRY_CAP` top-level fields other
+    than ``attrs``, and of a dict-valued ``attrs`` its ``target`` plus :data:`_HUMAN_ENTRY_CAP`
+    others — each set being the first in the order the page sorts them in, so the page draws the
+    fields it would have drawn from the whole envelope. Any other dict-valued field keeps its
+    first :data:`_HUMAN_ENTRY_CAP` entries in the same order. The second value counts what was
+    left out, EXACTLY, over the sanitised keys (two raw keys that sanitise alike are one field,
+    as in :func:`_sanitize_update_fields`): ``{"count": <top-level fields>, "within": {field:
+    <entries of that dict-valued field>}}``, each part present only when something was left out,
+    and ``{}`` when nothing was. Only the values kept are rendered.
+    """
+    by_key: dict[str, object] = {}
+    for k, v in fields.items():
+        by_key[_sanitize_display_string(_display_text(k))] = v  # the later value wins, as there
+
+    def first(keys: dict, always: str | None) -> tuple[set[str], int]:
+        """The keys drawn: *always* if present, and the first _HUMAN_ENTRY_CAP of the rest."""
+        rest = sorted((key for key in keys if key != always), key=_utf16_order)
+        kept = set(rest[:_HUMAN_ENTRY_CAP]) | ({always} if always in keys else set())
+        return kept, max(0, len(rest) - _HUMAN_ENTRY_CAP)
+
+    # Kept in the envelope's own order, so a payload with nothing to cut is the same dict, in the
+    # same order, as `_sanitize_update_fields` gives — and the raw-JSON drawer the same text.
+    out: dict = {}
+    within: dict[str, int] = {}
+    kept, top_left = first(by_key, "attrs")
+    for key, value in by_key.items():
+        if key not in kept:
+            continue
+        if not isinstance(value, dict):
+            out[key] = _sanitize_display_string(_display_text(value))
+            continue
+        inner: dict[str, object] = {}
+        for ik, iv in value.items():
+            inner[_sanitize_display_string(_display_text(ik))] = iv
+        inner_kept, inner_left = first(inner, "target" if key == "attrs" else None)
+        out[key] = {ik: _sanitize_display_string(_display_text(iv)) for ik, iv in inner.items() if ik in inner_kept}
+        if inner_left:
+            within[key] = inner_left
+    left: dict = {}
+    if top_left:
+        left["count"] = top_left
+    if within:
+        left["within"] = within
+    return out, left
+
+
 def _sanitize_display_string(s: object) -> str:
     """Strip control + invisible + combining codepoints from a string before printing.
 
@@ -1786,10 +1843,14 @@ def _classify_raw_tx(
     SUMMARY (see :func:`_classify_script`): its type, and for a HashMark record the status word
     its panel would show, are decided by the same code as a listed row's and counted, and the
     rest of what the classifier returned for it is dropped — it never becomes a row, and it is
-    not in the payload. So the payload, and everything a caller does with it after this returns,
-    is bounded by ``max_rows``. What still grows with the transaction is parsing it and the
-    per-entry work behind the exact counts: each output's type, each input's envelope and
-    payload, each relationship claim's verdict.
+    not in the payload. So the NUMBER of entries in each of those lists is bounded by
+    ``max_rows``, and so is the number of update envelopes; each of those carries at most
+    :data:`_HUMAN_ENTRY_CAP` fields per level (:func:`_drawn_update_fields`). The SIZE of one
+    entry is not bounded by ``max_rows``: a listed output row carries its script's hex and every
+    ref the script names (``input_refs`` / ``referenced_refs``), and the headline payload carries
+    its whole ``protocol`` list. Only the transaction's own bytes bound those. What also still
+    grows with the transaction is parsing it and the per-entry work behind the exact counts: each
+    output's type, each input's envelope and payload, each relationship claim's verdict.
 
     THE WORK ONE TRANSACTION CAN DEMAND IS BOUNDED HERE, not only what gets drawn. Nothing
     limits how many HashMark outputs a transaction carries — about 26,000 signed records fit
@@ -1989,7 +2050,15 @@ def _classify_raw_tx(
         if env.kind == "update":
             # Attacker-authored CBOR landing in terminal output: same sanitisation rule as every
             # other indexer/chain string here, applied to keys AND values.
-            entry["fields"] = _sanitize_update_fields(env.fields or {})
+            if max_rows is None:
+                entry["fields"] = _sanitize_update_fields(env.fields or {})
+            else:
+                # A bounded caller draws at most _HUMAN_ENTRY_CAP fields per level, and an update's
+                # key set is the publisher's to choose: carrying all of them was 21,000 fields per
+                # envelope in the review's measurement. So it gets what it draws, and counts.
+                entry["fields"], fields_not_listed = _drawn_update_fields(env.fields or {})
+                if fields_not_listed:
+                    entry["fields_not_listed"] = fields_not_listed
         else:
             entry["reason"] = _sanitize_display_string(env.reason)
         glyph_envelopes.append(entry)
