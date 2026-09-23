@@ -600,16 +600,21 @@ class TestDmintV1DeployParams:
                 difficulty=1,
             )
 
-    def test_max_height_is_capped_where_the_covenant_can_no_longer_read_it(self):
-        """One past 2**63 - 1 is refused; the cap itself, and the old 0xFFFFFF + 1 (which V1
-        used to refuse as a "3-byte ceiling" no covenant rule backed), are accepted."""
+    def test_max_height_is_capped_where_a_v1_contract_can_still_reach_its_last_mint(self):
+        """One past 2**31 is refused, with the 4-byte height as the reason, and so is the shared
+        8-byte bound; 2**31 itself, and the old 0xFFFFFF + 1 (which V1 used to refuse as a
+        "3-byte ceiling" no covenant rule backed), are accepted."""
         from pyrxd.glyph.builder import DmintV1DeployParams
-        from pyrxd.glyph.dmint.types import MAX_SCRIPT_NUM
+        from pyrxd.glyph.dmint.types import MAX_SCRIPT_NUM, MAX_V1_MAX_HEIGHT
 
+        assert MAX_V1_MAX_HEIGHT == 2**31
         kw = {"metadata": self._meta(), "owner_pkh": self._hex20(), "num_contracts": 1, "reward_photons": 1}
-        with pytest.raises(ValidationError, match="DmintV1DeployParams: max_height must be <="):
-            DmintV1DeployParams(**kw, max_height=MAX_SCRIPT_NUM + 1, difficulty=1)
-        for ok in (0x1000000, MAX_SCRIPT_NUM):
+        for refused in (MAX_V1_MAX_HEIGHT + 1, MAX_SCRIPT_NUM, MAX_SCRIPT_NUM + 1):
+            with pytest.raises(ValidationError, match="DmintV1DeployParams: max_height must be <="):
+                DmintV1DeployParams(**kw, max_height=refused, difficulty=1)
+        with pytest.raises(ValidationError, match=r"<= 2,147,483,648 \(a V1 contract's height is a 4-byte field"):
+            DmintV1DeployParams(**kw, max_height=MAX_V1_MAX_HEIGHT + 1, difficulty=1)
+        for ok in (0x1000000, MAX_V1_MAX_HEIGHT):
             assert DmintV1DeployParams(**kw, max_height=ok, difficulty=1).max_height == ok
 
     def test_reward_photons_is_capped_at_the_money_supply(self):

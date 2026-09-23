@@ -77,8 +77,8 @@ from ..glyph.dmint import (
     find_dmint_funding_utxo,
     mine_solution_dispatch,
 )
-from ..glyph.dmint.miner import _unreadable_target_reason
-from ..glyph.dmint.types import check_dmint_core_bounds, check_v2_numeric_bounds
+from ..glyph.dmint.miner import _unmintable_reason
+from ..glyph.dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
 from ..glyph.fees import (
     RevealFeeEstimate,
     check_reveal_funding,
@@ -1876,7 +1876,7 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
 
 
 #: The deploy-dmint flag behind each parameter ``check_v2_numeric_bounds`` bounds (V1 uses the
-#: first three, through ``check_dmint_core_bounds``), so a refusal names what the user typed.
+#: first three, through ``check_dmint_v1_bounds``), so a refusal names what the user typed.
 _V2_BOUND_FLAGS = {
     "max_height": "--max-height",
     "reward": "--reward",
@@ -1908,7 +1908,11 @@ _V2_BOUND_FLAGS = {
     "--max-height",
     type=int,
     required=True,
-    help="Mints per contract, [1..2^63-1] (the covenant reads it as a script number).",
+    help=(
+        "Mints per contract. V1: [1..2^31] (a V1 contract's 4-byte height field cannot pass "
+        "2^31 - 1, so a larger value would leave mints that can never happen). "
+        "V2: [1..2^63-1] (the covenant reads it as a script number)."
+    ),
 )
 @click.option(
     "--reward",
@@ -2095,9 +2099,10 @@ def deploy_dmint_cmd(
                 schedule=parsed_schedule,
             )
         else:
-            # The bounds V1 shares with V2, checked first for the same reason: a refusal names
-            # the flag the user typed. DmintV1DeployParams runs the same check.
-            check_dmint_core_bounds(
+            # The V1 bounds (those it shares with V2, and its 2**31 max_height), checked first for
+            # the same reason: a refusal names the flag the user typed. DmintV1DeployParams runs
+            # the same check.
+            check_dmint_v1_bounds(
                 stage="deploy-dmint", max_height=max_height, reward=reward, difficulty=difficulty, names=_V2_BOUND_FLAGS
             )
             deploy_params = DmintV1DeployParams(
@@ -2985,16 +2990,17 @@ async def _claim_prepare(
         raise UserError(
             f"contract is exhausted (height {contract_utxo.state.height} >= max_height {contract_utxo.state.max_height})"
         )
-    # Two contracts pyrxd cannot mint, refused here — after the contract read (the only way to
-    # learn either fact) and before the wallet's UTXO scan, the funding scan, the confirmation
-    # prompt and any grind. Every locator (--contract, --token-ref), both versions and every
-    # --miner-cmd reach the grind only through this function.
-    never = _unreadable_target_reason(contract_utxo.script)
+    # Contracts pyrxd will not mint, refused here — after the contract read (the only way to
+    # learn any of this) and before the wallet's UTXO scan, the funding scan, the confirmation
+    # prompt and any grind. The wallet file itself is loaded (and its passphrase asked for)
+    # earlier, in claim_dmint_cmd. Every locator (--contract, --token-ref), both versions and
+    # every --miner-cmd reach the grind only through this function.
+    never = _unmintable_reason(contract_utxo.script)
     if never is not None:
         raise UserError(
-            "this contract can never be minted",
+            "pyrxd will not mint this contract",
             cause=never,
-            fix="no claim can succeed, with any miner; nothing was ground, signed or broadcast",
+            fix="nothing was ground, signed or broadcast",
         )
     algo = contract_utxo.state.algo
     if algo is not DmintAlgo.SHA256D:

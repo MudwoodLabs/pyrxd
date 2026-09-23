@@ -578,7 +578,8 @@ class TestAContractPyrxdCannotMint:
 
         result = self._invoke(runner, monkeypatch, old_blake3_v2_contract_script())
         assert result.exit_code != 0, result.output
-        assert "this contract can never be minted, so there is no time to estimate" in result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "can never be minted" in result.output
         assert "33-byte script number" in result.output
         assert "ETA" not in result.output and "clamped" not in result.output
 
@@ -591,9 +592,45 @@ class TestAContractPyrxdCannotMint:
 
         result = self._invoke(runner, monkeypatch, legacy_v1_contract_script(5000))
         assert result.exit_code != 0, result.output
-        assert "this contract can never be minted, so there is no time to estimate" in result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "can never be minted" in result.output
         assert "its target is pushed as 08" in result.output
         assert "ETA" not in result.output
+
+    @staticmethod
+    def _no_estimate(monkeypatch) -> list[int]:
+        """Record calls to the attempt estimator, so a test can show a refusal came first."""
+        from pyrxd.cli import glyph_estimate
+
+        calls: list[int] = []
+        real = glyph_estimate.estimate_attempts
+        monkeypatch.setattr(glyph_estimate, "estimate_attempts", lambda t: calls.append(t) or real(t))
+        return calls
+
+    @staticmethod
+    def _v1_at(height: int, max_height: int) -> bytes:
+        from pyrxd.glyph.dmint import build_dmint_v1_contract_script
+        from pyrxd.glyph.types import GlyphRef
+
+        c_ref, t_ref = GlyphRef(txid="ab" * 32, vout=1), GlyphRef(txid="cd" * 32, vout=0)
+        return build_dmint_v1_contract_script(
+            height, c_ref, t_ref, max_height=max_height, reward=1000, target=difficulty_to_target(1)
+        )
+
+    def test_a_v1_contract_stuck_at_height_2_31_minus_1_gets_no_eta(self, runner: CliRunner, monkeypatch) -> None:
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, self._v1_at(2**31 - 1, 2**31 + 1))
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "cannot be minted further" in result.output
+        assert calls == [] and "ETA" not in result.output
+
+    def test_the_height_below_the_stuck_one_is_estimated(self, runner: CliRunner, monkeypatch) -> None:
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, self._v1_at(2**31 - 2, 2**31 + 1), "--json")
+        assert result.exit_code == 0, result.output
+        assert _extract_json(result.output)["contract"]["height"] == 2**31 - 2
+        assert calls == [difficulty_to_target(1)]
 
     @pytest.mark.parametrize("name", ["RABO", "Pepe"])
     def test_a_mainnet_v1_contract_is_estimated(self, runner: CliRunner, monkeypatch, name: str) -> None:

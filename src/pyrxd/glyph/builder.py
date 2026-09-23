@@ -29,7 +29,7 @@ from .dmint import (
     is_minimal_4byte_scriptnum,
     is_readable_last_time,
 )
-from .dmint.types import check_dmint_core_bounds, check_v2_numeric_bounds
+from .dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
@@ -1881,14 +1881,14 @@ class DmintV1DeployParams:
         (``src/validation.cpp:271``, ``src/init.cpp:1995`` @ v3.1.2). What
         actually bounds this is fee: every contract output costs ~241 bytes
         × the 10_000 photons/byte relay floor.
-    :param max_height:         Maximum mints per contract, ``[1, 2**63 - 1]``: the covenant
-        reads it as a script number (:func:`~pyrxd.glyph.dmint.types.check_dmint_core_bounds`
-        has the reason for this and the next two bounds). A V1 contract's height is a 4-byte
-        field that every mint but the last rewrites as ``NUM2BIN(height + 1, 4)`` (epilogue
-        ``54 78 54 80``), which cannot encode ``2**31``. So with a ``max_height`` above
-        ``2**31`` a contract stops at height ``2**31 - 1`` and its remaining mints cannot
-        happen. Such deploys exist on mainnet (``$BRO``: 696,969,000,000), and pyrxd builds them
-        as Photonic does.
+    :param max_height:         Maximum mints per contract, ``[1, 2**31]``. A V1 contract's
+        height is a 4-byte field that every mint but the last rewrites as
+        ``NUM2BIN(height + 1, 4)`` (epilogue ``54 78 54 80 7e``), which cannot encode ``2**31``,
+        so with a larger ``max_height`` the contract stops at height ``2**31 - 1`` with mints
+        left (:data:`~pyrxd.glyph.dmint.types.MAX_V1_MAX_HEIGHT`;
+        :func:`~pyrxd.glyph.dmint.types.check_dmint_v1_bounds` has this and the next two
+        bounds). Mainnet has such V1 deploys (``$BRO``: 696,969,000,000); pyrxd mints them up to
+        that height but does not deploy one.
     :param reward_photons:     Photons paid per successful mint, ``[1, RADIANT_MAX_PHOTONS]``.
     :param difficulty:         Initial PoW difficulty (1 = easiest; at most
         ``MAX_SHA256D_TARGET``). The target is ``MAX_SHA256D_TARGET // difficulty``
@@ -1940,8 +1940,9 @@ class DmintV1DeployParams:
         # The upper bounds V2 has for the same three numbers, for the same reasons: the V1
         # epilogue reads maxHeight and reward as script numbers exactly as V2's Part C does, and
         # above MAX_SHA256D_TARGET the target is 0 (which the V1 state builder refuses, but
-        # only once the deploy is built, after the wallet is loaded).
-        check_dmint_core_bounds(
+        # only once the deploy is built, after the wallet is loaded). Then V1's own, tighter
+        # max_height bound: past 2**31 the 4-byte height field stops the contract early.
+        check_dmint_v1_bounds(
             stage="DmintV1DeployParams",
             max_height=self.max_height,
             reward=self.reward_photons,

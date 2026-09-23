@@ -306,12 +306,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **V1 deploys refused `max_height` and `reward` above 0xFFFFFF.** The "3-byte ceiling" came
   from the push widths on the first V1 contracts pyrxd decoded, not from any covenant rule:
   the V1 epilogue reads both as script numbers exactly as V2 does. It refused deploys Photonic
-  builds — mainnet V1 contracts carry max heights of 300,000,000 and 696,969,000,000 and a
-  reward of 888,888,888. V1 now has V2's bounds for the three numbers they share
-  (`max_height` ≤ 2**63 − 1, `reward` ≤ Radiant's money supply, `difficulty` ≤
-  `MAX_SHA256D_TARGET`), from one function, and `deploy-dmint` names the flag. A V1 contract
-  stores its height in 4 bytes and cannot pass height 2**31 − 1, so with a `max_height` above
-  2**31 its last mints cannot happen; pyrxd builds such deploys, as Photonic does.
+  builds — mainnet V1 contracts carry a max height of 300,000,000 and a reward of
+  888,888,888. V1 now has V2's bounds for `reward` (≤ Radiant's money supply) and `difficulty`
+  (≤ `MAX_SHA256D_TARGET`), from one function, and `deploy-dmint` names the flag. Its
+  `max_height` bound is its own, 2**31 (`MAX_V1_MAX_HEIGHT`): a V1 contract stores its height
+  in 4 bytes, and every mint but the last writes the next one with `NUM2BIN(height + 1, 4)`,
+  which cannot encode 2**31, so with a larger `max_height` the contract stops at height
+  2**31 − 1 with mints left. Mainnet has such contracts (`$BRO`, 696,969,000,000); pyrxd parses
+  and mints them up to height 2**31 − 1, and the mint builder, `claim-dmint` and
+  `dmint-estimate` refuse the mint from there, which pyrxd would otherwise have built with a
+  height the covenant cannot write.
 
 - **A V2 contract's algorithm was read from a tag the covenant never reads.** The V2 state
   carries an `algoId`, but the hash the covenant runs is the opcode after Part A. The parser
@@ -379,7 +383,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   minimal-push encoder behind every dMint number now refuses anything wider than 8 bytes,
   whichever builder asks — in-range output is unchanged. `deploy-dmint --help` claimed
   `[1..0xFFFFFF]` for `--max-height` and `--reward`; it now gives the bounds above, which V1
-  shares (see the V1 entry). V1 `difficulty` is now capped at the parameter stage too; a
+  shares except that its `--max-height` stops at 2**31 (see the V1 entry). V1 `difficulty` is now capped at the parameter stage too; a
   target of 0 used to be refused only while the deploy was being built.
 
 - **`claim-dmint` reported a V2 mining timeout as a funding shortfall.** A grind that hit

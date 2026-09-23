@@ -286,12 +286,18 @@ the contract, before it scans the wallet or grinds:
   Every miner `claim-dmint` can use grinds and verifies SHA256d, including the
   external-miner protocol behind `--miner-cmd`, whose request carries no algorithm.
   Minting such a contract needs a miner for that hash; pyrxd does not ship one.
-- `error: this contract can never be minted` — a contract whose target the
-  covenant cannot read as a number: wider than 8 bytes, or not minimally encoded.
-  pyrxd deployed both before 2026-09-23 — BLAKE3/K12 V2 contracts with 33-byte
-  targets, and V1 contracts at difficulty 256 or more with the target pushed as a
-  fixed 8 bytes. No miner can mint one. `pyrxd glyph dmint-estimate` refuses the
-  same contract rather than print an ETA.
+- `error: pyrxd will not mint this contract` — the `cause` line says why:
+  - `this dMint contract can never be minted: its target ...` — a target the
+    covenant cannot read as a number: wider than 8 bytes, or not minimally encoded.
+    pyrxd deployed both before 2026-09-23 — BLAKE3/K12 V2 contracts with 33-byte
+    targets, and V1 contracts at difficulty 256 or more with the target pushed as a
+    fixed 8 bytes. No miner can mint one.
+  - `this V1 dMint contract cannot be minted further` — a V1 contract at height
+    2^31−1 whose max height is above 2^31. Its next mint would have to write height
+    2^31 into a 4-byte field, which the covenant cannot do, so every further spend
+    fails. Every height below that mints normally.
+
+  `pyrxd glyph dmint-estimate` refuses the same contracts rather than print an ETA.
 
 All of these are mapped in `claim_dmint_cmd`, `_claim_prepare` and `_grind_stopped_error` in
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).

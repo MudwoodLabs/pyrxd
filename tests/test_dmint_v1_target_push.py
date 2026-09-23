@@ -378,11 +378,13 @@ class TestMainnetV1Contracts:
         widths = {_parse_dmint_script(_mainnet(n))[1][0] for n in _MAINNET_V1}
         assert {0x06, 0x07, 0x08} <= widths
 
-    @pytest.mark.parametrize("name", ["$BRO", "MPrawn", "1"])
+    @pytest.mark.parametrize("name", ["MPrawn", "1"])
     def test_undeployed_contracts_rebuild_through_the_production_deploy_path(self, name: str) -> None:
         """``DmintV1DeployParams`` → ``prepare_dmint_deploy`` → ``build_reveal_outputs`` rebuilds a
-        height-0 mainnet contract exactly — including values the old 0xFFFFFF "3-byte ceiling"
-        refused ($BRO's max height, MPrawn's reward) and a 6-byte target."""
+        height-0 mainnet contract exactly — including a value the old 0xFFFFFF "3-byte ceiling"
+        refused (MPrawn's reward) and a 6-byte target. ($BRO, also at height 0, is not here: its
+        max height is above 2**31, which pyrxd no longer deploys; ``tests/test_dmint_state_judgement.py``
+        checks it is refused as a deploy and still parses and mints.)"""
         script = _mainnet(name)
         st_ = DmintState.from_script(script)
         assert st_.height == 0
@@ -394,7 +396,7 @@ class TestMainnetV1Contracts:
         result = GlyphBuilder().prepare_dmint_deploy(params)
         assert result.build_reveal_outputs(st_.token_ref.txid).contract_scripts[st_.contract_ref.vout - 1] == script
 
-    @pytest.mark.parametrize(("name", "field"), [("$BRO", "max_height"), ("$RBG", "max_height"), ("Pepe", "reward")])
+    @pytest.mark.parametrize(("name", "field"), [("$RBG", "max_height"), ("Pepe", "reward")])
     def test_values_above_the_old_3_byte_ceiling_are_accepted(self, name: str, field: str) -> None:
         st_ = DmintState.from_script(_mainnet(name))
         assert getattr(st_, field) > 0xFFFFFF

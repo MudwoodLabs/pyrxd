@@ -232,18 +232,18 @@ def _resolve_target(
             raise UserError(f"--target must be >= 1, got {target}")
         return target, None
 
-    from ..glyph.dmint.miner import _unreadable_target_reason  # after _fetch_contract: same import cost
+    from ..glyph.dmint.miner import _unmintable_reason  # after _fetch_contract: same import cost
 
     contract_utxo = _fetch_contract(ctx, contract_arg, token_ref_arg)
     state = contract_utxo.state
-    never = _unreadable_target_reason(contract_utxo.script)
+    never = _unmintable_reason(contract_utxo.script)
     if never is not None:
         # No estimate at all: the covenant does not clamp a target it cannot read, it aborts,
         # so any time-to-mint printed here would be the time to a mint that cannot happen.
         raise UserError(
-            "this contract can never be minted, so there is no time to estimate",
+            "pyrxd will not mint this contract, so there is no time to estimate",
             cause=never,
-            fix="no miner can mint it; claim-dmint refuses it too",
+            fix="claim-dmint refuses it too",
         )
     return state.target, {
         "contract": f"{contract_utxo.txid}:{contract_utxo.vout}",

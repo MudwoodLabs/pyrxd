@@ -539,10 +539,11 @@ def old_blake3_v2_contract_script() -> bytes:
 
 
 class TestDeployDmintCliBounds:
-    def _run(self, tmp_path, *extra: str):
+    def _run(self, tmp_path, *extra: str, v2: bool = True):
         meta = tmp_path / "m.json"
         meta.write_text('{"name": "T", "description": "t", "protocol": ["FT", "DMINT"], "ticker": "TT", "decimals": 0}')
-        args = ["--wallet", str(tmp_path / "none.dat"), "glyph", "deploy-dmint", str(meta), "--v2", *extra]
+        version = ["--v2"] if v2 else []
+        args = ["--wallet", str(tmp_path / "none.dat"), "glyph", "deploy-dmint", str(meta), *version, *extra]
         return CliRunner().invoke(cli, args)
 
     @pytest.mark.parametrize(
@@ -569,6 +570,22 @@ class TestDeployDmintCliBounds:
         good = self._run(tmp_path, *fixed, flag, str(accepted))
         assert "invalid dMint deploy parameters" not in good.output
         assert "no wallet at" in good.output, good.output
+
+    def test_v1_max_height_stops_at_2_31_naming_the_flag(self, tmp_path) -> None:
+        """V1's own bound: refused before the wallet is opened, naming --max-height and the
+        4-byte height as the reason. 2**31 itself reaches the wallet; V2 is not held to it."""
+        bad = self._run(tmp_path, "--max-height", str(2**31 + 1), "--reward", "1000", v2=False)
+        assert bad.exit_code != 0
+        assert "invalid dMint deploy parameters" in bad.output
+        assert "deploy-dmint: --max-height must be <= 2,147,483,648" in bad.output
+        assert "a V1 contract's height is a 4-byte field" in bad.output
+        assert "no wallet at" not in bad.output
+        good = self._run(tmp_path, "--max-height", str(2**31), "--reward", "1000", v2=False)
+        assert "invalid dMint deploy parameters" not in good.output
+        assert "no wallet at" in good.output, good.output
+        v2 = self._run(tmp_path, "--max-height", str(2**31 + 1), "--reward", "1000")
+        assert "invalid dMint deploy parameters" not in v2.output
+        assert "no wallet at" in v2.output, v2.output
 
     def test_a_fixed_target_time_past_the_spacing_cap_reaches_the_wallet(self, tmp_path) -> None:
         """The value the cap wrongly refused in every mode: FIXED never reads it as a number."""

@@ -74,6 +74,7 @@ from .types import (
     EPOCH_MAX_SAFE_TARGET,
     MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
+    MAX_V1_MAX_HEIGHT,
     DaaBytecodeVersion,
     DaaMode,
     DmintAlgo,
@@ -677,9 +678,8 @@ def _unreadable_target_reason(contract_script: bytes) -> str | None:
     A readable but negative target is refused too: both covenants require the proof-of-work
     number to be at least 0 (``81 76 00 a2 69``) and at most the target, so no hash meets one.
 
-    Shared by :func:`build_dmint_mint_tx` (which refuses on it, V1 and V2) and the
-    ``claim-dmint`` and ``dmint-estimate`` commands (which refuse on it before any wallet or
-    funding work).
+    Part of :func:`_unmintable_reason`, the judgement :func:`build_dmint_mint_tx` (V1 and V2),
+    ``claim-dmint`` and ``dmint-estimate`` refuse on.
 
     :raises ValidationError: ``contract_script`` is not a dMint contract script.
     """
@@ -714,6 +714,38 @@ def _unreadable_target_reason(contract_script: bytes) -> str | None:
             else ""
         )
     )
+
+
+def _unmintable_reason(contract_script: bytes) -> str | None:
+    """Why pyrxd will not mint the dMint contract ``contract_script``, or ``None`` if it will.
+
+    Judged from the script alone, so it runs before any work that needs more than the contract:
+    :func:`build_dmint_mint_tx` (V1 and V2) refuses on it before building anything, and the
+    ``claim-dmint`` and ``dmint-estimate`` commands refuse on it right after reading the
+    contract, before the wallet's UTXO scan, the funding scan, the confirmation prompt and any
+    grind. It judges:
+
+    * the target push, :func:`_unreadable_target_reason`;
+    * a V1 contract at height ``2**31 - 1`` whose ``maxHeight`` is above ``2**31``. Its next
+      mint is not its last, so the epilogue writes the next height as ``NUM2BIN(height + 1, 4)``,
+      and ``2**31`` does not fit in 4 bytes (:data:`~pyrxd.glyph.dmint.types.MAX_V1_MAX_HEIGHT`).
+      Every spend of it aborts. Mainnet V1 contracts with such a ``maxHeight`` exist (``$BRO``),
+      and every height below ``2**31 - 1`` mints normally.
+
+    :raises ValidationError: ``contract_script`` is not a dMint contract script pyrxd reads.
+    """
+    reason = _unreadable_target_reason(contract_script)
+    if reason is not None:
+        return reason
+    state, _ = _parse_dmint_script(contract_script)
+    if state.is_v1 and state.height == MAX_V1_MAX_HEIGHT - 1 and state.max_height > MAX_V1_MAX_HEIGHT:
+        return (
+            f"this V1 dMint contract cannot be minted further: it is at height {state.height:,} (2**31 - 1) and "
+            f"its maxHeight is {state.max_height:,}, so its next mint is not its last, and the covenant writes the "
+            "next height as NUM2BIN(height + 1, 4), which cannot encode 2**31. Every further spend of the contract "
+            "aborts, whatever the nonce and whoever mines it"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1920,7 +1952,7 @@ def build_dmint_mint_tx(
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
-    never = _unreadable_target_reason(contract_utxo.script)
+    never = _unmintable_reason(contract_utxo.script)
     if never is not None:
         raise ValidationError(never)
     if len(nonce) != 8:
@@ -1989,7 +2021,7 @@ def build_dmint_mint_tx(
     # all ASERT, each refused earlier because its state does not round-trip): pyrxd knows
     # neither which hash it runs nor how it builds its preimage, so it refuses here, in every
     # DAA mode, before any grind. (A script whose opcode after Part A disagrees with its tag never gets this far:
-    # _unreadable_target_reason parses the script, and the parser refuses it.)
+    # _unmintable_reason parses the script, and the parser refuses it.)
     if code[: len(_PART_A) + 1] != _PART_A + _POW_HASH_OP[state.algo]:
         raise ValidationError(
             "V2 mint: this contract's code does not open with the Part A template pyrxd mints, followed by "
@@ -2282,7 +2314,7 @@ def _build_dmint_v1_mint_tx(
         raise ContractExhaustedError(
             f"V1 dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
-    never = _unreadable_target_reason(contract_utxo.script)
+    never = _unmintable_reason(contract_utxo.script)
     if never is not None:
         raise ValidationError(never)
     if len(nonce) != 4:

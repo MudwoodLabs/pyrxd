@@ -5,14 +5,15 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (35 — every module-level name defined here, so the count is checkable rather than
+Symbols (37 — every module-level name defined here, so the count is checkable rather than
 decorative, and ``tests/test_dmint_deploy_bounds.py`` checks it and the list below against the
 module's own definitions; it read "20" while listing 17 before 2026-09-22, and "31" while
 listing 32 on 2026-09-23):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
-    MAX_SCRIPT_NUM_BYTES, MAX_SCRIPT_NUM, MAX_V2_TARGET_TIME,
-    target_for_difficulty, _refuse_above, check_dmint_core_bounds, check_v2_numeric_bounds,
+    MAX_SCRIPT_NUM_BYTES, MAX_SCRIPT_NUM, MAX_V1_MAX_HEIGHT, MAX_V2_TARGET_TIME,
+    target_for_difficulty, _refuse_above, check_dmint_core_bounds, check_dmint_v1_bounds,
+    check_v2_numeric_bounds,
     EPOCH_MAX_ADJUSTMENT_LOG2_VALUES, EPOCH_MAX_ADJUSTMENT_PAYLOAD_VALUES,
     EPOCH_MAX_SAFE_TARGET, SCHEDULE_MAX_ENTRIES,
     ASERT_V2_RADIX, ASERT_V2_DRIFT_CLAMP, ASERT_V2_MAX_TARGET_DIV4,
@@ -96,6 +97,18 @@ MAX_V2_TARGET_256 = (1 << 256) - 1
 #: fit, or the script aborts.
 MAX_SCRIPT_NUM_BYTES = 8
 MAX_SCRIPT_NUM = (1 << 63) - 1
+
+#: The largest ``max_height`` whose last mint a V1 contract can reach: ``2**31``. A V1 contract
+#: stores its height as a 4-byte field, and every mint but the last writes the next one as
+#: ``04 || NUM2BIN(height + 1, 4)`` (epilogue ``54 78 54 80 7e``). ``OP_NUM2BIN`` aborts with
+#: ``IMPOSSIBLE_ENCODING`` when the minimal encoding of the number is longer than the size asked
+#: for (Radiant Core ``interpreter.cpp``, vendored at ``tests/vendor/radiant_core/``), and
+#: ``2**31`` needs five bytes. The last mint, the one whose new height equals ``max_height``,
+#: takes the epilogue's other branch and writes no height, so a contract with ``max_height =
+#: 2**31`` makes its last mint from height ``2**31 - 1``. With a larger ``max_height`` the mint
+#: from ``2**31 - 1`` is not the last, needs ``NUM2BIN(2**31, 4)``, and aborts, so the contract
+#: can never be minted past that height. V2 pushes its height minimally and has no such limit.
+MAX_V1_MAX_HEIGHT = 1 << 31
 
 #: Upper bound on a V2 deploy's ``target_time`` in the modes whose retarget reads it as a number
 #: (:data:`DAA_MODES_READING_TARGET_TIME`: ASERT, LWMA, EPOCH). There ``target_time`` is a spacing
@@ -363,9 +376,9 @@ def check_dmint_core_bounds(
 ) -> None:
     """Refuse a ``max_height``, ``reward`` or ``difficulty`` no dMint contract, V1 or V2, can use.
 
-    Called from :func:`check_v2_numeric_bounds` (so from every V2 deploy path), from
-    ``DmintV1DeployParams.__post_init__`` and from ``deploy-dmint`` for V1, so the two versions
-    refuse the same values with the same words. ``names`` maps a parameter to the name the
+    Called from :func:`check_v2_numeric_bounds` (so from every V2 deploy path) and from
+    :func:`check_dmint_v1_bounds` (every V1 deploy path), so the two versions refuse the same
+    values with the same words. ``names`` maps a parameter to the name the
     caller knows it by (``reward`` -> ``reward_photons`` or ``--reward``). Each bound is what the
     covenant reads, and the V1 epilogue reads these the same way V2's Part C does:
 
@@ -383,9 +396,9 @@ def check_dmint_core_bounds(
     3-byte ceiling". No covenant rule was behind it: the first V1 contracts pyrxd decoded carry
     both as 3-byte pushes (``docs/dmint-research-mainnet.md`` §2.3,
     ``docs/dmint-research-photonic-deploy.md``), and that width became a limit. It refused
-    deploys Photonic builds — mainnet V1 contracts include max heights of 300,000,000 and
-    696,969,000,000 and a reward of 888,888,888, which ``tests/test_dmint_v1_target_push.py``
-    rebuilds byte for byte.
+    deploys Photonic builds — mainnet V1 contracts include a max height of 300,000,000 and a
+    reward of 888,888,888, which ``tests/test_dmint_v1_target_push.py`` rebuilds byte for byte.
+    V1 has one tighter limit of its own, on ``max_height``: see :func:`check_dmint_v1_bounds`.
     """
     from pyrxd.security.types import RADIANT_MAX_PHOTONS
 
@@ -411,6 +424,38 @@ def check_dmint_core_bounds(
         MAX_SHA256D_TARGET,
         "above it the target MAX_SHA256D_TARGET // difficulty is 0, which only a hash whose compared 8 bytes "
         "are all zero can meet",
+    )
+
+
+def check_dmint_v1_bounds(
+    *,
+    stage: str,
+    max_height: int,
+    reward: int,
+    difficulty: int,
+    names: Mapping[str, str] | None = None,
+) -> None:
+    """Refuse V1 deploy parameters that no V1 contract built from them could mint to the end.
+
+    :func:`check_dmint_core_bounds` (the bounds V1 shares with V2), then ``max_height`` <=
+    :data:`MAX_V1_MAX_HEIGHT` (``2**31``), past which a V1 contract stops at height
+    ``2**31 - 1`` with mints left (that constant has the reason). Called from
+    ``DmintV1DeployParams.__post_init__`` (every V1 deploy is built from one) and from
+    ``deploy-dmint`` for V1, first, so a refusal names the flag the user typed.
+
+    This bounds DEPLOYS. Mainnet has V1 contracts with a larger ``max_height`` (``$BRO``:
+    696,969,000,000); pyrxd parses and mints them like any other up to height ``2**31 - 1``,
+    and refuses the mint from there (``miner._unmintable_reason``).
+    """
+    check_dmint_core_bounds(stage=stage, max_height=max_height, reward=reward, difficulty=difficulty, names=names)
+    _refuse_above(
+        stage,
+        dict(names or {}).get("max_height", "max_height"),
+        max_height,
+        MAX_V1_MAX_HEIGHT,
+        "a V1 contract's height is a 4-byte field that every mint but the last rewrites with "
+        "NUM2BIN(height + 1, 4), which cannot encode 2**31, so with a larger max_height the contract "
+        "stops at height 2**31 - 1 and its remaining mints can never happen",
     )
 
 

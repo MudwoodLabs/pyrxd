@@ -2954,9 +2954,9 @@ class TestClaimDmintRefusesContractsPyrxdCannotMine:
         grinds = self._stub_grind(monkeypatch)
         result = self._claim(runner, tmp_wallet_path)
         assert result.exit_code != 0, result.output
-        assert "this contract can never be minted" in result.output
-        assert "33-byte script number" in result.output
-        assert "no claim can succeed, with any miner" in result.output
+        assert "pyrxd will not mint this contract" in result.output
+        assert "can never be minted: its target is a 33-byte script number" in result.output
+        assert "nothing was ground, signed or broadcast" in result.output
         assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
 
     @pytest.mark.parametrize("difficulty", [256, 5000])
@@ -2971,9 +2971,46 @@ class TestClaimDmintRefusesContractsPyrxdCannotMine:
         grinds = self._stub_grind(monkeypatch)
         result = self._claim(runner, tmp_wallet_path)
         assert result.exit_code != 0, result.output
-        assert "this contract can never be minted" in result.output
-        assert "its target is pushed as 08" in result.output
+        assert "pyrxd will not mint this contract" in result.output
+        assert "can never be minted: its target is pushed as 08" in result.output
         assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    @staticmethod
+    def _v1_at(height: int, max_height: int) -> bytes:
+        from pyrxd.glyph.dmint import build_dmint_v1_contract_script as v1
+
+        c_ref, t_ref = GlyphRef(txid="ab" * 32, vout=1), GlyphRef(txid="cd" * 32, vout=0)
+        return v1(height, c_ref, t_ref, max_height=max_height, reward=1000, target=difficulty_to_target(1))
+
+    @pytest.mark.parametrize("max_height", [2**31 + 1, 696_969_000_000])
+    def test_a_v1_contract_stuck_at_height_2_31_minus_1_is_refused_before_any_work(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, max_height: int
+    ) -> None:
+        """At height 2**31 - 1 with mints left, the next mint must write height 2**31 into the
+        4-byte field, which the covenant cannot. Refused after the contract read and before the
+        wallet's UTXO scan, the confirmation summary, the grind and any broadcast."""
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=self._v1_at(2**31 - 1, max_height))
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract" in result.output
+        assert "cannot be minted further" in result.output
+        assert "Mint (dMint claim)" not in result.output  # the confirmation summary never printed
+        assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    def test_the_height_below_the_stuck_one_still_claims(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """Honest path: one height lower, the same contract mints, writing height 2**31 - 1."""
+        from pyrxd.transaction.transaction import Transaction
+
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=self._v1_at(2**31 - 2, 2**31 + 1))
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code == 0, result.output
+        assert len(grinds) == 1 and len(net.broadcasts) == 1
+        out0 = Transaction.from_hex(net.broadcasts[0].hex()).outputs[0].locking_script.serialize()
+        assert out0[:5] == bytes.fromhex("04ffffff7f")
 
     @pytest.mark.parametrize("name", ["RABO", "BTC", "Pepe"])
     def test_a_mainnet_v1_contract_still_claims(
