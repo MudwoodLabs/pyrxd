@@ -10,6 +10,7 @@ builder and the command run for real, and what is asserted is the transaction br
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -17,7 +18,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from pyrxd.cli import glyph_cmds
+from pyrxd.cli import glyph_cmds, glyph_estimate, glyph_helpers
+from pyrxd.cli.errors import UserError
 from pyrxd.cli.main import cli
 from pyrxd.glyph.dmint import (
     DaaMode,
@@ -169,3 +171,80 @@ class TestClaimDmintStillRefusesWhatPartBCannotEvaluate:
         result, tx = _claim(tmp_path, monkeypatch, _v2(1, 2, DaaMode.ASERT), "--json")
         assert json.loads(result.stdout)["final_mint"] is True
         assert tx.outputs[0].locking_script.script == _BURN and tx.outputs[0].satoshis == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# After the final mint: the contract outpoint names a burn, and the commands say so
+# ---------------------------------------------------------------------------------------------
+
+_MAINNET = {
+    m["txid"]: m
+    for m in json.loads((Path(__file__).parent.parent / "fixtures" / "dmint_v1_final_mints_mainnet.json").read_text())[
+        "mints"
+    ]
+}
+_CROW_FINAL = "7c7ba54e06d022698488be37c3c1cf3b90dc942878a1fc264fc147a0dd6aaa0a"  # output 0: the burn
+_CROW_BEFORE = "b1a7c712a17c2173d7caaf532509a10fe40aa3c265928be48ebdd2ac72165415"  # output 0: the contract it burned
+
+
+class _Chain:
+    """Serves the real mainnet transactions in tests/fixtures/dmint_v1_final_mints_mainnet.json."""
+
+    async def __aenter__(self) -> _Chain:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def get_transaction(self, txid: object) -> bytes:
+        return bytes.fromhex(_MAINNET[str(txid)]["raw"])
+
+
+def _run_against_the_chain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str):
+    grinds: list[int] = []
+    monkeypatch.setattr(glyph_cmds, "_load_wallet", lambda ctx, **kw: object())
+    monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: _Chain())
+    monkeypatch.setattr(glyph_cmds, "_mine_bundled_parallel", lambda *a, **k: grinds.append(1))
+    result = CliRunner().invoke(cli, ["--wallet", str(tmp_path / "w.dat"), "--yes", "glyph", *args])
+    return result, grinds
+
+
+class TestAfterTheFinalMint:
+    @pytest.mark.parametrize(
+        "command",
+        [["claim-dmint", "--no-progress"], ["dmint-estimate", "--hash-rate", "1e6"]],
+        ids=["claim-dmint", "dmint-estimate"],
+    )
+    def test_the_burned_outpoint_is_named_as_a_burn(self, command, monkeypatch, tmp_path: Path) -> None:
+        result, grinds = _run_against_the_chain(monkeypatch, tmp_path, *command, "--contract", f"{_CROW_FINAL}:0")
+        assert result.exit_code == 1, result.output
+        assert grinds == []
+        assert "is a burned singleton (d8 <ref> 6a)" in result.output
+        assert "minted to its max_height and can be minted no" in result.output
+        assert "is not a dMint contract" not in result.output
+
+    def test_the_contract_it_burned_still_reads_as_a_contract(self) -> None:
+        """The honest neighbour: the outpoint the final mint spent is a live contract to the same
+        helper (it was, until that mint), one mint from its end."""
+        utxo = asyncio.run(glyph_helpers._fetch_dmint_contract(_Chain(), _CROW_BEFORE, 0))
+        assert utxo.state.is_v1 and utxo.state.next_mint_is_final
+
+    def test_any_other_output_is_still_not_a_dmint_contract(self) -> None:
+        with pytest.raises(UserError) as info:
+            asyncio.run(glyph_helpers._fetch_dmint_contract(_Chain(), _CROW_FINAL, 3))  # the change
+        assert "is not a dMint contract" in info.value.message
+
+
+class TestDmintEstimateSaysWhenTheNextClaimIsTheLast:
+    @pytest.mark.parametrize("height", [0, 1])
+    def test_the_note_and_the_json_field(self, height: int, monkeypatch, tmp_path: Path) -> None:
+        contract = _v1(height, 2)
+        monkeypatch.setattr(glyph_estimate, "_fetch_contract", lambda *a, **k: contract)
+        base = ["--wallet", str(tmp_path / "w.dat")]
+        tail = ["glyph", "dmint-estimate", "--contract", f"{'ab' * 32}:0", "--hash-rate", "1e6"]
+        human = CliRunner().invoke(cli, [*base, *tail])
+        as_json = CliRunner().invoke(cli, [*base, "--json", *tail])
+        assert human.exit_code == 0 and as_json.exit_code == 0, human.output + as_json.output
+        final = height == 1
+        assert ("the next claim is this contract's final mint (height 2)" in human.output) is final
+        assert json.loads(as_json.stdout)["contract"]["next_mint_is_final"] is final

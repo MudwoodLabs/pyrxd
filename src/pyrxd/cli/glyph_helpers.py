@@ -490,5 +490,30 @@ async def _fetch_dmint_contract(client: ElectrumXClient, txid: str, vout: int) -
     try:
         state = DmintState.from_script(script)
     except ValidationError as exc:
+        burned = _burned_singleton_ref(script)
+        if burned is not None:
+            raise UserError(
+                f"{txid}:{vout} is a burned singleton (d8 <ref> 6a): the output a dMint contract's "
+                "final mint leaves where the contract was",
+                cause=f"ref {burned.txid}:{burned.vout} is pushed into an OP_RETURN; nothing can spend this output",
+                fix=(
+                    "a contract that ends in this output was minted to its max_height and can be minted no "
+                    "further; if the token has other contracts, pass --token-ref to find a live one"
+                ),
+            ) from exc
         raise UserError(f"{txid}:{vout} is not a dMint contract", cause=str(exc)) from exc
     return DmintContractUtxo(txid=txid, vout=vout, value=out.satoshis, script=script, state=state)
+
+
+def _burned_singleton_ref(script: bytes) -> GlyphRef | None:
+    """The ref in ``d8 <ref> 6a``, the burn a dMint contract's final mint leaves, else ``None``.
+
+    Matched against :func:`~pyrxd.glyph.dmint.builders.build_dmint_contract_burn_script` itself,
+    so the shape is defined in one place.
+    """
+    from ..glyph.dmint import build_dmint_contract_burn_script
+
+    if len(script) != 38:
+        return None
+    ref = GlyphRef.from_bytes(script[1:37])
+    return ref if build_dmint_contract_burn_script(ref) == script else None
