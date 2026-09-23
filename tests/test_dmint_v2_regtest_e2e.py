@@ -49,8 +49,9 @@ recreated state's ``last_time`` and the tx ``nLockTime`` (which must agree, sinc
 Part C rebuilds ``last_time`` from ``OP_TXLOCKTIME``).
 
 Cost: a difficulty-1 mint is a ~2**33 SHA256d sweep (4-zero-byte floor + sign bit);
-the second mint of each v2 test runs at the MAX/4 cap, ~4x that. Raise
-``DMINT_MINE_TIMEOUT_S`` (default 1800 s) on a slow box.
+the second mint of each v2 test runs at the MAX/4 cap, ~4x that.
+``DMINT_MINE_TIMEOUT_S`` (default 1800 s) is the ceiling for a difficulty-1 grind, and a
+harder grind gets that multiple of it (``_grind_timeout_s``). Raise it on a slow box.
 
 Gating / safety: opt-in via ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``;
 reuses the isolated throwaway-container harness from ``test_htlc_regtest_e2e``
@@ -99,6 +100,7 @@ from pyrxd.glyph.dmint import (
     compute_next_target_linear_legacy,
     compute_next_target_linear_v2,
     detect_contract_daa_bytecode,
+    estimate_attempts,
     is_minimal_4byte_scriptnum,
     mine_solution_dispatch,
 )
@@ -121,12 +123,42 @@ pytestmark = pytest.mark.integration
 # PoW floor is consensus-hardcoded). Workers + timeout are env-tunable so the
 # test stays robust on a loaded box: DMINT_MINE_WORKERS caps worker processes
 # (default os.cpu_count()) to avoid oversubscription, DMINT_MINE_TIMEOUT_S
-# raises the ceiling (default 1800s).
+# raises the ceiling (default 1800s per difficulty-1 grind; see _grind_timeout_s).
 _MINER_ARGV = [sys.executable, "-m", "pyrxd.contrib.miner"]
 if os.environ.get("DMINT_MINE_WORKERS"):
     _MINER_ARGV += ["--workers", os.environ["DMINT_MINE_WORKERS"]]
 _MINE_TIMEOUT_S = float(os.environ.get("DMINT_MINE_TIMEOUT_S", "1800"))
 _CONTRACT_VALUE = 1  # V2 contract is a value-1 singleton (covenant: OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY)
+
+
+def _grind_timeout_s(target: int) -> float:
+    """The ceiling for ONE grind against ``target``: ``DMINT_MINE_TIMEOUT_S`` per difficulty-1
+    grind's worth of expected work.
+
+    A grind's duration is exponentially distributed with a mean proportional to its expected
+    attempts, so a ceiling ``T`` times out with probability ``exp(-T / mean)``. One fixed ceiling
+    for every grind makes the harder grinds the flaky ones. Every retarget the covenant computes
+    is capped at ``MAX/4`` (difficulty 4), so the second mint of each chained adaptive test below
+    is at least a 4x grind whatever the test's inputs. Only dropping the chained mint would avoid
+    it, and that mint is the proof that a state the covenant recreated is itself mineable. Scaling
+    the ceiling by the expected work (the exact ``estimate_attempts`` ratio, 4.0 for ``MAX/4``)
+    gives every grind the same odds of a false timeout, and a stuck difficulty-1 grind still
+    fails after the base ceiling.
+    """
+    ratio = estimate_attempts(target).expected_attempts / estimate_attempts(MAX_SHA256D_TARGET).expected_attempts
+    return _MINE_TIMEOUT_S * max(1.0, ratio)
+
+
+def _log_grind(target: int, mined) -> None:
+    """One line per grind: the measured rate is what sizes ``DMINT_MINE_TIMEOUT_S`` honestly."""
+    rate = mined.attempts / mined.elapsed_s if mined.elapsed_s > 0 else float("nan")
+    ratio = estimate_attempts(target).expected_attempts / estimate_attempts(MAX_SHA256D_TARGET).expected_attempts
+    print(
+        f"\n[grind] difficulty x{ratio:.2f}: {mined.attempts:,} attempts in {mined.elapsed_s:.0f}s "
+        f"({rate / 1e6:.1f} M/s), ceiling {_grind_timeout_s(target):.0f}s",
+        flush=True,
+    )
+
 
 # Plumbing values for the hand-built commit/reveal pair. The node runs at MAINNET's relay
 # floor (10 000 photons/byte), so `_RELAY_FEE_SATS` is 0.2 RXD and both commit outputs
@@ -307,8 +339,9 @@ def _build_signed_v2_mint(
         target=contract.state.target,
         nonce_width=8,
         miner_argv=_MINER_ARGV,
-        timeout_s=_MINE_TIMEOUT_S,
+        timeout_s=_grind_timeout_s(contract.state.target),
     )
+    _log_grind(contract.state.target, mined)
     nonce = mined.nonce
     tx.inputs[0].unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=8))
     _sign_funding_input(tx, 1, funding_coin.key)
@@ -464,6 +497,10 @@ def _mint_on_chain(
     )
     mtxid = node.cli("sendrawtransaction", raw)
     assert isinstance(mtxid, str), mtxid
+    print(
+        f"\n[mint] {contract.state.daa_mode.name} height {contract.state.height} -> {contract.state.height + 1}: {res}",
+        flush=True,
+    )
     node.mine(1)
     assert node.cli("gettxout", contract.txid, "0") in (None, ""), "spent V2 contract UTXO still unspent"
     out = node.cli("gettxout", mtxid, "0")
