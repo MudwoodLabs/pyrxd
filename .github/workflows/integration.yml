@@ -5,7 +5,8 @@ name: Integration (node-backed)
 # Why a separate workflow from ci.yml
 # -----------------------------------
 # `ci.yml` is the fast offline gate: unit tests, coverage, bandit, mypy. It runs on
-# every push and its two required checks (`test (3.12)`, `lint`) gate merges. Node-backed
+# every pull request and every push to main/dev, and its `test (3.12)` is one of the
+# required checks that gate merges into main. Node-backed
 # proof is a different shape of work — it builds a docker image, starts chains, and the
 # slowest suites grind proof-of-work for tens of minutes — so it lives here, where it can
 # be path-filtered off docs-only changes and split across a cheap per-push job and a
@@ -51,8 +52,11 @@ on:
       - "pyproject.toml"
       - "ci/poetry-pin.txt"
       - ".github/workflows/integration.yml"
+  # NO `branches:` filter on pull_request, deliberately: a PR into ANY base branch that
+  # touches these paths runs `regtest-core`, stacked PRs included. See ci.yml and
+  # tests/test_ci_workflows_check_every_pr_base.py. The `paths` filter stays: this lane
+  # is not a required check, so skipping it on a docs-only PR blocks nothing.
   pull_request:
-    branches: [main, dev]
     paths:
       - "src/**"
       - "tests/**"
