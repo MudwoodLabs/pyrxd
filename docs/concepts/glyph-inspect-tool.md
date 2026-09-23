@@ -368,6 +368,17 @@ over the *classified output types* and nothing else: the function never
 reads an output's value, never compares a `contract_ref` against the
 inputs, and never looks at `vin[]` at all.
 
+Every count, presence, absence and agreement is over **every** output of
+the transaction, not only the rows the page lists. When the classifier
+cuts the output list at `MAX_ROWS_SHOWN`, it sends `output_shape`: a
+count of every output by type and, for the `dmint` outputs, the first
+one's height and `max_height` and whether all of them agree on
+`token_ref`, `reward` and `max_height`. When nothing was cut, the banner
+works the same facts out from the rows. What it reads off the rows alone
+is a position — which vout the minted FT sits at, and whether the
+outputs are in the canonical mint order — and only when the rows are
+every output.
+
 Recognised shapes, in evaluation order:
 
 | # | Shape | Trigger |
@@ -383,7 +394,7 @@ Recognised shapes, in evaluation order:
 | 9 | **Glyph FT deploy** | At least one `commit-ft` **and** at least one `commit-nft` (having failed the P2PKH count above). It does *not* look for FT or NFT outputs. |
 | 10 | **commit-ft without commit-nft** | At least one `commit-ft` and no `commit-nft` — an older or unusual FT deploy. |
 | 11 | **Glyph NFT deploy** | At least one `commit-nft` and no `commit-ft`. |
-| 12 | **dMint deploy reveal** | The *first* `dmint` output has `height == 0`. The count of `dmint` outputs only chooses between the "N parallel contracts" and "a single contract" wording — it is not part of the trigger, no `token_ref` is compared across outputs, and V1 vs V2 is not distinguished here. |
+| 12 | **dMint deploy reveal** | The *first* `dmint` output has `height == 0`. The count of `dmint` outputs only chooses between the "N parallel contracts" and "a single contract" wording — it is not part of the trigger. With more than one, `token_ref`, `reward` and `max_height` are compared across every `dmint` output, and the banner says whether they are one token on one set of terms. V1 vs V2 is not distinguished here. |
 | 13 | **dMint claim** | The first `dmint` output has a non-zero `height`. When `vin[0]` happens to carry a decodable mint scriptSig, a sentence naming its v1/v2 shape is appended; when it does not, the banner still fires. |
 | 14 | **Mutable contract update** | At least one `mut` output. |
 
