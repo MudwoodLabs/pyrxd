@@ -232,6 +232,17 @@ class DmintState:
     def is_exhausted(self) -> bool:
         return self.height >= self.max_height
 
+    @property
+    def next_mint_is_final(self) -> bool:
+        """True when the next mint takes this contract to ``max_height``.
+
+        That mint recreates no contract: the covenant's final branch requires the burn
+        ``d8 <contractRef> 6a`` in its place (see
+        :func:`~pyrxd.glyph.dmint.builders.build_dmint_contract_burn_script`), and
+        :func:`~pyrxd.glyph.dmint.miner.build_dmint_mint_tx` builds exactly that.
+        """
+        return self.height + 1 == self.max_height
+
     @classmethod
     def from_script(cls, script_bytes: bytes) -> DmintState:
         """Parse a dMint contract UTXO script into a ``DmintState``.

@@ -253,6 +253,7 @@ def _resolve_target(
         "max_height": state.max_height,
         "reward": state.reward,
         "nonce_width": 4 if state.is_v1 else 8,
+        "next_mint_is_final": state.next_mint_is_final,
     }
 
 
@@ -326,6 +327,11 @@ def _render_human(payload: dict) -> str:
             )
         lines.append(_row("height", f"{contract['height']:,} / {contract['max_height']:,}"))
         lines.append(_row("reward", f"{contract['reward']:,} photons per mint"))
+        if contract["next_mint_is_final"]:
+            lines.append(
+                f"  note: the next claim is this contract's final mint (height {contract['max_height']:,}). It"
+                " burns the contract output, so nothing can mint this contract after it."
+            )
 
     measured = payload.get("measured")
     assumed = payload.get("assumed")

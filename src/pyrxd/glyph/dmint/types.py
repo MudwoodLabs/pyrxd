@@ -846,10 +846,21 @@ class DmintMintResult:
     :param tx:                 Unsigned transaction (caller must sign).
     :param updated_state:      New :class:`DmintState` written into the
                                contract output (height incremented, target
-                               updated if DAA is active).
-    :param contract_script:    New contract output script (state + separator + code).
-    :param reward_script:      P2PKH locking script of the miner reward output.
+                               updated if DAA is active). On the final mint no
+                               output carries a state: this is the spent state
+                               with only ``height`` advanced to ``max_height``
+                               (so ``is_exhausted`` is True).
+    :param contract_script:    The script of output 0: the recreated contract
+                               (state + separator + code), or on the final mint
+                               the burn ``d8 <contractRef> 6a`` that replaces it.
+    :param reward_script:      The FT-wrapped reward output script (P2PKH, then
+                               ``bd d0 <tokenRef>`` and the 12-byte FT code), paid to
+                               the miner.
     :param fee:                Transaction fee in photons.
+    :param is_final_mint:      True when this mint takes the contract to
+                               ``max_height``: output 0 is the burn, not a
+                               recreated contract, and no further mint of this
+                               contract is possible.
 
     .. note::
        The transaction returned here is **unsigned** — it uses raw script bytes
@@ -865,6 +876,7 @@ class DmintMintResult:
     contract_script: bytes
     reward_script: bytes
     fee: int
+    is_final_mint: bool = False
 
 
 @dataclass(frozen=True)

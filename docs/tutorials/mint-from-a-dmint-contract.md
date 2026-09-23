@@ -139,7 +139,9 @@ you will pass as `CONTRACT_TXID` and `CONTRACT_VOUT` in Step 3.
 The V1 mint transaction has two inputs:
 
 1. **`vin[0]`** — the contract UTXO you picked above. The covenant
-   carries 1 photon and is consumed-and-recreated by the mint.
+   carries 1 photon and is consumed-and-recreated by the mint, unless
+   this is the contract's final mint (its height is `max_height - 1`):
+   that mint consumes the contract and burns it instead (Step 4).
 2. **`vin[1]`** — a plain-RXD UTXO at *your* address. This input pays
    the reward output's 50,000 photons plus the transaction fee.
 
@@ -288,10 +290,18 @@ loop, you can replay it through any other broadcast path.
 ## Step 4 — Inspect the unsigned tx (optional but recommended)
 
 Paste the raw tx hex from Step 3 into the browser inspect tool
-(`/inspect/`). The structural-match qualifier will identify it as a
-**V1 dMint claim** and break the four outputs down:
+(`/inspect/`). For any mint but a contract's final one, the page's
+summary says "This is a dMint claim transaction (height N of M)",
+and the rows break the four outputs down:
 
 - `vout[0]` — the recreated contract UTXO at `height+1` (1 photon).
+  On the contract's final mint it is instead the burn
+  `d8 <contractRef> 6a` at 0 photons, and the contract's photon is in
+  the change. The inspect tool does not recognise the burn yet: it
+  labels a transaction a dMint claim only when it finds a recreated
+  contract output, so a final mint will not get that label, and
+  `pyrxd glyph inspect` shows the burn script as `type: unknown`,
+  token-bearing.
 - `vout[1]` — the FT reward going to your miner pubkey hash (50,000
   photons for GLYPH).
 - `vout[2]` — the `OP_RETURN` msg marker bound into the preimage.

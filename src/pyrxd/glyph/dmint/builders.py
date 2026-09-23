@@ -17,14 +17,14 @@ imports them from ``builders.py`` via the allowed ``chain → builders``
 edge. The ``_match_v1_epilogue`` function (which also uses them) is in
 ``chain.py`` and imports them from here.
 
-Symbols (23 + 4 epilogue constants shared with chain):
+Symbols (24 + 4 epilogue constants shared with chain):
     _push_minimal, _push_4bytes_le,
     _PART_A, _POW_HASH_OP,
     _build_asert_daa_legacy, _build_linear_daa_legacy, _build_linear_daa_legacy_prefloor,
     _build_asert_daa_v2, _build_linear_daa_v2, _build_epoch_daa, _build_schedule_daa,
     _build_part_b, DetectedDaaBytecode, detect_daa_bytecode,
     build_dmint_state_script, build_dmint_code_script,
-    build_dmint_contract_script,
+    build_dmint_contract_script, build_dmint_contract_burn_script,
     _V1_ALGO_BYTE_TO_ENUM, _V1_ENUM_TO_ALGO_BYTE,
     build_dmint_v1_state_script, build_dmint_v1_code_script,
     _V1_FT_OUTPUT_EPILOGUE, build_dmint_v1_ft_output_script,
@@ -958,6 +958,25 @@ def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
     state = build_dmint_state_script(params)
     code = build_dmint_code_script(params)
     return state + _OP_STATESEPARATOR + code
+
+
+def build_dmint_contract_burn_script(contract_ref: GlyphRef) -> bytes:
+    """The output a FINAL mint puts where the contract used to be: ``d8 <contractRef> 6a``.
+
+    ``OP_PUSHINPUTREFSINGLETON <contractRef> OP_RETURN``. On the mint whose new height equals
+    ``max_height``, the output-validation block (V2 Part C and the V1 epilogue carry the same
+    bytes here) takes its IF branch instead of rebuilding the next state: it reads
+    ``OP_OUTPUTBYTECODE`` at the contract's output index and ``OP_EQUALVERIFY``\\s it against
+    ``0xd8 || contractRef || 0x6a`` assembled on the stack (``5279cd01d853797e016a7e88``).
+    The ref is the CONTRACT ref read from the state, not the token ref. The prologue before
+    that branch also requires the token ref to appear in exactly as many outputs as there are
+    FT reward outputs, so the burn must not carry it.
+
+    Nothing can spend the output (execution ends at ``OP_RETURN``), so the contract singleton
+    ends here and no further mint of it is possible. Same bytes as Glyph-miner's
+    ``burnScript`` (``src/glyph.ts``).
+    """
+    return b"\xd8" + contract_ref.to_bytes() + b"\x6a"
 
 
 # ---------------------------------------------------------------------------

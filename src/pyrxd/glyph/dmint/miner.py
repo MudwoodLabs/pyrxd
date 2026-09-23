@@ -24,6 +24,7 @@ Symbols (22):
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -51,6 +52,7 @@ from .builders import (
     _build_part_b,
     _push_4bytes_le,
     _push_minimal,
+    build_dmint_contract_burn_script,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
     build_dmint_v1_state_script,
@@ -1813,7 +1815,8 @@ def build_dmint_mint_tx(
     """Build an unsigned dMint mint transaction.
 
     Spends the live dMint contract UTXO, recreates the 1-photon contract
-    singleton at ``height + 1``, and pays the FT reward to ``miner_pkh`` from a
+    singleton at ``height + 1`` (or, on the final mint, burns it: see below), and
+    pays the FT reward to ``miner_pkh`` from a
     separate plain-RXD funding input. V1 and V2 use the **same consensus shape**
     (the V2 covenant's output-validation block is byte-identical to V1's);
     they differ only in the nonce width (4B V1 / 8B V2) and the 10-item V2 state.
@@ -1827,24 +1830,45 @@ def build_dmint_mint_tx(
         photons + tx fee + change (the contract is a 1-photon singleton).
 
     **Outputs**
-      * Output 0: recreated contract (current script with only ``height`` bumped), value **1**.
+      * Output 0: recreated contract (the spent script with its state advanced: ``height``
+        + 1, and on V2 also ``lastTime`` and ``target`` as the note below says), value **1**.
       * Output 1: FT-wrapped reward output (value = ``state.reward``).
       * Output 2: OP_RETURN (when ``op_return_msg`` is set) — the output the PoW
         preimage binds (see :func:`build_dmint_v2_mint_preimage` / V1 analog).
       * Output 3: change back to ``miner_pkh``.
 
+    **The final mint** (``height + 1 == max_height``, flagged ``is_final_mint`` on the
+    result) has the same inputs and the same outputs 1-3, but output 0 is the burn
+    :func:`~pyrxd.glyph.dmint.builders.build_dmint_contract_burn_script`
+    (``d8 <contractRef> 6a``) at value 0 instead of a recreated contract: the covenant's
+    final branch requires exactly that script at the contract's output index, and
+    requires the token ref to appear in the FT reward outputs only. The FT reward is
+    unchanged. No state is rebuilt, so the checks that exist to protect the RECREATED
+    contract — its 1-photon value, and for V2 a ``lastTime`` its next retarget can read
+    and a target above 1 — are not applied to it. What the covenant still evaluates on
+    this spend is checked as on any other mint: the PoW binding, the reward, and for V2
+    the Part B retarget, which runs on the final mint too (its result is discarded, but
+    an input it cannot evaluate still fails the spend). The contract's photon goes to
+    change. Same output order and burn value as Glyph-miner's final mint.
+
     .. note::
        **V2 supports all five DAA modes** — FIXED, ASERT, LWMA, EPOCH, SCHEDULE
-       (the canonical Photonic redesign). The covenant rebuilds the next state's
-       ``last_time`` from ``OP_TXLOCKTIME`` and its ``target`` from the alt-stack DAA
-       result on every mint, so ``current_time`` IS the block locktime: it is written
-       into the recreated state's ``last_time`` AND set as the tx ``nLockTime`` (the
-       two must agree), and for DAA modes it drives the target retarget.
-       ``current_time`` must be ``<= 0x7FFFFFFF`` (Part C's ``NUM2BIN(_, 4)`` cannot write
-       a locktime with bit 31 set), and for the modes whose retarget reads ``lastTime``
+       (the canonical Photonic redesign). On every mint that recreates the contract,
+       the covenant rebuilds the next state's ``last_time`` from ``OP_TXLOCKTIME`` and
+       its ``target`` from the alt-stack DAA result, so ``current_time`` IS the block
+       locktime: it is written into the recreated state's ``last_time`` AND set as the
+       tx ``nLockTime`` (the two must agree), and for DAA modes it drives the target
+       retarget. The final mint recreates no state: ``current_time`` is still set as the
+       ``nLockTime``, and Part B, which runs on the final mint too, still reads it in the
+       modes whose retarget does, but no ``last_time`` or ``target`` is written.
+       ``current_time`` must be ``<= 0x7FFFFFFF`` on every V2 mint (on a mint that
+       recreates the contract, Part C's ``NUM2BIN(_, 4)`` cannot write a locktime with
+       bit 31 set; pyrxd applies the same bound to the final mint). On a mint that
+       recreates the contract, for the modes whose retarget reads ``lastTime``
        (:data:`~pyrxd.glyph.dmint.types.DAA_MODES_READING_LAST_TIME`: ASERT, LWMA, EPOCH)
-       also ``>= 2**23``, so the lastTime it writes is a minimally encoded script number a
-       later retarget can read. EPOCH/SCHEDULE bake
+       it must also be ``>= 2**23``, so the lastTime it writes is a minimally encoded
+       script number a later retarget can read; the final mint writes no lastTime, and
+       that lower bound is not applied to it. EPOCH/SCHEDULE bake
        their parameters into the contract code (not the parsed state), so the caller
        passes ``epoch_length``/``max_adjustment_log2`` or ``schedule`` (and
        ``half_life`` for ASERT) matching the deployed contract — a mismatch is caught
@@ -1902,16 +1926,19 @@ def build_dmint_mint_tx(
        connection or deterministic txid from a fully-built tx.
 
     :param contract_utxo:  The live dMint contract UTXO to spend.
-    :param nonce:          8-byte PoW nonce (use ``b'\\x00' * 8`` as placeholder
+    :param nonce:          8-byte PoW nonce, 4-byte for V1 (use ``b'\\x00' * 8``, or ``* 4``, as placeholder
                            when building the tx shell; replace after mining).
     :param miner_pkh:      20-byte P2PKH hash of the miner's reward address.
-    :param current_time:   Unix timestamp written as the tx ``nLockTime`` AND as the
+    :param current_time:   V2: Unix timestamp written as the tx ``nLockTime`` on every
+                           mint and, on a mint that recreates the contract, as the
                            recreated state's ``lastTime`` (the covenant rebuilds it
-                           from ``OP_TXLOCKTIME``); drives the DAA retarget.
+                           from ``OP_TXLOCKTIME``); drives the DAA retarget. The final
+                           mint writes no ``lastTime``. V1: must be 0.
     :param fee_rate:       Photons per byte for fee calculation (default 10_000,
                            the Radiant post-V2 relay minimum).
-    :raises ValidationError: ``contract_utxo.state.is_exhausted`` is True;
-        ``nonce`` is not 8 bytes; ``miner_pkh`` is not 20 bytes.
+    :raises ContractExhaustedError: ``contract_utxo.state.is_exhausted`` is True.
+    :raises ValidationError: ``nonce`` is not 8 bytes (4 for V1); ``miner_pkh`` is not
+        20 bytes.
     :returns: :class:`DmintMintResult` with the unsigned tx and updated state.
     """
 
@@ -1994,19 +2021,22 @@ def build_dmint_mint_tx(
             f"current_time must be <= 0x7FFFFFFF (2038-01-19), got {current_time}; the covenant "
             "reconstructs lastTime via NUM2BIN(_,4), which rejects locktimes with bit 31 set"
         )
+    if state.is_exhausted:
+        raise ContractExhaustedError(
+            f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
+        )
+    # The final mint recreates no contract: output 0 is the burn the covenant's final branch
+    # demands. The checks below that protect the RECREATED state are skipped for it.
+    is_final_mint = state.next_mint_is_final
     # pyrxd's miner never writes a lastTime the contract's next retarget cannot read: the
     # locktime becomes the recreated state's lastTime, and below 2**23 its fixed 4-byte push
     # is not a minimally encoded script number (bit 31 is refused just above). Every V2
-    # mint crosses this, whichever entry point built it.
-    if state.daa_mode in DAA_MODES_READING_LAST_TIME and not is_readable_last_time(current_time):
+    # mint that recreates the contract crosses this, whichever entry point built it.
+    if not is_final_mint and state.daa_mode in DAA_MODES_READING_LAST_TIME and not is_readable_last_time(current_time):
         raise ValidationError(
             f"current_time={current_time} is below 2**23: pyrxd writes a {state.daa_mode.name} mint's locktime "
             "into the recreated contract's lastTime, and does not write one the contract's next retarget "
             "cannot read. Pass a real Unix timestamp — normally the current time, claim-dmint's default."
-        )
-    if state.is_exhausted:
-        raise ContractExhaustedError(
-            f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
     never = _unmintable_reason(contract_utxo.script)
     if never is not None:
@@ -2015,7 +2045,7 @@ def build_dmint_mint_tx(
         raise ValidationError(f"V2 nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
-    if contract_utxo.value != 1:
+    if not is_final_mint and contract_utxo.value != 1:
         raise ValidationError(
             f"V2 dMint contract must be a 1-photon singleton, got {contract_utxo.value} photons. "
             "The covenant enforces OP_OUTPUTVALUE==1 on the recreated contract output, so a "
@@ -2143,26 +2173,33 @@ def build_dmint_mint_tx(
             )
         return state.target  # FIXED \u2014 target unchanged
 
+    # Part B runs on every mint, the final one included, so the retarget is computed here
+    # either way: the mirror raises where the contract's own arithmetic would abort.
     new_target = _next_target(current_time)
 
-    updated_state = DmintState(
-        height=new_height,
-        contract_ref=state.contract_ref,
-        token_ref=state.token_ref,
-        max_height=state.max_height,
-        reward=state.reward,
-        algo=state.algo,
-        daa_mode=state.daa_mode,
-        target_time=state.target_time,
-        last_time=current_time,
-        target=new_target,
-        is_v1=False,
-    )
-
-    # Recreate the contract output script. The code section (Part A/B/C, after
-    # the 0xbd separator) is invariant across mints \u2014 it was sliced from the spent
-    # UTXO above; graft the rebuilt state prefix onto it.
-    contract_script = _v2_state_script_bytes(updated_state) + code_with_separator
+    if is_final_mint:
+        # Nothing carries a next state. Part C's final branch drops the retarget result
+        # and checks output 0 against the burn; lastTime/target are not rebuilt.
+        updated_state = dataclasses.replace(state, height=new_height)
+        contract_script = build_dmint_contract_burn_script(state.contract_ref)
+    else:
+        updated_state = DmintState(
+            height=new_height,
+            contract_ref=state.contract_ref,
+            token_ref=state.token_ref,
+            max_height=state.max_height,
+            reward=state.reward,
+            algo=state.algo,
+            daa_mode=state.daa_mode,
+            target_time=state.target_time,
+            last_time=current_time,
+            target=new_target,
+            is_v1=False,
+        )
+        # Recreate the contract output script. The code section (Part A/B/C, after
+        # the 0xbd separator) is invariant across mints \u2014 it was sliced from the spent
+        # UTXO above; graft the rebuilt state prefix onto it.
+        contract_script = _v2_state_script_bytes(updated_state) + code_with_separator
 
     # Guard the caller-supplied DAA params against the contract's BAKED bytecode.
     # ASERT half_life, EPOCH epoch_length/max_adjustment, and SCHEDULE entries live in
@@ -2210,7 +2247,8 @@ def build_dmint_mint_tx(
         )
     # pyrxd's miner never writes target 1 over a contract that had a larger one, in any mode:
     # it is the hardest difficulty there is, and nothing could mint the contract after it.
-    if new_target == 1 and state.target > 1:
+    # The final mint writes no target, and nothing mints the contract after it anyway.
+    if not is_final_mint and new_target == 1 and state.target > 1:
         try:
             latest = _next_target(0x7FFFFFFF)
         except ValidationError:
@@ -2280,8 +2318,11 @@ def build_dmint_mint_tx(
     funding_input.locking_script = Script(funding_utxo.script)
     funding_input.unlocking_script = Script(placeholder_funding_scriptsig)
 
+    # Output 0 keeps the singleton's value when the contract is recreated; the final mint's
+    # burn carries 0 and the contract's photon joins the change.
+    contract_out_value = 0 if is_final_mint else contract_utxo.value
     trial_outputs = [
-        TransactionOutput(Script(contract_script), contract_utxo.value),  # value 1 (singleton), preserved
+        TransactionOutput(Script(contract_script), contract_out_value),
         TransactionOutput(Script(reward_script), state.reward),
     ]
     if op_return_script:
@@ -2289,9 +2330,13 @@ def build_dmint_mint_tx(
     change_output = TransactionOutput(Script(change_script), 0)  # value patched below
     trial_outputs.append(change_output)
 
-    # nLockTime MUST equal current_time: the covenant reconstructs the next
-    # state's lastTime from OP_TXLOCKTIME, so the recreated state only byte-matches
-    # if the tx's locktime is exactly the value we wrote into updated_state.
+    # nLockTime is current_time on every V2 mint. On a mint that recreates the contract it
+    # MUST be: Part C rebuilds the next state's lastTime from OP_TXLOCKTIME, so the recreated
+    # state only byte-matches if the locktime is the value written into updated_state. The
+    # final mint rebuilds no state, and Part C's final branch does not read it; only the
+    # ASERT and LWMA retarget fragments (always) and EPOCH's (at an epoch boundary) execute
+    # OP_TXLOCKTIME there. FIXED and SCHEDULE never do. It is set in every mode anyway, so
+    # one rule covers every V2 mint.
     tx = Transaction(
         tx_inputs=[contract_input, funding_input],
         tx_outputs=trial_outputs,
@@ -2299,7 +2344,7 @@ def build_dmint_mint_tx(
     )
     # The funding input pays the FT reward photons + the tx fee + change.
     fee = len(tx.serialize()) * fee_rate
-    change_value = funding_utxo.value - state.reward - fee
+    change_value = funding_utxo.value + contract_utxo.value - contract_out_value - state.reward - fee
     # pyrxd POLICY floor, not a node rule. Radiant would accept any change output of
     # 1 photon or more (`GetDustThreshold` returns 1, `IsDust` is `nValue <= 0`) — the
     # guard exists because a mint whose change is worth less than the fee to spend it
@@ -2322,6 +2367,7 @@ def build_dmint_mint_tx(
         contract_script=contract_script,
         reward_script=reward_script,
         fee=fee,
+        is_final_mint=is_final_mint,
     )
 
 
@@ -2350,13 +2396,19 @@ def _build_dmint_v1_mint_tx(
     the reward (which lands in the FT carrier output) plus the tx fee, and
     receives change.
 
+    On the final mint (``height + 1 == max_height``) vout[0] is the burn
+    ``d8 <contractRef> 6a`` at value 0 instead of a recreated contract — the V1
+    epilogue's final branch (``635279cd01d853797e016a7e88``) demands exactly that —
+    and the contract's photon joins the change. vout[1..3] are unchanged.
+
     :raises InvalidFundingUtxoError: ``funding_utxo.script`` contains any
         OP_PUSHINPUTREF-family opcode (0xd0–0xd8). Spending a token-bearing
         UTXO as fee silently destroys the token; this is the load-bearing
         defense against that mistake.
     :raises ContractExhaustedError: ``state.height >= state.max_height``.
     :raises PoolTooSmallError:      funding UTXO can't cover reward + fee + change dust.
-    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1.
+    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1;
+        ``contract_utxo.state`` is not the state ``contract_utxo.script`` carries.
     """
     from pyrxd.script.script import Script
     from pyrxd.security.errors import InvalidFundingUtxoError
@@ -2379,7 +2431,31 @@ def _build_dmint_v1_mint_tx(
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
     if fee_rate < 1:
         raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
-    if contract_utxo.value != 1:
+    # Everything below is decided from ``state`` (whether this is the final mint, what to
+    # recreate), so it must be the state the spent script carries: a state one height ahead
+    # of its script builds the burn a mint early, which the covenant rejects after the grind.
+    # The V2 path checks this by rebuilding the state bytes (_v2_code_section). Here the
+    # script is parsed again and compared, which holds for whatever encodings the V1 parser
+    # accepts.
+    #
+    # The ``except`` below cannot fire today: _unmintable_reason, above, has already parsed
+    # this same script with the same parser (DmintState.from_script is _parse_dmint_script's
+    # state) and raised if it could not. It is kept as a backstop, so that if the checks above
+    # are reordered, an unreadable script is still refused here with a V1-mint message.
+    try:
+        script_state = DmintState.from_script(contract_utxo.script)
+    except ValidationError as exc:
+        raise ValidationError(f"V1 mint: contract_utxo.script is not a dMint contract script ({exc})") from exc
+    if script_state != state:
+        raise ValidationError(
+            "V1 mint: contract_utxo.state does not match the state contract_utxo.script carries "
+            f"(state height {state.height}, script height {script_state.height}); build the state with "
+            "DmintState.from_script(contract_utxo.script)."
+        )
+    # The final mint recreates no contract (see build_dmint_mint_tx), so the recreated
+    # output's value rule below does not apply to it.
+    is_final_mint = state.next_mint_is_final
+    if not is_final_mint and contract_utxo.value != 1:
         # The V1 covenant's continue branch enforces
         # ``OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`` on the recreated contract
         # output, and the mint preserves ``contract_utxo.value``. So a contract
@@ -2415,7 +2491,16 @@ def _build_dmint_v1_mint_tx(
     # followed by every state byte after the height push, copied as-is (``c0 eb 55 7f 77 7e``),
     # and requires the recreated output to carry exactly that. pyrxd rebuilds the next state from
     # the parsed fields instead, so the two agree only if the spent state is what pyrxd's builder
-    # writes for those fields — check that before any grind, as the V2 path does.
+    # writes for those fields.
+    #
+    # The comparison below cannot fire today; two checks above refuse every input that would
+    # reach it. _unmintable_reason refuses a maxHeight, reward or target push that is not the
+    # minimal push of its number, and the state/script check above refuses a ``state`` that is
+    # not the one the script carries. A script that passes both has ``state`` as its parse and
+    # minimal number pushes; its height push is always ``04`` + 4 bytes and its refs are
+    # fixed-width, so build_dmint_v1_state_script, where it builds at all, rebuilds exactly its
+    # bytes. It is kept as a backstop: if either check above is weakened or moved, this one still
+    # refuses before any grind.
     spent_state = build_dmint_v1_state_script(
         height=state.height,
         contract_ref=state.contract_ref,
@@ -2448,15 +2533,20 @@ def _build_dmint_v1_mint_tx(
     )
 
     # --- Output scripts ---
-    contract_script = build_dmint_v1_contract_script(
-        height=new_height,
-        contract_ref=state.contract_ref,
-        token_ref=state.token_ref,
-        max_height=state.max_height,
-        reward=state.reward,
-        target=state.target,
-        algo=state.algo,
-    )
+    if is_final_mint:
+        # build_dmint_v1_contract_script refuses height >= max_height, and rightly: no
+        # contract is recreated here. The epilogue's final branch wants the burn instead.
+        contract_script = build_dmint_contract_burn_script(state.contract_ref)
+    else:
+        contract_script = build_dmint_v1_contract_script(
+            height=new_height,
+            contract_ref=state.contract_ref,
+            token_ref=state.token_ref,
+            max_height=state.max_height,
+            reward=state.reward,
+            target=state.target,
+            algo=state.algo,
+        )
     # The 75-byte FT-wrapped reward — load-bearing for the V1 covenant's
     # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check.
     reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
@@ -2549,8 +2639,9 @@ def _build_dmint_v1_mint_tx(
     # 8-byte satoshi field is fixed-width regardless), only on its
     # script length — so the trial measurement matches the final size
     # exactly.
+    contract_out_value = 0 if is_final_mint else contract_utxo.value  # the burn carries nothing
     trial_outputs = [
-        TransactionOutput(Script(contract_script), contract_utxo.value),
+        TransactionOutput(Script(contract_script), contract_out_value),
         TransactionOutput(Script(reward_script), state.reward),
     ]
     if op_return_script:
@@ -2567,8 +2658,9 @@ def _build_dmint_v1_mint_tx(
     #   - the FT reward output's photons (state.reward, FT carrier value on vout[1])
     #   - the tx fee (size × fee_rate)
     #   - the change output back to miner_pkh
+    # On the final mint the contract's own photon is released into the change too.
     fee = len(tx.serialize()) * fee_rate
-    change_value = funding_utxo.value - state.reward - fee
+    change_value = funding_utxo.value + contract_utxo.value - contract_out_value - state.reward - fee
     # pyrxd POLICY floor — see the V2 path above. Radiant's own floor is 1 photon.
     if change_value < DUST_THRESHOLD_PHOTONS:
         raise PoolTooSmallError(
@@ -2586,6 +2678,7 @@ def _build_dmint_v1_mint_tx(
         contract_script=contract_script,
         reward_script=reward_script,
         fee=fee,
+        is_final_mint=is_final_mint,
     )
 
 

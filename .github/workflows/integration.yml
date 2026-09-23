@@ -240,7 +240,9 @@ jobs:
           # Per-mine ceiling. The default 1800 s is sized for a developer box; a 4-vCPU
           # runner is several times slower and the grind's variance is wide (the V1
           # deploy+mint measured 80 s and 219 s on consecutive runs of the same box), so
-          # the default would turn a slow draw into a red nightly.
+          # the default would turn a slow draw into a red nightly. The V2 suite applies it
+          # per difficulty-1 grind and scales it by each grind's difficulty
+          # (`_grind_timeout_s`), so its MAX/4 grinds get four times this.
           DMINT_MINE_TIMEOUT_S: "3600"
         run: |
           poetry run pytest -o "addopts=" -m integration -q \

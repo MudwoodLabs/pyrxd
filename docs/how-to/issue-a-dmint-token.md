@@ -199,7 +199,12 @@ contract for the token. The command:
    broadcasts.
 
 On success it prints the mint txid; the contract is recreated at
-`height + 1` for the next claim.
+`height + 1` for the next claim. The exception is the contract's last mint
+(`height + 1 == max_height`): the covenant requires that mint to burn the
+contract output (`d8 <contractRef> 6a` in its place) rather than recreate it,
+so nothing can mint that contract afterwards. `claim-dmint` builds it that way,
+says so in the summary it prints before mining, and reports `final_mint` in
+its `--json` result.
 
 ### Mining notes
 

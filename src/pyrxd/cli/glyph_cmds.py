@@ -2736,20 +2736,18 @@ def claim_dmint_cmd(
     # funding, reward, network) are known now; only the final txid/nonce are not.
     # This fails fast for --json-without--yes and avoids a hostile re-prompt after
     # a long walk-away. (Deviation from the per-broadcast gate; see the module docstring.)
-    _confirm_or_abort(
-        ctx,
-        [
-            _BroadcastSummary(
-                title="Mint (dMint claim)",
-                lines=[
-                    f"contract:    {contract_utxo.txid}:{contract_utxo.vout} (height {contract_utxo.state.height} -> {contract_utxo.state.height + 1})",
-                    f"reward:      {contract_utxo.state.reward:,} photons of the FT",
-                    f"funding:     {funding.txid}:{funding.vout} ({funding.value:,} photons)",
-                    f"network:     {ctx.network}",
-                ],
-            ),
-        ],
-    )
+    summary_lines = [
+        f"contract:    {contract_utxo.txid}:{contract_utxo.vout} (height {contract_utxo.state.height} -> {contract_utxo.state.height + 1})",
+        f"reward:      {contract_utxo.state.reward:,} photons of the FT",
+        f"funding:     {funding.txid}:{funding.vout} ({funding.value:,} photons)",
+        f"network:     {ctx.network}",
+    ]
+    if contract_utxo.state.next_mint_is_final:
+        summary_lines.append(
+            f"final mint:  height {contract_utxo.state.max_height} is this contract's last; this mint burns "
+            "the contract output, so nothing can mint it afterwards"
+        )
+    _confirm_or_abort(ctx, [_BroadcastSummary(title="Mint (dMint claim)", lines=summary_lines)])
 
     is_v2 = not contract_utxo.state.is_v1
     nonce_width = 8 if is_v2 else 4
@@ -2914,6 +2912,8 @@ def claim_dmint_cmd(
         "contract": f"{contract_utxo.txid}:{contract_utxo.vout}",
         "reward": contract_utxo.state.reward,
         "new_height": contract_utxo.state.height + 1,
+        # From the transaction actually built, not re-derived: output 0 is the burn.
+        "final_mint": mint.is_final_mint,
     }
     if ctx.output_mode == "json":
         click.echo(emit(result, mode="json"))
@@ -2922,9 +2922,16 @@ def claim_dmint_cmd(
     else:
         click.echo("\ndMint claimed!")
         click.echo(f"  mint txid:  {mint_txid}")
-        click.echo(
-            f"  reward:     {contract_utxo.state.reward:,} photons (contract now at height {result['new_height']})"
-        )
+        if mint.is_final_mint:
+            click.echo(
+                f"  reward:     {contract_utxo.state.reward:,} photons (the final mint: height "
+                f"{result['new_height']} of {contract_utxo.state.max_height}; this transaction burns the "
+                "contract output, so the contract cannot be minted again)"
+            )
+        else:
+            click.echo(
+                f"  reward:     {contract_utxo.state.reward:,} photons (contract now at height {result['new_height']})"
+            )
 
 
 def _grind_stopped_error(

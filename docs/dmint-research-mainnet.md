@@ -117,14 +117,14 @@ across all seven.
 | 116 | `bc 0114 7f 77` | OP_REVERSEBYTES PUSH(0x14) OP_SPLIT OP_NIP | Drop the top 20 bytes of the reversed digest (keep only the low 12 bytes to compare) |
 | 121 | `58 7f` | OP_8 OP_SPLIT | Split off the leading 8 bytes for the "leading-zero" check |
 | 123 | `04 00000000 88` | PUSH(4 zeros) OP_EQUALVERIFY | Require the top 4 reversed bytes to be zero (standard work-prefix check) |
-| 129 | `81 76 00 a2 69 a2 69` | OP_NEGATE OP_DUP OP_0 OP_GEQ OP_VERIFY OP_GEQ OP_VERIFY | Target-comparison epilogue — the pow-hash low 8 bytes must be ≤ the pushed target |
-| 136 | `57 7a e5 00 a0 69` | OP_7 OP_ROLL OP_CODESCRIPTHASHOUTPUTCOUNT_UTXOS OP_0 OP_GREATERTHAN OP_VERIFY | ≥1 input with matching codescript hash (the contract input itself) |
-| 142 | `56 7a e6 00 a0 69` | OP_6 OP_ROLL OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS OP_0 OP_GREATERTHAN OP_VERIFY | ≥1 output with matching codescript hash (the recreated contract) |
+| 129 | `81 76 00 a2 69 a2 69` | OP_BIN2NUM OP_DUP OP_0 OP_GREATERTHANOREQUAL OP_VERIFY OP_GREATERTHANOREQUAL OP_VERIFY | Target comparison — the pow-hash's 8-byte window, read as a number, must be ≥ 0 and ≤ the pushed target |
+| 136 | `57 7a e5 00 a0 69` | OP_7 OP_ROLL OP_CODESCRIPTHASHOUTPUTCOUNT_UTXOS OP_0 OP_GREATERTHAN OP_VERIFY | Roll the scriptSig's **inputHash** up (row 105 put a copy of it into the PoW preimage) and require ≥1 spent input whose code-script hash equals it. It is the **funding input** that meets this, not the contract input: inputHash is `SHA256d(funding script)`, and a P2PKH has no state separator, so its code script is the whole script. In 434 of 434 mainnet V1 final mints checked, inputHash equals the code-script hash of input 1, the funding input, and of no other input; so do the five final mints and the one ordinary mint in `tests/fixtures/dmint_v1_final_mints_mainnet.json` |
+| 142 | `56 7a e6 00 a0 69` | OP_6 OP_ROLL OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS OP_0 OP_GREATERTHAN OP_VERIFY | Roll the scriptSig's **outputHash** up and require ≥1 output whose code-script hash equals it. It is the **OP_RETURN message output** that meets this, not a recreated contract (the final mint recreates none): outputHash is `SHA256d(OP_RETURN script)`, the output the PoW preimage binds. In 434 of 434 mainnet V1 final mints checked, outputHash equals the code-script hash of output 2, the OP_RETURN, and of no other output; so do the six transactions in that fixture |
 | 148 | `01 d0 53 79 7e 0c dec0e9aa76e378e4a269e69d 7e aa` | | Build the expected code-script prefix bytes (prepends `0xd0`, appends the 12-byte fingerprint `dec0e9aa76e378e4a269e69d`) then HASH256 — this is the codescript-hash pre-image the FT output must carry |
 | 168 | `76 e4 7b 9d` | OP_DUP OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_ROT OP_NUMEQUALVERIFY | **FT conservation** — sum of output photons under this codescript must equal the value rolled from state (reward). This is the core covenant enforcing per-mint emission. |
-| 172 | `54 7a 81 8b` | OP_4 OP_ROLL OP_NEGATE OP_NUMEQUALVERIFY | Verify the new contract's height equals old-height + 1 (encoded as `-oldHeight` NUMEQUALVERIFY pattern after the +1 fold) |
-| 176 | `76 53 7a 9c 53 7a de 78 91 81 54 7a e6 93 9d 63` | | Branch: singleton‐continue (IF maxHeight not reached) vs burn (ELSE) — uses `OP_REFTYPE_UTXO` and `OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS` |
-| 191 | `63 … 67 … 68` | OP_IF / OP_ELSE / OP_ENDIF | The full branch is 46 bytes (offsets 191–236) and covers: if still mintable → require an output that re-pushes the contract's `d8` singleton and has the contract codescript; else → require the singleton to appear in an `OP_RETURN 0x6a` burn output. |
+| 172 | `54 7a 81 8b` | OP_4 OP_ROLL OP_BIN2NUM OP_1ADD | Compute `newHeight`: roll the spent state's 4-byte height to the top, read it as a number, add 1. It verifies nothing; the rows below use it |
+| 176 | `76 53 7a 9c 53 7a de 78 91 81 54 7a e6 93 9d` | | `isFinal = (newHeight == maxHeight)`; the token ref must appear in exactly (FT outputs + `!isFinal`) outputs (`OP_REFOUTPUTCOUNT_OUTPUTS` = `OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS` + `!isFinal`) |
+| 191 | `63 … 67 … 68` | OP_IF / OP_ELSE / OP_ENDIF | `OP_IF isFinal`. The full branch is 47 bytes: `OP_IF` at 191, `OP_ELSE` at 204, `OP_ENDIF` at 237. IF — the final mint, `newHeight == maxHeight` — requires the output at the scriptSig's output index to be exactly `d8 <contractRef> 6a` (`OP_PUSHINPUTREFSINGLETON <contractRef> OP_RETURN`, a burn). ELSE — still mintable — requires the contract ref in exactly one output, whose state script is the spent one with the height replaced, whose codescript is the spent one's, and whose value is 1. |
 | 238 | `6d 75 51` | OP_2DROP OP_DROP OP_1 | Final cleanup, leave TRUE on stack |
 
 Total: **241 bytes**, **131 opcodes**.
@@ -190,9 +190,11 @@ bc01147f77587f 04 00000000 88
 | 43–74 | 32 B | tokenRef txid | fixed per deployment |
 | 87–94 | 8 B LE | difficulty target | fixed at deploy time (this contract is `fixed` mode; for ASERT/LWMA this would be updated each mint, but see below) |
 
-For a builder, the only thing that needs to move on each mint is the
-4-byte height push at offsets 1–4. Everything else is static for the
-contract's lifetime.
+For a builder, the only thing that needs to move on each mint that
+recreates the contract is the 4-byte height push at offsets 1–4.
+Everything else is static for the contract's lifetime. The final mint
+(`height + 1 == maxHeight`) recreates no contract: its output 0 is the
+burn `d8 <contractRef> 6a` at value 0 (the IF branch at offset 191).
 
 ---
 
