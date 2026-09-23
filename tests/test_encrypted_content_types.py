@@ -179,3 +179,82 @@ class TestEncryptedContentStub:
             ),
         )
         assert EncryptedContentStub.from_dict(stub.to_dict()) == stub
+
+
+# ──────────────────────────────── empty content, as Photonic encodes it ──
+
+
+class TestEmptyContentAsPhotonicEncodesIt:
+    """Zero bytes of content are ZERO chunks to Photonic, and pyrxd refused that.
+
+    Photonic's `encryptChunked` computes `Math.ceil(plaintext.length / CHUNK_SIZE)`, so a
+    0-byte `encryptContent` records `main: {size: 0, chunks: 0}` and no ciphertext at all.
+    `EncryptionMetadata.from_dict` refused any `chunks < 1` as "nonsensical", and
+    `decode_payload` logs and DROPS a field that fails to parse, so a Photonic-minted empty
+    token decoded with no `encrypted_main` — a guard refusing honest output.
+
+    Zero chunks is only sensible with zero bytes. `{size: 0, chunks: 0}` is accepted; zero
+    chunks with any content is still refused, as is a negative count. pyrxd itself still
+    writes one empty chunk for empty content (`encrypt_chunked`), and that stays readable.
+
+    `app_encrypt_content_recipient_empty` is Photonic's real output, generated through its app
+    service by `scripts/gen-photonic-vectors/gen-app-path-vector.ts` and decrypted by its own
+    `decryptContent` before it was written.
+    """
+
+    @pytest.fixture()
+    def v(self, photonic_vectors) -> dict:
+        return photonic_vectors["app_encrypt_content_recipient_empty"]
+
+    def test_the_vector_is_photonics_zero_chunk_encoding(self, v):
+        """The premise, read from the vector rather than assumed."""
+        assert v["metadata"]["main"]["size"] == 0
+        assert v["metadata"]["main"]["chunks"] == 0
+        assert v["encrypted_content"] == ""
+        assert v["photonic_commit"] == "becf41a731e78ab98fdd88652527d7dda12784c6"
+
+    def test_pyrxd_reads_photonics_empty_content_and_opens_it(self, v):
+        from pyrxd.crypto.aead import ChunkedCiphertext, decrypt_chunked
+        from pyrxd.crypto.kem import unwrap_cek_x25519
+        from pyrxd.glyph.timelock import cek_wrap_aad, parse_cek_hash
+
+        stub = EncryptedContentStub.from_dict(v["metadata"])
+        assert (stub.main.size, stub.main.chunks) == (0, 0)
+        assert stub.to_dict() == v["metadata"], "read back must not reshape Photonic's fields"
+        (rec,) = stub.crypto.recipients
+        cek = unwrap_cek_x25519(
+            rec.wrapped_cek,
+            rec.epk,
+            bytes.fromhex(v["recipient_sk"]),
+            cek_wrap_aad(stub.crypto.cek_hash),
+            allow_legacy_info=False,
+        )
+        plaintext_hash = parse_cek_hash(stub.main.hash)
+        assert decrypt_chunked(ChunkedCiphertext(chunks=[], plaintext_hash=plaintext_hash), cek, plaintext_hash) == b""
+
+    def test_decode_payload_keeps_it_instead_of_dropping_it(self, v):
+        """Through the production read path: the field used to be logged and dropped here."""
+        import cbor2
+
+        from pyrxd.glyph.payload import decode_payload
+
+        m = decode_payload(cbor2.dumps(v["metadata"], canonical=True))
+        assert m.encrypted_main is not None, "Photonic's empty encrypted main was dropped"
+        assert (m.encrypted_main.size, m.encrypted_main.chunks) == (0, 0)
+
+    def test_pyrxds_own_one_empty_chunk_is_still_read(self):
+        m = EncryptionMetadata.from_dict({"type": "x", "hash": "sha256:" + "ab" * 32, "size": 0, "chunks": 1})
+        assert (m.size, m.chunks) == (0, 1)
+
+    @pytest.mark.parametrize("size", [1, 70_000])
+    def test_zero_chunks_with_content_is_still_refused(self, size):
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="nonsensical size/chunks"):
+            EncryptionMetadata.from_dict({"type": "x", "hash": "sha256:" + "ab" * 32, "size": size, "chunks": 0})
+
+    def test_a_negative_chunk_count_is_still_refused(self):
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="nonsensical size/chunks"):
+            EncryptionMetadata.from_dict({"type": "x", "hash": "sha256:" + "ab" * 32, "size": 0, "chunks": -1})

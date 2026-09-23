@@ -20,10 +20,20 @@ reports to find out why.
 from __future__ import annotations
 
 import math
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
-from pyrxd.security.json_guards import finite_int, hex_str, merkle_branch, nonneg_int, require_bool
+from pyrxd.security.json_guards import (
+    MAX_EXACT_FLOAT_INT,
+    cbor_int,
+    finite_int,
+    hex_str,
+    merkle_branch,
+    nonneg_int,
+    require_bool,
+)
 
 
 class TestFiniteInt:
@@ -140,3 +150,44 @@ class TestMerkleBranch:
     def test_a_sibling_of_the_wrong_width_is_refused(self) -> None:
         with pytest.raises(ValueError, match="expected a 32-byte hex string"):
             merkle_branch(["ab" * 31])
+
+
+class TestCborInt:
+    """``cbor_int`` — an integer decoded from untrusted CBOR, typed BEFORE any coercion.
+
+    Tested here, inside the 100%-coverage gate's scope, for the reason the module docstring
+    gives: the CLI tests that exercise it (``tests/cli/test_glyph_inspect_hostile_integers.py``)
+    cannot satisfy a gate that runs ``tests/security`` and nothing else. That is exactly how this
+    function first reached CI at 72%.
+    """
+
+    def test_an_int_passes_through(self) -> None:
+        assert cbor_int(7) == 7
+        assert cbor_int(-7) == -7
+        assert cbor_int(2**80) == 2**80  # width is the CALLER's range check, not this one's
+
+    @pytest.mark.parametrize("value", [5e9, float(MAX_EXACT_FLOAT_INT), -float(MAX_EXACT_FLOAT_INT), 0.0])
+    def test_a_whole_float_up_to_2_53_is_the_integer_it_is(self, value) -> None:
+        """The honest path: cbor-x writes every JS number of 2**32 or more as a float64."""
+        assert cbor_int(value) == int(value)
+
+    @pytest.mark.parametrize(
+        ("value", "reason"),
+        [
+            (True, "a boolean is not an integer"),
+            (float("inf"), "non-finite"),
+            (float("nan"), "non-finite"),
+            (1.5, "fractional part"),
+            (float(MAX_EXACT_FLOAT_INT + 2), "cannot hold an exact integer"),
+            (-float(MAX_EXACT_FLOAT_INT + 2), "cannot hold an exact integer"),
+            (Decimal("1E+1000000"), "a Decimal is not an integer"),
+            (Fraction(7, 1), "a Fraction is not an integer"),
+            ("7", "a str is not an integer"),
+            (b"7", "a bytes is not an integer"),
+            (None, "a NoneType is not an integer"),
+        ],
+        ids=repr,
+    )
+    def test_everything_else_is_refused_with_its_reason(self, value, reason) -> None:
+        with pytest.raises(ValueError, match=reason):
+            cbor_int(value)

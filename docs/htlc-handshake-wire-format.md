@@ -121,7 +121,7 @@ The taker's public key material, so the maker can build the covenant and the tap
 | `taker_btc_refund_xonly_hex` | 64-hex | BTC only | Taker's x-only key for the BTC refund leaf. |
 | `eth_taker_refund_addr` | `0x`+40-hex | ETH only | Taker's address; becomes the contract's immutable `refundee`. |
 
-Source: `scripts/btc_swap_two_host.py:435-439`, `scripts/eth_swap_two_host.py:637`.
+Source: `scripts/btc_swap_two_host.py:435-439`, `scripts/eth_swap_two_host.py:635`.
 
 ### 2. `envelope` (maker → taker)
 
@@ -728,7 +728,7 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 `RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:478`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
-text warning that real value must set it deep (`scripts/btc_swap_two_host.py:939-944`). A
+text warning that real value must set it deep (`scripts/btc_swap_two_host.py:937-942`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it
 after the taker has locked strands the taker's counter leg.
 

@@ -104,7 +104,7 @@ Control surfaces target the upper rows; A6 is intentionally exportable; A10 is u
 
 **Goals:** Selective service denial (refuse to broadcast a tx, drop history queries), inducing wallet to derive new addresses (privacy attack), trickery to lure UTXOs into a malformed tx (limited by client-side validation).
 
-**Reach:** Significant for privacy, limited for theft. The default config uses one public ElectrumX server (`electrumx.radiant4people.com`) which is a single point of trust.
+**Reach:** Significant for privacy, limited for theft. The default mainnet config ships two public ElectrumX servers run by different operators (`network/registry.py`: `electrumx.radiant4people.com` and `electrumx.radiantcore.org`). What the second one buys is narrow. It is **failover, not a quorum**: `FailoverElectrumXClient` retries a call on the next server only when the first fails at the transport level, so an ordinary read (balance, UTXOs, history, confirmations, headers) is still whatever the one answering server says, and a hostile primary is still a single point of trust for it. The one place pyrxd uses the pair as two *independent* sources is HashMark §7.6 form 2 (`glyph inspect --wave-name`, `verify --wave-name`): the name binding and the mark's block height must come from different servers, and so must a mutable glyph's chain candidates and the proof its tip is unspent — which bounds what one hostile server can move, and does not help if both servers lie together. testnet and regtest ship no server at all.
 
 ### TA6: Hostile Bitcoin data source
 

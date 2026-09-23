@@ -6,7 +6,8 @@
 #
 # Hooks installed:
 #   pre-push  — runs the FAST local checks (`task ci-fast`: lint, format-check,
-#               typecheck, private-link guard) before every push. NOT the full
+#               typecheck, private-link guard) before every push, then scans every
+#               line the pushed commits add for the same leaks. NOT the full
 #               matrix: this header used to say `task ci`, contradicting the hook
 #               it installs, which explains at length why the full suite here is
 #               actively wrong — git opens the remote connection ~1s before the

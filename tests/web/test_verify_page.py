@@ -47,6 +47,8 @@ from pathlib import Path
 
 import pytest
 
+from pyrxd.script.hashmark import HashMarkOutcome
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HARNESS = _REPO_ROOT / "tests" / "web" / "verify_render_harness.mjs"
 _STATIC = _REPO_ROOT / "docs" / "inspect_static"
@@ -301,9 +303,23 @@ class TestTheHeadlineAndTheAnswerAgree:
         """The riskiest sentence on the page is the one under an affirmative result
         that says what it MEANS. It inherits the authority of the verdict while
         asserting something nobody checked."""
-        text = _page(_as_script_result(_payload_with_status("valid")))["text"]
-        assert "key custody and nothing more" in text
-        assert "does not say they wrote the file, own it, or were first to it" in text
+        flat = " ".join(_page(_as_script_result(_payload_with_status("valid")))["text"].split())
+        assert "does not say they wrote the file, own it, or were first to it" in flat
+
+    def test_a_verified_mark_does_not_claim_its_signer_put_it_here(self) -> None:
+        """ON THE RENDERED PAGE, not in a comment. The page said "key custody, nothing more" and
+        "That is key custody and nothing more" under a verified signature — and a signed record
+        can be copied into anyone's transaction, so a verified signature does not show that its
+        key's holder published THIS one. The same meaning `pyrxd verify` prints, pinned the same
+        way: the overstated word is gone, and the copy is named."""
+        rendered = _render({"case": {"result": _as_tx_result(_payload_with_status("valid"))}})
+        flat = " ".join(rendered["case"]["text"].split())
+        assert "custody" not in flat.lower(), "the overstated claim is still rendered"
+        assert "It does not show that they put this mark here" in flat
+        assert "a signed record can be copied, byte for byte, into anyone's transaction" in flat
+        shared = rendered["__constants__"]["what_a_mark_proves"]
+        assert shared in flat and "custody" not in shared.lower()
+        assert "a signed record can be copied into anyone's transaction" in shared
 
     def test_a_failed_signature_says_recovers_to_rather_than_belongs_to(self) -> None:
         """THE PARENTHETICAL UNDER A RESULT, which is where this page's riskiest text
@@ -845,3 +861,517 @@ class TestALookupThatFailedSaysWhichWayItFailed:
         assert not unhandled, f"the wire emits kinds the page has no branch for: {sorted(unhandled)}"
         stale = page_kinds - wire_kinds
         assert not stale, f"the page branches on kinds nothing emits: {sorted(stale)}"
+
+
+# ───────────────────── every decode outcome, in the words `pyrxd verify` uses ──
+
+
+def _push(b: bytes) -> bytes:
+    return bytes([len(b)]) + b
+
+
+def _record_script(header: bytes, digest: bytes) -> bytes:
+    return b"\x6a" + _push(b"HASHMARK") + _push(header) + _push(digest)
+
+
+def _signed_script(content: bytes) -> bytes:
+    """A real v2 record over ``content``, signed by a key generated here."""
+    import hashlib
+
+    from pyrxd.constants import genesis_hash_for
+    from pyrxd.hashmark_tx import plan_hashmark
+    from pyrxd.keys import PrivateKey
+
+    digest = hashlib.sha256(content).digest()
+    return plan_hashmark(
+        digest, PrivateKey(), label="quarterly report", network_genesis=genesis_hash_for("mainnet")
+    ).op_return_script
+
+
+def _with_bad_label(script: bytes) -> bytes:
+    """The same record with a control character in its label. §5.4 makes that non-canonical,
+    and the label is inside the signed statement, so the decoder refuses the whole record."""
+    hostile = b"quarterly\x1breport"[: len(b"quarterly report")]
+    assert len(hostile) == len(b"quarterly report")
+    out = bytearray(script)
+    at = out.rfind(b"quarterly report")
+    out[at : at + len(hostile)] = hostile
+    return bytes(out)
+
+
+#: One REAL script per decode outcome. Keyed by the enum member, and compared against the
+#: enum in both directions below, so an outcome added upstream fails here instead of being
+#: silently left out of the parametrisation.
+_OUTCOME_SCRIPTS = {
+    "ok": lambda: _signed_script(b"the advisory, as published\n"),
+    "not_hashmark": lambda: b"\x6a" + _push(b"NOTAMARK") + _push(b"\x01" * 8),
+    "invalid": lambda: _record_script(bytes([1, 1]), b"\x22" * 20),  # sha256 names 32 bytes; 20 here
+    "unknown_version": lambda: _record_script(bytes([9, 1]), b"\x11" * 32),
+    "unknown_algorithm": lambda: _record_script(bytes([1, 0x7F]), b"\x11" * 32),
+}
+
+
+def _glue():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pyrxd_inspect_glue", _INSPECT_DIR / "glue.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pyrxd_inspect_glue"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tx_result(*scripts: bytes, limit: int | None = None) -> tuple[str, bytes, dict]:
+    """A real transaction carrying ``scripts``, classified by the page's own Python entry point
+    (``glue.inspect_txid_with_raw``) — the exact dict ``verify.js`` receives in the browser.
+    ``limit`` is the attestation limit the page passes (``MAX_MARK_PANELS``); ``None`` checks all."""
+    from tests.test_hashmark_verify_cli import _tx_with
+
+    txid, raw = _tx_with(*scripts)
+    result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", limit)
+    assert result["ok"], result
+    return txid, raw, result
+
+
+def _cli_word(monkeypatch, tmp_path, txid: str, raw: bytes) -> str | None:
+    """What `pyrxd verify` — the real command — calls this record. ``None`` when it finds no
+    record at all. Read from ``--json``, so a change to the human layout cannot move it."""
+    from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+    r = _run(
+        monkeypatch,
+        _FakeServer({txid: raw}),
+        ["--json", "verify", txid, "--min-confirmations", "1"],
+        tmp_path=tmp_path,
+    )
+    if r.exit_code == 1 and "no HashMark record" in r.output:
+        return None
+    return json.loads(r.stdout)["checks"]["signature"]["state"]
+
+
+def _first_verdict_class(classes: list[str]) -> str:
+    return next(c for c in classes if c.split()[0] == "verdict")
+
+
+class TestEveryDecodeOutcomeReadsAsPyrxdVerifyReadsIt:
+    """A record the decoder calls malformed was a grey "NOT CHECKED" here, with "That is not a
+    sign that anything is wrong with it", while `pyrxd verify` called the same bytes RECORD
+    DOES NOT DECODE and failed its verdict. The page and the command a reader is pointed to must
+    not describe one record two ways — so this runs BOTH, over one real script per outcome."""
+
+    def test_there_is_a_script_for_every_outcome_and_no_other(self) -> None:
+        """NON-VACUITY, both directions. The parametrisation below is the enum itself; this is
+        what makes a missing script fail loudly rather than skip."""
+        assert set(_OUTCOME_SCRIPTS) == {o.value for o in HashMarkOutcome}
+        assert len(HashMarkOutcome) >= 5, "the enum shrank — re-read what this test is for"
+
+    @pytest.mark.parametrize("outcome", [o.value for o in HashMarkOutcome])
+    def test_the_page_prints_the_word_the_command_prints(self, monkeypatch, tmp_path, outcome) -> None:
+        from pyrxd.cli.hashmark_cmds import _CHECK_HOLDS
+        from pyrxd.script.hashmark import decode_hashmark
+
+        script = _OUTCOME_SCRIPTS[outcome]()
+        assert decode_hashmark(script).outcome.value == outcome, "the premise: these bytes reach this outcome"
+        txid, raw, result = _tx_result(script)
+        cli = _cli_word(monkeypatch, tmp_path, txid, raw)
+        rendered = _page(result)
+
+        if outcome == "not_hashmark":
+            assert cli is None, "the command found a record the decoder says is not one"
+            assert rendered["panels"] == [] and "There is no HashMark here" in rendered["text"]
+            return
+
+        assert cli, "the command printed no signature state — this comparison is vacuous"
+        assert rendered["statuses"], "the page printed no verdict — this comparison is vacuous"
+        assert rendered["statuses"][0] == cli, (
+            f"{outcome}: the page says {rendered['statuses'][0]!r} and `pyrxd verify` says {cli!r} "
+            "about the same record"
+        )
+        # AND THE COLOUR AGREES WITH THE COMMAND'S VERDICT. A word the command fails on must
+        # not be painted in the colour of "nothing wrong"; a word it holds on must not be red.
+        painted = _first_verdict_class(rendered["classes"])
+        assert ("verdict-bad" in painted) == (cli not in _CHECK_HOLDS), (outcome, cli, painted)
+
+
+class TestAMalformedRecordIsNotAFutureRecord:
+    def test_it_says_malformed_in_the_error_colour_and_does_not_reassure(self) -> None:
+        _txid, _raw, result = _tx_result(_OUTCOME_SCRIPTS["invalid"]())
+        rendered = _page(result)
+        assert rendered["statuses"][0] == "RECORD DOES NOT DECODE"
+        assert "verdict-bad" in _first_verdict_class(rendered["classes"])
+        flat = " ".join(rendered["text"].split())
+        assert "is malformed" in flat and "nothing in them" in flat and "can be relied on" in flat
+        for reassurance in ("That is not a sign that anything is wrong", "newer version"):
+            assert reassurance not in flat, f"a malformed record is told {reassurance!r}"
+
+    @pytest.mark.parametrize("outcome", ["unknown_version", "unknown_algorithm"])
+    def test_a_record_from_the_future_keeps_the_neutral_panel(self, outcome) -> None:
+        """The honest pair: these ARE well-formed and newer, and the reassurance is true of them."""
+        _txid, _raw, result = _tx_result(_OUTCOME_SCRIPTS[outcome]())
+        rendered = _page(result)
+        assert rendered["statuses"][0] == "NOT CHECKED"
+        assert "verdict-unchecked" in _first_verdict_class(rendered["classes"])
+        flat = " ".join(rendered["text"].split())
+        assert "newer version" in flat and "not a sign that anything is wrong" in flat
+        # And not an endorsement: a forged record with its algorithm byte changed lands here.
+        assert "it is not evidence of anything either" in flat
+
+    def test_a_decode_breaking_defect_does_not_move_a_forgery_out_of_the_error_colour(self) -> None:
+        """THE DOWNGRADE. A forged record is red. Add a defect that breaks its DECODE (here, a
+        control character in the signed label) and it used to become the grey "cannot read this —
+        nothing is wrong with it" panel. It stays red now.
+
+        What this does NOT cover, on purpose: changing the forged record's version byte to 9, or
+        its algorithm byte to an unknown one, makes a WELL-FORMED record from the future, and that
+        still reads NOT CHECKED — the spec separates it from a broken record and `pyrxd verify`
+        says the same. `TestAMalformedRecordIsNotAFutureRecord` pins that it says it is not
+        evidence of anything."""
+        forged = bytearray(_signed_script(b"the advisory, as published\n"))
+        forged[20] ^= 0x01  # one bit of the digest: well-formed, and the signature no longer holds
+        _t, _r, as_forged = _tx_result(bytes(forged))
+        _t, _r, as_broken = _tx_result(_with_bad_label(bytes(forged)))
+        first, second = _page(as_forged), _page(as_broken)
+        assert first["statuses"][0] == "DOES NOT VERIFY", "the premise: the forgery reaches the red verdict"
+        assert second["statuses"][0] == "RECORD DOES NOT DECODE", "the premise: the label defect breaks the decode"
+        for rendered in (first, second):
+            assert "verdict-bad" in _first_verdict_class(rendered["classes"])
+        assert "not a sign that anything is wrong" not in second["text"]
+
+    def test_an_outcome_nobody_has_heard_of_is_neutral_and_does_not_reassure(self) -> None:
+        payload = {"type": "op_return", "hashmark": {"outcome": "from_the_year_3000", "detail": "?"}}
+        rendered = _page(_as_script_result(payload))
+        assert rendered["statuses"][0] == "NOT CHECKED"
+        assert "verdict-unchecked" in _first_verdict_class(rendered["classes"])
+        assert "not a sign that anything is wrong" not in rendered["text"]
+        assert "from_the_year_3000" in rendered["text"], "it says what the decoder reported"
+
+
+class TestTheInspectorDoesNotGreyOutAMalformedRecordEither:
+    """THE SIBLING. /inspect/ renders the decoder's own outcome name, INVALID, through the same
+    `verdictClass` — and it was grey there too. Its word stays (the developer view shows the
+    decoder's vocabulary); its colour is the one that must not reassure."""
+
+    def test_invalid_is_red_and_a_future_record_is_not(self) -> None:
+        node = shutil.which("node") or _require_node()
+        script = (
+            "const fs=require('node:fs'),vm=require('node:vm');"
+            "const s={console,document:{getElementById:()=>({}),querySelectorAll:()=>[]}};"
+            "s.globalThis=s;vm.createContext(s);"
+            f"vm.runInContext(fs.readFileSync({str(_INSPECT_DIR / 'shared.js')!r},'utf8'),s);"
+            "console.log(JSON.stringify(['INVALID','UNKNOWN VERSION','UNKNOWN ALGORITHM','RECORD DOES NOT DECODE']"
+            ".map((w)=>s.verdictClass(w))))"
+        )
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)  # nosec B603
+        assert json.loads(out.stdout) == ["verdict-bad", "verdict-unchecked", "verdict-unchecked", "verdict-bad"]
+
+    def test_the_inspector_really_passes_the_decoder_word_to_that_function(self) -> None:
+        """The premise of the test above: /inspect/ builds its word from the outcome and hands
+        it to `verdictBlock`, which is `verdictClass`. If that path changes, re-derive this."""
+        source = (_INSPECT_DIR / "inspect.js").read_text(encoding="utf-8")
+        assert 'String(hm.outcome || "").toUpperCase().replace(/_/g, " ")' in source
+        assert "class: `verdict ${verdictClass(status)}`" in source
+
+
+# ───────────────────────────────────── a transaction cannot flood the page ──
+
+
+def _v1_rows(count: int) -> list[dict]:
+    """``count`` output rows exactly as the classifier emits them, from ONE real classified v1
+    record — the size of the transaction is the point here, not the variety of its records."""
+    _t, _r, result = _tx_result(_record_script(bytes([1, 1]), b"\x33" * 32))
+    template = result["payload"]["outputs"][0]
+    assert template["hashmark"]["outcome"] == "ok"
+    return [{**template, "vout": i} for i in range(count)]
+
+
+def _many(count: int) -> dict:
+    return {
+        "ok": True,
+        "form": "txid",
+        "input": "ab" * 32,
+        "payload": {"txid": "ab" * 32, "outputs": _v1_rows(count), "output_count": count},
+    }
+
+
+@pytest.fixture(scope="module")
+def limit() -> int:
+    """``MAX_MARK_PANELS``, read from verify.js through the harness rather than retyped here."""
+    n = _render({})["__constants__"]["max_mark_panels"]
+    assert isinstance(n, int), f"verify.js exposes no MAX_MARK_PANELS (got {n!r})"
+    return n
+
+
+class TestATransactionOfManyMarksCannotFloodThePage:
+    """One broadcastable transaction of ~72,000 minimal marks rendered every one of them. The
+    page now renders a bounded number and says, before and after, how many it left out."""
+
+    def test_the_limit_is_small_and_positive(self, limit) -> None:
+        assert 1 <= limit <= 100
+
+    def test_real_marks_past_the_limit_are_counted_not_rendered(self, limit) -> None:
+        scripts = [_record_script(bytes([1, 1]), bytes([i % 256]) * 32) for i in range(limit + 7)]
+        txid, _r, result = _tx_result(*scripts, limit=limit)
+        rendered = _page(result)
+        assert len(rendered["panels"]) == limit and rendered["file_inputs"] == limit
+        total = limit + 7
+        assert f"Mark {limit} of {total}" in rendered["text"]
+        assert f"Mark {limit + 1} of" not in rendered["text"]
+        flat = " ".join(rendered["text"].split())
+        assert f"This transaction carries {total} marks." in flat
+        assert f"The first {limit} are shown below; the other 7 are not shown on this page." in flat
+        # v1 records: nothing to check, and their NO SIGNATURE is free, so it is KNOWN, not unchecked.
+        assert (
+            "7 more marks are in this transaction and are not shown here. What this page knows about them: 7 NO SIGNATURE."
+            in flat
+        )
+        assert "not checked here" not in flat and "could be among them" not in flat, "nothing went unchecked"
+        assert f"To check every mark in it: pyrxd verify {txid} --min-confirmations N" in flat
+        # ORDER: the count before the first panel, the remainder after the last one.
+        assert flat.index("The first") < flat.index("Mark 1 of") < flat.index("7 more marks")
+
+    def test_the_page_does_not_grow_with_the_transaction(self, limit) -> None:
+        """THE BOUND ITSELF, at the size of the attack. 72,000 rows render exactly as much page
+        as limit+1 rows do — the same number of elements, only different numbers in the text."""
+        both = _render({"small": {"result": _many(limit + 1)}, "huge": {"result": _many(72_000)}})
+        small, huge = both["small"], both["huge"]
+        assert len(huge["panels"]) == limit == len(small["panels"])
+        assert len(huge["classes"]) == len(small["classes"]), "the page grew with the transaction"
+        assert f"{72_000 - limit} more marks are in this transaction" in " ".join(huge["text"].split())
+
+    def test_exactly_the_limit_is_all_shown_with_no_remainder_line(self, limit) -> None:
+        """The honest edge: nothing was left out, so nothing may say something was."""
+        rendered = _page(_many(limit))
+        assert len(rendered["panels"]) == limit
+        assert "more mark" not in rendered["text"] and "not shown" not in rendered["text"]
+        assert "and is checked separately below." in rendered["text"]
+
+    def test_one_past_the_limit_says_one_in_the_singular(self, limit) -> None:
+        flat = " ".join(_page(_many(limit + 1))["text"].split())
+        assert (
+            "1 more mark is in this transaction and is not shown here. What this page knows about it: 1 NO SIGNATURE."
+            in flat
+        )
+
+
+# ─────────────────────────── the WORK is bounded too, and the note says what was done ──
+
+
+def _signed_distinct(n: int) -> list[bytes]:
+    return [_signed_script(f"document {i}\n".encode()) for i in range(n)]
+
+
+class TestTheWorkIsBoundedNotOnlyTheDrawing:
+    """Drawing 50 panels bounded the DOM; the classifier still checked every signature first.
+    About 26,000 signed records fit under the 4 MB cap, and in the browser each check is a curve
+    recovery on the page's main thread. Now the page's own limit is passed to the classifier:
+    signatures past it are not checked (unless the record is a byte-for-byte copy of one that
+    was), and the note says exactly which is which."""
+
+    @pytest.fixture
+    def recoveries(self, monkeypatch) -> list:
+        """Every call the classifier makes to the real `verify_attestation` — each is a recovery."""
+        from pyrxd.glyph import _inspect_core
+
+        calls: list = []
+        real = _inspect_core.verify_attestation
+
+        def counting(record, **kw):
+            calls.append(record.signature_hex)
+            return real(record, **kw)
+
+        monkeypatch.setattr(_inspect_core, "verify_attestation", counting)
+        return calls
+
+    def test_distinct_signed_records_past_the_limit_are_not_checked(self, limit, recoveries) -> None:
+        scripts = _signed_distinct(limit + 5)
+        _t, _r, result = _tx_result(*scripts, limit=limit)
+        outcomes = [row["hashmark"]["attestation"]["outcome"] for row in result["payload"]["outputs"]]
+        assert len(recoveries) == limit, f"{len(recoveries)} signature checks for a limit of {limit}"
+        assert outcomes[:limit] == ["valid"] * limit and outcomes[limit:] == ["not_checked_here"] * 5
+
+    def test_copies_are_answered_without_another_check_with_or_without_a_limit(self, limit, recoveries) -> None:
+        """Exact, not an approximation: an attestation is a function of the bytes."""
+        one = _signed_script(b"the one document\n")
+        for lim in (limit, None):
+            recoveries.clear()
+            _t, _r, result = _tx_result(*([one] * (limit + 20)), limit=lim)
+            atts = [row["hashmark"]["attestation"] for row in result["payload"]["outputs"]]
+            assert len(recoveries) == 1, (lim, len(recoveries))
+            assert all(a == atts[0] for a in atts) and atts[0]["outcome"] == "valid"
+
+    def test_copies_do_not_share_one_mutable_attestation(self) -> None:
+        """Checked on the classifier the CLI calls, NOT through glue: glue's sanitiser rebuilds
+        every dict on the way out, so aliasing is invisible there — measured, a plant that handed
+        every copy the same dict passed the glue-level test. The CLI gets these dicts unrebuilt."""
+        from pyrxd.glyph._inspect_core import _classify_raw_tx
+        from tests.test_hashmark_verify_cli import _tx_with
+
+        txid, raw = _tx_with(*([_signed_script(b"the one document\n")] * 4))
+        for lim in (1, None):
+            atts = [
+                row["hashmark"]["attestation"]
+                for row in _classify_raw_tx(txid, raw, attest_hashmark_limit=lim)["outputs"]
+            ]
+            assert all(a == atts[0] for a in atts)
+            assert len({id(a) for a in atts}) == 4, f"copies share one attestation dict (limit={lim})"
+
+    def test_no_limit_still_checks_every_distinct_record(self, recoveries) -> None:
+        """The CLI's path — and the honest pair of the bound: nothing is skipped without a limit."""
+        _t, _r, result = _tx_result(*_signed_distinct(7))
+        assert len(recoveries) == 7
+        assert {row["hashmark"]["attestation"]["outcome"] for row in result["payload"]["outputs"]} == {"valid"}
+
+    def test_a_forgery_past_the_limit_is_reported_not_checked_and_a_clean_copy_is_not(self, limit) -> None:
+        """The reviewer's case. CLEAN: limit+1 copies of one genuine record. FORGED: limit copies
+        and one forged record last. The page cannot know the forgery is forged without checking
+        it — so it must SAY it did not check it, and the two pages must differ."""
+        good = _signed_script(b"release 1.0\n")
+        forged = bytearray(good)
+        forged[20] ^= 0x01  # well-formed; the signature no longer holds
+        _t, _r, clean = _tx_result(*([good] * (limit + 1)), limit=limit)
+        _t, _r, dirty = _tx_result(*([good] * limit), bytes(forged), limit=limit)
+        for result in (clean, dirty):  # the same txid string, so only the records differ
+            result["payload"]["txid"] = result["input"] = "ab" * 32
+        both = _render({"clean": {"result": clean}, "dirty": {"result": dirty}})
+        c, d = (" ".join(both[k]["text"].split()) for k in ("clean", "dirty"))
+        assert c != d
+        assert "What this page knows about it: 1 VERIFIED." in c and "could be among them" not in c
+        assert "What this page knows about it: 1 not checked here." in d
+        assert "The one not checked here was past that, so nothing here says whether it verifies" in d
+        assert "a mark that does not verify could be among them" in d
+
+    def test_a_forgery_within_the_limit_is_shown_in_the_error_colour(self, limit) -> None:
+        good = _signed_script(b"release 1.0\n")
+        forged = bytearray(good)
+        forged[20] ^= 0x01
+        _t, _r, result = _tx_result(*([good] * 10), bytes(forged), *([good] * limit), limit=limit)
+        rendered = _page(result)
+        assert rendered["statuses"][10] == "DOES NOT VERIFY"
+        assert "DOES NOT VERIFY" not in [s for i, s in enumerate(rendered["statuses"]) if i != 10]
+
+    def test_the_page_passes_its_panel_limit_as_the_checking_limit(self) -> None:
+        """The one number, structurally: `lookUp` hands MAX_MARK_PANELS to the classifier. The
+        render harness drives `renderReport`, not `lookUp`, so this is read from the source."""
+        source = (_VERIFY_DIR / "verify.js").read_text(encoding="utf-8")
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("//"))
+        assert 'fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS))' in code
+        assert code.count("pyFetch(") == 1, "a second call path to the classifier that may not pass the limit"
+
+    @pytest.mark.parametrize("bad", [-1, 1.5, "50", True])
+    def test_the_glue_refuses_a_limit_that_is_not_a_whole_number(self, bad) -> None:
+        from tests.test_hashmark_verify_cli import _tx_with
+
+        txid, raw = _tx_with(_record_script(bytes([1, 1]), b"\x11" * 32))
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", bad)
+        assert result["ok"] is False and "attest_hashmark_limit" in result["error"]
+
+    def test_the_glue_takes_a_javascript_whole_number(self) -> None:
+        """Pyodide may hand a JS number over as a float; 50.0 is 50, not a refusal."""
+        from tests.test_hashmark_verify_cli import _tx_with
+
+        txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1.0)
+        assert result["ok"], result
+        assert [r["hashmark"]["attestation"]["outcome"] for r in result["payload"]["outputs"]] == [
+            "valid",
+            "not_checked_here",
+        ]
+
+    def test_a_record_not_checked_here_never_says_the_curve_failed(self) -> None:
+        """Unreachable while the two limits are one number — and kept true if they ever are not."""
+        from tests.test_hashmark_verify_cli import _tx_with
+
+        txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1)
+        result["payload"]["outputs"] = result["payload"]["outputs"][1:]  # the unchecked one, alone
+        flat = " ".join(_page(result)["text"].split())
+        assert "NOT CHECKED" in flat and "this one is past that limit" in flat
+        assert "did not load" not in flat, "a deliberate skip was blamed on the reader's browser"
+
+
+class TestTheCommandTheNoteGivesWorks:
+    """The note used to say `pyrxd verify <transaction number>`, which the CLI refuses without
+    --min-confirmations. The note now carries the whole command; this runs it, as printed, with
+    only N filled in, through the real CLI."""
+
+    def test_the_printed_command_runs(self, monkeypatch, tmp_path, limit) -> None:
+        import shlex
+
+        from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+        scripts = [_record_script(bytes([1, 1]), bytes([i % 256]) * 32) for i in range(limit + 1)]
+        txid, raw, result = _tx_result(*scripts, limit=limit)
+        flat = " ".join(_page(result)["text"].split())
+        match = re.search(r"To check every mark in it: (pyrxd verify \S+ --min-confirmations N)", flat)
+        assert match, "the note carries no command"
+        argv = shlex.split(match.group(1).replace(" N", " 6"))
+        assert argv[:2] == ["pyrxd", "verify"] and argv[2] == txid
+        r = _run(monkeypatch, _FakeServer({txid: raw}), argv[1:], tmp_path=tmp_path)
+        assert r.exit_code == 0, r.output
+        assert "needs --min-confirmations" not in r.output
+        assert "where N is how many blocks must be built on top of the mark's block" in flat
+
+
+# ─────────────────────────────────── each panel's file check is ITS record's ──
+
+
+class TestEachPanelComparesAFileAgainstItsOwnRecord:
+    """Three marks, three file choosers. A file chosen in panel k must be compared against
+    record k's fingerprint — not the first record's, not the last one's. Driven through the
+    page's OWN change listeners, with the file really hashed by WebCrypto and the real plan
+    from Python; only the judge is a recorder, so what is asserted is what the page hands it."""
+
+    CONTENTS = (b"first file\n", b"second file\n", b"third file\n")
+
+    def test_the_file_is_compared_with_the_panel_it_was_chosen_in(self) -> None:
+        import hashlib
+
+        from pyrxd.glyph.inspect import file_check_plan
+
+        digests = [hashlib.sha256(c).hexdigest() for c in self.CONTENTS]
+        _t, _r, result = _tx_result(*(_record_script(bytes([1, 1]), bytes.fromhex(d)) for d in digests))
+        a, _b, c = (x.decode() for x in self.CONTENTS)
+        case = {
+            "result": result,
+            "file_check_plan": file_check_plan(0x01),
+            # A in panel 0 (its own), A in panel 1 (not its own), C in panel 2 (its own).
+            "choose_files": [{"input": 0, "text": a}, {"input": 1, "text": a}, {"input": 2, "text": c}],
+        }
+        rendered = _render({"case": case})["case"]
+        assert rendered["file_inputs"] == 3 and len(rendered["panels"]) == 3
+
+        expected = [digests[0], digests[1], digests[2]]
+        computed = [digests[0], digests[0], digests[2]]
+        assert [j["expected"] for j in rendered["judged"]] == expected, "a panel compared against another's record"
+        assert [j["computed"] for j in rendered["judged"]] == computed, "the file was not really hashed"
+        assert digests[0] != digests[1], "the premise: the two records differ"
+
+        for k, panel in enumerate(rendered["panels"]):
+            lines = panel.split("\n")
+            shown = lines[lines.index("the fingerprint in the record") + 1]
+            assert shown == digests[k], f"panel {k} showed another record's fingerprint beside the file"
+        assert "MATCHES" in rendered["panels"][0] and "DOES NOT MATCH" in rendered["panels"][1]
+        assert "MATCHES" in rendered["panels"][2] and "DOES NOT MATCH" not in rendered["panels"][2]
+
+
+class TestTheBlockShowsTheFingerprintWasKnownNotTheFile:
+    """ "Whoever published it knew the file by then" claimed more than a mark supports: a signed
+    record can be copied into anyone's transaction, and a v1 record carries whatever fingerprint
+    its publisher was given. What the block shows is that the FINGERPRINT was known by then."""
+
+    def test_the_rendered_answer_says_fingerprint(self) -> None:
+        from pyrxd.glyph.mark_anchor import UNVERIFIED_CAVEAT
+
+        anchor = {"resolved": True, "height": 460572, "confirmations": 9, "caveat": UNVERIFIED_CAVEAT, "source": "s"}
+        flat = " ".join(_page(_as_tx_result(_payload_with_status("valid"), anchor=anchor))["text"].split())
+        assert "whoever published it knew that fingerprint by then" in flat
+        assert "which is not the same as having had the file" in flat
+        assert "knew the file" not in flat
+
+    def test_the_page_chrome_says_it_too(self) -> None:
+        """The primer is never rendered by the harness, so it is read directly — flattened,
+        because it is hard-wrapped and a sentence can straddle a line break."""
+        flat = " ".join((_VERIFY_DIR / "index.html").read_text(encoding="utf-8").split())
+        assert "whoever published it knew that fingerprint by then" in flat
+        assert "knew the file" not in flat

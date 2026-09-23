@@ -55,7 +55,9 @@ import cbor2
 
 from ..constants import OpCode
 from ..security.errors import ValidationError
+from ..security.json_guards import cbor_int
 from ..utils import encode_pushdata
+from .payload import loads_chain_cbor
 from .timelock import (
     _protocols_and_spec,
     compute_cek_hash,
@@ -117,8 +119,8 @@ class RevealProof:
     @classmethod
     def from_dict(cls, d: dict) -> RevealProof:
         return cls(
-            v=int(d["v"]),
-            p=[int(x) for x in d["p"]],
+            v=cbor_int(d["v"]),
+            p=[cbor_int(x) for x in d["p"]],
             action=str(d["action"]),
             token_ref=str(d["token_ref"]),
             cek=str(d["cek"]),
@@ -287,9 +289,11 @@ def parse_reveal_proof_script(script: bytes) -> RevealProof | None:
     if len(marker) != 1 or marker[0] != REVEAL_MARKER:
         return None
 
+    # `loads_chain_cbor`: these are chain bytes, and the fields below are `str()`-coerced, which
+    # a shared or cyclic CBOR value makes exponential.
     try:
-        decoded = cbor2.loads(cbor_bytes)
-    except Exception:
+        decoded = loads_chain_cbor(cbor_bytes)
+    except ValidationError:
         return None
     if not isinstance(decoded, dict):
         return None

@@ -28,6 +28,7 @@ from enum import IntEnum
 from typing import Any
 
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.json_guards import cbor_int
 
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 
@@ -483,7 +484,7 @@ class DmintCborPayload:
     def from_cbor_dict(cls, d: dict) -> DmintCborPayload:
         """Parse the ``dmint`` CBOR value from an on-chain payload."""
         try:
-            algo = DmintAlgo(int(d["algo"]))
+            algo = DmintAlgo(cbor_int(d["algo"]))
         except (KeyError, ValueError) as e:
             raise ValidationError("dmint.algo missing or invalid") from e
         try:
@@ -497,21 +498,21 @@ class DmintCborPayload:
             schedule: tuple[tuple[int, int], ...] = ()
             if "daa" in d:
                 daa = d["daa"]
-                daa_mode = DaaMode(int(daa.get("mode", 0)))
-                target_block_time = int(daa.get("targetBlockTime", 60))
-                half_life = int(daa.get("halfLife", 0))
-                window_size = int(daa.get("windowSize", 0))
-                asymptote = int(daa.get("asymptote", 0))
-                epoch_length = int(daa.get("epochLength", 0))
-                max_adjustment = int(daa.get("maxAdjustment", 0))
+                daa_mode = DaaMode(cbor_int(daa.get("mode", 0)))
+                target_block_time = cbor_int(daa.get("targetBlockTime", 60))
+                half_life = cbor_int(daa.get("halfLife", 0))
+                window_size = cbor_int(daa.get("windowSize", 0))
+                asymptote = cbor_int(daa.get("asymptote", 0))
+                epoch_length = cbor_int(daa.get("epochLength", 0))
+                max_adjustment = cbor_int(daa.get("maxAdjustment", 0))
                 schedule = _schedule_from_cbor(daa.get("schedule"))
             return cls(
                 algo=algo,
-                num_contracts=int(d.get("numContracts", 1)),
-                max_height=int(d["maxHeight"]),
-                reward=int(d["reward"]),
-                premine=int(d.get("premine", 0)),
-                diff=int(d["diff"]),
+                num_contracts=cbor_int(d.get("numContracts", 1)),
+                max_height=cbor_int(d["maxHeight"]),
+                reward=cbor_int(d["reward"]),
+                premine=cbor_int(d.get("premine", 0)),
+                diff=cbor_int(d["diff"]),
                 daa_mode=daa_mode,
                 target_block_time=target_block_time,
                 half_life=half_life,
@@ -523,6 +524,10 @@ class DmintCborPayload:
             )
         except KeyError as e:
             raise ValidationError(f"dmint CBOR missing required field: {e}") from e
+        except (ValueError, AttributeError) as e:
+            # `cbor_int` refusing a field, or `daa` not being a map. Raised as the decoder's own
+            # refusal rather than escaping as a bare ValueError, like the missing-field case.
+            raise ValidationError(f"dmint CBOR field is not usable: {e}") from e
 
 
 def _schedule_from_cbor(raw: object) -> tuple[tuple[int, int], ...]:
@@ -546,7 +551,7 @@ def _schedule_from_cbor(raw: object) -> tuple[tuple[int, int], ...]:
             raise ValidationError(
                 f"dmint.daa.schedule[{i}] needs numeric 'height' and 'difficulty' (got keys {sorted(entry)})"
             )
-        entries.append((int(entry["height"]), int(entry["difficulty"])))
+        entries.append((cbor_int(entry["height"]), cbor_int(entry["difficulty"])))
     return tuple(entries)
 
 

@@ -242,7 +242,7 @@ Three normative consequences follow:
 All fields are OPTIONAL except `p`. Unknown fields MUST be ignored by a decoder
 rather than treated as an error (see §16.1 for what pyrxd does with them today).
 Field names, decoder types, and limits are from
-`src/pyrxd/glyph/payload.py:95-241` and `src/pyrxd/glyph/types.py:314-408`.
+`src/pyrxd/glyph/payload.py:95-261` and `src/pyrxd/glyph/types.py:314-408`.
 
 | Key | CBOR type | Required | Max length | Meaning |
 |---|---|---|---|---|
@@ -278,7 +278,7 @@ Notes on individual fields:
   the refs it parsed out of the reveal's *output* scripts, which is the only
   check either field admits (§7.5, §9.4). Entries MAY be raw byte strings or
   wrapped in **CBOR tag 64**, like `main.b`; a decoder MUST accept both
-  (`src/pyrxd/glyph/payload.py:139-178`). pyrxd emits raw byte strings.
+  (`src/pyrxd/glyph/payload.py:140-179`). pyrxd emits raw byte strings.
   A decoder SHOULD drop a malformed entry rather than fail the whole envelope —
   this is advisory metadata on an attacker-controlled payload.
 
@@ -324,7 +324,7 @@ over it.** The cap is gone; this sentence is restored.
 
 ### 4.5 What a decoder MUST reject
 
-`src/pyrxd/glyph/payload.py:95-241`:
+`src/pyrxd/glyph/payload.py:95-261`:
 
 - A body larger than 262,144 bytes.
 - Bytes that are not decodable CBOR.
@@ -345,8 +345,8 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:304-331`). A malformed
-`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:297-302`) — an
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:450-477`). A malformed
+`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:443-448`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
 
@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:436-443`), and reads it back with
+(`src/pyrxd/glyph/builder.py:437-444`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:392-397`).
+(`src/pyrxd/glyph/builder.py:393-397`).
 
 ### 6.2 Phase 2 — reveal
 

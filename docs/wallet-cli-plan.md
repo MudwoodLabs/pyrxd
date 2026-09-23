@@ -235,10 +235,13 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
 2   network error (couldn't reach ElectrumX, broadcast rejected)
 3   wallet decryption failed
 4   unexpected error (bug — should not happen)
-5   a verdict that does not hold (`pyrxd verify`): a signature that does not verify, a file
-    that is not what was marked, a block shallower than the floor the caller set, or a
-    `--wave-name` question that was asked and could not be answered. The full report is still
-    printed on stdout; only the status says no.
+5   a verdict that does not hold (`pyrxd verify`): no single HashMark record in the
+    transaction passes every check asked of it (the signature, `--file`/`--digest` and
+    `--wave-name` must all hold for the SAME record), a record anywhere in it does not decode
+    or its signature does not verify, a block shallower than the floor the caller set, or a
+    question that was asked and could not be answered (`--wave-name` NOT ESTABLISHED, or a
+    `--file`/`--digest` with CANNOT COMPARE because the record is one this build cannot read).
+    The full report is still printed on stdout; only the status says no.
 ```
 
 ## Configuration

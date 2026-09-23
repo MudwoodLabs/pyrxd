@@ -317,9 +317,7 @@ def _terms_from_public(
             rxd_block_interval_s=rxd_block_interval_s,
             btc_block_interval_s=btc_block_interval_s,
             # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
-            elapsed_reserve_blocks=elapsed_reserve_blocks(
-                rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS
-            ),
+            elapsed_reserve_blocks=elapsed_reserve_blocks(rxd_claim_burial_blocks=ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS),
         ),
         bt.TimeUnit.BLOCKS,
     )

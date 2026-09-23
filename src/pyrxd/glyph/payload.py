@@ -7,6 +7,7 @@ from typing import Literal
 import cbor2
 
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.json_guards import cbor_int
 
 from .dmint import DmintCborPayload
 from .script import hash_payload
@@ -108,6 +109,26 @@ def _cbor_str(d: dict, key: str, max_len: int) -> str:
     if len(v) > max_len:
         _log.warning("decode_payload: CBOR field %r is %d chars > %d; dropped", key, len(v), max_len)
         return ""
+    return v
+
+
+def _cbor_loc_vout(d: dict) -> int | None:
+    """An INTEGER ``loc`` is a ref-vout pointer, not a URI — keep it instead of dropping it.
+
+    Photonic treats ``loc`` exclusively as an index into the token's own refs and merges the
+    payload it points at (``packages/app/src/electrum/worker/NFT.ts:988-1010``). pyrxd reads
+    ``loc`` as text, so ``_cbor_str`` logged the integer form and returned "" — leaving a token
+    whose metadata lives in a second payload looking identical to one with no ``loc`` at all.
+
+    Bounds are deliberate: a vout is a non-negative output index, and ``bool`` is rejected
+    explicitly because it is an ``int`` subclass and ``loc: True`` is not vout 1.
+    """
+    v = d.get("loc")
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    if v < 0 or v > 0xFFFFFFFF:
+        _log.warning("decode_payload: integer 'loc' %d is not a plausible vout; dropped", v)
+        return None
     return v
 
 
@@ -263,6 +284,57 @@ def _decode_decimals(raw: object) -> int:
     return raw
 
 
+def loads_chain_cbor(blob: bytes) -> object:
+    """Decode CBOR read off the chain, refusing a value that reuses a container.
+
+    ``cbor2`` honours the value-sharing tags (28 marks a value shareable, 29 refers back to it),
+    so a few bytes decode into a graph rather than a tree: nine bytes (``d8 1c 82 d8 1d 00 d8 1d
+    00``) are a list that contains itself twice, and 168 bytes are a 26-level chain of
+    ``[x, x]`` pairs. Every consumer that prints or walks a decoded value then repeats that work
+    per PATH, not per object: measured, ``decode_payload`` of that 168-byte payload ran
+    ``repr()`` over it building a protocol error message and died with ``MemoryError`` under a
+    2 GB limit, and a 176-byte ``creator`` spent 6.5 s in ``str()``, doubling per level.
+
+    No Glyph writer emits these tags — pyrxd's writer never passes ``value_sharing``, and
+    cbor-x (Photonic's encoder) emits them only under ``structuredClone``, which Photonic does not
+    set — so a shared container is refused here, at the one call every chain decode makes, rather
+    than guarded at each of the many places a decoded value is later printed. The walk visits
+    each distinct container once, so it is linear in the payload.
+
+    :raises ValidationError: undecodable bytes, or a value in which a non-empty container
+        appears more than once (which includes every cycle).
+    """
+    try:
+        value = cbor2.loads(blob)
+    except Exception as e:
+        raise ValidationError("Invalid CBOR payload") from e
+    seen: set[int] = set()
+    stack: list[object] = [value]
+    while stack:
+        item = stack.pop()
+        children: list[object]
+        if isinstance(item, cbor2.CBORTag):
+            children = [item.value]
+        elif isinstance(item, dict):
+            children = [*item.keys(), *item.values()]
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            children = list(item)
+        else:
+            continue
+        # An EMPTY container is skipped: `()` and `frozenset()` are interned singletons, so two
+        # honest empty arrays used as map keys share an id, and an empty value amplifies nothing.
+        if not children:
+            continue
+        if id(item) in seen:
+            raise ValidationError(
+                "CBOR value reuses a container (value-sharing tags 28/29) — no Glyph writer emits "
+                "that, and a shared or cyclic value makes every reader that prints it repeat its work"
+            )
+        seen.add(id(item))
+        stack.extend(children)
+    return value
+
+
 def decode_update_payload(cbor_bytes: bytes) -> dict:
     """Decode a PARTIAL update envelope — the mutated fields only, carrying no ``p``.
 
@@ -288,10 +360,7 @@ def decode_update_payload(cbor_bytes: bytes) -> dict:
     """
     if len(cbor_bytes) > _MAX_CBOR_PAYLOAD_BYTES:
         raise ValidationError(f"CBOR payload too large: {len(cbor_bytes)} > {_MAX_CBOR_PAYLOAD_BYTES} bytes")
-    try:
-        d = cbor2.loads(cbor_bytes)
-    except Exception as e:
-        raise ValidationError("Invalid CBOR payload") from e
+    d = loads_chain_cbor(cbor_bytes)
     if not isinstance(d, dict):
         raise ValidationError("CBOR update payload must be a map")
     if "p" in d:
@@ -314,10 +383,7 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
     """Decode CBOR bytes (without 'gly' marker) to GlyphMetadata."""
     if len(cbor_bytes) > _MAX_CBOR_PAYLOAD_BYTES:
         raise ValidationError(f"CBOR payload too large: {len(cbor_bytes)} > {_MAX_CBOR_PAYLOAD_BYTES} bytes")
-    try:
-        d = cbor2.loads(cbor_bytes)
-    except Exception as e:
-        raise ValidationError("Invalid CBOR payload") from e
+    d = loads_chain_cbor(cbor_bytes)
 
     if not isinstance(d, dict):
         raise ValidationError("CBOR payload must be a map")
@@ -340,6 +406,12 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
             blob = m["b"]
             if isinstance(blob, cbor2.CBORTag):
                 blob = blob.value
+            # TYPED BEFORE `bytes()`, like every integer this decoder coerces: `bytes(n)` of an
+            # INT allocates n zero bytes, so `"b": 300000000` — 30 bytes of CBOR — became 300 MB
+            # of media that `glyph inspect` then hashed. A byte string, or an array of byte
+            # values (bounded by the payload's own size), is what a writer puts here.
+            if not isinstance(blob, (bytes, bytearray, list, tuple)):
+                raise ValidationError(f"CBOR field 'main.b' must be a byte string, not a {type(blob).__name__}")
             main = GlyphMedia(mime_type=mime_type, data=bytes(blob))
 
     # The ENCRYPTED spelling of the same CBOR key (#626, third field of the same class).
@@ -361,10 +433,12 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
 
     version = d.get("v")
     if version is not None:
+        # `cbor_int`, not `int()`: a CBOR decimal fraction (tag 4) decodes to a Decimal that
+        # `int()` takes minutes to expand. See `pyrxd.security.json_guards.cbor_int`.
         try:
-            version = int(version)
-        except (TypeError, ValueError) as e:
-            raise ValidationError("CBOR field 'v' must be an integer") from e
+            version = cbor_int(version)
+        except ValueError as e:
+            raise ValidationError(f"CBOR field 'v' must be an integer: {e}") from e
 
     dmint_params = None
     if "dmint" in d:
@@ -451,7 +525,11 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         main=main,
         encrypted_main=encrypted_main,
         attrs=_decode_attrs(d.get("attrs", {})),
-        loc=_cbor_str(d, "loc", 512),
+        # `loc` is text to pyrxd and a ref-vout to Photonic. Resolve which one this is ONCE:
+        # asking _cbor_str for a value we are about to keep would log "dropped" about a field
+        # that was not dropped, and a log line that contradicts the code is worse than silence.
+        loc="" if _cbor_loc_vout(d) is not None else _cbor_str(d, "loc", 512),
+        loc_vout=_cbor_loc_vout(d),
         loc_hash=_cbor_str(d, "loc_hash", 128),
         decimals=_decode_decimals(d.get("decimals", 0)),
         image_url=_cbor_str(d, "image", 512),

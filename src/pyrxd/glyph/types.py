@@ -282,12 +282,14 @@ class GlyphRoyalty:
     @classmethod
     def from_cbor_dict(cls, d: dict) -> GlyphRoyalty:
         splits_raw = d.get("splits", [])
-        splits = tuple((str(s["address"]), int(s["bps"])) for s in splits_raw if isinstance(s, dict))
+        from ..security.json_guards import cbor_int
+
+        splits = tuple((str(s["address"]), cbor_int(s["bps"])) for s in splits_raw if isinstance(s, dict))
         return cls(
-            bps=int(d["bps"]),
+            bps=cbor_int(d["bps"]),
             address=str(d["address"]),
             enforced=bool(d.get("enforced", False)),
-            minimum=int(d.get("minimum", 0)),
+            minimum=cbor_int(d.get("minimum", 0)),
             splits=splits,
         )
 
@@ -372,6 +374,21 @@ class GlyphMetadata:
     #: read, as ``WaveAttrs.from_dict`` does.
     attrs: dict[str, object] = field(default_factory=dict)
     loc: str = ""  # IPFS or external URI
+    #: An INTEGER ``loc``, kept rather than discarded. READ PATH ONLY — never encoded.
+    #:
+    #: pyrxd reads ``loc`` as a text URI. Photonic reads it as a REF VOUT: an integer ``loc``
+    #: points at one of the token's own refs, whose payload Photonic fetches and MERGES into
+    #: this one (``packages/app/src/electrum/worker/NFT.ts:988-1010``). The two
+    #: implementations do not mean the same thing by the field, and pyrxd was dropping the
+    #: integer form with a warning — so a token whose real metadata lives in a second payload
+    #: decoded as though it simply had no ``loc``, indistinguishable from one that never had
+    #: any. That is a silent partial read of third-party data.
+    #:
+    #: THE MERGE IS NOT IMPLEMENTED. Following the pointer means fetching another output
+    #: mid-decode, which this decode path deliberately does not do. Surfacing the vout is the
+    #: honest half: a caller can see the payload is incomplete and go and get the rest.
+    #: ``None`` means no integer ``loc`` was present, not that a merge was performed.
+    loc_vout: int | None = None
     loc_hash: str = ""  # integrity hash
     decimals: int = 0  # FT decimals (display only — consensus is 1 photon = 1 unit)
     image_url: str = ""  # HTTPS URL for token display image

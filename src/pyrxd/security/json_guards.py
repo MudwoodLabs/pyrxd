@@ -1,5 +1,8 @@
 """Fail-closed coercions for JSON fields that arrive from an untrusted server.
 
+:func:`cbor_int` applies the same rule to integers decoded from on-chain CBOR, which can
+additionally carry types JSON cannot (``Decimal``, ``Fraction``) — see its docstring.
+
 **WHY THIS LIVES UNDER ``security`` AND NOT UNDER ``network``.** It used to be
 ``pyrxd.network._guards``, and importing it therefore executed
 ``pyrxd.network.__init__``, which eagerly re-exports the ElectrumX and Bitcoin
@@ -55,7 +58,44 @@ from __future__ import annotations
 import math
 from typing import Any
 
-__all__ = ["finite_int", "hex_str", "merkle_branch", "nonneg_int", "require_bool"]
+__all__ = ["MAX_EXACT_FLOAT_INT", "cbor_int", "finite_int", "hex_str", "merkle_branch", "nonneg_int", "require_bool"]
+
+#: The largest magnitude at which every integer is exactly a float64. A JS writer's ``number``
+#: past this is already rounded before it is encoded, so it cannot be read back as a count.
+MAX_EXACT_FLOAT_INT = 2**53
+
+
+def cbor_int(value: Any) -> int:
+    """An integer decoded from untrusted CBOR, or ``ValueError`` saying why it is not one.
+
+    CHECKED BEFORE ANY COERCION, and that ordering is the point. CBOR can carry a decimal
+    fraction (tag 4) or a bigfloat (tag 5), which ``cbor2`` decodes to ``Decimal`` in constant
+    time — and ``int(Decimal("1E+1000000"))`` then takes minutes: 15 bytes of payload,
+    measured at 69.9 s through ``glyph inspect --fetch``. So ``int()`` is never applied to a
+    value this function has not already typed.
+
+    Accepted: a real ``int`` (not ``bool``), and a finite float with no fractional part whose
+    magnitude is at most :data:`MAX_EXACT_FLOAT_INT`. The float case is not leniency: cbor-x,
+    which Photonic Wallet encodes with, writes every JS ``number`` of 2**32 or more as a
+    float64 (measured: 5_000_000_000 encodes as ``fb 41f2a05f20000000``), so an honest
+    Photonic value above four billion ARRIVES as a float.
+
+    Refused, each with its reason: ``bool``; a float that is non-finite, fractional, or past
+    2**53; and every other type — ``Decimal``, ``Fraction``, ``str``, ``bytes``, containers.
+    """
+    if isinstance(value, bool):
+        raise ValueError("a boolean is not an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("a non-finite float (Infinity/NaN) is not an integer")
+        if not value.is_integer():
+            raise ValueError("a float with a fractional part is not an integer")
+        if abs(value) > MAX_EXACT_FLOAT_INT:
+            raise ValueError("a float above 2**53 cannot hold an exact integer")
+        return int(value)
+    raise ValueError(f"a {type(value).__name__} is not an integer")
 
 
 def finite_int(value: Any) -> int:

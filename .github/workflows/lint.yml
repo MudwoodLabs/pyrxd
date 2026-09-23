@@ -33,4 +33,8 @@ jobs:
         # hook installed. The tree is already clean, so this costs nothing and closes that gap.
         run: ruff check src tests examples scripts
       - name: ruff format (check only — no rewrites)
-        run: ruff format --check src tests examples
+        # `scripts` was in the `ruff check` line above and NOT here, so lint saw those files
+        # and formatting never did. Three of them had drifted out of format by the time anyone
+        # ran `ruff format --check` over them by hand. One missing word, and the only symptom
+        # was a check that passed.
+        run: ruff format --check src tests examples scripts
