@@ -449,9 +449,12 @@ Two consequences worth stating plainly:
   means a signature checked out. It still does not establish authorship,
   ownership, originality, or the truth of the marked file's contents —
   only that whoever holds that key made this statement about this digest
-  no later than the confirming block. The claim it reaches is **key
-  custody at that block**, and nothing wider: not who wrote the file, not
-  who owns it, and not where anyone was.
+  no later than the confirming block. The claim it reaches is **that the
+  key had signed this by that block**, and nothing wider: not that the
+  key's holder published it there (the signed statement does not bind the
+  transaction, so anyone can copy a genuine record into a transaction of
+  their own), not who wrote the file, not who owns it, and not where
+  anyone was.
 - The browser page adds one thing the CLI cannot: it will **hash a file
   you choose and compare it against the record's digest**, using the
   algorithm the record's own `algorithm_id` names. The file is read

@@ -23,6 +23,7 @@ for splitting a group's subcommands across modules.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import textwrap
 from collections.abc import Mapping, Sequence
@@ -809,13 +810,20 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
         ]
     chain = nam.get("chain") or {}
     same = nam.get("signer_is_target_at_height")
+    # THE WEAKER SENTENCE. This said "key custody at that block", and a matching name supports
+    # less: the signed statement does not bind the transaction, so a genuine record can be copied
+    # into anyone's transaction, in a later block. What the match shows is that the name pointed
+    # at a key that had signed this by that block — not that the key's holder published it here.
+    if same:
+        who = [
+            f"{indent}  the signing key IS that address — that key had signed this by that block;",
+            f"{indent}  not that its holder put it here, not authorship, not location",
+        ]
+    else:
+        who = [f"{indent}  the signing key is NOT that address"]
     lines = [
         f"{indent}at the mark's block ({nam.get('height')}), {name} pointed at {nam.get('target_at_height')}",
-        (
-            f"{indent}  the signing key IS that address — key custody at that block; not authorship, not location"
-            if same
-            else f"{indent}  the signing key is NOT that address"
-        ),
+        *who,
         f"{indent}  glyph {nam.get('ref')}; {chain.get('steps')} step(s) walked, tip {chain.get('tip')} proved unspent",
     ]
     if nam.get("provisional"):
@@ -825,18 +833,28 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
     return lines
 
 
-def _require_min_confirmations(min_confirmations: int | None) -> None:
-    """``--wave-name`` without ``--min-confirmations`` is refused, not defaulted.
+def _require_min_confirmations(
+    min_confirmations: int | None, *, needed_by: str = "--wave-name", command: str | None = None
+) -> None:
+    """A missing ``--min-confirmations`` is refused, not defaulted — and the refusal names who needs it.
 
     The depth registry (``btc_wallet/chains.py``) states the rule: confirmation depth is
     value-scaled per chain, and a shipped default would be folklore. ``resolve_mark_anchor``
     enforces the same at the library layer; this is the CLI-shaped refusal that names the flag.
+
+    ONE RULE, TWO CALLERS, AND THE WORDING IS THE CALLER'S. ``glyph inspect`` needs the floor only
+    for ``--wave-name``; ``pyrxd verify`` needs it on every run. The message said "--wave-name needs
+    --min-confirmations" to both, so ``pyrxd verify <txid>`` — the command the public verify page
+    tells people to run — was refused over a flag they had not passed. ``needed_by`` is what the
+    user typed that needs the floor, and ``command`` is the command line to re-run with it.
     """
     if min_confirmations is None:
+        where = f"to `{command}`" if command else "to the command"
         raise UserError(
-            "--wave-name needs --min-confirmations",
+            f"{needed_by} needs --min-confirmations",
             cause="confirmation depth is value-scaled per chain and deliberately has no default",
-            fix="pass --min-confirmations N, the depth below which the mark's block is treated as provisional",
+            fix=f"add --min-confirmations N {where}: N is how many blocks must sit on top of the mark's "
+            "block before you rely on it; below that the block is treated as provisional",
         )
 
 
@@ -847,9 +865,12 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     server that supplied the candidates, and the judge refuses a block height from the server
     that supplied the name→glyph binding. With ONE configured endpoint both clients are that
     endpoint and both labels are equal, so each of those rules degrades with its reason — which
-    is the truth of a single-server configuration, and is the shipped default. A second server
-    under ``electrumx_servers`` (pyrxd ships two independent mainnet operators in
-    ``network/registry.py``) is what makes form 2 reachable.
+    is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
+    config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
+    ships two independent operators, so with no configuration at all these are two different
+    endpoints and form 2 is reachable. (It used to say the default was single-server, which read
+    as though form 2 — and ``verify --wave-name``'s ESTABLISHED — needed opting into. It does not.
+    testnet and regtest ship no endpoint at all.)
 
     Tests patch this to hand in fakes.
     """
@@ -881,8 +902,33 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
     pasted script has none, and form 2 is then unavailable by construction.
     """
     mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
+    # ONE LOOKUP PER SIGNER, NOT PER RECORD. A lookup is a name resolution, an anchor and a chain
+    # walk across two servers, and it was run once for EVERY verified record — so a transaction
+    # carrying thousands of copies of one signed record made thousands of identical lookups.
+    # Within this call the name, the mark's txid and the floor are fixed, so the answer depends
+    # only on the signer: records sharing one get the same answer, looked up once, and each gets
+    # its own copy. Distinct signers are still looked up one by one.
+    by_signer: dict[str, dict] = {}
     for hm in hashmark_records(payload):
+        signer = _verified_signer(hm)
+        if signer is not None and signer in by_signer:
+            hm["name_at_mark"] = copy.deepcopy(by_signer[signer])
+            continue
         _judge_one_name_at_mark(ctx, hm, mark_txid=mark_txid, name=name, min_confirmations=min_confirmations)
+        if signer is not None and "name_at_mark" in hm:
+            by_signer[signer] = copy.deepcopy(hm["name_at_mark"])
+
+
+def _verified_signer(hm: dict | None) -> str | None:
+    """The recovered signer of a record whose signature VERIFIED, else ``None``.
+
+    The key the two per-record lookups are shared on. Only a verified record triggers a lookup
+    at all; anything else is answered locally, from the record, with no network.
+    """
+    att = (hm or {}).get("attestation") or {}
+    if att.get("outcome") != "valid" or not att.get("recovered_hash160"):
+        return None
+    return str(att["recovered_hash160"])
 
 
 def _judge_one_name_at_mark(
@@ -1624,8 +1670,17 @@ def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
     Errors are attached rather than raised: a name lookup failing is not a reason
     to lose the classification the user asked for.
     """
+    # One lookup per signer, for the same reason as `_attach_name_at_mark`: the answer depends
+    # only on the verified signer, and a transaction of many copies made one lookup per copy.
+    by_signer: dict[str, dict] = {}
     for hm in hashmark_records(payload):
+        signer = _verified_signer(hm)
+        if signer is not None and signer in by_signer:
+            hm["wave_identity"] = copy.deepcopy(by_signer[signer])
+            continue
         _resolve_one_wave_identity(ctx, hm)
+        if signer is not None and "wave_identity" in hm:
+            by_signer[signer] = copy.deepcopy(hm["wave_identity"])
 
 
 def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
