@@ -1059,7 +1059,7 @@ class TestTheJsonDrawerSaysItIsBounded:
         text = _flat(both["huge"]["result_block"])
         txid = result["payload"]["txid"]
         assert "Show raw JSON (the lists are cut short)" in text
-        assert f"it holds at most {limit} each of the transaction's outputs" in text
+        assert "This JSON is bounded like the card. Cut short in it: outputs — each with a *_not_listed key" in text
         assert f"For all of it: pyrxd glyph inspect {txid} --fetch" in text
         assert f"as JSON, pyrxd --json glyph inspect {txid} --fetch" in text
         # The drawer's JSON is the bounded payload: 3,000 more outputs add digits, not rows.
@@ -1087,6 +1087,120 @@ class TestTheJsonDrawerSaysItIsBounded:
         assert r.exit_code == 0, r.output
         full = json.loads(r.output)
         assert len(full["outputs"]) == limit + 4 and not [k for k in full if k.endswith("_not_listed")]
+
+
+def _emitted_counts() -> set[str]:
+    """Every ``*_not_listed`` key the classifier can emit, DERIVED from its source, as the render-
+    drift test derives them."""
+    import ast
+
+    source = (_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8")
+    return {
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith("_not_listed")
+    }
+
+
+def _counts_at(value, path: str = "") -> list[tuple[str, str]]:
+    """``(key, the path of the list it counts)`` for every ``*_not_listed`` key at any depth, the
+    list path spelled as the drawer spells it: ``outputs[].input_refs``."""
+    found: list[tuple[str, str]] = []
+    if isinstance(value, list):
+        for item in value:
+            found += _counts_at(item, f"{path}[]")
+    elif isinstance(value, dict):
+        for key, inner in value.items():
+            if key.endswith("_not_listed"):
+                found.append((key, (f"{path}." if path else "") + key.removesuffix("_not_listed")))
+            else:
+                found += _counts_at(inner, f"{path}.{key}" if path else key)
+    return found
+
+
+def _without_counts(value, keep: str | None = None):
+    """*value* with every ``*_not_listed`` key removed but those named *keep*."""
+    if isinstance(value, list):
+        return [_without_counts(item, keep) for item in value]
+    if isinstance(value, dict):
+        return {k: _without_counts(v, keep) for k, v in value.items() if not k.endswith("_not_listed") or k == keep}
+    return value
+
+
+def _drawer(results: dict) -> dict[str, tuple[str, list[str]]]:
+    """``{name: (the drawer's summary line, the lists its note names)}`` for each glue result."""
+    rendered = _render({name: {"result": result} for name, result in results.items()})
+    out = {}
+    for name in results:
+        lines = rendered[name]["result_block"].split("\n")
+        summary = next(line for line in lines if line.startswith("Show raw JSON"))
+        note = next((line for line in lines if line.startswith("This JSON is bounded like the card.")), "")
+        named = re.search(r"Cut short in it: (.*?) — each with", note)
+        out[name] = (summary, named.group(1).split(", ") if named else [])
+    return out
+
+
+class TestTheDrawerFindsEveryCut:
+    """The drawer looked for `*_not_listed` keys at the top level and under `metadata` only. An
+    update envelope's `fields_not_listed` sits inside an entry of `glyph_envelopes`, so the review
+    found a drawer that had dropped 3,436 fields saying "Show raw JSON" and nothing else. Its note
+    also listed the cut lists by hand, and left update fields out."""
+
+    def test_an_envelope_cut_alone_is_said(self, limit) -> None:
+        """The review's case: the only cut in the payload is an envelope's fields."""
+        fields = {f"k{i:04d}": i for i in range(3000)} | {
+            "attrs": {"target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"} | {f"a{i:04d}": i for i in range(500)}
+        }
+        result = _result(b"\x6a", limit=limit, inputs=[_update(fields)])
+        assert [key for key, _path in _counts_at(result["payload"])] == ["fields_not_listed"], "the premise"
+        summary, named = _drawer({"c": result})["c"]
+        assert summary == "Show raw JSON (the lists are cut short)"
+        assert named == ["glyph_envelopes[].fields"]
+
+    def test_every_count_the_classifier_can_emit_is_found_on_its_own(self) -> None:
+        """BOTH DIRECTIONS. One real transaction with every list cut, at a listing limit of 2: the
+        counts it carries must be exactly the ones the classifier's source can emit, and each, left
+        alone in the payload at the place the classifier put it, must make the drawer say it is cut
+        short and name that list. With every count removed, it must not."""
+        from pyrxd.glyph.script import build_delegate_burn_script
+        from pyrxd.glyph.types import GlyphRef
+
+        refs = tuple(GlyphRef(txid=(i + 1).to_bytes(32, "big").hex(), vout=0) for i in range(3))
+        inputs = (
+            [_envelope("head", container_refs=refs)]
+            + [_envelope(f"g{i}") for i in range(3)]
+            + [_update({f"k{i:02d}": i for i in range(40)})]
+            + [b"\x03gly"] * 3
+        )
+        outputs = [_refs(40, 40), _p2pkh()] + [
+            build_delegate_burn_script(GlyphRef(txid=(100 + i).to_bytes(32, "big").hex(), vout=1)) for i in range(3)
+        ]
+        tx = _tx(outputs, inputs)
+        result = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), None, 2)
+        assert result["ok"], result
+        counts = _counts_at(result["payload"])
+        assert {key for key, _path in counts} == _emitted_counts(), "a count the source emits is not exercised here"
+        assert len(_emitted_counts()) >= 8, sorted(_emitted_counts())
+
+        cases = {"all": result, "none": {**result, "payload": _without_counts(result["payload"])}}
+        for key, _path in counts:
+            cases[key] = {**result, "payload": _without_counts(result["payload"], keep=key)}
+        drawn = _drawer(cases)
+        assert sorted(drawn["all"][1]) == sorted(path for _key, path in counts)
+        assert drawn["none"] == ("Show raw JSON", [])
+        for key, path in counts:
+            assert drawn[key] == ("Show raw JSON (the lists are cut short)", [path]), key
+
+    def test_a_publishers_field_named_like_a_count_is_not_one(self, limit) -> None:
+        """The honest path: an update's keys are the publisher's, and every value the classifier
+        sends inside `fields` is text — so a field named like a count, with a count-shaped value,
+        cuts nothing."""
+        result = _result(b"\x6a", limit=limit, inputs=[_update({"x_not_listed": {"count": 9}, "y_not_listed": 5})])
+        assert result["payload"]["glyph_envelopes"][0]["fields"] == {
+            "x_not_listed": {"count": "9"},
+            "y_not_listed": "5",
+        }
+        assert _drawer({"c": result})["c"] == ("Show raw JSON", [])
 
 
 # ─────────────────────────────────────── a small transaction is drawn as before ──

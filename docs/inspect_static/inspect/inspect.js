@@ -2370,30 +2370,61 @@ function renderErrorCard(payload) {
 
 // --- JSON drawer -----------------------------------------------------
 
-// Did the classifier leave entries out of any list in this result? Read off the payload's
-// own `*_not_listed` keys — top level and under `metadata` — rather than off a count of rows.
-function isCutShort(result) {
-  const payload = (result && result.payload) || {};
-  const metadata = payload.metadata || {};
-  return [payload, metadata].some((obj) => Object.keys(obj).some((key) => key.endsWith("_not_listed")));
+// Every list the classifier cut in this result, named by its path in the JSON (`outputs`,
+// `metadata.relationships`, `glyph_envelopes[].fields`), in the order found.
+//
+// FOUND BY WALKING THE WHOLE PAYLOAD, not by looking in a list of places. A count sits beside
+// its list wherever the list is, and this used to look only at the top level and `metadata` —
+// so an update envelope's `fields_not_listed`, inside an entry of `glyph_envelopes`, left a
+// drawer that had dropped 3,436 fields saying nothing was cut. A count is a `*_not_listed` key
+// whose value holds a positive number: an update's own keys are the publisher's to choose and
+// can end the same way, but every value the classifier sends inside `fields` is text. The walk
+// stops at the depth `_render_safe` stops at, past which the payload holds a marker, not a
+// container.
+const _CUT_WALK_DEPTH = 32;
+
+function _countsSomething(value, depth) {
+  if (typeof value === "number" || typeof value === "bigint") return value > 0;
+  if (value === null || typeof value !== "object" || depth > _CUT_WALK_DEPTH) return false;
+  return Object.values(value).some((inner) => _countsSomething(inner, depth + 1));
+}
+
+function cutLists(result) {
+  const found = [];
+  const walk = (node, path, depth) => {
+    if (node === null || typeof node !== "object" || depth > _CUT_WALK_DEPTH) return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, `${path}[]`, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key.endsWith("_not_listed") && _countsSomething(value, depth + 1)) {
+        const list = (path ? `${path}.` : "") + key.slice(0, -"_not_listed".length);
+        if (!found.includes(list)) found.push(list);
+      } else {
+        walk(value, path ? `${path}.${key}` : key, depth + 1);
+      }
+    }
+  };
+  walk((result && result.payload) || {}, "", 0);
+  return found;
 }
 
 function renderJsonDrawer(result) {
   const details = el("details", { class: "json-drawer" });
-  const cut = isCutShort(result);
-  details.appendChild(el("summary", { text: cut ? "Show raw JSON (the lists are cut short)" : "Show raw JSON" }));
+  const cut = cutLists(result);
+  details.appendChild(el("summary", { text: cut.length ? "Show raw JSON (the lists are cut short)" : "Show raw JSON" }));
 
-  // THE DRAWER SAYS WHAT IT IS. Its lists are the ones the card drew — at most
-  // MAX_ROWS_SHOWN entries each — and a copied JSON that looked complete would be the
-  // silent truncation the card's notes exist to prevent. The `*_not_listed` keys inside it
-  // hold the counts; the command holds the rest.
-  if (cut) {
+  // THE DRAWER SAYS WHAT IT IS. Its lists are the ones the card drew, and a copied JSON that
+  // looked complete would be the silent truncation the card's notes exist to prevent. It names
+  // the lists cut, as found above — so it cannot name fewer than there are — and says the
+  // `*_not_listed` keys hold the counts; the command holds the rest.
+  if (cut.length) {
     const txid = (result.payload && result.payload.txid) || "<txid>";
     details.appendChild(el("p", {
       class: "card-note json-bounded-note",
-      text: `This JSON is bounded like the card: it holds at most ${MAX_ROWS_SHOWN} each of the ` +
-            "transaction's outputs, envelopes, other glyphs, relationship claims and delegate " +
-            "burns, and a *_not_listed key beside a list counts what it leaves out. For all of " +
+      text: `This JSON is bounded like the card. Cut short in it: ${cut.join(", ")} — each with a ` +
+            "*_not_listed key beside it counting exactly what it leaves out. For all of " +
             `it: pyrxd glyph inspect ${txid} --fetch — or, as JSON, pyrxd --json glyph inspect ${txid} --fetch`,
     }));
   }
