@@ -95,9 +95,10 @@ _ATTESTATION_VERDICTS: dict[str, tuple[str, str]] = {
 
 #: ``meaning`` is the READ-SURFACE elaboration — what `glyph inspect` and the browser
 #: panel print under the status. ``pyrxd verify`` keeps its own reason strings, because
-#: its context differs (it aggregates across every record in a transaction and quotes the
-#: failing one's detail). What must NEVER differ between surfaces is the STATUS word, and
-#: that is what this table owns: the claim is shared, the elaboration is local.
+#: its context differs (it judges each record alone, names which record its verdict is
+#: about, and quotes a failing record's detail). What must NEVER differ between surfaces
+#: is the STATUS word, and that is what this table owns: the claim is shared, the
+#: elaboration is local.
 #:
 #: What a reader is shown when the outcome is one this table has never heard of.
 #: Fails toward "we do not know" rather than toward either verdict, because a new

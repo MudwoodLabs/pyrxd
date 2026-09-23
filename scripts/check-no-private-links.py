@@ -161,8 +161,14 @@ _SSH_TARGET_RE = re.compile(r"\b([A-Za-z_][\w.-]{0,31})@((?:\d{1,3}\.){3}\d{1,3}
 #: Addresses that are NOT a disclosure: loopback, link-local, RFC1918 private space,
 #: and the RFC 5737 documentation ranges that exist precisely to appear in examples.
 _NON_ROUTABLE = (
-    ("0.",), ("127.",), ("10.",), ("192.168.",), ("169.254.",),
-    ("192.0.2.",), ("198.51.100.",), ("203.0.113.",),
+    ("0.",),
+    ("127.",),
+    ("10.",),
+    ("192.168.",),
+    ("169.254.",),
+    ("192.0.2.",),
+    ("198.51.100.",),
+    ("203.0.113.",),
 )
 
 

@@ -36,12 +36,37 @@ are two ways to validate that:
 - **The on-chain reveal transaction wrapper.** pyrxd builds its own
   transactions; the bridge only generates the OP_RETURN *script* bytes
   that go into the reveal tx, not the wrapping tx.
-- **CEK wrapping for recipients.** Photonic's `wrapCEK` /
-  `encapsulateHybrid` uses ML-KEM-768 hybrid post-quantum encryption.
-  pyrxd's v1 explicitly defers PQ; we test single-recipient X25519 only
-  via direct ECDH in the `x25519` section.
+- **The AAD Photonic's WALLET binds to a recipient wrap.** `gen-vectors.ts`
+  does call the library's `wrapCEK` (classical X25519 only; pyrxd defers
+  ML-KEM-768), but it supplies an AAD of its own choosing, and the library
+  takes the AAD from its caller — so a library-level wrap vector cannot say
+  what the app binds. That is `gen-app-path-vector.ts`, below.
 - **`isUnlocked` / `getUnlockRemaining`** — these are pure-Python logic
   in pyrxd, no interop concern. Tested via in-package round-trip.
+
+## The app-path recipient wrap (`gen-app-path-vector.ts`)
+
+Calls `encryptContent` from `packages/app/src/encryptionService.ts` — the
+function Photonic's mint screen calls — in recipient mode, and lets it compute
+the wrap AAD itself (the UTF-8 text of `crypto.cek_hash`). Every
+`crypto.getRandomValues` draw is served from a fixed queue with its length
+checked, the run fails if a draw is left over, each draw's role (CEK, chunk
+nonce, ephemeral key, wrap nonce, locator key) is checked against the output,
+and Photonic's own `decryptContent` must open the result before anything is
+printed. It needs no dependencies of its own; Photonic's modules resolve theirs
+from the Photonic checkout.
+
+```bash
+PHOTONIC_ROOT=/abs/path/to/Photonic-Wallet \
+PHOTONIC_COMMIT=$(git -C /abs/path/to/Photonic-Wallet rev-parse HEAD) \
+  npx tsx gen-app-path-vector.ts
+```
+
+It prints two vectors, `app_encrypt_content_recipient` and
+`app_encrypt_content_recipient_empty` (zero bytes of content, which Photonic
+records as `{size: 0, chunks: 0}`); merge both keys into
+`tests/fixtures/photonic_timelock_vectors.json`. They regenerate byte-for-byte
+for a given Photonic commit.
 
 ## Running
 

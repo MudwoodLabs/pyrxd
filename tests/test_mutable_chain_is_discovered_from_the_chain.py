@@ -224,8 +224,9 @@ async def test_two_servers_give_a_complete_walk() -> None:
 
 async def test_one_server_for_both_halves_degrades_with_the_reason() -> None:
     """Chain-based discovery does not repeal the two-source rule: a history is still one
-    server's claim about what exists. The shipped default config is a single server, so this
-    is the degrade most users will see, and it must say why."""
+    server's claim about what exists. A single-server configuration (`--electrumx URL`, or a
+    config naming one) lands here, and it must say why. (Not the shipped mainnet default, which
+    this used to say — that ships two independent endpoints.)"""
     server = FakeChainServer()
     result = await walk_discovered_chain(
         mint_txid=MINT, discovery_client=server, tip_client=server, discovery_source="A", tip_source="A"
