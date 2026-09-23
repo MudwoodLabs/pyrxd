@@ -104,6 +104,7 @@ from ..security.errors import (
     ConfirmationTimeoutError,
     DmintError,
     InsufficientFundsError,
+    InvalidFundingUtxoError,
     MaxAttemptsError,
     NetworkError,
     PolicyRejection,
@@ -1887,8 +1888,18 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     help="V2 difficulty mode (requires --v2).",
 )
 @click.option("--num-contracts", type=int, default=1, show_default=True, help="Parallel contracts to genesis [1..250].")
-@click.option("--max-height", type=int, required=True, help="Mints per contract [1..0xFFFFFF].")
-@click.option("--reward", type=int, required=True, help="Photons of the FT paid per successful mint [1..0xFFFFFF].")
+@click.option(
+    "--max-height",
+    type=int,
+    required=True,
+    help="Mints per contract. V1: [1..0xFFFFFF] (a 3-byte state field); V2: [1..2^63-1].",
+)
+@click.option(
+    "--reward",
+    type=int,
+    required=True,
+    help="Photons of the FT paid per successful mint. V1: [1..0xFFFFFF]; V2: up to Radiant's money supply (2.1e18).",
+)
 @click.option(
     "--difficulty",
     type=int,
@@ -1896,7 +1907,13 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     show_default=True,
     help="Initial PoW difficulty (1 = easiest; EPOCH needs >= 32768).",
 )
-@click.option("--target-time", type=int, default=60, show_default=True, help="V2 DAA: target seconds between mints.")
+@click.option(
+    "--target-time",
+    type=int,
+    default=60,
+    show_default=True,
+    help="V2 DAA: target seconds between mints [1..0xFFFFFFFF].",
+)
 @click.option(
     "--half-life",
     type=int,
@@ -2732,11 +2749,27 @@ def claim_dmint_cmd(
                 "implementation (or a newer one) and pyrxd needs a mirror for its formula."
             ),
         ) from exc
+    except MaxAttemptsError as exc:
+        # MUST precede `except DmintError` for the same reason as the clause above: a
+        # MaxAttemptsError IS a DmintError, and it was reported as "funding can't cover the
+        # mint reward + fee" — so a V2 grind that hit --timeout told the user to add RXD.
+        # Only V2 reaches here: the V1 reroll loop turns its own exhaustion into a UserError.
+        raise _grind_stopped_error(exc, timeout_s=timeout_s) from exc
+    except InvalidFundingUtxoError as exc:
+        # Also a DmintError, and also reported as a funding SHORTFALL before: the cause named
+        # the token on the UTXO correctly under a headline about the amount.
+        raise UserError(
+            "the funding UTXO carries a token and cannot pay for the mint",
+            cause=str(exc),
+            fix="fund the reward address with plain RXD, or pass --reward-address naming an address that holds some",
+        ) from exc
     except DmintError as exc:  # PoolTooSmallError: funding can't cover reward + fee + dust
+        # claim-dmint has no --fee-rate flag: the rate is the configured one (fee_rate in the
+        # pyrxd config, or PYRXD_FEE_RATE). The fix used to say "lower --fee-rate".
         raise UserError(
             "funding can't cover the mint reward + fee",
             cause=str(exc),
-            fix="fund the reward address with more plain RXD, or lower --fee-rate",
+            fix="fund the reward address with a larger plain-RXD UTXO, or lower the configured fee_rate (PYRXD_FEE_RATE)",
         ) from exc
     except ValidationError as exc:  # the A1 non-1-photon-carrier guard, or a rejected miner solution
         raise UserError("could not build a valid mint", cause=str(exc)) from exc
@@ -2779,6 +2812,35 @@ def claim_dmint_cmd(
         click.echo(
             f"  reward:     {contract_utxo.state.reward:,} photons (contract now at height {result['new_height']})"
         )
+
+
+def _grind_stopped_error(exc: MaxAttemptsError, *, timeout_s: float) -> UserError:
+    """The claim-dmint error for a PoW grind that ended without a nonce.
+
+    A wall-clock stop is told apart from a count-based one by what raised it: the bundled and
+    in-process miners stop at ``--timeout`` by raising :class:`MiningDeadline` out of the
+    progress callback (``_mine`` chains it as the cause), and an external miner's timeout is
+    the ``subprocess.TimeoutExpired`` that :func:`mine_solution_external` chains. Anything
+    else — the in-process ``--max-attempts`` cap, or a miner that swept its nonce space — is
+    reported as having run out of attempts, not time.
+    """
+    from subprocess import TimeoutExpired  # nosec B404 — exception class only; spawns nothing
+
+    if isinstance(exc.__cause__, (MiningDeadline, TimeoutExpired)):
+        return UserError(
+            f"mining timed out after {timeout_s:g}s without finding a nonce",
+            cause=str(exc),
+            fix=(
+                f"allow a longer grind with --timeout SECONDS (this run allowed {timeout_s:g}); "
+                "`pyrxd glyph dmint-estimate` shows how long this contract's target is likely to take "
+                "here, and a faster --miner-cmd shortens it"
+            ),
+        )
+    return UserError(
+        "mining stopped without finding a nonce",
+        cause=str(exc),
+        fix="raise --max-attempts (the in-process miner's cap), or run the claim again (a later claim time is a fresh preimage)",
+    )
 
 
 async def _claim_prepare(

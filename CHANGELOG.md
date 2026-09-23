@@ -305,7 +305,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value on the mainnet V2 deploys surveyed (and every value Photonic's Mint form offers)
   is well inside it. Independently, the minimal-push encoder behind every dMint number now
   refuses anything wider than 8 bytes, whichever builder asks — in-range output is
-  unchanged.
+  unchanged. `deploy-dmint --help` claimed `[1..0xFFFFFF]` for `--max-height` and
+  `--reward`; only V1 enforces that, and the help now says which bound is which version's.
+
+- **`claim-dmint` reported a V2 mining timeout as a funding shortfall.** A grind that hit
+  `--timeout` (or `--max-attempts`) raised `MaxAttemptsError`, a `DmintError`, which landed in
+  the "funding can't cover the mint reward + fee — fund the reward address" arm. It now says
+  `mining timed out after <N>s without finding a nonce` and how to allow longer
+  (`--timeout`), or, when a count rather than the clock ran out, `mining stopped without
+  finding a nonce`. A token-bearing funding UTXO, refused by the mint builder, also printed
+  the funding headline over a correct cause; it has its own now. The funding message's
+  remedy named `--fee-rate`, which `claim-dmint` does not have; it names the configured
+  `fee_rate` instead.
 
 ## [0.24.0] — 2026-09-14
 

@@ -135,7 +135,7 @@ error: no single UTXO is large enough to fund the dMint deploy
 ```
 
 From `glyph mint-nft`
-([`src/pyrxd/cli/glyph_cmds.py:297`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)),
+([`src/pyrxd/cli/glyph_cmds.py:298`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)),
 `glyph deploy-ft`
 ([`:551`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)),
 and `glyph deploy-dmint`
@@ -164,7 +164,7 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
   fix: shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:283-290`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
+— [`src/pyrxd/cli/glyph_cmds.py:284-291`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
 (`src/pyrxd/glyph/fees.py:208-241`).
@@ -210,38 +210,65 @@ error: could not find a plain-RXD funding UTXO for the mint
   fix: fund <miner_address> with >= <needed> photons of plain RXD, or pass --reward-address
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:2818-2823`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
+— [`src/pyrxd/cli/glyph_cmds.py:2880-2885`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
 `needed = contract.reward + 10_000_000 + 546` photons — the reward, a fee
 buffer, and dust for the change output. This scans for a UTXO that is
 **plain RXD only** (token-bearing UTXOs at the same address are excluded).
 
 **b) A funding UTXO exists but is too small** — the library's
-`PoolTooSmallError`, verbatim message shape:
+`PoolTooSmallError`, message shape:
 
 ```
 funding_utxo (<value> photons) too small to cover reward (<reward>) + fee (<fee>):
-change would be <change> photons, below 546 dust limit.
+change would be <change> photons, below pyrxd's 546-photon uneconomic-change floor
+(a pyrxd send policy, NOT a Radiant relay limit — Radiant's floor is 1 photon).
+Fund the mint from a larger UTXO.
 ```
 
-— [`src/pyrxd/glyph/dmint/miner.py:2109`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
-and
-[`:2350`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
-(the V1 and V2 mining paths). The CLI reframes any `DmintError` from mining
-as:
+— raised by `build_dmint_mint_tx` in
+[`src/pyrxd/glyph/dmint/miner.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py)
+(both the V1 and V2 paths). It can happen even after (a) found a UTXO, because
+(a)'s `needed` allows a flat 10,000,000 photons for the fee while the mint pays
+`size x fee_rate`: a raised fee rate can outgrow that allowance. `claim-dmint`
+reports it as:
 
 ```
 error: funding can't cover the mint reward + fee
   cause: <PoolTooSmallError text>
-  fix: fund the reward address with more plain RXD, or lower --fee-rate
+  fix: fund the reward address with a larger plain-RXD UTXO, or lower the configured fee_rate (PYRXD_FEE_RATE)
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:2735-2740`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
-Same caveat as item 4: `claim-dmint` has no `--fee-rate` flag either
-(verified) — the fix is really "fund more RXD," or lower the global fee rate
-via config/env.
+`claim-dmint` has no `--fee-rate` flag; the rate is the configured one (`fee_rate`
+in the config file, or `PYRXD_FEE_RATE`).
 
 **Fix:** fund the reward/miner address (`--reward-address`, or the wallet
-address with the largest UTXO by default) with more plain RXD.
+address with the largest UTXO by default) with a larger plain-RXD UTXO.
+
+**Not a funding problem, and no longer reported as one.** Before 2026-09-23 two
+more errors printed the "funding can't cover" headline although neither is about
+the amount; each now has its own:
+
+- **The grind stopped without a nonce** (V2 claims; V1 rerolls its OP_RETURN
+  instead and reports `no nonce found within N preimage rerolls`). When the
+  wall clock ran out — the bundled or in-process miner reaching `--timeout`, or an
+  external `--miner-cmd` not answering within it:
+
+  ```
+  error: mining timed out after <timeout>s without finding a nonce
+    fix: allow a longer grind with --timeout SECONDS (this run allowed <timeout>); ...
+  ```
+
+  When a count ran out instead (the in-process `--max-attempts` cap, or a miner
+  that swept its nonce space): `error: mining stopped without finding a nonce`,
+  with a fix naming `--max-attempts`. Run `pyrxd glyph dmint-estimate` against
+  the contract to see how long its target is likely to take on your machine.
+- **The funding UTXO carries a token** (`InvalidFundingUtxoError` from the mint
+  builder): `error: the funding UTXO carries a token and cannot pay for the mint`.
+  The funding scan in (a) already skips token-bearing UTXOs, so this is the
+  builder's second line of defence rather than something (a)'s choice produces.
+
+All of these are mapped in `claim_dmint_cmd` and `_grind_stopped_error` in
+[`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).
 
 ---
 
@@ -512,7 +539,7 @@ supply amount) gets counted exactly like spendable RXD, which it is
 **not** — spending it as a plain-RXD input burns the token.
 
 **Fix:** `pyrxd glyph list --type ft` (or `--type nft`, or `--type all`) —
-[`src/pyrxd/cli/glyph_cmds.py:1042-1053`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py) —
+[`src/pyrxd/cli/glyph_cmds.py:1043-1054`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py) —
 scans wallet addresses and decodes the Glyph envelope, so token holdings
 show up as tokens, separate from the plain-RXD balance. Use this whenever
 you need to know what's actually spendable versus what's a token carrier.

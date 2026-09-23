@@ -2518,15 +2518,196 @@ class TestClaimDmintReportsUnrecognizedBytecode:
         assert "funding can't cover" not in result.output
         assert "lower --fee-rate" not in result.output
 
-    def test_a_plain_dmint_error_still_reaches_the_funding_clause(
+    # The honest-path pair for this reordering — a real funding shortfall still reaching the
+    # `except DmintError` clause — is TestClaimDmintSaysWhyTheClaimStopped's first test. It was
+    # an exhausted contract here, a state production cannot hand the builder: the real
+    # `_claim_prepare` refuses an exhausted contract before any mint is built.
+
+
+class _ClaimNet:
+    """The ElectrumX reads the REAL ``_claim_prepare`` makes, answered from two raw transactions.
+
+    ``get_transaction`` serves the contract (``ab…:0``) and the funding (``ef…:0``) outputs and
+    ``get_utxos`` lists the funding UTXO, so the production contract fetch, the plain-RXD funding
+    scan and its ``needed`` arithmetic all run. Broadcasts are recorded (none are expected).
+    """
+
+    def __init__(self, contract_script: bytes, funding_script: bytes, funding_value: int) -> None:
+        from pyrxd.network.electrumx import UtxoRecord
+        from pyrxd.script.script import Script
+        from pyrxd.transaction.transaction import Transaction
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        def _raw(script: bytes, value: int) -> bytes:
+            return bytes(Transaction(tx_inputs=[], tx_outputs=[TransactionOutput(Script(script), value)]).serialize())
+
+        self._txs = {"ab" * 32: _raw(contract_script, 1), "ef" * 32: _raw(funding_script, funding_value)}
+        self.funding = UtxoRecord(tx_hash="ef" * 32, tx_pos=0, value=funding_value, height=100)
+        self.broadcasts: list[bytes] = []
+
+    async def __aenter__(self) -> _ClaimNet:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def get_transaction(self, txid: object) -> bytes:
+        return self._txs[str(txid)]
+
+    async def get_utxos(self, script_hash: object) -> list:
+        return [self.funding]
+
+    async def broadcast(self, raw: bytes) -> str:
+        self.broadcasts.append(bytes(raw))
+        return "11" * 32
+
+
+class TestClaimDmintSaysWhyTheClaimStopped:
+    """`except DmintError` in claim-dmint says "funding can't cover the mint reward + fee", and
+    three OTHER DmintErrors used to land in it: a V2 grind that hit ``--timeout`` (or ran out of
+    attempts) — ``MaxAttemptsError`` — and a token-bearing funding UTXO —
+    ``InvalidFundingUtxoError``. Each told the user to add RXD. These tests drive the shipped
+    command; only the wallet and the ElectrumX transport are faked, and where the real
+    ``_claim_prepare`` can run, it does."""
+
+    @staticmethod
+    def _contract(difficulty: int) -> bytes:
+        from pyrxd.glyph.dmint import DaaMode, DmintDeployParams, build_dmint_contract_script
+
+        return build_dmint_contract_script(
+            DmintDeployParams(
+                contract_ref=GlyphRef(txid="ab" * 32, vout=1),
+                token_ref=GlyphRef(txid="cd" * 32, vout=0),
+                max_height=100,
+                reward=1000,
+                difficulty=difficulty,
+                daa_mode=DaaMode.FIXED,
+                last_time=1_700_000_000,
+            )
+        )
+
+    def _wire(self, monkeypatch, *, difficulty: int, funding_value: int) -> _ClaimNet:
+        """Fake wallet + transport around the REAL `_claim_prepare`; returns the fake network."""
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.keys import PrivateKey
+
+        key = PrivateKey()  # a fresh random key; never hand-written material
+        funding_script = b"\x76\xa9\x14" + bytes(key.public_key().hash160()) + b"\x88\xac"
+        net = _ClaimNet(self._contract(difficulty), funding_script, funding_value)
+
+        class _Wallet:
+            async def collect_spendable(self, client: object) -> list:
+                return [(net.funding, key.address(), key)]
+
+        monkeypatch.setattr(glyph_cmds, "_load_wallet", lambda ctx, **kw: _Wallet())
+        monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: net)
+        return net
+
+    @staticmethod
+    def _claim(runner: CliRunner, tmp_wallet_path: Path, *extra: str, env: dict | None = None):
+        args = ["--wallet", str(tmp_wallet_path), "--yes", "glyph", "claim-dmint", "--contract", "ab" * 32 + ":0"]
+        return runner.invoke(cli, [*args, "--no-progress", "--current-time", "1700000090", *extra], env=env)
+
+    def test_a_real_funding_shortfall_still_reaches_the_funding_clause(
         self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
     ) -> None:
-        """The honest-path pair for the reordering: inserting a clause ABOVE
-        `except DmintError` must not shadow it. An exhausted contract raises
-        ContractExhaustedError — a plain DmintError — and must still land there."""
-        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
-        self._patch_prepare(monkeypatch, corrupt=False, height=100)
-        result = self._invoke(runner, tmp_wallet_path)
+        """The honest-path pair for every clause inserted ABOVE `except DmintError`: none may
+        shadow it. This is a shortfall production produces. `_claim_prepare` asks the funding
+        scan for ``reward + 10_000_000 + dust`` — a flat fee allowance — while the builder
+        charges ``size x fee_rate``; at five times the relay floor (a PYRXD_FEE_RATE the config
+        accepts) the fee outgrows the allowance, and a UTXO of exactly ``needed`` falls short."""
+        from pyrxd.constants import DUST_THRESHOLD_PHOTONS
+        from pyrxd.fee_sizing import relay_floor_photons_per_byte
+
+        needed = 1000 + 10_000_000 + DUST_THRESHOLD_PHOTONS  # _claim_prepare's own arithmetic
+        net = self._wire(monkeypatch, difficulty=1, funding_value=needed)
+        grinds: list[bytes] = []
+        from pyrxd.cli import glyph_cmds
+
+        monkeypatch.setattr(glyph_cmds, "_mine_bundled_parallel", lambda pre, tgt, **kw: grinds.append(pre) or b"")
+        result = self._claim(runner, tmp_wallet_path, env={"PYRXD_FEE_RATE": str(5 * relay_floor_photons_per_byte())})
         assert result.exit_code != 0, result.output
         assert "funding can't cover the mint reward + fee" in result.output
-        assert "matches no DAA generation" not in result.output
+        assert "too small to cover" in result.output  # PoolTooSmallError's own cause
+        assert grinds == [] and net.broadcasts == []
+        # The remedy no longer names a flag claim-dmint does not have.
+        assert "--fee-rate" not in result.output
+
+    def test_a_v2_grind_that_hits_timeout_says_it_timed_out(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """The in-process miner, for real, against target 1 (difficulty MAX_SHA256D_TARGET: no
+        nonce will be found), stopped by the real ``_MiningReporter`` deadline at the first
+        progress check (~0.5 s)."""
+        from pyrxd.glyph.dmint import MAX_SHA256D_TARGET
+
+        net = self._wire(monkeypatch, difficulty=MAX_SHA256D_TARGET, funding_value=500_000_000)
+        result = self._claim(runner, tmp_wallet_path, "--miner-cmd", "in-process", "--timeout", "0.05")
+        assert result.exit_code != 0, result.output
+        assert "mining timed out after 0.05s without finding a nonce" in result.output
+        assert "--timeout SECONDS (this run allowed 0.05)" in result.output
+        assert "funding can't cover" not in result.output
+        assert "fund the reward address" not in result.output
+        assert net.broadcasts == []
+
+    def test_an_external_miner_timeout_says_it_timed_out(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """The other wall-clock path: an external miner that never answers is killed at
+        ``--timeout`` by ``mine_solution_external``, which raises from ``TimeoutExpired``."""
+        import shlex
+        import sys
+
+        net = self._wire(monkeypatch, difficulty=1, funding_value=500_000_000)
+        miner = shlex.join([sys.executable, "-c", "import time; time.sleep(30)"])
+        result = self._claim(runner, tmp_wallet_path, "--miner-cmd", miner, "--timeout", "0.5")
+        assert result.exit_code != 0, result.output
+        assert "mining timed out after 0.5s" in result.output
+        assert "funding can't cover" not in result.output
+        assert net.broadcasts == []
+
+    def test_running_out_of_attempts_is_not_reported_as_a_timeout(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """The honest-path pair for the timeout wording: a count-based stop (``--max-attempts``)
+        must not claim it ran out of time, and must not claim a funding shortfall either."""
+        from pyrxd.glyph.dmint import MAX_SHA256D_TARGET
+
+        self._wire(monkeypatch, difficulty=MAX_SHA256D_TARGET, funding_value=500_000_000)
+        result = self._claim(runner, tmp_wallet_path, "--miner-cmd", "in-process", "--max-attempts", "1")
+        assert result.exit_code != 0, result.output
+        assert "mining stopped without finding a nonce" in result.output
+        assert "--max-attempts" in result.output
+        assert "timed out" not in result.output
+        assert "funding can't cover" not in result.output
+
+    def test_a_token_bearing_funding_utxo_is_named_as_such(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """Production's funding scan (``find_dmint_funding_utxo``) skips token-bearing UTXOs, so
+        this reaches the mint builder's own refusal only with `_claim_prepare` stubbed to hand
+        it one — it is the builder's second line of defence. What is tested is the headline:
+        it used to read "funding can't cover" over a cause naming the token."""
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.glyph.dmint import DmintContractUtxo, DmintMinerFundingUtxo, DmintState
+        from pyrxd.keys import PrivateKey
+
+        script = self._contract(1)
+        contract = DmintContractUtxo(
+            txid="ab" * 32, vout=0, value=1, script=script, state=DmintState.from_script(script)
+        )
+        key = PrivateKey()
+        pkh = bytes(key.public_key().hash160())
+        ft_script = b"\x76\xa9\x14" + pkh + b"\x88\xac\xbd\xd0" + bytes(36) + bytes.fromhex("dec0e9aa76e378e4a269e69d")
+        funding = DmintMinerFundingUtxo(txid="ef" * 32, vout=0, value=500_000_000, script=ft_script)
+
+        async def _fake_prepare(ctx, wallet, contract_arg, token_ref_arg, reward_address, client):
+            return contract, funding, key, pkh
+
+        self._wire(monkeypatch, difficulty=1, funding_value=500_000_000)
+        monkeypatch.setattr(glyph_cmds, "_claim_prepare", _fake_prepare)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "the funding UTXO carries a token and cannot pay for the mint" in result.output
+        assert "token envelope" in result.output  # the builder's cause, unchanged
+        assert "funding can't cover" not in result.output
