@@ -70,15 +70,14 @@ Run: ``RADIANT_REGTEST=1 pytest tests/test_dmint_v2_regtest_e2e.py -m integratio
 
 from __future__ import annotations
 
-import os
 import secrets
-import sys
 import warnings
 
 import pytest
 
 # Reuse the isolated-regtest harness wholesale (same pattern as the V1 test):
 # the ``node`` fixture spins up + tears down a throwaway radiant-core container.
+from _dmint_miner import dmint_mine_timeout_s, dmint_miner_argv, dmint_miner_label
 from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
     _RELAY_FEE_SATS,
     _p2pkh_unlock,
@@ -128,15 +127,14 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-# Mining an 8-byte-nonce V2 mint is an intrinsic ~2**32 sweep (the 4-zero-byte
-# PoW floor is consensus-hardcoded). Workers + timeout are env-tunable so the
-# test stays robust on a loaded box: DMINT_MINE_WORKERS caps worker processes
-# (default os.cpu_count()) to avoid oversubscription, DMINT_MINE_TIMEOUT_S
-# raises the ceiling (default 1800s per difficulty-1 grind; see _grind_timeout_s).
-_MINER_ARGV = [sys.executable, "-m", "pyrxd.contrib.miner"]
-if os.environ.get("DMINT_MINE_WORKERS"):
-    _MINER_ARGV += ["--workers", os.environ["DMINT_MINE_WORKERS"]]
-_MINE_TIMEOUT_S = float(os.environ.get("DMINT_MINE_TIMEOUT_S", "1800"))
+# Mining an 8-byte-nonce V2 mint is an intrinsic ~2**33-hash search at difficulty 1 (the
+# 4-zero-byte PoW floor is consensus-hardcoded). The miner, its worker count and the ceiling are
+# env-tunable (tests/_dmint_miner.py): DMINT_MINER_CMD picks the miner (default: the bundled
+# Python miner), DMINT_MINE_WORKERS caps its workers (default os.cpu_count()) to avoid
+# oversubscription, and DMINT_MINE_TIMEOUT_S raises the ceiling (default 1800s per difficulty-1
+# grind; see _grind_timeout_s).
+_MINER_ARGV = dmint_miner_argv()
+_MINE_TIMEOUT_S = dmint_mine_timeout_s(1800)
 _CONTRACT_VALUE = 1  # V2 contract is a value-1 singleton (covenant: OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY)
 
 
@@ -164,7 +162,7 @@ def _log_grind(target: int, mined) -> None:
     ratio = estimate_attempts(target).expected_attempts / estimate_attempts(MAX_SHA256D_TARGET).expected_attempts
     print(
         f"\n[grind] difficulty x{ratio:.2f}: {mined.attempts:,} attempts in {mined.elapsed_s:.0f}s "
-        f"({rate / 1e6:.1f} M/s), ceiling {_grind_timeout_s(target):.0f}s",
+        f"({rate / 1e6:.1f} M/s, {dmint_miner_label(_MINER_ARGV)}), ceiling {_grind_timeout_s(target):.0f}s",
         flush=True,
     )
 

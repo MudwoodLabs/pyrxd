@@ -22,9 +22,10 @@ This test proves, on an isolated ``radiant-core`` regtest node via
 Opt-in: ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1`` (skips, never
 fails, otherwise). It never runs in normal CI — honouring the PR #140
 "no PoW grinding in CI" decision. It manages its own throwaway container
-and moves no real value. The one-time ~3-4 min mine (the irreducible
-4-zero-byte SHA256d floor at difficulty 1) runs via the bundled parallel
-miner across all cores.
+and moves no real value. Each mine is the irreducible 4-zero-byte SHA256d
+floor at difficulty 1 (~2**33 hashes on average), ground by the miner
+``tests/_dmint_miner.py`` picks: the bundled parallel Python miner by default,
+or the command in ``DMINT_MINER_CMD`` (the nightly job's native grinder).
 
 Run: ``RADIANT_REGTEST=1 pytest tests/test_dmint_v1_regtest_e2e.py -m integration -s``
 """
@@ -32,13 +33,13 @@ Run: ``RADIANT_REGTEST=1 pytest tests/test_dmint_v1_regtest_e2e.py -m integratio
 from __future__ import annotations
 
 import os
-import sys
 
 import pytest
 
 # Reuse the isolated-regtest harness wholesale (same pattern as the SPV
 # differential test): the ``node`` fixture spins up + tears down a throwaway
 # radiant-core container; ``.accepts()`` == testmempoolaccept.
+from _dmint_miner import dmint_mine_timeout_s, dmint_miner_argv, dmint_miner_label
 from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
     _RELAY_FEE_SATS,
     _p2pkh_unlock,
@@ -83,6 +84,12 @@ _CARRIER = 1  # contract singleton carrier — the covenant HARDCODES vout0 valu
 #             dMint contracts are all 1 photon (ref-bearing outputs are dust-exempt).
 _FUNDING = 50_000_000  # 0.5 RXD plain coin to fund the mint (reward + fee + change)
 _OP_RETURN = b"r2w"  # forces the 4-output shape the V1 mint preimage requires
+
+# The miner (see tests/_dmint_miner.py) and the ceiling for ONE call to it. A V1 call is at most
+# one 2**32-nonce sweep — the miner exits "exhausted" at the end of it and the loops below reroll
+# the preimage — so this bounds a sweep, not a whole grind.
+_MINER_ARGV = dmint_miner_argv()
+_MINE_TIMEOUT_S = dmint_mine_timeout_s(1800)
 
 # --- plumbing values -----------------------------------------------------------------
 # The node runs at MAINNET's relay floor (10 000 photons/byte), so every hand-built
@@ -258,14 +265,18 @@ class TestDmintV1OnConsensus:
                     pre.preimage,
                     target=contract.state.target,
                     nonce_width=4,
-                    miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
-                    timeout_s=1800,
+                    miner_argv=_MINER_ARGV,
+                    timeout_s=_MINE_TIMEOUT_S,
                 )
             except MaxAttemptsError:
                 print(f"[mine] reroll {attempt}: 2**32 nonce space exhausted; varying OP_RETURN", flush=True)
                 continue
             nonce = result.nonce
-            print(f"[mine] hit on reroll {attempt}: nonce={nonce.hex()} in {result.elapsed_s:.0f}s", flush=True)
+            print(
+                f"[mine] hit on reroll {attempt}: nonce={nonce.hex()} in {result.elapsed_s:.0f}s "
+                f"({dmint_miner_label(_MINER_ARGV)})",
+                flush=True,
+            )
             break
         assert nonce is not None, "no nonce found within 40 preimage rerolls (P < 1e-13 — investigate)"
 
@@ -326,8 +337,8 @@ def _mine_v1(contract: DmintContractUtxo, funding: DmintMinerFundingUtxo, miner_
                 pre.preimage,
                 target=contract.state.target,
                 nonce_width=4,
-                miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
-                timeout_s=1800,
+                miner_argv=_MINER_ARGV,
+                timeout_s=_MINE_TIMEOUT_S,
             )
         except MaxAttemptsError:
             print(f"[mine] reroll {attempt}: 2**32 nonce space exhausted; varying OP_RETURN", flush=True)
@@ -335,7 +346,7 @@ def _mine_v1(contract: DmintContractUtxo, funding: DmintMinerFundingUtxo, miner_
         rate = result.attempts / result.elapsed_s if result.elapsed_s > 0 else float("nan")
         print(
             f"\n[grind] V1 hit on reroll {attempt}: {result.attempts:,} attempts in {result.elapsed_s:.0f}s "
-            f"({rate / 1e6:.1f} M/s)",
+            f"({rate / 1e6:.1f} M/s, {dmint_miner_label(_MINER_ARGV)})",
             flush=True,
         )
         return mint, pre, result.nonce, op_msg

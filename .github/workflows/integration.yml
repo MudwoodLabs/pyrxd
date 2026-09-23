@@ -234,9 +234,25 @@ jobs:
         run: pip install -r ci/poetry-pin.txt --require-hashes
       - name: Install dependencies
         run: poetry install --sync --no-interaction
+      # The native grinder: SHA256d with a precomputed midstate, the x86 SHA extensions where
+      # the CPU has them, one thread per CPU. Built from the C source pyrxd ships, by the same
+      # helper a user runs; the helper runs the binary's SHA-256 self-test and refuses a binary
+      # that fails it. The grinds below use it through DMINT_MINER_CMD; without that variable
+      # they fall back to the bundled Python miner (tests/_dmint_miner.py).
+      - name: Build the native SHA256d grinder
+        run: |
+          grep -m1 -o 'model name.*' /proc/cpuinfo || true
+          echo "logical CPUs: $(nproc); SHA extensions in /proc/cpuinfo: $(grep -m1 -wo sha_ni /proc/cpuinfo || echo none)"
+          poetry run python -m pyrxd.contrib.miner.native --out "$RUNNER_TEMP/sha256d-grind"
+      # One line per run and miner, on this runner, tonight: the rate both miners reach and the
+      # mean difficulty-1 grind it projects to. About a minute, and it is what sizes the
+      # ceilings below from a measurement instead of from a guess.
+      - name: Hash rate on this runner (bundled Python miner vs native grinder)
+        run: poetry run python scripts/bench_dmint_miners.py --grinder "$RUNNER_TEMP/sha256d-grind"
       - name: dMint V1 + V2 + premine, mined for real
         env:
           RADIANT_REGTEST: "1"
+          DMINT_MINER_CMD: ${{ runner.temp }}/sha256d-grind
           # Per-mine ceiling. The default 1800 s is sized for a developer box; a 4-vCPU
           # runner is several times slower and the grind's variance is wide (the V1
           # deploy+mint measured 80 s and 219 s on consecutive runs of the same box), so
@@ -244,8 +260,11 @@ jobs:
           # per difficulty-1 grind and scales it by each grind's difficulty
           # (`_grind_timeout_s`), so its MAX/4 grinds get four times this.
           DMINT_MINE_TIMEOUT_S: "3600"
+        # `-s` streams each grind's `[grind]`/`[mine]` line (attempts, seconds, rate, miner) as it
+        # happens, so even a run cut off by the job timeout shows how far it got;
+        # `--durations=0` prints every test's wall clock at the end.
         run: |
-          poetry run pytest -o "addopts=" -m integration -q \
+          poetry run pytest -o "addopts=" -m integration -q -s -rap --durations=0 \
             tests/test_dmint_v1_regtest_e2e.py \
             tests/test_dmint_v2_regtest_e2e.py \
             tests/test_dmint_premine_regtest_e2e.py
