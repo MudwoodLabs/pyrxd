@@ -46,7 +46,8 @@ from typing import TypeGuard
 import cbor2
 
 from ..security.errors import ValidationError
-from .payload import GLY_MARKER, _encode_payload_push
+from ..security.json_guards import cbor_int
+from .payload import GLY_MARKER, _encode_payload_push, loads_chain_cbor
 from .script import TruncatedScriptError, script_carries_ref
 from .types import GlyphProtocol, GlyphRef
 
@@ -55,6 +56,7 @@ _log = logging.getLogger(__name__)
 __all__ = [
     "BURN_MARKER_BYTE",
     "BURN_PROOF_VERSION",
+    "MAX_BURN_AMOUNT",
     "BurnBasis",
     "BurnProof",
     "BurnVerdict",
@@ -88,6 +90,27 @@ BURN_MARKER_BYTE = int(GlyphProtocol.BURN)  # 6
 #: not protocol limits, and interoperating means adopting the other implementation's policy.
 _MAX_PROOF_CBOR_BYTES = 131_072
 
+#: The largest ``amount`` a burn proof can carry and be read back as a count.
+#:
+#: Token units are photons, and a Radiant output value is a signed 64-bit integer, so no
+#: quantity of a token's units is negative or reaches 2**63. Photonic writes the field
+#: from ``burnFt``'s ``amountToBurn``, a JS ``number`` bounded by the token UTXO's
+#: value (``packages/lib/src/burn.ts``).
+#:
+#: A JS ``number`` is NOT always a CBOR integer on the wire. cbor-x — the encoder
+#: Photonic uses — writes every number of 2**32 or more as a float64 (measured with
+#: cbor-x 1.6.0: an amount of 5,000,000,000 encodes as ``fb 41f2a05f20000000``). So an
+#: honest proof burning more than about 4.29 billion units carries a FLOAT, and the reader
+#: accepts a finite integral float up to 2**53 as the integer it is
+#: (:func:`~pyrxd.security.json_guards.cbor_int`). Past 2**53 a JS number was already
+#: rounded before it was encoded, so it is withheld rather than reported as exact.
+#:
+#: The CBOR cap above does NOT bound it. A tag-2 bignum of 40,000 bits is 5 KB of
+#: CBOR, under the cap, and decodes to a Python int whose ``str()`` raises
+#: ``ValueError`` (CPython refuses int-to-decimal conversion past 4,300 digits). That
+#: crashed ``pyrxd glyph inspect`` on any transaction carrying one such output.
+MAX_BURN_AMOUNT = 2**63 - 1
+
 
 @dataclass(frozen=True)
 class BurnProof:
@@ -99,6 +122,14 @@ class BurnProof:
     protocol: tuple[int, ...] = (int(GlyphProtocol.BURN),)
     amount: int | None = None
     reason: str | None = None
+    #: Why the proof's ``amount`` field was present and NOT kept, or ``None``.
+    #:
+    #: ``amount is None`` alone could mean "the proof names no amount" or "it names one
+    #: this reader refused" — opposite facts, and the silent one reads as the harmless
+    #: one. Set when the field is not a whole number (a fractional or non-finite float, a
+    #: float past 2**53, a string, a boolean, a CBOR decimal fraction), is negative, or is
+    #: wider than :data:`MAX_BURN_AMOUNT`.
+    amount_withheld: str | None = None
 
 
 class BurnBasis(Enum):
@@ -134,11 +165,18 @@ def build_burn_proof_script(
     :param amount: units burned, for a fungible token. Omitted for an NFT.
     :param burn_reason: free text recorded in the proof. Operator-supplied and
         displayed, so treat it as untrusted on read.
-    :raises ValidationError: *amount* is negative, or the encoded proof exceeds
-        the CBOR cap.
+    :raises ValidationError: *amount* is not an integer in ``0..MAX_BURN_AMOUNT``,
+        or the encoded proof exceeds the CBOR cap.
     """
-    if amount is not None and amount < 0:
-        raise ValidationError(f"burn amount must be >= 0, got {amount}")
+    # THE SAME RANGE `parse_burn_proof` applies. Refusing only negatives here let this
+    # function write a proof whose amount the reader withholds — pyrxd emitting a record
+    # pyrxd cannot read back, which is how the crash reproducer was built. The writer is
+    # stricter about TYPE than the reader: a Python caller passes an int, and the reader's
+    # acceptance of whole floats exists only for what cbor-x writes.
+    if amount is not None:
+        problem = _burn_amount_out_of_range(amount) if _is_int(amount) else f"it is a {type(amount).__name__}"
+        if problem is not None:
+            raise ValidationError(f"burn amount must be >= 0 and <= 2**63 - 1, as an int: {problem}")
     proof: dict[str, object] = {
         "v": BURN_PROOF_VERSION,
         "p": [BURN_MARKER_BYTE],
@@ -180,6 +218,33 @@ def _is_int(value: object) -> TypeGuard[int]:
     runtime, it does not change which values pass.
     """
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _read_burn_amount(raw: object) -> tuple[int | None, str | None]:
+    """``(amount, None)`` for a count of burned units, else ``(None, why not)``.
+
+    A whole float is accepted up to 2**53 because that is what cbor-x writes for an honest
+    Photonic amount of 2**32 or more; see :data:`MAX_BURN_AMOUNT`.
+    """
+    try:
+        value = cbor_int(raw)
+    except ValueError as exc:
+        return None, f"it is not a whole number: {exc}"
+    problem = _burn_amount_out_of_range(value)
+    return (None, problem) if problem is not None else (value, None)
+
+
+def _burn_amount_out_of_range(amount: int) -> str | None:
+    """Why the integer *amount* cannot be a count of burned units, or ``None``.
+
+    The reason never repeats a wide value: printing the integer is the operation that
+    raises, so anything past 64 bits is described by its width instead.
+    """
+    if 0 <= amount <= MAX_BURN_AMOUNT:
+        return None
+    shown = str(amount) if amount.bit_length() <= 64 else f"a {amount.bit_length()}-bit integer"
+    sign = "negative" if amount < 0 else "above 2**63 - 1"
+    return f"it is {shown} ({sign}); token units are photons, and no count of them is negative or reaches 2**63"
 
 
 def parse_burn_proof(script: bytes) -> BurnProof | None:
@@ -224,8 +289,8 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
     if len(payload) > _MAX_PROOF_CBOR_BYTES:
         return None
     try:
-        d = cbor2.loads(payload)
-    except Exception:
+        d = loads_chain_cbor(payload)
+    except ValidationError:
         return None
     if not isinstance(d, dict) or not isinstance(d.get("token_ref"), str):
         return None
@@ -242,6 +307,9 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
     cbor_version = d.get("v")
     reason = d.get("reason")
     token_ref = d["token_ref"]
+    # A CBOR `null` is "no amount", the same as the key being absent; anything else
+    # that is not a count is withheld WITH its reason rather than dropped in silence.
+    amount_value, amount_withheld = _read_burn_amount(amount) if amount is not None else (None, None)
     return BurnProof(
         token_ref=token_ref if isinstance(token_ref, str) else "",
         action=action if isinstance(action, str) else "",
@@ -250,8 +318,9 @@ def parse_burn_proof(script: bytes) -> BurnProof | None:
         # and an amount, and `_inspect_core` then emitted `"amount": true`.
         version=cbor_version if _is_int(cbor_version) else 0,
         protocol=tuple(x for x in protocol if _is_int(x)) if isinstance(protocol, (list, tuple)) else (),
-        amount=amount if _is_int(amount) else None,
+        amount=amount_value,
         reason=reason if isinstance(reason, str) else None,
+        amount_withheld=amount_withheld,
     )
 
 

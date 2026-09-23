@@ -812,6 +812,10 @@ function appendOpReturnPayload(dl, row) {
     if (c.action) dl.appendChild(kv("action (claimed)", c.action));
     if (c.amount !== undefined && c.amount !== null) {
       dl.appendChild(kv("amount (claimed)", c.amount));
+    } else if (burn.amount_withheld) {
+      // The proof named an amount the classifier refused to repeat (a bignum,
+      // a negative, a non-integer). Say so: no line reads as "no amount claimed".
+      dl.appendChild(kv("amount (claimed)", `withheld — ${burn.amount_withheld}`, "kv-warning"));
     }
     if (c.reason) dl.appendChild(kv("reason (claimed)", c.reason));
     if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));

@@ -96,6 +96,7 @@ _SHAPE_NAMES = (
     "commit-ft",
     "commit-dat",
     "op_return-burn",
+    "op_return-burn-amount-withheld",
     "delegate-token",
     "delegate-burn",
     # A commit output carrying the 56-byte delegate prefix. Same emitted TYPE as
@@ -121,6 +122,17 @@ _SHAPE_NAMES = (
     "unknown-gate-only",
     "unknown-undecodable",
 )
+
+
+def _hand_encoded_burn_proof(ref, *, amount: object) -> bytes:
+    """A burn-proof OP_RETURN carrying *amount* verbatim, in the layout
+    ``build_burn_proof_script`` emits, for values that writer refuses."""
+    import cbor2
+
+    cbor = cbor2.dumps(
+        {"v": 2, "p": [6], "action": "burn", "token_ref": f"{ref.txid}:{ref.vout}", "amount": amount}, canonical=True
+    )
+    return b"\x6a\x03gly\x01\x02\x01\x06\x4c" + bytes([len(cbor)]) + cbor
 
 
 @functools.lru_cache(maxsize=1)
@@ -221,6 +233,11 @@ def _corpus() -> dict[str, bytes]:
         # the payload hash shifts relative to the two commits above.
         "commit-dat": build_dat_commit_locking_script(payload_hash, pkh),
         "op_return-burn": build_burn_proof_script(ref, amount=250, burn_reason="redeemed"),
+        # A burn proof whose `amount` is not a count (here negative). `parse_burn_proof`
+        # withholds it and says why, and that reason is a field both cards must show:
+        # a missing amount line reads as "no amount was claimed". Hand-encoded, because
+        # the writer refuses this value — a stranger's wallet does not.
+        "op_return-burn-amount-withheld": _hand_encoded_burn_proof(ref, amount=-1),
         # A delegate token is the SAME 63 bytes as "nft" above with a different
         # opcode (0xd0 vs 0xd8), which is exactly why it gets its own shape.
         "delegate-token": build_delegate_token_script(pkh, ref2),

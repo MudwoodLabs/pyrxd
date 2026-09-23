@@ -278,7 +278,7 @@ Notes on individual fields:
   the refs it parsed out of the reveal's *output* scripts, which is the only
   check either field admits (§7.5, §9.4). Entries MAY be raw byte strings or
   wrapped in **CBOR tag 64**, like `main.b`; a decoder MUST accept both
-  (`src/pyrxd/glyph/payload.py:139-178`). pyrxd emits raw byte strings.
+  (`src/pyrxd/glyph/payload.py:140-179`). pyrxd emits raw byte strings.
   A decoder SHOULD drop a malformed entry rather than fail the whole envelope —
   this is advisory metadata on an attacker-controlled payload.
 
@@ -345,8 +345,8 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:324-351`). A malformed
-`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:297-302`) — an
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:450-477`). A malformed
+`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:443-448`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
 
@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:336-343`), and reads it back with
+(`src/pyrxd/glyph/builder.py:337-344`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:294-300`).
+(`src/pyrxd/glyph/builder.py:295-301`).
 
 ### 6.2 Phase 2 — reveal
 
@@ -486,7 +486,7 @@ outpoint as a ref. It is bound to the spender's key by the P2PKH tail.
   required to.
 - The reveal's recipient MAY differ from the key that signs the reveal. pyrxd
   performs no authorisation check on recipient selection; mint-to-recipient is a
-  supported flow (`src/pyrxd/glyph/builder.py:82-99`).
+  supported flow (`src/pyrxd/glyph/builder.py:83-100`).
 
 ## 7. Locking-script templates
 
@@ -729,7 +729,7 @@ not cross-implementation agreement, and MUST NOT be cited as such.
 #### 7.6.3 The `dmint` envelope object
 
 Field names mirror Photonic's `DmintPayload`
-(`src/pyrxd/glyph/dmint/types.py:238-291`):
+(`src/pyrxd/glyph/dmint/types.py:239-296`):
 
 ```
 { "algo": uint, "numContracts": uint, "maxHeight": uint, "reward": uint,

@@ -1195,6 +1195,9 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
             value = claims.get(key)
             if value not in (None, ""):
                 out.append(f"{indent}  {key}: {_truncate_for_human(str(value))}")
+            elif key == "amount" and burn.get("amount_withheld"):
+                # Said, not skipped: a missing line reads as "no amount was claimed".
+                out.append(f"{indent}  amount: [withheld — {_truncate_for_human(burn['amount_withheld'])}]")
         if burn.get("note"):
             out.append(f"{indent}  {_truncate_for_human(str(burn['note']))}")
 
@@ -1254,8 +1257,16 @@ def _render_script_human(payload: dict) -> str:
         #
         # Naming the quantity is the fix: this output can only ever see the one
         # contract script it was handed.
-        cap = payload["max_height"] * payload["reward"]
-        body.append(f"  this contract's cap: {cap:,} photons ({payload['max_height']:,} mints x {payload['reward']:,})")
+        max_height, reward = payload["max_height"], payload["reward"]
+        # Either may arrive as "<oversized integer: N bits>": the payload is bounded
+        # (`_render_safe`), and a contract script's state pushes are whatever its deployer
+        # wrote. Multiplying a string raised TypeError; formatting it with `,` raised
+        # ValueError — the crash the bound exists to prevent, moved one line down.
+        if isinstance(max_height, int) and isinstance(reward, int):
+            cap = max_height * reward
+            body.append(f"  this contract's cap: {cap:,} photons ({max_height:,} mints x {reward:,})")
+        else:
+            body.append("  this contract's cap: not computed — max_height or reward is too large to render")
         body.append("  (the cap IF every mint succeeds, and for THIS contract only —")
         body.append("   a token may deploy several contracts against one token_ref,")
         body.append("   and its supply is the sum across them)")
