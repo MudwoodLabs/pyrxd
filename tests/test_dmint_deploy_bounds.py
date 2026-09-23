@@ -571,6 +571,29 @@ class TestDeployDmintCliBounds:
         assert "invalid dMint deploy parameters" not in good.output
         assert "no wallet at" in good.output, good.output
 
+    @pytest.mark.parametrize(
+        ("flag", "refused", "accepted"),
+        [
+            ("--reward", RADIANT_MAX_PHOTONS + 1, RADIANT_MAX_PHOTONS),
+            ("--max-height", 2**31 + 1, 2**31),
+            ("--difficulty", MAX_SHA256D_TARGET + 1, MAX_SHA256D_TARGET),
+        ],
+    )
+    def test_v1_caps_are_enforced_at_the_parameter_gate(self, tmp_path, flag, refused, accepted) -> None:
+        """The V1 half of the test above (which runs with --v2 only): deploy-dmint's own V1
+        check is what names the flag; without it DmintV1DeployParams would still refuse, but
+        naming ``reward_photons``/``max_height``, after the same gate."""
+        base = {"--max-height": "100", "--reward": "1000"}
+        base.pop(flag, None)
+        fixed = [x for kv in base.items() for x in kv]
+        bad = self._run(tmp_path, *fixed, flag, str(refused), v2=False)
+        assert bad.exit_code != 0
+        assert "invalid dMint deploy parameters" in bad.output
+        assert f"deploy-dmint: {flag} must be <=" in bad.output
+        good = self._run(tmp_path, *fixed, flag, str(accepted), v2=False)
+        assert "invalid dMint deploy parameters" not in good.output
+        assert "no wallet at" in good.output, good.output
+
     def test_v1_max_height_stops_at_2_31_naming_the_flag(self, tmp_path) -> None:
         """V1's own bound: refused before the wallet is opened, naming --max-height and the
         4-byte height as the reason. 2**31 itself reaches the wallet; V2 is not held to it."""
