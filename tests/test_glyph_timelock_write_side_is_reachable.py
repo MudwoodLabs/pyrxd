@@ -42,6 +42,7 @@ from pyrxd.glyph.timelock import (
     TimelockParams,
     TimelockRecipient,
     build_timelock_mint,
+    cek_wrap_aad,
     compute_cek_hash,
     format_cek_hash,
     get_unlock_remaining,
@@ -474,14 +475,22 @@ class TestARecipientCanOpenItWithoutWaiting:
         assert wrap["kid"] == "auctioneer"
 
         stub = EncryptedContentStub.from_dict(decoded_dict)
+        # The AAD is the on-chain `cek_hash` TEXT, read back off the decoded envelope — the
+        # value Photonic's `decryptContent` binds. This test passed the raw digest through 0.24.0,
+        # which is how it agreed with a mint Photonic could not open.
         recovered_cek = pyrxd.unwrap_cek_x25519(
             stub.crypto.recipients[0].wrapped_cek,
             stub.crypto.recipients[0].epk,
             sk,
-            compute_cek_hash(build.cek),
+            cek_wrap_aad(stub.crypto.cek_hash),
+            allow_legacy_info=False,
         )
         assert recovered_cek == build.cek
         assert pyrxd.decrypt_chunked(build.ciphertext, recovered_cek, build.ciphertext.plaintext_hash)
+        with pytest.raises(ValueError):
+            pyrxd.unwrap_cek_x25519(
+                stub.crypto.recipients[0].wrapped_cek, stub.crypto.recipients[0].epk, sk, compute_cek_hash(build.cek)
+            )
 
     def test_with_no_recipients_the_envelope_carries_no_wraps(self) -> None:
         assert "recipients" not in cbor2.loads(encode_payload(_seal().metadata)[0])["crypto"]

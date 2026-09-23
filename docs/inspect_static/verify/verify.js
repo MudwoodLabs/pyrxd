@@ -14,8 +14,10 @@
 //
 // THE CLAIM DISCIPLINE, which is the only thing here that can really go wrong:
 //
-//   * The claim is KEY CUSTODY AT A BLOCK. Someone knew this digest by this block,
-//     and this key vouched for it. Never authorship, never ownership, never
+//   * The claim is that someone knew this digest by this block and, if the signature
+//     verifies, that this key had signed it by then. NOT that the key's holder put it
+//     in that block: the signed statement does not bind the transaction, so a genuine
+//     record can be copied into anyone's. Never authorship, never ownership, never
 //     location, and never evidence that the document is true.
 //   * `UNVERIFIABLE` — rendered NOT CHECKED — is "this browser did not check",
 //     never "the claim failed". It used to be the ONLY outcome here: pyrxd installs
@@ -234,7 +236,11 @@ async function lookUp(text, token) {
   setFormStatus("Reading the record…");
   let result;
   try {
-    result = fromPy(pyFetch(txid, rawHex));
+    // THE PANEL LIMIT IS ALSO THE CHECKING LIMIT. The classifier checks the signatures of the
+    // first MAX_MARK_PANELS records only (and of any later byte-for-byte copy of one of them,
+    // which costs nothing), so a transaction of thousands of signed records costs this tab no
+    // more curve work than the page draws. One number, passed here, so the two cannot drift.
+    result = fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS));
   } catch (err) {
     return bridgeError(err);
   }
@@ -459,6 +465,23 @@ function renderResult(result) {
   RESULT_BLOCK.replaceChildren(renderReport(result));
 }
 
+// HOW MANY MARK PANELS ONE PAGE RENDERS, and why there is a limit at all.
+//
+// Nothing bounds how many HashMark outputs a transaction carries. Radiant mainnet
+// enforces no standardness, so a transaction of many OP_RETURN outputs relays, and the
+// classifier accepts up to 100,000 outputs. A minimal record is a 46-byte script, so one
+// 4 MB transaction holds about 72,000 of them. Rendered whole under the render harness
+// (tests/web/verify_render_harness.mjs, Node's stub DOM, not a browser), 72,000 records
+// made 72,000 panels, 2,304,005 elements and 72,000 file choosers — from one
+// broadcastable transaction that anyone can link to.
+//
+// 50 is far above any honest multi-mark transaction a person would read panel by panel
+// (a mark transaction ordinarily carries one), and it bounds the page: the same 72,000
+// records now render 50 panels and 1,606 elements, the same as 51 records do.
+// `pyrxd verify` has no such screen and checks every record, and the note under the last
+// panel says so.
+const MAX_MARK_PANELS = 50;
+
 // THE WHOLE ANSWER, as one node. Everything below this line is pure: it takes the
 // classification dict and returns DOM, touching no globals and no network, which is
 // what lets `tests/web/verify_render_harness.mjs` drive the real renderer under Node
@@ -490,14 +513,22 @@ function renderReport(result) {
   // first. One transaction can carry several marks, and showing one while silently
   // dropping the rest would answer a question the reader did not ask. Each gets its
   // own full report, numbered, and the count is stated.
+  //
+  // UP TO `MAX_MARK_PANELS`, and never silently fewer. The count is stated before the
+  // first panel, and what was left out is stated after the last one.
+  const shown = records.slice(0, MAX_MARK_PANELS);
+  const hidden = records.length - shown.length;
   if (records.length > 1) {
     wrap.appendChild(para(
       `This transaction carries ${records.length} marks. Each is a separate record ` +
-      `and is checked separately below.`,
+      (hidden > 0
+        ? `and is checked on its own. The first ${shown.length} are shown below; the ` +
+          `other ${hidden} are not shown on this page.`
+        : `and is checked separately below.`),
       "answer-body multi-note",
     ));
   }
-  records.forEach((entry, index) => {
+  shown.forEach((entry, index) => {
     wrap.appendChild(renderOneMark(entry.hashmark, {
       anchor: payload.mark_anchor,
       anchorReason: anchorReasonFor(result),
@@ -505,7 +536,67 @@ function renderReport(result) {
       vout: entry.vout,
     }));
   });
+  if (hidden > 0) {
+    for (const line of hiddenMarksNote(records.slice(shown.length), payload.txid)) {
+      wrap.appendChild(para(line, "answer-body multi-note"));
+    }
+  }
   return wrap;
+}
+
+// What this page can truthfully say about the marks it did not draw — EXACT counts, taken
+// from what the classifier actually did to each one, never inferred from the position.
+//
+// Past MAX_MARK_PANELS a signature is not checked, UNLESS the record is a byte-for-byte copy
+// of one that was (an attestation is a function of the bytes, so the copy's answer is known
+// and cost nothing). So "not shown" and "not checked" are different counts, and a forged
+// record past the limit is reported as NOT CHECKED — never folded into a total that reads as
+// clean. Worst first, in the page's own status words.
+function hiddenMarksNote(hiddenRecords, txid) {
+  const n = hiddenRecords.length;
+  const tally = new Map();
+  for (const entry of hiddenRecords) {
+    const word = hiddenStatus(entry.hashmark || {});
+    tally.set(word, (tally.get(word) || 0) + 1);
+  }
+  const order = [
+    "DOES NOT VERIFY", RECORD_DOES_NOT_DECODE, NOT_CHECKED_HERE_WORDS, "NOT CHECKED", "NO SIGNATURE", "VERIFIED",
+  ];
+  const parts = order.filter((w) => tally.has(w)).map((w) => `${tally.get(w)} ${w}`);
+  for (const [w, count] of tally) if (!order.includes(w)) parts.push(`${count} ${w}`);
+
+  const lines = [
+    `${n} more ${n === 1 ? "mark is" : "marks are"} in this transaction and ${n === 1 ? "is" : "are"} ` +
+    `not shown here. What this page knows about ${n === 1 ? "it" : "them"}: ${parts.join(", ")}.`,
+  ];
+  const unchecked = tally.get(NOT_CHECKED_HERE_WORDS) || 0;
+  if (unchecked > 0) {
+    lines.push(
+      `This page checks the signatures of the first ${MAX_MARK_PANELS} marks in a transaction, and of ` +
+      "any later mark that is a byte-for-byte copy of one of them. The " +
+      `${unchecked === 1 ? "one" : unchecked} ${NOT_CHECKED_HERE_WORDS} ${unchecked === 1 ? "was" : "were"} ` +
+      "past that, so nothing here says whether " + (unchecked === 1 ? "it verifies" : "they verify") +
+      " — a mark that does not verify could be among them.",
+    );
+  }
+  // THE WHOLE COMMAND, not a placeholder that the CLI then refuses. `pyrxd verify` has no
+  // default depth, on purpose, so the one thing a reader must supply is N — and what it means.
+  lines.push(
+    `To check every mark in it: pyrxd verify ${safeText(txid || "<transaction number>")} ` +
+    "--min-confirmations N — where N is how many blocks must be built on top of the mark's " +
+    "block before you rely on it. The command deliberately has no default for N.",
+  );
+  return lines;
+}
+
+// How the hidden-records note names one record, in the same words its panel would use.
+const NOT_CHECKED_HERE_WORDS = "not checked here";
+function hiddenStatus(hm) {
+  if (hm.outcome === "invalid") return RECORD_DOES_NOT_DECODE;
+  if (hm.outcome !== "ok") return "NOT CHECKED";
+  const att = hm.attestation || {};
+  if (att.outcome === "not_checked_here") return NOT_CHECKED_HERE_WORDS;
+  return att.status || "NOT CHECKED";
 }
 
 // Why there is no block to report, when there is none. NEVER SILENCE: a record with
@@ -585,27 +676,7 @@ function renderOneMark(hm, opts) {
   }
 
   if (hm.outcome !== "ok") {
-    // Claims to be a HashMark and is not readable HERE. A statement about the BYTES,
-    // not about anyone's signature — an unknown version or algorithm is a record from
-    // the future, not a forgery, and must not read as one.
-    panel.appendChild(verdictBlock(
-      "this record",
-      "NOT CHECKED",
-      "this is a statement about the record's format, not about anyone's signature: " +
-      "nothing here was checked against a key",
-      safeText(hm.detail || ""),
-    ));
-    panel.appendChild(para(
-      "This is a HashMark record that this page cannot read — most likely a newer " +
-      "version, or a fingerprint made with a hash this build does not implement. " +
-      "That is not a sign that anything is wrong with it.",
-    ));
-    if (hm.version !== null && hm.version !== undefined) {
-      panel.appendChild(fact("record version", hm.version));
-    }
-    if (hm.algorithm_id !== null && hm.algorithm_id !== undefined) {
-      panel.appendChild(fact("hash it names", `0x${Number(hm.algorithm_id).toString(16).padStart(2, "0")}`));
-    }
+    renderUnreadableRecord(panel, hm);
     return panel;
   }
 
@@ -629,6 +700,77 @@ function renderOneMark(hm, opts) {
   // claim different amounts for the same record.
   panel.appendChild(el("p", { class: "mark-proves", text: WHAT_A_MARK_PROVES }));
   return panel;
+}
+
+// A record that claims to be a HashMark and could not be read as one.
+//
+// THREE DIFFERENT FACTS, AND THEY USED TO SHARE ONE PANEL. `unknown_version` and
+// `unknown_algorithm` are records from the future: well-formed, just newer than this
+// build, and the neutral NOT CHECKED with "that is not a sign that anything is wrong
+// with it" is the truth about them. `invalid` is the opposite: the bytes break the
+// format's own rules. It was rendered in that same neutral panel, reassurance
+// included, while `pyrxd verify` calls it RECORD DOES NOT DECODE and fails the verdict
+// on it. That also gave a forger a way down from the error colour: a record whose
+// signature DOES NOT VERIFY is red, and one more defect in its bytes turned it into
+// this grey, reassuring panel.
+//
+// THE WORD IS `pyrxd verify`'s, for the same record — `_signature_check`'s literal,
+// pinned against this page by `tests/web/test_verify_page.py`, which runs both over
+// every `HashMarkOutcome` taken from the enum itself.
+const RECORD_DOES_NOT_DECODE = "RECORD DOES NOT DECODE";
+
+function renderUnreadableRecord(panel, hm) {
+  if (hm.outcome === "invalid") {
+    panel.appendChild(verdictBlock(
+      "this record",
+      RECORD_DOES_NOT_DECODE,
+      "the bytes say they are a HashMark record and break the format's own rules, so " +
+      "nothing in them — fingerprint, key or signature — can be relied on",
+      safeText(hm.detail || ""),
+    ));
+    panel.appendChild(para(
+      "This output claims to be a HashMark record and is malformed. Treat it as no mark " +
+      "at all: a record that breaks the format vouches for nothing, and none of it was " +
+      "checked here.",
+    ));
+  } else if (hm.outcome === "unknown_version" || hm.outcome === "unknown_algorithm") {
+    // Claims to be a HashMark and is not readable HERE. A statement about the BYTES,
+    // not about anyone's signature — an unknown version or algorithm is a record from
+    // the future, not a forgery, and must not read as one.
+    panel.appendChild(verdictBlock(
+      "this record",
+      "NOT CHECKED",
+      "this is a statement about the record's format, not about anyone's signature: " +
+      "nothing here was checked against a key",
+      safeText(hm.detail || ""),
+    ));
+    // BOTH HALVES OF THE SENTENCE. The first is true of a record from the future and
+    // must stay; the second is what stops it reading as an endorsement. Anyone can write
+    // these bytes — changing the algorithm byte of a forged record lands here — and
+    // nothing in it was read, so it vouches for nothing.
+    panel.appendChild(para(
+      "This is a HashMark record that this page cannot read — most likely a newer " +
+      "version, or a fingerprint made with a hash this build does not implement. " +
+      "That is not a sign that anything is wrong with it, and it is not evidence of " +
+      "anything either: none of it could be read, so none of it was checked.",
+    ));
+  } else {
+    // An outcome this page has never heard of. Fails toward "we do not know", and
+    // WITHOUT the reassurance above: that sentence is true of a record from the
+    // future, and nothing says this is one.
+    panel.appendChild(verdictBlock(
+      "this record",
+      "NOT CHECKED",
+      "this page does not know what that outcome means, so it says nothing about the record",
+      safeText(`the decoder reported ${hm.outcome}` + (hm.detail ? `: ${hm.detail}` : "")),
+    ));
+  }
+  if (hm.version !== null && hm.version !== undefined) {
+    panel.appendChild(fact("record version", hm.version));
+  }
+  if (hm.algorithm_id !== null && hm.algorithm_id !== undefined) {
+    panel.appendChild(fact("hash it names", `0x${Number(hm.algorithm_id).toString(16).padStart(2, "0")}`));
+  }
 }
 
 // ── 1. who ──────────────────────────────────────────────────────────────
@@ -658,9 +800,14 @@ function answerWhoSigned(hm, att, status) {
       "key made this statement.",
     ));
     sec.appendChild(para(
-      "That is key custody and nothing more. It does not say they wrote the file, own " +
-      "it, or were first to it — only that the holder of this key vouched for this " +
-      "fingerprint.",
+      // NOT "key custody". What a verified signature shows is that the key had signed this —
+      // NOT that its holder put it in this transaction: the signed statement does not bind the
+      // transaction, so a genuine record can be copied into anyone's. Same meaning as
+      // `pyrxd verify` prints.
+      "That is all it shows. It does not show that they put this mark here — a signed record " +
+      "can be copied, byte for byte, into anyone's transaction — and it does not say they " +
+      "wrote the file, own it, or were first to it: only that the holder of this key vouched " +
+      "for this fingerprint.",
       "answer-body muted",
     ));
   } else if (status === "DOES NOT VERIFY") {
@@ -681,6 +828,17 @@ function answerWhoSigned(hm, att, status) {
         "answer-body muted",
       ));
     }
+  } else if (att.outcome === "not_checked_here") {
+    // Not checked BY CHOICE, to bound the work: this record is past the number this page checks
+    // per transaction. Not the curve failing to load, which is what the branch below says — so
+    // it gets its own sentence. Unreachable while the panel limit and the checking limit are the
+    // one number `lookUp` passes, and kept true for the day they are not.
+    sec.appendChild(para(
+      "The record names a key. Whether the signature really comes from that key was NOT " +
+      "checked here: this page checks a limited number of marks per transaction, and this one " +
+      "is past that limit. It is not evidence either way. `pyrxd verify` in a terminal checks " +
+      "every mark.",
+    ));
   } else {
     // NOT CHECKED — and this is no longer the ordinary path. The page installs a
     // curve at boot and normally reaches a real verdict; landing here means that
@@ -801,9 +959,13 @@ function answerWhen(anchor, anchorReason) {
   // which is what keeps "every string is sanitised" a property of the file rather
   // than a fact about today's callers.
   sec.appendChild(para(
+    // "KNEW THE FINGERPRINT", not "knew the file". A signed record can be copied into
+    // anyone's transaction and a v1 record can carry any fingerprint its publisher was
+    // given, so the block shows the fingerprint was known by then — not that whoever
+    // published this transaction ever had the file.
     `In block ${safeText(anchor.height)}, with ${safeText(anchor.confirmations)} block(s) built ` +
     "on top of it since. So the fingerprint above existed no later than that block — whoever " +
-    "published it knew the file by then.",
+    "published it knew that fingerprint by then, which is not the same as having had the file.",
   ));
   const dl = el("dl", { class: "facts" });
   dl.appendChild(fact("block", anchor.height));

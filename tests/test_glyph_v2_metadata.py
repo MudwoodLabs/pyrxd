@@ -486,3 +486,56 @@ def test_glyph_nft_surfaces_membership_and_tolerates_missing_metadata():
 
     unknown = GlyphNft(ref=child.ref, owner_pkh=Hex20(bytes(20)), metadata=None)
     assert unknown.container_refs == () and unknown.author_refs == () and unknown.is_container is False
+
+
+class TestAnIntegerLocIsKeptNotDropped:
+    """`loc` means two different things in the two implementations, and pyrxd lost one of them.
+
+    pyrxd reads `loc` as a text URI. Photonic reads it as a REF VOUT — an index into the
+    token's own refs whose payload it fetches and MERGES into this one
+    (`packages/app/src/electrum/worker/NFT.ts:988-1010`). Measured on live mainnet:
+    Photonic-minted relationship glyphs carry `{'v':2,'p':[2],'loc':0,...}`.
+
+    pyrxd's `_cbor_str` logged the integer and returned "", so a token whose real metadata
+    lives in a second payload decoded as though it had no `loc` at all — indistinguishable
+    from one that never had any. A silent partial read of third-party data.
+
+    THE MERGE IS STILL NOT IMPLEMENTED, and these tests are careful not to imply it is.
+    Following the pointer means fetching another output mid-decode, which this path does not
+    do. `loc_vout` exists so a caller can SEE the payload is incomplete.
+    """
+
+    def _decode(self, loc):
+        return decode_payload(cbor2.dumps({"p": [2], "v": 2, "loc": loc}))
+
+    def test_an_integer_loc_is_surfaced_as_a_vout(self):
+        md = self._decode(0)
+        assert md.loc_vout == 0, "vout 0 is a real pointer and must not be confused with absent"
+        assert md.loc == ""
+
+    def test_a_nonzero_vout_is_kept(self):
+        assert self._decode(3).loc_vout == 3
+
+    def test_a_text_loc_is_unchanged_and_sets_no_vout(self):
+        md = self._decode("ipfs://bafy")
+        assert md.loc == "ipfs://bafy"
+        assert md.loc_vout is None
+
+    def test_absent_loc_reads_as_absent(self):
+        md = decode_payload(cbor2.dumps({"p": [2], "v": 2}))
+        assert md.loc == "" and md.loc_vout is None
+
+    def test_a_bool_is_not_a_vout(self):
+        """`bool` is an `int` subclass in Python. `loc: True` is not vout 1, and a decoder
+        that says it is has invented a pointer from a type accident."""
+        assert self._decode(True).loc_vout is None
+        assert self._decode(False).loc_vout is None
+
+    def test_an_implausible_vout_is_refused(self):
+        assert self._decode(-1).loc_vout is None
+        assert self._decode(2**33).loc_vout is None
+
+    def test_an_integer_loc_is_never_written_back(self):
+        """Read-path only. pyrxd must not start emitting a field it cannot resolve."""
+        md = self._decode(2)
+        assert "loc" not in md.to_cbor_dict() or md.to_cbor_dict().get("loc") == ""

@@ -13,13 +13,14 @@ the classifier — the txid the fake answers to is the sha256d of the bytes it r
 the classifier checks that and would refuse otherwise. So the signature each case verifies (or
 refuses) is a signature, not a fixture that says "valid".
 
-ONE THING THIS FILE CANNOT PROVE, and it is worth stating rather than leaving as a gap in the
-coverage: the §7.6 form-2 AFFIRMATIVE — *the name pointed at the signing key at that block*.
-Reaching it through the command needs a mark whose signer is the key behind a specific mainnet
-address in the chain fixture, and producing one means forging ECDSA. The form-2 path IS reached
-here (`TestFormTwoThroughTheCommand`) and returns the definite negative; the affirmative is
-covered against :func:`~pyrxd.cli.hashmark_cmds._name_check` directly, and the composition of
-the two is what is untested.
+ONE THING THIS FILE CANNOT PROVE: the §7.6 form-2 AFFIRMATIVE — *the name pointed at the
+signing key at that block* — over a REAL chain fixture. Reaching it that way needs a mark whose
+signer is the key behind a specific mainnet address in the chain fixture, and producing one
+means forging ECDSA. The form-2 path IS reached here (`TestFormTwoThroughTheCommand`) and
+returns the definite negative. The affirmative IS composed through the command in
+``tests/test_hashmark_verify_one_record.py``, which fakes the chain walk instead so the name can
+point at a key generated there — and which is also where a transaction carrying SEVERAL records
+is judged.
 """
 
 from __future__ import annotations
@@ -268,17 +269,29 @@ class TestTheFileMatchingHalf:
 
     def test_a_wrong_width_digest_says_why_rather_than_only_no(self) -> None:
         record = {"outcome": "ok", "digest": "ab" * 32, "algorithm": "sha256"}
-        v = judge_digest_match(record, "cd" * 20, source="--digest")
+        v = judge_digest_match(record, "cd" * 20, source="--digest", asked=True)
         assert v["state"] == "DOES NOT MATCH"
         assert "20 bytes" in v["reason"] and "32-byte sha256" in v["reason"]
 
-    def test_nothing_to_compare_is_NOT_CHECKED_never_a_mismatch(self) -> None:
+    def test_nothing_to_compare_is_never_a_mismatch_and_asked_is_never_NOT_CHECKED(self) -> None:
         """ "I did not check" and "it does not match" are opposite facts and the blind one reads
-        as the safe one. They must never collapse."""
+        as the safe one. They must never collapse.
+
+        And "nothing was asked" and "it was asked and could not be answered" are not the same
+        fact either: the first holds, the second fails the verdict. An undecodable record handed
+        a digest was reported NOT CHECKED, which holds — so `--digest ANYTHING` passed a record
+        nobody compared it with. It is CANNOT COMPARE now, and still never a mismatch."""
         record = {"outcome": "ok", "digest": "ab" * 32, "algorithm": "sha256"}
-        assert judge_digest_match(record, None, source="", absent_reason="nothing asked")["state"] == "NOT CHECKED"
+        not_asked = judge_digest_match(record, None, source="", asked=False, absent_reason="nothing asked")
+        assert not_asked["state"] == "NOT CHECKED" and "NOT CHECKED" in hashmark_cmds._CHECK_HOLDS
         undecodable = {"outcome": "invalid", "digest": None}
-        assert judge_digest_match(undecodable, "ab" * 32, source="--digest")["state"] == "NOT CHECKED"
+        for asked in (True, False):  # a digest in hand IS the question, whatever the flag says
+            v = judge_digest_match(undecodable, "ab" * 32, source="--digest", asked=asked)
+            assert v["state"] == "CANNOT COMPARE", v
+        unhashable = judge_digest_match(record, None, source="f", asked=True, absent_reason="no algorithm")
+        assert unhashable["state"] == "CANNOT COMPARE"
+        assert "CANNOT COMPARE" not in hashmark_cmds._CHECK_HOLDS
+        assert "MATCH" not in _digest_match_lines(unhashable)[0], "an inability is not an accusation"
 
     def test_the_match_line_does_not_claim_authorship(self) -> None:
         """The riskiest text in the output is the parenthetical explaining what the verified
@@ -417,14 +430,14 @@ class TestUnverifiableIsNotAnAccusation:
         out = json.loads(r.stdout)
         record = dict(out["records"][0])
         record["attestation"] = {"outcome": "unverifiable", "detail": "secp256k1 is not installed"}
-        state, reason = _signature_check([record])
+        state, reason = _signature_check(record)
         assert state == "NOT CHECKED"
         assert state in hashmark_cmds._CHECK_HOLDS, "a missing curve library must not fail the verdict"
         assert "secp256k1" in reason
 
     def test_an_invalid_signature_is_the_opposite_and_does_fail(self) -> None:
         """The pair for the case above: the refusal must still be reachable."""
-        state, _ = _signature_check([{"outcome": "ok", "attestation": {"outcome": "invalid_signature"}}])
+        state, _ = _signature_check({"outcome": "ok", "attestation": {"outcome": "invalid_signature"}})
         assert state == "DOES NOT VERIFY"
         assert state not in hashmark_cmds._CHECK_HOLDS
 
@@ -436,9 +449,14 @@ class TestFormTwoThroughTheCommand:
     def test_one_endpoint_degrades_to_form_1_with_a_reason_and_FAILS_CLOSED(
         self, monkeypatch, tmp_path, marked
     ) -> None:
-        """The shipped default config cannot reach form 2. `verify --wave-name` on it asks a
-        question that cannot be answered — and a gate that passes on "not answered" waves
-        everything through in silence, which is the direction that ships."""
+        """ONE configured endpoint (`--electrumx URL`, or a config naming a single server) cannot
+        reach form 2. `verify --wave-name` on it asks a question that cannot be answered — and a
+        gate that passes on "not answered" waves everything through in silence, which is the
+        direction that ships.
+
+        This is NOT the shipped default, which this docstring used to claim: mainnet ships two
+        independent endpoints, so form 2 is reachable with no configuration. That is pinned in
+        ``test_hashmark_verify_one_record.py``, not asserted here in prose."""
         r = _run(
             monkeypatch,
             marked["server"],
@@ -461,7 +479,7 @@ class TestFormTwoThroughTheCommand:
                 "signer_is_target_at_height": True,
             }
         }
-        state, reason = _name_check([record], asked=True)
+        state, reason = _name_check(record, asked=True)
         assert state == "ESTABLISHED" and state in hashmark_cmds._CHECK_HOLDS
         assert "458595" in reason
 
@@ -476,7 +494,7 @@ class TestFormTwoThroughTheCommand:
                 "signer_is_target_at_height": False,
             }
         }
-        state, reason = _name_check([record], asked=True)
+        state, reason = _name_check(record, asked=True)
         assert state == "NOT THE SIGNER" and state not in hashmark_cmds._CHECK_HOLDS
         assert "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7" in reason
 
@@ -556,11 +574,19 @@ class TestItReachesAHuman:
         assert "file:       MATCHES" in summary and "file/digest: MATCHES" in detail
         assert "DOES NOT VERIFY" not in r.output and "DOES NOT MATCH" not in r.output
 
-    def test_the_claim_is_key_custody_at_a_block_and_says_what_it_is_not(self, monkeypatch, tmp_path, marked) -> None:
+    def test_the_claim_is_a_key_that_had_signed_by_a_block_and_says_what_it_is_not(
+        self, monkeypatch, tmp_path, marked
+    ) -> None:
+        """It said "KEY CUSTODY AT THAT BLOCK", which a copied record does not support: the signed
+        statement does not bind the transaction, so a genuine record can be replayed into anyone's
+        transaction in a later block. The weaker sentence is the true one, so it ships."""
         r = _run(
             monkeypatch, marked["server"], ["verify", marked["txid"], "--min-confirmations", "6"], tmp_path=tmp_path
         )
-        assert "KEY CUSTODY AT THAT BLOCK" in r.output
+        flat = " ".join(r.output.split())
+        assert "the key had signed it by then" in flat
+        assert "NOT that the key's holder put it here" in flat
+        assert "custody" not in flat.lower(), "the overstated claim is gone, not merely joined by a weaker one"
         for word in ("authorship", "ownership", "originality", "location"):
             assert word in r.output
 
@@ -593,7 +619,7 @@ class TestItReachesAHuman:
         """The attacker-authored text that CAN reach this output is the name, not the label: a
         WAVE registration is whatever its registrant typed, and it arrives from an indexer."""
         reason = _name_check(
-            [{"name_at_mark": {"resolved": False, "reason": "lookup failed: \x1b[2K\rVERIFIED"}}], asked=True
+            {"name_at_mark": {"resolved": False, "reason": "lookup failed: \x1b[2K\rVERIFIED"}}, asked=True
         )[1]
         assert "\x1b" not in reason
         # `_sanitize_display_string` substitutes a literal "?" per stripped codepoint, so the
@@ -629,6 +655,7 @@ class TestTheVerdictTable:
                 "DOES NOT VERIFY",
                 "RECORD DOES NOT DECODE",
                 "DOES NOT MATCH",
+                "CANNOT COMPARE",
                 "NOT THE SIGNER",
                 "NOT ESTABLISHED",
                 "PROVISIONAL",

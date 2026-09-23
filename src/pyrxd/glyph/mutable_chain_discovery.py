@@ -37,7 +37,8 @@ earlier tip produces a stale record with an empty reason. Discovering from the c
 change that: a scripthash history is still one server's claim about which transactions exist.
 :func:`walk_discovered_chain` therefore takes a DISCOVERY client and a TIP client and labels them.
 Handing it the same endpoint twice is allowed and degrades honestly — which is what a single-server
-configuration should do, and is what the shipped default configuration is.
+configuration (``--electrumx URL``, or a config naming one server) should do. The shipped mainnet
+default is NOT single-server: ``network/registry.py`` ships two independent endpoints.
 
 WHAT IS AND IS NOT A SERVER CLAIM HERE. Every transaction is fetched txid-bound (the bytes must hash
 to the txid asked for), so the CONTENT of a transaction cannot be forged by either server. What a

@@ -22,13 +22,23 @@
 //               `result` is the whole dict `glue.run` / `glue.inspect_txid_with_raw`
 //               returns, optionally with `payload.mark_anchor` attached the way
 //               `lookUp` attaches it in production.
-//   stdout:     JSON — {"name": {"text": "…", "classes": [...]}}
+//               A case may also carry `choose_files: [{"input": k, "text": "..."}]`:
+//               after rendering, the k-th file chooser on the page (document order)
+//               is given a File of those bytes and its REAL `change` listener runs —
+//               the one `answerIsThisYourFile` attached, closing over ITS record.
+//   stdout:     JSON — {"name": {"text": "…", "classes": [...], "statuses": [...],
+//                                "panels": [...], "file_inputs": n, "judged": [...]}}
 //               `text` is one text node per line, so the Python side can assert on
 //               ORDER (index of one phrase against another) without a DOM query
 //               language; `classes` is every class attribute in document order,
 //               because the verdict's COLOUR is a claim that no text assertion sees.
+//               `statuses` is the text of every `.verdict-status` in document order
+//               (the headline WORD of each verdict block); `panels` is the text of
+//               each `.mark` panel, so an assertion can be scoped to ONE record;
+//               `judged` is every call the page made to the file judge.
 
 import { readFileSync } from "node:fs";
+import { webcrypto } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
@@ -57,6 +67,9 @@ class StubElement {
     this.childNodes = [];
     this.attributes = {};
     this.hidden = false;
+    // KEPT, not discarded, so a case can fire the page's own listener. A no-op here
+    // would leave every file chooser on the page inert under test.
+    this.listeners = {};
   }
   set textContent(value) {
     this.childNodes = [new StubText(String(value))];
@@ -77,7 +90,9 @@ class StubElement {
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
   }
-  addEventListener() {}
+  addEventListener(type, fn) {
+    (this.listeners[type] = this.listeners[type] || []).push(fn);
+  }
   focus() {}
 }
 
@@ -115,6 +130,24 @@ function renderedClasses(node) {
   return out;
 }
 
+function classOf(n) {
+  return n.className || (n.getAttribute ? n.getAttribute("class") : null) || "";
+}
+
+// Every element under `node`, in document order, that `keep` accepts.
+function collect(node, keep) {
+  const out = [];
+  const walk = (n) => {
+    if (n instanceof StubText) return;
+    if (keep(n)) out.push(n);
+    for (const child of n.childNodes) walk(child);
+  };
+  walk(node);
+  return out;
+}
+
+const hasClass = (name) => (n) => classOf(n).split(/\s+/).includes(name);
+
 function makeSandbox() {
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -134,7 +167,10 @@ function makeSandbox() {
     // because `loadPyodide` is undefined here, verify.js catches it and calls
     // showError. No pending promise, no network.
     fetch: () => Promise.reject(new Error("no network in the verify render harness")),
-    crypto: { subtle: {} },
+    // REAL digest, from Node's WebCrypto, so a file chosen in a case is really hashed.
+    // Nothing else on the page touches `crypto`.
+    crypto: { subtle: { digest: (algorithm, data) => webcrypto.subtle.digest(algorithm, data) } },
+    File,
     WebSocket: class {},
     navigator: {},
     location: { href: "https://pyrxd.invalid/verify/", search: "" },
@@ -179,11 +215,51 @@ function loadRenderer() {
       throw new Error(`${key} is not reachable from shared.js — do NOT delete the guard.`);
     }
   }
+  // A NUMBER, read the same way, and TOLERANTLY: absent, it is reported as null for the
+  // Python side to fail on, rather than taking every other case down with it.
+  constants.max_mark_panels = vm.runInContext(
+    'typeof MAX_MARK_PANELS === "number" ? MAX_MARK_PANELS : null',
+    sandbox,
+  );
   sandbox.__constants__ = constants;
   return sandbox;
 }
 
-function main() {
+// Choose files on the rendered page through its OWN listeners.
+//
+// `bridges` is verify.js's top-level binding, which `boot()` fills in the browser and
+// leaves null here. It is set for the duration of the case: the PLAN is the real one,
+// computed by Python and passed in with the case; the JUDGE is a recorder, because the
+// property this owns is which digest the page hands it — which record's — and the
+// deciding is Python's, tested elsewhere (`test_hashmark_panel_verdict`).
+async function chooseFiles(renderer, node, spec) {
+  const judged = [];
+  renderer.__harnessBridges__ = {
+    fileCheckPlan: () => spec.file_check_plan,
+    judgeFileDigest: (expected, computed, algorithm) => {
+      judged.push({ expected, computed, algorithm });
+      const match = expected === computed;
+      return { checked: true, match, status: match ? "MATCHES" : "DOES NOT MATCH", meaning: "(recorded by the harness)" };
+    },
+  };
+  vm.runInContext("bridges = __harnessBridges__;", renderer);
+  try {
+    const inputs = collect(node, (n) => n.tag === "input" && n.type === "file");
+    for (const choice of spec.choose_files) {
+      const input = inputs[choice.input];
+      if (!input) throw new Error(`there is no file chooser #${choice.input} (found ${inputs.length})`);
+      input.files = [new File([new TextEncoder().encode(choice.text)], choice.name || "chosen.bin")];
+      const handlers = input.listeners.change || [];
+      if (handlers.length !== 1) throw new Error(`file chooser #${choice.input} has ${handlers.length} change listeners`);
+      await handlers[0]();
+    }
+  } finally {
+    vm.runInContext("bridges = null;", renderer);
+  }
+  return judged;
+}
+
+async function main() {
   const payloadPath = process.argv[2];
   const raw = !payloadPath || payloadPath === "-"
     ? readFileSync(0, "utf8")
@@ -211,9 +287,20 @@ function main() {
     } else {
       throw new Error(`case ${JSON.stringify(name)} has neither "result" nor "wire_error" — nothing to render`);
     }
-    results[name] = { text: renderedLines(node), classes: renderedClasses(node) };
+    const judged = spec && spec.choose_files ? await chooseFiles(renderer, node, spec) : [];
+    results[name] = {
+      text: renderedLines(node),
+      classes: renderedClasses(node),
+      statuses: collect(node, hasClass("verdict-status")).map((n) => n.textContent),
+      panels: collect(node, hasClass("mark")).map(renderedLines),
+      file_inputs: collect(node, (n) => n.tag === "input" && n.type === "file").length,
+      judged,
+    };
   }
   process.stdout.write(JSON.stringify(results));
 }
 
-main();
+main().catch((err) => {
+  process.stderr.write(String((err && err.stack) || err) + "\n");
+  process.exit(1);
+});
