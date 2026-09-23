@@ -646,8 +646,16 @@ function renderFetchedTxCard(payload) {
       if (Array.isArray(claims.permissions) && claims.permissions.length > 0) {
         const shown = claims.permissions.slice(0, _ENTRY_CAP).map((p) => _capText(p)).join(", ");
         mdl.appendChild(kv("authority permissions", shown));
+        // "N more" is of the permissions this page was given, which are not necessarily all the
+        // token names: the payload decoder reads no more than _ATTRS_LIST_READ items of a list, so
+        // 200 permissions arrive as 64, and "32 more" alone read as a total of 64.
         if (claims.permissions.length > _ENTRY_CAP) {
-          mdl.appendChild(kv("", `… and ${claims.permissions.length - _ENTRY_CAP} more not shown`));
+          mdl.appendChild(kv(
+            "",
+            `… and ${claims.permissions.length - _ENTRY_CAP} more not shown, of the ` +
+            `${claims.permissions.length} this page read — the payload decoder reads no more than ` +
+            `the first ${_ATTRS_LIST_READ} entries of a list, so the token may name more`,
+          ));
         }
       }
       if (claims.expires) mdl.appendChild(kv("authority expires", _capText(claims.expires)));
@@ -775,8 +783,9 @@ function renderFetchedTxCard(payload) {
       if (env.kind === "update") {
         edl.appendChild(kv(`input ${env.input_index}`, "UPDATE — a mutable glyph's fields are being changed here"));
         const fields = env.fields || {};
-        // The classifier sends at most _ENTRY_CAP of each level — the ones drawn below — and
-        // counts the rest here, exactly, so "N more not shown" is the envelope's own N.
+        // The classifier sends the ones drawn below — `attrs.target` and _ENTRY_CAP other attrs,
+        // _ENTRY_CAP other top-level fields, _ENTRY_CAP entries of any other map — and counts the
+        // rest here, exactly, so "N more not shown" is the envelope's own N.
         const fieldsNotListed = env.fields_not_listed || {};
         const within = fieldsNotListed.within || {};
         const attrs = fields.attrs;
@@ -960,6 +969,9 @@ function relationshipTallyText(groups, burned, burnedNotListed) {
 // enough for a length cap to notice.
 const _STRING_CAP = 200;
 const _ENTRY_CAP = 32;
+// How many items of an `attrs` list the payload decoder reads (`_MAX_ATTRS_LIST_LEN` in
+// payload.py); the rest never reach this page. Pinned by test_inspect_page_is_bounded.py.
+const _ATTRS_LIST_READ = 64;
 
 function _capText(value) {
   const text = value === null || value === undefined ? "" : String(value);
@@ -2542,8 +2554,8 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // THE ROW LIMIT IS ALSO THE CHECKING LIMIT: the classifier checks the signatures of the
   // first MAX_ROWS_SHOWN HashMark records only (and of any later byte-for-byte copy of one,
   // which costs nothing), and lists at most MAX_ROWS_SHOWN entries of each list, counting the
-  // rest, and at most _ENTRY_CAP fields per level of an update envelope and _ENTRY_CAP of each
-  // list of refs a listed output names. So the NUMBER of entries this call hands back — and
+  // rest, and of an update envelope only the fields it draws (see where they are drawn) and
+  // _ENTRY_CAP of each list of refs a listed output names. So the NUMBER of entries this call hands back — and
   // converts, draws and puts in the drawer — does not grow with the transaction. What still
   // does: Python's parse of it and its per-entry count, and the size of one entry — a listed
   // output's script hex, the headline payload's protocol list — which only the transaction's

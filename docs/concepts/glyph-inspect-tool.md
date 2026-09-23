@@ -162,12 +162,16 @@ each entry, never from its position — and the command that shows all of
 it: `pyrxd glyph inspect <txid> --fetch`, which lists everything and
 checks every record.
 
-An update envelope's fields are cut the same way: at most 32 per level
-(its top level, `attrs` beside `attrs.target`, and any other map-valued
-field), the same ones the page draws, with the rest counted under the
-entry's `fields_not_listed`. An authority's permissions are at most 64,
-because the payload decoder keeps no more than 64 items of any `attrs`
-list; the page draws 32 and counts the rest.
+An update envelope's fields are cut the same way, to the ones the page
+draws: 32 top-level fields other than `attrs`, and `attrs` itself; of a
+map-valued `attrs`, its `target` and 32 others; and of any other
+map-valued field, 32 entries. The rest are counted under the entry's
+`fields_not_listed`. An authority's permissions are the ones the payload
+decoder kept: the strings among the first 64 items of the token's list,
+because the decoder reads no more than 64 items of any `attrs` list. The
+page draws 32 of those and counts the rest of them. It does not know how
+many the token names past the 64th item, and says the token may name
+more; `pyrxd glyph inspect` reads the list through the same decoder.
 
 A listed output's refs are cut too: at most 32 of the refs it carries
 and 32 of the refs it only names, with the rest counted under the row's

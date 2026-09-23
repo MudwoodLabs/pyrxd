@@ -819,7 +819,8 @@ def _update(fields: dict) -> bytes:
 
 class TestAnUpdatesFieldsAreBounded:
     """An update envelope's key set is the publisher's to choose, and the classifier used to send
-    every field to the page, which draws at most 32 per level. Measured by the review under
+    every field to the page, which draws 32 top-level fields besides `attrs`, and of `attrs` its
+    `target` and 32 others, and of any other map 32 entries. Measured by the review under
     Pyodide in Node (not a browser): 16 inputs each carrying a 21,000-field update took 13.11 s and
     389 MB and made a 9.85M-character drawer, with nothing for `max_rows` to cut. A bounded call
     now sends each envelope's fields as the page draws them and counts the rest."""
@@ -1049,6 +1050,42 @@ class TestTheRevealsOwnListsAreBounded:
 
 
 # ─────────────────────────────────────────── the JSON drawer says what it holds ──
+
+
+def _authority(permissions: int) -> dict:
+    """The page's payload for a reveal of an authority token naming *permissions* permissions."""
+    import cbor2
+
+    from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
+
+    attrs = {"issuer": "x", "permissions": [f"perm{i:03d}" for i in range(permissions)]}
+    cbor = cbor2.dumps({"p": [2, 10], "name": "auth", "attrs": attrs})
+    return _classified(_p2pkh(), limit=100, inputs=[_SIG + build_reveal_scriptsig_suffix(cbor)])
+
+
+class TestAnAuthoritysPermissionsAreNotMiscounted:
+    """The payload decoder reads no more than 64 items of an `attrs` list, so an authority naming
+    200 permissions arrives with 64, and the card said "… and 32 more not shown" of a token with
+    168 more (the review's reproduction). The count is now said to be of the ones read, with why
+    they may not be all."""
+
+    def test_a_list_past_what_the_decoder_reads_is_not_given_a_total(self) -> None:
+        from pyrxd.glyph.payload import _MAX_ATTRS_LIST_LEN
+
+        payload = _authority(200)
+        read = len(payload["metadata"]["authority"]["claims"]["permissions"])
+        assert read == _MAX_ATTRS_LIST_LEN, "the premise: the decoder cut the list"
+        text = _flat(_card(payload)["fetched_tx_card"])
+        assert (
+            f"… and {read - 32} more not shown, of the {read} this page read — the payload decoder reads "
+            f"no more than the first {_MAX_ATTRS_LIST_LEN} entries of a list, so the token may name more"
+        ) in text
+        assert "perm031" in text and "perm032" not in text
+
+    def test_a_list_the_page_draws_whole_carries_no_count(self) -> None:
+        """The honest path: 20 permissions are drawn, every one, with nothing about more."""
+        text = _flat(_card(_authority(20))["fetched_tx_card"])
+        assert "perm019" in text and "more not shown" not in text and "may name more" not in text
 
 
 class TestTheJsonDrawerSaysItIsBounded:

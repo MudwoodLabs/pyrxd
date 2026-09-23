@@ -1870,9 +1870,11 @@ def _classify_raw_tx(
     its panel would show, are decided by the same code as a listed row's and counted, and the
     rest of what the classifier returned for it is dropped — it never becomes a row, and it is
     not in the payload. So the NUMBER of entries in each of those lists is bounded by
-    ``max_rows``, and so is the number of update envelopes; each of those carries at most
-    :data:`_HUMAN_ENTRY_CAP` fields per level (:func:`_drawn_update_fields`). A listed output
-    row's refs are cut the same way: at most :data:`_HUMAN_ENTRY_CAP` of ``input_refs`` and of
+    ``max_rows``, and so is the number of update envelopes; each of those carries only the fields
+    the page draws — :data:`_HUMAN_ENTRY_CAP` top-level fields other than ``attrs``, and ``attrs``
+    itself; ``attrs.target`` and :data:`_HUMAN_ENTRY_CAP` other ``attrs`` entries;
+    :data:`_HUMAN_ENTRY_CAP` entries of any other map-valued field (:func:`_drawn_update_fields`).
+    A listed output row's refs are cut too: at most :data:`_HUMAN_ENTRY_CAP` of ``input_refs`` and of
     ``referenced_refs``, with the rest counted beside each (:func:`_drawn_row_lists`). The SIZE of
     one entry is otherwise not bounded by ``max_rows``: a listed output row carries its script's
     hex whole, and the headline payload carries its whole ``protocol`` list, whose VALUES
@@ -2088,8 +2090,9 @@ def _classify_raw_tx(
             if max_rows is None:
                 entry["fields"] = _sanitize_update_fields(env.fields or {})
             else:
-                # A bounded caller draws at most _HUMAN_ENTRY_CAP fields per level, and an update's
-                # key set is the publisher's to choose: carrying all of them was 21,000 fields per
+                # A bounded caller draws _HUMAN_ENTRY_CAP fields at the top level and of each map,
+                # besides `attrs` and `attrs.target` (`_drawn_update_fields` says exactly which), and
+                # an update's key set is the publisher's to choose: carrying all of them was 21,000 fields per
                 # envelope in the review's measurement. So it gets what it draws, and counts.
                 entry["fields"], fields_not_listed = _drawn_update_fields(env.fields or {})
                 if fields_not_listed:
