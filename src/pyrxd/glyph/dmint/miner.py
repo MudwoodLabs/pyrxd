@@ -738,9 +738,9 @@ def _unreadable_number_reason(name: str, push: bytes, value: int) -> str | None:
         return None
     return (
         f"this dMint contract can never be minted: its {name} is pushed as {push.hex()}, not as {canonical.hex()}, "
-        f"the minimal push of {value}. Radiant aborts a script on a push that is not minimal, and reads {name} as a "
-        "number on every mint only if it is minimally encoded, so every spend of the contract aborts, whatever the "
-        "nonce and whoever mines it"
+        f"the minimal push of {value}. The covenant reads {name} as a number on every mint, and Radiant requires "
+        "both the push and the number it carries to be minimally encoded, so every spend of the contract aborts, "
+        "whatever the nonce and whoever mines it"
     )
 
 

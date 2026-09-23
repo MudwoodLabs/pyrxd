@@ -33,9 +33,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`GlyphInspector.parse_mint_scriptsig` no longer returns `version_hint`; it returns
   `nonce_width` (4 or 8).** The same key changes in `pyrxd glyph inspect --json` output for a
   dMint mint, and the human output and the `/inspect/` page no longer label a mint "v1" or "v2".
-  The hint was read off the nonce width, which does not tell V1 from V2: of 475 mainnet mints of
-  V1 contracts sampled (final mints and the mints before them), 467 carry an 8-byte nonce, so the
-  hint called almost all of them "v2". The contract script is what tells the versions apart
+  The hint was read off the nonce width, which does not tell V1 from V2: of 473 mainnet mints of
+  V1 contracts sampled (final mints and the mints before them, each spending a contract pyrxd
+  parses as V1), 465 carry an 8-byte nonce, so the hint called almost all of them "v2". The contract script is what tells the versions apart
   (`DmintState.from_script`). Code that read `version_hint` should parse the spent contract
   instead, or read `nonce_width` for the width alone.
 
