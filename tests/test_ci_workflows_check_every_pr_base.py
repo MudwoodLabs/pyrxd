@@ -58,7 +58,7 @@ _PATH_FILTERS = ("paths", "paths-ignore")
 _BASE_FILTER_EXEMPTIONS: dict[str, str] = {}
 
 #: The status checks branch protection requires on `main`. REVIEWED, not derived: CI cannot
-#: read branch protection. Read 2026-09-22 with
+#: read branch protection. Read 2026-09-22, and again 2026-09-23 after `leak-scan` was added, with
 #: `gh api repos/MudwoodLabs/pyrxd/branches/main/protection --jq .required_status_checks.contexts`.
 #: The workflow that produces each one is NOT written here; it is derived from the workflows' job
 #: names, so a renamed job fails this file rather than silently leaving a check unguarded.
@@ -68,6 +68,7 @@ _REQUIRED_CHECKS = (
     "Scan for leaked secrets",
     "Analyze (Python)",
     "scan-pr / osv-scan",
+    "leak-scan",  # added to branch protection 2026-09-23, after #717 brought the workflow
 )
 
 #: A required check whose workflow does not exist on this branch yet, with the file that
@@ -76,10 +77,9 @@ _REQUIRED_CHECKS = (
 _PENDING_REQUIRED_CHECKS: dict[str, str] = {}
 
 #: Checks guarded exactly like the required ones (every PR base, no path filter) that branch
-#: protection does NOT require yet. REVIEWED, like `_REQUIRED_CHECKS`: `leak-scan` arrived with
-#: #717 on 2026-09-22 and was not in the required contexts read that day. When branch protection
-#: lists it, move it into `_REQUIRED_CHECKS`; until then this name is the honest place for it.
-_GUARDED_NOT_YET_REQUIRED = ("leak-scan",)
+#: protection does NOT require yet. REVIEWED, like `_REQUIRED_CHECKS`. Empty today; a check that
+#: must run on every PR before it is made required belongs here, then moves up.
+_GUARDED_NOT_YET_REQUIRED: tuple[str, ...] = ()
 
 #: A condition that reads the PR's base branch can reintroduce the filter one level down.
 _BASE_REF_IN_CONDITION = re.compile(r"\bbase_ref\b|pull_request\.base\.ref\b")
