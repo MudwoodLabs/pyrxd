@@ -613,6 +613,10 @@ _ONLY_PYTHON_ACCEPTS = [
     _req(extra="\\u0041"),
     _req(extra={"nested": 1}),
     _req(extra=[1, 2]),
+    # Not JSON, but Python's json module reads them as floats.
+    _raw("NaN"),
+    _raw("Infinity"),
+    _raw("-Infinity"),
     json.dumps({"preimage_hex": _PRE, "target_hex": "7f", "nonce_width": 4, "x": "\u00e9"}, ensure_ascii=False),
     # A repeated key whose FIRST value is invalid: Python keeps only the last, valid one.
     '{"nonce_width": 5, ' + _req()[1:],

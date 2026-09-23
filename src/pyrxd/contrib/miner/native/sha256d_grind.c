@@ -26,12 +26,14 @@
  * slow cores both stay busy until the range is done.
  *
  * Portability: C11 with POSIX threads and `unsigned __int128`, so a 64-bit
- * target and GCC or Clang. Build with, for example:
+ * target and GCC or Clang. Built and tested on Linux x86-64 only. Build with,
+ * for example:
  *
  *     cc -O2 -pthread -o sha256d-grind sha256d_grind.c
  *
- * or `python -m pyrxd.contrib.miner.native --out sha256d-grind`, which runs
- * the same command.
+ * or `python -m pyrxd.contrib.miner.native --out sha256d-grind`, which
+ * compiles with the same flags into a temporary directory, runs --selftest,
+ * and moves the binary to --out only if it passes.
  */
 
 #define _GNU_SOURCE
@@ -411,9 +413,13 @@ static int parse_u64_arg(const char *s, uint64_t *out) {
  * A deliberately small JSON reader for the one flat object the protocol sends:
  * {"preimage_hex": str, "target_hex": str, "nonce_width": int, "protocol": int}.
  * Unknown keys are ignored when their value is a string, number, true, false or
- * null. It refuses, with exit code 1, some JSON that Python's json module would
- * accept: a nested object or array, a string with a backslash escape, any byte
- * outside ASCII, and a repeated key whose first value is invalid. pyrxd's request
+ * null. It refuses, with exit code 1, some requests pyrxd's Python parser
+ * (MineRequest.from_json) accepts: a nested object or array, a string with a
+ * backslash escape, NaN, Infinity or -Infinity (Python's json module reads them
+ * as numbers) in an unknown field, any byte outside ASCII, a repeated key whose
+ * first value is invalid, and the hex that Python's int(x, 16) and bytes.fromhex
+ * allow and this reader does not: a leading '+', underscores or surrounding
+ * whitespace in target_hex, and whitespace in preimage_hex. pyrxd's request
  * (json.dumps of two lowercase hex strings and an integer) never contains any of
  * those. tests/contrib/test_native_grinder.py pins both lists.
  */

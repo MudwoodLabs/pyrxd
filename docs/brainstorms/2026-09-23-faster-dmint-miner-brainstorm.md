@@ -91,15 +91,16 @@ Conclusion: in Python the ceiling is the interpreter; the only large win is to l
 - **Expected speedup:** MEASURED here, same session, three runs each: **313–318 M hash/s on 32
   threads vs 25.3–25.7** for the bundled miner (about 12x); **47.9–48.0 vs 5.4–6.8 at 4
   threads/workers** (about 8x); **12.6–12.7 vs 1.5–1.7 at 1** (about 8x). Without the SHA
-  extensions its portable C path measured 3.2 M/s on one thread and 43.2 M/s on 32 (one run
-  each), still ahead of Python.
+  extensions its portable C path measured 57.7–58.1 M/s on 32 threads and 3.1–3.3 M/s on one
+  (`--impl portable`, three runs each, in a later session), still ahead of Python. A single
+  earlier run on 32 threads had given 43.2 M/s; why it was lower was not established.
 - **Verified by:** differential tests against `hashlib` and `verify_sha256d_solution` (below),
   plus `mine_solution_external` re-checking every nonce it returns in production.
-- **Cost:** one C file of 994 lines: 132 for the two SHA-256 compression functions, 132 for
-  the per-attempt hash and the threaded sweep, 216 for the request reader, 75 for the
-  self-test, the rest argument handling and output. No dependencies beyond libc and pthreads;
-  built with `cc -O2 -pthread`. No new runtime dependency
-  for `pip install pyrxd`: the source ships in the package, the binary is built where it runs.
+- **Cost:** one C file: the two SHA-256 compression functions, the per-attempt hash and the
+  threaded sweep, the request reader, the self-test, and argument handling and output. No
+  dependencies beyond libc and pthreads; built with `cc -O2 -pthread`. No new runtime
+  dependency for `pip install pyrxd`: the source ships in the package, the binary is built
+  where it runs.
 - **Supply chain:** nothing new is downloaded. The SHA-256 code is written from FIPS 180-4 and
   the SHA-extension instruction set; its correctness rests on the tests, not on provenance.
 - **Runs:** a developer's machine, the GitHub runner (built in the job), a user's
@@ -197,13 +198,14 @@ on the same line (after each, `git status --porcelain` listed no changed tracked
 This machine: the B rows above (313–318 vs 25.3–25.7 M/s at 32).
 
 GitHub runner, MEASURED on one `workflow_dispatch` of the integration workflow on this branch
-(2026-09-23). The runner was `ubuntu-latest`: an Intel Xeon 6973P-C, 4 logical CPUs, with
-the SHA extensions. The grinder's self-test picked them (`impl=shani`).
+(2026-09-23, run 35915931726, at commit 10d060d, before the request reader was rewritten). The
+runner was `ubuntu-latest`: an Intel Xeon 6973P-C, 4 logical CPUs, with the SHA extensions.
+The grinder's self-test picked them (`impl=shani`).
 
 | | bundled Python miner, 4 workers | native grinder, 4 threads |
 |---|---|---|
 | `scripts/bench_dmint_miners.py`, two runs | 2.92, 3.14 M hash/s | 28.94, 28.93 M hash/s |
-| every grind the suites ran (20 grinds) | — | 28.5–29.1 M hash/s |
+| the 17 of the suites' 20 grinds whose `[grind]` log line prints a rate (the other 3 are `[mine] hit` lines, which print elapsed time only) | — | 28.5–29.1 M hash/s |
 
 The whole dMint job **passed**: 15 tests in 7,806.78 s, and 133.1 minutes from job start to
 finish against the 300-minute limit. Its 20 grinds (18 at difficulty 1, 2 at difficulty 4)

@@ -25,8 +25,9 @@ cc -O2 -pthread -o sha256d-grind "$(python -m pyrxd.contrib.miner.native --print
 ```
 
 It needs C11, POSIX threads and `unsigned __int128`: a 64-bit target with GCC
-or Clang (Linux, macOS). The self-test prints which SHA-256 implementation it
-will use on this CPU:
+or Clang. It has been built and tested on Linux x86-64 only; macOS and ARM are
+untested. The self-test prints which SHA-256 implementation it will use on this
+CPU:
 
 ```text
 selftest ok: impl=shani shani_available=1 threads=32
@@ -92,6 +93,10 @@ three runs each, with `scripts/bench_dmint_miners.py`:
 | 1 | 1.5, 1.7, 1.7 M hash/s | 12.7, 12.6, 12.7 M hash/s |
 
 Without the SHA extensions (`--impl portable`) the same machine measured
-3.2 M hash/s on one thread and 43.2 M hash/s on 32 (one run each). Run
+58.1, 57.8, 57.7 M hash/s on 32 threads and 3.1, 3.1, 3.3 M hash/s on one
+(2026-09-23, a later session, three runs each). Those runs time
+`sha256d-grind --impl portable --quiet --workers N --nonce-count C` against a
+target no digest meets, process start included, the way the script times the
+default path (C = 2**30 on 32 threads, 2**28 on one). Run
 `scripts/bench_dmint_miners.py --grinder ./sha256d-grind` from a pyrxd checkout for your own
 numbers.
