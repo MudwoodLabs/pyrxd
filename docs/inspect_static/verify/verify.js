@@ -240,7 +240,7 @@ async function lookUp(text, token) {
     // first MAX_MARK_PANELS records only (and of any later byte-for-byte copy of one of them,
     // which costs nothing), so a transaction of thousands of signed records costs this tab no
     // more curve work than the page draws. One number, passed here, so the two cannot drift.
-    result = fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS));
+    result = fromPy(pyFetch(txid, rawHex, MAX_MARK_PANELS));
   } catch (err) {
     return bridgeError(err);
   }
@@ -276,15 +276,39 @@ function lookupFailure(err) {
   const kind = (err && err.kind) || "unknown";
 
   if (kind === "refused") {
+    // By what the frame says (`refusalReason`, shared.js). A refusal is not always about the
+    // transaction: a busy or failing server refuses in the same frame shape, and telling that
+    // reader "retrying will not change this answer" sent them away from the one thing that works.
+    const reason = refusalReason(err);
+    const sameShape =
+      "A fingerprint and a transaction number are the same shape — 64 letters and numbers — " +
+      "and a fingerprint locates nothing on its own. ";
+    let hint;
+    if (reason === "absent") {
+      hint =
+        "The server's node has no transaction with that number, in its chain or among those " +
+        "waiting to join it. The number may be wrong, or the transaction may not have reached " +
+        "that node yet — one sent moments ago may not have. " + sameShape +
+        "Check what you were given.";
+    } else if (reason === "server") {
+      hint =
+        "The server declined to answer this time — it was busy, or something failed on its " +
+        "side. Nothing was learned about the mark either way. Trying again in a moment may work.";
+    } else if (reason === "request") {
+      hint =
+        "The server refused the request itself, so asking again the same way will get the same " +
+        "answer. " + sameShape + "Check what you were given.";
+    } else {
+      hint =
+        "The server's reply does not say whether it has no such transaction or could not answer " +
+        "this time, so this page will not guess. " + sameShape +
+        "Check what you were given, and if it is right, try again later.";
+    }
     return {
       ok: false,
       form: "error",
       error: "The blockchain server answered, and it did not give back a transaction for that number.",
-      hint:
-        "The commonest reason is that the number is wrong, or is not a transaction at all. " +
-        "A fingerprint and a transaction number are the same shape — 64 letters and numbers — " +
-        "and a fingerprint locates nothing on its own. Check what you were given; retrying " +
-        "will not change this answer.",
+      hint,
       detail,
     };
   }
@@ -295,7 +319,7 @@ function lookupFailure(err) {
       error: "The blockchain server this page uses could not be reached.",
       hint:
         "Nothing was learned about the mark either way — this is a fact about the lookup, " +
-        "not about the record. Trying again in a moment usually works.",
+        "not about the record. Trying again in a moment may work.",
       detail,
     };
   }
@@ -307,6 +331,24 @@ function lookupFailure(err) {
       hint:
         "The reply did not have the shape a transaction has, so it was refused rather than " +
         "read. Nothing was learned about the mark either way.",
+      detail,
+    };
+  }
+  // THE SERVER'S ANSWER WAS WRONG, not missing and not unreadable: what came back is whole
+  // bytes, and they hash to a different number from the one asked for. Retrying
+  // the same server may well get the same wrong answer, so this does not promise that it
+  // helps; and it says nothing about whether the number itself is right, because a wrong
+  // number gets "no such transaction" from an honest server, never somebody else's bytes.
+  if (kind === "mismatch") {
+    return {
+      ok: false,
+      form: "error",
+      error: "The blockchain server's answer is not the transaction that was asked for.",
+      hint:
+        "A transaction number is a fingerprint of the transaction's own bytes, and the bytes that " +
+        "came back do not have that fingerprint — so the answer was refused rather than read. " +
+        "Nothing was learned about the mark either way. `pyrxd verify` in a terminal makes the " +
+        "same check and can be pointed at a different server.",
       detail,
     };
   }

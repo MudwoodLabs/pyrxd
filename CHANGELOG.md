@@ -73,6 +73,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after the proof-of-work grind. V2 already refused a state its script does not carry. The V1
   builder now parses the script and refuses a state that differs from it.
 
+- **`pyrxd glyph inspect` described every extra payload of a multi-glyph reveal two contradictory
+  ways (0.24.0).** Each payload after the headline one was listed under "Other glyphs minted in
+  this transaction", as read, and also under "Glyph envelopes carrying no full payload" as a
+  payload "the reveal reader did not return — the two readers disagree about these bytes". Both
+  readers had read it. On the mainnet GLYPH deploy reveal `b965b32d…9dd6`, input 33 was described
+  both ways in the terminal, in `--json` and on /inspect/. The `payload_unrendered` report skipped
+  only the headline input; it now skips every input the reveal reader read. **This changes
+  `--json` output:** `glyph_envelopes` no longer carries a `payload_unrendered` entry for a payload
+  that is listed in `metadata_inputs`. The entry is still emitted, with the same words, for an
+  input where the envelope classifier sees a full payload and the reveal reader returns nothing.
+
+- **`pyrxd glyph inspect` counted an authority's permissions as if it had read them all
+  (0.24.0).** The payload decoder reads no more than the first 64 entries of an `attrs` list, so
+  an authority naming 200 permissions printed 32 of them and "... and 32 more not shown". It now
+  prints "... and 32 more not shown, of the 64 read" and, only when 64 were read, that the
+  decoder reads no more than that many, so the token may name more. The decoder also drops
+  entries that are not text, and the payload does not say whether it did, so a list read short
+  of 64 is called neither whole nor cut. **This changes human output** for an authority with more
+  than 32 permissions read. `--json` is unchanged. /inspect/ says the same.
+
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
   `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit
@@ -140,6 +160,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   back. A push whose declared length runs past the end of the script is refused.
 
 ### Added
+
+- **`max_rows`, a keyword on `pyrxd.glyph.inspect.classify_raw_tx`** — for a caller that draws
+  what it is given. `None`, the default, lists everything and adds no key, and is what
+  `pyrxd glyph inspect` passes; /inspect/ passes 100. With a number set, the payload changes
+  shape:
+  - `outputs`, `glyph_envelopes`, the other payloads in `metadata_inputs`,
+    `metadata.relationships` and `metadata.delegate_burns` hold at most that many entries, and
+    the rest are counted under a `*_not_listed` key beside each;
+  - an update envelope's `fields` hold only the ones /inspect/ draws, and the rest are counted
+    under `fields_not_listed`;
+  - a listed output's `input_refs` and `referenced_refs` are cut to 32 entries each, one entry
+    per ref opcode, and the rest are counted under `input_refs_not_listed` and
+    `referenced_refs_not_listed` (with `singletons` for the 0xd8 pushes left out);
+  - when outputs were cut, `output_shape` says what every output is.
+
+  A negative or non-integer `max_rows` raises `ValidationError`.
 
 - **`GlyphMetadata.loc_vout`** — an INTEGER `loc` is kept instead of dropped with a warning.
   Photonic reads an integer `loc` as a pointer to one of the token's own refs, whose payload

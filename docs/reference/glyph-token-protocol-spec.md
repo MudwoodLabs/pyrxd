@@ -355,7 +355,8 @@ implementation that renders these to a terminal or a UI MUST strip Unicode
 categories `Cc`, `Cf`, `Cn`, `Co`, `Zl`, `Zp`, `Mn`, `Me` first — ANSI escapes,
 bidi overrides, zero-width joiners, and combining marks are all reachable through
 `name`, `desc`, `ticker`, and `attrs`
-(`src/pyrxd/glyph/_inspect_core.py:69-111`).
+(the categories at `src/pyrxd/glyph/_inspect_core.py:290`, applied by
+`src/pyrxd/glyph/_inspect_core.py:410-450`).
 
 ### 4.6 The payload hash
 
@@ -847,9 +848,9 @@ envelope carries more type information than the chain does.
 | CONTAINER | **not distinguishable** — byte-identical to an NFT by design (§7.5) | envelope only |
 | DAT, BURN, ENCRYPTED, TIMELOCK, AUTHORITY, WAVE | **not distinguishable** — envelope markers only | envelope only |
 
-`src/pyrxd/glyph/_inspect_core.py:515-585` is the dispatch order pyrxd uses — NFT, FT,
+`src/pyrxd/glyph/_inspect_core.py:1073-1228` is the dispatch order pyrxd uses — NFT, FT,
 container-legacy, MUT, commit-NFT, commit-FT, in that order — and
-`src/pyrxd/glyph/_inspect_core.py:762-824` is the envelope-side classification, which returns
+`src/pyrxd/glyph/_inspect_core.py:1404-1466` is the envelope-side classification, which returns
 the highest-specificity marker present.
 
 (Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,

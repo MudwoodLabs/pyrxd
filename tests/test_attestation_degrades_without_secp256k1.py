@@ -34,16 +34,27 @@ import pytest
 
 
 class _BlockCoincurve(importlib.abc.MetaPathFinder):
-    """Reproduce the browser: secp256k1 simply is not there."""
+    """Reproduce the browser: secp256k1 simply is not there. ``attempts`` counts the imports
+    that reached it — every one of them a full re-run of ``pyrxd/keys.py`` up to its import."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
 
     def find_spec(self, name, path=None, target=None):
         if name == "coincurve" or name.startswith("coincurve."):
+            self.attempts += 1
             raise ModuleNotFoundError("No module named 'coincurve'")
         return None
 
 
 @pytest.fixture
-def without_coincurve():
+def without_coincurve(monkeypatch):
+    # `verify_attestation` remembers a failed curve import (it is attempted once per process),
+    # so the memory is cleared here and restored by monkeypatch afterwards: a failure
+    # remembered from inside this fixture must not outlive it.
+    import pyrxd.script.hashmark as hashmark
+
+    monkeypatch.setattr(hashmark, "_secp256k1_import_failure", None)
     blocker = _BlockCoincurve()
     sys.meta_path.insert(0, blocker)
     # Drop anything already imported that would satisfy the import from cache.
@@ -51,7 +62,7 @@ def without_coincurve():
     for n in saved:
         del sys.modules[n]
     try:
-        yield
+        yield blocker
     finally:
         sys.meta_path.remove(blocker)
         sys.modules.update(saved)
@@ -152,3 +163,103 @@ class TestTheInspectCoreStaysNetworkFree:
         from pyrxd.network.registry import GENESIS_BLOCK_HASHES as REEXPORTED
 
         assert GENESIS_BLOCK_HASHES is REEXPORTED, "registry must re-export, not redefine"
+
+
+def _v1_record():
+    from pyrxd.script.hashmark import decode_hashmark
+
+    push = lambda b: bytes([len(b)]) + b  # noqa: E731
+    record = decode_hashmark(b"\x6a" + push(b"HASHMARK") + push(bytes([1, 1])) + push(bytes(range(32))))
+    assert record.ok and record.version == 1, "the premise: a readable v1 record"
+    return record
+
+
+class TestAnswersThatNeedNoCurveDoNotAskForOne:
+    """With no backend and no coincurve — the page when the JavaScript curve fails to load —
+    the curve was looked up BEFORE the record's own answer. Every v1 record re-attempted the
+    import (a re-run of ``pyrxd/keys.py`` each time: 500 records took 2.61 s, measured by the
+    review under Pyodide in Node) and came back NOT CHECKED, when its answer is NO SIGNATURE."""
+
+    def test_a_v1_record_says_no_signature_and_never_asks_for_the_curve(self, without_coincurve) -> None:
+        from pyrxd.glyph._inspect_core import _inspect_script
+        from pyrxd.script.hashmark import AttestationOutcome, verify_attestation
+
+        assert verify_attestation(_v1_record()).outcome is AttestationOutcome.NOT_ATTESTED
+        row = _inspect_script((b"\x6a\x08HASHMARK\x02\x01\x01\x20" + b"\x07" * 32).hex(), attest=True)
+        assert row["hashmark"]["attestation"]["status"] == "NO SIGNATURE"
+        assert without_coincurve.attempts == 0
+
+    def test_an_undecodable_record_is_answered_without_the_curve(self, without_coincurve) -> None:
+        from pyrxd.script.hashmark import AttestationOutcome, HashMarkOutcome, HashMarkRecord, verify_attestation
+
+        result = verify_attestation(HashMarkRecord(HashMarkOutcome.INVALID))
+        assert result.outcome is AttestationOutcome.INVALID_SIGNATURE and result.detail == "record did not decode"
+        assert without_coincurve.attempts == 0
+
+    def test_a_failed_curve_import_is_attempted_once(self, without_coincurve) -> None:
+        from pyrxd.script.hashmark import AttestationOutcome, decode_hashmark, verify_attestation
+
+        record = decode_hashmark(bytes.fromhex(_v2_script()))
+        results = [verify_attestation(record) for _ in range(5)]
+        assert all(r.outcome is AttestationOutcome.UNVERIFIABLE for r in results)
+        assert all("secp256k1" in (r.detail or "") for r in results), "every answer still says why"
+        assert without_coincurve.attempts == 1, f"the import was attempted {without_coincurve.attempts} times"
+
+    def test_a_registered_backend_is_used_and_the_import_is_never_attempted(self, without_coincurve) -> None:
+        """The page's normal state: a curve from JavaScript. Coincurve is not even looked for."""
+        from pyrxd.script.hashmark import (
+            AttestationOutcome,
+            RecoveryUnavailable,
+            decode_hashmark,
+            set_recovery_backend,
+            verify_attestation,
+        )
+
+        calls = []
+
+        def backend(*args):
+            calls.append(args)
+            raise RecoveryUnavailable("this test's backend does no arithmetic")
+
+        from tests.test_hashmark_mainnet_vectors import _V2_SIGNED  # r and s in range: it reaches the curve
+
+        set_recovery_backend(backend)
+        try:
+            result = verify_attestation(decode_hashmark(_V2_SIGNED))
+        finally:
+            set_recovery_backend(None)
+        assert len(calls) == 1 and result.outcome is AttestationOutcome.UNVERIFIABLE
+        assert "this test's backend does no arithmetic" in result.detail
+        assert without_coincurve.attempts == 0
+
+
+class TestTheHonestCurvesStillAnswer:
+    def test_coincurve_still_verifies_a_v2_record_without_a_backend(self) -> None:
+        """The CLI's path: no backend registered, coincurve present."""
+        from pyrxd.script.hashmark import AttestationOutcome, decode_hashmark, recovery_backend, verify_attestation
+        from tests.test_hashmark_mainnet_vectors import _V2_SIGNED
+
+        assert recovery_backend() is None
+        assert verify_attestation(decode_hashmark(_V2_SIGNED)).outcome is AttestationOutcome.VALID
+
+    def test_a_registered_backend_still_decides_a_v2_record(self) -> None:
+        """A backend that really recovers — coincurve's own, routed through the registry — is the
+        one that answers, and a real signature verifies through it."""
+        from pyrxd.keys import recover_public_key
+        from pyrxd.script.hashmark import AttestationOutcome, decode_hashmark, set_recovery_backend, verify_attestation
+        from tests.test_hashmark_mainnet_vectors import _V2_SIGNED
+
+        calls = []
+
+        def backend(message_hash, r, s, rec_id, compressed):
+            calls.append(1)
+            return recover_public_key(r + s + bytes([rec_id]), message_hash, hasher=None).serialize(
+                compressed=compressed
+            )
+
+        set_recovery_backend(backend)
+        try:
+            outcome = verify_attestation(decode_hashmark(_V2_SIGNED)).outcome
+        finally:
+            set_recovery_backend(None)
+        assert outcome is AttestationOutcome.VALID and calls == [1]

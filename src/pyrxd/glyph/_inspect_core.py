@@ -320,6 +320,93 @@ def _sanitize_update_fields(fields: dict) -> dict:
     return out
 
 
+def _utf16_order(text: str) -> bytes:
+    """A sort key that orders strings as JavaScript's default ``Array.prototype.sort`` does: by
+    UTF-16 code unit, which differs from Python's code-point order once a string has a character
+    past U+FFFF."""
+    return text.encode("utf-16-be", "surrogatepass")
+
+
+def _drawn_update_fields(fields: dict) -> tuple[dict, dict]:
+    """``(the fields a bounded caller draws, what it leaves out)`` for an update envelope.
+
+    The same sanitised keys and values :func:`_sanitize_update_fields` gives, cut to what
+    ``inspect.js`` draws of an update — at most :data:`_HUMAN_ENTRY_CAP` top-level fields other
+    than ``attrs``, and of a dict-valued ``attrs`` its ``target`` plus :data:`_HUMAN_ENTRY_CAP`
+    others — each set being the first in the order the page sorts them in, so the page draws the
+    fields it would have drawn from the whole envelope. Any other dict-valued field keeps its
+    first :data:`_HUMAN_ENTRY_CAP` entries in the same order. The second value counts what was
+    left out, EXACTLY, over the sanitised keys (two raw keys that sanitise alike are one field,
+    as in :func:`_sanitize_update_fields`): ``{"count": <top-level fields>, "within": {field:
+    <entries of that dict-valued field>}}``, each part present only when something was left out,
+    and ``{}`` when nothing was. Only the values kept are rendered.
+    """
+    by_key: dict[str, object] = {}
+    for k, v in fields.items():
+        by_key[_sanitize_display_string(_display_text(k))] = v  # the later value wins, as there
+
+    def first(keys: dict, always: str | None) -> tuple[set[str], int]:
+        """The keys drawn: *always* if present, and the first _HUMAN_ENTRY_CAP of the rest."""
+        rest = sorted((key for key in keys if key != always), key=_utf16_order)
+        kept = set(rest[:_HUMAN_ENTRY_CAP]) | ({always} if always in keys else set())
+        return kept, max(0, len(rest) - _HUMAN_ENTRY_CAP)
+
+    # Kept in the envelope's own order, so a payload with nothing to cut is the same dict, in the
+    # same order, as `_sanitize_update_fields` gives — and the raw-JSON drawer the same text.
+    out: dict = {}
+    within: dict[str, int] = {}
+    kept, top_left = first(by_key, "attrs")
+    for key, value in by_key.items():
+        if key not in kept:
+            continue
+        if not isinstance(value, dict):
+            out[key] = _sanitize_display_string(_display_text(value))
+            continue
+        inner: dict[str, object] = {}
+        for ik, iv in value.items():
+            inner[_sanitize_display_string(_display_text(ik))] = iv
+        inner_kept, inner_left = first(inner, "target" if key == "attrs" else None)
+        out[key] = {ik: _sanitize_display_string(_display_text(iv)) for ik, iv in inner.items() if ik in inner_kept}
+        if inner_left:
+            within[key] = inner_left
+    left: dict = {}
+    if top_left:
+        left["count"] = top_left
+    if within:
+        left["within"] = within
+    return out, left
+
+
+#: The lists one output row can carry, each with the key that counts what a bounded caller was not
+#: sent of it. A script's author chooses how many refs it names — the review measured one 3.7 MB
+#: output naming 100,000 distinct refs, which drew 300,042 elements — and these are the only
+#: list-valued fields of any row: ``tests/web/test_inspect_page_is_bounded.py`` classifies every
+#: shape the drift corpus holds and requires the list-valued fields it finds to be exactly these.
+_ROW_LISTS = {"input_refs": "input_refs_not_listed", "referenced_refs": "referenced_refs_not_listed"}
+
+
+def _drawn_row_lists(row: dict) -> None:
+    """Cut each of a listed row's :data:`_ROW_LISTS` to its first :data:`_HUMAN_ENTRY_CAP`
+    entries — the ones ``inspect.js`` draws — and count the rest, exactly, beside it as
+    ``{"count": n}``. A list at or under the cap is left whole, with no count.
+
+    An entry is one ref OPCODE in the script, not one distinct ref: a script pushing one ref 40
+    times has 40 entries, and the count is of opcodes. Of the entries left out, the singleton
+    pushes (0xd8) are also counted, as ``"singletons"``, when there are any, so that none is
+    hidden inside the bare count."""
+    from ..constants import OP_PUSHINPUTREFSINGLETON_BYTE
+
+    singleton = f"0x{OP_PUSHINPUTREFSINGLETON_BYTE:02x}"  # the spelling `_ref_summary` gives an opcode
+    for key, not_listed in _ROW_LISTS.items():
+        entries = row.get(key)
+        if isinstance(entries, list) and len(entries) > _HUMAN_ENTRY_CAP:
+            row[key] = entries[:_HUMAN_ENTRY_CAP]
+            row[not_listed] = {"count": len(entries) - _HUMAN_ENTRY_CAP}
+            singletons = sum(1 for entry in entries[_HUMAN_ENTRY_CAP:] if entry.get("opcode") == singleton)
+            if singletons:
+                row[not_listed]["singletons"] = singletons
+
+
 def _sanitize_display_string(s: object) -> str:
     """Strip control + invisible + combining codepoints from a string before printing.
 
@@ -753,8 +840,17 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet", attest: bool =
     return cast(dict, _render_safe(_classify_script(script_hex, network=network, attest=attest)))
 
 
-def _classify_script(script_hex: str, *, network: str, attest: bool = True) -> dict:
-    """The classifier behind :func:`_inspect_script`; its payload is NOT yet render-safe."""
+def _classify_script(script_hex: str, *, network: str, attest: bool = True, summary: bool = False) -> dict:
+    """The classifier behind :func:`_inspect_script`; its payload is NOT yet render-safe.
+
+    ``summary=True`` is for a row that is COUNTED and never drawn — an output past a page's
+    display limit (see :func:`_classify_raw_tx`'s ``max_rows``). It decides ``type`` by the same
+    branches in the same order, so the count by type is the one the full rows would give, and
+    for a HashMark record it still decides the attestation outcome. The OP_RETURN branch skips
+    the work that only feeds what a reader would see: decoders whose answer cannot change the
+    type, text sanitising, address encoding. Every other branch is unchanged — it returns the
+    same row, which the caller counts by type and discards.
+    """
     from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
 
@@ -812,106 +908,121 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True) -> d
     # re-strip the OP_RETURN byte. Length cap is the script's max
     # (already enforced upstream via _MAX_SCRIPT_HEX_LEN).
     if len(script) >= 1 and script[0] == 0x6A:
-        out = {
-            **base,
-            "type": "op_return",
-            "data_hex": script[1:].hex(),
-        }
+        # THE TYPE, DECIDED ONCE, for the full row and for a summary alike. Three decoders
+        # refine a plain `op_return`, and when more than one accepts the bytes the most
+        # specific wins: HashMark, then a Glyph burn proof, then the Photonic `msg`. Each is a
+        # pure function of the script that returns rather than raises, so in a SUMMARY
+        # (``summary=True``: a row counted past a page's display limit, never drawn) a decoder
+        # whose answer cannot change the type is simply not run — the `msg` walk is most of
+        # what a HashMark output costs. Everything else about the row is the same code.
+        #
         # HashMark is a THIRD-PARTY OP_RETURN format on Radiant (MIT, spec at
         # github.com/cdonnachie/hashmark.rxd). Decoding it here is read-only and
         # additive: anything that is not one stays plain `op_return`, because a
         # scanner meets thousands of other protocols' data outputs and treating
         # them as errors buries the real ones.
+        mark = decode_hashmark(script)
+        # A Glyph BURN proof. Everything in it is operator CBOR — the ref it names, the
+        # amount, the reason — so it is emitted under `claims` and the note says what is
+        # missing to turn it into a verdict.
+        proof = None if (summary and mark.ok) else parse_burn_proof(script)
         # The Photonic `msg` convention: OP_RETURN PUSH3 "msg" <push> <message>.
         # Measured on 20 consecutive mainnet blocks, 73 of 73 OP_RETURN outputs
         # carried this marker and nothing else did — it is the whole observed
         # population, and pyrxd already WRITES it. Reading it back turns the
         # commonest data output on the chain from an opaque blob into its text.
-        msg = decode_message(script)
-        if msg.outcome is not MessageOutcome.NOT_MESSAGE:
-            out["message"] = {
-                "outcome": msg.outcome.value,
-                # SANITISED here, at the display boundary. The message is arbitrary
-                # operator bytes and `repr` does not escape U+202E and friends; the
-                # decoder deliberately returns it unmangled so the raw bytes stay
-                # recoverable, and mangling belongs where it is shown.
-                "text": _sanitize_display_string(msg.text) if msg.text else None,
-                "is_utf8": msg.is_utf8,
-                "byte_length": len(msg.raw) if msg.raw else 0,
-                "detail": msg.detail,
-            }
-            if msg.ok:
-                out["type"] = "op_return-msg"
+        msg = None if (summary and (mark.ok or proof is not None)) else decode_message(script)
+        # Each type is a `{"type": ...}` literal, as in every other branch, so the drift
+        # test's extraction of the types this classifier can emit still finds them.
+        if mark.ok:
+            typed = {"type": f"op_return-hashmark-v{mark.version}"}
+        elif proof is not None:
+            typed = {"type": "op_return-burn"}
+        elif msg is not None and msg.ok:
+            typed = {"type": "op_return-msg"}
+        else:
+            typed = {"type": "op_return"}
 
-        # A Glyph BURN proof. Refines `op_return` the way the message and
-        # HashMark decoders do. Everything in it is operator CBOR — the ref it
-        # names, the amount, the reason — so it is emitted under `claims` and
-        # the note says what is missing to turn it into a verdict.
-        proof = parse_burn_proof(script)
-        if proof is not None:
-            out["type"] = "op_return-burn"
-            out["burn"] = {
-                "claims": {
-                    "token_ref": _sanitize_display_string(proof.token_ref),
-                    "action": _sanitize_display_string(proof.action),
-                    "amount": proof.amount,
-                    "reason": _sanitize_display_string(proof.reason) if proof.reason else "",
-                },
-                "note": (
-                    "a burn proof is an OP_RETURN and anyone can write one about any token — "
-                    "it is only a burn if this transaction also SPENT that token and no output "
-                    "carries it; see verify_burn"
-                ),
-            }
-            # WITH its reason. `amount: null` alone reads as "the proof names no amount",
-            # which is not what happened when it named one this reader refused to repeat.
-            if proof.amount_withheld:
-                out["burn"]["amount_withheld"] = _sanitize_display_string(proof.amount_withheld)
+        out: dict = typed if summary else {**base, **typed, "data_hex": script[1:].hex()}
+        if not summary:
+            if msg is not None and msg.outcome is not MessageOutcome.NOT_MESSAGE:
+                out["message"] = {
+                    "outcome": msg.outcome.value,
+                    # SANITISED here, at the display boundary. The message is arbitrary
+                    # operator bytes and `repr` does not escape U+202E and friends; the
+                    # decoder deliberately returns it unmangled so the raw bytes stay
+                    # recoverable, and mangling belongs where it is shown.
+                    "text": _sanitize_display_string(msg.text) if msg.text else None,
+                    "is_utf8": msg.is_utf8,
+                    "byte_length": len(msg.raw) if msg.raw else 0,
+                    "detail": msg.detail,
+                }
+            if proof is not None:
+                out["burn"] = {
+                    "claims": {
+                        "token_ref": _sanitize_display_string(proof.token_ref),
+                        "action": _sanitize_display_string(proof.action),
+                        "amount": proof.amount,
+                        "reason": _sanitize_display_string(proof.reason) if proof.reason else "",
+                    },
+                    "note": (
+                        "a burn proof is an OP_RETURN and anyone can write one about any token — "
+                        "it is only a burn if this transaction also SPENT that token and no output "
+                        "carries it; see verify_burn"
+                    ),
+                }
+                # WITH its reason. `amount: null` alone reads as "the proof names no amount",
+                # which is not what happened when it named one this reader refused to repeat.
+                if proof.amount_withheld:
+                    out["burn"]["amount_withheld"] = _sanitize_display_string(proof.amount_withheld)
 
-        mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
-            out["hashmark"] = {
-                "outcome": mark.outcome.value,
-                "version": mark.version,
-                "algorithm": mark.algorithm,
-                # THE ID, not only the name. Whoever re-hashes a local file to compare it
-                # against this digest has to run the algorithm the RECORD names, and
-                # `algorithm_for` is explicit that a caller spelling "sha256" itself has
-                # created a second source of truth for what was hashed. `digest_file` takes
-                # the id, so carrying it is what lets `pyrxd verify` stay on the one table.
-                # And it is the only way to name the algorithm of a record this build
-                # cannot read: `algorithm` is None for an `unknown_algorithm` outcome,
-                # so without the id the panel can say a record names something unknown
-                # and never say WHICH.
-                "algorithm_id": mark.algorithm_id,
-                "digest": mark.digest_hex,
-                # SANITISED, like every other display string on this renderer. The
-                # decoder now refuses a non-canonical label outright (spec 5.4), so
-                # this is defence in depth — but `msg` two branches up was sanitised
-                # and this was not, in the same function, which is how a label got to
-                # inject whole lines under "signature VERIFIED".
-                "label": _sanitize_display_string(mark.label) if mark.label else None,
-                "label_withheld": mark.label_withheld,
-                # v2 only, and NOT verified here — verifying needs secp256k1 and
-                # the chain the tx was found on. Well-formed is not believed.
-                "signer_hash160": mark.signer_hash160_hex,
-                # The SAME hash160, base58check-encoded — a re-encoding of a value the
-                # record itself holds, not a second piece of evidence, and emphatically
-                # not the RECOVERED key (that is `attestation.signer_address`, and the
-                # two are equal only when the signature verifies).
-                #
-                # It exists because the browser's normal outcome is `unverifiable`, where
-                # nothing is recovered and so no address was available at all — leaving a
-                # non-developer a 20-byte hex string to compare against a wallet that
-                # shows addresses. The honest answer to "who signed" when nothing was
-                # checked is "the record NAMES this key", and this is that answer in a
-                # form a person can act on.
-                "committed_signer_address": _address_for(mark.signer_hash160_hex, network),
-                "signature_unverified": mark.signature_hex,
-                "detail": mark.detail,
-            }
+            # A summary keeps only what its tally reads: the outcome, and below, the verdict.
+            out["hashmark"] = (
+                {"outcome": mark.outcome.value}
+                if summary
+                else {
+                    "outcome": mark.outcome.value,
+                    "version": mark.version,
+                    "algorithm": mark.algorithm,
+                    # THE ID, not only the name. Whoever re-hashes a local file to compare it
+                    # against this digest has to run the algorithm the RECORD names, and
+                    # `algorithm_for` is explicit that a caller spelling "sha256" itself has
+                    # created a second source of truth for what was hashed. `digest_file` takes
+                    # the id, so carrying it is what lets `pyrxd verify` stay on the one table.
+                    # And it is the only way to name the algorithm of a record this build
+                    # cannot read: `algorithm` is None for an `unknown_algorithm` outcome,
+                    # so without the id the panel can say a record names something unknown
+                    # and never say WHICH.
+                    "algorithm_id": mark.algorithm_id,
+                    "digest": mark.digest_hex,
+                    # SANITISED, like every other display string on this renderer. The
+                    # decoder now refuses a non-canonical label outright (spec 5.4), so
+                    # this is defence in depth — but `msg` two branches up was sanitised
+                    # and this was not, in the same function, which is how a label got to
+                    # inject whole lines under "signature VERIFIED".
+                    "label": _sanitize_display_string(mark.label) if mark.label else None,
+                    "label_withheld": mark.label_withheld,
+                    # v2 only, and NOT verified here — verifying needs secp256k1 and
+                    # the chain the tx was found on. Well-formed is not believed.
+                    "signer_hash160": mark.signer_hash160_hex,
+                    # The SAME hash160, base58check-encoded — a re-encoding of a value the
+                    # record itself holds, not a second piece of evidence, and emphatically
+                    # not the RECOVERED key (that is `attestation.signer_address`, and the
+                    # two are equal only when the signature verifies).
+                    #
+                    # It exists because the browser's normal outcome is `unverifiable`, where
+                    # nothing is recovered and so no address was available at all — leaving a
+                    # non-developer a 20-byte hex string to compare against a wallet that
+                    # shows addresses. The honest answer to "who signed" when nothing was
+                    # checked is "the record NAMES this key", and this is that answer in a
+                    # form a person can act on.
+                    "committed_signer_address": _address_for(mark.signer_hash160_hex, network),
+                    "signature_unverified": mark.signature_hex,
+                    "detail": mark.detail,
+                }
+            )
             if mark.ok:
-                out["type"] = f"op_return-hashmark-v{mark.version}"
                 # ATTEST, now that we can. The signed statement includes the chain's
                 # genesis hash, so THE SAME BYTES ON ANOTHER CHAIN ARE A DIFFERENT
                 # STATEMENT and verify against a different key.
@@ -952,7 +1063,8 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True) -> d
                     # The address form of the recovered key. §7.6's sound statement
                     # LEADS with this — it is the only identity fact the mark itself
                     # carries. Anything a naming system adds is separate context.
-                    "signer_address": _address_for(att.recovered_hash160_hex, network),
+                    # Not derived for a summary, which is counted and never shown.
+                    "signer_address": None if summary else _address_for(att.recovered_hash160_hex, network),
                     "assumed_network": f"radiant-{assumed}",
                     "detail": att.detail,
                 }
@@ -1406,6 +1518,311 @@ def _payload_binding(metadata_cbor: bytes | None, spent_script: bytes | None) ->
     }
 
 
+# --- The spent transaction, fetched: ONE definition for every surface that fetches it --------
+#
+# `_payload_binding` answers "was not supplied" when it is handed no spent script — true for a
+# caller that never fetched the spent transaction, and FALSE for one that asked, was answered,
+# and could not use the answer. Both fetching surfaces (the CLI's `--fetch` and the /inspect/
+# page) used to fall back to that sentence on every failure, including a server that answered
+# with a different transaction. They now both call `_spent_output_binding`, so they cannot say
+# different things about the same fetch.
+
+#: The spent transaction was asked for and nothing usable came back: the server refused, could
+#: not be reached, or answered with bytes that are not that transaction. ``detail`` says which.
+SPENT_TX_NOT_OBTAINED = (
+    "the spent transaction was asked for and nothing usable came back, so the payload was not "
+    "checked against the commit that committed to it"
+)
+#: The spent transaction's bytes arrived and could not stand in for the output this input spent.
+SPENT_TX_UNUSABLE = (
+    "the spent transaction was supplied but could not be used, so the payload was not checked "
+    "against the commit that committed to it"
+)
+
+
+class _SpentTxUnusable(Exception):
+    """The spent transaction's bytes cannot stand in for the output spent. ``str()`` says why."""
+
+
+def _bound_to_txid(txid_hex: str, raw: bytes) -> Txid:
+    """``txid_hex`` as a :class:`Txid`, once *raw* is proven to be that transaction's bytes.
+
+    THE SERVER-HONESTY CHECK lives here: ``hash256(raw)[::-1].hex() == txid_hex``, so a hostile
+    source cannot hand back some OTHER transaction. The txid a transaction is known by is the
+    hash of its own bytes, so binding the answer to the question needs no parser. Raises
+    ``ValidationError``.
+    """
+    txid = Txid(txid_hex.lower())  # raises ValidationError on bad shape
+
+    if len(raw) <= 64:
+        raise ValidationError(f"raw bytes too short for a valid transaction ({len(raw)} bytes; need >64)")
+
+    if len(raw) > _MAX_RAW_TX_BYTES:
+        raise ValidationError(
+            f"transaction is larger than the policy max "
+            f"(server returned {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES})"
+        )
+
+    computed = hash256(bytes(raw))[::-1].hex()
+    if computed != str(txid):
+        raise ValidationError(
+            f"server returned a transaction whose hash does not match the requested txid "
+            f"(requested {txid}, got {computed})"
+        )
+    return txid
+
+
+def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
+    """``raw`` parsed whole, after :func:`_bound_to_txid`. Raises ``ValidationError``."""
+    txid = _bound_to_txid(txid_hex, raw)
+    tx = Transaction.from_hex(bytes(raw))
+    if tx is None:
+        raise ValidationError("could not parse the raw transaction bytes")
+
+    if len(tx.inputs) > _MAX_INPUT_COUNT or len(tx.outputs) > _MAX_OUTPUT_COUNT:
+        raise ValidationError(
+            f"transaction structure exceeds inspect's safety caps (inputs={len(tx.inputs)}, outputs={len(tx.outputs)})"
+        )
+    return txid, tx
+
+
+def _checked_inputs(txid_hex: str, raw: bytes) -> list:
+    """The INPUTS of *raw*, after :func:`_bound_to_txid` — without building a single output.
+
+    For a caller that needs only the inputs: the spent-output binding reads one input's envelope,
+    and a transaction's outputs can be 4 MB of it. The inputs come first on the wire (version,
+    input count, inputs), and each is read by ``TransactionInput.from_hex``, the reader
+    ``Transaction.from_reader`` uses for them; ``tests/web/test_inspect_spent_tx_is_checked.py``
+    pins the result equal to ``Transaction.from_hex(raw).inputs``.
+
+    THE REST OF THE BYTES ARE WALKED, NOT TRUSTED. This is public
+    (``pyrxd.glyph.inspect.spent_output_binding`` reaches it), so it cannot lean on a caller
+    having parsed the transaction first: it used to stop after the inputs, and answered ``bound``
+    for bytes with trailing garbage, a missing outputs section, or an output count of 2**64 - 1,
+    all of which ``Transaction.from_hex`` refuses. So after the inputs it walks the outputs the
+    way ``Transaction.from_reader`` reads them — the count, and for each output its 8-byte value,
+    its script length and exactly that many script bytes — then the locktime, and requires the
+    walk to end on the last byte, as ``from_hex`` does. The script bytes are skipped, not copied,
+    and no output object is built. It refuses what a whole parse refuses, and the output-count
+    cap :func:`_checked_transaction` applies; the same test file pins that against
+    ``Transaction.from_hex`` on malformed and well-formed bytes alike. Raises ``ValidationError``.
+    """
+    from ..transaction.transaction_input import TransactionInput
+    from ..utils import Reader
+
+    _bound_to_txid(txid_hex, raw)
+    data = bytes(raw)
+    reader = Reader(data)
+    try:
+        version = reader.read_uint32_le()
+        count = reader.read_var_int_num()
+        if version is None or count is None:
+            raise ValidationError("could not parse the raw transaction bytes")
+        if count > _MAX_INPUT_COUNT:
+            raise ValidationError(f"transaction structure exceeds inspect's safety caps (inputs={count})")
+        inputs = []
+        for _ in range(count):
+            inp = TransactionInput.from_hex(reader)
+            if inp is None:
+                raise ValidationError("could not parse the raw transaction bytes")
+            inputs.append(inp)
+        _walk_outputs_to_the_end(reader, len(data))
+    except ValidationError:
+        raise
+    except Exception as exc:  # a non-canonical or truncated varint, and anything else about the bytes
+        raise ValidationError("could not parse the raw transaction bytes") from exc
+    return inputs
+
+
+def _walk_outputs_to_the_end(reader, total: int) -> None:
+    """Walk the outputs and locktime of a transaction whose inputs *reader* has just read, to its
+    last byte. ``Transaction.from_reader``'s layout; raises ``ValidationError`` where it fails."""
+    unparsable = "could not parse the raw transaction bytes"
+    count = reader.read_var_int_num()
+    if count is None:
+        raise ValidationError(unparsable)
+    if count > _MAX_OUTPUT_COUNT:
+        raise ValidationError(f"transaction structure exceeds inspect's safety caps (outputs={count})")
+    for _ in range(count):
+        if reader.read_exact(8) is None:  # the value
+            raise ValidationError(unparsable)
+        length = reader.read_var_int_num()
+        if length is None:
+            raise ValidationError(unparsable)
+        at = reader.tell()
+        if length > total - at:  # an over-claiming script length: a whole parse refuses it too
+            raise ValidationError(unparsable)
+        reader.seek(at + length)
+    if reader.read_uint32_le() is None:  # the locktime
+        raise ValidationError(unparsable)
+    if not reader.eof():
+        raise ValidationError(f"{unparsable}: {total - reader.tell()} byte(s) after the locktime")
+
+
+def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector) -> tuple | None:
+    """``(input_index, metadata, envelope_cbor, spent_outpoint)`` for the reveal the readers
+    attribute, or ``None``. The one rule both the classifier and the spent-binding check use."""
+    found = inspector.find_reveal_metadata(scriptsigs)
+    if found is None:
+        return None
+    input_idx, metadata = found
+    cbor = inspector.extract_reveal_cbor(scriptsigs[input_idx]) if scriptsigs else None
+    src = inputs[input_idx]
+    outpoint = f"{src.source_txid}:{src.source_output_index}" if src.source_txid else None
+    return input_idx, metadata, cbor, outpoint
+
+
+def _spent_script(outpoint: str, spent_raw: bytes) -> bytes:
+    """The locking script *outpoint* names, read out of *spent_raw* once it is proven to be
+    that transaction. Raises :class:`_SpentTxUnusable` with the reason."""
+    prev_txid, _, vout_str = outpoint.rpartition(":")
+    if not spent_raw:
+        raise _SpentTxUnusable("it is empty")
+    if len(spent_raw) > _MAX_RAW_TX_BYTES:
+        raise _SpentTxUnusable(f"it is {len(spent_raw):,} bytes, larger than any transaction")
+    got = hash256(bytes(spent_raw))[::-1].hex()
+    if got != prev_txid.lower():
+        raise _SpentTxUnusable(f"it is not the transaction this input spent: it hashes to {got}")
+    prev_tx = Transaction.from_hex(bytes(spent_raw))
+    if prev_tx is None:
+        raise _SpentTxUnusable("it does not parse as a transaction")
+    vout = int(vout_str)
+    if not 0 <= vout < len(prev_tx.outputs):
+        raise _SpentTxUnusable(f"it has no output {vout} ({len(prev_tx.outputs)} output(s))")
+    return bytes(prev_tx.outputs[vout].locking_script.serialize())
+
+
+def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *, spent_error: str = "") -> dict | None:
+    """``payload_binding`` for the reveal in *raw*, from what fetching its spent transaction gave.
+
+    *spent_raw* is the transaction the attributed input spent, or ``None`` when the fetch failed,
+    in which case *spent_error* says why. Returns ``None`` when no input is attributed a payload
+    (there is nothing to bind); otherwise the same dict :func:`_classify_raw_tx` would put under
+    ``metadata.payload_binding`` if handed that input's spent script — ``bound``, ``mismatch`` or
+    ``not-a-commit`` from :func:`_payload_binding` itself — or ``unchecked`` with a ``detail`` that
+    says what went wrong. Never "was not supplied": this is only called by a caller that asked.
+
+    Costs a hash of *raw*, a parse of its inputs and a walk of its outputs that builds none of
+    them (see :func:`_checked_inputs`), and a parse of *spent_raw*, and no classification of
+    anything: the binding reads the attributed input's envelope and the one output it spent.
+    ``tests/web/test_inspect_spent_tx_is_checked.py`` pins it equal to a full re-classification.
+
+    Raises ``ValidationError`` only for *raw* itself (bound to *txid_hex* by the same check
+    :func:`_classify_raw_tx` makes); everything about the spent transaction is reported.
+    """
+    from .inspector import GlyphInspector
+
+    inputs = _checked_inputs(txid_hex, raw)
+    scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in inputs]
+    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector())
+    if attributed is None or attributed[3] is None:
+        return None
+    _idx, _metadata, cbor, outpoint = attributed
+
+    def said(text: str) -> str:
+        # Whatever went wrong may quote a server, and it lands in terminal output and on a page.
+        return _truncate_for_human(_sanitize_display_string(text))
+
+    if spent_raw is None:
+        return {"state": "unchecked", "reason": SPENT_TX_NOT_OBTAINED, "detail": said(spent_error or "no reason given")}
+    try:
+        script = _spent_script(outpoint, spent_raw)
+    except _SpentTxUnusable as exc:
+        return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc))}
+    except Exception as exc:  # anything else about the bytes: the same honest state, with what went wrong
+        return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc) or type(exc).__name__)}
+    return _payload_binding(cbor, script)
+
+
+# --- Counting what a bounded caller does not list --------------------------------------------
+
+#: The word for a HashMark record whose signature was not checked because it was past the
+#: checking limit — the reader declining, which is not the curve failing to load (NOT CHECKED).
+NOT_CHECKED_HERE_WORD = "not checked here"
+
+
+def _hashmark_tally_word(hm: dict) -> str:
+    """The status word a HashMark record's panel leads with, for counting records not drawn.
+
+    The same words the panel prints: a record that is not readable is named by its decode
+    outcome (``appendMarkVerdict`` upper-cases it), a readable one by its attestation's
+    ``status`` from :data:`_ATTESTATION_VERDICTS` — except that a record past the checking
+    limit is :data:`NOT_CHECKED_HERE_WORD`, so a count cannot fold it into a total that reads
+    as clean. ``tests/web/test_inspect_page_is_bounded.py`` pins these against the panel.
+    """
+    outcome = hm.get("outcome")
+    if outcome != "ok":
+        return str(outcome or "").upper().replace("_", " ") or "NOT CHECKED"
+    att = hm.get("attestation") or {}
+    if att.get("outcome") == ATTESTATION_NOT_CHECKED_HERE:
+        return NOT_CHECKED_HERE_WORD
+    return att.get("status") or "NOT CHECKED"
+
+
+def _count(tally: dict, key: str) -> None:
+    tally[key] = tally.get(key, 0) + 1
+
+
+class _OutputShape:
+    """What every output of a transaction is, for a caller describing it from a cut listing.
+
+    A count of each output type, and for the dMint contract outputs the first one's vout, height
+    and max_height and whether ALL of them carry one token_ref, one reward and one max_height. The
+    page's transaction-shape banner states exactly these (``_detectTxShape`` in ``inspect.js``).
+    When nothing was cut the page works them out from the rows instead (``_outputShape``), and
+    there it sees an integer wider than :data:`_MAX_RENDERED_INT_BITS` only as the text that
+    replaced it: where every row holds the same such text for a field, it answers "cannot tell" rather
+    than the agreement this class computes. A field compared must be present on every row to
+    agree, as the banner's own comparison requires: a field absent everywhere does not agree by
+    having nothing to compare.
+
+    COMPARED AS THE CLASSIFIER'S OWN VALUES, for a listed row as for a counted one: the caller
+    notes every row BEFORE :func:`_render_safe` replaces an integer wider than
+    :data:`_MAX_RENDERED_INT_BITS` with text. So two rewards that differ past 2**53, or past the
+    width at which the payload carries text instead of a number, still differ, and two equal ones
+    still agree. The listed rows used to be noted after that replacement and the counted ones
+    before it, so 150 contracts sharing one 1,101-bit reward read "not all equal", and two with
+    different 1,101-bit rewards read "agree".
+    """
+
+    _COMPARED = ("token_ref_outpoint", "reward", "max_height")
+
+    def __init__(self) -> None:
+        self.by_type: dict[str, int] = {}
+        self.dmint_count = 0
+        self.dmint_first: dict = {}
+        self.dmint_same = dict.fromkeys(self._COMPARED, True)
+
+    def note(self, vout: int, row: dict) -> None:
+        kind = str(row.get("type", "unknown"))
+        _count(self.by_type, kind)
+        if kind != "dmint":
+            return
+        self.dmint_count += 1
+        if self.dmint_count == 1:
+            self.dmint_first = {"vout": vout, "height": row.get("height"), "max_height": row.get("max_height")}
+            self.dmint_first.update({f"cmp_{f}": row.get(f) for f in self._COMPARED})
+        for field in self._COMPARED:
+            value = row.get(field)
+            self.dmint_same[field] = (
+                self.dmint_same[field] and value is not None and value == self.dmint_first[f"cmp_{field}"]
+            )
+
+    def as_payload(self) -> dict:
+        out: dict = {"by_type": dict(self.by_type)}
+        if self.dmint_count:
+            out["dmint"] = {
+                "count": self.dmint_count,
+                "first_vout": self.dmint_first["vout"],
+                "first_height": self.dmint_first["height"],
+                "first_max_height": self.dmint_first["max_height"],
+                "same_token_ref": self.dmint_same["token_ref_outpoint"],
+                "same_reward": self.dmint_same["reward"],
+                "same_max_height": self.dmint_same["max_height"],
+            }
+        return out
+
+
 def _classify_raw_tx(
     txid_hex: str,
     raw: bytes,
@@ -1415,6 +1832,7 @@ def _classify_raw_tx(
     delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
     spent_scripts: Mapping[int, bytes] | None = None,
     attest_hashmark_limit: int | None = None,
+    max_rows: int | None = None,
 ) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
@@ -1452,6 +1870,33 @@ def _classify_raw_tx(
     :param attest_hashmark_limit: check the signatures of the first N HashMark records only;
         later ones are decoded and marked :data:`ATTESTATION_NOT_CHECKED_HERE`. ``None`` (the
         default, and what every CLI path passes) checks every record.
+    :param max_rows: list at most this many entries of each list the transaction produces —
+        ``outputs``, ``glyph_envelopes``, the other payloads in ``metadata_inputs`` (the headline
+        payload's own entry is always listed), and ``metadata.relationships`` and
+        ``metadata.delegate_burns`` — and COUNT the rest, exactly, under a ``*_not_listed`` key
+        beside each list. When outputs are cut, ``output_shape`` also says what EVERY output is:
+        a count by type and, for dMint contract outputs, the facts the page's shape banner states
+        (see :class:`_OutputShape`). ``None`` (the default, and what every CLI path passes) lists
+        everything and adds none of these keys.
+
+    WHAT ``max_rows`` BOUNDS, AND WHAT IT DOES NOT. An output past the limit is classified in
+    SUMMARY (see :func:`_classify_script`): its type, and for a HashMark record the status word
+    its panel would show, are decided by the same code as a listed row's and counted, and the
+    rest of what the classifier returned for it is dropped — it never becomes a row, and it is
+    not in the payload. So the NUMBER of entries in each of those lists is bounded by
+    ``max_rows``, and so is the number of update envelopes; each of those carries only the fields
+    the page draws — :data:`_HUMAN_ENTRY_CAP` top-level fields other than ``attrs``, and ``attrs``
+    itself; ``attrs.target`` and :data:`_HUMAN_ENTRY_CAP` other ``attrs`` entries;
+    :data:`_HUMAN_ENTRY_CAP` entries of any other map-valued field (:func:`_drawn_update_fields`).
+    A listed output row's refs are cut too: at most :data:`_HUMAN_ENTRY_CAP` of ``input_refs`` and of
+    ``referenced_refs``, with the rest counted beside each (:func:`_drawn_row_lists`). The SIZE of
+    one entry is otherwise not bounded by ``max_rows``: a listed output row carries its script's
+    hex whole, and the headline payload carries its whole ``protocol`` list, whose VALUES
+    ``GlyphMetadata`` holds to the known protocol numbers and whose LENGTH it does not bound — one
+    256 KB envelope repeating a number decodes to about 262,000 entries. Only the transaction's own
+    bytes bound those. What also still grows with the transaction is parsing it and the per-entry
+    work behind the exact counts: each output's type and refs, each input's envelope and payload,
+    each relationship claim's verdict.
 
     THE WORK ONE TRANSACTION CAN DEMAND IS BOUNDED HERE, not only what gets drawn. Nothing
     limits how many HashMark outputs a transaction carries — about 26,000 signed records fit
@@ -1469,41 +1914,11 @@ def _classify_raw_tx(
 
     from .inspector import GlyphInspector
 
-    if attest_hashmark_limit is not None and (
-        isinstance(attest_hashmark_limit, bool)
-        or not isinstance(attest_hashmark_limit, int)
-        or attest_hashmark_limit < 0
-    ):
-        raise ValidationError(
-            f"attest_hashmark_limit must be a non-negative int or None, got {attest_hashmark_limit!r}"
-        )
+    for name, value in (("attest_hashmark_limit", attest_hashmark_limit), ("max_rows", max_rows)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValidationError(f"{name} must be a non-negative int or None, got {value!r}")
 
-    txid = Txid(txid_hex.lower())  # raises ValidationError on bad shape
-
-    if len(raw) <= 64:
-        raise ValidationError(f"raw bytes too short for a valid transaction ({len(raw)} bytes; need >64)")
-
-    if len(raw) > _MAX_RAW_TX_BYTES:
-        raise ValidationError(
-            f"transaction is larger than the policy max "
-            f"(server returned {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES})"
-        )
-
-    computed = hash256(bytes(raw))[::-1].hex()
-    if computed != str(txid):
-        raise ValidationError(
-            f"server returned a transaction whose hash does not match the requested txid "
-            f"(requested {txid}, got {computed})"
-        )
-
-    tx = Transaction.from_hex(bytes(raw))
-    if tx is None:
-        raise ValidationError("could not parse the raw transaction bytes")
-
-    if len(tx.inputs) > _MAX_INPUT_COUNT or len(tx.outputs) > _MAX_OUTPUT_COUNT:
-        raise ValidationError(
-            f"transaction structure exceeds inspect's safety caps (inputs={len(tx.inputs)}, outputs={len(tx.outputs)})"
-        )
+    txid, tx = _checked_transaction(txid_hex, raw)
 
     output_rows: list[dict] = []
     enumerated = list(enumerate(tx.outputs))
@@ -1514,25 +1929,57 @@ def _classify_raw_tx(
 
     checked: dict[bytes, dict] = {}  # record bytes -> the attestation computed for them
     hashmark_rows = 0
-    for idx, out in enumerated:
+    # What is counted rather than listed. Filled only past `max_rows`.
+    outputs_by_type: dict[str, int] = {}
+    marks_by_status: dict[str, int] = {}
+    unlisted_vouts: list[int] = []
+    # What EVERY output is, listed or not — see `output_shape` below. Noted at exactly the points
+    # a row is committed to the listing or to `outputs_by_type`, so its counts are theirs summed.
+    shape = _OutputShape()
+    for position, (idx, out) in enumerate(enumerated):
+        listed = max_rows is None or position < max_rows
         try:
             script_bytes = bytes(out.locking_script.serialize())
             known = checked.get(script_bytes)
             within = attest_hashmark_limit is None or hashmark_rows < attest_hashmark_limit
-            row = _inspect_script(script_bytes.hex(), network=network, attest=within and known is None)
+            attest = within and known is None
+            if listed:
+                # What `_inspect_script` returns, in its two steps, because `shape` must see the
+                # first: the classifier's values, however wide (see `_OutputShape`).
+                classified = _classify_script(script_bytes.hex(), network=network, attest=attest)
+                if max_rows is not None:
+                    _drawn_row_lists(classified)  # before the render walk, which would visit every ref
+                row = cast(dict, _render_safe(classified))
+            else:
+                row = classified = _classify_script(script_bytes.hex(), network=network, attest=attest, summary=True)
             hm = row.get("hashmark")
             if hm is not None:
                 hashmark_rows += 1
                 att = hm.get("attestation")
+                # Copied for a listed row, whose dict is handed to the caller; a summary's is
+                # read once, for its status word, and dropped.
                 if att is not None and known is not None:
-                    hm["attestation"] = copy.deepcopy(known)
+                    hm["attestation"] = copy.deepcopy(known) if listed else known
                 elif att is not None and att.get("outcome") != ATTESTATION_NOT_CHECKED_HERE:
-                    checked[script_bytes] = copy.deepcopy(att)
+                    checked[script_bytes] = copy.deepcopy(att) if listed else att
+            if not listed:
+                _count(outputs_by_type, str(row.get("type", "unknown")))
+                shape.note(idx, classified)
+                if hm is not None:
+                    _count(marks_by_status, _hashmark_tally_word(hm))
+                unlisted_vouts.append(idx)
+                continue
             row.pop("form", None)  # always "script" — redundant inside a tx listing
             row["vout"] = idx
             row["satoshis"] = out.satoshis
             output_rows.append(row)
+            shape.note(idx, classified)
         except Exception as exc:  # defensive: any classifier crash → unknown row
+            if not listed:
+                _count(outputs_by_type, "error")
+                shape.note(idx, {"type": "error"})
+                unlisted_vouts.append(idx)
+                continue
             output_rows.append(
                 {
                     "vout": idx,
@@ -1541,6 +1988,7 @@ def _classify_raw_tx(
                     "satoshis": out.satoshis,
                 }
             )
+            shape.note(idx, output_rows[-1])
 
     # IMPORTANT: every string field surfaced into ``metadata_payload`` MUST
     # be passed through ``_sanitize_display_string`` first. JSON mode escapes
@@ -1552,7 +2000,8 @@ def _classify_raw_tx(
     # does NOT escape U+202E and friends.
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
-    found = inspector.find_reveal_metadata(scriptsigs)
+    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector)
+    found = None if attributed is None else (attributed[0], attributed[1])
 
     # dMint mint-claim scriptSig: if vin[0] is a dMint mint claim (4 canonical
     # pushes — nonce, inputHash, outputHash, OP_0), decode it for display.
@@ -1562,6 +2011,44 @@ def _classify_raw_tx(
     mint_scriptsig: dict | None = None
     if scriptsigs:
         mint_scriptsig = inspector.parse_mint_scriptsig(scriptsigs[0])
+    # EVERY input's payload, not just the first (#577).
+    #
+    # `find_reveal_metadata` returns the FIRST decodable scriptSig and that single
+    # payload was reported as the transaction's metadata. Multi-glyph reveals are
+    # real and not rare on mainnet — one observed reveal mints 35 refs from 36
+    # inputs — so 34 of those refs were being shown another token's name,
+    # description and media.
+    #
+    # The full per-input payload is not duplicated here; each entry carries enough
+    # to see WHICH input a name belongs to, and `metadata.input_index` already says
+    # which one the headline payload came from. What was missing was any signal
+    # that other payloads existed at all.
+    metadata_inputs: list[dict] = []
+    read_by_reveal_reader: set[int] = set()  # every input `extract_reveal_metadata` decoded
+    payload_count = 0
+    others_listed = 0
+    others_not_listed = 0
+    for idx, ss in enumerate(scriptsigs):
+        m = inspector.extract_reveal_metadata(ss)
+        if m is None:
+            continue
+        read_by_reveal_reader.add(idx)
+        payload_count += 1
+        # The headline payload's own entry is always listed; the OTHERS are what a reader has
+        # no other way to learn about, and they are what `max_rows` bounds.
+        if found is None or idx != found[0]:
+            if max_rows is not None and others_listed >= max_rows:
+                others_not_listed += 1
+                continue
+            others_listed += 1
+        metadata_inputs.append(
+            {
+                "input_index": idx,
+                "classification": _classify_metadata_protocol(m),
+                "name": _sanitize_display_string(m.name) if m.name else "",
+                "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
+            }
+        )
     # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
     # token payload here", and returns None both for "no glyph" and for "a glyph I could not
     # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on
@@ -1572,20 +2059,33 @@ def _classify_raw_tx(
     # is reported as UNREADABLE rather than omitted — "I cannot read this" and "there is nothing
     # here" are opposite facts and the blind one is the more reassuring.
     glyph_envelopes: list[dict] = []
+    envelopes_by_kind: dict[str, int] = {}  # past `max_rows`: counted by the kind each would show
     for idx, ss in enumerate(scriptsigs):
         env = inspector.classify_glyph_scriptsig(ss)
         if env is None:
             continue
+        if env.kind == "payload" and idx in read_by_reveal_reader:
+            # Skipped when the REVEAL READER read it too: it is the headline payload or one of the
+            # other glyphs above, so it is rendered and the two readers agree about it.
+            #
+            # `payload_unrendered` below is for the case where they DO NOT: this classifier sees a
+            # full payload and `extract_reveal_metadata` returns nothing, so neither the metadata
+            # block nor the other-glyphs list shows it. It was added (#665) when the reveal reader
+            # had its own push walker that stopped at `OP_0`; the same change gave both readers one
+            # walker and one marker rule, and no byte string is known today on which they
+            # disagree. It stays because a later change to either reader could bring the
+            # disagreement back, and a reveal rendered as nothing is the failure this surface
+            # exists to prevent.
+            #
+            # This skip used to test `found[0] == idx` — the HEADLINE input only — so every other
+            # payload of a multi-glyph reveal, listed under "other glyphs" as read, was also
+            # reported here as a payload "the reveal reader did not return". On the mainnet GLYPH
+            # deploy reveal (b965b32d…9dd6) that described input 33 both ways.
+            continue
+        if max_rows is not None and len(glyph_envelopes) >= max_rows:
+            _count(envelopes_by_kind, "payload_unrendered" if env.kind == "payload" else env.kind)
+            continue
         if env.kind == "payload":
-            # ONLY when the OTHER reader actually rendered it. `find_reveal_metadata` walks
-            # `_parse_reveal_scriptsig`, which was NOT unified with `_walk_pushes` - it breaks on
-            # `OP_0` where the new walker treats it as an empty push. So for a push-only scriptSig
-            # with one leading zero byte, classify sees a payload, extract sees nothing, and
-            # skipping here on the assumption that the metadata block will render it meant a glyph
-            # reveal rendered as NOTHING AT ALL - the blindness this whole surface exists to end,
-            # reintroduced one layer up. When the two disagree, say so rather than trusting either.
-            if found is not None and found[0] == idx:
-                continue
             glyph_envelopes.append(
                 {
                     "input_index": idx,
@@ -1601,19 +2101,26 @@ def _classify_raw_tx(
         if env.kind == "update":
             # Attacker-authored CBOR landing in terminal output: same sanitisation rule as every
             # other indexer/chain string here, applied to keys AND values.
-            entry["fields"] = _sanitize_update_fields(env.fields or {})
+            if max_rows is None:
+                entry["fields"] = _sanitize_update_fields(env.fields or {})
+            else:
+                # A bounded caller draws _HUMAN_ENTRY_CAP fields at the top level and of each map,
+                # besides `attrs` and `attrs.target` (`_drawn_update_fields` says exactly which), and
+                # an update's key set is the publisher's to choose: carrying all of them was 21,000 fields per
+                # envelope in the review's measurement. So it gets what it draws, and counts.
+                entry["fields"], fields_not_listed = _drawn_update_fields(env.fields or {})
+                if fields_not_listed:
+                    entry["fields_not_listed"] = fields_not_listed
         else:
             entry["reason"] = _sanitize_display_string(env.reason)
         glyph_envelopes.append(entry)
 
     metadata_payload: dict | None = None
-    if found is not None:
-        input_idx, metadata = found
+    if attributed is not None:
+        input_idx, metadata, _cbor, _outpoint = attributed
         # WHAT THIS ATTRIBUTION IS WORTH. Reported for every inspect, because
         # "I did not check" and "I checked and it held" are opposite facts and the
         # silent one reads as the reassuring one.
-        _cbor = inspector.extract_reveal_cbor(scriptsigs[input_idx]) if scriptsigs else None
-        _src = tx.inputs[input_idx]
         metadata_payload = {
             "input_index": input_idx,
             # THE OUTPOINT THAT WOULD SETTLE IT. The classifier is network-free by
@@ -1622,7 +2129,7 @@ def _classify_raw_tx(
             # this module — the CLI's --fetch path and the browser page both resolve
             # it from here — and it is also the outpoint a human would go and look
             # at by hand.
-            "input_outpoint": (f"{_src.source_txid}:{_src.source_output_index}" if _src.source_txid else None),
+            "input_outpoint": _outpoint,
             "payload_binding": _payload_binding(_cbor, (spent_scripts or {}).get(input_idx)),
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             # Human-friendly highest-specificity protocol label (e.g. "wave",
@@ -1659,6 +2166,7 @@ def _classify_raw_tx(
         output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
         rel = verify_relationship_claims(metadata, output_scripts, delegated_refs=delegated_refs)
         if rel:
+            listed_rel = rel if max_rows is None else rel[:max_rows]
             metadata_payload["relationships"] = [
                 {
                     "kind": v.kind.value,
@@ -1667,8 +2175,21 @@ def _classify_raw_tx(
                     "basis": v.basis.value,
                     "reason": v.reason,
                 }
-                for v in rel
+                for v in listed_rel
             ]
+            if len(listed_rel) < len(rel):
+                # Counted by everything a claim's verdict line is drawn from, so the words a
+                # reader is given for the rest are the words each claim would have been given.
+                groups: dict[tuple, int] = {}
+                for v in rel[len(listed_rel) :]:
+                    key = (v.kind.value, v.ok, v.basis.value)
+                    groups[key] = groups.get(key, 0) + 1
+                metadata_payload["relationships_not_listed"] = {
+                    "count": len(rel) - len(listed_rel),
+                    "groups": [
+                        {"kind": kind, "ok": ok, "basis": basis, "count": n} for (kind, ok, basis), n in groups.items()
+                    ],
+                }
         # A claim may instead be authorised by a DELEGATE, which this function
         # cannot resolve: it is handed a pre-fetched transaction and has no way
         # to fetch the base whose refs the burn points at. So report what is
@@ -1680,9 +2201,12 @@ def _classify_raw_tx(
 
         burns = delegate_burn_refs(output_scripts)
         if burns:
-            metadata_payload["delegate_burns"] = sorted(
-                f"{GlyphRef.from_bytes(b).txid}:{GlyphRef.from_bytes(b).vout}" for b in burns
-            )
+            all_burns = sorted(f"{GlyphRef.from_bytes(b).txid}:{GlyphRef.from_bytes(b).vout}" for b in burns)
+            metadata_payload["delegate_burns"] = all_burns if max_rows is None else all_burns[:max_rows]
+            if len(metadata_payload["delegate_burns"]) < len(all_burns):
+                metadata_payload["delegate_burns_not_listed"] = {
+                    "count": len(all_burns) - len(metadata_payload["delegate_burns"])
+                }
 
         # ABSENCE IS SILENCE, matching `glue.py`, which sets this key only when it has
         # something to say. Emitting an empty dict unconditionally made "flagged" and
@@ -1755,35 +2279,10 @@ def _classify_raw_tx(
                 f"sha256={sha256(metadata.main.data).hex()}>"
             )
 
-    # EVERY input's payload, not just the first (#577).
-    #
-    # `find_reveal_metadata` returns the FIRST decodable scriptSig and that single
-    # payload was reported as the transaction's metadata. Multi-glyph reveals are
-    # real and not rare on mainnet — one observed reveal mints 35 refs from 36
-    # inputs — so 34 of those refs were being shown another token's name,
-    # description and media.
-    #
-    # The full per-input payload is not duplicated here; each entry carries enough
-    # to see WHICH input a name belongs to, and `metadata.input_index` already says
-    # which one the headline payload came from. What was missing was any signal
-    # that other payloads existed at all.
-    metadata_inputs: list[dict] = []
-    for idx, ss in enumerate(scriptsigs):
-        m = inspector.extract_reveal_metadata(ss)
-        if m is None:
-            continue
-        metadata_inputs.append(
-            {
-                "input_index": idx,
-                "classification": _classify_metadata_protocol(m),
-                "name": _sanitize_display_string(m.name) if m.name else "",
-                "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
-            }
-        )
-    if metadata_payload is not None and len(metadata_inputs) > 1:
+    if metadata_payload is not None and payload_count > 1:
         # Say it on the headline payload too. A caller reading only `metadata` must
         # not be able to mistake one glyph's fields for the transaction's.
-        metadata_payload["of_n_payloads"] = len(metadata_inputs)
+        metadata_payload["of_n_payloads"] = payload_count
 
     payload = {
         "form": "txid",
@@ -1799,6 +2298,35 @@ def _classify_raw_tx(
         "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }
+    # WHAT WAS COUNTED AND NOT LISTED, beside each list, only when something was. Every count is
+    # of what the classifier decided about each entry left out — never inferred from position.
+    if unlisted_vouts:
+        payload["outputs_not_listed"] = {
+            "count": len(unlisted_vouts),
+            "first_vout": unlisted_vouts[0],
+            "last_vout": unlisted_vouts[-1],
+            "by_type": outputs_by_type,
+            "hashmark_by_status": marks_by_status,
+            # Past the CHECKING limit: its own number, because it is the one that says a
+            # record that does not verify could be among them.
+            "not_checked_here": marks_by_status.get(NOT_CHECKED_HERE_WORD, 0),
+        }
+        # WHAT THE WHOLE TRANSACTION IS, for a caller that describes it from a cut listing. The
+        # page's shape banner used to count `outputs` — at most `max_rows` of them — and so told a
+        # reader a 151-output dMint deploy "creates 100 dMint contract UTXOs", and that a
+        # 121-output FT deploy commit whose commit-nft sat at vout 120 "does not" carry one.
+        # Every figure here is over every output this call enumerated, from the same rows the
+        # counts above come from. Not emitted for an `only_vout` listing, which enumerates one
+        # output and so could not say anything about the rest.
+        if only_vout is None:
+            payload["output_shape"] = shape.as_payload()
+    if envelopes_by_kind:
+        payload["glyph_envelopes_not_listed"] = {
+            "count": sum(envelopes_by_kind.values()),
+            "by_kind": envelopes_by_kind,
+        }
+    if others_not_listed:
+        payload["metadata_inputs_not_listed"] = {"count": others_not_listed}
     # Bounded as a whole, like `_inspect_script`'s payload: the output rows already are, but
     # `metadata` carries reveal-envelope integers of its own — a TIMELOCK's `unlock_at` is
     # `int(...)` of raw CBOR with no width limit — and so will whatever field is added next.

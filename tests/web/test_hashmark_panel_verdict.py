@@ -70,7 +70,13 @@ class _BlockCoincurve(importlib.abc.MetaPathFinder):
 
 
 @pytest.fixture
-def without_coincurve():
+def without_coincurve(monkeypatch):
+    # `verify_attestation` remembers a failed curve import (it is attempted once per process),
+    # so the memory is cleared here and restored by monkeypatch afterwards: a failure
+    # remembered from inside this fixture must not outlive it.
+    import pyrxd.script.hashmark as hashmark
+
+    monkeypatch.setattr(hashmark, "_secp256k1_import_failure", None)
     blocker = _BlockCoincurve()
     sys.meta_path.insert(0, blocker)
     saved = {n: m for n, m in sys.modules.items() if n == "pyrxd.keys" or n.startswith("coincurve")}
