@@ -2119,10 +2119,13 @@ def build_dmint_mint_tx(
     change_output = TransactionOutput(Script(change_script), 0)  # value patched below
     trial_outputs.append(change_output)
 
-    # nLockTime MUST equal current_time: the covenant reconstructs the next
-    # state's lastTime from OP_TXLOCKTIME, so the recreated state only byte-matches
-    # if the tx's locktime is exactly the value we wrote into updated_state. The
-    # final mint rebuilds no state, but its Part B still reads OP_TXLOCKTIME.
+    # nLockTime is current_time on every V2 mint. On a mint that recreates the contract it
+    # MUST be: Part C rebuilds the next state's lastTime from OP_TXLOCKTIME, so the recreated
+    # state only byte-matches if the locktime is the value written into updated_state. The
+    # final mint rebuilds no state, and Part C's final branch does not read it; only the
+    # ASERT and LWMA retarget fragments (always) and EPOCH's (at an epoch boundary) execute
+    # OP_TXLOCKTIME there. FIXED and SCHEDULE never do. It is set in every mode anyway, so
+    # one rule covers every V2 mint.
     tx = Transaction(
         tx_inputs=[contract_input, funding_input],
         tx_outputs=trial_outputs,

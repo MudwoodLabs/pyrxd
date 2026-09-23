@@ -11,6 +11,7 @@ builder and the command run for real, and what is asserted is the transaction br
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -39,17 +40,21 @@ _TOKEN_REF = GlyphRef(txid="cd" * 32, vout=0)
 _BURN = b"\xd8" + _CONTRACT_REF.to_bytes() + b"\x6a"
 
 
-def _v2(height: int, max_height: int) -> DmintContractUtxo:
+def _v2(height: int, max_height: int, daa_mode: DaaMode = DaaMode.FIXED, **fields: int) -> DmintContractUtxo:
     params = DmintDeployParams(
         contract_ref=_CONTRACT_REF,
         token_ref=_TOKEN_REF,
         max_height=max_height,
         reward=1000,
         difficulty=1,
-        daa_mode=DaaMode.FIXED,
+        daa_mode=daa_mode,
         height=height,
         last_time=1 << 30,
     )
+    # A contract another deployer wrote: set after construction, so it keeps modelling that
+    # contract whatever bounds the deploy parameters come to enforce.
+    for name, value in fields.items():
+        object.__setattr__(params, name, value)
     spk = build_dmint_contract_script(params)
     return DmintContractUtxo(txid="ab" * 32, vout=0, value=1, script=spk, state=DmintState.from_script(spk))
 
@@ -67,6 +72,13 @@ def _v1(height: int, max_height: int) -> DmintContractUtxo:
 
 
 def _claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: DmintContractUtxo, *flags: str):
+    result, net, grinds = _invoke(tmp_path, monkeypatch, contract, *flags)
+    assert result.exit_code == 0, result.output
+    assert len(grinds) == 1 and len(net.broadcasts) == 1
+    return result, Transaction.from_hex(net.broadcasts[0].hex())
+
+
+def _invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: DmintContractUtxo, *flags: str):
     net = _Net()
     key = PrivateKey()  # fresh random key; never hand-written material
     pkh = bytes(key.public_key().hash160())
@@ -88,9 +100,7 @@ def _claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: DmintContr
     monkeypatch.setattr(glyph_cmds, "_mine_bundled_parallel", _fake_grind)
     argv = ["--wallet", str(tmp_path / "w.dat"), *flags, "--yes", "glyph", "claim-dmint", "--no-progress"]
     result = CliRunner().invoke(cli, [*argv, "--contract", "ab" * 32 + ":0"])
-    assert result.exit_code == 0, result.output
-    assert len(grinds) == 1 and len(net.broadcasts) == 1
-    return result, Transaction.from_hex(net.broadcasts[0].hex())
+    return result, net, grinds
 
 
 _KINDS = pytest.mark.parametrize("make", [_v1, _v2], ids=["V1", "V2"])
@@ -127,3 +137,35 @@ class TestClaimDmintFinalMint:
         assert (recreated.height, recreated.max_height) == (1, 2) and tx.outputs[0].satoshis == 1
         human, _tx = _claim(tmp_path, monkeypatch, make(0, 2))
         assert "final mint" not in human.output and "contract now at height 1" in human.output
+
+
+class TestClaimDmintStillRefusesWhatPartBCannotEvaluate:
+    """Part B runs on the final mint too. A final claim whose retarget the contract cannot
+    evaluate is refused before the grind, and nothing is broadcast; the honest final claim of
+    the same kind of contract goes through."""
+
+    @pytest.mark.parametrize(
+        ("fields", "why"),
+        [
+            ({"target_time": 2**63 - 1}, r"OP_MUL \(excess \* RADIX\) would leave the int64 range"),
+            ({"last_time": 0}, "can no longer be minted"),
+        ],
+        ids=["retarget-leaves-int64", "unreadable-state-lastTime"],
+    )
+    def test_the_final_claim_is_refused_before_any_grind(
+        self, fields, why, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        contract = _v2(1, 2, DaaMode.ASERT, **fields)
+        assert contract.state.next_mint_is_final
+        result, net, grinds = _invoke(tmp_path, monkeypatch, contract)
+        assert result.exit_code != 0, result.output
+        assert grinds == [] and net.broadcasts == []
+        assert "could not build a valid mint" in result.output
+        assert re.search(why, result.output), result.output
+
+    def test_the_honest_final_claim_of_the_same_contract_broadcasts_the_burn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, tx = _claim(tmp_path, monkeypatch, _v2(1, 2, DaaMode.ASERT), "--json")
+        assert json.loads(result.stdout)["final_mint"] is True
+        assert tx.outputs[0].locking_script.script == _BURN and tx.outputs[0].satoshis == 0

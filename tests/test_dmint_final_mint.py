@@ -24,6 +24,10 @@ What is proven where:
   builder is still accepted, and the old shape with the SAME nonce is rejected on the script.
   The node is the ground truth; the transcription below is how a pull request sees this
   without one.
+* against the chain — ``tests/test_dmint_final_mint_mainnet.py``: real mainnet V1 final mints,
+  rebuilt from their real spent contracts, byte for byte. The transcription cannot catch a
+  parse that is wrong in the same way for the builder and for itself (see
+  :func:`_validate_outputs`); the chain's own transactions can.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from pyrxd.glyph.dmint import (
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
 )
+from pyrxd.glyph.dmint.builders import _PART_A
 from pyrxd.glyph.dmint.types import MAX_SHA256D_TARGET
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
@@ -71,6 +76,28 @@ _FUNDING = DmintMinerFundingUtxo(
 
 def _v2(height: int, max_height: int, *, value: int = 1, **kw) -> DmintContractUtxo:
     kw.setdefault("daa_mode", DaaMode.FIXED)
+    kw.setdefault("difficulty", 1)
+    kw.setdefault("last_time", 1_790_000_000)
+    params = DmintDeployParams(
+        contract_ref=_CONTRACT_REF,
+        token_ref=_TOKEN_REF,
+        max_height=max_height,
+        reward=_REWARD,
+        height=height,
+        **kw,
+    )
+    script = build_dmint_contract_script(params)
+    return DmintContractUtxo(txid="dd" * 32, vout=0, value=value, script=script, state=DmintState.from_script(script))
+
+
+def _deployed_elsewhere(height: int, max_height: int, daa_mode: DaaMode, **fields) -> DmintContractUtxo:
+    """A V2 contract carrying state values pyrxd's own deploy path need not accept.
+
+    Nothing stops another deployer writing any value the state layout can hold, and the mint
+    builder is what meets that contract. ``fields`` are set after ``DmintDeployParams`` is
+    constructed, deliberately, so this keeps modelling such a contract whatever bounds the
+    deploy parameters come to enforce.
+    """
     params = DmintDeployParams(
         contract_ref=_CONTRACT_REF,
         token_ref=_TOKEN_REF,
@@ -79,10 +106,27 @@ def _v2(height: int, max_height: int, *, value: int = 1, **kw) -> DmintContractU
         difficulty=1,
         height=height,
         last_time=1_790_000_000,
-        **kw,
+        daa_mode=daa_mode,
     )
+    for name, value in fields.items():
+        object.__setattr__(params, name, value)
     script = build_dmint_contract_script(params)
-    return DmintContractUtxo(txid="dd" * 32, vout=0, value=value, script=script, state=DmintState.from_script(script))
+    state = DmintState.from_script(script)
+    for name, value in fields.items():
+        assert getattr(state, name) == value, f"{name} did not reach the contract's state"
+    return DmintContractUtxo(txid="dd" * 32, vout=0, value=1, script=script, state=state)
+
+
+#: What each mode needs to deploy at all, and to be minted: EPOCH caps its target at 2**48
+#: (difficulty 32768 and up), and EPOCH/SCHEDULE bake parameters the mint must restate.
+_MODE_DEPLOY = {
+    DaaMode.EPOCH: {"difficulty": 1 << 15, "epoch_length": 2016, "max_adjustment_log2": 2},
+    DaaMode.SCHEDULE: {"schedule": ((0, 1 << 40),)},
+}
+_MODE_MINT = {
+    DaaMode.EPOCH: {"epoch_length": 2016, "max_adjustment_log2": 2},
+    DaaMode.SCHEDULE: {"schedule": ((0, 1 << 40),)},
+}
 
 
 def _v1(height: int, max_height: int, *, value: int = 1) -> DmintContractUtxo:
@@ -179,8 +223,45 @@ class TestTheFinalMintBuildsTheBurn:
         with pytest.raises(ContractExhaustedError, match="exhausted"):
             _mint(exhausted)
 
-    def test_the_v2_final_mint_keeps_the_locktime_its_part_b_reads(self) -> None:
-        assert _mint(_v2(1, 2)).tx.locktime == _LOCKTIME
+    @pytest.mark.parametrize("mode", list(DaaMode), ids=lambda m: m.name)
+    def test_every_v2_final_mint_sets_nlocktime_to_current_time(self, mode) -> None:
+        """pyrxd sets nLockTime on every V2 mint, the final one included, in every mode. Which
+        modes' covenants READ it on the final mint is a different question, derived from the
+        bytes in :meth:`TestWhichModesReadTheLocktimeOnTheFinalMint`."""
+        res = _mint(_v2(1, 2, daa_mode=mode, **_MODE_DEPLOY.get(mode, {})), **_MODE_MINT.get(mode, {}))
+        assert res.is_final_mint and res.tx.locktime == _LOCKTIME
+
+
+class TestWhichModesReadTheLocktimeOnTheFinalMint:
+    """The final mint's Part C takes the burn branch, which does not execute OP_TXLOCKTIME (the
+    continue branch does: it rebuilds the next lastTime from it). So on the final mint only
+    Part B's retarget fragment can read the locktime. This is derived from each mode's bytes, so
+    the comment beside the locktime in ``build_dmint_mint_tx`` cannot drift from them unseen."""
+
+    def test_part_b_executes_op_txlocktime_only_in_the_adaptive_modes(self) -> None:
+        reads: dict[DaaMode, set[int]] = {}
+        for mode in DaaMode:
+            code = _code(_v2(1, 2, daa_mode=mode, **_MODE_DEPLOY.get(mode, {})).script)
+            part_b = code[len(_PART_A) + 1 : code.index(_OUTPUT_BLOCK_MARKER)]  # after Part A + powHashOp
+            depth, depths = 0, set()
+            for op, _data, _after in _walk(part_b):
+                depth += {0x63: 1, 0x64: 1, 0x68: -1}.get(op, 0)
+                if op == 0xC5:
+                    depths.add(depth)
+            reads[mode] = depths
+        # {IF depth of each OP_TXLOCKTIME}: 0 = on every mint; 1 = behind EPOCH's boundary gate.
+        assert reads == {
+            DaaMode.FIXED: set(),
+            DaaMode.SCHEDULE: set(),
+            DaaMode.ASERT: {0},
+            DaaMode.LWMA: {0},
+            DaaMode.EPOCH: {1},
+        }
+
+    def test_the_burn_branch_does_not_execute_it_and_the_continue_branch_does(self) -> None:
+        final, earlier = _v2(1, 2), _v2(0, 2)
+        assert 0xC5 not in _validate_outputs(final, _mint(final))
+        assert 0xC5 in _validate_outputs(earlier, _mint(earlier))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -222,6 +303,52 @@ class TestOnlyTheRecreatedContractGuardsAreSkipped:
             _mint(c, half_life=3600)
         with pytest.raises(ValidationError, match="SCHEDULE mint requires the schedule"):
             _mint(_v2(1, 2, daa_mode=DaaMode.SCHEDULE, schedule=((0, 1),)))
+
+
+class TestPartBStillRefusesTheFinalMint:
+    """Part B runs before Part C on every spend, so a retarget the contract cannot evaluate fails
+    the final mint exactly as it fails any other: the final branch drops Part B's result, but an
+    abort inside Part B has already failed the script. pyrxd keeps both refusals below on the
+    final mint, before any grind. Each is paired with the honest final mint beside it.
+
+    Until these tests, either one could be removed from the final mint (the retarget skipped,
+    or the spent state's lastTime left unchecked) with no test failing.
+    """
+
+    #: current_time - last_time on every mint here: _LOCKTIME - 1_790_000_000.
+    _TIME_DELTA = 60
+
+    def test_a_retarget_whose_arithmetic_leaves_int64(self) -> None:
+        """ASERT's fragment computes ``(timeDelta - targetTime) * RADIX`` (RADIX = 2**16), and
+        the covenant aborts outside ``[-(2**63 - 1), 2**63 - 1]``. With timeDelta = 60 that is
+        reached exactly at ``targetTime = 2**47 + 60``."""
+        edge = 2**47 + self._TIME_DELTA
+        for target_time in (edge, 2**63 - 1):
+            contract = _deployed_elsewhere(1, 2, DaaMode.ASERT, target_time=target_time)
+            assert contract.state.next_mint_is_final
+            with pytest.raises(ValidationError, match=r"OP_MUL \(excess \* RADIX\) would leave the int64 range"):
+                _mint(contract)
+        # One second of targetTime below the edge the product fits, and the final mint is built.
+        res = _mint(_deployed_elsewhere(1, 2, DaaMode.ASERT, target_time=edge - 1))
+        assert res.is_final_mint and _outs(res)[0] == (_BURN, 0)
+
+    @pytest.mark.parametrize("mode", [DaaMode.ASERT, DaaMode.LWMA], ids=lambda m: m.name)
+    def test_a_state_last_time_the_retarget_cannot_read(self, mode) -> None:
+        """ASERT and LWMA read the spent state's lastTime on every mint, the final one included,
+        and ``04 00000000`` is not a minimally encoded script number."""
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _mint(_v2(1, 2, daa_mode=mode, last_time=0))
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _mint(_v2(0, 2, daa_mode=mode, last_time=0))  # and one mint earlier, as before
+        res = _mint(_v2(1, 2, daa_mode=mode))  # the honest final mint: a readable lastTime
+        assert res.is_final_mint and _outs(res)[0] == (_BURN, 0)
+
+    @pytest.mark.parametrize("mode", [DaaMode.FIXED, DaaMode.SCHEDULE], ids=lambda m: m.name)
+    def test_a_mode_that_never_reads_last_time_is_not_refused_for_it(self, mode) -> None:
+        """The lastTime refusal is scoped to the modes whose fragment reads it."""
+        contract = _v2(1, 2, daa_mode=mode, last_time=0, **_MODE_DEPLOY.get(mode, {}))
+        res = _mint(contract, **_MODE_MINT.get(mode, {}))
+        assert res.is_final_mint and _outs(res)[0] == (_BURN, 0)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -438,7 +565,23 @@ def _run(
 def _validate_outputs(contract: DmintContractUtxo, res) -> list[int]:
     """Run the contract's own output-validation block over ``res.tx``'s outputs, from the stack
     Parts A/B leave it: ``[inHash, outHash, outIdx, height, cRef, tRef, maxHeight, reward]``,
-    plus the retargeted target on the alt stack for V2 (a FIXED target is unchanged)."""
+    plus the retargeted target on the alt stack for V2 (a FIXED target is unchanged).
+
+    What this can NOT catch, by construction:
+
+    * It starts at the output-validation marker (``577ae500a069…``). Parts A and B are not
+      executed; the stack above is what they WOULD leave, assembled here. The PoW check, the
+      retarget and anything else before the marker are outside it.
+    * ``height``, ``maxHeight``, the refs and the reward are seeded from ``contract.state``,
+      the state pyrxd parsed, not read out of the script by the covenant's own pushes. The
+      builder decides the final mint from that same parsed state, so the block's ``isFinal``
+      agrees with the builder's by construction: a parse that got height or maxHeight wrong
+      would move both together, and this would still accept.
+
+    What can catch that is a comparison with transactions the chain accepted:
+    ``tests/test_dmint_final_mint_mainnet.py`` rebuilds real mainnet final mints from their
+    real spent contracts and compares the bytes.
+    """
     code = _code(contract.script)
     assert code.count(_OUTPUT_BLOCK_MARKER) == 1, "the output-validation block was not found exactly once"
     block = code[code.index(_OUTPUT_BLOCK_MARKER) :]
