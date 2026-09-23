@@ -117,41 +117,71 @@ a reader could check one page against the other on — including the two
 sentences that are *claims* rather than facts: what a mark proves, and
 the promise that a chosen file never leaves the machine.
 
-Its normal signature outcome is `NOT CHECKED`, on both pages and for
-every v2 record, because pyrxd installs under Pyodide with
-`deps=False` and coincurve ships no pure-Python wheel. That is a
-missing capability of the reader's browser and never a verdict on the
-record — it is rendered neutral, says whose limitation it is, and
-points at the CLI, which has the curve library.
+Both pages check a v2 record's signature in the reader's browser.
+pyrxd installs under Pyodide with `deps=False` and coincurve ships no
+pure-Python wheel, so the one curve operation the check needs —
+recovering the signing key — comes from vendored JavaScript
+(`secp256k1-bridge.js`, which the page SHA-256 checks against the
+manifest before importing it) and is registered with
+`install_signature_backend` in `glue.py`. The rest of the check is the
+Python the CLI runs. If that script cannot be loaded, every v2 record
+reads `NOT CHECKED` instead. That is a missing capability of the
+reader's browser and never a verdict on the record — it is rendered
+neutral, says whose limitation it is, and points at the CLI, which has
+the curve library.
 
 ### What one transaction can cost the page
 
 A transaction is not small by default: about 28,000 signed HashMark
-records fit under the 4 MB cap, and each signature check is a curve
-recovery in JavaScript on the page's main thread. So `/inspect/` draws
-at most `MAX_ROWS_SHOWN` rows (set in `inspect.js`) from each list a
-transaction produces — its outputs, the other glyphs a reveal minted,
-its glyph envelopes — and passes the same number to the classifier as
-the number of HashMark signatures to check. A later record that is a
-byte-for-byte copy of a checked one gets that record's answer; any
-other record past the limit is reported as not checked here. Under the
-last row, a note gives exact counts of what was not drawn and what was
-not checked, and the command that shows all of it:
-`pyrxd glyph inspect <txid> --fetch`, which draws everything and checks
-every record. `/verify/` draws and checks at most its own, smaller
-number of marks (`MAX_MARK_PANELS` in `verify.js`).
+records, or about 72,000 minimal v1 ones, fit under the 4 MB cap.
+`/inspect/` hands the classifier one number, `MAX_ROWS_SHOWN` (set in
+`inspect.js`), as two limits:
 
-What is **not** bounded: every output and input is still decoded, sanitised and
-carried into the page, and into the raw-JSON drawer — work that grows
-with the transaction, without the signature checks.
+- **Signatures checked.** Signatures are checked only on the first
+  `MAX_ROWS_SHOWN` HashMark records in the transaction — every output
+  that reads as a HashMark record counts, readable or not. A later
+  record that is a byte-for-byte copy of a checked one gets that
+  record's answer. Any other v2 record past the limit is not checked,
+  and the counts below call it "not checked here". A v1 record carries
+  no signature and reads
+  `NO SIGNATURE` wherever it is; a record this build cannot read is
+  named by its decode outcome, such as `UNKNOWN VERSION`.
+- **Entries listed.** The classifier lists at most `MAX_ROWS_SHOWN`
+  entries of each list the transaction produces — its outputs, its
+  glyph envelopes that carry no full payload, the other glyphs a reveal
+  minted, and the reveal's relationship claims and delegate burns — and
+  counts the rest under a `*_not_listed` key beside each list. Of an
+  output past the limit, two things are kept — its type and, for a
+  HashMark record, the word its panel would lead with — and it never
+  becomes a row of the payload. The page draws what it is given, and its
+  raw-JSON drawer holds the same bounded payload and says so.
+
+Under each cut list, a note gives exact counts of what was not drawn and
+what was not checked — taken from what the classifier decided about
+each entry, never from its position — and the command that shows all of
+it: `pyrxd glyph inspect <txid> --fetch`, which lists everything and
+checks every record.
+
+What still grows with the transaction: fetching and parsing it, and the
+per-entry work behind the counts — each output's type, each input's
+envelope and payload, each relationship claim's verdict. Content inside
+one envelope — an update's fields, an authority's permissions — is drawn
+at most 32 entries per list, with the rest counted, but carried whole in
+the payload and the drawer. `/verify/` draws
+and checks at most its own, smaller number of marks (`MAX_MARK_PANELS`
+in `verify.js`) and passes no listing limit, so it still receives a row
+for every output.
 
 Every raw transaction either page fetches is hashed and compared with
 the txid it asked for before anything reads it, so a server that
 answers with some other transaction is refused. That includes
 `/inspect/`'s second fetch, of the commit a reveal spent, which is what
-decides `payload_binding`. When that fetch fails or is refused, the
-verdict reads `unchecked` and says why — not that the spent output
-"was not supplied".
+decides `payload_binding`. That step does not classify the transaction
+again: `spent_output_binding` reads the attributed input's envelope and
+the one output it spent, and `pyrxd glyph inspect <txid> --fetch` asks
+the same function, so the page and the CLI word the same fetch the same
+way. When the fetch fails or is refused, the verdict reads `unchecked`
+and says why — not that the spent output "was not supplied".
 
 ---
 
