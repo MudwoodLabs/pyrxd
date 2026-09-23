@@ -167,11 +167,15 @@ draws: 32 top-level fields other than `attrs`, and `attrs` itself; of a
 map-valued `attrs`, its `target` and 32 others; and of any other
 map-valued field, 32 entries. The rest are counted under the entry's
 `fields_not_listed`. An authority's permissions are the ones the payload
-decoder kept: the strings among the first 64 items of the token's list,
-because the decoder reads no more than 64 items of any `attrs` list. The
-page draws 32 of those and counts the rest of them. It does not know how
-many the token names past the 64th item, and says the token may name
-more; `pyrxd glyph inspect` reads the list through the same decoder.
+decoder kept: the text entries among the first 64 of the token's list,
+because the decoder reads no more than 64 entries of an `attrs` list.
+The page draws 32 of those and counts the rest as more "of the N this
+page read". Only when it read 64 does it add that the token may name
+more. The payload does not say whether the decoder dropped entries that
+are not text, so a list read short of 64 is called neither whole nor
+cut, and a list whose first 64 entries are not text draws no permissions
+line at all. `pyrxd glyph inspect` reads the list through the same
+decoder and counts it the same way.
 
 A listed output's refs are cut too: at most 32 of the refs it carries
 and 32 of the refs it only names, with the rest counted under the row's

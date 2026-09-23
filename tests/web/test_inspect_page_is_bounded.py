@@ -34,6 +34,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 # Every ``pyrxd`` import is LAZY — see the note in ``test_inspect_js_render_drift.py``.
 
@@ -1081,40 +1082,123 @@ class TestTheRevealsOwnListsAreBounded:
 # ─────────────────────────────────────────── the JSON drawer says what it holds ──
 
 
-def _authority(permissions: int) -> dict:
-    """The page's payload for a reveal of an authority token naming *permissions* permissions."""
+def _authority_tx(permissions: int | list):
+    """A reveal of an authority token whose ``permissions`` list is *permissions* — that many
+    names when it is an int."""
     import cbor2
 
     from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
 
-    attrs = {"issuer": "x", "permissions": [f"perm{i:03d}" for i in range(permissions)]}
-    cbor = cbor2.dumps({"p": [2, 10], "name": "auth", "attrs": attrs})
-    return _classified(_p2pkh(), limit=100, inputs=[_SIG + build_reveal_scriptsig_suffix(cbor)])
+    names = [f"perm{i:03d}" for i in range(permissions)] if isinstance(permissions, int) else permissions
+    cbor = cbor2.dumps({"p": [2, 10], "name": "auth", "attrs": {"issuer": "x", "permissions": names}})
+    return _tx([_p2pkh()], [_SIG + build_reveal_scriptsig_suffix(cbor)])
+
+
+def _authority(permissions: int | list) -> dict:
+    """The page's payload for that reveal."""
+    tx = _authority_tx(permissions)
+    result = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), 100, 100)
+    assert result["ok"], result
+    return result["payload"]
+
+
+def _cli(tx, monkeypatch, tmp_path, *, as_json: bool = False) -> str:
+    """``pyrxd [--json] glyph inspect <txid> --fetch`` through the real command and a real
+    ``ElectrumXClient``, whose transport alone is faked and knows only *tx*. Same shape as
+    ``tests/web/test_a_multi_glyph_reveal_is_described_once.py``."""
+    from pyrxd.cli.context import CliContext
+    from pyrxd.cli.main import cli
+    from pyrxd.network.electrumx import ElectrumXClient
+    from pyrxd.security.errors import NetworkError
+
+    table = {tx.txid(): tx.serialize().hex()}
+
+    async def _call(self, method, params):
+        assert method == "blockchain.transaction.get", method
+        if params[0] not in table:
+            raise NetworkError("ElectrumX RPC error: No such mempool or blockchain transaction")
+        return table[params[0]]
+
+    async def _nothing(self, *a, **kw):
+        return None
+
+    monkeypatch.setattr(ElectrumXClient, "_call", _call)
+    monkeypatch.setattr(ElectrumXClient, "_ensure_connected", _nothing)
+    monkeypatch.setattr(ElectrumXClient, "close", _nothing)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: ElectrumXClient(["wss://electrumx.invalid:50022"]))
+    args = ["--wallet", str(tmp_path / "w"), "--config", str(tmp_path / "c.toml")]
+    result = CliRunner().invoke(
+        cli, args + (["--json"] if as_json else []) + ["glyph", "inspect", tx.txid(), "--fetch"]
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
 
 
 class TestAnAuthoritysPermissionsAreNotMiscounted:
-    """The payload decoder reads no more than 64 items of an `attrs` list, so an authority naming
-    200 permissions arrives with 64, and the card said "… and 32 more not shown" of a token with
-    168 more (the review's reproduction). The count is now said to be of the ones read, with why
-    they may not be all."""
+    """The payload decoder reads no more than 64 entries of an `attrs` list, so an authority naming
+    200 permissions arrives with 64, and the card and the CLI said "… and 32 more not shown" of a
+    token with 168 more (the review's reproduction). Both now say the count is of the ones read.
+    Only a list read AT the decoder's limit is said to have met it: the decoder also drops entries
+    that are not text, and the payload does not say whether it did, so 40 read may be all the
+    token names or what is left of a longer list, and neither is claimed."""
 
-    def test_a_list_past_what_the_decoder_reads_is_not_given_a_total(self) -> None:
+    @staticmethod
+    def _page(permissions) -> str:
+        return _flat(_card(_authority(permissions))["fetched_tx_card"])
+
+    def test_a_list_read_to_the_decoders_limit_is_not_given_a_total(self) -> None:
         from pyrxd.glyph.payload import _MAX_ATTRS_LIST_LEN
 
-        payload = _authority(200)
-        read = len(payload["metadata"]["authority"]["claims"]["permissions"])
+        read = len(_authority(200)["metadata"]["authority"]["claims"]["permissions"])
         assert read == _MAX_ATTRS_LIST_LEN, "the premise: the decoder cut the list"
-        text = _flat(_card(payload)["fetched_tx_card"])
+        text = self._page(200)
         assert (
             f"… and {read - 32} more not shown, of the {read} this page read — the payload decoder reads "
-            f"no more than the first {_MAX_ATTRS_LIST_LEN} entries of a list, so the token may name more"
+            f"no more than the first {_MAX_ATTRS_LIST_LEN} entries of an attrs list, so the token may name more"
         ) in text
         assert "perm031" in text and "perm032" not in text
 
+    @pytest.mark.parametrize(
+        "permissions",
+        [
+            [f"perm{i:03d}" for i in range(40)],
+            [f"perm{i:03d}" for i in range(40)] + list(range(24)) + [f"late{i:03d}" for i in range(100)],
+        ],
+        ids=["40-names", "40-names-24-ints-100-names"],
+    )
+    def test_a_list_read_short_of_the_limit_claims_no_cause(self, permissions) -> None:
+        """40 read: counted, and the 64-entry limit is not offered as the reason for anything —
+        whether the token names more is not something the payload says."""
+        text = self._page(permissions)
+        assert "… and 8 more not shown, of the 40 this page read" in text
+        assert "may name more" not in text and "reads no more than" not in text
+
     def test_a_list_the_page_draws_whole_carries_no_count(self) -> None:
         """The honest path: 20 permissions are drawn, every one, with nothing about more."""
-        text = _flat(_card(_authority(20))["fetched_tx_card"])
+        text = self._page(20)
         assert "perm019" in text and "more not shown" not in text and "may name more" not in text
+
+    def test_the_cli_says_the_same(self, monkeypatch, tmp_path) -> None:
+        from pyrxd.glyph.payload import _MAX_ATTRS_LIST_LEN
+
+        out = _cli(_authority_tx(200), monkeypatch, tmp_path)
+        assert (
+            f"            ... and 32 more not shown, of the {_MAX_ATTRS_LIST_LEN} read\n"
+            f"            (the decoder reads no more than the first {_MAX_ATTRS_LIST_LEN} entries\n"
+            "             of an attrs list, so the token may name more)\n"
+        ) in out
+        assert "perm031" in out and "perm032" not in out
+        short = _cli(_authority_tx(40), monkeypatch, tmp_path)
+        assert "            ... and 8 more not shown, of the 40 read\n" in short
+        assert "may name more" not in short and "reads no more than" not in short
+
+    def test_the_cli_draws_a_short_list_whole_and_its_json_is_unchanged(self, monkeypatch, tmp_path) -> None:
+        """The honest path on the terminal, and ``--json``, which carries the permissions read and
+        no count, as before."""
+        out = _cli(_authority_tx(20), monkeypatch, tmp_path)
+        assert "perm019" in out and "more not shown" not in out and "may name more" not in out
+        authority = json.loads(_cli(_authority_tx(200), monkeypatch, tmp_path, as_json=True))["metadata"]["authority"]
+        assert authority["claims"]["permissions"] == [f"perm{i:03d}" for i in range(64)]
 
 
 class TestTheJsonDrawerSaysItIsBounded:

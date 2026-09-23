@@ -43,6 +43,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that is listed in `metadata_inputs`. The entry is still emitted, with the same words, for an
   input where the envelope classifier sees a full payload and the reveal reader returns nothing.
 
+- **`pyrxd glyph inspect` counted an authority's permissions as if it had read them all
+  (0.24.0).** The payload decoder reads no more than the first 64 entries of an `attrs` list, so
+  an authority naming 200 permissions printed 32 of them and "... and 32 more not shown". It now
+  prints "... and 32 more not shown, of the 64 read" and, only when 64 were read, that the
+  decoder reads no more than that many, so the token may name more. The decoder also drops
+  entries that are not text, and the payload does not say whether it did, so a list read short
+  of 64 is called neither whole nor cut. **This changes human output** for an authority with more
+  than 32 permissions read. `--json` is unchanged. /inspect/ says the same.
+
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
   `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit

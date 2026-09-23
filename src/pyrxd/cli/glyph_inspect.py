@@ -40,6 +40,7 @@ from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
 from ..glyph.mark_anchor import mark_anchor_dict
+from ..glyph.payload import _MAX_ATTRS_LIST_LEN
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
 from ..script.timelock import LOCKTIME_THRESHOLD
@@ -535,7 +536,20 @@ def _render_txid_human(payload: dict) -> str:
                 shown = ", ".join(_truncate_for_human(str(x)) for x in perms[:_HUMAN_ENTRY_CAP])
                 lines.append(f"            permissions: {shown}")
                 if len(perms) > _HUMAN_ENTRY_CAP:
-                    lines.append(f"            ... and {len(perms) - _HUMAN_ENTRY_CAP} more not shown")
+                    # Of the permissions the payload decoder read, which need not be all the token
+                    # names: it reads no more than the first _MAX_ATTRS_LIST_LEN entries of an `attrs`
+                    # list, so 200 arrive as 64, and "32 more" alone read as a total of 64. Only a
+                    # list read AT that limit is known to have reached it. The decoder then drops
+                    # entries that are not text, and the payload does not say whether it did, so a
+                    # shorter list is called neither whole nor cut. /inspect/ says the same.
+                    lines.append(
+                        f"            ... and {len(perms) - _HUMAN_ENTRY_CAP} more not shown, of the {len(perms)} read"
+                    )
+                    if len(perms) >= _MAX_ATTRS_LIST_LEN:
+                        lines.append(
+                            f"            (the decoder reads no more than the first {_MAX_ATTRS_LIST_LEN} entries"
+                        )
+                        lines.append("             of an attrs list, so the token may name more)")
             if claims.get("revocable") is False:
                 lines.append("            revocable: false")
             if auth.get("expired"):

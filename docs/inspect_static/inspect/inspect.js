@@ -647,14 +647,21 @@ function renderFetchedTxCard(payload) {
         const shown = claims.permissions.slice(0, _ENTRY_CAP).map((p) => _capText(p)).join(", ");
         mdl.appendChild(kv("authority permissions", shown));
         // "N more" is of the permissions this page was given, which are not necessarily all the
-        // token names: the payload decoder reads no more than _ATTRS_LIST_READ items of a list, so
-        // 200 permissions arrive as 64, and "32 more" alone read as a total of 64.
-        if (claims.permissions.length > _ENTRY_CAP) {
+        // token names. The payload decoder reads no more than the first _ATTRS_LIST_READ entries
+        // of an `attrs` list, so 200 permissions arrive as 64, and "32 more" alone read as a total
+        // of 64. Only a list read AT that limit is known to have reached it. Of the entries read,
+        // those that are not text are then dropped (`_decode_attr_value`, `read_authority_attrs`),
+        // and the payload does not say whether any were — so 40 read may be all the token names,
+        // or what was left of a longer list, and this says neither.
+        const read = claims.permissions.length;
+        if (read > _ENTRY_CAP) {
           mdl.appendChild(kv(
             "",
-            `… and ${claims.permissions.length - _ENTRY_CAP} more not shown, of the ` +
-            `${claims.permissions.length} this page read — the payload decoder reads no more than ` +
-            `the first ${_ATTRS_LIST_READ} entries of a list, so the token may name more`,
+            `… and ${read - _ENTRY_CAP} more not shown, of the ${read} this page read` +
+            (read >= _ATTRS_LIST_READ
+              ? ` — the payload decoder reads no more than the first ${_ATTRS_LIST_READ} entries ` +
+                "of an attrs list, so the token may name more"
+              : ""),
           ));
         }
       }
