@@ -38,6 +38,7 @@ import asyncio
 import json
 import shlex
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -60,6 +61,7 @@ from ..glyph.builder import (
 )
 from ..glyph.client import BroadcastEchoMismatch, _confirmed_txid
 from ..glyph.dmint import (
+    DEFAULT_ASERT_HALFLIFE,
     DEFAULT_MAX_ATTEMPTS,
     MAX_SHA256D_TARGET,
     DaaMode,
@@ -105,6 +107,7 @@ from ..security.errors import (
     MaxAttemptsError,
     NetworkError,
     PolicyRejection,
+    UnrecognizedDaaBytecodeError,
     ValidationError,
 )
 from ..security.types import Hex20, Txid
@@ -1894,7 +1897,25 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     help="Initial PoW difficulty (1 = easiest; EPOCH needs >= 32768).",
 )
 @click.option("--target-time", type=int, default=60, show_default=True, help="V2 DAA: target seconds between mints.")
-@click.option("--half-life", type=int, default=3600, show_default=True, help="V2 ASERT: half-life in seconds.")
+@click.option(
+    "--half-life",
+    type=int,
+    default=DEFAULT_ASERT_HALFLIFE,
+    show_default=True,
+    help="V2 ASERT: half-life in seconds (canonical Photonic default; was 3600 before 2026-09-16).",
+)
+@click.option(
+    "--last-time",
+    type=int,
+    default=None,
+    help=(
+        "V2 DAA: Unix timestamp written into the deployed state's lastTime — the baseline the "
+        "FIRST mint retargets against. Default: the deploy time (what Photonic passes). ASERT and "
+        "LWMA read it as a script number on the first mint, so values below 2^23 (including 0) "
+        "build a contract no miner can ever spend and are refused, as are values above 0x7FFFFFFF "
+        "(bit 31 is the script-number sign)."
+    ),
+)
 @click.option("--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH: retarget every N blocks.")
 @click.option(
     "--max-adjustment",
@@ -1934,6 +1955,7 @@ def deploy_dmint_cmd(
     difficulty: int,
     target_time: int,
     half_life: int,
+    last_time: int | None,
     epoch_length: int,
     max_adjustment: str,
     schedule: str | None,
@@ -1975,6 +1997,12 @@ def deploy_dmint_cmd(
         )
     if not v2 and daa_mode != "fixed":
         raise UserError("--daa-mode requires --v2 (V1 dMint is FIXED difficulty only)")
+    if not v2 and last_time is not None:
+        raise UserError(
+            "--last-time requires --v2",
+            cause="the V1 dMint state has no lastTime slot (6 items, no DAA)",
+            fix="add --v2, or drop --last-time",
+        )
     if premine is not None and premine < 1:
         raise UserError("--premine must be >= 1 photon (omit the flag for no premine)")
     if premine_to is not None and premine is None:
@@ -2010,6 +2038,7 @@ def deploy_dmint_cmd(
                 daa_mode=DaaMode[daa_mode.upper()],
                 target_time=target_time,
                 half_life=half_life,
+                last_time=last_time,
                 epoch_length=epoch_length,
                 max_adjustment_log2=_MAX_ADJUSTMENT_TO_LOG2[max_adjustment],
                 schedule=_parse_schedule(schedule) if schedule else (),
@@ -2409,12 +2438,15 @@ def _mine_claim_with_rerolls(
 
 
 def _v2_claim_daa_kwargs(
-    daa_mode: DaaMode, epoch_length: int, max_adjustment: str, schedule: str | None, half_life: int
+    daa_mode: DaaMode, epoch_length: int, max_adjustment: str, schedule: str | None, half_life: int | None
 ) -> dict:
-    """The DAA params build_dmint_mint_tx needs for a V2 claim. ASERT half_life,
-    EPOCH epoch_length/max_adjustment, and the SCHEDULE entries bake into the contract
-    code (not the parsed state), so the claimer must re-supply the ones their contract
-    used (``build_dmint_mint_tx`` fails fast if they don't reproduce the baked bytecode)."""
+    """The DAA params build_dmint_mint_tx needs for a V2 claim.
+
+    EPOCH's epoch_length/max_adjustment and the SCHEDULE entries bake into the contract
+    code (not the parsed state) and pyrxd ships no reader for them, so the claimer must
+    re-supply those (``build_dmint_mint_tx`` fails fast if they do not reproduce the baked
+    bytecode). ASERT's half_life IS readable from the bytecode, so ``None`` is forwarded
+    unchanged and the builder uses the detected value."""
     if daa_mode == DaaMode.ASERT:
         return {"half_life": half_life}
     if daa_mode == DaaMode.EPOCH:
@@ -2506,9 +2538,12 @@ def _mine_claim_v2(
 @click.option(
     "--current-time",
     type=int,
-    default=0,
-    show_default=True,
-    help="V2 only: block locktime written into the recreated state's lastTime (and the DAA retarget). 0 = always-final; for real DAA tracking pass a timestamp <= the chain's median-time-past.",
+    default=None,
+    help=(
+        "V2 only: the mint's locktime, written into the recreated state's lastTime and used by the "
+        "DAA retarget. Default: the wall-clock time when the claim is built — leave it unset. If you "
+        "pass it, pass a real Unix timestamp at or after the contract's lastTime."
+    ),
 )
 @click.option(
     "--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH claim: the contract's epoch length."
@@ -2524,7 +2559,15 @@ def _mine_claim_v2(
     "--schedule", default=None, help="V2 SCHEDULE claim: the contract's schedule as JSON [[height, difficulty], ...]."
 )
 @click.option(
-    "--half-life", type=int, default=3600, show_default=True, help="V2 ASERT claim: the contract's half-life (s)."
+    "--half-life",
+    type=int,
+    default=None,
+    help=(
+        "V2 ASERT claim: the contract's half-life (s). Omit it — the default is to READ the value "
+        "out of the contract's own bytecode, which is the only value that can work. Pass it only to "
+        "assert what you expect: a supplied value that disagrees with the baked one fails fast, "
+        "naming the baked value, before the PoW grind."
+    ),
 )
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
@@ -2540,11 +2583,11 @@ def claim_dmint_cmd(
     max_attempts: int | None,
     max_rerolls: int,
     reward_address: str | None,
-    current_time: int,
+    current_time: int | None,
     epoch_length: int,
     max_adjustment: str,
     schedule: str | None,
-    half_life: int,
+    half_life: int | None,
     passphrase: bool,
 ) -> None:
     """PoW-mine a claim from a live dMint contract (V1 or V2) and broadcast the mint.
@@ -2660,6 +2703,10 @@ def claim_dmint_cmd(
             daa_kwargs = _v2_claim_daa_kwargs(
                 contract_utxo.state.daa_mode, epoch_length, max_adjustment, schedule, half_life
             )
+            if current_time is None:
+                # The wall clock at claim, the way a deploy stamps its own lastTime. The old
+                # default, 0, wrote a lastTime the contract's next retarget could not read.
+                current_time = int(time.time())
             mint, pre, nonce = _mine_claim_v2(
                 contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, current_time, daa_kwargs, mine=_mine
             )
@@ -2667,6 +2714,24 @@ def claim_dmint_cmd(
             mint, pre, nonce = _mine_claim_with_rerolls(
                 contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, mine=_mine, max_rerolls=max_rerolls
             )
+    except UnrecognizedDaaBytecodeError as exc:
+        # MUST precede the `except DmintError` below. This error is BOTH a DmintError and
+        # a ValidationError, and except clauses are tried in source order — so without
+        # this clause an unrecognised-bytecode refusal was reported as "funding can't
+        # cover the mint reward + fee" and the user was advised to add RXD or lower the
+        # fee rate. Both wrong; no amount of funding makes an unknown retarget formula
+        # mineable. (Reordering the base classes does NOT fix that: the object is a
+        # DmintError either way, so the first matching clause still wins.)
+        raise UserError(
+            "this contract's retarget bytecode matches no DAA generation pyrxd knows",
+            cause=str(exc),
+            fix=(
+                "pyrxd will not mine under a guessed formula — the target it computed would be "
+                "rejected by the covenant after the whole PoW grind. Check --contract/--token-ref "
+                "points at the contract you meant; if it does, this contract was built by another "
+                "implementation (or a newer one) and pyrxd needs a mirror for its formula."
+            ),
+        ) from exc
     except DmintError as exc:  # PoolTooSmallError: funding can't cover reward + fee + dust
         raise UserError(
             "funding can't cover the mint reward + fee",

@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "format": 1,
+    "commit": "0174197d94d0e3c5719812581b1e56e12564e0c1",
+    "entries": 20,
+    "about": "Known leak-scan findings in history published before the scan ran, as SHA-256 digests of (commit, part, path, check). Suppressed only by exact identity; checked for exact membership by `scripts/check-no-private-links.py --check-baseline`. Regenerate with `--no-tree --range <commit> --write-baseline <this file>`, and say in the commit message why every added entry is historical."
+  },
+  "entries": [
+    "0c58d3547800a602506b5d78a3ad9d36c0092a96734a149b0ceaf331f553c96f",
+    "0de77bfdd9ceba516f2f86a3910102b145d38414df4d77ffcffd1bf965e811db",
+    "12a0c7e6ae172e323e80f14ee653461f18805cc10664f4faae6c2ee30b855675",
+    "342ab32ff5356b661e2be285918e451bd076fc453bcb3e7d7ee07b25b2ca3922",
+    "3ee72904a1966cd8bc9b6a31df2bdedd6ef1e208290363322b7a037b73846811",
+    "4eebf9b6824bd2d9742e74adf44e3cff71b89c663072fed6a95df9b448f46936",
+    "60611c3683b636c286473224a5811edb140834d9cc69def8720e605055fb193a",
+    "617473151a574ea36af302c6b213b534a2aec034dc2f397c9e3a213af5bdd216",
+    "6b92700ddd6aff94dd4a1a63db426f5abf1f034067dba22cb3b117196ad01605",
+    "7352ba7926e91e1712f291961cc4c08a70160f8c146b36fa42d2478fa055e6eb",
+    "81725447b0cf7adaa1b967dd603336151df70b09b23046796a4d242093d7c9c1",
+    "941f172cdb97dff263293f883b4760a224fa55626da09f2f30404505701aa39e",
+    "a638ffc2ce45e20feea0b2be51c4a95506e9eca36cde70299dac0630965946e1",
+    "b11d2b68ea1859b8356bed76dbdddea8654b1a07d396964daa3b15f90bd6a84c",
+    "b2bc67e8bbbe9fc62a7f11f4d9be6eaa04a7c38a46b2bb571540fc5e07a5a691",
+    "cd363f5f9c95eeba28e48b8409257bb550c305d03eb0f1f20cd97c1ddda26fbb",
+    "cd3c381432b9b460f24ae7b402cccb7cd6cbbb8a1521a331d04d056f721e9b70",
+    "dd2dda4d9d7177f38a4ba1c0edc3daff298d18952140f6640807ccca403e5a65",
+    "f0d65a0b25acb25c6d75a7f9bfd5558b605d70eea04af232335e075c95c88e5b",
+    "f14f8ed098fa0fe6ca4968061e6e2f40a45449a25ee5610cb529506c682b9f13"
+  ]
+}

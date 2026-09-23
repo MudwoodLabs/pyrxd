@@ -812,6 +812,10 @@ function appendOpReturnPayload(dl, row) {
     if (c.action) dl.appendChild(kv("action (claimed)", c.action));
     if (c.amount !== undefined && c.amount !== null) {
       dl.appendChild(kv("amount (claimed)", c.amount));
+    } else if (burn.amount_withheld) {
+      // The proof named an amount the classifier refused to repeat (a bignum,
+      // a negative, a non-integer). Say so: no line reads as "no amount claimed".
+      dl.appendChild(kv("amount (claimed)", `withheld — ${burn.amount_withheld}`, "kv-warning"));
     }
     if (c.reason) dl.appendChild(kv("reason (claimed)", c.reason));
     if (burn.note) dl.appendChild(kv("note", burn.note, "kv-warning"));
@@ -1088,8 +1092,9 @@ function appendMarkVerdict(wrapper, row, opts) {
   appendFileCheck(panel, hm);
 
   // LAST, and deliberately after everything a reader might have taken further than
-  // it goes. A verified signature reaches KEY CUSTODY at a block: the key that made
-  // this statement, at that time. Never authorship, never ownership, never location.
+  // it goes. A verified signature reaches this: the key had made this statement by the
+  // block that carries it — not that its holder put it there, since a signed record can
+  // be copied into anyone's transaction. Never authorship, never ownership, never location.
   // FROM shared.js, not from a literal here. This is the sentence that says what a
   // verified result MEANS, and the public page at /verify/ prints it too — two
   // copies is how one surface eventually claims more than the other about the same

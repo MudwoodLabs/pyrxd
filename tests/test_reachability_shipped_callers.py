@@ -334,3 +334,220 @@ class TestEveryCliFlagIsRead:
         assert not stale, "delete these now-read (or removed) flags from _KNOWN_DEAD_FLAGS:\n  " + "\n  ".join(
             sorted(stale)
         )
+
+
+# ---------------------------------------------------------------------------
+# Universality, not existence: every way to BUILD a dMint contract must cross
+# the lastTime check
+# ---------------------------------------------------------------------------
+#
+# The caller grep above asks "does this have *a* caller?". For a GUARD that is the
+# wrong question — a half-applied guard has real callers in shipped code, exercised
+# by passing tests, and greps clean. The right question is "what are all the ways to
+# do the dangerous thing, and does each one cross the check?".
+#
+# The dangerous thing here is emitting a V2 dMint contract script for a deploy. A
+# contract whose `lastTime` state item is not a minimally encoded script number is
+# unmineable from birth under MINIMALDATA — which is consensus on Radiant, not mempool
+# policy — and unfixable once the reveal confirms. `build_dmint_contract_script` is the
+# single encoder every such script comes out of, so the set of ITS shipped callers is
+# the set of ways to deploy, derived rather than typed.
+
+_CONTRACT_ENCODER = "build_dmint_contract_script"
+_LAST_TIME_GUARD = "require_mineable_last_time"
+
+
+def _references_by_scope(trees: list[tuple[str, ast.Module]] | None = None) -> dict[str, set[str]]:
+    """``"<file>::<scope>" -> {names referenced there}``, over every shipped module
+    (or over ``trees``, ``(relative path, module)`` pairs, for the scan's own self-test).
+
+    A *scope* is the innermost enclosing definition: ``<module>`` for module-level code,
+    ``Class`` for a class body, ``Class.method`` for a method, ``outer.inner`` for a nested
+    function (a lambda belongs to the scope it sits in). A *reference* is any load of a
+    name — a call, but also a bare ``Name`` (passed as a callback, stored, re-exported by
+    assignment), an attribute (``mod.name`` / ``self.name``), or ``getattr(x, "name")``
+    with a literal string. Names are resolved through the module's ``from … import X as Y``
+    aliases and its module-level ``Y = X`` rebinding, so ``Y(...)`` counts as a reference
+    to ``X``. An ``import`` statement on its own is not a reference; using what it binds is.
+
+    What this still CANNOT see, so a green run does not rule it out: a name reached by
+    string anywhere else (``importlib``/``__import__``, ``vars()``/``globals()``/``__dict__``
+    lookups, ``operator.attrgetter``, a ``getattr`` whose name is not a literal), ``exec``/
+    ``eval``, star imports, rebinding by anything but a plain module-level ``Y = X``, code
+    outside the scanned roots (see :func:`_shipped_trees`), and code that re-implements a
+    function's bytes instead of calling it.
+    """
+    out: dict[str, set[str]] = {}
+
+    def aliases_of(tree: ast.Module) -> dict[str, str]:
+        alias: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.asname and a.name != "*":
+                        alias[a.asname] = a.name
+        for node in tree.body:  # module-level `Y = X` rebinding
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        alias[t.id] = node.value.id
+        return alias
+
+    def referenced(node: ast.AST, alias: dict[str, str]) -> str | None:
+        name: str | None = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            name = node.id
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            name = node.attr
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            name = node.args[1].value
+        if name is None:
+            return None
+        seen: set[str] = set()
+        while name in alias and name not in seen:  # follow Y -> X chains, cycle-safe
+            seen.add(name)
+            name = alias[name]
+        return name
+
+    def visit(node: ast.AST, scope: str, rel: str, alias: dict[str, str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                inner = child.name if scope == "<module>" else f"{scope}.{child.name}"
+                visit(child, inner, rel, alias)
+                continue
+            name = referenced(child, alias)
+            if name is not None:
+                out.setdefault(f"{rel}::{scope}", set()).add(name)
+            visit(child, scope, rel, alias)
+
+    if trees is None:
+        trees = [(path.relative_to(_ROOT).as_posix(), tree) for path, tree in _shipped_trees()]
+    for rel, tree in trees:
+        visit(tree, "<module>", rel, aliases_of(tree))
+    return out
+
+
+class TestTheScanSeesTheFormsItClaims:
+    """The scan is a guard, so it is tested against instances it was not built from: every
+    reference form its docstring says it resolves, in a module that exists only here."""
+
+    _SRC = """
+from .miner import _v2_state_script_bytes as _write_state
+from . import miner
+_rebound = _v2_state_script_bytes
+
+def via_alias(st):
+    return _write_state(st)
+
+def via_rebinding(st):
+    return _rebound(st)
+
+def via_callback(sts):
+    return list(map(_v2_state_script_bytes, sts))
+
+def via_attribute(st):
+    return miner._v2_state_script_bytes(st)
+
+def via_getattr(st):
+    return getattr(miner, "_v2_state_script_bytes")(st)
+
+def via_nested(st):
+    def inner():
+        return _write_state(st)
+    return inner()
+
+class Writer:
+    hook = _write_state
+
+    def write(self, st):
+        return _write_state(st)
+
+def unrelated(st):
+    return len(st)
+"""
+
+    def test_every_claimed_form_is_attributed_to_its_scope(self) -> None:
+        refs = _references_by_scope([("x.py", ast.parse(self._SRC))])
+        users = sorted(w for w, names in refs.items() if _V2_STATE_ENCODER in names)
+        assert users == sorted(
+            f"x.py::{scope}"
+            for scope in (
+                "<module>",  # the `_rebound = ...` rebinding itself
+                "via_alias",
+                "via_rebinding",
+                "via_callback",
+                "via_attribute",
+                "via_getattr",
+                "via_nested.inner",
+                "Writer",  # class-level `hook = _write_state`
+                "Writer.write",
+            )
+        ), users
+
+
+class TestEveryShippedDmintDeployCrossesTheLastTimeGuard:
+    def test_every_caller_of_the_contract_encoder_also_calls_the_guard(self) -> None:
+        calls = _references_by_scope()
+        deployers = sorted(where for where, names in calls.items() if _CONTRACT_ENCODER in names)
+        # Non-vacuity: if the derivation stops finding the encoder at all (renamed,
+        # re-exported, called through an alias) this check would pass by having nothing
+        # to iterate, which is indistinguishable from passing correctly.
+        assert deployers, (
+            f"derived NO shipped caller of {_CONTRACT_ENCODER}() — the scan is broken, not the code. "
+            "A V2 dMint contract script cannot reach a transaction without it."
+        )
+        unguarded = [w for w in deployers if _LAST_TIME_GUARD not in calls.get(w, set())]
+        assert not unguarded, (
+            f"these shipped functions build a V2 dMint contract script without crossing "
+            f"{_LAST_TIME_GUARD}(): {unguarded}. A lastTime that is not a minimal script number "
+            "makes the contract unmineable from birth (MINIMALDATA is consensus on Radiant) and "
+            "nothing can fix it after the reveal confirms — so every deploy path has to cross it, "
+            "not just the ones someone remembered."
+        )
+
+    def test_the_guard_is_not_dead_code(self) -> None:
+        """The other direction: the guard must still have callers at all."""
+        calls = _references_by_scope()
+        guarded = sorted(where for where, names in calls.items() if _LAST_TIME_GUARD in names)
+        assert len(guarded) >= 2, (
+            f"{_LAST_TIME_GUARD}() is called from {guarded} — it is supposed to sit on the deploy "
+            "params, on prepare_dmint_deploy, on build_reveal_outputs and in the mainnet ops harness."
+        )
+
+
+# ---------------------------------------------------------------------------
+# The same question for MINTS: every way to write a recreated V2 state must cross
+# the lastTime guards
+# ---------------------------------------------------------------------------
+#
+# A mint writes its locktime into the recreated contract's lastTime, and ASERT/LWMA/EPOCH
+# read it back as a script number. `build_dmint_mint_tx` refuses an unreadable one, and
+# refuses to build a mint whose retarget reads an unreadable one from the spent state. That
+# only protects every mint if every mint goes through it — i.e. if it is the only shipped
+# code that encodes a V2 state from a parsed one. `_v2_state_script_bytes` is that encoder.
+
+_V2_STATE_ENCODER = "_v2_state_script_bytes"
+_MINT_BUILDER = "src/pyrxd/glyph/dmint/miner.py::build_dmint_mint_tx"
+
+
+class TestEveryShippedV2MintCrossesTheLastTimeGuards:
+    def test_the_only_shipped_state_writer_is_the_guarded_mint_builder(self) -> None:
+        calls = _references_by_scope()
+        users = sorted(where for where, names in calls.items() if _V2_STATE_ENCODER in names)
+        assert users, f"derived NO shipped caller of {_V2_STATE_ENCODER}() — the scan is broken, not the code"
+        # Membership is PINNED, not derived: `_v2_code_section` only re-encodes the SPENT state
+        # to find where its code starts (it writes nothing). A new entry here is a new way to
+        # write a V2 state, and has to cross the guards below before it joins this list.
+        assert users == ["src/pyrxd/glyph/dmint/miner.py::_v2_code_section", _MINT_BUILDER], users
+
+    def test_the_mint_builder_crosses_both_last_time_guards(self) -> None:
+        names = _references_by_scope()[_MINT_BUILDER]
+        assert "is_readable_last_time" in names, "the WRITE guard (current_time) is gone from the mint builder"
+        assert "_refuse_unreadable_state_last_time" in names, "the READ guard (the spent state) is gone"

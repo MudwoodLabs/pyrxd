@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 from ..hash import hash256
 from ..script.hashmark import (
@@ -95,9 +96,10 @@ _ATTESTATION_VERDICTS: dict[str, tuple[str, str]] = {
 
 #: ``meaning`` is the READ-SURFACE elaboration — what `glyph inspect` and the browser
 #: panel print under the status. ``pyrxd verify`` keeps its own reason strings, because
-#: its context differs (it aggregates across every record in a transaction and quotes the
-#: failing one's detail). What must NEVER differ between surfaces is the STATUS word, and
-#: that is what this table owns: the claim is shared, the elaboration is local.
+#: its context differs (it judges each record alone, names which record its verdict is
+#: about, and quotes a failing record's detail). What must NEVER differ between surfaces
+#: is the STATUS word, and that is what this table owns: the claim is shared, the
+#: elaboration is local.
 #:
 #: What a reader is shown when the outcome is one this table has never heard of.
 #: Fails toward "we do not know" rather than toward either verdict, because a new
@@ -153,6 +155,132 @@ _HUMAN_STRING_CAP = 200
 #: always stated, because a silent truncation reads as "that was everything".
 _HUMAN_ENTRY_CAP = 32
 
+#: The widest integer an inspect payload carries AS A NUMBER. Anything wider is replaced by
+#: ``<oversized integer: N bits>`` — the spelling ``decode_payload`` already uses for an
+#: oversized ``attrs`` value — so every surface says what it withheld.
+#:
+#: WHY THIS EXISTS. CPython refuses to turn an integer of more than 4,300 decimal digits
+#: into text (``ValueError``), and ``str()``, f-strings and ``json.dumps`` all go through
+#: that conversion. CBOR carries arbitrary-precision integers (tag 2/3 bignums), so one
+#: output or input a stranger published could make ``pyrxd glyph inspect`` exit with a
+#: traceback instead of an answer — measured for a burn proof's ``amount``, a TIMELOCK's
+#: ``unlock_at`` and every value of a mutable-glyph update envelope.
+#:
+#: WHY 1024 BITS. Nothing an honest payload carries is wider than 64 bits (values and
+#: amounts are int64; heights and times are at most 40), and the 256-bit quantities a
+#: chain does have — hashes, targets — are rendered as hex strings, not numbers. The
+#: bound is set so that the widest number a renderer DERIVES from two bounded fields — the
+#: dMint cap, ``max_height * reward`` — is at most 2048 bits (617 digits), under the
+#: 640-digit floor CPython lets any process configure (``sys.int_info
+#: .str_digits_check_threshold``). A bounded payload therefore renders under every
+#: interpreter configuration, not only the default one.
+#: ``tests/cli/test_glyph_inspect_hostile_integers.py`` pins that arithmetic, so the reason
+#: cannot go stale in silence.
+_MAX_RENDERED_INT_BITS = 1024
+
+#: How deep :func:`_render_safe` walks before it stops and says so. Inspect's own payloads
+#: are a few levels deep; an update envelope's values are whatever a publisher nested, and a
+#: recursive walk must not let them choose the recursion depth. cbor2 6.1.4 happens to refuse
+#: nesting past 400 (measured), but that is a dependency's default and the lockfile is not
+#: committed, so the bound this walk relies on is its own.
+_MAX_RENDER_DEPTH = 32
+
+
+def _oversized_int_text(value: int) -> str:
+    """The text that stands in for an integer too wide to render."""
+    return f"<oversized integer: {value.bit_length()} bits>"
+
+
+#: How many times :func:`_render_safe` will re-walk a container it has ALREADY rendered, before
+#: every further repeat is replaced by a statement. A tree — which is what every payload this
+#: module builds is — never repeats, so it never spends any of this; only a value that shares
+#: structure does. A budget on ALL nodes would instead truncate honest output: a 1,000-output
+#: transaction's payload is over 12,000 nodes.
+_RENDER_REPEAT_BUDGET = 10_000
+
+_CYCLE_TEXT = "<cycle: this value contains itself>"
+_REPEAT_TEXT = f"<not rendered: shared structure repeated past {_RENDER_REPEAT_BUDGET} times>"
+
+
+def _render_safe(value: object) -> object:
+    """*value* with every integer wider than :data:`_MAX_RENDERED_INT_BITS` replaced by text.
+
+    THE ONE BOUNDED FORMATTER both output modes use. The classifier's two entry points
+    (:func:`_inspect_script`, :func:`_classify_raw_tx`) return their payload through this, so
+    the CLI's human renderer, its ``--json`` output, the browser panel and an SDK caller all
+    receive a payload in which no integer is too wide to print. It is applied to the WHOLE
+    payload rather than to the fields known to be attacker-authored, because that list is
+    exactly what went stale: the burn amount, the TIMELOCK ``unlock_at`` and the update
+    envelope were three unrelated fields with the same defect.
+
+    THE WALK IS BOUNDED IN EVERY DIRECTION AN INPUT CAN CHOOSE. Depth is capped at
+    :data:`_MAX_RENDER_DEPTH`. A container already on the current path is a cycle, rendered as
+    a fixed marker. A container reached a second time by another path costs one unit of
+    :data:`_RENDER_REPEAT_BUDGET`, and past it renders as a marker. Without the last two, nine
+    bytes of CBOR (``d8 1c 82 d8 1d 00 d8 1d 00``, a list containing itself twice) made this
+    walk build 2**32 lists and die with ``MemoryError``. ``loads_chain_cbor`` now refuses such
+    values at decode, so this is the second line, for values that did not come from there.
+
+    Containers come back as their BASE type — a tuple stays a tuple, so it stays hashable for
+    use as a key — because rebuilding a subclass (a ``namedtuple``, a ``defaultdict``) from an
+    iterable is not a constructor call they all accept.
+    """
+    return _render_walk(value, 0, set(), set(), [_RENDER_REPEAT_BUDGET])
+
+
+def _render_walk(value: object, depth: int, on_path: set[int], seen: set[int], repeats_left: list[int]) -> object:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if value.bit_length() <= _MAX_RENDERED_INT_BITS else _oversized_int_text(value)
+    if not isinstance(value, (dict, list, tuple, set, frozenset)):
+        return value
+    ident = id(value)
+    if ident in on_path:
+        return _CYCLE_TEXT
+    if depth >= _MAX_RENDER_DEPTH:
+        return f"<{type(value).__name__} nested more than {_MAX_RENDER_DEPTH} levels deep — not rendered>"
+    # Empty containers are skipped: `()` and `frozenset()` are interned, so an honest payload
+    # holding two of them would otherwise look like shared structure.
+    if value and ident in seen:
+        if repeats_left[0] <= 0:
+            return _REPEAT_TEXT
+        repeats_left[0] -= 1
+    seen.add(ident)
+    on_path.add(ident)
+    try:
+        if isinstance(value, dict):
+            return {
+                _render_walk(k, depth + 1, on_path, seen, repeats_left): _render_walk(
+                    v, depth + 1, on_path, seen, repeats_left
+                )
+                for k, v in value.items()
+            }
+        items = [_render_walk(item, depth + 1, on_path, seen, repeats_left) for item in value]
+    finally:
+        on_path.discard(ident)
+    if isinstance(value, tuple):
+        return tuple(items)
+    if isinstance(value, frozenset):
+        return frozenset(items)
+    return set(items) if isinstance(value, set) else items
+
+
+def _display_text(value: object) -> str:
+    """``str(value)`` for an arbitrary decoded CBOR value, bounded, and never ``ValueError``.
+
+    :func:`_render_safe` bounds the integers it can SEE inside plain containers, and bounds the
+    walk itself (depth, cycles, repeated structure), so the string built from its result is
+    bounded by the value's distinct content. A CBOR value can also hide a bignum inside an object
+    whose ``str()`` prints it — an unknown tag (``CBORTag(40404, <bignum>)``) or a tag-30 rational
+    (``Fraction``) — so the conversion itself is guarded too, and what it could not render is
+    named rather than dropped.
+    """
+    try:
+        return str(_render_safe(value))
+    except (ValueError, RecursionError):
+        return f"<unrenderable {type(value).__name__}>"
+
 
 # Unicode general categories that must NOT reach a terminal: control (Cc),
 # format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
@@ -170,20 +298,29 @@ def _sanitize_update_fields(fields: dict) -> dict:
     would leave the ANSI injection in the key.
 
     Nested one level, because that is where the interesting content is (`attrs.target`). Deeper
-    structures are rendered as their repr and sanitised whole rather than walked — an attacker
-    choosing the nesting depth should not choose how much work this does.
+    structures are rendered through :func:`_display_text` and sanitised whole. That IS a walk —
+    :func:`_render_safe` visits every nested value — and it is bounded by depth, by cycle
+    detection and by a repeat budget, because a publisher chooses the nesting and the sharing.
+
+    Every ``str()`` here is :func:`_display_text`, not the builtin. These values are raw CBOR,
+    so any of them can be a bignum, and a bare ``str()`` of one raised ``ValueError`` out of the
+    classifier itself — before either output mode ran — so one update envelope anywhere in a
+    transaction made ``inspect --fetch`` exit with a traceback.
     """
     out: dict = {}
     for k, v in fields.items():
-        key = _sanitize_display_string(str(k))
+        key = _sanitize_display_string(_display_text(k))
         if isinstance(v, dict):
-            out[key] = {_sanitize_display_string(str(ik)): _sanitize_display_string(str(iv)) for ik, iv in v.items()}
+            out[key] = {
+                _sanitize_display_string(_display_text(ik)): _sanitize_display_string(_display_text(iv))
+                for ik, iv in v.items()
+            }
         else:
-            out[key] = _sanitize_display_string(str(v))
+            out[key] = _sanitize_display_string(_display_text(v))
     return out
 
 
-def _sanitize_display_string(s: str) -> str:
+def _sanitize_display_string(s: object) -> str:
     """Strip control + invisible + combining codepoints from a string before printing.
 
     Defense against terminal-injection / homoglyph / bidi-override attacks via
@@ -206,11 +343,17 @@ def _sanitize_display_string(s: str) -> str:
     Replaces each stripped char with a literal "?" so the user sees that
     something was filtered.
 
-    Non-`str` input is returned unchanged (defensive — the type signature
-    forbids it but the type system doesn't enforce that at runtime).
+    NON-STRING INPUT IS STRINGIFIED, not passed through. ``None`` stays ``None`` (an absent
+    field stays absent); anything else goes through :func:`_display_text` first, which is
+    bounded and cannot raise ``ValueError``. It used to be returned unchanged, so a value this
+    function's name promises is a safe string could be a 40,000-bit integer or a list that
+    contains itself — and ``glyph inspect --wave-name`` / ``pyrxd verify --wave-name`` passed a
+    WAVE update's ``attrs.target`` through it into ``json.dumps`` and the terminal, and crashed.
     """
-    if not isinstance(s, str):
+    if s is None:
         return s
+    if not isinstance(s, str):
+        s = _display_text(s)
     out: list[str] = []
     for ch in s:
         if unicodedata.category(ch) in _UNICODE_STRIP_CATEGORIES:
@@ -513,7 +656,8 @@ def _judge_file_digest(expected_hex: str | None, computed_hex: str, *, algorithm
     ``meaning`` is the weaker sentence on purpose. A digest match says the bytes in
     front of you are the bytes the record commits to — it says nothing whatever about
     who wrote them, who owned them, or whether the signer had ever seen them. That
-    claim belongs to the signature, and even the signature only reaches key custody.
+    claim belongs to the signature, and even the signature only reaches "this key had signed it by
+    then" — not that its holder put it in that transaction.
     """
     name = algorithm or "the record's algorithm"
     if not isinstance(expected_hex, str) or not expected_hex:
@@ -566,8 +710,51 @@ def _judge_file_digest(expected_hex: str | None, computed_hex: str, *, algorithm
     }
 
 
-def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
-    """Classify a single hex-encoded locking script. Returns a flat dict."""
+#: The attestation outcome for a record whose signature was deliberately NOT checked, to bound
+#: the work one transaction can demand. NOT an :class:`AttestationOutcome`: nothing about the
+#: record decided it. It is the READER declining, so — like ``unverifiable`` — it is worded as
+#: "not checked here" and never as a verdict on the record.
+ATTESTATION_NOT_CHECKED_HERE = "not_checked_here"
+
+
+def _attestation_not_checked_here(network: str) -> dict:
+    # Function-local, like the attestation step's own import: the Pyodide import budget covers
+    # what `pyrxd.glyph.inspect` loads at module import.
+    from ..constants import genesis_hash_for
+
+    status = _attestation_verdict("unverifiable")[0]  # the shared word for "not checked", not a new one
+    return {
+        "outcome": ATTESTATION_NOT_CHECKED_HERE,
+        "status": status,
+        "meaning": (
+            "not checked here: only a limited number of records per transaction are checked, and "
+            "this one is past that limit. It is not a verdict on the record"
+        ),
+        "recovered_hash160": None,
+        "signer_address": None,
+        "assumed_network": f"radiant-{network if genesis_hash_for(network) else 'mainnet'}",
+        "detail": "",
+    }
+
+
+def _inspect_script(script_hex: str, *, network: str = "mainnet", attest: bool = True) -> dict:
+    """Classify a single hex-encoded locking script. Returns a flat dict.
+
+    ``attest=False`` decodes a HashMark record in full and SKIPS only its signature check, marking
+    a signed record :data:`ATTESTATION_NOT_CHECKED_HERE` (a v1 record has no signature, and its
+    NO SIGNATURE answer is free, so it is still given). Decoding is cheap; the check is a curve
+    recovery, and in the browser that is JavaScript on the page's main thread. See
+    :func:`_classify_raw_tx`'s ``attest_hashmark_limit``.
+
+    The classifier has twenty-odd return statements, one per shape. Bounding the payload
+    HERE, at the one door they all leave through, means a shape added later cannot forget
+    to — see :func:`_render_safe`.
+    """
+    return cast(dict, _render_safe(_classify_script(script_hex, network=network, attest=attest)))
+
+
+def _classify_script(script_hex: str, *, network: str, attest: bool = True) -> dict:
+    """The classifier behind :func:`_inspect_script`; its payload is NOT yet render-safe."""
     from ..constants import REF_OPERAND_WIDTH
     from ..script.timelock import parse_p2pkh_timelock_script
 
@@ -676,6 +863,10 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                     "carries it; see verify_burn"
                 ),
             }
+            # WITH its reason. `amount: null` alone reads as "the proof names no amount",
+            # which is not what happened when it named one this reader refused to repeat.
+            if proof.amount_withheld:
+                out["burn"]["amount_withheld"] = _sanitize_display_string(proof.amount_withheld)
 
         mark = decode_hashmark(script)
         if mark.outcome is not HashMarkOutcome.NOT_HASHMARK:
@@ -742,6 +933,11 @@ def _inspect_script(script_hex: str, *, network: str = "mainnet") -> dict:
                 # the code did not make, which is worse than the hardcoding this
                 # replaces: the reader could not tell the verdict was against a
                 # different chain.
+                # Skipped only where there is a SIGNATURE to check. A v1 record carries none, and
+                # its answer (NO SIGNATURE) costs nothing, so it is always given.
+                if not attest and mark.signer_hash160_hex:
+                    out["hashmark"]["attestation"] = _attestation_not_checked_here(network)
+                    return out
                 genesis = genesis_hash_for(network)
                 assumed = network if genesis else "mainnet"
                 att = verify_attestation(mark, network_genesis=genesis or RADIANT_MAINNET_GENESIS)
@@ -1218,6 +1414,7 @@ def _classify_raw_tx(
     network: str = "mainnet",
     delegated_refs: Mapping[bytes, Sequence[bytes]] | None = None,
     spent_scripts: Mapping[int, bytes] | None = None,
+    attest_hashmark_limit: int | None = None,
 ) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
@@ -1252,8 +1449,34 @@ def _classify_raw_tx(
     :param raw: pre-fetched raw transaction bytes (NOT hex).
     :param only_vout: if not None, restrict the outputs list to a single
         vout — used by the ``--resolve`` outpoint flow.
+    :param attest_hashmark_limit: check the signatures of the first N HashMark records only;
+        later ones are decoded and marked :data:`ATTESTATION_NOT_CHECKED_HERE`. ``None`` (the
+        default, and what every CLI path passes) checks every record.
+
+    THE WORK ONE TRANSACTION CAN DEMAND IS BOUNDED HERE, not only what gets drawn. Nothing
+    limits how many HashMark outputs a transaction carries — about 26,000 signed records fit
+    under the 4 MB cap — and every one cost a curve recovery before a page could draw anything,
+    which in the browser is JavaScript on the main thread. A caller that renders a bounded number
+    of records passes that number, and pays for no more checks than it shows.
+
+    BYTE-IDENTICAL RECORDS SHARE ONE CHECK, with or without a limit. An attestation is a function
+    of the record's bytes and the network, both fixed here, so a copy of a record already checked
+    gets that record's answer (its own copy of it) without a second recovery. That is exact, not
+    an approximation, and it is what lets a limited caller still say something true about copies
+    past its limit.
     """
+    import copy
+
     from .inspector import GlyphInspector
+
+    if attest_hashmark_limit is not None and (
+        isinstance(attest_hashmark_limit, bool)
+        or not isinstance(attest_hashmark_limit, int)
+        or attest_hashmark_limit < 0
+    ):
+        raise ValidationError(
+            f"attest_hashmark_limit must be a non-negative int or None, got {attest_hashmark_limit!r}"
+        )
 
     txid = Txid(txid_hex.lower())  # raises ValidationError on bad shape
 
@@ -1289,10 +1512,22 @@ def _classify_raw_tx(
             raise ValidationError(f"vout {only_vout} is out of range (transaction has {len(tx.outputs)} output(s))")
         enumerated = [(only_vout, tx.outputs[only_vout])]
 
+    checked: dict[bytes, dict] = {}  # record bytes -> the attestation computed for them
+    hashmark_rows = 0
     for idx, out in enumerated:
         try:
-            script_bytes = out.locking_script.serialize()
-            row = _inspect_script(script_bytes.hex(), network=network)
+            script_bytes = bytes(out.locking_script.serialize())
+            known = checked.get(script_bytes)
+            within = attest_hashmark_limit is None or hashmark_rows < attest_hashmark_limit
+            row = _inspect_script(script_bytes.hex(), network=network, attest=within and known is None)
+            hm = row.get("hashmark")
+            if hm is not None:
+                hashmark_rows += 1
+                att = hm.get("attestation")
+                if att is not None and known is not None:
+                    hm["attestation"] = copy.deepcopy(known)
+                elif att is not None and att.get("outcome") != ATTESTATION_NOT_CHECKED_HERE:
+                    checked[script_bytes] = copy.deepcopy(att)
             row.pop("form", None)  # always "script" — redundant inside a tx listing
             row["vout"] = idx
             row["satoshis"] = out.satoshis
@@ -1550,7 +1785,7 @@ def _classify_raw_tx(
         # not be able to mistake one glyph's fields for the transaction's.
         metadata_payload["of_n_payloads"] = len(metadata_inputs)
 
-    return {
+    payload = {
         "form": "txid",
         "txid": str(txid),
         "byte_length": len(raw),
@@ -1564,3 +1799,7 @@ def _classify_raw_tx(
         "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }
+    # Bounded as a whole, like `_inspect_script`'s payload: the output rows already are, but
+    # `metadata` carries reveal-envelope integers of its own — a TIMELOCK's `unlock_at` is
+    # `int(...)` of raw CBOR with no width limit — and so will whatever field is added next.
+    return cast(dict, _render_safe(payload))

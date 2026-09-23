@@ -802,10 +802,17 @@ class TestSanitizeDisplayString:
     def test_empty_string(self) -> None:
         assert _sanitize_display_string("") == ""
 
-    def test_non_string_passthrough(self) -> None:
-        # Defensive — type signature says str but enforce runtime safety.
-        assert _sanitize_display_string(None) is None  # type: ignore[arg-type]
-        assert _sanitize_display_string(b"bytes") == b"bytes"  # type: ignore[arg-type]
+    def test_non_string_input_is_stringified_safely_not_passed_through(self) -> None:
+        # None stays None: an absent field stays absent.
+        assert _sanitize_display_string(None) is None
+        # Anything else becomes a bounded string. It used to be returned unchanged, so a
+        # chain-derived 40,000-bit int or a self-containing list crossed a function whose name
+        # promises a safe string and crashed `json.dumps` / the terminal (`--wave-name`).
+        assert _sanitize_display_string(b"bytes") == "b'bytes'"
+        assert _sanitize_display_string(2**40_000) == "<oversized integer: 40001 bits>"
+        cyclic: list = []
+        cyclic.append(cyclic)
+        assert _sanitize_display_string(cyclic) == "['<cycle: this value contains itself>']"
 
 
 # ---------------------------------------------------------------------------

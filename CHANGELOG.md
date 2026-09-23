@@ -177,6 +177,107 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Cherry-picked from `Radiant-Core:pyrxd` `4e4e4bee` (theartofsatoshi, 2026-07-19); the
   RPC was re-confirmed live on `electrumx.radiantcore.org` on 2026-09-16.
 
+### Fixed
+
+- **Every adaptive dMint contract the library deployed was unmineable from birth.**
+  `DmintV2DeployParams` had no `last_time` field, so both sites that convert it to
+  `DmintDeployParams` fell through to the default `0`. The V2 state pushes `lastTime`
+  as a fixed `04 <4B LE>`, so that deployed the state item `04 00000000` — and ASERT
+  and LWMA open their retarget with `OP_TXLOCKTIME OP_2 OP_PICK OP_SUB`, which builds a
+  `CScriptNum` with `fRequireMinimal`. `00000000` is not minimally encoded, and
+  `SCRIPT_VERIFY_MINIMALDATA` is in radiant-core's `MANDATORY_SCRIPT_VERIFY_FLAGS`:
+  consensus, not mempool policy. The first retarget aborted, and nothing can fix that
+  once the reveal confirms.
+
+  `DmintV2DeployParams.last_time` and `deploy-dmint --last-time` now exist; omitting
+  them stamps the deploy time, which is what Photonic's own `dMintScript` call site
+  passes (`Math.floor(Date.now() / 1000)`). A `last_time` whose four-byte
+  little-endian form is not a minimal script number — or that has bit 31 set, which a
+  script number reads as NEGATIVE — is REFUSED for the modes that read it on the first
+  mint, at three points: on the params object the caller constructed,
+  as the first act of `prepare_dmint_deploy` (before the CBOR is encoded or a commit
+  script exists), and again in `build_reveal_outputs`, which a caller may reach in a
+  later process. `pyrxd.glyph.require_mineable_last_time` is public so code building
+  through `build_dmint_contract_script` directly can cross the same check —
+  `scripts/dmint_v2_mainnet_run.py` now does. `DmintV2DeployResult` gained a required
+  `last_time` field.
+
+  The encoder itself still accepts any `lastTime`: it is pyrxd's byte-level mirror of
+  Photonic `dMintScript`, and it has to stay able to reproduce the exact bytes of
+  contracts other implementations have already deployed. The refusal therefore lives on
+  the deploy paths, and `tests/test_reachability_shipped_callers.py` DERIVES the set of
+  shipped callers of the encoder from the source and fails if any one of them does not
+  cross the check — the guard question asked as "do all the ways cross it?", not "does
+  it have a caller?".
+
+  Proven on a node, with a control. `tests/test_dmint_v2_regtest_e2e.py::
+  test_v2_adaptive_deploy_via_api_is_mineable_and_the_old_shape_is_not` deploys through
+  `prepare_dmint_deploy` -> `build_reveal_outputs` with no `last_time` supplied, PoW-mines
+  the first mint and watches a real `radiant-core:v3.1.2` regtest node accept it — for
+  ASERT and for LWMA. The control is the same mode with the same retarget bytecode and
+  `lastTime = 0`, fully mined: the node refuses it, `16: mandatory-script-verify-flag-failed
+  (unknown error)`, in both modes. Without that refusal the acceptances would only show a
+  covenant that accepts anything.
+
+  Pre-existing. Upstream `dMintScript` declares the same `lastTime = 0` default, but its
+  one deploy call site (`packages/lib/src/mint.ts` at `becf41a7`) passes
+  `Math.floor(Date.now() / 1000)`, so Photonic never deploys that shape. pyrxd inherited
+  the default and had no call site that could pass anything else.
+
+- **`claim-dmint`'s default claim wrote a `lastTime` the contract's next retarget could not
+  read, and the claim `deploy-dmint` prints was refused for every adaptive mode.**
+  `--current-time` defaulted to `0`. And once deploy began stamping `lastTime = now`, the
+  mint builder's refusal of any `current_time` earlier than `last_time` rejected the printed
+  `claim with:` command (it has no `--current-time`) for ASERT, LWMA, EPOCH and SCHEDULE,
+  with a reason ("the retarget would overflow") that did not describe those contracts.
+
+  Now:
+  - `claim-dmint --current-time` defaults to the wall-clock time when the claim is built.
+  - `build_dmint_mint_tx`, which every mint path goes through (the CLI, the public API,
+    the example and the mainnet harness), refuses before any grind:
+    - a `current_time` below `2**23` for ASERT, LWMA and EPOCH
+      (`DAA_MODES_READING_LAST_TIME`);
+    - a contract whose `lastTime` this mint's retarget reads and cannot, reported as one that
+      "can no longer be minted"; a `lastTime` with bit 31 set is refused as one pyrxd's
+      mirrors do not model;
+    - a `current_time` earlier than `last_time` on the 2026-06-16 pre-floor LWMA;
+    - any mint, in any mode, whose recreated target would be 1 while the spent target is
+      larger;
+    - any input the retarget mirror reports the contract's int64 arithmetic cannot evaluate
+      (the legacy ASERT and legacy LWMA mirrors and the EPOCH mirror now check this, as the
+      v2 mirror already did).
+  - Other backwards mints are built, and the contract's own retarget fragment, run under the
+    int64/MINIMALDATA evaluator, reproduces the target the builder wrote — checked across
+    target times up to the int64 limit, half-lives, targets and both directions.
+  - New predicate `is_readable_last_time` (minimal AND bit 31 clear);
+    `is_minimal_4byte_scriptnum` still answers the encoding question alone.
+  - Deploy: an EPOCH contract with `target_time < 2**max_adjustment_log2` is refused by
+    `DmintDeployParams`, `DmintV2DeployParams` and `deploy-dmint`, and a `last_time`
+    outside `0..0xFFFFFFFF` is refused as a `ValidationError` in every mode (it used to
+    escape as a raw `struct.error`).
+
+  The regtest control that proves a `lastTime = 0` contract is refused by a real node now
+  first asserts pyrxd refuses to build that mint, then patches the refusal out so the node
+  remains the judge.
+
+- **`claim-dmint` reported an unrecognised retarget formula as a funding shortfall.**
+  `UnrecognizedDaaBytecodeError` is both a `DmintError` and a `ValidationError`, and
+  `except` clauses are tried in source order, so the `except DmintError` arm caught it
+  and told the user "funding can't cover the mint reward + fee — fund the reward address
+  with more plain RXD, or lower --fee-rate". Wrong diagnosis and wrong remedy: no amount
+  of funding makes an unknown formula mineable. The real reason survived only in
+  `__cause__`. There is now an arm above it that names the bytecode. (Reordering the
+  base classes would not have helped — the object is a `DmintError` either way.)
+
+- **`claim-dmint` refused honest work after the half-life default moved.** The mint
+  builder's `half_life` defaulted to `DEFAULT_ASERT_HALFLIFE`, which changed from 3600
+  to 240 on 2026-09-16, so every claim against a contract deployed on the old default
+  began failing unless the user restated a value pyrxd had *already read out of the
+  contract's bytecode* two lines earlier. `build_dmint_mint_tx(half_life=...)` and
+  `claim-dmint --half-life` now default to `None` and use the detected value; supplying
+  one still byte-verifies it against the baked Part B and fails fast, naming the baked
+  value, before the PoW grind.
+
 ## [0.24.0] — 2026-09-14
 
 ### Security

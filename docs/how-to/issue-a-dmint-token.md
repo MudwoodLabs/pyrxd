@@ -113,13 +113,35 @@ pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 
 > now merged upstream ([`Radiant-Core/Photonic-Wallet#2`](https://github.com/Radiant-Core/Photonic-Wallet/pull/2)
 > — divide-first with the target clamped to 2^48 on both sides of the retarget
 > multiply) and pyrxd byte-matches it, so EPOCH deploy is re-enabled. EPOCH
-> requires `--difficulty >= 32768` (the 2^48 target cap).
+> requires `--difficulty >= 32768` (the 2^48 target cap) and a `--target-time` at
+> least the `--max-adjustment` factor (e.g. `>= 4` for the default `4`).
+
+> **`--last-time` (ASERT and LWMA).** The deployed state carries a `lastTime`
+> slot — the baseline the first retarget measures against — and those two modes
+> read it as a script number on the very first mint. `deploy-dmint` stamps the
+> deploy time by default, which is what Photonic's own deploy does, so you
+> normally never pass `--last-time`. If you do pass it, it must be a real Unix
+> timestamp: the state pushes it as a fixed four-byte value, and anything below
+> 2^23 (including 0) is not a *minimally encoded* script number. MINIMALDATA is
+> in Radiant's mandatory script-verify flags — consensus, not mempool policy —
+> so such a contract aborts on its first retarget and can never be mined. The
+> deploy is refused rather than built, because nothing can fix it once the
+> reveal confirms. Values above `0x7FFFFFFF` are refused too.
 
 `claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
 **SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`
 or `--schedule` you deployed with (those parameters live in the contract code,
-not the on-chain state), plus `--current-time <ts>` if you want real
-difficulty tracking (default 0 = always-final locktime).
+not the on-chain state) — the `claim with:` line `deploy-dmint` prints already
+includes them. You do **not** need to pass `--half-life` for an ASERT contract:
+the claim reads the baked half-life out of the contract's own bytecode. Pass it
+only to assert what you expect — a value that disagrees with the baked one fails
+fast, naming the baked value, before the PoW grind.
+
+`--current-time` is the mint's locktime; leave it unset. It defaults to the
+wall-clock time when the claim is built, which is what you want. If you do pass
+it, pass a real Unix timestamp at or after the contract's `lastTime`. The claim
+refuses, before any mining, a mint pyrxd will not build — for example one whose
+contract can no longer be minted — and says why.
 
 The command builds a **commit** transaction (an FT-commit hashlock plus
 `K` ref-seed outputs), waits for it to confirm, then builds the
