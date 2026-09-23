@@ -1457,12 +1457,13 @@ class _SpentTxUnusable(Exception):
     """The spent transaction's bytes cannot stand in for the output spent. ``str()`` says why."""
 
 
-def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
-    """``raw`` parsed, after every check that binds it to ``txid_hex``. Raises ``ValidationError``.
+def _bound_to_txid(txid_hex: str, raw: bytes) -> Txid:
+    """``txid_hex`` as a :class:`Txid`, once *raw* is proven to be that transaction's bytes.
 
     THE SERVER-HONESTY CHECK lives here: ``hash256(raw)[::-1].hex() == txid_hex``, so a hostile
     source cannot hand back some OTHER transaction. The txid a transaction is known by is the
-    hash of its own bytes, so binding the answer to the question needs no parser.
+    hash of its own bytes, so binding the answer to the question needs no parser. Raises
+    ``ValidationError``.
     """
     txid = Txid(txid_hex.lower())  # raises ValidationError on bad shape
 
@@ -1481,7 +1482,12 @@ def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
             f"server returned a transaction whose hash does not match the requested txid "
             f"(requested {txid}, got {computed})"
         )
+    return txid
 
+
+def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
+    """``raw`` parsed whole, after :func:`_bound_to_txid`. Raises ``ValidationError``."""
+    txid = _bound_to_txid(txid_hex, raw)
     tx = Transaction.from_hex(bytes(raw))
     if tx is None:
         raise ValidationError("could not parse the raw transaction bytes")
@@ -1493,7 +1499,39 @@ def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
     return txid, tx
 
 
-def _reveal_attribution(tx: Transaction, scriptsigs: list[bytes], inspector) -> tuple | None:
+def _checked_inputs(txid_hex: str, raw: bytes) -> list:
+    """The INPUTS of *raw*, after :func:`_bound_to_txid` — without parsing a single output.
+
+    For a caller that needs only the inputs: the spent-output binding reads one input's envelope,
+    and a transaction's outputs can be 4 MB of it. The inputs come first on the wire (version,
+    input count, inputs), and each is read by ``TransactionInput.from_hex``, the reader
+    ``Transaction.from_reader`` uses for them; ``tests/web/test_inspect_spent_tx_is_checked.py``
+    pins the result equal to ``Transaction.from_hex(raw).inputs``. What is NOT checked here is
+    that the rest of the bytes parse: the hash check has already bound them to a txid, and both
+    callers in this repository — the page's binding step and ``pyrxd glyph inspect --fetch`` —
+    have classified that same transaction, whole, first. Raises ``ValidationError``.
+    """
+    from ..transaction.transaction_input import TransactionInput
+    from ..utils import Reader
+
+    _bound_to_txid(txid_hex, raw)
+    reader = Reader(bytes(raw))
+    version = reader.read_uint32_le()
+    count = reader.read_var_int_num()
+    if version is None or count is None:
+        raise ValidationError("could not parse the raw transaction bytes")
+    if count > _MAX_INPUT_COUNT:
+        raise ValidationError(f"transaction structure exceeds inspect's safety caps (inputs={count})")
+    inputs = []
+    for _ in range(count):
+        inp = TransactionInput.from_hex(reader)
+        if inp is None:
+            raise ValidationError("could not parse the raw transaction bytes")
+        inputs.append(inp)
+    return inputs
+
+
+def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector) -> tuple | None:
     """``(input_index, metadata, envelope_cbor, spent_outpoint)`` for the reveal the readers
     attribute, or ``None``. The one rule both the classifier and the spent-binding check use."""
     found = inspector.find_reveal_metadata(scriptsigs)
@@ -1501,7 +1539,7 @@ def _reveal_attribution(tx: Transaction, scriptsigs: list[bytes], inspector) -> 
         return None
     input_idx, metadata = found
     cbor = inspector.extract_reveal_cbor(scriptsigs[input_idx]) if scriptsigs else None
-    src = tx.inputs[input_idx]
+    src = inputs[input_idx]
     outpoint = f"{src.source_txid}:{src.source_output_index}" if src.source_txid else None
     return input_idx, metadata, cbor, outpoint
 
@@ -1536,18 +1574,19 @@ def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *,
     ``not-a-commit`` from :func:`_payload_binding` itself — or ``unchecked`` with a ``detail`` that
     says what went wrong. Never "was not supplied": this is only called by a caller that asked.
 
-    Costs one parse of *raw* and one of *spent_raw*, and no classification of any output: the
-    binding reads the attributed input's envelope and the one output it spent, nothing else.
+    Costs a hash of *raw*, a parse of its inputs (never its outputs — see
+    :func:`_checked_inputs`) and a parse of *spent_raw*, and no classification of anything: the
+    binding reads the attributed input's envelope and the one output it spent.
     ``tests/web/test_inspect_spent_tx_is_checked.py`` pins it equal to a full re-classification.
 
-    Raises ``ValidationError`` only for *raw* itself (the same checks :func:`_classify_raw_tx`
-    makes, since it is the same transaction); everything about the spent transaction is reported.
+    Raises ``ValidationError`` only for *raw* itself (bound to *txid_hex* by the same check
+    :func:`_classify_raw_tx` makes); everything about the spent transaction is reported.
     """
     from .inspector import GlyphInspector
 
-    _txid, tx = _checked_transaction(txid_hex, raw)
-    scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
-    attributed = _reveal_attribution(tx, scriptsigs, GlyphInspector())
+    inputs = _checked_inputs(txid_hex, raw)
+    scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in inputs]
+    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector())
     if attributed is None or attributed[3] is None:
         return None
     _idx, _metadata, cbor, outpoint = attributed
@@ -1749,7 +1788,7 @@ def _classify_raw_tx(
     # does NOT escape U+202E and friends.
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
-    attributed = _reveal_attribution(tx, scriptsigs, inspector)
+    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector)
     found = None if attributed is None else (attributed[0], attributed[1])
 
     # dMint mint-claim scriptSig: if vin[0] is a dMint mint claim (4 canonical

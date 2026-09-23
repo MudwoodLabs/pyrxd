@@ -320,3 +320,52 @@ class TestTheBindingStepIsOneFieldNotASecondInspect:
         # The counters count: the same patch sees the first pass classify.
         _glue().inspect_txid_with_raw(reveal.txid(), reveal.serialize().hex(), 2, 2)
         assert calls["script"] == 150 and calls["attest"] == 2, calls
+
+
+class TestTheBindingStepReadsOnlyTheInputs:
+    """It never parses an output of the reveal — a 4 MB transaction is mostly outputs — so it reads
+    the inputs itself. That read must be the whole transaction's, input for input."""
+
+    @pytest.mark.parametrize("shape", sorted(_graft_shapes()))
+    def test_the_inputs_are_the_whole_parses_inputs(self, shape) -> None:
+        from pyrxd.transaction.transaction import Transaction
+
+        for tx in _graft_shapes()[shape][:2]:
+            raw = tx.serialize()
+            got = _core()._checked_inputs(tx.txid(), raw)
+            whole = Transaction.from_hex(raw).inputs
+            assert [i.serialize() for i in got] == [i.serialize() for i in whole]
+            assert len(got) == len(whole) > 0
+
+    def test_a_transaction_that_is_not_the_one_named_is_refused(self) -> None:
+        from pyrxd.security.errors import ValidationError
+
+        commit, reveal = _commit_and_reveal("honest")
+        with pytest.raises(ValidationError, match="does not match the requested txid"):
+            _core()._checked_inputs(commit.txid(), reveal.serialize())
+
+    def test_truncated_inputs_are_refused_not_read_short(self) -> None:
+        """Bytes that hash to the txid named cannot be truncated, so this reaches the parser only
+        by naming the truncated bytes' own hash: the read must still refuse them."""
+        from pyrxd.hash import hash256
+        from pyrxd.security.errors import ValidationError
+
+        _commit, reveal = _commit_and_reveal("honest")
+        cut = reveal.serialize()[:90]
+        with pytest.raises(ValidationError, match="could not parse"):
+            _core()._checked_inputs(hash256(cut)[::-1].hex(), cut)
+
+    def test_the_outputs_are_never_parsed(self, monkeypatch) -> None:
+        from pyrxd.transaction import transaction_output
+
+        calls = []
+        real = transaction_output.TransactionOutput.from_hex.__func__
+
+        def counting(cls, stream):
+            calls.append(1)
+            return real(cls, stream)
+
+        reveal, commit, _state = _graft_shapes()["150-signed-marks-and-a-marked-commit"]
+        monkeypatch.setattr(transaction_output.TransactionOutput, "from_hex", classmethod(counting))
+        assert _binding(reveal, commit.serialize().hex())["state"] == "bound"
+        assert len(calls) == 3, f"{len(calls)} outputs parsed: the spent transaction has 3, the reveal none"
