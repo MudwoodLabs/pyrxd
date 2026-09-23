@@ -1741,8 +1741,15 @@ class _OutputShape:
     page's transaction-shape banner states exactly these (``_detectTxShape`` in ``inspect.js``,
     which computes the same facts from the rows when nothing was cut). A field compared must be
     present on every row to agree, as the banner's own comparison requires: a field absent
-    everywhere does not agree by having nothing to compare. Compared as Python values, so two
-    rewards that differ past 2**53 still differ.
+    everywhere does not agree by having nothing to compare.
+
+    COMPARED AS THE CLASSIFIER'S OWN VALUES, for a listed row as for a counted one: the caller
+    notes every row BEFORE :func:`_render_safe` replaces an integer wider than
+    :data:`_MAX_RENDERED_INT_BITS` with text. So two rewards that differ past 2**53, or past the
+    width at which the payload carries text instead of a number, still differ, and two equal ones
+    still agree. The listed rows used to be noted after that replacement and the counted ones
+    before it, so 150 contracts sharing one 1,101-bit reward read "not all equal", and two with
+    different 1,101-bit rewards read "agree".
     """
 
     _COMPARED = ("token_ref_outpoint", "reward", "max_height")
@@ -1898,9 +1905,12 @@ def _classify_raw_tx(
             within = attest_hashmark_limit is None or hashmark_rows < attest_hashmark_limit
             attest = within and known is None
             if listed:
-                row = _inspect_script(script_bytes.hex(), network=network, attest=attest)
+                # What `_inspect_script` returns, in its two steps, because `shape` must see the
+                # first: the classifier's values, however wide (see `_OutputShape`).
+                classified = _classify_script(script_bytes.hex(), network=network, attest=attest)
+                row = cast(dict, _render_safe(classified))
             else:
-                row = _classify_script(script_bytes.hex(), network=network, attest=attest, summary=True)
+                row = classified = _classify_script(script_bytes.hex(), network=network, attest=attest, summary=True)
             hm = row.get("hashmark")
             if hm is not None:
                 hashmark_rows += 1
@@ -1913,7 +1923,7 @@ def _classify_raw_tx(
                     checked[script_bytes] = copy.deepcopy(att) if listed else att
             if not listed:
                 _count(outputs_by_type, str(row.get("type", "unknown")))
-                shape.note(idx, row)
+                shape.note(idx, classified)
                 if hm is not None:
                     _count(marks_by_status, _hashmark_tally_word(hm))
                 unlisted_vouts.append(idx)
@@ -1922,7 +1932,7 @@ def _classify_raw_tx(
             row["vout"] = idx
             row["satoshis"] = out.satoshis
             output_rows.append(row)
-            shape.note(idx, row)
+            shape.note(idx, classified)
         except Exception as exc:  # defensive: any classifier crash → unknown row
             if not listed:
                 _count(outputs_by_type, "error")

@@ -1547,8 +1547,20 @@ function _outputShape(payload) {
   // `undefined === undefined` is true, so a field absent from every row would "agree" vacuously
   // and the check would pass by having nothing to compare. Require it present before believing
   // it matches. The classifier's `_OutputShape` applies the same rule to the rows it counts.
-  const agreesOn = (field) =>
-    dmintRows.every((o) => o[field] !== undefined && o[field] !== null && o[field] === dmintRows[0][field]);
+  //
+  // A VALUE THIS PAGE CANNOT COMPARE DOES NOT MATCH ANYTHING. The rows carry an integer wider than
+  // 1024 bits as the text "<oversized integer: N bits>", so two DIFFERENT 1,101-bit rewards arrive
+  // as the same text, and comparing the text called them equal. When every row reads alike and
+  // what they read is that text, the answer is null: this page cannot tell. Rows that read
+  // differently still differ — a number and that text, or two such texts of different widths,
+  // are never the same integer. (`_OutputShape` compares the integers themselves, and its answer
+  // is used instead whenever the classifier sent one.)
+  const tooWideToCompare = (value) => typeof value === "string" && /^<oversized integer: \d+ bits>$/.test(value);
+  const agreesOn = (field) => {
+    const first = dmintRows[0][field];
+    const same = dmintRows.every((o) => o[field] !== undefined && o[field] !== null && o[field] === first);
+    return same && tooWideToCompare(first) ? null : same;
+  };
   const dmint = dmintRows.length === 0 ? null : {
     count: dmintRows.length,
     first_vout: dmintRows[0].vout,
@@ -1776,14 +1788,23 @@ function _detectTxShape(payload) {
       // contract V1 deploy with a V2 single-contract deploy.
       let parallel;
       if (dmintCount > 1) {
+        // Each is true, false, or — from `_outputShape`'s own count of the rows — null, "cannot
+        // tell". Only true is agreement and only false is disagreement.
         const oneToken = dmint.same_token_ref === true;
         const sameTerms = dmint.same_reward === true && dmint.same_max_height === true;
+        const termsDiffer = dmint.same_reward === false || dmint.same_max_height === false;
         parallel = `${dmintCount} dMint contract UTXOs. `;
-        if (!oneToken) {
+        if (dmint.same_token_ref === false) {
           parallel +=
             `They do NOT all carry the same token_ref, so this is not one ` +
             `token deployed in parallel — check the token ref on each row ` +
             `before treating the contracts as interchangeable. `;
+        } else if (!oneToken || !(sameTerms || termsDiffer)) {
+          parallel +=
+            `This page cannot tell whether all ${dmintCount} agree on token_ref, ` +
+            `reward and max_height: at least one of those values is an integer ` +
+            `too wide for it to compare, so it gives no reward × max_height × ` +
+            `${dmintCount} figure. `;
         } else if (sameTerms) {
           parallel +=
             `All ${dmintCount} carry the same token_ref and agree on reward ` +

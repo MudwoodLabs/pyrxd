@@ -206,17 +206,19 @@ class TestThePayloadIsBounded:
 
     def test_only_the_listed_rows_are_classified_in_full(self, limit, monkeypatch) -> None:
         """The work, not only the payload: a row past the limit is never built. Counted on the
-        function every listed row goes through, and the counter is checked to count."""
+        function every row goes through — a full classification is a call without ``summary`` —
+        and the counter is checked to count."""
         from pyrxd.glyph import _inspect_core
 
         calls = []
-        real = _inspect_core._inspect_script
+        real = _inspect_core._classify_script
 
         def counting(*a, **kw):
-            calls.append(1)
+            if not kw.get("summary"):
+                calls.append(1)
             return real(*a, **kw)
 
-        monkeypatch.setattr(_inspect_core, "_inspect_script", counting)
+        monkeypatch.setattr(_inspect_core, "_classify_script", counting)
         _classified(*(_v1(i) for i in range(limit + 500)), limit=limit)
         assert len(calls) == limit, f"{len(calls)} full classifications for a limit of {limit}"
         calls.clear()
@@ -696,6 +698,77 @@ class TestTheOutputShapeIsEveryOutputs:
         tx = _tx([_dmint(5), _p2pkh(), _p2pkh()])
         payload = classify_raw_tx(tx.txid(), tx.serialize(), only_vout=1, max_rows=0)
         assert payload["outputs_not_listed"]["count"] == 1 and "output_shape" not in payload
+
+
+_WIDE = (1 << 1100) + 12345  # 1,101 bits: past the width at which the payload carries text
+_WIDE_2 = (1 << 1100) + 99999  # the same width, a different value
+
+
+def _wide_dmint(reward: int) -> bytes:
+    """A dMint contract whose reward is *reward*, however wide: `_dmint`'s script with its one
+    reward push (100,000, pushed as ``03 a0 86 01``) replaced, and parsed back to check it."""
+    from pyrxd.glyph.dmint import DmintState
+
+    script, push = _dmint(), b"\x03\xa0\x86\x01"
+    assert script.count(push) == 1
+    raw = reward.to_bytes((reward.bit_length() + 8) // 8, "little")  # sign bit clear
+    wide = script.replace(push, b"\x4c" + bytes([len(raw)]) + raw)
+    assert DmintState.from_script(wide).reward == reward
+    return wide
+
+
+class TestAWideRewardIsComparedAsAnInteger:
+    """The payload carries an integer wider than 1024 bits as the text "<oversized integer: N
+    bits>". `_OutputShape` compared the LISTED rows after that replacement and the counted ones
+    before it, so 150 contracts sharing one 1,101-bit reward read "not all equal" and two with
+    different 1,101-bit rewards read "agree". Each case is drawn cut (the classifier's
+    `output_shape`) and uncut (the page's own count of the rows, which sees only the text)."""
+
+    _AGREE = "agree on reward and max_height"
+    _DIFFER = "their reward / max_height are not all equal"
+    _CANNOT = "This page cannot tell whether all"
+
+    def test_one_wide_reward_past_the_limit_agrees_with_itself(self, limit) -> None:
+        """Case A: listed rows and counted rows compared as the same integer."""
+        page, whole = _banners([_wide_dmint(_WIDE) for _ in range(150)] + [_p2pkh()], limit)
+        assert f"All 150 carry the same token_ref and {self._AGREE}" in page
+        assert self._DIFFER not in page
+        assert self._CANNOT in whole and self._AGREE not in whole and self._DIFFER not in whole
+
+    def test_two_different_wide_rewards_within_the_limit_differ(self, limit) -> None:
+        """Case B: both listed, both drawn as the same text, and different integers."""
+        scripts = [_wide_dmint(_WIDE), _wide_dmint(_WIDE_2)] + [_p2pkh(i) for i in range(limit + 20)]
+        bounded = _classified(*scripts, limit=limit)
+        rewards = [row["reward"] for row in bounded["outputs"] if row["type"] == "dmint"]
+        assert rewards == ["<oversized integer: 1101 bits>"] * 2, "the premise: the rows read alike"
+        assert bounded["output_shape"]["dmint"]["same_reward"] is False
+        page, _whole = _banners(scripts, limit)
+        assert self._DIFFER in page and self._AGREE not in page
+
+    @pytest.mark.parametrize(
+        "rewards, words",
+        [
+            ((_WIDE, _WIDE_2), _CANNOT),  # the text is alike and the integers are not
+            ((_WIDE, _WIDE), _CANNOT),  # the text is alike and so are the integers: still unknown here
+            ((_WIDE, 100_000), _DIFFER),  # a number and the text are never one integer
+            ((100_000, 100_000), _AGREE),  # the ordinary controls
+            ((100_000, 5), _DIFFER),
+        ],
+        ids=["wide-different", "wide-equal", "wide-beside-ordinary", "ordinary-equal", "ordinary-different"],
+    )
+    def test_uncut_the_page_claims_only_what_it_can_compare(self, limit, rewards, words) -> None:
+        scripts = [_wide_dmint(r) if r.bit_length() > 64 else _dmint(reward=r) for r in rewards] + [_p2pkh()]
+        payload = _classified(*scripts, limit=limit)
+        assert "output_shape" not in payload, "the premise: nothing cut, so the page counts the rows"
+        page = _banner(_card(payload)["fetched_tx_card"])
+        assert words in page, page
+        assert [w for w in (self._AGREE, self._DIFFER, self._CANNOT) if w in page] == [words], page
+
+    @pytest.mark.parametrize("reward", [100_000, 5], ids=["ordinary-equal", "ordinary-different"])
+    def test_cut_ordinary_rewards_are_compared_as_before(self, limit, reward) -> None:
+        scripts = [_dmint(reward=reward if i == 140 else 100_000) for i in range(150)] + [_p2pkh()]
+        page, whole = _banners(scripts, limit)
+        assert (self._AGREE if reward == 100_000 else self._DIFFER) in page and page == whole
 
 
 # ─────────────────────────────────────── the inputs' lists are bounded the same way ──
