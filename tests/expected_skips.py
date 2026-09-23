@@ -70,6 +70,30 @@ EXPECTED_SKIPS: tuple[ExpectedSkip, ...] = (
             "legitimately skips these. Install the eth extra to run them."
         ),
     ),
+    # --- the native grinder needs a C compiler ------------------------------------------
+    ExpectedSkip(
+        reason=r"^no C compiler found \(cc/gcc/clang\)",
+        nodeid=r"^tests/contrib/test_(native_grinder|dmint_miner_selection)\.py::",
+        why=(
+            "The native-grinder tests build the grinder from its C source with the machine's "
+            "compiler. A developer machine without one cannot run them, and nothing else in pyrxd "
+            "needs a compiler, so there they skip. They cannot skip in CI: the `grinder` fixture "
+            "(tests/contrib/conftest.py) FAILS instead when the CI environment variable is set, so "
+            "this entry cannot hide a runner that lost its compiler."
+        ),
+    ),
+    ExpectedSkip(
+        reason=r"^no /proc/cpuinfo on this platform$|^the parent-death check is asserted via /proc$",
+        nodeid=(
+            r"^tests/contrib/test_native_grinder\.py::(TestBuildAndSelftest::"
+            r"test_sha_extension_detection_agrees_with_the_kernel|test_the_grinder_stops_when_its_parent_is_killed)$"
+        ),
+        why=(
+            "Two native-grinder checks read Linux's /proc: the kernel's CPU flags, to cross-check "
+            "the grinder's own SHA-extension detection, and a process's state, to see the grinder "
+            "exit when its parent is killed. CI runs Linux, where both run; on macOS they skip."
+        ),
+    ),
     # --- opt-in live-node lanes ----------------------------------------------------------
     ExpectedSkip(
         reason=r"^[A-Z][A-Z_]* not set\b",
