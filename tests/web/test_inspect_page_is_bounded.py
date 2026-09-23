@@ -788,10 +788,14 @@ class TestAnUpdatesFieldsAreBounded:
         assert len(json.dumps(huge)) - len(json.dumps(small)) < 100
 
     def test_the_card_draws_what_it_would_have_drawn_from_the_whole_envelope(self, limit) -> None:
-        """The same fields, the same values, the same counts. Keys past U+FFFF are included:
-        JavaScript sorts by UTF-16 code unit, which puts "\U0001f600" before "\uff01" where a
-        Python sort by code point does not, and the classifier picks the fields the page's sort
-        would reach first."""
+        """The same fields, the same values, the same counts.
+
+        THE ORDER IS JAVASCRIPT'S. The page sorts keys by UTF-16 code unit; Python sorts by code
+        point, and the two disagree once a key has a character past U+FFFF: "\U0001f600" (a
+        surrogate pair, D83D DE00) sorts BEFORE "\uff01" in JavaScript and after it in Python.
+        Twenty keys of each, cut at 32, keep a different set in each order — so a classifier
+        picking by Python's order would send fields the page would not have drawn first. Each
+        level is checked, and a random mix beside them."""
         import random
 
         rng = random.Random(5)
@@ -800,15 +804,27 @@ class TestAnUpdatesFieldsAreBounded:
         def key() -> str:
             return "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 4)))
 
-        fields = {key(): key() for _ in range(90)} | {
-            "attrs": {"target": "t"} | {key(): rng.randint(0, 9) for _ in range(90)},
-            "meta": {key(): key() for _ in range(90)},
+        def astral_and_bmp(tag: str) -> dict:
+            return {f"{c}{tag}{i:02d}": f"{tag}{i}" for c in ("\U0001f600", "\uff01") for i in range(20)}
+
+        fields = astral_and_bmp("t") | {
+            "attrs": {"target": "t"} | astral_and_bmp("a"),
+            "a-meta": astral_and_bmp("m"),
         }
-        bounded, whole = self._envelopes(fields, limit)
-        assert bounded["glyph_envelopes"][0]["fields_not_listed"]["count"] > 0, "the premise: something was cut"
-        both = _render({"b": {"tx": bounded}, "w": {"tx": whole}})
-        assert both["b"]["fetched_tx_card"] == both["w"]["fetched_tx_card"]
-        assert "\U0001f600" in both["b"]["fetched_tx_card"], "the premise: an astral key was drawn"
+        mixed = {key(): key() for _ in range(90)} | {"attrs": {key(): rng.randint(0, 9) for _ in range(90)}}
+        for case in (fields, mixed):
+            bounded, whole = self._envelopes(case, limit)
+            assert bounded["glyph_envelopes"][0]["fields_not_listed"]["count"] > 0, "the premise: something was cut"
+            both = _render({"b": {"tx": bounded}, "w": {"tx": whole}})
+            assert both["b"]["fetched_tx_card"] == both["w"]["fetched_tx_card"]
+        drawn = _render({"b": {"tx": self._envelopes(fields, limit)[0]}})["b"]["fetched_tx_card"]
+        # The premise, on the page: the first 32 in JavaScript's order are all twenty astral keys
+        # and then BMP ones — eleven at the top level, where "a-meta" sorts first and takes a
+        # place, and twelve in `attrs`, where `target` is drawn on its own. (The map-valued field
+        # is one line, capped at 200 characters, so it is checked by the equality above.)
+        for tag, bmp_drawn in (("t", 11), ("a", 12)):
+            assert all(f"{tag}{i}\n" in drawn for i in range(20)), tag
+            assert f"\uff01{tag}{bmp_drawn - 1:02d}" in drawn and f"\uff01{tag}{bmp_drawn:02d}" not in drawn, tag
 
     def test_an_update_the_page_draws_whole_is_sent_whole(self, limit) -> None:
         """The honest path: nothing past the cap, nothing cut, and no count."""
