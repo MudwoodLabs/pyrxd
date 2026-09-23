@@ -69,7 +69,10 @@ _LWMA_PARAMS = DmintDeployParams(
     daa_mode=DaaMode.LWMA,
     target_time=60,
     height=0,
-    last_time=0,
+    # Deliberately NOT 0, and deliberately different from _ASERT_PARAMS: an LWMA state
+    # whose lastTime pushes non-minimally is one radiant-core refuses to run (MINIMALDATA
+    # is consensus), so a fixture built with 0 describes a contract that cannot exist.
+    last_time=1_699_000_000,
 )
 
 
@@ -748,12 +751,16 @@ class TestBuildDmintMintTx:
             _mint(_make_contract_utxo(), funding=_funding(value=10_000))  # << fee + reward
 
     def test_asert_daa_updates_target(self):
-        # Redesign: ASERT is mintable. A slow block (delta=2*targetTime over the
-        # half-life worth of excess) eases difficulty → target grows.
+        # Redesign: ASERT is mintable. A slow block eases difficulty → target grows.
+        # The fixture bakes half_life 3600 and, since the 2026-09-16 resync to Photonic's
+        # ASERT-v2 (ed53cd41), the mint builder defaults to DEFAULT_ASERT_HALFLIFE (240) and
+        # refuses a half-life the contract does not bake — so the baked value is passed
+        # explicitly. Under ASERT-v2 the 7140 s excess clamps to +25% of min(target, MAX/4).
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.ASERT)
         last_time = utxo.state.last_time
-        result = _mint(utxo, current_time=last_time + 7200)  # excess 7140, drift +1
+        result = _mint(utxo, current_time=last_time + 7200, half_life=3_600)
         assert result.updated_state.target > utxo.state.target
+        assert result.updated_state.target == utxo.state.target + (utxo.state.target // 65536) * 16384
         assert result.updated_state.last_time == last_time + 7200
 
     def test_epoch_mint_retargets_at_boundary(self):
@@ -799,14 +806,23 @@ class TestBuildDmintMintTx:
         with pytest.raises(ValidationError, match="0x7FFFFFFF"):
             _mint(_make_contract_utxo(), current_time=0x80000000)
 
-    def test_backwards_current_time_rejected_for_daa(self):
-        # LWMA negative-delta → on-chain OP_MUL overflows; off-chain would diverge.
+    def test_an_unreadable_current_time_is_refused_for_daa(self):
+        # current_time=0 used to be refused as "backwards" with a reason that did not describe
+        # this contract. It is refused now because pyrxd does not write a lastTime the
+        # contract's next retarget cannot read.
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.LWMA, difficulty=1)
-        with pytest.raises(ValidationError, match="must be >= the contract's last_time"):
-            _mint(utxo, current_time=0)  # 0 < the contract's last_time (1.7e9)
+        with pytest.raises(ValidationError, match=r"is below 2\*\*23"):
+            _mint(utxo, current_time=0)
+
+    def test_backwards_current_time_accepted_for_v2_lwma(self):
+        # The honest neighbour: a real timestamp one hour BEFORE the contract's last_time
+        # (1.7e9) builds; refusing it was a guard refusing valid work.
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.LWMA, difficulty=1)
+        result = _mint(utxo, current_time=utxo.state.last_time - 3600)
+        assert result.updated_state.last_time == utxo.state.last_time - 3600
 
     def test_backwards_current_time_allowed_for_fixed(self):
-        # FIXED has no DAA multiply → a backwards lastTime is harmless (no overflow).
+        # FIXED never reads lastTime, so neither a backwards nor a non-minimal one matters.
         utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.FIXED)
         _mint(utxo, current_time=0)  # must NOT raise
 

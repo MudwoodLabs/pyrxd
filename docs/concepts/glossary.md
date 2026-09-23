@@ -133,7 +133,7 @@ those for depth; use this page to look something up mid-task.
 
 - **DAA modes** — the five difficulty-adjustment-algorithm modes a dMint V2
   contract can choose (`DaaMode` enum,
-  [`src/pyrxd/glyph/dmint/types.py:91`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)):
+  [`src/pyrxd/glyph/dmint/types.py:123`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)):
   `FIXED` (no retarget), `EPOCH` (retarget every N blocks, capped
   adjustment), `ASERT` (continuous retarget on a half-life), `LWMA` (linear
   weighted moving average), `SCHEDULE` (a baked ascending height→target
@@ -169,13 +169,13 @@ those for depth; use this page to look something up mid-task.
   wrong and your ETA is off by 2³³.** A dMint PoW solution is valid iff a
   SHA256d digest's top 4 bytes are zero *and* the next 8 bytes (big-endian)
   are below `target`. Because `MAX_SHA256D_TARGET = 2**63 - 1 < 2**64`
-  ([`src/pyrxd/glyph/dmint/types.py:63`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)),
+  ([`src/pyrxd/glyph/dmint/types.py:70`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/types.py)),
   that's exactly "the top **96** bits of the digest are below `target`" —
   the hit space is `2**96`, not `2**256`. So:
   - `p = target / 2**96`
   - **expected attempts** `= 2**96 / target`
   - `target_to_difficulty(target) = MAX_SHA256D_TARGET // target`
-    ([`src/pyrxd/glyph/dmint/miner.py:385`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py))
+    ([`src/pyrxd/glyph/dmint/miner.py:670`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/miner.py))
     is the **difficulty multiplier** — a completely different quantity.
 
   `MAX_SHA256D_TARGET / target` is low as an attempt estimate by a factor of

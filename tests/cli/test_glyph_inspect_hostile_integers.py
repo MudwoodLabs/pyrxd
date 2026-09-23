@@ -653,6 +653,22 @@ class TestDecimalFractionsAreRefusedBeforeAnyCoercion:
                 {"p": [1, 4], "dmint": {"algo": 0, "maxHeight": _DECIMAL, "reward": 1, "diff": 1}},
                 "dmint CBOR field is not usable",
             ),
+            (
+                # A SCHEDULE entry is decoded by its own helper (`_schedule_from_cbor`), not by the
+                # field list above, so it is a separate site that must refuse a Decimal too.
+                "dmint daa schedule height",
+                {
+                    "p": [1, 4],
+                    "dmint": {
+                        "algo": 0,
+                        "maxHeight": 10,
+                        "reward": 1,
+                        "diff": 1,
+                        "daa": {"mode": 4, "schedule": [{"height": _DECIMAL, "difficulty": 1}]},
+                    },
+                },
+                "dmint CBOR field is not usable",
+            ),
             ("royalty bps", {"p": [2], "name": "t", "royalty": {"bps": _DECIMAL, "address": "a"}}, '"name": "t"'),
         ],
         ids=lambda v: v if isinstance(v, str) else "",

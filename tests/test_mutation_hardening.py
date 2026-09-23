@@ -327,9 +327,14 @@ class TestDmintParamsValidation:
                 self._params(**{field: bad})
 
     def test_documented_defaults(self):
+        """``half_life`` defaults to the canonical Photonic ``DEFAULT_ASERT_HALFLIFE`` (240 s,
+        ``packages/lib/src/script.ts``). It was 3600 until the 2026-09-16 ASERT-v2/LWMA-v2
+        resync (Photonic ``ed53cd41`` / ``c90e6506``): the old value belonged to the retired
+        power-of-2 stepper, and an ASERT deploy that omits the half-life must bake what a
+        Photonic miner assumes when it is omitted."""
         p = self._params()
         assert p.target_time == 60
-        assert p.half_life == 3600
+        assert p.half_life == 240
         assert p.height == 0
         assert p.last_time == 0
         assert p.epoch_length == 2016
@@ -1170,14 +1175,19 @@ class TestDmintV1BuilderGuards:
                 build_dmint_v1_ft_output_script(bad, ref)
 
     def test_part_b_defaults_match_explicit(self):
-        """The documented defaults (half_life 3600, epoch 2016, log2 2) must
-        be what the no-arg form actually builds."""
+        """The documented defaults (half_life 240, epoch 2016, log2 2) must
+        be what the no-arg form actually builds.
+
+        ``half_life`` was 3600 until 2026-09-16, when the resync to Photonic's ASERT-v2 /
+        LWMA-v2 (``ed53cd41`` / ``c90e6506``) moved every default to the canonical
+        ``DEFAULT_ASERT_HALFLIFE`` (240, ``script.ts``)."""
         from pyrxd.glyph.dmint import DaaMode
         from pyrxd.glyph.dmint.builders import _build_part_b
 
-        assert _build_part_b(DaaMode.ASERT) == _build_part_b(DaaMode.ASERT, 3600)
+        assert _build_part_b(DaaMode.ASERT) == _build_part_b(DaaMode.ASERT, 240)
+        assert _build_part_b(DaaMode.ASERT) != _build_part_b(DaaMode.ASERT, 3600)
         assert _build_part_b(DaaMode.EPOCH) == _build_part_b(
-            DaaMode.EPOCH, 3600, epoch_length=2016, max_adjustment_log2=2
+            DaaMode.EPOCH, 240, epoch_length=2016, max_adjustment_log2=2
         )
 
 

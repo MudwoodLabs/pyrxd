@@ -19,13 +19,27 @@ two showstoppers that made the prior shape un-mineable on mainnet:
 
 This test proves the redesigned covenant is accepted by REAL Radiant consensus:
 deploy a V2 contract, PoW-mine an 8-byte-nonce mint, and confirm the node
-accepts it (and rejects a wrong nonce) — for FIXED difficulty AND for an ASERT
-DAA contract whose recreated ``target``/``last_time`` advance on-chain.
+accepts it (and rejects a wrong nonce) — for FIXED difficulty AND for the
+adaptive modes whose recreated ``target``/``last_time`` advance on-chain.
 
-Paths proven: ``test_v2_fixed_mint_...`` and ``test_v2_asert_mint_...`` deploy by
-direct ref-induction (spend two genesis outpoints so the singleton
-``contractRef`` + normal ``tokenRef`` are inducted) as focused covenant proofs;
-``test_v2_deploy_via_api_then_mint`` exercises the full library API
+The ASERT-v2 and LWMA-v2 tests (the fractional, damped retargets Photonic landed
+on 2026-06-19 ``ed53cd41`` / 2026-06-20 ``c90e6506``, byte-matched by pyrxd since
+2026-09-16) each deploy a contract and mine it TWICE, chained: mint 1 is a slow
+block that drives the target through the ``min(target, MAX/4)`` pre-cap, mint 2 is
+a fast block mined UNDER that retargeted difficulty that takes the fractional step
+(truncation toward zero and the ±25% clamp both on the path). Consensus accepting
+each mint is the proof that ``compute_next_target_asert_v2`` /
+``compute_next_target_linear_v2`` equal the on-chain ``_build_asert_daa_v2`` /
+``_build_linear_daa_v2`` bytecode for that input: the covenant recomputes the next
+target itself and Part C OP_EQUALVERIFYs the recreated state, so any divergence
+rejects the mint. Contracts deployed before the resync bake the retired formulas and
+are covered offline (``tests/test_dmint_daa_v2_resync.py``, including the mainnet
+``dea3beb9…`` LWMA deploy verified against the chain).
+
+Paths proven: ``test_v2_fixed_mint_...``, ``test_v2_lwma_v2_...`` and
+``test_v2_asert_v2_...`` deploy by direct ref-induction (spend two genesis outpoints
+so the singleton ``contractRef`` + normal ``tokenRef`` are inducted) as focused
+covenant proofs; ``test_v2_deploy_via_api_then_mint`` exercises the full library API
 (``prepare_dmint_deploy(DmintV2DeployParams)`` -> commit -> reveal ->
 ``build_reveal_outputs``). All feed ``build_dmint_mint_tx``, which emits the
 consensus-correct mint: contract + funding inputs; outputs = recreated contract
@@ -33,6 +47,10 @@ consensus-correct mint: contract + funding inputs; outputs = recreated contract
 vout[2], change. ``current_time`` is the block locktime — it lands in the
 recreated state's ``last_time`` and the tx ``nLockTime`` (which must agree, since
 Part C rebuilds ``last_time`` from ``OP_TXLOCKTIME``).
+
+Cost: a difficulty-1 mint is a ~2**33 SHA256d sweep (4-zero-byte floor + sign bit);
+the second mint of each v2 test runs at the MAX/4 cap, ~4x that. Raise
+``DMINT_MINE_TIMEOUT_S`` (default 1800 s) on a slow box.
 
 Gating / safety: opt-in via ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``;
 reuses the isolated throwaway-container harness from ``test_htlc_regtest_e2e``
@@ -63,6 +81,8 @@ from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
 
 from pyrxd.glyph.builder import DmintV2DeployParams, GlyphBuilder
 from pyrxd.glyph.dmint import (
+    DEFAULT_ASERT_HALFLIFE,
+    DaaBytecodeVersion,
     DaaMode,
     DmintAlgo,
     DmintContractUtxo,
@@ -74,14 +94,22 @@ from pyrxd.glyph.dmint import (
     build_dmint_mint_tx,
     build_dmint_v2_mint_preimage,
     build_mint_scriptsig,
-    compute_next_target_linear,
+    compute_next_target_asert_legacy,
+    compute_next_target_asert_v2,
+    compute_next_target_linear_legacy,
+    compute_next_target_linear_v2,
+    detect_contract_daa_bytecode,
+    is_minimal_4byte_scriptnum,
     mine_solution_dispatch,
 )
-from pyrxd.glyph.dmint.types import MAX_SHA256D_TARGET
+from pyrxd.glyph.dmint import miner as dmint_miner
+from pyrxd.glyph.dmint.miner import _v2_code_section
+from pyrxd.glyph.dmint.types import ASERT_V2_MAX_TARGET_DIV4, ASERT_V2_RADIX, MAX_SHA256D_TARGET
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import encode_pushdata, to_unlock_script_template
+from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -159,7 +187,7 @@ def _v2_params(
     daa_mode=DaaMode.FIXED,
     difficulty=1,
     target_time=60,
-    half_life=3600,
+    half_life=DEFAULT_ASERT_HALFLIFE,  # 240: the canonical Photonic default (was 3600 before 2026-09-16)
     **daa_kwargs,
 ):
     return DmintDeployParams(
@@ -307,11 +335,25 @@ def _commit_reveal_unlock(key: PrivateKey, suffix: bytes):
     return to_unlock_script_template(_u, lambda: 110 + len(suffix))
 
 
-def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUtxo:
+def _deploy_v2_via_api(
+    node: _RegtestNode,
+    owner: PrivateKey,
+    *,
+    daa_mode: DaaMode = DaaMode.FIXED,
+    target_time: int = 60,
+    half_life: int = DEFAULT_ASERT_HALFLIFE,
+) -> tuple[DmintContractUtxo, int]:
     """Deploy a 1-contract V2 dMint via the real API (prepare_dmint_deploy +
     commit -> reveal + build_reveal_outputs) and return the live value-1 singleton
-    contract UTXO. Mirrors the V1 deploy; asserts the reveal is accepted by
-    consensus before the caller spends minutes mining.
+    contract UTXO together with the ``last_time`` the API stamped. Mirrors the V1
+    deploy; asserts the reveal is accepted by consensus before the caller spends
+    minutes mining.
+
+    ``last_time`` is deliberately NOT passed: the point of the adaptive cases is that
+    the shipped path stamps a mineable one by itself. Before 2026-09-22 it had no such
+    field, every ASERT/LWMA contract it built carried ``04 00000000``, and that is not
+    a minimal CScriptNum — so the first retarget aborted under MINIMALDATA, which is
+    consensus on Radiant, not policy.
     """
     owner_pkh = Hex20(owner.public_key().hash160())
     owner_spk = _p2pkh(owner_pkh)
@@ -331,6 +373,9 @@ def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUt
                 max_height=1000,
                 reward_photons=1000,
                 difficulty=1,
+                daa_mode=daa_mode,
+                target_time=target_time,
+                half_life=half_life,
             ),
             allow_v2_deploy=True,
         )
@@ -398,7 +443,41 @@ def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUt
     node.mine(1)
     state = DmintState.from_script(contract_script)
     assert state.is_v1 is False and state.height == 0
-    return DmintContractUtxo(txid=reveal_txid, vout=0, value=rev.contract_value, script=contract_script, state=state)
+    assert state.last_time == deploy.last_time, "the reveal script does not carry the lastTime the API resolved"
+    utxo = DmintContractUtxo(txid=reveal_txid, vout=0, value=rev.contract_value, script=contract_script, state=state)
+    return utxo, deploy.last_time
+
+
+def _mint_on_chain(
+    node: _RegtestNode, contract: DmintContractUtxo, *, current_time: int, **daa_kwargs
+) -> DmintContractUtxo:
+    """Build + PoW-mine + sign a mint of ``contract`` at block locktime ``current_time``,
+    require consensus to accept it, broadcast it, mine a block, and return the RECREATED
+    contract UTXO parsed back from the node — so the next mint can chain off it under the
+    retargeted difficulty. Every assertion here is about what the NODE holds."""
+    tx, _nonce = _build_signed_v2_mint(node, contract, current_time=current_time, **daa_kwargs)
+    raw = tx.serialize().hex()
+    res = node.accepts(raw)
+    assert res["allowed"] is True, (
+        f"{contract.state.daa_mode.name} V2 mint at height {contract.state.height} rejected by consensus "
+        f"(off-chain DAA != on-chain bytecode?): {res}"
+    )
+    mtxid = node.cli("sendrawtransaction", raw)
+    assert isinstance(mtxid, str), mtxid
+    node.mine(1)
+    assert node.cli("gettxout", contract.txid, "0") in (None, ""), "spent V2 contract UTXO still unspent"
+    out = node.cli("gettxout", mtxid, "0")
+    assert out and round(out["value"] * 1e8) == _CONTRACT_VALUE, "recreated V2 contract wrong"
+    spk = bytes.fromhex(out["scriptPubKey"]["hex"])
+    state = DmintState.from_script(spk)
+    assert state.height == contract.state.height + 1
+    assert state.last_time == current_time
+    # The code section is immutable across mints: only the state prefix moved. The boundary is
+    # found by re-serialising the parsed state (the production builder's own method) — NOT by
+    # searching for the first 0xbd byte, which can occur inside a ref: the first run of this
+    # test failed exactly that way after consensus had accepted the mint (token ref 8e04bd41…).
+    assert _v2_code_section(spk, state) == _v2_code_section(contract.script, contract.state)
+    return DmintContractUtxo(txid=mtxid, vout=0, value=_CONTRACT_VALUE, script=spk, state=state)
 
 
 class TestRadiantDmintV2OnConsensus:
@@ -433,45 +512,87 @@ class TestRadiantDmintV2OnConsensus:
         reward_out = node.cli("gettxout", mtxid, "1")
         assert reward_out and round(reward_out["value"] * 1e8) == 1000, "V2 FT reward output (vout 1) wrong"
 
-    def test_v2_lwma_mint_advances_target_on_chain(self, node):
-        """An LWMA (DAA) V2 contract mints and the covenant retargets difficulty
-        on-chain: the recreated state's ``target`` and ``last_time`` advance to
-        the DAA-computed values. Consensus accepting the mint PROVES pyrxd's
-        off-chain ``compute_next_target_linear`` byte-matches the on-chain
-        divide-first/capped LWMA bytecode (a mismatch → recreated state differs →
-        Part C's OP_EQUALVERIFY rejects the mint). The old V2 covenant could not
-        do this at all (it forbade any state change but ``height``).
+    def test_v2_lwma_v2_retargets_twice_on_chain(self, node):
+        """LWMA-v2 (Photonic ``c90e6506``, 2026-06-20): deploy, then TWO chained mints, each
+        retargeted by the covenant on the real node.
+
+        Mint 1 is a SLOW block (delta 120 > targetTime 60): driftFp = trunc(60·65536/60) =
+        65536 → clamped to +16384 (+25%), but ``t = min(MAX, MAX/4)`` first, so the recreated
+        target is exactly MAX/4 — the pre-cap path (from MAX the first step is always the
+        cap). Mint 2 is a FAST block (delta 30) mined UNDER that retargeted difficulty:
+        driftFp = trunc(-30·65536/60) = -32768 → clamped to -16384 → 3/4 of MAX/4 = 3·MAX/16
+        — the fractional step, with the clamp on the path. The legacy formula gives a
+        different answer at BOTH steps (≈MAX/2 → MAX cap; then (MAX/4//60)·30 = MAX/8), so a
+        dispatch to the wrong mirror is rejected by the node, not hidden.
         """
         last_time = 1_700_000_000
-        # difficulty=1 → current target = MAX, so THIS mint's PoW is just the
-        # 4-zero floor (fast). The contract retargets the NEXT state's target.
         contract = _deploy_v2_contract(
             node, max_height=10, reward=1000, daa_mode=DaaMode.LWMA, difficulty=1, last_time=last_time, target_time=60
         )
         assert contract.state.target == MAX_SHA256D_TARGET
+        assert detect_contract_daa_bytecode(contract.script).version == DaaBytecodeVersion.V2
 
-        # A fast block (delta=30 < target_time=60) → LWMA lowers the target.
-        current_time = last_time + 30
-        tx, _nonce = _build_signed_v2_mint(node, contract, current_time=current_time)
+        t1 = last_time + 120  # slow block → capped at MAX/4
+        expected1 = compute_next_target_linear_v2(MAX_SHA256D_TARGET, last_time, t1, 60)
+        assert expected1 == ASERT_V2_MAX_TARGET_DIV4
+        assert compute_next_target_linear_legacy(MAX_SHA256D_TARGET, last_time, t1, 60) != expected1
+        c1 = _mint_on_chain(node, contract, current_time=t1)
+        assert c1.state.target == expected1  # the covenant wrote MAX/4 into the recreated state
 
-        expected_target = compute_next_target_linear(
-            current_target=MAX_SHA256D_TARGET, last_time=last_time, current_time=current_time, target_time=60
+        t2 = t1 + 30  # fast block, mined at MAX/4 (~4x the PoW of mint 1)
+        expected2 = compute_next_target_linear_v2(expected1, t1, t2, 60)
+        assert expected2 == expected1 - (expected1 // ASERT_V2_RADIX) * 16384  # -25% clamp
+        assert compute_next_target_linear_legacy(expected1, t1, t2, 60) != expected2
+        c2 = _mint_on_chain(node, c1, current_time=t2)
+        assert (c2.state.height, c2.state.target) == (2, expected2)
+
+    def test_v2_asert_v2_retargets_twice_on_chain(self, node):
+        """ASERT-v2 (Photonic ``ed53cd41``, 2026-06-19) with the canonical half-life 240
+        (``DEFAULT_ASERT_HALFLIFE``): deploy, then TWO chained mints retargeted on the node.
+
+        Mint 1: slow block, delta 120 → excess 60 → driftFp = 60·65536/240 = 16384, exactly
+        the clamp → +25% of ``t = min(MAX, MAX/4)`` → re-capped at MAX/4. The legacy stepper
+        would have left the target at MAX (drift = trunc(60/240) = 0: its dead zone, and with
+        half_life >= target_time it could never harden at all). Mint 2: fast block, delta 30,
+        mined at MAX/4 → excess -30 → driftFp = trunc(-30·65536/240) = trunc(-8192.0) = -8192
+        → -12.5% → 7·MAX/32. Also proves, without a grind, that the mint builder refuses a
+        half-life the contract does not bake.
+        """
+        last_time = 1_700_000_000
+        half_life = DEFAULT_ASERT_HALFLIFE
+        contract = _deploy_v2_contract(
+            node,
+            max_height=10,
+            reward=1000,
+            daa_mode=DaaMode.ASERT,
+            difficulty=1,
+            last_time=last_time,
+            target_time=60,
+            half_life=half_life,
         )
-        assert expected_target < MAX_SHA256D_TARGET, "LWMA fast block should LOWER the target"
+        assert contract.state.target == MAX_SHA256D_TARGET
+        detected = detect_contract_daa_bytecode(contract.script)
+        assert (detected.version, detected.half_life) == (DaaBytecodeVersion.V2, half_life)
+        # Wrong half-life: refused BEFORE any PoW, naming the baked value.
+        funding = DmintMinerFundingUtxo(txid="cc" * 32, vout=0, value=50_000_000, script=_p2pkh(b"\x11" * 20))
+        with pytest.raises(ValidationError, match=f"bakes half_life={half_life}"):
+            build_dmint_mint_tx(
+                contract, b"\x00" * 8, b"\x22" * 20, last_time + 120, funding_utxo=funding, half_life=3600
+            )
 
-        res = node.accepts(tx.serialize().hex())
-        assert res["allowed"] is True, f"LWMA V2 mint rejected by consensus (off-chain DAA != on-chain?): {res}"
+        t1 = last_time + 120  # slow block → driftFp = +16384 (the clamp) → capped at MAX/4
+        expected1 = compute_next_target_asert_v2(MAX_SHA256D_TARGET, last_time, t1, 60, half_life)
+        assert expected1 == ASERT_V2_MAX_TARGET_DIV4
+        assert compute_next_target_asert_legacy(MAX_SHA256D_TARGET, last_time, t1, 60, half_life) == MAX_SHA256D_TARGET
+        c1 = _mint_on_chain(node, contract, current_time=t1, half_life=half_life)
+        assert c1.state.target == expected1
 
-        mtxid = node.cli("sendrawtransaction", tx.serialize().hex())
-        assert isinstance(mtxid, str), mtxid
-        node.mine(1)
-        # The recreated contract carries the retargeted state: parse it back and
-        # confirm target/last_time advanced exactly as the off-chain DAA predicted.
-        recreated_spk = bytes.fromhex(node.cli("gettxout", mtxid, "0")["scriptPubKey"]["hex"])
-        recreated = DmintState.from_script(recreated_spk)
-        assert recreated.height == 1
-        assert recreated.last_time == current_time
-        assert recreated.target == expected_target
+        t2 = t1 + 30  # fast block, mined at MAX/4
+        expected2 = compute_next_target_asert_v2(expected1, t1, t2, 60, half_life)
+        assert expected2 == expected1 - (expected1 // ASERT_V2_RADIX) * 8192  # -12.5%, not a clamp value
+        assert compute_next_target_asert_legacy(expected1, t1, t2, 60, half_life) == expected1  # legacy dead zone
+        c2 = _mint_on_chain(node, c1, current_time=t2, half_life=half_life)
+        assert (c2.state.height, c2.state.target) == (2, expected2)
 
     def test_v2_schedule_mint_sets_target_on_chain(self, node):
         """A SCHEDULE (pre-baked curve) V2 contract mints and the covenant sets the
@@ -520,8 +641,81 @@ class TestRadiantDmintV2OnConsensus:
         commit -> reveal -> build_reveal_outputs) produces a value-1 V2 singleton
         that the real mint builder can spend and consensus accepts."""
         owner = PrivateKey(secrets.token_bytes(32))
-        contract = _deploy_v2_via_api(node, owner)
+        contract, _stamped = _deploy_v2_via_api(node, owner)
         assert contract.value == 1 and contract.state.is_v1 is False
         tx, _nonce = _build_signed_v2_mint(node, contract)
         res = node.accepts(tx.serialize().hex())
         assert res["allowed"] is True, f"mint of API-deployed V2 contract rejected: {res}"
+
+    @pytest.mark.parametrize("daa_mode", [DaaMode.ASERT, DaaMode.LWMA])
+    def test_v2_adaptive_deploy_via_api_is_mineable_and_the_old_shape_is_not(self, node, daa_mode, monkeypatch):
+        """The shipped deploy path, with NO last_time given, produces an ASERT/LWMA
+        contract the NODE will let a miner spend — and the shape it used to produce does not.
+
+        Before this fix, `DmintV2DeployParams` had no `last_time` field at all, so both
+        conversion sites built `DmintDeployParams` on its default 0 and every adaptive
+        contract the library deployed carried the state item `04 00000000`. That is not a
+        minimally encoded CScriptNum, the retarget reads it with `OP_2 OP_PICK; OP_SUB` on
+        the FIRST mint, and SCRIPT_VERIFY_MINIMALDATA is in radiant-core's
+        MANDATORY_SCRIPT_VERIFY_FLAGS — consensus, not policy. The contract was unmineable
+        from birth and unfixable once revealed.
+
+        The CONTROL is what makes the acceptance evidence rather than a covenant that
+        accepts anything: a contract in the SAME mode, carrying the SAME retarget bytecode
+        and the same state everywhere the refusal could otherwise be blamed on, but with
+        lastTime 0. It is built through the byte-level mirror, which still accepts any
+        lastTime because it has to be able to reproduce contracts other implementations
+        have already deployed. The node is asked to accept a fully-mined mint of it, and
+        must refuse. (It cannot be byte-identical to the subject: a ref is inducted by
+        spending a particular outpoint, so two live contracts always differ in their
+        contractRef/tokenRef. The assertions below pin what IS held equal.)
+        """
+        owner = PrivateKey(secrets.token_bytes(32))
+        contract, stamped = _deploy_v2_via_api(node, owner, daa_mode=daa_mode)
+        assert contract.value == 1 and contract.state.is_v1 is False
+        assert contract.state.daa_mode == daa_mode
+        # The API stamped a real timestamp and the state carries it, minimally encoded.
+        assert contract.state.last_time == stamped >= (1 << 23)
+        assert is_minimal_4byte_scriptnum(stamped)
+        assert b"\x04" + stamped.to_bytes(4, "little") in contract.script
+
+        # --- the fixed path: consensus accepts the first mint -------------------
+        tx, _nonce = _build_signed_v2_mint(node, contract, current_time=stamped + 120)
+        res = node.accepts(tx.serialize().hex())
+        assert res["allowed"] is True, f"{daa_mode.name} mint of the API-deployed contract rejected: {res}"
+        mtxid = node.cli("sendrawtransaction", tx.serialize().hex())
+        assert isinstance(mtxid, str), mtxid
+        node.mine(1)
+        out = node.cli("gettxout", mtxid, "0")
+        assert out and round(out["value"] * 1e8) == _CONTRACT_VALUE
+        assert DmintState.from_script(bytes.fromhex(out["scriptPubKey"]["hex"])).height == 1
+
+        # --- the control: the pre-fix shape, same bytes but lastTime = 0 --------
+        dead = _deploy_v2_contract(node, max_height=1000, reward=1000, daa_mode=daa_mode, last_time=0)
+        assert dead.state.last_time == 0
+        assert b"\x04\x00\x00\x00\x00" in dead.script
+        # The control cannot be byte-identical to the contract above: a ref is inducted by
+        # spending a particular outpoint, so two live contracts necessarily carry different
+        # contractRef/tokenRef. What CAN be held equal is everything the refusal could
+        # otherwise be blamed on — the retarget bytecode and every other state field.
+        subject_daa = detect_contract_daa_bytecode(contract.script)
+        control_daa = detect_contract_daa_bytecode(dead.script)
+        assert (control_daa.daa_bytes, control_daa.version) == (subject_daa.daa_bytes, subject_daa.version), (
+            "control and subject bake different retarget bytecode; the refusal would prove nothing"
+        )
+        for field in ("max_height", "reward", "algo", "daa_mode", "target_time", "target", "height"):
+            assert getattr(dead.state, field) == getattr(contract.state, field), field
+        # pyrxd itself now refuses to build this mint ("can no longer be minted") — that is
+        # the point of the control's premise, so assert it first. The NODE is the judge the
+        # control exists for, though, so the refusal is patched out below to let the bytes
+        # reach it: without the node's own rejection, pyrxd's refusal would be a claim.
+        with pytest.raises(ValidationError, match="can no longer be minted"):
+            _build_signed_v2_mint(node, dead, current_time=stamped + 120)
+        monkeypatch.setattr(dmint_miner, "_refuse_unreadable_state_last_time", lambda state, epoch_length: None)
+        dead_tx, _n = _build_signed_v2_mint(node, dead, current_time=stamped + 120)
+        dead_res = node.accepts(dead_tx.serialize().hex())
+        assert dead_res.get("allowed") is not True, (
+            f"CONTROL FAILED: the node accepted a mint of a {daa_mode.name} contract whose lastTime "
+            f"is the non-minimal 00000000 — the whole premise of this fix is wrong: {dead_res}"
+        )
+        print(f"\n[{daa_mode.name}] control refusal: {dead_res.get('reject-reason')}")

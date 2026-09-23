@@ -81,6 +81,17 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "build_reveal_unlock_template": ("pyrxd.glyph.mint", "build_reveal_unlock_template"),
     "compute_next_target_asert": ("pyrxd.glyph.dmint", "compute_next_target_asert"),
     "compute_next_target_linear": ("pyrxd.glyph.dmint", "compute_next_target_linear"),
+    # Two generations of ASERT/LWMA retarget bytecode exist on chain (2026-09-16 resync to
+    # Photonic ASERT-v2 / LWMA-v2). The bare names above are the LEGACY formulas; these are
+    # the explicit spellings plus the detector `build_dmint_mint_tx` dispatches on.
+    "compute_next_target_asert_legacy": ("pyrxd.glyph.dmint", "compute_next_target_asert_legacy"),
+    "compute_next_target_asert_v2": ("pyrxd.glyph.dmint", "compute_next_target_asert_v2"),
+    "compute_next_target_linear_legacy": ("pyrxd.glyph.dmint", "compute_next_target_linear_legacy"),
+    "compute_next_target_linear_v2": ("pyrxd.glyph.dmint", "compute_next_target_linear_v2"),
+    "detect_contract_daa_bytecode": ("pyrxd.glyph.dmint", "detect_contract_daa_bytecode"),
+    "require_mineable_last_time": ("pyrxd.glyph.builder", "require_mineable_last_time"),
+    "DaaBytecodeVersion": ("pyrxd.glyph.dmint", "DaaBytecodeVersion"),
+    "DEFAULT_ASERT_HALFLIFE": ("pyrxd.glyph.dmint", "DEFAULT_ASERT_HALFLIFE"),
     "difficulty_to_target": ("pyrxd.glyph.dmint", "difficulty_to_target"),
     "mine_solution": ("pyrxd.glyph.dmint", "mine_solution"),
     "mine_solution_dispatch": ("pyrxd.glyph.dmint", "mine_solution_dispatch"),

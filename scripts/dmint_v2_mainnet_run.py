@@ -34,6 +34,7 @@ from pathlib import Path
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
+from pyrxd.glyph.builder import require_mineable_last_time
 from pyrxd.glyph.dmint import (
     DaaMode,
     DmintAlgo,
@@ -264,6 +265,13 @@ def prepare() -> None:
         height=0,
         last_time=_DEPLOY_LAST_TIME,
     )
+    # This harness reaches the byte-level encoder directly rather than going through
+    # prepare_dmint_deploy, so it has to cross the deploy guard itself. _DEPLOY_LAST_TIME
+    # is already correct per mode, but "already correct" is what every silently-broken
+    # deploy path looked like the day before it broke: a lastTime that is not a minimal
+    # script number builds a MAINNET contract nobody can ever mine, and nothing can undo
+    # it once the deploy confirms.
+    require_mineable_last_time(params.last_time, params.daa_mode, stage="dmint_v2_mainnet_run.prepare")
     contract_script = build_dmint_contract_script(params)
     state = DmintState.from_script(contract_script)
     assert state.is_v1 is False, "deploy script did not parse as V2"
