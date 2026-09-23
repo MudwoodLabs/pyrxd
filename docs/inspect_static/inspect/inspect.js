@@ -2391,8 +2391,9 @@ function renderErrorCard(payload) {
 // drawer that had dropped 3,436 fields saying nothing was cut. A count is a `*_not_listed` key
 // whose value holds a positive number: an update's own keys are the publisher's to choose and
 // can end the same way, but every value the classifier sends inside `fields` is text. The walk
-// stops at the depth `_render_safe` stops at, past which the payload holds a marker, not a
-// container.
+// goes at least as deep as `_render_safe` keeps containers (`_MAX_RENDER_DEPTH`; past it the
+// payload holds a text marker, which cannot hold a count) — test_inspect_page_is_bounded.py
+// pins that.
 const _CUT_WALK_DEPTH = 32;
 
 function _countsSomething(value, depth) {

@@ -1228,6 +1228,15 @@ class TestTheDrawerFindsEveryCut:
         for key, path in counts:
             assert drawn[key] == ("Show raw JSON (the lists are cut short)", [path]), key
 
+    def test_the_walk_goes_as_deep_as_the_payload_keeps_containers(self) -> None:
+        """Past `_MAX_RENDER_DEPTH` levels `_render_safe` leaves a text marker, which cannot hold a
+        count, so a walk at least that deep sees every count a payload can carry."""
+        from pyrxd.glyph._inspect_core import _MAX_RENDER_DEPTH
+
+        source = (_REPO_ROOT / "docs/inspect_static/inspect/inspect.js").read_text(encoding="utf-8")
+        (depth,) = re.findall(r"^const _CUT_WALK_DEPTH = (\d+);$", source, flags=re.MULTILINE)
+        assert int(depth) >= _MAX_RENDER_DEPTH
+
     def test_a_publishers_field_named_like_a_count_is_not_one(self, limit) -> None:
         """The honest path: an update's keys are the publisher's, and every value the classifier
         sends inside `fields` is text — so a field named like a count, with a count-shaped value,
