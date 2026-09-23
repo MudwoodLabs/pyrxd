@@ -11,9 +11,11 @@ at `pyrxd.contrib.miner` so callers don't have to provide their own.
 Every grinder pyrxd ships computes SHA256d and nothing else:
 `mine_solution`, `mine_solution_dispatch`, `mine_solution_external` (whose
 request carries no algorithm, and whose answer pyrxd re-checks with
-`verify_sha256d_solution`), and the bundled `pyrxd.contrib.miner`, whose
-`MineParams` has no algorithm field. A preimage is only bytes, so none of them
-can tell which hash the contract it came from runs.
+`verify_sha256d_solution`), the bundled `pyrxd.contrib.miner`, whose
+`MineParams` has no algorithm field, and the native grinder
+(`pyrxd.contrib.miner.native`), which receives that same algorithm-free request.
+A preimage is only bytes, so none of them can tell which hash the contract it
+came from runs.
 
 The first three take an `algo=` argument that defaults to `DmintAlgo.SHA256D`.
 Pass the contract's own `state.algo` and they raise `NotImplementedError` for
@@ -277,7 +279,7 @@ for a third-party binary that predates this addition) simply means the
 callback is never called — the grind still runs to completion or
 timeout exactly as it would with `progress=None`.
 
-### Why pure-Python and not C / GPU
+### Why pure-Python by default, and not C / GPU
 
 The load-bearing risk for any miner is **silent divergence** with the
 verifier. A miner that's byte-equivalent in the easy cases but drifts
@@ -290,18 +292,41 @@ the same primitive that `verify_sha256d_solution` uses. The parallel
 miner builds on that. **By construction**, the miner can't compute
 different bytes than the verifier on the same input.
 
-A hand-rolled C miner (or a GPU implementation) has to re-implement the
-midstate precompute, the byte-order conventions, and the
-fixed-preimage-length padding. Any one of those drifting silently
-produces nonces the network rejects. Until someone is willing to ship
-+ maintain that miner with byte-equality tests against pyrxd's
-verifier, the pure-Python option is the safer default.
+A C miner (or a GPU implementation) has to re-implement the midstate
+precompute, the byte-order conventions, and the fixed-preimage-length
+padding. Any one of those drifting silently produces nonces the network
+rejects. The native grinder below does exactly that, which is why it is held
+to byte-equality tests against `hashlib` and pyrxd's verifier, and why
+`mine_solution_external` re-checks every nonce it returns. The pure-Python
+miner stays the default because it needs no compiler and computes its hashes
+with the same `hashlib` primitive as the verifier.
 
 ### Cross-platform
 
 The bundled miner explicitly requests `multiprocessing`'s `spawn`
 start method via `get_context("spawn")` — works identically on Linux,
 macOS, and Windows. CI runs Linux + macOS; Windows is best-effort.
+
+## The native grinder: `pyrxd.contrib.miner.native`
+
+A C implementation of the same protocol, shipped as source and built on the
+machine that runs it:
+
+```bash
+python -m pyrxd.contrib.miner.native --out ./sha256d-grind   # compile + self-test
+pyrxd glyph claim-dmint ... --miner-cmd ./sha256d-grind
+```
+
+It computes the same rule as `verify_sha256d_solution`, compresses the
+64-byte preimage once per request instead of once per attempt, and uses the x86
+SHA extensions where the CPU has them. Measured on the i9-14900K named under
+[Performance](#performance) (2026-09-23, three runs each): 313–318 M hash/s on
+32 threads against the bundled miner's 25.3–25.7 M hash/s on 32 workers, and
+12.6–12.7 against 1.5–1.7 M hash/s on one. Like any external miner, every nonce
+it returns is re-checked by `mine_solution_external`. Its differential tests
+are described in its [README](../../src/pyrxd/contrib/miner/native/README.md).
+Building it needs a C compiler, which is why the pure-Python miner stays the
+default.
 
 ## Writing a custom miner
 
