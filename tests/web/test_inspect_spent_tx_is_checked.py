@@ -369,3 +369,152 @@ class TestTheBindingStepReadsOnlyTheInputs:
         monkeypatch.setattr(transaction_output.TransactionOutput, "from_hex", classmethod(counting))
         assert _binding(reveal, commit.serialize().hex())["state"] == "bound"
         assert len(calls) == 3, f"{len(calls)} outputs parsed: the spent transaction has 3, the reveal none"
+
+
+# ─────────────── the bytes after the inputs are walked, not trusted ──
+#
+# `_checked_inputs` is reachable from outside through the public
+# `pyrxd.glyph.inspect.spent_output_binding`, and it used to stop reading after the inputs,
+# relying on its callers having parsed the whole transaction first. A guard beside the operation
+# rather than inside it: called directly, it answered `bound` for bytes no parser accepts.
+
+
+def _malformed_after_the_inputs() -> dict[str, bytes]:
+    """The review's table: a well-formed reveal, then each way of breaking what follows its
+    inputs, plus a non-canonical input count."""
+    from pyrxd.transaction.transaction import Transaction
+
+    _commit, reveal = _commit_and_reveal("honest")
+    good = reveal.serialize()
+    tx = Transaction.from_hex(good)
+    assert len(tx.inputs) == 1 and len(tx.outputs) == 1, "the fixture's layout changed; recompute the offsets"
+    in_end = 4 + 1 + len(tx.inputs[0].serialize())
+    return {
+        "trailing-garbage": good + b"\xde\xad\xbe\xef",
+        "output-count-5-with-1-present": good[:in_end] + b"\x05" + good[in_end + 1 :],
+        "outputs-section-missing": good[:in_end],
+        "output-count-2**64-1": good[:in_end] + b"\xff" + b"\xff" * 8 + good[in_end + 1 :],
+        "script-length-over-claims": good[:in_end] + b"\x01" + b"\x00" * 8 + b"\x40" + good[in_end + 10 :],
+        "locktime-short": good[:-1],
+        "non-canonical-input-count": good[:4] + b"\xfd\x01\x00" + good[5:],
+    }
+
+
+class TestTheBytesAfterTheInputsAreWalked:
+    @pytest.mark.parametrize("case", sorted(_malformed_after_the_inputs()))
+    def test_what_a_whole_parse_refuses_is_refused(self, case) -> None:
+        from pyrxd.glyph import inspect as facade
+        from pyrxd.hash import hash256
+        from pyrxd.security.errors import ValidationError
+        from pyrxd.transaction.transaction import Transaction
+
+        raw = _malformed_after_the_inputs()[case]
+        txid = hash256(raw)[::-1].hex()
+        assert Transaction.from_hex(raw) is None, "the premise: a whole parse refuses these bytes"
+        with pytest.raises(ValidationError, match="could not parse|safety caps|non-canonical"):
+            _core()._checked_inputs(txid, raw)
+        # Through the public function the review called, and through the page's bridge.
+        commit, _reveal = _commit_and_reveal("honest")
+        with pytest.raises(ValidationError):
+            facade.spent_output_binding(txid, raw, commit.serialize())
+        refused = _glue().spent_output_binding(txid, raw.hex(), commit.serialize().hex(), "")
+        assert refused["ok"] is False, refused
+
+    def test_a_well_formed_transaction_is_still_bound(self) -> None:
+        """The honest neighbour of every refusal above, through the same public function."""
+        from pyrxd.glyph import inspect as facade
+
+        commit, reveal = _commit_and_reveal("honest")
+        assert facade.spent_output_binding(reveal.txid(), reveal.serialize(), commit.serialize())["state"] == "bound"
+
+    def test_more_outputs_than_the_cap_are_refused_as_the_classifier_refuses_them(self) -> None:
+        """Bytes a whole parse ACCEPTS and `_checked_transaction` refuses on its output cap. The
+        walk applies the same cap, so the binding step does not answer for a transaction the
+        classifier would not look at."""
+        from pyrxd.hash import hash256
+        from pyrxd.security.errors import ValidationError
+        from pyrxd.transaction.transaction import Transaction
+
+        n = _core()._MAX_OUTPUT_COUNT + 1
+        raw = (1).to_bytes(4, "little") + b"\x00" + b"\xfe" + n.to_bytes(4, "little") + b"\x00" * 9 * n + b"\x00" * 4
+        txid = hash256(raw)[::-1].hex()
+        assert len(Transaction.from_hex(raw).outputs) == n, "the premise: these bytes parse whole"
+        with pytest.raises(ValidationError, match="safety caps") as whole:
+            _core()._checked_transaction(txid, raw)
+        with pytest.raises(ValidationError, match="safety caps") as walked:
+            _core()._checked_inputs(txid, raw)
+        assert f"outputs={n}" in str(whole.value) and f"outputs={n}" in str(walked.value)
+
+    def test_the_walk_agrees_with_a_whole_parse_on_mutated_bytes(self) -> None:
+        """Not only the review's table: a seeded sweep of byte flips, cuts, insertions, deletions
+        and varint prefixes over transactions with no inputs, no outputs, 0xfd-wide lengths and
+        counts. The walk must refuse exactly what `Transaction.from_hex` plus the caps refuse, and
+        where both accept, read the same inputs. Counted both ways, so a sweep in which every
+        case is refused (or none is) cannot pass by being one-sided."""
+        import random
+
+        from pyrxd.hash import hash256
+        from pyrxd.security.errors import ValidationError
+        from pyrxd.transaction.transaction import Transaction
+
+        rng = random.Random(20260923)
+
+        def raw_tx(n_in: int, outs: list[tuple[bytes, int]]) -> bytes:
+            # One push of random bytes: a well-formed script whose length varies.
+            pushes = [bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 75))) for _ in range(n_in)]
+            ins = [(f"{rng.getrandbits(256):064x}", i, bytes([len(p)]) + p) for i, p in enumerate(pushes)]
+            return _tx(outs, ins).serialize()
+
+        bases = [
+            raw_tx(1, [(_P2PKH, 5)]),
+            raw_tx(2, [(b"\x51" * rng.randint(0, 300), rng.randint(0, 10**9)) for _ in range(12)]),
+            raw_tx(3, []),
+            raw_tx(0, [(b"\x6a", 0)] * 3),
+            raw_tx(1, [(b"\x51" * 300, 1)] * 2),
+            raw_tx(1, [(b"", 0)] * 300),
+        ]
+        caps = (_core()._MAX_INPUT_COUNT, _core()._MAX_OUTPUT_COUNT)
+
+        def whole(raw: bytes):
+            tx = Transaction.from_hex(raw)
+            if tx is None or len(tx.inputs) > caps[0] or len(tx.outputs) > caps[1]:
+                return None
+            return [i.serialize() for i in tx.inputs]
+
+        def walked(raw: bytes):
+            try:
+                return [i.serialize() for i in _core()._checked_inputs(hash256(raw)[::-1].hex(), raw)]
+            except ValidationError:
+                return None
+
+        def mutate(b: bytes) -> bytes:
+            out = bytearray(b)
+            op = rng.randrange(6)
+            if op == 0:
+                out[rng.randrange(len(out))] = rng.randrange(256)
+            elif op == 1:
+                del out[rng.randrange(len(out) + 1) :]
+            elif op == 2:
+                at = rng.randrange(len(out) + 1)
+                out[at:at] = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 9)))
+            elif op == 3:
+                at = rng.randrange(len(out))
+                del out[at : at + rng.randint(1, 9)]
+            elif op == 4:
+                out += bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 5)))
+            else:
+                out[rng.randrange(len(out))] = rng.choice([0x00, 0xFC, 0xFD, 0xFE, 0xFF])
+            return bytes(out)
+
+        accepted = refused = 0
+        for _ in range(3000):
+            raw = rng.choice(bases)
+            for _ in range(rng.randint(0, 3)):
+                raw = mutate(raw) if raw else raw
+            if len(raw) <= 64:  # refused by the hash binding before either reader runs
+                continue
+            expected, got = whole(raw), walked(raw)
+            assert got == expected, f"the walk and a whole parse disagree on {raw.hex()[:160]}…"
+            accepted += got is not None
+            refused += got is None
+        assert accepted > 300 and refused > 300, (accepted, refused)

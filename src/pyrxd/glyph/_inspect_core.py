@@ -1500,35 +1500,76 @@ def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
 
 
 def _checked_inputs(txid_hex: str, raw: bytes) -> list:
-    """The INPUTS of *raw*, after :func:`_bound_to_txid` — without parsing a single output.
+    """The INPUTS of *raw*, after :func:`_bound_to_txid` — without building a single output.
 
     For a caller that needs only the inputs: the spent-output binding reads one input's envelope,
     and a transaction's outputs can be 4 MB of it. The inputs come first on the wire (version,
     input count, inputs), and each is read by ``TransactionInput.from_hex``, the reader
     ``Transaction.from_reader`` uses for them; ``tests/web/test_inspect_spent_tx_is_checked.py``
-    pins the result equal to ``Transaction.from_hex(raw).inputs``. What is NOT checked here is
-    that the rest of the bytes parse: the hash check has already bound them to a txid, and both
-    callers in this repository — the page's binding step and ``pyrxd glyph inspect --fetch`` —
-    have classified that same transaction, whole, first. Raises ``ValidationError``.
+    pins the result equal to ``Transaction.from_hex(raw).inputs``.
+
+    THE REST OF THE BYTES ARE WALKED, NOT TRUSTED. This is public
+    (``pyrxd.glyph.inspect.spent_output_binding`` reaches it), so it cannot lean on a caller
+    having parsed the transaction first: it used to stop after the inputs, and answered ``bound``
+    for bytes with trailing garbage, a missing outputs section, or an output count of 2**64 - 1,
+    all of which ``Transaction.from_hex`` refuses. So after the inputs it walks the outputs the
+    way ``Transaction.from_reader`` reads them — the count, and for each output its 8-byte value,
+    its script length and exactly that many script bytes — then the locktime, and requires the
+    walk to end on the last byte, as ``from_hex`` does. The script bytes are skipped, not copied,
+    and no output object is built. It refuses what a whole parse refuses, and the output-count
+    cap :func:`_checked_transaction` applies; the same test file pins that against
+    ``Transaction.from_hex`` on malformed and well-formed bytes alike. Raises ``ValidationError``.
     """
     from ..transaction.transaction_input import TransactionInput
     from ..utils import Reader
 
     _bound_to_txid(txid_hex, raw)
-    reader = Reader(bytes(raw))
-    version = reader.read_uint32_le()
-    count = reader.read_var_int_num()
-    if version is None or count is None:
-        raise ValidationError("could not parse the raw transaction bytes")
-    if count > _MAX_INPUT_COUNT:
-        raise ValidationError(f"transaction structure exceeds inspect's safety caps (inputs={count})")
-    inputs = []
-    for _ in range(count):
-        inp = TransactionInput.from_hex(reader)
-        if inp is None:
+    data = bytes(raw)
+    reader = Reader(data)
+    try:
+        version = reader.read_uint32_le()
+        count = reader.read_var_int_num()
+        if version is None or count is None:
             raise ValidationError("could not parse the raw transaction bytes")
-        inputs.append(inp)
+        if count > _MAX_INPUT_COUNT:
+            raise ValidationError(f"transaction structure exceeds inspect's safety caps (inputs={count})")
+        inputs = []
+        for _ in range(count):
+            inp = TransactionInput.from_hex(reader)
+            if inp is None:
+                raise ValidationError("could not parse the raw transaction bytes")
+            inputs.append(inp)
+        _walk_outputs_to_the_end(reader, len(data))
+    except ValidationError:
+        raise
+    except Exception as exc:  # a non-canonical or truncated varint, and anything else about the bytes
+        raise ValidationError("could not parse the raw transaction bytes") from exc
     return inputs
+
+
+def _walk_outputs_to_the_end(reader, total: int) -> None:
+    """Walk the outputs and locktime of a transaction whose inputs *reader* has just read, to its
+    last byte. ``Transaction.from_reader``'s layout; raises ``ValidationError`` where it fails."""
+    unparsable = "could not parse the raw transaction bytes"
+    count = reader.read_var_int_num()
+    if count is None:
+        raise ValidationError(unparsable)
+    if count > _MAX_OUTPUT_COUNT:
+        raise ValidationError(f"transaction structure exceeds inspect's safety caps (outputs={count})")
+    for _ in range(count):
+        if reader.read_exact(8) is None:  # the value
+            raise ValidationError(unparsable)
+        length = reader.read_var_int_num()
+        if length is None:
+            raise ValidationError(unparsable)
+        at = reader.tell()
+        if length > total - at:  # an over-claiming script length: a whole parse refuses it too
+            raise ValidationError(unparsable)
+        reader.seek(at + length)
+    if reader.read_uint32_le() is None:  # the locktime
+        raise ValidationError(unparsable)
+    if not reader.eof():
+        raise ValidationError(f"{unparsable}: {total - reader.tell()} byte(s) after the locktime")
 
 
 def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector) -> tuple | None:
@@ -1574,9 +1615,9 @@ def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *,
     ``not-a-commit`` from :func:`_payload_binding` itself — or ``unchecked`` with a ``detail`` that
     says what went wrong. Never "was not supplied": this is only called by a caller that asked.
 
-    Costs a hash of *raw*, a parse of its inputs (never its outputs — see
-    :func:`_checked_inputs`) and a parse of *spent_raw*, and no classification of anything: the
-    binding reads the attributed input's envelope and the one output it spent.
+    Costs a hash of *raw*, a parse of its inputs and a walk of its outputs that builds none of
+    them (see :func:`_checked_inputs`), and a parse of *spent_raw*, and no classification of
+    anything: the binding reads the attributed input's envelope and the one output it spent.
     ``tests/web/test_inspect_spent_tx_is_checked.py`` pins it equal to a full re-classification.
 
     Raises ``ValidationError`` only for *raw* itself (bound to *txid_hex* by the same check
