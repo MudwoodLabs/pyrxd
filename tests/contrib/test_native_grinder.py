@@ -431,6 +431,11 @@ def _req(**fields) -> str:
     return json.dumps({k: v for k, v in base.items() if v is not ...})
 
 
+def _raw(value_text: str) -> str:
+    """A valid request plus an unknown field whose value is ``value_text`` verbatim."""
+    return _req()[:-1] + f', "x": {value_text}}}'
+
+
 # Requests both parsers accept, and requests both refuse (exit 1 / ProtocolError).
 _BOTH_ACCEPT = [
     _req(),
@@ -443,6 +448,11 @@ _BOTH_ACCEPT = [
     _req(target_hex="1" + "0" * 40),
     _req(extra="x", n=3, f=1.5, t=True, z=None),
     " \n" + _req() + "\n ",
+    _raw("-0.5e+3"),
+    _raw("0"),
+    _raw("-0"),
+    _raw("1E9"),
+    _raw("18446744073709551616"),
 ]
 _BOTH_REFUSE = [
     "",
@@ -465,6 +475,19 @@ _BOTH_REFUSE = [
     _req(protocol="1"),
     _req() + "garbage",
     "{" + " " * 5000 + "}",
+    # Not JSON numbers or literals, even in a field nobody reads.
+    _raw("-"),
+    _raw("01"),
+    _raw("1."),
+    _raw(".5"),
+    _raw("1e"),
+    _raw("+1"),
+    _raw("truex"),
+    _raw("nul"),
+    # Not UTF-8.
+    _req().encode()[:-1] + b', "x": "\xff"}',
+    # A repeated key: the last value wins in both, and here it is invalid.
+    _req()[:-1] + ', "nonce_width": 5}',
 ]
 # Accepted by the Python parser, refused by the C one — deliberately: pyrxd's own request never
 # contains any of them (it is json.dumps of two lowercase hex strings and an int). Pinned both
@@ -477,37 +500,40 @@ _ONLY_PYTHON_ACCEPTS = [
     _req(extra="\\u0041"),
     _req(extra={"nested": 1}),
     _req(extra=[1, 2]),
+    json.dumps({"preimage_hex": _PRE, "target_hex": "7f", "nonce_width": 4, "x": "\u00e9"}, ensure_ascii=False),
+    # A repeated key whose FIRST value is invalid: Python keeps only the last, valid one.
+    '{"nonce_width": 5, ' + _req()[1:],
 ]
 
 
-def _python_accepts(request: str) -> bool:
+def _python_accepts(request: str | bytes) -> bool:
     try:
-        MineRequest.from_json(request.encode())
+        MineRequest.from_json(request.encode() if isinstance(request, str) else request)
     except ValueError:
         return False
     return True
 
 
-def _grinder_accepts(grinder: str, request: str) -> bool:
+def _grinder_accepts(grinder: str, request: str | bytes) -> bool:
     r = _run(grinder, request, "--nonce-count", "1", "--quiet", timeout=30)
     assert r.returncode in (0, 1, 2), r
     return r.returncode != 1
 
 
 @pytest.mark.parametrize("request_text", _BOTH_ACCEPT)
-def test_requests_both_parsers_accept(grinder: str, request_text: str) -> None:
+def test_requests_both_parsers_accept(grinder: str, request_text: str | bytes) -> None:
     assert _python_accepts(request_text)
     assert _grinder_accepts(grinder, request_text)
 
 
 @pytest.mark.parametrize("request_text", _BOTH_REFUSE)
-def test_requests_both_parsers_refuse(grinder: str, request_text: str) -> None:
+def test_requests_both_parsers_refuse(grinder: str, request_text: str | bytes) -> None:
     assert not _python_accepts(request_text)
     assert not _grinder_accepts(grinder, request_text)
 
 
 @pytest.mark.parametrize("request_text", _ONLY_PYTHON_ACCEPTS)
-def test_requests_only_the_python_parser_accepts(grinder: str, request_text: str) -> None:
+def test_requests_only_the_python_parser_accepts(grinder: str, request_text: str | bytes) -> None:
     assert _python_accepts(request_text)
     assert not _grinder_accepts(grinder, request_text)
 

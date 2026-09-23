@@ -408,8 +408,11 @@ static int parse_u64_arg(const char *s, uint64_t *out) {
  * A deliberately small JSON reader for the one flat object the protocol sends:
  * {"preimage_hex": str, "target_hex": str, "nonce_width": int, "protocol": int}.
  * Unknown keys are ignored when their value is a string, number, true, false or
- * null; a nested object or array, or a string containing a backslash escape, is
- * refused with exit code 1. pyrxd's request never contains any of those.
+ * null. It refuses, with exit code 1, some JSON that Python's json module would
+ * accept: a nested object or array, a string with a backslash escape, any byte
+ * outside ASCII, and a repeated key whose first value is invalid. pyrxd's request
+ * (json.dumps of two lowercase hex strings and an integer) never contains any of
+ * those. tests/contrib/test_native_grinder.py pins both lists.
  */
 typedef struct {
     const char *p, *end;
@@ -445,26 +448,46 @@ static int read_string(cursor_t *c, const char **s, size_t *n) {
     return 1;
 }
 
-/* A JSON number token. Sets *is_uint and *value when it is a plain non-negative integer. */
+static int is_digit(char ch) { return ch >= '0' && ch <= '9'; }
+
+/*
+ * One JSON number (RFC 8259: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?). Sets *is_uint and
+ * *value when it is a non-negative integer that fits in 64 bits, as the protocol's integer
+ * fields must be. Anything else that is not a number returns 0.
+ */
 static int read_number(cursor_t *c, int *is_uint, uint64_t *value) {
     skip_ws(c);
-    const char *start = c->p;
+    const char *p = c->p, *const end = c->end;
     int plain = 1;
     uint64_t v = 0;
-    while (c->p < c->end) {
-        const char ch = *c->p;
-        if (ch >= '0' && ch <= '9') {
-            if (v > (UINT64_MAX - 9) / 10) plain = 0;
-            v = v * 10 + (uint64_t)(ch - '0');
-        } else if (ch == '-' || ch == '+' || ch == '.' || ch == 'e' || ch == 'E') {
-            plain = 0;
-        } else {
-            break;
-        }
-        c->p++;
+    if (p < end && *p == '-') {
+        plain = 0;
+        p++;
     }
-    if (c->p == start) return 0;
-    *is_uint = plain && (start[0] != '0' || c->p - start == 1);
+    if (p >= end || !is_digit(*p)) return 0;
+    if (*p == '0') {
+        p++;
+    } else {
+        for (; p < end && is_digit(*p); p++) {
+            if (v > (UINT64_MAX - 9) / 10) plain = 0;
+            v = v * 10 + (uint64_t)(*p - '0');
+        }
+    }
+    if (p < end && *p == '.') {
+        plain = 0;
+        p++;
+        if (p >= end || !is_digit(*p)) return 0;
+        while (p < end && is_digit(*p)) p++;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        plain = 0;
+        p++;
+        if (p < end && (*p == '+' || *p == '-')) p++;
+        if (p >= end || !is_digit(*p)) return 0;
+        while (p < end && is_digit(*p)) p++;
+    }
+    c->p = p;
+    *is_uint = plain;
     *value = v;
     return 1;
 }
@@ -490,6 +513,12 @@ typedef struct {
 static int parse_request(const char *buf, size_t len, request_t *req, const char **why) {
     cursor_t c = {buf, buf + len};
     int have_pre = 0, have_target = 0, have_width = 0;
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)buf[i] >= 0x80) {
+            *why = "request contains a byte outside ASCII";
+            return 0;
+        }
+    }
     if (!take_char(&c, '{')) {
         *why = "request must be a JSON object";
         return 0;
