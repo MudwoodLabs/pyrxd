@@ -983,8 +983,38 @@ class TestAnOutputsRefsAreBounded:
         assert bounded["token_bearing"] is True, "decided over every ref, not the ones sent"
         text = _card(_classified(_refs(100, 150), _p2pkh(), limit=limit))["fetched_tx_card"]
         assert text.count("ref (0xd0)") == _HUMAN_ENTRY_CAP and text.count("ref (0xd2)") == _HUMAN_ENTRY_CAP
-        assert f"… and {100 - _HUMAN_ENTRY_CAP} more TOKEN-BEARING refs not shown" in text
-        assert f"… and {150 - _HUMAN_ENTRY_CAP} more named refs not shown" in text
+        assert f"… and {100 - _HUMAN_ENTRY_CAP} more TOKEN-BEARING ref pushes not shown\n" in text
+        assert f"… and {150 - _HUMAN_ENTRY_CAP} more named-ref opcodes not shown" in text
+
+    @staticmethod
+    def _pushed(*opcodes: int) -> tuple[dict, str]:
+        """(the page's row, its card) for one output pushing ONE ref once per opcode given."""
+        ref = os.urandom(32) + b"\x00" * 4
+        script = b"".join(bytes([op]) + ref for op in opcodes)
+        payload = _classified(script, _p2pkh(), limit=100)
+        return payload["outputs"][0], _card(payload)["fetched_tx_card"]
+
+    def test_the_count_is_of_pushes_not_of_distinct_refs(self) -> None:
+        """One ref pushed 40 times is 40 entries, 32 drawn alike, and the words say what was
+        counted: it read "8 more TOKEN-BEARING refs" of an output that names one."""
+        row, text = self._pushed(*[0xD0] * 40)
+        assert len({ref["ref_outpoint"] for ref in row["input_refs"]}) == 1, "the premise: one distinct ref"
+        assert row["input_refs_not_listed"] == {"count": 8}
+        assert text.count("ref (0xd0)") == 32
+        assert "… and 8 more TOKEN-BEARING ref pushes not shown\n" in text
+
+    def test_a_singleton_past_the_cut_is_counted_on_its_own(self) -> None:
+        row, text = self._pushed(*[0xD0] * 40, 0xD8)
+        assert row["input_refs_not_listed"] == {"count": 9, "singletons": 1}
+        assert "ref (0xd8)" not in text, "the premise: the singleton is past the cut"
+        assert "… and 9 more TOKEN-BEARING ref pushes not shown, 1 of them 0xd8 (singleton)" in text
+
+    def test_a_singleton_that_is_drawn_is_not_counted_again(self) -> None:
+        """The honest path: a 0xd8 among the drawn 32 is on the card, and the count of the rest
+        carries no singleton figure."""
+        row, text = self._pushed(0xD8, *[0xD0] * 40)
+        assert row["input_refs_not_listed"] == {"count": 9}
+        assert "ref (0xd8)" in text and "of them 0xd8" not in text
 
     def test_the_page_does_not_grow_with_the_refs(self, limit) -> None:
         small = _result(_refs(40, 40), _p2pkh(), limit=limit)

@@ -177,9 +177,13 @@ cut, and a list whose first 64 entries are not text draws no permissions
 line at all. `pyrxd glyph inspect` reads the list through the same
 decoder and counts it the same way.
 
-A listed output's refs are cut too: at most 32 of the refs it carries
-and 32 of the refs it only names, with the rest counted under the row's
-`input_refs_not_listed` and `referenced_refs_not_listed`.
+A listed output's refs are cut too: at most 32 of the opcodes that
+carry a ref (0xd0, 0xd8) and 32 of those that only name one (0xd1–0xd3),
+with the rest counted under the row's `input_refs_not_listed` and
+`referenced_refs_not_listed`. These count opcodes, not distinct refs: a
+script that pushes one ref 40 times has 40. Of the carried ones left
+out, the singleton pushes (0xd8) are counted again on their own, and the
+page says how many.
 
 What still grows with the transaction: fetching and parsing it, the
 per-entry work behind the counts — each output's type and refs, each

@@ -1474,12 +1474,21 @@ function renderOutputRow(row, opts) {
     ));
     // Each list arrives cut at _ENTRY_CAP, with the rest counted beside it: a script's author
     // chooses how many refs it names, and one output naming 100,000 of them drew 300,042 elements.
+    // An entry, and so a count, is one ref opcode in the script, not one distinct ref: one ref
+    // pushed 40 times is 40. A singleton push (0xd8) left out is counted on its own, so it is
+    // never hidden inside the bare count.
     const refsNotListed = (key) => Number((row[`${key}_not_listed`] || {}).count) || 0;
     for (const ref of row.input_refs || []) {
       dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} TOKEN-BEARING`, "kv-warning"));
     }
     if (refsNotListed("input_refs") > 0) {
-      dl.appendChild(kv("", `… and ${refsNotListed("input_refs")} more TOKEN-BEARING refs not shown`, "kv-warning"));
+      const singletons = Number((row.input_refs_not_listed || {}).singletons) || 0;
+      dl.appendChild(kv(
+        "",
+        `… and ${refsNotListed("input_refs")} more TOKEN-BEARING ref pushes not shown` +
+          (singletons > 0 ? `, ${singletons} of them 0xd8 (singleton)` : ""),
+        "kv-warning",
+      ));
     }
     // 0xd1/0xd2/0xd3 name a ref without holding one — a gate, not a
     // carrier. Kept visually apart from the line above so it never reads
@@ -1488,7 +1497,7 @@ function renderOutputRow(row, opts) {
       dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} — named, not carried`));
     }
     if (refsNotListed("referenced_refs") > 0) {
-      dl.appendChild(kv("", `… and ${refsNotListed("referenced_refs")} more named refs not shown`));
+      dl.appendChild(kv("", `… and ${refsNotListed("referenced_refs")} more named-ref opcodes not shown`));
     }
   }
 

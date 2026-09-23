@@ -388,12 +388,23 @@ _ROW_LISTS = {"input_refs": "input_refs_not_listed", "referenced_refs": "referen
 def _drawn_row_lists(row: dict) -> None:
     """Cut each of a listed row's :data:`_ROW_LISTS` to its first :data:`_HUMAN_ENTRY_CAP`
     entries — the ones ``inspect.js`` draws — and count the rest, exactly, beside it as
-    ``{"count": n}``. A list at or under the cap is left whole, with no count."""
+    ``{"count": n}``. A list at or under the cap is left whole, with no count.
+
+    An entry is one ref OPCODE in the script, not one distinct ref: a script pushing one ref 40
+    times has 40 entries, and the count is of opcodes. Of the entries left out, the singleton
+    pushes (0xd8) are also counted, as ``"singletons"``, when there are any, so that none is
+    hidden inside the bare count."""
+    from ..constants import OP_PUSHINPUTREFSINGLETON_BYTE
+
+    singleton = f"0x{OP_PUSHINPUTREFSINGLETON_BYTE:02x}"  # the spelling `_ref_summary` gives an opcode
     for key, not_listed in _ROW_LISTS.items():
         entries = row.get(key)
         if isinstance(entries, list) and len(entries) > _HUMAN_ENTRY_CAP:
             row[key] = entries[:_HUMAN_ENTRY_CAP]
             row[not_listed] = {"count": len(entries) - _HUMAN_ENTRY_CAP}
+            singletons = sum(1 for entry in entries[_HUMAN_ENTRY_CAP:] if entry.get("opcode") == singleton)
+            if singletons:
+                row[not_listed]["singletons"] = singletons
 
 
 def _sanitize_display_string(s: object) -> str:
