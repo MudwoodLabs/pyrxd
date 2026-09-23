@@ -120,6 +120,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`max_rows`, a keyword on `pyrxd.glyph.inspect.classify_raw_tx`** — for a caller that draws
+  what it is given. `None`, the default, lists everything and adds no key, and is what
+  `pyrxd glyph inspect` passes; /inspect/ passes 100. With a number set, the payload changes
+  shape:
+  - `outputs`, `glyph_envelopes`, the other payloads in `metadata_inputs`,
+    `metadata.relationships` and `metadata.delegate_burns` hold at most that many entries, and
+    the rest are counted under a `*_not_listed` key beside each;
+  - an update envelope's `fields` hold only the ones /inspect/ draws, and the rest are counted
+    under `fields_not_listed`;
+  - a listed output's `input_refs` and `referenced_refs` are cut to 32 entries each, one entry
+    per ref opcode, and the rest are counted under `input_refs_not_listed` and
+    `referenced_refs_not_listed` (with `singletons` for the 0xd8 pushes left out);
+  - when outputs were cut, `output_shape` says what every output is.
+
+  A negative or non-integer `max_rows` raises `ValidationError`.
+
 - **`GlyphMetadata.loc_vout`** — an INTEGER `loc` is kept instead of dropped with a warning.
   Photonic reads an integer `loc` as a pointer to one of the token's own refs, whose payload
   it merges into this one; pyrxd read `loc` only as text, so such a token decoded as though it
