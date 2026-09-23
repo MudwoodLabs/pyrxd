@@ -2406,10 +2406,31 @@ function fetchFailure(err, txid) {
   const cli = `pyrxd glyph inspect ${txid} --fetch`;
   let hint;
   if (kind === "refused") {
-    hint =
-      "The server answered, and it did not give back a transaction for that number. The " +
-      "commonest reason is that the number is wrong, or is not a transaction at all; " +
-      "retrying will not change this answer.";
+    // By what the frame says (`refusalReason`, shared.js): a refusal is not always about the
+    // transaction, and "retrying will not change this answer" was false for a busy server.
+    const reason = refusalReason(err);
+    if (reason === "absent") {
+      hint =
+        "The server answered that the Radiant node behind it has no transaction with that " +
+        "number, in its chain or its mempool. The number may be wrong, or the transaction may " +
+        "not have reached that node: one broadcast moments ago may not have yet.";
+    } else if (reason === "server") {
+      hint =
+        "The server declined to answer this time, for a reason of its own (it was busy, or " +
+        "failed), so nothing was learned about the transaction. Try again in a moment, or ask " +
+        `another server with the CLI: pyrxd --electrumx URL glyph inspect ${txid} --fetch`;
+    } else if (reason === "request") {
+      hint =
+        "The server refused the request itself as malformed, so nothing was learned about the " +
+        "transaction, and asking again in the same form will get the same answer. A transaction " +
+        "number is 64 hexadecimal characters.";
+    } else {
+      hint =
+        "The server answered with an error instead of the transaction. Its words, above, do " +
+        "not say whether it has no such transaction or could not answer this time, so this " +
+        "page will not guess: check the number, and if it is right, try again later or ask " +
+        `another server with the CLI: pyrxd --electrumx URL glyph inspect ${txid} --fetch`;
+    }
   } else if (kind === "unreachable") {
     hint =
       `The server could not be reached. Try again in a moment, check that ${ELECTRUMX_WSS_URL} is ` +

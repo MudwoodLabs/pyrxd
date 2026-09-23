@@ -27,10 +27,11 @@
 // Contract:
 //   node inspect_fetch_flow_harness.mjs < case.json
 //   stdin:  {"txid": hex,
-//            "server": {txid: {"hex": rawHex} | {"error": message} | {"close": true}
-//                             | {"frame": text}},  — anything not listed answers
-//                      "No such mempool or blockchain transaction". `close` closes the socket
-//                      without answering; `frame` is sent verbatim instead of a JSON reply.
+//            "server": {txid: {"hex": rawHex} | {"error": message, "code"?: n} | {"close": true}
+//                             | {"frame": text}},  — anything not listed answers with the frame
+//                      the public endpoint was measured to send for a transaction it does not
+//                      have (NOT_FOUND_FRAME below). `close` closes the socket without
+//                      answering; `frame` is sent verbatim instead of a JSON reply.
 //            "glue_returns": [result, …],   — what the classifier bridge returns, call by call
 //            "binding_returns": [result, …]} — what the binding bridge returns, call by call
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
@@ -101,6 +102,16 @@ function renderedLines(node) {
   return out.join("\n");
 }
 
+// What the public ElectrumX endpoint /inspect/ uses answered, measured 2026-09-23, for
+// `blockchain.transaction.get` of a txid it does not have: ElectrumX's DAEMON_ERROR (2) wrapping
+// the node's own -5.
+const NOT_FOUND_ERROR = {
+  code: 2,
+  message:
+    "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. " +
+    "Use gettransaction for wallet transactions.'})",
+};
+
 // One ElectrumX server, answering `blockchain.transaction.get` from a table. Each socket
 // serves one request, as `electrumxRpc` uses it: open, one frame out, one frame back.
 function makeServer(table, requested) {
@@ -131,9 +142,14 @@ function makeServer(table, requested) {
         setTimeout(() => this.dispatch("message", { data: entry.frame }), 0);
         return;
       }
-      const frame = entry && typeof entry.hex === "string"
-        ? { id: req.id, result: entry.hex }
-        : { id: req.id, error: { message: (entry && entry.error) || "No such mempool or blockchain transaction" } };
+      let frame;
+      if (entry && typeof entry.hex === "string") {
+        frame = { id: req.id, result: entry.hex };
+      } else if (entry && typeof entry.error === "string") {
+        frame = { id: req.id, error: entry.code === undefined ? { message: entry.error } : { code: entry.code, message: entry.error } };
+      } else {
+        frame = { id: req.id, error: NOT_FOUND_ERROR };
+      }
       setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
     }
     close() {}

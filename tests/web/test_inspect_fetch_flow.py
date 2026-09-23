@@ -285,9 +285,67 @@ class TestAFailedFirstFetchIsAdvisedByWhatFailed:
         hint = self._hint(_flow("ab" * 32, {"ab" * 32: {"close": True}}, []))
         assert "could not be reached" in hint and "reachable" in hint
 
-    def test_a_refusal_says_the_number_may_be_wrong(self) -> None:
-        hint = self._hint(_flow("ab" * 32, {}, []))
-        assert "number is wrong" in hint and "reachable" not in hint
+    # REAL error frames. The first three are aiorpcX 0.25.0's own (``aiorpcx/session.py``,
+    # ``_throttled_request``; codes from ``aiorpcx/jsonrpc.py``), which every ElectrumX server
+    # answers through; "not-found" is what the page's public endpoint was measured to send
+    # (2026-09-23) for a txid it does not have, and "bad-request" what it sent for "zz".
+    _TRANSIENT = {
+        "server-busy": (-102, "server busy - request timed out"),
+        "excessive-resource-usage": (-101, "excessive resource usage"),
+        "internal-server-error": (-32603, "internal server error"),
+    }
+    _NOT_FOUND = (
+        2,
+        "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. "
+        "Use gettransaction for wallet transactions.'})",
+    )
+
+    def _refused(self, code, message) -> tuple[str, str]:
+        """(the drawn error line, the drawn hint) for a refusal carrying this code and message."""
+        entry = {"error": message} if code is None else {"error": message, "code": code}
+        lines = _flow("ab" * 32, {"ab" * 32: entry}, [])["rendered"].split("\n")
+        failed = next(i for i, line in enumerate(lines) if line.startswith("fetch failed: "))
+        return lines[failed], lines[failed + 1]
+
+    @pytest.mark.parametrize("case", sorted(_TRANSIENT))
+    def test_a_busy_or_failing_server_is_not_called_a_wrong_number(self, case) -> None:
+        """ "retrying will not change this answer" was the advice for EVERY refusal, and for these
+        three retrying is the one thing that can."""
+        error, hint = self._refused(*self._TRANSIENT[case])
+        assert error == f"fetch failed: server error: {self._TRANSIENT[case][1]}"
+        assert "declined to answer this time" in hint and "Try again in a moment" in hint
+        assert "number" not in hint.split("CLI")[0], hint
+        assert "will not change" not in hint and "commonest" not in hint
+
+    def test_a_transaction_the_node_does_not_have_says_the_number_may_be_wrong(self) -> None:
+        """The honest neighbour: the definitive answer still points at the number — and does not
+        promise that retrying cannot help, since a transaction broadcast moments ago may not have
+        reached the server's node yet."""
+        error, hint = self._refused(*self._NOT_FOUND)
+        assert "No such mempool or blockchain transaction" in error
+        assert "no transaction with that number" in hint and "number may be wrong" in hint
+        assert "may not have reached that node" in hint
+        assert "will not change" not in hint and "commonest" not in hint and "reachable" not in hint
+
+    def test_the_servers_default_refusal_is_the_real_not_found_frame(self) -> None:
+        """The harness's own default (a txid not in its table) is that measured frame, so every
+        flow above that ends on a refusal ends on the real one."""
+        rendered = _flow("ab" * 32, {}, [])["rendered"]
+        assert "fetch failed: server error: daemon error: DaemonError({'code': -5" in rendered
+        assert "no transaction with that number" in rendered
+
+    def test_a_malformed_request_says_asking_again_gets_the_same_answer(self) -> None:
+        _error, hint = self._refused(1, "zz should be a transaction hash")
+        assert "refused the request itself" in hint and "same answer" in hint
+
+    @pytest.mark.parametrize("code, message", [(None, "daemon busy"), (-1, "something else"), (2, "daemon error: x")])
+    def test_a_refusal_the_frame_does_not_explain_gets_advice_true_for_both(self, code, message) -> None:
+        """No code, or a code the page does not know, or ElectrumX's daemon error wrapping
+        something other than -5: the advice has to hold whether the transaction is missing or the
+        server is not."""
+        _error, hint = self._refused(code, message)
+        assert "will not guess" in hint and "check the number" in hint and "try again later" in hint
+        assert "will not change" not in hint and "declined to answer this time" not in hint
 
     def test_an_unreadable_reply_says_it_was_refused_rather_than_read(self) -> None:
         hint = self._hint(_flow("ab" * 32, {"ab" * 32: {"frame": "not json"}}, []))

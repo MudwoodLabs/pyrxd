@@ -486,6 +486,38 @@ function wireError(kind, message) {
   return err;
 }
 
+// WHAT A "refused" ANSWER SAYS ABOUT THE TRANSACTION, where the frame says it.
+//
+// `refused` is EVERY JSON-RPC error frame, and they are not all about the transaction asked for.
+// ElectrumX servers answer through aiorpcX, which (0.25.0, `aiorpcx/session.py`
+// `_throttled_request`; codes in `aiorpcx/jsonrpc.py`) sends the same frame shape when the server
+// is too busy to finish — "server busy - request timed out", -102 — when this connection has
+// used too much — "excessive resource usage", -101 — and when its own handler failed — "internal
+// server error", -32603. None of those is an answer about the transaction, and each can go away.
+// A transaction the server's node does not have comes back as ElectrumX's DAEMON_ERROR, code 2,
+// wrapping the node's own code -5: measured against the endpoint above,
+// `daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction.
+// Use gettransaction for wallet transactions.'})`. A parameter that is not a transaction hash
+// is refused with ElectrumX's BAD_REQUEST, code 1.
+//
+//   "absent"  — code 2 wrapping the node's -5: no such transaction in that node's chain or
+//               mempool. About the transaction, AS THAT NODE SEES IT NOW: one broadcast moments
+//               ago may not have reached it.
+//   "server"  — -101, -102 or -32603: the server declined for a reason of its own, and nothing
+//               was learned about the transaction.
+//   "request" — code 1: the request itself was refused, and asking again in the same form gets
+//               the same answer.
+//   "unknown" — any other frame. The words cannot tell which of the above it is, so advice
+//               written for it must hold whether the transaction is missing or the server is not.
+function refusalReason(err) {
+  const code = err && Number.isInteger(err.code) ? err.code : null;
+  const said = String((err && err.message) || "");
+  if (code === -101 || code === -102 || code === -32603) return "server";
+  if (code === 2 && /DaemonError\(\{'code': -5[,}]/.test(said)) return "absent";
+  if (code === 1) return "request";
+  return "unknown";
+}
+
 // ONE request, ONE socket, ONE set of guards.
 //
 // The wire handling and the transaction-specific checks are deliberately NOT
@@ -570,7 +602,11 @@ function electrumxRpc(method, params) {
       }
       if (frame.error) {
         const rawMsg = (frame.error && frame.error.message) || JSON.stringify(frame.error);
-        settle(reject, wireError("refused", `server error: ${stripControlChars(rawMsg)}`));
+        const refused = wireError("refused", `server error: ${stripControlChars(rawMsg)}`);
+        // The JSON-RPC error code, when the frame carries a whole number: `refusalReason` below
+        // tells a refusal about the transaction from one about the server by it.
+        if (Number.isInteger(frame.error.code)) refused.code = frame.error.code;
+        settle(reject, refused);
         return;
       }
       settle(resolve, frame.result);

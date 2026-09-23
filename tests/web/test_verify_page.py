@@ -790,11 +790,58 @@ class TestALookupThatFailedSaysWhichWayItFailed:
     that ships broken, and here the branch real users take is the wrong-number one.
     """
 
-    def test_a_server_that_refused_does_not_tell_the_reader_to_retry(self) -> None:
-        rendered = _wire_failure("refused", "server error: No such mempool or blockchain transaction")
-        assert "did not give back a transaction for that number" in rendered["text"]
-        assert "retrying will not change this answer" in rendered["text"]
-        assert "Trying again in a moment" not in rendered["text"]
+    # REAL error frames, through shared.js's own fetch. The three transient ones are aiorpcX
+    # 0.25.0's (``aiorpcx/session.py`` ``_throttled_request``; codes from ``aiorpcx/jsonrpc.py``),
+    # which ElectrumX servers answer through; "not-found" and "bad-request" are what the public
+    # endpoint the pages use was measured (2026-09-23) to send for a txid it does not have and
+    # for "zz".
+    _FRAMES = {
+        "server-busy": (-102, "server busy - request timed out"),
+        "excessive-resource-usage": (-101, "excessive resource usage"),
+        "internal-server-error": (-32603, "internal server error"),
+        "not-found": (
+            2,
+            "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. "
+            "Use gettransaction for wallet transactions.'})",
+        ),
+        "bad-request": (1, "zz should be a transaction hash"),
+    }
+
+    @staticmethod
+    def _framed(code: int, message: str) -> str:
+        frame = json.dumps({"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": 1})
+        return " ".join(_render({"case": {"wire_frame": frame}})["case"]["text"].split())
+
+    @pytest.mark.parametrize("case", ["server-busy", "excessive-resource-usage", "internal-server-error"])
+    def test_a_busy_or_failing_server_is_told_to_retry(self, case) -> None:
+        """It told every refusal "retrying will not change this answer" — for these three,
+        retrying is the one thing that can."""
+        code, message = self._FRAMES[case]
+        text = self._framed(code, message)
+        assert "declined to answer this time" in text and "Trying again in a moment may work" in text
+        assert "will not change" not in text and "commonest" not in text
+        assert "Nothing was learned about the mark either way" in text
+        assert message in text, "the server's own words are kept"
+
+    def test_a_transaction_the_node_does_not_have_says_check_the_number(self) -> None:
+        """The honest neighbour, and it no longer promises retrying cannot help: a transaction
+        sent moments ago may not have reached the server's node yet."""
+        text = self._framed(*self._FRAMES["not-found"])
+        assert "did not give back a transaction for that number" in text
+        assert "has no transaction with that number" in text and "may not have reached that node" in text
+        assert "Check what you were given" in text
+        assert "will not change" not in text and "commonest" not in text
+
+    def test_a_malformed_request_says_asking_again_gets_the_same_answer(self) -> None:
+        text = self._framed(*self._FRAMES["bad-request"])
+        assert "refused the request itself" in text and "same answer" in text
+
+    def test_a_refusal_the_frame_does_not_explain_gets_advice_true_for_both(self) -> None:
+        """A frame with no code, as a server that omits it would send."""
+        frame = json.dumps({"id": 1, "error": {"message": "No such mempool or blockchain transaction"}})
+        text = " ".join(_render({"case": {"wire_frame": frame}})["case"]["text"].split())
+        assert "will not guess" in text and "Check what you were given" in text and "try again later" in text
+        assert "will not change" not in text and "declined to answer this time" not in text
 
     def test_a_server_nobody_could_reach_does_tell_the_reader_to_retry(self) -> None:
         """The OTHER branch, in the app rather than only in a test of the first."""

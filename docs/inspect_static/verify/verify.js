@@ -276,15 +276,39 @@ function lookupFailure(err) {
   const kind = (err && err.kind) || "unknown";
 
   if (kind === "refused") {
+    // By what the frame says (`refusalReason`, shared.js). A refusal is not always about the
+    // transaction: a busy or failing server refuses in the same frame shape, and telling that
+    // reader "retrying will not change this answer" sent them away from the one thing that works.
+    const reason = refusalReason(err);
+    const sameShape =
+      "A fingerprint and a transaction number are the same shape — 64 letters and numbers — " +
+      "and a fingerprint locates nothing on its own. ";
+    let hint;
+    if (reason === "absent") {
+      hint =
+        "The server's node has no transaction with that number, in its chain or among those " +
+        "waiting to join it. The number may be wrong, or the transaction may not have reached " +
+        "that node yet — one sent moments ago may not have. " + sameShape +
+        "Check what you were given.";
+    } else if (reason === "server") {
+      hint =
+        "The server declined to answer this time — it was busy, or something failed on its " +
+        "side. Nothing was learned about the mark either way. Trying again in a moment may work.";
+    } else if (reason === "request") {
+      hint =
+        "The server refused the request itself, so asking again the same way will get the same " +
+        "answer. " + sameShape + "Check what you were given.";
+    } else {
+      hint =
+        "The server's reply does not say whether it has no such transaction or could not answer " +
+        "this time, so this page will not guess. " + sameShape +
+        "Check what you were given, and if it is right, try again later.";
+    }
     return {
       ok: false,
       form: "error",
       error: "The blockchain server answered, and it did not give back a transaction for that number.",
-      hint:
-        "The commonest reason is that the number is wrong, or is not a transaction at all. " +
-        "A fingerprint and a transaction number are the same shape — 64 letters and numbers — " +
-        "and a fingerprint locates nothing on its own. Check what you were given; retrying " +
-        "will not change this answer.",
+      hint,
       detail,
     };
   }
@@ -295,7 +319,7 @@ function lookupFailure(err) {
       error: "The blockchain server this page uses could not be reached.",
       hint:
         "Nothing was learned about the mark either way — this is a fact about the lookup, " +
-        "not about the record. Trying again in a moment usually works.",
+        "not about the record. Trying again in a moment may work.",
       detail,
     };
   }
