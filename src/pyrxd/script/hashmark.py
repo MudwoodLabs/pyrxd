@@ -400,6 +400,42 @@ def recovery_backend() -> RecoveryBackend | None:
     return _recovery_backend
 
 
+#: Why ``pyrxd.keys`` (and so coincurve) could not be imported, once an import has been
+#: tried and has failed; ``None`` until then.
+#:
+#: REMEMBERED, SO THE IMPORT IS ATTEMPTED ONCE. A failed import leaves nothing in
+#: ``sys.modules``, so Python retries it in full on every call — and under Pyodide, where
+#: coincurve has no wheel, that re-compiled ``pyrxd/keys.py`` for every record. Measured
+#: under Pyodide 0.26.4 in Node (not a browser), with no curve registered: 500 v1 records
+#: took 2.73 s and compiled it 500 times. The answer cannot change within a process that
+#: has no coincurve, so it is asked once. Tests that hide coincurve reset this around
+#: themselves.
+_secp256k1_import_failure: str | None = None
+
+
+def _coincurve_backend() -> RecoveryBackend | str:
+    """coincurve's recovery as a :data:`RecoveryBackend`, or the reason it is unavailable."""
+    global _secp256k1_import_failure
+    if _secp256k1_import_failure is not None:
+        return _secp256k1_import_failure
+    try:
+        from ..keys import recover_public_key
+    except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
+        _secp256k1_import_failure = str(exc)
+        return _secp256k1_import_failure
+
+    def backend(message_hash: bytes, r_b: bytes, s_b: bytes, rid: int, is_compressed: bool) -> bytes:
+        # `hasher=None` because the caller has already applied `hash256`. Byte-identical to
+        # the older `hasher=hash256` form over the preimage — coincurve applies the hasher
+        # itself and this just applies it one line earlier, so BOTH backends receive the same
+        # ECDSA `z` and the two paths differ in nothing but the curve arithmetic.
+        return recover_public_key(r_b + s_b + bytes([rid]), message_hash, hasher=None).serialize(
+            compressed=is_compressed
+        )
+
+    return backend
+
+
 class AttestationOutcome(Enum):
     """Whether a decoded v2 record's signature actually holds."""
 
@@ -495,32 +531,23 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # the reader, and only the verdict is withheld, with the reason. Reporting
     # INVALID_SIGNATURE here would be far worse: it would tell a reader a genuine
     # mark's claim does not hold, on the strength of a missing dependency.
-    # A REGISTERED BACKEND WINS, and when there is one the coincurve import is not
-    # attempted at all — under Pyodide it would only raise. See `set_recovery_backend`.
-    backend: RecoveryBackend | None = _recovery_backend
-    if backend is None:
-        try:
-            from ..keys import recover_public_key
-        except ImportError as exc:  # pragma: no cover - exercised via a meta-path block
-            return AttestationResult(
-                AttestationOutcome.UNVERIFIABLE,
-                detail=f"secp256k1 unavailable here, so the signature was not checked ({exc})",
-            )
-
-        def backend(message_hash: bytes, r_b: bytes, s_b: bytes, rid: int, is_compressed: bool) -> bytes:
-            # `hasher=None` because the caller below has already applied `hash256`.
-            # Byte-identical to the older `hasher=hash256` form over the preimage —
-            # coincurve applies the hasher itself and this just applies it one line
-            # earlier, so BOTH backends receive the same ECDSA `z` and the two paths
-            # differ in nothing but the curve arithmetic.
-            return recover_public_key(r_b + s_b + bytes([rid]), message_hash, hasher=None).serialize(
-                compressed=is_compressed
-            )
-
+    # THE ANSWERS THAT NEED NO CURVE COME FIRST. A record that did not decode, and a v1
+    # record, are decided by their bytes alone. They used to be decided AFTER the curve was
+    # looked up — so with no backend and no coincurve every v1 record re-attempted the
+    # import and came back NOT CHECKED, when the true answer (NO SIGNATURE) needs nothing.
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")
     if record.version != 2 or not record.signature_hex or not record.signer_hash160_hex:
         return AttestationResult(AttestationOutcome.NOT_ATTESTED, detail="v1 record carries no signer")
+
+    # A REGISTERED BACKEND WINS, and when there is one the coincurve import is not
+    # attempted at all — under Pyodide it would only raise. See `set_recovery_backend`.
+    backend = _recovery_backend if _recovery_backend is not None else _coincurve_backend()
+    if isinstance(backend, str):
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"secp256k1 unavailable here, so the signature was not checked ({backend})",
+        )
 
     # §6.3 step 3 makes "65 bytes" part of VERIFYING, not only of decoding, and this
     # function is public API: `decode_hashmark` enforces the length, but a caller doing

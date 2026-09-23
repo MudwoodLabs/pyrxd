@@ -117,12 +117,97 @@ a reader could check one page against the other on — including the two
 sentences that are *claims* rather than facts: what a mark proves, and
 the promise that a chosen file never leaves the machine.
 
-Its normal signature outcome is `NOT CHECKED`, on both pages and for
-every v2 record, because pyrxd installs under Pyodide with
-`deps=False` and coincurve ships no pure-Python wheel. That is a
-missing capability of the reader's browser and never a verdict on the
-record — it is rendered neutral, says whose limitation it is, and
-points at the CLI, which has the curve library.
+Both pages check a v2 record's signature in the reader's browser.
+pyrxd installs under Pyodide with `deps=False` and coincurve ships no
+pure-Python wheel, so the one curve operation the check needs —
+recovering the signing key — comes from vendored JavaScript
+(`secp256k1-bridge.js`, which the page SHA-256 checks against the
+manifest before importing it) and is registered with
+`install_signature_backend` in `glue.py`. The rest of the check is the
+Python the CLI runs. If that script cannot be loaded, every v2 record
+reads `NOT CHECKED` instead. That is a missing capability of the
+reader's browser and never a verdict on the record — it is rendered
+neutral, says whose limitation it is, and points at the CLI, which has
+the curve library.
+
+### What one transaction can cost the page
+
+A transaction is not small by default: about 28,000 signed HashMark
+records, or about 72,000 minimal v1 ones, fit under the 4 MB cap.
+`/inspect/` hands the classifier one number, `MAX_ROWS_SHOWN` (set in
+`inspect.js`), as two limits:
+
+- **Signatures checked.** Signatures are checked only on the first
+  `MAX_ROWS_SHOWN` HashMark records in the transaction — every output
+  that reads as a HashMark record counts, readable or not. A later
+  record that is a byte-for-byte copy of a checked one gets that
+  record's answer. Any other v2 record past the limit is not checked,
+  and the counts below call it "not checked here". A v1 record carries
+  no signature and reads
+  `NO SIGNATURE` wherever it is; a record this build cannot read is
+  named by its decode outcome, such as `UNKNOWN VERSION`.
+- **Entries listed.** The classifier lists at most `MAX_ROWS_SHOWN`
+  entries of each list the transaction produces — its outputs, its
+  glyph envelopes that carry no full payload, the other glyphs a reveal
+  minted, and the reveal's relationship claims and delegate burns — and
+  counts the rest under a `*_not_listed` key beside each list. Of an
+  output past the limit, two things are kept — its type and, for a
+  HashMark record, the word its panel would lead with — and it never
+  becomes a row of the payload. The page draws what it is given, and its
+  raw-JSON drawer holds the same bounded payload and says so.
+
+Under each cut list, a note gives exact counts of what was not drawn and
+what was not checked — taken from what the classifier decided about
+each entry, never from its position — and the command that shows all of
+it: `pyrxd glyph inspect <txid> --fetch`, which lists everything and
+checks every record.
+
+An update envelope's fields are cut the same way, to the ones the page
+draws: 32 top-level fields other than `attrs`, and `attrs` itself; of a
+map-valued `attrs`, its `target` and 32 others; and of any other
+map-valued field, 32 entries. The rest are counted under the entry's
+`fields_not_listed`. An authority's permissions are the ones the payload
+decoder kept: the text entries among the first 64 of the token's list,
+because the decoder reads no more than 64 entries of an `attrs` list.
+The page draws 32 of those and counts the rest as more "of the N this
+page read". Only when it read 64 does it add that the token may name
+more. The payload does not say whether the decoder dropped entries that
+are not text, so a list read short of 64 is called neither whole nor
+cut, and a list whose first 64 entries are not text draws no permissions
+line at all. `pyrxd glyph inspect` reads the list through the same
+decoder and counts it the same way.
+
+A listed output's refs are cut too: at most 32 of the opcodes that
+carry a ref (0xd0, 0xd8) and 32 of those that only name one (0xd1–0xd3),
+with the rest counted under the row's `input_refs_not_listed` and
+`referenced_refs_not_listed`. These count opcodes, not distinct refs: a
+script that pushes one ref 40 times has 40. Of the carried ones left
+out, the singleton pushes (0xd8) are counted again on their own, and the
+page says how many.
+
+What still grows with the transaction: fetching and parsing it, the
+per-entry work behind the counts — each output's type and refs, each
+input's envelope and payload, each relationship claim's verdict — and
+the size of a single entry, which the listing limit does not otherwise
+touch. A listed output carries its script's hex whole, and the reveal's
+headline payload carries its whole `protocol` list. The decoder accepts
+only known protocol numbers but does not bound how many times one
+repeats, so a 256 KB envelope can carry about 262,000 of them. Only the
+transaction's own bytes bound those. `/verify/` draws
+and checks at most its own, smaller number of marks (`MAX_MARK_PANELS`
+in `verify.js`) and passes no listing limit, so it still receives a row
+for every output.
+
+Every raw transaction either page fetches is hashed and compared with
+the txid it asked for before anything reads it, so a server that
+answers with some other transaction is refused. That includes
+`/inspect/`'s second fetch, of the commit a reveal spent, which is what
+decides `payload_binding`. That step does not classify the transaction
+again: `spent_output_binding` reads the attributed input's envelope and
+the one output it spent, and `pyrxd glyph inspect <txid> --fetch` asks
+the same function, so the page and the CLI word the same fetch the same
+way. When the fetch fails or is refused, the verdict reads `unchecked`
+and says why — not that the spent output "was not supplied".
 
 ---
 
@@ -301,6 +386,21 @@ over the *classified output types* and nothing else: the function never
 reads an output's value, never compares a `contract_ref` against the
 inputs, and never looks at `vin[]` at all.
 
+Every count, presence, absence and agreement is over **every** output of
+the transaction, not only the rows the page lists. When the classifier
+cuts the output list at `MAX_ROWS_SHOWN`, it sends `output_shape`: a
+count of every output by type and, for the `dmint` outputs, the first
+one's height and `max_height` and whether all of them agree on
+`token_ref`, `reward` and `max_height`. When nothing was cut, the banner
+works the same facts out from the rows, with one difference: a row
+carries an integer wider than 1024 bits as text, so where every `dmint`
+row carries the same such text for `reward` or `max_height` the banner
+says it cannot tell whether they agree, and, when their `token_ref`s
+agree, that claims race between them. What it reads off the rows alone
+is a position — which vout the minted FT sits at, and whether the
+outputs are in the canonical mint order — and only when the rows are
+every output.
+
 Recognised shapes, in evaluation order:
 
 | # | Shape | Trigger |
@@ -316,7 +416,7 @@ Recognised shapes, in evaluation order:
 | 9 | **Glyph FT deploy** | At least one `commit-ft` **and** at least one `commit-nft` (having failed the P2PKH count above). It does *not* look for FT or NFT outputs. |
 | 10 | **commit-ft without commit-nft** | At least one `commit-ft` and no `commit-nft` — an older or unusual FT deploy. |
 | 11 | **Glyph NFT deploy** | At least one `commit-nft` and no `commit-ft`. |
-| 12 | **dMint deploy reveal** | The *first* `dmint` output has `height == 0`. The count of `dmint` outputs only chooses between the "N parallel contracts" and "a single contract" wording — it is not part of the trigger, no `token_ref` is compared across outputs, and V1 vs V2 is not distinguished here. |
+| 12 | **dMint deploy reveal** | The *first* `dmint` output has `height == 0`. The count of `dmint` outputs only chooses between the "N parallel contracts" and "a single contract" wording — it is not part of the trigger. With more than one, `token_ref`, `reward` and `max_height` are compared across every `dmint` output, and the banner says whether they are one token on one set of terms. V1 vs V2 is not distinguished here. |
 | 13 | **dMint claim** | The first `dmint` output has a non-zero `height`. When `vin[0]` happens to carry a decodable mint scriptSig, a sentence naming its v1/v2 shape is appended; when it does not, the banner still fires. |
 | 14 | **Mutable contract update** | At least one `mut` output. |
 

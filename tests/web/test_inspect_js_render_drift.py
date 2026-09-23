@@ -382,6 +382,38 @@ _OMITTED_NESTED_KEYS = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _tally_keys() -> frozenset[str]:
+    """The payload keys whose dict is a TALLY: its keys are data — an output type, a verdict
+    word, an envelope kind — that the card's notes print beside each count.
+
+    DERIVED from the classifier's source rather than listed here: a tally is a dict the
+    classifier fills with ``_count(<dict>, <word>)``, and its payload key is whatever key a dict
+    literal files that same name under (``"by_type": outputs_by_type``). A hand-kept list would
+    miss the next tally added — the way the leaf recursion below, left alone, required every
+    count and none of the words beside them.
+    """
+    import ast
+
+    tree = ast.parse((_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8"))
+    counted = {
+        call.args[0].id
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_count"
+        and call.args
+        and isinstance(call.args[0], ast.Name)
+    }
+    return frozenset(
+        k.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for k, v in zip(node.keys, node.values, strict=True)
+        if isinstance(k, ast.Constant) and isinstance(v, ast.Name) and v.id in counted
+    )
+
+
 def _required_evidence(key: str, value) -> list[str]:
     """Substrings the rendered text must contain for *key* to count as shown."""
     if key in _PROSE_EVIDENCE and _hashable(value) and value in _PROSE_EVIDENCE[key]:
@@ -391,7 +423,11 @@ def _required_evidence(key: str, value) -> list[str]:
         # A nested block (hashmark, message, attestation). Recurse to its LEAVES:
         # asserting the dict's repr would be satisfied by nothing a renderer emits,
         # and skipping it entirely is how the whole block went unrendered.
-        return [
+        #
+        # A TALLY's keys are required too: in `{"op_return": 1}` the count alone says nothing,
+        # and a note that printed "1" and no type name would have passed on the count.
+        words = [str(sub_key) for sub_key in value] if key in _tally_keys() else []
+        return words + [
             evidence
             for sub_key, sub_value in value.items()
             if sub_key not in _OMITTED_NESTED_KEYS
@@ -993,19 +1029,31 @@ def _reveal_scriptsig(name: str, *, ticker: str = "", protocol=(2,), extra: dict
     return push(b"\x30" * 71) + push(PrivateKey().public_key().serialize()) + push(b"gly") + push(cbor2.dumps(body))
 
 
+def _update_scriptsig(fields: dict) -> bytes:
+    """``<sig> <pubkey> "gly" <CBOR>`` carrying a PARTIAL update — no ``p``, only the fields
+    being changed — which the envelope reader reads as ``kind: "update"``."""
+    import cbor2
+
+    from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
+
+    return b"\x47" + b"\x30" * 71 + b"\x21" + b"\x02" * 33 + build_reveal_scriptsig_suffix(cbor2.dumps(fields))
+
+
 def _mint_claim_scriptsig() -> bytes:
     """The 72-byte V1 dMint mint-claim scriptSig: nonce(4), inputHash(32),
     outputHash(32), OP_0. ``parse_mint_scriptsig`` decodes exactly this."""
     return b"\x04" + os.urandom(4) + b"\x20" + os.urandom(32) + b"\x20" + os.urandom(32) + b"\x00"
 
 
-def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> dict:
+def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], *, max_rows: int | None = None) -> dict:
     """Classify a transaction through the REAL browser entry point.
 
     ``glue.inspect_txid_with_raw`` is what the page calls after its ElectrumX
     fetch, and it is where ``display_warnings`` is attached. Hand-building the
     dict would exercise the renderer against a payload the browser never
     produces — which is how a banner came to describe a check that does not run.
+    ``max_rows`` is the page's listing limit; set, the payload carries the
+    ``*_not_listed`` counts the card must render too.
     """
     from pyrxd.hash import hash256
     from pyrxd.script.script import Script
@@ -1024,7 +1072,7 @@ def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> di
         ],
     )
     raw = tx.serialize()
-    result = _glue().inspect_txid_with_raw(hash256(raw)[::-1].hex(), raw.hex())
+    result = _glue().inspect_txid_with_raw(hash256(raw)[::-1].hex(), raw.hex(), None, max_rows)
     assert result["ok"], result
     return result["payload"]
 
@@ -1249,7 +1297,64 @@ def _tx_payloads() -> dict[str, dict]:
         # script" from a pure category test — no confusability check runs — and
         # the banner used to tell this token's holder it mimicked Latin letters.
         "homoglyph-non-latin": _tx_payload([_reveal_scriptsig("トークン")], [(nft, 546)]),
+        # EVERY LIST CUT SHORT, so every `*_not_listed` key the classifier emits reaches the
+        # field guard above: outputs (with HashMark records among the ones left out),
+        # envelopes, other glyphs, and the headline's relationship claims and delegate burns.
+        # A listing limit of 2 is not the page's; it keeps the case small. What this case
+        # CANNOT show is that a small count was drawn — the guard accepts a short number
+        # wherever it stands alone on the card, and single digits do (planting an undrawn
+        # envelope note passed here). `test_inspect_page_is_bounded.py` asserts each count's
+        # drawn sentence, and is what caught that plant.
+        "bounded-lists": _tx_payload(
+            [
+                _reveal_scriptsig(
+                    "HEAD", extra={"in": [GlyphRef(txid=os.urandom(32).hex(), vout=i).to_bytes() for i in range(3)]}
+                ),
+                _reveal_scriptsig("Other1"),
+                _reveal_scriptsig("Other2"),
+                _reveal_scriptsig("Other3"),
+                # An update with more fields than the page draws at every level it draws — the
+                # top level, `attrs` and another map-valued field — so each is cut and counted.
+                _update_scriptsig(
+                    {f"f{i:02d}": i for i in range(40)}
+                    | {"attrs": {"target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"} | {f"a{i:02d}": i for i in range(40)}}
+                    | {"a-meta": {f"m{i:02d}": i for i in range(40)}}
+                ),
+                # Bare markers after it, for a limit of 2, so the envelope list is cut too. The
+                # other payloads above are glyphs the reveal reader read, and are not envelopes.
+                b"\x03gly",
+                b"\x03gly",
+                b"\x03gly",
+            ],
+            [
+                (_hashmark_v1_script(1), 0),
+                (p2pkh, 546),
+                (_hashmark_v1_script(2), 0),
+                (op_return, 0),
+                (_hashmark_v1_script(3), 0),
+            ]
+            + [(build_delegate_burn_script(GlyphRef(txid=os.urandom(32).hex(), vout=1)), 0) for _ in range(3)],
+            max_rows=2,
+        ),
+        # A LISTED OUTPUT'S REFS CUT SHORT: more of each kind than the page draws of a row, so both
+        # of a row's ref counts reach the check below. The output list itself is not cut.
+        "bounded-refs": _tx_payload(
+            [b"\x00"],
+            [
+                (
+                    b"".join(b"\xd0" + os.urandom(32) + b"\x00" * 4 for _ in range(40))
+                    + b"".join(b"\xd2" + os.urandom(32) + b"\x00" * 4 for _ in range(40)),
+                    0,
+                ),
+                (p2pkh, 546),
+            ],
+            max_rows=2,
+        ),
     }
+
+
+def _hashmark_v1_script(i: int) -> bytes:
+    return b"\x6a\x08HASHMARK\x02\x01\x01\x20" + bytes([i]) * 32
 
 
 @pytest.fixture(scope="module")
@@ -1261,7 +1366,9 @@ def tx_payloads() -> dict[str, dict]:
 def tx_rendered(tx_payloads) -> dict[str, str]:
     """``{case: fetched-tx-card text}`` from the real JS."""
     cases = {name: {"tx": payload} for name, payload in tx_payloads.items()}
-    return {name: out["fetched_tx_card"] for name, out in _run_harness(_require_node(), cases).items()}
+    out = _run_harness(_require_node(), cases)
+    # By the names SENT, not the names returned: the harness also returns `__constants__`.
+    return {name: out[name]["fetched_tx_card"] for name in cases}
 
 
 # A key the tx card is ALLOWED to drop, with the reason. Same contract as the
@@ -1271,6 +1378,11 @@ _OMITTED_FROM_TX_CARD = {
     "outputs": "rendered as one row per output, and every field of every row is "
     "guarded field-by-field by test_output_row_renders_every_field. Demanding them "
     "again here would re-demand `hex` and `length`, which the rows omit on purpose",
+    "output_shape": "WORDED, not printed as data: the transaction-shape banner states its counts "
+    "and agreements in sentences ('creates 150 dMint contract UTXOs', 'They do NOT all carry the "
+    "same token_ref'). test_inspect_page_is_bounded.py::TestTheShapeBannerDescribesTheWhole"
+    "Transaction checks each sentence against it on transactions over the listing limit, and "
+    "fails if the banner reads the listed rows instead",
 }
 
 
@@ -1318,6 +1430,38 @@ class TestTheTxCardRendersEveryFieldToo:
         # the field guard above passed vacuously over them while the browser
         # rendered a delegated claim as "spent in this tx".
         assert {"relationships", "delegate_burns"} <= meta
+        # The counts of what a cut list left out — DERIVED from the classifier's source, so
+        # a list bounded later without a case here fails rather than passing empty.
+        import ast
+
+        source = (_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8")
+        emitted = {
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith("_not_listed")
+        }
+
+        # A count sits wherever its list does — inside an envelope entry (an update's
+        # `fields_not_listed`), inside an output row (its refs') — so the payloads are searched at
+        # every depth rather than in a list of places, which is how the drawer came to miss one.
+        def keys_anywhere(value) -> set[str]:
+            if isinstance(value, list):
+                return set().union(*(keys_anywhere(item) for item in value))
+            if not isinstance(value, dict):
+                return set()
+            return {k for k, v in value.items() if v}.union(*(keys_anywhere(v) for v in value.values()))
+
+        exercised = set().union(*(keys_anywhere(payload) for payload in tx_payloads.values()))
+        assert len(emitted) >= 8, f"only {sorted(emitted)} derived — the extraction is broken"
+        assert emitted <= exercised, f"never exercised: {sorted(emitted - exercised)}"
+
+
+def test_the_tallies_whose_words_are_required_are_derived_and_found() -> None:
+    """The derivation above, checked against the tallies known today, so an extraction that
+    finds nothing cannot make the tally clause of `_required_evidence` pass by requiring
+    nothing. Named here as a floor, not as the set: a new tally is picked up without editing
+    this line."""
+    assert {"by_type", "hashmark_by_status", "by_kind"} <= _tally_keys(), sorted(_tally_keys())
 
 
 class TestTheBurnBannerStopsAssertingAnOutcome:

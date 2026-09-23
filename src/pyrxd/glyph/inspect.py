@@ -23,6 +23,10 @@ Public surface:
   rather than an ElectrumXClient, so the browser tool can fetch via the
   native WebSocket API and feed bytes straight into the same classifier
   the CLI uses
+* :func:`spent_output_binding` — ``payload_binding`` for a reveal, from what
+  fetching the transaction its attributed input spent gave: the bytes, or why
+  there are none. The CLI's ``--fetch`` and the browser page both call it, so
+  the two cannot word the same fetch differently
 * :func:`inspect_contract` — decode a 72-char Glyph contract id
 * :func:`inspect_outpoint` — decode a ``txid:vout`` outpoint
 * :func:`inspect_script` — classify a hex-encoded locking script and
@@ -80,6 +84,9 @@ from ._inspect_core import (
     _sanitize_display_string as sanitize_display_string,
 )
 from ._inspect_core import (
+    _spent_output_binding as spent_output_binding,
+)
+from ._inspect_core import (
     _truncate_for_human as truncate_for_human,
 )
 from .confusables import looks_confusable_with_latin, skeleton
@@ -104,5 +111,6 @@ __all__ = [
     "looks_confusable_with_latin",
     "sanitize_display_string",
     "skeleton",
+    "spent_output_binding",
     "truncate_for_human",
 ]

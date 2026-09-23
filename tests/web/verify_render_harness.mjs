@@ -26,6 +26,11 @@
 //               after rendering, the k-th file chooser on the page (document order)
 //               is given a File of those bytes and its REAL `change` listener runs —
 //               the one `answerIsThisYourFile` attached, closing over ITS record.
+//               A case may instead carry `wire_error: {"message", "kind"?}` — a rejection built
+//               here and handed to `lookupFailure` — or `wire_frame: "<text>"`: a server that
+//               answers `blockchain.transaction.get` with exactly that frame, fetched through
+//               shared.js's own `fetchRawTxFromElectrumx`, whose rejection is then handed to
+//               `lookupFailure`. The second is the whole path a real error frame takes.
 //   stdout:     JSON — {"name": {"text": "…", "classes": [...], "statuses": [...],
 //                                "panels": [...], "file_inputs": n, "judged": [...]}}
 //               `text` is one text node per line, so the Python side can assert on
@@ -190,7 +195,7 @@ function loadRenderer() {
   // and the rest by name — the same way the browser does.
   vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
   vm.runInContext(readFileSync(VERIFY_JS, "utf8"), sandbox, { filename: VERIFY_JS });
-  for (const name of ["renderReport", "verdictClass", "hashmarkRecords", "lookupFailure"]) {
+  for (const name of ["renderReport", "verdictClass", "hashmarkRecords", "lookupFailure", "fetchRawTxFromElectrumx"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
         `${name} is not reachable after loading shared.js + verify.js. Both were ` +
@@ -259,6 +264,27 @@ async function chooseFiles(renderer, node, spec) {
   return judged;
 }
 
+// A server that answers the one request with `frame`, verbatim — the socket shape
+// `electrumxRpc` uses: open, one frame out, one frame back.
+function frameServer(frame) {
+  return class FrameWebSocket {
+    constructor() {
+      this.listeners = {};
+      setTimeout(() => this.dispatch("open", {}), 0);
+    }
+    addEventListener(type, cb) {
+      (this.listeners[type] ||= []).push(cb);
+    }
+    dispatch(type, ev) {
+      for (const cb of this.listeners[type] || []) cb(ev);
+    }
+    send() {
+      setTimeout(() => this.dispatch("message", { data: frame }), 0);
+    }
+    close() {}
+  };
+}
+
 async function main() {
   const payloadPath = process.argv[2];
   const raw = !payloadPath || payloadPath === "-"
@@ -278,7 +304,17 @@ async function main() {
     // page with a hand-built error dict would prove the renderer and leave the
     // translation, which is the half that was wrong, untested.
     let node;
-    if (spec && spec.wire_error) {
+    if (spec && typeof spec.wire_frame === "string") {
+      renderer.WebSocket = frameServer(spec.wire_frame);
+      let rejection = null;
+      try {
+        await renderer.fetchRawTxFromElectrumx("ab".repeat(32));
+      } catch (err) {
+        rejection = err;
+      }
+      if (rejection === null) throw new Error(`case ${JSON.stringify(name)}: the frame did not reject`);
+      node = renderer.renderReport(renderer.lookupFailure(rejection));
+    } else if (spec && spec.wire_error) {
       const err = new Error(spec.wire_error.message || "");
       if (spec.wire_error.kind !== undefined) err.kind = spec.wire_error.kind;
       node = renderer.renderReport(renderer.lookupFailure(err));

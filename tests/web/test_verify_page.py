@@ -86,7 +86,13 @@ class _BlockCoincurve(importlib.abc.MetaPathFinder):
 
 
 @pytest.fixture
-def without_coincurve():
+def without_coincurve(monkeypatch):
+    # `verify_attestation` remembers a failed curve import (it is attempted once per process),
+    # so the memory is cleared here and restored by monkeypatch afterwards: a failure
+    # remembered from inside this fixture must not outlive it.
+    import pyrxd.script.hashmark as hashmark
+
+    monkeypatch.setattr(hashmark, "_secp256k1_import_failure", None)
     blocker = _BlockCoincurve()
     sys.meta_path.insert(0, blocker)
     saved = {n: m for n, m in sys.modules.items() if n == "pyrxd.keys" or n.startswith("coincurve")}
@@ -784,11 +790,58 @@ class TestALookupThatFailedSaysWhichWayItFailed:
     that ships broken, and here the branch real users take is the wrong-number one.
     """
 
-    def test_a_server_that_refused_does_not_tell_the_reader_to_retry(self) -> None:
-        rendered = _wire_failure("refused", "server error: No such mempool or blockchain transaction")
-        assert "did not give back a transaction for that number" in rendered["text"]
-        assert "retrying will not change this answer" in rendered["text"]
-        assert "Trying again in a moment" not in rendered["text"]
+    # REAL error frames, through shared.js's own fetch. The three transient ones are aiorpcX
+    # 0.25.0's (``aiorpcx/session.py`` ``_throttled_request``; codes from ``aiorpcx/jsonrpc.py``),
+    # which ElectrumX servers answer through; "not-found" and "bad-request" are what the public
+    # endpoint the pages use was measured (2026-09-23) to send for a txid it does not have and
+    # for "zz".
+    _FRAMES = {
+        "server-busy": (-102, "server busy - request timed out"),
+        "excessive-resource-usage": (-101, "excessive resource usage"),
+        "internal-server-error": (-32603, "internal server error"),
+        "not-found": (
+            2,
+            "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. "
+            "Use gettransaction for wallet transactions.'})",
+        ),
+        "bad-request": (1, "zz should be a transaction hash"),
+    }
+
+    @staticmethod
+    def _framed(code: int, message: str) -> str:
+        frame = json.dumps({"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": 1})
+        return " ".join(_render({"case": {"wire_frame": frame}})["case"]["text"].split())
+
+    @pytest.mark.parametrize("case", ["server-busy", "excessive-resource-usage", "internal-server-error"])
+    def test_a_busy_or_failing_server_is_told_to_retry(self, case) -> None:
+        """It told every refusal "retrying will not change this answer" — for these three,
+        retrying is the one thing that can."""
+        code, message = self._FRAMES[case]
+        text = self._framed(code, message)
+        assert "declined to answer this time" in text and "Trying again in a moment may work" in text
+        assert "will not change" not in text and "commonest" not in text
+        assert "Nothing was learned about the mark either way" in text
+        assert message in text, "the server's own words are kept"
+
+    def test_a_transaction_the_node_does_not_have_says_check_the_number(self) -> None:
+        """The honest neighbour, and it no longer promises retrying cannot help: a transaction
+        sent moments ago may not have reached the server's node yet."""
+        text = self._framed(*self._FRAMES["not-found"])
+        assert "did not give back a transaction for that number" in text
+        assert "has no transaction with that number" in text and "may not have reached that node" in text
+        assert "Check what you were given" in text
+        assert "will not change" not in text and "commonest" not in text
+
+    def test_a_malformed_request_says_asking_again_gets_the_same_answer(self) -> None:
+        text = self._framed(*self._FRAMES["bad-request"])
+        assert "refused the request itself" in text and "same answer" in text
+
+    def test_a_refusal_the_frame_does_not_explain_gets_advice_true_for_both(self) -> None:
+        """A frame with no code, as a server that omits it would send."""
+        frame = json.dumps({"id": 1, "error": {"message": "No such mempool or blockchain transaction"}})
+        text = " ".join(_render({"case": {"wire_frame": frame}})["case"]["text"].split())
+        assert "will not guess" in text and "Check what you were given" in text and "try again later" in text
+        assert "will not change" not in text and "declined to answer this time" not in text
 
     def test_a_server_nobody_could_reach_does_tell_the_reader_to_retry(self) -> None:
         """The OTHER branch, in the app rather than only in a test of the first."""
@@ -825,6 +878,20 @@ class TestALookupThatFailedSaysWhichWayItFailed:
         rendered = _wire_failure("malformed", "server returned a non-hex string")
         assert "could not be used" in rendered["text"]
         assert "did not have the shape a transaction has" in rendered["text"]
+
+    def test_a_server_answering_with_another_transaction_is_named_as_that(self) -> None:
+        """The fourth tagged case: whole bytes came back, and they are not the transaction asked
+        for. Not "could not be reached" (it answered), not "did not have the shape a transaction
+        has" (nothing parsed them to find out), and not a claim that the NUMBER is wrong."""
+        detail = "the server's answer is not the transaction asked for: it hashes to " + "cd" * 32
+        rendered = _wire_failure("mismatch", detail)
+        text = " ".join(rendered["text"].split())
+        assert "answer is not the transaction that was asked for" in text
+        assert "refused rather than read" in text
+        assert "Nothing was learned about the mark either way" in text
+        assert detail in rendered["text"], "the server's own answer is never dropped"
+        for other in ("could not be reached", "did not have the shape a transaction has", "DOES NOT VERIFY"):
+            assert other not in text
 
     def test_an_untagged_rejection_claims_less_than_a_malformed_one(self) -> None:
         """A rejection from a path that tags nothing must not borrow the sentence
@@ -929,7 +996,7 @@ def _tx_result(*scripts: bytes, limit: int | None = None) -> tuple[str, bytes, d
     from tests.test_hashmark_verify_cli import _tx_with
 
     txid, raw = _tx_with(*scripts)
-    result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", limit)
+    result = _glue().inspect_txid_with_raw(txid, raw.hex(), limit)
     assert result["ok"], result
     return txid, raw, result
 
@@ -1255,7 +1322,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         render harness drives `renderReport`, not `lookUp`, so this is read from the source."""
         source = (_VERIFY_DIR / "verify.js").read_text(encoding="utf-8")
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("//"))
-        assert 'fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS))' in code
+        assert "fromPy(pyFetch(txid, rawHex, MAX_MARK_PANELS))" in code
         assert code.count("pyFetch(") == 1, "a second call path to the classifier that may not pass the limit"
 
     @pytest.mark.parametrize("bad", [-1, 1.5, "50", True])
@@ -1263,7 +1330,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_record_script(bytes([1, 1]), b"\x11" * 32))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", bad)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), bad)
         assert result["ok"] is False and "attest_hashmark_limit" in result["error"]
 
     def test_the_glue_takes_a_javascript_whole_number(self) -> None:
@@ -1271,7 +1338,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1.0)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), 1.0)
         assert result["ok"], result
         assert [r["hashmark"]["attestation"]["outcome"] for r in result["payload"]["outputs"]] == [
             "valid",
@@ -1283,7 +1350,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), 1)
         result["payload"]["outputs"] = result["payload"]["outputs"][1:]  # the unchecked one, alone
         flat = " ".join(_page(result)["text"].split())
         assert "NOT CHECKED" in flat and "this one is past that limit" in flat
