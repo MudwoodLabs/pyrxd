@@ -431,7 +431,7 @@ class TestTheOtherNumbersTheCovenantReads:
         assert _unmintable_reason(v1_with_pushes(_MIN_MH, _MIN_RW, _MIN_TG)) is None
         assert _unmintable_reason(v2_with_pushes(_MIN_MH, _MIN_RW)) is None
 
-    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES)
+    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES, ids=[c[0] for c in _NUMERIC_CASES])
     def test_v1_is_refused_with_the_reason(self, label: str, mh: bytes, rw: bytes, says: str) -> None:
         script = v1_with_pushes(mh, rw, _MIN_TG)
         DmintState.from_script(script)  # it parses: the refusal is the judgement, not the parser
@@ -440,12 +440,24 @@ class TestTheOtherNumbersTheCovenantReads:
         with pytest.raises(ValidationError, match=re.escape(says)):
             _mint(script)  # the builder's refusal names the push, not a generic round-trip
 
-    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES)
+    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES, ids=[c[0] for c in _NUMERIC_CASES])
     def test_v2_is_refused_with_the_reason(self, label: str, mh: bytes, rw: bytes, says: str) -> None:
         script = v2_with_pushes(mh, rw)
         DmintState.from_script(script)
         reason = _unmintable_reason(script)
         assert reason is not None and says in reason
+
+    def test_a_negative_reward_is_refused(self) -> None:
+        """Readable, but no mint's reward outputs can total a negative number of photons (the
+        same reason a negative target is refused)."""
+        from pyrxd.glyph.dmint.builders import _push_minimal
+
+        for push in (_push_minimal(-5), b"\x4f"):  # -5, and OP_1NEGATE
+            script = v1_with_pushes(_MIN_MH, push, _MIN_TG)
+            assert DmintState.from_script(script).reward < 0
+            reason = _unmintable_reason(script)
+            assert reason is not None and "a negative number" in reason and "reward" in reason
+        assert "its reward is -5" in (_unmintable_reason(v2_with_pushes(_MIN_MH, _push_minimal(-5))) or "")
 
     @pytest.mark.parametrize("reward", [1, 5, 16, 17, 127, 128, 255, 256, 888_888_888])
     def test_minimal_rewards_of_every_width_are_not(self, reward: int) -> None:

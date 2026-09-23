@@ -755,7 +755,8 @@ def _unmintable_reason(contract_script: bytes) -> str | None:
 
     * the target push, :func:`_unreadable_target_reason`, and a target of 0, which only a proof
       of work whose number is exactly 0 meets;
-    * the ``maxHeight`` and ``reward`` pushes, :func:`_unreadable_number_reason`;
+    * the ``maxHeight`` and ``reward`` pushes, :func:`_unreadable_number_reason`, and a negative
+      reward, which no set of outputs can hold;
     * a V1 contract at height ``2**31 - 1`` whose ``maxHeight`` is above ``2**31``. Its next
       mint is not its last, so the epilogue writes the next height as ``NUM2BIN(height + 1, 4)``,
       and ``2**31`` does not fit in 4 bytes (:data:`~pyrxd.glyph.dmint.types.MAX_V1_MAX_HEIGHT`).
@@ -788,6 +789,11 @@ def _unmintable_reason(contract_script: bytes) -> str | None:
         if reason is not None:
             return reason
         pos = end
+    if state.reward < 0:
+        return (
+            f"this dMint contract can never be minted: its reward is {state.reward}, a negative number, and the "
+            "covenant requires every mint's reward outputs to hold exactly that many photons"
+        )
     if state.is_v1 and state.height == MAX_V1_MAX_HEIGHT - 1 and state.max_height > MAX_V1_MAX_HEIGHT:
         return (
             f"this V1 dMint contract cannot be minted further: it is at height {state.height:,} (2**31 - 1) and "
