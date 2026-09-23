@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main, dev]
+  # NO `branches:` filter on pull_request, deliberately: a PR into ANY base branch runs
+  # this. With `branches: [main, dev]` a stacked PR (base = another feature branch) ran
+  # no checks at all, and its change then reached main inside its base PR. The push
+  # filter above is intended and stays. Guarded by
+  # tests/test_ci_workflows_check_every_pr_base.py.
   pull_request:
-    branches: [main, dev]
 
 # Cancel any in-flight CI run for the same branch / PR when a new push lands.
 # Dependabot rebases and force-pushes used to fan out wasted runs per chore PR;

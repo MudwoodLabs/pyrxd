@@ -23,9 +23,15 @@ name: trufflehog
 
 on:
   # PR-scan: every PR gets a fresh secret scan against its diff +
-  # whatever's in the worktree. Blocks merge if a secret is found.
+  # whatever's in the worktree. A required check on main, so a finding
+  # blocks merging there.
+  #
+  # "Every PR" means every BASE: there is NO `branches:` filter, on
+  # purpose. With `branches: [main]` a stacked PR (base = another
+  # feature branch) was never scanned. The action scans
+  # pull_request.base.sha..head.sha, so it follows whatever the PR
+  # targets. See tests/test_ci_workflows_check_every_pr_base.py.
   pull_request:
-    branches: [main]
   # Push-scan: catches anything that lands on main directly (admin
   # override of branch protection, etc.).
   push:

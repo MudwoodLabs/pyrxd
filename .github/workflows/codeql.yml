@@ -3,8 +3,10 @@ name: CodeQL
 on:
   push:
     branches: [main]
+  # NO `branches:` filter on pull_request, deliberately: a PR into ANY base branch runs
+  # this, stacked PRs included. See ci.yml and
+  # tests/test_ci_workflows_check_every_pr_base.py.
   pull_request:
-    branches: [main]
   schedule:
     # Weekly re-scan, Mondays 06:00 UTC. Catches CVEs that land in
     # CodeQL's queries after our last code change.

@@ -137,7 +137,7 @@ chain. Those suites need a real node and they run in their own workflow,
 
 | When | What |
 | --- | --- |
-| every push/PR that touches code | `regtest-core`: the Tier-1 quickstart plus the fast Radiant covenant/builder suites |
+| every PR (into any base branch) and every push to `main`/`dev` that touches code | `regtest-core`: the Tier-1 quickstart plus the fast Radiant covenant/builder suites |
 | nightly (and `workflow_dispatch`) | RSWP, dMint's proof-of-work suites, the SPV covenant differential matrix, bitcoind + litecoind, the BTC↔RXD and ETH↔RXD legs, and the vendored-source freshness check |
 
 Run the per-push set locally with:

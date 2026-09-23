@@ -3,8 +3,11 @@ name: Docs
 on:
   push:
     branches: [main]
+  # NO `branches:` filter on pull_request, deliberately: a PR into ANY base branch gets
+  # the build check, stacked PRs included. See ci.yml and
+  # tests/test_ci_workflows_check_every_pr_base.py. A PR run never deploys, whatever
+  # its base: the `deploy` job is skipped for every pull_request event.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 # Single in-flight deploy at a time, but don't cancel a running one.

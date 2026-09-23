@@ -460,8 +460,8 @@ Cross-reference of controls and the threats they address:
 | Pre-reveal issuer-freeze gate INSIDE `claim`: HTLC contract + claimant, read at the TIP, raises rather than guessing when unreadable | S25 | `src/pyrxd/eth_wallet/erc20.py:assert_not_frozen_before_reveal`/`is_blacklisted`, called from `eth_wallet/erc20_leg.py:claim` |
 | Freeze capability and predicate NAME pinned per token (never probed), default `has_blacklist=True` so a new entry fails safe | S25 | `src/pyrxd/eth_wallet/tokens.py:Erc20Token.has_blacklist`/`blacklist_fn` |
 | A pre-reveal refusal raises `PreRevealAbort` — nothing broadcast, so the preimage survives and the swap can retry or refund | S25 | `src/pyrxd/eth_wallet/erc20_leg.py:claim` |
-| CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |
-| Bandit on every push | security smells | `.github/workflows/ci.yml` |
+| CodeQL on every PR (any base branch) and every push to `main` | static analysis | `.github/workflows/codeql.yml` |
+| Bandit on every PR (any base branch) and every push to `main`/`dev` | security smells | `.github/workflows/ci.yml` |
 | ruff lint + format | code hygiene | `.github/workflows/lint.yml` |
 | `pip-audit` (dev dep) | known-CVE supply-chain | `pyproject.toml` |
 | detect-secrets pre-commit | committed-secret prevention | `.pre-commit-config.yaml` |

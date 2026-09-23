@@ -8,8 +8,11 @@ name: OSV Scanner
 on:
   push:
     branches: [main]
+  # NO `branches:` filter on pull_request, deliberately: a PR into ANY base branch runs
+  # `scan-pr`, stacked PRs included. The reusable PR workflow diffs against
+  # $GITHUB_BASE_REF, i.e. whatever branch the PR targets. See ci.yml and
+  # tests/test_ci_workflows_check_every_pr_base.py.
   pull_request:
-    branches: [main]
   schedule:
     # Weekly full scan, Mondays 08:00 UTC. Offset from Scorecard (07:00) and
     # CodeQL (06:00) to spread runner load.
