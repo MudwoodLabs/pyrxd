@@ -32,6 +32,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd glyph inspect` described every extra payload of a multi-glyph reveal two contradictory
+  ways (0.24.0).** Each payload after the headline one was listed under "Other glyphs minted in
+  this transaction", as read, and also under "Glyph envelopes carrying no full payload" as a
+  payload "the reveal reader did not return — the two readers disagree about these bytes". Both
+  readers had read it. On the mainnet GLYPH deploy reveal `b965b32d…9dd6`, input 33 was described
+  both ways in the terminal, in `--json` and on /inspect/. The `payload_unrendered` report skipped
+  only the headline input; it now skips every input the reveal reader read. **This changes
+  `--json` output:** `glyph_envelopes` no longer carries a `payload_unrendered` entry for a payload
+  that is listed in `metadata_inputs`. The entry is still emitted, with the same words, for an
+  input where the envelope classifier sees a full payload and the reveal reader returns nothing.
+
 - **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
   `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
   `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit

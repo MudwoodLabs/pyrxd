@@ -182,17 +182,17 @@ class TestThePayloadIsBounded:
     def test_every_list_is_cut_and_counted(self, limit) -> None:
         """Outputs, envelopes and the other payloads of a reveal, each past the limit.
 
-        The classifier reports every payload input but the headline's in ``glyph_envelopes`` too,
-        as ``payload_unrendered`` (it did before this change), so the envelope list here is the
-        ``limit + 2`` other payloads followed by the ``limit + 3`` bare markers."""
+        The other payloads are read by the reveal reader, so they are listed (and counted) as
+        other glyphs and NOT as envelopes. They used to be reported in ``glyph_envelopes`` too, as
+        ``payload_unrendered`` — a payload "the reveal reader did not return" — which is how one
+        input came to be described both ways. The envelope list here is the ``limit + 3`` bare
+        markers alone."""
         inputs = [_envelope("head")] + [_envelope(f"g{i}") for i in range(limit + 2)] + [b"\x03gly"] * (limit + 3)
         payload = _classified(*([_p2pkh()] * (limit + 4)), limit=limit, inputs=inputs)
         assert len(payload["outputs"]) == limit and payload["outputs_not_listed"]["count"] == 4
         assert len(payload["glyph_envelopes"]) == limit
-        assert payload["glyph_envelopes_not_listed"] == {
-            "count": limit + 5,
-            "by_kind": {"payload_unrendered": 2, "unreadable": limit + 3},
-        }
+        assert {env["kind"] for env in payload["glyph_envelopes"]} == {"unreadable"}
+        assert payload["glyph_envelopes_not_listed"] == {"count": 3, "by_kind": {"unreadable": 3}}
         assert len(payload["metadata_inputs"]) == limit + 1, "the headline plus the first `limit` others"
         assert payload["metadata_inputs_not_listed"] == {"count": 2}
         assert payload["metadata"]["of_n_payloads"] == limit + 3, "counted over every payload, not the listed ones"

@@ -1267,6 +1267,9 @@ def _tx_payloads() -> dict[str, dict]:
                 _reveal_scriptsig("Other1"),
                 _reveal_scriptsig("Other2"),
                 _reveal_scriptsig("Other3"),
+                # Three bare markers for a limit of 2, so the envelope list is cut too. The other
+                # payloads above are glyphs the reveal reader read, and are not envelopes.
+                b"\x03gly",
                 b"\x03gly",
                 b"\x03gly",
             ],

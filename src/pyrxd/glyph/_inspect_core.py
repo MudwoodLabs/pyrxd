@@ -1840,6 +1840,44 @@ def _classify_raw_tx(
     mint_scriptsig: dict | None = None
     if scriptsigs:
         mint_scriptsig = inspector.parse_mint_scriptsig(scriptsigs[0])
+    # EVERY input's payload, not just the first (#577).
+    #
+    # `find_reveal_metadata` returns the FIRST decodable scriptSig and that single
+    # payload was reported as the transaction's metadata. Multi-glyph reveals are
+    # real and not rare on mainnet — one observed reveal mints 35 refs from 36
+    # inputs — so 34 of those refs were being shown another token's name,
+    # description and media.
+    #
+    # The full per-input payload is not duplicated here; each entry carries enough
+    # to see WHICH input a name belongs to, and `metadata.input_index` already says
+    # which one the headline payload came from. What was missing was any signal
+    # that other payloads existed at all.
+    metadata_inputs: list[dict] = []
+    read_by_reveal_reader: set[int] = set()  # every input `extract_reveal_metadata` decoded
+    payload_count = 0
+    others_listed = 0
+    others_not_listed = 0
+    for idx, ss in enumerate(scriptsigs):
+        m = inspector.extract_reveal_metadata(ss)
+        if m is None:
+            continue
+        read_by_reveal_reader.add(idx)
+        payload_count += 1
+        # The headline payload's own entry is always listed; the OTHERS are what a reader has
+        # no other way to learn about, and they are what `max_rows` bounds.
+        if found is None or idx != found[0]:
+            if max_rows is not None and others_listed >= max_rows:
+                others_not_listed += 1
+                continue
+            others_listed += 1
+        metadata_inputs.append(
+            {
+                "input_index": idx,
+                "classification": _classify_metadata_protocol(m),
+                "name": _sanitize_display_string(m.name) if m.name else "",
+                "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
+            }
+        )
     # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
     # token payload here", and returns None both for "no glyph" and for "a glyph I could not
     # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on
@@ -1855,14 +1893,23 @@ def _classify_raw_tx(
         env = inspector.classify_glyph_scriptsig(ss)
         if env is None:
             continue
-        if env.kind == "payload" and found is not None and found[0] == idx:
-            # Skipped ONLY when the OTHER reader actually rendered it. `find_reveal_metadata` walks
-            # `_parse_reveal_scriptsig`, which was NOT unified with `_walk_pushes` - it breaks on
-            # `OP_0` where the new walker treats it as an empty push. So for a push-only scriptSig
-            # with one leading zero byte, classify sees a payload, extract sees nothing, and
-            # skipping here on the assumption that the metadata block will render it meant a glyph
-            # reveal rendered as NOTHING AT ALL - the blindness this whole surface exists to end,
-            # reintroduced one layer up. When the two disagree, say so rather than trusting either.
+        if env.kind == "payload" and idx in read_by_reveal_reader:
+            # Skipped when the REVEAL READER read it too: it is the headline payload or one of the
+            # other glyphs above, so it is rendered and the two readers agree about it.
+            #
+            # `payload_unrendered` below is for the case where they DO NOT: this classifier sees a
+            # full payload and `extract_reveal_metadata` returns nothing, so neither the metadata
+            # block nor the other-glyphs list shows it. It was added (#665) when the reveal reader
+            # had its own push walker that stopped at `OP_0`; the same change gave both readers one
+            # walker and one marker rule, and no byte string is known today on which they
+            # disagree. It stays because a later change to either reader could bring the
+            # disagreement back, and a reveal rendered as nothing is the failure this surface
+            # exists to prevent.
+            #
+            # This skip used to test `found[0] == idx` — the HEADLINE input only — so every other
+            # payload of a multi-glyph reveal, listed under "other glyphs" as read, was also
+            # reported here as a payload "the reveal reader did not return". On the mainnet GLYPH
+            # deploy reveal (b965b32d…9dd6) that described input 33 both ways.
             continue
         if max_rows is not None and len(glyph_envelopes) >= max_rows:
             _count(envelopes_by_kind, "payload_unrendered" if env.kind == "payload" else env.kind)
@@ -2052,42 +2099,6 @@ def _classify_raw_tx(
                 f"sha256={sha256(metadata.main.data).hex()}>"
             )
 
-    # EVERY input's payload, not just the first (#577).
-    #
-    # `find_reveal_metadata` returns the FIRST decodable scriptSig and that single
-    # payload was reported as the transaction's metadata. Multi-glyph reveals are
-    # real and not rare on mainnet — one observed reveal mints 35 refs from 36
-    # inputs — so 34 of those refs were being shown another token's name,
-    # description and media.
-    #
-    # The full per-input payload is not duplicated here; each entry carries enough
-    # to see WHICH input a name belongs to, and `metadata.input_index` already says
-    # which one the headline payload came from. What was missing was any signal
-    # that other payloads existed at all.
-    metadata_inputs: list[dict] = []
-    payload_count = 0
-    others_listed = 0
-    others_not_listed = 0
-    for idx, ss in enumerate(scriptsigs):
-        m = inspector.extract_reveal_metadata(ss)
-        if m is None:
-            continue
-        payload_count += 1
-        # The headline payload's own entry is always listed; the OTHERS are what a reader has
-        # no other way to learn about, and they are what `max_rows` bounds.
-        if found is None or idx != found[0]:
-            if max_rows is not None and others_listed >= max_rows:
-                others_not_listed += 1
-                continue
-            others_listed += 1
-        metadata_inputs.append(
-            {
-                "input_index": idx,
-                "classification": _classify_metadata_protocol(m),
-                "name": _sanitize_display_string(m.name) if m.name else "",
-                "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
-            }
-        )
     if metadata_payload is not None and payload_count > 1:
         # Say it on the headline payload too. A caller reading only `metadata` must
         # not be able to mistake one glyph's fields for the transaction's.
