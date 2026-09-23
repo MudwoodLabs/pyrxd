@@ -1336,6 +1336,20 @@ def _tx_payloads() -> dict[str, dict]:
             + [(build_delegate_burn_script(GlyphRef(txid=os.urandom(32).hex(), vout=1)), 0) for _ in range(3)],
             max_rows=2,
         ),
+        # A LISTED OUTPUT'S REFS CUT SHORT: more of each kind than the page draws of a row, so both
+        # of a row's ref counts reach the check below. The output list itself is not cut.
+        "bounded-refs": _tx_payload(
+            [b"\x00"],
+            [
+                (
+                    b"".join(b"\xd0" + os.urandom(32) + b"\x00" * 4 for _ in range(40))
+                    + b"".join(b"\xd2" + os.urandom(32) + b"\x00" * 4 for _ in range(40)),
+                    0,
+                ),
+                (p2pkh, 546),
+            ],
+            max_rows=2,
+        ),
     }
 
 
@@ -1426,17 +1440,20 @@ class TestTheTxCardRendersEveryFieldToo:
             for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith("_not_listed")
         }
-        # One of them sits INSIDE an envelope entry (an update's `fields_not_listed`), not beside
-        # a list at the top level or under `metadata`, so the entries are searched too.
-        in_envelopes = {
-            key
-            for payload in tx_payloads.values()
-            for entry in payload.get("glyph_envelopes") or []
-            for key, value in entry.items()
-            if value
-        }
-        assert len(emitted) >= 6, f"only {sorted(emitted)} derived — the extraction is broken"
-        assert emitted <= top | meta | in_envelopes, f"never exercised: {sorted(emitted - (top | meta | in_envelopes))}"
+
+        # A count sits wherever its list does — inside an envelope entry (an update's
+        # `fields_not_listed`), inside an output row (its refs') — so the payloads are searched at
+        # every depth rather than in a list of places, which is how the drawer came to miss one.
+        def keys_anywhere(value) -> set[str]:
+            if isinstance(value, list):
+                return set().union(*(keys_anywhere(item) for item in value))
+            if not isinstance(value, dict):
+                return set()
+            return {k for k, v in value.items() if v}.union(*(keys_anywhere(v) for v in value.values()))
+
+        exercised = set().union(*(keys_anywhere(payload) for payload in tx_payloads.values()))
+        assert len(emitted) >= 8, f"only {sorted(emitted)} derived — the extraction is broken"
+        assert emitted <= exercised, f"never exercised: {sorted(emitted - exercised)}"
 
 
 def test_the_tallies_whose_words_are_required_are_derived_and_found() -> None:

@@ -377,6 +377,25 @@ def _drawn_update_fields(fields: dict) -> tuple[dict, dict]:
     return out, left
 
 
+#: The lists one output row can carry, each with the key that counts what a bounded caller was not
+#: sent of it. A script's author chooses how many refs it names — the review measured one 3.7 MB
+#: output naming 100,000 distinct refs, which drew 300,042 elements — and these are the only
+#: list-valued fields of any row: ``tests/web/test_inspect_page_is_bounded.py`` classifies every
+#: shape the drift corpus holds and requires the list-valued fields it finds to be exactly these.
+_ROW_LISTS = {"input_refs": "input_refs_not_listed", "referenced_refs": "referenced_refs_not_listed"}
+
+
+def _drawn_row_lists(row: dict) -> None:
+    """Cut each of a listed row's :data:`_ROW_LISTS` to its first :data:`_HUMAN_ENTRY_CAP`
+    entries — the ones ``inspect.js`` draws — and count the rest, exactly, beside it as
+    ``{"count": n}``. A list at or under the cap is left whole, with no count."""
+    for key, not_listed in _ROW_LISTS.items():
+        entries = row.get(key)
+        if isinstance(entries, list) and len(entries) > _HUMAN_ENTRY_CAP:
+            row[key] = entries[:_HUMAN_ENTRY_CAP]
+            row[not_listed] = {"count": len(entries) - _HUMAN_ENTRY_CAP}
+
+
 def _sanitize_display_string(s: object) -> str:
     """Strip control + invisible + combining codepoints from a string before printing.
 
@@ -1852,12 +1871,16 @@ def _classify_raw_tx(
     rest of what the classifier returned for it is dropped — it never becomes a row, and it is
     not in the payload. So the NUMBER of entries in each of those lists is bounded by
     ``max_rows``, and so is the number of update envelopes; each of those carries at most
-    :data:`_HUMAN_ENTRY_CAP` fields per level (:func:`_drawn_update_fields`). The SIZE of one
-    entry is not bounded by ``max_rows``: a listed output row carries its script's hex and every
-    ref the script names (``input_refs`` / ``referenced_refs``), and the headline payload carries
-    its whole ``protocol`` list. Only the transaction's own bytes bound those. What also still
-    grows with the transaction is parsing it and the per-entry work behind the exact counts: each
-    output's type, each input's envelope and payload, each relationship claim's verdict.
+    :data:`_HUMAN_ENTRY_CAP` fields per level (:func:`_drawn_update_fields`). A listed output
+    row's refs are cut the same way: at most :data:`_HUMAN_ENTRY_CAP` of ``input_refs`` and of
+    ``referenced_refs``, with the rest counted beside each (:func:`_drawn_row_lists`). The SIZE of
+    one entry is otherwise not bounded by ``max_rows``: a listed output row carries its script's
+    hex whole, and the headline payload carries its whole ``protocol`` list, whose VALUES
+    ``GlyphMetadata`` holds to the known protocol numbers and whose LENGTH it does not bound — one
+    256 KB envelope repeating a number decodes to about 262,000 entries. Only the transaction's own
+    bytes bound those. What also still grows with the transaction is parsing it and the per-entry
+    work behind the exact counts: each output's type and refs, each input's envelope and payload,
+    each relationship claim's verdict.
 
     THE WORK ONE TRANSACTION CAN DEMAND IS BOUNDED HERE, not only what gets drawn. Nothing
     limits how many HashMark outputs a transaction carries — about 26,000 signed records fit
@@ -1908,6 +1931,8 @@ def _classify_raw_tx(
                 # What `_inspect_script` returns, in its two steps, because `shape` must see the
                 # first: the classifier's values, however wide (see `_OutputShape`).
                 classified = _classify_script(script_bytes.hex(), network=network, attest=attest)
+                if max_rows is not None:
+                    _drawn_row_lists(classified)  # before the render walk, which would visit every ref
                 row = cast(dict, _render_safe(classified))
             else:
                 row = classified = _classify_script(script_bytes.hex(), network=network, attest=attest, summary=True)

@@ -169,12 +169,18 @@ entry's `fields_not_listed`. An authority's permissions are at most 64,
 because the payload decoder keeps no more than 64 items of any `attrs`
 list; the page draws 32 and counts the rest.
 
+A listed output's refs are cut too: at most 32 of the refs it carries
+and 32 of the refs it only names, with the rest counted under the row's
+`input_refs_not_listed` and `referenced_refs_not_listed`.
+
 What still grows with the transaction: fetching and parsing it, the
-per-entry work behind the counts — each output's type, each input's
-envelope and payload, each relationship claim's verdict — and the size
-of a single entry, which the listing limit does not touch. A listed
-output carries its script's hex and every ref the script names, and the
-reveal's headline payload carries its whole `protocol` list; only the
+per-entry work behind the counts — each output's type and refs, each
+input's envelope and payload, each relationship claim's verdict — and
+the size of a single entry, which the listing limit does not otherwise
+touch. A listed output carries its script's hex whole, and the reveal's
+headline payload carries its whole `protocol` list. The decoder accepts
+only known protocol numbers but does not bound how many times one
+repeats, so a 256 KB envelope can carry about 262,000 of them. Only the
 transaction's own bytes bound those. `/verify/` draws
 and checks at most its own, smaller number of marks (`MAX_MARK_PANELS`
 in `verify.js`) and passes no listing limit, so it still receives a row

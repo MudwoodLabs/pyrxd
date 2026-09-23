@@ -912,6 +912,79 @@ class TestAnUpdatesFieldsAreBounded:
         assert "meta x=1, y=2" in text and "[object Object]" not in text
 
 
+def _refs(carried: int, named: int) -> bytes:
+    """One output naming *carried* distinct refs through 0xd0 and *named* through 0xd2 — the
+    review's shape: a script's author chooses how many refs it names."""
+    return b"".join(b"\xd0" + i.to_bytes(32, "little") + b"\x00" * 4 for i in range(carried)) + b"".join(
+        b"\xd2" + (i + 10**6).to_bytes(32, "little") + b"\x00" * 4 for i in range(named)
+    )
+
+
+class TestAnOutputsRefsAreBounded:
+    """One listed row carried every ref its script names: measured by the review, one 3.7 MB
+    output naming 100,000 refs made a 22.6M-character drawer and 300,042 elements. A bounded
+    call now sends at most 32 of each ref list, the ones the page draws, and counts the rest."""
+
+    @staticmethod
+    def _rows(carried: int, named: int, limit: int) -> tuple[dict, dict]:
+        """(the page's row, the same output listed WHOLE) for one ref-heavy output."""
+        scripts = [_refs(carried, named), _p2pkh()]
+        bounded = _result(*scripts, limit=limit)["payload"]["outputs"][0]
+        whole = _result(*scripts, limit=limit, bounded=False)["payload"]["outputs"][0]
+        assert bounded["type"] == whole["type"] == "unknown"
+        return bounded, whole
+
+    def test_each_ref_list_is_cut_to_what_is_drawn_and_counted_exactly(self, limit) -> None:
+        from pyrxd.glyph._inspect_core import _HUMAN_ENTRY_CAP
+
+        bounded, whole = self._rows(100, 150, limit)
+        assert len(whole["input_refs"]) == 100 and len(whole["referenced_refs"]) == 150, "the CLI keeps every ref"
+        assert bounded["input_refs"] == whole["input_refs"][:_HUMAN_ENTRY_CAP]
+        assert bounded["referenced_refs"] == whole["referenced_refs"][:_HUMAN_ENTRY_CAP]
+        assert bounded["input_refs_not_listed"] == {"count": 100 - _HUMAN_ENTRY_CAP}
+        assert bounded["referenced_refs_not_listed"] == {"count": 150 - _HUMAN_ENTRY_CAP}
+        assert bounded["token_bearing"] is True, "decided over every ref, not the ones sent"
+        text = _card(_classified(_refs(100, 150), _p2pkh(), limit=limit))["fetched_tx_card"]
+        assert text.count("ref (0xd0)") == _HUMAN_ENTRY_CAP and text.count("ref (0xd2)") == _HUMAN_ENTRY_CAP
+        assert f"… and {100 - _HUMAN_ENTRY_CAP} more TOKEN-BEARING refs not shown" in text
+        assert f"… and {150 - _HUMAN_ENTRY_CAP} more named refs not shown" in text
+
+    def test_the_page_does_not_grow_with_the_refs(self, limit) -> None:
+        small = _result(_refs(40, 40), _p2pkh(), limit=limit)
+        huge = _result(_refs(5_000, 5_000), _p2pkh(), limit=limit)
+
+        def row_without_its_script(result: dict) -> dict:
+            """The row less `hex` and `length`, which the script's own bytes bound, and nothing cuts."""
+            return {k: v for k, v in result["payload"]["outputs"][0].items() if k not in ("hex", "length")}
+
+        assert len(json.dumps(row_without_its_script(huge))) - len(json.dumps(row_without_its_script(small))) < 100
+        both = _render({"small": {"result": small}, "huge": {"result": huge}})
+        assert both["huge"]["result_block_elements"] == both["small"]["result_block_elements"]
+
+    def test_a_row_the_page_draws_whole_is_sent_whole(self, limit) -> None:
+        """The honest path: 32 of each is under the cap — nothing cut, no count, the same row."""
+        bounded, whole = self._rows(32, 32, limit)
+        assert bounded == whole and not [k for k in bounded if k.endswith("_not_listed")]
+
+    def test_the_lists_cut_are_every_list_a_row_carries(self) -> None:
+        """DERIVED: every shape the drift corpus holds (whose coverage of every type the classifier
+        emits that test derives from the source), classified in full, and every list-valued field
+        found at any depth of its row. A row gaining another list fails here rather than growing
+        with the transaction."""
+        from pyrxd.glyph._inspect_core import _ROW_LISTS, _classify_script
+        from tests.web.test_inspect_js_render_drift import _corpus
+
+        def lists(value) -> set[str]:
+            found: set[str] = set()
+            for key, inner in value.items() if isinstance(value, dict) else ():
+                found |= {key} if isinstance(inner, (list, tuple)) else lists(inner)
+            return found
+
+        rows = [_classify_script(script.hex(), network="mainnet") for script in _corpus().values()]
+        assert set().union(*(lists(row) for row in rows)) == set(_ROW_LISTS)
+        assert sum(bool(row.get("input_refs")) for row in rows) >= 1, "the premise: a corpus row carries a ref"
+
+
 class TestTheRevealsOwnListsAreBounded:
     """A reveal's relationship claims and the delegate burns beside them. Both used to be drawn
     one row per entry, with nothing bounding how many a payload names — measured by the review, a

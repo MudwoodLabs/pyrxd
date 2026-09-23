@@ -1453,14 +1453,23 @@ function renderOutputRow(row, opts) {
       row.token_bearing === null ? "unknown (script does not decode)" : String(row.token_bearing),
       row.token_bearing === false ? undefined : "kv-warning",
     ));
+    // Each list arrives cut at _ENTRY_CAP, with the rest counted beside it: a script's author
+    // chooses how many refs it names, and one output naming 100,000 of them drew 300,042 elements.
+    const refsNotListed = (key) => Number((row[`${key}_not_listed`] || {}).count) || 0;
     for (const ref of row.input_refs || []) {
       dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} TOKEN-BEARING`, "kv-warning"));
+    }
+    if (refsNotListed("input_refs") > 0) {
+      dl.appendChild(kv("", `… and ${refsNotListed("input_refs")} more TOKEN-BEARING refs not shown`, "kv-warning"));
     }
     // 0xd1/0xd2/0xd3 name a ref without holding one — a gate, not a
     // carrier. Kept visually apart from the line above so it never reads
     // as a burn warning.
     for (const ref of row.referenced_refs || []) {
       dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} — named, not carried`));
+    }
+    if (refsNotListed("referenced_refs") > 0) {
+      dl.appendChild(kv("", `… and ${refsNotListed("referenced_refs")} more named refs not shown`));
     }
   }
 
@@ -2502,11 +2511,12 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // THE ROW LIMIT IS ALSO THE CHECKING LIMIT: the classifier checks the signatures of the
   // first MAX_ROWS_SHOWN HashMark records only (and of any later byte-for-byte copy of one,
   // which costs nothing), and lists at most MAX_ROWS_SHOWN entries of each list, counting the
-  // rest, and at most _ENTRY_CAP fields per level of an update envelope. So the NUMBER of
-  // entries this call hands back — and converts, draws and puts in the drawer — does not grow
-  // with the transaction. What still does: Python's parse of it and its per-entry count, and the
-  // size of one entry — a listed output's script hex and the refs it names, the headline
-  // payload's protocol list — which only the transaction's bytes bound.
+  // rest, and at most _ENTRY_CAP fields per level of an update envelope and _ENTRY_CAP of each
+  // list of refs a listed output names. So the NUMBER of entries this call hands back — and
+  // converts, draws and puts in the drawer — does not grow with the transaction. What still
+  // does: Python's parse of it and its per-entry count, and the size of one entry — a listed
+  // output's script hex, the headline payload's protocol list — which only the transaction's
+  // bytes bound.
   //
   // PAYLOAD BINDING — a SECOND fetch, and NOT a second classification. The first pass names
   // the outpoint the reveal's attributed input spent. That output is the commit whose
