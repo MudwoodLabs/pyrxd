@@ -52,6 +52,7 @@ from pyrxd.glyph.dmint.builders import (
 from pyrxd.glyph.dmint.types import (
     _PART_B1,
     _PART_B2,
+    DAA_MODES_READING_TARGET_TIME,
     MAX_SCRIPT_NUM,
     MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
@@ -62,7 +63,17 @@ from pyrxd.glyph.dmint.types import (
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
-from tests.test_dmint_daa_offchain_onchain_differential import _Abort, _cs_encode, _daa_stack, _num, _result, _run
+from tests.test_dmint_daa_offchain_onchain_differential import (
+    _ALL_GENERATIONS,
+    _EPOCH_L,
+    _Abort,
+    _cs_encode,
+    _daa_stack,
+    _fragment,
+    _num,
+    _result,
+    _run,
+)
 
 _C = GlyphRef(txid="aa" * 32, vout=1)
 _T = GlyphRef(txid="aa" * 32, vout=0)
@@ -229,15 +240,29 @@ _CAPS = [
     ("max_height", "max_height", MAX_SCRIPT_NUM + 1, DaaMode.FIXED),
     ("reward", "reward_photons", RADIANT_MAX_PHOTONS + 1, DaaMode.FIXED),
     ("difficulty", "difficulty", MAX_SHA256D_TARGET + 1, DaaMode.FIXED),
-    ("target_time", "target_time", MAX_V2_TARGET_TIME + 1, DaaMode.ASERT),
-    ("target_time", "target_time", MAX_V2_TARGET_TIME + 1, DaaMode.FIXED),
     ("half_life", "half_life", MAX_SCRIPT_NUM + 1, DaaMode.ASERT),
     ("epoch_length", "epoch_length", MAX_SCRIPT_NUM + 1, DaaMode.EPOCH),
+    # target_time, in EVERY mode: the observable-spacing cap where the retarget reads it as a
+    # number, and only the encoder's 8 bytes where the covenant just carries its bytes. Which is
+    # which comes from DAA_MODES_READING_TARGET_TIME, itself derived from the bytecode below.
+    *(
+        (
+            "target_time",
+            "target_time",
+            (MAX_V2_TARGET_TIME if mode in DAA_MODES_READING_TARGET_TIME else MAX_SCRIPT_NUM) + 1,
+            mode,
+        )
+        for mode in DaaMode
+    ),
 ]
 
 
 def _mode_kw(mode: DaaMode) -> dict:
-    return {"daa_mode": mode, "difficulty": 32768} if mode is DaaMode.EPOCH else {"daa_mode": mode}
+    if mode is DaaMode.EPOCH:
+        return {"daa_mode": mode, "difficulty": 32768}
+    if mode is DaaMode.SCHEDULE:
+        return {"daa_mode": mode, "schedule": ((5, MAX_SHA256D_TARGET // 4),)}
+    return {"daa_mode": mode}
 
 
 class TestUpperBounds:
@@ -288,6 +313,57 @@ class TestUpperBounds:
             sched = ((5, 4),) if mode is DaaMode.SCHEDULE else ()
             _params(daa_mode=mode, half_life=MAX_SCRIPT_NUM + 1, epoch_length=MAX_SCRIPT_NUM + 1, schedule=sched)
 
+    @pytest.mark.parametrize("mode", sorted(set(DaaMode) - DAA_MODES_READING_TARGET_TIME, key=int))
+    @pytest.mark.parametrize("target_time", [MAX_V2_TARGET_TIME + 1, 1 << 40, MAX_SCRIPT_NUM])
+    def test_a_target_time_no_retarget_reads_is_not_held_to_the_spacing_cap(self, mode, target_time) -> None:
+        """FIXED and SCHEDULE carry targetTime only as bytes, so the 0xFFFFFFFF spacing cap
+        would refuse deploys that mint (and that pyrxd built before this PR). Through the
+        production deploy path, both param types, into the contract bytes."""
+        from pyrxd.glyph.builder import GlyphBuilder
+
+        kw = _mode_kw(mode)
+        assert _params(**kw, target_time=target_time).target_time == target_time
+        result = GlyphBuilder().prepare_dmint_deploy(_v2(**kw, target_time=target_time))
+        for script in (*result.placeholder_contract_scripts, *result.build_reveal_outputs("dd" * 32).contract_scripts):
+            assert DmintState.from_script(script).target_time == target_time
+
+    def test_the_modes_that_read_target_time_are_derived_by_running_every_fragment(self) -> None:
+        """DAA_MODES_READING_TARGET_TIME is read out of the BYTECODE'S BEHAVIOUR, not typed.
+
+        Every generation of every mode's retarget fragment runs under the int64/MINIMALDATA
+        evaluator with a targetTime too wide to read as a number (9 bytes), at heights that
+        include an EPOCH boundary. A mode reads targetTime iff some run aborts on it. The rest
+        of the covenant is the same bytes in every mode and never reads it as a number (Part A
+        picks only contractRef and the scriptSig items, Part B4 OP_DROPs it, Part C copies it
+        inside its baked literal) — that part is established by reading the bytecode, not here.
+        """
+        unreadable = _cs_encode(1 << 64)  # 9 bytes
+        assert len(unreadable) == MAX_SCRIPT_NUM_BYTES + 1
+        heights = (0, 1, _EPOCH_L, _EPOCH_L + 1)
+
+        def aborts_on(frag: bytes, mode: DaaMode, item: bytes, height: int) -> bool:
+            stack = _daa_stack(int(mode), 60, _LAST, 1 << 40, height)
+            stack[7] = item  # targetTime (see _daa_stack's layout)
+            try:
+                _run(frag, stack, _LAST + 120)
+            except _Abort as exc:
+                assert "longer than 8 bytes" in str(exc), f"aborted for another reason: {exc}"
+                return True
+            return False
+
+        reads: dict[DaaMode, bool] = {}
+        for mode, versions in _ALL_GENERATIONS.items():
+            for version in versions:
+                frag = _fragment(mode, version)
+                # Control: a readable targetTime never aborts these runs.
+                assert not any(aborts_on(frag, mode, _cs_encode(60), h) for h in heights)
+                hit = any(aborts_on(frag, mode, unreadable, h) for h in heights)
+                reads[mode] = reads.get(mode, False) or hit
+        assert len(reads) == len(DaaMode), "the derivation must see every DaaMode"
+        derived = frozenset(m for m, hit in reads.items() if hit)
+        assert derived, "derivation found nothing — the evaluator or the builders moved"
+        assert derived == DAA_MODES_READING_TARGET_TIME
+
     @pytest.mark.parametrize("mode", [DaaMode.ASERT, DaaMode.LWMA, DaaMode.EPOCH])
     def test_at_the_target_time_cap_every_retarget_stays_inside_int64(self, mode: DaaMode) -> None:
         """THE REASON FOR THE target_time CAP, EXECUTED. At ``MAX_V2_TARGET_TIME`` each retarget
@@ -309,21 +385,43 @@ class TestUpperBounds:
             with pytest.raises(_Abort, match="int64"):
                 _run(frag, _daa_stack(int(mode), (1 << 47) + 121, _LAST, target), _LAST + 120)
 
+    def test_v1_difficulty_is_capped_where_the_target_would_be_0(self) -> None:
+        """V1 had no upper bound at the parameter stage: a target of 0 was refused only while
+        the deploy was being built, after the wallet had been opened. The honest neighbour,
+        difficulty == MAX_SHA256D_TARGET (target 1), still deploys."""
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+
+        kw = {
+            "metadata": GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="t", ticker="T"),
+            "owner_pkh": Hex20(bytes(20)),
+            "num_contracts": 1,
+            "max_height": 100,
+            "reward_photons": 1000,
+        }
+        with pytest.raises(ValidationError, match="difficulty must be <="):
+            DmintV1DeployParams(**kw, difficulty=MAX_SHA256D_TARGET + 1)
+        result = GlyphBuilder().prepare_dmint_deploy(DmintV1DeployParams(**kw, difficulty=MAX_SHA256D_TARGET))
+        (script,) = result.build_reveal_outputs("dd" * 32).contract_scripts
+        assert DmintState.from_script(script).target == 1
+
     def test_the_reward_cap_is_also_a_readable_script_number(self) -> None:
         assert RADIANT_MAX_PHOTONS < MAX_SCRIPT_NUM
         assert len(_push_minimal(RADIANT_MAX_PHOTONS)) - 1 <= MAX_SCRIPT_NUM_BYTES
 
-    # Every numeric parameter value on a V2 dMint deploy found on mainnet by a 2026-09-22 scan
-    # (41 contracts, read from their state scripts and, for ASERT, the half-life baked into the
-    # bytecode), plus the ranges Photonic's Mint form offers (targetBlockTime 10..3600, ASERT
-    # halfLife 1..1,000,000, difficulty up to 1,000,000). A cap that refused any of them would
-    # be a guard refusing valid work.
+    # Every numeric parameter value on the V2 dMint deploys in a survey of mainnet deploy
+    # scripts collected 2026-09-22 (41 distinct V2 contracts, read from their state scripts and,
+    # for ASERT, the half-life baked into the bytecode; a survey, not a proof that no other V2
+    # contract exists), plus the ranges Photonic's Mint form offers (targetBlockTime 10..3600,
+    # ASERT halfLife 1..1,000,000, difficulty up to 1,000,000). Difficulty is not stored on
+    # chain: each value here is MAX_SHA256D_TARGET // target for an observed target, and each
+    # round-trips to that target exactly. A cap that refused any of them would be a guard
+    # refusing valid work.
     _REAL = {
         "max_height": [5, 10, 100, 1000, 10_000, 30_000, 210_000, 1_000_000, 1_111_111],
         "reward_photons": [1, 3, 10, 21, 100, 1000, 1200],
         "target_time": [10, 12, 33, 60, 3600],
         "half_life": [1, 30, 100, 240, 1000, 1_000_000],
-        "difficulty": [1, 2, 3, 4, 5, 10, 12, 5000, 1_000_000],
+        "difficulty": [1, 2, 3, 4, 10, 12, 256, 4999, 5000, 1_000_000],
     }
 
     @pytest.mark.parametrize("field", sorted(_REAL))
@@ -392,23 +490,33 @@ class TestTheEncoderGuard:
 
     def test_a_contract_carrying_the_old_blake3_target_is_refused_before_any_grind(self) -> None:
         """A V2 contract whose state holds a >8-byte target — what pyrxd deployed for BLAKE3/K12
-        before this fix — can never be minted, and the mint builder now says so before a PoW
-        grind starts: rebuilding its state crosses the same encoder."""
-        honest = build_dmint_contract_script(_params(algo=DmintAlgo.BLAKE3, difficulty=1, last_time=_LAST))
-        state_len = len(build_dmint_state_script(_params(algo=DmintAlgo.BLAKE3, difficulty=1, last_time=_LAST)))
-        old_target = MAX_V2_TARGET_256
-        wide = old_target.to_bytes(33, "little")
-        target_push = _push_minimal(MAX_SHA256D_TARGET)
-        assert honest[state_len - len(target_push) : state_len] == target_push
-        script = honest[: state_len - len(target_push)] + bytes([len(wide)]) + wide + honest[state_len:]
+        before this fix — can never be minted, and the mint builder says so, in those words,
+        before a PoW grind starts."""
+        script = old_blake3_v2_contract_script()
         st_ = DmintState.from_script(script)  # it parses — the reader takes any width
-        assert st_.target == old_target
+        assert st_.target == MAX_V2_TARGET_256
         utxo = DmintContractUtxo(txid="dd" * 32, vout=0, value=1, script=script, state=st_)
         funding = DmintMinerFundingUtxo(
             txid="ee" * 32, vout=0, value=50_000_000, script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
         )
-        with pytest.raises(ValidationError, match="script number"):
+        with pytest.raises(ValidationError, match=r"can never be minted: its target is a 33-byte script number"):
             build_dmint_mint_tx(utxo, b"\x00" * 8, b"\x22" * 20, _LAST + 60, funding_utxo=funding)
+        # The honest neighbour: the same contract with the 8-byte target builds.
+        honest = build_dmint_contract_script(_params(algo=DmintAlgo.BLAKE3, difficulty=1, last_time=_LAST))
+        good = DmintContractUtxo(txid="dd" * 32, vout=0, value=1, script=honest, state=DmintState.from_script(honest))
+        build_dmint_mint_tx(good, b"\x00" * 8, b"\x22" * 20, _LAST + 60, funding_utxo=funding)
+
+
+def old_blake3_v2_contract_script() -> bytes:
+    """A BLAKE3 FIXED V2 contract exactly as pyrxd built one before 2026-09-23: target
+    ``(2**256 - 1) // 1`` in a 33-byte push. Only the target push differs from today's build
+    (no code section bakes the target), so it is today's bytes with that one push swapped."""
+    honest = build_dmint_contract_script(_params(algo=DmintAlgo.BLAKE3, difficulty=1, last_time=_LAST))
+    state_len = len(build_dmint_state_script(_params(algo=DmintAlgo.BLAKE3, difficulty=1, last_time=_LAST)))
+    wide = MAX_V2_TARGET_256.to_bytes(33, "little")
+    target_push = _push_minimal(MAX_SHA256D_TARGET)
+    assert honest[state_len - len(target_push) : state_len] == target_push
+    return honest[: state_len - len(target_push)] + bytes([len(wide)]) + wide + honest[state_len:]
 
 
 # =====================================================================================
@@ -424,22 +532,80 @@ class TestDeployDmintCliBounds:
         return CliRunner().invoke(cli, args)
 
     @pytest.mark.parametrize(
-        ("flag", "refused", "accepted", "named"),
+        ("flag", "refused", "accepted", "mode"),
         [
-            ("--reward", RADIANT_MAX_PHOTONS + 1, RADIANT_MAX_PHOTONS, "reward_photons"),
-            ("--max-height", MAX_SCRIPT_NUM + 1, MAX_SCRIPT_NUM, "max_height"),
-            ("--target-time", MAX_V2_TARGET_TIME + 1, MAX_V2_TARGET_TIME, "target_time"),
+            ("--reward", RADIANT_MAX_PHOTONS + 1, RADIANT_MAX_PHOTONS, "fixed"),
+            ("--max-height", MAX_SCRIPT_NUM + 1, MAX_SCRIPT_NUM, "fixed"),
+            ("--difficulty", MAX_SHA256D_TARGET + 1, MAX_SHA256D_TARGET, "fixed"),
+            ("--target-time", MAX_V2_TARGET_TIME + 1, MAX_V2_TARGET_TIME, "asert"),
+            ("--target-time", MAX_SCRIPT_NUM + 1, MAX_SCRIPT_NUM, "fixed"),
+            ("--half-life", MAX_SCRIPT_NUM + 1, MAX_SCRIPT_NUM, "asert"),
         ],
     )
-    def test_the_cap_is_enforced_at_the_parameter_gate(self, tmp_path, flag, refused, accepted, named) -> None:
-        base = {"--max-height": "100", "--reward": "1000"}
+    def test_the_cap_is_enforced_at_the_parameter_gate(self, tmp_path, flag, refused, accepted, mode) -> None:
+        """Refused before the wallet is opened, naming the flag the user typed."""
+        base = {"--max-height": "100", "--reward": "1000", "--daa-mode": mode}
         base.pop(flag, None)
         fixed = [x for kv in base.items() for x in kv]
         bad = self._run(tmp_path, *fixed, flag, str(refused))
         assert bad.exit_code != 0
         assert "invalid dMint deploy parameters" in bad.output
-        assert f"{named} must be <=" in bad.output
+        assert f"deploy-dmint: {flag} must be <=" in bad.output
         # Honest path: the cap itself passes the gate and reaches the next stage (the wallet).
         good = self._run(tmp_path, *fixed, flag, str(accepted))
         assert "invalid dMint deploy parameters" not in good.output
         assert "no wallet at" in good.output, good.output
+
+    def test_a_fixed_target_time_past_the_spacing_cap_reaches_the_wallet(self, tmp_path) -> None:
+        """The value the cap wrongly refused in every mode: FIXED never reads it as a number."""
+        good = self._run(
+            tmp_path, "--max-height", "100", "--reward", "1000", "--target-time", str(MAX_V2_TARGET_TIME + 1)
+        )
+        assert "invalid dMint deploy parameters" not in good.output
+        assert "no wallet at" in good.output, good.output
+
+    def test_every_bounded_parameter_has_a_flag_name_and_the_flag_exists(self) -> None:
+        """The CLI names flags through a map; derive both of its sides so a parameter added to
+        check_v2_numeric_bounds cannot fall back to its internal name unnoticed."""
+        import inspect
+
+        from pyrxd.cli.glyph_cmds import _V2_BOUND_FLAGS, deploy_dmint_cmd
+        from pyrxd.glyph.dmint.types import check_v2_numeric_bounds
+
+        bounded = set(inspect.signature(check_v2_numeric_bounds).parameters) - {"stage", "names", "daa_mode"}
+        assert bounded, "found no bounded parameters — the derivation broke"
+        assert set(_V2_BOUND_FLAGS) == bounded
+        flags = {opt for p in deploy_dmint_cmd.params for opt in getattr(p, "opts", [])}
+        assert set(_V2_BOUND_FLAGS.values()) <= flags
+
+
+# =====================================================================================
+# 5. The types module's symbol list is checked, not decorative
+# =====================================================================================
+
+
+def test_the_types_module_docstring_lists_exactly_its_definitions() -> None:
+    """``pyrxd.glyph.dmint.types`` says "Symbols (N — every module-level name ...)". Both the
+    count and the list are compared with the module's own definitions, both directions."""
+    import ast
+    import re
+    from pathlib import Path
+
+    import pyrxd.glyph.dmint.types as types_mod
+
+    tree = ast.parse(Path(types_mod.__file__).read_text(encoding="utf-8"))
+    defined: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+    assert "check_v2_numeric_bounds" in defined  # the walk sees what it must
+    doc = ast.get_docstring(tree) or ""
+    m = re.search(r"Symbols \((\d+) [^\n]*(?:\n(?!    )[^\n]*)*\n((?:    .*\n?)+)", doc)
+    assert m, "the Symbols block moved"
+    listed = [name.strip() for name in m.group(2).replace("\n", " ").split(",") if name.strip()]
+    assert int(m.group(1)) == len(listed) == len(set(listed))
+    assert set(listed) == defined

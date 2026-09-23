@@ -5,8 +5,10 @@ Pure data types consumed by ≥2 sibling submodules, plus the
 constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
-Symbols (31 — every module-level name, so the count is checkable rather than
-decorative; it read "20" while listing 17 before 2026-09-22):
+Symbols (33 — every module-level name defined here, so the count is checkable rather than
+decorative, and ``tests/test_dmint_deploy_bounds.py`` checks it and the list below against the
+module's own definitions; it read "20" while listing 17 before 2026-09-22, and "31" while
+listing 32 on 2026-09-23):
     V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
     MAX_SCRIPT_NUM_BYTES, MAX_SCRIPT_NUM, MAX_V2_TARGET_TIME,
@@ -19,6 +21,7 @@ decorative; it read "20" while listing 17 before 2026-09-22):
     _OP_STATESEPARATOR, _PART_B1, _PART_B2, _PART_B4,
     is_minimal_4byte_scriptnum, is_readable_last_time,
     DAA_MODES_READING_DEPLOY_LAST_TIME, DAA_MODES_READING_LAST_TIME,
+    DAA_MODES_READING_TARGET_TIME,
     DmintDeployParams, DmintCborPayload, _schedule_from_cbor, DmintMintResult,
     DmintV1ContractInitialState
 """
@@ -27,12 +30,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.json_guards import cbor_int
 
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # ---------------------------------------------------------------------------
 # V2 warning category (retired)
@@ -86,19 +92,22 @@ MAX_V2_TARGET_256 = (1 << 256) - 1
 #: longer than ``MAXIMUM_ELEMENT_SIZE_64_BIT`` = 8 bytes (Radiant Core ``script.h``, vendored at
 #: ``tests/vendor/radiant_core/script.h``), so the largest script number is ``2**63 - 1``. Every
 #: number a dMint covenant reads as one — the state's height, maxHeight, reward and target on
-#: every mint, targetTime in the DAA modes, and the constants its DAA fragment bakes — has to
+#: every mint, targetTime in ASERT/LWMA/EPOCH, and the constants its DAA fragment bakes — has to
 #: fit, or the script aborts.
 MAX_SCRIPT_NUM_BYTES = 8
 MAX_SCRIPT_NUM = (1 << 63) - 1
 
-#: Upper bound on a V2 deploy's ``target_time`` (and the reason it is not ``MAX_SCRIPT_NUM``).
-#: ``target_time`` is a spacing in seconds that the ASERT/LWMA/EPOCH retarget compares with the
-#: difference of two 32-bit Unix timestamps (the state's ``lastTime`` is a 4-byte push), so no
-#: spacing wider than ``0xFFFFFFFF`` seconds can ever be observed. The bound also keeps every
-#: intermediate of those retargets inside int64 for any pair of such timestamps: ASERT and LWMA
-#: multiply ``(timeDelta - targetTime)`` by 2**16, which aborts the script once the difference
-#: reaches 2**47, and EPOCH doubles ``targetTime`` up to four times. (Photonic's Mint form offers
-#: 10..3600; ``tests/test_dmint_deploy_bounds.py`` pins the values mainnet deploys use.)
+#: Upper bound on a V2 deploy's ``target_time`` in the modes whose retarget reads it as a number
+#: (:data:`DAA_MODES_READING_TARGET_TIME`: ASERT, LWMA, EPOCH). There ``target_time`` is a spacing
+#: in seconds that the retarget compares with the difference of two 32-bit Unix timestamps (the
+#: state's ``lastTime`` is a 4-byte push), so no mint can ever observe a spacing wider than
+#: ``0xFFFFFFFF`` seconds: a larger ``target_time`` is one no mint can meet. The bound is NOT the
+#: int64 abort point, which is further out (ASERT and LWMA multiply ``(timeDelta - targetTime)``
+#: by 2**16, which aborts the script once the difference reaches 2**47; EPOCH doubles
+#: ``targetTime`` up to four times), and it keeps every intermediate of those retargets inside
+#: int64 for any pair of such timestamps. FIXED and SCHEDULE never read ``targetTime`` as a number,
+#: so this bound does not apply to them. (Photonic's Mint form offers 10..3600;
+#: ``tests/test_dmint_deploy_bounds.py`` pins the values mainnet deploys use.)
 MAX_V2_TARGET_TIME = 0xFFFFFFFF
 
 # EPOCH DAA: allowed max-adjustment factors and their log2 (shift count). Restricted
@@ -301,6 +310,17 @@ DAA_MODES_READING_DEPLOY_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA})
 #: and checked against this constant there.
 DAA_MODES_READING_LAST_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA, DaaMode.EPOCH})
 
+#: The DAA modes whose retarget fragment reads the state's ``targetTime`` as a number.
+#:
+#: ASERT and LWMA subtract it from the observed spacing; EPOCH scales and divides by it at an
+#: epoch boundary. FIXED has no fragment and SCHEDULE's reads only the height, so for those two
+#: ``targetTime`` is only ever carried as bytes: Part A never picks it, Part B4 drops it with
+#: ``OP_DROP``, and Part C copies it inside the baked middle literal. :data:`MAX_V2_TARGET_TIME`
+#: applies to these modes only. Membership is DERIVED by running every generation of every
+#: mode's fragment under the int64/MINIMALDATA evaluator with a ``targetTime`` too wide to read
+#: as a number (``tests/test_dmint_deploy_bounds.py``), and checked against this constant there.
+DAA_MODES_READING_TARGET_TIME = frozenset({DaaMode.ASERT, DaaMode.LWMA, DaaMode.EPOCH})
+
 
 # ---------------------------------------------------------------------------
 # Deploy-parameter arithmetic and bounds (shared by DmintDeployParams and
@@ -335,19 +355,22 @@ def check_v2_numeric_bounds(
     half_life: int,
     epoch_length: int,
     schedule: tuple[tuple[int, int], ...],
-    reward_name: str = "reward",
+    names: Mapping[str, str] | None = None,
 ) -> None:
     """Refuse V2 deploy parameters no contract built from them could ever be minted with.
 
     Upper bounds only; each type keeps its own lower-bound checks. Called from
     ``DmintDeployParams.__post_init__`` (which both V2 deploy scripts — the fee placeholder and
-    the real reveal — are built from) and from ``DmintV2DeployParams.__post_init__`` (so the CLI
-    and API refuse on the caller's own object, naming the caller's argument, before any
-    network work). ``_push_minimal`` separately refuses to emit any number wider than
+    the real reveal — are built from), from ``DmintV2DeployParams.__post_init__`` (so the API
+    refuses on the caller's own object) and from ``deploy-dmint --v2`` (so the CLI refuses
+    before any wallet or network work, naming the flag the user typed). ``names`` maps a
+    parameter (``max_height``, ``reward``, ``difficulty``, ``target_time``, ``half_life``,
+    ``epoch_length``, ``schedule``) to the name the caller knows it by; unmapped ones keep their
+    own name. ``_push_minimal`` separately refuses to emit any number wider than
     ``MAX_SCRIPT_NUM_BYTES``, whichever builder asks.
 
-    Each bound is the point past which the covenant cannot work, not a guess at what is
-    sensible; every value on a mainnet V2 deploy is far inside all of them
+    Each bound comes from what the covenant can read or observe, not from a guess at what is
+    sensible; every value on the mainnet V2 deploys surveyed is far inside all of them
     (``tests/test_dmint_deploy_bounds.py`` pins the observed values as accepted):
 
     * ``max_height`` <= ``MAX_SCRIPT_NUM`` — Part C adds 1 to the height and compares it with
@@ -358,7 +381,11 @@ def check_v2_numeric_bounds(
       (``bad-txns-txouttotal-toolarge``), so a larger reward could never be paid.
     * ``difficulty`` <= ``MAX_SHA256D_TARGET`` — above it the target is 0, which only a hash
       whose compared 8 bytes are all zero can meet.
-    * ``target_time`` <= ``MAX_V2_TARGET_TIME`` — see that constant.
+    * ``target_time`` <= ``MAX_V2_TARGET_TIME`` in the modes that read it as a number
+      (:data:`DAA_MODES_READING_TARGET_TIME`) — a wider spacing than any mint can observe; see
+      that constant. FIXED and SCHEDULE only carry ``targetTime`` as bytes, so there it is held
+      only to ``MAX_SCRIPT_NUM``: the one bound here that is pyrxd's encoder's (it writes every
+      state number in at most 8 bytes), not the covenant's.
     * ``half_life`` <= ``MAX_SCRIPT_NUM`` (ASERT, where it is baked in) — only ever a divisor
       (``OP_DIV``), so any readable number works; nothing narrower is imposed.
     * ``epoch_length`` <= ``MAX_SCRIPT_NUM`` (EPOCH) — only ever a divisor (``OP_MOD``).
@@ -367,8 +394,11 @@ def check_v2_numeric_bounds(
     """
     from pyrxd.security.types import RADIANT_MAX_PHOTONS
 
-    def _cap(name: str, value: int, cap: int, why: str) -> None:
+    called = dict(names or {})
+
+    def _cap(field: str, value: int, cap: int, why: str, *, label: str | None = None) -> None:
         if value > cap:
+            name = label if label is not None else called.get(field, field)
             raise ValidationError(f"{stage}: {name} must be <= {cap:,} ({why}), got {value:,}")
 
     _cap(
@@ -378,7 +408,7 @@ def check_v2_numeric_bounds(
         "the covenant compares height+1 with maxHeight as an 8-byte script number on every mint",
     )
     _cap(
-        reward_name,
+        "reward",
         reward,
         RADIANT_MAX_PHOTONS,
         "Radiant's money supply: a mint's outputs must hold the whole reward, and no transaction's outputs may total more",
@@ -389,13 +419,22 @@ def check_v2_numeric_bounds(
         MAX_SHA256D_TARGET,
         "above it the target MAX_SHA256D_TARGET // difficulty is 0, which no ordinary hash can meet",
     )
-    _cap(
-        "target_time",
-        target_time,
-        MAX_V2_TARGET_TIME,
-        "the widest spacing two 32-bit timestamps can have; from about 2**47 on, the ASERT/LWMA "
-        "retarget's multiply would also overflow int64 and abort the mint",
-    )
+    if daa_mode in DAA_MODES_READING_TARGET_TIME:
+        _cap(
+            "target_time",
+            target_time,
+            MAX_V2_TARGET_TIME,
+            f"the widest spacing two 32-bit timestamps can have, so no {daa_mode.name} mint could ever meet a "
+            "larger one; it also keeps the retarget's arithmetic inside int64",
+        )
+    else:
+        _cap(
+            "target_time",
+            target_time,
+            MAX_SCRIPT_NUM,
+            f"pyrxd writes every dMint state number in at most 8 bytes; {daa_mode.name} never reads targetTime "
+            "as a number, so this is pyrxd's limit, not the covenant's",
+        )
     if daa_mode == DaaMode.ASERT:
         _cap("half_life", half_life, MAX_SCRIPT_NUM, "it is baked into the ASERT retarget as an 8-byte script number")
     if daa_mode == DaaMode.EPOCH:
@@ -408,10 +447,11 @@ def check_v2_numeric_bounds(
     if daa_mode == DaaMode.SCHEDULE:
         for i, (h, _t) in enumerate(schedule):
             _cap(
-                f"schedule entry {i} height",
+                "schedule",
                 h,
                 MAX_SCRIPT_NUM,
                 "it is baked into the SCHEDULE retarget as an 8-byte script number",
+                label=f"{called.get('schedule', 'schedule')} entry {i} height",
             )
 
 

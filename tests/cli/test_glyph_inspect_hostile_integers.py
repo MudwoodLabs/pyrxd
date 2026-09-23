@@ -62,13 +62,14 @@ from pyrxd.glyph._inspect_core import _MAX_RENDERED_INT_BITS, _render_safe
 from pyrxd.glyph.burn import MAX_BURN_AMOUNT, build_burn_proof_script, parse_burn_proof
 from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
 from pyrxd.glyph.dmint.builders import build_dmint_state_script
+from pyrxd.glyph.dmint.types import MAX_SCRIPT_NUM
 from pyrxd.glyph.payload import _encode_payload_push, build_reveal_scriptsig_suffix, decode_payload, loads_chain_cbor
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.json_guards import cbor_int
-from pyrxd.security.types import RawTx
+from pyrxd.security.types import RADIANT_MAX_PHOTONS, RawTx
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -139,8 +140,9 @@ def _dmint_script(*, max_height: int, reward: int) -> bytes:
     at = 1 + 37 + 37  # height (OP_0) | d8 + contractRef | d0 + tokenRef
     assert honest[at : at + 2] == b"\x51\x51", "state layout moved: max_height/reward are no longer here"
     spliced = honest[:at] + _any_width_num_push(max_height) + _any_width_num_push(reward) + honest[at + 2 :]
-    if max(max_height, reward) <= 2**63 - 1:  # the builder's own range: the two must agree there
-        # (Part C's middle literal repeats both values, so the STATE is what is compared)
+    if max_height <= MAX_SCRIPT_NUM and reward <= RADIANT_MAX_PHOTONS:  # the builder's own bounds
+        # There the two must agree. (Part C's middle literal repeats both values, so the STATE
+        # is what is compared.)
         built_state = build_dmint_state_script(DmintDeployParams(max_height=max_height, reward=reward, **params))
         assert spliced.startswith(built_state + b"\xbd")
     return spliced
@@ -330,9 +332,10 @@ class TestTheWholePayloadIsBounded:
 
     @pytest.mark.parametrize("mode", ["human", "json"])
     def test_an_oversized_dmint_state_renders_without_a_cap(self, runner, mode) -> None:
-        """A contract script's state pushes are whatever its deployer wrote — the builder and
-        parser both take 1,500-bit values. The bound turns them into text, so the human
-        renderer's `max_height * reward` must not assume integers."""
+        """A contract script's state pushes are whatever its deployer wrote, and the parser
+        takes 1,500-bit values (pyrxd's builder no longer writes them: it refuses a number
+        wider than 8 bytes, so the fixture splices them in). The bound turns them into text, so
+        the human renderer's `max_height * reward` must not assume integers."""
         script = _dmint_script(max_height=2**1500, reward=2**1500)
         out = _ok(_inspect_script(runner, script, mode))
         if mode == "json":
@@ -342,6 +345,15 @@ class TestTheWholePayloadIsBounded:
         else:
             assert "reward:       <oversized integer: 1501 bits> photons/mint" in out
             assert "this contract's cap: not computed" in out
+
+    def test_the_fixture_splices_what_the_builder_refuses(self) -> None:
+        """The fixture must only consult the builder inside the builder's own bounds: a reward
+        between Radiant's money supply and 2**63 - 1 is a readable script number the builder
+        refuses, and a chain script can still carry it."""
+        script = _dmint_script(max_height=1, reward=RADIANT_MAX_PHOTONS + 1)
+        from pyrxd.glyph.dmint import DmintState
+
+        assert DmintState.from_script(script).reward == RADIANT_MAX_PHOTONS + 1
 
     def test_an_honest_dmint_still_prints_its_cap(self, runner) -> None:
         out = _ok(_inspect_script(runner, _dmint_script(max_height=1000, reward=100), "human"))

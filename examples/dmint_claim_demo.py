@@ -100,6 +100,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
+    DmintAlgo,
     DmintContractUtxo,
     DmintState,
     build_dmint_mint_tx,
@@ -197,7 +198,7 @@ def _sign_p2pkh_input(tx: Transaction, input_index: int, private_key: PrivateKey
 # ---------------------------------------------------------------------------
 
 
-def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
+def _mine(preimage: bytes, target: int, nonce_width: int, algo: DmintAlgo) -> bytes:
     """Find a nonce satisfying the target.
 
     Thin wrapper around :func:`pyrxd.glyph.dmint.mine_solution_dispatch`
@@ -221,6 +222,7 @@ def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
             nonce_width=nonce_width,  # type: ignore[arg-type]
             miner_argv=argv,
             timeout_s=timeout_s,
+            algo=algo,  # the contract's own algorithm: anything but SHA256D is refused, not ground
         )
     else:
         print(
@@ -232,6 +234,7 @@ def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
             target=target,
             nonce_width=nonce_width,  # type: ignore[arg-type]
             max_attempts=MAX_ATTEMPTS,
+            algo=algo,
         )
     print(f"Found nonce {result.nonce.hex()} after {result.attempts:,} attempts in {result.elapsed_s:.1f}s")
     return result.nonce
@@ -316,6 +319,12 @@ async def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(2)
+        if state.algo is not DmintAlgo.SHA256D:
+            print(
+                f"ERROR: this contract's proof of work is {state.algo.name}; pyrxd's miners grind SHA256d only",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         # 2. Funding-UTXO scan. Conservative bound: reward + ~10MB of fee.
         #    The actual fee is computed by build_dmint_mint_tx; this number
@@ -358,7 +367,7 @@ async def main() -> None:
 
         # 5. Mine.
         try:
-            nonce = _mine(pow_result.preimage, state.target, nonce_width=4)
+            nonce = _mine(pow_result.preimage, state.target, nonce_width=4, algo=state.algo)
         except MaxAttemptsError as exc:
             print(
                 f"\nERROR: miner exhausted {exc.attempts:,} attempts in {exc.elapsed_s:.1f}s "

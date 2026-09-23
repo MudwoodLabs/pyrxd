@@ -287,36 +287,65 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (it takes no algorithm argument; Part B1 cuts the same 8-byte hash window whatever the
   hash opcode). `difficulty_to_target` / `target_to_difficulty` follow; their `algo`
   argument is kept but no longer changes the result. Measured against a transcription of
-  Photonic's `dMintScript`: 56 of 56 BLAKE3/K12 parameter sets diverged before, 0 after,
-  and the other 9,186 stayed byte-identical. Three BLAKE3/K12 V2 contracts on mainnet
-  (DM03, RXD2026, VGM) now rebuild byte for byte from their declared difficulty; DM03 and
-  VGM have been minted on chain. `MAX_V2_TARGET_256` is kept for imports but is no dMint
-  bound. pyrxd's own miners still grind SHA256d only.
+  Photonic's `dMintScript` over a parameter grid: 56 BLAKE3/K12 parameter sets diverged
+  before and 0 after, 9,186 byte-identical sets stayed identical, and 8 BLAKE3/K12 EPOCH
+  sets that pyrxd used to refuse now build identically too. Three BLAKE3/K12 V2 contracts on
+  mainnet (DM03, RXD2026, VGM) now rebuild byte for byte from their declared difficulty;
+  DM03 and VGM have been minted on chain. `MAX_V2_TARGET_256` is kept for imports but is
+  no dMint bound.
+
+  A contract pyrxd deployed with the old target can never be minted, by any miner. The
+  mint builder, `claim-dmint` and `dmint-estimate` now say so in those words: the builder
+  and `claim-dmint` refuse it before any grind, and `dmint-estimate` refuses to print an
+  ETA for it (it used to print one, with a note that the target had been "clamped by the
+  verifier"; the covenant does not clamp, it aborts).
+
+- **`claim-dmint` ground SHA256d for BLAKE3 and K12 contracts.** pyrxd can deploy these
+  but cannot mine them: the bundled parallel miner, `--miner-cmd in-process` and the
+  external-miner protocol all grind and verify SHA256d, and the protocol's request carries
+  no algorithm. `claim-dmint` never read the contract's algorithm, so a claim against a
+  BLAKE3 or K12 contract (several are live on mainnet) ground SHA256d for the whole
+  expected time and built a mint the node would reject. It now refuses such a contract
+  right after reading it — before the wallet's UTXO scan, the funding scan and any grind —
+  naming the algorithm. In the SDK, `mine_solution_dispatch(algo=...)` used to drop `algo`
+  on the external-miner path; both paths now raise `NotImplementedError` for BLAKE3/K12, as
+  `mine_solution` already did, and `mine_solution_external` takes `algo=` and does the same
+  before spawning anything. SHA256d claims, V1 and V2, are unchanged.
 
 - **V2 deploy parameters had no upper bounds.** `max_height`, `reward`, `target_time`,
   `half_life`, `epoch_length`, SCHEDULE heights and `difficulty` were accepted at any size,
   so a deploy could bake a 9-byte number the covenant cannot read, a `target_time` large
   enough to overflow the ASERT/LWMA retarget's int64 multiply, a reward no transaction can
   pay, or a target of 0. `DmintDeployParams` and `DmintV2DeployParams` (and so
-  `deploy-dmint --v2`, before it loads a wallet) now refuse: `max_height`, `half_life`
-  (ASERT), `epoch_length` (EPOCH) and schedule heights above 2**63 - 1; `reward` above
-  Radiant's money supply; `difficulty` above `MAX_SHA256D_TARGET`; `target_time` above
-  0xFFFFFFFF seconds. Each bound is the point past which the contract cannot work, and every
-  value on the mainnet V2 deploys surveyed (and every value Photonic's Mint form offers)
-  is well inside it. Independently, the minimal-push encoder behind every dMint number now
-  refuses anything wider than 8 bytes, whichever builder asks — in-range output is
-  unchanged. `deploy-dmint --help` claimed `[1..0xFFFFFF]` for `--max-height` and
-  `--reward`; only V1 enforces that, and the help now says which bound is which version's.
+  `deploy-dmint --v2`, before it loads a wallet, naming the flag that was typed) now refuse:
+  `max_height`, `half_life` (ASERT), `epoch_length` (EPOCH) and schedule heights above
+  2**63 - 1; `reward` above Radiant's money supply; `difficulty` above `MAX_SHA256D_TARGET`;
+  and `target_time` above 0xFFFFFFFF seconds in ASERT, LWMA and EPOCH, whose retarget
+  compares it with the gap between two 32-bit timestamps, so a larger one is a spacing no
+  mint can meet. FIXED and SCHEDULE never read `target_time` as a number, so there it is
+  held only to the encoder's 8 bytes. Every value on the mainnet V2 deploys surveyed (and
+  every value Photonic's Mint form offers) is well inside every bound. Independently, the
+  minimal-push encoder behind every dMint number now refuses anything wider than 8 bytes,
+  whichever builder asks — in-range output is unchanged. `deploy-dmint --help` claimed
+  `[1..0xFFFFFF]` for `--max-height` and `--reward`; only V1 enforces that, and the help now
+  says which bound is which version's. V1 `difficulty` is now capped at the parameter stage
+  too; a target of 0 used to be refused only while the deploy was being built.
 
 - **`claim-dmint` reported a V2 mining timeout as a funding shortfall.** A grind that hit
-  `--timeout` (or `--max-attempts`) raised `MaxAttemptsError`, a `DmintError`, which landed in
-  the "funding can't cover the mint reward + fee — fund the reward address" arm. It now says
-  `mining timed out after <N>s without finding a nonce` and how to allow longer
+  `--timeout` (or ran out of attempts) raised `MaxAttemptsError`, a `DmintError`, which
+  landed in the "funding can't cover the mint reward + fee — fund the reward address" arm.
+  It now says `mining timed out after <N>s without finding a nonce` and how to allow longer
   (`--timeout`), or, when a count rather than the clock ran out, `mining stopped without
-  finding a nonce`. A token-bearing funding UTXO, refused by the mint builder, also printed
-  the funding headline over a correct cause; it has its own now. The funding message's
-  remedy named `--fee-rate`, which `claim-dmint` does not have; it names the configured
-  `fee_rate` instead.
+  finding a nonce`, with a remedy that changes the search: a different `--op-return`, which
+  is part of the proof-of-work preimage (the claim time is not, so rerunning the same claim
+  repeats the same preimage), and, for `--miner-cmd in-process` only, a higher
+  `--max-attempts`. The funding message's remedy named `--fee-rate`, which `claim-dmint`
+  does not have; it now gives the amount to fund (the reward + the fee + 546 photons in one
+  UTXO), and says lowering the configured `fee_rate` helps only if it was raised above the
+  relay floor, which is the default and the lowest the config accepts. `claim-dmint` also
+  maps the mint builder's refusal of a token-bearing funding UTXO to its own headline
+  instead of the funding one; that is defensive, since the funding scan already skips such
+  UTXOs and no `claim-dmint` run is known to reach it.
 
 ## [0.24.0] — 2026-09-14
 

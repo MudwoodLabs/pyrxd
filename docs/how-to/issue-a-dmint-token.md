@@ -84,7 +84,7 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 
 | Flag | Meaning |
 |------|---------|
-| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`). V1: 1–0xFFFFFF (a 3-byte state field); V2: 1–2^63−1 |
+| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`). V1: 1–0xFFFFFF (pyrxd's V1 limit); V2: 1–2^63−1 |
 | `--reward P` | photons of the FT paid per successful claim. V1: 1–0xFFFFFF; V2: up to Radiant's money supply (2.1×10^18) |
 | `--num-contracts K` | parallel contracts to genesis (1–250); each is an independent mining lane |
 | `--difficulty D` | initial PoW difficulty (1 = easiest; start here on testnet) |
@@ -92,7 +92,10 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 The V2 upper bounds are the points past which a contract built from the value could never
 be minted — a state number the covenant cannot read (wider than 8 bytes), or a reward no
 transaction can pay — and `deploy-dmint` refuses anything outside them before it touches
-your wallet. `--target-time` is bounded the same way (at most 0xFFFFFFFF seconds).
+your wallet, naming the flag. `--target-time` is at most 0xFFFFFFFF seconds in the ASERT,
+LWMA and EPOCH modes, whose retarget compares it with the gap between two 32-bit
+timestamps, so a larger value is a spacing no mint can meet. FIXED and SCHEDULE never read
+it as a number; there it only has to fit pyrxd's 8-byte encoder (up to 2^63−1).
 
 ### V1 vs V2 (adaptive difficulty)
 

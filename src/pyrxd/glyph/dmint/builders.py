@@ -66,13 +66,17 @@ def _push_minimal(n: int) -> bytes:
     """Encode integer ``n`` as a minimal script-number push (Photonic ``pushMinimal``).
 
     Refuses any ``n`` whose minimal encoding is wider than ``MAX_SCRIPT_NUM_BYTES`` (8) —
-    i.e. outside ``±(2**63 - 1)``. Every caller pushes a dMint script number (state items, DAA
-    constants, schedule entries), and the ones a covenant reads back — all of them but the
-    algoId/daaMode tags, which never approach 8 bytes — go through ``CScriptNum``, which aborts
-    the script on an operand wider than 8 bytes. A wider push can therefore only build a
-    contract that can never be minted. Photonic's ``pushMinimal`` would emit one; for every
-    value inside the range the bytes are identical to Photonic's (a 1..8-byte payload always
-    takes the direct-push opcode, so the PUSHDATA forms never arise).
+    i.e. outside ``±(2**63 - 1)``. Almost everything it encodes is read back by the covenant
+    through ``CScriptNum``, which aborts the script on an operand wider than 8 bytes: height,
+    maxHeight, reward and target on every mint, the constants a DAA fragment bakes, and
+    targetTime in ASERT/LWMA/EPOCH. For those a wider push could only build a contract that can
+    never be minted. Two things it encodes are never read as numbers — the algoId/daaMode tags
+    (which never approach 8 bytes) and targetTime in FIXED and SCHEDULE, which the covenant
+    only carries as bytes — and for those the 8-byte limit is pyrxd's rule, not the covenant's:
+    one limit for every push, so no caller has to know which mode reads what. Photonic's
+    ``pushMinimal`` would emit a wider push; for every value inside the range the bytes are
+    identical to Photonic's (a 1..8-byte payload always takes the direct-push opcode, so the
+    PUSHDATA forms never arise).
     """
     if n == 0:
         return b"\x00"  # OP_0

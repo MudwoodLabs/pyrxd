@@ -69,6 +69,8 @@ from .types import (
     DAA_MODES_READING_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     EPOCH_MAX_SAFE_TARGET,
+    MAX_SCRIPT_NUM,
+    MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
     DaaMode,
@@ -653,6 +655,29 @@ def _refuse_unreadable_state_last_time(state: DmintState, epoch_length: int | No
     )
 
 
+def _unreadable_target_reason(state: DmintState) -> str | None:
+    """Why no mint of a V2 contract carrying ``state`` can ever be valid, or ``None``.
+
+    Part B2 compares every mint's proof of work with the state's ``target`` as a script number,
+    and Radiant reads at most ``MAX_SCRIPT_NUM_BYTES`` bytes as one, so a wider target aborts
+    every spend of the contract — whatever the nonce, and whichever miner found it. pyrxd
+    deployed BLAKE3/K12 V2 contracts with such targets (``(2**256 - 1) // difficulty``) before
+    2026-09-23. V1 carries its target as a fixed 8-byte push and is not judged here.
+
+    Shared by :func:`build_dmint_mint_tx` (which refuses on it) and the ``claim-dmint`` and
+    ``dmint-estimate`` commands (which refuse on it before any wallet or funding work).
+    """
+    if state.is_v1 or state.target <= MAX_SCRIPT_NUM:
+        return None
+    width = state.target.bit_length() // 8 + 1  # the minimal script-number width of a positive n
+    return (
+        f"this dMint contract can never be minted: its target is a {width}-byte script number, and "
+        f"the covenant compares every mint's proof of work with it as a number of at most "
+        f"{MAX_SCRIPT_NUM_BYTES} bytes, so every spend of the contract aborts, whatever the nonce "
+        "and whoever mines it (pyrxd deployed BLAKE3/K12 V2 contracts with such targets before 2026-09-23)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Difficulty ↔ target conversion
 # ---------------------------------------------------------------------------
@@ -762,6 +787,23 @@ _PROGRESS_CHECK_MASK = 0xFFFF
 DEFAULT_PROGRESS_INTERVAL_S = 0.5
 
 
+def _refuse_non_sha256d_grind(algo: DmintAlgo, *, caller: str) -> None:
+    """Refuse to grind for a contract whose proof-of-work hash pyrxd's miners do not compute.
+
+    Every miner pyrxd runs or speaks to hashes SHA256d: :func:`mine_solution`, the bundled
+    parallel miner (``pyrxd.contrib.miner``), and the external-miner protocol
+    :func:`mine_solution_external` speaks, whose request carries no algorithm field and whose
+    answer is re-checked with :func:`verify_sha256d_solution`. A nonce ground that way for a
+    BLAKE3 or K12 contract is not a solution to it, so each grinder that is told the contract's
+    algorithm refuses here, before any hashing.
+    """
+    if algo is not DmintAlgo.SHA256D:
+        raise NotImplementedError(
+            f"{caller}: this contract's proof of work is {algo.name}, and pyrxd's miners grind SHA256d "
+            f"only; mining it needs a {algo.name} miner, which pyrxd does not ship"
+        )
+
+
 @dataclass(frozen=True)
 class DmintMineResult:
     """The output of a successful :func:`mine_solution` call.
@@ -859,8 +901,7 @@ def mine_solution(
         raise ValidationError(f"max_attempts must be >= 1, got {max_attempts}")
     if progress_interval_s <= 0:
         raise ValidationError(f"progress_interval_s must be positive, got {progress_interval_s}")
-    if algo != DmintAlgo.SHA256D:
-        raise NotImplementedError(f"mine_solution: algo {algo.name} not implemented in M1; only SHA256D ships")
+    _refuse_non_sha256d_grind(algo, caller="mine_solution")
 
     started = time.monotonic()
     next_progress = started + progress_interval_s
@@ -1243,6 +1284,7 @@ def mine_solution_external(
     timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
     progress: ProgressCallback | None = None,
     progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
 ) -> DmintMineResult:
     """Delegate nonce search to an external miner via JSON-over-subprocess.
 
@@ -1326,9 +1368,15 @@ def mine_solution_external(
                          ``pyrxd.contrib.miner.parallel.mine``.
     :param progress_interval_s: Minimum seconds between ``progress`` calls.
                          Ignored when ``progress`` is ``None``.
+    :param algo:         The contract's PoW algorithm. The protocol carries no
+                         algorithm field and the answer is re-verified with
+                         SHA256d, so anything but SHA256D is refused before the
+                         miner is spawned. Pass the contract's own
+                         ``state.algo``; the default keeps older callers working.
     :raises ValidationError:   The miner returned a malformed JSON response,
                                a nonce of wrong width, or a nonce that fails
                                local verification.
+    :raises NotImplementedError: ``algo`` is BLAKE3 or K12.
     :raises MaxAttemptsError:  The miner exceeded ``timeout_s``.
     :raises FileNotFoundError: ``miner_argv[0]`` is not on PATH.
     """
@@ -1344,6 +1392,7 @@ def mine_solution_external(
         raise ValidationError("miner_argv must not be empty")
     if progress_interval_s <= 0:
         raise ValidationError(f"progress_interval_s must be positive, got {progress_interval_s}")
+    _refuse_non_sha256d_grind(algo, caller="mine_solution_external")
 
     request = json.dumps(
         {
@@ -1546,12 +1595,13 @@ def mine_solution_dispatch(
     :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
     :param target:       The PoW target.
     :param nonce_width:  4 for V1 contracts, 8 for V2.
-    :param algo:         Hash algorithm. Currently only SHA256D is implemented;
-                         BLAKE3 and K12 raise from :func:`mine_solution`.
-                         Ignored on the external-miner path (the protocol
-                         doesn't carry an algo field; external miners
-                         are assumed SHA256D until the protocol is
-                         extended).
+    :param algo:         The contract's PoW algorithm. Only SHA256D can be
+                         mined: BLAKE3 and K12 raise :class:`NotImplementedError`
+                         on BOTH paths, before any hashing. (This used to be
+                         ignored on the external-miner path, whose protocol
+                         carries no algorithm field and whose answer is
+                         re-verified with SHA256d — so a BLAKE3/K12 caller got
+                         a SHA256d grind, not a refusal.)
     :param miner_argv:   ``None`` → in-process; otherwise an argv list
                          passed to :func:`subprocess.run` for the
                          external miner. Use
@@ -1580,6 +1630,7 @@ def mine_solution_dispatch(
     :raises ValidationError:   external miner returned a malformed
                                response or a nonce that fails local
                                verification.
+    :raises NotImplementedError: ``algo`` is BLAKE3 or K12 (either path).
     """
     if miner_argv is None:
         return mine_solution(
@@ -1599,6 +1650,7 @@ def mine_solution_dispatch(
         timeout_s=timeout_s,
         progress=progress,
         progress_interval_s=progress_interval_s,
+        algo=algo,
     )
 
 
@@ -1830,6 +1882,9 @@ def build_dmint_mint_tx(
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
+    never = _unreadable_target_reason(state)
+    if never is not None:
+        raise ValidationError(never)
     if len(nonce) != 8:
         raise ValidationError(f"V2 nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
