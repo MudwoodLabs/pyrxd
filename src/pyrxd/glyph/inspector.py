@@ -337,12 +337,18 @@ class GlyphInspector:
         A V1/V2 dMint mint claim spends the contract UTXO with a scriptSig
         of the form::
 
-            V1 (nonce_width=4): <0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 72 bytes
-            V2 (nonce_width=8): <0x08 nonce(8)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 76 bytes
+            <0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 72 bytes
+            <0x08 nonce(8)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 76 bytes
 
         Where:
 
-        * ``nonce`` — little-endian PoW nonce found by the miner.
+        * ``nonce`` — little-endian PoW nonce found by the miner. Its width does NOT say whether
+          the contract is V1 or V2. Neither covenant checks it — each concatenates the nonce into
+          the proof-of-work preimage (V1 epilogue ``5a 7a 7e``, V2 Part A ``5e 7a 7e``) — and V1
+          mints on mainnet use both widths: 465 of 473 mints of V1 contracts in a sample collected
+          on 2026-09-23 pushed 8 bytes. The contract script the input spends is what tells V1 from
+          V2 (``DmintState.from_script``). This payload used to carry a ``version_hint`` read off
+          the width, which called those V1 mints "v2"; it carries ``nonce_width`` instead.
         * ``inputHash`` — ``SHA256d(funding_input_locking_script)``. NOT a
           preimage half; the on-chain covenant recomputes
           ``SHA256(inputHash || outputHash)`` from these literal pushes.
@@ -353,9 +359,8 @@ class GlyphInspector:
         ``c9fdcd34…e530``.
 
         Returns a dict with ``nonce_hex``, ``input_hash``, ``output_hash``,
-        ``version_hint`` (``"v1"`` | ``"v2"`` | ``None``), and
-        ``scriptsig_length`` — or ``None`` if the scriptSig doesn't match
-        the canonical 4-push shape.
+        ``nonce_width`` (4 or 8) and ``scriptsig_length`` — or ``None`` if the
+        scriptSig doesn't match the canonical 4-push shape.
 
         Catches ``Exception`` broadly because every call site crosses a
         trust boundary: scriptSigs from network-fetched txs are attacker-
@@ -376,12 +381,11 @@ class GlyphInspector:
         # The sentinel is ``OP_0`` which pushes the empty byte string.
         if sentinel != b"":
             return None
-        version_hint = "v1" if len(nonce) == 4 else "v2"
         return {
             "nonce_hex": nonce.hex(),
             "input_hash": input_hash.hex(),
             "output_hash": output_hash.hex(),
-            "version_hint": version_hint,
+            "nonce_width": len(nonce),
             "scriptsig_length": len(scriptsig),
         }
 

@@ -777,19 +777,24 @@ producers to have done.
 ### 7.7 Mint scriptSig (dMint claim)
 
 A dMint mint spends a contract UTXO with exactly four pushes
-(`src/pyrxd/glyph/inspector.py:327-379`):
+(`src/pyrxd/glyph/inspector.py` `GlyphInspector.parse_mint_scriptsig`):
 
 ```
 <nonce:4 or 8> <input_hash:32> <output_hash:32> OP_0
 ```
 
-- `nonce` — little-endian PoW nonce. 4 bytes = V1, 8 bytes = V2. This width is the
-  only V1/V2 discriminator in the scriptSig.
+- `nonce` — little-endian PoW nonce, 4 or 8 bytes. Its width does NOT tell V1 from
+  V2: neither covenant checks it (each concatenates the nonce into the proof-of-work
+  preimage: V1 epilogue `5a 7a 7e`, V2 Part A `5e 7a 7e`), and V1 mints on mainnet
+  use both widths — 465 of 473 mints of V1 contracts in a sample collected on
+  2026-09-23 push 8 bytes. pyrxd's V1 builder writes 4 bytes and its V2 builder 8.
+  The scriptSig alone does not say which version it spends; the contract script
+  does (§13).
 - `input_hash` — `SHA256d(funding_input_locking_script)`.
 - `output_hash` — `SHA256d(OP_RETURN script at vout[2])`.
 - `OP_0` — the sentinel the covenant requires.
 
-Total 72 bytes (V1) or 76 bytes (V2).
+Total 72 bytes (4-byte nonce) or 76 bytes (8-byte nonce).
 
 ## 8. Token types
 
@@ -1133,8 +1138,8 @@ version field: V1 has six state items followed by its 145-byte epilogue, which
 opens with `0xbd` where V2's seventh state item (`daaMode`) would be; V2 has ten
 (`src/pyrxd/glyph/dmint/chain.py` `DmintState._walk_v1`, `DmintState._walk_v2`).
 The width of the target push is not a discriminator: both versions push it
-minimally. In a mint scriptSig the discriminator is the nonce width, 4 vs 8 bytes
-(§7.7).
+minimally. Nor is anything in a mint scriptSig: the nonce's width is not, since
+neither covenant checks it and V1 mints use both 4 and 8 bytes (§7.7).
 
 **Relation to the pyrxd version.** This specification revision describes pyrxd
 0.15.0. pyrxd is 0.x: the API and on-chain formats are **not yet stable**. Under

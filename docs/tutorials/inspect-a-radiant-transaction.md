@@ -122,7 +122,9 @@ The four output rows you should see:
 Below the outputs, a section titled **dMint mint scriptSig (vin 0)**
 shows the four pushes the miner placed on the input:
 
-- `version (by nonce width)` — `v1` for this transaction.
+- `nonce width` — 4 bytes for this transaction. This is not a version:
+  V1 mints use both 4- and 8-byte nonces, and the contract script is what
+  says V1 or V2.
 - `nonce (LE)` — the 4-byte PoW solution.
 - `input hash (SHA256d funding script)` — the literal hash of the
   funding input's locking script.

@@ -19,6 +19,10 @@
    ``dmint-estimate`` accepted the contract, and the builder refused it only after the wallet
    scan, with a generic round-trip message. A target of 0 passed too, and ``dmint-estimate``
    then called ``estimate_attempts(0)``, which raises. All are now judged with the target.
+5. **A mint scriptSig does not say V1 or V2.** The inspector reported a ``version_hint`` read
+   off the nonce's width (4 = "v1", 8 = "v2"). Neither covenant checks that width, and most
+   mainnet V1 mints push 8 bytes, so it called them "v2". The payload now reports
+   ``nonce_width`` and no version.
 """
 
 from __future__ import annotations
@@ -461,3 +465,107 @@ class TestTheOtherNumbersTheCovenantReads:
     @pytest.mark.parametrize("name", ["G22K", "RABO", "BTC", "GTC", "1", "MPrawn", "$BRO", "$RBG", "Pepe"])
     def test_no_pinned_mainnet_contract_is_refused(self, name: str) -> None:
         assert _unmintable_reason(_mainnet(name)) is None
+
+
+# =====================================================================================
+# 5. A mint scriptSig does not say V1 or V2
+# =====================================================================================
+
+#: Two real mainnet mints of V1 contracts (vin[0]'s scriptSig, and the state of the contract it
+#: spends; the contract script is that state + the SHA256d V1 epilogue). The 8-byte one is the
+#: common case: 465 of 473 mints of V1 contracts in the sample this was taken from pushed 8.
+_MAINNET_V1_MINTS = {
+    # rgmau: final mint 20a03441a349c7dbcc08bae8c9a26b346a474deaf4c34d8741f9317b4000fa3e, spending
+    # b0f9a650e209c1be27033f192ded6f6e1a4a0826efb2be2627171f502f6b6209:0 (height 4,999 of 5,000)
+    8: (
+        "08cb4c8ecae8f34a5a20697d6c4988c9d0c0279d43da4856718900f19eb87cbfa46499d075828b345e4b20cb455ad4c533ed"
+        "52f134a3e55c1d3c48b8a8b53cdc5e949c13f9c64da3a4f36000",
+        "0487130000d8a0f3aa23268137fbe0b75eeec8c4c208c6317aa770dc7559cb7a8f6eae02389402000000d0a0f3aa23268137fb"
+        "e0b75eeec8c4c208c6317aa770dc7559cb7a8f6eae02389400000000028813027102089999999999999919",
+    ),
+    # LEO: final mint b9135cda8cd51f16b18f2319c12d6713f8802d71413147e015ef46128ed84786, spending
+    # 84301a285c5344e1e49ed51f1d5dd24dfdaed71628730d3ea59f65c638cedf2e:0 (height 999 of 1,000)
+    4: (
+        "04f25b736c20e9a2f04fab2416274e10f783f781594eab4b3f19a48a063fed46203dc1159dcf202fcaa0aba0533d4d12c6b0"
+        "5a2df675c26df36b5ab1ca25facb9a54b77e1d126700",
+        "04e7030000d81892dee83e08097d141625e6cf2015639e93973c3c48e04e6ed9839486d5cebf01000000d01892dee83e0809"
+        "7d141625e6cf2015639e93973c3c48e04e6ed9839486d5cebf0000000002e80304406f400108ffffffffffffff7f",
+    ),
+}
+
+
+def _opcodes(code: bytes) -> list[int]:
+    """The opcodes of ``code``, skipping push payloads (and ref operands)."""
+    ops, i = [], 0
+    while i < len(code):
+        op = code[i]
+        ops.append(op)
+        i += 1
+        if 1 <= op <= 0x4B:
+            i += op
+        elif op == 0x4C:
+            i += 1 + code[i]
+        elif op == 0x4D:
+            i += 2 + int.from_bytes(code[i : i + 2], "little")
+        elif op in (0xD0, 0xD1, 0xD2, 0xD3, 0xD8):
+            i += 36
+    return ops
+
+
+class TestTheMintScriptsigSaysNoVersion:
+    @pytest.mark.parametrize("width", [8, 4])
+    def test_a_real_v1_mint_is_not_labelled_by_its_nonce_width(self, width: int) -> None:
+        from pyrxd.glyph.inspector import GlyphInspector
+        from tests.test_dmint_v1_target_push import _V1_SHA256D_EPILOGUE
+
+        scriptsig_hex, state_hex = _MAINNET_V1_MINTS[width]
+        assert DmintState.from_script(bytes.fromhex(state_hex + _V1_SHA256D_EPILOGUE)).is_v1  # it spends V1
+        parsed = GlyphInspector().parse_mint_scriptsig(bytes.fromhex(scriptsig_hex))
+        assert parsed is not None
+        assert parsed["nonce_width"] == width
+        assert "version_hint" not in parsed
+        assert not {"v1", "v2"} & {v for v in parsed.values() if isinstance(v, str)}
+
+    def test_neither_covenant_checks_the_nonce_width(self) -> None:
+        """No OP_SIZE in the V1 epilogue; in V2 code the only OP_SIZEs are the ones inside the
+        MINIMAL_PUSH primitive that writes the next height and target. The nonce is only
+        rolled and concatenated into the preimage (V1 ``5a 7a 7e``, V2 Part A ``5e 7a 7e``)."""
+        from pyrxd.glyph.dmint import DaaMode, DmintDeployParams, build_dmint_code_script
+        from pyrxd.glyph.dmint.builders import _MINIMAL_PUSH_BYTECODE, _PART_A, build_dmint_v1_code_script
+        from pyrxd.glyph.dmint.types import DmintAlgo
+
+        op_size = 0x82
+        assert _opcodes(_MINIMAL_PUSH_BYTECODE).count(op_size) == 1  # control: the walk sees an OP_SIZE
+        for algo in DmintAlgo:
+            v1 = build_dmint_v1_code_script(algo)
+            assert op_size not in _opcodes(v1)
+            assert bytes.fromhex("5a7a7e") in v1
+        for mode in DaaMode:
+            kw: dict = {"daa_mode": mode, "difficulty": 32768 if mode is DaaMode.EPOCH else 10}
+            if mode is DaaMode.SCHEDULE:
+                kw["schedule"] = ((5, MAX_SHA256D_TARGET // 4),)
+            code = build_dmint_code_script(
+                DmintDeployParams(
+                    contract_ref=_C, token_ref=_T, max_height=100, reward=1000, last_time=1_700_000_000, **kw
+                )
+            )
+            assert code.startswith(_PART_A) and _PART_A.endswith(bytes.fromhex("5e7a7e"))
+            assert _opcodes(code).count(op_size) == code.count(_MINIMAL_PUSH_BYTECODE) == 2
+
+    def test_the_cli_render_shows_the_width_and_no_version(self) -> None:
+        from pyrxd.cli.glyph_inspect import _render_txid_human
+        from pyrxd.glyph.inspector import GlyphInspector
+
+        parsed = GlyphInspector().parse_mint_scriptsig(bytes.fromhex(_MAINNET_V1_MINTS[8][0]))
+        text = _render_txid_human(
+            {
+                "txid": "20a0" * 16,
+                "byte_length": 1,
+                "input_count": 2,
+                "output_count": 0,
+                "outputs": [],
+                "mint_scriptsig": parsed,
+            }
+        )
+        assert "nonce width:              8 bytes" in text
+        assert "version (by nonce width)" not in text and ": v2" not in text
