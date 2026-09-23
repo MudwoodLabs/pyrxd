@@ -382,6 +382,38 @@ _OMITTED_NESTED_KEYS = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _tally_keys() -> frozenset[str]:
+    """The payload keys whose dict is a TALLY: its keys are data — an output type, a verdict
+    word, an envelope kind — that the card's notes print beside each count.
+
+    DERIVED from the classifier's source rather than listed here: a tally is a dict the
+    classifier fills with ``_count(<dict>, <word>)``, and its payload key is whatever key a dict
+    literal files that same name under (``"by_type": outputs_by_type``). A hand-kept list would
+    miss the next tally added — the way the leaf recursion below, left alone, required every
+    count and none of the words beside them.
+    """
+    import ast
+
+    tree = ast.parse((_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8"))
+    counted = {
+        call.args[0].id
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_count"
+        and call.args
+        and isinstance(call.args[0], ast.Name)
+    }
+    return frozenset(
+        k.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for k, v in zip(node.keys, node.values, strict=True)
+        if isinstance(k, ast.Constant) and isinstance(v, ast.Name) and v.id in counted
+    )
+
+
 def _required_evidence(key: str, value) -> list[str]:
     """Substrings the rendered text must contain for *key* to count as shown."""
     if key in _PROSE_EVIDENCE and _hashable(value) and value in _PROSE_EVIDENCE[key]:
@@ -391,7 +423,11 @@ def _required_evidence(key: str, value) -> list[str]:
         # A nested block (hashmark, message, attestation). Recurse to its LEAVES:
         # asserting the dict's repr would be satisfied by nothing a renderer emits,
         # and skipping it entirely is how the whole block went unrendered.
-        return [
+        #
+        # A TALLY's keys are required too: in `{"op_return": 1}` the count alone says nothing,
+        # and a note that printed "1" and no type name would have passed on the count.
+        words = [str(sub_key) for sub_key in value] if key in _tally_keys() else []
+        return words + [
             evidence
             for sub_key, sub_value in value.items()
             if sub_key not in _OMITTED_NESTED_KEYS
@@ -1401,6 +1437,14 @@ class TestTheTxCardRendersEveryFieldToo:
         }
         assert len(emitted) >= 6, f"only {sorted(emitted)} derived — the extraction is broken"
         assert emitted <= top | meta | in_envelopes, f"never exercised: {sorted(emitted - (top | meta | in_envelopes))}"
+
+
+def test_the_tallies_whose_words_are_required_are_derived_and_found() -> None:
+    """The derivation above, checked against the tallies known today, so an extraction that
+    finds nothing cannot make the tally clause of `_required_evidence` pass by requiring
+    nothing. Named here as a floor, not as the set: a new tally is picked up without editing
+    this line."""
+    assert {"by_type", "hashmark_by_status", "by_kind"} <= _tally_keys(), sorted(_tally_keys())
 
 
 class TestTheBurnBannerStopsAssertingAnOutcome:
