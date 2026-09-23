@@ -215,8 +215,9 @@ class TestPhotonicV1Parity:
         assert DmintState.from_script(ours).target == target
 
     @given(
-        height=st.integers(min_value=0, max_value=(1 << 31) - 2),
-        extra=st.integers(min_value=1, max_value=MAX_SCRIPT_NUM - (1 << 31)),
+        # heights a V1 contract can reach: its 4-byte height field tops out at 0x7FFFFFFF
+        height=st.integers(min_value=0, max_value=0x7FFFFFFE),
+        extra=st.integers(min_value=1, max_value=MAX_SCRIPT_NUM - 0x7FFFFFFF),
         reward=st.integers(min_value=1, max_value=RADIANT_MAX_PHOTONS),
         difficulty=st.integers(min_value=1, max_value=MAX_SHA256D_TARGET),
     )
