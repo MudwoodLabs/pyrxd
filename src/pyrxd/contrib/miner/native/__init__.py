@@ -12,8 +12,9 @@ Build it with the C compiler already on the machine::
 
 which is :func:`build`. It compiles, then runs the binary's ``--selftest``
 (SHA-256 known-answer vectors on every compression implementation the CPU can
-use) and refuses to hand back a binary that fails it. See ``README.md`` beside
-the source for usage, and ``docs/concepts/parallel-mining.md`` for the protocol.
+use) and refuses to hand back a binary that fails it or cannot run it. See
+``README.md`` beside the source for usage, and ``docs/concepts/parallel-mining.md``
+for the protocol.
 
 Whatever nonce the binary returns is re-verified by ``mine_solution_external``
 with :func:`pyrxd.glyph.dmint.verify_sha256d_solution` before it is used, the
@@ -26,6 +27,7 @@ import os
 import shlex
 import shutil
 import subprocess  # nosec B404 -- runs the caller's C compiler and the binary it just built
+import tempfile
 from pathlib import Path
 
 #: The grinder's C source, shipped inside the package.
@@ -46,7 +48,7 @@ _SELFTEST_TIMEOUT_S = 60.0
 
 
 class NativeGrinderBuildError(RuntimeError):
-    """The grinder could not be compiled, or the binary failed its self-test."""
+    """The grinder could not be compiled or put in place, or the binary failed or could not run its self-test."""
 
 
 def find_compiler(cc: str | None = None) -> list[str] | None:
@@ -70,11 +72,18 @@ def find_compiler(cc: str | None = None) -> list[str] | None:
 def build(out: str | os.PathLike[str], *, cc: str | None = None) -> Path:
     """Compile :data:`SOURCE` to ``out``, run its self-test, and return the binary's path.
 
-    :param out: Where to write the executable. Its directory must exist.
+    The binary is compiled into a new temporary directory beside ``out`` and self-tested
+    there; only a binary that passes is moved onto ``out`` (``os.replace``). If ``out`` is a
+    symlink, the link itself is replaced, never the file it points to.
+
+    :param out: Where to write the executable, absolute or relative to the working directory.
+        Its directory must exist.
     :param cc:  Compiler command (may include flags). Defaults as in :func:`find_compiler`.
-    :raises NativeGrinderBuildError: no compiler was found, the compile failed, or the
-        built binary failed ``--selftest`` (the file is then removed, so a caller cannot
-        pick up a binary that fails the SHA-256 known-answer vectors).
+    :raises NativeGrinderBuildError: no compiler was found, the compile failed, the built
+        binary could not run or failed ``--selftest``, or it could not be moved onto ``out``.
+        Nothing is then written at ``out``, so a caller cannot pick up a binary that fails the
+        SHA-256 known-answer vectors. The temporary directory is deleted either way (an error
+        deleting it is ignored).
     """
     compiler = find_compiler(cc)
     if compiler is None:
@@ -82,20 +91,31 @@ def build(out: str | os.PathLike[str], *, cc: str | None = None) -> Path:
             "no C compiler found: set CC, pass cc=, or install cc/gcc/clang "
             "(the bundled Python miner, python -m pyrxd.contrib.miner, needs none)"
         )
-    out_path = Path(out).resolve()
-    cmd = [*compiler, *CFLAGS, "-o", str(out_path), str(SOURCE)]
-    compiled = subprocess.run(  # noqa: S603 # nosec B603 -- argv built above from the caller's compiler choice
-        cmd, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_S, check=False
-    )
-    if compiled.returncode != 0:
-        raise NativeGrinderBuildError(
-            f"compiling {SOURCE.name} failed (exit {compiled.returncode}): {' '.join(cmd)}\n{compiled.stderr.strip()}"
-        )
+    out_path = Path(out).absolute()  # not resolve(): a symlink at `out` is replaced, not followed
     try:
-        selftest_line(out_path)
-    except NativeGrinderBuildError:
-        out_path.unlink(missing_ok=True)
-        raise
+        work = Path(tempfile.mkdtemp(prefix=f".{out_path.name}.build-", dir=out_path.parent))
+    except OSError as exc:
+        raise NativeGrinderBuildError(f"cannot write the grinder beside {out_path}: {exc}") from exc
+    try:
+        built = work / out_path.name
+        cmd = [*compiler, *CFLAGS, "-o", str(built), str(SOURCE)]
+        try:
+            compiled = subprocess.run(  # noqa: S603 # nosec B603 -- argv built above from the caller's compiler choice
+                cmd, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_S, check=False
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise NativeGrinderBuildError(f"could not run the compiler {' '.join(cmd)}: {exc}") from exc
+        if compiled.returncode != 0:
+            raise NativeGrinderBuildError(
+                f"compiling {SOURCE.name} failed (exit {compiled.returncode}): {' '.join(cmd)}\n{compiled.stderr.strip()}"
+            )
+        selftest_line(built)
+        try:
+            os.replace(built, out_path)
+        except OSError as exc:
+            raise NativeGrinderBuildError(f"could not move the built grinder onto {out_path}: {exc}") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return out_path
 
 
@@ -104,11 +124,18 @@ def selftest_line(binary: str | os.PathLike[str]) -> str:
     implementation the CPU can run passed the known-answer vectors, which one ``auto``
     picks, whether the SHA extensions are available, and the default thread count.
 
-    :raises NativeGrinderBuildError: the self-test failed.
+    :raises NativeGrinderBuildError: the self-test failed, or the binary could not be run
+        (not executable, built for another machine) or did not finish within
+        ``_SELFTEST_TIMEOUT_S`` seconds.
     """
-    result = subprocess.run(  # noqa: S603 # nosec B603 -- a grinder binary the caller names
-        [str(binary), "--selftest"], capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT_S, check=False
-    )
+    try:
+        result = subprocess.run(  # noqa: S603 # nosec B603 -- a grinder binary the caller names
+            [str(binary), "--selftest"], capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT_S, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise NativeGrinderBuildError(f"{binary} --selftest did not finish within {exc.timeout} s") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NativeGrinderBuildError(f"{binary} could not run its self-test: {exc}") from exc
     if result.returncode != 0 or not result.stdout.startswith("selftest ok"):
         raise NativeGrinderBuildError(f"{binary} failed its self-test:\n{result.stdout}{result.stderr}".strip())
     return result.stdout.strip()

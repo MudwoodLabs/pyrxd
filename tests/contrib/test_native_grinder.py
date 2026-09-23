@@ -205,6 +205,119 @@ class TestBuildAndSelftest:
         with pytest.raises(SystemExit):
             native_main([])
 
+    @pytest.mark.parametrize(
+        ("what_cc_writes", "chmod", "expected"),
+        [
+            # Built for another machine (a cross-compiling CC): the kernel refuses to exec it.
+            ("\x7fELF but not really", 0o755, "Exec format error"),
+            # Not executable at all.
+            ("#!/bin/sh\necho 'selftest ok: impl=portable shani_available=0 threads=1'\n", 0o644, "Permission denied"),
+        ],
+    )
+    def test_a_binary_that_cannot_run_its_selftest_is_removed_and_reported(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        what_cc_writes: str,
+        chmod: int,
+        expected: str,
+    ) -> None:
+        """Failing to RUN the self-test is failing it: the error is NativeGrinderBuildError, no
+        file is left at ``out`` or beside it, and the CLI prints one line, not a traceback."""
+        payload = tmp_path / "payload"
+        payload.write_text(what_cc_writes)
+        fake_cc = tmp_path / "fake-cc"
+        fake_cc.write_text(
+            f'#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\ncp "{payload}" "$2"\nchmod {chmod:o} "$2"\n'
+        )
+        fake_cc.chmod(0o755)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        with pytest.raises(NativeGrinderBuildError, match=f"could not run its self-test: .*{expected}"):
+            build(dest / "g", cc=str(fake_cc))
+        assert list(dest.iterdir()) == []
+
+        assert native_main(["--out", str(dest / "g"), "--cc", str(fake_cc)]) == 1
+        captured = capsys.readouterr()
+        assert expected in captured.err and "Traceback" not in captured.err
+        assert len(captured.err.strip().splitlines()) == 1, captured.err
+        assert list(dest.iterdir()) == []
+
+    def test_a_selftest_that_never_finishes_is_killed_removed_and_reported(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("pyrxd.contrib.miner.native._SELFTEST_TIMEOUT_S", 0.5)
+        fake_cc = tmp_path / "fake-cc"
+        fake_cc.write_text(
+            "#!/bin/sh\n"
+            'while [ "$1" != "-o" ]; do shift; done\n'
+            "printf '#!/bin/sh\\nexec sleep 30\\n' > \"$2\"\n"
+            'chmod +x "$2"\n'
+        )
+        fake_cc.chmod(0o755)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        started = time.monotonic()
+        with pytest.raises(NativeGrinderBuildError, match=r"--selftest did not finish within 0\.5 s"):
+            build(dest / "g", cc=str(fake_cc))
+        assert time.monotonic() - started < 15
+        assert list(dest.iterdir()) == []
+
+        assert native_main(["--out", str(dest / "g"), "--cc", str(fake_cc)]) == 1
+        captured = capsys.readouterr()
+        assert "did not finish" in captured.err and "Traceback" not in captured.err
+        assert len(captured.err.strip().splitlines()) == 1, captured.err
+        assert list(dest.iterdir()) == []
+
+    def test_out_that_is_a_symlink_replaces_the_link_and_never_its_target(self, tmp_path: Path, grinder: str) -> None:
+        """Like ``cc -o``: the link at ``out`` becomes the binary; the file it pointed to is not
+        written, and on a failed build not deleted either."""
+        del grinder  # only here so this test skips/fails with the others when there is no compiler
+        precious = tmp_path / "precious"
+        precious.write_bytes(b"not yours to overwrite\n")
+
+        # A failed build: the link and its target are both left exactly as they were.
+        link = tmp_path / "link"
+        link.symlink_to(precious)
+        with pytest.raises(NativeGrinderBuildError):
+            build(link, cc="false")
+        fake_cc = tmp_path / "fake-cc"  # compiles "fine", then fails its self-test
+        fake_cc.write_text(
+            "#!/bin/sh\n"
+            'while [ "$1" != "-o" ]; do shift; done\n'
+            'printf \'#!/bin/sh\\necho "selftest FAILED: impl=portable"\\nexit 1\\n\' > "$2"\n'
+            'chmod +x "$2"\n'
+        )
+        fake_cc.chmod(0o755)
+        with pytest.raises(NativeGrinderBuildError, match="failed its self-test"):
+            build(link, cc=str(fake_cc))
+        assert link.is_symlink() and os.readlink(link) == str(precious)
+        assert precious.read_bytes() == b"not yours to overwrite\n"
+
+        # A good build: the link itself is replaced by a binary that passes its self-test.
+        built = build(link)
+        assert precious.read_bytes() == b"not yours to overwrite\n"
+        assert not link.is_symlink()
+        assert selftest_line(link).startswith("selftest ok")
+        assert built == link
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["fake-cc", "link", "precious"]
+
+    def test_a_relative_out_and_an_out_in_a_missing_directory(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, grinder: str
+    ) -> None:
+        del grinder  # only here so this test skips/fails with the others when there is no compiler
+        monkeypatch.chdir(tmp_path)
+        assert native_main(["--out", "rel-g"]) == 0
+        assert capsys.readouterr().out.startswith(f"built {Path.cwd() / 'rel-g'}\n")
+        assert selftest_line(tmp_path / "rel-g").startswith("selftest ok")
+
+        assert native_main(["--out", str(tmp_path / "missing" / "g")]) == 1
+        captured = capsys.readouterr()
+        assert "missing" in captured.err and "Traceback" not in captured.err
+        assert len(captured.err.strip().splitlines()) == 1, captured.err
+        assert not (tmp_path / "missing").exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["rel-g"]
+
 
 # --------------------------------------------------------------------------- digests
 

@@ -13,12 +13,15 @@ python -m pyrxd.contrib.miner.native --out ./sha256d-grind
 ```
 
 That compiles with the machine's C compiler (`$CC`, else `cc`, `gcc` or
-`clang`) using `-O2 -pthread`, runs the binary's `--selftest`, and deletes the
-binary if the self-test fails. The equivalent by hand:
+`clang`) using `-O2 -pthread` into a temporary directory beside `--out`, runs
+the binary's `--selftest` there, and only then moves it onto `--out`. A symlink
+at `--out` is itself replaced, never the file it points to. A binary that fails
+its self-test, or cannot run it, is deleted and nothing is written at `--out`.
+The same compile and self-test by hand, without the temporary directory:
 
 ```bash
 cc -O2 -pthread -o sha256d-grind "$(python -m pyrxd.contrib.miner.native --print-source)"
-./sha256d-grind --selftest
+./sha256d-grind --selftest || rm -f sha256d-grind
 ```
 
 It needs C11, POSIX threads and `unsigned __int128`: a 64-bit target with GCC
