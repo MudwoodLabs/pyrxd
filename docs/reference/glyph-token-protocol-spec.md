@@ -574,7 +574,7 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 
 A MUT reveal produces **two** outputs: the 63-byte NFT singleton the owner holds,
 and this 174-byte contract UTXO that holds the mutable state
-(`src/pyrxd/glyph/builder.py:576-619`). Both carry the same ref.
+(`src/pyrxd/glyph/builder.py:827-932`). Both carry the same ref.
 
 The contract is spent with a scriptSig of the shape
 
@@ -751,7 +751,7 @@ alone does not determine the clamp a contract bakes — the bytecode does.
 `daa` is omitted when the mode is `FIXED`. **Nothing on chain reconciles
 `premine` against the photons a deploy actually emits.** pyrxd refuses a deploy
 whose metadata advertises a premine it does not emit
-(`src/pyrxd/glyph/builder.py:67-130`) — a deliberate addition, not shared with
+(`src/pyrxd/glyph/builder.py:68-131`) — a deliberate addition, not shared with
 Photonic, and therefore not something an implementation may rely on other
 producers to have done.
 
@@ -1310,12 +1310,12 @@ behaviour stay on chain and a reader still has to handle them.
 | Royalty `minimum` with `splits` | Each split computed independently; `minimum` never consulted, so a royalty declaring `bps=100, minimum=50000` pays the minimum with one recipient and ignores it with two | Total computed once, then divided | Photonic's version can pay the creator less than the recorded terms (`src/pyrxd/glyph/royalty.py:56-68`). |
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
-| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:67-130`). |
+| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:68-131`). |
 | Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:332-335`). |
 | V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py:119-151`). |
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
 | V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
-| WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:687-735`). |
+| WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:1457-1469`). |
 | Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
 | Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
 | `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |
@@ -1389,8 +1389,8 @@ for such a script is undefined.
 No consensus rule fixes the photon value of a commit, contract, or NFT carrier
 output. Radiant-Core has no dust threshold — `GetDustThreshold` returns 1 and
 `IsDust` is `nValue <= 0` — so any output worth at least one photon is standard
-(`src/pyrxd/glyph/builder.py:1296-1308`, citing `src/policy/policy.cpp:19-25` at
-`afdf57b1`). The 1-photon value on dMint contract outputs is pinned by the
+(`src/pyrxd/glyph/builder.py:1802-1808`, citing `src/policy/policy.cpp:19-25` at
+`v3.1.2`). The 1-photon value on dMint contract outputs is pinned by the
 **covenant** (`OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`,
 `src/pyrxd/glyph/dmint/builders.py:872`), not by the chain. The 546-photon floors
 in pyrxd are wallet policy, not chain rules, and are labelled as such at
