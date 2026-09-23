@@ -253,8 +253,11 @@ jobs:
           poetry run python -m pyrxd.contrib.miner.native --out "$RUNNER_TEMP/sha256d-grind"
       # One line per run and miner, on this runner, tonight: the rate both miners reach and the
       # mean difficulty-1 grind it projects to. It took 97 s on the 2026-09-23 runner, and it
-      # is what sizes the ceilings below from a measurement instead of from a guess.
+      # is what sizes the ceilings below from a measurement instead of from a guess. Bounded
+      # (each run at the script's 300 s, the step at 15 minutes) so a hung miner fails the job
+      # here rather than using up its 300 minutes before any suite starts.
       - name: Hash rate on this runner (bundled Python miner vs native grinder)
+        timeout-minutes: 15
         run: poetry run python scripts/bench_dmint_miners.py --grinder "$RUNNER_TEMP/sha256d-grind"
       - name: dMint V1 + V2 + premine, mined for real
         env:
