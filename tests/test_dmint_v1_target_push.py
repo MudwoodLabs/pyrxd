@@ -418,6 +418,24 @@ class TestANonMinimalTargetIsRefused:
         )
         assert _unreadable_target_reason(legacy) is None
 
+    def test_a_v1_state_that_does_not_round_trip_is_refused_before_any_grind(self) -> None:
+        """The V1 covenant copies the spent state's bytes after the height into the next state;
+        pyrxd rebuilds them from the parsed fields. The mint builder refuses where the two could
+        differ: a script whose (readable) numbers are pushed non-canonically, and a
+        DmintContractUtxo whose state does not match its script."""
+        today = build_dmint_v1_contract_script(0, _C, _T, max_height=100, reward=1000, target=MAX_SHA256D_TARGET)
+        i = today.index(_push_minimal(100), 79)
+        padded = today[:i] + b"\x02\x64\x00" + today[i + 2 :]  # max_height 100 as 2 bytes
+        assert DmintState.from_script(padded).max_height == 100
+        assert _unreadable_target_reason(padded) is None  # the target is fine; the state is not canonical
+        with pytest.raises(ValidationError, match="does not round-trip to the contract UTXO script"):
+            build_dmint_mint_tx(_utxo(padded), b"\x00" * 4, b"\x22" * 20, 0, funding_utxo=_funding())
+        other = build_dmint_v1_contract_script(0, _C, _T, max_height=101, reward=1000, target=MAX_SHA256D_TARGET)
+        stale = DmintContractUtxo(txid="cc" * 32, vout=0, value=1, script=today, state=DmintState.from_script(other))
+        with pytest.raises(ValidationError, match="does not round-trip to the contract UTXO script"):
+            build_dmint_mint_tx(stale, b"\x00" * 4, b"\x22" * 20, 0, funding_utxo=_funding())
+        build_dmint_mint_tx(_utxo(today), b"\x00" * 4, b"\x22" * 20, 0, funding_utxo=_funding())
+
     def test_a_negative_target_is_refused(self) -> None:
         """An 8-byte push with the top bit set is a negative number to the covenant (the parser
         used to read V1 targets unsigned, as 2**64 - 1 here). Readable, but no hash meets it."""
