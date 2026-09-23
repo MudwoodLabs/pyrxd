@@ -682,6 +682,28 @@ def test_the_last_nonce_of_the_v1_space_is_searchable(grinder: str) -> None:
     assert json.loads(r.stdout)["nonce_hex"] == "ffffffff"
 
 
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full, whose every write fails with ENOSPC")
+def test_a_solution_that_cannot_be_written_is_not_reported_as_found(grinder: str) -> None:
+    """Exit 0 means "found, and the answer is on stdout". When stdout cannot take the answer,
+    the grinder exits 3 and says why on stderr."""
+    preimage, nonce = bytes.fromhex(_HIT_W4["preimage"]), _nonce_int(_HIT_W4)
+    flags = ("--nonce-start", str(nonce), "--nonce-count", "1", "--quiet")
+    # The same request to a pipe finds it and exits 0.
+    code, result = _solve(grinder, preimage, 4, nonce, 1)
+    assert code == 0 and isinstance(result, MineSuccess) and result.nonce.hex() == _HIT_W4["nonce"]
+    with open("/dev/full", "wb") as full:
+        r = subprocess.run(
+            [grinder, *flags],
+            input=_request(preimage, 4).encode(),
+            stdout=full,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+    assert r.returncode == 3, r
+    assert b"writing the solution to stdout failed" in r.stderr, r.stderr
+
+
 # --------------------------------------------------------------------------- lifecycle
 
 

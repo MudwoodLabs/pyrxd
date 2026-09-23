@@ -83,15 +83,21 @@ EXPECTED_SKIPS: tuple[ExpectedSkip, ...] = (
         ),
     ),
     ExpectedSkip(
-        reason=r"^no /proc/cpuinfo on this platform$|^the parent-death check is asserted via /proc$",
+        reason=(
+            r"^no /proc/cpuinfo on this platform$|^the parent-death check is asserted via /proc$"
+            r"|^needs /dev/full, whose every write fails with ENOSPC$"
+        ),
         nodeid=(
             r"^tests/contrib/test_native_grinder\.py::(TestBuildAndSelftest::"
-            r"test_sha_extension_detection_agrees_with_the_kernel|test_the_grinder_stops_when_its_parent_is_killed)$"
+            r"test_sha_extension_detection_agrees_with_the_kernel|test_the_grinder_stops_when_its_parent_is_killed"
+            r"|test_a_solution_that_cannot_be_written_is_not_reported_as_found)$"
         ),
         why=(
             "Two native-grinder checks read Linux's /proc: the kernel's CPU flags, to cross-check "
             "the grinder's own SHA-extension detection, and a process's state, to see the grinder "
-            "exit when its parent is killed. CI runs Linux, where both run; on macOS they skip."
+            "exit when its parent is killed. A third writes the grinder's answer to Linux's "
+            "/dev/full, to see it refuse to exit 0 when the answer cannot be written. CI runs "
+            "Linux, where all three run; on macOS they skip."
         ),
     ),
     # --- opt-in live-node lanes ----------------------------------------------------------

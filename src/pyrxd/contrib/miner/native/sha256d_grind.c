@@ -80,6 +80,9 @@ __extension__ typedef unsigned __int128 u128;
 #define EXIT_FOUND 0
 #define EXIT_USAGE 1
 #define EXIT_EXHAUSTED 2
+/* A solution was found but could not be written to stdout (a full disk, for example). Not 0,
+ * so the caller cannot take the missing or partial output for an answer. */
+#define EXIT_WRITE_FAILED 3
 
 /* ------------------------------------------------------------------ SHA-256 */
 
@@ -751,7 +754,8 @@ static void usage(FILE *f) {
             "Exit codes:\n"
             "  0  solution found (stdout: {nonce_hex, attempts, elapsed_s})\n"
             "  1  usage / protocol error (stderr has details)\n"
-            "  2  nonce range exhausted (stdout: {\"exhausted\": true})\n",
+            "  2  nonce range exhausted (stdout: {\"exhausted\": true})\n"
+            "  3  solution found but writing it to stdout failed (stderr has details)\n",
             PROTOCOL_VERSION);
 }
 
@@ -1016,8 +1020,11 @@ int main(int argc, char **argv) {
     char nh[17];
     for (unsigned b = 0; b < job.nonce_width; b++) nb[b] = (uint8_t)(sw.found_nonce >> (8 * b));
     hex_encode(nb, job.nonce_width, nh);
-    printf("{\"nonce_hex\": \"%s\", \"attempts\": %llu, \"elapsed_s\": %.6f}\n", nh, (unsigned long long)attempts,
-           elapsed);
-    fflush(stdout);
+    const int written = printf("{\"nonce_hex\": \"%s\", \"attempts\": %llu, \"elapsed_s\": %.6f}\n", nh,
+                               (unsigned long long)attempts, elapsed);
+    if (written < 0 || fflush(stdout) != 0) {
+        fprintf(stderr, "writing the solution to stdout failed: %s\n", strerror(errno));
+        return EXIT_WRITE_FAILED;
+    }
     return EXIT_FOUND;
 }
