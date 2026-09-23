@@ -301,9 +301,9 @@ Notes on individual fields:
 
 | Limit | Value | Source |
 |---|---|---|
-| CBOR body | 262,144 bytes (256 KiB) | `src/pyrxd/glyph/payload.py:51` |
-| `attrs` entries | 64 | `src/pyrxd/glyph/payload.py:58` |
-| `main.t` (MIME type) | 256 characters | `src/pyrxd/glyph/payload.py:67` |
+| CBOR body | 262,144 bytes (256 KiB) | `src/pyrxd/glyph/payload.py` `_MAX_CBOR_PAYLOAD_BYTES` |
+| `attrs` entries | 64 | `src/pyrxd/glyph/payload.py` `_MAX_ATTRS_COUNT` |
+| `main.t` (MIME type) | 256 characters | `src/pyrxd/glyph/payload.py` `_MAX_MIME_TYPE_CHARS` |
 | `main.b` (media) | bounded only by the CBOR body cap | — |
 
 The 256 KiB body cap is a DoS bound chosen above the largest known real payload

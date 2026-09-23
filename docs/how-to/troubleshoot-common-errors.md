@@ -557,7 +557,7 @@ supply amount) gets counted exactly like spendable RXD, which it is
 **not** — spending it as a plain-RXD input burns the token.
 
 **Fix:** `pyrxd glyph list --type ft` (or `--type nft`, or `--type all`) —
-(`list_cmd` in [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)) —
+`list_cmd` in [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py) —
 scans wallet addresses and decodes the Glyph envelope, so token holdings
 show up as tokens, separate from the plain-RXD balance. Use this whenever
 you need to know what's actually spendable versus what's a token carrier.
