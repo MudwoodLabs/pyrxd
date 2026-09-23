@@ -642,3 +642,38 @@ class TestTheOutputValidationBlockAcceptsIt:
         res.tx.outputs[0].locking_script = Script(burn)
         with pytest.raises(_Abort):
             _validate_outputs(contract, res)
+
+
+# ---------------------------------------------------------------------------------------------
+# The state the builder decides from must be the state the spent script carries
+# ---------------------------------------------------------------------------------------------
+
+
+class TestTheStateMustBeTheScripts:
+    """``build_dmint_mint_tx`` decides everything from ``contract_utxo.state``, above all whether
+    this is the final mint. A state that disagrees with ``contract_utxo.script`` builds a mint of
+    a contract that is not the one being spent: one height ahead, it builds the burn a mint early,
+    which the covenant rejects after the grind. V2 has refused this since its state bytes are
+    rebuilt and matched against the script; V1 now re-parses the script and compares."""
+
+    @pytest.mark.parametrize(
+        "forge",
+        [
+            {"height": 1},  # one ahead: the builder would take this for the final mint
+            {"max_height": 1},  # the same mistake from the other side
+            {"contract_ref": _TOKEN_REF},  # a burn naming a ref the covenant does not
+        ],
+        ids=["height", "max_height", "contract_ref"],
+    )
+    @_BUILDERS
+    def test_a_state_that_is_not_the_scripts_is_refused(self, make, forge) -> None:
+        contract = make(0, 2)
+        forged = dataclasses.replace(contract, state=dataclasses.replace(contract.state, **forge))
+        with pytest.raises(ValidationError, match="does not (match the state|round-trip to)"):
+            _mint(forged)
+        assert not _mint(contract).is_final_mint  # the honest state of the same script
+
+    def test_a_v1_state_parsed_from_its_own_script_is_accepted_at_every_height(self) -> None:
+        for height in (0, 1):
+            res = _mint(_v1(height, 2))
+            assert res.is_final_mint is (height == 1)

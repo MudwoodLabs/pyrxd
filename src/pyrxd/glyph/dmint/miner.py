@@ -2196,7 +2196,8 @@ def _build_dmint_v1_mint_tx(
         defense against that mistake.
     :raises ContractExhaustedError: ``state.height >= state.max_height``.
     :raises PoolTooSmallError:      funding UTXO can't cover reward + fee + change dust.
-    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1.
+    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1;
+        ``contract_utxo.state`` is not the state ``contract_utxo.script`` carries.
     """
     from pyrxd.script.script import Script
     from pyrxd.security.errors import InvalidFundingUtxoError
@@ -2216,6 +2217,22 @@ def _build_dmint_v1_mint_tx(
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
     if fee_rate < 1:
         raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+    # Everything below is decided from ``state`` (whether this is the final mint, what to
+    # recreate), so it must be the state the spent script carries: a state one height ahead
+    # of its script builds the burn a mint early, which the covenant rejects after the grind.
+    # The V2 path checks this by rebuilding the state bytes (_v2_code_section). Here the
+    # script is parsed again and compared, which holds for whatever encodings the V1 parser
+    # accepts.
+    try:
+        script_state = DmintState.from_script(contract_utxo.script)
+    except ValidationError as exc:
+        raise ValidationError(f"V1 mint: contract_utxo.script is not a dMint contract script ({exc})") from exc
+    if script_state != state:
+        raise ValidationError(
+            "V1 mint: contract_utxo.state does not match the state contract_utxo.script carries "
+            f"(state height {state.height}, script height {script_state.height}); build the state with "
+            "DmintState.from_script(contract_utxo.script)."
+        )
     # The final mint recreates no contract (see build_dmint_mint_tx), so the recreated
     # output's value rule below does not apply to it.
     is_final_mint = state.next_mint_is_final

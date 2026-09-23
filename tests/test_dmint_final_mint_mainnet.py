@@ -25,6 +25,7 @@ txid, so version, both outpoints, sequences, all four outputs and locktime.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -39,6 +40,7 @@ from pyrxd.glyph.dmint import (
     build_dmint_mint_tx,
 )
 from pyrxd.script.script import Script
+from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import Transaction
 
 _FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "dmint_v1_final_mints_mainnet.json").read_text())
@@ -130,3 +132,19 @@ def test_pyrxd_rebuilds_the_mint_the_chain_accepted(entry: dict) -> None:
     built.outputs[3].satoshis = chain.outputs[3].satoshis
     assert built.serialize() == raw
     assert built.txid() == entry["txid"]
+
+
+@pytest.mark.parametrize("entry", _MINTS, ids=_IDS)
+def test_the_state_check_accepts_the_real_contract_and_refuses_a_forged_state(entry: dict) -> None:
+    """``build_dmint_mint_tx`` refuses a V1 state that is not the one its script carries. The
+    honest half is every real mainnet contract here, parsed from its own script: accepted (the
+    rebuild above goes through the same check). The forged half is that contract's state one
+    height BEHIND its script: for a final mint's contract, pyrxd would recreate the contract
+    where the covenant demands the burn. (One height ahead of a final mint's contract is
+    ``max_height``, which the exhausted check refuses first.)"""
+    _raw, chain, contract, funding = _read(entry)
+    reward_pkh, message = _reward_pkh_and_message(chain)
+    build_dmint_mint_tx(contract, b"\x00" * 4, reward_pkh, 0, funding_utxo=funding, op_return_msg=message)
+    behind = dataclasses.replace(contract, state=dataclasses.replace(contract.state, height=contract.state.height - 1))
+    with pytest.raises(ValidationError, match="does not match the state contract_utxo.script carries"):
+        build_dmint_mint_tx(behind, b"\x00" * 4, reward_pkh, 0, funding_utxo=funding, op_return_msg=message)
