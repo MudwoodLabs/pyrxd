@@ -293,12 +293,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   grind. The same check refuses a negative target.
 
   The V1 parser had the mirror defect: it accepted only the `08` push, so it could not read
-  the V1 contracts Photonic deployed at difficulty 256 or more. A corpus of mainnet V1
-  contract scripts read on 2026-09-22 holds 2,177 distinct scripts; the parser before this
-  change read 1,875 of them and refused the other 302 (difficulty 256 to 1,000,000, 6- and
-  7-byte targets, two of them minted over a thousand times). All 2,177 now parse — the 1,875 to the same
-  state as before — and rebuild byte for byte through pyrxd's builder and the Photonic
-  transcription. None carries a non-minimal target.
+  mainnet V1 contracts deployed at difficulty 256 or more with minimal 6- or 7-byte targets,
+  and `claim-dmint` called them "not a dMint contract". Selected by their raw bytes, not by
+  pyrxd's parser, mainnet data collected on 2026-09-22 and 2026-09-23 (a survey of contract
+  scripts, and the contracts spent by 434 V1 final mints) holds 2,611 distinct V1 scripts.
+  324 are at difficulty 256 or more, and 22 of the final mints, across 9 tokens, spent such a
+  contract, so the covenant has accepted those targets. All 2,611 now parse, to the numbers a
+  raw decode gives, and rebuild byte for byte through pyrxd's builder and the Photonic
+  transcription. None carries a non-minimal target, so none carries the push pyrxd's builder
+  wrote at difficulty 256 or more.
 
 - **V1 deploys refused `max_height` and `reward` above 0xFFFFFF.** The "3-byte ceiling" came
   from the push widths on the first V1 contracts pyrxd decoded, not from any covenant rule:

@@ -34,6 +34,7 @@ from pyrxd.glyph.dmint import (
     DmintState,
     build_dmint_mint_tx,
     build_dmint_v1_contract_script,
+    difficulty_to_target,
 )
 from pyrxd.glyph.dmint.builders import _push_minimal, build_dmint_v1_state_script
 from pyrxd.glyph.dmint.chain import _parse_dmint_script
@@ -279,11 +280,19 @@ class TestTheCovenantReadsTheDeployedTarget:
 # 3. Mainnet V1 contracts, pinned
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
-#: V1 contract scripts read from Radiant mainnet UTXOs on 2026-09-22 (outpoint of the UTXO that
-#: carried the script then). Each rebuilds byte for byte from its parsed fields. The ones at
+#: V1 contract scripts from Radiant mainnet (outpoint of the output that carries the script).
+#: Each rebuilds byte for byte from its parsed fields at its own difficulty. The ones at
 #: difficulty 256 or more have a target shorter than 8 bytes, which pyrxd's parser refused before
-#: 2026-09-23; RABO and BTC had been minted 1,404 and 2,495 times with those pushes.
+#: 2026-09-23. They are minted like any other: RABO and BTC sat at heights 1,404 and 2,495 when
+#: read (2026-09-22), and the G22K contract was spent by its final mint.
 _MAINNET_V1 = {
+    # difficulty 22,000, 7-byte target; height 1 of max 2. Spent on mainnet by the contract's
+    # final mint bc15c1119b44b51d8c3839472f7856b416c54d74c03dec5303ca7102e837a921.
+    "G22K": (
+        "c0a9acafb525dc5d2dc0f84304fb6a646192df48de7f4fa8b119386022f2231a:0",
+        "0401000000d86b7eda989bff81f61dd7a9cfa9a171460b968f832dc0086d5859eb3d709d0bb601000000d06b7eda989bff81f61d"
+        "d7a9cfa9a171460b968f832dc0086d5859eb3d709d0bb600000000525107169ba1e44c7d01",
+    ),
     # difficulty 256: target 2**55 - 1, the widest 7-byte push. height 1,404.
     "RABO": (
         "8f3156923f40a3bf6b0ec501be4bed39d8bc12da197cfcecfc3dfa00127343e0:0",
@@ -347,8 +356,10 @@ class TestMainnetV1Contracts:
         script = _mainnet(name)
         st_ = DmintState.from_script(script)
         assert st_.is_v1
+        difficulty = MAX_SHA256D_TARGET // st_.target
+        assert _photonic_diff_to_target(difficulty) == st_.target  # its own difficulty gives its target
         rebuilt = build_dmint_v1_contract_script(
-            st_.height, st_.contract_ref, st_.token_ref, st_.max_height, st_.reward, st_.target, st_.algo
+            st_.height, st_.contract_ref, st_.token_ref, st_.max_height, st_.reward, difficulty_to_target(difficulty)
         )
         assert rebuilt == script
         cref, tref = st_.contract_ref.to_bytes().hex(), st_.token_ref.to_bytes().hex()
