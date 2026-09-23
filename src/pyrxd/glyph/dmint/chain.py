@@ -406,7 +406,7 @@ class DmintState:
         V1 has 6 state items plus a 145-byte fixed code epilogue (varying
         only in the algo selector byte). Layout:
 
-          [0] height       — ``_push_4bytes_le`` (opcode 0x04 + 4 bytes LE)
+          [0] height       — ``_push_4bytes_le`` (opcode 0x04 + 4 bytes LE), bit 31 clear
           [1] contractRef  — ``0xd8`` + 36-byte wire ref
           [2] tokenRef     — ``0xd0`` + 36-byte wire ref
           [3] maxHeight    — ``_push_minimal``
@@ -417,7 +417,7 @@ class DmintState:
                              targets). pyrxd pushed it as ``0x08`` + 8 bytes before then; that
                              parses to the same number, but below 2**55 no mint can read it
                              (see ``miner._unreadable_target_reason``)
-          —— OP_STATESEPARATOR (0xbd) + 144-byte fixed code epilogue ——
+          —— OP_STATESEPARATOR (0xbd) + 144-byte fixed code epilogue, which ends the script ——
 
         ``daa_mode`` is always ``FIXED`` for V1 (V1 has no DAA bytecode).
         ``target_time`` and ``last_time`` are V2-only and set to 0; the
@@ -436,6 +436,16 @@ class DmintState:
         if pos + 5 > len(script_bytes):
             raise ValidationError("DmintState._from_v1_script: script truncated inside height")
         height = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
+        # The epilogue reads this field with OP_BIN2NUM, as a signed number: 0x80000000 is 0 to
+        # it and anything above is negative, so it would write a next height pyrxd, reading the
+        # field unsigned, does not. Minting from a height below 2**31 never writes bit 31 (the
+        # epilogue cannot encode 2**31); only a contract deployed at such a height carries one,
+        # and pyrxd refuses to read that state rather than model a negative height.
+        if height & 0x80000000:
+            raise ValidationError(
+                f"DmintState._from_v1_script: the height field {script_bytes[pos + 1 : pos + 5].hex()} has bit 31 "
+                "set; the covenant reads it as a signed number, and pyrxd does not read such a V1 state"
+            )
         pos += 5
 
         # --- Item 1: contractRef
@@ -474,6 +484,15 @@ class DmintState:
         algo = _match_v1_epilogue(script_bytes, pos)
         if algo is None:
             raise ValidationError(f"DmintState._from_v1_script: code epilogue at pos {pos} does not match V1 template")
+        # The V1 template ends with its epilogue. pyrxd recreates a contract from the template, so
+        # it would drop anything after it, and the covenant requires the recreated contract's code
+        # to equal the spent one's (OP_CODESCRIPTBYTECODE_OUTPUT == OP_CODESCRIPTBYTECODE_UTXO).
+        trailing = len(script_bytes) - (pos + _V1_EPILOGUE_LEN)
+        if trailing:
+            raise ValidationError(
+                f"DmintState._from_v1_script: {trailing} byte(s) follow the {_V1_EPILOGUE_LEN}-byte V1 code "
+                "epilogue, which ends the V1 template"
+            )
 
         return cls(
             height=height,

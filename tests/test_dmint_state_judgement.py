@@ -8,10 +8,17 @@
    The boundary is checked here by running the V1 epilogue's own height bytes on a port of the
    vendored interpreter's ``OP_BIN2NUM`` / ``OP_NUM2BIN`` (``tests/vendor/radiant_core/``), and
    the port is pinned to that source text.
+2. **A V1 height with bit 31 set.** The epilogue reads the height field with ``OP_BIN2NUM``, as a
+   signed number; pyrxd read it unsigned, judged such a contract mintable, and built the wrong
+   next height. No mint from a height below ``2**31`` writes one. The parser now refuses it.
+3. **Bytes after the V1 epilogue.** The parser matched the 145-byte epilogue and ignored what
+   followed; pyrxd then recreated the contract without those bytes, which the covenant rejects
+   after the grind. The parser now refuses them.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -288,3 +295,65 @@ def test_the_ceiling_and_the_difficulty_bound_are_independent() -> None:
         difficulty=MAX_SHA256D_TARGET,
     )
     assert (p.max_height, p.difficulty) == (2**31, MAX_SHA256D_TARGET)
+
+
+# =====================================================================================
+# 2. A V1 height with bit 31 set
+# =====================================================================================
+
+
+def _with_height_field(script: bytes, field: int) -> bytes:
+    return b"\x04" + field.to_bytes(4, "little") + script[5:]
+
+
+class TestAV1HeightWithBit31Set:
+    def test_2_31_minus_1_is_read(self) -> None:
+        script = _with_height_field(_v1(0, 2**31), 0x7FFFFFFF)
+        assert DmintState.from_script(script).height == 0x7FFFFFFF
+        assert _unmintable_reason(script) is None  # at max_height 2**31 its next mint is the last
+
+    @pytest.mark.parametrize("field", [0x80000000, 0x80000001, 0xFFFFFFFF])
+    def test_bit_31_is_refused_where_the_script_is_read(self, field: int) -> None:
+        """The covenant reads 0x80000000 as 0 and 0x80000001 as -1 (the port above agrees), so
+        its next heights are 1 and 0; pyrxd would have written 0x80000001 and 0x80000002."""
+        script = _with_height_field(_v1(0, 2**40), field)
+        with pytest.raises(ValidationError, match="has bit 31 set"):
+            DmintState.from_script(script)
+        with pytest.raises(ValidationError, match="has bit 31 set"):
+            _unmintable_reason(script)
+        # the mint builder refuses it too, even handed a state built without the parser
+        state = dataclasses.replace(DmintState.from_script(_v1(0, 2**40)), height=field)
+        utxo = DmintContractUtxo(txid="cc" * 32, vout=0, value=1, script=script, state=state)
+        with pytest.raises(ValidationError, match="has bit 31 set"):
+            build_dmint_mint_tx(utxo, b"\x00" * 4, b"\x22" * 20, 0, funding_utxo=_funding(1000))
+
+    def test_the_port_reads_those_fields_as_the_covenant_does(self) -> None:
+        assert _bin2num(bytes.fromhex("00000080")) == b""  # 0
+        assert _cs_decode(_bin2num(bytes.fromhex("01000080"))) == -1
+        assert _covenant_mint_step(0x80000000, 2**40) == "0401000000"
+        assert _covenant_mint_step(0x80000001, 2**40) == "0400000000"
+
+
+# =====================================================================================
+# 3. Bytes after the V1 epilogue
+# =====================================================================================
+
+
+class TestBytesAfterTheV1Epilogue:
+    @pytest.mark.parametrize("tail", [b"\x61", b"\x51\x75"])  # OP_NOP; OP_1 OP_DROP
+    def test_are_refused_where_the_script_is_read(self, tail: bytes) -> None:
+        control = _v1(0, 100)
+        script = control + tail
+        with pytest.raises(ValidationError, match=r"byte\(s\) follow the 145-byte V1 code epilogue"):
+            DmintState.from_script(script)
+        with pytest.raises(ValidationError, match="follow the 145-byte V1 code epilogue"):
+            _unmintable_reason(script)
+        utxo = DmintContractUtxo(txid="cc" * 32, vout=0, value=1, script=script, state=DmintState.from_script(control))
+        with pytest.raises(ValidationError, match="follow the 145-byte V1 code epilogue"):
+            build_dmint_mint_tx(utxo, b"\x00" * 4, b"\x22" * 20, 0, funding_utxo=_funding(1000))
+
+    def test_a_mainnet_contract_with_a_byte_appended_is_refused_and_without_it_is_not(self) -> None:
+        rbg = _mainnet("$RBG")
+        assert DmintState.from_script(rbg).is_v1 and _unmintable_reason(rbg) is None
+        with pytest.raises(ValidationError, match="1 byte\\(s\\) follow"):
+            DmintState.from_script(rbg + b"\x61")

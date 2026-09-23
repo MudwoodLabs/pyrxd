@@ -2998,6 +2998,29 @@ class TestClaimDmintRefusesContractsPyrxdCannotMine:
         assert "Mint (dMint claim)" not in result.output  # the confirmation summary never printed
         assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
 
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("height 0x80000000", lambda s: b"\x04" + (0x80000000).to_bytes(4, "little") + s[5:]),
+            ("height 0x80000001", lambda s: b"\x04" + (0x80000001).to_bytes(4, "little") + s[5:]),
+            ("OP_NOP after the epilogue", lambda s: s + b"\x61"),
+            ("OP_1 OP_DROP after the epilogue", lambda s: s + b"\x51\x75"),
+        ],
+    )
+    def test_a_v1_state_pyrxd_does_not_read_is_refused_at_the_read(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, label: str, mutate
+    ) -> None:
+        """A height with bit 31 set (the covenant reads it signed) and bytes after the epilogue
+        (pyrxd would recreate the contract without them) are refused when the contract is
+        read: before the wallet's UTXO scan, the grind and any broadcast."""
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=mutate(self._v1_at(0, 2**40)))
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "is not a dMint contract" in result.output
+        assert ("has bit 31 set" if "height" in label else "follow the 145-byte V1 code epilogue") in result.output
+        assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
     def test_the_height_below_the_stuck_one_still_claims(
         self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
     ) -> None:
