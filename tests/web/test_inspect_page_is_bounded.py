@@ -474,6 +474,230 @@ class TestTheCardSaysExactlyWhatWasLeftOut:
         assert "not checked here" not in r.output
 
 
+# ─────────────────────── the shape banner describes the WHOLE transaction ──
+#
+# The banner above the rows (`_detectTxShape`) states counts, presence, absence and agreement:
+# "creates N dMint contract UTXOs", "this one does not [carry a commit-nft]", "All N carry the
+# same token_ref". It counted `payload.outputs`, which the classifier now cuts at the listing
+# limit, so every one of those became a statement about the first 100 outputs. The classifier
+# now sends `output_shape`, worked out over every output, whenever it cuts the list.
+
+
+def _token(i: int):
+    from pyrxd.glyph.types import GlyphRef
+
+    return GlyphRef(txid=f"{i + 1:064x}", vout=0)
+
+
+def _dmint(height: int = 0, *, token: int = 0, reward: int = 100_000, max_height: int = 1000) -> bytes:
+    from pyrxd.glyph.dmint.builders import build_dmint_v1_contract_script
+    from pyrxd.glyph.types import GlyphRef
+
+    return build_dmint_v1_contract_script(
+        height=height,
+        contract_ref=GlyphRef(txid=os.urandom(32).hex(), vout=0),
+        token_ref=_token(token),
+        max_height=max_height,
+        reward=reward,
+        target=0x7FFFFFFFFFFFFF,
+    )
+
+
+def _commit(is_nft: bool) -> bytes:
+    from pyrxd.glyph.script import build_commit_locking_script
+    from pyrxd.security.types import Hex20
+
+    return build_commit_locking_script(os.urandom(32), Hex20(b"\x22" * 20), is_nft=is_nft)
+
+
+def _ft(i: int = 0) -> bytes:
+    from pyrxd.glyph.script import build_ft_locking_script
+    from pyrxd.security.types import Hex20
+
+    return build_ft_locking_script(Hex20(i.to_bytes(20, "big")), _token(0))
+
+
+def _mut() -> bytes:
+    from pyrxd.glyph.script import build_mutable_nft_script
+
+    return build_mutable_nft_script(_token(3), b"\x33" * 32)
+
+
+def _banner(card_text: str) -> str:
+    """The shape banner: the paragraph between the ``outputs`` count and the first heading."""
+    lines = card_text.split("\n")
+    after = lines[lines.index("outputs") + 2]
+    return "" if after.startswith("Outputs") or after.startswith("Reveal metadata") else after
+
+
+def _banners(scripts: list[bytes], limit: int, *, inputs: list[bytes] | None = None) -> tuple[str, str]:
+    """(the banner the page draws, the banner for the same transaction listed WHOLE)."""
+    bounded = _result(*scripts, limit=limit, inputs=inputs)["payload"]
+    whole = _result(*scripts, limit=limit, inputs=inputs, bounded=False)["payload"]
+    assert "outputs_not_listed" in bounded or len(scripts) <= limit
+    both = _render({"bounded": {"tx": bounded}, "whole": {"tx": whole}})
+    return _banner(both["bounded"]["fetched_tx_card"]), _banner(both["whole"]["fetched_tx_card"])
+
+
+class TestTheShapeBannerDescribesTheWholeTransaction:
+    def test_a_151_output_dmint_deploy_is_150_contracts(self, limit) -> None:
+        """The review's first case: it read "creates 100 dMint contract UTXOs … × 100"."""
+        assert limit < 150, "the premise: the deploy is wider than the listing limit"
+        page, whole = _banners([_dmint() for _ in range(150)] + [_p2pkh()], limit)
+        assert "creates 150 dMint contract UTXOs" in page
+        assert "All 150 carry the same token_ref and agree on reward and max_height" in page
+        assert "reward × max_height × 150" in page
+        assert f"× {limit}." not in page and f"creates {limit} " not in page
+        assert page == whole
+
+    def test_a_deploy_commit_whose_commit_nft_is_past_the_limit_carries_one(self, limit) -> None:
+        """The review's second case, laid out like the mainnet GLYPH deploy commit a443d9df…878b:
+        commit-ft first, P2PKH ref-seeds, the commit-nft second to last, change last. It read
+        "Most modern FT deploys also carry a commit-nft singleton; this one does not"."""
+        scripts = [_commit(False)] + [_p2pkh(i) for i in range(118)] + [_commit(True), _p2pkh(999)]
+        assert len(scripts) == 121 and scripts.index(scripts[-2]) > limit
+        page, whole = _banners(scripts, limit)
+        assert "This is a V1 dMint deploy commit" in page
+        assert "the remaining 118 P2PKH outputs are 1-photon ref-seeds" in page
+        assert "this one does not" not in page
+        assert page == whole
+
+    def test_an_ft_deploy_whose_commit_nft_is_past_the_limit_is_an_ft_deploy(self, limit) -> None:
+        scripts = [_commit(False)] + [_ft(i) for i in range(limit + 5)] + [_commit(True), _p2pkh()]
+        page, whole = _banners(scripts, limit)
+        assert page.startswith("This is a Glyph FT deploy transaction") and "this one does not" not in page
+        assert page == whole
+
+    def test_a_commit_ft_with_no_commit_nft_anywhere_still_says_so(self, limit) -> None:
+        """The honest neighbour of the case above: when the commit-nft really is absent from the
+        whole transaction, the absence may be stated."""
+        page, whole = _banners([_commit(False)] + [_ft(i) for i in range(limit + 5)] + [_p2pkh()], limit)
+        assert "this one does not" in page
+        assert page == whole
+
+    @pytest.mark.parametrize("field", ["token", "reward", "max_height"])
+    def test_a_disagreement_past_the_limit_is_seen(self, limit, field) -> None:
+        """Agreement is a claim about EVERY contract: one that differs at vout 140 must stop it."""
+        odd = {"token": {"token": 7}, "reward": {"reward": 250_000}, "max_height": {"max_height": 5}}[field]
+        scripts = [_dmint(**(odd if i == 140 else {})) for i in range(150)] + [_p2pkh()]
+        page, whole = _banners(scripts, limit)
+        if field == "token":
+            assert "They do NOT all carry the same token_ref" in page
+        else:
+            assert "All 150 carry the same token_ref, so claims race" in page
+            assert "their reward / max_height are not all equal" in page
+        assert "agree on reward and max_height" not in page
+        assert page == whole
+
+    def test_a_claim_with_no_ft_output_anywhere_says_so(self, limit) -> None:
+        page, whole = _banners([_dmint(5)] + [_p2pkh(i) for i in range(limit + 50)], limit)
+        assert "This is a dMint claim transaction (height 5 of 1000)" in page
+        assert "This transaction has NO ft output" in page
+        assert page == whole
+
+    def test_a_claim_whose_ft_output_is_past_the_limit_does_not_say_there_is_none(self, limit) -> None:
+        """Presence is known over the whole transaction; the POSITION is not, past the rows."""
+        scripts = [_dmint(5)] + [_p2pkh(i) for i in range(limit + 29)] + [_ft()] + [_p2pkh(i) for i in range(20)]
+        page, whole = _banners(scripts, limit)
+        assert "NO ft output" not in page and "NO ft output" not in whole
+        assert f"Only the first {limit} of this transaction's {len(scripts)} outputs are listed here" in page
+        assert f"The freshly-minted FT is the ft output at vout {limit + 30}." in whole
+
+    def test_a_small_transaction_gives_the_same_banner_whatever_the_limit(self) -> None:
+        """The two derivations — the classifier's `output_shape` and the page's own count of
+        complete rows — must say the same thing about one transaction. Every non-claim shape the
+        banner knows, cut at every limit from 0 up to its size."""
+        shapes = {
+            "deploy-commit": [_commit(False), _p2pkh(1), _p2pkh(2), _commit(True), _p2pkh(3)],
+            "ft-deploy": [_commit(False), _commit(True), _ft(), _p2pkh()],
+            "commit-ft-only": [_commit(False), _ft(), _p2pkh()],
+            "commit-nft-only": [_p2pkh(), _commit(True)],
+            "dmint-one-token": [_dmint(), _dmint(), _dmint(), _p2pkh()],
+            "dmint-mixed-refs": [_dmint(), _dmint(token=1), _dmint(), _p2pkh()],
+            "dmint-mixed-terms": [_dmint(), _dmint(reward=7), _dmint(), _p2pkh()],
+            "dmint-single": [_p2pkh(), _dmint()],
+            "mut": [_p2pkh(), _mut()],
+            "plain": [_p2pkh(1), _p2pkh(2)],
+        }
+        cases, expected = {}, {}
+        for name, scripts in shapes.items():
+            tx = _tx(scripts)
+            for cut in [None, *range(len(scripts) + 1)]:
+                result = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), None, cut)
+                assert result["ok"], result
+                cases[f"{name}/{cut}"] = {"tx": result["payload"]}
+        rendered = _render(cases)
+        for key in cases:
+            expected.setdefault(key.split("/")[0], _banner(rendered[f"{key.split('/')[0]}/None"]["fetched_tx_card"]))
+            assert _banner(rendered[key]["fetched_tx_card"]) == expected[key.split("/")[0]], key
+        # Not vacuous: all but the plain shape draw a banner.
+        assert sum(bool(b) for b in expected.values()) == len(shapes) - 1, expected
+
+
+class TestTheOutputShapeIsEveryOutputs:
+    """The classifier's half, exact: `output_shape` equals what the full rows of the same
+    transaction give — counted by type, and for dMint rows by the banner's own agreement rule —
+    on transactions drawn from a palette of real shapes, at random listing limits."""
+
+    def test_it_equals_the_full_rows(self) -> None:
+        import random
+
+        rng = random.Random(720)
+        palette = [
+            lambda: _p2pkh(rng.randrange(5)),
+            lambda: _commit(False),
+            lambda: _commit(True),
+            lambda: _ft(),
+            lambda: _v1(rng.randrange(5)),
+            lambda: b"\x6a\x04test",
+            lambda: _dmint(rng.choice([0, 0, 3]), token=rng.randrange(2), reward=rng.choice([1, 1, 2])),
+            lambda: _dmint(0, max_height=rng.choice([1000, 1000, 9])),
+        ]
+        compared = with_dmint = 0
+        for _ in range(120):
+            scripts = [rng.choice(palette)() for _ in range(rng.randint(1, 14))]
+            cut = rng.randint(0, len(scripts) - 1)
+            tx = _tx(scripts)
+            bounded = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), None, cut)["payload"]
+            rows = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), None, None)["payload"]["outputs"]
+            dm = [r for r in rows if r["type"] == "dmint"]
+
+            def agree(field, dm=dm):
+                return all(r.get(field) is not None and r.get(field) == dm[0].get(field) for r in dm)
+
+            expected: dict = {"by_type": dict(Counter(r["type"] for r in rows))}
+            if dm:
+                expected["dmint"] = {
+                    "count": len(dm),
+                    "first_vout": dm[0]["vout"],
+                    "first_height": dm[0]["height"],
+                    "first_max_height": dm[0]["max_height"],
+                    "same_token_ref": agree("token_ref_outpoint"),
+                    "same_reward": agree("reward"),
+                    "same_max_height": agree("max_height"),
+                }
+                with_dmint += 1
+            assert bounded["output_shape"] == expected
+            listed = Counter(r["type"] for r in bounded["outputs"])
+            assert dict(listed + Counter(bounded["outputs_not_listed"]["by_type"])) == expected["by_type"]
+            compared += 1
+        assert compared == 120 and with_dmint > 30, (compared, with_dmint)
+
+    def test_nothing_cut_means_no_shape_and_the_cli_gets_none(self, limit) -> None:
+        """Byte-identical for every caller whose list was not cut, and for the CLI, which passes
+        no `max_rows`."""
+        assert "output_shape" not in _classified(*([_p2pkh()] * limit), limit=limit)
+        assert "output_shape" not in _result(*([_p2pkh()] * (limit + 9)), limit=limit, bounded=False)["payload"]
+
+    def test_an_only_vout_listing_carries_no_shape(self) -> None:
+        """One output enumerated says nothing about the rest, so no whole-transaction shape."""
+        from pyrxd.glyph.inspect import classify_raw_tx
+
+        tx = _tx([_dmint(5), _p2pkh(), _p2pkh()])
+        payload = classify_raw_tx(tx.txid(), tx.serialize(), only_vout=1, max_rows=0)
+        assert payload["outputs_not_listed"]["count"] == 1 and "output_shape" not in payload
+
+
 # ─────────────────────────────────────── the inputs' lists are bounded the same way ──
 
 

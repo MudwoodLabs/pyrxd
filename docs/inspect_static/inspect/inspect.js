@@ -1497,21 +1497,71 @@ function renderOutputRow(row, opts) {
   return wrapper;
 }
 
+// What the shape banner below knows about the transaction's outputs: a count of each type, and
+// for its dMint contract outputs the first one's height and max_height and whether they ALL carry
+// one token_ref, one reward and one max_height. `whole` says whether that describes every output.
+//
+// WHERE IT COMES FROM. When the classifier cut the output list at MAX_ROWS_SHOWN it worked these
+// out over EVERY output, listed or not, and sent them as `output_shape`. The listed rows alone
+// describe the first 100: counting them told a reader that a 151-output dMint deploy "creates 100
+// dMint contract UTXOs", and that a 121-output FT deploy commit whose commit-nft sat at vout 120
+// "does not" carry one. When nothing was cut the rows ARE the whole transaction, and the same
+// facts are worked out from them here. When the list is partial and nothing says what the rest
+// is (`classify_raw_tx`'s `only_vout`, which this page never asks for), `whole` is false and the
+// banner makes no claim that needs the rest.
+function _outputShape(payload) {
+  const given = payload.output_shape;
+  if (given && typeof given === "object") {
+    const byType = {};
+    for (const [type, n] of Object.entries(given.by_type || {})) {
+      const t = String(type).toLowerCase();
+      byType[t] = (byType[t] || 0) + Number(n);
+    }
+    return { byType, dmint: given.dmint || null, whole: true };
+  }
+  const outputs = payload.outputs || [];
+  const byType = {};
+  for (const o of outputs) {
+    const t = String(o.type || "").toLowerCase();
+    byType[t] = (byType[t] || 0) + 1;
+  }
+  const dmintRows = outputs.filter((o) => String(o.type).toLowerCase() === "dmint");
+  // `undefined === undefined` is true, so a field absent from every row would "agree" vacuously
+  // and the check would pass by having nothing to compare. Require it present before believing
+  // it matches. The classifier's `_OutputShape` applies the same rule to the rows it counts.
+  const agreesOn = (field) =>
+    dmintRows.every((o) => o[field] !== undefined && o[field] !== null && o[field] === dmintRows[0][field]);
+  const dmint = dmintRows.length === 0 ? null : {
+    count: dmintRows.length,
+    first_vout: dmintRows[0].vout,
+    first_height: dmintRows[0].height,
+    first_max_height: dmintRows[0].max_height,
+    same_token_ref: agreesOn("token_ref_outpoint"),
+    same_reward: agreesOn("reward"),
+    same_max_height: agreesOn("max_height"),
+  };
+  const whole = typeof payload.output_count !== "number" || outputs.length === payload.output_count;
+  return { byType, dmint, whole };
+}
+
 // Recognise common Glyph transaction shapes by their output type
 // distribution and produce a one-paragraph explanation. Returns ""
 // for shapes we don't have a specific story for (e.g. arbitrary
 // mixed transfers). The goal is to head off "wait, why is there an
 // NFT in my transfer?"-style confusion when a user pastes an FT
 // contract id and gets the deploy tx back.
+//
+// EVERY COUNT, PRESENCE, ABSENCE AND AGREEMENT BELOW IS OVER THE WHOLE TRANSACTION — read from
+// `_outputShape`, never from `payload.outputs`, which holds at most MAX_ROWS_SHOWN rows. The one
+// thing still read off the rows is a POSITION (which vout the minted FT sits at, whether the
+// outputs are in the canonical mint order), and only when the rows are every output.
 function _detectTxShape(payload) {
   const outputs = payload.outputs || [];
-  const counts = {};
-  for (const o of outputs) {
-    const t = String(o.type || "").toLowerCase();
-    counts[t] = (counts[t] || 0) + 1;
-  }
+  const shape = _outputShape(payload);
+  const counts = shape.byType;
   const has = (t) => (counts[t] || 0) > 0;
-  const dmintOutput = outputs.find((o) => String(o.type).toLowerCase() === "dmint");
+  const dmint = shape.dmint;
+  const isDeployHeight = (h) => h === 0 || h === "0";
 
   // Burn — the explicit Glyph protocol marker (GlyphProtocol.BURN = 6)
   // appearing in the reveal-metadata's protocol list.
@@ -1615,6 +1665,11 @@ function _detectTxShape(payload) {
     );
   }
 
+  // A PARTIAL LISTING THAT SAYS NOTHING ABOUT THE REST. Every branch below decides from what the
+  // transaction lacks or how many of a type it has, except the mint claim's, which gates each of
+  // its sentences on the rows being every output. So only that one may run.
+  if (!shape.whole && !(dmint && !isDeployHeight(dmint.first_height))) return "";
+
   // V1 dMint deploy COMMIT: 1 commit-ft + 1 commit-nft + N ref-seed
   // P2PKHs (one per parallel contract) + 1 P2PKH change. The mainnet
   // Glyph Protocol deploy (a443d9df…878b) had 1+1+32+1 = 35 outputs;
@@ -1684,8 +1739,8 @@ function _detectTxShape(payload) {
   // so we can distinguish from the output alone — no need to walk
   // inputs. The contract_ref + token_ref point to the deploy outpoint
   // either way.
-  if (dmintOutput) {
-    // THE ROWS, not just a count of them. This branch used to assert from
+  if (dmint) {
+    // THE FIELDS, not just a count of rows. This branch used to assert from
     // `counts["dmint"]` alone that N contracts were "all sharing the same
     // token_ref" and that "total supply is reward × max_height × N" — claims
     // about three fields it never compared, while every dmint row carries all
@@ -1693,25 +1748,18 @@ function _detectTxShape(payload) {
     // reward and max_height). N rows of type dmint is not N contracts of ONE
     // token: a transaction may carry dmint outputs for unrelated tokens, or for
     // one token on different terms, and the banner called it a parallel deploy
-    // of a single token either way.
-    const dmintRows = outputs.filter((o) => String(o.type).toLowerCase() === "dmint");
-    const dmintCount = dmintRows.length;
-    // `undefined === undefined` is true, so a field absent from every row would
-    // "agree" vacuously and the check would pass by having nothing to compare.
-    // Require it present before believing it matches.
-    const agreesOn = (field) =>
-      dmintRows.every(
-        (o) => o[field] !== undefined && o[field] !== null && o[field] === dmintRows[0][field],
-      );
-    if (dmintOutput.height === 0 || dmintOutput.height === "0") {
+    // of a single token either way. The comparison is `_outputShape`'s, over
+    // every dMint output of the transaction.
+    const dmintCount = dmint.count;
+    if (isDeployHeight(dmint.first_height)) {
       // V1 deploy reveal: typically ships N parallel contracts in one
       // tx (mainnet GLYPH had 32). One-contract deploys are also valid;
       // distinguish in the banner so callers don't confuse a multi-
       // contract V1 deploy with a V2 single-contract deploy.
       let parallel;
       if (dmintCount > 1) {
-        const oneToken = agreesOn("token_ref_outpoint");
-        const sameTerms = agreesOn("reward") && agreesOn("max_height");
+        const oneToken = dmint.same_token_ref === true;
+        const sameTerms = dmint.same_reward === true && dmint.same_max_height === true;
         parallel = `${dmintCount} dMint contract UTXOs. `;
         if (!oneToken) {
           parallel +=
@@ -1786,31 +1834,47 @@ function _detectTxShape(payload) {
     const shapeSentence =
       "the canonical mint tx has 4 outputs: [0] dMint continuation, [1] " +
       "75-byte FT-wrapped reward, [2] OP_RETURN message, [3] P2PKH change";
+    const noFtSentence =
+      "This transaction has NO ft output, so the minted reward is not " +
+      "where the canonical mint shape puts it — read the rows below " +
+      "rather than assuming a reward output exists. ";
     let ftNote;
     let shapeNote;
-    if (!outputsComplete) {
+    if (!outputsComplete && !shape.whole) {
+      // `only_vout`: one output was classified and nothing is known about the rest.
       ftNote =
         `Only ${outputs.length} of this transaction's ${payload.output_count} ` +
         `outputs were classified here, so where the minted FT sits is not ` +
         `decided from this view. `;
       shapeNote = `For reference, ${shapeSentence}. `;
+    } else if (!outputsComplete) {
+      // Cut at the listing limit: every output was classified and counted, so whether there is
+      // an ft output at all is known; which vout it sits at is not, past the listed rows.
+      ftNote = has("ft")
+        ? `Only the first ${outputs.length} of this transaction's ${payload.output_count} ` +
+          `outputs are listed here, so where the minted FT sits is not decided from this view. `
+        : noFtSentence;
+      // The canonical shape is FOUR outputs, so a count other than four settles it without the
+      // order; four outputs cut short (a limit under four) do not.
+      shapeNote = payload.output_count !== 4
+        ? `Its ${payload.output_count} outputs do NOT match the canonical mint shape ` +
+          `in count or in order — ${shapeSentence}. Read the rows below. `
+        : `For reference, ${shapeSentence}. `;
     } else {
       ftNote =
         ftRows.length === 1
           ? `The freshly-minted FT is the ft output at vout ${ftRows[0].vout}. `
           : ftRows.length > 1
             ? `${ftRows.length} ft outputs are present here; the minted reward is one of them. `
-            : "This transaction has NO ft output, so the minted reward is not " +
-              "where the canonical mint shape puts it — read the rows below " +
-              "rather than assuming a reward output exists. ";
+            : noFtSentence;
       shapeNote = canonicalShape
         ? `Its outputs match the canonical mint shape — ${shapeSentence}. `
         : `Its ${outputs.length} outputs do NOT match the canonical mint shape ` +
           `in count or in order — ${shapeSentence}. Read the rows below. `;
     }
     return (
-      `This is a dMint claim transaction (height ${dmintOutput.height} ` +
-      `of ${dmintOutput.max_height}) — somebody spent the contract's ` +
+      `This is a dMint claim transaction (height ${dmint.first_height} ` +
+      `of ${dmint.first_max_height}) — somebody spent the contract's ` +
       "previous output to mint themselves a token, and the contract " +
       "continues at the new dmint output. " +
       ftNote +

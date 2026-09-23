@@ -1676,6 +1676,56 @@ def _count(tally: dict, key: str) -> None:
     tally[key] = tally.get(key, 0) + 1
 
 
+class _OutputShape:
+    """What every output of a transaction is, for a caller describing it from a cut listing.
+
+    A count of each output type, and for the dMint contract outputs the first one's vout, height
+    and max_height and whether ALL of them carry one token_ref, one reward and one max_height. The
+    page's transaction-shape banner states exactly these (``_detectTxShape`` in ``inspect.js``,
+    which computes the same facts from the rows when nothing was cut). A field compared must be
+    present on every row to agree, as the banner's own comparison requires: a field absent
+    everywhere does not agree by having nothing to compare. Compared as Python values, so two
+    rewards that differ past 2**53 still differ.
+    """
+
+    _COMPARED = ("token_ref_outpoint", "reward", "max_height")
+
+    def __init__(self) -> None:
+        self.by_type: dict[str, int] = {}
+        self.dmint_count = 0
+        self.dmint_first: dict = {}
+        self.dmint_same = dict.fromkeys(self._COMPARED, True)
+
+    def note(self, vout: int, row: dict) -> None:
+        kind = str(row.get("type", "unknown"))
+        _count(self.by_type, kind)
+        if kind != "dmint":
+            return
+        self.dmint_count += 1
+        if self.dmint_count == 1:
+            self.dmint_first = {"vout": vout, "height": row.get("height"), "max_height": row.get("max_height")}
+            self.dmint_first.update({f"cmp_{f}": row.get(f) for f in self._COMPARED})
+        for field in self._COMPARED:
+            value = row.get(field)
+            self.dmint_same[field] = (
+                self.dmint_same[field] and value is not None and value == self.dmint_first[f"cmp_{field}"]
+            )
+
+    def as_payload(self) -> dict:
+        out: dict = {"by_type": dict(self.by_type)}
+        if self.dmint_count:
+            out["dmint"] = {
+                "count": self.dmint_count,
+                "first_vout": self.dmint_first["vout"],
+                "first_height": self.dmint_first["height"],
+                "first_max_height": self.dmint_first["max_height"],
+                "same_token_ref": self.dmint_same["token_ref_outpoint"],
+                "same_reward": self.dmint_same["reward"],
+                "same_max_height": self.dmint_same["max_height"],
+            }
+        return out
+
+
 def _classify_raw_tx(
     txid_hex: str,
     raw: bytes,
@@ -1727,8 +1777,10 @@ def _classify_raw_tx(
         ``outputs``, ``glyph_envelopes``, the other payloads in ``metadata_inputs`` (the headline
         payload's own entry is always listed), and ``metadata.relationships`` and
         ``metadata.delegate_burns`` — and COUNT the rest, exactly, under a ``*_not_listed`` key
-        beside each list. ``None`` (the default, and what every CLI path passes) lists
-        everything and adds no such key.
+        beside each list. When outputs are cut, ``output_shape`` also says what EVERY output is:
+        a count by type and, for dMint contract outputs, the facts the page's shape banner states
+        (see :class:`_OutputShape`). ``None`` (the default, and what every CLI path passes) lists
+        everything and adds none of these keys.
 
     WHAT ``max_rows`` BOUNDS, AND WHAT IT DOES NOT. An output past the limit is classified in
     SUMMARY (see :func:`_classify_script`): its type, and for a HashMark record the status word
@@ -1774,6 +1826,9 @@ def _classify_raw_tx(
     outputs_by_type: dict[str, int] = {}
     marks_by_status: dict[str, int] = {}
     unlisted_vouts: list[int] = []
+    # What EVERY output is, listed or not — see `output_shape` below. Noted at exactly the points
+    # a row is committed to the listing or to `outputs_by_type`, so its counts are theirs summed.
+    shape = _OutputShape()
     for position, (idx, out) in enumerate(enumerated):
         listed = max_rows is None or position < max_rows
         try:
@@ -1797,6 +1852,7 @@ def _classify_raw_tx(
                     checked[script_bytes] = copy.deepcopy(att) if listed else att
             if not listed:
                 _count(outputs_by_type, str(row.get("type", "unknown")))
+                shape.note(idx, row)
                 if hm is not None:
                     _count(marks_by_status, _hashmark_tally_word(hm))
                 unlisted_vouts.append(idx)
@@ -1805,9 +1861,11 @@ def _classify_raw_tx(
             row["vout"] = idx
             row["satoshis"] = out.satoshis
             output_rows.append(row)
+            shape.note(idx, row)
         except Exception as exc:  # defensive: any classifier crash → unknown row
             if not listed:
                 _count(outputs_by_type, "error")
+                shape.note(idx, {"type": "error"})
                 unlisted_vouts.append(idx)
                 continue
             output_rows.append(
@@ -1818,6 +1876,7 @@ def _classify_raw_tx(
                     "satoshis": out.satoshis,
                 }
             )
+            shape.note(idx, output_rows[-1])
 
     # IMPORTANT: every string field surfaced into ``metadata_payload`` MUST
     # be passed through ``_sanitize_display_string`` first. JSON mode escapes
@@ -2131,6 +2190,15 @@ def _classify_raw_tx(
             # record that does not verify could be among them.
             "not_checked_here": marks_by_status.get(NOT_CHECKED_HERE_WORD, 0),
         }
+        # WHAT THE WHOLE TRANSACTION IS, for a caller that describes it from a cut listing. The
+        # page's shape banner used to count `outputs` — at most `max_rows` of them — and so told a
+        # reader a 151-output dMint deploy "creates 100 dMint contract UTXOs", and that a
+        # 121-output FT deploy commit whose commit-nft sat at vout 120 "does not" carry one.
+        # Every figure here is over every output this call enumerated, from the same rows the
+        # counts above come from. Not emitted for an `only_vout` listing, which enumerates one
+        # output and so could not say anything about the rest.
+        if only_vout is None:
+            payload["output_shape"] = shape.as_payload()
     if envelopes_by_kind:
         payload["glyph_envelopes_not_listed"] = {
             "count": sum(envelopes_by_kind.values()),

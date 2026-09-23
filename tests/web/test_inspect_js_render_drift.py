@@ -1311,6 +1311,11 @@ _OMITTED_FROM_TX_CARD = {
     "outputs": "rendered as one row per output, and every field of every row is "
     "guarded field-by-field by test_output_row_renders_every_field. Demanding them "
     "again here would re-demand `hex` and `length`, which the rows omit on purpose",
+    "output_shape": "WORDED, not printed as data: the transaction-shape banner states its counts "
+    "and agreements in sentences ('creates 150 dMint contract UTXOs', 'They do NOT all carry the "
+    "same token_ref'). test_inspect_page_is_bounded.py::TestTheShapeBannerDescribesTheWhole"
+    "Transaction checks each sentence against it on transactions over the listing limit, and "
+    "fails if the banner reads the listed rows instead",
 }
 
 
