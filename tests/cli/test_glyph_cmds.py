@@ -23,6 +23,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from pyrxd.cli.main import cli
+from tests.test_dmint_state_judgement import unreadable_number_scripts
 
 
 def _new_wallet_args(tmp_wallet_path: Path) -> list[str]:
@@ -3019,6 +3020,26 @@ class TestClaimDmintRefusesContractsPyrxdCannotMine:
         assert result.exit_code != 0, result.output
         assert "is not a dMint contract" in result.output
         assert ("has bit 31 set" if "height" in label else "follow the 145-byte V1 code epilogue") in result.output
+        assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    @pytest.mark.parametrize(
+        ("script", "says"), [pytest.param(sc, says, id=i) for i, sc, says in unreadable_number_scripts()]
+    )
+    def test_a_number_the_covenant_cannot_read_is_refused_before_any_work(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, script: bytes, says: str
+    ) -> None:
+        """maxHeight and reward are read as numbers on every mint, like the target; a target of
+        0 is met only by a proof of work whose number is 0. Refused with the reason, before the
+        wallet's UTXO scan, the confirmation summary, the grind and any broadcast (the builder
+        used to refuse these only after all of that, with a generic round-trip message)."""
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=script)
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract" in result.output
+        assert says in result.output.replace("\n", " ")
+        assert "does not round-trip" not in result.output
+        assert "Mint (dMint claim)" not in result.output
         assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
 
     def test_the_height_below_the_stuck_one_still_claims(

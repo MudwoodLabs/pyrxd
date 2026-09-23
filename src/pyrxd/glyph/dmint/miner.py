@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pyrxd.constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES, REF_OPERAND_WIDTH
 from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.hash import hash256, sha256
 from pyrxd.security.errors import (
@@ -61,6 +61,7 @@ from .chain import (
     DmintMinerFundingUtxo,
     DmintState,
     _parse_dmint_script,
+    _parse_script_int,
     is_token_bearing_script,
 )
 from .types import (
@@ -716,6 +717,33 @@ def _unreadable_target_reason(contract_script: bytes) -> str | None:
     )
 
 
+def _unreadable_number_reason(name: str, push: bytes, value: int) -> str | None:
+    """Why the covenant cannot read the state item ``name``, pushed as ``push``, as a number.
+
+    ``None`` if it can. For ``maxHeight`` and ``reward``, which both covenants read as numbers
+    on every mint (the shared ``… 76 e4 7b 9d 54 7a 81 8b 76 53 7a 9c …`` sequence:
+    ``OP_NUMEQUALVERIFY`` against the reward outputs' sum, ``OP_NUMEQUAL`` against height + 1).
+    The target has its own wording, :func:`_unreadable_target_reason`.
+    """
+    op = push[0]
+    width = len(push) - (2 if op == 0x4C else 1) if 1 <= op <= 0x4C else 1  # the pushed payload's length
+    if width > MAX_SCRIPT_NUM_BYTES:
+        return (
+            f"this dMint contract can never be minted: its {name} is a {width}-byte script number, and the covenant "
+            f"reads {name} as a number of at most {MAX_SCRIPT_NUM_BYTES} bytes on every mint, so every spend of the "
+            "contract aborts, whatever the nonce and whoever mines it"
+        )
+    canonical = _push_minimal(value)
+    if push == canonical:
+        return None
+    return (
+        f"this dMint contract can never be minted: its {name} is pushed as {push.hex()}, not as {canonical.hex()}, "
+        f"the minimal push of {value}. Radiant aborts a script on a push that is not minimal, and reads {name} as a "
+        "number on every mint only if it is minimally encoded, so every spend of the contract aborts, whatever the "
+        "nonce and whoever mines it"
+    )
+
+
 def _unmintable_reason(contract_script: bytes) -> str | None:
     """Why pyrxd will not mint the dMint contract ``contract_script``, or ``None`` if it will.
 
@@ -723,14 +751,22 @@ def _unmintable_reason(contract_script: bytes) -> str | None:
     :func:`build_dmint_mint_tx` (V1 and V2) refuses on it before building anything, and the
     ``claim-dmint`` and ``dmint-estimate`` commands refuse on it right after reading the
     contract, before the wallet's UTXO scan, the funding scan, the confirmation prompt and any
-    grind. It judges:
+    grind. It judges the state items both covenants read as numbers on every mint, as pushed:
 
-    * the target push, :func:`_unreadable_target_reason`;
+    * the target push, :func:`_unreadable_target_reason`, and a target of 0, which only a proof
+      of work whose number is exactly 0 meets;
+    * the ``maxHeight`` and ``reward`` pushes, :func:`_unreadable_number_reason`;
     * a V1 contract at height ``2**31 - 1`` whose ``maxHeight`` is above ``2**31``. Its next
       mint is not its last, so the epilogue writes the next height as ``NUM2BIN(height + 1, 4)``,
       and ``2**31`` does not fit in 4 bytes (:data:`~pyrxd.glyph.dmint.types.MAX_V1_MAX_HEIGHT`).
       Every spend of it aborts. Mainnet V1 contracts with such a ``maxHeight`` exist (``$BRO``),
       and every height below ``2**31 - 1`` mints normally.
+
+    Not judged here: the V1 height, which the epilogue reads with ``OP_BIN2NUM`` and the parser
+    reads the same way or refuses (bit 31); and a V2 retarget's reads of ``lastTime`` and
+    ``targetTime``, which depend on the mode and, for EPOCH, on the height. The mint builder
+    judges ``lastTime`` before its grind; any other V2 state push pyrxd would not rebuild byte for
+    byte is refused by the builder's state round-trip, also before its grind.
 
     :raises ValidationError: ``contract_script`` is not a dMint contract script pyrxd reads.
     """
@@ -738,6 +774,20 @@ def _unmintable_reason(contract_script: bytes) -> str | None:
     if reason is not None:
         return reason
     state, _ = _parse_dmint_script(contract_script)
+    if state.target == 0:
+        return (
+            "this dMint contract's target is 0: the covenant accepts a proof of work only if its number is exactly 0, "
+            "and pyrxd does not grind for that"
+        )
+    # maxHeight and reward follow the height push and the two 37-byte refs, in both versions.
+    pos = 5 if state.is_v1 else _parse_script_int(contract_script, 0)[1]
+    pos += 2 * (1 + REF_OPERAND_WIDTH)
+    for name, value in (("maxHeight", state.max_height), ("reward", state.reward)):
+        _, end = _parse_script_int(contract_script, pos)
+        reason = _unreadable_number_reason(name, contract_script[pos:end], value)
+        if reason is not None:
+            return reason
+        pos = end
     if state.is_v1 and state.height == MAX_V1_MAX_HEIGHT - 1 and state.max_height > MAX_V1_MAX_HEIGHT:
         return (
             f"this V1 dMint contract cannot be minted further: it is at height {state.height:,} (2**31 - 1) and "

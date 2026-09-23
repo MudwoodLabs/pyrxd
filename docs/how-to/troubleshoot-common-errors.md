@@ -292,6 +292,11 @@ the contract, before it scans the wallet or grinds:
     pyrxd deployed both before 2026-09-23 — BLAKE3/K12 V2 contracts with 33-byte
     targets, and V1 contracts at difficulty 256 or more with the target pushed as a
     fixed 8 bytes. No miner can mint one.
+  - `this dMint contract can never be minted: its maxHeight ...` (or `its reward ...`)
+    — the other two state numbers the covenant reads on every mint, pushed wider than
+    8 bytes or not minimally. No miner can mint one.
+  - `this dMint contract's target is 0` — the covenant accepts only a proof of work
+    whose number is exactly 0, and pyrxd does not grind for that.
   - `this V1 dMint contract cannot be minted further` — a V1 contract at height
     2^31−1 whose max height is above 2^31. Its next mint would have to write height
     2^31 into a 4-byte field, which the covenant cannot do, so every further spend

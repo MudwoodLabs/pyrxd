@@ -317,6 +317,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dmint-estimate` refuse the mint from there, which pyrxd would otherwise have built with a
   height the covenant cannot write.
 
+- **`claim-dmint` and `dmint-estimate` judged only a contract's target, and the V1 parser read
+  two states wrongly.** A `maxHeight` or `reward` pushed non-minimally or wider than 8 bytes —
+  both covenants read these as numbers on every mint — passed, so `claim-dmint` scanned the
+  wallet before the mint builder refused the contract with a generic round-trip message; a
+  target of 0 passed too, and `dmint-estimate` then raised from `estimate_attempts(0)`. Both are
+  now refused with the reason, right after the contract is read. The V1 parser read a height
+  field with bit 31 set unsigned, where the epilogue reads it signed (`0x80000000` is 0), and
+  ignored bytes after the 145-byte epilogue, which pyrxd's recreated contract then lacked; it
+  built the wrong mint for both, and now refuses to read either. On mainnet data collected on
+  2026-09-22 and 2026-09-23 (57,068 distinct scripts, of which 2,650 parse as V1 and 53,501 as
+  V2 contracts), none is newly refused.
+
 - **A V2 contract's algorithm was read from a tag the covenant never reads.** The V2 state
   carries an `algoId`, but the hash the covenant runs is the opcode after Part A. The parser
   reported the tag, so a contract tagged SHA256D whose covenant runs `OP_BLAKE3` passed every

@@ -14,11 +14,17 @@
 3. **Bytes after the V1 epilogue.** The parser matched the 145-byte epilogue and ignored what
    followed; pyrxd then recreated the contract without those bytes, which the covenant rejects
    after the grind. The parser now refuses them.
+4. **The other numbers the covenant reads.** Only the target push was judged. A ``maxHeight``
+   or ``reward`` pushed non-minimally, or wider than 8 bytes, passed; ``claim-dmint`` and
+   ``dmint-estimate`` accepted the contract, and the builder refused it only after the wallet
+   scan, with a generic round-trip message. A target of 0 passed too, and ``dmint-estimate``
+   then called ``estimate_attempts(0)``, which raises. All are now judged with the target.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import re
 from pathlib import Path
 
 import pytest
@@ -357,3 +363,101 @@ class TestBytesAfterTheV1Epilogue:
         assert DmintState.from_script(rbg).is_v1 and _unmintable_reason(rbg) is None
         with pytest.raises(ValidationError, match="1 byte\\(s\\) follow"):
             DmintState.from_script(rbg + b"\x61")
+
+
+# =====================================================================================
+# 4. maxHeight, reward and a target of 0
+# =====================================================================================
+
+
+def v1_with_pushes(max_height: bytes, reward: bytes, target: bytes) -> bytes:
+    """A V1 contract script at height 0 whose three numeric state items are pushed exactly as given."""
+    control = _v1(0, 100)
+    return control[:79] + max_height + reward + target + control[-145:]
+
+
+def v2_with_pushes(max_height: bytes, reward: bytes, target: bytes | None = None) -> bytes:
+    """A FIXED V2 contract at height 0 with its maxHeight / reward (and target) pushes replaced."""
+    from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
+    from pyrxd.glyph.dmint.builders import _push_minimal, build_dmint_state_script
+
+    params = DmintDeployParams(
+        contract_ref=_C, token_ref=_T, max_height=100, reward=1000, difficulty=10, last_time=1_700_000_000
+    )
+    script, state = build_dmint_contract_script(params), build_dmint_state_script(params)
+    head = 1 + 74  # OP_0 height, then the two 37-byte refs
+    mid = state[
+        head + len(_push_minimal(100)) + len(_push_minimal(1000)) : len(state)
+        - len(_push_minimal(params.initial_target))
+    ]
+    tgt = target if target is not None else _push_minimal(params.initial_target)
+    return state[:head] + max_height + reward + mid + tgt + script[len(state) :]
+
+
+_MIN_MH, _MIN_RW, _MIN_TG = b"\x01\x64", b"\x02\xe8\x03", b"\x06" + (1 << 40).to_bytes(6, "little")
+
+#: (label, maxHeight push, reward push, what the refusal says) — the reviewer's cases, and the width
+_NUMERIC_CASES = [
+    ("maxHeight 02 6400", b"\x02\x64\x00", _MIN_RW, "its maxHeight is pushed as 026400, not as 0164"),
+    ("maxHeight PUSHDATA1", b"\x4c\x01\x64", _MIN_RW, "its maxHeight is pushed as 4c0164, not as 0164"),
+    (
+        "maxHeight 9 bytes",
+        b"\x09" + (1 << 64).to_bytes(9, "little"),
+        _MIN_RW,
+        "its maxHeight is a 9-byte script number",
+    ),
+    ("reward 03 e80300", _MIN_MH, b"\x03\xe8\x03\x00", "its reward is pushed as 03e80300, not as 02e803"),
+    ("reward 01 05", _MIN_MH, b"\x01\x05", "its reward is pushed as 0105, not as 55"),
+]
+
+
+def unreadable_number_scripts() -> list[tuple[str, bytes, str]]:
+    """``(id, script, what the refusal says)`` for every case above in V1 and V2, and a target of
+    0 in each; the CLI tests drive these through ``claim-dmint`` and ``dmint-estimate``."""
+    cases = [(f"V1 {label}", v1_with_pushes(mh, rw, _MIN_TG), says) for label, mh, rw, says in _NUMERIC_CASES]
+    cases += [(f"V2 {label}", v2_with_pushes(mh, rw), says) for label, mh, rw, says in _NUMERIC_CASES]
+    cases.append(("V1 target 0", v1_with_pushes(_MIN_MH, _MIN_RW, b"\x00"), "target is 0"))
+    cases.append(("V2 target 0", v2_with_pushes(_MIN_MH, _MIN_RW, b"\x00"), "target is 0"))
+    return cases
+
+
+class TestTheOtherNumbersTheCovenantReads:
+    def test_the_control_scripts_are_judged_mintable(self) -> None:
+        assert v1_with_pushes(_MIN_MH, _MIN_RW, _MIN_TG) == _v1(0, 100)
+        assert _unmintable_reason(v1_with_pushes(_MIN_MH, _MIN_RW, _MIN_TG)) is None
+        assert _unmintable_reason(v2_with_pushes(_MIN_MH, _MIN_RW)) is None
+
+    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES)
+    def test_v1_is_refused_with_the_reason(self, label: str, mh: bytes, rw: bytes, says: str) -> None:
+        script = v1_with_pushes(mh, rw, _MIN_TG)
+        DmintState.from_script(script)  # it parses: the refusal is the judgement, not the parser
+        reason = _unmintable_reason(script)
+        assert reason is not None and says in reason and "can never be minted" in reason
+        with pytest.raises(ValidationError, match=re.escape(says)):
+            _mint(script)  # the builder's refusal names the push, not a generic round-trip
+
+    @pytest.mark.parametrize(("label", "mh", "rw", "says"), _NUMERIC_CASES)
+    def test_v2_is_refused_with_the_reason(self, label: str, mh: bytes, rw: bytes, says: str) -> None:
+        script = v2_with_pushes(mh, rw)
+        DmintState.from_script(script)
+        reason = _unmintable_reason(script)
+        assert reason is not None and says in reason
+
+    @pytest.mark.parametrize("reward", [1, 5, 16, 17, 127, 128, 255, 256, 888_888_888])
+    def test_minimal_rewards_of_every_width_are_not(self, reward: int) -> None:
+        """Honest neighbours: OP_1..OP_16, then 1, 2 and 4-byte pushes, as the builder writes them."""
+        assert _unmintable_reason(_v1(0, 100, reward=reward)) is None
+
+    def test_a_target_of_0_is_refused(self) -> None:
+        for script in (v1_with_pushes(_MIN_MH, _MIN_RW, b"\x00"), v2_with_pushes(_MIN_MH, _MIN_RW, b"\x00")):
+            assert DmintState.from_script(script).target == 0
+            reason = _unmintable_reason(script)
+            assert reason is not None and "target is 0" in reason
+        with pytest.raises(ValidationError, match="target is 0"):
+            _mint(v1_with_pushes(_MIN_MH, _MIN_RW, b"\x00"))
+        # the honest neighbour: target 1 (OP_1)
+        assert _unmintable_reason(v1_with_pushes(_MIN_MH, _MIN_RW, b"\x51")) is None
+
+    @pytest.mark.parametrize("name", ["G22K", "RABO", "BTC", "GTC", "1", "MPrawn", "$BRO", "$RBG", "Pepe"])
+    def test_no_pinned_mainnet_contract_is_refused(self, name: str) -> None:
+        assert _unmintable_reason(_mainnet(name)) is None

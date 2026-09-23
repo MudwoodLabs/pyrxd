@@ -25,6 +25,7 @@ from pyrxd.cli.glyph_estimate import (
 )
 from pyrxd.cli.main import cli
 from pyrxd.glyph.dmint import difficulty_to_target, estimate_attempts
+from tests.test_dmint_state_judgement import unreadable_number_scripts
 
 
 def _extract_json(output: str) -> dict:
@@ -623,6 +624,21 @@ class TestAContractPyrxdCannotMint:
         assert result.exit_code != 0, result.output
         assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
         assert "cannot be minted further" in result.output
+        assert calls == [] and "ETA" not in result.output
+
+    @pytest.mark.parametrize(
+        ("script", "says"), [pytest.param(sc, says, id=i) for i, sc, says in unreadable_number_scripts()]
+    )
+    def test_a_number_the_covenant_cannot_read_gets_no_eta(
+        self, runner: CliRunner, monkeypatch, script: bytes, says: str
+    ) -> None:
+        """Refused before the attempt estimator runs: for a target of 0 it used to be reached
+        with 0, and raise."""
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, script)
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert says in result.output.replace("\n", " ")
         assert calls == [] and "ETA" not in result.output
 
     def test_the_height_below_the_stuck_one_is_estimated(self, runner: CliRunner, monkeypatch) -> None:
