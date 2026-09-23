@@ -338,7 +338,18 @@ class TestAFailedFirstFetchIsAdvisedByWhatFailed:
         _error, hint = self._refused(1, "zz should be a transaction hash")
         assert "refused the request itself" in hint and "same answer" in hint
 
-    @pytest.mark.parametrize("code, message", [(None, "daemon busy"), (-1, "something else"), (2, "daemon error: x")])
+    @pytest.mark.parametrize(
+        "code, message",
+        [
+            (None, "daemon busy"),
+            (-1, "something else"),
+            (2, "daemon error: x"),
+            # HYPOTHETICAL, not a measured frame: a node code that BEGINS with -5. It is what makes
+            # the `[,}]` after -5 in `refusalReason` load-bearing — without it, -50 reads as -5.
+            (2, "daemon error: DaemonError({'code': -50, 'message': 'hypothetical'})"),
+        ],
+        ids=["no-code", "unknown-code", "daemon-error-without-a-node-code", "daemon-error-minus-50"],
+    )
     def test_a_refusal_the_frame_does_not_explain_gets_advice_true_for_both(self, code, message) -> None:
         """No code, or a code the page does not know, or ElectrumX's daemon error wrapping
         something other than -5: the advice has to hold whether the transaction is missing or the
