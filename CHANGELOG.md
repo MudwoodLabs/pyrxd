@@ -6,7 +6,109 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **CEK wraps from this release cannot be opened by pyrxd 0.24.0 or earlier, and the reverse needs
+  a recipe.** Two wire-format changes land together, and either alone breaks old readers: the
+  KEK is now derived under `glyph-kek-classical-v1` (was `glyph-kek-v1`), and a recipient wrap
+  made by `build_timelock_mint` is bound to the UTF-8 text of `crypto.cek_hash` (was the raw
+  32-byte digest). Both follow Photonic; see Fixed. Measured: of 10 recipient wraps minted by
+  this release, pyrxd 0.24.0 opened 0 under the raw-digest AAD and 0 under the text AAD (it
+  knows only the old KEK string).
+
+  Who is affected:
+  - a SENDER on this release cannot reach a recipient still running pyrxd 0.24.0 or earlier.
+    The recipient has to upgrade.
+  - READER code written against 0.24.0 that passes the raw digest
+    (`compute_cek_hash(cek)` / `parse_cek_hash(cek_hash)`) as the AAD fails on every new mint.
+    Pass `pyrxd.glyph.timelock.cek_wrap_aad(stub.crypto.cek_hash)` instead.
+
+  Opening a wrap 0.24.0 made, on this release: pass the raw digest as the AAD with
+  `allow_legacy_info=True` (the default):
+  `pyrxd.crypto.kem.unwrap_cek_x25519_detailed(wrapped_cek, epk, sk, parse_cek_hash(stub.crypto.cek_hash))`.
+  `legacy_info` comes back `True`, which marks the content for re-wrapping. Measured: 10 of 10
+  v0.24.0 recipient wraps (0 B to 70,000 B payloads) open this way and decrypt; each is refused
+  under the text AAD and under `allow_legacy_info=False`.
+
+### Fixed
+
+- **CEK wrapping could not interoperate with Photonic, and said it could (v0.6.0–0.24.0).**
+  `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"`. Photonic split that string into
+  `glyph-kek-classical-v1` / `glyph-kek-hybrid-v1` on 2026-05-16 (`8e6bb6e`, under a commit
+  titled "C4: Add transaction confirmation modal") as downgrade
+  protection — binding the HKDF info to the mode so stripping the ML-KEM ciphertext cannot still
+  decrypt. pyrxd's `kem.py` was first committed 2026-05-18, AFTER that split, so the two sides
+  NEVER derived the same KEK on this path and could not exchange
+  encrypted Glyph content, while `pyrxd/__init__.py` and the 0.22.0 entry below both stated
+  byte-compatibility flatly. **The 0.22.0 claim is wrong as written and is corrected here rather
+  than edited, since released sections are frozen:** the draft-irtf-cfrg-xchacha-03 Appendix
+  A.3.1 vector it cites covers the raw AEAD only and never touched the KEM path, and the
+  Photonic interop fixture that appeared to cover it was generated 2026-05-18 — two days AFTER
+  the upstream change — recording `photonic_commit: "UNKNOWN"`.
+
+  pyrxd now emits `glyph-kek-classical-v1`, the correct string for the X25519-only path it
+  implements. `unwrap_cek_x25519` still reads the legacy spelling, so content pyrxd sealed in
+  that window stays readable; `unwrap_cek_x25519_detailed` reports which derivation succeeded so
+  a caller can re-wrap it, and `allow_legacy_info=False` refuses the fallback. The retry is not a
+  downgrade hole: both values are fixed constants, the AEAD tag still has to verify, and neither
+  is Photonic's hybrid string. The `UnwrappedCEK` it returns keeps `cek` out of `repr`.
+
+- **Photonic still could not open a pyrxd recipient wrap after the KEK fix: the AAD was wrong
+  too (0.24.0).** A wrap's AAD is its caller's choice, and `build_timelock_mint` — so
+  `GlyphClient.mint_timelocked_nft` and `pyrxd glyph timelock-mint --recipient` — bound the raw
+  32-byte `sha256(cek)`. Photonic's app binds the UTF-8 TEXT of the on-chain `crypto.cek_hash`
+  (`"sha256:<hex>"`, 71 bytes) everywhere it wraps or opens a recipient slot
+  (`packages/app/src/encryptionService.ts`,
+  `packages/app/src/components/EncryptedContentUnlock.tsx`, at `becf41a7`), and
+  has since before pyrxd's `kem.py` existed. No REP settles it — REP-3006 defines AAD only for
+  the content AEAD, and REP-3008's wrap publishes its own `aad` field — so the wallet is the
+  reference. Measured against Photonic's own `decryptContent`: 0 of 8 pyrxd mints opened
+  before, 16 of 16 after, with Photonic → pyrxd 16 of 16 the other way. The mint now wraps
+  under `pyrxd.glyph.timelock.cek_wrap_aad(cek_hash)`. The old comment cited "REP-3006 and
+  Photonic's encryption.ts". It paraphrased Photonic's LIBRARY doc, which at `becf41a7` says
+  "@param aad ... (REP-3006: use cek_hash bytes)". That phrase is ambiguous (the digest's bytes or
+  the string's bytes) and its REP citation is unsupported: no REP mentions `cek_hash`. Photonic's
+  APP resolves it as the UTF-8 string, and the ambiguity is the likely origin of pyrxd's
+  raw-digest choice. Pinned by a vector generated through Photonic's APP service
+  (`scripts/gen-photonic-vectors/gen-app-path-vector.ts`), which pyrxd's mint reproduces
+  byte-for-byte from the same randomness. This is a wire-format change; see Changed (breaking).
+
+  What this does NOT fix: Photonic's unlock SCREEN still cannot fetch pyrxd-minted ciphertext.
+  Before it calls `decryptContent` it requires `main.b`, or both `crypto.locator` and
+  `crypto.locator_nonce` (`EncryptedContentUnlock.tsx`, `assertStorageAvailable`), and pyrxd
+  writes neither `main.b` nor `locator_nonce`. Per that source a pyrxd timelock mint stops at
+  "Storage Locator Missing" there (read from the source, not rendered). The interop proved here
+  is the `decryptContent` step, handed the ciphertext. The storage gap predates this release and
+  is not addressed in it.
+
+- **A Photonic-minted token with EMPTY encrypted content lost its `encrypted_main` on decode.**
+  Photonic encodes zero bytes as zero chunks (`Math.ceil(0 / CHUNK_SIZE)`), so its app records
+  `main: {size: 0, chunks: 0}`. `EncryptionMetadata.from_dict` refused any `chunks < 1`, and
+  `decode_payload` drops a field that fails to parse, so such a token read as having no encrypted
+  main at all. `{size: 0, chunks: 0}` is now accepted; zero chunks with nonzero size, and any
+  negative count, are still refused. Measured against Photonic's app service: of 12 random 0-byte
+  mints, pyrxd kept the field, unwrapped strictly and decrypted to empty 0 of 12 times before,
+  12 of 12 after. Pinned by `app_encrypt_content_recipient_empty`, Photonic's real output.
+
+- **`verify_burn` reported valid Photonic burns as "no burn proof output found".** The read cap
+  on a burn proof's CBOR was 8,192 bytes; Photonic builds proofs up to 131,072
+  (`MAX_CBOR_SIZE = 128 * 1024`, `burn.ts`), so any proof between the two parsed as absent. The
+  cap is now 131,072 on both the write and read side, inclusive, as Photonic's writer is.
+  `parse_burn_proof` also gained a PUSHDATA4 branch: above 65,535 bytes the encoder already
+  emits PUSHDATA4, and without the branch pyrxd would have written proofs it could not read
+  back. A push whose declared length runs past the end of the script is refused.
+
 ### Added
+
+- **`GlyphMetadata.loc_vout`** — an INTEGER `loc` is kept instead of dropped with a warning.
+  Photonic reads an integer `loc` as a pointer to one of the token's own refs, whose payload
+  it merges into this one; pyrxd read `loc` only as text, so such a token decoded as though it
+  had no `loc` at all. Read path only, and the merge is NOT implemented: `loc_vout` tells a
+  caller the metadata is incomplete and where the rest is. `None` means no integer `loc` was
+  present, not that a merge happened.
+- **`pyrxd.glyph.timelock.cek_wrap_aad`** — the AAD a Glyph recipient wrap is bound to, for
+  readers calling `unwrap_cek_x25519` themselves. Pass the on-chain string verbatim; it refuses
+  `bytes`, because handing it the digest is the 0.24.0 mistake.
 
 - **`pyrxd mark <file>`** — the write side reaches a chain. Hashes a file (streamed,
   sha256), signs a v2 HashMark record with the wallet's first receive key, funds it

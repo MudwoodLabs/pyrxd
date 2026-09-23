@@ -131,9 +131,16 @@ class EncryptionMetadata:
         # consumers as a real value — the same malformed-number class as the CBOR Infinity that
         # raised OverflowError here, except silent. Both are now refused, and `decode_payload`
         # logs and drops the field exactly as it does for every other malformed input.
+        #
+        # ZERO chunks is NOT nonsensical when there are zero bytes: it is how Photonic encodes
+        # EMPTY content (`encryptChunked` takes `Math.ceil(0 / CHUNK_SIZE)` = 0), so a 0-byte
+        # Photonic mint records `{size: 0, chunks: 0}`. This check used to refuse `chunks < 1`
+        # outright and so dropped every such token's `encrypted_main`. Zero chunks with any
+        # content is still refused. (pyrxd's own `encrypt_chunked` writes one empty chunk for
+        # empty content; `{size: 0, chunks: 1}` stays accepted too.)
         size = cbor_int(d.get("size", 0))
         chunks = cbor_int(d.get("chunks", 1))
-        if size < 0 or chunks < 1:
+        if size < 0 or chunks < 0 or (chunks == 0 and size != 0):
             raise ValidationError(f"encrypted main has a nonsensical size/chunks: {size}/{chunks}")
         return cls(
             type=str(d["type"]),

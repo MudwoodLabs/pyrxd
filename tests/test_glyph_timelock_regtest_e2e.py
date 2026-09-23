@@ -87,6 +87,7 @@ from pyrxd.glyph.timelock import (
     TimelockParams,
     TimelockRecipient,
     build_timelock_mint,
+    cek_wrap_aad,
     compute_cek_hash,
     parse_cek_hash,
     spec_is_unlocked,
@@ -402,9 +403,21 @@ class TestTheSealIsAcceptedByTheNode:
         wraps = list(on_chain.crypto.recipients)
         assert len(wraps) == 1 and wraps[0].kid == "auctioneer-1"
 
-        commitment = parse_cek_hash(_spec_of(on_chain).cek_hash)
-        cek = unwrap_cek_x25519(wraps[0].wrapped_cek, wraps[0].epk, recipient_sk, commitment)
+        # The wrap's AAD is the on-chain `crypto.cek_hash` TEXT, read off the chain copy — what
+        # Photonic's `decryptContent` binds (see `cek_wrap_aad`). This test was written against the
+        # raw 32-byte digest, which is what pyrxd 0.24.0 wrapped under and Photonic cannot open.
+        cek = unwrap_cek_x25519(
+            wraps[0].wrapped_cek,
+            wraps[0].epk,
+            recipient_sk,
+            cek_wrap_aad(on_chain.crypto.cek_hash),
+            allow_legacy_info=False,
+        )
         assert verify_cek_reveal(cek, _spec_of(on_chain).cek_hash)
+        with pytest.raises(ValueError):  # the raw digest must not open it, or the AAD proves nothing
+            unwrap_cek_x25519(
+                wraps[0].wrapped_cek, wraps[0].epk, recipient_sk, parse_cek_hash(on_chain.crypto.cek_hash)
+            )
         opened = decrypt_chunked(maturing["build"].ciphertext, cek, parse_cek_hash(on_chain.encrypted_main.hash))
         assert opened == SEALED_PLAINTEXT
 

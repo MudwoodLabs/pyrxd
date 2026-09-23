@@ -178,7 +178,9 @@ def _inspect_txid_offline(value: str) -> dict:
     }
 
 
-def _reclassify_with_spent(txid: str, raw: bytes, payload: dict, prev_raw_hex: str) -> dict:
+def _reclassify_with_spent(
+    txid: str, raw: bytes, payload: dict, prev_raw_hex: str, attest_hashmark_limit: int | None = None
+) -> dict:
     """Re-run the classifier with the attributed input's spent locking script.
 
     Mirrors the CLI ``--fetch`` path. Kept separate so the failure contract is
@@ -202,10 +204,14 @@ def _reclassify_with_spent(txid: str, raw: bytes, payload: dict, prev_raw_hex: s
         raw,
         network=_PAGE_NETWORK,
         spent_scripts={int(input_index): script},
+        # The SAME bound as the first pass: a second pass that checked everything would undo it.
+        attest_hashmark_limit=attest_hashmark_limit,
     )
 
 
-def inspect_txid_with_raw(txid: str, raw_hex: str, prev_raw_hex: str = "") -> dict:
+def inspect_txid_with_raw(
+    txid: str, raw_hex: str, prev_raw_hex: str = "", attest_hashmark_limit: object = None
+) -> dict:
     """Classify a transaction whose raw bytes JS already fetched.
 
     *prev_raw_hex*, when given, is the raw transaction containing the output that
@@ -231,6 +237,22 @@ def inspect_txid_with_raw(txid: str, raw_hex: str, prev_raw_hex: str = "") -> di
     """
     if not isinstance(txid, str) or not isinstance(raw_hex, str):
         return _err("txid and raw_hex must both be strings", form="error")
+    # *attest_hashmark_limit*: check the signatures of only the first N HashMark records (see
+    # ``classify_raw_tx``). The public verify page passes the number of records it draws, so the
+    # work one linked transaction can demand of a stranger's tab is bounded by what is shown.
+    # Arrives from JavaScript, so it is checked here rather than trusted: a JS number that is not
+    # a whole, non-negative integer is refused, not rounded.
+    if attest_hashmark_limit is not None:
+        if isinstance(attest_hashmark_limit, float) and attest_hashmark_limit.is_integer():
+            attest_hashmark_limit = int(attest_hashmark_limit)
+        if (
+            isinstance(attest_hashmark_limit, bool)
+            or not isinstance(attest_hashmark_limit, int)
+            or attest_hashmark_limit < 0
+        ):
+            return _err(
+                f"attest_hashmark_limit must be a whole number >= 0, got {attest_hashmark_limit!r}", form="error"
+            )
 
     txid = txid.strip().lower()
     raw_hex = raw_hex.strip()
@@ -261,14 +283,16 @@ def inspect_txid_with_raw(txid: str, raw_hex: str, prev_raw_hex: str = "") -> di
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
     try:
-        payload = _inspect.classify_raw_tx(txid, raw, network=_PAGE_NETWORK)
+        payload = _inspect.classify_raw_tx(
+            txid, raw, network=_PAGE_NETWORK, attest_hashmark_limit=attest_hashmark_limit
+        )
         # SECOND PASS, only when the page supplied the spent transaction. A failure
         # here must leave the FIRST payload standing: the rest of the report is
         # still true, and `payload_binding` degrades to its own stated `unchecked`
         # reason rather than taking the whole inspect down.
         if prev_raw_hex:
             try:
-                payload = _reclassify_with_spent(txid, raw, payload, prev_raw_hex)
+                payload = _reclassify_with_spent(txid, raw, payload, prev_raw_hex, attest_hashmark_limit)
             except Exception:
                 pass
     except Exception as exc:
