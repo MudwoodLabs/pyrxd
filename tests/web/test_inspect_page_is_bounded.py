@@ -26,6 +26,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess  # nosec B404 — fixed argv, no shell, repo-local script
 import sys
@@ -50,10 +51,38 @@ def _require_node() -> str:
     return node
 
 
+#: Pyodide's ``toJs`` hands the page an int as a JS number only while its magnitude is under
+#: 2**53 − 1, and as a BigInt from there on. Measured under Pyodide 0.26.4 (the version the page's
+#: index.html loads) in Node: 2**53 − 2 and −(2**53 − 2) arrived as numbers, 2**53 − 1 and
+#: −(2**53 − 1) as BigInts.
+_TO_JS_BIGINT_FROM = 2**53 - 1
+
+
+def _as_to_js_hands_it(value, key: str):
+    """*value* with every int ``toJs`` would hand the page as a BigInt replaced by the harness's
+    ``--bigint-key`` marker for it, so the harness hands the page that BigInt."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return {key: str(value)} if abs(value) >= _TO_JS_BIGINT_FROM else value
+    if isinstance(value, dict):
+        return {k: _as_to_js_hands_it(v, key) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_to_js_hands_it(v, key) for v in value]
+    return value
+
+
 def _render(cases: dict) -> dict:
+    """Draw *cases* with the page's own renderers, each value as the page receives it.
+
+    The page receives a glue result through ``toJs``, which makes a wide int a BigInt. Sent as
+    ``json.dumps`` alone, that int reached the harness as a JSON number, rounded by JSON.parse,
+    and no case here could reach what the page does with a BigInt — the drawer threw on one. The
+    marker key is new each run, so no text in a payload can take the marker's form."""
+    key = f"__bigint_{secrets.token_hex(8)}__"
     proc = subprocess.run(  # nosec B603 — fixed argv, no shell, repo-local script
-        [_require_node(), str(_HARNESS), "-"],
-        input=json.dumps(cases),
+        [_require_node(), str(_HARNESS), "-", "--bigint-key", key],
+        input=json.dumps(_as_to_js_hands_it(cases, key)),
         capture_output=True,
         text=True,
         check=False,
@@ -1247,6 +1276,58 @@ class TestTheDrawerFindsEveryCut:
             "y_not_listed": "5",
         }
         assert _drawer({"c": result})["c"] == ("Show raw JSON", [])
+
+
+class TestAnIntegerPastWhatANumberHoldsReachesTheDrawer:
+    """``toJs`` hands the page an int of magnitude 2**53 − 1 or more as a BigInt, and
+    ``JSON.stringify`` throws on one. A dMint reward is the deployer's to choose, and an output
+    of about 90 million RXD is that wide in photons: ``renderResult`` threw after drawing the
+    card, so the drawer, its Copy JSON button and its cut-short note never appeared, and the
+    exception left ``onFetchTxid``. Each case goes through ``_render``, which hands the page the
+    BigInts ``toJs`` would."""
+
+    _WIDE = 2**53 + 1
+
+    @staticmethod
+    def _valued(values: list[int], limit: int) -> dict:
+        """The page's glue result for a transaction whose outputs carry these photon values."""
+        from pyrxd.script.script import Script
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        scripts = [_p2pkh(), b"\x6a\x04abcd"][: len(values)]
+        tx = _tx(scripts)
+        tx.outputs = [TransactionOutput(Script(s), v) for s, v in zip(scripts, values)]
+        result = _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), limit, limit)
+        assert result["ok"], result
+        return result
+
+    def test_a_wide_reward_is_written_as_its_digits_in_the_drawer_and_the_copy(self, limit) -> None:
+        result = _result(_dmint(reward=self._WIDE), _p2pkh(), limit=limit)
+        assert result["payload"]["outputs"][0]["reward"] == self._WIDE, "the premise: the payload holds the int"
+        out = _render({"case": {"result": result, "json_drawer": True}})["case"]
+        drawer = out["json_drawer_text"]
+        # Quoted, so it came from a BigInt: a JSON number would have been rounded to ...992.
+        assert f'"reward": "{self._WIDE}"' in drawer
+        assert json.loads(drawer)["payload"]["txid"] == result["payload"]["txid"]
+        assert out["json_drawer_copied"] == drawer, "Copy JSON copies the drawer's text"
+        assert f"reward\n{self._WIDE}" in out["result_block"], "the card draws the exact digits"
+
+    def test_a_wide_output_value_is_drawn_exactly_and_the_drawer_still_appears(self, limit) -> None:
+        """An OP_RETURN's burnt photons were printed through ``Number()``, which rounds past
+        2**53: 2**53 + 7 read as 9007199254741000."""
+        out = _render({"case": {"result": self._valued([self._WIDE, self._WIDE + 6], limit), "json_drawer": True}})
+        text, drawer = out["case"]["result_block"], out["case"]["json_drawer_text"]
+        assert f'"satoshis": "{self._WIDE}"' in drawer and f'"satoshis": "{self._WIDE + 6}"' in drawer
+        assert f"{self._WIDE} sats" in text
+        assert f"This output carries {self._WIDE + 6} photons and no scriptSig" in text
+
+    def test_an_ordinary_integer_is_still_a_json_number(self, limit) -> None:
+        """The honest path: under 2**53 − 1 ``toJs`` hands over a number, and the drawer writes a
+        number, not a string."""
+        drawer = _render({"case": {"result": self._valued([2**53 - 2, 0], limit), "json_drawer": True}})["case"][
+            "json_drawer_text"
+        ]
+        assert f'"satoshis": {2**53 - 2}\n' in drawer and '"satoshis": 0\n' in drawer
 
 
 # ─────────────────────────────────────── a small transaction is drawn as before ──

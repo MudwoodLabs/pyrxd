@@ -28,6 +28,15 @@
 //               no output row can hold on its own — today the mark's block anchor.
 //               `renderFetchedTxCard` supplies it in production; a case that omits
 //               it gets the same "no block was looked up" degrade a caller would.
+//               `json_drawer: true` beside a `result` also answers `json_drawer_text`
+//               (the drawer's whole JSON text) and `json_drawer_copied` (what pressing
+//               its Copy JSON button handed the clipboard, or null).
+//   --bigint-key K: every object of the input whose ONLY key is K, holding a string of
+//               decimal digits, arrives as that BigInt — the way Pyodide's `toJs` hands
+//               the page a wide int. JSON has no BigInt, and a JSON number past 2**53 is
+//               rounded by JSON.parse before any page code runs, so a caller that means
+//               to reach the page's BigInt path marks those values; K is the caller's
+//               own, chosen per run, so no payload text can take that form by accident.
 //   stdout:     JSON — {"name": {"script_card": "…", "output_row": "…",
 //                                "fetched_tx_card": "…"}}
 //               where each value is the rendered text, one text node per line,
@@ -79,6 +88,7 @@ class StubElement {
     this.tag = tag;
     this.childNodes = [];
     this.attributes = {};
+    this.listeners = {};
   }
   set textContent(value) {
     this.childNodes = [new StubText(String(value))];
@@ -99,7 +109,10 @@ class StubElement {
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
   }
-  addEventListener() {}
+  // Kept, not dropped, so a case can press a button the page drew (the drawer's Copy JSON).
+  addEventListener(type, listener) {
+    (this.listeners[type] ||= []).push(listener);
+  }
   focus() {}
 }
 
@@ -180,6 +193,16 @@ function makeSandbox() {
     fetch: () => Promise.reject(new Error("no network in the render harness")),
     crypto: { subtle: {} },
     WebSocket: class {},
+    // What the Copy JSON button writes is kept in `__copied__`. The promise never settles, so the
+    // button's "Copied" timer is never started and the harness exits when it is done.
+    navigator: {
+      clipboard: {
+        writeText: (text) => {
+          sandbox.__copied__ = String(text);
+          return new Promise(() => {});
+        },
+      },
+    },
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -216,12 +239,29 @@ function loadRenderer() {
   return sandbox;
 }
 
+// The BigInt a `--bigint-key` marker stands for; anything else is returned as it came.
+function bigintReviver(key) {
+  return (_name, value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const keys = Object.keys(value);
+    if (keys.length !== 1 || keys[0] !== key) return value;
+    if (typeof value[key] !== "string" || !/^-?[0-9]+$/.test(value[key])) {
+      throw new Error(`a --bigint-key marker holds ${JSON.stringify(value[key])}, not decimal digits`);
+    }
+    return BigInt(value[key]);
+  };
+}
+
 function main() {
-  const payloadPath = process.argv[2];
+  const args = process.argv.slice(2);
+  const keyAt = args.indexOf("--bigint-key");
+  const bigintKey = keyAt >= 0 ? args.splice(keyAt, 2)[1] : null;
+  if (keyAt >= 0 && !bigintKey) throw new Error("--bigint-key needs a key");
+  const payloadPath = args[0];
   const raw = !payloadPath || payloadPath === "-"
     ? readFileSync(0, "utf8")
     : readFileSync(payloadPath, "utf8");
-  const cases = JSON.parse(raw);
+  const cases = bigintKey ? JSON.parse(raw, bigintReviver(bigintKey)) : JSON.parse(raw);
   const renderer = loadRenderer();
   const results = { __constants__: renderer.__constants__ };
   for (const [name, payloads] of Object.entries(cases)) {
@@ -255,10 +295,22 @@ function main() {
       out.result_block_elements = countElements(block, () => true);
       const pre = findFirst(block, (n) => n.className === "json-block");
       out.json_drawer_chars = pre ? pre.textContent.length : null;
+      if (payloads.json_drawer) {
+        out.json_drawer_text = pre ? pre.textContent : null;
+        renderer.__copied__ = null;
+        const copy = findFirst(block, (n) => n.className === "copy-json-btn");
+        for (const listener of (copy && copy.listeners.click) || []) listener();
+        out.json_drawer_copied = renderer.__copied__;
+      }
     }
     if (Object.keys(out).length === 0) {
       throw new Error(
         `case ${JSON.stringify(name)} has none of "script", "row", "tx", "result" — nothing to render`
+      );
+    }
+    if (payloads.json_drawer && !payloads.result) {
+      throw new Error(
+        `case ${JSON.stringify(name)} has "json_drawer" but no "result", so no drawer was drawn`
       );
     }
     // `row_opts` without a `row` renders nothing and silently proves nothing — the

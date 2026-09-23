@@ -2012,7 +2012,7 @@ function _structuralQualifierNote(type, payload) {
     let valueNote;
     if (Number.isFinite(sats) && sats > 0) {
       valueNote =
-        `This output carries ${sats} photons and no scriptSig can ever ` +
+        `This output carries ${payload.satoshis} photons and no scriptSig can ever ` +
         `satisfy OP_RETURN, so those photons are destroyed — they are not ` +
         `spendable by anyone, including the sender.`;
     } else if (Number.isFinite(sats)) {
@@ -2442,8 +2442,13 @@ function renderJsonDrawer(result) {
     }));
   }
 
+  // A BIGINT IS WRITTEN AS ITS DIGITS, in quotes. Pyodide 0.26.4's `toJs` hands over every int of
+  // magnitude 2**53 − 1 or more as a BigInt (measured), and `JSON.stringify` throws on one — so a
+  // dMint reward the deployer chose, or an output of about 90 million RXD, threw here after the
+  // card was drawn, and the drawer and its Copy JSON button never appeared. As a string the value
+  // is exact; as a JSON number any JavaScript reader would round it. Copy JSON copies this text.
   const pre = el("pre", { class: "json-block" });
-  pre.textContent = JSON.stringify(result, null, 2);
+  pre.textContent = JSON.stringify(result, (_key, value) => (typeof value === "bigint" ? String(value) : value), 2);
   details.appendChild(pre);
 
   const copyBtn = el("button", { class: "copy-json-btn", text: "Copy JSON" });
