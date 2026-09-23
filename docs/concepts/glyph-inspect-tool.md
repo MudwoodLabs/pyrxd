@@ -388,7 +388,11 @@ cuts the output list at `MAX_ROWS_SHOWN`, it sends `output_shape`: a
 count of every output by type and, for the `dmint` outputs, the first
 one's height and `max_height` and whether all of them agree on
 `token_ref`, `reward` and `max_height`. When nothing was cut, the banner
-works the same facts out from the rows. What it reads off the rows alone
+works the same facts out from the rows, with one difference: a row
+carries an integer wider than 1024 bits as text, so where every `dmint`
+row carries the same such text for `reward` or `max_height` the banner
+says it cannot tell whether they agree, and, when their `token_ref`s
+agree, that claims race between them. What it reads off the rows alone
 is a position — which vout the minted FT sits at, and whether the
 outputs are in the canonical mint order — and only when the rows are
 every output.

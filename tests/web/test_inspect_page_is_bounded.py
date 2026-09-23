@@ -752,18 +752,23 @@ class TestAWideRewardIsComparedAsAnInteger:
     bits>". `_OutputShape` compared the LISTED rows after that replacement and the counted ones
     before it, so 150 contracts sharing one 1,101-bit reward read "not all equal" and two with
     different 1,101-bit rewards read "agree". Each case is drawn cut (the classifier's
-    `output_shape`) and uncut (the page's own count of the rows, which sees only the text)."""
+    `output_shape`) and uncut (the page's own count of the rows, which sees only the text).
 
-    _AGREE = "agree on reward and max_height"
+    Where the page cannot compare the terms it still compared the token_refs, and says what that
+    established: its "cannot tell" banner used to drop it."""
+
+    _AGREE = "token_ref and agree on reward and max_height"
     _DIFFER = "their reward / max_height are not all equal"
-    _CANNOT = "This page cannot tell whether all"
+    _CANNOT = "this page cannot tell whether they agree on reward and max_height"
+    _RACE = "carry the same token_ref, so claims race between them"
 
     def test_one_wide_reward_past_the_limit_agrees_with_itself(self, limit) -> None:
         """Case A: listed rows and counted rows compared as the same integer."""
         page, whole = _banners([_wide_dmint(_WIDE) for _ in range(150)] + [_p2pkh()], limit)
-        assert f"All 150 carry the same token_ref and {self._AGREE}" in page
+        assert f"All 150 carry the same {self._AGREE}" in page
         assert self._DIFFER not in page
         assert self._CANNOT in whole and self._AGREE not in whole and self._DIFFER not in whole
+        assert f"All 150 {self._RACE}" in whole
 
     def test_two_different_wide_rewards_within_the_limit_differ(self, limit) -> None:
         """Case B: both listed, both drawn as the same text, and different integers."""
@@ -793,6 +798,7 @@ class TestAWideRewardIsComparedAsAnInteger:
         page = _banner(_card(payload)["fetched_tx_card"])
         assert words in page, page
         assert [w for w in (self._AGREE, self._DIFFER, self._CANNOT) if w in page] == [words], page
+        assert f"All 2 {self._RACE}" in page or words == self._AGREE, "the token_refs were compared"
 
     @pytest.mark.parametrize("reward", [100_000, 5], ids=["ordinary-equal", "ordinary-different"])
     def test_cut_ordinary_rewards_are_compared_as_before(self, limit, reward) -> None:

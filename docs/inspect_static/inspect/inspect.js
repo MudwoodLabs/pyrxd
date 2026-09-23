@@ -1827,7 +1827,15 @@ function _detectTxShape(payload) {
             `They do NOT all carry the same token_ref, so this is not one ` +
             `token deployed in parallel — check the token ref on each row ` +
             `before treating the contracts as interchangeable. `;
-        } else if (!oneToken || !(sameTerms || termsDiffer)) {
+        } else if (oneToken && !(sameTerms || termsDiffer)) {
+          // The token_refs were compared and agree; only the terms could not be. Say both, or the
+          // one thing this page did establish — that claims race between these contracts — is lost.
+          parallel +=
+            `All ${dmintCount} carry the same token_ref, so claims race between ` +
+            `them — but this page cannot tell whether they agree on reward and ` +
+            `max_height: at least one of those is an integer too wide for it to ` +
+            `compare, so it gives no reward × max_height × ${dmintCount} figure. `;
+        } else if (!oneToken) {
           parallel +=
             `This page cannot tell whether all ${dmintCount} agree on token_ref, ` +
             `reward and max_height: at least one of those values is an integer ` +

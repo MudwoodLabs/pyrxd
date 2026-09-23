@@ -1757,10 +1757,13 @@ class _OutputShape:
 
     A count of each output type, and for the dMint contract outputs the first one's vout, height
     and max_height and whether ALL of them carry one token_ref, one reward and one max_height. The
-    page's transaction-shape banner states exactly these (``_detectTxShape`` in ``inspect.js``,
-    which computes the same facts from the rows when nothing was cut). A field compared must be
-    present on every row to agree, as the banner's own comparison requires: a field absent
-    everywhere does not agree by having nothing to compare.
+    page's transaction-shape banner states exactly these (``_detectTxShape`` in ``inspect.js``).
+    When nothing was cut the page works them out from the rows instead (``_outputShape``), and
+    there it sees an integer wider than :data:`_MAX_RENDERED_INT_BITS` only as the text that
+    replaced it: where every row holds the same such text for a field, it answers "cannot tell" rather
+    than the agreement this class computes. A field compared must be present on every row to
+    agree, as the banner's own comparison requires: a field absent everywhere does not agree by
+    having nothing to compare.
 
     COMPARED AS THE CLASSIFIER'S OWN VALUES, for a listed row as for a counted one: the caller
     notes every row BEFORE :func:`_render_safe` replaces an integer wider than
