@@ -154,10 +154,25 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "verify_tx_in_block": ("pyrxd.spv", "verify_tx_in_block"),
     # Content encryption primitives — pyrxd.crypto (#556).
     #
-    # These are BYTE-COMPATIBLE WITH PHOTONIC WALLET (`packages/lib/src/encryption.ts`), which is
-    # what makes them worth a public export rather than an internal detail: a caller encrypting
-    # Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the actual use
-    # case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1 vector.
+    # These target BYTE-COMPATIBILITY WITH PHOTONIC WALLET (`packages/lib/src/encryption.ts`),
+    # which is what makes them worth a public export rather than an internal detail: a caller
+    # encrypting Glyph content with pyrxd and decrypting it in Photonic, or the reverse, is the
+    # actual use case. `aead` is verified against the draft-irtf-cfrg-xchacha-03 Appendix A.3.1
+    # vector — an independent published vector, so that half of the claim is falsifiable.
+    #
+    # The KEM half was NOT, and was false for four months. This comment said "BYTE-COMPATIBLE"
+    # flatly while `wrap_cek_x25519` derived its KEK under `b"glyph-kek-v1"` and Photonic had
+    # moved to `b"glyph-kek-classical-v1"` on 2026-05-16 (`8e6bb6e`) — so wrap/unwrap could not interoperate
+    # at all from v0.6.0 through 0.24.0. The interop fixture could not catch it: it was generated
+    # two days AFTER the upstream change, from a checkout that did not carry it. The Appendix
+    # A.3.1 vector never covered the KEM path, only the raw AEAD.
+    #
+    # A SECOND break sat one layer up, and fixing the KEK alone did not reach it: the wrap's AAD
+    # is the CALLER's choice, and `build_timelock_mint` passed the raw 32-byte digest where
+    # Photonic's app binds the UTF-8 text of `crypto.cek_hash` — so Photonic still could not open
+    # a pyrxd recipient wrap. Both are fixed; `pyrxd.glyph.timelock.cek_wrap_aad` is the AAD, and
+    # tests/test_crypto_kem.py::TestTheAppPathVector checks both directions against a vector
+    # generated through Photonic's app service rather than its library.
     #
     # These were exported rather than wired when #560 landed: #556 had found them unreachable
     # alongside the timelocked-content feature, and nothing in `src/` imported them at all. That

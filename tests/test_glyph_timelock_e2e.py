@@ -41,6 +41,7 @@ from pyrxd.glyph.encrypted_content import (
 from pyrxd.glyph.timelock import (
     TimelockParams,
     add_timelock_to_metadata,
+    cek_wrap_aad,
     compute_cek_hash,
     format_cek_hash,
     is_unlocked,
@@ -84,12 +85,12 @@ class TestFullLifecycleSelfContained:
         chunked = encrypt_chunked(plaintext, cek)
         plaintext_hash = chunked.plaintext_hash
 
-        # Wrap the CEK for the recipient using X25519 ECDH
-        wrap_aad = compute_cek_hash(cek)  # bind to commitment per REP-3006
-        wrapped = wrap_cek_x25519(cek, recipient_pk, wrap_aad)
+        # Wrap the CEK for the recipient using X25519 ECDH, bound to the on-chain cek_hash
+        # STRING as UTF-8 — what Photonic's app binds (no REP specifies it; see cek_wrap_aad).
+        cek_hash_str = format_cek_hash(compute_cek_hash(cek))
+        wrapped = wrap_cek_x25519(cek, recipient_pk, cek_wrap_aad(cek_hash_str))
 
         # Build the EncryptedContentStub (mint metadata)
-        cek_hash_str = format_cek_hash(compute_cek_hash(cek))
         stub = EncryptedContentStub(
             p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED],
             type="text/plain",
@@ -167,13 +168,14 @@ class TestFullLifecycleSelfContained:
         # 5. Unwrap the CEK using the recipient's X25519 key (alternative
         #    path: a holder of the wrapping key can decrypt WITHOUT the
         #    reveal tx — the reveal is for everyone else)
-        unwrap_aad = compute_cek_hash(revealed_cek)
+        unwrap_aad = cek_wrap_aad(mint_metadata.crypto.cek_hash)
         wrapped_data = mint_metadata.crypto.recipients[0]
         unwrapped_cek = unwrap_cek_x25519(
             wrapped_data.wrapped_cek,
             wrapped_data.epk,
             recipient_sk,
             unwrap_aad,
+            allow_legacy_info=False,
         )
         assert unwrapped_cek == cek
 
@@ -200,7 +202,9 @@ class TestPhotonicInteropEndToEnd:
         wrapped_bytes = bytes.fromhex(wrap["wrapped_cek"])
         ephemeral = bytes.fromhex(wrap["ephemeral_x25519_pub"])
         aad = bytes.fromhex(wrap["aad"])
-        unwrapped_cek = unwrap_cek_x25519(wrapped_bytes, ephemeral, recipient_sk, aad)
+        # Strict: the default would also accept the pre-split KEK info, and a pass through that
+        # fallback proves only that the fallback works — the same vacuity that hid the KEK split.
+        unwrapped_cek = unwrap_cek_x25519(wrapped_bytes, ephemeral, recipient_sk, aad, allow_legacy_info=False)
         assert unwrapped_cek == bytes.fromhex(wrap["original_cek"])
 
         # 2. The unwrapped CEK is the same one used in chunked_aead_small

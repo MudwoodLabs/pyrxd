@@ -11,6 +11,7 @@ one.
 
 from __future__ import annotations
 
+import cbor2
 import pytest
 
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder
@@ -182,8 +183,16 @@ def test_a_negative_burn_amount_is_refused():
 
 
 def test_an_oversized_reason_is_refused():
+    """9_000 used to be oversized. It is not any more.
+
+    The cap moved from 8_192 to 131_072 to match Photonic's `MAX_CBOR_SIZE = 128 * 1024`,
+    because pyrxd was refusing burn proofs Photonic builds. This test asserted the REFUSAL,
+    so it had to move with the cap or it would be pinning the bug. The property is unchanged
+    — a proof too large to decode safely is still refused — and the honest-path side is
+    covered by `TestBurnProofCapMatchesPhotonic`, which proves 32 KiB and 70 KiB now pass.
+    """
     with pytest.raises(ValidationError, match="over the"):
-        build_burn_proof_script(TOKEN, burn_reason="x" * 9000)
+        build_burn_proof_script(TOKEN, burn_reason="x" * 200_000)
 
 
 def test_non_burn_scripts_parse_as_none_rather_than_raising():
@@ -419,3 +428,152 @@ def test_a_proof_naming_a_DIFFERENT_token_is_still_refused_in_both_spellings() -
     for spelling in (f"{other.txid}:{other.vout}", f"{other.txid}{(1).to_bytes(4, 'big').hex()}"):
         verdict = verify_burn([_proof_script_naming(spelling)], ref, held)
         assert not verdict.ok, f"a proof naming another token was accepted ({spelling})"
+
+
+class TestBurnProofCapMatchesPhotonic:
+    """pyrxd refused burn proofs Photonic builds, and reported the refusal as absence.
+
+    Photonic's `packages/lib/src/burn.ts:19` sets `MAX_CBOR_SIZE = 128 * 1024` and writes
+    proofs up to it. pyrxd capped at 8_192, and `parse_burn_proof` returned None above that,
+    so `verify_burn` announced "no burn proof output found" for a perfectly valid burn
+    between 8 KiB and 128 KiB. Two defects in one: a guard refusing honest work, and a
+    refusal reported as an absence, which sends the reader looking for the wrong thing.
+
+    Consensus is not the constraint — MAX_SCRIPT_ELEMENT_SIZE is 32_000_000 and standardness
+    never runs on Radiant — so these caps are DoS policy, and interoperating means adopting
+    the other implementation's number.
+    """
+
+    def _proof_with_reason(self, n: int) -> bytes:
+        from pyrxd.glyph.burn import build_burn_proof_script
+
+        return build_burn_proof_script(
+            token_ref=GlyphRef(txid="ab" * 32, vout=0),
+            amount=1,
+            burn_reason="x" * n,
+        )
+
+    def test_the_cap_equals_photonics(self):
+        from pyrxd.glyph.burn import _MAX_PROOF_CBOR_BYTES
+
+        assert _MAX_PROOF_CBOR_BYTES == 128 * 1024
+
+    def test_a_proof_larger_than_the_old_cap_round_trips(self):
+        """The honest path that used to be refused. 32 KiB sits above the old 8_192 limit
+        and below the new one."""
+        from pyrxd.glyph.burn import parse_burn_proof
+
+        script = self._proof_with_reason(32_768)
+        parsed = parse_burn_proof(script)
+        assert parsed is not None, "a proof Photonic would build must parse"
+        assert len(parsed.reason) == 32_768
+
+    def test_a_pushdata4_sized_proof_round_trips(self):
+        """Above 65_535 the encoder switches to PUSHDATA4. The reader stopped at PUSHDATA2,
+        so raising the cap without this branch would have let pyrxd write proofs it could
+        not read back — the writer and reader disagreeing about their own format."""
+        from pyrxd.glyph.burn import parse_burn_proof
+
+        script = self._proof_with_reason(70_000)
+        # At the payload push's own offset. (This used to slice the first 0x4E found anywhere
+        # and compare it to 0x4E, which is true of any script containing that byte at all.)
+        assert script[self.PAYLOAD_PUSH_AT] == 0x4E, "the payload is not behind PUSHDATA4"
+        parsed = parse_burn_proof(script)
+        assert parsed is not None, "PUSHDATA4-encoded proof must parse"
+        assert len(parsed.reason) == 70_000
+
+    # -- the boundary, on both sides --------------------------------------------------------
+    #
+    # The two refusal tests these replace built their scripts with marker 0x42 (the burn marker
+    # is 0x06) and, for the oversized one, no `token_ref`, so `parse_burn_proof` returned None
+    # at the MARKER check and never reached the code either test was named for. Deleting the
+    # read cap, or the push bounds check, left the whole suite green. Everything below builds a
+    # proof that is valid in every respect but the one under test, and carries a control showing
+    # that the same bytes DO parse once that one thing is removed.
+
+    CAP = 128 * 1024
+
+    @staticmethod
+    def _envelope(payload: bytes, *, declared_len: int | None = None) -> bytes:
+        """``payload`` behind the real magic, version and BURN marker, pushed with PUSHDATA4."""
+        n = len(payload) if declared_len is None else declared_len
+        return (
+            b"\x6a\x03gly"
+            + bytes([1, BURN_PROOF_VERSION])
+            + bytes([1, BURN_MARKER_BYTE])
+            + b"\x4e"
+            + n.to_bytes(4, "little")
+            + payload
+        )
+
+    @staticmethod
+    def _proof_dict(reason_len: int) -> dict:
+        """The dict `build_burn_proof_script` encodes for `_proof_with_reason`, key for key."""
+        return {
+            "v": BURN_PROOF_VERSION,
+            "p": [BURN_MARKER_BYTE],
+            "action": "burn",
+            "token_ref": f"{'ab' * 32}:0",
+            "amount": 1,
+            "reason": "x" * reason_len,
+        }
+
+    def _reason_len_for_cbor_size(self, size: int) -> int:
+        """The reason length whose canonical proof CBOR is exactly ``size`` bytes."""
+        probe = 65_536  # past the last CBOR text-length header change, so the size is linear here
+        r = size - len(cbor2.dumps(self._proof_dict(probe), canonical=True)) + probe
+        assert len(cbor2.dumps(self._proof_dict(r), canonical=True)) == size
+        return r
+
+    #: OP_RETURN(1) + push "gly"(4) + push version(2) + push marker(2): the payload push opcode.
+    PAYLOAD_PUSH_AT = 9
+
+    def _payload_len(self, script: bytes) -> int:
+        assert script[self.PAYLOAD_PUSH_AT] == 0x4E, "expected the payload behind PUSHDATA4"
+        return int.from_bytes(script[self.PAYLOAD_PUSH_AT + 1 : self.PAYLOAD_PUSH_AT + 5], "little")
+
+    def test_the_writer_accepts_a_proof_of_exactly_the_cap(self):
+        """Photonic refuses only ``encodedProof.length > MAX_CBOR_SIZE`` (burn.ts:66), so a
+        131_072-byte proof is one it builds. pyrxd must build it and read it back."""
+        from pyrxd.glyph.burn import parse_burn_proof
+
+        script = self._proof_with_reason(self._reason_len_for_cbor_size(self.CAP))
+        assert self._payload_len(script) == self.CAP, "the boundary case is not at the boundary"
+        parsed = parse_burn_proof(script)
+        assert parsed is not None and parsed.token_ref == f"{'ab' * 32}:0"
+
+    def test_the_writer_refuses_one_byte_over_the_cap(self):
+        with pytest.raises(ValidationError, match="over the 131072-byte cap"):
+            self._proof_with_reason(self._reason_len_for_cbor_size(self.CAP + 1))
+
+    def test_the_reader_accepts_a_proof_of_exactly_the_cap(self):
+        from pyrxd.glyph.burn import parse_burn_proof
+
+        payload = cbor2.dumps(self._proof_dict(self._reason_len_for_cbor_size(self.CAP)), canonical=True)
+        parsed = parse_burn_proof(self._envelope(payload))
+        assert parsed is not None and parsed.token_ref == f"{'ab' * 32}:0"
+
+    def test_the_reader_refuses_one_byte_over_the_cap_and_only_for_its_size(self, monkeypatch):
+        from pyrxd.glyph import burn
+
+        payload = cbor2.dumps(self._proof_dict(self._reason_len_for_cbor_size(self.CAP + 1)), canonical=True)
+        script = self._envelope(payload)
+        assert burn.parse_burn_proof(script) is None
+
+        # Control: the SAME bytes parse once the cap is lifted by one, so the refusal above is
+        # the cap and nothing else (not the marker, not a missing field, not the push).
+        monkeypatch.setattr(burn, "_MAX_PROOF_CBOR_BYTES", self.CAP + 1)
+        assert burn.parse_burn_proof(script) is not None
+
+    @pytest.mark.parametrize("declared_len", ["one_past_the_end", 10**9])
+    def test_a_push_longer_than_the_script_is_refused_not_read_short(self, declared_len):
+        """A PUSHDATA4 length that runs past the end must be refused, not satisfied with the
+        shorter operand that is actually there. (A Python slice past the end just truncates, so
+        without the bound this would parse the proof as if the push were complete.)"""
+        from pyrxd.glyph.burn import parse_burn_proof
+
+        payload = cbor2.dumps(self._proof_dict(200), canonical=True)
+        n = len(payload) + 1 if declared_len == "one_past_the_end" else declared_len
+        assert parse_burn_proof(self._envelope(payload, declared_len=n)) is None
+        # Control: declared honestly, the same payload is a valid proof.
+        assert parse_burn_proof(self._envelope(payload)) is not None

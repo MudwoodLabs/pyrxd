@@ -14,10 +14,13 @@
   ],
   "not_found_at_this_commit": [],
   "files": {
+    "packages/app/src/components/EncryptedContentUnlock.tsx": "78b1943fad6fdc63730800248d927e68b9fbf0995c3993bf8fa8d71f0ab40cf1",
     "packages/app/src/electrum/worker/NFT.ts": "a69688b2a429ce3a4a9b014acb54e82597e29ee3790328f8ec22db4b78636bb4",
+    "packages/app/src/encryptionService.ts": "6d76e8f7efde480c5cf6cab2acc218fc0002a7e29a399ebd930c04bbfb5bddf7",
     "packages/app/src/keys.ts": "7878c888da260a203d65b67fcad9715320e589e804e25f5791d15c09322677cd",
     "packages/app/src/pages/Mint.tsx": "f6948dafe9dc7495d8a150cd5adb88aff437d23054547f0371b7065a40eb6345",
     "packages/app/src/pages/Swap.tsx": "47bb53fedb1c4eade74875679354d0368e6323a44291247916b7db2b2fbfccb3",
+    "packages/app/src/shareLink.ts": "ae96aa2b0e6858b4f07c34fefe65e1eb2bdfdf35303b71429dc7d2702b656dea",
     "packages/app/src/swap.ts": "4a2ab4a48a61004b6c51fce0c947245462a622ae0d76c880645a11d16f89afc7",
     "packages/app/src/swapBroadcast.ts": "3edf70660dd8e967b1f3c51ba9e8b4d2709521b977652a35db0770439d12377c",
     "packages/app/src/types.ts": "9414d134734eb70311af674c39190ce5d2d3c1409dd532af63ea6b69fd1e6261",

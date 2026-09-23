@@ -719,9 +719,7 @@ def derive_counter_timelock(
     t_btc_blocks = usable_btc_blocks - margin_blocks
     if t_btc_blocks < 1:
         # The smallest t_rxd that yields t_btc >= 1, inverted from the relation above.
-        need = elapsed_reserve_blocks + int(
-            -(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s)
-        )
+        need = elapsed_reserve_blocks + int(-(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s))
         raise SystemExit(
             f"{rxd_flag} {t_rxd_blocks} leaves no room for a counter leg: {t_rxd_blocks} Radiant "
             f"blocks is {t_rxd_blocks * rxd_block_interval_s / 3600:.2f} h, and the "

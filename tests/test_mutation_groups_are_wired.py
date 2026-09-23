@@ -56,6 +56,13 @@ def _meta_groups() -> set[str]:
     return out
 
 
+def _consensus_groups() -> set[str]:
+    """CONSENSUS_GROUPS as the shell script declares it."""
+    m = re.search(r'^CONSENSUS_GROUPS="([^"]+)"', _SCRIPT.read_text(), re.M)
+    assert m, "CONSENSUS_GROUPS not found in scripts/mutation_test.sh"
+    return set(m.group(1).split())
+
+
 def _value_groups() -> set[str]:
     body = _SCRIPT.read_text()
     m = re.search(r'^VALUE_GROUPS="([^"]+)"', body, re.M)
@@ -84,6 +91,22 @@ def test_every_VALUE_group_is_RUN_weekly_by_the_workflow() -> None:
     dispatch description still said "all six value groups" when there were nine."""
     unrun = _value_groups() - _matrix_groups()
     assert not unrun, f"value groups the generator does not emit: {sorted(unrun)}"
+
+
+def test_every_CONSENSUS_group_is_RUN_weekly_by_the_workflow() -> None:
+    """The mirror of the VALUE check above, and it was missing for as long as the gap existed.
+
+    `scripts/mutation_groups.py` derived the matrix from VALUE_GROUPS alone, so spv, script,
+    transaction and dmint — the groups that mutate consensus-critical modules — were reachable
+    only by typing the name. `dmint` mutates covenant bytes where a wrong byte bricks a
+    contract permanently, and nothing scheduled had ever mutated it.
+
+    The previous fix for this class DERIVED the matrix instead of restating it, which is right;
+    it just derived it from one of the two aggregates. Asserting only the VALUE half is what
+    let the other half stay invisible, so both halves are asserted now.
+    """
+    unrun = _consensus_groups() - _matrix_groups()
+    assert not unrun, f"CONSENSUS groups defined but never run weekly: {sorted(unrun)}"
 
 
 def test_the_workflow_DERIVES_the_matrix_and_does_not_restate_it() -> None:
