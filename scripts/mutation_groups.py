@@ -35,12 +35,37 @@ _MIN_KILL: dict[str, int] = {
 }
 
 
-def _value_groups() -> list[str]:
+def _groups_named(var: str) -> list[str]:
     body = _SCRIPT.read_text()
-    m = re.search(r'^VALUE_GROUPS="([^"]+)"', body, re.M)
+    m = re.search(rf'^{var}="([^"]+)"', body, re.M)
     if not m:
-        raise SystemExit(f"VALUE_GROUPS not found in {_SCRIPT}")
+        raise SystemExit(f"{var} not found in {_SCRIPT}")
     return m.group(1).split()
+
+
+def _value_groups() -> list[str]:
+    """Every group the weekly workflow should run — CONSENSUS first, then VALUE.
+
+    CONSENSUS_GROUPS WAS NOT IN HERE, AND SO NEVER RAN WEEKLY. The four groups that mutate
+    the consensus-critical modules — spv, script, transaction, dmint — were reachable only by
+    someone typing the name. That is the same defect this file was written to fix, one level
+    up: `mint` and `glyphscript` once sat in VALUE_GROUPS and out of a hand-typed matrix, and
+    the answer was to DERIVE the matrix. The derivation was then pointed at one of the two
+    aggregates, so the other stayed invisible — a fix that generalised over the axis it was
+    shown. `dmint` mutates the covenant bytes a wrong byte of which bricks a contract
+    permanently, and nothing scheduled had ever mutated it.
+
+    Order matters only for readability of the matrix; the workflow runs them independently.
+    """
+    consensus = _groups_named("CONSENSUS_GROUPS")
+    value = _groups_named("VALUE_GROUPS")
+    seen: set[str] = set()
+    out: list[str] = []
+    for g in consensus + value:
+        if g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
 
 
 def main() -> int:

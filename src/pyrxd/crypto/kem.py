@@ -11,10 +11,16 @@ The wrap protocol:
 1. Sender picks an ephemeral X25519 keypair (k, k·G)
 2. Sender computes the ECDH shared secret ``ss = k · recipient_pubkey``
 3. Sender derives a KEK via HKDF-SHA256:
-   ``kek = HKDF(ss, salt=None, info=b"glyph-kek-v1", length=32)``
+   ``kek = HKDF(ss, salt=None, info=b"glyph-kek-classical-v1", length=32)``
+   — the info string is MODE-BOUND upstream (classical vs hybrid), see
+   :data:`KEK_DERIVATION_INFO`. pyrxd emitted ``b"glyph-kek-v1"`` from v0.6.0
+   through 0.24.0, which no longer interoperates; see
+   :data:`LEGACY_KEK_DERIVATION_INFO` for how that content is still read.
 4. Sender encrypts the 32-byte CEK with XChaCha20-Poly1305 under ``kek``
-   with a random 24-byte nonce, binding the AAD (typically the CEK hash
-   commitment bytes per REP-3006)
+   with a random 24-byte nonce, binding a caller-supplied AAD. For a Glyph
+   recipient slot that is the UTF-8 text of ``crypto.cek_hash``
+   (``"sha256:<hex>"``), which is what Photonic's app binds — see
+   ``pyrxd.glyph.timelock.cek_wrap_aad``. This module does not choose it.
 5. Wire format: ``wrapped_cek = nonce(24) || ciphertext(32) || tag(16)`` = 72 bytes
 6. Sender publishes ``(wrapped_cek, ephemeral_pubkey)``; recipient computes
    the same shared secret via ECDH and unwraps
@@ -32,7 +38,7 @@ Library choice (per the planning triage, see
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -51,8 +57,28 @@ from .aead import (
 #: X25519 keys are 32 bytes (both scalar and compressed-pubkey).
 X25519_KEY_SIZE = 32
 
-#: HKDF info string for the KEK derivation. Bound to "glyph-kek-v1" by spec.
-KEK_DERIVATION_INFO = b"glyph-kek-v1"
+#: HKDF info for the KEK derivation, on the classical (X25519-only) path.
+#:
+#: MODE-BOUND, AND THAT IS THE POINT. Photonic derives this from whether the wrap is hybrid
+#: (X25519 + ML-KEM-768) or classical, so the two modes produce different KEKs and an attacker
+#: who strips the ML-KEM ciphertext cannot still decrypt — their own comment calls it
+#: "SECURITY FIX (C8) ... prevents downgrade attacks" (``packages/lib/src/encryption.ts``
+#: wrapCEK/unwrapCEK at Radiant-Core/Photonic-Wallet ``becf41a7``). pyrxd implements only the
+#: classical path, so this is the only info string it may emit.
+KEK_DERIVATION_INFO = b"glyph-kek-classical-v1"
+
+#: The pre-split spelling, accepted on UNWRAP ONLY and never emitted.
+#:
+#: pyrxd shipped ``b"glyph-kek-v1"`` from v0.6.0 (#106) through 0.24.0. It is the spelling
+#: Photonic used BEFORE ``8e6bb6e`` (2026-05-16), which split classical from hybrid two days
+#: before this module was first committed (2026-05-18) — so it was already stale when written,
+#: and pyrxd never matched the upstream code of its own day on this path. Every CEK pyrxd
+#: wrapped in that window is recoverable only with this
+#: value, and dropping it would strand content pyrxd itself encrypted. It is tried only after
+#: the current derivation fails its AEAD tag, and :func:`unwrap_cek_x25519` reports which one
+#: succeeded rather than hiding it, because "this ciphertext is legacy" is a fact the caller
+#: may need to act on (re-wrap it) and must never learn by accident.
+LEGACY_KEK_DERIVATION_INFO = b"glyph-kek-v1"
 
 #: Wire layout: nonce(24) || ciphertext(32) || tag(16) = 72 bytes total.
 WRAPPED_CEK_SIZE = XCHACHA20_NONCE_SIZE + XCHACHA20_KEY_SIZE + 16
@@ -139,8 +165,11 @@ def wrap_cek_x25519(
     using their X25519 private key.
 
     ``aad`` is bound to the AEAD wrap — passing different ``aad`` to unwrap
-    fails decryption. Photonic uses the on-chain CEK hash commitment bytes
-    here per REP-3006.
+    fails decryption. For a Glyph recipient slot, Photonic's app binds the
+    UTF-8 bytes of the on-chain ``crypto.cek_hash`` STRING (``"sha256:<hex>"``,
+    71 bytes), not the 32-byte digest; build it with
+    ``pyrxd.glyph.timelock.cek_wrap_aad``. No REP fixes this value — REP-3006
+    defines AAD only for the content AEAD — so the wallet is the reference.
     """
     if len(cek) != XCHACHA20_KEY_SIZE:
         raise ValueError(f"cek must be {XCHACHA20_KEY_SIZE} bytes, got {len(cek)}")
@@ -166,14 +195,69 @@ def unwrap_cek_x25519(
     ephemeral_pubkey: bytes,
     recipient_privkey: bytes,
     aad: bytes = b"",
+    *,
+    allow_legacy_info: bool = True,
 ) -> bytes:
     """Recover a CEK wrapped via :func:`wrap_cek_x25519` (or Photonic's
     ``wrapCEK`` with the non-PQ X25519 path).
+
+    Tries :data:`KEK_DERIVATION_INFO` first and, if the AEAD tag fails, retries once with
+    :data:`LEGACY_KEK_DERIVATION_INFO` — the string pyrxd emitted from v0.6.0 to 0.24.0,
+    before Photonic split classical from hybrid. Without that retry, content pyrxd itself
+    encrypted in that window becomes permanently unreadable, which is a worse outcome than
+    accepting a second known-good derivation. Pass ``allow_legacy_info=False`` to require the
+    current spelling.
+
+    THE RETRY IS NOT A DOWNGRADE HOLE. Both values are fixed constants, not attacker-chosen;
+    the AEAD tag still has to verify under whichever one is tried; and neither corresponds to
+    Photonic's hybrid mode, so a stripped ML-KEM ciphertext still fails here exactly as
+    upstream intends. What it changes is only which of two pyrxd-era spellings is accepted.
+
+    Use :func:`unwrap_cek_x25519_detailed` when the caller needs to know which derivation
+    succeeded — for example to re-wrap legacy content before the fallback is retired.
 
     Raises ``ValueError`` if any of the inputs are wrong: wrong privkey
     (ECDH gives a different shared secret → wrong KEK → AEAD tag fails),
     wrong AAD, tampered wrapped_cek bytes, or malformed sizes.
     """
+    return unwrap_cek_x25519_detailed(
+        wrapped_cek,
+        ephemeral_pubkey,
+        recipient_privkey,
+        aad,
+        allow_legacy_info=allow_legacy_info,
+    ).cek
+
+
+@dataclass(frozen=True)
+class UnwrappedCEK:
+    """A recovered CEK plus the fact of HOW it was recovered.
+
+    ``legacy_info`` is True when the CEK only decrypted under the pre-split info string,
+    which means these bytes were wrapped by pyrxd v0.6.0-0.24.0 and will stop being readable
+    if the fallback is ever retired. Returned rather than logged so a caller can act on it.
+
+    ``cek`` is ``repr=False``. This is the one object in the module whose whole purpose is to
+    hold a recovered content key, and a default dataclass ``repr`` printed it verbatim into any
+    log line, f-string or exception message that touched the result — for a caller holding a
+    recipient wrap before the reveal, that is the pre-reveal secret the timelock exists to
+    keep. Same rule as ``TimelockMintBuild.cek``; the derived guard in
+    ``tests/security/test_no_dataclass_prints_a_secret.py`` now enforces it package-wide.
+    """
+
+    cek: bytes = field(repr=False)
+    legacy_info: bool
+
+
+def unwrap_cek_x25519_detailed(
+    wrapped_cek: bytes,
+    ephemeral_pubkey: bytes,
+    recipient_privkey: bytes,
+    aad: bytes = b"",
+    *,
+    allow_legacy_info: bool = True,
+) -> UnwrappedCEK:
+    """:func:`unwrap_cek_x25519`, reporting which KEK derivation succeeded."""
     if len(wrapped_cek) != WRAPPED_CEK_SIZE:
         raise ValueError(
             f"wrapped_cek must be {WRAPPED_CEK_SIZE} bytes (24 nonce + 32 cek + 16 tag), got {len(wrapped_cek)}"
@@ -184,23 +268,43 @@ def unwrap_cek_x25519(
         raise ValueError(f"recipient_privkey must be {X25519_KEY_SIZE} bytes, got {len(recipient_privkey)}")
 
     shared = x25519_ecdh(recipient_privkey, ephemeral_pubkey)
-    kek = hkdf_sha256(shared, salt=None, info=KEK_DERIVATION_INFO, length=XCHACHA20_KEY_SIZE)
-
     nonce = wrapped_cek[:XCHACHA20_NONCE_SIZE]
     ciphertext_with_tag = wrapped_cek[XCHACHA20_NONCE_SIZE:]
-    cek = decrypt_xchacha20_poly1305(ciphertext_with_tag, kek, nonce, aad)
-    if len(cek) != XCHACHA20_KEY_SIZE:
-        raise ValueError(f"unwrapped CEK is the wrong size: got {len(cek)}, expected {XCHACHA20_KEY_SIZE}")
-    return cek
+
+    attempts: tuple[tuple[bytes, bool], ...] = ((KEK_DERIVATION_INFO, False),)
+    if allow_legacy_info:
+        attempts += ((LEGACY_KEK_DERIVATION_INFO, True),)
+
+    last_exc: Exception | None = None
+    for info, is_legacy in attempts:
+        kek = hkdf_sha256(shared, salt=None, info=info, length=XCHACHA20_KEY_SIZE)
+        try:
+            cek = decrypt_xchacha20_poly1305(ciphertext_with_tag, kek, nonce, aad)
+        except Exception as exc:  # AEAD tag failure — try the next known derivation
+            last_exc = exc
+            continue
+        if len(cek) != XCHACHA20_KEY_SIZE:
+            raise ValueError(f"unwrapped CEK is the wrong size: got {len(cek)}, expected {XCHACHA20_KEY_SIZE}")
+        return UnwrappedCEK(cek=cek, legacy_info=is_legacy)
+
+    # Every known derivation failed. The cause is indistinguishable between wrong privkey,
+    # wrong AAD and tampered bytes — by design, so this reports the class, not a guess.
+    raise ValueError(
+        "could not unwrap CEK under any known KEK derivation "
+        f"({len(attempts)} tried): wrong recipient key, wrong AAD, or tampered bytes"
+    ) from last_exc
 
 
 __all__ = [
     "KEK_DERIVATION_INFO",
+    "LEGACY_KEK_DERIVATION_INFO",
     "WRAPPED_CEK_SIZE",
     "X25519_KEY_SIZE",
+    "UnwrappedCEK",
     "WrappedCEK",
     "hkdf_sha256",
     "unwrap_cek_x25519",
+    "unwrap_cek_x25519_detailed",
     "wrap_cek_x25519",
     "x25519_ecdh",
     "x25519_public_key",
