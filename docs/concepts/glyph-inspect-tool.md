@@ -354,13 +354,17 @@ shape, the inspect tool decodes the four canonical pushes:
 
 | Push    | Field         | Width                                  |
 |--------:|---------------|----------------------------------------|
-| 1       | nonce (LE)    | **4 bytes = V1**, **8 bytes = V2**     |
+| 1       | nonce (LE)    | 4 or 8 bytes                           |
 | 2       | input hash    | 32 bytes — `SHA256d(funding_script)`   |
 | 3       | output hash   | 32 bytes — `SHA256d(OP_RETURN_script)` |
 | 4       | OP_0          | 1 byte                                 |
 
-The version is distinguished by nonce width: a 4-byte nonce (V1) gives
-a 72-byte scriptSig; an 8-byte nonce (V2) gives 76 bytes. The two
+A 4-byte nonce gives a 72-byte scriptSig and an 8-byte nonce 76 bytes. The
+width is **not** a V1/V2 marker: neither covenant checks it (each
+concatenates the nonce into the proof-of-work preimage), and V1 mints on
+mainnet use both widths — 465 of 473 mints of V1 contracts in a sample
+collected on 2026-09-23 pushed 8 bytes. What tells V1 from V2 is the
+contract script the input spends. The two
 hashes are **literal `SHA256d` outputs**, not preimage halves — this
 distinction is load-bearing because the M1 release shipped with the
 preimage halves pushed instead of the SHA256d outputs, and every
@@ -370,9 +374,10 @@ mainnet txid
 (see the 0.5.0 CHANGELOG entry and the related solutions doc on the
 M1 V1 mint scriptSig divergence).
 
-The inspect tool surfaces all four pushes plus the inferred version
-hint, so a reader can verify by eye that a mint claim's scriptSig
-matches the convention.
+The inspect tool surfaces all four pushes plus the nonce's width, so a
+reader can verify by eye that a mint claim's scriptSig matches the
+convention. (It used to show a "version" inferred from the width, which
+called most mainnet V1 mints "v2".)
 
 ---
 

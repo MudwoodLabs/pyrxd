@@ -137,10 +137,16 @@ class AttemptEstimate:
     """**EXACT** attempt statistics for a target — closed form, no measurement.
 
     :param target:                  The target as supplied.
-    :param effective_target:        ``min(target, MAX_SHA256D_TARGET)`` — the
-                                    verifier clamps, so the estimate must too.
+    :param effective_target:        ``min(target, MAX_SHA256D_TARGET)`` — pyrxd's
+                                    verifier (:func:`~pyrxd.glyph.dmint.verify_sha256d_solution`)
+                                    clamps, so the estimate must too.
     :param clamped:                 True iff the supplied target exceeded the
-                                    ceiling and was clamped.
+                                    ceiling and was clamped. A dMint covenant does
+                                    NOT clamp: it reads the target as a signed
+                                    script number of at most 8 bytes, so a target
+                                    above the ceiling is unreadable (every mint
+                                    aborts) or negative (no hash meets it). No
+                                    contract carrying one can be minted.
     :param difficulty:              ``target_to_difficulty(effective_target)``.
     :param probability_per_attempt: ``p = effective_target / 2**96``.
     :param expected_attempts:       ``1 / p = 2**96 / effective_target``.

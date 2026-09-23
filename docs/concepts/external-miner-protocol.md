@@ -38,9 +38,19 @@ Two entry points:
        miner_argv=["/usr/local/bin/glyph-miner", "--stdin"],
        nonce_width=4,        # 4 for V1, 8 for V2
        timeout_s=600.0,
+       algo=state.algo,      # the contract's: BLAKE3/K12 raise instead of grinding SHA256d
    )
    nonce = mined.nonce
    ```
+
+   The protocol is SHA256d only: the request carries no algorithm, and pyrxd
+   re-checks every answer with `verify_sha256d_solution`. The preimage is just
+   bytes, so `mine_solution_external` cannot tell which hash the contract runs;
+   its `algo` argument defaults to `DmintAlgo.SHA256D`. Pass the contract's own
+   `state.algo` and it refuses BLAKE3 or K12 before spawning anything; leave it
+   out and it runs the SHA256d search whatever the contract is. **Do not use it
+   to mine a BLAKE3 or K12 contract.** See
+   [SHA256d only](parallel-mining.md#sha256d-only).
 
 2. **Env-var wiring in the demo.** `examples/dmint_claim_demo.py`
    reads two environment variables:

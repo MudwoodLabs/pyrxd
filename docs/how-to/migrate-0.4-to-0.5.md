@@ -244,6 +244,7 @@ mine_result = mine_solution(
     pow_result.preimage,
     contract_utxo.state.target,
     nonce_width=4,
+    algo=contract_utxo.state.algo,  # the contract's: BLAKE3/K12 are refused, not ground as SHA256d
 )
 
 # 4. Build the scriptSig — pushes MUST come from pow_result, not recomputed.

@@ -6,6 +6,24 @@ miner via `mine_solution_external`. The subprocess path is the
 production-ready option, and pyrxd 0.5.1 added a bundled implementation
 at `pyrxd.contrib.miner` so callers don't have to provide their own.
 
+## SHA256d only
+
+Every grinder pyrxd ships computes SHA256d and nothing else:
+`mine_solution`, `mine_solution_dispatch`, `mine_solution_external` (whose
+request carries no algorithm, and whose answer pyrxd re-checks with
+`verify_sha256d_solution`), and the bundled `pyrxd.contrib.miner`, whose
+`MineParams` has no algorithm field. A preimage is only bytes, so none of them
+can tell which hash the contract it came from runs.
+
+The first three take an `algo=` argument that defaults to `DmintAlgo.SHA256D`.
+Pass the contract's own `state.algo` and they raise `NotImplementedError` for
+BLAKE3 or K12 before hashing anything. Leave it out, as the shorter examples
+below do, or call `pyrxd.contrib.miner.parallel.mine`, and they grind SHA256d
+whatever the contract is — and a nonce found that way does not mint a BLAKE3 or
+K12 contract. **If you are mining a BLAKE3 or K12 contract, do not use these
+functions**; you need a miner for that hash, which pyrxd does not ship.
+`pyrxd glyph claim-dmint` reads the contract and refuses such contracts itself.
+
 ## The two miners
 
 ### `mine_solution` — slow but correct
@@ -139,6 +157,7 @@ result = mine_solution_external(
     target=state.target,
     miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
     nonce_width=4,
+    algo=state.algo,  # refuses BLAKE3/K12 instead of grinding SHA256d for them
 )
 # result.nonce is verified against pyrxd's internal SHA256d check.
 ```
@@ -231,6 +250,8 @@ def on_progress(attempts: int, elapsed_s: float) -> None:
     s = live_stats(attempts, elapsed_s, est)
     print(f"{s.observed_hashes_per_second:,.0f} h/s, mean {s.remaining_mean_s:,.0f}s remaining")
 
+# SHA256d only, and MineParams has no algorithm field: check the contract's
+# state.algo is DmintAlgo.SHA256D before you call this.
 result = mine(MineParams(...), progress=on_progress)
 ```
 
@@ -247,6 +268,7 @@ result = mine_solution_external(
     miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
     nonce_width=4,
     progress=lambda attempts, elapsed: ...,   # called if the miner emits frames
+    algo=state.algo,  # the contract's; see "SHA256d only" above
 )
 ```
 
