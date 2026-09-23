@@ -1986,9 +1986,9 @@ def build_dmint_mint_tx(
     # The template pyrxd mints opens its code with Part A and then the proof-of-work hash
     # opcode, and the parser derived state.algo from that opcode. A code section that does not
     # open that way is another template (a 2026-09-22 survey of mainnet V2 scripts found six,
-    # all ASERT, which detect_daa_bytecode refuses just above): pyrxd knows neither which hash it
-    # runs nor how it builds its preimage, so it refuses here, in every DAA mode, before any
-    # grind. (A script whose opcode after Part A disagrees with its tag never gets this far:
+    # all ASERT, each refused earlier because its state does not round-trip): pyrxd knows
+    # neither which hash it runs nor how it builds its preimage, so it refuses here, in every
+    # DAA mode, before any grind. (A script whose opcode after Part A disagrees with its tag never gets this far:
     # _unreadable_target_reason parses the script, and the parser refuses it.)
     if code[: len(_PART_A) + 1] != _PART_A + _POW_HASH_OP[state.algo]:
         raise ValidationError(
