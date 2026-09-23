@@ -158,12 +158,15 @@ class TestOneTargetFormulaForEveryAlgorithm:
             _run(_PART_B2[:-1], [old, _cs_encode(12345)], 0)
 
     # BLAKE3/K12 V2 contracts on mainnet, as their reveals put them on chain (vout 0 of each
-    # reveal), with the difficulty each reveal's CBOR declares (``dmint.diff``). DM03 (K12) and
-    # VGM (BLAKE3) have since been MINTED — DM03 to height 3 by
-    # 20d9e4f2c7c0e22c2e7ba2a9dd10fa90d3d1f64d8ace00709222aa25cbcc1b75 and VGM's first contract
-    # to height 29 by 181186177124320cebc4e8c1a3d310b176fbf4a6510fda305be0b72b60e27bf6 (both
-    # read back from the chain 2026-09-23) — so these are targets the covenant has accepted a
-    # proof of work against.
+    # reveal), with the difficulty each reveal's CBOR declares (``dmint.diff``). All three have
+    # since been MINTED — DM03 (K12) to height 3 by
+    # 20d9e4f2c7c0e22c2e7ba2a9dd10fa90d3d1f64d8ace00709222aa25cbcc1b75 and VGM's (BLAKE3) first
+    # contract to height 29 by 181186177124320cebc4e8c1a3d310b176fbf4a6510fda305be0b72b60e27bf6
+    # (both read back from the chain 2026-09-23), and RXD2026 (BLAKE3) to height 2 by
+    # de93d84b56df214f4f42205321d422cc91da217810578de776272c146777f828, which spends the height-1
+    # contract 52db6889…2d15:0, which spends the reveal's vout 0 (from a transaction survey
+    # collected 2026-09-22) — so these are targets the covenant has accepted a proof of work
+    # against.
     _MAINNET = {
         # K12 FIXED, reveal d93833836ca15fbc897e6549a7e01a4451d31d19bc86796cbd7faa7d5072c794, diff 2
         "DM03": (
@@ -367,9 +370,9 @@ class TestUpperBounds:
     @pytest.mark.parametrize("mode", [DaaMode.ASERT, DaaMode.LWMA, DaaMode.EPOCH])
     def test_at_the_target_time_cap_every_retarget_stays_inside_int64(self, mode: DaaMode) -> None:
         """THE REASON FOR THE target_time CAP, EXECUTED. At ``MAX_V2_TARGET_TIME`` each retarget
-        fragment runs to a result for every pair of 32-bit timestamps a V2 state and mint can
-        carry — including the extremes both ways — and one far past it (near 2**47, where the
-        unbounded parameter used to be accepted) aborts the script."""
+        fragment runs to a result for every pair of timestamps a V2 state and mint can carry
+        (each below 2**31) — including the extremes both ways — and one far past it (near 2**47,
+        where the unbounded parameter used to be accepted) aborts the script."""
         tt = MAX_V2_TARGET_TIME
         frag = {
             DaaMode.ASERT: _build_asert_daa_v2(240),
@@ -378,9 +381,9 @@ class TestUpperBounds:
         }[mode]
         target = 1 << 40
         for last_time in (1 << 23, _LAST, 0x7FFFFFFF):
-            for locktime in (1 << 23, _LAST, 0x7FFFFFFF):
+            for mint_time in (1 << 23, _LAST, 0x7FFFFFFF):
                 stack = _daa_stack(int(mode), tt, last_time, target, height=1)
-                assert 1 <= _result(_run(frag, stack, locktime)) <= MAX_SHA256D_TARGET
+                assert 1 <= _result(_run(frag, stack, mint_time)) <= MAX_SHA256D_TARGET
         if mode is not DaaMode.EPOCH:  # ASERT/LWMA scale (timeDelta - targetTime) by 2**16
             with pytest.raises(_Abort, match="int64"):
                 _run(frag, _daa_stack(int(mode), (1 << 47) + 121, _LAST, target), _LAST + 120)
@@ -388,8 +391,13 @@ class TestUpperBounds:
     def test_v1_difficulty_is_capped_where_the_target_would_be_0(self) -> None:
         """V1 had no upper bound at the parameter stage: a target of 0 was refused only while
         the deploy was being built, after the wallet had been opened. The honest neighbour,
-        difficulty == MAX_SHA256D_TARGET (target 1), still deploys."""
+        difficulty == MAX_SHA256D_TARGET (target 1), deploys a contract that can be minted: its
+        target is pushed as OP_1, and the V1 epilogue's comparison reads it. (Until 2026-09-23
+        it was pushed as ``08 0100000000000000``, which that comparison cannot read — this test
+        used to pass on that contract, because it only checked the parsed number.)"""
         from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.dmint.chain import _parse_dmint_script
+        from pyrxd.glyph.dmint.miner import _unreadable_target_reason
 
         kw = {
             "metadata": GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="t", ticker="T"),
@@ -402,7 +410,13 @@ class TestUpperBounds:
             DmintV1DeployParams(**kw, difficulty=MAX_SHA256D_TARGET + 1)
         result = GlyphBuilder().prepare_dmint_deploy(DmintV1DeployParams(**kw, difficulty=MAX_SHA256D_TARGET))
         (script,) = result.build_reveal_outputs("dd" * 32).contract_scripts
-        assert DmintState.from_script(script).target == 1
+        state, push = _parse_dmint_script(script)
+        assert state.target == 1
+        assert push == b"\x51"  # OP_1: the minimal push of 1
+        assert _unreadable_target_reason(script) is None
+        # V1 compares target >= hash number (OP_GREATERTHANOREQUAL) on the push as deployed.
+        assert _num(_run(push + b"\x00" + b"\xa2", [], 0)[-1]) == 1
+        assert _num(_run(push + b"\x52" + b"\xa2", [], 0)[-1]) == 0
 
     def test_the_reward_cap_is_also_a_readable_script_number(self) -> None:
         assert RADIANT_MAX_PHOTONS < MAX_SCRIPT_NUM
@@ -584,6 +598,74 @@ class TestDeployDmintCliBounds:
 # =====================================================================================
 
 
+def _module_level_definitions(body: list) -> set[str]:
+    """Every name a module body binds by definition — ``def``, ``class``, assignment (plain,
+    annotated, augmented, unpacked), a ``for`` or ``with … as`` target — including inside module-level ``if``,
+    ``try``, ``with`` and loop blocks, which still bind module globals. Imports are not
+    definitions and are skipped; function and class bodies are not module level."""
+    import ast
+
+    names: set[str] = set()
+
+    def targets(t) -> None:
+        if isinstance(t, ast.Name):
+            names.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                targets(e)
+        elif isinstance(t, ast.Starred):
+            targets(t.value)
+
+    def walk(nodes: list) -> None:
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    targets(t)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+                targets(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        targets(item.optional_vars)
+            if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(node, field, []))
+                for handler in getattr(node, "handlers", []):
+                    walk(handler.body)
+
+    walk(body)
+    return names
+
+
+def test_the_definition_walk_sees_names_bound_inside_blocks() -> None:
+    """Control for the walk: a name defined inside a module-level ``try``/``if`` is counted,
+    an import is not, and a function's locals are not."""
+    import ast
+
+    src = (
+        "import os\nfrom x import y\nA = 1\ntry:\n    B = 2\nexcept E:\n    C = 3\nfinally:\n    D = 4\n"
+        "if T:\n    E2: int = 5\nelse:\n    def f():\n        local = 6\n"
+        "for G in ():\n    pass\nH, (I, *J) = 1, (2, 3)\nK += 1\nwith m() as w:\n    class L: pass\n"
+    )
+    assert _module_level_definitions(ast.parse(src).body) == {
+        "A",
+        "B",
+        "C",
+        "D",
+        "E2",
+        "f",
+        "G",
+        "H",
+        "I",
+        "J",
+        "K",
+        "L",
+        "w",
+    }
+
+
 def test_the_types_module_docstring_lists_exactly_its_definitions() -> None:
     """``pyrxd.glyph.dmint.types`` says "Symbols (N — every module-level name ...)". Both the
     count and the list are compared with the module's own definitions, both directions."""
@@ -594,14 +676,7 @@ def test_the_types_module_docstring_lists_exactly_its_definitions() -> None:
     import pyrxd.glyph.dmint.types as types_mod
 
     tree = ast.parse(Path(types_mod.__file__).read_text(encoding="utf-8"))
-    defined: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            defined.add(node.name)
-        elif isinstance(node, ast.Assign):
-            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            defined.add(node.target.id)
+    defined = _module_level_definitions(tree.body)
     assert "check_v2_numeric_bounds" in defined  # the walk sees what it must
     doc = ast.get_docstring(tree) or ""
     m = re.search(r"Symbols \((\d+) [^\n]*(?:\n(?!    )[^\n]*)*\n((?:    .*\n?)+)", doc)

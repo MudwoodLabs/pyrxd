@@ -29,7 +29,7 @@ from .dmint import (
     is_minimal_4byte_scriptnum,
     is_readable_last_time,
 )
-from .dmint.types import MAX_SHA256D_TARGET, check_v2_numeric_bounds
+from .dmint.types import check_dmint_core_bounds, check_v2_numeric_bounds
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
@@ -1881,11 +1881,18 @@ class DmintV1DeployParams:
         (``src/validation.cpp:271``, ``src/init.cpp:1995`` @ v3.1.2). What
         actually bounds this is fee: every contract output costs ~241 bytes
         × the 10_000 photons/byte relay floor.
-    :param max_height:         Maximum mints per contract (3-byte ceiling).
-    :param reward_photons:     Photons paid per successful mint (3-byte
-        ceiling — see V1 contract state layout).
-    :param difficulty:         Initial PoW difficulty (1 = easiest).
-        Translated to 8-byte target via :func:`difficulty_to_target`.
+    :param max_height:         Maximum mints per contract, ``[1, 2**63 - 1]``: the covenant
+        reads it as a script number (:func:`~pyrxd.glyph.dmint.types.check_dmint_core_bounds`
+        has the reason for this and the next two bounds). A V1 contract's height is a 4-byte
+        field that every mint but the last rewrites as ``NUM2BIN(height + 1, 4)`` (epilogue
+        ``54 78 54 80``), which cannot encode ``2**31``. So with a ``max_height`` above
+        ``2**31`` a contract stops at height ``2**31 - 1`` and its remaining mints cannot
+        happen. Such deploys exist on mainnet (``$BRO``: 696,969,000,000), and pyrxd builds them
+        as Photonic does.
+    :param reward_photons:     Photons paid per successful mint, ``[1, RADIANT_MAX_PHOTONS]``.
+    :param difficulty:         Initial PoW difficulty (1 = easiest; at most
+        ``MAX_SHA256D_TARGET``). The target is ``MAX_SHA256D_TARGET // difficulty``
+        (:func:`difficulty_to_target`), pushed as a minimal script number.
     :param premine_amount:     Photons emitted as an additional FT output on
         the reveal tx (1 photon = 1 FT unit), on top of the mineable supply.
         ``None`` = no premine. The photons are real: the deployer must fund
@@ -1926,22 +1933,21 @@ class DmintV1DeployParams:
             )
         if self.max_height < 1:
             raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
-        if self.max_height > 0xFFFFFF:
-            raise ValidationError(f"max_height ({self.max_height}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.reward_photons < 1:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
-        if self.reward_photons > 0xFFFFFF:
-            raise ValidationError(f"reward_photons ({self.reward_photons}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
-        if self.difficulty > MAX_SHA256D_TARGET:
-            # The same bound V2 has (check_v2_numeric_bounds): the target MAX // difficulty
-            # would be 0, and the V1 state builder refuses a target of 0 — but only once the
-            # deploy is being built, after the wallet is loaded. Refuse it with the parameters.
-            raise ValidationError(
-                f"difficulty must be <= {MAX_SHA256D_TARGET:,} (above it the target "
-                f"MAX_SHA256D_TARGET // difficulty is 0, which no ordinary hash can meet), got {self.difficulty:,}"
-            )
+        # The upper bounds V2 has for the same three numbers, for the same reasons: the V1
+        # epilogue reads maxHeight and reward as script numbers exactly as V2's Part C does, and
+        # above MAX_SHA256D_TARGET the target is 0 (which the V1 state builder refuses, but
+        # only once the deploy is built, after the wallet is loaded).
+        check_dmint_core_bounds(
+            stage="DmintV1DeployParams",
+            max_height=self.max_height,
+            reward=self.reward_photons,
+            difficulty=self.difficulty,
+            names={"reward": "reward_photons"},
+        )
         if self.algo != DmintAlgo.SHA256D:
             raise ValidationError(
                 f"V1 dMint only supports SHA256d; got {self.algo}. Use DmintV2DeployParams for blake3/k12."

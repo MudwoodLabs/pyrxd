@@ -732,6 +732,58 @@ class TestDmintCliHelpers:
                 max_rerolls=3,
             )
 
+    @staticmethod
+    def _exhaust(base: bytes, *, cause: BaseException | None = None, miner_kind: str = "parallel"):
+        """Run the reroll loop with a miner that never finds a nonce; return (preimages, UserError)."""
+        seen: list[bytes] = []
+
+        def never(preimage: bytes, target: int) -> bytes:
+            seen.append(preimage)
+            raise MaxAttemptsError("no nonce", attempts=1, elapsed_s=0.1) from cause
+
+        with pytest.raises(UserError) as exc:
+            _mine_claim_with_rerolls(
+                _dmint_contract(),
+                _dmint_funding(),
+                bytes(range(20)),
+                base,
+                10_000,
+                mine=never,
+                max_rerolls=3,
+                miner_kind=miner_kind,
+            )
+        return seen, exc.value
+
+    def test_v1_rerolls_are_deterministic_so_the_advice_is_a_new_op_return(self) -> None:
+        """What the exhaustion advice says, checked against what the loop does: the same
+        --op-return repeats every preimage of the run before, a different one shares none, and
+        a swept nonce space is not told that --timeout would help."""
+        first, err = self._exhaust(b"pyrxd-mint")
+        rerun, _ = self._exhaust(b"pyrxd-mint")
+        other, _ = self._exhaust(b"pyrxd-mint-2")
+        assert rerun == first and len(set(first)) == 3
+        assert not set(other) & set(first)
+        assert "pass a different --op-return (this run used 'pyrxd-mint')" in err.fix
+        assert "repeats these 3 searches" in err.fix
+        assert "--timeout" not in err.fix and "--max-attempts" not in err.fix
+
+    def test_v1_exhaustion_names_timeout_only_when_the_clock_stopped_a_grind(self) -> None:
+        from subprocess import TimeoutExpired
+
+        from pyrxd.cli.glyph_estimate import MiningDeadline
+
+        for cause in (MiningDeadline("deadline"), TimeoutExpired(["miner"], 1.0)):
+            _, err = self._exhaust(b"m", cause=cause)
+            assert "3 of the 3 grinds stopped at --timeout" in err.fix
+            assert "a longer --timeout" in err.fix
+
+    def test_v1_exhaustion_names_max_attempts_only_for_the_in_process_miner(self) -> None:
+        _, sequential = self._exhaust(b"m", miner_kind="sequential")
+        assert "--max-attempts raises the in-process miner's cap" in sequential.fix
+        for kind in ("parallel", "external"):
+            _, err = self._exhaust(b"m", miner_kind=kind)
+            assert "--max-attempts" not in err.fix
+
 
 import asyncio
 import dataclasses
@@ -2698,13 +2750,13 @@ class TestClaimDmintSaysWhyTheClaimStopped:
         assert "timed out" not in result.output
         assert "funding can't cover" not in result.output
 
-    def test_the_count_stop_remedy_changes_the_preimage_and_a_plain_rerun_does_not(
+    def test_the_count_stop_remedy_changes_the_preimage_and_the_same_inputs_repeat_it(
         self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
     ) -> None:
         """The remedy for a count-based stop is a claim to TRY AGAIN DIFFERENTLY, so check what
-        each suggestion does to the preimage the real miner is handed. The fix used to say
-        "run the claim again (a later claim time is a fresh preimage)": the V2 preimage holds no
-        time, so that reran the same search. A different --op-return is a new preimage."""
+        the suggestion does to the preimage the real miner is handed: the same claim run twice
+        with identical inputs hands it the same preimage, and a different --op-return hands it
+        a new one."""
         from pyrxd.cli import glyph_cmds
         from pyrxd.glyph.dmint import MAX_SHA256D_TARGET
         from pyrxd.keys import PrivateKey
@@ -2719,24 +2771,22 @@ class TestClaimDmintSaysWhyTheClaimStopped:
 
         monkeypatch.setattr(glyph_cmds, "mine_solution_dispatch", _recording)
 
-        def claim(current_time: int, op_return: str):
+        def claim(op_return: str):
             self._wire(monkeypatch, difficulty=MAX_SHA256D_TARGET, funding_value=500_000_000, key=key)
-            args = ["--wallet", str(tmp_wallet_path), "--yes", "glyph", "claim-dmint", "--contract", "ab" * 32 + ":0"]
-            extra = ["--no-progress", "--miner-cmd", "in-process", "--max-attempts", "1"]
-            when = ["--current-time", str(current_time), "--op-return", op_return]
-            return runner.invoke(cli, [*args, *extra, *when])
+            extra = ["--miner-cmd", "in-process", "--max-attempts", "1", "--op-return", op_return]
+            return self._claim(runner, tmp_wallet_path, *extra)
 
-        first = claim(1_700_000_090, "pyrxd-mint")
+        first = claim("pyrxd-mint")
         assert first.exit_code != 0, first.output
         assert "mining stopped without finding a nonce" in first.output
         assert "pass a different --op-return (this run used 'pyrxd-mint')" in first.output
-        assert "later claim time" not in first.output
-        later = claim(1_700_086_490, "pyrxd-mint")  # the removed remedy: a day later, same flags
-        other = claim(1_700_000_090, "pyrxd-mint-2")  # the named remedy
+        assert "binds the contract, the funding script and the OP_RETURN" in first.output
+        again = claim("pyrxd-mint")  # identical inputs
+        other = claim("pyrxd-mint-2")  # the named remedy
         assert len(handed) == 3, "each claim must reach the miner exactly once"
-        assert handed[1] == handed[0], "a later claim time must NOT be claimed to change the preimage"
+        assert handed[1] == handed[0], "the same inputs must hand the miner the same preimage"
         assert handed[2] != handed[0], "a different --op-return must change the preimage"
-        assert later.exit_code != 0 and other.exit_code != 0
+        assert again.exit_code != 0 and other.exit_code != 0
 
     def test_an_external_miner_that_runs_out_is_not_told_to_raise_max_attempts(
         self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
@@ -2756,6 +2806,29 @@ class TestClaimDmintSaysWhyTheClaimStopped:
         assert "--max-attempts applies only to --miner-cmd in-process" in result.output
         assert "raise --max-attempts" not in result.output
         assert net.broadcasts == []
+
+    def test_a_v1_claim_that_exhausts_its_rerolls_names_what_changes_the_search(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """Through the command: every V1 grind comes back empty, and the advice names a new
+        --op-return (the rerolls are deterministic) — not --timeout, which no grind hit."""
+        from pyrxd.cli import glyph_cmds
+
+        v1 = TestClaimDmintRefusesContractsPyrxdCannotMine._script(1, DmintAlgo.SHA256D)
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=v1)
+        grinds: list[bytes] = []
+
+        def _swept(pre: bytes, tgt: int, **kw) -> bytes:
+            grinds.append(pre)
+            raise MaxAttemptsError("swept the 4-byte nonce space", attempts=1 << 32, elapsed_s=1.0)
+
+        monkeypatch.setattr(glyph_cmds, "_mine_bundled_parallel", _swept)
+        result = self._claim(runner, tmp_wallet_path, "--max-rerolls", "2", "--op-return", "hello")
+        assert result.exit_code != 0, result.output
+        assert "no nonce found within 2 preimage rerolls" in result.output
+        assert "pass a different --op-return (this run used 'hello')" in result.output
+        assert "--timeout" not in result.output
+        assert len(grinds) == 2 and len(set(grinds)) == 2 and net.broadcasts == []
 
     def test_a_token_bearing_funding_utxo_is_named_as_such(
         self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
@@ -2790,13 +2863,14 @@ class TestClaimDmintSaysWhyTheClaimStopped:
 
 
 class TestClaimDmintRefusesContractsPyrxdCannotMine:
-    """Two contracts claim-dmint cannot mint, refused in `_claim_prepare` — after the contract
+    """Contracts claim-dmint cannot mint, refused in `_claim_prepare` — after the contract
     read, before the wallet's UTXO scan, the funding scan, any grind and any broadcast:
 
     * a BLAKE3 or K12 contract. Every miner claim-dmint can use grinds and verifies SHA256d;
       before this, a BLAKE3 V2 claim with a stubbed miner exited 0 and broadcast.
-    * a V2 contract whose target is wider than 8 bytes (what pyrxd built for BLAKE3/K12 before
-      2026-09-23), which no miner can ever mint.
+    * a contract whose target the covenant cannot read: a V2 one wider than 8 bytes (what
+      pyrxd built for BLAKE3/K12 before 2026-09-23), or a V1 one pushed as 8 bytes where that
+      is not minimal (what pyrxd's V1 deploy built at difficulty 256 or more before then).
 
     Driven through the shipped command and the REAL `_claim_prepare`; only the wallet, the
     ElectrumX transport and the grind are faked."""
@@ -2884,3 +2958,95 @@ class TestClaimDmintRefusesContractsPyrxdCannotMine:
         assert "33-byte script number" in result.output
         assert "no claim can succeed, with any miner" in result.output
         assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    @pytest.mark.parametrize("difficulty", [256, 5000])
+    def test_a_v1_contract_pyrxd_deployed_with_an_8_byte_target_is_said_to_be_unmintable(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, difficulty: int
+    ) -> None:
+        """What pyrxd's V1 deploy built at difficulty 256 or more before 2026-09-23: a target the
+        epilogue cannot read. Refused where the V2 one is — before the wallet scan and any grind."""
+        from tests.test_dmint_v1_target_push import legacy_v1_contract_script
+
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=legacy_v1_contract_script(difficulty))
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "this contract can never be minted" in result.output
+        assert "its target is pushed as 08" in result.output
+        assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    @pytest.mark.parametrize("name", ["RABO", "BTC", "Pepe"])
+    def test_a_mainnet_v1_contract_still_claims(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, name: str
+    ) -> None:
+        """The honest path of that refusal, on real mainnet V1 scripts: 7-byte targets (RABO,
+        BTC — contracts pyrxd could not even parse before) and an 8-byte one (Pepe) reach the
+        grind and the broadcast (the grind is stubbed; nothing here checks the nonce)."""
+        from tests.test_dmint_v1_target_push import _mainnet
+
+        net = self._wire(monkeypatch, funding_value=5_000_000_000, contract_script=_mainnet(name))
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code == 0, result.output
+        assert len(grinds) == 1 and len(net.broadcasts) == 1
+
+    def test_a_contract_whose_tag_and_opcode_disagree_is_refused_at_the_read(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch
+    ) -> None:
+        """A V2 contract tagged SHA256D whose covenant runs OP_BLAKE3 used to pass the SHA256d
+        check (it read the tag) and grind. It is refused when the contract is read, naming both."""
+        from tests.test_dmint_v2_algo_is_the_opcode import _with_opcode
+
+        flipped = _with_opcode(DmintAlgo.SHA256D, 0xEE)
+        net = self._wire(monkeypatch, funding_value=500_000_000, contract_script=flipped)
+        grinds = self._stub_grind(monkeypatch)
+        result = self._claim(runner, tmp_wallet_path)
+        assert result.exit_code != 0, result.output
+        assert "is not a dMint contract" in result.output
+        assert "algoId tag says SHA256D, but the covenant hashes the proof of work with BLAKE3" in result.output
+        assert grinds == [] and net.broadcasts == [] and net.wallet_scans == 0
+
+    @pytest.mark.parametrize("miner", ["parallel", "in-process", "external"])
+    def test_every_miner_refuses_a_blake3_contract_even_past_the_first_check(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, tmp_path: Path, miner: str
+    ) -> None:
+        """Defence in depth. `_claim_prepare` refuses BLAKE3/K12 first; here it is stubbed to
+        hand one over anyway, and each miner claim-dmint can run refuses before any hashing: the
+        bundled parallel miner before its workers start, and the dispatcher (which `_mine` now
+        tells the contract's algorithm) before the in-process loop or an external process."""
+        import shlex
+        import sys
+
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.contrib.miner import parallel
+        from pyrxd.glyph.dmint import DmintContractUtxo, DmintMinerFundingUtxo, DmintState
+        from pyrxd.keys import PrivateKey
+
+        script = self._script(2, DmintAlgo.BLAKE3)
+        contract = DmintContractUtxo(
+            txid="ab" * 32, vout=0, value=1, script=script, state=DmintState.from_script(script)
+        )
+        key = PrivateKey()
+        pkh = bytes(key.public_key().hash160())
+        funding = DmintMinerFundingUtxo(
+            txid="ef" * 32, vout=0, value=500_000_000, script=b"\x76\xa9\x14" + pkh + b"\x88\xac"
+        )
+
+        async def _fake_prepare(ctx, wallet, contract_arg, token_ref_arg, reward_address, client):
+            return contract, funding, key, pkh
+
+        net = self._wire(monkeypatch, funding_value=500_000_000)
+        monkeypatch.setattr(glyph_cmds, "_claim_prepare", _fake_prepare)
+        swept: list[object] = []
+        monkeypatch.setattr(parallel, "mine", lambda *a, **k: swept.append(a))
+        spawned = tmp_path / "spawned"
+        flags = {
+            "parallel": [],
+            "in-process": ["--miner-cmd", "in-process"],
+            "external": ["--miner-cmd", shlex.join([sys.executable, "-c", f"open({str(spawned)!r}, 'w')"])],
+        }[miner]
+        result = self._claim(runner, tmp_wallet_path, *flags)
+        assert result.exit_code != 0, result.output
+        assert isinstance(result.exception, NotImplementedError), result.exception
+        assert "BLAKE3" in str(result.exception)
+        assert swept == [] and not spawned.exists() and net.broadcasts == []

@@ -726,6 +726,27 @@ def _fragment(mode: DaaMode, version: DaaBytecodeVersion) -> bytes:
     )
 
 
+def test_all_generations_is_every_fragment_each_mode_can_build() -> None:
+    """``_ALL_GENERATIONS`` is typed by hand, and the derivation tests iterate it, so check it
+    both ways against the builder: for every ``DaaMode`` × ``DaaBytecodeVersion`` that builds,
+    its fragment is listed exactly once, and every listed pair builds. (EPOCH, SCHEDULE and
+    FIXED ignore the version, so all versions give one fragment and one entry covers them.)"""
+    assert set(_ALL_GENERATIONS) == set(DaaMode)
+    buildable_total = 0
+    for mode in DaaMode:
+        buildable: set[bytes] = set()
+        for version in DaaBytecodeVersion:
+            try:
+                buildable.add(_fragment(mode, version))
+            except ValueError:
+                continue
+        listed = [_fragment(mode, v) for v in _ALL_GENERATIONS[mode]]
+        assert len(listed) == len(set(listed)), f"{mode.name}: one fragment is listed twice"
+        assert set(listed) == buildable, f"{mode.name}: listed and buildable fragments differ"
+        buildable_total += len(buildable)
+    assert buildable_total == sum(len(v) for v in _ALL_GENERATIONS.values()) == 8  # non-vacuity
+
+
 def _state_stack(mode: DaaMode, *, last_time_item: bytes, height: int, target: int = 1 << 40) -> list:
     stack = _daa_stack(int(mode), 60, 0, target, height)
     stack[8] = last_time_item  # the raw 4-byte lastTime push, exactly as the state carries it

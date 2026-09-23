@@ -677,7 +677,7 @@ d8 <contract_ref:36>
 d0 <token_ref:36>
 <max_height minimal push>
 <reward minimal push>
-08 <target:8 LE>
+<target minimal push>
 ```
 
 followed by the 145-byte code epilogue, which begins with `0xbd`
@@ -688,6 +688,19 @@ selector byte at epilogue offset 19: `0xaa` = SHA256d, `0xee` = BLAKE3,
 `target` MUST be in `[1, 0x7fffffffffffffff]`. Script integers are signed, so a
 value with the high bit set is negative on the stack and the on-chain comparison
 misbehaves (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_state_script`).
+
+`target` MUST be pushed minimally, as Photonic's V1-era `dMintScript` does
+(`pushMinimal`, `packages/lib/src/script.ts` at `c8540a6`). The epilogue compares
+the pushed item as it stands with the proof-of-work number (`81 76 00 a2 69 a2 69`:
+`OP_BIN2NUM` is applied to the hash window, not to the target), and Radiant reads
+that operand only if it is minimally encoded. The minimal push is 8 bytes for a
+target of at least 2^55 (difficulty 255 or less), shorter below that, and
+`OP_1`…`OP_16` for 1…16. Until 2026-09-23 pyrxd pushed every V1 target as `08` +
+8 bytes, which is not minimal below 2^55, so a V1 contract pyrxd deployed at
+difficulty 256 or more can never be minted; pyrxd refuses to mint or estimate one
+(`src/pyrxd/glyph/dmint/miner.py` `_unreadable_target_reason`). A reader MUST
+accept every width: mainnet V1 contracts carry 6-, 7- and 8-byte targets
+(`tests/test_dmint_v1_target_push.py`).
 
 The reward output a V1 mint pays is the 75-byte FT lock of §7.2, bound to
 `token_ref` (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_ft_output_script`). Producing a plain
@@ -711,6 +724,12 @@ pushes: a fixed-width height push is rejected by Radiant's MINIMALDATA mempool
 policy (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_state_script`). `last_time` stays a 4-byte
 push because the covenant reconstructs it from `OP_TXLOCKTIME` with a fixed-width
 `OP_NUM2BIN`.
+
+`algo_id` is carried, not read: the proof-of-work hash the covenant runs is the
+opcode right after Part A in the code script (`aa` SHA256d, `ee` BLAKE3, `ef`
+K12). A reader MUST take the algorithm from that opcode. pyrxd refuses a script
+whose `algo_id` names a different one (`src/pyrxd/glyph/dmint/chain.py`
+`DmintState._walk_v2`); on a 2026-09-22 survey of mainnet V2 scripts none did.
 
 The five difficulty-adjustment modes (`FIXED`, `EPOCH`, `ASERT`, `LWMA`,
 `SCHEDULE`) each contribute a distinct bytecode block. The authoritative,
@@ -1110,10 +1129,12 @@ Indexers use `v` to select a parser. A V1 dMint deploy MUST NOT carry a `v` fiel
 pyrxd refuses one at build time (`src/pyrxd/glyph/builder.py` `GlyphBuilder._prepare_dmint_v1_deploy`).
 
 **dMint contract version.** V1 and V2 are distinguished structurally, not by a
-version field: V1's sixth state item is a fixed 8-byte target push (`0x08` + 8
-bytes), V2's is a minimal-push `algoId`
-(`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_state_script`). In a mint scriptSig the
-discriminator is the nonce width, 4 vs 8 bytes (§7.7).
+version field: V1 has six state items followed by its 145-byte epilogue, which
+opens with `0xbd` where V2's seventh state item (`daaMode`) would be; V2 has ten
+(`src/pyrxd/glyph/dmint/chain.py` `DmintState._walk_v1`, `DmintState._walk_v2`).
+The width of the target push is not a discriminator: both versions push it
+minimally. In a mint scriptSig the discriminator is the nonce width, 4 vs 8 bytes
+(§7.7).
 
 **Relation to the pyrxd version.** This specification revision describes pyrxd
 0.15.0. pyrxd is 0.x: the API and on-chain formats are **not yet stable**. Under
@@ -1314,7 +1335,7 @@ behaviour stay on chain and a reader still has to handle them.
 | Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:332-335`). |
 | V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py` `_PART_A`). |
 | V2 dMint deploy target, BLAKE3/K12 | `dMintDiffToTarget`: `MAX_TARGET / difficulty` for every algorithm | The same, since 2026-09-23. Before then pyrxd deployed BLAKE3/K12 with `(2^256 - 1) // difficulty`, wider than the 8 bytes Part B2 reads as a number, so those contracts could never be minted | Part B1 compares the same 8-byte hash window whatever the hash opcode (`src/pyrxd/glyph/dmint/types.py` `target_for_difficulty`; the BLAKE3/K12 mainnet deploys rebuild byte for byte in `tests/test_dmint_deploy_bounds.py`). |
-| V2 dMint numeric deploy parameters | `dMintScript` bounds none of `maxHeight`, `reward`, `targetTime`, `halfLife`, `epochLength` or schedule heights above, and `pushMinimal` emits any width (the Mint form's inputs carry min/max hints) | Refused: a number wider than 8 bytes, a reward above Radiant's money supply, a difficulty whose target is 0, and, in ASERT/LWMA/EPOCH, a target time above 0xFFFFFFFF s. FIXED and SCHEDULE only carry the target time as bytes, so there it is held only to pyrxd's 8-byte encoder limit. In-range bytes are identical | Past those bounds a deploy builds a number the covenant cannot read, a reward no transaction can pay, a target only an all-zero hash meets, or a target spacing no mint can meet (the retarget compares it with the gap between two 32-bit timestamps) (`src/pyrxd/glyph/dmint/types.py` `check_v2_numeric_bounds`, `DAA_MODES_READING_TARGET_TIME`). |
+| V2 dMint numeric deploy parameters | `dMintScript` bounds none of `maxHeight`, `reward`, `targetTime`, `halfLife`, `epochLength` or schedule heights above, and `pushMinimal` emits any width (the Mint form's inputs carry min/max hints) | Refused: a number wider than 8 bytes, a reward above Radiant's money supply, a difficulty whose target is 0, and, in ASERT/LWMA/EPOCH, a target time above 0xFFFFFFFF s. FIXED and SCHEDULE only carry the target time as bytes, so there it is held only to pyrxd's 8-byte encoder limit. In-range bytes are identical | Past those bounds a deploy builds a number the covenant cannot read, a reward no transaction can pay, a target only an all-zero hash meets, or a target spacing no mint can meet (the retarget compares it with the gap between two timestamps, each below 2^31 in any mint the covenant accepts) (`src/pyrxd/glyph/dmint/types.py` `check_v2_numeric_bounds`, `DAA_MODES_READING_TARGET_TIME`). |
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
 | V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
 | WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_wave_reveal`). |

@@ -582,6 +582,33 @@ class TestAContractPyrxdCannotMint:
         assert "33-byte script number" in result.output
         assert "ETA" not in result.output and "clamped" not in result.output
 
+    def test_a_v1_contract_pyrxd_deployed_with_an_8_byte_target_gets_no_eta(
+        self, runner: CliRunner, monkeypatch
+    ) -> None:
+        """pyrxd's V1 deploy pushed every target as 8 bytes until 2026-09-23; at difficulty 256
+        or more that push is not minimal, the epilogue cannot read it, and no mint can happen."""
+        from tests.test_dmint_v1_target_push import legacy_v1_contract_script
+
+        result = self._invoke(runner, monkeypatch, legacy_v1_contract_script(5000))
+        assert result.exit_code != 0, result.output
+        assert "this contract can never be minted, so there is no time to estimate" in result.output
+        assert "its target is pushed as 08" in result.output
+        assert "ETA" not in result.output
+
+    @pytest.mark.parametrize("name", ["RABO", "Pepe"])
+    def test_a_mainnet_v1_contract_is_estimated(self, runner: CliRunner, monkeypatch, name: str) -> None:
+        """The honest path on real V1 scripts: a 7-byte target (RABO, difficulty 256) and an
+        8-byte one (Pepe, difficulty 1) are estimated at their own targets."""
+        from pyrxd.glyph.dmint import DmintState
+        from tests.test_dmint_v1_target_push import _mainnet
+
+        script = _mainnet(name)
+        result = self._invoke(runner, monkeypatch, script, "--json")
+        assert result.exit_code == 0, result.output
+        payload = _extract_json(result.output)
+        assert payload["contract"]["version"] == "V1"
+        assert payload["exact"]["target"] == DmintState.from_script(script).target
+
     def test_an_in_range_contract_is_estimated_as_before(self, runner: CliRunner, monkeypatch) -> None:
         from pyrxd.glyph.dmint import DmintAlgo
 

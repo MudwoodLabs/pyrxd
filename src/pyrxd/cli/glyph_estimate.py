@@ -236,7 +236,7 @@ def _resolve_target(
 
     contract_utxo = _fetch_contract(ctx, contract_arg, token_ref_arg)
     state = contract_utxo.state
-    never = _unreadable_target_reason(state)
+    never = _unreadable_target_reason(contract_utxo.script)
     if never is not None:
         # No estimate at all: the covenant does not clamp a target it cannot read, it aborts,
         # so any time-to-mint printed here would be the time to a mint that cannot happen.
@@ -303,7 +303,10 @@ def _render_human(payload: dict) -> str:
     header = f"dMint mint estimate — difficulty {exact['difficulty']:,} (target {exact['effective_target']:#x})"
     lines.append(header)
     if exact["clamped"]:
-        # A live contract never reaches here (_resolve_target refuses one); this is --target.
+        # Only --target reaches here. A live contract's target is read as the signed script
+        # number the covenant sees: wider than 8 bytes, _resolve_target refuses it, and at most
+        # 8 bytes it cannot exceed the ceiling (V1 targets were read unsigned before 2026-09-23,
+        # so a top-bit-set one used to land here).
         lines.append(
             f"  note: supplied target {exact['target']:#x} is above the ceiling (MAX_SHA256D_TARGET). No dMint"
             " contract carrying it can be minted: the covenant reads the target as a signed script number"

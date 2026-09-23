@@ -24,9 +24,10 @@ This module re-exports ``_OP_STATESEPARATOR`` and the epilogue
 constants so they remain importable from their plan-specified locations
 for any downstream that imports from ``chain`` directly.
 
-Symbols (19):
+Symbols (21):
     _OP_STATESEPARATOR (re-export from types),
     _parse_script_int, _decode_script_le_int,
+    _POW_OP_BYTE_TO_ALGO, _parse_dmint_script,
     _V1_EPILOGUE_PREFIX (re-export from builders),
     _V1_EPILOGUE_ALGO_OFFSET (re-export from builders),
     _V1_EPILOGUE_SUFFIX (re-export from builders),
@@ -56,6 +57,8 @@ from ...constants import OP_PUSHINPUTREF_BYTE, OP_PUSHINPUTREFSINGLETON_BYTE, RE
 from ..script import TruncatedScriptError, iter_input_refs
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 from .builders import (
+    _PART_A,
+    _POW_HASH_OP,
     _V1_ALGO_BYTE_TO_ENUM,
     _V1_EPILOGUE_ALGO_OFFSET,
     _V1_EPILOGUE_LEN,
@@ -168,6 +171,34 @@ def _match_v1_epilogue(script: bytes, start: int) -> DmintAlgo | None:
     return algo
 
 
+#: The proof-of-work hash a V2 covenant EXECUTES, keyed by the opcode byte right after Part A —
+#: derived from the builder's own map, so the two cannot drift.
+_POW_OP_BYTE_TO_ALGO: dict[int, DmintAlgo] = {op[0]: algo for algo, op in _POW_HASH_OP.items()}
+
+
+def _parse_dmint_script(script_bytes: bytes) -> tuple[DmintState, bytes]:
+    """:meth:`DmintState.from_script`, plus the target item exactly as the script pushes it.
+
+    The second element is the whole push (opcode and payload) — ``08`` + 8 bytes, ``07`` + 7,
+    ``55`` (OP_5), ``21`` + 33 bytes, whatever is on chain. The parsed ``target`` is the same
+    number for several spellings, and only the spelling says whether the covenant can read it
+    (:func:`pyrxd.glyph.dmint.miner._unreadable_target_reason`). Tries V2 first, then V1, as
+    ``from_script`` does.
+
+    :raises ValidationError: as :meth:`DmintState.from_script`.
+    """
+    try:
+        state, span = DmintState._walk_v2(script_bytes)
+    except ValidationError as v2_exc:
+        try:
+            state, span = DmintState._walk_v1(script_bytes)
+        except ValidationError as v1_exc:
+            raise ValidationError(
+                f"DmintState.from_script: not a dMint contract (V2: {v2_exc}; V1: {v1_exc})"
+            ) from None
+    return state, script_bytes[span]
+
+
 # ---------------------------------------------------------------------------
 # DmintState + related dataclasses
 # ---------------------------------------------------------------------------
@@ -216,19 +247,23 @@ class DmintState:
         # Try V2 first. If V2 raises, try V1; if V1 also raises, surface a
         # combined error that names both attempts so callers don't have to
         # guess which version they had.
-        try:
-            return cls._from_v2_script(script_bytes)
-        except ValidationError as v2_exc:
-            try:
-                return cls._from_v1_script(script_bytes)
-            except ValidationError as v1_exc:
-                raise ValidationError(
-                    f"DmintState.from_script: not a dMint contract (V2: {v2_exc}; V1: {v1_exc})"
-                ) from None
+        return _parse_dmint_script(script_bytes)[0]
 
     @classmethod
     def _from_v2_script(cls, script_bytes: bytes) -> DmintState:
-        """Parse a V2 dMint contract (10 state items + ``bd``).
+        """Parse a V2 dMint contract (10 state items + ``bd``); see :meth:`_walk_v2`."""
+        return cls._walk_v2(script_bytes)[0]
+
+    @classmethod
+    def _from_v1_script(cls, script_bytes: bytes) -> DmintState:
+        """Parse a V1 dMint contract (6 state items + the V1 epilogue); see :meth:`_walk_v1`."""
+        return cls._walk_v1(script_bytes)[0]
+
+    @classmethod
+    def _walk_v2(cls, script_bytes: bytes) -> tuple[DmintState, slice]:
+        """Parse a V2 dMint contract (10 state items + ``bd``) and locate its target push.
+
+        Returns the state and the slice of ``script_bytes`` holding the target item's push.
 
         Walks the 10 state pushes in declared order, then verifies that the
         next byte is ``OP_STATESEPARATOR`` (0xbd). Closes ultrareview
@@ -247,7 +282,8 @@ class DmintState:
           [2] tokenRef    — ``0xd0`` + 36-byte wire ref
           [3] maxHeight   — ``_push_minimal``
           [4] reward      — ``_push_minimal``
-          [5] algoId      — ``_push_minimal``
+          [5] algoId      — ``_push_minimal`` (a tag the covenant carries but never reads; it
+                            must agree with the hash opcode after Part A, which is what runs)
           [6] daaMode     — ``_push_minimal``
           [7] targetTime  — ``_push_minimal``
           [8] lastTime    — ``_push_4bytes_le`` (opcode 0x04 + 4-byte LE uint32)
@@ -255,7 +291,7 @@ class DmintState:
                             builds it, and as pyrxd has since 2026-09-23; a wider one — pyrxd
                             built those for BLAKE3/K12 before then — parses, but cannot be minted)
           —— OP_STATESEPARATOR (0xbd) ——
-          (code section follows; not parsed here)
+          (code section follows; only its proof-of-work opcode is read, below)
         """
         # Walk the full script — do NOT pre-slice on the first 0xbd. The
         # parser consumes exactly the bytes belonging to each push, so by
@@ -301,6 +337,7 @@ class DmintState:
         pos += 5
 
         # --- Item 9: target (variable length; parsed at any width — see the layout above)
+        target_start = pos
         target, pos = _parse_script_int(script_bytes, pos)
 
         # --- After 10 state items, the next byte MUST be OP_STATESEPARATOR.
@@ -326,6 +363,28 @@ class DmintState:
         except ValueError:
             raise ValidationError(f"DmintState.from_script: unknown daa_mode id {daa_id}")
 
+        # The proof-of-work hash the covenant runs is the opcode right after Part A. The algoId
+        # tag above is only carried (Part C copies it into the next state); nothing on chain
+        # reads it. So the algorithm is the opcode's, and a script whose tag names another hash
+        # is refused: a miner trusting the tag would grind a hash the covenant never checks.
+        # A code section that does not open with Part A is left to the tag here — it is not the
+        # template pyrxd mints, and build_dmint_mint_tx refuses it.
+        op_pos = pos + 1 + len(_PART_A)
+        if script_bytes[pos + 1 : op_pos] == _PART_A and op_pos < len(script_bytes):
+            executed = _POW_OP_BYTE_TO_ALGO.get(script_bytes[op_pos])
+            if executed is None:
+                raise ValidationError(
+                    f"DmintState.from_script: the covenant's proof-of-work opcode after Part A is "
+                    f"0x{script_bytes[op_pos]:02x}, which is not OP_HASH256, OP_BLAKE3 or OP_K12"
+                )
+            if executed is not algo:
+                raise ValidationError(
+                    f"DmintState.from_script: the state's algoId tag says {algo.name}, but the covenant "
+                    f"hashes the proof of work with {executed.name} (opcode 0x{script_bytes[op_pos]:02x} "
+                    "after Part A). The covenant runs the opcode and never reads the tag, so pyrxd refuses "
+                    "a contract whose tag and opcode disagree rather than mine the hash the tag names"
+                )
+
         return cls(
             height=height,
             contract_ref=contract_ref,
@@ -338,11 +397,11 @@ class DmintState:
             last_time=last_time,
             target=target,
             is_v1=False,
-        )
+        ), slice(target_start, pos)
 
     @classmethod
-    def _from_v1_script(cls, script_bytes: bytes) -> DmintState:
-        """Parse a V1 dMint contract (the current mainnet format).
+    def _walk_v1(cls, script_bytes: bytes) -> tuple[DmintState, slice]:
+        """Parse a V1 dMint contract (the current mainnet format) and locate its target push.
 
         V1 has 6 state items plus a 145-byte fixed code epilogue (varying
         only in the algo selector byte). Layout:
@@ -352,12 +411,19 @@ class DmintState:
           [2] tokenRef     — ``0xd0`` + 36-byte wire ref
           [3] maxHeight    — ``_push_minimal``
           [4] reward       — ``_push_minimal``
-          [5] target       — full 8-byte push (``0x08`` + 8 LE bytes)
+          [5] target       — ``_push_minimal``, as Photonic builds it and as pyrxd has since
+                             2026-09-23: 8 bytes for a target of at least 2**55, shorter below,
+                             OP_1..OP_16 for 1..16 (mainnet V1 contracts carry 6-, 7- and 8-byte
+                             targets). pyrxd pushed it as ``0x08`` + 8 bytes before then; that
+                             parses to the same number, but below 2**55 no mint can read it
+                             (see ``miner._unreadable_target_reason``)
           —— OP_STATESEPARATOR (0xbd) + 144-byte fixed code epilogue ——
 
         ``daa_mode`` is always ``FIXED`` for V1 (V1 has no DAA bytecode).
         ``target_time`` and ``last_time`` are V2-only and set to 0; the
-        ``is_v1`` flag is True so callers can ignore those fields.
+        ``is_v1`` flag is True so callers can ignore those fields. What tells V1 from V2 is the
+        structure, not the target's width: a V2 parse of a V1 script meets 0xbd where its seventh
+        state item (daaMode) should be, and the V1 epilogue is fingerprinted byte for byte below.
         """
         pos = 0
 
@@ -394,14 +460,11 @@ class DmintState:
         max_height, pos = _parse_script_int(script_bytes, pos)
         reward, pos = _parse_script_int(script_bytes, pos)
 
-        # --- Item 5: target (V1 always uses an 8-byte push; never the
-        #     algoId/daaMode pushes V2 has).
-        if pos >= len(script_bytes) or script_bytes[pos] != 0x08:
-            raise ValidationError(f"DmintState._from_v1_script: expected 0x08 (push-8) for target at pos {pos}")
-        if pos + 9 > len(script_bytes):
-            raise ValidationError("DmintState._from_v1_script: script truncated inside target")
-        target = int.from_bytes(script_bytes[pos + 1 : pos + 9], "little")
-        pos += 9
+        # --- Item 5: target — a script number, decoded the way the covenant reads it (signed,
+        #     little-endian), at whatever width it was pushed. Whether that push is readable on
+        #     chain is judged by miner._unreadable_target_reason, not here.
+        target_start = pos
+        target, pos = _parse_script_int(script_bytes, pos)
 
         # --- After 6 state items, fingerprint the V1 code epilogue. The
         # epilogue is byte-identical across V1 deployments except for one
@@ -424,7 +487,7 @@ class DmintState:
             last_time=0,  # not encoded in V1
             target=target,
             is_v1=True,
-        )
+        ), slice(target_start, pos)
 
 
 @dataclass(frozen=True)

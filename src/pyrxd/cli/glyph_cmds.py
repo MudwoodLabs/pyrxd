@@ -78,7 +78,7 @@ from ..glyph.dmint import (
     mine_solution_dispatch,
 )
 from ..glyph.dmint.miner import _unreadable_target_reason
-from ..glyph.dmint.types import check_v2_numeric_bounds
+from ..glyph.dmint.types import check_dmint_core_bounds, check_v2_numeric_bounds
 from ..glyph.fees import (
     RevealFeeEstimate,
     check_reveal_funding,
@@ -1875,8 +1875,8 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
-#: The deploy-dmint flag behind each parameter ``check_v2_numeric_bounds`` bounds, so a refusal
-#: names what the user typed.
+#: The deploy-dmint flag behind each parameter ``check_v2_numeric_bounds`` bounds (V1 uses the
+#: first three, through ``check_dmint_core_bounds``), so a refusal names what the user typed.
 _V2_BOUND_FLAGS = {
     "max_height": "--max-height",
     "reward": "--reward",
@@ -1908,13 +1908,13 @@ _V2_BOUND_FLAGS = {
     "--max-height",
     type=int,
     required=True,
-    help="Mints per contract. V1: [1..0xFFFFFF] (pyrxd's V1 limit); V2: [1..2^63-1].",
+    help="Mints per contract, [1..2^63-1] (the covenant reads it as a script number).",
 )
 @click.option(
     "--reward",
     type=int,
     required=True,
-    help="Photons of the FT paid per successful mint. V1: [1..0xFFFFFF]; V2: up to Radiant's money supply (2.1e18).",
+    help="Photons of the FT paid per successful mint, up to Radiant's money supply (2.1e18).",
 )
 @click.option(
     "--difficulty",
@@ -2095,6 +2095,11 @@ def deploy_dmint_cmd(
                 schedule=parsed_schedule,
             )
         else:
+            # The bounds V1 shares with V2, checked first for the same reason: a refusal names
+            # the flag the user typed. DmintV1DeployParams runs the same check.
+            check_dmint_core_bounds(
+                stage="deploy-dmint", max_height=max_height, reward=reward, difficulty=difficulty, names=_V2_BOUND_FLAGS
+            )
             deploy_params = DmintV1DeployParams(
                 metadata=metadata,
                 owner_pkh=placeholder_pkh,
@@ -2406,6 +2411,7 @@ def _mine_bundled_parallel(
     nonce_width: int,
     workers: int,
     progress: Callable[[int, float], None] | None,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
 ) -> bytes:
     """Run the bundled parallel miner in this process and return the nonce.
 
@@ -2415,7 +2421,16 @@ def _mine_bundled_parallel(
     Sweeps the whole nonce space (``2**(8*nonce_width)``); exhaustion becomes
     :class:`MaxAttemptsError`, which is what the V1 reroll loop expects, and
     matches what the external miner's exit-code-2 path already raises.
+
+    The bundled miner computes SHA256d only and ``MineParams`` has no algorithm field, so
+    ``algo`` (the contract's) is checked here: anything else raises ``NotImplementedError``
+    before a worker starts. ``_claim_prepare`` refuses such contracts first; this is the
+    second line.
     """
+    if algo is not DmintAlgo.SHA256D:
+        raise NotImplementedError(
+            f"the bundled parallel miner grinds SHA256d only; this contract's proof of work is {algo.name}"
+        )
     from ..contrib.miner.parallel import MineParams, mine
     from ..contrib.miner.protocol import MineSuccess
 
@@ -2455,6 +2470,7 @@ def _mine_claim_with_rerolls(
     *,
     mine: Callable[[bytes, int], bytes],
     max_rerolls: int,
+    miner_kind: str = "parallel",
 ) -> tuple[DmintMintResult, PowPreimageResult, bytes]:
     """Reroll the OP_RETURN until a nonce is found; return (mint_result, preimage_result, nonce).
 
@@ -2464,7 +2480,14 @@ def _mine_claim_with_rerolls(
     hashes must come from the same build_dmint_v1_mint_preimage call). ``mine``
     is injected so the loop is unit-testable without a real grind; it raises
     MaxAttemptsError on a swept-without-hit preimage.
+
+    The rerolls are deterministic — reroll ``i`` grinds ``op_return_base`` with ``i`` appended
+    — so a rerun with the same ``--op-return`` repeats every search this run made before it
+    tries a new one. The advice when all rerolls fail says so, and names ``--timeout`` only
+    when some grind was actually stopped by the clock (a swept nonce space is not helped by
+    more time) and ``--max-attempts`` only for the in-process miner, the one it reaches.
     """
+    stopped_by_clock = 0
     for attempt in range(max_rerolls):
         op_msg = op_return_base + attempt.to_bytes(4, "big")
         mint = build_dmint_mint_tx(
@@ -2479,13 +2502,39 @@ def _mine_claim_with_rerolls(
         pre = build_dmint_v1_mint_preimage(contract, funding, mint.tx)
         try:
             nonce = mine(pre.preimage, contract.state.target)
-        except MaxAttemptsError:
+        except MaxAttemptsError as exc:
+            stopped_by_clock += _stopped_by_clock(exc)
             continue
         return mint, pre, nonce
-    raise UserError(
-        f"no nonce found within {max_rerolls} preimage rerolls",
-        fix="raise --max-rerolls or --timeout, or use a faster --miner-cmd (e.g. a GPU glyph-miner)",
-    )
+    shown = op_return_base.decode("utf-8", errors="replace")
+    fix = [
+        f"pass a different --op-return (this run used {shown!r}): reroll i grinds that value with i appended, so a "
+        f"rerun with the same one repeats these {max_rerolls} searches before it tries a new one; --max-rerolls adds "
+        "rerolls after them"
+    ]
+    if stopped_by_clock:
+        fix.append(
+            f"{stopped_by_clock} of the {max_rerolls} grinds stopped at --timeout before covering their nonce range, "
+            "so a longer --timeout lets each search further"
+        )
+    if miner_kind == "sequential":
+        fix.append("--max-attempts raises the in-process miner's cap on each grind")
+    fix.append("a faster --miner-cmd shortens every grind")
+    raise UserError(f"no nonce found within {max_rerolls} preimage rerolls", fix="; ".join(fix))
+
+
+def _stopped_by_clock(exc: MaxAttemptsError) -> bool:
+    """Did this grind end because the wall clock ran out, not because a count did?
+
+    The bundled and in-process miners stop at ``--timeout`` by raising :class:`MiningDeadline`
+    out of the progress callback (``_mine`` chains it as the cause), and an external miner's
+    timeout is the ``subprocess.TimeoutExpired`` that :func:`mine_solution_external` chains.
+    Anything else — the in-process ``--max-attempts`` cap, or a miner that swept its nonce
+    space — is a count.
+    """
+    from subprocess import TimeoutExpired  # nosec B404 — exception class only; spawns nothing
+
+    return isinstance(exc.__cause__, (MiningDeadline, TimeoutExpired))
 
 
 def _v2_claim_daa_kwargs(
@@ -2550,7 +2599,10 @@ def _mine_claim_v2(
     "op_return",
     default="pyrxd-mint",
     show_default=True,
-    help="Base OP_RETURN; rerolled on nonce exhaustion.",
+    help=(
+        "Base OP_RETURN message; part of the proof-of-work preimage. V1 claims append a reroll "
+        "counter to it when a grind ends without a nonce; V2 claims use it as given."
+    ),
 )
 @click.option(
     "--miner-cmd",
@@ -2579,7 +2631,7 @@ def _mine_claim_v2(
 )
 @click.option("--max-attempts", type=int, default=None, help="In-process nonce cap (default: the library default).")
 @click.option(
-    "--max-rerolls", type=int, default=40, show_default=True, help="Preimage rerolls on nonce-space exhaustion."
+    "--max-rerolls", type=int, default=40, show_default=True, help="V1: preimage rerolls on nonce-space exhaustion."
 )
 @click.option(
     "--reward-address",
@@ -2729,6 +2781,7 @@ def claim_dmint_cmd(
                     nonce_width=nonce_width,
                     workers=n_workers,
                     progress=reporter,
+                    algo=contract_utxo.state.algo,
                 )
             # sequential -> mine_solution's in-process progress hook;
             # external -> mine_solution_external's stderr progress-frame
@@ -2741,6 +2794,9 @@ def claim_dmint_cmd(
                 max_attempts=max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS,
                 timeout_s=timeout_s,
                 progress=reporter,
+                # The contract's own algorithm, so the dispatcher refuses BLAKE3/K12 on either
+                # path. _claim_prepare already refused them; this is the second line.
+                algo=contract_utxo.state.algo,
             ).nonce
         except MiningDeadline as exc:
             # Same signal an external miner's timeout raises, so the V1 reroll
@@ -2763,7 +2819,14 @@ def claim_dmint_cmd(
             )
         else:
             mint, pre, nonce = _mine_claim_with_rerolls(
-                contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, mine=_mine, max_rerolls=max_rerolls
+                contract_utxo,
+                funding,
+                miner_pkh,
+                op_return_base,
+                ctx.fee_rate,
+                mine=_mine,
+                max_rerolls=max_rerolls,
+                miner_kind=miner_kind,
             )
     except UnrecognizedDaaBytecodeError as exc:
         # MUST precede the `except DmintError` below. This error is BOTH a DmintError and
@@ -2864,23 +2927,17 @@ def _grind_stopped_error(
 ) -> UserError:
     """The claim-dmint error for a PoW grind that ended without a nonce.
 
-    A wall-clock stop is told apart from a count-based one by what raised it: the bundled and
-    in-process miners stop at ``--timeout`` by raising :class:`MiningDeadline` out of the
-    progress callback (``_mine`` chains it as the cause), and an external miner's timeout is
-    the ``subprocess.TimeoutExpired`` that :func:`mine_solution_external` chains. Anything
-    else — the in-process ``--max-attempts`` cap, or a miner that swept its nonce space — is
-    reported as having run out of attempts, not time.
+    A wall-clock stop is told apart from a count-based one by :func:`_stopped_by_clock`.
 
     The count-based remedy has to change what the miner searches. The V2 preimage is
     ``SHA256(contract txid || contractRef) || SHA256(SHA256d(funding script) ||
-    SHA256d(OP_RETURN script))`` (:func:`build_dmint_v2_mint_preimage`): the claim time is not
-    part of it, so running the same claim again hands the miner the same preimage — and the
-    in-process miner sweeps from nonce 0 again. A different ``--op-return`` changes the
-    preimage, whichever miner runs; ``--max-attempts`` only reaches the in-process miner.
+    SHA256d(OP_RETURN script))`` (:func:`build_dmint_v2_mint_preimage`): it binds the contract,
+    the funding script and the OP_RETURN, so re-running with the same inputs hands the miner
+    the same preimage — and the in-process miner sweeps from nonce 0 again. A different
+    ``--op-return`` changes the preimage, whichever miner runs; ``--max-attempts`` only reaches
+    the in-process miner.
     """
-    from subprocess import TimeoutExpired  # nosec B404 — exception class only; spawns nothing
-
-    if isinstance(exc.__cause__, (MiningDeadline, TimeoutExpired)):
+    if _stopped_by_clock(exc):
         return UserError(
             f"mining timed out after {timeout_s:g}s without finding a nonce",
             cause=str(exc),
@@ -2891,10 +2948,9 @@ def _grind_stopped_error(
             ),
         )
     fresh = (
-        f"pass a different --op-return (this run used {op_return!r}): the OP_RETURN is part of the "
-        "proof-of-work preimage, so a new value is a new search. Running the same claim again unchanged "
-        "repeats this preimage — it binds the contract, the funding address and the OP_RETURN, not the "
-        "claim time"
+        f"pass a different --op-return (this run used {op_return!r}): the proof-of-work preimage binds the "
+        "contract, the funding script and the OP_RETURN, so a new value is a new search, and re-running with "
+        "the same inputs hands the miner this same preimage again"
     )
     if miner_kind == "sequential":
         allowed = max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS
@@ -2933,7 +2989,7 @@ async def _claim_prepare(
     # learn either fact) and before the wallet's UTXO scan, the funding scan, the confirmation
     # prompt and any grind. Every locator (--contract, --token-ref), both versions and every
     # --miner-cmd reach the grind only through this function.
-    never = _unreadable_target_reason(contract_utxo.state)
+    never = _unreadable_target_reason(contract_utxo.script)
     if never is not None:
         raise UserError(
             "this contract can never be minted",

@@ -1036,16 +1036,28 @@ def build_dmint_v1_state_script(
 ) -> bytes:
     """Build the 6-item V1 dMint state script (before OP_STATESEPARATOR).
 
-    Layout (docs/dmint-research-mainnet.md §2.2 offsets 0–94)::
+    Layout::
 
-        height(4B LE) | d8 contractRef(36B) | d0 tokenRef(36B) |
-        maxHeight | reward | target(0x08 + 8B LE)
+        04 <height:4 LE> | d8 contractRef(36B) | d0 tokenRef(36B) |
+        maxHeight | reward | target
 
-    The target is always pushed as a fixed 8-byte little-endian value
-    (push opcode 0x08, then 8 bytes of payload). This is what
-    distinguishes V1 from V2 in the state-script discriminator at parse
-    time: V2's item 5 is ``algoId`` via ``_push_minimal``, never an
-    8-byte push.
+    the last three as minimal script-number pushes (:func:`_push_minimal`). That is byte for
+    byte what Photonic Wallet's V1-era ``dMintScript`` builds (its SHA256d/FIXED branch,
+    ``packages/lib/src/script.ts`` at c8540a6: ``push4bytes(height)``, then ``pushMinimal`` for
+    maxHeight, reward and target), and ``tests/test_dmint_v1_target_push.py`` checks it against
+    a transcription of that builder.
+
+    The target has to be minimal. The V1 epilogue compares the target, exactly as pushed, with
+    the proof-of-work number (``… 81 76 00 a2 69 a2 69``: OP_BIN2NUM normalises the hash window,
+    never the target), and Radiant reads that operand as a script number with minimal encoding
+    required. The minimal push is 8 bytes only for a target of at least ``2**55`` (difficulty
+    255 or less); below that it is shorter, down to OP_1..OP_16 for targets 1..16. Mainnet V1
+    contracts carry 6-, 7- and 8-byte targets, and two pinned in
+    ``tests/test_dmint_v1_target_push.py`` have been minted over a thousand times each with a
+    7-byte one. Until 2026-09-23
+    pyrxd pushed every target as ``08`` + 8 bytes, which is not minimal below ``2**55``, so no
+    V1 contract it deployed at difficulty 256 or more can ever be minted
+    (:func:`pyrxd.glyph.dmint.miner._unreadable_target_reason` refuses them).
 
     :raises ValidationError: ``height < 0``; ``max_height < 1``;
         ``height >= max_height`` (born-exhausted contract); ``reward < 1``;
@@ -1055,7 +1067,8 @@ def build_dmint_v1_state_script(
         the high bit set produces a negative number on the stack, and the
         on-chain target comparison would behave wrongly. Photonic Wallet's
         ``dMintDiffToTarget`` formula always produces a value in this
-        signed-positive range.
+        signed-positive range. A target of 0 is refused by pyrxd: only a hash
+        whose compared 8 bytes are all zero meets it.
     """
     if height < 0:
         raise ValidationError("height must be >= 0")
@@ -1084,8 +1097,7 @@ def build_dmint_v1_state_script(
         + token_ref.to_bytes()
         + _push_minimal(max_height)
         + _push_minimal(reward)
-        + b"\x08"
-        + struct.pack("<Q", target)
+        + _push_minimal(target)
     )
 
 

@@ -46,18 +46,21 @@ from pyrxd.security.errors import (
 
 from .builders import (
     _PART_A,
+    _POW_HASH_OP,
     DetectedDaaBytecode,
     _build_part_b,
     _push_4bytes_le,
     _push_minimal,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
+    build_dmint_v1_state_script,
     detect_daa_bytecode,
 )
 from .chain import (
     DmintContractUtxo,
     DmintMinerFundingUtxo,
     DmintState,
+    _parse_dmint_script,
     is_token_bearing_script,
 )
 from .types import (
@@ -69,7 +72,6 @@ from .types import (
     DAA_MODES_READING_LAST_TIME,
     DEFAULT_ASERT_HALFLIFE,
     EPOCH_MAX_SAFE_TARGET,
-    MAX_SCRIPT_NUM,
     MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
@@ -655,26 +657,62 @@ def _refuse_unreadable_state_last_time(state: DmintState, epoch_length: int | No
     )
 
 
-def _unreadable_target_reason(state: DmintState) -> str | None:
-    """Why no mint of a V2 contract carrying ``state`` can ever be valid, or ``None``.
+def _unreadable_target_reason(contract_script: bytes) -> str | None:
+    """Why no mint of the dMint contract ``contract_script`` can ever be valid, or ``None``.
 
-    Part B2 compares every mint's proof of work with the state's ``target`` as a script number,
-    and Radiant reads at most ``MAX_SCRIPT_NUM_BYTES`` bytes as one, so a wider target aborts
-    every spend of the contract — whatever the nonce, and whichever miner found it. pyrxd
-    deployed BLAKE3/K12 V2 contracts with such targets (``(2**256 - 1) // difficulty``) before
-    2026-09-23. V1 carries its target as a fixed 8-byte push and is not judged here.
+    Both covenants compare every mint's proof of work with the state's target as a script
+    number — V2 in Part B2 (``51 79 7c a2 69``), V1 in its epilogue (``… 81 76 00 a2 69 a2 69``,
+    where OP_BIN2NUM normalises the hash window but the target is taken exactly as the state
+    pushed it). Radiant reads such an operand only if it is at most ``MAX_SCRIPT_NUM_BYTES``
+    bytes and minimally encoded, so a target pushed wider, or non-minimally, aborts every spend
+    of the contract, whatever the nonce and whichever miner found it. The judgement is on the
+    push as the script carries it (:func:`~pyrxd.glyph.dmint.chain._parse_dmint_script`): the
+    parsed number alone cannot tell ``07 ffffffffffff7f`` (minimal) from ``08 ffffffffffff7f00``
+    (not).
 
-    Shared by :func:`build_dmint_mint_tx` (which refuses on it) and the ``claim-dmint`` and
-    ``dmint-estimate`` commands (which refuse on it before any wallet or funding work).
+    pyrxd deployed both kinds before 2026-09-23: BLAKE3/K12 V2 contracts with 33-byte targets
+    (``(2**256 - 1) // difficulty``), and V1 contracts at difficulty 256 or more, whose target
+    it pushed as a fixed 8 bytes where the minimal push is shorter.
+
+    A readable but negative target is refused too: both covenants require the proof-of-work
+    number to be at least 0 (``81 76 00 a2 69``) and at most the target, so no hash meets one.
+
+    Shared by :func:`build_dmint_mint_tx` (which refuses on it, V1 and V2) and the
+    ``claim-dmint`` and ``dmint-estimate`` commands (which refuse on it before any wallet or
+    funding work).
+
+    :raises ValidationError: ``contract_script`` is not a dMint contract script.
     """
-    if state.is_v1 or state.target <= MAX_SCRIPT_NUM:
+    state, push = _parse_dmint_script(contract_script)
+    op = push[0]
+    width = len(push) - (2 if op == 0x4C else 1) if 1 <= op <= 0x4C else 1  # the pushed payload's length
+    if width > MAX_SCRIPT_NUM_BYTES:
+        return (
+            f"this dMint contract can never be minted: its target is a {width}-byte script number, and "
+            f"the covenant compares every mint's proof of work with it as a number of at most "
+            f"{MAX_SCRIPT_NUM_BYTES} bytes, so every spend of the contract aborts, whatever the nonce "
+            "and whoever mines it"
+            + ("" if state.is_v1 else " (pyrxd deployed BLAKE3/K12 V2 contracts with such targets before 2026-09-23)")
+        )
+    canonical = _push_minimal(state.target)
+    if push == canonical:
+        if state.target < 0:
+            return (
+                f"this dMint contract can never be minted: its target is {state.target}, a negative number, and "
+                "the covenant accepts a proof of work only if its number is at least 0 and at most the target"
+            )
         return None
-    width = state.target.bit_length() // 8 + 1  # the minimal script-number width of a positive n
     return (
-        f"this dMint contract can never be minted: its target is a {width}-byte script number, and "
-        f"the covenant compares every mint's proof of work with it as a number of at most "
-        f"{MAX_SCRIPT_NUM_BYTES} bytes, so every spend of the contract aborts, whatever the nonce "
-        "and whoever mines it (pyrxd deployed BLAKE3/K12 V2 contracts with such targets before 2026-09-23)"
+        f"this dMint contract can never be minted: its target is pushed as {push.hex()}, which is not a "
+        f"minimally encoded script number (the minimal push of {state.target} is {canonical.hex()}), and the "
+        "covenant reads the target as a number with minimal encoding required, so every spend of the contract "
+        "aborts, whatever the nonce and whoever mines it"
+        + (
+            " (pyrxd deployed V1 contracts with the target pushed as a fixed 8 bytes before 2026-09-23, which is "
+            "not minimal for a target below 2**55: difficulty 256 or more)"
+            if state.is_v1
+            else ""
+        )
     )
 
 
@@ -1882,7 +1920,7 @@ def build_dmint_mint_tx(
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
-    never = _unreadable_target_reason(state)
+    never = _unreadable_target_reason(contract_utxo.script)
     if never is not None:
         raise ValidationError(never)
     if len(nonce) != 8:
@@ -1945,6 +1983,19 @@ def build_dmint_mint_tx(
                     "half_life entirely to use the baked one — a different value recreates a target the "
                     "covenant rejects, after the PoW grind."
                 )
+    # The template pyrxd mints opens its code with Part A and then the proof-of-work hash
+    # opcode, and the parser derived state.algo from that opcode. A code section that does not
+    # open that way is another template (a 2026-09-22 survey of mainnet V2 scripts found six,
+    # all ASERT, which detect_daa_bytecode refuses just above): pyrxd knows neither which hash it
+    # runs nor how it builds its preimage, so it refuses here, in every DAA mode, before any
+    # grind. (A script whose opcode after Part A disagrees with its tag never gets this far:
+    # _unreadable_target_reason parses the script, and the parser refuses it.)
+    if code[: len(_PART_A) + 1] != _PART_A + _POW_HASH_OP[state.algo]:
+        raise ValidationError(
+            "V2 mint: this contract's code does not open with the Part A template pyrxd mints, followed by "
+            f"the {state.algo.name} hash opcode; pyrxd cannot tell which proof of work or preimage it checks, "
+            "so it refuses before any grind."
+        )
     if half_life is None:
         # Reached for LWMA (bakes no half-life), and for EPOCH/SCHEDULE/FIXED, which never
         # consult it. _build_part_b and the retarget mirrors below want an int; for these
@@ -2231,6 +2282,9 @@ def _build_dmint_v1_mint_tx(
         raise ContractExhaustedError(
             f"V1 dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
+    never = _unreadable_target_reason(contract_utxo.script)
+    if never is not None:
+        raise ValidationError(never)
     if len(nonce) != 4:
         raise ValidationError(f"V1 nonce must be 4 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
@@ -2267,6 +2321,26 @@ def _build_dmint_v1_mint_tx(
             f"op_return_msg too long ({len(op_return_msg)} bytes); pyrxd encodes the message with "
             f"OP_PUSHDATA1, whose length field is one byte, so the cap is {MAX_OP_RETURN_MSG_BYTES}. "
             "This is an encoder limit, not a Radiant relay or consensus limit."
+        )
+
+    # The V1 covenant builds the next state from the spent one: ``04 NUM2BIN(height + 1, 4)``
+    # followed by every state byte after the height push, copied as-is (``c0 eb 55 7f 77 7e``),
+    # and requires the recreated output to carry exactly that. pyrxd rebuilds the next state from
+    # the parsed fields instead, so the two agree only if the spent state is what pyrxd's builder
+    # writes for those fields — check that before any grind, as the V2 path does.
+    spent_state = build_dmint_v1_state_script(
+        height=state.height,
+        contract_ref=state.contract_ref,
+        token_ref=state.token_ref,
+        max_height=state.max_height,
+        reward=state.reward,
+        target=state.target,
+    )
+    if contract_utxo.script[: len(spent_state) + 1] != spent_state + _OP_STATESEPARATOR:
+        raise ValidationError(
+            "V1 mint: the parsed state does not round-trip to the contract UTXO script (a non-canonical "
+            "encoding, or a state that does not match the script); the covenant copies the spent state's "
+            "bytes into the next one, so pyrxd cannot safely recreate it."
         )
 
     # --- Compute updated state. V1 has no DAA, so target is unchanged. ---

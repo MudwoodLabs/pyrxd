@@ -251,7 +251,7 @@ more errors printed the "funding can't cover" headline although neither is about
 the amount; each now has its own:
 
 - **The grind stopped without a nonce** (V2 claims; V1 rerolls its OP_RETURN
-  instead and reports `no nonce found within N preimage rerolls`). When the
+  instead and reports `no nonce found within N preimage rerolls` — see below). When the
   wall clock ran out — the bundled or in-process miner reaching `--timeout`, or an
   external `--miner-cmd` not answering within it:
 
@@ -262,12 +262,18 @@ the amount; each now has its own:
 
   When a count ran out instead (the in-process `--max-attempts` cap, or a miner
   that swept its nonce space): `error: mining stopped without finding a nonce`.
-  Its fix names a different `--op-return`, because the OP_RETURN is part of the
-  proof-of-work preimage and the claim time is not: running the same claim again
-  unchanged hands the miner the same preimage. With `--miner-cmd in-process` it
+  Its fix names a different `--op-return`, because the proof-of-work preimage binds
+  the contract, the funding script and the OP_RETURN: re-running with the same
+  inputs hands the miner the same preimage. With `--miner-cmd in-process` it
   also names `--max-attempts`, which reaches no other miner. Run
   `pyrxd glyph dmint-estimate` against the contract to see how long its target is
   likely to take on your machine.
+- **A V1 claim ran out of rerolls** (`no nonce found within N preimage rerolls`).
+  Reroll i grinds the `--op-return` value with i appended, so the same
+  `--op-return` repeats every search of the run before; the fix names a different
+  one. It names `--timeout` only when some grind was stopped by the clock (a swept
+  nonce space is not helped by more time), and `--max-attempts` only for
+  `--miner-cmd in-process`.
 - **The funding UTXO carries a token** (`InvalidFundingUtxoError` from the mint
   builder): `error: the funding UTXO carries a token and cannot pay for the mint`.
   The funding scan in (a) already skips token-bearing UTXOs, so this is the
@@ -280,10 +286,12 @@ the contract, before it scans the wallet or grinds:
   Every miner `claim-dmint` can use grinds and verifies SHA256d, including the
   external-miner protocol behind `--miner-cmd`, whose request carries no algorithm.
   Minting such a contract needs a miner for that hash; pyrxd does not ship one.
-- `error: this contract can never be minted` — a V2 contract whose target is wider
-  than the 8 bytes the covenant reads as a number. pyrxd deployed BLAKE3/K12 V2
-  contracts like that before 2026-09-23; no miner can mint one.
-  `pyrxd glyph dmint-estimate` refuses the same contract rather than print an ETA.
+- `error: this contract can never be minted` — a contract whose target the
+  covenant cannot read as a number: wider than 8 bytes, or not minimally encoded.
+  pyrxd deployed both before 2026-09-23 — BLAKE3/K12 V2 contracts with 33-byte
+  targets, and V1 contracts at difficulty 256 or more with the target pushed as a
+  fixed 8 bytes. No miner can mint one. `pyrxd glyph dmint-estimate` refuses the
+  same contract rather than print an ETA.
 
 All of these are mapped in `claim_dmint_cmd`, `_claim_prepare` and `_grind_stopped_error` in
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py).

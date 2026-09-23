@@ -278,6 +278,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one still byte-verifies it against the baked Part B and fails fast, naming the baked
   value, before the PoW grind.
 
+- **Every V1 dMint contract pyrxd deployed at difficulty 256 or more can never be minted.**
+  `build_dmint_v1_state_script` pushed the target as a fixed `08` + 8 bytes. The V1
+  epilogue compares that item with the proof-of-work number as it was pushed
+  (`… 81 76 00 a2 69 a2 69`; `OP_BIN2NUM` normalises the hash window, never the target), and
+  Radiant reads the operand only if it is minimally encoded. Below 2**55 — difficulty 256 or
+  more — an 8-byte push is not minimal, so every mint of such a contract aborts, whichever
+  miner found the nonce. This dates from the V1 builder's first version (0.5.0, 2026-05-10).
+  The target is now pushed with `pushMinimal`, as Photonic's V1-era `dMintScript` builds it
+  (`packages/lib/src/script.ts` at `c8540a6`); a transcription of that builder agrees byte for
+  byte at every push width, from `OP_1` to 8 bytes. At difficulty 255 or less the bytes are
+  unchanged. A contract pyrxd already deployed with the non-minimal push can never be minted:
+  the mint builder, `claim-dmint` and `dmint-estimate` now refuse it in those words, before any
+  grind. The same check refuses a negative target.
+
+  The V1 parser had the mirror defect: it accepted only the `08` push, so it could not read
+  the V1 contracts Photonic deployed at difficulty 256 or more. A corpus of mainnet V1
+  contract scripts read on 2026-09-22 holds 2,177 distinct scripts; the parser before this
+  change read 1,875 of them and refused the other 302 (difficulty 256 to 1,000,000, 6- and
+  7-byte targets, two of them minted over a thousand times). All 2,177 now parse — the 1,875 to the same
+  state as before — and rebuild byte for byte through pyrxd's builder and the Photonic
+  transcription. None carries a non-minimal target.
+
+- **V1 deploys refused `max_height` and `reward` above 0xFFFFFF.** The "3-byte ceiling" came
+  from the push widths on the first V1 contracts pyrxd decoded, not from any covenant rule:
+  the V1 epilogue reads both as script numbers exactly as V2 does. It refused deploys Photonic
+  builds — mainnet V1 contracts carry max heights of 300,000,000 and 696,969,000,000 and a
+  reward of 888,888,888. V1 now has V2's bounds for the three numbers they share
+  (`max_height` ≤ 2**63 − 1, `reward` ≤ Radiant's money supply, `difficulty` ≤
+  `MAX_SHA256D_TARGET`), from one function, and `deploy-dmint` names the flag. A V1 contract
+  stores its height in 4 bytes and cannot pass height 2**31 − 1, so with a `max_height` above
+  2**31 its last mints cannot happen; pyrxd builds such deploys, as Photonic does.
+
+- **A V2 contract's algorithm was read from a tag the covenant never reads.** The V2 state
+  carries an `algoId`, but the hash the covenant runs is the opcode after Part A. The parser
+  reported the tag, so a contract tagged SHA256D whose covenant runs `OP_BLAKE3` passed every
+  SHA256d-only check and `build_dmint_mint_tx` built a mint for it. The parser now takes the
+  algorithm from the opcode and refuses a script whose tag disagrees, naming both; the mint
+  builder refuses a code section that does not open with that template. On a 2026-09-22
+  survey of 53,501 mainnet V2 contract scripts, none is refused and every one parses to the
+  same state as before.
+
 - **Every V2 BLAKE3 or K12 dMint deploy was unmineable from birth.**
   `DmintDeployParams.initial_target` gave BLAKE3 and K12 `(2**256 - 1) // difficulty` — for
   any difficulty below 2**192 a number wider than 8 bytes. Part B2 reads the target as a
@@ -291,7 +332,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before and 0 after, 9,186 byte-identical sets stayed identical, and 8 BLAKE3/K12 EPOCH
   sets that pyrxd used to refuse now build identically too. Three BLAKE3/K12 V2 contracts on
   mainnet (DM03, RXD2026, VGM) now rebuild byte for byte from their declared difficulty;
-  DM03 and VGM have been minted on chain. `MAX_V2_TARGET_256` is kept for imports but is
+  all three have been minted on chain. `MAX_V2_TARGET_256` is kept for imports but is
   no dMint bound.
 
   A contract pyrxd deployed with the old target can never be minted, by any miner. The
@@ -307,10 +348,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   BLAKE3 or K12 contract (several are live on mainnet) ground SHA256d for the whole
   expected time and built a mint the node would reject. It now refuses such a contract
   right after reading it — before the wallet's UTXO scan, the funding scan and any grind —
-  naming the algorithm. In the SDK, `mine_solution_dispatch(algo=...)` used to drop `algo`
-  on the external-miner path; both paths now raise `NotImplementedError` for BLAKE3/K12, as
-  `mine_solution` already did, and `mine_solution_external` takes `algo=` and does the same
-  before spawning anything. SHA256d claims, V1 and V2, are unchanged.
+  naming the algorithm, and passes the contract's algorithm to whichever grinder it runs, so
+  each would refuse too. In the SDK, `mine_solution_dispatch(algo=...)` used to drop `algo`
+  on the external-miner path; given `algo=` BLAKE3 or K12, both paths now raise
+  `NotImplementedError`, as `mine_solution` already did, and `mine_solution_external` takes
+  `algo=` and does the same before spawning anything. SHA256d claims, V1 and V2, are
+  unchanged. **The SDK grinders compute SHA256d only.** `mine_solution`,
+  `mine_solution_dispatch` and `mine_solution_external` default to `algo=SHA256D`, and
+  `pyrxd.contrib.miner.parallel.mine` has no algorithm at all: a raw preimage does not say
+  which hash its contract runs, so called without the contract's `algo` they grind SHA256d
+  for any contract. A caller mining a BLAKE3 or K12 contract must not use them
+  (`docs/concepts/parallel-mining.md`, "SHA256d only").
 
 - **V2 deploy parameters had no upper bounds.** `max_height`, `reward`, `target_time`,
   `half_life`, `epoch_length`, SCHEDULE heights and `difficulty` were accepted at any size,
@@ -321,25 +369,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_height`, `half_life` (ASERT), `epoch_length` (EPOCH) and schedule heights above
   2**63 - 1; `reward` above Radiant's money supply; `difficulty` above `MAX_SHA256D_TARGET`;
   and `target_time` above 0xFFFFFFFF seconds in ASERT, LWMA and EPOCH, whose retarget
-  compares it with the gap between two 32-bit timestamps, so a larger one is a spacing no
-  mint can meet. FIXED and SCHEDULE never read `target_time` as a number, so there it is
+  compares it with the gap between two timestamps that are each below 2**31 in any mint the
+  covenant accepts, so a larger one is a spacing no mint can meet. FIXED and SCHEDULE never read `target_time` as a number, so there it is
   held only to the encoder's 8 bytes. Every value on the mainnet V2 deploys surveyed (and
   every value Photonic's Mint form offers) is well inside every bound. Independently, the
   minimal-push encoder behind every dMint number now refuses anything wider than 8 bytes,
   whichever builder asks — in-range output is unchanged. `deploy-dmint --help` claimed
-  `[1..0xFFFFFF]` for `--max-height` and `--reward`; only V1 enforces that, and the help now
-  says which bound is which version's. V1 `difficulty` is now capped at the parameter stage
-  too; a target of 0 used to be refused only while the deploy was being built.
+  `[1..0xFFFFFF]` for `--max-height` and `--reward`; it now gives the bounds above, which V1
+  shares (see the V1 entry). V1 `difficulty` is now capped at the parameter stage too; a
+  target of 0 used to be refused only while the deploy was being built.
 
 - **`claim-dmint` reported a V2 mining timeout as a funding shortfall.** A grind that hit
   `--timeout` (or ran out of attempts) raised `MaxAttemptsError`, a `DmintError`, which
   landed in the "funding can't cover the mint reward + fee — fund the reward address" arm.
   It now says `mining timed out after <N>s without finding a nonce` and how to allow longer
   (`--timeout`), or, when a count rather than the clock ran out, `mining stopped without
-  finding a nonce`, with a remedy that changes the search: a different `--op-return`, which
-  is part of the proof-of-work preimage (the claim time is not, so rerunning the same claim
-  repeats the same preimage), and, for `--miner-cmd in-process` only, a higher
-  `--max-attempts`. The funding message's remedy named `--fee-rate`, which `claim-dmint`
+  finding a nonce`, with a remedy that changes the search: a different `--op-return` (the
+  preimage binds the contract, the funding script and the OP_RETURN, so re-running with the
+  same inputs repeats the same preimage), and, for `--miner-cmd in-process` only, a higher
+  `--max-attempts`. A V1 claim that exhausts its rerolls said "raise --max-rerolls or
+  --timeout"; its rerolls are deterministic (reroll i appends i to the OP_RETURN), so a rerun
+  repeats every search first. It now names a different `--op-return`, names `--timeout` only
+  if some grind was stopped by the clock, and `--max-attempts` only for the in-process miner.
+  The `--op-return` help said "rerolled on nonce exhaustion", which only V1 does; it now says
+  so. The funding message's remedy named `--fee-rate`, which `claim-dmint`
   does not have; it now gives the amount to fund (the reward + the fee + 546 photons in one
   UTXO), and says lowering the configured `fee_rate` helps only if it was raised above the
   relay floor, which is the default and the lowest the config accepts. `claim-dmint` also
