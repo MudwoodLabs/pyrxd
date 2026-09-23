@@ -73,9 +73,13 @@ _REQUIRED_CHECKS = (
 #: A required check whose workflow does not exist on this branch yet, with the file that
 #: will produce it. Strict: once the file exists, the pending test fails until the name
 #: moves into `_REQUIRED_CHECKS`, so it cannot sit here unguarded.
-_PENDING_REQUIRED_CHECKS = {
-    "leak-scan": "leak-scan.yml",  # added by PR #717
-}
+_PENDING_REQUIRED_CHECKS: dict[str, str] = {}
+
+#: Checks guarded exactly like the required ones (every PR base, no path filter) that branch
+#: protection does NOT require yet. REVIEWED, like `_REQUIRED_CHECKS`: `leak-scan` arrived with
+#: #717 on 2026-09-22 and was not in the required contexts read that day. When branch protection
+#: lists it, move it into `_REQUIRED_CHECKS`; until then this name is the honest place for it.
+_GUARDED_NOT_YET_REQUIRED = ("leak-scan",)
 
 #: A condition that reads the PR's base branch can reintroduce the filter one level down.
 _BASE_REF_IN_CONDITION = re.compile(r"\bbase_ref\b|pull_request\.base\.ref\b")
@@ -195,7 +199,7 @@ def test_no_job_or_step_condition_filters_on_the_base_branch(path: Path) -> None
     assert not offending, f"{path.name}: conditions that read the PR's base branch: {offending}"
 
 
-@pytest.mark.parametrize("check", _REQUIRED_CHECKS)
+@pytest.mark.parametrize("check", (*_REQUIRED_CHECKS, *_GUARDED_NOT_YET_REQUIRED))
 def test_every_required_check_runs_on_every_pull_request(check: str) -> None:
     """A required check must report on every PR: no base filter and no path filter. A path
     filter on a required check's workflow leaves a docs-only PR waiting for a check that will
