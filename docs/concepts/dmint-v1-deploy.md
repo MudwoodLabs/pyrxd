@@ -24,7 +24,10 @@ contracts** sharing one `tokenRef`:
 
 The miner side is unchanged from a single-contract mint: any holder
 picks one of the N contract UTXOs, finds a PoW nonce, spends it, and
-re-creates it at `height+1` with the same `tokenRef`. Total supply is
+re-creates it at `height+1` with the same `tokenRef`. The mint that
+takes a contract to `max_height` re-creates nothing: it burns the
+contract instead, leaving `d8 <contractRef> 6a` at 0 photons in its
+place, and pays the reward as any other mint does. Total supply is
 `num_contracts × max_height × reward_photons`.
 
 As of 0.9.0, V2 dMint is **consensus-validated and mainnet-proven** across all

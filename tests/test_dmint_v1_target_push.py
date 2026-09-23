@@ -432,13 +432,15 @@ class TestANonMinimalTargetIsRefused:
         )
         assert _unreadable_target_reason(legacy) is None
 
-    def test_a_v1_state_that_does_not_round_trip_is_refused_before_any_grind(self) -> None:
+    def test_a_non_minimal_v1_push_or_a_stale_state_is_refused_before_any_grind(self) -> None:
         """The V1 covenant copies the spent state's bytes after the height into the next state;
-        pyrxd rebuilds them from the parsed fields. The mint builder refuses where the two could
-        differ: a script whose numbers are pushed non-canonically (since 2026-09-23 refused
-        first, by name, by the judgement every mint crosses: a non-minimal maxHeight is a number
-        the covenant cannot read), and a DmintContractUtxo whose state does not match its script
-        (the round-trip check)."""
+        pyrxd rebuilds them from the parsed fields. The mint builder refuses, before any grind,
+        both inputs where the two could differ: a script whose numbers are pushed non-canonically
+        (since 2026-09-23 refused first, by name, by the judgement every mint crosses: a
+        non-minimal maxHeight is a number the covenant cannot read), and a DmintContractUtxo
+        whose state does not match its script (refused by the state/script check, which compares
+        the state with the script's own parse). The builder's byte round-trip check, after both,
+        refuses neither; nothing reaches it today."""
         today = build_dmint_v1_contract_script(0, _C, _T, max_height=100, reward=1000, target=MAX_SHA256D_TARGET)
         i = today.index(_push_minimal(100), 79)
         padded = today[:i] + b"\x02\x64\x00" + today[i + 2 :]  # max_height 100 as 2 bytes

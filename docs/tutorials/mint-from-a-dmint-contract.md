@@ -290,9 +290,9 @@ loop, you can replay it through any other broadcast path.
 ## Step 4 — Inspect the unsigned tx (optional but recommended)
 
 Paste the raw tx hex from Step 3 into the browser inspect tool
-(`/inspect/`). For any mint but a contract's final one, the
-structural-match qualifier will identify it as a **V1 dMint claim**
-and break the four outputs down:
+(`/inspect/`). For any mint but a contract's final one, the page's
+summary says "This is a dMint claim transaction (height N of M)",
+and the rows break the four outputs down:
 
 - `vout[0]` — the recreated contract UTXO at `height+1` (1 photon).
   On the contract's final mint it is instead the burn

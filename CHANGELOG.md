@@ -57,10 +57,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   contract (its 1-photon value; on V2 a readable `lastTime` and a target above 1) are not
   applied to the final mint, which recreates none; everything the covenant still evaluates is.
   `pyrxd glyph claim-dmint` builds it through the same path, says in its pre-grind summary that
-  the claim burns the contract, and reports `final_mint` in `--json`. Pointed at a contract's
-  outpoint after its final mint, `claim-dmint` and `dmint-estimate` now say it holds the burn
-  rather than "not a dMint contract", and `dmint-estimate` says when the next claim is the
-  final one. Proven on a Radiant Core v3.1.2 regtest node for V1, V2 FIXED, and V2 ASERT and
+  the claim burns the contract, and reports `final_mint` in `--json`. Pointed at the burn a
+  final mint leaves (`--contract <final-mint txid>:0`), `claim-dmint` and `dmint-estimate` now
+  say it is a burned singleton rather than "not a dMint contract"; the contract outpoint that
+  final mint spent still reads as a contract. `dmint-estimate` also says when the next claim is
+  the final one. Proven on a Radiant Core v3.1.2 regtest node for V1, V2 FIXED, and V2 ASERT and
   LWMA contracts whose first mint is their last: the final mint is accepted and mined and the
   contract output is gone; the same final mint recreating the contract instead, with the same
   nonce, is rejected on the script. Five mainnet V1 final mints, rebuilt from the contracts they
