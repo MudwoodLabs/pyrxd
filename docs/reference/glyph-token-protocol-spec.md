@@ -193,7 +193,7 @@ The push opcode for the CBOR body MUST be selected by length
 
 A parser MUST locate the envelope by walking the scriptSig's pushes and taking the
 push immediately **after** a push equal to `gly`
-(`src/pyrxd/glyph/inspector.py:256-360`). It MUST NOT assume the marker is at a
+(`src/pyrxd/glyph/inspector.py` `GlyphInspector._parse_reveal_scriptsig`, over `GlyphInspector._walk_pushes`). It MUST NOT assume the marker is at a
 fixed offset, and it MUST support all four push opcodes — a walker that stops at
 `0x4e` never reaches the marker on the mainnet token above.
 
@@ -1289,7 +1289,7 @@ d0 8b87c3c7…43a4 00000000                tokenRef    = commit:0
 ```
 
 then the 145-byte code epilogue beginning `bd`. The full bytes are pinned at
-`tests/test_dmint_v1_deploy.py:1126-1168`.
+`tests/test_dmint_v1_deploy.py` `TestV1GoldenVectorGlyphPattern._GLYPH_CONTRACT_0_HEX`.
 
 **Verifying this yourself.** Every value above is reproducible from the repository:
 
@@ -1443,8 +1443,8 @@ transaction in CI. The anchors:
 | NFT lock (63 B) | `27390efa…be7e` vout 0 | `tests/test_glyph.py:130-196` |
 | Commit script, both variants (75 B) | `a443d9df…878b` vouts 0 and 33 | `tests/test_glyph_dmint.py:171-240` |
 | CBOR envelope + reveal framing (65,569 B) | `b965b32d…9dd6` vin 0 | `tests/test_glyph.py:436-525` |
-| dMint V1 contract (241 B) | `b965b32d…9dd6` vout 0 | `tests/test_dmint_v1_deploy.py:1098-1214` |
-| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py:252-289` |
+| dMint V1 contract (241 B) | `b965b32d…9dd6` vout 0 | `tests/test_dmint_v1_deploy.py` `TestV1GoldenVectorGlyphPattern` |
+| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py` `TestBuildDmintV1FtOutputScript` |
 | dMint V2 contract, FIXED (380 B) | `95335028…bb16fb09` vout 0 | `tests/test_dmint_v2_mainnet_golden.py:23-68` |
 | Mutable NFT body (102 B) | Photonic `parseMutableScript` reference | `tests/test_glyph_v2.py:112-121` |
 | Container lock (63 B) + `in` envelope | frozen goldfile | `tests/test_golden_vectors.py`, `TestFrozenContainerVectors` |
