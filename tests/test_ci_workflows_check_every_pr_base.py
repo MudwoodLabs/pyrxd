@@ -227,3 +227,6 @@ def test_pending_required_checks_are_still_pending() -> None:
         f"{arrived} now exist. Move each check name from _PENDING_REQUIRED_CHECKS into "
         f"_REQUIRED_CHECKS in {Path(__file__).name} (and confirm branch protection requires it)."
     )
+
+
+# Throwaway: a trivial change for the stacked-PR proof of #718. Never merged.
