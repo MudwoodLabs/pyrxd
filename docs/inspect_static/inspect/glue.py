@@ -1,10 +1,12 @@
 """Pyodide-side glue between the browser UI and the ``pyrxd.glyph.inspect`` façade.
 
 This module is loaded into the Pyodide WASM runtime by ``inspect.js`` and
-exposes two entry points — :func:`run` for offline classification of a
-user-pasted string, and :func:`inspect_txid_with_raw` for classifying a
-transaction whose raw bytes JS already fetched. Both return a
-JSON-serialisable dict that the JS side renders without further parsing.
+exposes, among others, :func:`run` for offline classification of a
+user-pasted string, :func:`inspect_txid_with_raw` for classifying a
+transaction whose raw bytes JS already fetched, and
+:func:`spent_output_binding` for checking a reveal's payload against the
+commit it spent. Each returns a JSON-serialisable dict that the JS side
+renders without further parsing.
 
 Design rules:
 
@@ -183,136 +185,40 @@ def _inspect_txid_offline(value: str) -> dict:
     }
 
 
-class _SpentTxUnusable(Exception):
-    """The spent transaction was supplied and could not be used. ``str()`` says why."""
+def _whole_number(name: str, value: object) -> int | dict | None:
+    """*value* as a non-negative int, ``None`` for ``None``, or an ``_err`` dict.
 
-
-#: Why ``payload_binding`` is ``unchecked`` when the spent transaction never reached this
-#: module, or reached it and was refused. The classifier's own ``unchecked`` reason says it
-#: "was not supplied" — true for a caller that never fetched it, and FALSE for a page that
-#: asked, was answered, and refused the answer. That page used to print it anyway, because
-#: every failure here was swallowed and the first payload's reason stood.
-_SPENT_NOT_OBTAINED = (
-    "the page asked the server for the spent transaction and did not get one it could use, "
-    "so the payload was not checked against the commit that committed to it"
-)
-_SPENT_REFUSED = (
-    "the spent transaction was supplied but could not be used, so the payload was not "
-    "checked against the commit that committed to it"
-)
-
-
-def _binding_against_spent(txid: str, raw: bytes, payload: dict, prev_raw_hex: str) -> dict | None:
-    """``payload_binding`` computed against the supplied spent transaction.
-
-    ``None`` when the payload attributes no input, so there is nothing to bind. Raises
-    :class:`_SpentTxUnusable` when the supplied bytes cannot stand in for the transaction the
-    attributed input spent.
-
-    THE SERVER-HONESTY CHECK, the one the first fetch already gets. ``classify_raw_tx`` refuses
-    a transaction whose hash is not the txid that was asked for, and the CLI's ElectrumX client
-    refuses one on every fetch. This second fetch had neither: a server asked for the commit
-    could hand back ANY transaction, including one it built with a commit to the envelope on
-    screen, and ``payload_binding`` read ``bound`` for a payload the real commit never committed
-    to. The txid a transaction is known by is ``hash256`` of its own bytes, so binding the
-    answer to the question needs no parser and cannot itself be fooled by one.
-
-    Only ``payload_binding`` is taken from the second classification. It is the one field
-    ``spent_scripts`` affects (``_classify_raw_tx`` reads it in exactly one place), so the
-    second pass classifies one output and checks no signatures: re-running every output, with
-    every signature check, to recompute one field of the metadata was the most expensive way
-    to do it. ``tests/web/test_inspect_spent_tx_is_checked.py`` pins the graft equal to a full
-    re-run.
+    Arrives from JavaScript, so it is checked here rather than trusted: a JS number that is not
+    a whole, non-negative integer is refused, not rounded.
     """
-    from pyrxd.hash import hash256
-    from pyrxd.transaction import Transaction
-
-    metadata = payload.get("metadata") or {}
-    outpoint = metadata.get("input_outpoint")
-    input_index = metadata.get("input_index")
-    if not outpoint or input_index is None:
+    if value is None:
         return None
-    prev_txid, _, vout_str = str(outpoint).rpartition(":")
-
-    text = prev_raw_hex.strip()
-    if not text:
-        raise _SpentTxUnusable("it is empty")
-    if len(text) > _MAX_RAW_HEX_CHARS:
-        raise _SpentTxUnusable(f"it is {len(text):,} hex characters, larger than any transaction")
-    try:
-        prev_raw = bytes.fromhex(text)
-    except ValueError as exc:
-        raise _SpentTxUnusable(f"it is not valid hex ({_safe_error(exc)})") from exc
-    got = hash256(prev_raw)[::-1].hex()
-    if got != prev_txid.lower():
-        raise _SpentTxUnusable(f"it is not the transaction this input spent: it hashes to {got}")
-    prev_tx = Transaction.from_hex(prev_raw)
-    if prev_tx is None:
-        raise _SpentTxUnusable("it does not parse as a transaction")
-    vout = int(vout_str)
-    if not 0 <= vout < len(prev_tx.outputs):
-        raise _SpentTxUnusable(f"it has no output {vout} ({len(prev_tx.outputs)} output(s))")
-    script = bytes(prev_tx.outputs[vout].locking_script.serialize())
-    again = _inspect.classify_raw_tx(
-        txid,
-        raw,
-        network=_PAGE_NETWORK,
-        spent_scripts={int(input_index): script},
-        only_vout=0 if payload.get("output_count") else None,
-        attest_hashmark_limit=0,
-    )
-    return (again.get("metadata") or {}).get("payload_binding")
-
-
-def _attach_spent_binding(txid: str, raw: bytes, payload: dict, prev_raw_hex: str, prev_fetch_error: str) -> None:
-    """Replace the first pass's ``payload_binding`` with the answer the page actually has.
-
-    Never raises. A failure here must leave the rest of the report standing — it is still
-    true — and must SAY what happened rather than let the classifier's "was not supplied"
-    stand for a transaction that was supplied, or asked for, and could not be used.
-    """
-    metadata = payload.get("metadata") if isinstance(payload, dict) else None
-    if not isinstance(metadata, dict) or not metadata.get("input_outpoint"):
-        return  # no attributed input: nothing binds, whatever was or was not supplied
-    if not prev_raw_hex:
-        metadata["payload_binding"] = {
-            "state": "unchecked",
-            "reason": _SPENT_NOT_OBTAINED,
-            "detail": prev_fetch_error,
-        }
-        return
-    try:
-        binding = _binding_against_spent(txid, raw, payload, prev_raw_hex)
-    except _SpentTxUnusable as exc:
-        binding = {"state": "unchecked", "reason": _SPENT_REFUSED, "detail": str(exc)}
-    except Exception as exc:  # any other failure: the same honest state, with what went wrong
-        binding = {"state": "unchecked", "reason": _SPENT_REFUSED, "detail": _safe_error(exc)}
-    if binding is not None:
-        metadata["payload_binding"] = binding
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return _err(f"{name} must be a whole number >= 0, got {value!r}", form="error")
+    return value
 
 
 def inspect_txid_with_raw(
     txid: str,
     raw_hex: str,
-    prev_raw_hex: str = "",
     attest_hashmark_limit: object = None,
-    prev_fetch_error: object = "",
+    max_rows: object = None,
 ) -> dict:
     """Classify a transaction whose raw bytes JS already fetched.
 
-    *prev_raw_hex*, when given, is the raw transaction containing the output that
-    the attributed reveal input SPENT — the commit whose ``payload_hash`` is the
-    only thing that binds the displayed envelope to anything. The page fetches it
-    on a second round trip after reading ``metadata.input_outpoint`` out of the
-    first pass. Without it ``payload_binding`` can only read ``unchecked``, so this
-    parameter is what makes the check reachable in the browser at all rather than
-    only from a library caller. It is hash-checked against the outpoint's txid here
-    before anything is read out of it — see :func:`_binding_against_spent`.
+    *attest_hashmark_limit*: check the signatures of only the first N HashMark records (see
+    ``classify_raw_tx``). Both pages pass the number of records they draw, so the curve work one
+    linked transaction can demand of a stranger's tab is bounded by what is shown.
 
-    *prev_fetch_error*, when *prev_raw_hex* is empty, is why the page has no spent
-    transaction to hand over: its fetch was refused or never answered. It becomes the
-    ``detail`` of an ``unchecked`` verdict that says the page ASKED — rather than the
-    classifier's "was not supplied", which is what a caller that never asked is told.
+    *max_rows*: list at most N entries of each list the transaction produces, and count the rest
+    exactly under a ``*_not_listed`` key beside each list (see ``classify_raw_tx``). /inspect/
+    passes the number of rows it draws, so what crosses into JavaScript — and what the page then
+    converts, draws and puts in its raw-JSON drawer — is bounded by it. ``None`` lists everything.
+
+    The payload binding is NOT decided here: :func:`spent_output_binding` does that, once the
+    page has fetched the transaction the reveal spent.
 
     The JS side opens a WebSocket to the configured ElectrumX server,
     sends ``blockchain.transaction.get`` for ``txid``, and hands the
@@ -329,27 +235,12 @@ def inspect_txid_with_raw(
     """
     if not isinstance(txid, str) or not isinstance(raw_hex, str):
         return _err("txid and raw_hex must both be strings", form="error")
-    # JavaScript's null arrives as None: the same "nothing here" as the empty string.
-    prev_raw_hex = "" if prev_raw_hex is None else prev_raw_hex
-    if not isinstance(prev_raw_hex, str):
-        return _err("prev_raw_hex must be a string", form="error")
-    prev_fetch_error = "" if prev_fetch_error is None else str(prev_fetch_error)
-    # *attest_hashmark_limit*: check the signatures of only the first N HashMark records (see
-    # ``classify_raw_tx``). The public verify page passes the number of records it draws, so the
-    # work one linked transaction can demand of a stranger's tab is bounded by what is shown.
-    # Arrives from JavaScript, so it is checked here rather than trusted: a JS number that is not
-    # a whole, non-negative integer is refused, not rounded.
-    if attest_hashmark_limit is not None:
-        if isinstance(attest_hashmark_limit, float) and attest_hashmark_limit.is_integer():
-            attest_hashmark_limit = int(attest_hashmark_limit)
-        if (
-            isinstance(attest_hashmark_limit, bool)
-            or not isinstance(attest_hashmark_limit, int)
-            or attest_hashmark_limit < 0
-        ):
-            return _err(
-                f"attest_hashmark_limit must be a whole number >= 0, got {attest_hashmark_limit!r}", form="error"
-            )
+    attest_hashmark_limit = _whole_number("attest_hashmark_limit", attest_hashmark_limit)
+    if isinstance(attest_hashmark_limit, dict):
+        return attest_hashmark_limit
+    max_rows = _whole_number("max_rows", max_rows)
+    if isinstance(max_rows, dict):
+        return max_rows
 
     txid = txid.strip().lower()
     raw_hex = raw_hex.strip()
@@ -381,7 +272,7 @@ def inspect_txid_with_raw(
 
     try:
         payload = _inspect.classify_raw_tx(
-            txid, raw, network=_PAGE_NETWORK, attest_hashmark_limit=attest_hashmark_limit
+            txid, raw, network=_PAGE_NETWORK, attest_hashmark_limit=attest_hashmark_limit, max_rows=max_rows
         )
     except Exception as exc:
         return _err(
@@ -393,14 +284,6 @@ def inspect_txid_with_raw(
                 "servers. Other errors usually mean the bytes are malformed."
             ),
         )
-
-    # SECOND STEP, only when the page has something to say about the spent transaction —
-    # its bytes, or why it has none. Outside the try above on purpose: nothing here may take
-    # the first payload down (the rest of the report is still true), and nothing here may be
-    # swallowed either. It used to be `except Exception: pass`, which left the classifier's
-    # "was not supplied" on screen for a transaction that WAS supplied and failed.
-    if prev_raw_hex or prev_fetch_error:
-        _attach_spent_binding(txid, raw, payload, prev_raw_hex, prev_fetch_error)
 
     # Annotate metadata strings with homoglyph / script-mixing warnings.
     # The control-byte sanitizer runs in the next step, but it doesn't
@@ -461,6 +344,58 @@ def inspect_txid_with_raw(
         "input": txid,
         "payload": sanitized,
     }
+
+
+def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", prev_fetch_error: object = "") -> dict:
+    """``payload_binding`` for the reveal *raw_hex* carries, against the transaction it spent.
+
+    The page's SECOND step, after :func:`inspect_txid_with_raw` has classified the transaction and
+    named ``metadata.input_outpoint``: the page fetches that outpoint's transaction and hands it
+    here as *prev_raw_hex* — or, when the fetch was refused, unanswered, or answered with bytes
+    that are not that transaction, hands ``""`` and says why in *prev_fetch_error*.
+
+    It does NOT classify the transaction again. Re-running the whole classifier to change one
+    field of its metadata was what this step used to cost; the answer comes from
+    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope and
+    the one output it spent, and which the CLI's ``--fetch`` calls too. The spent transaction is
+    hash-checked there against the txid in the outpoint before anything is read out of it.
+
+    Returns ``{"ok": True, "binding": {...}}`` — ``binding`` is ``None`` when no input is
+    attributed a payload — or the usual ``{"ok": False, ...}``. Never raises.
+    """
+    if not isinstance(txid, str) or not isinstance(raw_hex, str):
+        return _err("txid and raw_hex must both be strings", form="error")
+    # JavaScript's null arrives as None: the same "nothing here" as the empty string.
+    prev_raw_hex = "" if prev_raw_hex is None else prev_raw_hex
+    if not isinstance(prev_raw_hex, str):
+        return _err("prev_raw_hex must be a string", form="error")
+    prev_fetch_error = "" if prev_fetch_error is None else str(prev_fetch_error)
+    raw_hex = raw_hex.strip()
+    if len(raw_hex) > _MAX_RAW_HEX_CHARS:
+        return _err(f"raw_hex too long ({len(raw_hex):,} chars); cap is {_MAX_RAW_HEX_CHARS:,}", form="error")
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError as exc:
+        return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
+
+    spent_raw: bytes | None = None
+    text = prev_raw_hex.strip()
+    if text:
+        if len(text) > _MAX_RAW_HEX_CHARS:
+            prev_fetch_error = f"the answer is {len(text):,} hex characters, larger than any transaction"
+        else:
+            try:
+                spent_raw = bytes.fromhex(text)
+            except ValueError as exc:
+                prev_fetch_error = f"the answer is not valid hex ({_safe_error(exc)})"
+    elif not prev_fetch_error:
+        prev_fetch_error = "the page handed over no spent transaction and no reason"
+
+    try:
+        binding = _inspect.spent_output_binding(txid.strip().lower(), raw, spent_raw, spent_error=prev_fetch_error)
+    except Exception as exc:
+        return _err(_safe_error(exc), form="error")
+    return {"ok": True, "binding": _sanitize_payload_strings(binding)}
 
 
 # Whether a Letter codepoint is Latin-script (A-Z, a-z, plus Latin

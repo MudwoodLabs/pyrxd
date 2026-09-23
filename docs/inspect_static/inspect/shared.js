@@ -403,6 +403,7 @@ _pyrxd_version_blob = (
     bridges = {
       run: glue.run,
       inspectTxidWithRaw: glue.inspect_txid_with_raw,
+      spentOutputBinding: glue.spent_output_binding,
       markAnchor: glue.mark_anchor,
       fileCheckPlan: glue.file_check_plan,
       judgeFileDigest: glue.judge_file_digest,

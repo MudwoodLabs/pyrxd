@@ -1,23 +1,30 @@
-"""/inspect/'s "Fetch from network" flow, end to end: what the page fetches, what it hands the
-classifier, and what the classifier then says.
+"""/inspect/'s "Fetch from network" flow, end to end: what the page fetches, what it hands each
+Python bridge, and what it then DRAWS.
 
 ``inspect_fetch_flow_harness.mjs`` runs the page's own ``onFetchTxid`` against a stub ElectrumX
-server and records every argument it passes to the classifier bridge. These tests REPLAY those
-recorded arguments through the real ``glue.inspect_txid_with_raw`` — so what is asserted is the
-verdict the real classifier gives for the arguments the real page passed, not for arguments a
-test chose. ``test_inspect_spent_tx_is_checked.py`` covers the Python half on its own.
+server and records every argument it passes to the two bridges — the classifier
+(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_binding``). Each bridge
+answers from a canned list, and every canned answer here is computed by the REAL ``glue.py`` on
+the arguments the page really passed: a first run records the binding step's arguments, the real
+glue answers them, and a second run renders that answer after checking the page passed the same
+arguments again. So the rendered text asserted on is what the page draws for the real answer —
+not the harness's own "no canned result" error card, which is where every flow used to end.
+``test_inspect_spent_tx_is_checked.py`` covers the Python half on its own.
 
-Three properties, each a defect this change fixes:
+Properties, each a defect this change fixes:
 
 * **A server that answers with a different transaction is refused, on every fetch.** The page's
   second fetch — the commit a reveal spent — was checked by nothing, so a server could answer
   with a transaction of its own carrying a commit to the envelope on screen and the page printed
   ``bound``. The check now lives in ``fetchRawTxFromElectrumx``, which every raw fetch on both
   pages goes through.
-* **A spent transaction the page could not get is SAID, not swallowed.** The refusal travels to
-  Python as ``prev_fetch_error`` and becomes the verdict's ``detail``; the report no longer says
-  the spent output "was not supplied" when the page asked for it.
-* **The page passes its row limit as the signature-checking limit on every classification.**
+* **A spent transaction the page could not get is SAID, not swallowed** — in the drawn
+  ``payload binding`` row and its ``detail``, not "was not supplied".
+* **The binding step does not classify the transaction again.** It used to be a second full
+  ``inspect_txid_with_raw``; it is one ``spent_output_binding`` call.
+* **A failed first fetch is advised by what failed.** A server that answered with a different
+  transaction was reachable, and is not told to be checked for reachability.
+* **The page passes its row limit as the classifier's checking limit AND its listing limit.**
 """
 
 from __future__ import annotations
@@ -55,20 +62,6 @@ def _glue():
     sys.modules["pyrxd_inspect_glue_flow"] = module
     spec.loader.exec_module(module)
     return module
-
-
-def _flow(txid: str, server: dict, glue_returns: list) -> dict:
-    proc = subprocess.run(  # nosec B603 — fixed argv, no shell, repo-local script
-        [_require_node(), str(_HARNESS)],
-        input=json.dumps({"txid": txid, "server": server, "glue_returns": glue_returns}),
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=str(_REPO_ROOT),
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"fetch-flow harness failed (exit {proc.returncode}):\n{proc.stderr}")
-    return json.loads(proc.stdout)
 
 
 def _envelope(name: str) -> tuple[bytes, bytes]:
@@ -122,71 +115,120 @@ def limit() -> int:
     return n
 
 
-def _first_pass(reveal, limit: int) -> dict:
+def _first_pass(tx, limit: int) -> dict:
     """What the page's FIRST classification returns — the real one, computed by the real glue on
     the arguments the flow is asserted (below) to pass."""
-    return _glue().inspect_txid_with_raw(reveal.txid(), reveal.serialize().hex(), "", limit)
+    return _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), limit, limit)
 
 
-def _replay(call: list) -> dict:
-    result = _glue().inspect_txid_with_raw(*call)
-    assert result["ok"], result
-    return result
+def _flow(txid: str, server: dict, glue_returns: list, binding_returns: list | None = None) -> dict:
+    proc = subprocess.run(  # nosec B603 — fixed argv, no shell, repo-local script
+        [_require_node(), str(_HARNESS)],
+        input=json.dumps(
+            {"txid": txid, "server": server, "glue_returns": glue_returns, "binding_returns": binding_returns or []}
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(_REPO_ROOT),
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"fetch-flow harness failed (exit {proc.returncode}):\n{proc.stderr}")
+    return json.loads(proc.stdout)
 
 
 def _run(reveal, server: dict, limit: int) -> dict:
-    return _flow(reveal.txid(), server, [_first_pass(reveal, limit)])
+    """The whole flow with REAL answers from both bridges, in two passes.
+
+    Pass 1 records what the page hands the binding step. The real glue answers exactly that, and
+    pass 2 runs again with the answer, asserting the page asked the same thing both times — so
+    what pass 2 draws is the page's drawing of the real binding for the real arguments."""
+    first = [_first_pass(reveal, limit)]
+    recorded = _flow(reveal.txid(), server, first)
+    answers = [_glue().spent_output_binding(*call) for call in recorded["binding_calls"]]
+    flow = _flow(reveal.txid(), server, first, answers)
+    assert flow["glue_calls"] == recorded["glue_calls"]
+    assert flow["binding_calls"] == recorded["binding_calls"]
+    assert "harness: no canned" not in flow["rendered"], "the flow ended on the harness's own error"
+    flow["binding_answers"] = answers
+    return flow
+
+
+def _drawn_binding(flow: dict) -> tuple[str, str | None]:
+    """The rendered ``payload binding`` row, and its ``payload binding detail`` row if any —
+    read off the drawn card, one text node per line."""
+    lines = flow["rendered"].split("\n")
+    assert "payload binding" in lines, f"no payload binding row was drawn:\n{flow['rendered']}"
+    value = lines[lines.index("payload binding") + 1]
+    detail = lines[lines.index("payload binding detail") + 1] if "payload binding detail" in lines else None
+    return value, detail
 
 
 # ─────────────────────────────────── the second fetch is checked, and its failure is said ──
 
 
 class TestTheSpentTransactionTheServerSends:
-    def test_the_real_commit_reaches_the_classifier_and_binds(self, limit) -> None:
+    def test_the_real_commit_reaches_the_binding_step_and_binds(self, limit) -> None:
         """The honest path, and the neighbour of every refusal below."""
         reveal, commit, _forged = _world()
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": commit.serialize().hex()}}
         flow = _run(reveal, server, limit)
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         raw = reveal.serialize().hex()
-        assert flow["glue_calls"] == [
-            [reveal.txid(), raw, "", limit],
-            [reveal.txid(), raw, commit.serialize().hex(), limit, ""],
-        ]
-        assert _replay(flow["glue_calls"][1])["payload"]["metadata"]["payload_binding"]["state"] == "bound"
+        assert flow["glue_calls"] == [[reveal.txid(), raw, limit, limit]], "the transaction was classified twice"
+        assert flow["binding_calls"] == [[reveal.txid(), raw, commit.serialize().hex(), ""]]
+        assert flow["binding_answers"][0]["binding"]["state"] == "bound"
+        assert _drawn_binding(flow) == ("bound — the spent commit committed to exactly this payload", None)
+
+    def test_a_commit_to_a_different_payload_is_drawn_as_a_mismatch(self, limit) -> None:
+        """The honest server, the dishonest reveal: the real commit committed to another payload."""
+        reveal, commit, _forged = _world("EVIL", "real-token")
+        server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": commit.serialize().hex()}}
+        value, detail = _drawn_binding(_run(reveal, server, limit))
+        assert value.startswith("mismatch — THE SPENT COMMIT COMMITTED TO A DIFFERENT PAYLOAD")
+        assert detail is None
 
     @pytest.mark.parametrize("shown, committed", [("honest", None), ("EVIL", "real-token")])
     def test_a_server_answering_with_a_different_transaction_is_refused(self, limit, shown, committed) -> None:
         """The reviewer's case, through the page. Asked for the commit, the server answers with a
         transaction of its own committing to the envelope on screen. It used to reach the
         classifier and read ``bound`` — for the attack too, where the real commit committed to a
-        different payload. Now the fetch refuses it and the page says so."""
+        different payload. Now the fetch refuses it and the page SAYS so, in the drawn row."""
+        from pyrxd.glyph._inspect_core import SPENT_TX_NOT_OBTAINED
+
         reveal, commit, forged = _world(shown, committed)
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": forged.serialize().hex()}}
         flow = _run(reveal, server, limit)
         assert flow["requested"] == [reveal.txid(), commit.txid()]
-        second = flow["glue_calls"][1]
-        assert second[2] == "", "the forged transaction reached the classifier"
-        assert second[4] == f"the server's answer is not the transaction asked for: it hashes to {forged.txid()}"
-
-        binding = _replay(second)["payload"]["metadata"]["payload_binding"]
-        assert binding["state"] == "unchecked"
-        assert binding["reason"] == _glue()._SPENT_NOT_OBTAINED
-        assert binding["detail"] == second[4]
+        (call,) = flow["binding_calls"]
+        assert call[2] == "", "the forged transaction reached the binding step"
+        said = f"the server's answer is not the transaction asked for: it hashes to {forged.txid()}"
+        assert call[3] == said
+        value, detail = _drawn_binding(flow)
+        assert value == f"unchecked — {SPENT_TX_NOT_OBTAINED}"
+        assert detail == said
+        assert "was not supplied" not in flow["rendered"]
 
     def test_a_server_that_refuses_the_commit_is_said_too(self, limit) -> None:
+        from pyrxd.glyph._inspect_core import SPENT_TX_NOT_OBTAINED
+
         reveal, commit, _forged = _world()
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"error": "daemon busy"}}
         flow = _run(reveal, server, limit)
-        second = flow["glue_calls"][1]
-        assert second[2:] == ["", limit, "server error: daemon busy"]
-        binding = _replay(second)["payload"]["metadata"]["payload_binding"]
-        assert binding == {
-            "state": "unchecked",
-            "reason": _glue()._SPENT_NOT_OBTAINED,
-            "detail": "server error: daemon busy",
-        }
-        assert "was not supplied" not in binding["reason"]
+        (call,) = flow["binding_calls"]
+        assert call[2:] == ["", "server error: daemon busy"]
+        assert _drawn_binding(flow) == (f"unchecked — {SPENT_TX_NOT_OBTAINED}", "server error: daemon busy")
+        assert "was not supplied" not in flow["rendered"]
+
+    def test_a_binding_step_that_answers_nothing_does_not_leave_was_not_supplied(self, limit) -> None:
+        """The fallback for a binding step that returns an error: the first pass's "was not
+        supplied" must not stand for a transaction the page asked for."""
+        reveal, commit, _forged = _world()
+        server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": commit.serialize().hex()}}
+        flow = _flow(reveal.txid(), server, [_first_pass(reveal, limit)], [{"ok": False, "error": "boom"}])
+        value, detail = _drawn_binding(flow)
+        assert value.startswith("unchecked — ") and "was not supplied" not in value
+        assert detail == "boom"
 
 
 # ──────────────────────────────── the FIRST fetch is checked by the same function ──
@@ -196,7 +238,7 @@ class TestTheTransactionAskedForIsTheOneThatCameBack:
     def test_a_different_transaction_never_reaches_the_classifier(self, limit) -> None:
         reveal, commit, _forged = _world()
         flow = _flow(reveal.txid(), {reveal.txid(): {"hex": commit.serialize().hex()}}, [])
-        assert flow["glue_calls"] == [], "the classifier was handed a transaction nobody asked for"
+        assert flow["glue_calls"] == [] and flow["binding_calls"] == [], "a transaction nobody asked for was used"
         assert (
             f"fetch failed: the server's answer is not the transaction asked for: it hashes to {commit.txid()}"
             in (flow["rendered"])
@@ -221,7 +263,38 @@ class TestTheTransactionAskedForIsTheOneThatCameBack:
         assert words in flow["rendered"]
 
 
-# ──────────────────────────────────── the row limit is the checking limit, on every call ──
+class TestAFailedFirstFetchIsAdvisedByWhatFailed:
+    """/verify/ branches on the wire's ``err.kind``; /inspect/ gave every failure the same
+    "check that the server is reachable" advice — including a server that WAS reachable and
+    answered with a different transaction."""
+
+    @staticmethod
+    def _hint(flow: dict) -> str:
+        lines = flow["rendered"].split("\n")
+        failed = next(i for i, line in enumerate(lines) if line.startswith("fetch failed: "))
+        return lines[failed + 1]
+
+    def test_a_different_transaction_is_not_blamed_on_reachability(self) -> None:
+        reveal, commit, _forged = _world()
+        hint = self._hint(_flow(reveal.txid(), {reveal.txid(): {"hex": commit.serialize().hex()}}, []))
+        assert "reachable" not in hint
+        assert "do not have that fingerprint" in hint and f"glyph inspect {reveal.txid()} --fetch" in hint
+
+    def test_a_server_that_cannot_be_reached_is_told_to_be_checked(self) -> None:
+        """The honest neighbour: the one kind the old advice was right for keeps it."""
+        hint = self._hint(_flow("ab" * 32, {"ab" * 32: {"close": True}}, []))
+        assert "could not be reached" in hint and "reachable" in hint
+
+    def test_a_refusal_says_the_number_may_be_wrong(self) -> None:
+        hint = self._hint(_flow("ab" * 32, {}, []))
+        assert "number is wrong" in hint and "reachable" not in hint
+
+    def test_an_unreadable_reply_says_it_was_refused_rather_than_read(self) -> None:
+        hint = self._hint(_flow("ab" * 32, {"ab" * 32: {"frame": "not json"}}, []))
+        assert "shape a transaction has" in hint and "reachable" not in hint
+
+
+# ──────────────────────────── the row limit is the checking limit AND the listing limit ──
 
 
 class TestEveryClassificationIsBounded:
@@ -229,10 +302,12 @@ class TestEveryClassificationIsBounded:
         plain = _tx([(b"\x6a" + b"\x00" * 30, 0)], [("ab" * 32, 0, b"\x00")])
         flow = _flow(plain.txid(), {plain.txid(): {"hex": plain.serialize().hex()}}, [_first_pass(plain, limit)])
         assert flow["requested"] == [plain.txid()], "a transaction with no reveal has no spent commit to fetch"
-        assert flow["glue_calls"] == [[plain.txid(), plain.serialize().hex(), "", limit]]
+        assert flow["glue_calls"] == [[plain.txid(), plain.serialize().hex(), limit, limit]]
+        assert flow["binding_calls"] == []
 
-    def test_every_call_the_page_makes_carries_the_limit(self, limit) -> None:
+    def test_a_reveal_is_classified_once_and_its_binding_asked_for_once(self, limit) -> None:
         reveal, commit, _forged = _world()
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": commit.serialize().hex()}}
-        calls = _run(reveal, server, limit)["glue_calls"]
-        assert len(calls) == 2 and all(call[3] == limit for call in calls), calls
+        flow = _run(reveal, server, limit)
+        assert len(flow["glue_calls"]) == 1 and flow["glue_calls"][0][2:] == [limit, limit], flow["glue_calls"]
+        assert len(flow["binding_calls"]) == 1

@@ -240,7 +240,7 @@ async function lookUp(text, token) {
     // first MAX_MARK_PANELS records only (and of any later byte-for-byte copy of one of them,
     // which costs nothing), so a transaction of thousands of signed records costs this tab no
     // more curve work than the page draws. One number, passed here, so the two cannot drift.
-    result = fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS));
+    result = fromPy(pyFetch(txid, rawHex, MAX_MARK_PANELS));
   } catch (err) {
     return bridgeError(err);
   }

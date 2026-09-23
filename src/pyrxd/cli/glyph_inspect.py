@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _truncate_for_human
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_binding, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -275,36 +275,39 @@ async def _inspect_txid_inner(
     #
     # EXACTLY ONE round trip, bounded by construction rather than by a cap: there is
     # one attributed input and it has one prevout. No loop, so nothing to bound.
-    spent_scripts: dict[int, bytes] = {}
+    #
+    # THE VERDICT COMES FROM `_spent_output_binding`, the function the browser page calls too,
+    # so the two surfaces cannot word one fetch differently. A failure here used to fall back
+    # to the classifier's "was not supplied" — including when the server answered with a
+    # DIFFERENT transaction, which `get_transaction` refuses. It now says it asked, and why
+    # nothing usable came back.
+    binding: dict | None = None
     meta = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}) or {}
     outpoint = meta.get("input_outpoint")
     if outpoint:
-        prev_txid, _, prev_vout = str(outpoint).rpartition(":")
+        prev_txid = str(outpoint).rpartition(":")[0]
+        spent_raw: bytes | None = None
+        spent_error = ""
         try:
-            prev_raw = await client.get_transaction(Txid(prev_txid.lower()))
-            prev_tx = Transaction.from_hex(bytes(prev_raw))
-            if prev_tx is None:
-                raise ValidationError(f"prevout tx {prev_txid} did not decode")
-            spent_scripts[int(meta["input_index"])] = bytes(prev_tx.outputs[int(prev_vout)].locking_script.serialize())
-        except (ValidationError, ValueError, IndexError, KeyError):
-            pass
+            spent_raw = bytes(await client.get_transaction(Txid(prev_txid.lower())))
         except Exception as exc:
-            # Same contract as the delegate block above: a failed resolution leaves
-            # the verdict "unchecked" — with its own stated reason — rather than
-            # failing the whole inspect. Logged, not swallowed: "unchecked because
-            # the server was unreachable" and "unchecked because nobody asked" render
-            # identically, and whoever is debugging that needs to know which it was.
-            _log.debug("could not resolve the attributed input's prevout %s: %s", outpoint, exc)
+            # Same contract as the delegate block above: a failed fetch leaves the verdict
+            # "unchecked" rather than failing the whole inspect — and the reason is carried
+            # into the verdict's `detail` rather than only logged.
+            spent_error = str(exc) or type(exc).__name__
+            _log.debug("could not fetch the attributed input's prevout %s: %s", outpoint, exc)
+        binding = _spent_output_binding(str(txid), bytes(raw), spent_raw, spent_error=spent_error)
 
-    if resolved or spent_scripts:
+    if resolved:
         payload = _classify_raw_tx(
             str(txid),
             bytes(raw),
             only_vout=only_vout,
             network=network,
-            delegated_refs=resolved or None,
-            spent_scripts=spent_scripts or None,
+            delegated_refs=resolved,
         )
+    if binding is not None and isinstance(payload, dict) and payload.get("metadata"):
+        payload["metadata"]["payload_binding"] = binding
     if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
@@ -448,6 +451,10 @@ def _render_txid_human(payload: dict) -> str:
             # Same reasoning as the browser: every state, including "unchecked".
             _mark = "  *** " if _pb.get("state") == "mismatch" else "  "
             lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
+            # WHY, when the spent transaction was asked for and nothing usable came back. Already
+            # sanitised and capped by `_spent_output_binding`: it can quote a server.
+            if _pb.get("detail"):
+                lines.append(f"    why: {_pb['detail']}")
             # Named whatever the verdict. On `unchecked` it is what someone would
             # fetch to settle it; on `mismatch` it is where the real payload is.
             if metadata.get("input_outpoint"):

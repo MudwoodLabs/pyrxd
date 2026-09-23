@@ -17,8 +17,12 @@
 // Contract:
 //   node inspect_render_harness.mjs [payloads.json|-]
 //   stdin/file: JSON — {"name": {"script": {...}, "row": {...}, "tx": {...},
-//                                  "row_opts": {...}}, ...}
-//               each of the three RENDER keys optional; at least one required.
+//                                  "result": {...}, "row_opts": {...}}, ...}
+//               each of the four RENDER keys optional; at least one required.
+//               `result` is a whole glue result (`{ok, form, input, payload}`), drawn by
+//               the page's own `renderResult` — card AND raw-JSON drawer — and answered
+//               as `result_block` (its text), `result_block_elements`, and
+//               `json_drawer_chars` (the length of the drawer's JSON text).
 //               `row_opts` is not a render key: it is the optional second argument
 //               to `renderOutputRow`, which carries facts about the TRANSACTION that
 //               no output row can hold on its own — today the mark's block anchor.
@@ -146,6 +150,17 @@ function countElements(node, pred) {
   return n;
 }
 
+// The first element in document order that satisfies `pred`, or null.
+function findFirst(node, pred) {
+  if (node instanceof StubText) return null;
+  if (pred(node)) return node;
+  for (const child of node.childNodes) {
+    const hit = findFirst(child, pred);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 function makeSandbox() {
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -180,7 +195,7 @@ function loadRenderer() {
   // by name — the same way the browser does.
   vm.runInContext(readFileSync(SHARED_JS, "utf8"), sandbox, { filename: SHARED_JS });
   vm.runInContext(readFileSync(INSPECT_JS, "utf8"), sandbox, { filename: INSPECT_JS });
-  for (const name of ["renderScriptCard", "renderOutputRow", "renderFetchedTxCard"]) {
+  for (const name of ["renderScriptCard", "renderOutputRow", "renderFetchedTxCard", "renderResult"]) {
     if (typeof sandbox[name] !== "function") {
       throw new Error(
         `${name} is not reachable after loading inspect.js. It was a top-level ` +
@@ -232,9 +247,18 @@ function main() {
       out.fetched_tx_card_elements = countElements(tx, () => true);
       out.fetched_tx_card_file_inputs = countElements(tx, (n) => n.tag === "input" && n.type === "file");
     }
+    if (payloads.result) {
+      // `RESULT_BLOCK` is inspect.js's own top-level const: the element renderResult fills.
+      renderer.renderResult(payloads.result);
+      const block = vm.runInContext("RESULT_BLOCK", renderer);
+      out.result_block = renderedLines(block);
+      out.result_block_elements = countElements(block, () => true);
+      const pre = findFirst(block, (n) => n.className === "json-block");
+      out.json_drawer_chars = pre ? pre.textContent.length : null;
+    }
     if (Object.keys(out).length === 0) {
       throw new Error(
-        `case ${JSON.stringify(name)} has none of "script", "row", "tx" — nothing to render`
+        `case ${JSON.stringify(name)} has none of "script", "row", "tx", "result" — nothing to render`
       );
     }
     // `row_opts` without a `row` renders nothing and silently proves nothing — the

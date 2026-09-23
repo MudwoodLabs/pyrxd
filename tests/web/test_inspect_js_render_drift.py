@@ -999,13 +999,15 @@ def _mint_claim_scriptsig() -> bytes:
     return b"\x04" + os.urandom(4) + b"\x20" + os.urandom(32) + b"\x20" + os.urandom(32) + b"\x00"
 
 
-def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> dict:
+def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]], *, max_rows: int | None = None) -> dict:
     """Classify a transaction through the REAL browser entry point.
 
     ``glue.inspect_txid_with_raw`` is what the page calls after its ElectrumX
     fetch, and it is where ``display_warnings`` is attached. Hand-building the
     dict would exercise the renderer against a payload the browser never
     produces — which is how a banner came to describe a check that does not run.
+    ``max_rows`` is the page's listing limit; set, the payload carries the
+    ``*_not_listed`` counts the card must render too.
     """
     from pyrxd.hash import hash256
     from pyrxd.script.script import Script
@@ -1024,7 +1026,7 @@ def _tx_payload(scriptsigs: list[bytes], outputs: list[tuple[bytes, int]]) -> di
         ],
     )
     raw = tx.serialize()
-    result = _glue().inspect_txid_with_raw(hash256(raw)[::-1].hex(), raw.hex())
+    result = _glue().inspect_txid_with_raw(hash256(raw)[::-1].hex(), raw.hex(), None, max_rows)
     assert result["ok"], result
     return result["payload"]
 
@@ -1249,7 +1251,37 @@ def _tx_payloads() -> dict[str, dict]:
         # script" from a pure category test — no confusability check runs — and
         # the banner used to tell this token's holder it mimicked Latin letters.
         "homoglyph-non-latin": _tx_payload([_reveal_scriptsig("トークン")], [(nft, 546)]),
+        # EVERY LIST CUT SHORT, so every `*_not_listed` count the classifier emits reaches
+        # the field guard above: outputs (with HashMark records among the ones left out),
+        # envelopes, other glyphs, and the headline's relationship claims and delegate
+        # burns. A listing limit of 2 is not the page's; it keeps the case small, and the
+        # counts' wording is the same at any limit.
+        "bounded-lists": _tx_payload(
+            [
+                _reveal_scriptsig(
+                    "HEAD", extra={"in": [GlyphRef(txid=os.urandom(32).hex(), vout=i).to_bytes() for i in range(3)]}
+                ),
+                _reveal_scriptsig("Other1"),
+                _reveal_scriptsig("Other2"),
+                _reveal_scriptsig("Other3"),
+                b"\x03gly",
+                b"\x03gly",
+            ],
+            [
+                (_hashmark_v1_script(1), 0),
+                (p2pkh, 546),
+                (_hashmark_v1_script(2), 0),
+                (op_return, 0),
+                (_hashmark_v1_script(3), 0),
+            ]
+            + [(build_delegate_burn_script(GlyphRef(txid=os.urandom(32).hex(), vout=1)), 0) for _ in range(3)],
+            max_rows=2,
+        ),
     }
+
+
+def _hashmark_v1_script(i: int) -> bytes:
+    return b"\x6a\x08HASHMARK\x02\x01\x01\x20" + bytes([i]) * 32
 
 
 @pytest.fixture(scope="module")
@@ -1320,6 +1352,18 @@ class TestTheTxCardRendersEveryFieldToo:
         # the field guard above passed vacuously over them while the browser
         # rendered a delegated claim as "spent in this tx".
         assert {"relationships", "delegate_burns"} <= meta
+        # The counts of what a cut list left out — DERIVED from the classifier's source, so
+        # a list bounded later without a case here fails rather than passing empty.
+        import ast
+
+        source = (_REPO_ROOT / "src/pyrxd/glyph/_inspect_core.py").read_text(encoding="utf-8")
+        emitted = {
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith("_not_listed")
+        }
+        assert len(emitted) >= 5, f"only {sorted(emitted)} derived — the extraction is broken"
+        assert emitted <= top | meta, f"never exercised: {sorted(emitted - (top | meta))}"
 
 
 class TestTheBurnBannerStopsAssertingAnOutcome:

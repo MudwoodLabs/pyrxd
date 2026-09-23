@@ -949,7 +949,7 @@ def _tx_result(*scripts: bytes, limit: int | None = None) -> tuple[str, bytes, d
     from tests.test_hashmark_verify_cli import _tx_with
 
     txid, raw = _tx_with(*scripts)
-    result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", limit)
+    result = _glue().inspect_txid_with_raw(txid, raw.hex(), limit)
     assert result["ok"], result
     return txid, raw, result
 
@@ -1275,7 +1275,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         render harness drives `renderReport`, not `lookUp`, so this is read from the source."""
         source = (_VERIFY_DIR / "verify.js").read_text(encoding="utf-8")
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("//"))
-        assert 'fromPy(pyFetch(txid, rawHex, "", MAX_MARK_PANELS))' in code
+        assert "fromPy(pyFetch(txid, rawHex, MAX_MARK_PANELS))" in code
         assert code.count("pyFetch(") == 1, "a second call path to the classifier that may not pass the limit"
 
     @pytest.mark.parametrize("bad", [-1, 1.5, "50", True])
@@ -1283,7 +1283,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_record_script(bytes([1, 1]), b"\x11" * 32))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", bad)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), bad)
         assert result["ok"] is False and "attest_hashmark_limit" in result["error"]
 
     def test_the_glue_takes_a_javascript_whole_number(self) -> None:
@@ -1291,7 +1291,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1.0)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), 1.0)
         assert result["ok"], result
         assert [r["hashmark"]["attestation"]["outcome"] for r in result["payload"]["outputs"]] == [
             "valid",
@@ -1303,7 +1303,7 @@ class TestTheWorkIsBoundedNotOnlyTheDrawing:
         from tests.test_hashmark_verify_cli import _tx_with
 
         txid, raw = _tx_with(_signed_script(b"x"), _signed_script(b"y"))
-        result = _glue().inspect_txid_with_raw(txid, raw.hex(), "", 1)
+        result = _glue().inspect_txid_with_raw(txid, raw.hex(), 1)
         result["payload"]["outputs"] = result["payload"]["outputs"][1:]  # the unchecked one, alone
         flat = " ".join(_page(result)["text"].split())
         assert "NOT CHECKED" in flat and "this one is past that limit" in flat
