@@ -1462,6 +1462,20 @@ class TestTheDmintDeployBannerComparesTheRowsItTalksAbout:
         assert "the supply ceiling is reward × max_height × 3" not in text
 
 
+class TestTheMintScriptsigCardClaimsNoVersion:
+    """The card used to print "version (by nonce width): v1|v2" and a banner sentence built on
+    it. Neither covenant checks the nonce's width and most mainnet V1 mints push 8 bytes, so
+    that called them V2. The card shows the width, and says it is not a version."""
+
+    def test_the_width_is_shown_and_no_version_is_inferred_from_it(self, tx_payloads, tx_rendered):
+        assert tx_payloads["dmint-claim-canonical"]["mint_scriptsig"]["nonce_width"] == 4
+        text = tx_rendered["dmint-claim-canonical"]
+        assert "nonce width" in text and "4 bytes" in text
+        assert "does not say whether the contract is V1 or V2" in text
+        assert "version (by nonce width)" not in text
+        assert "shape (4-byte nonce" not in text
+
+
 class TestTheDmintClaimBannerLooksAtTheOutputs:
     """ "The freshly-minted FT lives in a separate ft output in this same tx" and
     "the canonical mint tx has 4 outputs" were stated for every claim tx."""

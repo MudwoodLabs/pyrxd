@@ -43,7 +43,7 @@ _TOKEN_REF = GlyphRef(txid=Txid(_COMMIT_TXID), vout=0)
 
 
 def _initial_state(num: int = 3) -> DmintV1ContractInitialState:
-    """Conservative defaults that fit V1's 3-byte ceilings."""
+    """Small, conservative contract parameters."""
     return DmintV1ContractInitialState(
         num_contracts=num,
         reward_sats=1_000,
@@ -600,31 +600,32 @@ class TestDmintV1DeployParams:
                 difficulty=1,
             )
 
-    def test_max_height_3_byte_ceiling(self):
+    def test_max_height_is_capped_where_a_v1_contract_can_still_reach_its_last_mint(self):
+        """One past 2**31 is refused, with the 4-byte height as the reason, and so is the shared
+        8-byte bound; 2**31 itself, and the old 0xFFFFFF + 1 (which V1 used to refuse as a
+        "3-byte ceiling" no covenant rule backed), are accepted."""
         from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.glyph.dmint.types import MAX_SCRIPT_NUM, MAX_V1_MAX_HEIGHT
 
-        with pytest.raises(ValidationError, match="max_height"):
-            DmintV1DeployParams(
-                metadata=self._meta(),
-                owner_pkh=self._hex20(),
-                num_contracts=1,
-                max_height=0x1000000,  # 3-byte ceiling + 1
-                reward_photons=1,
-                difficulty=1,
-            )
+        assert MAX_V1_MAX_HEIGHT == 2**31
+        kw = {"metadata": self._meta(), "owner_pkh": self._hex20(), "num_contracts": 1, "reward_photons": 1}
+        for refused in (MAX_V1_MAX_HEIGHT + 1, MAX_SCRIPT_NUM, MAX_SCRIPT_NUM + 1):
+            with pytest.raises(ValidationError, match="DmintV1DeployParams: max_height must be <="):
+                DmintV1DeployParams(**kw, max_height=refused, difficulty=1)
+        with pytest.raises(ValidationError, match=r"<= 2,147,483,648 \(a V1 contract's height is a 4-byte field"):
+            DmintV1DeployParams(**kw, max_height=MAX_V1_MAX_HEIGHT + 1, difficulty=1)
+        for ok in (0x1000000, MAX_V1_MAX_HEIGHT):
+            assert DmintV1DeployParams(**kw, max_height=ok, difficulty=1).max_height == ok
 
-    def test_reward_photons_3_byte_ceiling(self):
+    def test_reward_photons_is_capped_at_the_money_supply(self):
         from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.security.types import RADIANT_MAX_PHOTONS
 
-        with pytest.raises(ValidationError, match="reward_photons"):
-            DmintV1DeployParams(
-                metadata=self._meta(),
-                owner_pkh=self._hex20(),
-                num_contracts=1,
-                max_height=1,
-                reward_photons=0x1000000,
-                difficulty=1,
-            )
+        kw = {"metadata": self._meta(), "owner_pkh": self._hex20(), "num_contracts": 1, "max_height": 1}
+        with pytest.raises(ValidationError, match="DmintV1DeployParams: reward_photons must be <="):
+            DmintV1DeployParams(**kw, reward_photons=RADIANT_MAX_PHOTONS + 1, difficulty=1)
+        for ok in (0x1000000, RADIANT_MAX_PHOTONS):
+            assert DmintV1DeployParams(**kw, reward_photons=ok, difficulty=1).reward_photons == ok
 
     def test_non_sha256d_algo_rejected(self):
         from pyrxd.glyph.builder import DmintV1DeployParams
@@ -965,9 +966,9 @@ class TestDmintV1DeployResult:
 
         Reconciling only ``premine`` left the product unchecked: metadata
         advertising ``reward=10, maxHeight=10_000, numContracts=1`` (100,000
-        supply) deployed against the 3-byte ceilings genesises contracts minting
-        70,368,735,789,056,250 photons, with both premines 0 so the old check
-        passed. Each field is pinned individually here.
+        supply) deployed with reward = maxHeight = 0xFFFFFF and 250 contracts
+        genesises contracts minting 70,368,735,789,056,250 photons, with both
+        premines 0 so the old check passed. Each field is pinned individually here.
         """
         from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
         from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload

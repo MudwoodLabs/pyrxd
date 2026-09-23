@@ -55,9 +55,9 @@ def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
     #
     # Here instead, because it is WRITE-ONLY: `decode_payload` does not call this, so the read
     # path stays permissive about third-party bytes (it must — timelocked tokens with junk
-    # metadata exist on chain and a reader has to survive them). Every builder entry point
-    # (builder.py:301, :508, :617) and the fee estimator funnel through here, so there is no
-    # second door to remember.
+    # metadata exist on chain and a reader has to survive them). GlyphBuilder's commits from a GlyphMetadata
+    # (prepare_commit, prepare_dat_commit, _prepare_dmint_v1_deploy, _prepare_dmint_v2_deploy) and the fee
+    # estimator (fees.estimate_reveal_fee_for_metadata) all encode through here: no second door to remember.
     #
     # A mint cannot be amended and the failure is silent: the token looks sealed, the operator
     # holds a CEK, and nothing on chain can ever verify the reveal.

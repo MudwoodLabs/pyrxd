@@ -84,10 +84,27 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 
 | Flag | Meaning |
 |------|---------|
-| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`) |
-| `--reward P` | photons of the FT paid per successful claim |
+| `--max-height N` | claims allowed per contract (total supply = `reward × max-height × num-contracts`): 1–2^31 for V1, 1–2^63−1 for V2 |
+| `--reward P` | photons of the FT paid per successful claim, up to Radiant's money supply (2.1×10^18) |
 | `--num-contracts K` | parallel contracts to genesis (1–250); each is an independent mining lane |
-| `--difficulty D` | initial PoW difficulty (1 = easiest; start here on testnet) |
+| `--difficulty D` | initial PoW difficulty (1 = easiest; start here on testnet), up to 2^63−1 |
+
+These upper bounds are the points past which a contract built from the value could never
+be minted — a state number the covenant cannot read (wider than 8 bytes), a reward no
+transaction can pay, or a difficulty whose target is 0 — and `deploy-dmint` refuses anything
+outside them before it touches your wallet, naming the flag. They are the same for V1 and V2,
+except that V1's `--max-height` stops at 2^31 (below).
+`--target-time` (V2) is at most 0xFFFFFFFF seconds in the ASERT, LWMA and EPOCH modes, whose
+retarget compares it with the gap between two timestamps that are each below 2^31 in any
+mint the covenant accepts, so a larger value is a spacing no mint can meet. FIXED and SCHEDULE never read
+it as a number; there it only has to fit pyrxd's 8-byte encoder (up to 2^63−1).
+
+V1's `--max-height` stops at 2^31 because a V1 contract stores its height in 4 bytes: every
+mint but the last writes the next height with `NUM2BIN(height + 1, 4)`, which cannot hold
+2^31, so a contract with a larger `--max-height` would stop at height 2^31−1 with mints it can
+never make. Mainnet has such V1 deploys (Photonic builds them). `claim-dmint` mints them like
+any other up to height 2^31−1 and refuses the mint from there; `deploy-dmint` will not create
+one.
 
 ### V1 vs V2 (adaptive difficulty)
 

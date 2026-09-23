@@ -49,6 +49,7 @@ from .types import (
     ASERT_V2_DRIFT_CLAMP,
     ASERT_V2_RADIX,
     DEFAULT_ASERT_HALFLIFE,
+    MAX_SCRIPT_NUM_BYTES,
     MAX_SHA256D_TARGET,
     DaaBytecodeVersion,
     DaaMode,
@@ -62,7 +63,21 @@ from .types import (
 
 
 def _push_minimal(n: int) -> bytes:
-    """Encode integer n using Bitcoin script minimal push encoding."""
+    """Encode integer ``n`` as a minimal script-number push (Photonic ``pushMinimal``).
+
+    Refuses any ``n`` whose minimal encoding is wider than ``MAX_SCRIPT_NUM_BYTES`` (8) —
+    i.e. outside ``±(2**63 - 1)``. Almost everything it encodes is read back by the covenant
+    through ``CScriptNum``, which aborts the script on an operand wider than 8 bytes: height,
+    maxHeight, reward and target on every mint, the constants a DAA fragment bakes, and
+    targetTime in ASERT/LWMA/EPOCH. For those a wider push could only build a contract that can
+    never be minted. Two things it encodes are never read as numbers — the algoId/daaMode tags
+    (which never approach 8 bytes) and targetTime in FIXED and SCHEDULE, which the covenant
+    only carries as bytes — and for those the 8-byte limit is pyrxd's rule, not the covenant's:
+    one limit for every push, so no caller has to know which mode reads what. Photonic's
+    ``pushMinimal`` would emit a wider push; for every value inside the range the bytes are
+    identical to Photonic's (a 1..8-byte payload always takes the direct-push opcode, so the
+    PUSHDATA forms never arise).
+    """
     if n == 0:
         return b"\x00"  # OP_0
     if n == -1:
@@ -71,23 +86,22 @@ def _push_minimal(n: int) -> bytes:
         return bytes([0x50 + n])  # OP_1 .. OP_16
     # General case: little-endian with sign bit.
     negative = n < 0
-    n = abs(n)
+    magnitude = abs(n)
     result = []
-    while n > 0:
-        result.append(n & 0xFF)
-        n >>= 8
+    while magnitude > 0:
+        result.append(magnitude & 0xFF)
+        magnitude >>= 8
     if result[-1] & 0x80:
         result.append(0x80 if negative else 0x00)
     elif negative:
         result[-1] |= 0x80
-    payload = bytes(result)
-    # Prefix with length byte (PUSHDATA1 if needed)
-    length = len(payload)
-    if length < 0x4C:
-        return bytes([length]) + payload
-    if length <= 0xFF:
-        return b"\x4c" + bytes([length]) + payload
-    raise ValidationError(f"pushMinimal: number too large: {n}")
+    if len(result) > MAX_SCRIPT_NUM_BYTES:
+        raise ValidationError(
+            f"pushMinimal: {n} needs a {len(result)}-byte script number; Radiant reads at most "
+            f"{MAX_SCRIPT_NUM_BYTES} bytes as a number (|n| <= 2**63 - 1), so a covenant that reads "
+            "this push would abort on every spend"
+        )
+    return bytes([len(result)]) + bytes(result)
 
 
 def _push_4bytes_le(n: int) -> bytes:
@@ -1022,16 +1036,28 @@ def build_dmint_v1_state_script(
 ) -> bytes:
     """Build the 6-item V1 dMint state script (before OP_STATESEPARATOR).
 
-    Layout (docs/dmint-research-mainnet.md §2.2 offsets 0–94)::
+    Layout::
 
-        height(4B LE) | d8 contractRef(36B) | d0 tokenRef(36B) |
-        maxHeight | reward | target(0x08 + 8B LE)
+        04 <height:4 LE> | d8 contractRef(36B) | d0 tokenRef(36B) |
+        maxHeight | reward | target
 
-    The target is always pushed as a fixed 8-byte little-endian value
-    (push opcode 0x08, then 8 bytes of payload). This is what
-    distinguishes V1 from V2 in the state-script discriminator at parse
-    time: V2's item 5 is ``algoId`` via ``_push_minimal``, never an
-    8-byte push.
+    the last three as minimal script-number pushes (:func:`_push_minimal`). That is byte for
+    byte what Photonic Wallet's V1-era ``dMintScript`` builds (its SHA256d/FIXED branch,
+    ``packages/lib/src/script.ts`` at c8540a6: ``push4bytes(height)``, then ``pushMinimal`` for
+    maxHeight, reward and target), and ``tests/test_dmint_v1_target_push.py`` checks it against
+    a transcription of that builder.
+
+    The target has to be minimal. The V1 epilogue compares the target, exactly as pushed, with
+    the proof-of-work number (``… 81 76 00 a2 69 a2 69``: OP_BIN2NUM normalises the hash window,
+    never the target), and Radiant reads that operand as a script number with minimal encoding
+    required. The minimal push is 8 bytes only for a target of at least ``2**55`` (difficulty
+    255 or less); below that it is shorter, down to OP_1..OP_16 for targets 1..16. Mainnet V1
+    contracts carry 6-, 7- and 8-byte targets, and two pinned in
+    ``tests/test_dmint_v1_target_push.py`` have been minted over a thousand times each with a
+    7-byte one. Until 2026-09-23
+    pyrxd pushed every target as ``08`` + 8 bytes, which is not minimal below ``2**55``, so no
+    V1 contract it deployed at difficulty 256 or more can ever be minted
+    (:func:`pyrxd.glyph.dmint.miner._unreadable_target_reason` refuses them).
 
     :raises ValidationError: ``height < 0``; ``max_height < 1``;
         ``height >= max_height`` (born-exhausted contract); ``reward < 1``;
@@ -1041,7 +1067,8 @@ def build_dmint_v1_state_script(
         the high bit set produces a negative number on the stack, and the
         on-chain target comparison would behave wrongly. Photonic Wallet's
         ``dMintDiffToTarget`` formula always produces a value in this
-        signed-positive range.
+        signed-positive range. A target of 0 is refused by pyrxd: only a hash
+        whose compared 8 bytes are all zero meets it.
     """
     if height < 0:
         raise ValidationError("height must be >= 0")
@@ -1070,8 +1097,7 @@ def build_dmint_v1_state_script(
         + token_ref.to_bytes()
         + _push_minimal(max_height)
         + _push_minimal(reward)
-        + b"\x08"
-        + struct.pack("<Q", target)
+        + _push_minimal(target)
     )
 
 

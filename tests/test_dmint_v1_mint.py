@@ -161,9 +161,11 @@ class TestBuildDmintV1ContractScript:
         assert state.last_time == 0
 
     def test_roundtrip_high_height(self):
-        # Heights up to 0xFFFFFFFF must round-trip (4-byte LE encoding)
+        # Heights up to 0x7FFFFFFF round-trip (4-byte LE encoding). Above that bit 31 is set,
+        # which the covenant reads as a negative number (OP_BIN2NUM), and the parser refuses it:
+        # tests/test_dmint_state_judgement.py has the boundary.
         script = build_dmint_v1_contract_script(
-            height=0xDEADBEEF,
+            height=0x7FFFFFFF,
             contract_ref=_CONTRACT_REF,
             token_ref=_TOKEN_REF,
             max_height=0xFFFFFFFF,
@@ -171,8 +173,18 @@ class TestBuildDmintV1ContractScript:
             target=1,
         )
         state = DmintState.from_script(script)
-        assert state.height == 0xDEADBEEF
+        assert state.height == 0x7FFFFFFF
         assert state.max_height == 0xFFFFFFFF
+        high = build_dmint_v1_contract_script(
+            height=0xDEADBEEF,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=0xFFFFFFFF,
+            reward=1,
+            target=1,
+        )
+        with pytest.raises(ValidationError, match="has bit 31 set"):
+            DmintState.from_script(high)
 
     @pytest.mark.parametrize("algo", [DmintAlgo.SHA256D, DmintAlgo.BLAKE3, DmintAlgo.K12])
     def test_roundtrip_each_algo(self, algo: DmintAlgo):

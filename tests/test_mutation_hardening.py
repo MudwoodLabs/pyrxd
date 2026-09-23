@@ -346,11 +346,13 @@ class TestDmintParamsValidation:
         with pytest.raises(dataclasses.FrozenInstanceError):
             self._params().max_height = 99
 
-    def test_max_v2_target_is_2_256_minus_1(self):
+    def test_every_algo_has_the_8_byte_max_target(self):
+        # BLAKE3/K12 once got (1 << 256) - 1 here, and this test pinned it: a 33-byte target
+        # Part B2 cannot read. Photonic's dMintDiffToTarget has no algorithm argument.
         from pyrxd.glyph.dmint import DmintAlgo
 
-        p = self._params(algo=DmintAlgo.BLAKE3, difficulty=1)
-        assert p.initial_target == (1 << 256) - 1
+        for algo in DmintAlgo:
+            assert self._params(algo=algo, difficulty=1).initial_target == (1 << 63) - 1
 
     def test_schedule_boundaries(self):
         from pyrxd.glyph.dmint import DaaMode
@@ -673,15 +675,15 @@ class TestDmintPushEncoders:
         from pyrxd.glyph.dmint.builders import _push_minimal
         from pyrxd.security.errors import ValidationError
 
-        # 75-byte payload → direct push; 76 → PUSHDATA1; >255 → error
-        n75 = int.from_bytes(b"\x7f" * 75, "little")
-        assert _push_minimal(n75) == bytes([75]) + b"\x7f" * 75
-        n76 = int.from_bytes(b"\x7f" * 76, "little")
-        assert _push_minimal(n76) == b"\x4c\x4c" + b"\x7f" * 76
-        n255 = int.from_bytes(b"\x7f" * 255, "little")
-        assert _push_minimal(n255) == b"\x4c\xff" + b"\x7f" * 255
-        with pytest.raises(ValidationError):
-            _push_minimal(int.from_bytes(b"\x7f" * 256, "little"))
+        # The cliff is the 8-byte script-number limit, both signs: the widest numbers the
+        # interpreter reads are pushed directly; one byte wider is refused (the PUSHDATA forms
+        # this test once pinned at 75/76/255 bytes built pushes no covenant could read).
+        assert _push_minimal((1 << 63) - 1) == b"\x08" + b"\xff" * 7 + b"\x7f"
+        assert _push_minimal(-((1 << 63) - 1)) == b"\x08" + b"\xff" * 8
+        assert _push_minimal(1 << 55) == b"\x08" + b"\x00" * 6 + b"\x80\x00"  # sign-pad byte counts
+        for too_wide in (1 << 63, -(1 << 63), 1 << 64, int.from_bytes(b"\x7f" * 76, "little")):
+            with pytest.raises(ValidationError, match="script number"):
+                _push_minimal(too_wide)
 
     def test_push_4bytes_le(self):
         from pyrxd.glyph.dmint.builders import _push_4bytes_le
@@ -1001,7 +1003,7 @@ class TestDmintDaaBoundaries:
         from pyrxd.security.errors import ValidationError
 
         assert difficulty_to_target(1) == self._MAX
-        assert difficulty_to_target(1, DmintAlgo.BLAKE3) == (1 << 256) - 1  # 256-bit max, not SHA256D's
+        assert difficulty_to_target(1, DmintAlgo.BLAKE3) == self._MAX  # one formula for every algo
         assert target_to_difficulty(1) == self._MAX  # target=1 boundary valid
         assert target_to_difficulty(self._MAX) == 1
         for fn in (difficulty_to_target, target_to_difficulty):

@@ -193,7 +193,7 @@ The push opcode for the CBOR body MUST be selected by length
 
 A parser MUST locate the envelope by walking the scriptSig's pushes and taking the
 push immediately **after** a push equal to `gly`
-(`src/pyrxd/glyph/inspector.py:256-360`). It MUST NOT assume the marker is at a
+(`src/pyrxd/glyph/inspector.py` `GlyphInspector._parse_reveal_scriptsig`, over `GlyphInspector._walk_pushes`). It MUST NOT assume the marker is at a
 fixed offset, and it MUST support all four push opcodes — a walker that stops at
 `0x4e` never reaches the marker on the mainnet token above.
 
@@ -301,9 +301,9 @@ Notes on individual fields:
 
 | Limit | Value | Source |
 |---|---|---|
-| CBOR body | 262,144 bytes (256 KiB) | `src/pyrxd/glyph/payload.py:51` |
-| `attrs` entries | 64 | `src/pyrxd/glyph/payload.py:58` |
-| `main.t` (MIME type) | 256 characters | `src/pyrxd/glyph/payload.py:67` |
+| CBOR body | 262,144 bytes (256 KiB) | `src/pyrxd/glyph/payload.py` `_MAX_CBOR_PAYLOAD_BYTES` |
+| `attrs` entries | 64 | `src/pyrxd/glyph/payload.py` `_MAX_ATTRS_COUNT` |
+| `main.t` (MIME type) | 256 characters | `src/pyrxd/glyph/payload.py` `_MAX_MIME_TYPE_CHARS` |
 | `main.b` (media) | bounded only by the CBOR body cap | — |
 
 The 256 KiB body cap is a DoS bound chosen above the largest known real payload
@@ -395,7 +395,7 @@ The input being evaluated is the one spending the commit output, so its outpoint
 produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
-(`src/pyrxd/glyph/builder.py:437-444`), and reads it back with
+(`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_reveal`), and reads it back with
 `extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:343-354`).
 
 **Requirements.**
@@ -442,7 +442,7 @@ sufficient in general, because metadata routinely carries timestamps
 The commit script's ref-type byte is derived from the envelope's `p` field, not
 chosen independently: NFT (`2` present in `p`) produces the `OP_2`/SINGLETON
 variant, anything else the `OP_1`/NORMAL variant
-(`src/pyrxd/glyph/builder.py:393-397`).
+(`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_commit`).
 
 ### 6.2 Phase 2 — reveal
 
@@ -486,7 +486,7 @@ outpoint as a ref. It is bound to the spender's key by the P2PKH tail.
   required to.
 - The reveal's recipient MAY differ from the key that signs the reveal. pyrxd
   performs no authorisation check on recipient selection; mint-to-recipient is a
-  supported flow (`src/pyrxd/glyph/builder.py:83-100`).
+  supported flow (`src/pyrxd/glyph/builder.py` `RevealParams`).
 
 ## 7. Locking-script templates
 
@@ -574,7 +574,7 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 
 A MUT reveal produces **two** outputs: the 63-byte NFT singleton the owner holds,
 and this 174-byte contract UTXO that holds the mutable state
-(`src/pyrxd/glyph/builder.py:827-932`). Both carry the same ref.
+(`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_mutable_reveal`). Both carry the same ref.
 
 The contract is spent with a scriptSig of the shape
 
@@ -594,7 +594,7 @@ the regex and the built script (`src/pyrxd/glyph/script.py:332-335`).
 ### 7.5 CONTAINER
 
 A container's locking script is the **63-byte NFT singleton of §7.1, unchanged**
-(`src/pyrxd/glyph/builder.py:995-1000`). There is no container script shape.
+(`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_container_reveal`). There is no container script shape.
 Container-ness is the `7` marker in the envelope's `p` field, and it is invisible
 on chain — exactly as in Photonic Wallet, which has a single `nftScript` and no
 container variant (`packages/lib/src/script.ts`).
@@ -669,7 +669,7 @@ and `build_nft_transfer_tx` refuses it by name
 
 #### 7.6.1 V1 — 241 bytes for typical parameters
 
-State script (`src/pyrxd/glyph/dmint/builders.py:1015-1075`):
+State script (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_state_script`):
 
 ```
 04 <height:4 LE>
@@ -677,20 +677,33 @@ d8 <contract_ref:36>
 d0 <token_ref:36>
 <max_height minimal push>
 <reward minimal push>
-08 <target:8 LE>
+<target minimal push>
 ```
 
 followed by the 145-byte code epilogue, which begins with `0xbd`
 (`OP_STATESEPARATOR`) and is byte-identical across every V1 deployment except one
 selector byte at epilogue offset 19: `0xaa` = SHA256d, `0xee` = BLAKE3,
-`0xef` = K12 (`src/pyrxd/glyph/dmint/builders.py:972-1009`).
+`0xef` = K12 (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_code_script`).
 
 `target` MUST be in `[1, 0x7fffffffffffffff]`. Script integers are signed, so a
 value with the high bit set is negative on the stack and the on-chain comparison
-misbehaves (`src/pyrxd/glyph/dmint/builders.py:1058-1063`).
+misbehaves (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_state_script`).
+
+`target` MUST be pushed minimally, as Photonic's V1-era `dMintScript` does
+(`pushMinimal`, `packages/lib/src/script.ts` at `c8540a6`). The epilogue compares
+the pushed item as it stands with the proof-of-work number (`81 76 00 a2 69 a2 69`:
+`OP_BIN2NUM` is applied to the hash window, not to the target), and Radiant reads
+that operand only if it is minimally encoded. The minimal push is 8 bytes for a
+target of at least 2^55 (difficulty 255 or less), shorter below that, and
+`OP_1`…`OP_16` for 1…16. Until 2026-09-23 pyrxd pushed every V1 target as `08` +
+8 bytes, which is not minimal below 2^55, so a V1 contract pyrxd deployed at
+difficulty 256 or more can never be minted; pyrxd refuses to mint or estimate one
+(`src/pyrxd/glyph/dmint/miner.py` `_unreadable_target_reason`). A reader MUST
+accept every width: mainnet V1 contracts carry 6-, 7- and 8-byte targets
+(`tests/test_dmint_v1_target_push.py`).
 
 The reward output a V1 mint pays is the 75-byte FT lock of §7.2, bound to
-`token_ref` (`src/pyrxd/glyph/dmint/builders.py:1107-1135`). Producing a plain
+`token_ref` (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_v1_ft_output_script`). Producing a plain
 P2PKH instead breaks the conservation check and the mint is rejected.
 
 #### 7.6.2 V2 — 10-item state
@@ -706,11 +719,17 @@ bd  OP_STATESEPARATOR
 <code script>
 ```
 
-`src/pyrxd/glyph/dmint/builders.py:899-946`. `height` and `target` use **minimal**
+`src/pyrxd/glyph/dmint/builders.py` `build_dmint_state_script`. `height` and `target` use **minimal**
 pushes: a fixed-width height push is rejected by Radiant's MINIMALDATA mempool
-policy (`src/pyrxd/glyph/dmint/builders.py:908-913`). `last_time` stays a 4-byte
+policy (`src/pyrxd/glyph/dmint/builders.py` `build_dmint_state_script`). `last_time` stays a 4-byte
 push because the covenant reconstructs it from `OP_TXLOCKTIME` with a fixed-width
 `OP_NUM2BIN`.
+
+`algo_id` is carried, not read: the proof-of-work hash the covenant runs is the
+opcode right after Part A in the code script (`aa` SHA256d, `ee` BLAKE3, `ef`
+K12). A reader MUST take the algorithm from that opcode. pyrxd refuses a script
+whose `algo_id` names a different one (`src/pyrxd/glyph/dmint/chain.py`
+`DmintState._walk_v2`); on a 2026-09-22 survey of mainnet V2 scripts none did.
 
 The five difficulty-adjustment modes (`FIXED`, `EPOCH`, `ASERT`, `LWMA`,
 `SCHEDULE`) each contribute a distinct bytecode block. The authoritative,
@@ -751,26 +770,31 @@ alone does not determine the clamp a contract bakes — the bytecode does.
 `daa` is omitted when the mode is `FIXED`. **Nothing on chain reconciles
 `premine` against the photons a deploy actually emits.** pyrxd refuses a deploy
 whose metadata advertises a premine it does not emit
-(`src/pyrxd/glyph/builder.py:68-131`) — a deliberate addition, not shared with
+(`src/pyrxd/glyph/builder.py` `_assert_declared_dmint_matches`) — a deliberate addition, not shared with
 Photonic, and therefore not something an implementation may rely on other
 producers to have done.
 
 ### 7.7 Mint scriptSig (dMint claim)
 
 A dMint mint spends a contract UTXO with exactly four pushes
-(`src/pyrxd/glyph/inspector.py:327-379`):
+(`src/pyrxd/glyph/inspector.py` `GlyphInspector.parse_mint_scriptsig`):
 
 ```
 <nonce:4 or 8> <input_hash:32> <output_hash:32> OP_0
 ```
 
-- `nonce` — little-endian PoW nonce. 4 bytes = V1, 8 bytes = V2. This width is the
-  only V1/V2 discriminator in the scriptSig.
+- `nonce` — little-endian PoW nonce, 4 or 8 bytes. Its width does NOT tell V1 from
+  V2: neither covenant checks it (each concatenates the nonce into the proof-of-work
+  preimage: V1 epilogue `5a 7a 7e`, V2 Part A `5e 7a 7e`), and V1 mints on mainnet
+  use both widths — 465 of 473 mints of V1 contracts in a sample collected on
+  2026-09-23 push 8 bytes. pyrxd's V1 builder writes 4 bytes and its V2 builder 8.
+  The scriptSig alone does not say which version it spends; the contract script
+  does (§13).
 - `input_hash` — `SHA256d(funding_input_locking_script)`.
 - `output_hash` — `SHA256d(OP_RETURN script at vout[2])`.
 - `OP_0` — the sentinel the covenant requires.
 
-Total 72 bytes (V1) or 76 bytes (V2).
+Total 72 bytes (4-byte nonce) or 76 bytes (8-byte nonce).
 
 ## 8. Token types
 
@@ -1107,13 +1131,15 @@ Consolidated. Each entry cites the section that justifies it.
 **Envelope version (`v`).** Absent means V1; `2` means V2. V2 adds `dmint`,
 `creator`, `royalty`, `policy`, `rights`, `created`, and `commit_outpoint`.
 Indexers use `v` to select a parser. A V1 dMint deploy MUST NOT carry a `v` field;
-pyrxd refuses one at build time (`src/pyrxd/glyph/builder.py:411-419`).
+pyrxd refuses one at build time (`src/pyrxd/glyph/builder.py` `GlyphBuilder._prepare_dmint_v1_deploy`).
 
 **dMint contract version.** V1 and V2 are distinguished structurally, not by a
-version field: V1's sixth state item is a fixed 8-byte target push (`0x08` + 8
-bytes), V2's is a minimal-push `algoId`
-(`src/pyrxd/glyph/dmint/builders.py:1030-1044`). In a mint scriptSig the
-discriminator is the nonce width, 4 vs 8 bytes (§7.7).
+version field: V1 has six state items followed by its 145-byte epilogue, which
+opens with `0xbd` where V2's seventh state item (`daaMode`) would be; V2 has ten
+(`src/pyrxd/glyph/dmint/chain.py` `DmintState._walk_v1`, `DmintState._walk_v2`).
+The width of the target push is not a discriminator: both versions push it
+minimally. Nor is anything in a mint scriptSig: the nonce's width is not, since
+neither covenant checks it and V1 mints use both 4 and 8 bytes (§7.7).
 
 **Relation to the pyrxd version.** This specification revision describes pyrxd
 0.15.0. pyrxd is 0.x: the API and on-chain formats are **not yet stable**. Under
@@ -1263,7 +1289,7 @@ d0 8b87c3c7…43a4 00000000                tokenRef    = commit:0
 ```
 
 then the 145-byte code epilogue beginning `bd`. The full bytes are pinned at
-`tests/test_dmint_v1_deploy.py:1126-1168`.
+`tests/test_dmint_v1_deploy.py` `TestV1GoldenVectorGlyphPattern._GLYPH_CONTRACT_0_HEX`.
 
 **Verifying this yourself.** Every value above is reproducible from the repository:
 
@@ -1310,12 +1336,15 @@ behaviour stay on chain and a reader still has to handle them.
 | Royalty `minimum` with `splits` | Each split computed independently; `minimum` never consulted, so a royalty declaring `bps=100, minimum=50000` pays the minimum with one recipient and ignores it with two | Total computed once, then divided | Photonic's version can pay the creator less than the recorded terms (`src/pyrxd/glyph/royalty.py:56-68`). |
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
-| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py:68-131`). |
+| `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py` `_assert_declared_dmint_matches`). |
 | Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:332-335`). |
-| V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py:119-151`). |
+| V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py` `_PART_A`). |
+| V2 dMint deploy target, BLAKE3/K12 | `dMintDiffToTarget`: `MAX_TARGET / difficulty` for every algorithm | The same, since 2026-09-23. Before then pyrxd deployed BLAKE3/K12 with `(2^256 - 1) // difficulty`, wider than the 8 bytes Part B2 reads as a number, so those contracts could never be minted | Part B1 compares the same 8-byte hash window whatever the hash opcode (`src/pyrxd/glyph/dmint/types.py` `target_for_difficulty`; the BLAKE3/K12 mainnet deploys rebuild byte for byte in `tests/test_dmint_deploy_bounds.py`). |
+| V2 dMint numeric deploy parameters | `dMintScript` bounds none of `maxHeight`, `reward`, `targetTime`, `halfLife`, `epochLength` or schedule heights above, and `pushMinimal` emits any width (the Mint form's inputs carry min/max hints) | Refused: a number wider than 8 bytes, a reward above Radiant's money supply, a difficulty whose target is 0, and, in ASERT/LWMA/EPOCH, a target time above 0xFFFFFFFF s. FIXED and SCHEDULE only carry the target time as bytes, so there it is held only to pyrxd's 8-byte encoder limit. In-range bytes are identical | Past those bounds a deploy builds a number the covenant cannot read, a reward no transaction can pay, a target only an all-zero hash meets, or a target spacing no mint can meet (the retarget compares it with the gap between two timestamps, each below 2^31 in any mint the covenant accepts) (`src/pyrxd/glyph/dmint/types.py` `check_v2_numeric_bounds`, `DAA_MODES_READING_TARGET_TIME`). |
+| V1 dMint `maxHeight` at deploy | `dMintScript` builds any `maxHeight`; mainnet has V1 contracts above 2^31 (`$BRO`: 696,969,000,000) | Refused above 2^31. Such contracts are still read and minted up to height 2^31 − 1, and the mint from there is refused | A V1 contract's height is a 4-byte field that every mint but the last rewrites as `NUM2BIN(height + 1, 4)`, which cannot encode 2^31, so above that `maxHeight` the contract stops at height 2^31 − 1 with mints left (`src/pyrxd/glyph/dmint/types.py` `MAX_V1_MAX_HEIGHT`, `check_dmint_v1_bounds`). |
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
 | V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
-| WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py:1457-1469`). |
+| WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_wave_reveal`). |
 | Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
 | Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
 | `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |
@@ -1389,10 +1418,10 @@ for such a script is undefined.
 No consensus rule fixes the photon value of a commit, contract, or NFT carrier
 output. Radiant-Core has no dust threshold — `GetDustThreshold` returns 1 and
 `IsDust` is `nValue <= 0` — so any output worth at least one photon is standard
-(`src/pyrxd/glyph/builder.py:1802-1808`, citing `src/policy/policy.cpp:19-25` at
+(`src/pyrxd/glyph/builder.py` `_validate_premine`, citing `src/policy/policy.cpp:19-25` at
 `v3.1.2`). The 1-photon value on dMint contract outputs is pinned by the
 **covenant** (`OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`,
-`src/pyrxd/glyph/dmint/builders.py:872`), not by the chain. The 546-photon floors
+`src/pyrxd/glyph/dmint/builders.py` `_build_part_c`), not by the chain. The 546-photon floors
 in pyrxd are wallet policy, not chain rules, and are labelled as such at
 `src/pyrxd/glyph/ft.py:71`.
 
@@ -1414,8 +1443,8 @@ transaction in CI. The anchors:
 | NFT lock (63 B) | `27390efa…be7e` vout 0 | `tests/test_glyph.py:130-196` |
 | Commit script, both variants (75 B) | `a443d9df…878b` vouts 0 and 33 | `tests/test_glyph_dmint.py:171-240` |
 | CBOR envelope + reveal framing (65,569 B) | `b965b32d…9dd6` vin 0 | `tests/test_glyph.py:436-525` |
-| dMint V1 contract (241 B) | `b965b32d…9dd6` vout 0 | `tests/test_dmint_v1_deploy.py:1098-1214` |
-| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py:252-289` |
+| dMint V1 contract (241 B) | `b965b32d…9dd6` vout 0 | `tests/test_dmint_v1_deploy.py` `TestV1GoldenVectorGlyphPattern` |
+| dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py` `TestBuildDmintV1FtOutputScript` |
 | dMint V2 contract, FIXED (380 B) | `95335028…bb16fb09` vout 0 | `tests/test_dmint_v2_mainnet_golden.py:23-68` |
 | Mutable NFT body (102 B) | Photonic `parseMutableScript` reference | `tests/test_glyph_v2.py:112-121` |
 | Container lock (63 B) + `in` envelope | frozen goldfile | `tests/test_golden_vectors.py`, `TestFrozenContainerVectors` |

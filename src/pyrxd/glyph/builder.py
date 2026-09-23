@@ -29,6 +29,7 @@ from .dmint import (
     is_minimal_4byte_scriptnum,
     is_readable_last_time,
 )
+from .dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
 from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
@@ -1880,11 +1881,18 @@ class DmintV1DeployParams:
         (``src/validation.cpp:271``, ``src/init.cpp:1995`` @ v3.1.2). What
         actually bounds this is fee: every contract output costs ~241 bytes
         × the 10_000 photons/byte relay floor.
-    :param max_height:         Maximum mints per contract (3-byte ceiling).
-    :param reward_photons:     Photons paid per successful mint (3-byte
-        ceiling — see V1 contract state layout).
-    :param difficulty:         Initial PoW difficulty (1 = easiest).
-        Translated to 8-byte target via :func:`difficulty_to_target`.
+    :param max_height:         Maximum mints per contract, ``[1, 2**31]``. A V1 contract's
+        height is a 4-byte field that every mint but the last rewrites as
+        ``NUM2BIN(height + 1, 4)`` (epilogue ``54 78 54 80 7e``), which cannot encode ``2**31``,
+        so with a larger ``max_height`` the contract stops at height ``2**31 - 1`` with mints
+        left (:data:`~pyrxd.glyph.dmint.types.MAX_V1_MAX_HEIGHT`;
+        :func:`~pyrxd.glyph.dmint.types.check_dmint_v1_bounds` has this and the next two
+        bounds). Mainnet has such V1 deploys (``$BRO``: 696,969,000,000); pyrxd mints them up to
+        that height but does not deploy one.
+    :param reward_photons:     Photons paid per successful mint, ``[1, RADIANT_MAX_PHOTONS]``.
+    :param difficulty:         Initial PoW difficulty (1 = easiest; at most
+        ``MAX_SHA256D_TARGET``). The target is ``MAX_SHA256D_TARGET // difficulty``
+        (:func:`difficulty_to_target`), pushed as a minimal script number.
     :param premine_amount:     Photons emitted as an additional FT output on
         the reveal tx (1 photon = 1 FT unit), on top of the mineable supply.
         ``None`` = no premine. The photons are real: the deployer must fund
@@ -1925,14 +1933,22 @@ class DmintV1DeployParams:
             )
         if self.max_height < 1:
             raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
-        if self.max_height > 0xFFFFFF:
-            raise ValidationError(f"max_height ({self.max_height}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.reward_photons < 1:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
-        if self.reward_photons > 0xFFFFFF:
-            raise ValidationError(f"reward_photons ({self.reward_photons}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
+        # The upper bounds V2 has for the same three numbers, for the same reasons: the V1
+        # epilogue reads maxHeight and reward as script numbers exactly as V2's Part C does, and
+        # above MAX_SHA256D_TARGET the target is 0 (which the V1 state builder refuses, but
+        # only once the deploy is built, after the wallet is loaded). Then V1's own, tighter
+        # max_height bound: past 2**31 the 4-byte height field stops the contract early.
+        check_dmint_v1_bounds(
+            stage="DmintV1DeployParams",
+            max_height=self.max_height,
+            reward=self.reward_photons,
+            difficulty=self.difficulty,
+            names={"reward": "reward_photons"},
+        )
         if self.algo != DmintAlgo.SHA256D:
             raise ValidationError(
                 f"V1 dMint only supports SHA256d; got {self.algo}. Use DmintV2DeployParams for blake3/k12."
@@ -1964,18 +1980,28 @@ class DmintV2DeployParams:
     :param owner_pkh:       20-byte PKH of the key that signs commit + the
         ref-seed reveal inputs.
     :param num_contracts:   Count of parallel V2 contract UTXOs (``[1, 250]``).
-    :param max_height:      Maximum mints per contract.
-    :param reward_photons:  Photons paid per successful mint.
-    :param difficulty:      Initial PoW difficulty (1 = easiest).
+    :param max_height:      Maximum mints per contract (``[1, 2**63 - 1]``: the covenant reads
+        it as a script number). The upper bounds on this and the other numeric parameters, and
+        the reason for each, are in :func:`pyrxd.glyph.dmint.types.check_v2_numeric_bounds`.
+    :param reward_photons:  Photons paid per successful mint (``[1, RADIANT_MAX_PHOTONS]``).
+    :param difficulty:      Initial PoW difficulty (1 = easiest; at most ``MAX_SHA256D_TARGET``).
+        The target is ``MAX_SHA256D_TARGET // difficulty`` for every ``algo``.
     :param premine_amount:  Photons emitted as an extra FT output on the reveal,
         on top of the mineable supply (mirrors V1 — see
         :class:`DmintV1DeployParams`). If ``metadata`` carries a ``dmint.premine``
         field, the two must agree or the deploy is refused.
     :param premine_pkh:     PKH receiving the premine; ``None`` = ``owner_pkh``.
     :param op_return_msg:   Optional OP_RETURN data carrier (raw bytes after 0x6a).
-    :param algo:            PoW algorithm (default SHA256d; only SHA256D is mined).
-    :param daa_mode:        Must be ``DaaMode.FIXED`` (the only mintable mode).
-    :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED).
+    :param algo:            PoW algorithm (default SHA256d). BLAKE3 and K12 deploy with the same
+        8-byte target formula as SHA256d, as Photonic does. pyrxd can deploy them but cannot
+        mine them: every miner it runs or speaks to (including the external-miner protocol
+        behind ``claim-dmint --miner-cmd``) grinds and verifies SHA256d only, and ``claim-dmint``
+        refuses a BLAKE3/K12 contract before any grind. Minting one needs a miner for that hash,
+        which pyrxd does not ship.
+    :param daa_mode:        Any :class:`DaaMode` (FIXED, ASERT, LWMA, EPOCH, SCHEDULE).
+    :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED). At most
+        ``MAX_V2_TARGET_TIME`` (``0xFFFFFFFF`` s) for ASERT, LWMA and EPOCH, whose retarget
+        reads it; FIXED and SCHEDULE never read it as a number and take up to ``2**63 - 1``.
     :param half_life:       Baked into the ASERT-v2 bytecode (ASERT only; vestigial
         otherwise). Defaults to the canonical Photonic ``DEFAULT_ASERT_HALFLIFE`` (240 s)
         so an omitted value deploys what a Photonic miner assumes; before 2026-09-16 the
@@ -2023,6 +2049,21 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
+        # Upper bounds, refused on the caller's own object (naming reward_photons, not the
+        # internal `reward`). DmintDeployParams runs the SAME check when the scripts are built,
+        # and deploy-dmint runs it first, naming the flags.
+        check_v2_numeric_bounds(
+            stage="DmintV2DeployParams",
+            max_height=self.max_height,
+            reward=self.reward_photons,
+            difficulty=self.difficulty,
+            daa_mode=self.daa_mode,
+            target_time=self.target_time,
+            half_life=self.half_life,
+            epoch_length=self.epoch_length,
+            schedule=self.schedule,
+            names={"reward": "reward_photons"},
+        )
         # All five DAA modes are supported (FIXED/ASERT/LWMA/EPOCH/SCHEDULE). EPOCH was
         # temporarily refused here while its canonical bytecode had an int64-overflow that
         # bricked the contract on-chain; that fix is now merged upstream

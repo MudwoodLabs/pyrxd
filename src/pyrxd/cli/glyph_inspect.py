@@ -614,12 +614,14 @@ def _render_txid_human(payload: dict) -> str:
 
     # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
     # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
-    # V1 = 4-byte nonce / 72-byte scriptSig; V2 = 8-byte / 76-byte.
+    # Neither covenant checks the nonce's width (V1 mints on mainnet use both 4 and 8 bytes), so
+    # the scriptSig does not say whether the contract is V1 or V2; the contract script does.
     mint_scriptsig = payload.get("mint_scriptsig")
     if mint_scriptsig is not None:
         lines.append("")
         lines.append("dMint mint scriptSig (vin 0):")
-        lines.append(f"  version (by nonce width): {mint_scriptsig.get('version_hint', '?')}")
+        lines.append(f"  nonce width:              {mint_scriptsig.get('nonce_width', '?')} bytes")
+        lines.append("  (not a version: neither covenant checks it, and V1 mints use both widths)")
         lines.append(f"  scriptSig length:         {mint_scriptsig.get('scriptsig_length')} bytes")
         lines.append(f"  nonce (LE):               {mint_scriptsig.get('nonce_hex')}")
         lines.append(f"  input  hash (SHA256d):    {mint_scriptsig.get('input_hash')}")
@@ -1568,7 +1570,7 @@ def inspect_cmd(
                           outputs[], metadata, mint_scriptsig}
         outputs[]: {vout, type, satoshis, ...same per-type fields as script form}
         mint_scriptsig: null OR {nonce_hex, input_hash, output_hash,
-                          version_hint ("v1"|"v2"), scriptsig_length} —
+                          nonce_width (4|8), scriptsig_length} —
                           present when vin[0] is a dMint V1/V2 mint claim
 
     All hex values are lowercase. Outpoints render as "txid:vout"

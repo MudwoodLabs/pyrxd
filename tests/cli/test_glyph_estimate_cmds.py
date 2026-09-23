@@ -25,6 +25,7 @@ from pyrxd.cli.glyph_estimate import (
 )
 from pyrxd.cli.main import cli
 from pyrxd.glyph.dmint import difficulty_to_target, estimate_attempts
+from tests.test_dmint_state_judgement import unreadable_number_scripts
 
 
 def _extract_json(output: str) -> dict:
@@ -75,12 +76,17 @@ class TestOfflineEstimate:
         assert float(result.output.strip()) == pytest.approx(8589934592.0 / 1e6)
 
     def test_clamped_target_is_flagged(self, runner: CliRunner) -> None:
+        """An offline --target above the ceiling: the figures are for the ceiling pyrxd's own
+        verifier clamps to, and the note must not suggest the COVENANT clamps — it cannot read
+        such a target at all, so no contract carrying one can be minted."""
         result = runner.invoke(
             cli,
             ["glyph", "dmint-estimate", "--target", "0xffffffffffffffff", "--hash-rate", "1e6"],
         )
         assert result.exit_code == 0, result.output
-        assert "clamped" in result.output
+        assert "No dMint contract carrying it can be minted" in result.output
+        assert "pyrxd's own verifier clamps to" in result.output
+        assert "was clamped by the verifier" not in result.output
 
 
 class TestJsonKeepsMeasuredAndProjectedApart:
@@ -520,3 +526,159 @@ class TestContractLookup:
         assert "CONTRACT (from the network)" in result.output
         assert "3 / 100" in result.output
         assert "1,000 photons per mint" in result.output
+
+
+class TestAContractPyrxdCannotMint:
+    """Driven through the shipped command with the REAL ``_fetch_contract`` and
+    ``_resolve_target``; only the ElectrumX read (``_fetch_dmint_contract``) is faked."""
+
+    @staticmethod
+    def _invoke(runner: CliRunner, monkeypatch, script: bytes, *global_flags: str):
+        from pyrxd.cli import glyph_estimate
+        from pyrxd.cli.context import CliContext
+        from pyrxd.glyph.dmint import DmintContractUtxo, DmintState
+
+        utxo = DmintContractUtxo(txid="ab" * 32, vout=0, value=1, script=script, state=DmintState.from_script(script))
+
+        async def fake_fetch(_client, txid, vout):
+            return utxo
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(glyph_estimate, "_fetch_dmint_contract", fake_fetch)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: _Client())
+        args = [*global_flags, "glyph", "dmint-estimate", "--contract", f"{'ab' * 32}:0", "--hash-rate", "1e6"]
+        return runner.invoke(cli, args)
+
+    @staticmethod
+    def _v2(algo) -> bytes:
+        from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
+        from pyrxd.glyph.types import GlyphRef
+
+        return build_dmint_contract_script(
+            DmintDeployParams(
+                contract_ref=GlyphRef(txid="ab" * 32, vout=1),
+                token_ref=GlyphRef(txid="cd" * 32, vout=0),
+                max_height=100,
+                reward=1000,
+                difficulty=64,
+                algo=algo,
+                last_time=1_700_000_000,
+            )
+        )
+
+    def test_a_target_no_covenant_can_read_gets_no_eta(self, runner: CliRunner, monkeypatch) -> None:
+        """It used to print an ETA and "was clamped by the verifier". The covenant does not
+        clamp: every mint of such a contract aborts, so there is no time to estimate."""
+        from tests.test_dmint_deploy_bounds import old_blake3_v2_contract_script
+
+        result = self._invoke(runner, monkeypatch, old_blake3_v2_contract_script())
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "can never be minted" in result.output
+        assert "33-byte script number" in result.output
+        assert "ETA" not in result.output and "clamped" not in result.output
+
+    def test_a_v1_contract_pyrxd_deployed_with_an_8_byte_target_gets_no_eta(
+        self, runner: CliRunner, monkeypatch
+    ) -> None:
+        """pyrxd's V1 deploy pushed every target as 8 bytes until 2026-09-23; at difficulty 256
+        or more that push is not minimal, the epilogue cannot read it, and no mint can happen."""
+        from tests.test_dmint_v1_target_push import legacy_v1_contract_script
+
+        result = self._invoke(runner, monkeypatch, legacy_v1_contract_script(5000))
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "can never be minted" in result.output
+        assert "its target is pushed as 08" in result.output
+        assert "ETA" not in result.output
+
+    @staticmethod
+    def _no_estimate(monkeypatch) -> list[int]:
+        """Record calls to the attempt estimator, so a test can show a refusal came first."""
+        from pyrxd.cli import glyph_estimate
+
+        calls: list[int] = []
+        real = glyph_estimate.estimate_attempts
+        monkeypatch.setattr(glyph_estimate, "estimate_attempts", lambda t: calls.append(t) or real(t))
+        return calls
+
+    @staticmethod
+    def _v1_at(height: int, max_height: int) -> bytes:
+        from pyrxd.glyph.dmint import build_dmint_v1_contract_script
+        from pyrxd.glyph.types import GlyphRef
+
+        c_ref, t_ref = GlyphRef(txid="ab" * 32, vout=1), GlyphRef(txid="cd" * 32, vout=0)
+        return build_dmint_v1_contract_script(
+            height, c_ref, t_ref, max_height=max_height, reward=1000, target=difficulty_to_target(1)
+        )
+
+    def test_a_v1_contract_stuck_at_height_2_31_minus_1_gets_no_eta(self, runner: CliRunner, monkeypatch) -> None:
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, self._v1_at(2**31 - 1, 2**31 + 1))
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert "cannot be minted further" in result.output
+        assert calls == [] and "ETA" not in result.output
+
+    @pytest.mark.parametrize(
+        ("script", "says"), [pytest.param(sc, says, id=i) for i, sc, says in unreadable_number_scripts()]
+    )
+    def test_a_number_the_covenant_cannot_read_gets_no_eta(
+        self, runner: CliRunner, monkeypatch, script: bytes, says: str
+    ) -> None:
+        """Refused before the attempt estimator runs: for a target of 0 it used to be reached
+        with 0, and raise."""
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, script)
+        assert result.exit_code != 0, result.output
+        assert "pyrxd will not mint this contract, so there is no time to estimate" in result.output
+        assert says in result.output.replace("\n", " ")
+        assert calls == [] and "ETA" not in result.output
+
+    def test_the_height_below_the_stuck_one_is_estimated(self, runner: CliRunner, monkeypatch) -> None:
+        calls = self._no_estimate(monkeypatch)
+        result = self._invoke(runner, monkeypatch, self._v1_at(2**31 - 2, 2**31 + 1), "--json")
+        assert result.exit_code == 0, result.output
+        assert _extract_json(result.output)["contract"]["height"] == 2**31 - 2
+        assert calls == [difficulty_to_target(1)]
+
+    @pytest.mark.parametrize("name", ["RABO", "Pepe"])
+    def test_a_mainnet_v1_contract_is_estimated(self, runner: CliRunner, monkeypatch, name: str) -> None:
+        """The honest path on real V1 scripts: a 7-byte target (RABO, difficulty 256) and an
+        8-byte one (Pepe, difficulty 1) are estimated at their own targets."""
+        from pyrxd.glyph.dmint import DmintState
+        from tests.test_dmint_v1_target_push import _mainnet
+
+        script = _mainnet(name)
+        result = self._invoke(runner, monkeypatch, script, "--json")
+        assert result.exit_code == 0, result.output
+        payload = _extract_json(result.output)
+        assert payload["contract"]["version"] == "V1"
+        assert payload["exact"]["target"] == DmintState.from_script(script).target
+
+    def test_an_in_range_contract_is_estimated_as_before(self, runner: CliRunner, monkeypatch) -> None:
+        from pyrxd.glyph.dmint import DmintAlgo
+
+        result = self._invoke(runner, monkeypatch, self._v2(DmintAlgo.SHA256D), "--json")
+        assert result.exit_code == 0, result.output
+        payload = _extract_json(result.output)
+        expected = estimate_attempts(difficulty_to_target(64))
+        assert payload["exact"]["expected_attempts"] == expected.expected_attempts
+        assert payload["exact"]["clamped"] is False
+        assert payload["contract"]["algo"] == "SHA256D"
+        human = self._invoke(runner, monkeypatch, self._v2(DmintAlgo.SHA256D))
+        assert "mean ETA" in human.output and "note:" not in human.output
+
+    def test_a_blake3_contract_says_pyrxd_cannot_mine_it(self, runner: CliRunner, monkeypatch) -> None:
+        from pyrxd.glyph.dmint import DmintAlgo
+
+        result = self._invoke(runner, monkeypatch, self._v2(DmintAlgo.BLAKE3))
+        assert result.exit_code == 0, result.output
+        assert "this contract's proof of work is BLAKE3" in result.output
+        assert "pyrxd cannot mine this contract" in result.output

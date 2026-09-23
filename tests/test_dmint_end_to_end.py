@@ -17,7 +17,6 @@ from pyrxd.glyph.builder import (
 )
 from pyrxd.glyph.dmint import (
     MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
     DaaMode,
     DmintAlgo,
     DmintContractUtxo,
@@ -178,8 +177,10 @@ class TestDmintStateFromScript:
         assert state.target == expected
 
     def test_target_blake3_round_trips(self):
+        assert _LWMA_PARAMS.algo == DmintAlgo.BLAKE3
         state = self._round_trip(_LWMA_PARAMS)
-        expected = MAX_V2_TARGET_256 // _LWMA_PARAMS.difficulty
+        # One target formula for every algorithm (was MAX_V2_TARGET_256 // difficulty: unreadable).
+        expected = MAX_SHA256D_TARGET // _LWMA_PARAMS.difficulty
         assert state.target == expected
 
     def test_full_state_object_equality(self):
@@ -344,19 +345,25 @@ class TestStateSeparatorN7:
         assert state.last_time == last_time
 
     def test_0xbd_inside_target_does_not_truncate_state(self):
-        """A 256-bit target value (BLAKE3 / K12 algos) can contain 0xbd
-        bytes anywhere in its 32-byte representation.
+        """A target's 8 bytes can contain 0xbd (the OP_STATESEPARATOR byte) anywhere.
+
+        Difficulty 27 gives target 0x04bda12f684bda12, whose little-endian push carries 0xbd.
+        (This once used difficulty 189 on the assumption of a 32-byte BLAKE3 target — a target
+        no covenant can read; the 8-byte target for 189 has no 0xbd, so the premise is asserted
+        here rather than hoped for.)
         """
         params = DmintDeployParams(
             contract_ref=_CONTRACT_REF,
             token_ref=_TOKEN_REF,
             max_height=100,
             reward=10,
-            difficulty=189,  # 0xbd — likely to put 0xbd bytes in target
+            difficulty=27,
             algo=DmintAlgo.BLAKE3,
             daa_mode=DaaMode.LWMA,
             target_time=60,
+            last_time=1_699_000_000,
         )
+        assert 0xBD in params.initial_target.to_bytes(8, "little"), "fixture no longer exercises the premise"
         script = build_dmint_contract_script(params)
         state = DmintState.from_script(script)
         # Round-trip: rebuild from same params, confirm targets match.

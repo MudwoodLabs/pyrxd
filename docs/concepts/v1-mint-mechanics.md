@@ -29,13 +29,15 @@ preimage — the covenant recomputes
 the result into the PoW check. Diverging the scriptSig pushes from
 the preimage is the recurring failure mode the M1 incident surfaced.
 
-V1 vs V2 differs only in nonce width: V1 uses a 4-byte nonce
-(`nonce_width=4`, 72-byte scriptSig), V2 uses 8 bytes (76-byte
-scriptSig). The byte layout, FT-conservation check, and 4-output
-shape are otherwise identical-by-construction in pyrxd's builder.
-**No V2 dMint contracts exist on chain**, so V2 mint mechanics are
-not field-verified — V1 is the only path with mainnet golden vectors
-pinning it.
+pyrxd's V1 mint builder pushes a 4-byte nonce (`nonce_width=4`,
+72-byte scriptSig) and its V2 builder 8 bytes (76-byte scriptSig), but
+the width is not what makes a mint V1 or V2: neither covenant checks
+it, and most V1 mints on mainnet push 8 bytes (465 of 473 mints of V1
+contracts in a sample collected on 2026-09-23). What differs is the
+contract script the mint spends — V1's six-item state and 145-byte
+epilogue, V2's ten-item state. The byte layout, FT-conservation check,
+and 4-output shape are otherwise identical-by-construction in pyrxd's
+builder. V1 mints are pinned against mainnet golden vectors.
 
 ---
 
@@ -106,8 +108,8 @@ public helpers.
 ## The 72-byte scriptSig push convention
 
 The contract input's scriptSig is a fixed byte layout. The 4-byte
-nonce variant (V1) totals 72 bytes; the 8-byte variant (V2) totals
-76. Layout from
+nonce variant (what pyrxd's V1 builder writes) totals 72 bytes; the
+8-byte variant totals 76. Layout from
 [`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint/__init__.py):
 
 ```
@@ -129,9 +131,10 @@ where:
   pushes an empty item that the script consumes during the unlock
   sequence.
 
-The V2 form is identical except the first byte is `0x08` and the
-nonce is 8 bytes (76 bytes total). The single-byte switch
-between layouts is why
+The 8-byte form is identical except the first byte is `0x08` and the
+nonce is 8 bytes (76 bytes total); pyrxd's V2 builder uses it, and so
+do most V1 mints on mainnet, since the V1 epilogue accepts either width.
+The single-byte switch between layouts is why
 [`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint/__init__.py) takes a
 keyword-only `nonce_width: Literal[4, 8]` argument — a stray
 positional `4` is a type error rather than a silent V1/V2 confusion.
@@ -143,7 +146,7 @@ This is the load-bearing rule:
 ```python
 pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, unsigned_tx)
 # Mine using pow_result.preimage
-nonce = mine_solution(pow_result.preimage, target, nonce_width=4)
+nonce = mine_solution(pow_result.preimage, target, nonce_width=4, algo=contract_utxo.state.algo).nonce
 # Build scriptSig from the SAME PowPreimageResult
 scriptsig = build_mint_scriptsig(
     nonce, pow_result.input_hash, pow_result.output_hash, nonce_width=4,
@@ -356,7 +359,11 @@ result = build_dmint_mint_tx(
 pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
 
 # 5. Mine.
-nonce = mine_solution(pow_result.preimage, contract_utxo.state.target, nonce_width=4)
+# algo= is the contract's own: the miner grinds SHA256d only and refuses BLAKE3/K12
+# rather than grind the wrong hash. mine_solution returns a DmintMineResult.
+nonce = mine_solution(
+    pow_result.preimage, contract_utxo.state.target, nonce_width=4, algo=contract_utxo.state.algo
+).nonce
 
 # 6. Splice the real scriptSig in. Same .input_hash / .output_hash
 #    as the preimage was built from.
