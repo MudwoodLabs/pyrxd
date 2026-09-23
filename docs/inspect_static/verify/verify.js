@@ -310,6 +310,24 @@ function lookupFailure(err) {
       detail,
     };
   }
+  // THE SERVER'S ANSWER WAS WRONG, not missing and not unreadable: what came back is whole
+  // bytes, and they hash to a different number from the one asked for. Retrying
+  // the same server may well get the same wrong answer, so this does not promise that it
+  // helps; and it says nothing about whether the number itself is right, because a wrong
+  // number gets "no such transaction" from an honest server, never somebody else's bytes.
+  if (kind === "mismatch") {
+    return {
+      ok: false,
+      form: "error",
+      error: "The blockchain server's answer is not the transaction that was asked for.",
+      hint:
+        "A transaction number is a fingerprint of the transaction's own bytes, and the bytes that " +
+        "came back do not have that fingerprint — so the answer was refused rather than read. " +
+        "Nothing was learned about the mark either way. `pyrxd verify` in a terminal makes the " +
+        "same check and can be pointed at a different server.",
+      detail,
+    };
+  }
   // AN UNTAGGED REJECTION GETS THE WEAKER SENTENCE, and this branch exists precisely
   // so it cannot borrow the one above. "The reply did not have the shape a transaction
   // has" is a CLAIM about what arrived — true for a `malformed` rejection, and

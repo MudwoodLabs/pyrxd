@@ -826,6 +826,20 @@ class TestALookupThatFailedSaysWhichWayItFailed:
         assert "could not be used" in rendered["text"]
         assert "did not have the shape a transaction has" in rendered["text"]
 
+    def test_a_server_answering_with_another_transaction_is_named_as_that(self) -> None:
+        """The fourth tagged case: whole bytes came back, and they are not the transaction asked
+        for. Not "could not be reached" (it answered), not "did not have the shape a transaction
+        has" (nothing parsed them to find out), and not a claim that the NUMBER is wrong."""
+        detail = "the server's answer is not the transaction asked for: it hashes to " + "cd" * 32
+        rendered = _wire_failure("mismatch", detail)
+        text = " ".join(rendered["text"].split())
+        assert "answer is not the transaction that was asked for" in text
+        assert "refused rather than read" in text
+        assert "Nothing was learned about the mark either way" in text
+        assert detail in rendered["text"], "the server's own answer is never dropped"
+        for other in ("could not be reached", "did not have the shape a transaction has", "DOES NOT VERIFY"):
+            assert other not in text
+
     def test_an_untagged_rejection_claims_less_than_a_malformed_one(self) -> None:
         """A rejection from a path that tags nothing must not borrow the sentence
         above it. "The reply did not have the shape a transaction has" is a claim

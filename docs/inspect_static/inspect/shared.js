@@ -470,6 +470,12 @@ function fromPy(value) {
 //                   talking; it did not give back what was asked for.
 //   "unreachable" — no answer at all: no socket, a timeout, or a close before a reply.
 //   "malformed"   — an answer arrived and is not usable (non-JSON, over the cap, not hex).
+//   "mismatch"    — an answer arrived as whole bytes of hex, and they are not the transaction
+//                   asked for: they hash to a different txid. Not "malformed", which is kept for
+//                   a reply that is not even that, and not "unreachable" — the server is up and
+//                   talking. It is the one kind that says the server's answer was WRONG rather
+//                   than missing or unreadable. (Whether the bytes are some other transaction
+//                   is not checked: nothing here parses them, because nothing needs to.)
 //
 // The message text is unchanged, so anything matching on it still works; `kind` is
 // additive and a caller that ignores it behaves exactly as before.
@@ -579,8 +585,46 @@ function electrumxRpc(method, params) {
   });
 }
 
+// The txid of a raw transaction: sha256(sha256(bytes)), byte-reversed, as hex.
+//
+// Throws — it never returns a guess — when this browser offers no WebCrypto digest. That
+// is a non-secure context (plain http:// from anywhere but localhost), and a page there
+// cannot boot at all: `fetchAndVerify` needs the same digest to check the wheels.
+async function txidOfRawHex(rawHex) {
+  if (!(typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.digest === "function")) {
+    throw new Error(
+      "this browser offers no WebCrypto digest here, so the server's answer could not be " +
+      "checked against the transaction number it was asked for, and it was not used"
+    );
+  }
+  // By character code rather than `parseInt(substr)`: on a 4 MB transaction the latter took
+  // 0.7–1.5 s under Node, on the main thread, for every fetch. The caller has already
+  // refused anything that is not an even number of hex digits.
+  const nibble = (c) => (c <= 57 ? c - 48 : (c | 32) - 87);
+  const bytes = new Uint8Array(rawHex.length >>> 1);
+  for (let i = 0, j = 0; i < bytes.length; i += 1, j += 2) {
+    bytes[i] = (nibble(rawHex.charCodeAt(j)) << 4) | nibble(rawHex.charCodeAt(j + 1));
+  }
+  const once = await crypto.subtle.digest("SHA-256", bytes);
+  const twice = new Uint8Array(await crypto.subtle.digest("SHA-256", once));
+  let hex = "";
+  for (let i = twice.length - 1; i >= 0; i -= 1) hex += twice[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
 // The raw transaction, hex, with the checks that are about THIS method's result
 // rather than about the wire.
+//
+// THE ANSWER IS CHECKED AGAINST THE QUESTION, HERE, FOR EVERY FETCH. A txid is the hash
+// of the transaction's own bytes, so a server that answers with any other transaction is
+// caught by hashing what it sent. The first fetch on each page was already checked — in
+// Python, by `classify_raw_tx` — but /inspect/'s SECOND fetch, of the commit a reveal
+// spent, was checked by nothing: a server could answer with a transaction of its own
+// carrying a commit to the envelope on screen, and the page printed "bound" for a payload
+// the real commit never committed to. This is the one function every raw-transaction fetch
+// on both pages goes through, so the check lives in it rather than beside one caller —
+// a second fetch added later gets it without anyone remembering to ask. (`glue.py` checks
+// the spent transaction again before reading it, for a caller that is not this page.)
 async function fetchRawTxFromElectrumx(txid) {
   const result = await electrumxRpc("blockchain.transaction.get", [txid, false]);
   if (typeof result !== "string") {
@@ -596,6 +640,16 @@ async function fetchRawTxFromElectrumx(txid) {
   // Light hex sanity check — Python side does the real validation.
   if (!/^[0-9a-fA-F]*$/.test(result)) {
     throw wireError("malformed", "server returned a non-hex string");
+  }
+  if (result.length === 0) {
+    throw wireError("malformed", "server returned an empty string, not a transaction");
+  }
+  if (result.length % 2 !== 0) {
+    throw wireError("malformed", "server returned an odd number of hex digits, which is not whole bytes");
+  }
+  const got = await txidOfRawHex(result);
+  if (got !== String(txid).toLowerCase()) {
+    throw wireError("mismatch", `the server's answer is not the transaction asked for: it hashes to ${got}`);
   }
   return result;
 }
