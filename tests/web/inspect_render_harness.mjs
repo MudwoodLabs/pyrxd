@@ -27,7 +27,11 @@
 //   stdout:     JSON — {"name": {"script_card": "…", "output_row": "…",
 //                                "fetched_tx_card": "…"}}
 //               where each value is the rendered text, one text node per line,
-//               and a key is present only when its input payload was.
+//               and a key is present only when its input payload was. A `tx` case
+//               also reports `fetched_tx_card_elements` and
+//               `fetched_tx_card_file_inputs` — how MUCH page one transaction built,
+//               which no amount of text can show. `__constants__` carries the page's
+//               own MAX_ROWS_SHOWN, read from inspect.js rather than retyped.
 //
 // `tx` drives `renderFetchedTxCard`, which is where the TX-LEVEL prose lives:
 // the shape banner (`_detectTxShape`) and the reveal-metadata block. Those are
@@ -132,6 +136,16 @@ function renderedClasses(node) {
   return out;
 }
 
+// Every element in the rendered tree, and the file choosers among them. The size of the
+// page is a property the text cannot show: 28,000 rows of the same words read as one row
+// repeated, and a bound on the page is a bound on THIS number.
+function countElements(node, pred) {
+  if (node instanceof StubText) return 0;
+  let n = pred(node) ? 1 : 0;
+  for (const child of node.childNodes) n += countElements(child, pred);
+  return n;
+}
+
 function makeSandbox() {
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -175,6 +189,15 @@ function loadRenderer() {
       );
     }
   }
+  // A top-level `const` is not a property of the global object (see
+  // verify_render_harness.mjs), so it is read the way the page reads it: by name.
+  // Tolerantly — absent, it is null for the Python side to fail on.
+  sandbox.__constants__ = {
+    max_rows_shown: vm.runInContext(
+      'typeof MAX_ROWS_SHOWN === "number" ? MAX_ROWS_SHOWN : null',
+      sandbox,
+    ),
+  };
   return sandbox;
 }
 
@@ -185,7 +208,7 @@ function main() {
     : readFileSync(payloadPath, "utf8");
   const cases = JSON.parse(raw);
   const renderer = loadRenderer();
-  const results = {};
+  const results = { __constants__: renderer.__constants__ };
   for (const [name, payloads] of Object.entries(cases)) {
     const out = {};
     // A key is rendered only when its payload is present, so a tx-level case
@@ -206,6 +229,8 @@ function main() {
       const tx = renderer.renderFetchedTxCard(payloads.tx);
       out.fetched_tx_card = renderedLines(tx);
       out.fetched_tx_card_classes = renderedClasses(tx);
+      out.fetched_tx_card_elements = countElements(tx, () => true);
+      out.fetched_tx_card_file_inputs = countElements(tx, (n) => n.tag === "input" && n.type === "file");
     }
     if (Object.keys(out).length === 0) {
       throw new Error(

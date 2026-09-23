@@ -124,6 +124,35 @@ missing capability of the reader's browser and never a verdict on the
 record — it is rendered neutral, says whose limitation it is, and
 points at the CLI, which has the curve library.
 
+### What one transaction can cost the page
+
+A transaction is not small by default: about 28,000 signed HashMark
+records fit under the 4 MB cap, and each signature check is a curve
+recovery in JavaScript on the page's main thread. So `/inspect/` draws
+at most `MAX_ROWS_SHOWN` rows (set in `inspect.js`) from each list a
+transaction produces — its outputs, the other glyphs a reveal minted,
+its glyph envelopes — and passes the same number to the classifier as
+the number of HashMark signatures to check. A later record that is a
+byte-for-byte copy of a checked one gets that record's answer; any
+other record past the limit is reported as not checked here. Under the
+last row, a note gives exact counts of what was not drawn and what was
+not checked, and the command that shows all of it:
+`pyrxd glyph inspect <txid> --fetch`, which draws everything and checks
+every record. `/verify/` draws and checks at most its own, smaller
+number of marks (`MAX_MARK_PANELS` in `verify.js`).
+
+What is **not** bounded: every output and input is still decoded, sanitised and
+carried into the page, and into the raw-JSON drawer — work that grows
+with the transaction, without the signature checks.
+
+Every raw transaction either page fetches is hashed and compared with
+the txid it asked for before anything reads it, so a server that
+answers with some other transaction is refused. That includes
+`/inspect/`'s second fetch, of the commit a reveal spent, which is what
+decides `payload_binding`. When that fetch fails or is refused, the
+verdict reads `unchecked` and says why — not that the spent output
+"was not supplied".
+
 ---
 
 ## The trust boundary

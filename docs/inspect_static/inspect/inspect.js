@@ -76,7 +76,7 @@ const CURVE_URL = new URL("./secp256k1-bridge.js", document.baseURI).toString();
 // Keeping these on the module rather than `window` avoids polluting the
 // global namespace and keeps the surface explicit.
 let pyGlue = null;          // glue.run(text) -> dict
-let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex) -> dict
+let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex, prev_raw_hex, limit, prev_error) -> dict
 // The verdict view's three extra bridges. Each is a thin forward to pyrxd: the
 // block comes from `resolve_mark_anchor`, the hash choice from `algorithm_for`,
 // and the digest comparison and its wording from `_inspect_core`. None of the
@@ -85,6 +85,26 @@ let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex) -> dict
 let pyMarkAnchor = null;      // glue.mark_anchor(txid, verbose_json, tip) -> dict
 let pyFileCheckPlan = null;   // glue.file_check_plan(algorithm_id) -> dict
 let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo) -> dict
+
+// THE MOST ROWS THIS PAGE DRAWS FROM ANY ONE LIST OF ONE TRANSACTION — its outputs, the
+// other glyphs a reveal minted, its glyph envelopes — AND THE NUMBER OF HASHMARK SIGNATURES
+// IT CHECKS. One number, for the reason /verify/'s MAX_MARK_PANELS is one number: the page
+// then pays for no more curve work than it shows, and every mark in a drawn row is within
+// the checking limit (a record in the first N rows is among the first N records).
+//
+// Nothing else bounds any of it. Measured when this limit was added: 28,166 distinct signed
+// v2 records (no label) fit under the 4 MB transaction cap, and this page checked and drew
+// every one — 1,013,995 elements and 28,166 file choosers under Node's stub DOM (not a
+// browser), after a curve recovery per record in JavaScript on the main thread (about 1.4 ms
+// each under Node; not measured in a browser). A transaction of 88,884 inputs that each carry
+// a bare `gly` marker drew 622,218 elements the same way, from the envelope list.
+//
+// 100 rather than /verify/'s 50 because a row here is any output, not only a mark, and an
+// inspector reader is more likely to be looking at a wide payout than a stranger is. Past
+// it, a note gives exact counts of what was not drawn and not checked, and the command that
+// shows everything: `pyrxd glyph inspect <txid> --fetch` has no screen to fill and checks
+// every record.
+const MAX_ROWS_SHOWN = 100;
 
 // The ElectrumX endpoint, the wire timeout and the transaction size cap are
 // `ELECTRUMX_WSS_URL` / `FETCH_TIMEOUT_MS` / `MAX_FETCHED_TX_HEX_LEN` in shared.js,
@@ -436,12 +456,20 @@ function renderFetchedTxCard(payload) {
     wrapper.appendChild(el("p", { class: "tx-shape-note", text: shapeNote }));
   }
 
-  // Per-output rows.
+  // Per-output rows — at most MAX_ROWS_SHOWN, and never silently fewer: the heading says
+  // how many were drawn out of how many, and the note after the last row says what the
+  // rest are.
   const outputs = payload.outputs || [];
   if (outputs.length > 0) {
-    wrapper.appendChild(el("h3", { class: "result-subhead", text: "Outputs" }));
+    const shownOutputs = outputs.slice(0, MAX_ROWS_SHOWN);
+    wrapper.appendChild(el("h3", {
+      class: "result-subhead",
+      text: shownOutputs.length < outputs.length
+        ? `Outputs (the first ${shownOutputs.length} of ${outputs.length})`
+        : "Outputs",
+    }));
     const outList = el("div", { class: "output-rows" });
-    for (const row of outputs) {
+    for (const row of shownOutputs) {
       // The block is a fact about the TRANSACTION, so it is resolved once and handed
       // to every row that carries a mark rather than looked up per output.
       outList.appendChild(renderOutputRow(row, {
@@ -450,6 +478,9 @@ function renderFetchedTxCard(payload) {
       }));
     }
     wrapper.appendChild(outList);
+    for (const line of hiddenOutputsNote(outputs.slice(shownOutputs.length), payload.txid)) {
+      wrapper.appendChild(el("p", { class: "card-note hidden-rows-note", text: line }));
+    }
   }
 
   // dMint mint-claim scriptSig (if present at vin[0]). Surfaces the four
@@ -515,6 +546,11 @@ function renderFetchedTxCard(payload) {
       const pb = metadata.payload_binding;
       const cls = pb.state === "mismatch" ? "kv-warning" : undefined;
       mdl.appendChild(kv("payload binding", `${pb.state} — ${pb.reason}`, cls));
+      // WHY, when the page asked for the spent transaction and could not use what it got:
+      // the server's refusal, or what was wrong with its answer — including an answer that
+      // was not the transaction asked for. From `glue.py`, which says it rather than letting
+      // "was not supplied" stand for a transaction that was.
+      if (pb.detail) mdl.appendChild(kv("payload binding detail", pb.detail));
     }
     // Named whatever the verdict. On `unchecked` it is the outpoint someone would
     // fetch to settle it; on `mismatch` it is where the committed payload lives.
@@ -665,7 +701,9 @@ function renderFetchedTxCard(payload) {
       text: `Other glyphs minted in this transaction (${otherGlyphs.length})`,
     }));
     const odl = el("dl", { class: "kv-list" });
-    for (const row of otherGlyphs) {
+    // At most MAX_ROWS_SHOWN, like the outputs: one row per payload-carrying input, and
+    // nothing else bounds how many inputs carry one.
+    for (const row of otherGlyphs.slice(0, MAX_ROWS_SHOWN)) {
       // Name AND ticker, not whichever is truthy first: a glyph carrying both
       // and shown one of them is the same "you were told about a different
       // token" failure one level down.
@@ -673,6 +711,14 @@ function renderFetchedTxCard(payload) {
       odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}`));
     }
     wrapper.appendChild(odl);
+    const hiddenGlyphs = otherGlyphs.length - Math.min(otherGlyphs.length, MAX_ROWS_SHOWN);
+    if (hiddenGlyphs > 0) {
+      wrapper.appendChild(el("p", {
+        class: "card-note hidden-rows-note",
+        text: `The first ${MAX_ROWS_SHOWN} are listed; ${hiddenGlyphs} more ` +
+              `${hiddenGlyphs === 1 ? "is" : "are"} not shown here. ${seeEverything(payload.txid)}`,
+      }));
+    }
   }
 
   // Glyph envelopes carrying no full payload.
@@ -695,7 +741,9 @@ function renderFetchedTxCard(payload) {
       class: "result-subhead",
       text: `Glyph envelopes carrying no full payload (${envelopes.length})`,
     }));
-    for (const env of envelopes) {
+    // At most MAX_ROWS_SHOWN entries, each of which can be dozens of rows; the rest are counted
+    // by kind below, in the words each entry would have been shown with.
+    for (const env of envelopes.slice(0, MAX_ROWS_SHOWN)) {
       const edl = el("dl", { class: "kv-list" });
       if (env.kind === "update") {
         edl.appendChild(kv(`input ${env.input_index}`, "UPDATE — a mutable glyph's fields are being changed here"));
@@ -752,9 +800,117 @@ function renderFetchedTxCard(payload) {
       if (env.reason) edl.appendChild(kv("reason", _capText(env.reason)));
       wrapper.appendChild(edl);
     }
+    const hiddenEnvelopes = envelopes.slice(MAX_ROWS_SHOWN);
+    if (hiddenEnvelopes.length > 0) {
+      const n = hiddenEnvelopes.length;
+      wrapper.appendChild(el("p", {
+        class: "card-note hidden-rows-note",
+        text: `${n} more ${n === 1 ? "envelope is" : "envelopes are"} not shown here: ` +
+              `${tallyText(hiddenEnvelopes, envelopeWord, ENVELOPE_WORD_ORDER)}. ${seeEverything(payload.txid)}`,
+      }));
+    }
   }
 
   return wrapper;
+}
+
+// ─────────────────────────────── what was not drawn, in exact counts ──
+//
+// A list cut at MAX_ROWS_SHOWN must not read as the whole list. Every count below is taken
+// from what the classifier actually said about each row that was left out — never inferred
+// from its position — and in the words that row would have been drawn with, so a forged
+// record past the limit is counted as what it is and a record past the checking limit is
+// counted as NOT checked, not folded into a total that reads as clean.
+
+// The command that shows everything. `pyrxd glyph inspect --fetch` has no screen to fill:
+// it prints every output, every envelope and every other glyph, and checks every record.
+function seeEverything(txid) {
+  return `To see all of it, with every signature checked: pyrxd glyph inspect ${txid || "<txid>"} --fetch`;
+}
+
+// "3 VERIFIED, 1 DOES NOT VERIFY" — counts of `keyOf(item)`, words in `order` first (worst
+// first), then the rest by count. At most 12 distinct words are named: the words come from
+// the classifier's own vocabulary, but a count of them must not become the flood it reports.
+const _TALLY_WORDS_NAMED = 12;
+function tallyText(items, keyOf, order) {
+  const counts = new Map();
+  for (const item of items) {
+    const key = keyOf(item);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const rank = (w) => {
+    const i = (order || []).indexOf(w);
+    return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  const words = [...counts.keys()].sort(
+    (a, b) => rank(a) - rank(b) || counts.get(b) - counts.get(a) || (a < b ? -1 : a > b ? 1 : 0),
+  );
+  const parts = words.slice(0, _TALLY_WORDS_NAMED).map((w) => `${counts.get(w)} ${w}`);
+  const rest = words.slice(_TALLY_WORDS_NAMED);
+  if (rest.length > 0) {
+    const n = rest.reduce((sum, w) => sum + counts.get(w), 0);
+    parts.push(`${n} more of ${rest.length} other ${rest.length === 1 ? "kind" : "kinds"}`);
+  }
+  return parts.join(", ");
+}
+
+// The status word a HashMark row's panel would show, with the one distinction the panel
+// never has to draw: a record past the checking limit is "not checked here", which is the
+// page declining to check — not the curve failing to load, which is NOT CHECKED.
+const NOT_CHECKED_HERE = "not checked here";
+const MARK_WORD_ORDER = [
+  "DOES NOT VERIFY", "INVALID", NOT_CHECKED_HERE, "NOT CHECKED",
+  "UNKNOWN VERSION", "UNKNOWN ALGORITHM", "NO SIGNATURE", "VERIFIED",
+];
+function markWord(hm) {
+  // The same expression `appendMarkVerdict` prints for a record that is not readable.
+  if (hm.outcome !== "ok") return String(hm.outcome || "").toUpperCase().replace(/_/g, " ") || "NOT CHECKED";
+  const att = hm.attestation || {};
+  if (att.outcome === "not_checked_here") return NOT_CHECKED_HERE;
+  return att.status || "NOT CHECKED";
+}
+
+// The word each envelope entry leads with when it is drawn.
+const ENVELOPE_WORD_ORDER = ["UNREADABLE", "payload_unrendered", "UPDATE"];
+function envelopeWord(env) {
+  if (env.kind === "update") return "UPDATE";
+  if (env.kind === "payload_unrendered") return "payload_unrendered";
+  return "UNREADABLE";
+}
+
+// What the outputs past MAX_ROWS_SHOWN are. `hidden` is the tail of `payload.outputs`, which
+// the classifier emits in vout order.
+function hiddenOutputsNote(hidden, txid) {
+  const n = hidden.length;
+  if (n === 0) return [];
+  const where = n === 1 ? `vout ${hidden[0].vout}` : `vout ${hidden[0].vout} to ${hidden[n - 1].vout}`;
+  const lines = [
+    `${n} more ${n === 1 ? "output is" : "outputs are"} in this transaction and ` +
+    `${n === 1 ? "is" : "are"} not shown here (${where}). By type: ` +
+    `${tallyText(hidden, (row) => String(row.type || "unknown"))}.`,
+  ];
+  const marks = hidden.filter((row) => row && row.hashmark);
+  if (marks.length > 0) {
+    const k = marks.length;
+    lines.push(
+      `${k === n ? (k === 1 ? "It carries" : "They carry") : `${k} of them carry`} ` +
+      `${k === 1 ? "a HashMark record" : "HashMark records"}. What this page knows about ` +
+      `${k === 1 ? "its signature" : "their signatures"}: ` +
+      `${tallyText(marks, (row) => markWord(row.hashmark), MARK_WORD_ORDER)}.`,
+    );
+    const unchecked = marks.filter((row) => markWord(row.hashmark) === NOT_CHECKED_HERE).length;
+    if (unchecked > 0) {
+      lines.push(
+        `This page checks the signatures of the first ${MAX_ROWS_SHOWN} HashMark records in a ` +
+        "transaction, and of any later record that is a byte-for-byte copy of one of them. The " +
+        `${unchecked === 1 ? "one" : unchecked} ${NOT_CHECKED_HERE} ${unchecked === 1 ? "was" : "were"} ` +
+        "past that, so nothing here says whether " + (unchecked === 1 ? "it verifies" : "they verify") +
+        " — a record that does not verify could be among them.",
+      );
+    }
+  }
+  lines.push(seeEverything(txid));
+  return lines;
 }
 
 // Display caps for publisher-chosen text, mirroring `_HUMAN_STRING_CAP` and
@@ -2134,13 +2290,18 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // this the verdict can only ever read "unchecked".
   //
   // BOUNDED BY CONSTRUCTION: one attributed input, one prevout, one extra round trip.
-  // Best-effort throughout — a failure here leaves the first pass standing and the
-  // verdict degrades to its own stated "unchecked" reason rather than erroring out.
+  // A failure here leaves the rest of the report standing — and is SAID: the refusal or the
+  // unusable answer goes to Python as `prevError`, and the verdict reads "unchecked" with
+  // that as its detail. It used to be swallowed, and the report then said the spent
+  // transaction "was not supplied" when the page had asked for it and been lied to.
+  //
+  // THE ROW LIMIT IS ALSO THE CHECKING LIMIT, on both calls: the classifier checks the
+  // signatures of the first MAX_ROWS_SHOWN HashMark records only (and of any later
+  // byte-for-byte copy of one, which costs nothing), so a lookup costs this tab at most two
+  // classifications' worth of that — never one curve recovery per record in the transaction.
   let result;
   try {
-    let pyResult = pyGlueFetch(txid, rawHex);
-    result = pyResult.toJs({ dict_converter: Object.fromEntries });
-    pyResult.destroy();
+    result = fromPy(pyGlueFetch(txid, rawHex, "", MAX_ROWS_SHOWN));
 
     const outpoint = result && result.payload && result.payload.metadata
       ? result.payload.metadata.input_outpoint
@@ -2148,17 +2309,16 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
     if (outpoint) {
       statusEl.textContent = "checking payload binding…";
       const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
-      let prevRawHex = null;
+      let prevRawHex = "";
+      let prevError = "";
       try {
+        // Hash-checked against `prevTxid` inside the fetch: a server that answers with any
+        // other transaction is refused there, before a byte of it reaches the classifier.
         prevRawHex = await fetchRawTxFromElectrumx(prevTxid);
-      } catch {
-        prevRawHex = null;  // stays "unchecked", with its own reason
+      } catch (err) {
+        prevError = stripControlChars(String((err && err.message) || err));
       }
-      if (prevRawHex) {
-        pyResult = pyGlueFetch(txid, rawHex, prevRawHex);
-        result = pyResult.toJs({ dict_converter: Object.fromEntries });
-        pyResult.destroy();
-      }
+      result = fromPy(pyGlueFetch(txid, rawHex, prevRawHex, MAX_ROWS_SHOWN, prevError));
     }
   } catch (err) {
     fetchBtn.disabled = false;

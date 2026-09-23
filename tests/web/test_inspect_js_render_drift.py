@@ -1261,7 +1261,9 @@ def tx_payloads() -> dict[str, dict]:
 def tx_rendered(tx_payloads) -> dict[str, str]:
     """``{case: fetched-tx-card text}`` from the real JS."""
     cases = {name: {"tx": payload} for name, payload in tx_payloads.items()}
-    return {name: out["fetched_tx_card"] for name, out in _run_harness(_require_node(), cases).items()}
+    out = _run_harness(_require_node(), cases)
+    # By the names SENT, not the names returned: the harness also returns `__constants__`.
+    return {name: out[name]["fetched_tx_card"] for name in cases}
 
 
 # A key the tx card is ALLOWED to drop, with the reason. Same contract as the
