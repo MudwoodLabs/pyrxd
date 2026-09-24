@@ -467,7 +467,6 @@ Mechanisms catch decay. Finding a wrong idea still takes an adversarial reader.
 - [`glyph-mint-fee-ceiling-judged-one-rate-while-the-reveal-spent-another.md`](../logic-errors/glyph-mint-fee-ceiling-judged-one-rate-while-the-reveal-spent-another.md) — a fund-safety guard that existed but was unreachable on the default path.
 - [`taproot-refund-leaf-empty-stack-test-the-execution-not-just-the-bytes.md`](../logic-errors/taproot-refund-leaf-empty-stack-test-the-execution-not-just-the-bytes.md) — the same discipline one layer down: test execution, not bytes.
 - [`funding-utxo-byte-scan-dos.md`](../logic-errors/funding-utxo-byte-scan-dos.md) — a fixture-vs-domain gap; tests exercised only adversarial shapes and never the honest one.
-- [`task-ci-spurious-failures-from-concurrent-worktrees.md`](../integration-issues/task-ci-spurious-failures-from-concurrent-worktrees.md) — a different flavour of the gate lying.
 - `docs/how-to/mutation-testing.md` — the equivalent-mutant classes, and the trap where a plant that never applied reads exactly like a survivor.
 - `tests/conftest.py` and `tests/expected_skips.py` — the skip audit, built after sixteen golden-vector tests skipped green since the day they were written.
 - Open, unresolved instances of this class: **#510** (coverage that reads as production coverage and is not), **#517** (a flaky assertion on a signed transaction size), **#505** (above).
