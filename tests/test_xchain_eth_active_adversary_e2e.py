@@ -116,9 +116,7 @@ class TestEthActiveAdversary:
         node, url = env
         # Honest taker coordinator — role=TAKER (P3 guard). _build generates p, but we hand it ONLY to
         # the adversary; the honest coordinator never receives it (recovers it from chain in step 5).
-        coord, cov, p_secret, eth_leg, rpc, _ref = _build(
-            node, url, t_rxd_blocks=60, asset_variant="rxd", role=SwapRole.TAKER
-        )
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd", role=SwapRole.TAKER)
         terms = coord.record.terms
         adv = _ActiveAdversaryMaker(url, p_raw=p_secret.unsafe_raw_bytes(), eth_timeout_unix_s=terms.eth_timeout_unix_s)
 
@@ -192,10 +190,8 @@ class TestEthActiveAdversary:
         the covenant off a non-final reveal (which a reorg of the ETH claim would turn into one-sided
         loss). The genuinely-separated + active-reveal analogue of S4."""
         node, url = env
-        # Tight t_rxd so the window can close while the ETH claim stays non-final.
-        coord, cov, p_secret, eth_leg, rpc, _ref = _build(
-            node, url, t_rxd_blocks=12, asset_variant="rxd", role=SwapRole.TAKER
-        )
+        # The derived window; the test closes it by mining while the ETH claim stays non-final.
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd", role=SwapRole.TAKER)
         terms = coord.record.terms
         adv = _ActiveAdversaryMaker(url, p_raw=p_secret.unsafe_raw_bytes(), eth_timeout_unix_s=terms.eth_timeout_unix_s)
 

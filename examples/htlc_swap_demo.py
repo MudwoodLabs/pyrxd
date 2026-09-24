@@ -93,17 +93,20 @@ def main() -> None:
 
     # -- The safety invariant -------------------------------------------------
     _hr("2. The ordering + timelock invariant (read before wiring anything)")
-    _info("1) maker publishes H        2) taker locks BTC/ETH  FIRST")
-    _info("3) maker locks the NFT covenant  SECOND")
+    _info("1) maker publishes H        2) maker locks the NFT covenant  FIRST")
+    _info("3) taker locks BTC/ETH  SECOND, only after reading that covenant on chain (HZ-1)")
     _info("4) maker claims BTC/ETH FIRST, revealing p   5) taker scrapes p, claims the NFT")
     _info("")
-    _info("Timelocks MUST satisfy   t_counterchain > t_rxd + margin .  The leg claimed")
-    _info("SECOND (Radiant) carries the SHORTER refund window, so the taker has time to")
-    _info("scrape p and claim before its own refund opens. SwapCoordinator enforces this")
-    _info("fail-closed (assert_timelock_margin) — never route around it.")
+    _info("Timelocks MUST satisfy, in WALL CLOCK (#482, #567):")
+    _info("    t_rxd * i_rxd  >=  t_counterchain * i_counter  +  margin")
+    _info("The maker holds p and LOCKS the Radiant leg, so that leg carries the LONGER")
+    _info("refund: the taker's counter-leg refund opens a full margin BEFORE the maker's")
+    _info("covenant refund, so the taker can recover its leg before the maker can recover")
+    _info("the asset. SwapCoordinator enforces this fail-closed (assert_timelock_margin)")
+    _info("— never route around it.")
 
     # -- The NFT HTLC covenant (the asset leg) --------------------------------
-    _hr("3. Build the NFT HTLC covenant (the asset the maker locks SECOND)")
+    _hr("3. Build the NFT HTLC covenant (the asset the maker locks FIRST)")
     # In a real swap the genesis outpoint is the NFT's actual mint ref, resolved and
     # authenticity-checked via verify_ref_authenticity: consensus enforces ref
     # UNIQUENESS, not mint PROVENANCE, so a fake-singleton covenant is accepted by

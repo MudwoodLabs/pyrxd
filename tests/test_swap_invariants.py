@@ -28,9 +28,11 @@ The invariants (stated precisely so they are falsifiable):
       goes through COMPLETED, and COMPLETED is reachable. => the success
       terminal and the loss terminal are mutually exclusive outcomes.
 
-  I5  ORDERING (NegotiatedTerms). t_btc > t_rxd in the same unit is rejected at
-      construction (the maker must hold the LONGER refund window so the taker can
-      always refund Radiant before the BTC refund opens). Property-tested.
+  I5  ORDERING (NegotiatedTerms). t_btc >= t_rxd in the same unit is rejected at
+      construction (#482: the maker holds p and LOCKS the Radiant leg, so that leg
+      carries the LONGER refund and the taker's BTC refund opens first; this read
+      "so the taker can always refund Radiant before the BTC refund opens", the
+      pre-#482 picture, until 2026-09-23). Property-tested.
 """
 
 from __future__ import annotations

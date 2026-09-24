@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -40,15 +41,21 @@ from pyrxd.btc_wallet import taproot as bt
 from pyrxd.devnet import RegtestNode
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import (
+    CrossClockMargin,
+    assert_covenant_confirms_before_eth_deadline,
+    eth_absolute_to_rxd_relative_blocks,
+)
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import JsonFileRecordSink
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator, _dividing_interval_s
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import ChainObserver, DedupAlerter, EthClaimStatus, Intent, Reconciler, Severity
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
+from pyrxd.security.errors import NetworkError
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
@@ -66,6 +73,7 @@ from tests.test_xchain_swap_regtest_e2e import (
     _RXD_MIN_RELAY_RXD_PER_KB,
     _RXD_RELAY_FEE,
     _FeeSource,
+    _fewest_blocks_left_that_wait,
     _LiveRecordStore,
     _p2pkh_unlock,
     _RadiantCliClient,
@@ -73,6 +81,10 @@ from tests.test_xchain_swap_regtest_e2e import (
     _RegtestRxdChainSource,
     _rxd_pay,
     _src,
+    # The ONE canonical counter-leg derivation (scripts/_dust_swap_shared.py), re-exported by the BTC
+    # e2e, which puts scripts/ on the path — the same function scripts/eth_swap_two_host.py calls.
+    derive_counter_timelock,
+    elapsed_reserve_blocks,
 )
 
 pytestmark = pytest.mark.integration
@@ -288,6 +300,78 @@ def _eth_policy():
     )
 
 
+#: How far past anvil's clock these swaps put the ETH refund deadline: the one INPUT the timelocks
+#: are derived from. Far enough out that the maker's claim clears the pre-reveal head-room gate
+#: (#491) while anvil's clock barely moves during a test.
+_ETH_WINDOW_S = 50_000
+
+
+def _derive_eth_timelocks(url, policy: MarginPolicy) -> tuple[bt.Timelock, bt.Timelock, int]:
+    """``(t_btc, t_rxd, eth_timeout_unix_s)`` for an ETH swap, derived the way the production ETH path does.
+
+    ``t_rxd`` is SIZED from the ETH deadline by ``eth_absolute_to_rxd_relative_blocks`` — the sizer
+    ``scripts/eth_swap_run.py`` calls — at the interval the coordinator's cross-clock gate divides
+    by, so the maker's covenant refund opens no earlier than the ETH deadline plus the cross-clock
+    margin (#482). ``t_btc`` has no on-chain meaning on an ETH swap (HZ-4), but ``NegotiatedTerms``
+    still refuses ``t_btc >= t_rxd``, so it is derived with ``derive_counter_timelock`` exactly as
+    ``scripts/eth_swap_two_host.py`` derives it.
+
+    ANCHORED ONE COVENANT-CONFIRM-WAIT EARLY, as ``test_xchain_eth_glyph_real_rxindexer_e2e`` does.
+    The gate measures the REMAINING window from ``now`` — ``now + (t_rxd - elapsed) * interval`` —
+    and regtest mines the covenant's confirmations without moving anvil's clock, so each one reaches
+    the gate as a block of window that no time paid for. Sized at ``now`` itself, the pre-fund gate
+    refused every scenario in these suites that funds the counter leg, at one confirmation (e.g.
+    "178 blk left of 179"). The early anchor
+    pre-pays that depth using the policy's own confirm-wait, and the loop below checks the gate
+    actually accepts every depth it claims to cover.
+
+    This suite used ``t_btc = t_rxd + 40`` with ``t_rxd`` of 12-60 blocks against a deadline 50,000 s
+    out: the pre-#482 layout TWICE over — the raw ordering, which ``NegotiatedTerms`` refuses, and a
+    Radiant refund opening hours BEFORE the ETH deadline, which the cross-clock gate refuses.
+    """
+    now = _anvil_now(url)
+    eth_timeout = now + _ETH_WINDOW_S
+    interval = _dividing_interval_s(policy)
+    wait = int(policy.max_covenant_confirm_wait_s)
+    t_rxd = eth_absolute_to_rxd_relative_blocks(
+        eth_timeout_unix_s=eth_timeout,
+        expected_rxd_lock_time_unix_s=now - wait,
+        margin=policy.cross_clock_margin,
+        rxd_block_interval_s=interval,
+    )
+    for elapsed in range(int(wait // interval) + 1):
+        assert_covenant_confirms_before_eth_deadline(
+            now_unix_s=now,
+            eth_timeout_unix_s=eth_timeout,
+            margin=policy.cross_clock_margin,
+            t_rxd=t_rxd,
+            rxd_block_interval_s=interval,
+            max_covenant_confirm_wait_s=wait,
+            elapsed_blocks=elapsed,
+        )
+    t_btc = bt.Timelock(
+        derive_counter_timelock(
+            t_rxd_blocks=t_rxd.value,
+            margin_blocks=policy.margin.value,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            btc_block_interval_s=policy.block_interval_s,
+            elapsed_reserve_blocks=elapsed_reserve_blocks(rxd_claim_burial_blocks=policy.rxd_claim_burial.value),
+        ),
+        bt.TimeUnit.BLOCKS,
+    )
+    return t_btc, t_rxd, eth_timeout
+
+
+def _pass_the_eth_deadline(node, url, terms, policy: MarginPolicy) -> None:
+    """Advance to the ETH refund deadline — the counter leg's refund opens — and mine the Radiant
+    blocks the same wall clock holds at the policy's nominal interval, rounded UP so any following
+    "the covenant has NOT matured yet" assertion is only made harder to pass."""
+    elapsed_s = terms.eth_timeout_unix_s + 1 - _anvil_now(url)
+    _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
+    _anvil_mine(url, 1)
+    node.rxd_mine(math.ceil(elapsed_s / policy.rxd_block_interval_s))
+
+
 def _fund_spending_ref(node, dest_spk: bytes, amount: int, ref_utxo: dict) -> str:
     """Fund ``dest_spk`` by spending EXACTLY ``ref_utxo`` (so its outpoint enters the input-ref
     set — the R1 mechanism that makes consensus accept the FT/NFT singleton; consensus enforces
@@ -319,17 +403,20 @@ def _fund_spending_ref(node, dest_spk: bytes, amount: int, ref_utxo: dict) -> st
     return str(txid)
 
 
-def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None, record_path=None):
+def _build(node, url, *, asset_variant="rxd", role=None, record_path=None):
     """Build the covenant, the real legs, and the coordinator for an ETH↔(RXD|FT-glyph|NFT-glyph)
     swap. Returns (coord, cov, p_secret, eth_leg, rpc, ref_utxo) — ref_utxo is None for rxd, else
-    the wallet UTXO that funds the singleton (the maker spends it to lock the asset)."""
+    the wallet UTXO that funds the singleton (the maker spends it to lock the asset).
+
+    The timelocks are DERIVED (``_derive_eth_timelocks``), never passed in: every scenario gets the
+    window production would negotiate, and one that needs a CLOSING window mines towards it after
+    both legs are locked — which is also the only way a window closes in production."""
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
     # rxd swaps the photons; ft/nft swap a small token carrier (the singleton/FT amount).
     carrier = 100_000 if asset_variant == "rxd" else 1000
-    t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    t_btc = bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS)  # decorative for ETH; kept > t_rxd
-    eth_timeout = _anvil_now(url) + 50_000  # clears the cross-clock projection; future for claim()
+    policy = _eth_policy()
+    t_btc, t_rxd, eth_timeout = _derive_eth_timelocks(url, policy)
 
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
@@ -437,7 +524,7 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None, record_pa
         # on a value-bearing (anvil) counter-leg; the MEDIUM-1 guard (#192) refuses that unless the
         # operator opts in — the same explicit hatch the dust harnesses use. No real value moves.
         config=CoordinatorConfig(
-            margin_policy=_eth_policy(),
+            margin_policy=policy,
             accept_nondurable_seen=True,
             accept_estimated_eth_margins=True,
             role=role,
@@ -456,9 +543,12 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None, record_pa
 # ChainObserver and DedupAlerter run UNCHANGED, so a green run proves the real ETH decision core emits
 # the correct Intent on real anvil+regtest consensus.
 #
-# With _eth_policy(): rxd_claim_burial = 6 (default), counter_reserve = ceil(768/300) = 3, so the gate
-# reduces to blocks_left = t_rxd - cov_confs + 1 with: FINAL → SAFE iff blocks_left >= 6; NOT_YET_FINAL
-# → WAIT iff blocks_left >= 9, else SQUEEZED; a maker stall pages mutual_refund once blocks_left <= 6.
+# blocks_left = deadline - tip, with deadline = covenant height + t_rxd. The thresholds are the
+# coordinator's and are derived where a test needs one (`_fewest_blocks_left_that_wait`): FINAL → SAFE
+# while there is room to mine and bury the taker's claim; NOT_YET_FINAL → WAIT only while there is ALSO
+# room for the ETH finalization window, else SQUEEZED; a maker stall pages mutual_refund once
+# blocks_left <= `maker_stall_safety_window_blocks`. This comment used to spell them as numbers, and
+# they went stale when #511 added the claim-inclusion blocks.
 
 
 def _claimed_topic0() -> str:
@@ -516,9 +606,9 @@ def _eth_watchtower(node, url, coord, rpc):
     return reconciler, channel
 
 
-async def _setup_eth_both_locked(node, url, *, t_rxd_blocks):
+async def _setup_eth_both_locked(node, url):
     """Drive an ETH↔RXD (rxd) swap to BOTH_LOCKED on real anvil + regtest. Returns (coord, p_secret, rpc)."""
-    coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=t_rxd_blocks)
+    coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url)
     terms = coord.record.terms
     # HZ-1: the maker locks the RXD covenant FIRST and it is mined; only then may the taker fund
     # the ETH counter leg. taker_funds_btc reads the Radiant chain for this exact covenant SPK
@@ -546,7 +636,7 @@ class TestWatchtowerEthIntentSequence:
 
     async def test_eth_happy_watch_then_wait_then_page_claim(self, env):
         node, url = env
-        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=60)
+        coord, p_secret, rpc = await _setup_eth_both_locked(node, url)
         reconciler, channel = _eth_watchtower(node, url, coord, rpc)
 
         # 1. maker hasn't revealed p, deadline far → WATCH (no page).
@@ -590,21 +680,30 @@ class TestWatchtowerEthIntentSequence:
 
     async def test_eth_maker_stall_watch_then_page_mutual_refund(self, env):
         node, url = env
-        coord, _p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=20)
+        coord, _p_secret, rpc = await _setup_eth_both_locked(node, url)
         reconciler, channel = _eth_watchtower(node, url, coord, rpc)
+        window = coord.config.maker_stall_safety_window_blocks
 
         # 1. just locked, refund window not near → WATCH.
         r = await self._tick(reconciler)
         assert r.decision.intent is Intent.WATCH
         assert channel.pages == []
+        deadline = r.decision.deadline_rxd_height
+        assert deadline is not None
 
-        # 2. maker never claims; advance RXD to within the safety window of t_rxd maturity
-        #    (cov_confs 1→15 ⇒ now >= maturity - 6) → PAGE_REFUND naming mutual_refund (NOT the RXD-only
-        #    maybe_refund_asset_on_maker_stall, which is forbidden on the ETH stall path).
-        node.rxd_mine(14)
+        # 2. maker never claims; one block before the stall window opens → still WATCH.
+        node.rxd_mine(deadline - window - 1 - int(node.rxd("getblockcount")))
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH, "the stall page must not fire before its window"
+        assert channel.pages == []
+
+        # 3. the window opens (blocks_left == window) → PAGE_REFUND naming mutual_refund (NOT the
+        #    RXD-only maybe_refund_asset_on_maker_stall, which is forbidden on the ETH stall path).
+        node.rxd_mine(1)
         r = await self._tick(reconciler)
         assert r.decision.intent is Intent.PAGE_REFUND
         assert r.decision.recommended_action == "mutual_refund"
+        assert r.decision.deadline_rxd_height == deadline
         assert r.alert_delivered is True
         assert len(channel.pages) == 1
         assert channel.pages[0].severity is Severity.WARN  # a stall refund is recoverable, not a race
@@ -613,23 +712,32 @@ class TestWatchtowerEthIntentSequence:
 
     async def test_eth_reveal_with_closing_window_pages_squeezed(self, env):
         node, url = env
-        # 12 then mine 4, rather than negotiating 8. A swap this tight is now refused at FUND
-        # time, so it can no longer be set up by agreeing to it — which is right, and does not
-        # make the state unreachable: a window closes because BLOCKS PASS after both legs are
-        # locked. Reaching it that way is also the only way it happens in production.
-        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=12)
+        # The window is closed by MINING after both legs are locked, not by negotiating a short one:
+        # a swap that tight is refused at FUND time, and a window closes in production because
+        # blocks pass. With the ETH clock held still, this is Radiant blocks outrunning an ETH
+        # finality that has not arrived — the case the cross-clock margin budgets for.
+        coord, p_secret, rpc = await _setup_eth_both_locked(node, url)
         reconciler, channel = _eth_watchtower(node, url, coord, rpc)
+        not_final = CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+        squeeze_left = _fewest_blocks_left_that_wait(coord.config.margin_policy, not_final) - 2  # under the floor
+        assert squeeze_left > coord.config.maker_stall_safety_window_blocks, (
+            "the squeeze window must sit outside the stall page, or the pre-reveal tick is a refund page"
+        )
 
         # 1. pre-reveal, full window → WATCH.
         r = await self._tick(reconciler)
         assert r.decision.intent is Intent.WATCH
         assert channel.pages == []
+        deadline = r.decision.deadline_rxd_height
 
-        # The window CLOSES: 4 blocks pass, leaving the same 8 this test used to negotiate.
-        node.rxd_mine(4)
+        # The window CLOSES to `squeeze_left` blocks; the maker is still silent → still WATCH.
+        node.rxd_mine(deadline - squeeze_left - int(node.rxd("getblockcount")))
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
 
-        # 2. maker reveals p but the claim is NOT finalized and t_rxd is too tight to wait
-        #    (blocks_left 8 < the 9 a WAIT needs: 8 - reserve 3 < burial 6) → SQUEEZED → PAGE_SQUEEZED.
+        # 2. maker reveals p but the claim is NOT finalized and blocks_left is under the WAIT floor
+        #    (no room left for the ETH finalization window plus the taker's own burial) → SQUEEZED.
         rec = await coord.maker_claims_btc(p_secret)
         assert rec.state is SwapState.SECRET_REVEALED
         r = await self._tick(reconciler)
@@ -647,7 +755,7 @@ class TestEthRxdSwap:
         """ETH↔(RXD | NFT-glyph | FT-glyph) settles end-to-end. The NFT/FT cases bind a Glyph
         token (genesis ref) into the covenant — proving the swap of a Glyph asset, not just RXD."""
         node, url = env
-        coord, cov, p_secret, eth_leg, rpc, ref_utxo = _build(node, url, t_rxd_blocks=60, asset_variant=asset_variant)
+        coord, cov, p_secret, eth_leg, rpc, ref_utxo = _build(node, url, asset_variant=asset_variant)
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
@@ -692,13 +800,14 @@ class TestEthRxdSwap:
         await rpc.close()
 
     async def test_mutual_refund_when_maker_never_claims(self, env):
+        """The maker never claims, and BOTH legs refund — in the order the #482 ordering produces:
+        the ETH refund opens at the ETH deadline while the maker's covenant refund is still closed
+        (both clocks advanced together), and only once ``t_rxd`` has also matured does
+        ``mutual_refund`` run and refund both legs."""
         node, url = env
-        # 12, not 3: the fund-time burial gate refuses any t_rxd that can never reach a safe claim
-        # (burial 6 + counter-leg reserve 3 + 1 to mine = 10). A refund test still has to get
-        # PAST funding, and no real operator would negotiate 3 blocks either. The CSV wait below
-        # scales off terms.t_rxd, so nothing else changes.
-        coord, cov, _p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12)
+        coord, cov, _p_secret, _eth_leg, rpc, _ref = _build(node, url)
         terms = coord.record.terms
+        policy = coord.config.margin_policy
         now_unix = _anvil_now(url)
 
         # HZ-1: maker locks the covenant first (mined), then the taker funds ETH against it. The
@@ -710,11 +819,18 @@ class TestEthRxdSwap:
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 
-        # Maker never claims. Mature the RXD CSV; warp anvil past the ETH timeout for the ETH refund.
-        node.rxd_mine(terms.t_rxd.value)
-        _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
-        _anvil_mine(url, 1)
+        # Maker never claims. 1. The ETH deadline passes (the taker's ETH refund opens) — and the
+        #    maker's covenant refund is still CLOSED at the same wall clock: the production leg's own
+        #    maturity check refuses it, before it takes a fee input or broadcasts anything.
+        _pass_the_eth_deadline(node, url, terms, policy)
+        cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
+        cov_confs = int(node.rxd("getrawtransaction", cov_txid, "true")["confirmations"])
+        assert cov_confs < terms.t_rxd.value, "the covenant refund must open LAST"
+        with pytest.raises(NetworkError, match="not yet mature"):
+            await coord.radiant_leg.refund_asset(coord.record)
 
+        # 2. t_rxd matures last; now mutual_refund unwinds BOTH legs.
+        node.rxd_mine(terms.t_rxd.value - cov_confs)
         rec = await coord.mutual_refund()
         assert rec.state is SwapState.MUTUAL_REFUND
         _outpoint_txid, _, _outpoint_vout = coord.record.radiant_covenant_outpoint.partition(":")

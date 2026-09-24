@@ -14,13 +14,19 @@ branch from the same BOTH_LOCKED state (``_setup_locked_swap``):
 
 * HAPPY PATH: maker_claims_btc -> SECRET_REVEALED (reveals p); then
   taker_scrape_and_claim_asset -> COMPLETED (scrapes p, claims the RXD covenant).
-* MUTUAL REFUND (maker never claims): both CSV timeouts elapse -> mutual_refund
-  refunds BOTH legs -> MUTUAL_REFUND. No one-sided loss.
-* MAKER STALL: taker proactively refunds the RXD asset via CSV before relying on the
-  swap -> ASSET_REFUNDED_TAKER_ACTS. Taker never loses both.
+* MUTUAL REFUND (maker never claims): the taker's BTC refund opens FIRST (``t_btc``), the
+  maker's Radiant refund LAST (``t_rxd``); once both have matured, mutual_refund refunds
+  BOTH legs -> MUTUAL_REFUND. No one-sided loss.
+* MAKER STALL (mechanics): ``maybe_refund_asset_on_maker_stall`` fires near ``t_rxd`` and
+  CSV-refunds the covenant -> ASSET_REFUNDED_TAKER_ACTS. That refund pays the MAKER, so it is a
+  maker-side primitive, not a taker recovery (see TestMakerStallAssetOnlyRefundIsTakerLoss).
 
-These prove the swap is safe whether it completes OR fails — the FSM's terminal
-paths all settle correctly on real consensus.
+THE TIMELOCKS ARE DERIVED, NEVER TYPED (see ``_derive_timelocks``). #482 inverted the required
+ordering: the maker holds ``p`` and LOCKS the Radiant leg, so ``t_rxd`` is the LONGER leg in wall
+clock and ``t_btc`` (the leg the maker CLAIMS) the shorter. This suite built ``t_btc = t_rxd + 40``
+by hand, which is the exploitable pre-#482 layout; ``NegotiatedTerms`` refuses it at construction,
+so every test in this file failed on every nightly run from 2026-09-01. The pair now comes from
+the same derivation the production runners use, against the coordinator's own policy.
 
 Both legs hit real nodes via thin shims (the production legs are unchanged):
 * BtcLeg -> bitcoind regtest (BtcCliBroadcaster + BtcCliFundingReader).
@@ -47,20 +53,38 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import coincurve
 import pytest
+
+# scripts/ on path: the ONE canonical counter-leg derivation (`derive_counter_timelock`) lives there,
+# and the production runners import it from there too. Also used by the dust-harness proof below.
+_HARNESS_SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
+if _HARNESS_SCRIPTS not in sys.path:
+    sys.path.insert(0, _HARNESS_SCRIPTS)
+
+from _dust_swap_shared import derive_counter_timelock, elapsed_reserve_blocks
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.devnet import RegtestNode
+from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import (
+    ClaimFinality,
+    CoordinatorConfig,
+    MarginPolicy,
+    SwapCoordinator,
+    assert_timelock_margin,
+    assess_claim_finality,
+)
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.gravity.watch.alerts import DedupAlerter, Page, Severity
 from pyrxd.gravity.watch.decide import Intent
@@ -439,6 +463,120 @@ class _Seen:
         self._s.add(bytes(h))
 
 
+# --------------------------------------------------------------------------- the negotiated timelocks
+
+
+def _policy() -> MarginPolicy:
+    """The policy every swap here is BOTH negotiated against and gated by.
+
+    One constructor, so the terms and the coordinator that judges them cannot come from two
+    different policies. ESTIMATED (test-only) — the coordinator's documented test defaults.
+    """
+    return MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S)
+
+
+def _derive_timelocks(policy: MarginPolicy, *, t_rxd_blocks: int) -> tuple[bt.Timelock, bt.Timelock]:
+    """``(t_btc, t_rxd)`` for a Radiant window of ``t_rxd_blocks``, derived as the BTC runners derive it.
+
+    ``t_btc`` comes from ``derive_counter_timelock`` — the shared definition
+    ``scripts/btc_swap_two_host.py`` negotiates with — fed THIS policy's margin, both chains'
+    intervals, and the elapsed-depth reserve coupled to the policy's claim burial.
+
+    The result is then put to the production gate at every elapsed depth that reserve covers —
+    the call ``pre_btc_lock_check`` really makes (step 7 passes ``elapsed_blocks=cov_confs``) — so
+    a fixture that drifts from the invariant fails HERE, with the gate's own reason, instead of as
+    a refusal deep inside a swap.
+    """
+    for name in ("margin", "rxd_claim_burial"):
+        if getattr(policy, name).unit is not bt.TimeUnit.BLOCKS:
+            raise AssertionError(f"policy.{name} must be BLOCKS-tagged for the block-count derivation")
+    reserve = elapsed_reserve_blocks(rxd_claim_burial_blocks=policy.rxd_claim_burial.value)
+    t_btc = bt.Timelock(
+        derive_counter_timelock(
+            t_rxd_blocks=t_rxd_blocks,
+            margin_blocks=policy.margin.value,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            btc_block_interval_s=policy.block_interval_s,
+            elapsed_reserve_blocks=reserve,
+        ),
+        bt.TimeUnit.BLOCKS,
+    )
+    t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
+    for elapsed in range(reserve + 1):
+        assert_timelock_margin(t_btc, t_rxd, policy, elapsed_blocks=elapsed)
+    return t_btc, t_rxd
+
+
+def _shortest_t_rxd_blocks(policy: MarginPolicy) -> int:
+    """The shortest Radiant window whose derived counter leg is LONGER than the BTC reorg depth.
+
+    A MEASURED maker does not reveal ``p`` until the taker's BTC funding is
+    ``btc_claim_reorg_depth`` deep (``SwapCoordinator._btc_counter_funding_depth``). A counter leg
+    no longer than that depth has its refund spendable by the time such a maker may reveal, so its
+    claim would race the taker's refund; one block more is the shortest leg in which the maker's
+    claim, mined in the next block, confirms before the refund becomes spendable.
+
+    Found by asking the derivation for each candidate rather than by inverting it here, so this
+    and ``derive_counter_timelock`` cannot disagree. Short on purpose: every refund scenario has to
+    mine the whole window on regtest.
+    """
+    need = policy.btc_claim_reorg_depth.value + 1
+    for t_rxd_blocks in range(1, 10_000):
+        try:
+            t_btc, _t_rxd = _derive_timelocks(policy, t_rxd_blocks=t_rxd_blocks)
+        except SystemExit:  # derive_counter_timelock's "no room for a counter leg"
+            continue
+        if t_btc.value >= need:
+            return t_rxd_blocks
+    raise AssertionError(f"no t_rxd below 10000 derives a counter leg of {need} blocks under {policy}")
+
+
+def _fewest_blocks_left_that_wait(policy: MarginPolicy, shallow: CounterClaimFinality | None = None) -> int:
+    """The fewest Radiant blocks before the maker's refund at which the coordinator still WAITs on a
+    not-yet-final counter-leg claim (by default a 1-confirmation BTC claim) — asked of
+    ``assess_claim_finality`` itself, so a test that squeezes "just under the floor" cannot drift
+    from the gate that decides it."""
+    if shallow is None:
+        shallow = CounterClaimFinality.from_btc_depth(1, policy.btc_claim_reorg_depth.value)
+    for blocks_left in range(1, 10_000):
+        verdict = assess_claim_finality(
+            counter_claim_finality=shallow,
+            now_rxd_height=0,
+            asset_locked_at_height=0,
+            t_rxd=bt.Timelock(blocks_left, bt.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+        if verdict is ClaimFinality.WAIT:
+            return blocks_left
+    raise AssertionError(f"assess_claim_finality never WAITs below 10000 blocks under {policy}")
+
+
+def _btc_blocks_during(policy: MarginPolicy, rxd_blocks: int) -> int:
+    """BTC blocks at the policy's nominal interval in the wall clock ``rxd_blocks`` Radiant blocks take.
+
+    FLOORED: use it where the assertion that follows is "the BTC leg has ALREADY matured", so
+    rounding can only make that assertion harder to pass.
+    """
+    return int(rxd_blocks * policy.rxd_block_interval_s // policy.block_interval_s)
+
+
+def _rxd_blocks_during(policy: MarginPolicy, btc_blocks: int) -> int:
+    """Radiant blocks at the policy's nominal interval in the wall clock ``btc_blocks`` BTC blocks take.
+
+    CEILED: use it where the assertion that follows is "the Radiant leg has NOT yet matured", so
+    rounding can only make that assertion harder to pass.
+    """
+    return math.ceil(btc_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+
+
+def _btc_confs(nodes: _Nodes, txid: str) -> int:
+    return int(nodes.btc("getrawtransaction", txid, "true").get("confirmations", 0) or 0)
+
+
+def _rxd_confs(nodes: _Nodes, txid: str) -> int:
+    return int(nodes.rxd("getrawtransaction", txid, "true").get("confirmations", 0) or 0)
+
+
 # --------------------------------------------------------------------------- swap setup
 
 
@@ -456,20 +594,20 @@ class _LockedSwap:
         self.rxd_amount = rxd_amount
 
 
-async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None) -> _LockedSwap:
+async def _setup_locked_swap(nodes: _Nodes, *, role=None) -> _LockedSwap:
     """Fund the BTC HTLC + the RXD covenant and drive the coordinator to BOTH_LOCKED.
 
-    Shared by the happy path and the failure paths — all terminal scenarios branch
-    from the same locked state. ``t_rxd_blocks`` is per-scenario (see below).
+    Shared by the happy path and the failure paths — all terminal scenarios branch from the same
+    locked state, with the same derived timelocks. A scenario that needs a CLOSING Radiant window
+    mines towards it from here rather than negotiating a smaller ``t_rxd``: a window short enough
+    to be closing at the reveal cannot also carry the margin, and the gate refuses it before any
+    lock.
     """
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
     btc_sats = rxd_photons = 100_000
-    # t_rxd_blocks varies by scenario: small (fast CSV maturity) for the refund paths,
-    # large (window survives the reorg-gate wait + mined harness blocks) for the happy
-    # path. t_btc keeps the >= 36-block ESTIMATED margin above t_rxd in either case.
-    t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    t_btc = bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS)
+    policy = _policy()
+    t_btc, t_rxd = _derive_timelocks(policy, t_rxd_blocks=_shortest_t_rxd_blocks(policy))
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
     taker_btc_kp = generate_keypair(_BTC_HRP)
@@ -544,7 +682,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None)
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=_Seen(),
-        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S), role=role),
+        config=CoordinatorConfig(margin_policy=policy, role=role),
     )
 
     # 1. MAKER locks the RXD asset FIRST, and it is mined (HZ-1). The taker's pre-BTC-lock
@@ -569,6 +707,13 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None)
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
     assert rec.state is SwapState.BOTH_LOCKED
 
+    # Not a fiction: BOTH_LOCKED is where the maker may reveal p, and under the #482 ordering the
+    # counter leg is the SHORT one. A fixture whose BTC refund were already spendable here would have
+    # every scenario below reveal p into an open refund race without saying so.
+    assert _btc_confs(nodes, rec.btc_locator.funding_outpoint.txid) < t_btc.value, (
+        "fixture: the taker's BTC refund must still be closed when the swap reaches BOTH_LOCKED"
+    )
+
     return _LockedSwap(
         coord=coord,
         cov=cov,
@@ -587,9 +732,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None)
 class TestCrossChainSwap:
     async def test_happy_path_completes(self, nodes):
         """Maker claims BTC (reveals p), taker scrapes p and claims the RXD asset."""
-        # Large t_rxd so the reorg-gate wait (bury the BTC claim) + the harness's own
-        # mined RXD blocks still leave the t_rxd window open -> the gate returns SAFE.
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
 
         # 3. Maker claims the BTC, revealing p on the Bitcoin chain.
@@ -618,7 +761,7 @@ class TestCrossChainSwap:
         claim, state unchanged); burying it to the reorg-safe depth flips it to SAFE
         and the asset settles. This is the D4 protection against a BTC-claim reorg
         after p is public."""
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
         depth = coord.config.margin_policy.btc_claim_reorg_depth.value
 
@@ -635,6 +778,9 @@ class TestCrossChainSwap:
             claim_raw, now_rxd_height=now, asset_locked_at_height=s.rxd_locked_at
         )
         assert rec.state is SwapState.SECRET_REVEALED, "shallow BTC claim must not settle the asset"
+        assert isinstance(nodes.rxd("gettxout", rec.radiant_covenant_outpoint.split(":")[0], "0"), dict), (
+            "WAIT must broadcast nothing: the covenant is still unspent"
+        )
 
         # Bury the BTC claim to the reorg-safe depth; now the gate returns SAFE.
         nodes.btc_mine(depth)
@@ -647,43 +793,87 @@ class TestCrossChainSwap:
         assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "asset should settle once the BTC claim is deep"
 
     async def test_mutual_refund_when_maker_never_claims(self, nodes):
-        """The guaranteed-safe failure: maker never claims, both timeouts elapse, both
-        legs refund via CSV — neither party suffers one-sided loss."""
+        """The guaranteed-safe failure: the maker never claims, and BOTH legs refund.
+
+        In the order the #482 ordering produces: the taker's BTC refund (``t_btc``, the short leg)
+        becomes spendable while the maker's Radiant refund (``t_rxd``) is still locked, with both
+        chains advanced in step at the policy's nominal block intervals so the two readings are taken
+        at the same wall clock. Only once ``t_rxd`` has also matured does ``mutual_refund`` run, and it
+        refunds both legs -> MUTUAL_REFUND. Neither party suffers a one-sided loss.
+
+        ``mutual_refund`` is called once, after BOTH have matured. Called between the two maturities
+        it refunds the counter leg, fails on the covenant and leaves the record at BOTH_LOCKED, which
+        is why the two-host runner's refund phase checks both timeouts before broadcasting anything.
+        """
         s = await _setup_locked_swap(nodes)
         coord = s.coord
+        policy = coord.config.margin_policy
         loc = coord.record.btc_locator
+        cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
 
-        # Maker never claims. Mature BOTH relative timelocks (BTC t_btc, RXD t_rxd).
-        nodes.btc_mine(s.t_btc.value)
-        nodes.rxd_mine(s.t_rxd.value)
+        # 1. The maker never claims. Advance BTC to the block the taker's refund matures at, and
+        #    Radiant by the same wall clock.
+        btc_to_go = s.t_btc.value - _btc_confs(nodes, loc.funding_outpoint.txid)
+        nodes.btc_mine(btc_to_go)
+        nodes.rxd_mine(_rxd_blocks_during(policy, btc_to_go))
+        assert _btc_confs(nodes, loc.funding_outpoint.txid) >= s.t_btc.value, "the taker's BTC refund is open"
+        # ...while the maker's Radiant refund is still closed: the production leg's own maturity check
+        # refuses it, before it takes a fee input or broadcasts anything.
+        assert _rxd_confs(nodes, cov_txid) < s.t_rxd.value
+        with pytest.raises(NetworkError, match="not yet mature"):
+            await coord.radiant_leg.refund_asset(coord.record)
+        assert isinstance(nodes.rxd("gettxout", cov_txid, "0"), dict), "the covenant is still unspent"
 
+        # 2. The maker's Radiant refund matures last; now mutual_refund unwinds BOTH legs.
+        nodes.rxd_mine(s.t_rxd.value - _rxd_confs(nodes, cov_txid))
         rec = await coord.mutual_refund()
         assert rec.state is SwapState.MUTUAL_REFUND
 
         # Both locked UTXOs are now spent (refunded) on their chains.
         btc_spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
-        rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+        rxd_spent = nodes.rxd("gettxout", cov_txid, "0")
         assert btc_spent in (None, ""), "BTC HTLC should be refunded (spent)"
         assert rxd_spent in (None, ""), "RXD covenant should be refunded (spent)"
 
     async def test_maker_stall_asset_only_refund_mechanics(self, nodes):
         """Exercises the maybe_refund_asset_on_maker_stall MECHANICS (the helper still exists as a
-        maker-side primitive). NOTE: its CSV refund pays the MAKER, not the taker — see
+        maker-side primitive): a no-op before the stall window opens; inside the window the trigger
+        fires but the P3 maturity pre-check refuses a non-final refund; at ``t_rxd`` maturity the
+        covenant CSV refund broadcasts. NOTE: that refund pays the MAKER, not the taker — see
         TestMakerStallAssetOnlyRefundIsTakerLoss for why this is NOT a taker recovery. The watchtower
         no longer routes a taker here (FSM finding #2); the safe taker recovery is mutual_refund."""
         s = await _setup_locked_swap(nodes)
         coord = s.coord
+        cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
+        # The coordinator judges maturity as `asset_locked_at_height + t_rxd`; this is the anchor it is given.
+        maturity = s.rxd_locked_at + s.t_rxd.value
 
-        # Mature the RXD CSV so the proactive asset refund is spendable.
-        nodes.rxd_mine(s.t_rxd.value)
+        async def _stall_refund(now: int):
+            assert int(nodes.rxd("getblockcount")) == now
+            return await coord.maybe_refund_asset_on_maker_stall(
+                now_block_height=now, asset_locked_at_height=s.rxd_locked_at, maker_has_claimed_btc=False
+            )
+
+        # 1. The maker has not claimed, but t_rxd is far off: the stall trigger has not fired — a no-op.
         now = int(nodes.rxd("getblockcount"))
+        assert now < maturity - coord.config.maker_stall_safety_window_blocks
+        rec = await _stall_refund(now)
+        assert rec.state is SwapState.BOTH_LOCKED
 
-        rec = await coord.maybe_refund_asset_on_maker_stall(
-            now_block_height=now, asset_locked_at_height=s.rxd_locked_at, maker_has_claimed_btc=False
-        )
+        # 2. One block short of maturity is inside the stall window, so the trigger FIRES — and the
+        #    maturity pre-check refuses to broadcast a refund the chain would reject.
+        nodes.rxd_mine(maturity - 1 - now)
+        with pytest.raises(NetworkError, match="not yet mature"):
+            await _stall_refund(maturity - 1)
+        assert coord.record.state is SwapState.BOTH_LOCKED
+        assert isinstance(nodes.rxd("gettxout", cov_txid, "0"), dict), "nothing was broadcast"
+
+        # 3. At maturity the covenant CSV refund broadcasts.
+        nodes.rxd_mine(1)
+        rec = await _stall_refund(maturity)
         assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
 
-        rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+        rxd_spent = nodes.rxd("gettxout", cov_txid, "0")
         assert rxd_spent in (None, ""), "the covenant CSV refund was broadcast (covenant spent) — pays the MAKER"
 
 
@@ -701,7 +891,7 @@ class TestCovenantRefundCsvMaturity:
     avoid). Drives the leg directly to isolate the leg check from the coordinator-side height gate."""
 
     async def test_refund_asset_boundary_matches_consensus(self, nodes):
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=5)
+        s = await _setup_locked_swap(nodes)
         leg = s.coord.radiant_leg
         rec = s.coord.record
         cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
@@ -710,8 +900,7 @@ class TestCovenantRefundCsvMaturity:
             return await leg.chain_io.confirmations(cov_txid)
 
         # Mine to exactly t_rxd - 1 confirmations (one short of CSV maturity).
-        while await _confs() < s.t_rxd.value - 1:
-            nodes.rxd_mine(1)
+        nodes.rxd_mine(s.t_rxd.value - 1 - await _confs())
         assert await _confs() == s.t_rxd.value - 1
         # The leg refuses to broadcast a non-final refund — fail-closed, no tx emitted.
         with pytest.raises(NetworkError, match=f"needs {s.t_rxd.value} confirmations, has {s.t_rxd.value - 1}"):
@@ -736,8 +925,7 @@ class TestBtcActiveAdversary:
     Safety is asserted from chain-re-derived facts."""
 
     async def test_A1_active_reveal_honest_taker_recovers_from_chain(self, nodes):
-        # Large t_rxd so the reorg-gate burial of the BTC claim still leaves the t_rxd window open.
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=60, role=SwapRole.TAKER)
+        s = await _setup_locked_swap(nodes, role=SwapRole.TAKER)
         coord = s.coord
         depth = coord.config.margin_policy.btc_claim_reorg_depth.value
 
@@ -783,20 +971,27 @@ class TestBtcActiveAdversary:
 class TestMakerStallAssetOnlyRefundIsTakerLoss:
     """ADVERSARIAL (FSM finding #2, 2026-06-09): on the BTC<->RXD runbook the asset-only
     proactive refund (:meth:`maybe_refund_asset_on_maker_stall`) is NOT a taker defense — its
-    CSV refund pays the MAKER. If a taker is driven to run it on a maker stall (which the BTC
-    watchtower/runbook recommends: decide.py:311-349 + dust_swap_run.py:327), it DESTROYS the
-    taker's only recourse (the claimable covenant) while the taker's own BTC is still locked
-    until ``t_btc``. The maker, still privately holding ``p``, then claims the BTC (claim leaf is
-    maker-only, valid until ``t_btc``) and takes BOTH legs.
+    CSV refund pays the MAKER. A taker driven to run it on a maker stall (which the BTC watchtower
+    and runbook once recommended) DESTROYS its only claim on the asset (the claimable covenant) and
+    recovers nothing for itself: its own BTC stays in the HTLC, whose claim leaf is maker-only and
+    has NO expiry (``claim_leaf_script`` carries no timelock). The maker, still privately holding
+    ``p``, then claims that BTC and takes BOTH legs.
+
+    UNDER THE #482 ORDERING THE TAKER'S BTC REFUND HAS ALREADY OPENED BY THEN. ``t_btc`` is the
+    short leg, so by the time the covenant's ``t_rxd`` CSV can be mined the taker's refund leaf has
+    been spendable for at least the margin, at the policy's nominal intervals. This test used to
+    assert the opposite — "the taker's own BTC is still locked until t_btc" — which is true only of
+    the exploitable pre-#482 layout. Opening is not spending: until the taker broadcasts its own
+    refund, the maker's claim leaf spends the same output, and the loss below is the taker that
+    acted on the maker's covenant instead of on its own leg.
 
     Contrast :meth:`TestCrossChainSwap.test_mutual_refund_when_maker_never_claims`, which unwinds
-    BOTH legs safely — the recovery the ETH path already mandates (decide.py:508-542)."""
+    BOTH legs safely — the recovery the ETH path already mandates."""
 
     async def test_asset_only_refund_gifts_asset_to_maker_then_maker_takes_btc(self, nodes):
-        # Small t_rxd (fast CSV), t_btc = t_rxd + 40 so the taker's BTC refund leaf is NOWHERE
-        # near open when the asset-only refund fires — the crux of the asymmetry.
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=3)
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
+        policy = coord.config.margin_policy
         loc = coord.record.btc_locator
         cov_value = s.rxd_amount
 
@@ -805,9 +1000,13 @@ class TestMakerStallAssetOnlyRefundIsTakerLoss:
         assert _scan_value_for_spk(nodes, s.cov.maker_holder_script) == 0
         assert _scan_value_for_spk(nodes, s.cov.taker_holder_script) == 0
 
-        # 1. Maker stalls (never claims BTC; p stays private). The taker is driven to the
-        #    asset-only proactive refund. Mature the RXD CSV so the refund is BIP68-spendable.
-        nodes.rxd_mine(s.t_rxd.value)
+        # 1. Maker stalls (never claims BTC; p stays private). Advance Radiant to the covenant's CSV
+        #    maturity — the first height the asset-only refund can be mined — and BTC by the same
+        #    wall clock. (Run from an unset-role coordinator: since the P3 role guard a TAKER-role
+        #    coordinator refuses this primitive outright, and this test is the reason why.)
+        rxd_to_go = s.rxd_locked_at + s.t_rxd.value - int(nodes.rxd("getblockcount"))
+        nodes.rxd_mine(rxd_to_go)
+        nodes.btc_mine(_btc_blocks_during(policy, rxd_to_go))
         now = int(nodes.rxd("getblockcount"))
         rec = await coord.maybe_refund_asset_on_maker_stall(
             now_block_height=now, asset_locked_at_height=s.rxd_locked_at, maker_has_claimed_btc=False
@@ -822,13 +1021,18 @@ class TestMakerStallAssetOnlyRefundIsTakerLoss:
         assert maker_got == cov_value, "the asset-only CSV refund pays the MAKER (maker_holder_script)"
         assert taker_got == 0, "the taker recovered NOTHING from the covenant — its recourse is gone"
 
-        # 3. The taker's own BTC is STILL LOCKED: t_btc has not elapsed, so the refund leaf is not
-        #    open. The taker cannot recover the BTC yet.
-        funding_confs = int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true").get("confirmations", 0))
-        assert funding_confs < s.t_btc.value, "precondition: taker's BTC refund leaf must NOT be open yet"
+        # 3. The #482 ordering: the taker's BTC refund leaf opened BEFORE the covenant's CSV did...
+        assert _btc_confs(nodes, loc.funding_outpoint.txid) >= s.t_btc.value, (
+            "the counter leg is the SHORT one: its refund must already be open when t_rxd matures"
+        )
+        # ...but opening is not spending. The asset-only refund never touched the taker's BTC.
+        assert isinstance(nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout)), dict), (
+            "the taker's BTC HTLC is still unspent after the asset-only refund"
+        )
 
         # 4. The adversarial maker, still holding p, claims the BTC directly (bypassing the honest
-        #    coordinator — the FSM is terminal). The claim leaf is maker-only and valid until t_btc.
+        #    coordinator — the FSM is terminal). The claim leaf is maker-only and has no expiry, so it
+        #    spends the output the taker left unrefunded.
         claim_txid = await coord.btc_leg.claim(loc, s.p_secret.unsafe_raw_bytes())
         claim_decoded = nodes.btc("decoderawtransaction", s.broadcaster.last_raw[claim_txid].hex())
 
@@ -852,10 +1056,13 @@ class TestMakerStallAssetOnlyRefundIsTakerLoss:
 #     claim's confirmation depth (the reorg-gate input), both derived purely from block data.
 #   * _RegtestRxdChainSource — RXD tip + covenant confirmation depth (→ asset-lock height).
 #
-# Estimated policy (the harness default): btc_claim_reorg_depth = rxd_claim_burial = 6, safety window
-# = 6, so the gate reduces to blocks_left = t_rxd - cov_confs + 1, where a SAFE claim needs the BTC
-# claim >= 6 deep AND blocks_left >= 6; a shallow claim WAITs only while blocks_left >= 18, else
-# SQUEEZES; a maker stall pages a refund once blocks_left <= 6.
+# The tower's window is blocks_left = deadline - tip, with deadline = covenant height + t_rxd (so
+# t_rxd - cov_confs + 1). The thresholds are the coordinator's, and a test that needs one derives it
+# from `_claim_floor_blocks` rather than restating it: a SAFE claim needs the BTC claim
+# `btc_claim_reorg_depth` deep and room left to mine and bury the taker's own claim; a shallow claim
+# WAITs only while there is ALSO room for the BTC claim to reach that depth first, else SQUEEZES; a
+# maker stall pages a refund once blocks_left <= `maker_stall_safety_window_blocks`. This comment used
+# to spell those thresholds as numbers, and they went stale when #511 added the claim-inclusion blocks.
 
 
 def _find_btc_spender(nodes: _Nodes, funding_txid: str, vout: int) -> str | None:
@@ -960,8 +1167,7 @@ class TestWatchtowerIntentSequence:
     correct Intent SEQUENCE for happy / reorg-WAIT / maker-stall / SQUEEZED — and NEVER pages
     PAGE_CLAIM against a WAIT/SQUEEZED gate verdict (plan AC 2026-06-03, :109). It broadcasts
     nothing: the production decide()/ChainObserver/DedupAlerter run unchanged against real consensus
-    on both chains. (blocks_left = t_rxd - cov_confs + 1; estimated policy → reorg depth 6, burial 6,
-    safety window 6.)"""
+    on both chains. (blocks_left = t_rxd - cov_confs + 1; thresholds as in the section comment above.)"""
 
     async def _tick_one(self, reconciler: Reconciler):
         results = await reconciler.tick()
@@ -972,7 +1178,7 @@ class TestWatchtowerIntentSequence:
         """Wide t_rxd window: pre-reveal WATCH → maker reveals shallow (gate WAIT → still WATCH, the
         headline 'never claim on a reorg-unsafe BTC claim' invariant) → bury deep (gate SAFE) →
         PAGE_CLAIM with the deadline + the named coordinator step."""
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
         reconciler, channel = _watchtower(nodes, coord)
         depth = coord.config.margin_policy.btc_claim_reorg_depth.value
@@ -1021,53 +1227,78 @@ class TestWatchtowerIntentSequence:
     async def test_maker_stall_watch_then_page_refund(self, nodes):
         """Maker locks the asset then stalls (never reveals p). As t_rxd nears, the tower pages the
         safe both-legs recovery — mutual_refund (WARN — recoverable, not a race), NOT the asset-only
-        refund that pays the maker (FSM finding #2). The page names the coordinator step."""
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=30)
+        refund that pays the maker (FSM finding #2). The page names the coordinator step, and fires
+        exactly when blocks_left reaches the coordinator's ``maker_stall_safety_window_blocks``.
+
+        This pins the STALL page. It says nothing about the earliest moment the taker could act:
+        under the #482 ordering the taker's own BTC refund (``t_btc``, the short leg) opens well
+        before this page fires, and the tower's BOTH_LOCKED branch does not read it."""
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
         reconciler, channel = _watchtower(nodes, coord)
+        window = coord.config.maker_stall_safety_window_blocks
 
-        # 1. Just locked: blocks_left = 30 (>> safety window 6) → WATCH.
+        # 1. Just locked: the deadline is far off → WATCH.
         r = await self._tick_one(reconciler)
         assert r.decision.intent is Intent.WATCH
         assert channel.pages == []
+        deadline = r.decision.deadline_rxd_height
+        assert deadline is not None
 
-        # 2. Advance RXD toward t_rxd maturity (cov_confs → 28 ⇒ blocks_left = 3 ≤ 6) → PAGE_REFUND.
-        nodes.rxd_mine(27)
+        # 2. One block before the stall window opens: still WATCH.
+        nodes.rxd_mine(deadline - window - 1 - int(nodes.rxd("getblockcount")))
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH, "the stall page must not fire before its window"
+        assert channel.pages == []
+
+        # 3. The window opens (blocks_left == window) → PAGE_REFUND naming mutual_refund.
+        nodes.rxd_mine(1)
         r = await self._tick_one(reconciler)
         assert r.decision.intent is Intent.PAGE_REFUND
         assert r.decision.recommended_action == "mutual_refund"
-        assert r.decision.deadline_rxd_height is not None
+        assert r.decision.deadline_rxd_height == deadline
         assert r.alert_delivered is True
         assert len(channel.pages) == 1
         assert channel.pages[0].severity is Severity.WARN  # a stall refund is recoverable, not a race
         assert channel.pages[0].low_corroboration is True
 
     async def test_reveal_with_closing_window_pages_squeezed(self, nodes):
-        """Tight t_rxd window + a shallow reveal: there is no longer room to wait for a reorg-safe
-        burial before the maker's CSV refund opens → the gate SQUEEZES → a decision-required
-        PAGE_SQUEEZED (winner-take-all vs accept loss), never a silent claim or a silent wait.
+        """A shallow reveal into a CLOSING t_rxd window: there is no longer room to wait for a
+        reorg-safe burial before the maker's CSV refund opens → the gate SQUEEZES → a
+        decision-required PAGE_SQUEEZED (winner-take-all vs accept loss), never a silent claim or a
+        silent wait.
 
-        The squeeze threshold is CHAIN-SPECIFIC: WAIT needs blocks_left >= counter_reserve +
-        burial, where counter_reserve converts the counter chain's reorg depth into RXD blocks
-        via its block interval (BTC 600 s → reserve 12, threshold 18; LTC 150 s → reserve 3,
-        threshold 9 — a fixed window of 10 genuinely has room to WAIT on Litecoin, which is
-        correct gate behaviour, not slack). Derive the window from the same policy math so the
-        test forces a squeeze on whichever chain this run uses."""
-        policy = MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S)
-        counter_reserve = math.ceil(
-            policy.btc_claim_reorg_depth.value * policy.block_interval_s / policy.rxd_block_interval_s
-        )
-        squeeze_window = counter_reserve + policy.rxd_claim_burial.value - 2  # 2 under the WAIT threshold
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=squeeze_window)
+        The window is closed by MINING towards the deadline, not by negotiating a short ``t_rxd``:
+        a window that short cannot carry the margin, and the fund-time gate refuses it (#482). With
+        the two regtest chains mined independently, this is a maker that reveals late; at these
+        derived timelocks, in wall clock, that is after the taker's own BTC refund has opened.
+
+        The WAIT floor is ASKED of ``assess_claim_finality`` (``_fewest_blocks_left_that_wait``)
+        rather than restated, because it is chain-specific — the counter chain's reorg depth is
+        converted into Radiant blocks at its own interval — and because the restated version here
+        went stale when #511 added the claim-inclusion blocks."""
+        s = await _setup_locked_swap(nodes)
         coord = s.coord
         reconciler, channel = _watchtower(nodes, coord)
+        squeeze_left = _fewest_blocks_left_that_wait(coord.config.margin_policy) - 2  # 2 under the WAIT floor
+        assert squeeze_left > coord.config.maker_stall_safety_window_blocks, (
+            "the squeeze window must sit outside the stall page, or the pre-reveal tick is a refund page"
+        )
 
-        # 1. Pre-reveal, window not yet near → WATCH.
+        # 1. Pre-reveal, deadline far off → WATCH.
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+        deadline = r.decision.deadline_rxd_height
+
+        # 2. The maker stays silent while the window closes to `squeeze_left` blocks — still outside
+        #    the stall window, so still WATCH.
+        nodes.rxd_mine(deadline - squeeze_left - int(nodes.rxd("getblockcount")))
         r = await self._tick_one(reconciler)
         assert r.decision.intent is Intent.WATCH
         assert channel.pages == []
 
-        # 2. Maker reveals p with ~1 conf and blocks_left = 10 (< the 18 a WAIT requires): SQUEEZED.
+        # 3. Maker reveals p with ~1 conf and blocks_left = squeeze_left (< the WAIT floor): SQUEEZED.
         rec = await coord.maker_claims_btc(s.p_secret)
         assert rec.state is SwapState.SECRET_REVEALED
         r = await self._tick_one(reconciler)
@@ -1093,8 +1324,10 @@ class TestWatchtowerAutonomousRefundRegtest:
     async def test_auto_refund_spends_outpoint_after_maturity_and_early_is_rejected(self, nodes, tmp_path):
         from pyrxd.gravity.watch import Decision, ExecOutcome, PresignedRefund, RefundExecutor
 
-        t_btc = bt.Timelock(6, bt.TimeUnit.BLOCKS)
-        t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
+        # Derived like every other swap here (the pair was spelled 6/3 — the pre-#482 layout, which
+        # NegotiatedTerms refuses at construction below).
+        policy = _policy()
+        t_btc, t_rxd = _derive_timelocks(policy, t_rxd_blocks=_shortest_t_rxd_blocks(policy))
         h = hashlib.sha256(os.urandom(32)).digest()
         maker_btc = coincurve.PrivateKey(os.urandom(32))
         taker_kp = generate_keypair(_BTC_HRP)
@@ -1175,15 +1408,6 @@ class TestWatchtowerAutonomousRefundRegtest:
         assert spent in (None, ""), "funding outpoint must be SPENT by the auto-broadcast refund on real consensus"
 
 
-# scripts/ on path for the operator dust-run harness (used by the proof below).
-import sys as _sys
-from pathlib import Path as _Path
-
-_HARNESS_SCRIPTS = str(_Path(__file__).resolve().parent.parent / "scripts")
-if _HARNESS_SCRIPTS not in _sys.path:
-    _sys.path.insert(0, _HARNESS_SCRIPTS)
-
-
 class TestWatchtowerDustHarnessRegtest:
     """Prove the GO-GATED dust harness (scripts/watchtower_dust_run.py) end-to-end on real bitcoind: its
     setup→record→presign artifacts, loaded FROM DISK by the keyless production executor, broadcast a
@@ -1199,7 +1423,11 @@ class TestWatchtowerDustHarnessRegtest:
         records = tmp_path / "records"
         records.mkdir()
         state_file = tmp_path / "run.state.json"
-        swap_id, btc_sats, t_btc, t_rxd, fee = "dust1", 50_000, 6, 3, 2_000
+        swap_id, btc_sats, fee = "dust1", 50_000, 2_000
+        # Derived, as for every swap here. Spelled 6/3 until now, which the harness's own ordering
+        # check refuses ("--t-rxd must be > --t-btc").
+        policy = _policy()
+        t_btc, t_rxd = (tl.value for tl in _derive_timelocks(policy, t_rxd_blocks=_shortest_t_rxd_blocks(policy)))
 
         # The operator's pinned refund address (a fresh node address) → its scriptPubKey.
         dest = bytes.fromhex(

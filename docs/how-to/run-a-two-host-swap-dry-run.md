@@ -149,13 +149,23 @@ and publishes `envelope.json`. The maker prints the **covenant SPK to fund**.
 maker$ python scripts/eth_swap_two_host.py --role maker --phase envelope \
     --io ./swapdir \
     --eth-maker-addr 0x<maker-eth-addr> --eth-key-file ~/.swap-maker-eth-key \
-    --rxd-photons 100000 --t-rxd-blocks 60 --margin-blocks 36
+    --rxd-photons 100000 --t-rxd-blocks 300 --margin-blocks 36
 # → writes envelope.json   (copy it to the taker's host)
 ```
 
+`--t-rxd-blocks` is the maker's own leg, so it must be the LONGER one (#482): the covenant's
+refund may open no earlier than the ETH deadline (`--eth-timeout-s`, 24 h by default) plus the
+cross-clock margin, and the taker's step 3 refuses anything shorter. 300 is the smallest window
+`eth_absolute_to_rxd_relative_blocks` accepts at the script's default margins, the nominal
+300 s Radiant interval and a 768 s finalization window (Ethereum, Sepolia, anvil); chains with a
+longer window need more. The script's own default of 120 is shorter than that, and the 60 this
+page used to show exits at startup. Size it for your own deadline, chain and interval with that
+function.
+
 **3. Taker — verify the margin, fund the ETH HTLC, publish the locator.** The taker reads
-the envelope, runs its **independent** `assert_timelock_margin` check (refusing if
-`t_eth − t_rxd < margin`), re-derives the covenant SPK and checks it matches, then **funds
+the envelope, runs its **independent** `assert_t_rxd_fits_the_eth_deadline` check (refusing
+unless the covenant's refund opens no earlier than the ETH deadline plus the cross-clock
+margin), re-derives the covenant SPK and checks it matches, then **funds
 the ETH HTLC first** (claim pays the maker, refund pays the taker) and publishes the
 funding locator.
 

@@ -540,3 +540,45 @@ def test_btc_funding_spk_does_not_bind_the_asset_side():
     covenants = {v["covenant_scriptpubkey_hex"] for v in _BTC_TERMS if v["id"] in {"btc-rxd", "btc-ft", "btc-nft"}}
     assert len(spks) == 1, "the BTC funding SPK unexpectedly varies with the asset side"
     assert len(covenants) == 3, "the covenant SPK must distinguish the three asset variants"
+
+
+_SPEC_PATH = VECTORS_PATH.parent.parent / "docs" / "htlc-handshake-wire-format.md"
+
+
+def _spec_worked_example() -> tuple[str, dict]:
+    """The vector id the spec's "Worked example" cites, and the JSON object it prints.
+
+    Read from the spec itself, so the citation and the object are the ones a reader sees.
+    """
+    text = _SPEC_PATH.read_text(encoding="utf-8")
+    section = text.split("### Worked example", 1)[1]
+    cited = section.split("htlc-handshake-vectors.json` (`", 1)[1].split("`)", 1)[0]
+    block = section.split("```json", 1)[1].split("```", 1)[0]
+    return cited, json.loads(block)
+
+
+def test_the_spec_worked_example_is_the_vector_it_cites():
+    """The spec's worked example says it is taken from a named vector. Make that a checked fact.
+
+    It printed ``t_btc`` 60 / ``t_rxd`` 20 — the pre-#482 ordering that ``NegotiatedTerms``
+    refuses — for two releases after the vector it cites was corrected to 20 / 120, directly
+    above the section stating the relation it violated. The prose guards read sentences and
+    cannot see a JSON block, and nothing compared the block with the vector.
+
+    Every field the spec prints in full must equal the cited vector's. Fields the spec elides
+    with "…" are skipped, and the test fails if that leaves the timelocks uncompared.
+    """
+    cited, example = _spec_worked_example()
+    vector = next((v for v in _TERMS if v["id"] == cited), None)
+    assert vector is not None, f"the spec cites vector {cited!r}, which is not in {VECTORS_PATH.name}"
+    compared = []
+    for key, shown in example.items():
+        if isinstance(shown, str) and "…" in shown:
+            continue
+        assert shown == vector["terms"][key], (
+            f"spec worked example {key}={shown!r}, vector {cited} has {vector['terms'][key]!r}"
+        )
+        compared.append(key)
+    assert {"t_btc", "t_rxd"} <= set(compared), f"the timelocks were not compared (only {compared})"
+    # And the object the spec teaches must be one the reference implementation accepts.
+    NegotiatedTerms.from_dict(vector["terms"])

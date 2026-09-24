@@ -94,8 +94,11 @@ These are ordinary operational controls, available today, none of which touch th
 - **Order the legs by trust.** The taker-locks-first ordering is a *default*, not a consensus rule.
   Against an untrusted counterparty, negotiate the maker locking first — the griefing cost then
   lands on the party who chose to grief.
-- **Size `t_btc` deliberately.** The margin has a floor for safety, but everything above it is
-  chosen. A longer-than-necessary `t_btc` buys nothing and directly lengthens the griefing window.
+- **Size `t_btc` deliberately.** Since #482 the margin bounds `t_btc` from ABOVE — the counter leg
+  must refund a full margin before the maker's Radiant refund opens, in wall clock — and below that
+  ceiling the value is chosen. (This read "the margin has a floor for safety, but everything above
+  it is chosen" until 2026-09-23: the pre-#482 geometry, which the §1 banner did not reach.) A
+  longer-than-necessary `t_btc` buys nothing and directly lengthens the griefing window.
 - **Keep counterparty state at the negotiation layer.** An allowlist or a simple abort-rate memory
   is trivially cheap and sits entirely outside the swap protocol.
 - **Do not automate acceptance.** The RSWP orderbook makes accepting swaps programmatic; an
