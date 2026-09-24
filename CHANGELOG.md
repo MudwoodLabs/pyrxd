@@ -162,6 +162,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A native SHA256d grinder for dMint proof of work, shipped as C source:
+  `pyrxd.contrib.miner.native`.** `python -m pyrxd.contrib.miner.native --out ./sha256d-grind`
+  compiles `sha256d_grind.c` with the machine's C compiler, runs its SHA-256 self-test, and
+  deletes the binary if that fails. The result speaks the external-miner protocol, so it works
+  with `claim-dmint --miner-cmd` and `mine_solution_external`, which re-check every nonce it
+  returns. It compresses the preimage's one SHA-256 block once per request, not once per attempt, and
+  uses the x86 SHA extensions where the CPU has them. Measured on one 32-thread desktop, three
+  runs each: 313–318 M hash/s on 32 threads against 25.3–25.7 M hash/s for the bundled Python
+  miner on 32 workers. Nothing is added to `pip install pyrxd`'s dependencies, and the bundled
+  Python miner is unchanged and still the default everywhere a miner is not named. The nightly
+  dMint job now builds it and grinds with it (`DMINT_MINER_CMD`); the suites fall back to the
+  bundled Python miner when that variable is unset. `scripts/bench_dmint_miners.py` measures
+  both miners' rates on a machine.
+
 - **`max_rows`, a keyword on `pyrxd.glyph.inspect.classify_raw_tx`** — for a caller that draws
   what it is given. `None`, the default, lists everything and adds no key, and is what
   `pyrxd glyph inspect` passes; /inspect/ passes 100. With a number set, the payload changes

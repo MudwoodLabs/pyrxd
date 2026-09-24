@@ -36,14 +36,13 @@ Run: ``RADIANT_REGTEST=1 pytest tests/test_dmint_premine_regtest_e2e.py -m integ
 
 from __future__ import annotations
 
-import os
 import secrets
-import sys
 
 import pytest
 
 # Reuse the isolated-regtest harness wholesale (same pattern as the V1/V2 dMint
 # e2e tests): the ``node`` fixture spins up + tears down a throwaway container.
+from _dmint_miner import dmint_mine_timeout_s, dmint_miner_argv, dmint_miner_label
 from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
     _RELAY_FEE_SATS,
     _p2pkh_unlock,
@@ -92,15 +91,14 @@ _MAX_HEIGHT = 628_328
 _DIFFICULTY = 1  # target 0x7fffffffffffffff — the easiest legal target
 _FUNDING = 50_000_000  # plain coin funding a mint (reward + fee + change)
 
-_MINER_ARGV = [sys.executable, "-m", "pyrxd.contrib.miner"]
-if os.environ.get("DMINT_MINE_WORKERS"):
-    _MINER_ARGV += ["--workers", os.environ["DMINT_MINE_WORKERS"]]
+# The miner: see tests/_dmint_miner.py (DMINT_MINER_CMD, DMINT_MINE_WORKERS).
+_MINER_ARGV = dmint_miner_argv()
 # The PoW floor is consensus-hardcoded (4 zero bytes + a signed-positive int64), so
 # each claim is an intrinsic ~2**33-hash search no parameter can shorten. The default
 # ceiling is 3600s rather than the 1800s the other dMint regtest suites use because
 # the tail is fat: on a 24-worker run measured here the V1 claim landed in 58s and the
 # V2 claim in 1505s, which is within one unlucky factor of a 1800s false failure.
-_MINE_TIMEOUT_S = float(os.environ.get("DMINT_MINE_TIMEOUT_S", "3600"))
+_MINE_TIMEOUT_S = dmint_mine_timeout_s(3600)
 
 
 def _p2pkh(pkh: object) -> bytes:
@@ -353,7 +351,11 @@ def _mine_and_assert(node: _RegtestNode, dep: _PremineDeploy, *, v2: bool) -> No
             print(f"[mine] reroll {attempt}: nonce space exhausted; varying OP_RETURN", flush=True)
             continue
         nonce = result.nonce
-        print(f"[mine] hit on reroll {attempt}: nonce={nonce.hex()} in {result.elapsed_s:.0f}s", flush=True)
+        print(
+            f"[mine] hit on reroll {attempt}: nonce={nonce.hex()} in {result.elapsed_s:.0f}s "
+            f"({dmint_miner_label(_MINER_ARGV)})",
+            flush=True,
+        )
         break
     assert nonce is not None, "no nonce found within 40 preimage rerolls (P < 1e-13 — investigate)"
 
