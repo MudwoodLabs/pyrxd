@@ -3467,9 +3467,10 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     best `t_rxd`. So SAFE is reachable AT ALL only if `t_rxd >= B(V)` — and that was checked nowhere
     before the taker committed its counter leg.
 
-    The maker chooses `t_rxd`, and shrinking it made the ordering gate pass MORE easily (`t_btc -
-    t_rxd` grows), so the one gate that looked at `t_rxd` rewarded exactly the direction that
-    nullifies the burial. A maker could hand over a swap that is unconditionally SQUEEZED, and the
+    The maker chooses `t_rxd`, and under the pre-#482 ordering gate shrinking it made that gate pass
+    MORE easily (`t_btc - t_rxd` grew), so the one gate that looked at `t_rxd` rewarded exactly the
+    direction that nullifies the burial. (#482 inverted that gate; this burial check stands on its
+    own either way.) A maker could hand over a swap that is unconditionally SQUEEZED, and the
     taker would discover it only after revealing.
     """
 

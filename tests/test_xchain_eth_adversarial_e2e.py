@@ -45,7 +45,7 @@ import os
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.swap_coordinator import taker_refund_window_open
 from pyrxd.gravity.swap_state import SwapState
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 
 # Reuse the real chain harness from the happy-path e2e (one source of truth for the node/anvil/legs).
 from tests.test_xchain_eth_swap_regtest_e2e import (
@@ -58,6 +58,7 @@ from tests.test_xchain_eth_swap_regtest_e2e import (
     _anvil_now,
     _anvil_rpc,
     _build,
+    _pass_the_eth_deadline,
     _rxd_pay,
     env,  # the module-scoped fixture (radiant regtest node + anvil)
 )
@@ -101,13 +102,15 @@ class TestEthAdversarial:
         the RXD covenant refunds to the maker regardless. The safety property is: a stalling maker
         cannot make the honest taker suffer a ONE-SIDED LOSS.
 
-        This asserts:
+        This asserts, in the order the #482 ordering produces:
+          (0) when the ETH deadline passes (the taker's ETH refund opens) the maker's covenant refund
+              is still CLOSED at the same wall clock — the counter leg is the short one;
           (a) the C1 decision trigger fires as t_rxd-N approaches (the taker must stop waiting);
           (b) `mutual_refund` then refunds BOTH legs — the taker's ETH back to the taker AND the
               covenant back to the maker — so NEITHER party loses;
           (c) and separately that the maker never revealed p (it stalled)."""
         node, url = env
-        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
@@ -137,9 +140,16 @@ class TestEthAdversarial:
                 is False
             )
 
-            # 3. (a) Advance RXD to within the safety window of t_rxd maturity. The C1 DECISION
+            # 3. (0) The ETH deadline passes with the maker still silent: the taker's ETH refund is
+            #    open, and the maker's covenant refund is still closed at the same wall clock — the
+            #    production leg's maturity check refuses it without taking a fee input or broadcasting.
+            _pass_the_eth_deadline(node, url, terms, coord.config.margin_policy)
+            with pytest.raises(NetworkError, match="not yet mature"):
+                await coord.radiant_leg.refund_asset(coord.record)
+
+            # 4. (a) Advance RXD to within the safety window of t_rxd maturity. The C1 DECISION
             #    trigger must now FIRE ("stop waiting — the maker is stalling").
-            node.rxd_mine(terms.t_rxd.value - n)
+            node.rxd_mine(max(0, asset_locked_at + terms.t_rxd.value - n - int(node.rxd("getblockcount"))))
             assert (
                 taker_refund_window_open(
                     now_block_height=int(node.rxd("getblockcount")),
@@ -152,13 +162,11 @@ class TestEthAdversarial:
                 is True
             ), "C1 proactive-refund decision must fire as t_rxd-N approaches on a maker stall"
 
-            # 4. (b) The taker protects itself with mutual_refund — the guaranteed-safe failure that
+            # 5. (b) The taker protects itself with mutual_refund — the guaranteed-safe failure that
             #    refunds BOTH legs (taker's ETH → taker, covenant → maker). NEITHER party loses.
-            #    The CSV refund spend needs the covenant buried t_rxd deep, and the ETH refund needs
-            #    the ETH timeout passed — mature both, then mutual_refund.
-            node.rxd_mine(n)  # covenant now t_rxd deep (CSV mature)
-            _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
-            _anvil_mine(url, 1)  # past the ETH timeout (ETH refund spendable)
+            #    The ETH refund has been spendable since step 3; the CSV refund spend needs the
+            #    covenant buried t_rxd deep, which is the last thing to mature.
+            node.rxd_mine(max(0, asset_locked_at + terms.t_rxd.value - int(node.rxd("getblockcount"))))
             rec = await coord.mutual_refund()
             assert rec.state is SwapState.MUTUAL_REFUND, (
                 f"honest taker recovers via mutual_refund on a maker stall, got {rec.state.value}"
@@ -177,7 +185,7 @@ class TestEthAdversarial:
         hostile maker cannot race a CSV refund against a claim the taker acted on prematurely. Only
         once the ETH claim is FINAL may the taker claim."""
         node, url = env
-        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=60, asset_variant="rxd")
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
         adversary = _AdversaryActor(coord, p_secret)
 
@@ -238,7 +246,7 @@ class TestEthAdversarial:
 
         Either way the safety invariant is unchanged: the taker does NOT enter BOTH_LOCKED."""
         node, url = env
-        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
@@ -290,8 +298,8 @@ class TestEthAdversarial:
         window has nearly closed. The reorg gate must SQUEEZE (→ ASSET_VULNERABLE), never silently
         claim and never indefinitely WAIT — the danger zone is surfaced as an explicit decision."""
         node, url = env
-        # Tight t_rxd so the window can close while the ETH claim stays non-final.
-        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        # The derived window; step 3 closes it by mining while the ETH claim stays non-final.
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
@@ -328,7 +336,7 @@ class TestEthAdversarial:
         the negotiated terms (here: an underfunded balance). The honest maker's verify_funded gate
         must RAISE, so the maker never locks the RXD asset against a bad/absent ETH leg."""
         node, url = env
-        coord, _cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, _cov, _p, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
@@ -372,7 +380,7 @@ class TestEthAdversarial:
         S3 layer B (maker-reported SPK != the taker's re-derived SPK → PARAMS_MISMATCH) and, offline,
         tests/test_swap_coordinator.py."""
         node, url = env
-        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
@@ -407,7 +415,7 @@ class TestEthAdversarial:
         COORDINATOR (not eth_leg._inner._leg), the gap the prior single-operator flows masked."""
         node, url = env
         # An honest maker coordinator: its counter_leg pays the MAKER (claim_to=_ADDR_MAKER) on claim.
-        coord, _cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, _cov, _p, _eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
 
         from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg

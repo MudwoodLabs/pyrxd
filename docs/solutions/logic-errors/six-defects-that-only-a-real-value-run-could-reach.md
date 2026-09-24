@@ -99,8 +99,10 @@ that the taker must sit through before it can claim — ETH finality, the stall 
 slack. The maker could have refunded the covenant while the taker was still, correctly, waiting.
 
 That is threat-model **S20** ("taker offline/censored during `[reveal, t_rxd]`"), whose control list
-opens with *"the cross-clock timelock margin sizes `t_rxd` to open strictly before the counter-leg
+then opened with *"the cross-clock timelock margin sizes `t_rxd` to open strictly before the counter-leg
 deadline minus the finality-stall-tolerant margin."* On this runner that control **was not in force**.
+(That quoted sentence was itself the pre-#482 relation; S20 was corrected on 2026-09-23 to "no
+earlier than the counter-leg deadline PLUS the margin", which is what the sizer computes.)
 
 Two bounds, and they legitimately use different intervals:
 

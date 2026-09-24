@@ -33,13 +33,14 @@ pytest.importorskip("eth_keys")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pyrxd.gravity.swap_state import SwapState
+from pyrxd.security.errors import NetworkError
 
 # Reuse the real chain harness (node + anvil + the real legs/coordinator builder).
 from tests.test_xchain_eth_swap_regtest_e2e import (
     _anvil_mine,
     _anvil_now,
-    _anvil_rpc,
     _build,
+    _pass_the_eth_deadline,
     _rxd_pay,
     env,
 )
@@ -134,7 +135,7 @@ class TestEthTierBIsolated:
         node, url = env
         # _build returns one coordinator that can drive both legs; we split its use across two role
         # contexts that share only the _WireBus. The taker context never touches p_secret.
-        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=60, asset_variant="rxd")
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
         wire = _WireBus()
         maker = _MakerContext(coord, cov, p_secret)
@@ -177,7 +178,7 @@ class TestEthTierBIsolated:
         and the RXD covenant CSV-refunds to the maker (the covenant refund branch pays the MAKER, not
         the taker). NEITHER party suffers a one-sided loss; p never crossed the wire."""
         node, url = env
-        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, asset_variant="rxd")
         terms = coord.record.terms
         wire = _WireBus()
         maker = _MakerContext(coord, cov, _p)
@@ -192,12 +193,18 @@ class TestEthTierBIsolated:
             await taker.fund_eth(wire, url)
             assert await taker.revalidate_lock(wire, url) is SwapState.BOTH_LOCKED
 
-            # The maker STALLS (never calls claim_eth). The taker recovers safely: mature both legs
-            # (RXD CSV depth + ETH timeout), then mutual_refund refunds BOTH — taker's ETH to taker,
-            # covenant to maker. No one-sided loss.
-            node.rxd_mine(terms.t_rxd.value)
-            _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
-            _anvil_mine(url, 1)
+            # The maker STALLS (never calls claim_eth). The ETH deadline passes first — the taker's
+            # ETH refund opens while the maker's covenant refund is still closed at the same wall
+            # clock (#482: the counter leg is the short one)...
+            _pass_the_eth_deadline(node, url, terms, coord.config.margin_policy)
+            cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
+            cov_confs = int(node.rxd("getrawtransaction", cov_txid, "true")["confirmations"])
+            assert cov_confs < terms.t_rxd.value, "the covenant refund must open LAST"
+            with pytest.raises(NetworkError, match="not yet mature"):
+                await coord.radiant_leg.refund_asset(coord.record)
+            # ...then t_rxd matures, and mutual_refund refunds BOTH — taker's ETH to taker, covenant
+            # to maker. No one-sided loss.
+            node.rxd_mine(terms.t_rxd.value - cov_confs)
             rec = await coord.mutual_refund()
             assert rec.state is SwapState.MUTUAL_REFUND
             cov_txid = rec.radiant_covenant_outpoint.split(":")[0]

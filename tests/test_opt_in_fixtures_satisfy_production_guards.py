@@ -151,10 +151,31 @@ def _inverted_relations(path: Path) -> list[tuple[int, str]]:
     return sorted(bad)
 
 
-#: A file whose timelocks come from the production sizer cannot drift from the gate by
+#: A file whose timelocks come from a production derivation cannot drift from the gate by
 #: construction — there is no constant to go stale. That is the SAFE pattern, and it is also
 #: invisible to a scan looking for literals, so the two have to be told apart.
-_DERIVED_FROM_PRODUCTION = "eth_absolute_to_rxd_relative_blocks"
+#:
+#: ONE PER COUNTER-CHAIN CLOCK. The ETH sizer sizes ``t_rxd`` from the absolute ETH deadline; the
+#: BTC-family derivation (``scripts/_dust_swap_shared.py``, what the BTC runners negotiate with)
+#: derives ``t_btc`` from ``t_rxd`` in wall clock. This named only the ETH sizer — the one the guard
+#: was written from — so the BTC<->RXD suite, once it derived its timelocks, read as "evaluated
+#: NOTHING".
+_DERIVED_FROM_PRODUCTION = ("eth_absolute_to_rxd_relative_blocks", "derive_counter_timelock")
+
+
+def _calls_a_production_derivation(path: Path) -> bool:
+    """True iff the file CALLS one of ``_DERIVED_FROM_PRODUCTION`` — a call, not a mention.
+
+    This was a substring test on the file's text, which accepted a file that merely NAMED the sizer
+    in a comment or docstring — and a comment is exactly where a file says it SHOULD derive its
+    timelocks. That is the fail-open direction: a blind scan reported as a derived one.
+    """
+    for node in ast.walk(ast.parse(path.read_text(errors="ignore"))):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in _DERIVED_FROM_PRODUCTION:
+                return True
+    return False
 
 
 def _comparisons_made(path: Path) -> int:
@@ -201,15 +222,19 @@ def test_the_scan_finds_the_opt_in_swap_suites() -> None:
 #: it has to delete the entry. That is the difference between debt that gets paid and debt that
 #: quietly becomes the baseline.
 #:
-#: NOT mechanical to fix, which is why they are recorded rather than patched here. At least one
-#: (`TestMakerStallAssetOnlyRefundIsTakerLoss` in test_xchain_swap_regtest_e2e.py) uses the
-#: inverted ordering DELIBERATELY, to demonstrate that the asset-only refund is not a taker
-#: defense. #482 changed the geometry that scenario lives in, so it needs re-deriving rather than
-#: flipping — the spec/threat-model trap this repo has hit before.
+#: The BTC<->RXD and ETH<->RXD nightly suites were on this list until they were re-derived: they now
+#: take their timelocks from the production derivations, and their strict xfails XPASSed, which is
+#: what removed them. Neither turned out to be mechanical. Both needed ``t_rxd`` re-derived as well
+#: as ``t_btc`` (the ETH suites against the cross-clock gate), and the adversarial
+#: ``TestMakerStallAssetOnlyRefundIsTakerLoss`` needed its geometry re-derived, not flipped: under
+#: #482 the taker's BTC refund has already opened by the time the asset-only refund can fire.
 _KNOWN_BROKEN = {
-    "test_xchain_eth_swap_regtest_e2e.py": "t_btc = t_rxd + 40; t_btc is decorative on ETH (HZ-4) so likely a mechanical fix",
-    "test_xchain_erc20_usdc_lifecycle_e2e.py": "same shape, passed as a constructor keyword rather than a local",
-    "test_xchain_swap_regtest_e2e.py": "BTC<->RXD, where t_btc is REAL; includes an adversarial test that needs re-deriving post-#482",
+    "test_xchain_erc20_usdc_lifecycle_e2e.py": (
+        "t_btc = t_rxd + 40 passed as a constructor keyword; ALSO its t_rxd (8/60 blocks at 600 s) cannot "
+        "clear the cross-clock gate against its 50,000 s ETH deadline, and its flows mine 3 extra covenant "
+        "confirmations before funding, so a sizer anchored at now would still be refused. Needs a mainnet "
+        "fork RPC to run, so it has not been re-derived blind"
+    ),
 }
 
 
@@ -223,12 +248,12 @@ def _blindness_reason(path: Path) -> str | None:
     """
     if _comparisons_made(path) > 0:
         return None
-    if _DERIVED_FROM_PRODUCTION in path.read_text(errors="ignore"):
+    if _calls_a_production_derivation(path):
         return None
     return (
         f"{path.name} builds swap terms, but this scan evaluated NOTHING in it and it does not "
-        f"derive them via {_DERIVED_FROM_PRODUCTION}. A clean result here means the scan could not "
-        "read the file, not that the file is correct — extend the scan or derive the timelocks."
+        f"derive them via {' or '.join(_DERIVED_FROM_PRODUCTION)}. A clean result here means the scan "
+        "could not read the file, not that the file is correct — extend the scan or derive the timelocks."
     )
 
 
@@ -383,4 +408,35 @@ class TestTheScanItselfBehaves:
         f = tmp_path / "readable.py"
         f.write_text("def t():\n    t_rxd = bt.Timelock(100, B)\n    t_btc = bt.Timelock(60, B)\n")
         assert _comparisons_made(f) > 0
+        assert _blindness_reason(f) is None
+
+    @pytest.mark.parametrize("derivation", _DERIVED_FROM_PRODUCTION)
+    def test_a_file_that_only_MENTIONS_a_derivation_is_not_called_derived(self, tmp_path, derivation) -> None:
+        """The fail-open case of the old substring test: a comment naming the sizer is where a file
+        says it SHOULD derive its timelocks, and the substring test accepted it as having done so."""
+        f = tmp_path / "mentions.py"
+        f.write_text(
+            f"# TODO: take these from {derivation}\n"
+            "def t():\n    t_rxd = compute_it_somehow()\n    t_btc = compute_it_too()\n"
+        )
+        assert _comparisons_made(f) == 0
+        reason = _blindness_reason(f)
+        assert reason is not None and "evaluated NOTHING" in reason
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "def t():\n    t_rxd = eth_absolute_to_rxd_relative_blocks(eth_timeout_unix_s=x)\n"
+            "    t_btc = bt.Timelock(t_rxd.value // 2, B)\n",
+            "def t():\n    t_rxd = bt.Timelock(n, B)\n"
+            "    t_btc = bt.Timelock(shared.derive_counter_timelock(t_rxd_blocks=n), B)\n",
+        ],
+        ids=["eth-sizer", "btc-derivation-as-attribute"],
+    )
+    def test_a_file_that_CALLS_a_derivation_is_accepted(self, tmp_path, body) -> None:
+        """The honest partner, for each counter-chain clock and for both call shapes (bare name
+        and attribute), so the check above cannot be satisfied by refusing every derived file."""
+        f = tmp_path / "derived.py"
+        f.write_text(body)
+        assert _comparisons_made(f) == 0
         assert _blindness_reason(f) is None

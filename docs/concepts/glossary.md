@@ -462,10 +462,13 @@ those for depth; use this page to look something up mid-task.
   this said `t_btc - t_rxd` until 2026-09-01, which is the layout in which the
   party holding `p` takes both legs; and see #567, the two legs' blocks are not
   the same unit)
-  ([`src/pyrxd/gravity/swap_coordinator.py:475`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/gravity/swap_coordinator.py)).
-  The direction matters: it's what stops a maker from setting too-tight a
-  BTC refund (or too-loose an RXD refund) and creates the race window a
-  malicious maker could otherwise exploit. See
+  ([`src/pyrxd/gravity/swap_coordinator.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/gravity/swap_coordinator.py),
+  `assert_timelock_margin`).
+  The direction matters: it's what stops a maker from setting too-short an
+  RXD refund (or too-long a BTC refund) — the layout in which the maker refunds
+  the covenant it locked while `p` is still secret and then claims the counter
+  leg with `p`. (Until 2026-09-23 this line named the pre-#482 danger instead:
+  a too-tight BTC refund or a too-loose RXD refund.) See
   [Build a cross-chain atomic swap](../how-to/build-a-cross-chain-swap.md).
 - **TIMELOCK** — a Glyph protocol type (`GlyphProtocol.TIMELOCK = 9`,
   `glyph/types.py`, requires **ENCRYPTED**) for a timelocked reveal: the
