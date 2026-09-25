@@ -1,29 +1,42 @@
 """WAVE name protocol helpers — Photonic-compatible shape.
 
-WAVE is the on-chain naming protocol used on Radiant mainnet. The canonical
-shape (matching `Photonic Wallet's wave.ts` and what `RXinDexer` and other
-indexers parse) carries the name in a nested ``attrs`` dict:
+WAVE is the on-chain naming protocol used on Radiant mainnet. A claim's shape is
+the one Photonic Wallet builds (``createWaveNameMetadata``,
+``packages/lib/src/wave.ts`` at Radiant-Core/Photonic-Wallet ``becf41a7``, lines
+71-109): the QUALIFIED name at the top level, and the BARE LABEL in ``attrs.name``
+with its domain in ``attrs.domain``:
 
 .. code-block:: json
 
     {
+        "v": 2,
         "p": [2, 5, 11],
+        "name": "alice.rxd",
+        "type": "wave_name",
         "attrs": {
-            "name": "alice.rxd",
+            "name": "alice",
             "domain": "rxd",
             "target": "<radiant_address>",
             "target_type": "address"
         }
     }
 
-This module provides :func:`build_wave_metadata` to construct
-``GlyphMetadata`` with this shape, and :class:`WaveAttrs` to parse it back
-from on-chain CBOR.
+RXinDexer (``electrumx/server/wave_index.py``) registers the claim from
+``attrs.name``, and ``validate_wave_name`` refuses any character outside
+``a-z 0-9 -``. :func:`build_wave_metadata` reproduces a real mainnet claim built
+by Photonic byte for byte (``tests/test_wave_claim_registers_with_the_indexer.py``).
 
-Legacy pyrxd WAVE tokens stored the name as a top-level ``name`` field —
-the validator in :meth:`GlyphBuilder.prepare_wave_reveal` accepts both for
-backwards compatibility, but only the canonical shape is indexed by
-RXinDexer.
+THREE SHAPES A READER MAY MEET, and has to tell apart:
+
+- Photonic's, above. Indexed.
+- pyrxd through 0.24.0 (#728): ``attrs.name`` carried the QUALIFIED name
+  (``"alice.rxd"``) and the top-level ``name`` was empty. By RXinDexer's source such a
+  claim is skipped without an error, because ``validate_wave_name`` refuses the ``.`` —
+  read from source; no pyrxd-built claim has been checked against a live indexer.
+  :class:`WaveAttrs` still parses them, verbatim; pyrxd's envelope writers refuse to
+  build a new one (:func:`~pyrxd.glyph.payload.refuse_qualified_wave_label`).
+- Older pyrxd, with only a top-level ``name``. Not indexed; :func:`extract_wave_attrs`
+  returns ``None`` for it.
 """
 
 from __future__ import annotations
@@ -45,6 +58,9 @@ if TYPE_CHECKING:
 
 SCHEME_ADDRESS: Final = "address"
 """``target_type`` value for plain Radiant addresses."""
+
+WAVE_NAME_TYPE: Final = "wave_name"
+"""The top-level ``type`` Photonic writes on a WAVE claim (``createWaveNameMetadata``)."""
 
 
 def _optional_int(value: object) -> int | None:
@@ -89,7 +105,14 @@ def _optional_int(value: object) -> int | None:
 
 @dataclass(frozen=True)
 class WaveAttrs:
-    """Parsed WAVE attrs dict, mirroring the on-chain Photonic shape."""
+    """Parsed WAVE attrs dict, mirroring the on-chain Photonic shape.
+
+    ``name`` is carried VERBATIM, not normalised. On a Photonic claim, and on one pyrxd
+    builds now, it is the bare label (``"alice"``) and ``domain`` holds the rest. On a claim
+    pyrxd built through 0.24.0 it is the qualified name (``"alice.rxd"``), which RXinDexer
+    does not index (see the module docstring). A reader that appends ``domain`` must check
+    for a ``.`` first, or it prints ``alice.rxd.rxd`` for the older shape.
+    """
 
     name: str
     domain: str
@@ -205,39 +228,63 @@ def build_wave_metadata(
     target_type: str = SCHEME_ADDRESS,
     description: str = "",
     allow_confusable: bool = False,
+    expires: int | None = None,
 ) -> GlyphMetadata:
-    """Construct a Photonic-compatible WAVE :class:`GlyphMetadata`.
+    """Construct a WAVE claim's :class:`GlyphMetadata` in Photonic's shape.
 
-    :param qualified_name: e.g. ``"alice.rxd"`` — split into name + domain.
+    :param qualified_name: e.g. ``"alice.rxd"``, split into label + domain. A name with no
+        dot gets the ``rxd`` domain, so ``"alice"`` builds ``alice.rxd``.
     :param target: the address (or other identifier) the name resolves to.
     :param target_type: ``"address"`` by default; other values are reserved
         for future schemas (e.g. ``"cross_chain"``).
     :param description: optional human-readable description; stored as
         top-level ``desc`` in CBOR (NOT inside ``attrs``).
+    :param expires: optional unix-seconds ``attrs.expires``. Photonic always writes one
+        (``now + 2 years``); pyrxd writes it only when given, so the bytes do not depend on
+        the clock. It is display-level on both sides: RXinDexer stamps the real term from
+        the registration BLOCK time and ignores this field for expiry.
 
-    The returned metadata has protocol ``[NFT, MUT, WAVE]`` and an ``attrs``
-    dict matching the Photonic on-chain shape — pass it through
-    :func:`encode_payload` and then :meth:`GlyphBuilder.prepare_wave_reveal`
-    to construct the actual reveal transaction.
+    The result is what Photonic's ``createWaveNameMetadata`` builds (``v`` 2, protocol
+    ``[NFT, MUT, WAVE]``, top-level ``name`` = the qualified name, ``type`` =
+    ``"wave_name"``, and ``attrs`` = bare label, domain, target, target type). Pass it
+    through :func:`encode_payload` and then :meth:`GlyphBuilder.prepare_wave_reveal`.
 
-    The top-level ``name`` field on :class:`GlyphMetadata` is intentionally
-    left empty: validation in ``prepare_wave_reveal`` prefers ``attrs.name``,
-    and emitting both would create ambiguity if they ever disagree.
+    THE LABEL GOES IN ``attrs.name``, NOT THE QUALIFIED NAME. Through 0.24.0 this function
+    wrote ``attrs.name = "alice.rxd"`` and left the top level empty. RXinDexer registers a
+    claim from ``attrs.name`` and its ``validate_wave_name`` refuses the ``.``, so by the
+    indexer's source no name built here was ever registered (#728; read from source, not
+    yet observed against a live indexer).
+
+    A label that itself contains a dot (``"foo.bar.rxd"``) is refused. As ``attrs.name``
+    the indexer drops it, and Photonic's split (``foo`` under domain ``bar``) would register
+    a different name from the one asked for.
     """
     label, domain = split_qualified_name(qualified_name)
     validate_wave_text(label, field="WAVE label", allow_confusable=allow_confusable)
     validate_wave_text(domain, field="WAVE domain", allow_confusable=allow_confusable)
+    if "." in label:
+        raise ValidationError(
+            f"WAVE label {label!r} contains '.'. A WAVE claim carries a single label in attrs.name, "
+            f"and RXinDexer refuses a '.' there, so this name would never resolve. Subdomain claims "
+            f"are not built by this helper."
+        )
     if not target:
         raise ValidationError("WAVE target must not be empty")
+    if expires is not None and (isinstance(expires, bool) or not isinstance(expires, int) or expires < 0):
+        raise ValidationError(f"WAVE expires must be a non-negative int (unix seconds), got {expires!r}")
 
     attrs = WaveAttrs(
-        name=qualified_name,
+        name=label,
         domain=domain,
         target=target,
         target_type=target_type,
+        expires=expires,
     )
     return GlyphMetadata(
+        v=2,
         protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
+        name=f"{label}.{domain}",
+        token_type=WAVE_NAME_TYPE,
         attrs=attrs.to_dict(),
         description=description,
     )
@@ -248,7 +295,8 @@ def extract_wave_attrs(cbor_data: dict) -> WaveAttrs | None:
 
     Returns ``None`` for non-WAVE payloads or WAVE payloads using only the
     legacy top-level ``name`` shape (those exist on-chain but RXinDexer
-    won't index them).
+    won't index them). A pyrxd ≤0.24.0 claim, whose ``attrs.name`` is the qualified
+    name, IS returned, with ``name`` verbatim — see :class:`WaveAttrs`.
     """
     protocol = cbor_data.get("p", [])
     if GlyphProtocol.WAVE not in protocol:
@@ -268,7 +316,8 @@ def wave_attrs_from_metadata(metadata: GlyphMetadata) -> WaveAttrs | None:
     :meth:`GlyphInspector.extract_reveal_metadata`).
 
     Returns ``None`` for non-WAVE metadata or legacy-shape WAVE without
-    ``attrs.name`` (which RXinDexer cannot index).
+    ``attrs.name`` (which RXinDexer cannot index). Like :func:`extract_wave_attrs`, it
+    returns a pyrxd ≤0.24.0 claim's qualified ``attrs.name`` verbatim.
     """
     if GlyphProtocol.WAVE not in metadata.protocol:
         return None
@@ -492,7 +541,8 @@ def classify_glyph_metadata(metadata: GlyphMetadata) -> str:
     """Return the highest-specificity protocol classification for a metadata payload.
 
     Examples:
-        ``[NFT, MUT, WAVE]`` → ``"wave"`` (when attrs.name present)
+        ``[NFT, MUT, WAVE]`` → ``"wave"`` (when attrs.name present — including a
+            pyrxd ≤0.24.0 claim whose qualified attrs.name RXinDexer does not index)
         ``[NFT, MUT, WAVE]`` without attrs.name → ``"mut"`` (legacy, won't resolve)
         ``[NFT, MUT, CONTAINER]`` → ``"container"``
         ``[NFT, MUT]`` → ``"mut"``

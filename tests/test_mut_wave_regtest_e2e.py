@@ -765,7 +765,12 @@ def test_the_wave_name_resolves_off_the_confirmed_reveal(node, wave):  # noqa: F
 
     attrs = wave_attrs_from_metadata(metadata)
     assert attrs is not None, "the registration is not indexer-visible — attrs.name is missing"
-    assert attrs.name == "regtest-alice.rxd"
+    # The BARE LABEL, which is what RXinDexer registers from. This line asserted
+    # "regtest-alice.rxd" through 0.24.0 — the shape the indexer refuses (#728) — so the
+    # assertion described as separating an indexable claim from an invisible one was pinning
+    # the invisible one.
+    assert attrs.name == "regtest-alice"
+    assert metadata.name == "regtest-alice.rxd"
     assert attrs.domain == "rxd"
     assert attrs.target == wave["target"]
     assert attrs.target_type == "address"

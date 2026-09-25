@@ -30,7 +30,12 @@ from .dmint import (
     is_readable_last_time,
 )
 from .dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
-from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
+from .payload import (
+    build_dat_reveal_scriptsig_suffix,
+    build_reveal_scriptsig_suffix,
+    encode_payload,
+    refuse_qualified_wave_label,
+)
 from .script import (
     build_authority_gated_nft_script,
     build_commit_locking_script,
@@ -1407,32 +1412,46 @@ class GlyphBuilder:
         ``name`` must be non-empty, printable, at most 255 characters, and must not
         impersonate Latin text — see :func:`pyrxd.glyph.wave.validate_wave_text`, which is
         the single definition of that rule and is applied here and in
-        :func:`~pyrxd.glyph.wave.build_wave_metadata`. This method is the funnel every WAVE
-        registration crosses, whatever built its CBOR, so the check belongs here rather than
-        only in the metadata helper a caller may not have used. Pass
+        :func:`~pyrxd.glyph.wave.build_wave_metadata`. It is applied here so a caller who
+        hand-rolls the CBOR still crosses it. It is NOT applied by :meth:`prepare_mutable_reveal`
+        or :meth:`prepare_reveal`, both of which also accept a payload marked WAVE, so this
+        method is the documented door rather than the only one. Pass
         ``allow_confusable=True`` to register a look-alike deliberately.
-        The name is validated here but must already be embedded in
-        ``cbor_bytes`` by the caller via either ``attrs["name"]`` (the
-        Photonic-compatible canonical shape — required for resolution against
-        RXinDexer and other indexers) or top-level ``name`` (legacy pyrxd
-        shape, accepted for backwards compatibility but not indexer-visible).
 
-        Photonic-compatible CBOR shape (canonical, see Photonic Wallet
-        ``packages/lib/src/wave.ts``)::
+        ``name`` is the qualified name (``"alice.rxd"``; a bare ``"alice"`` means
+        ``alice.rxd``, as in :func:`~pyrxd.glyph.wave.split_qualified_name`). It is validated
+        here but must already be embedded in ``cbor_bytes``, in Photonic's shape (Photonic
+        Wallet ``packages/lib/src/wave.ts``, ``createWaveNameMetadata``)::
 
             {
+                "v": 2,
                 "p": [2, 5, 11],
+                "name": "alice.rxd",
+                "type": "wave_name",
                 "attrs": {
-                    "name": "alice.rxd",
+                    "name": "alice",
                     "domain": "rxd",
                     "target": "<radiant_address>",
                     "target_type": "address"
                 }
             }
 
-        Use :meth:`build_wave_attrs` (or :func:`pyrxd.glyph.wave.build_wave_metadata`)
-        to construct the canonical shape; passing a top-level ``name`` field
-        still works but emits a token RXinDexer will not index.
+        The label and domain in ``attrs`` must match ``name``. A top-level ``name``, when
+        present, must be that qualified name or the bare label (Photonic's two builders
+        write one or the other), because RXinDexer registers from ``attrs`` and rebuilds
+        from the top-level name on a backfill, and the two must not name different claims.
+
+        REFUSED: an ``attrs.name`` containing ``.``. That is the shape pyrxd built through
+        0.24.0 (``attrs.name = "alice.rxd"``), and RXinDexer's ``validate_wave_name`` refuses
+        the ``.`` and skips the claim without an error, so the reveal would confirm and the
+        name would never resolve (#728). Unlike the homograph check this one is enforced in
+        the envelope writers themselves (:func:`~pyrxd.glyph.payload.refuse_qualified_wave_label`),
+        so every reveal builder refuses it.
+
+        Still accepted: a payload with no ``attrs.name`` and only a top-level ``name``
+        (older pyrxd), cross-checked against it. RXinDexer does not index that shape either.
+
+        Use :func:`pyrxd.glyph.wave.build_wave_metadata` to construct the payload.
 
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
 
@@ -1443,7 +1462,7 @@ class GlyphBuilder:
         seed input is rejected by consensus, as every one built through 0.15.0
         was.
         """
-        from .wave import validate_wave_text
+        from .wave import split_qualified_name, validate_wave_text
 
         validate_wave_text(name, field="WAVE name", allow_confusable=allow_confusable)
         try:
@@ -1455,19 +1474,44 @@ class GlyphBuilder:
                 )
             if GlyphProtocol.MUT not in protocol:
                 raise ValidationError(f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})")
-            # Prefer the Photonic-compatible attrs.name; fall back to top-level
-            # name/n for backwards compatibility with pre-Photonic-shape pyrxd
-            # tokens. Tokens minted without attrs.name will not resolve against
-            # RXinDexer — see the docstring above.
             attrs = cbor_data.get("attrs") or {}
-            cbor_name = attrs.get("name") if isinstance(attrs, dict) else None
-            if not cbor_name:
+            attrs_name = attrs.get("name") if isinstance(attrs, dict) else None
+            if attrs_name:
+                # Photonic's shape: the bare label in attrs.name, the domain beside it.
+                if not isinstance(attrs_name, str):
+                    raise ValidationError(f"CBOR attrs.name must be text, got {type(attrs_name).__name__}")
+                # Before the cross-check, so pyrxd's own pre-0.25 shape gets the error that
+                # explains it rather than a name mismatch. The writers enforce it again.
+                refuse_qualified_wave_label(cbor_bytes)
+                attrs_domain = attrs.get("domain") or "rxd"
+                if not isinstance(attrs_domain, str):
+                    raise ValidationError(f"CBOR attrs.domain must be text, got {type(attrs_domain).__name__}")
+                qualified = f"{attrs_name}.{attrs_domain}"
+                if split_qualified_name(name) != (attrs_name, attrs_domain):
+                    raise ValidationError(
+                        f"name argument {name!r} does not match the CBOR's attrs "
+                        f"(name={attrs_name!r}, domain={attrs_domain!r}, i.e. {qualified!r})."
+                    )
+                # Photonic writes the qualified name here (createWaveNameMetadata) or the bare
+                # label (createWaveName). RXinDexer rebuilds names from this field on a backfill,
+                # so a value naming something else would register a different name there. Exact
+                # comparison: case-folding would let e.g. U+212A KELVIN SIGN through as "k"
+                # without crossing validate_wave_text.
+                top = cbor_data.get("name")
+                if top not in (None, "") and top not in (qualified, attrs_name):
+                    raise ValidationError(
+                        f"CBOR top-level name {top!r} disagrees with attrs ({qualified!r}); an indexer "
+                        f"reading one would register a different name from one reading the other."
+                    )
+            else:
+                # Older pyrxd: the name only at the top level. Not indexed by RXinDexer, which
+                # reads attrs.name — kept so existing callers still get a cross-checked build.
                 cbor_name = cbor_data.get("name") or cbor_data.get("n", "")
-            if cbor_name != name:
-                raise ValidationError(
-                    f"name argument {name!r} does not match CBOR name field {cbor_name!r}. "
-                    f"Checked attrs.name then top-level name/n."
-                )
+                if cbor_name != name:
+                    raise ValidationError(
+                        f"name argument {name!r} does not match CBOR name field {cbor_name!r}. "
+                        f"Checked attrs.name then top-level name/n."
+                    )
         except ValidationError:
             raise
         except Exception as exc:

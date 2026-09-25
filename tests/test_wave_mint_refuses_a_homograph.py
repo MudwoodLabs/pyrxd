@@ -6,11 +6,12 @@ letters; the mint path that CREATES such a name accepted it silently. For a name
 that asymmetry is backwards — refusing to create a spoof is worth more than labelling one
 after it is on-chain and somebody else owns it.
 
-This is the write-side half, and it is checked on BOTH doors: ``build_wave_metadata`` (the
-documented helper) and ``GlyphBuilder.prepare_wave_reveal`` (the funnel every registration
-crosses whatever built its CBOR). A caller who hand-rolls the CBOR skips the first and still
-crosses the second — which is the reason the rule lives in one function called from both
-rather than being written out twice, as it was before.
+This is the write-side half, and it is checked on BOTH documented doors: ``build_wave_metadata``
+(the helper) and ``GlyphBuilder.prepare_wave_reveal`` (the WAVE reveal builder). A caller who
+hand-rolls the CBOR skips the first and still crosses the second — which is the reason the rule
+lives in one function called from both rather than being written out twice, as it was before.
+(``prepare_mutable_reveal`` and ``prepare_reveal`` also accept a WAVE-marked payload and do not
+apply this check; see ``prepare_wave_reveal``'s docstring.)
 
 The honest-path tests are not decoration. A guard that refuses valid work is a defect, and
 this one refuses on a Unicode property, so the cases it must NOT touch — non-Latin scripts,
@@ -62,12 +63,18 @@ HONEST = {
 
 
 def _wave_cbor(name: str) -> bytes:
-    """A minimal WAVE payload whose attrs.name matches, so the builder's cross-check passes
-    and the homograph clause is what refuses — not an unrelated mismatch."""
+    """A minimal WAVE payload whose attrs match ``name``, so the builder's cross-check passes
+    and the homograph clause is what refuses — not an unrelated mismatch.
+
+    Photonic's shape: the bare label in attrs.name. This helper used to put the qualified
+    name there, which is the shape RXinDexer refuses (#728) and which the builder now refuses
+    too — so the honest-path tests below would have been refused for the wrong reason."""
+    label, _, domain = name.rpartition(".")
     return cbor2.dumps(
         {
             "p": [GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
-            "attrs": {"name": name, "domain": "rxd", "target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"},
+            "name": name,
+            "attrs": {"name": label, "domain": domain, "target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"},
         }
     )
 
@@ -106,7 +113,8 @@ class TestTheHonestPathStillWorks:
     @pytest.mark.parametrize("kind", sorted(HONEST))
     def test_build_wave_metadata_accepts(self, kind: str) -> None:
         md = build_wave_metadata(qualified_name=f"{HONEST[kind]}.rxd", target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
-        assert md.attrs["name"] == f"{HONEST[kind]}.rxd"
+        assert md.attrs["name"] == HONEST[kind]
+        assert md.name == f"{HONEST[kind]}.rxd"
 
     @pytest.mark.parametrize("kind", sorted(HONEST))
     def test_prepare_wave_reveal_accepts(self, kind: str) -> None:

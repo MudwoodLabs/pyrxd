@@ -15,6 +15,20 @@ related_files:
 pyrxd has ~80% of the building blocks already; full support is gated on
 a real consumer surfacing. Until then, do not invest design effort.
 
+> **Update 2026-09-24 (#728).** The `WaveAttrs` shape this record asks for
+> was added in #102, and it put the QUALIFIED name in `attrs.name`
+> (`"alice.rxd"`) with the top-level `name` empty. Photonic puts the bare
+> label there (`attrs.name = "alice"`, `attrs.domain = "rxd"`) and the
+> qualified name at the top level (`createWaveNameMetadata`,
+> `packages/lib/src/wave.ts`), and RXinDexer's `validate_wave_name` refuses the
+> `.` — so by the indexer's source no WAVE name pyrxd built through 0.24.0 was
+> registered. This is the silent-divergence risk described below, arriving by
+> a different route. The "byte-equivalence test against Photonic-emitted
+> mainnet tokens" named under *Why deferred* now exists
+> (`tests/test_wave_claim_registers_with_the_indexer.py`), and so do the
+> inspector classifier and `WaveResolver`. The sections below are the record
+> as written on 2026-05-13.
+
 ## What WAVE actually is (verified 2026-05-13)
 
 Two specs exist under the "WAVE" name:
