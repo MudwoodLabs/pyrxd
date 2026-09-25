@@ -149,6 +149,14 @@ _OUT_OF_SCOPE: dict[str, str] = {
     "token.ts": "Photonic Wallet",
     "tx.ts": "Photonic Wallet",
     "types.ts": "Photonic Wallet",
+    "packages/lib/src/wave.ts": "Photonic Wallet",
+    # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. Not vendored; the
+    # files pyrxd cites are digest-pinned in tests/fixtures/rxindexer_upstream_pin.json
+    # and watched by scripts/check_photonic_drift.py --target rxindexer.
+    "electrumx/server/glyph_index.py": "Radiant-Core/RXinDexer, pinned by digest",
+    "electrumx/server/wave_index.py": "Radiant-Core/RXinDexer, pinned by digest",
+    # Radiant-Core/WAVE-Protocol, the WAVE protocol description (3-63 character names).
+    "ANNOUNCEMENT.md": "Radiant-Core/WAVE-Protocol",
     # Not a citation at all: an ElectrumX endpoint, host:port. Listed rather than
     # filtered out by a cleverer regex, because a rule that silently drops things
     # is a rule nobody reviews.

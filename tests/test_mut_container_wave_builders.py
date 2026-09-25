@@ -27,6 +27,7 @@ from pyrxd.glyph.script import (
     parse_mutable_nft_script,
 )
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
+from pyrxd.glyph.wave import build_wave_metadata
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
@@ -54,7 +55,12 @@ def _cbor_child(protocol: list[int], name: str, *, container_refs: list[GlyphRef
 
 MUT_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.MUT], "mut-test")
 CONTAINER_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.CONTAINER], "container-test")
-WAVE_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], "myname.rxd")
+#: A registrable claim, built the way callers are told to. This was a top-level-only payload
+#: (`name="myname.rxd"`, no attrs), which the indexer's live claim path skips; pyrxd refuses
+#: to write that shape now (#728).
+WAVE_CBOR = encode_payload(
+    build_wave_metadata(qualified_name="myname.rxd", target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
+)[0]
 
 BUILDER = GlyphBuilder()
 #: The container's own current locking script. A plain NFT here; the gated case is
@@ -471,13 +477,14 @@ class TestPrepareWaveReveal:
         assert wave_result.contract_script
         assert MUTABLE_NFT_SCRIPT_RE.fullmatch(wave_result.contract_script.hex())
 
-    def test_255_char_name_is_valid(self):
-        name = "a" * 255
-        cbor_255, _ = encode_payload(
-            GlyphMetadata(name=name, protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE])
+    def test_the_longest_label_is_valid(self):
+        """63 characters, the WAVE maximum. This test used to pass 255, a length no indexer
+        registers; the boundary on both sides is in test_wave_claim_registers_with_the_indexer."""
+        name = "a" * 63 + ".rxd"
+        cbor_63, _ = encode_payload(
+            build_wave_metadata(qualified_name=name, target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
         )
-        # Should not raise
-        result = BUILDER.prepare_wave_reveal(TXID, 0, cbor_255, PKH, name)
+        result = BUILDER.prepare_wave_reveal(TXID, 0, cbor_63, PKH, name)
         assert len(result.nft_script) == 63
 
 

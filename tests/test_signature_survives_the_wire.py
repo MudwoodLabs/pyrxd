@@ -9,7 +9,7 @@ the only transport a signature exists for, it did not:
     timelocked NFT          ON CHAIN=False  signature mismatch
 
 `_cbor_for_signing` produced insertion-order CBOR while `encode_payload` publishes canonical
-(payload.py:67), so the signed bytes were never the published bytes. It passed for a plain NFT
+(payload.py:68), so the signed bytes were never the published bytes. It passed for a plain NFT
 because that metadata's field order happens to already be canonical — the fixture could not
 express the defect.
 

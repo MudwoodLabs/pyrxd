@@ -3,18 +3,27 @@
 Through 0.24.0 ``build_wave_metadata("alice.rxd", ...)`` wrote ``attrs.name = "alice.rxd"``
 and left the top-level ``name`` empty. RXinDexer registers a claim from ``attrs.name`` and its
 ``validate_wave_name`` refuses the ``.``, logging at debug level and returning. So, by the
-indexer's source, such a reveal confirms, spends its fee, and registers nothing. (Read from
-source: no pyrxd-built claim has been put to a live indexer.) Every existing test passed,
-because each one checked pyrxd's output against pyrxd's own idea of the shape; none ran it past
-the indexer's rule, and the one that compared against "the Photonic shape" had hand-typed it
-wrong.
+indexer's source, no claim ``build_wave_metadata`` built was registered: such a reveal confirms,
+spends its fee, and registers nothing. (Read from source: no pyrxd-built claim has been put to
+a live indexer. Hand-built CBOR of the right shape could always be revealed through
+``prepare_wave_reveal``, so the statement is about the helper, not about every pyrxd claim.)
+Every existing test passed, because each one checked pyrxd's output against pyrxd's own idea of
+the shape; none ran it past the indexer's rule, and the one that compared against "the Photonic
+shape" had hand-typed it wrong.
 
 This file checks the shape against two things pyrxd did not write:
 
-1. A REAL CLAIM built by Photonic and indexed on mainnet — ``f644794b…`` in
+1. A REAL CLAIM the public indexer resolves — ``f644794b…`` in
    ``fixtures/wave_update_chain_mainnet.json`` (``custodian-gate-x7f3.rxd``, block 458585,
-   reveal input 0). The builder has to reproduce it byte for byte from its own name, target
-   and expiry.
+   reveal input 0). ``wave.resolve("custodian-gate-x7f3")`` on ``electrumx.radiantcore.org``
+   returned ``ref f644794b…_0``, ``status active`` (measured 2026-09-24). Its FIELD SET and
+   values are those of Photonic's ``createWaveNameMetadata``; the builder reproduces its BYTES
+   from its name, target and expiry. Those bytes were NOT encoded by Photonic: they are
+   canonical CBOR (short map headers, sorted keys) and carry no ``desc``, while Photonic's
+   ``cbor-x`` ``encode`` writes 16-bit map headers in object order (measured with cbor-x 1.6.6
+   on ``createWaveNameMetadata``'s object: ``b9 0005 61 76 …``) and its register page always
+   sets ``desc`` (``WaveRegister.tsx:127``). The claim is probably hand-assembled; that is an
+   inference, not established. What it proves is that this shape registers.
 2. A TRANSCRIPTION of the indexer's own rules, from Radiant-Core/RXinDexer at commit
    ``ca8a6a4e77ef0ad3f24ec6f41cb0a73eb5f3651e`` (main, 2026-08-05):
    ``electrumx/server/wave_index.py`` — ``WAVE_CHARS`` / ``WAVE_MAX_NAME_LENGTH`` (37, 42),
@@ -22,15 +31,18 @@ This file checks the shape against two things pyrxd did not write:
    address in ``WaveZoneRecords.from_metadata`` (189-197) and the backfill path in
    ``backfill_from_glyph_db`` (1378-1391); and ``electrumx/lib/glyph.py`` — the envelope's
    standalone-``gly`` case in ``parse_glyph_envelope`` (214-232) and the token name (672).
-   Transcribed, not imported: the indexer is not a dependency. If upstream changes these
-   lines, this file is stale and has to be re-read against them.
+   Transcribed, not imported: the indexer is not a dependency. Both files are pinned by
+   digest in ``fixtures/rxindexer_upstream_pin.json`` at that commit, and
+   ``scripts/check_photonic_drift.py --target rxindexer`` reports when upstream moves.
 
 Photonic's builder is ``createWaveNameMetadata``, ``packages/lib/src/wave.ts`` lines 71-109 at
-Radiant-Core/Photonic-Wallet ``becf41a731e78ab98fdd88652527d7dda12784c6``.
+Radiant-Core/Photonic-Wallet ``becf41a731e78ab98fdd88652527d7dda12784c6``. The rule pyrxd
+holds every claim to is in ``src/pyrxd/glyph/wave_rules.py``.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 
@@ -39,6 +51,7 @@ import pytest
 
 from pyrxd.glyph._inspect_core import _classify_metadata_protocol, _classify_raw_tx
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
+from pyrxd.glyph.fees import estimate_reveal_fee
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import (
     GLY_MARKER,
@@ -47,6 +60,7 @@ from pyrxd.glyph.payload import (
     decode_payload,
     encode_payload,
 )
+from pyrxd.glyph.script import hash_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.wave import (
     build_wave_metadata,
@@ -54,6 +68,7 @@ from pyrxd.glyph.wave import (
     extract_wave_attrs,
     wave_attrs_from_metadata,
 )
+from pyrxd.glyph.wave_rules import wave_claim_problem
 from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.security.errors import ValidationError
@@ -73,6 +88,7 @@ PKH = Hex20(bytes(range(20)))
 TXID = "ab" * 32
 #: A real mainnet address: the claim's own target.
 TARGET = _MINT_DICT["attrs"]["target"]
+_SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "pyrxd"
 
 
 def _old_pyrxd_claim(qualified: str = "alice.rxd", target: str = TARGET) -> dict:
@@ -92,6 +108,16 @@ def _old_pyrxd_claim(qualified: str = "alice.rxd", target: str = TARGET) -> dict
             "target_type": "address",
         },
     }
+
+
+def _old_commit_bytes() -> bytes:
+    """The bytes a 0.24.0 commit committed to: its builder's metadata through the same
+    canonical encoder, which is unchanged."""
+    return encode_payload(
+        GlyphMetadata(
+            protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], attrs=_old_pyrxd_claim()["attrs"]
+        )
+    )[0]
 
 
 # ─────────────────────────────── RXinDexer, transcribed (ca8a6a4e) ──
@@ -216,19 +242,37 @@ class TestTheTranscriptionAgreesWithCasesWhoseAnswerIsKnown:
         assert _indexer_reveal_metadata(_MINT_TX.inputs[0].unlocking_script.serialize()) == _MINT_DICT
 
 
-# ─────────────────────────────────────────── (a) Photonic's shape ──
+# ─────────────────────────────── (a) Photonic's fields, a registered claim's bytes ──
 
 
-class TestTheBuilderBuildsPhotonicsShape:
-    def test_it_reproduces_a_real_photonic_claim_byte_for_byte(self) -> None:
-        """Name, target and expiry taken from the mainnet claim; the expected bytes ARE the
-        mainnet claim. Nothing here is pyrxd's own idea of the shape."""
+class TestTheBuilderWritesPhotonicsFields:
+    def test_it_reproduces_an_indexed_mainnet_claim_byte_for_byte(self) -> None:
+        """Name, target and expiry taken from the mainnet claim; the expected bytes ARE that
+        claim, which the public indexer resolves. Not Photonic's encoding — see the next test."""
         md = build_wave_metadata(
             qualified_name=_MINT_DICT["name"],
             target=_MINT_DICT["attrs"]["target"],
             expires=_MINT_DICT["attrs"]["expires"],
         )
         assert encode_payload(md)[0] == _MINT_CBOR
+
+    def test_those_bytes_are_canonical_cbor_not_photonics_encoder(self) -> None:
+        """What the byte test does and does not show, made executable. Photonic's ``cbor-x``
+        writes a 16-bit map header (``b9 0005``) with ``v`` first; this claim opens with a
+        short header and keys in canonical order, so it is not Photonic's encoder output."""
+        assert _MINT_CBOR[0] == 0xA5
+        assert list(_MINT_DICT) == ["p", "v", "name", "type", "attrs"]
+        assert cbor2.dumps(_MINT_DICT, canonical=True) == _MINT_CBOR
+        assert "desc" not in _MINT_DICT
+
+    def test_the_field_set_is_create_wave_name_metadatas(self) -> None:
+        """``createWaveNameMetadata`` (wave.ts:89-108) writes v, p, name, type and attrs with
+        name/domain/target/target_type/expires — and ``desc`` only when given."""
+        md = build_wave_metadata(qualified_name="alice.rxd", target=TARGET, expires=1)
+        d = cbor2.loads(encode_payload(md)[0])
+        assert set(d) == {"v", "p", "name", "type", "attrs"}
+        assert set(d["attrs"]) == {"name", "domain", "target", "target_type", "expires"}
+        assert (d["v"], d["p"], d["name"], d["type"]) == (2, [2, 5, 11], "alice.rxd", "wave_name")
 
     def test_without_an_expiry_it_is_that_claim_less_attrs_expires(self) -> None:
         """Photonic always writes ``attrs.expires`` (``now + 2 years``). pyrxd writes it only
@@ -264,7 +308,7 @@ class TestTheIndexerRegistersTheNewShapeAndNotTheOld:
         assert _indexer_backfills(claim) is None
 
 
-# ─────────────────────────── (c) through the entry point that builds the reveal ──
+# ─────────────────────────── (c) through the entry points that build the claim ──
 
 
 class TestThroughTheProductionEntryPoint:
@@ -275,6 +319,7 @@ class TestThroughTheProductionEntryPoint:
             CommitParams(metadata=md, owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000_000)
         )
         scripts = builder.prepare_wave_reveal(TXID, 0, commit.cbor_bytes, PKH, name_arg or qualified)
+        assert scripts.payload_hash == commit.payload_hash
         return scripts.scriptsig_suffix
 
     def test_the_reveal_bytes_register_the_name_asked_for(self) -> None:
@@ -292,40 +337,202 @@ class TestThroughTheProductionEntryPoint:
         assert metadata["name"] == "alice.rxd"
 
 
-# ───────────────────── every writer refuses the old shape; none refuses honest work ──
+# ───────────────────────────── the rule, on every door; and none refuses honest work ──
 
 
-def _old_cbor() -> bytes:
-    return cbor2.dumps(_old_pyrxd_claim())
+def _claim(label: object, **extra: object) -> dict:
+    """A WAVE claim carrying ``label`` in attrs.name, otherwise in Photonic's shape."""
+    d: dict = {
+        "v": 2,
+        "p": [GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
+        "type": "wave_name",
+        "attrs": {"name": label, "domain": "rxd", "target": TARGET, "target_type": "address"},
+    }
+    d.update(extra)
+    return d
 
 
-def _new_cbor() -> bytes:
-    return encode_payload(build_wave_metadata(qualified_name="alice.rxd", target=TARGET))[0]
+def _commit(d: dict) -> object:
+    md = GlyphMetadata(
+        protocol=d["p"],
+        attrs=d.get("attrs", {}),
+        name=d.get("name", "") if isinstance(d.get("name", ""), str) else "",
+    )
+    return GlyphBuilder().prepare_commit(
+        CommitParams(metadata=md, owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000)
+    )
 
 
-#: Each builder that writes a reveal or update envelope, called on one payload. The refusal
-#: lives in the two envelope writers, so these are the DOORS to them, not the check itself.
-_WRITERS = {
-    "prepare_wave_reveal": lambda cbor: GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor, PKH, "alice.rxd"),
-    "prepare_mutable_reveal": lambda cbor: GlyphBuilder().prepare_mutable_reveal(TXID, 0, cbor, PKH),
-    "prepare_reveal": lambda cbor: GlyphBuilder().prepare_reveal(
-        RevealParams(commit_txid=TXID, commit_vout=0, commit_value=10_000, cbor_bytes=cbor, owner_pkh=PKH, is_nft=True)
+#: Every way to write a WAVE claim, each fed decoded CBOR. ``prepare_commit`` is the point
+#: of no return; the others write an envelope. Which functions COUNT as writers is derived
+#: and pinned in ``TestTheWriterSetIsDerived`` below, not trusted to this dict.
+_DOORS = {
+    "prepare_commit": _commit,
+    "prepare_wave_reveal": lambda d: GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor2.dumps(d), PKH, "alice.rxd"),
+    "prepare_mutable_reveal": lambda d: GlyphBuilder().prepare_mutable_reveal(TXID, 0, cbor2.dumps(d), PKH),
+    "prepare_reveal": lambda d: GlyphBuilder().prepare_reveal(
+        RevealParams(
+            commit_txid=TXID, commit_vout=0, commit_value=10_000, cbor_bytes=cbor2.dumps(d), owner_pkh=PKH, is_nft=True
+        )
     ),
-    "build_reveal_scriptsig_suffix": build_reveal_scriptsig_suffix,
-    "build_mutable_scriptsig": lambda cbor: build_mutable_scriptsig("mod", cbor, 1, 1, 0, 0),
+    "build_reveal_scriptsig_suffix": lambda d: build_reveal_scriptsig_suffix(cbor2.dumps(d)),
+    "build_mutable_scriptsig": lambda d: build_mutable_scriptsig("mod", cbor2.dumps(d), 1, 1, 0, 0),
 }
 
+#: (attrs.name, the reason it must be refused for). Asserting the REASON, not just a refusal,
+#: is what stops a case passing because some other clause fired first — which is why the
+#: hyphen cases are four characters, not the two-character "-a" that the length clause
+#: would refuse on its own.
+_REFUSED_LABELS = [
+    ("alice.rxd", "contains '.'"),
+    ("sub.alice", "contains '.'"),
+    ("a.b.c", "contains '.'"),
+    ("alice．rxd", "write a non-ASCII name as xn-- punycode"),  # U+FF0E FULLWIDTH FULL STOP
+    ("Alice", "uppercase is refused"),
+    ("-abc", "starts or ends with '-'"),
+    ("abc-", "starts or ends with '-'"),
+    ("a--b", "contains '--'"),
+    ("ab", "is 2 characters"),
+    ("a" * 64, "is 64 characters"),
+    (b"alice", "must be text"),
+    (5, "must be text"),
+]
+_ACCEPTED_LABELS = ["abc", "a" * 63, "xn--caf-dma", "custodian-gate-x7f3", "usdt1"]
 
-class TestEveryWriterRefusesTheOldShape:
-    @pytest.mark.parametrize("writer", sorted(_WRITERS))
-    def test_refused(self, writer: str) -> None:
-        with pytest.raises(ValidationError, match=r"attrs\.name 'alice\.rxd' is a qualified name"):
-            _WRITERS[writer](_old_cbor())
 
-    @pytest.mark.parametrize("writer", sorted(_WRITERS))
-    def test_the_photonic_shape_passes(self, writer: str) -> None:
-        assert _WRITERS[writer](_new_cbor()) is not None
+class TestTheLabelRuleOnEveryDoor:
+    @pytest.mark.parametrize("door", sorted(_DOORS))
+    @pytest.mark.parametrize(("label", "reason"), _REFUSED_LABELS, ids=[repr(c[0])[:12] for c in _REFUSED_LABELS])
+    def test_refused_for_its_reason(self, door: str, label: object, reason: str) -> None:
+        with pytest.raises(ValidationError, match="indexer will not register") as exc:
+            _DOORS[door](_claim(label))
+        assert reason in str(exc.value)
 
+    @pytest.mark.parametrize("door", sorted(_DOORS))
+    @pytest.mark.parametrize("label", _ACCEPTED_LABELS)
+    def test_accepted(self, door: str, label: str) -> None:
+        # prepare_wave_reveal cross-checks its name argument, so give it this claim's name.
+        if door == "prepare_wave_reveal":
+            assert GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor2.dumps(_claim(label)), PKH, f"{label}.rxd")
+        else:
+            assert _DOORS[door](_claim(label)) is not None
+
+    @pytest.mark.parametrize("label", _ACCEPTED_LABELS)
+    def test_every_accepted_label_the_indexer_also_accepts(self, label: str) -> None:
+        """The rule is an INTERSECTION: nothing pyrxd accepts may be something the indexer
+        refuses. (The converse is deliberate: 1-2 character labels, which RXinDexer alone
+        allows.)"""
+        assert _indexer_registers(_claim(label)) == (label, None)
+
+    @pytest.mark.parametrize(("label", "reason"), [c for c in _REFUSED_LABELS if isinstance(c[0], str)])
+    def test_the_builder_refuses_the_same_labels(self, label: str, reason: str) -> None:
+        with pytest.raises(ValidationError):
+            build_wave_metadata(qualified_name=f"{label}.rxd", target=TARGET)
+
+
+#: The doors that take raw CBOR. ``prepare_commit`` takes a ``GlyphMetadata``, which has no
+#: ``app`` field and types ``attrs`` as a dict, so it cannot WRITE an ``app.data`` name or
+#: parent or a non-map ``attrs`` — those cases exist only on the doors below.
+_CBOR_DOORS = sorted(d for d in _DOORS if d != "prepare_commit")
+
+
+class TestTheDomainAndTheNameTheIndexerReads:
+    """The indexer reads the name from attrs.name, then app.data.name, and the parent from
+    app.data.parent, then attrs.domain (wave_index.py:711-717). The rule reads the same."""
+
+    @pytest.mark.parametrize("door", sorted(_DOORS))
+    def test_a_domain_other_than_rxd_is_refused(self, door: str) -> None:
+        claim = _claim("alice")
+        claim["attrs"]["domain"] = "evil"
+        assert _indexer_registers(claim) == ("alice", "evil")  # a subdomain, to the indexer
+        with pytest.raises(ValidationError, match="parent/domain 'evil'"):
+            _DOORS[door](claim)
+
+    def test_an_uppercase_domain_is_refused_not_folded(self) -> None:
+        """The indexer compares the parent with 'rxd' exactly (wave_index.py:716), so 'RXD'
+        is looked up as a parent name, not treated as the root."""
+        claim = _claim("alice")
+        claim["attrs"]["domain"] = "RXD"
+        assert _indexer_registers(claim) == ("alice", "RXD")
+        with pytest.raises(ValidationError, match="parent/domain 'RXD'"):
+            _DOORS["prepare_commit"](claim)
+        with pytest.raises(ValidationError, match="must be lowercase"):
+            build_wave_metadata(qualified_name="alice.RXD", target=TARGET)
+
+    def test_a_missing_domain_is_the_root_and_is_accepted(self) -> None:
+        claim = _claim("alice")
+        del claim["attrs"]["domain"]
+        assert _indexer_registers(claim) == ("alice", None)
+        assert _DOORS["build_reveal_scriptsig_suffix"](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    def test_an_app_data_name_is_checked_when_attrs_has_none(self, door: str) -> None:
+        claim = _claim("")
+        claim["app"] = {"data": {"name": "alice.rxd"}}
+        assert _indexer_registers(claim) == "Invalid WAVE name 'alice.rxd': Invalid character: ."
+        with pytest.raises(ValidationError, match=r"attrs\.name 'alice\.rxd' contains '\.'"):
+            _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    def test_a_parent_hidden_in_app_data_is_refused(self, door: str) -> None:
+        claim = _claim("alice", app={"data": {"parent": "bob"}})
+        assert _indexer_registers(claim) == ("alice", "bob")
+        with pytest.raises(ValidationError, match="parent/domain 'bob'"):
+            _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    def test_a_second_name_in_app_data_is_refused(self, door: str) -> None:
+        claim = _claim("alice", app={"data": {"name": "bob"}})
+        with pytest.raises(ValidationError, match="name different claims"):
+            _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", sorted(_DOORS))
+    def test_a_top_level_name_naming_something_else_is_refused(self, door: str) -> None:
+        """The live indexer registers from attrs; its backfill registers from the top-level
+        name. A payload where they disagree registers two different names."""
+        claim = _claim("alice", name="bob.rxd")
+        assert _indexer_registers(claim) == ("alice", None) and _indexer_backfills(claim) == "bob"
+        with pytest.raises(ValidationError, match="names a different claim"):
+            _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    def test_unreadable_attrs_is_refused(self, door: str) -> None:
+        claim = _claim("alice")
+        claim["attrs"] = ["alice"]
+        with pytest.raises(ValidationError, match="not a map"):
+            _DOORS[door](claim)
+
+
+class TestATopLevelOnlyClaimIsRefused:
+    """Older pyrxd put the name only at the top level. The indexer's LIVE claim path, which is
+    how a new claim is registered, skips it; only a backfill of an empty index reads it."""
+
+    def _legacy(self) -> dict:
+        return {"p": [GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], "name": "alice.rxd"}
+
+    def test_the_live_path_skips_it_and_the_backfill_would_not(self) -> None:
+        assert _indexer_registers(self._legacy()) == "has no name"
+        assert _indexer_backfills(self._legacy()) == "alice"
+
+    @pytest.mark.parametrize("door", sorted(_DOORS))
+    def test_refused(self, door: str) -> None:
+        with pytest.raises(ValidationError, match="carries no attrs.name"):
+            _DOORS[door](self._legacy())
+
+    def test_a_wave_marked_payload_that_is_not_a_claim_is_refused_too(self) -> None:
+        """Photonic's commit-reveal ``wave_commit`` metadata is WAVE-marked with no attrs.name.
+        pyrxd has no flow that writes one, and the rule cannot tell it from a claim that lost
+        its name, so it is refused. Recorded so the choice is visible."""
+        commitment = {
+            "p": [2, 5, 11],
+            "name": "wave_commit_ab12cd34",
+            "type": "wave_commit",
+            "attrs": {"commitment": "ab" * 32, "revealAfterHeight": 1, "owner": TARGET},
+        }
+        assert wave_claim_problem(commitment) is not None
+
+
+class TestTheRuleLeavesOtherPayloadsAlone:
     def test_a_dot_in_a_non_wave_attrs_name_is_not_touched(self) -> None:
         """The rule is about WAVE claims. An ordinary NFT called ``photo.png`` is honest."""
         cbor = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], attrs={"name": "photo.png"}))[0]
@@ -336,6 +543,120 @@ class TestEveryWriterRefusesTheOldShape:
         nothing — and a holder of a pre-0.25 name must still be able to write one."""
         cbor = cbor2.dumps({"attrs": {"name": "alice.rxd", "domain": "rxd", "target": TARGET}})
         assert build_mutable_scriptsig("mod", cbor, 1, 1, 0, 0)
+
+
+# ──────────────────── the escape: recovering a commit pyrxd <=0.24.0 already broadcast ──
+
+
+class TestACommitMadeBy024CanStillBeRevealed:
+    """A 0.24.0 commit can only be spent by revealing the exact CBOR it commits to. Refusing
+    that reveal would strand the commit's value, so the reveal paths take an explicit escape.
+    The commit path does not: a new commit with this shape is the bug."""
+
+    def test_the_commit_path_refuses_and_has_no_escape(self) -> None:
+        with pytest.raises(ValidationError, match="indexer will not register"):
+            _commit(_old_pyrxd_claim())
+        assert "allow_unregistrable_wave" not in CommitParams.__dataclass_fields__
+
+    def test_the_reveal_is_refused_by_default(self) -> None:
+        with pytest.raises(ValidationError, match="allow_unregistrable_wave=True"):
+            GlyphBuilder().prepare_wave_reveal(TXID, 0, _old_commit_bytes(), PKH, "alice.rxd")
+
+    def test_the_reveal_is_built_with_the_escape_and_spends_that_commit(self) -> None:
+        old = _old_commit_bytes()
+        scripts = GlyphBuilder().prepare_wave_reveal(TXID, 0, old, PKH, "alice.rxd", allow_unregistrable_wave=True)
+        assert scripts.payload_hash == hash_payload(old)  # the hash the 0.24.0 commit locked
+        assert _indexer_reveal_metadata(scripts.scriptsig_suffix) == cbor2.loads(old)
+        # ...and, as the docstring says, the claim so revealed does not register.
+        assert _indexer_registers(cbor2.loads(old)).startswith("Invalid WAVE name")
+
+    def test_the_escape_still_checks_the_name_is_the_payloads(self) -> None:
+        with pytest.raises(ValidationError, match="not a name this CBOR carries"):
+            GlyphBuilder().prepare_wave_reveal(
+                TXID, 0, _old_commit_bytes(), PKH, "bob.rxd", allow_unregistrable_wave=True
+            )
+
+    def test_the_other_reveal_paths_take_the_escape_too(self) -> None:
+        old = _old_commit_bytes()
+        assert GlyphBuilder().prepare_mutable_reveal(TXID, 0, old, PKH, allow_unregistrable_wave=True)
+        assert GlyphBuilder().prepare_reveal(
+            RevealParams(
+                commit_txid=TXID,
+                commit_vout=0,
+                commit_value=10_000,
+                cbor_bytes=old,
+                owner_pkh=PKH,
+                is_nft=True,
+                allow_unregistrable_wave=True,
+            )
+        )
+        assert build_reveal_scriptsig_suffix(old, allow_unregistrable_wave=True)
+
+    def test_the_recovery_reveal_can_be_priced(self) -> None:
+        assert estimate_reveal_fee(cbor_bytes=_old_commit_bytes(), is_nft=True).fee > 0
+
+    def test_an_update_has_no_escape(self) -> None:
+        """An update payload is chosen fresh, so refusing one strands nothing."""
+        with pytest.raises(TypeError):
+            build_mutable_scriptsig("mod", _old_commit_bytes(), 1, 1, 0, 0, allow_unregistrable_wave=True)  # type: ignore[call-arg]
+
+
+class TestTheWriterSetIsDerived:
+    """Every function in src/pyrxd that touches the ``gly`` marker, found by walking the AST —
+    not a hand-kept list of doors. A new one fails here until someone says what it is."""
+
+    #: REVIEWED, not derived: why each member is or is not a WAVE door. The membership is
+    #: pinned exactly, so adding or removing a function forces this table to be re-read.
+    _MEMBERS = {
+        ("glyph/payload.py", "build_reveal_scriptsig_suffix"): "WRITER — must call the rule",
+        ("glyph/payload.py", "build_mutable_scriptsig"): "WRITER — must call the rule",
+        (
+            "glyph/payload.py",
+            "build_dat_reveal_scriptsig_suffix",
+        ): "DAT: 'dat' follows 'gly', so the indexer does not read it as a claim",
+        ("glyph/burn.py", "build_burn_proof_script"): "burn proof: a 1-byte push follows 'gly' (lib/glyph.py:218)",
+        ("glyph/timelock_reveal_tx.py", "create_reveal_proof"): "timelock proof: a 1-byte push follows 'gly'",
+        ("glyph/script.py", "build_commit_locking_script"): "commit script: checks the marker, carries no payload",
+        ("glyph/script.py", "build_dat_commit_locking_script"): "commit script: checks the marker, carries no payload",
+        ("glyph/burn.py", "parse_burn_proof"): "reader",
+        ("glyph/inspector.py", "_parse_reveal_scriptsig"): "reader",
+        ("glyph/inspector.py", "classify_glyph_scriptsig"): "reader",
+        ("glyph/inspector.py", "extract_reveal_cbor"): "reader",
+        ("glyph/mutable_chain.py", "_envelope_of"): "reader",
+        ("glyph/timelock_reveal_tx.py", "parse_reveal_proof_script"): "reader",
+    }
+
+    @staticmethod
+    def _functions(pred) -> set[tuple[str, str]]:  # type: ignore[no-untyped-def]
+        found = set()
+        for path in sorted(_SRC.rglob("*.py")):
+            for fn in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(pred(n) for n in ast.walk(fn)):
+                    found.add((str(path.relative_to(_SRC)), fn.name))
+        return found
+
+    def test_the_set_is_exactly_the_reviewed_one(self) -> None:
+        marks = {"GLY_MARKER", "GLYPH_MAGIC_BYTES"}
+        found = self._functions(
+            lambda n: (
+                (isinstance(n, ast.Name) and n.id in marks)
+                or (isinstance(n, ast.Constant) and isinstance(n.value, bytes) and b"gly" in n.value)
+            )
+        )
+        assert found, "the scan found nothing — it is broken, not the codebase"
+        assert found == set(self._MEMBERS)
+
+    def test_each_writer_and_the_commit_path_calls_the_rule(self) -> None:
+        callers = self._functions(
+            lambda n: (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "refuse_unregistrable_wave_claim"
+            )
+        )
+        writers = {k for k, why in self._MEMBERS.items() if why.startswith("WRITER")}
+        assert writers <= callers
+        assert ("glyph/builder.py", "prepare_commit") in callers
 
 
 # ──────────────────────────────── (d) readers accept both shapes, verbatim ──
@@ -374,7 +695,7 @@ class TestReadersAcceptBothShapes:
         what the chain says. Any pyrxd release through 0.24.0 could have minted one (none has
         been located on mainnet yet), and refusing to read them would hide them from the
         people who paid for them."""
-        cbor = _old_cbor()
+        cbor = cbor2.dumps(_old_pyrxd_claim())
         md = decode_payload(cbor)
         attrs = wave_attrs_from_metadata(md)
         assert (attrs.name, attrs.domain, attrs.target) == ("alice.rxd", "rxd", TARGET)
@@ -383,6 +704,14 @@ class TestReadersAcceptBothShapes:
         txid, raw = _tx_carrying(cbor)
         result = _classify_raw_tx(txid, raw)
         assert (result["metadata"]["classification"], result["metadata"]["name"]) == ("wave", "")
+
+    def test_the_longest_wave_name_round_trips(self) -> None:
+        """A 63-character label makes a 67-character top-level name. The decoder capped
+        ``name`` at 64 and dropped it; the cap is now RXinDexer's 200 (glyph_index.py:1465)."""
+        qualified = "a" * 63 + ".rxd"
+        md = decode_payload(encode_payload(build_wave_metadata(qualified_name=qualified, target=TARGET))[0])
+        assert md.name == qualified
+        assert wave_attrs_from_metadata(md).name == "a" * 63
 
 
 # ──────────────────────────────────────────── (e) the honest path ──
@@ -411,24 +740,28 @@ class TestTheHonestPath:
         assert _indexer_registers(cbor2.loads(cbor)) == ("alice", None)
         assert GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor, PKH, "alice.rxd").nft_script
 
-    def test_a_top_level_name_naming_something_else_is_refused(self) -> None:
-        """The live indexer registers from attrs; its backfill registers from the top-level
-        name. A payload where they disagree registers two different names."""
-        claim = cbor2.loads(_new_cbor())
-        claim["name"] = "bob.rxd"
-        assert _indexer_registers(claim) == ("alice", None) and _indexer_backfills(claim) == "bob"
-        with pytest.raises(ValidationError, match="disagrees with attrs"):
-            GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor2.dumps(claim), PKH, "alice.rxd")
-
     def test_a_name_argument_that_is_not_the_claim_is_refused(self) -> None:
-        with pytest.raises(ValidationError, match="does not match the CBOR's attrs"):
-            GlyphBuilder().prepare_wave_reveal(TXID, 0, _new_cbor(), PKH, "bob.rxd")
+        cbor = encode_payload(build_wave_metadata(qualified_name="alice.rxd", target=TARGET))[0]
+        with pytest.raises(ValidationError, match="does not match the claim in the CBOR"):
+            GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor, PKH, "bob.rxd")
 
-    def test_a_label_with_a_dot_is_refused_by_the_builder(self) -> None:
-        """``foo.bar.rxd`` cannot be a single label, and Photonic's split would register
-        ``foo`` under ``bar`` — a different name from the one asked for."""
-        with pytest.raises(ValidationError, match="contains '.'"):
-            build_wave_metadata(qualified_name="foo.bar.rxd", target=TARGET)
+    @pytest.mark.parametrize(
+        ("qualified", "reason"),
+        [
+            ("sub.alice.rxd", "more than one '.'"),
+            ("sub.alice", "has domain 'alice'"),
+            ("alice.RXD", "must be lowercase"),
+            ("alice.eth", "has domain 'eth'"),
+        ],
+    )
+    def test_a_name_that_is_not_label_dot_rxd_is_refused(self, qualified: str, reason: str) -> None:
+        """Subdomains are 'Planned' in the WAVE protocol (ANNOUNCEMENT.md:70). pyrxd used to
+        split on the LAST dot, so ``sub.alice`` built ``('sub', 'alice')`` — a subdomain claim
+        under a message saying none was built."""
+        with pytest.raises(ValidationError, match=reason):
+            build_wave_metadata(qualified_name=qualified, target=TARGET)
+        with pytest.raises(ValidationError, match=reason):
+            GlyphBuilder().prepare_wave_reveal(TXID, 0, cbor2.dumps(_claim("alice")), PKH, qualified)
 
     @pytest.mark.parametrize("bad", [True, -1, 1.5, "1850743929"])
     def test_an_unusable_expires_is_refused(self, bad: object) -> None:

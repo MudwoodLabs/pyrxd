@@ -96,7 +96,7 @@ def _cbor_for_signing(metadata: GlyphMetadata, pubkey_hex: str, algo: str) -> by
     unsigned = GlyphCreator(pubkey=pubkey_hex, sig="00", algo=algo).to_cbor_dict()
     unsigned["sig"] = ""
     d["creator"] = unsigned
-    # CANONICAL, because that is what `encode_payload` PUBLISHES (payload.py:67). Signing
+    # CANONICAL, because that is what `encode_payload` PUBLISHES (payload.py:68). Signing
     # insertion-order bytes made pyrxd unable to verify its own tokens once they were on chain:
     # measured, a plain NFT verified, an NFT with a `description` did not, and every timelocked
     # token did not — canonical ordering sorts `desc` before `name` and re-sorts the `crypto`

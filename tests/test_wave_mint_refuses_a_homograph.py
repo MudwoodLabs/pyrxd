@@ -1,21 +1,22 @@
-"""The WAVE mint path refuses a name that impersonates Latin text.
+"""The WAVE mint path refuses a name that impersonates Latin text — by the label rule.
 
-``looks_confusable_with_latin`` has shipped since before v0.18.0 and was wired into the
-INSPECT path only (``glyph/_inspect_core.py``). A reader was told a name mimics Latin
-letters; the mint path that CREATES such a name accepted it silently. For a name registry
-that asymmetry is backwards — refusing to create a spoof is worth more than labelling one
-after it is on-chain and somebody else owns it.
+#698 added a homograph check to the WAVE builders (``validate_wave_text``, with an
+``allow_confusable`` override), because ``looks_confusable_with_latin`` had been wired into the
+INSPECT path only: a reader was told a name mimicked Latin letters while the mint path that
+CREATED it accepted it. That check flagged impersonation and let non-Latin script through, and
+this file pinned ``トークン``, ``中文``, ``café``, ``Łódź`` and ``Œuf`` as honest WAVE labels.
 
-This is the write-side half, and it is checked on BOTH documented doors: ``build_wave_metadata``
-(the helper) and ``GlyphBuilder.prepare_wave_reveal`` (the WAVE reveal builder). A caller who
-hand-rolls the CBOR skips the first and still crosses the second — which is the reason the rule
-lives in one function called from both rather than being written out twice, as it was before.
-(``prepare_mutable_reveal`` and ``prepare_reveal`` also accept a WAVE-marked payload and do not
-apply this check; see ``prepare_wave_reveal``'s docstring.)
+They are not WAVE labels. The indexer that registers claims refuses every character outside
+``a-z 0-9 -`` (RXinDexer ``validate_wave_name``), and so do the WAVE protocol and Photonic
+(see :mod:`pyrxd.glyph.wave_rules`). A claim carrying one of those names confirms, spends its
+fee, and never registers — the class #728 is about. So the honest-path set here was pinning
+the defect, and it is now refused. The name a person means by ``café`` is written as its
+punycode, ``xn--caf-dma``, which every source accepts; that is the honest path pinned below.
 
-The honest-path tests are not decoration. A guard that refuses valid work is a defect, and
-this one refuses on a Unicode property, so the cases it must NOT touch — non-Latin scripts,
-Latin Extended, digits — are pinned as hard as the cases it must.
+With an ASCII-only label rule the homograph question does not arise for a WAVE label: every
+look-alike character is non-ASCII and refused by the rule, with no Unicode table involved and
+no override to route around. ``validate_wave_text`` and ``allow_confusable`` were removed
+(#698 was merged but unreleased). The spoofs below are kept to prove that, on every door.
 """
 
 from __future__ import annotations
@@ -23,139 +24,125 @@ from __future__ import annotations
 import cbor2
 import pytest
 
-from pyrxd.glyph.builder import GlyphBuilder
-from pyrxd.glyph.types import GlyphProtocol
-from pyrxd.glyph.wave import build_wave_metadata, validate_wave_text
+from pyrxd.glyph.builder import CommitParams, GlyphBuilder
+from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+from pyrxd.glyph.wave import build_wave_metadata
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Hex20
 
 TXID = "ab" * 32
-PKH = bytes(range(20))
+PKH = Hex20(bytes(range(20)))
 BUILDER = GlyphBuilder()
+TARGET = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
 
 # Each carries a character that renders as Latin but is not. Written as escapes so the
 # intent survives a font, an editor, and a copy-paste — the whole point is that the two
 # spellings are indistinguishable on screen.
 SPOOFS = {
     "cyrillic-i": "casіno",  # U+0456 CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I
-    "cyrillic-es": "USDС",  # U+0421 CYRILLIC CAPITAL LETTER ES
-    "greek-omicron": "ΟMG",  # U+039F GREEK CAPITAL LETTER OMICRON
-    "math-bold": "\U0001d414\U0001d412\U0001d413\U0001d402",  # Mathematical Bold USDC
+    "cyrillic-es": "usdс",  # U+0441 CYRILLIC SMALL LETTER ES
+    "greek-omicron": "οmg",  # U+03BF GREEK SMALL LETTER OMICRON
+    "math-bold": "\U0001d42e\U0001d42c\U0001d41d\U0001d41c",  # Mathematical Bold usdc
     "ipa-alpha": "ɑpple",  # U+0251 LATIN SMALL LETTER ALPHA
+    "kelvin-sign": "Key",  # U+212A KELVIN SIGN, which case-folds to ASCII "k"
+    "bidi-override": "‮cdsu",  # renders as "usdc" with no non-ASCII LETTER in it
 }
 
-# Refused, but by the PRINTABILITY clause rather than the homograph one: `str.isprintable()`
-# is False for bidi format controls, so this never reaches `looks_confusable_with_latin`.
-# Kept separate and asserted separately, because a test that let it match the homograph
-# message would be recording a mechanism that is not the one doing the work.
-BIDI_SPOOF = "‮CDSU"  # renders as "USDC" without containing one non-ASCII letter
-
-# Names that are not impersonating anything. Refusing these would be the bug.
-HONEST = {
-    "ascii": "alice",
-    "digits": "usdt1",
-    "hyphen": "custodian-gate-x7f3",
+# Names #698 pinned as honest. None can register: every one is refused by the indexer.
+NON_ASCII = {
     "japanese": "トークン",  # トークン
     "chinese": "中文",  # 中文
-    "french": "café",  # Café
-    "polish": "Łódź",  # Łódź
-    "ligature": "Œuf",  # Œuf
+    "french": "café",  # café
+    "polish": "łódź",  # łódź
+    "ligature": "œuf",  # œuf
 }
 
+HONEST = {"ascii": "alice", "digits": "usdt1", "hyphen": "custodian-gate-x7f3", "punycode": "xn--caf-dma"}
 
-def _wave_cbor(name: str) -> bytes:
-    """A minimal WAVE payload whose attrs match ``name``, so the builder's cross-check passes
-    and the homograph clause is what refuses — not an unrelated mismatch.
 
-    Photonic's shape: the bare label in attrs.name. This helper used to put the qualified
-    name there, which is the shape RXinDexer refuses (#728) and which the builder now refuses
-    too — so the honest-path tests below would have been refused for the wrong reason."""
-    label, _, domain = name.rpartition(".")
+def _wave_cbor(label: str) -> bytes:
+    """A WAVE payload claiming ``label``, so the rule on the label is what decides."""
     return cbor2.dumps(
         {
             "p": [GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
-            "name": name,
-            "attrs": {"name": label, "domain": domain, "target": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"},
+            "name": f"{label}.rxd",
+            "attrs": {"name": label, "domain": "rxd", "target": TARGET},
         }
     )
 
 
-class TestTheHelperRefusesASpoof:
-    @pytest.mark.parametrize("kind", sorted(SPOOFS))
-    def test_build_wave_metadata_refuses(self, kind: str) -> None:
-        with pytest.raises(ValidationError, match="mimic Latin"):
-            build_wave_metadata(qualified_name=f"{SPOOFS[kind]}.rxd", target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
+def _commit(label: str) -> object:
+    md = GlyphMetadata(
+        protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
+        name=f"{label}.rxd",
+        attrs={"name": label, "domain": "rxd", "target": TARGET},
+    )
+    return BUILDER.prepare_commit(CommitParams(metadata=md, owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000))
 
-    def test_a_bidi_reordered_name_is_refused_by_the_printability_clause(self) -> None:
-        for fn in (
-            lambda n: build_wave_metadata(qualified_name=n, target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT"),
-            lambda n: BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor(n), PKH, n),
-        ):
-            with pytest.raises(ValidationError, match="printable"):
-                fn(f"{BIDI_SPOOF}.rxd")
+
+#: Every door a WAVE claim can be written through, by label.
+DOORS = {
+    "build_wave_metadata": lambda label: build_wave_metadata(qualified_name=f"{label}.rxd", target=TARGET),
+    "prepare_commit": _commit,
+    "prepare_wave_reveal": lambda label: BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor(label), PKH, f"{label}.rxd"),
+    "prepare_mutable_reveal": lambda label: BUILDER.prepare_mutable_reveal(TXID, 0, _wave_cbor(label), PKH),
+}
+
+
+class TestEveryDoorRefusesASpoof:
+    @pytest.mark.parametrize("door", sorted(DOORS))
+    @pytest.mark.parametrize("kind", sorted(SPOOFS))
+    def test_refused(self, door: str, kind: str) -> None:
+        with pytest.raises(ValidationError, match="lowercase a-z, 0-9 and '-' only"):
+            DOORS[door](SPOOFS[kind])
 
     def test_a_spoofed_domain_is_refused_too(self) -> None:
-        """The domain is half the name. Gating the label alone would leave `alice.гxd`."""
-        with pytest.raises(ValidationError, match="WAVE domain"):
-            build_wave_metadata(qualified_name="alice.гxd", target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
+        """The domain is half the name. Gating the label alone would leave ``alice.гxd``."""
+        with pytest.raises(ValidationError, match="the domain must be exactly 'rxd'"):
+            build_wave_metadata(qualified_name="alice.гxd", target=TARGET)
+
+    def test_the_kelvin_spoof_really_does_fold_to_ascii(self) -> None:
+        """Non-vacuity: a case-insensitive comparison anywhere would have let this through."""
+        assert SPOOFS["kelvin-sign"].lower() == "key"
 
 
-class TestTheBuilderRefusesASpoof:
-    """The second door. A caller who never touches build_wave_metadata still crosses here."""
+class TestNonAsciiNamesAreRefusedAndTheirPunycodeIsNot:
+    """#698 pinned these as honest. By the indexer's own rule none of them could register."""
 
-    @pytest.mark.parametrize("kind", sorted(SPOOFS))
-    def test_prepare_wave_reveal_refuses(self, kind: str) -> None:
-        name = f"{SPOOFS[kind]}.rxd"
-        with pytest.raises(ValidationError, match="mimic Latin"):
-            BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor(name), PKH, name)
+    @pytest.mark.parametrize("door", sorted(DOORS))
+    @pytest.mark.parametrize("kind", sorted(NON_ASCII))
+    def test_the_raw_name_is_refused(self, door: str, kind: str) -> None:
+        with pytest.raises(ValidationError, match="punycode"):
+            DOORS[door](NON_ASCII[kind])
+
+    @pytest.mark.parametrize("kind", sorted(NON_ASCII))
+    def test_its_punycode_is_accepted(self, kind: str) -> None:
+        label = "xn--" + NON_ASCII[kind].encode("punycode").decode("ascii")
+        md = build_wave_metadata(qualified_name=f"{label}.rxd", target=TARGET)
+        assert md.attrs["name"] == label
+
+    def test_the_punycode_of_cafe_is_the_known_one(self) -> None:
+        """Non-vacuity for the derivation above: RFC 3492's encoding of ``café`` is the
+        ``xn--caf-dma`` every IDNA implementation produces."""
+        assert "xn--" + NON_ASCII["french"].encode("punycode").decode("ascii") == "xn--caf-dma"
 
 
 class TestTheHonestPathStillWorks:
+    @pytest.mark.parametrize("door", sorted(DOORS))
     @pytest.mark.parametrize("kind", sorted(HONEST))
-    def test_build_wave_metadata_accepts(self, kind: str) -> None:
-        md = build_wave_metadata(qualified_name=f"{HONEST[kind]}.rxd", target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
-        assert md.attrs["name"] == HONEST[kind]
-        assert md.name == f"{HONEST[kind]}.rxd"
+    def test_accepted(self, door: str, kind: str) -> None:
+        assert DOORS[door](HONEST[kind]) is not None
 
     @pytest.mark.parametrize("kind", sorted(HONEST))
-    def test_prepare_wave_reveal_accepts(self, kind: str) -> None:
-        name = f"{HONEST[kind]}.rxd"
-        assert BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor(name), PKH, name) is not None
+    def test_the_label_is_the_claim(self, kind: str) -> None:
+        md = build_wave_metadata(qualified_name=f"{HONEST[kind]}.rxd", target=TARGET)
+        assert (md.attrs["name"], md.name) == (HONEST[kind], f"{HONEST[kind]}.rxd")
 
 
-class TestTheOverrideExists:
-    """A guard with no way past it becomes a reason to route around the guard. A registrar
-    reclaiming a spoof of its own brand is honest work."""
-
-    def test_helper_allows_confusable_when_asked(self) -> None:
-        md = build_wave_metadata(
-            qualified_name=f"{SPOOFS['cyrillic-i']}.rxd",
-            target="1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
-            allow_confusable=True,
-        )
-        assert md.attrs["name"].startswith("cas")
-
-    def test_builder_allows_confusable_when_asked(self) -> None:
-        name = f"{SPOOFS['cyrillic-i']}.rxd"
-        assert BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor(name), PKH, name, allow_confusable=True) is not None
-
-
-class TestTheSharedRuleIsOneDefinition:
-    def test_the_length_and_printability_clauses_still_hold(self) -> None:
-        for bad in ("", "a" * 256, "bad\x00name"):
-            with pytest.raises(ValidationError):
-                validate_wave_text(bad)
-
-    def test_the_error_no_longer_claims_ascii(self) -> None:
-        """Both copies of this rule said "printable ASCII" while `str.isprintable()` accepts
-        any printable Unicode — a sentence that was false about the check beside it, and the
-        sentence a reader would have trusted when deciding a homograph was already handled."""
-        with pytest.raises(ValidationError) as exc:
-            validate_wave_text("")
-        assert "ASCII" not in str(exc.value)
-
-    def test_a_confusable_skeleton_really_does_collide(self) -> None:
-        """Non-vacuity: proves the spoofs above are spoofs, so a future change to the
-        detector that stopped flagging them would not leave these tests passing emptily."""
-        from pyrxd.glyph.confusables import skeleton
-
-        assert skeleton(SPOOFS["cyrillic-i"]) == skeleton("casino")
+def test_there_is_no_override_to_route_around() -> None:
+    """``allow_confusable`` promised a look-alike could be minted deliberately. Under an
+    ASCII-only rule it could not do that any more, so it is gone rather than left promising."""
+    with pytest.raises(TypeError):
+        build_wave_metadata(qualified_name="alice.rxd", target=TARGET, allow_confusable=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        BUILDER.prepare_wave_reveal(TXID, 0, _wave_cbor("alice"), PKH, "alice.rxd", allow_confusable=True)  # type: ignore[call-arg]

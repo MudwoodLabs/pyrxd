@@ -21,6 +21,7 @@ from .types import (
     GlyphRights,
     GlyphRoyalty,
 )
+from .wave_rules import refuse_unregistrable_wave_claim
 
 _log = logging.getLogger(__name__)
 
@@ -518,7 +519,11 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         crypto=crypto,
         container_refs=_decode_rel_refs(d.get("in"), "in"),
         author_refs=_decode_rel_refs(d.get("by"), "by"),
-        name=_cbor_str(d, "name", 64),
+        # 200, the cap RXinDexer's glyph index applies to token names
+        # (electrumx/server/glyph_index.py:1465 at ca8a6a4e). It was 64, which dropped every
+        # WAVE name with a 61-63 character label: the qualified name is the label plus ".rxd",
+        # up to 67 characters.
+        name=_cbor_str(d, "name", 200),
         ticker=_cbor_str(d, "ticker", 16),
         description=_cbor_str(d, "desc", 1000),
         token_type=_cbor_str(d, "type", 64),
@@ -561,53 +566,7 @@ def build_dat_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     return b"\x03" + GLY_MARKER + b"\x03" + DAT_MARKER + _encode_payload_push(cbor_bytes)
 
 
-def refuse_qualified_wave_label(cbor_bytes: bytes) -> None:
-    """Refuse a WAVE payload whose ``attrs.name`` contains a ``.``. THE ONE PLACE THIS RULE LIVES.
-
-    RXinDexer registers a WAVE claim from ``attrs.name`` and its ``validate_wave_name`` refuses
-    every character outside ``a-z 0-9 -`` (``electrumx/server/wave_index.py``, Radiant-Core/
-    RXinDexer ``ca8a6a4e``). By that source a refused claim is skipped with a debug log line
-    and nothing else: the reveal confirms, its fee is spent, and the name does not resolve.
-    Through 0.24.0 ``build_wave_metadata`` put the QUALIFIED name there (``"alice.rxd"``), so
-    every WAVE name pyrxd built had this shape (#728). Photonic puts the bare label there and
-    the domain in ``attrs.domain``.
-
-    Called from both envelope writers — :func:`build_reveal_scriptsig_suffix`, which every
-    reveal builder except the DAT one uses, and :func:`build_mutable_scriptsig`, because the
-    indexer treats ANY
-    envelope whose ``p`` carries WAVE as a registration — and from
-    :meth:`GlyphBuilder.prepare_wave_reveal` for its clearer error. It sits in the writers,
-    not in ``prepare_wave_reveal`` alone, because ``prepare_mutable_reveal`` and
-    ``prepare_reveal`` accept a WAVE payload too.
-
-    Only the ``.`` is refused. The rest of the indexer's rule (its character set, length and
-    hyphen placement) is NOT enforced here; see #728.
-
-    Bytes that are not a CBOR map carrying ``p`` with WAVE (11) are left alone: they are not
-    a WAVE claim to any indexer, and other checks own them.
-    """
-    try:
-        d = cbor2.loads(cbor_bytes)
-    except Exception:  # not decodable is not a WAVE claim; see the docstring
-        return
-    if not isinstance(d, dict):
-        return
-    protocol = d.get("p")
-    if not isinstance(protocol, (list, tuple)) or GlyphProtocol.WAVE not in protocol:
-        return
-    attrs = d.get("attrs")
-    label = attrs.get("name") if isinstance(attrs, dict) else None
-    if isinstance(label, str) and "." in label:
-        raise ValidationError(
-            f"WAVE attrs.name {label!r} is a qualified name. WAVE puts the bare label in "
-            f"attrs.name and the domain in attrs.domain; RXinDexer refuses a '.' in attrs.name "
-            f"and skips the claim without an error, so this would confirm and the name would "
-            f"never resolve. pyrxd built this shape through 0.24.0 (#728) — rebuild the payload "
-            f"with build_wave_metadata."
-        )
-
-
-def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
+def build_reveal_scriptsig_suffix(cbor_bytes: bytes, *, allow_unregistrable_wave: bool = False) -> bytes:
     """
     Return the 'gly' + CBOR portion of the reveal scriptSig.
 
@@ -622,10 +581,11 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
 
-    Refuses a WAVE payload the indexer would silently drop — see
-    :func:`refuse_qualified_wave_label`.
+    Refuses a WAVE claim the indexer would not register, unless ``allow_unregistrable_wave``
+    — see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`, which says what
+    that escape is for.
     """
-    refuse_qualified_wave_label(cbor_bytes)
+    refuse_unregistrable_wave_claim(cbor_bytes, allow_unregistrable_wave=allow_unregistrable_wave)
     return b"\x03" + GLY_MARKER + _encode_payload_push(cbor_bytes)
 
 
@@ -695,8 +655,9 @@ def build_mutable_scriptsig(
         raise ValidationError(f"operation must be 'mod' or 'sl', got {operation!r}")
     if not cbor_bytes:
         raise ValidationError("cbor_bytes must not be empty")
-    # An update envelope carrying WAVE in `p` is read as a registration by RXinDexer.
-    refuse_qualified_wave_label(cbor_bytes)
+    # An update envelope carrying WAVE in `p` is read as a registration by RXinDexer. No
+    # escape here: an update payload is chosen fresh, so refusing one strands nothing.
+    refuse_unregistrable_wave_claim(cbor_bytes)
     for name, val in (
         ("contract_output_index", contract_output_index),
         ("ref_hash_index", ref_hash_index),

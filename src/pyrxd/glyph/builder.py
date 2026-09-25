@@ -30,12 +30,7 @@ from .dmint import (
     is_readable_last_time,
 )
 from .dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
-from .payload import (
-    build_dat_reveal_scriptsig_suffix,
-    build_reveal_scriptsig_suffix,
-    encode_payload,
-    refuse_qualified_wave_label,
-)
+from .payload import build_dat_reveal_scriptsig_suffix, build_reveal_scriptsig_suffix, encode_payload
 from .script import (
     build_authority_gated_nft_script,
     build_commit_locking_script,
@@ -53,6 +48,7 @@ from .script import (
     script_carries_ref,
 )
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
+from .wave_rules import indexed_wave_name, parse_wave_name, refuse_unregistrable_wave_claim
 
 # Minimum fee rate post-V2. DERIVED from the single definition of Radiant's
 # effective relay floor in :mod:`pyrxd.fee_sizing` rather than written out — this
@@ -199,6 +195,11 @@ class RevealParams:
     #: Delegate BASE ref, for callers that do not have the commit script to
     #: hand. Prefer ``commit_script``.
     delegate_ref: GlyphRef | None = None
+    #: Recovery only: reveal a WAVE-marked payload the indexer will not register. For a
+    #: commit pyrxd ≤0.24.0 already broadcast, which can only be spent by revealing its
+    #: old-shape CBOR. The claim WILL NOT REGISTER. See
+    #: :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`.
+    allow_unregistrable_wave: bool = False
 
 
 @dataclass
@@ -394,8 +395,14 @@ class GlyphBuilder:
         commit. This means the caller does not hand-pick refType — the
         metadata drives it. Prior versions forced every commit to NFT
         shape; see ``build_commit_locking_script`` for the fix note.
+
+        A WAVE claim the indexer would not register is refused HERE, before the commit
+        exists: once a commit is broadcast it can only be spent by revealing exactly the CBOR
+        it commits to, so a refusal at reveal time would strand its value. There is no
+        override on this path (see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`).
         """
         cbor_bytes, payload_hash = encode_payload(params.metadata)
+        refuse_unregistrable_wave_claim(cbor_bytes)
         is_nft = GlyphProtocol.NFT in params.metadata.protocol
         commit_script = build_commit_locking_script(
             payload_hash,
@@ -464,7 +471,9 @@ class GlyphBuilder:
                 )
             delegate_ref = from_script
 
-        scriptsig_suffix = build_reveal_scriptsig_suffix(params.cbor_bytes)
+        scriptsig_suffix = build_reveal_scriptsig_suffix(
+            params.cbor_bytes, allow_unregistrable_wave=params.allow_unregistrable_wave
+        )
         return RevealScripts(
             locking_script=locking,
             scriptsig_suffix=scriptsig_suffix,
@@ -836,8 +845,15 @@ class GlyphBuilder:
         commit_vout: int,
         cbor_bytes: bytes,
         owner_pkh: Hex20,
+        *,
+        allow_unregistrable_wave: bool = False,
     ) -> MutableRevealScripts:
         """Prepare scripts for a MUT (mutable NFT) reveal.
+
+        A payload marked WAVE is held to the WAVE claim rule
+        (:func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`) unless
+        ``allow_unregistrable_wave=True``, which exists only to reveal a commit pyrxd
+        ≤0.24.0 already broadcast; the claim so revealed will not register.
 
         Returns the two output locking scripts the caller must place in the
         reveal tx:
@@ -924,7 +940,7 @@ class GlyphBuilder:
         payload_hash = hash_payload(cbor_bytes)
         nft_script = build_nft_locking_script(owner_pkh, ref)
         contract_script = build_mutable_nft_script(mutable_ref, payload_hash)
-        scriptsig_suffix = build_reveal_scriptsig_suffix(cbor_bytes)
+        scriptsig_suffix = build_reveal_scriptsig_suffix(cbor_bytes, allow_unregistrable_wave=allow_unregistrable_wave)
         return MutableRevealScripts(
             ref=ref,
             nft_script=nft_script,
@@ -1402,26 +1418,14 @@ class GlyphBuilder:
         cbor_bytes: bytes,
         owner_pkh: Hex20,
         name: str,
-        allow_confusable: bool = False,
+        *,
+        allow_unregistrable_wave: bool = False,
     ) -> MutableRevealScripts:
         """Prepare scripts for a WAVE (on-chain naming) reveal.
 
-        WAVE extends MUT with a ``name`` field in the CBOR payload.
-        Protocol field must include ``GlyphProtocol.WAVE`` (11).
-
-        ``name`` must be non-empty, printable, at most 255 characters, and must not
-        impersonate Latin text — see :func:`pyrxd.glyph.wave.validate_wave_text`, which is
-        the single definition of that rule and is applied here and in
-        :func:`~pyrxd.glyph.wave.build_wave_metadata`. It is applied here so a caller who
-        hand-rolls the CBOR still crosses it. It is NOT applied by :meth:`prepare_mutable_reveal`
-        or :meth:`prepare_reveal`, both of which also accept a payload marked WAVE, so this
-        method is the documented door rather than the only one. Pass
-        ``allow_confusable=True`` to register a look-alike deliberately.
-
-        ``name`` is the qualified name (``"alice.rxd"``; a bare ``"alice"`` means
-        ``alice.rxd``, as in :func:`~pyrxd.glyph.wave.split_qualified_name`). It is validated
-        here but must already be embedded in ``cbor_bytes``, in Photonic's shape (Photonic
-        Wallet ``packages/lib/src/wave.ts``, ``createWaveNameMetadata``)::
+        ``name`` is the name being claimed: ``"alice.rxd"``, or a bare ``"alice"``, which
+        means the same. It must already be embedded in ``cbor_bytes``, with the fields
+        Photonic Wallet's ``createWaveNameMetadata`` writes (``packages/lib/src/wave.ts``)::
 
             {
                 "v": 2,
@@ -1436,22 +1440,23 @@ class GlyphBuilder:
                 }
             }
 
-        The label and domain in ``attrs`` must match ``name``. A top-level ``name``, when
-        present, must be that qualified name or the bare label (Photonic's two builders
-        write one or the other), because RXinDexer registers from ``attrs`` and rebuilds
-        from the top-level name on a backfill, and the two must not name different claims.
+        Use :func:`pyrxd.glyph.wave.build_wave_metadata` to construct it, and pass the same
+        payload to :meth:`prepare_commit` first — which applies the same rule, so a claim
+        that would be refused here is refused before its commit can be broadcast.
 
-        REFUSED: an ``attrs.name`` containing ``.``. That is the shape pyrxd built through
-        0.24.0 (``attrs.name = "alice.rxd"``), and RXinDexer's ``validate_wave_name`` refuses
-        the ``.`` and skips the claim without an error, so the reveal would confirm and the
-        name would never resolve (#728). Unlike the homograph check this one is enforced in
-        the envelope writers themselves (:func:`~pyrxd.glyph.payload.refuse_qualified_wave_label`),
-        so every reveal builder refuses it.
+        REFUSED, by :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim` — the one
+        rule every WAVE write door calls — any payload the indexer would not register as a
+        top-level ``.rxd`` name: a label outside 3-63 characters of lowercase ``a-z``,
+        ``0-9`` and ``-`` (so pyrxd's own ≤0.24.0 shape, ``attrs.name = "alice.rxd"``), a
+        domain other than ``rxd``, a claim with no ``attrs.name``, and a top-level or
+        ``app.data`` name naming a different claim. Then ``name`` must be the name the
+        indexer will read from the payload.
 
-        Still accepted: a payload with no ``attrs.name`` and only a top-level ``name``
-        (older pyrxd), cross-checked against it. RXinDexer does not index that shape either.
-
-        Use :func:`pyrxd.glyph.wave.build_wave_metadata` to construct the payload.
+        ``allow_unregistrable_wave=True`` skips both checks and only confirms ``name`` is a
+        name the payload carries. It is for ONE job: revealing a commit pyrxd ≤0.24.0 already
+        broadcast, whose CBOR has the old shape. That commit can only be spent by revealing
+        exactly those bytes, so refusing them would strand its value. THE CLAIM SO REVEALED
+        WILL NOT REGISTER with the indexer; the reveal only recovers the commit.
 
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
 
@@ -1462,60 +1467,40 @@ class GlyphBuilder:
         seed input is rejected by consensus, as every one built through 0.15.0
         was.
         """
-        from .wave import split_qualified_name, validate_wave_text
-
-        validate_wave_text(name, field="WAVE name", allow_confusable=allow_confusable)
         try:
             cbor_data = cbor2.loads(cbor_bytes)
-            protocol = cbor_data.get("p", [])
-            if GlyphProtocol.WAVE not in protocol:
-                raise ValidationError(
-                    f"CBOR protocol field {protocol!r} must include GlyphProtocol.WAVE ({GlyphProtocol.WAVE})"
-                )
-            if GlyphProtocol.MUT not in protocol:
-                raise ValidationError(f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})")
-            attrs = cbor_data.get("attrs") or {}
-            attrs_name = attrs.get("name") if isinstance(attrs, dict) else None
-            if attrs_name:
-                # Photonic's shape: the bare label in attrs.name, the domain beside it.
-                if not isinstance(attrs_name, str):
-                    raise ValidationError(f"CBOR attrs.name must be text, got {type(attrs_name).__name__}")
-                # Before the cross-check, so pyrxd's own pre-0.25 shape gets the error that
-                # explains it rather than a name mismatch. The writers enforce it again.
-                refuse_qualified_wave_label(cbor_bytes)
-                attrs_domain = attrs.get("domain") or "rxd"
-                if not isinstance(attrs_domain, str):
-                    raise ValidationError(f"CBOR attrs.domain must be text, got {type(attrs_domain).__name__}")
-                qualified = f"{attrs_name}.{attrs_domain}"
-                if split_qualified_name(name) != (attrs_name, attrs_domain):
-                    raise ValidationError(
-                        f"name argument {name!r} does not match the CBOR's attrs "
-                        f"(name={attrs_name!r}, domain={attrs_domain!r}, i.e. {qualified!r})."
-                    )
-                # Photonic writes the qualified name here (createWaveNameMetadata) or the bare
-                # label (createWaveName). RXinDexer rebuilds names from this field on a backfill,
-                # so a value naming something else would register a different name there. Exact
-                # comparison: case-folding would let e.g. U+212A KELVIN SIGN through as "k"
-                # without crossing validate_wave_text.
-                top = cbor_data.get("name")
-                if top not in (None, "") and top not in (qualified, attrs_name):
-                    raise ValidationError(
-                        f"CBOR top-level name {top!r} disagrees with attrs ({qualified!r}); an indexer "
-                        f"reading one would register a different name from one reading the other."
-                    )
-            else:
-                # Older pyrxd: the name only at the top level. Not indexed by RXinDexer, which
-                # reads attrs.name — kept so existing callers still get a cross-checked build.
-                cbor_name = cbor_data.get("name") or cbor_data.get("n", "")
-                if cbor_name != name:
-                    raise ValidationError(
-                        f"name argument {name!r} does not match CBOR name field {cbor_name!r}. "
-                        f"Checked attrs.name then top-level name/n."
-                    )
-        except ValidationError:
-            raise
         except Exception as exc:
             raise ValidationError(f"Could not parse CBOR for WAVE cross-check: {exc}") from exc
+        if not isinstance(cbor_data, dict):
+            raise ValidationError(f"WAVE CBOR must be a map, got {type(cbor_data).__name__}")
+        protocol = cbor_data.get("p", [])
+        if not isinstance(protocol, (list, tuple)) or GlyphProtocol.WAVE not in protocol:
+            raise ValidationError(
+                f"CBOR protocol field {protocol!r} must include GlyphProtocol.WAVE ({GlyphProtocol.WAVE})"
+            )
+        if GlyphProtocol.MUT not in protocol:
+            raise ValidationError(f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})")
+
+        if allow_unregistrable_wave:
+            # Recovery: the committed bytes are fixed. Confirm only that `name` is one the
+            # payload carries, in any of the forms pyrxd or Photonic ever wrote.
+            attrs = cbor_data.get("attrs")
+            attrs = attrs if isinstance(attrs, dict) else {}
+            label, domain = attrs.get("name"), attrs.get("domain") or "rxd"
+            carried = {cbor_data.get("name"), cbor_data.get("n"), label}
+            if isinstance(label, str) and isinstance(domain, str):
+                carried.add(f"{label}.{domain}")
+            if name not in {c for c in carried if isinstance(c, str) and c}:
+                raise ValidationError(f"name argument {name!r} is not a name this CBOR carries")
+        else:
+            refuse_unregistrable_wave_claim(cbor_data)
+            wanted = parse_wave_name(name)
+            indexed, _parent = indexed_wave_name(cbor_data)
+            if indexed != wanted:
+                raise ValidationError(
+                    f"name argument {name!r} does not match the claim in the CBOR, which the "
+                    f"indexer will read as {indexed!r}.rxd."
+                )
 
         # WAVE uses the same two-output structure as MUT.
         return self.prepare_mutable_reveal(
@@ -1523,6 +1508,7 @@ class GlyphBuilder:
             commit_vout=commit_vout,
             cbor_bytes=cbor_bytes,
             owner_pkh=owner_pkh,
+            allow_unregistrable_wave=allow_unregistrable_wave,
         )
 
     def build_transfer_locking_script(

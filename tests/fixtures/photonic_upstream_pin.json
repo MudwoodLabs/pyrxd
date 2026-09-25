@@ -17,6 +17,7 @@
     "packages/app/src/components/EncryptedContentUnlock.tsx": "78b1943fad6fdc63730800248d927e68b9fbf0995c3993bf8fa8d71f0ab40cf1",
     "packages/app/src/electrum/worker/NFT.ts": "a69688b2a429ce3a4a9b014acb54e82597e29ee3790328f8ec22db4b78636bb4",
     "packages/app/src/encryptionService.ts": "6d76e8f7efde480c5cf6cab2acc218fc0002a7e29a399ebd930c04bbfb5bddf7",
+    "packages/app/src/hooks/useWaveResolver.ts": "4fd06191191ed940cee6e9ec2b24b399629a83420daccfbfd66ec12a6a6897d6",
     "packages/app/src/keys.ts": "7878c888da260a203d65b67fcad9715320e589e804e25f5791d15c09322677cd",
     "packages/app/src/pages/Mint.tsx": "f6948dafe9dc7495d8a150cd5adb88aff437d23054547f0371b7065a40eb6345",
     "packages/app/src/pages/Swap.tsx": "47bb53fedb1c4eade74875679354d0368e6323a44291247916b7db2b2fbfccb3",

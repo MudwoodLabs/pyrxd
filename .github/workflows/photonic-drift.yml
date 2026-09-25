@@ -15,6 +15,10 @@
 # Companion: tests/test_photonic_citations_are_pinned.py runs offline in normal
 # CI and fails if a newly cited Photonic file was never added to the pin, so the
 # watch set cannot silently stop covering something.
+#
+# The second job does the same for Radiant-Core/RXinDexer, whose WAVE claim rule
+# pyrxd transcribes into src/pyrxd/glyph/wave_rules.py (#728). Its offline
+# companion is tests/test_rxindexer_citations_are_pinned.py.
 
 name: Photonic drift
 
@@ -29,6 +33,7 @@ on:
     paths:
       - "scripts/check_photonic_drift.py"
       - "tests/fixtures/photonic_upstream_pin.json"
+      - "tests/fixtures/rxindexer_upstream_pin.json"
       - ".github/workflows/photonic-drift.yml"
 
 concurrency:
@@ -107,4 +112,72 @@ jobs:
         if: always()
         with:
           name: photonic-drift-report
+          path: drift-report.txt
+
+  rxindexer-drift:
+    name: Has RXinDexer moved under a rule we transcribe?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check cited RXinDexer files against the pin
+        id: drift
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python scripts/check_photonic_drift.py --target rxindexer | tee drift-report.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # Exit 2 is a broken watcher, never a clean result.
+      - name: Fail loudly if the watcher could not run
+        if: steps.drift.outputs.code == '2'
+        run: |
+          echo "::error::The RXinDexer drift watcher could not complete. This is NOT 'no drift' — the check itself is broken."
+          exit 1
+
+      - name: Open or update the drift issue
+        if: steps.drift.outputs.code == '1' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="RXinDexer moved under a WAVE rule pyrxd transcribes"
+          BODY_FILE=body.md
+          {
+            echo "The weekly watcher found upstream changes in RXinDexer files pyrxd cites."
+            echo "pyrxd's WAVE claim rule (src/pyrxd/glyph/wave_rules.py) is transcribed from them."
+            echo "**This is a report, not a verdict** — read the diff and decide which case applies."
+            echo
+            echo '```'
+            cat drift-report.txt
+            echo '```'
+            echo
+            echo "When resolved, re-pin and say in the commit message which case it was:"
+            echo
+            echo '```'
+            echo "python scripts/check_photonic_drift.py --target rxindexer --update-pin"
+            echo '```'
+            echo
+            echo "_Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
+          } > "$BODY_FILE"
+
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+            echo "commented on #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body-file "$BODY_FILE"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: rxindexer-drift-report
           path: drift-report.txt
