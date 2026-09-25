@@ -66,7 +66,9 @@ unlock) and one more output (the 25-byte treasury P2PKH):
   registers a name unless the caller says what it pays, and checks exactly one output pays the
   treasury exactly the tier value.
 - :func:`assert_reveal_balances` is the whole pre-broadcast gate: that measurement, then inputs
-  covering every output plus the miner fee, with the change output surviving.
+  covering every output plus the miner fee, with the change output surviving, the commit input
+  paying the carrier and the miner fee by itself (so the wallet input pays only the registration
+  fee and its change), and the miner fee at most 10x the relay floor for the reveal's size.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..fee_models import SatoshisPerKilobyte
+from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
 from ..security.errors import InsufficientFundsError, ValidationError
 from ..security.types import Hex20, Txid
 from .builder import MIN_FEE_RATE
@@ -466,13 +469,25 @@ def assert_reveal_balances(
     the measured fee. A reveal that "balances" by losing its change, or by leaving the miner
     fee short, is refused here with the numbers.
 
+    Two more rules bound what the reveal SPENDS, not only what it covers:
+
+    - **The commit (input 0) pays the carrier and the miner fee by itself.** Any input after it
+      — the wallet input a WAVE registration adds — pays only the registration fee and its own
+      change. Without this a reveal fee'd above what its commit was sized for balances by
+      taking the difference from the wallet input, silently.
+    - **The miner fee is at most** :data:`~pyrxd.fee_sizing.MAX_FEE_OVERPAY_MULTIPLE` **times
+      the relay floor for the reveal's size**, whatever ``fee_rate`` says. The ``fee_rate``
+      itself may be the mistake (the per-kB constant handed to a per-byte parameter is a 1000x
+      overpay), so the bound is taken from the floor, not from it.
+
     Works on an unsigned, un-fee'd reveal (the dry run) and on a signed one. Every input must
     carry its value (``satoshis``).
 
     Raises:
-        InsufficientFundsError: the inputs do not cover the outputs and the fee, or the change
-            would be dropped; itemised.
-        ValidationError: anything :func:`measure_reveal_fee` refuses, or an input with no value.
+        InsufficientFundsError: the inputs do not cover the outputs and the fee, the change
+            would be dropped, or the commit cannot pay the carrier and the miner fee; itemised.
+        ValidationError: anything :func:`measure_reveal_fee` refuses, an input with no value,
+            or a miner fee above the ceiling.
     """
     measured = measure_reveal_fee(
         reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len, registration_fee=registration_fee
@@ -513,13 +528,30 @@ def assert_reveal_balances(
                 available=total_in,
                 required=fixed_value + measured.fee + len(change) + 1,
             )
-        return measured
-    paid = total_in - fixed_value - change_value
-    if paid < measured.fee:
+        miner_fee = measured.fee
+    else:
+        miner_fee = total_in - fixed_value - change_value
+        if miner_fee < measured.fee:
+            raise InsufficientFundsError(
+                f"the reveal does not pay its fee: {itemised}; change {change_value:,} leaves {miner_fee:,} for the miner",
+                available=total_in,
+                required=fixed_value + change_value + measured.fee,
+            )
+    ceiling = measured.size_bytes * relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE
+    if miner_fee > ceiling:
+        raise ValidationError(
+            f"the reveal would pay {miner_fee:,} photons to miners for {measured.size_bytes:,} bytes, above "
+            f"{ceiling:,} ({MAX_FEE_OVERPAY_MULTIPLE}x the relay floor for its size); Radiant has no RBF and no "
+            f"CPFP, so an overpay cannot be recovered: {itemised}"
+        )
+    carried = fixed_value - fee_part
+    if len(ints) > 1 and ints[0] < carried + miner_fee:
         raise InsufficientFundsError(
-            f"the reveal does not pay its fee: {itemised}; change {change_value:,} leaves {paid:,} for the miner",
-            available=total_in,
-            required=fixed_value + change_value + measured.fee,
+            f"the commit input holds {ints[0]:,} photons, less than the {carried:,} it carries plus the "
+            f"{miner_fee:,} miner fee, so the wallet input would pay the miner; it pays only the WAVE "
+            f"registration fee and its own change: {itemised}",
+            available=ints[0],
+            required=carried + miner_fee,
         )
     return measured
 

@@ -1594,7 +1594,7 @@ class GlyphBuilder:
 
             input 0   commit_txid:commit_vout       the commit (scriptSig: sig, pubkey, envelope)
             input 1   commit_txid:commit_vout + 1   the seed for the contract's ref
-            input 2   a plain P2PKH wallet UTXO     funds the fee (f644794b: the commit's change)
+            input 2   a plain P2PKH wallet UTXO     funds the fee (f644794b: its commit tx's vout 2)
             vout 0    nft_script                    the name's claim token
             vout 1    contract_script               the mutable contract
             vout 2    registration_fee_output       (value, locking_script)

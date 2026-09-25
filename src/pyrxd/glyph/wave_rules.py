@@ -76,7 +76,9 @@ THE FEE IS FUNDED AT REVEAL TIME, FROM THE WALLET. Photonic's commit output hold
 reveal is funded by wallet inputs chosen by ``fundTx`` (``mint.ts:883-904``) from an unspent
 set that includes the commit's own change (``updateUnspent``, ``mint.ts:827``; the commit's
 outputs are the commit, the mutable seed, then change, ``mint.ts:818``). Mainnet claim
-``f644794b…``'s third input is exactly that: its commit transaction's vout 2. So the fee sits in
+``f644794b…``'s third input is its commit transaction's vout 2 (read from the chain); that this
+output is the commit's CHANGE is inferred from that code, since the commit transaction itself is
+not in the fixture. So the fee sits in
 the wallet until the reveal that registers the name spends it, and a reveal that does not pay
 it (because the name was taken in between) leaves it there. pyrxd does the same: nothing for the
 fee goes in the commit output.

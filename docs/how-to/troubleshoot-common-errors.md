@@ -173,7 +173,7 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
-(`src/pyrxd/glyph/fees.py:588-624`). Before that, the whole reveal is measured by
+(`src/pyrxd/glyph/fees.py:620-656`). Before that, the whole reveal is measured by
 `assert_reveal_balances` (same file): when the metadata registers a WAVE name its
 reveal also spends the wallet input that pays the fee, and a shortfall reads
 `the reveal does not balance: inputs … ; outputs … + <photons> WAVE registration
@@ -414,17 +414,36 @@ re-run the mint while the commit may still confirm.
 
 - **`glyph mint-nft` or `glyph timelock-mint`.** The command saved a record of
   the commit before broadcasting it, in `pending-mints/` beside the wallet file
-  (`~/.pyrxd/pending-mints` for the default wallet), and the error names the
-  commit's txid, its value and that record. Once the commit confirms, `pyrxd
-  glyph resume-mint <commit txid>` builds, checks and broadcasts its reveal.
-  For a WAVE name it asks the indexer again and pays the registration fee from
-  a plain wallet input only if the name is still free; if the name has been
-  taken, `pyrxd glyph resume-mint <commit txid> --no-wave-registration-fee`
+  (`~/.pyrxd/pending-mints` for the default wallet). The error names the
+  commit's txid, its value and that record, and prints the exact command to run
+  once the commit confirms: `pyrxd --network <net> --wallet <path> glyph
+  resume-mint <commit txid>`, with the mint's WAVE fee choice repeated
+  (`--no-wave-registration-fee` if it declined the fee, `--wave-treasury` if it
+  named a treasury). `resume-mint` does what the mint chose, which the record
+  keeps: it refuses a flag that would pay a fee the mint declined, or pay a
+  different treasury. For a WAVE name the mint paid for, it asks the indexer
+  again and pays from a plain wallet input only if the name is still free; if
+  the name has been taken, the same command with `--no-wave-registration-fee`
   reveals the commit without the fee (a duplicate claim the indexer does not
-  register; the carrier and the change come back to the wallet). Every exit
-  after the commit is broadcast (a declined reveal prompt, a network error, this
-  timeout, Ctrl-C) prints the same recovery, and in `--json` mode also writes it
-  to stdout as a JSON document.
+  register; the carrier and the change come back to the wallet).
+- **What `resume-mint` checks first.** The record must be the one for that
+  txid, its commit script must re-derive from its payload and this wallet's
+  key, the NFT must go to this wallet, the server must list the commit output
+  at the value the record says, and the record's fee rate must be between
+  Radiant's relay floor and 10 times it. The reveal's miner fee comes out of
+  the commit alone; the wallet input pays only the registration fee and its own
+  change. Any mismatch is refused, naming the field, before anything is signed.
+- **When the record is deleted.** Only once the reveal CONFIRMS: a reveal that
+  is broadcast and then dropped from the mempool needs the record to be built
+  again. `resume-mint` deletes a record only on positive evidence — a confirmed
+  transaction that spends the commit output. If the server lists the commit
+  output as neither unspent nor spent, it says so and keeps the record.
+- **Every exit after the commit is broadcast** — a declined reveal prompt, a
+  network error, a node rejecting the reveal, this timeout, Ctrl-C — prints the
+  recovery, and in `--json` mode also writes it to stdout as a JSON document.
+  A commit broadcast that fails or is interrupted (Ctrl-C while it is in
+  flight) says the commit may or may not have reached the network, with what to
+  do in each case.
 - **It never confirms.** If the commit leaves the mempool without confirming,
   its inputs were never spent, and `resume-mint` will not find it confirmed.
 - **`glyph deploy-ft` or `glyph deploy-dmint`, or no record.** There is no

@@ -25,6 +25,7 @@ from pyrxd.glyph.mint import (
     DEFAULT_MINT_CONFIRMATIONS,
     NFT_CARRIER_VALUE,
     PENDING_MINT_SCHEMA_VERSION,
+    PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE,
     GlyphMinter,
     JsonFilePendingStore,
     MintResult,
@@ -162,11 +163,24 @@ class TestPendingMint:
     def test_to_dict_carries_the_schema_version(self):
         assert _pending().to_dict()["schema_version"] == PENDING_MINT_SCHEMA_VERSION
 
-    @pytest.mark.parametrize("version", [None, 0, 2, "1", PENDING_MINT_SCHEMA_VERSION + 1])
+    @pytest.mark.parametrize("version", [None, 0, 3, "1", True, PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE + 1])
     def test_from_dict_rejects_an_unknown_schema_version(self, version):
         d = _pending().to_dict()
         d["schema_version"] = version
-        with pytest.raises(ValidationError, match="schema_version"):
+        with pytest.raises(ValidationError, match="unsupported PendingMint schema_version"):
+            PendingMint.from_dict(d)
+
+    def test_version_2_is_the_record_that_carries_a_wave_fee_decision(self):
+        """Version 2 exists for one reason: a record carrying the WAVE fee decision must not be
+        read by code that would ignore it. Version 1 cannot carry one; version 2 must."""
+        d = _pending().to_dict()
+        assert "wave_fee" not in d  # a plain record is written exactly as before
+        d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
+        with pytest.raises(ValidationError, match="is missing its WAVE fee decision"):
+            PendingMint.from_dict(d)
+        d = _pending().to_dict()
+        d.update(wave_fee="decline", wave_treasury=None)
+        with pytest.raises(ValidationError, match="carries a WAVE fee decision it cannot hold"):
             PendingMint.from_dict(d)
 
     def test_from_dict_rejects_a_missing_field(self):

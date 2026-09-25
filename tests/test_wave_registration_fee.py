@@ -59,7 +59,13 @@ from pyrxd.glyph.fees import (
     measure_reveal_fee,
 )
 from pyrxd.glyph.inspector import GlyphInspector
-from pyrxd.glyph.mint import GlyphMinter, PendingMint, UnsafeNullPendingStore
+from pyrxd.glyph.mint import (
+    PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE,
+    GlyphMinter,
+    JsonFilePendingStore,
+    PendingMint,
+    UnsafeNullPendingStore,
+)
 from pyrxd.glyph.payload import build_mutable_scriptsig, build_reveal_scriptsig_suffix, encode_payload
 from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_script, hash_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
@@ -341,9 +347,11 @@ class TestTheMainnetClaimPaysItAtVout2:
         assert len(outs) == 4  # vout 3 is change
 
     def test_the_fee_was_funded_by_a_third_input_from_the_commit_transaction(self) -> None:
-        """Photonic funds the reveal from wallet inputs, and its commit's change is among them
-        (``mint.ts:818``, ``:827``): inputs 0 and 1 are the commit and the mutable seed, input 2
-        the commit transaction's vout 2 — not the commit output."""
+        """Read from the chain: inputs 0 and 1 are the commit and the mutable seed, input 2 the
+        commit transaction's vout 2 — not the commit output. That vout 2 is the commit's CHANGE is
+        inferred from Photonic's code (its commit outputs are commit, seed, change, ``mint.ts:818``;
+        the change joins the reveal's spendable set, ``:827``): the fixture does not hold the
+        commit transaction, so this test cannot see it."""
         commit_txid = _MINT_TX.inputs[0].source_txid
         assert [(i.source_txid, i.source_output_index) for i in _MINT_TX.inputs] == [
             (commit_txid, 0),
@@ -748,6 +756,31 @@ class TestTheBalanceGate:
         with pytest.raises(InsufficientFundsError, match="only by dropping its change"):
             assert_reveal_balances(tx, registration_fee=self.FEE)
 
+    def test_the_commit_pays_the_miner_and_the_wallet_input_only_the_fee(self) -> None:
+        """M1(b): a commit one photon short of its carrier and miner fee is refused even though
+        the wallet input could cover it — that input pays the registration fee and nothing more."""
+        probe = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        miner_fee = measure_reveal_fee(probe, registration_fee=self.FEE).fee
+        honest = _reveal_with(self.FEE, self.CBOR, commit_value=546 + miner_fee, funding_value=600_000_000)
+        assert_reveal_balances(honest, registration_fee=self.FEE)
+        short = _reveal_with(self.FEE, self.CBOR, commit_value=546 + miner_fee - 1, funding_value=600_000_000)
+        with pytest.raises(InsufficientFundsError, match="so the wallet input would pay the miner"):
+            assert_reveal_balances(short, registration_fee=self.FEE)
+
+    @pytest.mark.parametrize("signed", [False, True], ids=["dry-run", "signed"])
+    def test_a_miner_fee_above_ten_times_the_floor_is_refused(self, signed: bool) -> None:
+        """M1(c): the ceiling comes from the relay floor, not from the fee_rate the caller passed,
+        which may itself be the mistake. 100,000/byte (exactly 10x) passes; 100,001 does not."""
+        for rate, allowed in ((100_000, True), (100_001, False)):
+            tx = _reveal_with(self.FEE, self.CBOR, commit_value=1_000_000_000, funding_value=600_000_000)
+            if signed:
+                tx.fee(SatoshisPerKilobyte(rate * 1000))
+            if allowed:
+                assert_reveal_balances(tx, fee_rate=rate, registration_fee=self.FEE)
+            else:
+                with pytest.raises(ValidationError, match="10x the relay floor for its size"):
+                    assert_reveal_balances(tx, fee_rate=rate, registration_fee=self.FEE)
+
     def test_the_signed_reveal_is_held_to_its_real_size(self) -> None:
         tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
         tx.fee(SatoshisPerKilobyte(10_000_000))
@@ -771,6 +804,53 @@ class _MinterClient:
 
     async def get_transaction_verbose(self, txid: str) -> dict:
         return {"confirmations": 1}
+
+
+def _wave_pending(key: PrivateKey, **kw: Any) -> PendingMint:
+    cbor = encode_payload(build_wave_metadata(qualified_name="abcdef.rxd", target=TARGET))[0]
+    pkh = Hex20(key.public_key().hash160())
+    fields: dict[str, Any] = {
+        "commit_txid": "12" * 32,
+        "commit_vout": 0,
+        "commit_value": 10_000_000,
+        "commit_script": build_commit_locking_script(hash_payload(cbor), pkh, is_nft=True),
+        "cbor_bytes": cbor,
+        "owner_pkh": bytes(pkh),
+        "is_nft": True,
+        "carrier_value": 546,
+        "fee_rate": 10_000,
+        "funding_address": key.address(),
+    }
+    fields.update(kw)
+    return PendingMint(**fields)
+
+
+class TestTheRecordKeepsTheFeeDecision:
+    """M2: the mint's WAVE fee choice lives in its record, so a recovery cannot lose it."""
+
+    @pytest.mark.parametrize(
+        ("choice", "treasury"), [("decline", None), ("pay", None), ("pay", "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn")]
+    )
+    def test_it_round_trips_through_the_store_at_version_2(
+        self, tmp_path: pathlib.Path, choice: str, treasury: str | None
+    ) -> None:
+        pending = _wave_pending(PrivateKey(), wave_fee=choice, wave_treasury=treasury)
+        d = pending.to_dict()
+        assert d["schema_version"] == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
+        assert (d["wave_fee"], d["wave_treasury"]) == (choice, treasury)
+        store = JsonFilePendingStore(tmp_path)
+        store.save(pending)
+        assert store.load(pending.commit_txid) == pending
+
+    def test_a_decision_on_a_payload_that_registers_nothing_is_refused(self) -> None:
+        cbor = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="plain"))[0]
+        with pytest.raises(ValidationError, match="registers no WAVE name"):
+            _wave_pending(PrivateKey(), cbor_bytes=cbor, wave_fee="pay")
+
+    @pytest.mark.parametrize(("choice", "treasury"), [("decline", WAVE_TREASURY_ADDRESS), ("maybe", None), (None, "x")])
+    def test_an_incoherent_decision_is_refused(self, choice: str | None, treasury: str | None) -> None:
+        with pytest.raises(ValidationError, match="wave_fee|wave_treasury"):
+            _wave_pending(PrivateKey(), wave_fee=choice, wave_treasury=treasury)
 
 
 @pytest.mark.filterwarnings("ignore:UnsafeNullPendingStore discards")

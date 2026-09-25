@@ -39,10 +39,12 @@ transferable from the moment it is minted; the timelock gates *visibility*, not 
    ``timelock-mint`` writes the key, the ciphertext and the envelope bytes to files, and
    **nothing on chain carries any of them**. Lose the key or the ciphertext and the content is
    sealed forever — a mint cannot be re-run against the same token. Lose the envelope and a
-   mint whose commit confirms while its reveal does not can never be completed: the commit
-   output is a hashlock over those exact bytes, this CLI keeps no pending store, and an
-   envelope built with ``--recipient`` cannot be reproduced from the same inputs (each wrap
-   draws a fresh ephemeral key and nonce). All three output paths are required arguments for
+   mint whose commit confirms while its reveal does not can be completed only from a second
+   copy of those bytes: the commit output is a hashlock over them, and an envelope built with
+   ``--recipient`` cannot be reproduced from the same inputs (each wrap draws a fresh ephemeral
+   key and nonce). The mint also saves a pending record beside the wallet file, which
+   ``glyph resume-mint`` reveals from; the envelope file is the copy that does not depend on
+   that directory. All three output paths are required arguments for
    that reason, and all three files are written before the mint is broadcast.
 
    ``timelock-reveal`` publishes the key in an OP_RETURN. Once the transaction relays, anyone

@@ -22,6 +22,7 @@ import functools
 import json
 import os
 import pathlib
+import shlex
 from collections.abc import Callable
 from typing import Any
 
@@ -41,9 +42,10 @@ from pyrxd.network import confirm
 from pyrxd.network.electrumx import UtxoRecord, script_hash_for_script
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import NetworkError, PolicyRejection
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
 
 TARGET = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
@@ -75,6 +77,14 @@ class _Chain:
         self.before_broadcast: Callable[[int, bytes], None] | None = None
         #: Called with the txid on every confirmation poll; may raise.
         self.on_poll: Callable[[str], None] | None = None
+        #: Accepted but not yet mined: 0 confirmations, height 0 in history.
+        self.unconfirmed: set[str] = set()
+        #: Broadcasts from this index on stay unconfirmed (None: every broadcast confirms).
+        self.unconfirmed_from: int | None = None
+        #: Outpoints the server leaves out of get_utxos although they are unspent.
+        self.hidden: set[tuple[str, int]] = set()
+        #: txid -> the scripts of the outputs its inputs spent (for get_history).
+        self.spent_scripts: dict[str, list[bytes]] = {}
 
     async def __aenter__(self) -> _Chain:
         return self
@@ -97,8 +107,10 @@ class _Chain:
 
     def _accept(self, tx: Transaction, raw: bytes) -> str:
         txid = str(tx.txid())
+        spent = []
         for i in tx.inputs:
-            self.utxos.pop((i.source_txid, i.source_output_index))
+            spent.append(self.utxos.pop((i.source_txid, i.source_output_index))[0])
+        self.spent_scripts[txid] = spent
         for n, out in enumerate(tx.outputs):
             self.utxos[(txid, n)] = (out.locking_script.serialize(), out.satoshis)
         self.txs[txid] = raw
@@ -116,8 +128,28 @@ class _Chain:
         ]
         if missing:
             raise NetworkError(f"missing inputs: {missing}")  # what a node says
+        if self.unconfirmed_from is not None and len(self.broadcasts) >= self.unconfirmed_from:
+            self.unconfirmed.add(str(tx.txid()))
         self.broadcasts.append(raw)
         return self._accept(tx, raw)
+
+    def spend(self, outpoint: tuple[str, int], *, confirmed: bool = True) -> str:
+        """Another transaction spends ``outpoint`` (a reveal made elsewhere, say)."""
+        inp = TransactionInput(source_txid=outpoint[0], source_output_index=outpoint[1])
+        tx = Transaction(tx_inputs=[inp], tx_outputs=[TransactionOutput(Script(b"\x6a"), 0)])
+        txid = self._accept(tx, bytes(tx.serialize()))
+        if not confirmed:
+            self.unconfirmed.add(txid)
+        return txid
+
+    async def get_history(self, script_hash: Any) -> list[dict]:
+        def _touches(txid: str) -> bool:
+            outs = [o.locking_script.serialize() for o in _tx(self.txs[txid]).outputs]
+            return any(bytes(script_hash_for_script(s)) == bytes(script_hash) for s in outs + self.spent_scripts[txid])
+
+        return [
+            {"tx_hash": txid, "height": 0 if txid in self.unconfirmed else 1} for txid in self.txs if _touches(txid)
+        ]
 
     async def get_transaction(self, txid: Any) -> bytes:
         try:
@@ -128,13 +160,14 @@ class _Chain:
     async def get_transaction_verbose(self, txid: Any) -> dict:
         if self.on_poll is not None:
             self.on_poll(str(txid))
-        return {"confirmations": self.confirmations if str(txid) in self.txs else 0}
+        known = str(txid) in self.txs and str(txid) not in self.unconfirmed
+        return {"confirmations": self.confirmations if known else 0}
 
     async def get_utxos(self, script_hash: Any) -> list[UtxoRecord]:
         return [
             UtxoRecord(tx_hash=txid, tx_pos=vout, value=value, height=100)
             for (txid, vout), (script, value) in self.utxos.items()
-            if bytes(script_hash_for_script(script)) == bytes(script_hash)
+            if bytes(script_hash_for_script(script)) == bytes(script_hash) and (txid, vout) not in self.hidden
         ]
 
     async def call_extension(self, method: str, params: list[Any]) -> Any:
@@ -502,26 +535,40 @@ class TestTheNameMustBeFree:
 # ─────────────────────────────── (3) every exit after the commit names the recovery ──
 
 
-def _assert_recovery(result: Any, tmp_path: pathlib.Path, txid: str, value: int, *, wave: str | None) -> None:
+def _command(tmp_path: pathlib.Path, txid: str, *extra: str, network: str = "mainnet") -> str:
+    """The resume command the CLI must print: the globals that find the record, then the choice."""
+    wallet = str((tmp_path / "w.dat").absolute())
+    return shlex.join(["pyrxd", "--network", network, "--wallet", wallet, "glyph", "resume-mint", txid, *extra])
+
+
+def _assert_recovery(
+    result: Any, tmp_path: pathlib.Path, txid: str, value: int, *, wave: str | None, declined: bool = False
+) -> None:
     """The commit txid, what it holds, where the record is and how to finish — never "re-run"."""
     said = " ".join(result.output.split())
     assert f"The commit {txid}:0 was broadcast and holds {value:,} photons" in said
     assert f"its record is saved in {tmp_path / 'pending-mints'}" in said
+    resume = _command(tmp_path, txid, *(["--no-wave-registration-fee"] if declined else []))
     assert (
-        f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run "
-        f"`pyrxd glyph resume-mint {txid}`." in said
+        f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run `{resume}`." in said
     )
     assert "nothing is stranded" not in said
     assert "re-run with the inputs" not in said
     if wave is None:
         assert "--no-wave-registration-fee" not in said
+    elif declined:
+        # M2: the mint's opt-out is repeated, never replaced by the paying default.
+        assert (
+            f"This mint declined the WAVE registration fee for {wave}.rxd, and that command keeps that choice" in said
+        )
+        assert "pays the registration fee from a wallet input only if" not in said
     else:
-        # M1: pay only if the name is still free; otherwise reveal without the fee.
+        # Pay only if the name is still free; otherwise reveal without the fee.
         assert (
             f"resume-mint checks {wave}.rxd is still free and pays the registration fee from a wallet input only if it is"
             in said
         )
-        assert f"`pyrxd glyph resume-mint {txid} --no-wave-registration-fee`" in said
+        assert f"`{_command(tmp_path, txid, '--no-wave-registration-fee')}`" in said
     record = _store(tmp_path).load(txid)
     assert (record.commit_txid, record.commit_value) == (txid, value)
 
@@ -635,10 +682,12 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
             "commit_txid": txid,
             "commit_vout": 0,
             "commit_value": _tx(chain.broadcasts[0]).outputs[0].satoshis,
+            "reveal_txid": None,
             "pending_record": str(tmp_path / "pending-mints" / f"{txid}.json"),
             "wave_name": "abcde.rxd",
-            "recover": f"pyrxd glyph resume-mint {txid}",
-            "recover_without_wave_fee": f"pyrxd glyph resume-mint {txid} --no-wave-registration-fee",
+            "wave_fee": "pay",
+            "recover": _command(tmp_path, txid),
+            "recover_without_wave_fee": _command(tmp_path, txid, "--no-wave-registration-fee"),
         }
 
     @pytest.mark.parametrize("mode", [("--json", "--yes"), ("--yes",)], ids=["json", "human"])
@@ -660,7 +709,7 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
         said = " ".join(result.output.split())
         assert "the commit broadcast failed, and the commit may or may not have reached the network" in said
         assert f"look up {txid} on a block explorer before running anything else" in said
-        assert f"`pyrxd glyph resume-mint {txid}`" in said
+        assert f"`{_command(tmp_path, txid)}`" in said
         assert f"If it never appears, nothing was spent: delete {tmp_path / 'pending-mints' / (txid + '.json')}" in said
         if mode[0] == "--json":
             assert json.loads(result.stdout)["status"] == "commit_broadcast_failed_may_have_relayed"
@@ -689,7 +738,9 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
         fix = " ".join(str(exc.value.fix).split())
         assert "nothing is stranded" not in fix
         assert "do not simply re-run the command: that would commit, and spend, again" in fix
-        assert f"pyrxd glyph resume-mint {'ab' * 32}" in fix
+        assert "print, with this error, the exact `pyrxd glyph resume-mint` command" in fix
+        assert "only source" not in fix
+        assert "If it declined the fee, build with pay_registration_fee=False" in fix
         assert "ONLY if WaveResolver.check_available says the name is still free" in fix
         assert "build with pay_registration_fee=False" in fix
 
@@ -728,21 +779,18 @@ class TestResumeMint:
         )
         assert _store(tmp_path).list_pending() == []
 
-    def test_a_commit_that_is_already_spent_has_nothing_to_recover(
+    def test_a_commit_spent_by_a_confirmed_transaction_has_nothing_to_recover(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         chain, _wallet = _wire(monkeypatch)
-        chain.confirmations = 0
-        _no_wait(monkeypatch)
-        _mint(tmp_path, "abcde")
-        txid = str(_tx(chain.broadcasts[0]).txid())
-        chain.utxos.pop((txid, 0))  # revealed elsewhere
-        chain.confirmations = 1
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        spender = chain.spend((txid, 0))  # revealed elsewhere, and mined
         result = _resume(tmp_path, txid)
         assert result.exit_code == 1
-        assert f"the commit {txid}:0 is already spent" in result.stderr
+        assert f"the commit {txid}:0 is already revealed, by {spender}" in result.stderr
         assert "Do not re-run the mint" not in result.stderr  # not pointed at a recovery that finds nothing
         assert _store(tmp_path).list_pending() == []
+        assert len(chain.broadcasts) == 1
 
     def test_no_record_is_a_clear_refusal(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
         chain, _wallet = _wire(monkeypatch)
@@ -777,3 +825,381 @@ class TestResumeMint:
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         assert "no plain-RXD wallet UTXO holds the 10 RXD WAVE registration fee for abcde.rxd" in result.stderr
         _assert_recovery(result, tmp_path, txid, commit.outputs[0].satoshis, wave="abcde")
+
+
+# ─────────────────────── (5) resume-mint trusts nothing it reads (round 3: M1-M3, L1, L2) ──
+
+
+def _timed_out_mint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, chain: _Chain, *extra: str, **kw: Any
+) -> str:
+    """A WAVE mint whose commit did not confirm in time: exit 2, one broadcast, the record on disk.
+    The chain then confirms, so the next resume-mint finds the commit mined."""
+    chain.confirmations = 0
+    _no_wait(monkeypatch)
+    result = _mint(tmp_path, kw.pop("label", "abcde"), *extra, **kw)
+    assert result.exit_code == 2, result.output
+    assert len(chain.broadcasts) == 1
+    chain.confirmations = 1
+    return str(_tx(chain.broadcasts[0]).txid())
+
+
+def _record_path(tmp_path: pathlib.Path, txid: str) -> pathlib.Path:
+    return tmp_path / "pending-mints" / f"{txid}.json"
+
+
+def _edit_record(tmp_path: pathlib.Path, txid: str, **changes: Any) -> None:
+    path = _record_path(tmp_path, txid)
+    d = json.loads(path.read_text())
+    d.update(changes)
+    path.write_text(json.dumps(d))
+
+
+def _run_printed(tmp_path: pathlib.Path, command: str) -> Any:
+    """Run a command the CLI printed, exactly, behind the hermetic config and --json --yes."""
+    argv = shlex.split(command)
+    assert argv[0] == "pyrxd"
+    return CliRunner().invoke(cli, ["--config", str(tmp_path / "absent.toml"), "--json", "--yes", *argv[1:]])
+
+
+def _spent_value(chain: _Chain, inp: Any) -> int:
+    return _tx(chain.txs[inp.source_txid]).outputs[inp.source_output_index].satoshis
+
+
+class TestResumeMintReadsTheRecordWithSuspicion:
+    """L1 and N15: the record must be this txid's, reproduce its commit script from this
+    wallet, mint to this wallet, and agree with the chain about the commit's value."""
+
+    def test_a_record_filed_under_another_txid_is_refused(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        other = "cd" * 32
+        _record_path(tmp_path, other).write_text(_record_path(tmp_path, txid).read_text())
+        result = _resume(tmp_path, other)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        assert f"the record for {other} does not match: commit_txid" in result.stderr
+
+    def test_a_record_that_mints_to_someone_else_is_refused(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """owner_pkh is not part of the commit script, so the script check alone passes it."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        _edit_record(tmp_path, txid, owner_pkh=PrivateKey().public_key().hash160().hex())
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        assert f"the record for {txid} does not match: owner_pkh" in result.stderr
+
+    def test_a_commit_value_the_chain_does_not_list_is_refused(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        on_chain = chain.utxos[(txid, 0)][1]
+        _edit_record(tmp_path, txid, commit_value=on_chain + 1_000_000)
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        said = " ".join(result.output.split())
+        assert f"the record for {txid} does not match: commit_value" in said
+        assert f"the server lists {on_chain:,}" in said
+
+    def test_a_payload_that_does_not_reproduce_the_commit_script_is_refused(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """N15: the commit script is re-derived from the stored payload and this wallet's key."""
+        import cbor2
+
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        claim = cbor2.loads(_store(tmp_path).load(txid).cbor_bytes)
+        claim["attrs"]["target"] = PrivateKey().public_key().address()  # still a valid claim for abcde
+        _edit_record(tmp_path, txid, cbor_bytes=cbor2.dumps(claim).hex())
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        assert "does not reproduce its commit script" in " ".join(result.output.split())
+
+    def test_the_honest_record_still_reveals(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The other half of every refusal above: the untouched record goes through."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        assert _resume(tmp_path, txid).exit_code == 0
+        assert len(chain.broadcasts) == 2 and _store(tmp_path).list_pending() == []
+
+
+class TestResumeMintNeverOverpays:
+    """M1: a record's fee_rate is read off disk. Signing at 10,000,000 (the per-kB constant)
+    paid 58.1 RXD to miners, taken from the wallet's largest plain UTXO."""
+
+    @pytest.mark.parametrize("rate", [10_000_000, 5_000], ids=["per-kB-as-per-byte", "below-the-floor"])
+    def test_a_fee_rate_outside_the_relay_band_is_refused_before_signing(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, rate: int
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        _edit_record(tmp_path, txid, fee_rate=rate)
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        said = " ".join(result.output.split())
+        assert (
+            f"the commit's record asks for a reveal fee rate of {rate:,} photons/byte — refusing to sign at it" in said
+        )
+        assert str(_record_path(tmp_path, txid)) in said
+        assert _store(tmp_path).list_pending() == [txid]
+
+    def test_a_rate_the_commit_was_not_sized_for_is_not_paid_by_the_wallet(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M1(b): 100,000 photons/byte is inside the band (10x the floor), but the commit was
+        sized at 10,000. The difference would come out of the wallet input, which pays only the
+        registration fee and its own change."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        _edit_record(tmp_path, txid, fee_rate=100_000)
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        assert "so the wallet input would pay the miner" in " ".join(result.output.split())
+
+    def test_the_reveal_fee_comes_out_of_the_commit(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The honest half, measured: the wallet input pays the registration fee and gets the rest back."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        assert _resume(tmp_path, txid).exit_code == 0
+        reveal = _tx(chain.broadcasts[1])
+        commit_in, fee_in = (_spent_value(chain, i) for i in reveal.inputs)
+        nft, fee_out, change = (o.satoshis for o in reveal.outputs)
+        assert fee_out == 1_000_000_000
+        assert change >= fee_in - fee_out
+        assert commit_in >= nft + _miner_fee(chain, reveal)
+
+
+class TestAnOptOutSurvivesRecovery:
+    """M2: after `mint-nft --no-wave-registration-fee`, every exit and the JSON `recover`
+    field used to recommend a plain `resume-mint`, which pays by default. Running it paid
+    10 RXD the user had declined."""
+
+    def test_the_printed_command_and_recover_keep_the_decline(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        chain.confirmations = 0
+        _no_wait(monkeypatch)
+        result = _mint(tmp_path, "abcde", "--no-wave-registration-fee")
+        assert result.exit_code == 2
+        txid = str(_tx(chain.broadcasts[0]).txid())
+        commit_value = _tx(chain.broadcasts[0]).outputs[0].satoshis
+        _assert_recovery(result, tmp_path, txid, commit_value, wave="abcde", declined=True)
+        doc = json.loads(result.stdout)
+        assert doc["wave_fee"] == "decline"
+        assert doc["recover"] == _command(tmp_path, txid, "--no-wave-registration-fee")
+        assert doc["recover_without_wave_fee"] is None
+        assert _store(tmp_path).load(txid).wave_fee == "decline"
+
+        chain.confirmations = 1
+        recovered = _run_printed(tmp_path, doc["recover"])
+        assert recovered.exit_code == 0, recovered.output
+        reveal = _tx(chain.broadcasts[1])
+        assert _outpoints(reveal) == [(txid, 0)] and _TREASURY_SCRIPT not in _scripts(reveal)
+        assert json.loads(recovered.stdout)["wave_registration"]["fee_paid"] is False
+
+    def test_the_command_in_the_human_text_keeps_the_decline_too(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        chain.confirmations = 0
+        _no_wait(monkeypatch)
+        result = _mint(tmp_path, "abcde", "--no-wave-registration-fee", mode=("--yes",))
+        assert result.exit_code == 2
+        txid = str(_tx(chain.broadcasts[0]).txid())
+        said = " ".join(result.output.split())
+        printed = said.split("To reveal this one, run `", 1)[1].split("`", 1)[0]
+        assert printed == _command(tmp_path, txid, "--no-wave-registration-fee")
+        chain.confirmations = 1
+        recovered = _run_printed(tmp_path, printed)
+        assert recovered.exit_code == 0, recovered.output
+        assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
+
+    def test_the_stored_decline_holds_even_for_a_bare_resume(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain, "--no-wave-registration-fee")
+        bare = _resume(tmp_path, txid)
+        assert bare.exit_code == 0, bare.output
+        assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
+
+    @pytest.mark.parametrize(
+        "flags", [("--wave-registration-fee",), ("--wave-treasury", WAVE_TREASURY_ADDRESS)], ids=["pay", "treasury"]
+    )
+    def test_resume_mint_will_not_pay_what_the_mint_declined(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, flags: tuple[str, ...]
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain, "--no-wave-registration-fee")
+        result = _resume(tmp_path, txid, *flags)
+        assert result.exit_code == 1 and len(chain.broadcasts) == 1
+        assert "resume-mint will not pay what the mint declined" in " ".join(result.output.split())
+
+    def test_a_named_treasury_is_repeated_and_honoured(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        treasury = PrivateKey().public_key().address(network=Network.TESTNET)
+        chain.confirmations = 0
+        _no_wait(monkeypatch)
+        result = _mint(tmp_path, "abcde", "--wave-treasury", treasury, network="regtest")
+        assert result.exit_code == 2
+        txid = str(_tx(chain.broadcasts[0]).txid())
+        doc = json.loads(result.stdout)
+        assert doc["recover"] == _command(tmp_path, txid, "--wave-treasury", treasury, network="regtest")
+        other = PrivateKey().public_key().address(network=Network.TESTNET)
+        chain.confirmations = 1
+        refused = _resume(tmp_path, txid, "--wave-treasury", other, network="regtest")
+        assert refused.exit_code == 1 and "--wave-treasury is not the treasury the mint chose" in refused.stderr
+        recovered = _run_printed(tmp_path, doc["recover"])
+        assert recovered.exit_code == 0, recovered.output
+        assert _tx(chain.broadcasts[1]).outputs[1].locking_script.serialize() == P2PKH().lock(treasury).serialize()
+
+    def test_a_taken_name_with_a_named_treasury_recovers_without_the_fee(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The printed "if the name is taken" command, for a mint that named a treasury. Found by
+        the regtest e2e: the declining run kept the recorded treasury and was refused for it."""
+        chain, _wallet = _wire(monkeypatch, available=[{"available": True}, {"available": False}])
+        treasury = PrivateKey().public_key().address(network=Network.TESTNET)
+        stopped = _mint(tmp_path, "abcde", "--wave-treasury", treasury, network="regtest")
+        assert stopped.exit_code == 1 and len(chain.broadcasts) == 1
+        doc = json.loads(stopped.stdout)
+        txid = doc["commit_txid"]
+        assert doc["recover_without_wave_fee"] == _command(
+            tmp_path, txid, "--no-wave-registration-fee", network="regtest"
+        )
+        recovered = _run_printed(tmp_path, doc["recover_without_wave_fee"])
+        assert recovered.exit_code == 0, recovered.output
+        reveal = _tx(chain.broadcasts[1])
+        assert _outpoints(reveal) == [(txid, 0)]
+        assert P2PKH().lock(treasury).serialize() not in _scripts(reveal)
+
+    def test_a_record_without_a_choice_needs_the_flag_said(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registering record that does not say (not written by mint-nft) is not guessed at."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        d = json.loads(_record_path(tmp_path, txid).read_text())
+        del d["wave_fee"], d["wave_treasury"]
+        d["schema_version"] = 1
+        _record_path(tmp_path, txid).write_text(json.dumps(d))
+        refused = _resume(tmp_path, txid)
+        assert refused.exit_code == 1 and len(chain.broadcasts) == 1
+        assert "does not say whether the WAVE registration fee is paid" in " ".join(refused.output.split())
+        declined = _resume(tmp_path, txid, "--no-wave-registration-fee")
+        assert declined.exit_code == 0, declined.output
+        assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
+
+
+class TestTheRecordIsDeletedOnlyOnPositiveEvidence:
+    """M3: an empty unspent list is not evidence the commit was spent. And the record outlives
+    the reveal's broadcast until the reveal confirms."""
+
+    def test_an_empty_unspent_list_keeps_the_record(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        chain.hidden.add((txid, 0))  # unspent on chain; the server lists nothing
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 2 and len(chain.broadcasts) == 1
+        said = " ".join(result.output.split())
+        assert f"the server lists the commit {txid}:0 neither as unspent nor as spent — the record is kept" in said
+        assert _store(tmp_path).list_pending() == [txid]
+        assert json.loads(result.stdout)["commit_txid"] == txid  # --json: the document is on stdout too
+
+    def test_the_record_is_kept_until_the_reveal_confirms(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+        _no_wait(monkeypatch)
+        chain.unconfirmed_from = 1  # the reveal is accepted and not mined
+        result = _mint(tmp_path, "abcde")
+        assert result.exit_code == 2 and len(chain.broadcasts) == 2
+        txid, reveal_txid = (str(_tx(raw).txid()) for raw in chain.broadcasts)
+        said = " ".join(result.output.split())
+        assert f"the reveal {reveal_txid} was broadcast and has not confirmed yet" in said
+        assert f"The reveal {reveal_txid} of the commit {txid}:0 was broadcast" in said
+        assert _store(tmp_path).list_pending() == [txid]
+        doc = json.loads(result.stdout)
+        assert (doc["status"], doc["reveal_txid"]) == ("reveal_broadcast_not_confirmed", reveal_txid)
+
+        # Still in the mempool: resume-mint finds it, waits, and keeps the record.
+        waiting = _resume(tmp_path, txid)
+        assert waiting.exit_code == 2 and _store(tmp_path).list_pending() == [txid]
+        assert f"the reveal {reveal_txid} was broadcast and has not confirmed yet" in " ".join(waiting.output.split())
+        assert len(chain.broadcasts) == 2
+        # Mined: resume-mint finds the confirmed reveal and only then deletes the record.
+        chain.unconfirmed.discard(reveal_txid)
+        done = _resume(tmp_path, txid)
+        assert f"is already revealed, by {reveal_txid}" in done.stderr
+        assert _store(tmp_path).list_pending() == [] and len(chain.broadcasts) == 2
+
+
+class TestExitsTheBroadcastsThemselvesCanTake:
+    """L2: Ctrl-C while the commit is in flight, and a node refusing the reveal."""
+
+    def test_ctrl_c_during_the_commit_broadcast_says_it_may_have_relayed(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+
+        def _ctrl_c(n: int, raw: bytes) -> None:
+            if n == 0:
+                raise KeyboardInterrupt
+
+        chain.before_broadcast = _ctrl_c
+        result = _mint(tmp_path, "abcde")
+        assert result.exit_code == 1
+        [txid] = _store(tmp_path).list_pending()
+        said = " ".join(result.stderr.split())
+        assert "interrupted while the commit was being broadcast: it may or may not have reached the network" in said
+        assert f"look up {txid} on a block explorer" in said and f"`{_command(tmp_path, txid)}`" in said
+
+    def test_a_node_refusing_the_reveal_is_named_as_a_refusal(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chain, _wallet = _wire(monkeypatch)
+
+        def _refuse(n: int, raw: bytes) -> None:
+            if n == 1:
+                raise PolicyRejection("min relay fee not met", code=1, reason="min relay fee not met")
+
+        chain.before_broadcast = _refuse
+        result = _mint(tmp_path, "abcde")
+        assert result.exit_code == 2 and len(chain.broadcasts) == 1
+        said = " ".join(result.output.split())
+        assert "the node rejected the reveal transaction — nothing was spent by it" in said
+        assert "a server stopped answering" not in said
+        commit = _tx(chain.broadcasts[0])
+        _assert_recovery(result, tmp_path, str(commit.txid()), commit.outputs[0].satoshis, wave="abcde")
+
+
+class TestResumeMintPaysFromPlainRxdOnly:
+    def test_the_fee_input_is_never_a_token(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """N1: resume-mint picks its fee input by on-chain script, like mint-nft's funding."""
+        chain, wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        chain.utxos.pop((txid, 1))  # the commit's change is gone; two other candidates remain
+        pkh = Hex20(wallet.key.public_key().hash160())
+        token = chain.fund(build_nft_locking_script(pkh, GlyphRef(txid=Txid("cd" * 32), vout=0)), 90_000_000_000)
+        plain = chain.fund(wallet.script, 20_000_000_000)
+
+        async def _both(client: object) -> list:
+            return [(token, wallet.address, wallet.key), (plain, wallet.address, wallet.key)]
+
+        monkeypatch.setattr(wallet, "collect_spendable", _both)
+        result = _resume(tmp_path, txid)
+        assert result.exit_code == 0, result.output
+        assert _outpoints(_tx(chain.broadcasts[1]))[1] == (plain.tx_hash, 1)
+        assert (token.tx_hash, 1) in chain.utxos

@@ -42,9 +42,11 @@ Run: ``RADIANT_REGTEST=1 pytest -o addopts= -m integration tests/test_wave_regis
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 from typing import Any
@@ -72,6 +74,7 @@ from pyrxd.glyph.mint import JsonFilePendingStore
 from pyrxd.glyph.wave import build_wave_metadata
 from pyrxd.glyph.wave_rules import WAVE_TREASURY_ADDRESS, wave_registered_label, wave_registration_fee_for
 from pyrxd.keys import PrivateKey
+from pyrxd.network import confirm
 from pyrxd.network.electrumx import UtxoRecord, script_hash_for_script
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -217,6 +220,8 @@ class _NodeNet:
 
     def __init__(self, rt: _RegtestNode, *, available: list[bool]) -> None:
         self.rt = rt
+        #: False leaves a broadcast in the mempool, so a wait for it times out.
+        self.mine_on_broadcast = True
         self.known: set[tuple[str, int]] = set()
         self.available = available
         self.asked: list[list[Any]] = []
@@ -233,7 +238,8 @@ class _NodeNet:
 
     async def broadcast(self, raw: bytes) -> str:
         txid = str(self.rt.cli("sendrawtransaction", bytes(raw).hex()))
-        self.rt.mine(1)
+        if self.mine_on_broadcast:
+            self.rt.mine(1)
         self.track(txid)
         return txid
 
@@ -357,6 +363,45 @@ def test_a_name_taken_after_the_commit_is_recovered_without_the_fee(
     assert _TREASURY_SCRIPT not in [bytes.fromhex(o["scriptPubKey"]["hex"]) for o in reveal["vout"]]
     assert _out_spk(reveal, 1) == wallet.script  # the commit's value, back as change
     assert not node.cli("gettxout", commit_txid, "0")
+
+
+def test_a_declined_fee_survives_a_timeout_and_the_printed_recover_keeps_it(
+    node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 against a node: `mint-nft --no-wave-registration-fee` times out waiting for its commit;
+    the `recover` command it prints, run exactly as printed, reveals WITHOUT the fee. Before
+    round 3 that command was a bare `resume-mint`, which paid the declined fee."""
+    label = "regtest-cli-declined"
+    net, wallet = _wire(node, monkeypatch, available=[True])
+    net.mine_on_broadcast = False
+
+    async def _no_sleep(_s: float) -> None:
+        return None
+
+    # The real waiter, one poll: the commit sits in the mempool, so mint-nft times out.
+    monkeypatch.setattr(
+        glyph_cmds,
+        "wait_for_confirmation",
+        functools.partial(confirm.wait_for_confirmation, max_iterations=1, sleep=_no_sleep),
+    )
+    stopped = _cli(tmp_path, "mint-nft", str(_metadata_file(tmp_path, label)), "--no-wave-registration-fee")
+    assert stopped.exit_code == 2, stopped.output
+    doc = json.loads(stopped.stdout)
+    commit_txid = doc["commit_txid"]
+    assert doc["wave_fee"] == "decline" and shlex.split(doc["recover"])[-1] == "--no-wave-registration-fee"
+
+    node.mine(1)
+    net.mine_on_broadcast = True
+    argv = shlex.split(doc["recover"])
+    assert argv[0] == "pyrxd"
+    recovered = CliRunner().invoke(cli, ["--config", str(tmp_path / "absent.toml"), "--json", "--yes", *argv[1:]])
+    assert recovered.exit_code == 0, (recovered.output, recovered.exception)
+    reveal = _confirmed(node, json.loads(recovered.stdout)["reveal_txid"])
+    assert [(i["txid"], i["vout"]) for i in reveal["vin"]] == [(commit_txid, 0)]
+    assert _TREASURY_SCRIPT not in [bytes.fromhex(o["scriptPubKey"]["hex"]) for o in reveal["vout"]]
+    assert _out_spk(reveal, 1) == wallet.script
+    assert not node.cli("gettxout", commit_txid, "0")
+    assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
 
 
 # ─────────────────────────────────────────────────────────────── (4) negative ──

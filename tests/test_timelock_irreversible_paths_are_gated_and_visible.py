@@ -401,9 +401,10 @@ class TestTheOperatorSeesTheClockThatDecided:
 class TestTheMintSavesTheBytesItsRevealNeeds:
     """``timelock-mint`` broadcasts a commit, waits 10+ minutes, then prompts AGAIN for the reveal.
     The commit output is ``OP_HASH256 <payload_hash> OP_EQUALVERIFY``, spendable only by a reveal
-    pushing byte-identical CBOR — and this CLI has no pending store, this command has no metadata
-    file, and a timeout, a kill or a declined prompt in that window strands the commit's value
-    permanently.
+    pushing byte-identical CBOR — and this command has no metadata file, so a timeout, a kill or
+    a declined prompt in that window leaves the value recoverable only from saved bytes: the
+    pending record (in pending-mints/, which resume-mint reveals from) or this envelope file,
+    the copy that does not depend on that directory.
     """
 
     def _mint(self, runner, tmp_path, monkeypatch, *, inner, extra=(), files=None):
