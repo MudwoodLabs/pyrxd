@@ -16,10 +16,16 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pyrxd.hash import double_sha256
-from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.network.electrumx import ElectrumXClient, _rpc_error
 from pyrxd.network.failover import FailoverElectrumXClient
 from pyrxd.network.registry import Endpoint, NetworkProfile
-from pyrxd.security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
+from pyrxd.security.errors import (
+    NetworkError,
+    PolicyRejection,
+    RpcMethodNotFound,
+    TlsPinMismatchError,
+    ValidationError,
+)
 from pyrxd.security.types import BTC_MAX_SATS, BlockHeight, RawTx, Txid
 
 pytestmark = pytest.mark.asyncio
@@ -203,6 +209,111 @@ async def test_call_extension_retries_when_the_caller_declares_it_idempotent() -
     fakes[A].extension_error = NetworkError("down")
 
     assert await client.call_extension("glyph.get_token", idempotent=True) == {"ok": "glyph.get_token"}
+
+
+# ── "method not found" is an answer, not a fault ─────────────────────────────
+#
+# A server without the RXinDexer extension answers every indexer method with JSON-RPC -32601.
+# The exception below is built by `_rpc_error`, the function the transport's reader loop calls
+# on that frame, so these fakes raise what a real ElectrumXClient raises. The same behaviour over
+# real ElectrumXClient reader loops and the measured wire frame is in
+# tests/test_indexer_reads_fail_over.py.
+
+
+def _method_not_found(method: str) -> Exception:
+    return _rpc_error(-32601, f'unknown method "{method}"')
+
+
+async def test_an_idempotent_read_moves_past_an_endpoint_that_lacks_the_method() -> None:
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _method_not_found("wave.resolve")
+
+    assert await client.call_extension("wave.resolve", ["alice"], idempotent=True) == {"ok": "wave.resolve"}
+    assert ("call_extension", "wave.resolve") in fakes[A].calls
+
+
+async def test_lacking_the_method_costs_the_endpoint_nothing() -> None:
+    """Not closed, not demoted: the next ordinary read still goes to it first.
+
+    Closing it (`_discard`) would fail every other call in flight on its socket, and promoting B
+    would move core reads off the current primary over an extension A never had to run."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _method_not_found("wave.resolve")
+    await client.call_extension("wave.resolve", ["alice"], idempotent=True)
+
+    assert fakes[A].closed == 0
+    assert client.active_url == A
+    fakes[A].calls.clear()
+    fakes[B].calls.clear()
+    await client.get_tip_height()
+    assert fakes[A].calls == [("get_tip_height", None)]
+    assert fakes[B].calls == []
+
+
+async def test_a_dead_endpoint_passed_over_on_the_way_still_promotes_the_winner() -> None:
+    """[A lacks the method, B is down, C answers]. B is dead, so promotion still routes around
+    it — which is what promotion is for. A, which only lacked the method, is not closed."""
+    client, fakes = build([A, B, C])
+    fakes[A].extension_error = _method_not_found("wave.resolve")
+    fakes[B].extension_error = NetworkError("ElectrumX connection lost")
+
+    assert await client.call_extension("wave.resolve", ["alice"], idempotent=True) == {"ok": "wave.resolve"}
+    assert client.active_url == C
+    assert fakes[B].closed == 1
+    assert fakes[A].closed == 0
+
+
+async def test_not_idempotent_a_missing_method_is_still_a_fault() -> None:
+    """Only an idempotent extension call treats -32601 as an answer. A caller that did not
+    declare its call a read gets exactly the old behaviour: no retry, and the endpoint dropped."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _method_not_found("some.method")
+
+    with pytest.raises(NetworkError, match=r"^ElectrumX RPC error \(code -32601\)$"):
+        await client.call_extension("some.method")
+    assert fakes[B].calls == []
+    assert fakes[A].closed == 1
+
+
+async def test_on_a_core_read_a_missing_method_is_still_a_fault() -> None:
+    """A server that cannot answer a CORE method is broken for our purposes, not merely
+    without an extension: dropped, routed around, and the all-endpoints error is unchanged."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _method_not_found("blockchain.headers.subscribe")
+    fakes[B].tip_value = 4242
+
+    assert int(await client.get_tip_height()) == 4242
+    assert fakes[A].closed == 1
+    assert client.active_url == B
+
+    fakes[B].tip_error = _method_not_found("blockchain.headers.subscribe")
+    with pytest.raises(NetworkError) as exc:
+        await client.get_tip_height()
+    assert type(exc.value) is NetworkError
+    assert str(exc.value) == "get_tip_height failed on all 2 ElectrumX endpoint(s)"
+
+
+@pytest.mark.parametrize("urls", [[A], [A, B]], ids=["one endpoint", "two endpoints"])
+async def test_when_no_endpoint_has_the_method_the_error_says_so(urls) -> None:
+    """The other branch: `--electrumx` pointed at a server without the indexer, or no configured
+    server running it. A bare "failed on all N endpoints" would hide the one fact the user needs."""
+    client, fakes = build(urls)
+    for fake in fakes.values():
+        fake.extension_error = _method_not_found("wave.resolve")
+
+    with pytest.raises(RpcMethodNotFound, match=f"none of the {len(urls)} .* implements this method"):
+        await client.call_extension("wave.resolve", ["alice"], idempotent=True)
+    assert all(fake.closed == 0 for fake in fakes.values())
+
+
+async def test_down_and_unsupported_together_are_reported_as_a_network_failure() -> None:
+    client, fakes = build([A, B])
+    fakes[A].extension_error = NetworkError("ElectrumX connection lost")
+    fakes[B].extension_error = _method_not_found("wave.resolve")
+
+    with pytest.raises(NetworkError, match="all 2 ElectrumX endpoint.*1 of them do not implement") as exc:
+        await client.call_extension("wave.resolve", ["alice"], idempotent=True)
+    assert not isinstance(exc.value, RpcMethodNotFound)
 
 
 async def test_tls_pin_mismatch_is_not_routed_around() -> None:

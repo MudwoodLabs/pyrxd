@@ -1004,7 +1004,7 @@ import time
 
 from pyrxd.network import electrumx
 from pyrxd.network.electrumx import _rpc_error, _sanitize_server_message
-from pyrxd.security.errors import CovenantError, PolicyRejection, redact
+from pyrxd.security.errors import CovenantError, PolicyRejection, RpcMethodNotFound, redact
 
 
 class TestPolicyRejectionClassification:
@@ -1036,16 +1036,22 @@ class TestPolicyRejectionClassification:
     @pytest.mark.parametrize(
         ("code", "message"),
         [
-            (-32601, "Method not found"),
             (-32700, "Parse error"),
+            (-32603, "Internal error"),
             (-5, "No such mempool or blockchain transaction"),
             (-99, "server is shutting down"),
         ],
     )
     def test_transport_and_protocol_errors_stay_plain_network_error(self, code, message) -> None:
-        err = _rpc_error(code, message)
-        assert isinstance(err, NetworkError)
-        assert not isinstance(err, PolicyRejection)
+        # EXACT type, not isinstance: every subclass is a NetworkError, so `isinstance` would
+        # pass if these were misclassified as RpcMethodNotFound — which the failover layer
+        # passes over without dropping the server, for an indexer read.
+        assert type(_rpc_error(code, message)) is NetworkError
+
+    def test_only_minus_32601_is_method_not_found(self) -> None:
+        err = _rpc_error(-32601, 'unknown method "wave.resolve"')
+        assert type(err) is RpcMethodNotFound
+        assert str(err) == "ElectrumX RPC error (code -32601)"  # the message did not change
 
     def test_policy_rejection_is_catchable_as_network_error(self) -> None:
         # ~30 sites in the SDK already wrap broadcasts in `except NetworkError`. Now

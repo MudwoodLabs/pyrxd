@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .failover import FailoverElectrumXClient
+
 if TYPE_CHECKING:
     from .electrumx import ElectrumXClient
 
@@ -276,8 +278,26 @@ class RxinDexerClient:
     # ─────────────────────────────────────────── transport ──
 
     async def _call(self, method: str, params: list) -> Any:
-        """Shared call wrapper — converts transport errors to RxinDexerError."""
+        """Shared call wrapper — converts transport errors to RxinDexerError.
+
+        EVERY METHOD ON THIS CLASS IS A READ, so every one is declared idempotent to a
+        :class:`~pyrxd.network.failover.FailoverElectrumXClient`. Without that, the failover
+        client's default for extensions ("do not retry") made the first server it tried final
+        — and of the two shipped mainnet servers only the second,
+        ``electrumx.radiantcore.org``, runs the RXinDexer extension. The first answers
+        ``-32601``, and that answer went no further: measured 2026-09-24, ``glyph inspect
+        --fetch --verify-wave`` and ``verify --verify-wave`` both failed with the default
+        config. Idempotent, the read moves on to the server that has the extension. The set of
+        methods, and the upstream review that each is a read, is pinned by
+        ``tests/test_indexer_reads_fail_over.py``: adding a method here fails that test until
+        someone has decided whether the new one is a read too.
+
+        A plain :class:`~pyrxd.network.electrumx.ElectrumXClient` (no request-level failover)
+        and duck-typed clients are called exactly as before, without the keyword.
+        """
         try:
+            if isinstance(self.client, FailoverElectrumXClient):
+                return await self.client.call_extension(method, params, idempotent=True)
             return await self.client.call_extension(method, params)
         except Exception as exc:
             raise RxinDexerError(f"{method}({params!r}) failed: {exc}") from exc
