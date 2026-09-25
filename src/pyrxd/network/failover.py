@@ -511,7 +511,10 @@ class FailoverElectrumXClient:
                 raise  # a substituted server must never be silently routed around
             except NetworkError as exc:
                 last_exc = exc
-                if skip_unsupported and reached_op and isinstance(exc, RpcMethodNotFound):
+                # `retryable` is re-checked here rather than trusted from the one caller that
+                # sets both flags together: skipping a server is only safe for a call that may
+                # be sent to the next one.
+                if skip_unsupported and retryable and reached_op and isinstance(exc, RpcMethodNotFound):
                     unsupported += 1
                     logger.info("%s is not implemented by %s; next endpoint", description, endpoint.url)
                     continue
