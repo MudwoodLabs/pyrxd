@@ -39,14 +39,15 @@ import json
 import shlex
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import click
 
 from ..constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES, Network
 from ..fee_models import SatoshisPerKilobyte
+from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, assert_fee_rate_clears_relay_floor, relay_floor_photons_per_byte
 from ..glyph.builder import (
     AirdropFunding,
     AirdropRecipient,
@@ -57,7 +58,6 @@ from ..glyph.builder import (
     FtUtxo,
     GlyphBuilder,
     RevealParams,
-    RevealScripts,
 )
 from ..glyph.client import BroadcastEchoMismatch, _confirmed_txid
 from ..glyph.dmint import (
@@ -81,11 +81,13 @@ from ..glyph.dmint.miner import _unmintable_reason
 from ..glyph.dmint.types import check_dmint_v1_bounds, check_v2_numeric_bounds
 from ..glyph.fees import (
     RevealFeeEstimate,
+    assert_reveal_balances,
     check_reveal_funding,
     commit_value_for_reveal,
     estimate_reveal_fee_for_metadata,
-    measure_reveal_fee,
 )
+from ..glyph.mint import JsonFilePendingStore, PendingMint
+from ..glyph.payload import encode_payload
 from ..glyph.scanner import GlyphScanner
 from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdrop
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
@@ -95,6 +97,14 @@ from ..glyph.transfer import ft_funding as lib_ft_funding
 from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
 from ..glyph.transfer import single_ft_signing_key as lib_single_ft_signing_key
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
+from ..glyph.wave_rules import (
+    FEE_DECLINED,
+    WAVE_TREASURY_ADDRESS,
+    WaveRegistrationFee,
+    format_rxd,
+    wave_registered_label,
+    wave_registration_fee_for,
+)
 from ..hd.wallet import HdWallet
 from ..network.confirm import (
     DEFAULT_CONFIRMATION_TIMEOUT_S,
@@ -119,9 +129,10 @@ from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
 from ..utils import validate_address
+from .config import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_PATH
 from .context import CliContext
-from .errors import NetworkBoundaryError, UserError
-from .format import emit, emit_table
+from .errors import CliError, NetworkBoundaryError, UserError
+from .format import emit, emit_table, format_photons
 from .glyph_estimate import MiningDeadline, _MiningReporter, dmint_estimate_cmd
 from .glyph_helpers import (
     _TEMPLATE_TYPES,
@@ -140,7 +151,7 @@ from .glyph_inspect import inspect_cmd
 from .prompts import _load_wallet
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from ..glyph.dmint import DmintMintResult, PowPreimageResult
     from ..keys import PrivateKey
@@ -155,6 +166,13 @@ if TYPE_CHECKING:
 @click.group(name="glyph")
 def glyph_group() -> None:
     """Mint, transfer, and inspect Glyph tokens."""
+
+
+_UNVERIFIED_FLAG_HELP = (
+    "Go ahead when no indexer can say whether the WAVE name is free. If the name is already "
+    "registered, the reveal is a duplicate claim the indexer does not register, and the "
+    "registration fee buys NOTHING."
+)
 
 
 @glyph_group.command(name="init-metadata")
@@ -206,14 +224,53 @@ def init_metadata_cmd(ctx: CliContext, kind: str, out_path: Path | None) -> None
     default=False,
     help="Prompt for the BIP39 passphrase used at wallet creation.",
 )
+@click.option(
+    "--wave-registration-fee/--no-wave-registration-fee",
+    "pay_wave_fee",
+    default=True,
+    show_default=True,
+    help=(
+        "When the metadata registers a WAVE name, pay the protocol's registration fee to the WAVE "
+        "treasury in the reveal (100/50/10/5 RXD for a 3/4/5/6+ character name). "
+        "--no-wave-registration-fee registers the name without paying: the published protocol "
+        "expects the fee, the indexer does not check it at registration (so the name still "
+        "resolves), and renewing the name requires paying its price to the treasury."
+    ),
+)
+@click.option(
+    "--wave-treasury",
+    "wave_treasury",
+    default=None,
+    metavar="ADDRESS",
+    help=(
+        "Pay the WAVE registration fee to this address instead of the published mainnet treasury. "
+        "Required to pay the fee on testnet or regtest, where no treasury is published."
+    ),
+)
+@click.option("--allow-unverified-wave-name", "allow_unverified_wave_name", is_flag=True, help=_UNVERIFIED_FLAG_HELP)
 @click.pass_obj
-def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None:
+def mint_nft_cmd(
+    ctx: CliContext,
+    metadata_file: Path,
+    passphrase: bool,
+    pay_wave_fee: bool,
+    wave_treasury: str | None,
+    allow_unverified_wave_name: bool,
+) -> None:
     """Mint a Glyph NFT via two-phase commit + reveal.
 
     Builds and broadcasts the commit transaction, polls for
     confirmation, then builds and broadcasts the reveal. Both txs
     require a separate confirmation in human mode (or a single
-    --yes for both in scripted mode).
+    --yes for both in scripted mode). A record of the commit is saved
+    before it is broadcast; if the reveal does not happen, every exit
+    says how to finish it with `glyph resume-mint`.
+
+    If the metadata registers a WAVE name, the name must be free (the
+    indexer is asked before the commit and again before the reveal), and
+    the reveal pays the WAVE registration fee to the treasury from a
+    wallet input unless --no-wave-registration-fee is given. The
+    confirmation shows the amount, the treasury and the input.
     """
     metadata = _read_metadata_file(metadata_file)
     if GlyphProtocol.NFT not in metadata.protocol:
@@ -222,12 +279,28 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
             cause=f"got protocol={list(metadata.protocol)}",
             fix='set "protocol": ["NFT"] (or ["NFT", "MUT"], etc.) in the metadata file',
         )
+    if wave_treasury is not None:
+        if not pay_wave_fee:
+            raise UserError(
+                "--wave-treasury was given with --no-wave-registration-fee",
+                cause="nothing would be paid to the treasury named",
+                fix="drop one of the two",
+            )
+        _require_address_on_network(ctx, wave_treasury, what="--wave-treasury")
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
     async def _do_mint() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _mint_nft_inner(ctx, wallet, metadata, client)
+            return await _mint_nft_inner(
+                ctx,
+                wallet,
+                metadata,
+                client,
+                pay_registration_fee=pay_wave_fee,
+                registration_treasury=wave_treasury,
+                allow_unverified_wave_name=allow_unverified_wave_name,
+            )
 
     try:
         result = asyncio.run(_do_mint())
@@ -238,6 +311,10 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
             fix=f"check that {ctx.electrumx_url} is reachable",
         ) from exc
 
+    _echo_mint_result(ctx, result)
+
+
+def _echo_mint_result(ctx: CliContext, result: dict[str, Any]) -> None:
     if ctx.output_mode == "json":
         click.echo(emit(result, mode="json"))
     elif ctx.output_mode == "quiet":
@@ -247,6 +324,97 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
         click.echo(f"  commit txid: {result['commit_txid']}")
         click.echo(f"  reveal txid: {result['reveal_txid']}")
         click.echo(f"  glyph ref:   {result['ref']}")
+        wave = result.get("wave_registration")
+        if wave is not None:
+            fee = wave["fee"]
+            click.echo(
+                f"  WAVE fee:    {fee['rxd']} RXD to {fee['treasury']} (reveal vout {wave['fee_vout']}, "
+                f"paid from {wave['fee_input']})"
+                if fee is not None
+                else f"  WAVE fee:    NOT PAID for {wave['name']} (--no-wave-registration-fee)"
+            )
+
+
+@glyph_group.command(name="resume-mint")
+@click.argument("commit_txid", type=str)
+@click.option(
+    "--passphrase/--no-passphrase",
+    default=False,
+    help="Prompt for the BIP39 passphrase used at wallet creation.",
+)
+@click.option(
+    "--wave-registration-fee/--no-wave-registration-fee",
+    "pay_wave_fee",
+    default=None,
+    help=(
+        "Normally unnecessary: resume-mint does what the mint chose, which its record keeps. "
+        "--no-wave-registration-fee reveals without paying: the way to recover a commit whose name was "
+        "taken in the meantime (the reveal is then a duplicate claim the indexer does not register; the "
+        "carrier and the change come back to this wallet). A mint that declined the fee is never made to "
+        "pay here: --wave-registration-fee against such a record is refused."
+    ),
+)
+@click.option(
+    "--wave-treasury",
+    "wave_treasury",
+    default=None,
+    metavar="ADDRESS",
+    help="The treasury the mint named with --wave-treasury. Refused if it is not the one the record keeps.",
+)
+@click.option("--allow-unverified-wave-name", "allow_unverified_wave_name", is_flag=True, help=_UNVERIFIED_FLAG_HELP)
+@click.pass_obj
+def resume_mint_cmd(
+    ctx: CliContext,
+    commit_txid: str,
+    passphrase: bool,
+    pay_wave_fee: bool | None,
+    wave_treasury: str | None,
+    allow_unverified_wave_name: bool,
+) -> None:
+    """Reveal a commit `glyph mint-nft` broadcast but did not reveal.
+
+    Reads the record mint-nft saved before broadcasting the commit, checks it against this
+    wallet and the chain, waits for the commit to confirm, and builds, checks and (after
+    confirmation) broadcasts its reveal. For a WAVE name it does what the mint chose: it
+    pays the fee from a plain wallet input only if the mint paid it and the name is still
+    free. The record is deleted once the reveal confirms.
+    """
+    try:
+        Txid(commit_txid)
+    except ValidationError as exc:
+        raise UserError("not a transaction id", cause=str(exc)) from exc
+    if wave_treasury is not None:
+        if pay_wave_fee is False:
+            raise UserError(
+                "--wave-treasury was given with --no-wave-registration-fee",
+                cause="nothing would be paid to the treasury named",
+                fix="drop one of the two",
+            )
+        _require_address_on_network(ctx, wave_treasury, what="--wave-treasury")
+    wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+
+    async def _do() -> dict[str, Any]:
+        client = ctx.make_client()
+        async with client:
+            return await _resume_mint_inner(
+                ctx,
+                wallet,
+                client,
+                commit_txid,
+                pay_registration_fee=pay_wave_fee,
+                registration_treasury=wave_treasury,
+                allow_unverified_wave_name=allow_unverified_wave_name,
+            )
+
+    try:
+        result = asyncio.run(_do())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable, then run resume-mint again",
+        ) from exc
+    _echo_mint_result(ctx, result)
 
 
 # Commit sizing now lives in ``pyrxd.glyph.fees`` — the library-side mint facade
@@ -264,12 +432,23 @@ _commit_value_for_reveal = commit_value_for_reveal
 _PLACEHOLDER_COMMIT_TXID = "00" * 32
 
 
+def _fee_statement(
+    fee: WaveRegistrationFee | None, registered_label: str | None
+) -> WaveRegistrationFee | Literal["declined"] | None:
+    """What a reveal says it pays for a WAVE name, in :func:`~pyrxd.glyph.fees.measure_reveal_fee`'s terms."""
+    if fee is not None:
+        return fee
+    return FEE_DECLINED if registered_label is not None else None
+
+
 def _assert_reveal_is_fundable(
     commit_value: int,
     carrier_value: int,
     reveal_tx: Transaction,
     fee_rate: int,
     cbor_bytes_len: int,
+    *,
+    registration_fee: WaveRegistrationFee | Literal["declined"] | None,
 ) -> RevealFeeEstimate:
     """Fail the mint *before* the commit is broadcast if the reveal cannot pay its fee.
 
@@ -282,12 +461,21 @@ def _assert_reveal_is_fundable(
     fires if the estimator's shim (its prefix constant, its locking-script sizes, its
     assumed output set) has stopped describing the transaction the CLI actually builds.
 
+    Two checks. The commit alone must cover the carrier and the reveal's whole miner fee
+    (:func:`~pyrxd.glyph.fees.check_reveal_funding`), as it always has. And the reveal as a
+    whole must balance (:func:`~pyrxd.glyph.fees.assert_reveal_balances`): exactly one
+    output pays the WAVE treasury exactly the tier value when a fee is paid, the inputs —
+    the commit, plus the wallet input that funds the fee — cover every output and the
+    miner fee, and the change output survives.
+
     Returns the measured estimate so the caller can display the real number. Raises
     :class:`UserError` naming the shortfall while the money is still in the wallet,
     instead of leaving a rejected reveal and a commit output nothing can spend.
     """
-    measured = measure_reveal_fee(reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len)
     try:
+        measured = assert_reveal_balances(
+            reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len, registration_fee=registration_fee
+        )
         check_reveal_funding(commit_value=commit_value, carrier_value=carrier_value, estimate=measured)
     except InsufficientFundsError as exc:
         raise UserError(
@@ -295,7 +483,28 @@ def _assert_reveal_is_fundable(
             cause=str(exc),
             fix=("shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate"),
         ) from exc
+    except ValidationError as exc:
+        raise UserError(
+            "the reveal this mint would broadcast is wrong — refusing to broadcast the commit", cause=str(exc)
+        ) from exc
     return measured
+
+
+@dataclass(frozen=True)
+class _FeeFunding:
+    """The plain wallet UTXO a reveal that registers a WAVE name spends to pay the fee.
+
+    ``mint-nft`` uses its own commit's change (Photonic's shape; mainnet claim ``f644794b…``'s
+    third input is its commit's vout 2). ``resume-mint`` picks one from the wallet with
+    :func:`~pyrxd.glyph.transfer.find_plain_rxd_utxo`, which checks the on-chain script is a
+    bare P2PKH, so a token UTXO is never spent as the fee.
+    """
+
+    txid: str
+    vout: int
+    value: int
+    address: str
+    key: PrivateKey
 
 
 def _build_reveal_tx(
@@ -308,13 +517,25 @@ def _build_reveal_tx(
     change_locking: Script,
     funding_key: PrivateKey,
     scriptsig_suffix: bytes,
+    registration_fee: WaveRegistrationFee | None,
+    fee_funding: _FeeFunding | None = None,
 ) -> Transaction:
     """Build (unsigned, un-fee'd) the reveal that spends the commit output.
 
     Shared by the pre-broadcast dry run and the real post-confirmation build so the two
     cannot diverge — a dry run that measured a *different* transaction would be worth no
     more than the tautology it replaced.
+
+    With a WAVE ``registration_fee`` (pass the builder result's ``registration_fee_output``)
+    the reveal takes a second input, ``fee_funding``, a plain wallet UTXO, and puts the fee
+    at vout 1, right after the token and before change: the order Photonic's ``mintToken``
+    uses (token outputs, then the extra outputs, then change; see
+    :mod:`pyrxd.glyph.wave_rules`). Photonic's WAVE reveal also carries the mutable contract,
+    so its fee lands at vout 2; this reveal has no contract output. The commit is never the
+    fee's source: what the fee input holds beyond the fee comes back as change.
     """
+    if (registration_fee is None) != (fee_funding is None):
+        raise ValueError("a WAVE registration fee and the wallet input that funds it go together")
     shim_commit_out = TransactionOutput(Script(commit_script), commit_value)
     src_commit_tx = Transaction(tx_inputs=[], tx_outputs=[shim_commit_out])
     src_commit_tx.txid = lambda: commit_txid  # type: ignore[method-assign]
@@ -326,17 +547,528 @@ def _build_reveal_tx(
     )
     reveal_input.satoshis = commit_value
     reveal_input.locking_script = Script(commit_script)
+    inputs = [reveal_input]
+
+    fee_outputs: list[TransactionOutput] = []
+    if registration_fee is not None and fee_funding is not None:
+        spk = P2PKH().lock(fee_funding.address)
+        src_outs = [TransactionOutput(Script(b""), 0) for _ in range(fee_funding.vout)]
+        src_outs.append(TransactionOutput(spk, fee_funding.value))
+        src_fee_tx = Transaction(tx_inputs=[], tx_outputs=src_outs)
+        src_fee_tx.txid = lambda: fee_funding.txid  # type: ignore[method-assign]
+        fee_input = TransactionInput(
+            source_transaction=src_fee_tx,
+            source_txid=fee_funding.txid,
+            source_output_index=fee_funding.vout,
+            unlocking_script_template=P2PKH().unlock(fee_funding.key),
+        )
+        fee_input.satoshis = fee_funding.value
+        fee_input.locking_script = spk
+        inputs.append(fee_input)
+        fee_outputs.append(TransactionOutput(Script(registration_fee.locking_script), registration_fee.value))
 
     # The token sits on vout[0] (a dust carrier for an NFT, the whole supply for an FT
-    # premine); the rest of the commit value returns as change (fee() sized from the real
+    # premine); the rest of the inputs returns as change (fee() sized from the real
     # length) instead of being burned to fee.
     return Transaction(
-        tx_inputs=[reveal_input],
+        tx_inputs=inputs,
         tx_outputs=[
             TransactionOutput(Script(reveal_locking_script), carrier_value),
+            *fee_outputs,
             TransactionOutput(change_locking, 0, change=True),
         ],
     )
+
+
+#: Where ``_build_reveal_tx`` puts a WAVE registration fee: right after the token.
+_REVEAL_FEE_VOUT = 1
+
+
+def _wave_registration_summary(
+    label: str | None,
+    fee: WaveRegistrationFee | None,
+    *,
+    name_status: str | None,
+    fee_funding: _FeeFunding | None,
+) -> list[_BroadcastSummary]:
+    """The confirmation section for a mint that registers a WAVE name; nothing otherwise."""
+    if label is None:
+        return []
+    lines = [f"name:          {label}.rxd", f"available:     {name_status or 'not checked'}"]
+    if fee is None:
+        lines += [
+            "fee:           NOT PAID (--no-wave-registration-fee)",
+            "               The published WAVE protocol expects this fee. The indexer does not",
+            "               check it at registration, so the name still resolves if it is free;",
+            "               renewing it requires paying the name's price to the WAVE treasury.",
+        ]
+    else:
+        lines += [
+            f"fee:           {format_photons(fee.value)}",
+            f"treasury:      {fee.treasury_address}"
+            + ("" if fee.is_published_treasury else "  (NOT the published WAVE treasury)"),
+            f"paid:          in the reveal, vout {_REVEAL_FEE_VOUT}, from a wallet input (not the commit)",
+        ]
+        if fee_funding is not None:
+            lines.append(
+                f"fee input:     {fee_funding.txid[:16]}…:{fee_funding.vout}  {fee_funding.value:,} photons "
+                f"({fee_funding.address}; the rest comes back as change)"
+            )
+    return [_BroadcastSummary(title="WAVE registration fee", lines=lines)]
+
+
+# ---------------------------------------------------------------------------
+# WAVE name availability
+# ---------------------------------------------------------------------------
+
+
+async def _wave_name_available(client: ElectrumXClient, label: str) -> bool | None:
+    """The indexer's answer to "is ``label`` free?", or ``None`` if no server could answer.
+
+    :meth:`~pyrxd.glyph.wave.WaveResolver.check_available`, which fails over to a server
+    running the RXinDexer extension (#730) and raises rather than guessing on any answer that
+    is not a definite ``available`` boolean. Every such failure is ``None`` here: unknown.
+    """
+    from ..glyph.wave import WaveResolver
+    from ..network.rxindexer import RxinDexerError
+
+    try:
+        return await WaveResolver(client).check_available(label)
+    except (RxinDexerError, NetworkError):
+        return None
+
+
+async def _require_wave_name_free_before_commit(client: ElectrumXClient, label: str, *, allow_unverified: bool) -> str:
+    """Refuse to commit a claim for a name that is taken, or that no indexer vouches for."""
+    available = await _wave_name_available(client, label)
+    if available is False:
+        raise UserError(
+            f"the WAVE name {label}.rxd is already registered",
+            cause="the indexer (wave.check_available) reports it taken; a claim for it would be a duplicate",
+            fix="choose another name. Nothing was broadcast.",
+        )
+    if available is None:
+        if not allow_unverified:
+            raise UserError(
+                f"could not confirm the WAVE name {label}.rxd is available",
+                cause="no configured server answered wave.check_available",
+                fix=(
+                    "retry when an RXinDexer server answers, or pass --allow-unverified-wave-name to mint "
+                    "anyway: if the name is already registered, the registration fee buys nothing. "
+                    "Nothing was broadcast."
+                ),
+            )
+        return "NOT VERIFIED (--allow-unverified-wave-name): if it is taken, the fee buys nothing"
+    return "yes (the indexer says it is free)"
+
+
+class _RevealRefused(UserError):
+    """A refusal after the commit is broadcast and before the reveal is: nothing more is spent.
+
+    Carries no ``fix`` of its own; :func:`_after_commit` supplies the commit's recovery.
+    """
+
+
+class _NothingToRecover(UserError):
+    """An exit after the commit that has nothing left to recover (the commit is already spent).
+
+    :func:`_after_commit` passes it through as it is, rather than pointing at a recovery that
+    would find nothing.
+    """
+
+
+class _RecordRefused(UserError):
+    """The commit's record cannot be trusted to sign with (a fee rate out of bounds, a value
+    the chain does not agree with). Carries its own fix; passed through as it is, because the
+    usual recovery — run resume-mint — would read the same record and refuse again."""
+
+
+class _Inconclusive(NetworkBoundaryError):
+    """The server's answers do not say whether the commit is spent. The record is KEPT, and the
+    error carries its own fix; passed through as it is."""
+
+
+async def _require_wave_name_free_before_reveal(client: ElectrumXClient, label: str, *, allow_unverified: bool) -> str:
+    """The same check, after the commit: a refusal here pays nothing and loses nothing."""
+    available = await _wave_name_available(client, label)
+    if available is False:
+        raise _RevealRefused(
+            f"the WAVE name {label}.rxd is registered now — NOT paying the registration fee",
+            cause=(
+                "the indexer (wave.check_available) reports the name taken, so this claim would be a "
+                "duplicate it does not register; the fee would buy nothing"
+            ),
+        )
+    if available is None:
+        if not allow_unverified:
+            raise _RevealRefused(
+                f"could not confirm the WAVE name {label}.rxd is still available — NOT paying the registration fee",
+                cause="no configured server answered wave.check_available",
+            )
+        return "NOT VERIFIED (--allow-unverified-wave-name): if it is taken, the fee buys nothing"
+    return "yes (the indexer says it is free)"
+
+
+# ---------------------------------------------------------------------------
+# The commit's record, and what every exit after the commit says
+# ---------------------------------------------------------------------------
+
+
+def _pending_store(ctx: CliContext) -> JsonFilePendingStore:
+    """Where ``mint-nft`` keeps the record that lets a broadcast commit be revealed later.
+
+    Beside the wallet file (``~/.pyrxd/pending-mints`` for the default wallet), owner-only.
+    """
+    wallet_path = Path(ctx.wallet_path).expanduser()
+    base = wallet_path.parent if str(wallet_path) not in ("", ".") else DEFAULT_CONFIG_DIR
+    return JsonFilePendingStore(base / "pending-mints")
+
+
+@dataclass
+class _Progress:
+    """What has happened since the commit was broadcast, so an exit says what is true."""
+
+    #: Set once the reveal is broadcast. From then on the record is kept until it confirms.
+    reveal_txid: str | None = None
+
+
+def _resume_command(ctx: CliContext, pending: PendingMint, *, decline: bool = False) -> str:
+    """The exact command that finishes ``pending``, with the options it needs to find it.
+
+    The global options come first because the record lives beside the wallet file and the
+    commit on one network: a bare ``pyrxd glyph resume-mint <txid>`` run with a different
+    ``--wallet`` or ``--network`` looks in the wrong place. And the mint's WAVE fee choice is
+    repeated, so the printed command is exactly what the mint agreed to: a declined fee stays
+    declined, a named treasury stays named.
+    """
+    args = ["pyrxd"]
+    source = ctx.config.source_path
+    if source is not None and Path(source) != DEFAULT_CONFIG_PATH:
+        args += ["--config", str(source)]
+    args += ["--network", ctx.network, "--wallet", str(Path(ctx.wallet_path).expanduser().absolute())]
+    args += ["glyph", "resume-mint", pending.commit_txid]
+    if decline or pending.wave_fee == "decline":
+        args.append("--no-wave-registration-fee")
+    elif pending.wave_treasury is not None:
+        args += ["--wave-treasury", pending.wave_treasury]
+    return shlex.join(args)
+
+
+def _commit_recovery(ctx: CliContext, pending: PendingMint, store_dir: Path, progress: _Progress) -> str:
+    """How to recover a commit that has been broadcast and not revealed. Never just "re-run"."""
+    txid = pending.commit_txid
+    registered_label = wave_registered_label(pending.cbor_bytes)
+    resume = _resume_command(ctx, pending)
+    if progress.reveal_txid is not None:
+        return (
+            f"The reveal {progress.reveal_txid} of the commit {txid}:{pending.commit_vout} was broadcast and has not "
+            f"been seen to confirm. The commit's record is kept in {store_dir} until it does. Do not re-run the mint "
+            f"command. Run `{resume}`: it finds the reveal, waits for it to confirm and deletes the record — or, "
+            "if the reveal was dropped from the mempool, reveals the commit again."
+        )
+    lines = [
+        f"The commit {txid}:{pending.commit_vout} was broadcast and holds {pending.commit_value:,} photons "
+        f"({pending.carrier_value:,} for the NFT carrier; the rest pays the reveal's miner fee and comes back "
+        f"as change). Only a reveal of its exact envelope can spend it, and its record is saved in {store_dir}.",
+        f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run `{resume}`.",
+    ]
+    if registered_label is not None and pending.wave_fee == "decline":
+        lines.append(
+            f"This mint declined the WAVE registration fee for {registered_label}.rxd, and that command keeps "
+            "that choice: it reveals without paying."
+        )
+    elif registered_label is not None:
+        lines.append(
+            f"resume-mint checks {registered_label}.rxd is still free and pays the registration fee from a "
+            f"wallet input only if it is. If the name is taken, reveal without the fee: "
+            f"`{_resume_command(ctx, pending, decline=True)}` — the reveal is then a duplicate claim the "
+            f"indexer does not register, and the carrier and the change come back to this wallet."
+        )
+    lines.append(
+        "If the commit never confirms and leaves the mempool, its inputs were never spent and the record can "
+        "be deleted."
+    )
+    return " ".join(lines)
+
+
+def _json_recovery_document(
+    ctx: CliContext,
+    pending: PendingMint,
+    store_dir: Path,
+    progress: _Progress,
+    *,
+    status: str = "commit_broadcast_reveal_not_done",
+) -> dict[str, Any]:
+    registered_label = wave_registered_label(pending.cbor_bytes)
+    return {
+        "status": "reveal_broadcast_not_confirmed" if progress.reveal_txid is not None else status,
+        "commit_txid": pending.commit_txid,
+        "commit_vout": pending.commit_vout,
+        "commit_value": pending.commit_value,
+        "reveal_txid": progress.reveal_txid,
+        "pending_record": str(store_dir / f"{pending.commit_txid}.json"),
+        "wave_name": None if registered_label is None else f"{registered_label}.rxd",
+        "wave_fee": pending.wave_fee,
+        "recover": _resume_command(ctx, pending),
+        "recover_without_wave_fee": (
+            _resume_command(ctx, pending, decline=True) if pending.wave_fee == "pay" else None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The reveal, shared by mint-nft and resume-mint
+# ---------------------------------------------------------------------------
+
+
+async def _utxo_is_unspent(client: ElectrumXClient, funding: _FeeFunding) -> bool:
+    """Whether ``funding`` is still in its address's unspent set, as the server reports it."""
+    from ..network.electrumx import script_hash_for_address
+
+    utxos = await client.get_utxos(script_hash_for_address(funding.address))
+    return any(u.tx_hash == funding.txid and u.tx_pos == funding.vout for u in utxos)
+
+
+def _reveal_fee_rate(pending: PendingMint, store_dir: Path) -> int:
+    """The record's fee rate, judged from both ends before it is spent (M1).
+
+    A record's ``fee_rate`` is read off disk, and ``mint-nft`` only ever writes the configured
+    rate, which :func:`~pyrxd.cli.config.validated_fee_rate` has held to the relay floor and
+    the 10x ceiling. Anything else was edited or written by other code, and signing at it is
+    how a record carrying ``10_000_000`` (the per-kB constant) paid 58 RXD to miners. The same
+    bounds :class:`~pyrxd.glyph.mint.GlyphMinter` applies to its records.
+    """
+    try:
+        return assert_fee_rate_clears_relay_floor(pending.fee_rate, what="glyph reveal", error_type=ValidationError)
+    except ValidationError as exc:
+        floor = relay_floor_photons_per_byte()
+        raise _RecordRefused(
+            f"the commit's record asks for a reveal fee rate of {pending.fee_rate:,} photons/byte — refusing "
+            "to sign at it",
+            cause=(
+                f"Radiant relays at {floor:,} photons/byte, and resume-mint signs at no more than "
+                f"{floor * MAX_FEE_OVERPAY_MULTIPLE:,} ({MAX_FEE_OVERPAY_MULTIPLE}x): below the floor the reveal "
+                "would not relay, above the ceiling it would overpay with no way to recover the difference"
+            ),
+            fix=(
+                f"glyph mint-nft writes the configured fee_rate, so the fee_rate in "
+                f"{store_dir / (pending.commit_txid + '.json')} was changed after the mint. Put back the rate "
+                "the mint used (the fee_rate in your config; 10000 by default). Nothing was broadcast."
+            ),
+        ) from exc
+
+
+async def _reveal_committed(
+    ctx: CliContext,
+    client: ElectrumXClient,
+    pending: PendingMint,
+    *,
+    key: PrivateKey,
+    pay_registration_fee: bool,
+    registration_treasury: str | None,
+    allow_unverified_wave_name: bool,
+    fee_funding: _FeeFunding | None,
+    store: JsonFilePendingStore,
+    progress: _Progress,
+) -> dict[str, Any]:
+    """Reveal a CONFIRMED commit. Every refusal here happens before anything is broadcast.
+
+    The record's fee rate is judged first (:func:`_reveal_fee_rate`). For a claim that
+    registers a WAVE name and pays for it: the name must still be free (checked again now,
+    since the commit), and the wallet input that funds the fee must still be unspent. The
+    built reveal is gated before signing, and again after, and only then shown for
+    confirmation and broadcast. The commit's record is deleted only once the reveal CONFIRMS:
+    a mempool accept is not a block, and a reveal that is dropped needs the record to be
+    rebuilt (the same reasoning as :class:`~pyrxd.glyph.mint.GlyphMinter`).
+    """
+    fee_rate = _reveal_fee_rate(pending, store.directory)
+    builder = GlyphBuilder()
+    scripts = builder.prepare_reveal(
+        RevealParams(
+            commit_txid=pending.commit_txid,
+            commit_vout=pending.commit_vout,
+            commit_value=pending.commit_value,
+            cbor_bytes=pending.cbor_bytes,
+            owner_pkh=Hex20(pending.owner_pkh),
+            is_nft=pending.is_nft,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
+        )
+    )
+    fee = scripts.registration_fee_output
+    registered_label = wave_registered_label(pending.cbor_bytes)
+    name_status: str | None = None
+    if fee is not None:
+        name_status = await _require_wave_name_free_before_reveal(
+            client, fee.label, allow_unverified=allow_unverified_wave_name
+        )
+        if fee_funding is None:
+            raise _RevealRefused(
+                f"no plain-RXD wallet UTXO holds the {format_rxd(fee.value)} WAVE registration fee for {fee.label}.rxd",
+                cause="the fee is paid from a wallet input, never from the commit",
+            )
+        if not await _utxo_is_unspent(client, fee_funding):
+            raise _RevealRefused(
+                f"the wallet UTXO chosen to pay the WAVE fee ({fee_funding.txid}:{fee_funding.vout}) is spent or "
+                "not visible — NOT paying",
+                cause="the server no longer lists it as unspent for its address",
+            )
+    change_locking = P2PKH().lock(pending.funding_address)
+    reveal_tx = _build_reveal_tx(
+        commit_txid=pending.commit_txid,
+        commit_value=pending.commit_value,
+        commit_script=pending.commit_script,
+        reveal_locking_script=scripts.locking_script,  # type: ignore[arg-type]
+        carrier_value=pending.carrier_value,
+        change_locking=change_locking,
+        funding_key=key,
+        scriptsig_suffix=scripts.scriptsig_suffix,
+        registration_fee=fee,
+        fee_funding=fee_funding if fee is not None else None,
+    )
+    statement = _fee_statement(fee, registered_label)
+    try:
+        measured = assert_reveal_balances(
+            reveal_tx, fee_rate=fee_rate, cbor_bytes_len=len(pending.cbor_bytes), registration_fee=statement
+        )
+    except (InsufficientFundsError, ValidationError) as exc:
+        raise _RevealRefused(
+            "the reveal does not balance — NOT broadcasting it",
+            cause=str(exc),
+            fix=(
+                "resume-mint builds the same reveal from the same record, so first fix what the cause names: fund "
+                "the wallet if its input is short, or, if the record's fee_rate was changed after the mint, put "
+                "back the rate the mint used"
+            ),
+        ) from exc
+    reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
+    if not any(o.change for o in reveal_tx.outputs):
+        raise _RevealRefused("the reveal lost its change output when fee'd — NOT broadcasting it")
+    reveal_tx.sign()
+    try:
+        assert_reveal_balances(
+            reveal_tx, fee_rate=fee_rate, cbor_bytes_len=len(pending.cbor_bytes), registration_fee=statement
+        )
+    except (InsufficientFundsError, ValidationError) as exc:
+        raise _RevealRefused("the signed reveal does not pay its way — NOT broadcasting it", cause=str(exc)) from exc
+    reveal_hex = reveal_tx.serialize()
+
+    change_value = sum(o.satoshis for o in reveal_tx.outputs if o.change)
+    reveal_lines = [
+        f"commit:        {pending.commit_txid}:{pending.commit_vout}  ({pending.commit_value:,} photons)",
+        f"nft to:        {Hex20(pending.owner_pkh).hex()}  ({pending.carrier_value:,}-photon carrier)",
+    ]
+    if fee is not None and fee_funding is not None:
+        reveal_lines += [
+            f"fee input:     {fee_funding.txid}:{fee_funding.vout}  ({fee_funding.value:,} photons, {fee_funding.address})",
+            f"WAVE fee:      {fee.describe()} (vout {_REVEAL_FEE_VOUT})",
+            f"name free:     {name_status}",
+        ]
+    elif registered_label is not None:
+        reveal_lines.append(f"WAVE fee:      NOT PAID for {registered_label}.rxd (--no-wave-registration-fee)")
+    reveal_lines += [
+        f"miner fee:     {reveal_tx.get_fee():,} photons ({len(reveal_hex):,} B @ {fee_rate:,}/B, from the commit)",
+        f"change:        {change_value:,} photons back to {pending.funding_address}",
+    ]
+    try:
+        _confirm_or_abort(ctx, [_BroadcastSummary(title="Reveal transaction", lines=reveal_lines)])
+    except UserError as exc:
+        # Its own fix says "re-run with the inputs you want", which after a commit would spend
+        # again. The reveal was not broadcast; the recovery names the commit.
+        raise _RevealRefused(f"the reveal was not broadcast: {exc.message}", cause=exc.cause) from exc
+    _echoed_reveal = await client.broadcast(reveal_hex)
+    reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
+    progress.reveal_txid = str(reveal_txid)
+    if ctx.output_mode == "human":
+        click.echo(f"\nreveal broadcast: {reveal_txid}")
+        click.echo("waiting for it to confirm before deleting the commit's record...")
+    await _await_reveal(ctx, client, str(reveal_txid))
+    store.delete(pending.commit_txid)
+    # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
+    # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
+    # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
+    # back — so it is what `transfer-nft` / `transfer-ft` match on.
+    ref = GlyphRef(txid=Txid(pending.commit_txid), vout=pending.commit_vout)
+    result: dict[str, object] = {
+        "commit_txid": pending.commit_txid,
+        "reveal_txid": str(reveal_txid),
+        "ref": f"{ref.txid}:{ref.vout}",
+        "owner_address": pending.funding_address,
+        "reveal_fee": measured.fee,
+    }
+    if registered_label is not None:
+        result["wave_registration"] = {
+            "name": f"{registered_label}.rxd",
+            "fee_paid": fee is not None,
+            "fee": None if fee is None else fee.to_dict(),
+            "fee_vout": None if fee is None else _REVEAL_FEE_VOUT,
+            "fee_input": None if fee_funding is None or fee is None else f"{fee_funding.txid}:{fee_funding.vout}",
+            "name_available": name_status,
+        }
+    return result
+
+
+async def _await_reveal(ctx: CliContext, client: ElectrumXClient, reveal_txid: str) -> None:
+    """Wait for a broadcast reveal to confirm; a timeout says the reveal, not the commit, is pending."""
+    try:
+        await wait_for_confirmation(client, reveal_txid, interval_s=_poll_interval_for(ctx))
+    except ConfirmationTimeoutError as exc:
+        raise NetworkBoundaryError(
+            f"the reveal {reveal_txid} was broadcast and has not confirmed yet", cause=str(exc)
+        ) from exc
+
+
+async def _after_commit(
+    ctx: CliContext,
+    pending: PendingMint,
+    store: JsonFilePendingStore,
+    step: Callable[[_Progress], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Run everything after the commit broadcast so that EVERY exit names the commit and its recovery.
+
+    A refusal or an error keeps its exit code and gains the commit's txid, value, record and
+    recovery commands (and in ``--json`` mode the same, as a JSON document on stdout, since
+    errors go to stderr). Anything else — a crash, Ctrl-C — prints the recovery to stderr
+    before propagating. The record was saved before the commit was broadcast, so it survives
+    all of them. The recovery is worked out when the exit happens, so once the reveal is
+    broadcast it says so instead of offering to reveal again.
+    """
+    progress = _Progress()
+
+    def _recovery() -> str:
+        return _commit_recovery(ctx, pending, store.directory, progress)
+
+    def _document() -> None:
+        if ctx.output_mode == "json":
+            click.echo(emit(_json_recovery_document(ctx, pending, store.directory, progress), mode="json"))
+
+    try:
+        return await step(progress)
+    except (_NothingToRecover, _RecordRefused):
+        raise
+    except _Inconclusive:
+        _document()
+        raise
+    except CliError as exc:
+        _document()
+        # Keep what the error itself advises (a timeout's "it may still confirm", a mismatched
+        # echo's "check it on an explorer"), then the recovery. A refusal has no advice of its own.
+        exc.fix = _recovery() if not exc.fix else f"{exc.fix} — {_recovery()}"
+        raise
+    except PolicyRejection as exc:
+        # The node answered, and said no: nothing was spent by the reveal it refused.
+        _document()
+        raise NetworkBoundaryError(
+            "the node rejected the reveal transaction — nothing was spent by it", cause=str(exc), fix=_recovery()
+        ) from exc
+    except NetworkError as exc:
+        _document()
+        raise NetworkBoundaryError(
+            "a server stopped answering after the commit was broadcast", cause=str(exc), fix=_recovery()
+        ) from exc
+    except BaseException:
+        click.echo(f"\ninterrupted after the commit was broadcast. {_recovery()}", err=True)
+        raise
 
 
 async def _mint_nft_inner(
@@ -344,8 +1076,55 @@ async def _mint_nft_inner(
     wallet: HdWallet,
     metadata: GlyphMetadata,
     client: ElectrumXClient,
+    *,
+    pay_registration_fee: bool = True,
+    registration_treasury: str | None = None,
+    allow_unverified_wave_name: bool = False,
 ) -> dict:
-    """Heavy lifting for `glyph mint-nft`. Returns a result dict."""
+    """Heavy lifting for `glyph mint-nft`. Returns a result dict.
+
+    A metadata file that registers a WAVE name: the name must be free (asked of the indexer
+    before the commit, and again before the reveal), and the reveal pays the registration fee
+    from a wallet input — the commit's own change — unless ``pay_registration_fee`` is ``False``.
+    Nothing for the fee goes in the commit output.
+    """
+    fee_rate = ctx.fee_rate
+    # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
+    # scales with metadata size and is paid entirely out of the commit output. Size
+    # the commit from the real estimate instead of the old flat 5,000,000, which at
+    # 10,000 photons/byte only covered ~230 bytes of CBOR. For a WAVE registration the
+    # estimate also sizes the wallet input that funds the fee and the fee's output; the
+    # fee's VALUE is not the commit's. Worked out before the wallet is scanned, so a network
+    # with no treasury is refused before anything else happens.
+    try:
+        reveal_estimate = estimate_reveal_fee_for_metadata(
+            metadata,
+            fee_rate=fee_rate,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
+        )
+    except ValidationError as exc:
+        raise UserError("could not size the reveal", cause=str(exc)) from exc
+    registered_label = wave_registered_label(encode_payload(metadata)[0])
+    registration_fee = reveal_estimate.registration_fee
+    if registration_fee is not None and registration_treasury is None and ctx.network != Network.MAINNET.value:
+        raise UserError(
+            f"no WAVE treasury is published for {ctx.network}",
+            cause=(
+                f"this metadata registers {registered_label}.rxd, and the WAVE registration fee is paid by "
+                f"default; the only published treasury, {WAVE_TREASURY_ADDRESS}, is a mainnet address"
+            ),
+            fix=(
+                f"pass --wave-treasury <a {ctx.network} address> to pay one you choose, or "
+                "--no-wave-registration-fee to register without paying"
+            ),
+        )
+    name_status: str | None = None
+    if registered_label is not None:
+        name_status = await _require_wave_name_free_before_commit(
+            client, registered_label, allow_unverified=allow_unverified_wave_name
+        )
+
     # 1) Pick a funding UTXO.
     builder = GlyphBuilder()
     triples = await wallet.collect_spendable(client)
@@ -356,31 +1135,40 @@ async def _mint_nft_inner(
             fix="fund the wallet, or run `pyrxd balance --refresh` to discover used addresses",
         )
 
-    # Estimate funding requirement: commit value + commit fee + reveal fee buffer.
-    fee_rate = ctx.fee_rate
     # The NFT's carrier value on the reveal. Same number as
     # ``pyrxd.glyph.mint.NFT_CARRIER_VALUE``, which derives from the same constant.
     # It is a pyrxd convention, not a chain minimum: Radiant would carry the NFT on
     # 1 photon (`GetDustThreshold` returns 1) — dMint contracts do exactly that.
     carrier_value = DUST_THRESHOLD_PHOTONS
-    # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
-    # scales with metadata size and is paid entirely out of the commit output. Size
-    # the commit from the real estimate instead of the old flat 5,000,000, which at
-    # 10,000 photons/byte only covered ~230 bytes of CBOR.
-    reveal_estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=fee_rate)
     commit_value = _commit_value_for_reveal(carrier_value, reveal_estimate)
     commit_fee_estimate = 300 * fee_rate  # ~300-byte commit
-    # The reveal fee comes out of commit_value (sized above), so the funding UTXO needs
-    # the commit value plus the commit's own fee; the extra carrier_value is slack so a
-    # UTXO is not selected on an exact tie.
-    total_required = commit_value + commit_fee_estimate + carrier_value
+    # The reveal's miner fee comes out of commit_value (sized above), so the funding UTXO
+    # needs the commit value plus the commit's own fee; the extra carrier_value is slack so a
+    # UTXO is not selected on an exact tie. A WAVE fee is paid by the reveal from the commit's
+    # CHANGE, so the same UTXO must also leave at least the fee in change — it stays in the
+    # wallet until the reveal that registers the name spends it.
+    total_required = commit_value + commit_fee_estimate + carrier_value + reveal_estimate.required_funding_value
 
-    triples.sort(key=lambda t: t[0].value, reverse=True)
-    funding = next((t for t in triples if t[0].value >= total_required), None)
+    # Token-free: the on-chain script is checked to be a bare P2PKH, so a UTXO carrying a
+    # Glyph token is never spent as funding (which would burn the token), and the commit's
+    # change — which pays the WAVE fee — is plain RXD by construction.
+    funding = await lib_find_plain_rxd_utxo(triples, client, exclude=set(), needed=total_required)
     if funding is None:
+        includes = (
+            ""
+            if registration_fee is None
+            else (
+                f", including the {format_rxd(registration_fee.value)} WAVE registration fee for "
+                f"{registration_fee.label}.rxd, which the reveal pays from this UTXO's change"
+            )
+        )
+        largest = max(t[0].value for t in triples)
         raise UserError(
             "no single UTXO is large enough to fund the mint",
-            cause=f"need ≥ {total_required:,} photons in one UTXO; largest is {triples[0][0].value:,}",
+            cause=(
+                f"need ≥ {total_required:,} photons in one plain-RXD (token-free) UTXO{includes}; "
+                f"largest in the wallet is {largest:,}"
+            ),
             fix="consolidate UTXOs first, or fund the wallet from a single source",
         )
     funding_utxo, funding_addr, funding_key = funding
@@ -424,108 +1212,391 @@ async def _mint_nft_inner(
     commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     commit_tx.sign()
     commit_hex = commit_tx.serialize()
+    local_commit_txid = str(commit_tx.txid())
+
+    # The commit's change (vout 1) is the wallet input that pays a WAVE fee. Chosen HERE,
+    # before anything is broadcast, and re-checked unspent just before the reveal. Whether it
+    # is enough is the dry-run gate's question below (the reveal must balance with the fee
+    # input at this value); a separate "change below the fee" check stood here and could not
+    # fire, because total_required already reserves required_funding_value in the change.
+    fee_funding: _FeeFunding | None = None
+    if registration_fee is not None:
+        fee_funding = _FeeFunding(
+            txid=local_commit_txid,
+            vout=1,
+            value=sum(o.satoshis for o in commit_tx.outputs[1:] if o.change),
+            address=funding_addr,
+            key=funding_key,
+        )
 
     # C-1 gate: the last point at which nothing has been spent. Once the commit is
     # broadcast an unfundable reveal strands the commit output permanently. Build the
     # reveal now, against a placeholder commit txid, and MEASURE it — an independent
     # check on the estimate that sized commit_value above.
     cbor_bytes = commit_result.cbor_bytes
-    is_nft = True
-
-    def _nft_reveal_scripts(txid: str) -> RevealScripts:
-        return builder.prepare_reveal(
-            RevealParams(
-                commit_txid=txid,
-                commit_vout=0,
-                commit_value=commit_value,
-                cbor_bytes=cbor_bytes,
-                owner_pkh=funding_pkh,
-                is_nft=is_nft,
-            )
+    dry_run_scripts = builder.prepare_reveal(
+        RevealParams(
+            commit_txid=_PLACEHOLDER_COMMIT_TXID,
+            commit_vout=0,
+            commit_value=commit_value,
+            cbor_bytes=cbor_bytes,
+            owner_pkh=funding_pkh,
+            is_nft=True,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
         )
-
-    dry_run_scripts = _nft_reveal_scripts(_PLACEHOLDER_COMMIT_TXID)
+    )
+    # The fee the estimate sized the reveal for must be the fee the reveal pays. Both come
+    # from wave_registration_fee_for with the same arguments, so a difference is a bug here.
+    if dry_run_scripts.registration_fee_output != registration_fee:
+        raise UserError(
+            "internal error: the reveal's WAVE registration fee is not the one the estimate sized",
+            cause=f"estimate {registration_fee!r}, reveal {dry_run_scripts.registration_fee_output!r}",
+        )
     dry_run_reveal = _build_reveal_tx(
         commit_txid=_PLACEHOLDER_COMMIT_TXID,
         commit_value=commit_value,
         commit_script=commit_result.commit_script,
-        reveal_locking_script=dry_run_scripts.locking_script,
+        reveal_locking_script=dry_run_scripts.locking_script,  # type: ignore[arg-type]
         carrier_value=carrier_value,
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+        registration_fee=dry_run_scripts.registration_fee_output,
+        fee_funding=fee_funding,
     )
-    measured = _assert_reveal_is_fundable(commit_value, carrier_value, dry_run_reveal, fee_rate, len(cbor_bytes))
+    measured = _assert_reveal_is_fundable(
+        commit_value,
+        carrier_value,
+        dry_run_reveal,
+        fee_rate,
+        len(cbor_bytes),
+        registration_fee=_fee_statement(dry_run_scripts.registration_fee_output, registered_label),
+    )
 
+    commit_fee = commit_tx.get_fee()
+    total_cost = commit_fee + carrier_value + measured.fee + reveal_estimate.registration_fee_value
     sections = [
         _metadata_summary(metadata),
+        *_wave_registration_summary(
+            registered_label, registration_fee, name_status=name_status, fee_funding=fee_funding
+        ),
         _BroadcastSummary(
             title="Commit transaction",
             lines=[
                 f"funding addr:  {funding_addr}",
                 f"funding utxo:  {funding_utxo.tx_hash}:{funding_utxo.tx_pos}",
                 f"funding value: {funding_utxo.value:,} photons",
-                f"commit value:  {commit_value:,} photons",
+                f"commit value:  {commit_value:,} photons (the NFT carrier + the reveal's miner fee)",
                 f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
+                f"commit fee:    {commit_fee:,} photons",
                 f"reveal fee:    {measured.fee:,} photons "
                 f"({measured.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
+                f"total cost:    {format_photons(total_cost)} (commit fee + {carrier_value}-photon carrier + "
+                "reveal fee" + (" + WAVE registration fee)" if registration_fee is not None else ")"),
                 f"network:       {ctx.network}",
             ],
         ),
     ]
     _confirm_or_abort(ctx, sections)
-    _echoed_commit = await client.broadcast(commit_hex)
-    commit_txid = _local_commit_txid(commit_hex, _echoed_commit)
 
-    # 3) Poll for confirmation.
-    if ctx.output_mode == "human":
-        click.echo(f"\ncommit broadcast: {commit_txid}")
-        click.echo("waiting for confirmation (this can take 10+ minutes)...")
-    await _wait_for_tx(client, str(commit_txid), interval_s=_poll_interval_for(ctx))
-
-    # 4) Build reveal — the same builder the dry run above measured, now with the real
-    # commit txid (same length, so the same size and fee).
-    reveal_scripts = _nft_reveal_scripts(str(commit_txid))
-    reveal_tx = _build_reveal_tx(
-        commit_txid=str(commit_txid),
-        commit_value=commit_value,
+    # The record that lets this commit be revealed after a crash, a timeout or a refusal, saved
+    # and read back BEFORE the commit is broadcast. GlyphMinter keeps records the same way. It
+    # keeps the WAVE fee decision too, so resume-mint does what this mint agreed to: a declined
+    # fee stays declined, a named treasury stays named.
+    pending = PendingMint(
+        commit_txid=local_commit_txid,
+        commit_vout=0,
+        commit_value=commit_tx.outputs[0].satoshis,
         commit_script=commit_result.commit_script,
-        reveal_locking_script=reveal_scripts.locking_script,
+        cbor_bytes=cbor_bytes,
+        owner_pkh=bytes(funding_pkh),
+        is_nft=True,
         carrier_value=carrier_value,
-        change_locking=locking,
-        funding_key=funding_key,
-        scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+        fee_rate=fee_rate,
+        funding_address=funding_addr,
+        wave_fee=None if registered_label is None else ("pay" if registration_fee is not None else "decline"),
+        wave_treasury=registration_treasury if registration_fee is not None else None,
     )
-    reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
-    reveal_tx.sign()
-    reveal_hex = reveal_tx.serialize()
+    store = _pending_store(ctx)
+    store.save(pending)
 
-    _confirm_or_abort(
-        ctx,
-        [
-            _BroadcastSummary(
-                title="Reveal transaction",
-                lines=[
-                    f"commit txid:   {commit_txid}",
-                    f"nft to:        {funding_pkh.hex()}  ({carrier_value}-photon carrier; change returned)",
-                ],
+    try:
+        _echoed_commit = await client.broadcast(commit_hex)
+    except BaseException as exc:
+        # A failed or interrupted broadcast is ambiguous: a server can drop the connection after
+        # relaying, and Ctrl-C can land after the bytes left. So this says what to look for, and
+        # both answers, rather than "check the server" — which invites a second commit that
+        # spends again.
+        _commit_broadcast_uncertain(ctx, pending, store, exc)
+        raise
+
+    async def _step(progress: _Progress) -> dict[str, Any]:
+        commit_txid = _local_commit_txid(commit_hex, _echoed_commit)
+        if ctx.output_mode == "human":
+            click.echo(f"\ncommit broadcast: {commit_txid}")
+            click.echo(f"pending record:   {store.directory / (commit_txid + '.json')}")
+            click.echo("waiting for confirmation (this can take 10+ minutes)...")
+        await _wait_for_tx(client, str(commit_txid), interval_s=_poll_interval_for(ctx))
+        return await _reveal_committed(
+            ctx,
+            client,
+            pending,
+            key=funding_key,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
+            allow_unverified_wave_name=allow_unverified_wave_name,
+            fee_funding=fee_funding,
+            store=store,
+            progress=progress,
+        )
+
+    return await _after_commit(ctx, pending, store, _step)
+
+
+def _commit_broadcast_uncertain(
+    ctx: CliContext, pending: PendingMint, store: JsonFilePendingStore, exc: BaseException
+) -> None:
+    """Say what is true when the commit broadcast did not return: it may have relayed.
+
+    A :class:`NetworkError` becomes a :class:`NetworkBoundaryError` carrying both answers (and,
+    in ``--json`` mode, a JSON document on stdout). Anything else — Ctrl-C, a crash — prints
+    the same text to stderr and lets the caller re-raise it. The record exists already.
+    """
+    record = store.directory / f"{pending.commit_txid}.json"
+    recovery = _commit_recovery(ctx, pending, store.directory, _Progress())
+    fix = (
+        f"look up {pending.commit_txid} on a block explorer before running anything else. If it is there: "
+        f"{recovery} If it never appears, nothing was spent: delete {record} and mint again."
+    )
+    if not isinstance(exc, NetworkError):
+        click.echo(
+            f"\ninterrupted while the commit was being broadcast: it may or may not have reached the network. {fix}",
+            err=True,
+        )
+        return
+    if ctx.output_mode == "json":
+        doc = _json_recovery_document(
+            ctx, pending, store.directory, _Progress(), status="commit_broadcast_failed_may_have_relayed"
+        )
+        click.echo(emit(doc, mode="json"))
+    headline = (
+        "the node rejected the commit broadcast"
+        if isinstance(exc, PolicyRejection)
+        else "the commit broadcast failed, and the commit may or may not have reached the network"
+    )
+    raise NetworkBoundaryError(headline, cause=str(exc), fix=fix) from exc
+
+
+async def _find_commit_spend(client: ElectrumXClient, pending: PendingMint) -> tuple[str, int] | None:
+    """POSITIVE evidence that the commit output is spent: ``(spending txid, height)``, or ``None``.
+
+    Reads the commit script's history and returns the transaction that has an input spending
+    ``commit_txid:commit_vout``, re-hashed locally so a server cannot substitute another. A
+    height of 0 or less means it is still in the mempool. ``None`` means no such transaction
+    was found — which is NOT evidence that the commit is unspent either.
+    """
+    from ..network.electrumx import script_hash_for_script
+
+    history = await client.get_history(script_hash_for_script(pending.commit_script))
+    for item in history:
+        txid = str(item["tx_hash"])
+        if txid == pending.commit_txid:
+            continue
+        tx = Transaction.from_hex(bytes(await client.get_transaction(Txid(txid))))
+        if tx is None or str(tx.txid()) != txid:
+            continue
+        if any(
+            i.source_txid == pending.commit_txid and i.source_output_index == pending.commit_vout for i in tx.inputs
+        ):
+            return txid, int(item["height"])
+    return None
+
+
+def _refuse_record(store: JsonFilePendingStore, commit_txid: str, field: str, detail: str) -> _RecordRefused:
+    return _RecordRefused(
+        f"the record for {commit_txid} does not match: {field}",
+        cause=detail,
+        fix=(
+            f"the record in {store.directory / (commit_txid + '.json')} is not the one glyph mint-nft wrote for this "
+            "commit, or this is not the wallet that made it. Nothing was broadcast."
+        ),
+    )
+
+
+def _resume_fee_choice(
+    ctx: CliContext,
+    pending: PendingMint,
+    registered_label: str | None,
+    flag: bool | None,
+    treasury: str | None,
+) -> tuple[bool, str | None]:
+    """``(pay, treasury)`` for this reveal: the mint's recorded choice, never a guess (M2).
+
+    The recorded choice wins. A flag may only DECLINE a recorded payment — the recovery for a
+    name that was taken after the commit, which spends nothing the mint did not agree to. A
+    flag that would pay what the mint declined, or pay a different treasury, is refused. A
+    record with no choice (not written by ``glyph mint-nft``) needs the flag said out loud.
+    """
+    if registered_label is None:
+        return False, None
+    stored = pending.wave_fee
+    if stored is None:
+        if flag is None:
+            raise UserError(
+                f"the record for {pending.commit_txid} registers {registered_label}.rxd but does not say whether "
+                "the WAVE registration fee is paid",
+                cause="it was not written by glyph mint-nft, which always records the choice",
+                fix="say which: --wave-registration-fee or --no-wave-registration-fee",
             )
-        ],
-    )
-    _echoed_reveal = await client.broadcast(reveal_hex)
-    reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
-    # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
-    # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
-    # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
-    # back — so it is what `transfer-nft` / `transfer-ft` match on.
-    ref = GlyphRef(txid=Txid(str(commit_txid)), vout=0)
+        return flag, treasury
+    if stored == "decline":
+        if flag is True or treasury is not None:
+            raise UserError(
+                f"the mint declined the WAVE registration fee for {registered_label}.rxd, and resume-mint will not "
+                "pay what the mint declined",
+                cause="the record says --no-wave-registration-fee; this run says "
+                + ("--wave-registration-fee" if flag is True else f"--wave-treasury {treasury}"),
+                fix=f"run `{_resume_command(ctx, pending)}`, which reveals without paying, as the mint chose",
+            )
+        return False, None
+    if treasury is not None and treasury != pending.wave_treasury:
+        raise UserError(
+            "--wave-treasury is not the treasury the mint chose",
+            cause=f"the record pays {pending.wave_treasury or WAVE_TREASURY_ADDRESS}; this run names {treasury}",
+            fix=f"run `{_resume_command(ctx, pending)}`",
+        )
+    if flag is False:
+        # The recovery for a name taken after the commit: nothing is paid, so no treasury.
+        return False, None
+    return True, pending.wave_treasury
 
-    return {
-        "commit_txid": str(commit_txid),
-        "reveal_txid": str(reveal_txid),
-        "ref": f"{ref.txid}:{ref.vout}",
-        "owner_address": funding_addr,
-    }
+
+async def _resume_mint_inner(
+    ctx: CliContext,
+    wallet: HdWallet,
+    client: ElectrumXClient,
+    commit_txid: str,
+    *,
+    pay_registration_fee: bool | None,
+    registration_treasury: str | None,
+    allow_unverified_wave_name: bool,
+) -> dict[str, Any]:
+    """Heavy lifting for `glyph resume-mint`: reveal a commit from its saved record.
+
+    The record is checked before anything else: it must be the record for THIS txid, its
+    commit script must re-derive from its payload and this wallet's key, the NFT must go to
+    this wallet, and (once the commit is confirmed) the server must list the commit output at
+    the value the record says. The record is deleted only on POSITIVE evidence that the commit
+    is spent — a transaction whose input spends it, confirmed — never because the server
+    lists nothing.
+    """
+    from ..glyph.mint import GlyphMinter, PendingMintNotFound
+    from ..network.electrumx import script_hash_for_script
+
+    store = _pending_store(ctx)
+    try:
+        pending = store.load(commit_txid)
+    except PendingMintNotFound as exc:
+        listed = ", ".join(store.list_pending()) or "none"
+        raise UserError(
+            f"no pending mint recorded for {commit_txid}",
+            cause=f"looked in {store.directory}; records there: {listed}",
+            fix="pass the commit txid mint-nft printed, with the same --wallet",
+        ) from exc
+    if pending.commit_txid != commit_txid:
+        raise _refuse_record(
+            store, commit_txid, "commit_txid", f"the file for {commit_txid} holds {pending.commit_txid}"
+        )
+    registered_label = wave_registered_label(pending.cbor_bytes)
+    try:
+        key = wallet.privkey_for_address(pending.funding_address)
+        # Re-derive the commit script from the stored payload and this key: the reveal can
+        # only spend the commit if both are what the commit was built from.
+        GlyphMinter._assert_payload_still_matches(pending, key)
+    except ValidationError as exc:
+        raise UserError("this wallet cannot reveal that commit", cause=str(exc)) from exc
+    if bytes(pending.owner_pkh) != bytes(key.public_key().hash160()):
+        # mint-nft mints to the wallet that pays. Revealing to another owner would mint the NFT
+        # to someone else while this wallet pays the fee.
+        raise _refuse_record(
+            store,
+            commit_txid,
+            "owner_pkh",
+            f"the record mints to {bytes(pending.owner_pkh).hex()}, not to this wallet's "
+            f"{bytes(key.public_key().hash160()).hex()}",
+        )
+    pay, treasury = _resume_fee_choice(ctx, pending, registered_label, pay_registration_fee, registration_treasury)
+    if treasury is not None:
+        _require_address_on_network(ctx, treasury, what="the recorded WAVE treasury")
+    if pay and registered_label is not None and treasury is None and ctx.network != Network.MAINNET.value:
+        raise UserError(
+            f"no WAVE treasury is published for {ctx.network}",
+            cause=f"this commit registers {registered_label}.rxd and the mint chose to pay the fee",
+            fix=f"pass --wave-treasury <a {ctx.network} address>, or --no-wave-registration-fee",
+        )
+
+    async def _step(progress: _Progress) -> dict[str, Any]:
+        await _wait_for_tx(client, pending.commit_txid, interval_s=_poll_interval_for(ctx))
+        listed = [
+            u
+            for u in await client.get_utxos(script_hash_for_script(pending.commit_script))
+            if u.tx_hash == pending.commit_txid and u.tx_pos == pending.commit_vout
+        ]
+        if not listed:
+            spend = await _find_commit_spend(client, pending)
+            if spend is None:
+                raise _Inconclusive(
+                    f"the server lists the commit {pending.commit_txid}:{pending.commit_vout} neither as unspent "
+                    "nor as spent — the record is kept",
+                    cause="no unspent entry for the commit output, and no transaction in its history spends it",
+                    fix=(
+                        "run resume-mint again later, or against another server (--electrumx). Delete the record "
+                        f"in {store.directory} only once an explorer shows the commit output spent."
+                    ),
+                )
+            spender, height = spend
+            if height <= 0:
+                progress.reveal_txid = spender
+                await _await_reveal(ctx, client, spender)
+            store.delete(pending.commit_txid)
+            raise _NothingToRecover(
+                f"the commit {pending.commit_txid}:{pending.commit_vout} is already revealed, by {spender}",
+                cause=f"{spender} spends the commit output and is confirmed",
+                fix=f"nothing to recover; the record in {store.directory} has been deleted",
+            )
+        if listed[0].value != pending.commit_value:
+            raise _refuse_record(
+                store,
+                commit_txid,
+                "commit_value",
+                f"the record says {pending.commit_value:,} photons; the server lists {listed[0].value:,}",
+            )
+        fee_funding: _FeeFunding | None = None
+        fee = wave_registration_fee_for(pending.cbor_bytes, pay_registration_fee=pay, registration_treasury=treasury)
+        if fee is not None:
+            triples = await wallet.collect_spendable(client)
+            taken = {(pending.commit_txid, pending.commit_vout)}
+            found = await lib_find_plain_rxd_utxo(triples, client, exclude=taken, needed=fee.value)
+            if found is not None:
+                utxo, address, fkey = found
+                fee_funding = _FeeFunding(
+                    txid=utxo.tx_hash, vout=utxo.tx_pos, value=utxo.value, address=address, key=fkey
+                )
+        return await _reveal_committed(
+            ctx,
+            client,
+            pending,
+            key=key,
+            pay_registration_fee=pay,
+            registration_treasury=treasury,
+            allow_unverified_wave_name=allow_unverified_wave_name,
+            fee_funding=fee_funding,
+            store=store,
+            progress=progress,
+        )
+
+    return await _after_commit(ctx, pending, store, _step)
 
 
 def _poll_interval_for(ctx: CliContext) -> float:
@@ -566,6 +1637,12 @@ async def _wait_for_tx(
     way to spend the output is a reveal pushing byte-identical CBOR), a timeout here can
     strand real value — and sending that user to a flag that does not exist is the worst
     possible answer. The text below names the recovery that actually works.
+
+    It also used to say "Not confirmed: nothing is stranded — re-run the command". A commit
+    that has not confirmed yet may still confirm, and a re-run commits and spends again, so
+    that was false exactly when it mattered. And it told every WAVE mint to add the
+    registration fee on a rebuilt reveal, unconditionally — paying a second fee for a
+    duplicate if the name had been registered meanwhile.
     """
     try:
         await wait_for_confirmation(client, txid, timeout_s=timeout_s, interval_s=interval_s)
@@ -574,15 +1651,23 @@ async def _wait_for_tx(
             "timed out waiting for confirmation",
             cause=str(exc),
             fix=(
-                "check the txid on a block explorer. Not confirmed: nothing is stranded — re-run the "
-                "command. Confirmed: this CLI has no resume flag, so rebuild the reveal with the SDK — "
-                "GlyphBuilder.prepare_reveal(RevealParams(commit_txid=<txid>, commit_vout=0, "
+                f"the transaction {txid} was broadcast and has not confirmed yet. It may still confirm, so do "
+                "not simply re-run the command: that would commit, and spend, again. Check the txid on a block "
+                "explorer. `glyph mint-nft` and `glyph timelock-mint` saved a record of the commit and print, "
+                "with this error, the exact `pyrxd glyph resume-mint` command that reveals it once it confirms. "
+                "Without that record (`glyph deploy-ft` and `glyph deploy-dmint` keep none), rebuild the reveal "
+                "with the SDK — GlyphBuilder.prepare_reveal(RevealParams(commit_txid=<txid>, commit_vout=0, "
                 "commit_value=<photons>, cbor_bytes=..., owner_pkh=..., is_nft=...)) with the SAME wallet "
                 "and BYTE-IDENTICAL CBOR — that is what the commit output is a hashlock over. For "
                 "`glyph mint-nft` the bytes come from re-encoding the SAME unmodified metadata file; for "
-                "`glyph timelock-mint` they are the file --envelope-out wrote, which is the only source "
+                "`glyph timelock-mint` they are also in the file --envelope-out wrote "
                 "(a timelocked envelope with --recipient is NOT reproducible from the same inputs — each "
-                "wrap draws a fresh ephemeral key and nonce). See docs/how-to/troubleshoot-common-errors.md"
+                "wrap draws a fresh ephemeral key and nonce). A WAVE claim: keep the mint's fee choice. If it "
+                "declined the fee, build with pay_registration_fee=False. Otherwise pay its "
+                "registration_fee_output from a wallet input ONLY if WaveResolver.check_available says the "
+                "name is still free; if it is taken, build with pay_registration_fee=False, which reveals a "
+                "duplicate the indexer does not register and returns the value. If the commit is never mined "
+                "and leaves the mempool, its inputs were never spent. See docs/how-to/troubleshoot-common-errors.md"
             ),
         ) from exc
 
@@ -750,6 +1835,8 @@ async def _deploy_ft_inner(
         )
 
     dry_run_scripts = _ft_reveal_scripts(_PLACEHOLDER_COMMIT_TXID)
+    # No WAVE registration fee on an FT deploy: prepare_ft_deploy_reveal refuses a payload
+    # that would register a WAVE name rather than return one without its fee.
     dry_run_reveal = _build_reveal_tx(
         commit_txid=_PLACEHOLDER_COMMIT_TXID,
         commit_value=commit_value,
@@ -759,9 +1846,10 @@ async def _deploy_ft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+        registration_fee=None,
     )
     measured = _assert_reveal_is_fundable(
-        commit_value, carrier_value, dry_run_reveal, fee_rate, len(commit_result.cbor_bytes)
+        commit_value, carrier_value, dry_run_reveal, fee_rate, len(commit_result.cbor_bytes), registration_fee=None
     )
 
     _confirm_or_abort(
@@ -803,6 +1891,7 @@ async def _deploy_ft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+        registration_fee=None,
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()
@@ -1012,11 +2101,12 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
             "the commit was broadcast but its txid could not be re-derived locally",
             cause="the signed commit bytes did not parse back into a transaction",
             # Name a recovery that EXISTS. An earlier version of this sent the user to a
-            # "PendingMint record still in the store" — this CLI has no PendingStore at
-            # all (that is the SDK's `GlyphMinter`), so the advice was fiction on a path
-            # where the commit is a hashlock with no owner-only spend path. `_wait_for_tx`
-            # above had this exact bug once and calls sending a user to a recovery that
-            # does not exist "the worst possible answer". Same answer here, same reason.
+            # "PendingMint record still in the store" when no command kept one, so the advice
+            # was fiction on a path where the commit is a hashlock with no owner-only spend
+            # path. `deploy-ft` and `deploy-dmint` still keep no record, so the SDK recipe is
+            # their recovery; `mint-nft` does, and `_after_commit` appends its `resume-mint`
+            # recovery to this. `_wait_for_tx` below calls a recovery that does not exist
+            # "the worst possible answer". Same answer here, same reason.
             fix=(
                 f"the server echoed {echoed} — check it on an explorer. If it is there the commit "
                 "relayed: rebuild the reveal with the SDK — GlyphBuilder.prepare_reveal("

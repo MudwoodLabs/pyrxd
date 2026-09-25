@@ -37,6 +37,22 @@ a real consumer surfacing. Until then, do not invest design effort.
 > byte. The inspector classifier and `WaveResolver` also exist now, and every
 > claim pyrxd writes is held to one rule (`src/pyrxd/glyph/wave_rules.py`). The
 > sections below are the record as written on 2026-05-13.
+>
+> **Update 2026-09-25 (registration fee).** Item 4 below calls Photonic's pricing
+> tiers "advisory". That is true of consensus and of RXinDexer's claim path,
+> which registers a name whatever it pays, but it is not what the protocol says:
+> WAVE-Protocol's `ANNOUNCEMENT.md` (`c05b8e7a`, lines 51-52) makes registration
+> "a one-time, length-based fee" and renewal a payment of "the name's
+> registration price to the protocol treasury", which RXinDexer does check
+> (`_maybe_process_renewal`, `wave_index.py:581-642` at `ca8a6a4e`). The
+> maintainer's decision: pyrxd pays the fee by default, as Photonic's register
+> page does, to the treasury Photonic and RXinDexer both name. The reveal
+> builders return the fee output for the caller to add, funded from a wallet
+> input at reveal time as Photonic funds it, and `pyrxd glyph mint-nft` pays it
+> after checking the name is free; `pay_registration_fee=False` is the only way
+> out. See the
+> "WAVE registration fee" paragraph in §8.1 of
+> `docs/reference/glyph-token-protocol-spec.md` and `src/pyrxd/glyph/wave_rules.py`.
 
 ## What WAVE actually is (verified 2026-05-13)
 

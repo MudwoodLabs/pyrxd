@@ -276,8 +276,9 @@ def _ciphertext_json(build: TimelockMintBuild) -> str:
     type=click.Path(dir_okay=False, path_type=Path),
     help="REQUIRED. Where to write the raw envelope CBOR — the exact bytes the reveal must push. "
     "This mint has no metadata file to rebuild from and, with --recipient, the envelope is NOT "
-    "reproducible from the same inputs. Without this file a commit that confirms while the reveal "
-    "does not is unspendable forever.",
+    "reproducible from the same inputs. The mint's pending record (pending-mints/, beside the wallet) "
+    "holds the same bytes and `glyph resume-mint` reveals from it; this file is the copy that does "
+    "not depend on that directory.",
 )
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
@@ -310,10 +311,11 @@ def timelock_mint_cmd(
     commit whose output is a hashlock over the envelope bytes, then a reveal that pushes
     those exact bytes to spend it. If the commit confirms and the reveal does not — a
     timeout, a kill during the 10+ minute wait, a declined prompt — the only way to recover
-    the commit's value is to rebuild the reveal from BYTE-IDENTICAL CBOR, and this CLI keeps
-    no pending store. `glyph mint-nft` can rebuild from its metadata file; this command has
-    none, and with --recipient the envelope cannot be rebuilt from the same inputs at all,
-    because each wrap draws a fresh ephemeral X25519 key and nonce. So the bytes are saved.
+    the commit's value is a reveal from BYTE-IDENTICAL CBOR. The pending record the mint saves
+    before broadcasting holds those bytes, and `glyph resume-mint` reveals from it. This file
+    is a second copy that does not depend on that directory: this command has no metadata file
+    to rebuild from, and with --recipient the envelope cannot be rebuilt from the same inputs
+    at all, because each wrap draws a fresh ephemeral X25519 key and nonce.
     """
     if unlock_at <= 0:
         raise UserError(f"--unlock-at must be positive, got {unlock_at}")
@@ -367,7 +369,7 @@ def timelock_mint_cmd(
                     f"recipients:  {', '.join(r.kid for r in recipients) if recipients else '(none — reveal only)'}",
                     f"key file:    {cek_out}  <- THE ONLY COPY. Nothing on chain carries the key.",
                     f"ciphertext:  {ciphertext_out}  <- the payload itself is NOT on chain.",
-                    f"envelope:    {envelope_out}  <- the only way to rebuild the reveal if it fails.",
+                    f"envelope:    {envelope_out}  <- the reveal's bytes, also kept in the pending record.",
                     f"network:     {ctx.network}",
                 ],
             )
@@ -383,8 +385,9 @@ def timelock_mint_cmd(
     # prompts AGAIN for the reveal — and the commit output is `OP_HASH256 <payload_hash>
     # OP_EQUALVERIFY`, spendable only by a reveal pushing byte-identical CBOR. A timeout, a
     # kill or a declined prompt in that window leaves value recoverable ONLY from these
-    # bytes: there is no pending store on this path, no metadata file for this command, and
-    # `wrap_cek_x25519` draws a fresh ephemeral key and nonce per call, so re-running the
+    # bytes. `_mint_nft_inner` also saves them in its pending record (resume-mint reveals from
+    # it); this file is the copy that survives losing that directory. There is no metadata file
+    # for this command, and `wrap_cek_x25519` draws a fresh ephemeral key and nonce per call, so re-running the
     # same command with the same key does not reproduce the envelope when --recipient was
     # given. Written raw rather than hex: these bytes go into `RevealParams(cbor_bytes=...)`
     # unmodified, and a re-encode from anything else is exactly the drift that strands it.

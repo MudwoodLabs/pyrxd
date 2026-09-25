@@ -111,11 +111,13 @@ from .fees import (
 )
 from .script import build_commit_locking_script, hash_payload
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
+from .wave_rules import wave_registered_label
 
 __all__ = [
     "DEFAULT_MINT_CONFIRMATIONS",
     "NFT_CARRIER_VALUE",
     "PENDING_MINT_SCHEMA_VERSION",
+    "PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE",
     "GlyphMinter",
     "JsonFilePendingStore",
     "MintResult",
@@ -178,6 +180,14 @@ _PLACEHOLDER_COMMIT_TXID = "00" * 32
 # does not recognise rather than best-effort parsing it: a half-understood record on this
 # path produces a reveal that cannot spend the commit.
 PENDING_MINT_SCHEMA_VERSION = 1
+
+# The version of a record that also carries a WAVE registration-fee decision
+# (:attr:`PendingMint.wave_fee`). Every other record is still written at
+# :data:`PENDING_MINT_SCHEMA_VERSION`, byte for byte as before. A separate number rather than
+# new optional keys at version 1: a reader that does not know the keys would ignore them, and
+# the decision they carry is whether the reveal spends 5-100 RXD of the user's money. An older
+# pyrxd refuses a version-2 record instead of revealing it on a guess.
+PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE = 2
 
 # Protocol tags whose reveal is NOT the single-output shape this module builds. MUT and
 # WAVE need a second contract output AND a second commit outpoint to seed its singleton
@@ -272,7 +282,11 @@ def build_reveal_unlock_template(private_key: Any, scriptsig_suffix: bytes) -> A
     def estimated_unlocking_byte_length() -> int:
         return REVEAL_SIG_PREFIX_BYTES + len(suffix)
 
-    return to_unlock_script_template(sign, estimated_unlocking_byte_length)
+    template = to_unlock_script_template(sign, estimated_unlocking_byte_length)
+    # The envelope, readable before signing: pyrxd.glyph.fees.measure_reveal_fee checks what a
+    # reveal pays for a WAVE name against the name its OWN envelope registers.
+    template.glyph_scriptsig_suffix = suffix
+    return template
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +323,13 @@ class PendingMint:
             for an NFT, the whole premined supply for an FT.
         fee_rate: photons per byte the reveal will be fee'd at.
         funding_address: address whose key signs the reveal and receives its change.
+        wave_fee: for a payload that registers a WAVE name, what the minter chose to do about
+            the registration fee: ``"pay"`` or ``"decline"``. ``None`` for every other record.
+            ``pyrxd glyph resume-mint`` honours it, so an opt-out made at mint time survives a
+            timeout or a crash instead of reverting to the paying default.
+        wave_treasury: the address the fee is paid to when the minter named one
+            (``--wave-treasury``); ``None`` for the published treasury. Only with
+            ``wave_fee="pay"``.
     """
 
     commit_txid: str
@@ -321,6 +342,8 @@ class PendingMint:
     carrier_value: int
     fee_rate: int
     funding_address: str
+    wave_fee: str | None = None
+    wave_treasury: str | None = None
 
     def __post_init__(self) -> None:
         # Txid() rejects anything that is not 64 lowercase hex. This also makes the
@@ -350,6 +373,14 @@ class PendingMint:
                 f"PendingMint.carrier_value ({self.carrier_value:,}) must be below commit_value "
                 f"({self.commit_value:,}) — the reveal fee is paid out of the difference"
             )
+        if self.wave_fee not in (None, "pay", "decline"):
+            raise ValidationError("PendingMint.wave_fee must be 'pay', 'decline' or None")
+        if self.wave_treasury is not None and (not isinstance(self.wave_treasury, str) or not self.wave_treasury):
+            raise ValidationError("PendingMint.wave_treasury must be a non-empty str or None")
+        if self.wave_treasury is not None and self.wave_fee != "pay":
+            raise ValidationError("PendingMint.wave_treasury is only meaningful with wave_fee='pay'")
+        if self.wave_fee is not None and wave_registered_label(self.cbor_bytes) is None:
+            raise ValidationError("PendingMint.wave_fee is set, but the payload registers no WAVE name")
 
     @property
     def ref(self) -> GlyphRef:
@@ -368,7 +399,7 @@ class PendingMint:
         ``BtcHtlcLocator``, ``EscalationState``), leaving the caller to choose the
         serializer.
         """
-        return {
+        d: dict[str, Any] = {
             "schema_version": PENDING_MINT_SCHEMA_VERSION,
             "commit_txid": self.commit_txid,
             "commit_vout": self.commit_vout,
@@ -381,6 +412,11 @@ class PendingMint:
             "fee_rate": self.fee_rate,
             "funding_address": self.funding_address,
         }
+        if self.wave_fee is not None:
+            d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
+            d["wave_fee"] = self.wave_fee
+            d["wave_treasury"] = self.wave_treasury
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> PendingMint:
@@ -394,12 +430,23 @@ class PendingMint:
         if not isinstance(d, dict):
             raise ValidationError("PendingMint.from_dict expects a dict")
         version = d.get("schema_version")
-        if version != PENDING_MINT_SCHEMA_VERSION:
+        known = (PENDING_MINT_SCHEMA_VERSION, PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE)
+        if version not in known or isinstance(version, bool):
             raise ValidationError(
                 f"unsupported PendingMint schema_version {version!r} "
-                f"(this build understands {PENDING_MINT_SCHEMA_VERSION}) — refusing to guess at a "
+                f"(this build understands {' and '.join(map(str, known))}) — refusing to guess at a "
                 "record that decides whether a commit output can be spent"
             )
+        # Version 1 carries no fee decision and version 2 must: a version-1 record with the keys,
+        # or a version-2 record without them, was not written by this code.
+        has_fee = "wave_fee" in d or "wave_treasury" in d
+        if has_fee != (version == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE):
+            raise ValidationError(
+                f"PendingMint schema_version {version} record "
+                + ("carries a WAVE fee decision it cannot hold" if has_fee else "is missing its WAVE fee decision")
+            )
+        if has_fee and d.get("wave_fee") not in ("pay", "decline"):
+            raise ValidationError(f"PendingMint schema_version {version} record has wave_fee {d.get('wave_fee')!r}")
         try:
             return cls(
                 commit_txid=d["commit_txid"],
@@ -412,6 +459,8 @@ class PendingMint:
                 carrier_value=d["carrier_value"],
                 fee_rate=d["fee_rate"],
                 funding_address=d["funding_address"],
+                wave_fee=d["wave_fee"] if has_fee else None,
+                wave_treasury=d["wave_treasury"] if has_fee else None,
             )
         except KeyError as exc:
             raise ValidationError(f"PendingMint record is missing field {exc.args[0]!r}") from exc
@@ -1126,6 +1175,21 @@ class GlyphMinter:
     ) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
         self._assert_payload_still_matches(pending, funding_key)
+        # A WAVE claim's reveal pays the registration fee from a second, plain wallet input
+        # (pyrxd.glyph.wave_rules), and this facade builds a one-input reveal: it neither
+        # commits WAVE claims (_UNSUPPORTED_PROTOCOLS) nor pays their fee. So a record that
+        # registers a name was not written here, and is refused BEFORE anything else happens,
+        # rather than revealed without its fee or with the fee taken out of the commit.
+        label = wave_registered_label(pending.cbor_bytes)
+        if label is not None:
+            raise ValidationError(
+                f"pending mint {pending.commit_txid} registers the WAVE name {label}.rxd; GlyphMinter does not "
+                "register WAVE names and did not write this record. Reveal it with `pyrxd glyph resume-mint "
+                f"{pending.commit_txid}` (pays the registration fee from a wallet input if the name is still "
+                "free), or with GlyphBuilder.prepare_reveal plus a wallet input that funds its "
+                "registration_fee_output — or pay_registration_fee=False there to recover the commit without "
+                "registering. The record is kept."
+            )
 
         await wait_for_confirmation(
             self._client,
@@ -1332,6 +1396,10 @@ class GlyphMinter:
         Shared by the pre-broadcast dry run and the real post-confirmation build so the
         two cannot diverge — a dry run that measured a *different* transaction would be
         worth no more than the tautology it replaced.
+
+        One input, the commit: this facade builds no reveal that registers a WAVE name, whose
+        registration fee is funded from a second, wallet input (:meth:`_reveal` refuses those
+        records before reaching here, and :meth:`_commit` never writes one).
         """
         scripts = self._builder.prepare_reveal(
             RevealParams(

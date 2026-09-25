@@ -21,7 +21,7 @@ from .types import (
     GlyphRights,
     GlyphRoyalty,
 )
-from .wave_rules import refuse_unregistrable_wave_claim
+from .wave_rules import FEE_UNSTATED, WaveRegistrationFee, refuse_unregistrable_wave_claim, refuse_unstated_wave_fee
 
 _log = logging.getLogger(__name__)
 
@@ -566,7 +566,12 @@ def build_dat_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     return b"\x03" + GLY_MARKER + b"\x03" + DAT_MARKER + _encode_payload_push(cbor_bytes)
 
 
-def build_reveal_scriptsig_suffix(cbor_bytes: bytes, *, allow_unregistrable_wave: bool = False) -> bytes:
+def build_reveal_scriptsig_suffix(
+    cbor_bytes: bytes,
+    *,
+    allow_unregistrable_wave: bool = False,
+    registration_fee: WaveRegistrationFee | Literal["unstated"] | None = FEE_UNSTATED,
+) -> bytes:
     """
     Return the 'gly' + CBOR portion of the reveal scriptSig.
 
@@ -584,8 +589,16 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes, *, allow_unregistrable_wave
     Refuses a WAVE claim the indexer would not register, unless ``allow_unregistrable_wave``
     — see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`, which says what
     that escape is for.
+
+    Refuses a WAVE claim that WILL register until ``registration_fee`` says what the reveal
+    pays for it: the :class:`~pyrxd.glyph.wave_rules.WaveRegistrationFee` that
+    :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for` returns (whose output then goes
+    in the reveal), or ``None`` to register without paying. Leaving it out is not an opt-out
+    — see :func:`~pyrxd.glyph.wave_rules.refuse_unstated_wave_fee`. Any other
+    payload ignores it.
     """
     refuse_unregistrable_wave_claim(cbor_bytes, allow_unregistrable_wave=allow_unregistrable_wave)
+    refuse_unstated_wave_fee(cbor_bytes, registration_fee)
     return b"\x03" + GLY_MARKER + _encode_payload_push(cbor_bytes)
 
 
@@ -636,6 +649,8 @@ def build_mutable_scriptsig(
     ref_hash_index: int,
     ref_index: int,
     token_output_index: int,
+    *,
+    registration_fee: WaveRegistrationFee | Literal["unstated"] | None = FEE_UNSTATED,
 ) -> bytes:
     """Build the scriptSig for spending a mutable NFT contract input.
 
@@ -650,6 +665,20 @@ def build_mutable_scriptsig(
     :param ref_hash_index:        Index into the refdatasummary for this token.
     :param ref_index:             Index of the singleton ref in token output data.
     :param token_output_index:    Output index of the token in the tx.
+    :param registration_fee:      Required only when ``cbor_bytes`` carries WAVE in ``p``
+        and would register: see below. Any other payload ignores it.
+
+    An update envelope whose ``p`` carries WAVE is read by RXinDexer as a REGISTRATION of
+    ``attrs.name``, not as an update: ``process_tx`` sends everything WAVE-marked down the
+    claim path (``electrumx/server/wave_index.py:684-699`` at ``ca8a6a4e``). While the name is
+    held and has not lapsed that registers nothing (a duplicate, ``wave_index.py:767-781``);
+    once it has lapsed, or for another name, it registers a new claim at this transaction's
+    vout 0 (``:730``, ``:782-807``). So a WAVE-marked update is held to the claim rule and,
+    like a reveal, must say what it pays for the name: ``registration_fee=`` a
+    :class:`~pyrxd.glyph.wave_rules.WaveRegistrationFee` whose output goes in the update, or
+    ``None``. An update whose payload carries no ``p`` — the ``{attrs: {...}}`` shape the
+    indexer's own comment describes for a ``mod`` (``wave_index.py:686-691``) — is not a claim,
+    and neither of these applies to it.
     """
     if operation not in ("mod", "sl"):
         raise ValidationError(f"operation must be 'mod' or 'sl', got {operation!r}")
@@ -658,6 +687,7 @@ def build_mutable_scriptsig(
     # An update envelope carrying WAVE in `p` is read as a registration by RXinDexer. No
     # escape here: an update payload is chosen fresh, so refusing one strands nothing.
     refuse_unregistrable_wave_claim(cbor_bytes)
+    refuse_unstated_wave_fee(cbor_bytes, registration_fee, what="update")
     for name, val in (
         ("contract_output_index", contract_output_index),
         ("ref_hash_index", ref_hash_index),

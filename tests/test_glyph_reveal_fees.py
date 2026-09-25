@@ -232,7 +232,7 @@ class TestMeasureRevealFee:
     def test_measurement_agrees_with_the_estimate_on_a_real_reveal(self, description: str) -> None:
         metadata = _nft_metadata(description)
         reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
-        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, registration_fee=None)
         estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE)
         assert measured.fee == estimate.fee
         assert measured.size_bytes == estimate.size_bytes
@@ -249,7 +249,9 @@ class TestMeasureRevealFee:
             metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE, commit_txid="00" * 32
         )
         real = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE, commit_txid="9f" * 32)
-        assert measure_reveal_fee(placeholder, fee_rate=MIN_FEE_RATE) == measure_reveal_fee(real, fee_rate=MIN_FEE_RATE)
+        assert measure_reveal_fee(placeholder, fee_rate=MIN_FEE_RATE, registration_fee=None) == measure_reveal_fee(
+            real, fee_rate=MIN_FEE_RATE, registration_fee=None
+        )
 
     def test_measurement_catches_a_shim_that_understates_the_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The drift this guard exists for: if the estimator's sig+pubkey allowance ever
@@ -260,7 +262,7 @@ class TestMeasureRevealFee:
         reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
         monkeypatch.setattr(fees, "REVEAL_SIG_PREFIX_BYTES", 7)
         understated = estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE)
-        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, registration_fee=None)
         assert understated.fee < measured.fee
 
         commit_value = 546 + understated.fee  # what a caller sized from the bad estimate
@@ -273,14 +275,14 @@ class TestMeasureRevealFee:
         reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
         reveal.fee(SatoshisPerKilobyte(MIN_FEE_RATE * 1000))
         reveal.sign()
-        signed = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        signed = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, registration_fee=None)
         # A real low-S signature is a byte or two shorter than the 107-byte allowance.
         assert signed.size_bytes <= estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE).size_bytes
 
     def test_carries_the_cbor_length_into_the_error_message(self) -> None:
         metadata = _nft_metadata("x" * 900)
         reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
-        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, cbor_bytes_len=931)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, cbor_bytes_len=931, registration_fee=None)
         with pytest.raises(InsufficientFundsError, match="931 bytes of CBOR"):
             check_reveal_funding(commit_value=546, carrier_value=546, estimate=measured)
 
@@ -288,4 +290,4 @@ class TestMeasureRevealFee:
     def test_rejects_a_bad_fee_rate(self, fee_rate) -> None:
         reveal = _build_real_reveal(_nft_metadata(), commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
         with pytest.raises(ValidationError):
-            measure_reveal_fee(reveal, fee_rate=fee_rate)
+            measure_reveal_fee(reveal, fee_rate=fee_rate, registration_fee=None)

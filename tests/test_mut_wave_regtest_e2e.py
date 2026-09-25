@@ -78,6 +78,7 @@ from pyrxd.glyph.script import (
 )
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.glyph.wave import build_wave_metadata, classify_glyph_metadata, wave_attrs_from_metadata
+from pyrxd.glyph.wave_rules import wave_registration_fee_for
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH, encode_pushdata, to_unlock_script_template
@@ -227,6 +228,12 @@ def _mint_mut(rt: _RegtestNode, metadata: GlyphMetadata, *, name: str | None = N
 
     Two inputs — the commit outpoint and the seed outpoint one vout along — and
     two token outputs. Returns everything later cases need to keep spending.
+
+    A WAVE claim also pays its registration fee, at vout 2 after the two token outputs, as
+    ``prepare_wave_reveal`` says (``tests/test_wave_registration_fee_regtest_e2e.py`` checks
+    that output on chain). It is funded as Photonic funds it: a third, plain output of the
+    commit transaction (the owner's), spent by the reveal as a third input — never the commit
+    output. Change moves to vout 3.
     """
     owner = PrivateKey()
     owner_pkh = Hex20(owner.public_key().hash160())
@@ -240,16 +247,33 @@ def _mint_mut(rt: _RegtestNode, metadata: GlyphMetadata, *, name: str | None = N
             funding_satoshis=_COMMIT_VALUE,
         )
     )
+    fee = wave_registration_fee_for(commit.cbor_bytes)
+    fee_outputs = [] if fee is None else [TransactionOutput(Script(fee.locking_script), fee.value)]
+    owner_spk = P2PKH().lock(owner.public_key().hash160()).serialize()
     # The seed output at commit_vout+1 is what makes the contract's singleton ref
     # spendable-into-existence. Held under a throwaway key of our own.
     seed_key = PrivateKey()
     seed_spk = P2PKH().lock(seed_key.public_key().hash160()).serialize()
-    commit_txid = _pay_outputs(rt, [(commit.commit_script, _COMMIT_VALUE), (seed_spk, _SEED_VALUE)])
+    fee_funding = [] if fee is None else [(owner_spk, fee.value)]
+    commit_txid = _pay_outputs(rt, [(commit.commit_script, _COMMIT_VALUE), (seed_spk, _SEED_VALUE), *fee_funding])
+    fee_inputs = (
+        []
+        if fee is None
+        else [
+            TransactionInput(
+                source_transaction=_src(commit_txid, 2, owner_spk, fee.value),
+                source_txid=commit_txid,
+                source_output_index=2,
+                unlocking_script_template=_p2pkh_unlock(owner),
+            )
+        ]
+    )
 
     if name is None:
         scripts = builder.prepare_mutable_reveal(commit_txid, 0, commit.cbor_bytes, owner_pkh)
     else:
         scripts = builder.prepare_wave_reveal(commit_txid, 0, commit.cbor_bytes, owner_pkh, name)
+    assert scripts.registration_fee_output == fee
 
     change = _COMMIT_VALUE + _SEED_VALUE - 2 * _CARRIER - _FEE
     reveal = Transaction(
@@ -266,10 +290,12 @@ def _mint_mut(rt: _RegtestNode, metadata: GlyphMetadata, *, name: str | None = N
                 source_output_index=1,
                 unlocking_script_template=_p2pkh_unlock(seed_key),
             ),
+            *fee_inputs,
         ],
         tx_outputs=[
             TransactionOutput(Script(scripts.nft_script), _CARRIER),
             TransactionOutput(Script(scripts.contract_script), _CARRIER),
+            *fee_outputs,
             TransactionOutput(P2PKH().lock(owner.public_key().hash160()), change),
         ],
     )
@@ -293,6 +319,7 @@ def _mint_mut(rt: _RegtestNode, metadata: GlyphMetadata, *, name: str | None = N
         "nft_value": _CARRIER,
         "contract_value": _CARRIER,
         "change_value": change,
+        "change_vout": 2 + len(fee_outputs),
         "key": owner,
         "pkh": owner_pkh,
     }
@@ -547,9 +574,11 @@ def _mod_tx(
                 unlocking_script_template=_raw_unlock(scriptsig),
             ),
             TransactionInput(
-                source_transaction=_src(minted["reveal_txid"], 2, p2pkh_spk, minted["change_value"]),
+                source_transaction=_src(
+                    minted["reveal_txid"], minted["change_vout"], p2pkh_spk, minted["change_value"]
+                ),
                 source_txid=minted["reveal_txid"],
-                source_output_index=2,
+                source_output_index=minted["change_vout"],
                 unlocking_script_template=_p2pkh_unlock(minted["key"]),
             ),
         ],
@@ -607,6 +636,7 @@ def test_mod_installs_a_new_payload_hash_on_chain(node, mut):  # noqa: F811
     mut["nft_script"] = token_spk
     mut["contract_script"] = contract_spk
     mut["change_value"] = mut["change_value"] - _FEE
+    mut["change_vout"] = 2  # the mod spend's outputs: token, contract, change
     mut["cbor"] = new_cbor
 
 

@@ -24,7 +24,9 @@ with its domain in ``attrs.domain``:
 RXinDexer (``electrumx/server/wave_index.py``) registers the claim from
 ``attrs.name``, and ``validate_wave_name`` refuses any character outside
 ``a-z 0-9 -``. The rule every claim pyrxd writes must meet lives in
-:mod:`pyrxd.glyph.wave_rules`.
+:mod:`pyrxd.glyph.wave_rules`, and so does the registration fee a claim pays by default
+(:func:`~pyrxd.glyph.wave_rules.wave_registration_price`,
+:data:`~pyrxd.glyph.wave_rules.WAVE_TREASURY_ADDRESS`).
 
 WHAT IS PROVED ABOUT THIS SHAPE, and what is not
 (``tests/test_wave_claim_registers_with_the_indexer.py``): the FIELD SET and values
@@ -225,6 +227,10 @@ def build_wave_metadata(
     ``[NFT, MUT, WAVE]``, top-level ``name`` = the qualified name, ``type`` =
     ``"wave_name"``, ``attrs`` = bare label, domain, target, target type). Pass the result
     to :meth:`GlyphBuilder.prepare_commit` and then :meth:`GlyphBuilder.prepare_wave_reveal`.
+    Registering the name pays the WAVE registration fee: both return it as
+    ``registration_fee_output`` (``wave_registration_price(qualified_name)`` photons to the
+    WAVE treasury), and the reveal must carry that output unless the caller passes
+    ``pay_registration_fee=False``. See :mod:`pyrxd.glyph.wave_rules`.
 
     THE LABEL GOES IN ``attrs.name``, NOT THE QUALIFIED NAME. Through 0.24.0 this function
     wrote ``attrs.name = "alice.rxd"`` and left the top level empty. RXinDexer registers a

@@ -546,8 +546,9 @@ class TestTheMintsOnlyKeyIsDurableBeforeTheCommitRelays:
         self, runner, tmp_path, monkeypatch
     ) -> None:
         """Both directions of the gap, not only the one it was demonstrated on. Without the
-        envelope bytes a commit that confirms while its reveal does not is unspendable forever,
-        so this file is no less final than the key."""
+        envelope bytes — this file, or the pending record that holds the same bytes — a commit
+        that confirms while its reveal does not is unspendable forever, so this file is no less
+        final than the key."""
         foreign = b"another token's envelope"
 
         def _appears() -> None:
