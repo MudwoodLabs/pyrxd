@@ -121,12 +121,13 @@ def _first_pass(tx, limit: int) -> dict:
     return _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), limit, limit)
 
 
-def _flow(txid: str, server: dict, glue_returns: list, binding_returns: list | None = None) -> dict:
+def _flow(txid: str, server: dict, glue_returns: list, binding_returns: list | None = None, *, interleave=None) -> dict:
+    spec = {"txid": txid, "server": server, "glue_returns": glue_returns, "binding_returns": binding_returns or []}
+    if interleave is not None:
+        spec["interleave"] = interleave
     proc = subprocess.run(  # nosec B603 — fixed argv, no shell, repo-local script
         [_require_node(), str(_HARNESS)],
-        input=json.dumps(
-            {"txid": txid, "server": server, "glue_returns": glue_returns, "binding_returns": binding_returns or []}
-        ),
+        input=json.dumps(spec),
         capture_output=True,
         text=True,
         check=False,
@@ -380,3 +381,50 @@ class TestEveryClassificationIsBounded:
         flow = _run(reveal, server, limit)
         assert len(flow["glue_calls"]) == 1 and flow["glue_calls"][0][2:] == [limit, limit], flow["glue_calls"]
         assert len(flow["binding_calls"]) == 1
+
+
+# ─────────────────────────────── a fetch the reader moved on from draws nothing ──
+
+
+class TestAFetchTheReaderMovedOnFromDrawsNothing:
+    """The "Fetch from network" button awaits the server and then renders. /inspect/ had no in-flight guard,
+    so classifying another input — or pressing Clear — while it waited did not stop it: the slow
+    answer about the OLD transaction replaced whatever the reader was now looking at. /verify/
+    already had the token pattern; this is the same pattern, and Clear cancels too.
+
+    Each case runs the page's own ``onFetchTxid`` and, while it is still waiting on the server,
+    the page's own ``onClear`` or ``onClassify``."""
+
+    @staticmethod
+    def _plain(limit: int):
+        """A transaction with no reveal: one fetch, one classification, nothing else awaited."""
+        tx = _tx([(b"\x6a" + b"\x00" * 30, 0)], [("ab" * 32, 0, b"\x00")])
+        return tx, {tx.txid(): {"hex": tx.serialize().hex()}}, [_first_pass(tx, limit)]
+
+    def test_the_honest_path_still_draws_the_fetched_transaction(self, limit) -> None:
+        """The neighbour of both refusals below: with nobody interrupting, the answer is drawn."""
+        tx, server, first = self._plain(limit)
+        flow = _flow(tx.txid(), server, first)
+        assert "Fetched transaction" in flow["rendered"] and tx.txid() in flow["rendered"]
+
+    def test_clear_during_the_fetch_leaves_the_screen_clear(self, limit) -> None:
+        tx, server, first = self._plain(limit)
+        flow = _flow(tx.txid(), server, first, interleave="clear")
+        assert flow["requested"] == [tx.txid()], "the premise: the fetch really was in flight"
+        assert flow["rendered"] == "", f"a fetch the reader cleared drew its result anyway:\n{flow['rendered']}"
+
+    def test_a_failed_fetch_after_clear_does_not_draw_its_error_either(self) -> None:
+        """The failure branch renders too, so it is guarded too."""
+        flow = _flow("cd" * 32, {}, [], interleave="clear")
+        assert flow["requested"] == ["cd" * 32]
+        assert flow["rendered"] == ""
+
+    def test_classifying_something_else_is_not_overwritten_by_the_old_fetch(self, limit) -> None:
+        tx, server, first = self._plain(limit)
+        other = "76a914" + "5a" * 20 + "88ac"
+        classified = _glue().run(other)
+        assert classified["ok"] and classified["form"] == "script", classified
+        flow = _flow(tx.txid(), server, first, interleave={"classify": {"text": other, "result": classified}})
+        assert flow["requested"] == [tx.txid()], "the premise: the fetch really was in flight"
+        assert tx.txid() not in flow["rendered"], "the old fetch replaced the input the reader classified since"
+        assert "5a" * 20 in flow["rendered"], f"the newer classification is not on screen:\n{flow['rendered']}"

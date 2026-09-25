@@ -1377,7 +1377,31 @@ class TestTheCommandTheNoteGivesWorks:
         r = _run(monkeypatch, _FakeServer({txid: raw}), argv[1:], tmp_path=tmp_path)
         assert r.exit_code == 0, r.output
         assert "needs --min-confirmations" not in r.output
-        assert "where N is how many blocks must be built on top of the mark's block" in flat
+        assert "where N is how many confirmations the mark's block must have" in flat
+        assert "blocks must be built on top" not in flat, "N was described as blocks on top, one more than the CLI asks"
+
+    def test_what_the_note_says_N_means_is_what_the_command_does(self, monkeypatch, tmp_path, limit) -> None:
+        """THE NOTE'S DEFINITION OF N, run. It says N counts the mark's own block as the first
+        confirmation. So a mark in the newest block — one confirmation, nothing on top of it —
+        must pass `--min-confirmations 1` and fail `--min-confirmations 2`. Under the old wording
+        ("N blocks built on top") the first of those would have to fail."""
+        import shlex
+
+        from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+        scripts = [_record_script(bytes([1, 1]), bytes([i % 256]) * 32) for i in range(limit + 1)]
+        txid, raw, result = _tx_result(*scripts, limit=limit)
+        flat = " ".join(_page(result)["text"].split())
+        assert "The block itself is the first confirmation, so N means the block and N − 1 built on top of it" in flat
+        match = re.search(r"To check every mark in it: (pyrxd verify \S+ --min-confirmations N)", flat)
+        assert match, "the note carries no command"
+        verdicts = {}
+        for n in (1, 2):
+            argv = shlex.split(match.group(1).replace(" N", f" {n}"))
+            server = _FakeServer({txid: raw}, confirmations=1)
+            verdicts[n] = _run(monkeypatch, server, argv[1:], tmp_path=tmp_path).exit_code
+        assert verdicts[1] == 0, "one confirmation did not satisfy N = 1, so N is not a confirmation count"
+        assert verdicts[2] != 0, "one confirmation satisfied N = 2 — the premise of this test has moved"
 
 
 # ─────────────────────────────────── each panel's file check is ITS record's ──
@@ -1442,3 +1466,202 @@ class TestTheBlockShowsTheFingerprintWasKnownNotTheFile:
         flat = " ".join((_VERIFY_DIR / "index.html").read_text(encoding="utf-8").split())
         assert "whoever published it knew that fingerprint by then" in flat
         assert "knew the file" not in flat
+
+
+# ─────────────────────────────── a failure says which network it failed on ──
+
+
+def _record_signed_for(network: str) -> bytes:
+    """A GENUINE v2 record, signed for ``network`` — the chain's genesis hash is inside what
+    is signed, so the same key and file give different bytes per network."""
+    import hashlib
+
+    from pyrxd.constants import genesis_hash_for
+    from pyrxd.hashmark_tx import plan_hashmark
+    from pyrxd.keys import PrivateKey
+
+    digest = hashlib.sha256(b"the testnet report\n").digest()
+    return plan_hashmark(
+        digest, PrivateKey(), label="testnet report", network_genesis=genesis_hash_for(network)
+    ).op_return_script
+
+
+class TestAFailureSaysWhichNetworkItWasCheckedOn:
+    """An HONEST testnet record, pasted here, reads as a red DOES NOT VERIFY — correctly, since
+    the page checks against mainnet and the chain is part of what is signed. But the page said
+    "the signature it carries does not come from that key", which is false of a genuine record,
+    and showed which chain it assumed only under VERIFIED. The payloads here come from the real
+    classifier over a record really signed for testnet."""
+
+    @pytest.fixture
+    def testnet_record(self) -> dict:
+        from pyrxd.glyph._inspect_core import _inspect_script
+
+        script = _record_signed_for("testnet").hex()
+        on_mainnet = _inspect_script(script)
+        on_testnet = _inspect_script(script, network="testnet")
+        # The premise, from the code rather than from this docstring: genuine on testnet,
+        # a failure when read as mainnet, and the page's classifier assumes mainnet.
+        assert on_testnet["hashmark"]["attestation"]["outcome"] == "valid"
+        assert on_mainnet["hashmark"]["attestation"]["outcome"] == "invalid_signature"
+        assert on_mainnet["hashmark"]["attestation"]["assumed_network"] == "radiant-mainnet"
+        return on_mainnet
+
+    def test_the_failure_is_worded_against_the_network(self, testnet_record) -> None:
+        flat = " ".join(_page(_as_script_result(testnet_record))["text"].split())
+        assert "does not verify against that key on Radiant mainnet" in flat
+        assert "does not come from that key" not in flat, "a genuine record was told its signature is not its key's"
+        assert "a genuine record made for a different Radiant network — a testnet, say — lands here too" in flat
+
+    def test_the_network_row_is_shown_beside_the_failure(self, testnet_record) -> None:
+        lines = _page(_as_script_result(testnet_record))["text"].split("\n")
+        assert lines[lines.index("checked against") + 1] == "radiant-mainnet"
+
+    @pytest.mark.parametrize(
+        "outcome, label",
+        [("valid", "checked against"), ("invalid_signature", "checked against"), ("unverifiable", "network assumed")],
+    )
+    def test_every_signature_outcome_names_the_network(self, outcome, label) -> None:
+        """EVERY outcome with a signature, and the label says whether a check ran: "checked
+        against" is a claim that one did, which a NOT CHECKED record cannot support."""
+        payload = _payload_with_status(outcome)
+        payload["hashmark"]["attestation"]["assumed_network"] = "radiant-mainnet"
+        lines = _page(_as_script_result(payload))["text"].split("\n")
+        assert label in lines, f"{outcome}: no {label!r} row"
+        assert lines[lines.index(label) + 1] == "radiant-mainnet"
+        other = {"checked against", "network assumed"} - {label}
+        assert not other & set(lines), f"{outcome}: also labelled {other & set(lines)}"
+
+    def test_the_command_the_failure_names_does_verify_the_record(self, testnet_record, monkeypatch, tmp_path) -> None:
+        """The advice is a command, so it is run: the CLI with ``--network testnet`` verifies the
+        record the page could not, through the real top-level entry point."""
+        from click.testing import CliRunner
+
+        from pyrxd.cli.main import cli
+
+        flat = " ".join(_page(_as_script_result(testnet_record))["text"].split())
+        assert "`pyrxd --network testnet glyph inspect`" in flat
+        script = _record_signed_for("testnet").hex()
+        args = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+        testnet = CliRunner().invoke(cli, ["--network", "testnet", *args, "glyph", "inspect", script])
+        assert testnet.exit_code == 0, testnet.output
+        assert "signature VERIFIED" in testnet.output
+
+
+# ───────────────────────────────── a pointer to a mark's transaction is looked up ──
+
+
+class TestAPointerToAMarkIsNotToldItIsNotAMark:
+    """``<txid>:0`` and a contract id both POINT AT a transaction; a raw transaction is read by
+    the classifier as ONE script. The page answered all three, for a real mark, with "There is
+    no HashMark here … it is not a HashMark record". Driven through the page's own ``onCheck``
+    against a server holding a real transaction that carries a real signed record, with every
+    bridge answer computed by the real ``glue.py``."""
+
+    @staticmethod
+    def _mark_tx(limit: int) -> tuple[str, str, dict]:
+        txid, raw, fetched = _tx_result(_signed_script(b"the advisory, as published\n"), limit=limit)
+        return txid, raw.hex(), fetched
+
+    def _check(self, text: str, txid: str, raw_hex: str, fetched: dict) -> dict:
+        glue = _glue()
+        case = {
+            "text": text,
+            "raw": {txid: raw_hex},
+            "confirmations": 5,
+            "run_returns": [glue.run(text)],
+            "fetch_returns": [fetched],
+            "anchor_returns": [glue.mark_anchor(txid, json.dumps({"txid": txid, "confirmations": 5}), 460572)],
+        }
+        return _render({"case": {"check": case}})["case"]
+
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_the_transaction_it_points_at_is_checked(self, shape, limit) -> None:
+        txid, raw_hex, fetched = self._mark_tx(limit)
+        text = f"{txid}:0" if shape == "outpoint" else f"{txid}{0:08x}"
+        assert _glue().run(text)["form"] == shape, "the premise: the classifier reads this as the form under test"
+        out = self._check(text, txid, raw_hex, fetched)
+        flat = " ".join(out["text"].split())
+        assert ["blockchain.transaction.get", [txid, False]] in out["requested"], (
+            f"the page never asked the server for the transaction {text!r} points at"
+        )
+        assert [c[0] for c in out["calls"]["fetch"]] == [txid]
+        assert out["statuses"] == ["VERIFIED"], f"the real signed mark was not checked: {out['statuses']}"
+        assert "not a HashMark record" not in flat
+        assert "There is no HashMark here" not in flat
+        assert f"which points at output 0 of transaction {txid}" in flat, "the page did not say what it looked up"
+
+    def test_a_raw_transaction_is_told_it_was_read_as_one_script(self, limit) -> None:
+        """The classifier reads raw transaction hex as a single script (anything of script length
+        that is not 64 or 72 characters), so "not a HashMark record" was a claim about bytes the
+        reader never meant as a script. Now it is scoped to what was read, and says what to paste."""
+        txid, raw_hex, fetched = self._mark_tx(limit)
+        assert _glue().run(raw_hex)["form"] == "script", "the premise: raw transaction hex classifies as a script"
+        out = self._check(raw_hex, txid, raw_hex, fetched)
+        flat = " ".join(out["text"].split())
+        assert out["requested"] == [], "a pasted script reached the server"
+        assert "this single script is not a HashMark record" in flat
+        assert "it is not a HashMark record" not in flat
+        assert "Paste its transaction number instead" in flat
+
+    def test_a_pointer_to_a_transaction_the_server_lacks_still_says_what_was_looked_up(self, limit) -> None:
+        """The failure path keeps the note: the reader typed an outpoint, and the error is about
+        the transaction it named."""
+        txid, raw_hex, _fetched = self._mark_tx(limit)
+        other = "cd" * 32
+        text = f"{other}:3"
+        glue = _glue()
+        case = {
+            "text": text,
+            "raw": {txid: raw_hex},
+            "run_returns": [glue.run(text)],
+            "fetch_returns": [],
+            "anchor_returns": [],
+        }
+        out = _render({"case": {"check": case}})["case"]
+        flat = " ".join(out["text"].split())
+        assert ["blockchain.transaction.get", [other, False]] in out["requested"]
+        assert f"which points at output 3 of transaction {other}" in flat
+        assert "did not give back a transaction for that number" in flat
+
+
+# ─────────────────────────────────────── a confirmation count includes the block ──
+
+
+class TestAConfirmationCountIncludesTheBlock:
+    """``confirmations`` counts the mark's OWN block: ``resolve_mark_anchor`` places it at
+    ``tip - confirmations + 1``, so a mark in the newest block has one confirmation and nothing
+    built on top of it. The page printed "N block(s) built on top of it", overstating every
+    mark's burial by one block on the one screen a stranger reads it from.
+
+    The anchor is produced by the page's own Python entry point (``glue.mark_anchor``) from the
+    reply shape the endpoint really sends, so the height/confirmation pairing is the real one."""
+
+    TIP = 460_572
+
+    def _answer(self, confirmations: int) -> tuple[dict, str, list[str]]:
+        txid = "ab" * 32
+        verbose = json.dumps({"txid": txid, "confirmations": confirmations})
+        anchor = _glue().mark_anchor(txid, verbose, self.TIP)
+        assert anchor["resolved"], anchor
+        assert anchor["height"] == self.TIP - confirmations + 1, "the premise: the count includes the block"
+        text = _page(_as_tx_result(_payload_with_status("valid"), anchor=anchor))["text"]
+        return anchor, " ".join(text.split()), text.split("\n")
+
+    def test_a_mark_in_the_newest_block_has_nothing_on_top_of_it(self) -> None:
+        anchor, flat, _ = self._answer(1)
+        assert anchor["height"] == self.TIP, "one confirmation is the tip itself"
+        assert "1 block(s) built on top" not in flat, "a mark in the newest block was said to have a block on top"
+        assert "which has 1 confirmation: the block itself, with none built on top of it yet" in flat
+
+    def test_n_confirmations_is_the_block_and_n_minus_one_on_top(self) -> None:
+        _, flat, _ = self._answer(9)
+        assert "9 block(s) built on top" not in flat
+        assert "which has 9 confirmations: the block itself and 8 built on top of it" in flat
+
+    def test_the_row_beside_it_is_labelled_as_what_the_number_is(self) -> None:
+        """The fact row carried the same number under "blocks on top of it". Two elements
+        describing one quantity must agree after the fix, so the row is checked too."""
+        _, _, lines = self._answer(9)
+        assert "blocks on top of it" not in lines
+        assert lines[lines.index("confirmations") + 1] == "9"

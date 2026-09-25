@@ -370,8 +370,9 @@ _OMITTED_NESTED_KEYS = {
     "outcome text otherwise. The literal 'ok' would tell a reader nothing",
     "signature_unverified": "the raw 65-byte signature. The VERDICT is what a reader "
     "needs and the bytes are in the JSON drawer; the CLI omits it for the same reason",
-    "assumed_network": "shown beside a VERIFIED signature, where the assumption is "
-    "load-bearing. On a failure the reason is the detail, not the chain",
+    "assumed_network": "shown beside every SIGNATURE verdict — VERIFIED, DOES NOT VERIFY and "
+    "NOT CHECKED alike, since a record signed for another chain fails here. A v1 record carries "
+    "the key too but has no signature for the chain to bear on, so it is not shown there",
     "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
     "recovered_hash160": "identical to the committed signer whenever it is set, and "
     "the signer is already rendered; printing both invites reading them as two facts",

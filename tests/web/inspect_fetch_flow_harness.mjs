@@ -33,7 +33,9 @@
 //                      have (NOT_FOUND_FRAME below). `close` closes the socket without
 //                      answering; `frame` is sent verbatim instead of a JSON reply.
 //            "glue_returns": [result, …],   — what the classifier bridge returns, call by call
-//            "binding_returns": [result, …]} — what the binding bridge returns, call by call
+//            "binding_returns": [result, …], — what the binding bridge returns, call by call
+//            "interleave"?: "clear" | {"classify": {"text", "result"}}} — what the reader does
+//                      while the fetch is still waiting on the server
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
 //            "glue_calls": [[arg, …], …],   — every call to the classifier bridge, verbatim
 //            "binding_calls": [[arg, …], …], — every call to the binding bridge, verbatim
@@ -178,6 +180,9 @@ async function main() {
     crypto: { subtle: { digest: (algorithm, data) => webcrypto.subtle.digest(algorithm, data) } },
     WebSocket: makeServer(spec.server || {}, requested),
     navigator: {},
+    // Read by Clear and by a classification, which rewrite `?input=` in the address bar.
+    location: { href: "https://pyrxd.invalid/inspect/", search: "" },
+    history: { replaceState() {} },
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -208,7 +213,22 @@ async function main() {
 
   const fetchBtn = new StubElement("button");
   const status = new StubElement("span");
-  await sandbox.onFetchTxid(spec.txid, fetchBtn, status);
+  // `interleave`: what the reader does WHILE the fetch is waiting on the server — run
+  // synchronously after `onFetchTxid` has started and before any answer can arrive (the stub
+  // server answers on a later timer tick). "clear" presses Clear; {"classify": {"text",
+  // "result"}} classifies another input, the offline bridge answering with `result`.
+  const pending = sandbox.onFetchTxid(spec.txid, fetchBtn, status);
+  if (spec.interleave === "clear") {
+    sandbox.onClear();
+  } else if (spec.interleave && spec.interleave.classify) {
+    const { text, result } = spec.interleave.classify;
+    sandbox.__classify__ = () => ({ toJs: () => JSON.parse(JSON.stringify(result)), destroy() {} });
+    vm.runInContext(`pyGlue = __classify__; INPUT_BOX.value = ${JSON.stringify(text)};`, sandbox);
+    sandbox.onClassify();
+  } else if (spec.interleave) {
+    throw new Error(`unknown interleave ${JSON.stringify(spec.interleave)}`);
+  }
+  await pending;
 
   const resultBlock = vm.runInContext("RESULT_BLOCK", sandbox);
   const constants = {
