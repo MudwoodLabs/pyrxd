@@ -45,8 +45,8 @@ def _tx(outputs, inputs):
 def _world():
     """(reveal, the real commit it spent, a FORGED transaction the server answers with instead)."""
     from pyrxd.glyph.payload import build_reveal_scriptsig_suffix, encode_payload
-    from pyrxd.glyph.script import build_commit_locking_script
-    from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+    from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_script
+    from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
     from pyrxd.hash import hash256
     from pyrxd.security.types import Hex20
 
@@ -56,7 +56,10 @@ def _world():
         [("cd" * 32, 0, b"\x00")],
     )
     unlocking = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + build_reveal_scriptsig_suffix(cbor)
-    reveal = _tx([(b"\x6a" + b"\x00" * 8, 0)], [(commit.txid(), 0, unlocking)])
+    # The singleton the commit demands: without it no node accepts the reveal, and the binding says
+    # so rather than `bound`.
+    minted = build_nft_locking_script(Hex20(os.urandom(20)), GlyphRef(txid=commit.txid(), vout=0))
+    reveal = _tx([(minted, 1)], [(commit.txid(), 0, unlocking)])
     forged = _tx([(b"\x6a" + b"\x00" * 80, 0)], [("ee" * 32, 0, b"\x00")])
     return reveal, commit, forged
 
@@ -116,7 +119,11 @@ class TestTheCliSaysWhatHappenedToTheSpentTransaction:
         transport.update({reveal.txid(): reveal.serialize().hex(), commit.txid(): commit.serialize().hex()})
         assert _fetch(reveal.txid())["metadata"]["payload_binding"] == {
             "state": "bound",
-            "reason": "the spent commit committed to exactly this payload",
+            "commit": "nft",
+            "reason": "the spent NFT commit committed to exactly this payload, and this transaction creates its "
+            "ref as a singleton at output 0: that token's payload, not every output's",
+            "first_ref_output": 0,
+            "ref_output_count": 1,
         }
 
     def test_a_server_answering_with_another_transaction_is_not_called_not_supplied(self, transport) -> None:

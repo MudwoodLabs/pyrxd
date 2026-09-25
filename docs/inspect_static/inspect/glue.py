@@ -358,8 +358,9 @@ def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", pre
 
     It does NOT classify the transaction again. Re-running the whole classifier to change one
     field of its metadata was what this step used to cost; the answer comes from
-    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope and
-    the one output it spent, and which the CLI's ``--fetch`` calls too. The spent transaction is
+    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope, the
+    one output it spent, and the reveal's own output scripts (for the ref that output's commit
+    demands), and which the CLI's ``--fetch`` calls too. The spent transaction is
     hash-checked there against the txid in the outpoint before anything is read out of it.
 
     Returns ``{"ok": True, "binding": {...}}`` — ``binding`` is ``None`` when no input is

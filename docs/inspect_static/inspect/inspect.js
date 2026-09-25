@@ -114,6 +114,11 @@ let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo
 // entry and checks every record.
 const MAX_ROWS_SHOWN = 100;
 
+// The `payload_binding` states drawn as a warning: a node would REJECT the transaction as shown,
+// so its envelope is unattributed. `PAYLOAD_BINDING_WARNING_STATES` in `_inspect_core.py`, which
+// the CLI reads; `tests/web/test_payload_binding_warning_is_drawn.py` pins the two equal.
+const PAYLOAD_BINDING_WARNING_STATES = ["mismatch", "commit-unsatisfied"];
+
 // The ElectrumX endpoint, the wire timeout and the transaction size cap are
 // `ELECTRUMX_WSS_URL` / `FETCH_TIMEOUT_MS` / `MAX_FETCHED_TX_HEX_LEN` in shared.js,
 // which this page loads first. MAINNET is not incidental: glue.py's `_PAGE_NETWORK`
@@ -552,10 +557,12 @@ function renderFetchedTxCard(payload) {
     // first input that decodes, so the name shown need not be the one the commit
     // committed to. `mismatch` means it demonstrably is not. Rendered for every
     // state, because "not checked" and "checked and held" are opposite facts and
-    // omitting the weak one leaves the confident reading in place.
+    // omitting the weak one leaves the confident reading in place. Flagged: the
+    // states that say a node would REJECT this transaction as shown — the same set
+    // as `PAYLOAD_BINDING_WARNING_STATES` in `_inspect_core.py`.
     if (metadata.payload_binding) {
       const pb = metadata.payload_binding;
-      const cls = pb.state === "mismatch" ? "kv-warning" : undefined;
+      const cls = PAYLOAD_BINDING_WARNING_STATES.includes(pb.state) ? "kv-warning" : undefined;
       mdl.appendChild(kv("payload binding", `${pb.state} — ${pb.reason}`, cls));
       // WHY, when the page asked for the spent transaction and could not use what it got:
       // the server's refusal, or what was wrong with its answer — including an answer that
@@ -2593,7 +2600,8 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // `payload_hash` is the only thing binding the displayed name/attrs to anything, and the
   // classifier is network-free, so without this the verdict can only ever read "unchecked".
   // `spent_output_binding` answers for that one field — it reads the attributed input's
-  // envelope and the one output it spent — and the CLI's `--fetch` asks the same function.
+  // envelope, the one output it spent, and this transaction's output scripts for the ref that
+  // output's commit demands — and the CLI's `--fetch` asks the same function.
   //
   // BOUNDED BY CONSTRUCTION: one attributed input, one prevout, one extra round trip.
   // A failure here leaves the rest of the report standing — and is SAID: the refusal or the

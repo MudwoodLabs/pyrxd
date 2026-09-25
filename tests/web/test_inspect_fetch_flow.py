@@ -97,12 +97,19 @@ def _commit_for(cbor: bytes, amount: int = 1000):
 
 
 def _world(shown: str = "honest", committed: str | None = None):
-    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen)."""
+    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen). The reveal
+    mints the singleton its commit demands; ``committed`` differing from ``shown`` is a spend no
+    node accepts, which is what ``mismatch`` reports."""
+    from pyrxd.glyph.script import build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.security.types import Hex20
+
     suffix, shown_cbor = _envelope(shown)
     _, committed_cbor = _envelope(committed if committed is not None else shown)
     commit = _commit_for(committed_cbor)
     unlocking = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + suffix
-    reveal = _tx([(b"\x6a" + b"\x00" * 8, 0)], [(commit.txid(), 0, unlocking)])
+    minted = build_nft_locking_script(Hex20(b"\x33" * 20), GlyphRef(txid=commit.txid(), vout=0))
+    reveal = _tx([(minted, 1)], [(commit.txid(), 0, unlocking)])
     forged = _commit_for(shown_cbor, amount=999)
     assert forged.txid() != commit.txid()
     return reveal, commit, forged
@@ -177,8 +184,13 @@ class TestTheSpentTransactionTheServerSends:
         raw = reveal.serialize().hex()
         assert flow["glue_calls"] == [[reveal.txid(), raw, limit, limit]], "the transaction was classified twice"
         assert flow["binding_calls"] == [[reveal.txid(), raw, commit.serialize().hex(), ""]]
-        assert flow["binding_answers"][0]["binding"]["state"] == "bound"
-        assert _drawn_binding(flow) == ("bound — the spent commit committed to exactly this payload", None)
+        binding = flow["binding_answers"][0]["binding"]
+        assert binding["state"] == "bound" and binding["first_ref_output"] == 0
+        assert _drawn_binding(flow) == (
+            "bound — the spent NFT commit committed to exactly this payload, and this transaction creates its ref "
+            "as a singleton at output 0: that token's payload, not every output's",
+            None,
+        )
 
     def test_a_commit_to_a_different_payload_is_drawn_as_a_mismatch(self, limit) -> None:
         """The honest server, the dishonest reveal: the real commit committed to another payload."""

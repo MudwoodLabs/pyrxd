@@ -449,8 +449,11 @@ def _render_txid_human(payload: dict) -> str:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
         _pb = metadata.get("payload_binding")
         if _pb:
-            # Same reasoning as the browser: every state, including "unchecked".
-            _mark = "  *** " if _pb.get("state") == "mismatch" else "  "
+            # Same reasoning as the browser: every state, including "unchecked". Flagged: the
+            # states that say a node would reject this transaction as shown.
+            from ..glyph._inspect_core import PAYLOAD_BINDING_WARNING_STATES
+
+            _mark = "  *** " if _pb.get("state") in PAYLOAD_BINDING_WARNING_STATES else "  "
             lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
             # WHY, when the spent transaction was asked for and nothing usable came back. Already
             # sanitised and capped by `_spent_output_binding`: it can quote a server.

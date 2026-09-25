@@ -203,11 +203,24 @@ the txid it asked for before anything reads it, so a server that
 answers with some other transaction is refused. That includes
 `/inspect/`'s second fetch, of the commit a reveal spent, which is what
 decides `payload_binding`. That step does not classify the transaction
-again: `spent_output_binding` reads the attributed input's envelope and
-the one output it spent, and `pyrxd glyph inspect <txid> --fetch` asks
-the same function, so the page and the CLI word the same fetch the same
-way. When the fetch fails or is refused, the verdict reads `unchecked`
-and says why — not that the spent output "was not supplied".
+again: `spent_output_binding` reads the attributed input's envelope,
+the one output it spent, and the reveal's own output scripts (to see
+whether they carry the ref that output's commit demands), and
+`pyrxd glyph inspect <txid> --fetch` asks the same function, so the
+page and the CLI word the same fetch the same way. When the fetch fails
+or is refused, the verdict reads `unchecked` and says why — not that the
+spent output "was not supplied".
+
+What each `payload_binding` state establishes:
+
+| state | what it means | what it does NOT mean |
+|---|---|---|
+| `bound` | The attributed input spent an NFT or FT commit whose payload hash is the envelope shown, and this transaction's outputs carry that commit's outpoint as the ref type the commit demands. `first_ref_output` and `ref_output_count` say where; the reason names up to three. | That the name belongs to any OTHER output. A reveal minting two tokens is `bound` for whichever input is attributed, and only for that input's token. Signatures are not checked. |
+| `bound-no-token` | The same hash match against a DAT commit. A DAT commit demands no ref, so the payload is data and describes no output — whatever protocol it declares. | That a token was created. A DAT commit mints nothing, which makes it exactly what a decoy input placed first could spend. |
+| `mismatch` | The spent commit committed to a different payload. A node rejects that spend, so these are bytes that were never mined (pasted raw, or served for a txid no block holds). Flagged. | — |
+| `commit-unsatisfied` | The hash matches, and the outputs do not carry the commit's ref as it demands. A node rejects that spend too. Flagged. | — |
+| `not-a-commit` | The attributed input spent none of the three commit templates (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing). | Anything about the envelope. |
+| `unchecked` | The spent output, or the envelope's bytes, was not available. | — |
 
 ---
 
