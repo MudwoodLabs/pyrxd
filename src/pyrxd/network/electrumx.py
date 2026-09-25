@@ -37,7 +37,14 @@ from websockets.exceptions import WebSocketException
 from ..hash import hash256, sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
-from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError, redact
+from ..security.errors import (
+    NetworkError,
+    PolicyRejection,
+    RpcMethodNotFound,
+    TlsPinMismatchError,
+    ValidationError,
+    redact,
+)
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..security.units import ChainHeight, PhotonValue
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
@@ -117,6 +124,13 @@ _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 #  -26  RPC_TRANSACTION_REJECTED
 #  -27  RPC_TRANSACTION_ALREADY_IN_CHAIN
 _POLICY_ERROR_CODES: frozenset[int] = frozenset({1, -25, -26, -27})
+
+# JSON-RPC 2.0 "Method not found". It is how a server without the RXinDexer extension answers
+# `wave.*` / `glyph.*` / `swap.*` calls. Measured 2026-09-24 against the first shipped mainnet
+# default, electrumx.radiant4people.com, for wave.reverse_lookup, wave.resolve, glyph.get_token,
+# glyph.get_recent and swap.get_orders; e.g.
+#   {"jsonrpc":"2.0","error":{"code":-32601,"message":"unknown method \"wave.reverse_lookup\""},"id":2}
+_METHOD_NOT_FOUND_CODE: int = -32601
 
 # Reject-reason fragments (matched case-insensitively) that identify a policy/consensus
 # rejection even when it arrives under an unexpected code. Kept to strings a node emits
@@ -217,8 +231,10 @@ def _rpc_error(code: Any, message: Any) -> NetworkError:
 
     Returns :class:`~pyrxd.security.errors.PolicyRejection` (itself a
     ``NetworkError``, so existing ``except NetworkError`` handlers keep working) when
-    the code or the sanitized reason says the node rejected a transaction; a plain
-    ``NetworkError`` otherwise.
+    the code or the sanitized reason says the node rejected a transaction;
+    :class:`~pyrxd.security.errors.RpcMethodNotFound` (also a ``NetworkError``) for code
+    ``-32601``, so the failover layer can tell "this server does not implement that method"
+    from a transport fault; a plain ``NetworkError`` otherwise.
 
     The sanitized reason is attached **only** to a policy rejection — that is the one
     place where discarding it caused real harm. Every other RPC error keeps the
@@ -229,6 +245,8 @@ def _rpc_error(code: Any, message: Any) -> NetworkError:
     lowered = reason.lower()
     is_policy = code in _POLICY_ERROR_CODES or any(marker in lowered for marker in _POLICY_MESSAGE_MARKERS)
     if not is_policy:
+        if code == _METHOD_NOT_FOUND_CODE:
+            return RpcMethodNotFound(f"ElectrumX RPC error (code {code})")
         return NetworkError(f"ElectrumX RPC error (code {code})")
     detail = f": {reason}" if reason else ""
     return PolicyRejection(

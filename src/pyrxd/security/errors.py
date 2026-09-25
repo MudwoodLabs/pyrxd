@@ -44,6 +44,7 @@ __all__ = [
     "PoolTooSmallError",
     "PreRevealAbort",
     "PreRevealExpired",
+    "RpcMethodNotFound",
     "RxdSdkError",
     "SpvVerificationError",
     "TlsPinMismatchError",
@@ -497,6 +498,23 @@ class TlsPinMismatchError(NetworkError):
     "Cannot be performed" (no peer certificate available) raises this too, on
     purpose: a check that silently degrades to no check is worse than no check,
     because it is believed.
+    """
+
+
+class RpcMethodNotFound(NetworkError):
+    """The server answered, and its answer was JSON-RPC ``-32601``: it does not implement
+    the method.
+
+    That is how a plain ElectrumX server answers an RXinDexer extension (``wave.*``,
+    ``glyph.*``, ``swap.*``) it does not run, and a plain server is not expected to run one.
+    :class:`~pyrxd.network.failover.FailoverElectrumXClient` treats it as an answer rather
+    than a fault in ONE case: an idempotent ``call_extension``, where it skips such a server
+    without dropping its client, and without that answer demoting it. Everywhere else — a
+    non-idempotent extension call, a core method, or the genesis read behind the chain
+    check — it is handled as a fault, like any other ``NetworkError``.
+
+    A subclass of :class:`NetworkError`, so every existing ``except NetworkError`` handler
+    still catches it.
     """
 
 
