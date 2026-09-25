@@ -13,8 +13,28 @@
 #
 # THE TOKEN IS NOT GITHUB_TOKEN. These endpoints need repository Administration
 # (read), which is not among the permissions `GITHUB_TOKEN` can be granted
-# (there is no `administration` key). A PAT in TRAFFIC_TOKEN is required; the
-# collector exits 2 with the remediation text if it is missing or wrong.
+# (there is no `administration` key). So TRAFFIC_TOKEN is a PAT: FINE-GRAINED,
+# this repository only, Repository permissions -> Administration: Read-only and
+# nothing else. Not a classic PAT: the `repo` scope a classic one needs grants
+# full control of every repository its owner can reach.
+#
+# THE SECRET LIVES IN THE `traffic` ENVIRONMENT, not in the repository's secrets.
+# A repository secret is readable by any workflow on any branch that asks for it;
+# an environment secret only by a job that names the environment, and only from
+# the branches the environment admits (here: main). The `collect` job checks that
+# restriction before anything else and fails, naming the fix, if it is missing —
+# including the case GitHub creates silently: the first run that names an
+# environment that does not exist CREATES it, with no branch restriction at all.
+# Setup (maintainer, once): Settings -> Environments -> New environment `traffic`
+# -> Deployment branches and tags -> "Selected branches and tags" -> add branch
+# `main`; add TRAFFIC_TOKEN as an environment secret; delete the repository-level
+# TRAFFIC_TOKEN. The collector exits 2 with the remediation if the token is
+# missing or wrong.
+#
+# PULL REQUESTS run a separate job with a read-only token, no persisted
+# credentials, no environment and no secrets. That job IMPORTS the PR's copies of
+# both collectors (exec_module), so it executes the PR's code; it must never hold
+# a token that can write.
 #
 # PYPI DOWNLOADS go to `pypi.json` on the same branch, from pypistats.org (public,
 # no token). pyrxd's first downloads (2026-04-29) were ~150 days back when this was
@@ -25,9 +45,12 @@
 # empty day list as errors and writes nothing, so a broken run can never be
 # committed as a quiet week. The two collectors run independently
 # (continue-on-error), so one source's outage does not lose the other's day, and
-# the last step turns the run red if either failed. Guarded by
-# tests/test_traffic_history_is_never_silently_shortened.py and
-# tests/test_pypi_download_history_is_never_silently_shortened.py, which run in
+# the last step turns the run red if either failed. A CANCELLED run commits
+# nothing, and each collector replaces its file atomically, so an interrupted
+# write cannot leave a truncated history to commit. Guarded by
+# tests/test_traffic_history_is_never_silently_shortened.py,
+# tests/test_pypi_download_history_is_never_silently_shortened.py and
+# tests/test_pr_code_never_runs_with_the_traffic_write_token.py, which run in
 # ordinary CI.
 
 name: Traffic history
@@ -53,39 +76,45 @@ on:
       - ".github/workflows/traffic.yml"
 
 concurrency:
-  # Never two writers on the data branch at once.
-  group: traffic-history
-  cancel-in-progress: false
+  # Never two writers on the data branch at once: every scheduled and dispatched
+  # run shares ONE group, and none is cancelled once it has started.
+  #
+  # A pull_request run writes nothing, so it gets a group of its own per PR.
+  # Sharing the writers' group let a PR run DISPLACE a pending scheduled one:
+  # GitHub keeps one pending run per group and cancels the older pending run even
+  # with cancel-in-progress false — and a missed day is the failure the
+  # collector cannot see from inside.
+  group: >-
+    ${{ github.event_name == 'pull_request'
+    && format('traffic-history-pr-{0}', github.event.pull_request.number)
+    || 'traffic-history' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  collect:
-    name: Append today's traffic to the kept history
+  dry-run:
+    name: Dry-run the collectors (pull request, read-only)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read  # checks out the PR; this job writes nothing
     steps:
       - name: Check out the collector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Check out the data branch
-        if: github.event_name != 'pull_request'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: traffic-data
-          path: data
+          # The next step executes the PR's code. Leave no token on disk for it.
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
-      # On a pull_request the secret is not available to forks and we do not
-      # want to write anyway, so the PR run only proves the script imports and
-      # its guards behave — the real coverage is the test file, in normal CI.
-      - name: Dry run (pull_request only)
-        if: github.event_name == 'pull_request'
+      # The PR's collectors cannot reach the secret (this job names no
+      # environment and no secret), so this only proves the scripts import and
+      # merge() behaves. The real coverage is the test files, in normal CI.
+      - name: Import both collectors and exercise merge()
         run: |
           python -c "
           import importlib.util
@@ -95,12 +124,100 @@ jobs:
               print(path, 'imports cleanly; merge() is pure:', m.merge({}, {})[1] == 0)
           "
 
+  collect:
+    name: Append today's traffic to the kept history
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: traffic
+    permissions:
+      contents: write  # the commit step pushes the day's rows to the traffic-data branch
+      actions: read  # the first check reads this repository's `traffic` environment settings
+    steps:
+      - name: Check out the collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Only the data checkout below pushes. This one keeps no credentials.
+          persist-credentials: false
+
+      # TRAFFIC_TOKEN is only as protected as the environment holding it. GitHub
+      # CREATES a missing environment the first time a job names it, with no
+      # branch restriction, and a job in such an environment still reads a
+      # repository-level secret of the same name. So nothing would fail: it would
+      # quietly run unprotected. This step turns that into a red run naming the
+      # fix. It DETECTS a misconfiguration; it cannot enforce anything, since a
+      # workflow edited on another branch could delete it. The enforcement is the
+      # environment's own branch rule.
+      - name: Check the traffic environment admits only main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: traffic
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          repo, env = os.environ["REPO"], os.environ["ENVIRONMENT"]
+          fix = (
+              f"Fix: Settings -> Environments -> {env} -> Deployment branches and tags -> "
+              "'Selected branches and tags' -> add the branch rule `main` (and nothing else); keep "
+              f"TRAFFIC_TOKEN as a secret of the {env} environment and delete the repository-level "
+              "one. See the header of .github/workflows/traffic.yml."
+          )
+
+          def fail(message):
+              print(f"::error::{message} {fix}")
+              sys.exit(1)
+
+          def api(path):
+              proc = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/environments/{path}"], capture_output=True, text=True
+              )
+              if proc.returncode:
+                  fail(f"could not read environment {env!r}: {(proc.stderr or proc.stdout).strip()}.")
+              return json.loads(proc.stdout)
+
+          policy = api(env).get("deployment_branch_policy")
+          if not policy:
+              fail(
+                  f"environment {env!r} has NO deployment branch restriction, so a workflow on any "
+                  "branch can run a job in it and read its secrets. GitHub creates an environment "
+                  "exactly like that, silently, the first time a workflow names one that does not exist."
+              )
+          if policy.get("custom_branch_policies"):
+              rules = sorted(
+                  (p.get("type") or "branch", p.get("name"))
+                  for p in api(f"{env}/deployment-branch-policies").get("branch_policies") or []
+              )
+              if rules != [("branch", "main")]:
+                  fail(f"environment {env!r} admits {rules}; it must admit exactly the branch main.")
+              admits = "the branch main"
+          elif policy.get("protected_branches"):
+              admits = "protected branches only"
+          else:
+              fail(f"environment {env!r} has a branch policy that restricts nothing: {policy}.")
+          print(f"environment {env!r}: deployments restricted to {admits}")
+          PY
+
+      - name: Check out the data branch
+        id: data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: traffic-data
+          path: data
+          # The one checkout that keeps its credentials: the commit step pushes from it.
+          # zizmor artipacked is about a token uploaded in an ARTIFACT; this job uploads none.
+          persist-credentials: true  # zizmor: ignore[artipacked]
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
       - name: Collect GitHub traffic
         id: traffic
-        if: github.event_name != 'pull_request'
         continue-on-error: true
         env:
-          # A PAT with Administration:read. GITHUB_TOKEN cannot do this.
+          # A fine-grained PAT, Administration: Read-only, from the `traffic`
+          # environment. GITHUB_TOKEN cannot do this.
           TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
           TRAFFIC_REPO: ${{ github.repository }}
           TRAFFIC_FILE: data/traffic.json
@@ -108,18 +225,19 @@ jobs:
 
       - name: Collect PyPI downloads
         id: pypi
-        if: github.event_name != 'pull_request'
         continue-on-error: true
         env:
           PYPI_PACKAGE: pyrxd
           PYPI_DOWNLOADS_FILE: data/pypi.json
         run: python scripts/collect_pypi_downloads.py
 
-      # A failed collector writes nothing (both scripts exit 2 before any write), so
-      # committing whatever changed can never commit a failed fetch. Runs even when
-      # one collector failed, so the other's day is not lost.
+      # A failed collector writes nothing (both scripts exit 2 before any write), and
+      # a successful one replaces its file atomically, so committing whatever changed
+      # can never commit a failed or half-written fetch. Runs when one collector
+      # failed, so the other's day is not lost, but NOT when the run was cancelled:
+      # `always()` here once meant a cancel mid-write went on to commit the result.
       - name: Commit if anything changed
-        if: always() && github.event_name != 'pull_request'
+        if: ${{ !cancelled() && steps.data.outcome == 'success' }}
         working-directory: data
         run: |
           if git diff --quiet -- traffic.json pypi.json && [ -z "$(git ls-files --others --exclude-standard -- pypi.json)" ]; then
@@ -137,7 +255,10 @@ jobs:
       # continue-on-error keeps one source's outage from losing the other's day, but
       # it also turns a failed collector green. This puts the red back.
       - name: Fail the run if a collector failed
-        if: always() && github.event_name != 'pull_request' && (steps.traffic.outcome == 'failure' || steps.pypi.outcome == 'failure')
+        if: ${{ !cancelled() && (steps.traffic.outcome == 'failure' || steps.pypi.outcome == 'failure') }}
+        env:
+          TRAFFIC_OUTCOME: ${{ steps.traffic.outcome }}
+          PYPI_OUTCOME: ${{ steps.pypi.outcome }}
         run: |
-          echo "traffic: ${{ steps.traffic.outcome }} · pypi: ${{ steps.pypi.outcome }}"
+          echo "traffic: $TRAFFIC_OUTCOME · pypi: $PYPI_OUTCOME"
           exit 1

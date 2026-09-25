@@ -602,6 +602,75 @@ def test_the_non_personal_home_exemption_is_pinned(repo) -> None:
     assert _scan(repo).returncode == 0
 
 
+# The forms a 2026-09-25 probe showed the home-path check could not see: a temp repo holding only
+# these gave 0 findings, while the control `/home/<name>/notes.md` gave 1. Built at runtime like
+# the fixtures above, since this file is scanned too. The encoded forms are how Claude Code names
+# a directory after an absolute path: `/home/<user>/apps/pyrxd` becomes `-home-<user>-apps-pyrxd`.
+_ENCODED_HOME = "-".join(("", "home", _USERNAME, "apps", "pyrxd"))
+_HOME_LEAK_FORMS = {
+    "bare-home": "my home is " + "/" + "/".join(("home", _USERNAME)),
+    "bare-home-end-of-sentence": "it lives in " + "/" + "/".join(("home", _USERNAME)) + ".",
+    "bare-users-quoted": 'HOME = "' + "/" + "/".join(("Users", _USERNAME)) + '"',
+    "claude-projects": "see ~/.claude/projects/" + _ENCODED_HOME + "/memory/x.md",
+    "claude-tmp-scratch": "and /tmp/claude-1000/" + _ENCODED_HOME + "/scratch",
+    "macos-encoded": "under ~/.claude/projects/" + "-".join(("", "Users", _USERNAME, "src")),
+    "encoded-in-backticks": "the project dir `" + _ENCODED_HOME + "`",
+}
+
+
+@pytest.mark.parametrize("form", sorted(_HOME_LEAK_FORMS))
+def test_a_bare_or_dash_encoded_home_path_is_caught_by_both_scans(repo, form) -> None:
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, {"notes.md": f"{_HOME_LEAK_FORMS[form]}\n"}, "notes")
+    for proc in (_scan(repo), _scan(repo, "--no-tree", "--range", f"{base}..HEAD")):
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "notes.md:1" in proc.stderr and "bare home-directory paths" in proc.stderr, proc.stderr
+    redacted = _scan(repo, "--redact", "--no-tree", "--range", f"{base}..HEAD")
+    assert "notes.md:1: home-path" in redacted.stderr
+    assert _USERNAME not in redacted.stdout + redacted.stderr, "the redacted report echoed the username"
+
+
+def test_a_dash_encoded_home_path_in_a_commit_message_is_caught(repo) -> None:
+    """Every part of a commit goes through the same `scan_text`; this pins that the new pattern
+    reached the commit-message path too, not only file content."""
+    base = _git(repo, "rev-parse", "HEAD")
+    _write(repo, {"a.txt": "ok\n"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "notes", "-m", _HOME_LEAK_FORMS["claude-projects"])
+    proc = _scan(repo, "--redact", "--no-tree", "--range", f"{base}..HEAD")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "(commit message):3: home-path" in proc.stderr
+
+
+def test_home_path_look_alikes_are_not_flagged(repo) -> None:
+    """The honest-path twin of the test above. Widening a pattern is where a scanner starts
+    refusing honest docs, so each near miss is here: placeholders in both spellings, a flag and a
+    hyphenated word that contain `-home-`, `/home` with no user, the exempt Pyodide home in both
+    spellings and at the end of a sentence, a lowercase `/users/` URL path, and a `/tmp/claude-*/`
+    scratch path that carries no username."""
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(
+        repo,
+        {
+            "docs/near-misses.md": (
+                "clone into /home/<user> or /home/$USER, never /home/<user>/apps\n"
+                "Claude Code keeps it in ~/.claude/projects/-home-<user>-apps-<repo>/\n"
+                "pass --home-dir to override; a non-home-directory install works too\n"
+                "the /home directory, and /home/ itself\n"
+                "Pyodide is rooted at /home/pyodide. Its glue is -home-pyodide-glue.\n"
+                "see https://api.github.com/users/octocat and /tmp/claude-1000/scratch\n"
+            ),
+            "shared.js": 'sys.path.insert(0, "/home/pyodide")\n',
+        },
+        "near misses",
+    )
+    tree = _scan(repo)
+    assert tree.returncode == 0, tree.stdout + tree.stderr
+    history = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
+    assert history.returncode == 0, history.stdout + history.stderr
+    assert "1 commit(s), 7 added line(s), 0 finding(s)" in history.stdout
+
+
 @pytest.mark.parametrize(
     ("name", "text"),
     [("deploy.ps1", f"ssh {_SSH_LEAK}\r\n"), ("notes.md", f"see {_HOME_LEAK}\r\n")],

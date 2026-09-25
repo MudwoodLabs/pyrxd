@@ -9,9 +9,12 @@ Four checks:
    link text.
 2. **Bare home-directory paths** — an absolute ``/home/<user>/`` or
    ``/Users/<user>/`` path *anywhere* in any tracked text file: link, prose,
-   code or config. These leak the author's username and local layout,
-   break in every other clone, and — when they point into a sibling
-   project — leak that project's existence. Username-agnostic forms
+   code or config; a bare ``/home/<user>`` with nothing after it; and the
+   DASH-ENCODED form tools derive from one, ``-home-<user>-…``, as in
+   ``~/.claude/projects/-home-<user>-apps-<repo>/`` or
+   ``/tmp/claude-1000/-home-<user>-…``. These leak the author's username and
+   local layout, break in every other clone, and — when they point into a
+   sibling project — leak that project's existence. Username-agnostic forms
    like ``~/.pyrxd/config.toml`` are NOT flagged: that's the correct
    way to document a home-relative path.
 3. **Private project names** — read from a local, gitignored
@@ -93,7 +96,8 @@ Design notes
   username-agnostic), ``/root/...`` (no username embedded), or
   ``/tmp/...`` (scratch paths carry no username and are a normal way to
   describe a throwaway clone or fixture dump). Only paths with a
-  concrete username — ``/home/<user>/`` or ``/Users/<user>/`` — leak
+  concrete username leak: ``/home/<user>``, ``/Users/<user>``, and the
+  dash-encoded ``-home-<user>-…`` a ``/tmp/`` or ``~/`` path can carry
 """
 
 from __future__ import annotations
@@ -126,7 +130,9 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 # `](path)` form; this catches the rest. A ``file://`` prefix is
 # matched too, so a ``file://`` URL of a home path is caught.
 #
-# Matches: /home/<concrete-user>/..., /Users/<concrete-user>/...
+# Matches: /home/<concrete-user>/..., /Users/<concrete-user>/..., and
+# /home/<concrete-user> with NOTHING after it (a probe on 2026-09-25 found
+# "my home is /home/<user>" with a real name passed: a trailing "/" was required),
 # where the username segment is constrained to characters POSIX
 # usernames actually use ([a-zA-Z0-9._-]).
 #
@@ -141,7 +147,22 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 #   - /root/... — no username embedded; rare and not a personal leak
 #   - /tmp/... — scratch paths carry no username and are a normal way
 #     to describe a throwaway clone or fixture dump
-_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)/[^\s`)\"'<>]+")
+_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)(?:/[^\s`)\"'<>]*)?")
+
+#: The SAME leak with its slashes turned into dashes. Tools that key a directory on an absolute
+#: path encode it this way — Claude Code keeps per-project state under
+#: ``~/.claude/projects/-home-<user>-apps-<repo>/`` and scratch under
+#: ``/tmp/claude-<uid>/-home-<user>-…`` — and neither form contains ``/home/``, so the pattern above
+#: never saw them (the same 2026-09-25 probe: 0 findings for both). Group 1 is the username, up to
+#: the next dash; a username that itself contains a dash cannot be told apart from the path that
+#: follows, which does not matter for flagging it.
+#:
+#: The segment must START the token: nothing word-like, no ``.`` and no ``-`` immediately before
+#: it. So ``--home-dir`` (a flag) and ``non-home-directory`` (prose) do not match, while
+#: a segment after ``/`` and a backticked one do. A placeholder (``-home-<user>-``) does not match,
+#: for the same reason as ``/home/<user>/``. A SINGLE-dash flag spelled ``-home-<word>`` would
+#: match and be reported; none is in the tree (checked 2026-09-25), and the report names the line.
+_ENCODED_HOME_PATH_RE = re.compile(r"(?<![\w.-])-(?:home|Users)-([a-zA-Z0-9._]+)[^\s`)\"'<>]*")
 
 #: Home directories that name no person. Each is an exemption, so the membership is pinned by
 #: ``tests/test_leak_scan_covers_what_is_published.py`` rather than trusted as prose.
@@ -150,6 +171,29 @@ _HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)/[^\s`
 #: browser inspect page writes its glue module there (``docs/inspect_static/inspect/shared.js``).
 #: It was the one hit in a non-doc file when this check was widened to every file.
 _NON_PERSONAL_HOMES = frozenset({"pyodide"})
+
+
+def _is_personal_home(user: str) -> bool:
+    """False for a home that names no person. A sentence can end right after a bare home
+    (``rooted at /home/pyodide.``), so a trailing ``.`` is not part of the name."""
+    return user.rstrip(".") not in _NON_PERSONAL_HOMES
+
+
+def _home_path_matches(content: str) -> list[re.Match[str]]:
+    """Every home-path leak in *content*, both spellings, in order.
+
+    THE ONE DEFINITION, used by every scan through :func:`scan_text`. An encoded match that sits
+    inside a slash-form match (``/home/<user>/.claude/projects/-home-<user>-…``) is the same leak and is
+    reported once, as the slash form.
+    """
+    plain = [m for m in _HOME_PATH_RE.finditer(content) if _is_personal_home(m.group(1))]
+    encoded = [
+        m
+        for m in _ENCODED_HOME_PATH_RE.finditer(content)
+        if _is_personal_home(m.group(1)) and not any(p.start() <= m.start() < p.end() for p in plain)
+    ]
+    return sorted(plain + encoded, key=lambda m: m.start())
+
 
 #: Check names, as printed. `--redact` prints these and a location, nothing else.
 CHECK_PRIVATE_LINK = "private-link"
@@ -334,11 +378,11 @@ def find_home_paths(content: str) -> list[str]:
     the link-target checks, this scans the *whole* document body — a
     leak in a fenced code block or a plain prose mention counts.
 
-    Only ``/home/<user>/`` and ``/Users/<user>/`` match; ``~/``,
-    ``/root/`` and ``/tmp/`` are intentionally not flagged (see the
-    module docstring for why).
+    ``/home/<user>``, ``/Users/<user>`` (with or without a path after them) and
+    the dash-encoded ``-home-<user>-…`` match; ``~/``, ``/root/`` and ``/tmp/``
+    alone are intentionally not flagged (see the module docstring for why).
     """
-    return [m.group(0) for m in _HOME_PATH_RE.finditer(content) if m.group(1) not in _NON_PERSONAL_HOMES]
+    return [m.group(0) for m in _home_path_matches(content)]
 
 
 def looks_like_url(target: str) -> bool:
@@ -488,9 +532,8 @@ def scan_text(
             found.append(hit(CHECK_SSH_TARGET, m))
     # EVERY file, not only docs — the scope the ssh-target check was widened to for the same
     # reason: a home path in a .py, .yml, .toml or .sh file is exactly as public.
-    for m in _HOME_PATH_RE.finditer(content):
-        if m.group(1) not in _NON_PERSONAL_HOMES:
-            found.append(hit(CHECK_HOME_PATH, m))
+    for m in _home_path_matches(content):
+        found.append(hit(CHECK_HOME_PATH, m))
     if not is_doc:
         return found
 
@@ -959,7 +1002,7 @@ _EXPLANATIONS = {
         "error: tracked docs link to gitignored (private) paths:",
         "Public docs (anything tracked by git) must not link to private paths.\n"
         "Either move the target out of the gitignored directory, or remove the\n"
-        "link. See docs/CONTRIBUTING.md for the docs-publication convention.",
+        "link. See docs/security-review-playbook.md.",
     ),
     CHECK_PRIVATE_NAME: (
         "error: tracked docs name a private project:",
@@ -967,15 +1010,17 @@ _EXPLANATIONS = {
         "link to it would. This check exists because the link and home-path checks\n"
         "did not catch one: a prose aside crediting a sibling repo for a technique\n"
         "was written, committed and pushed before anyone noticed. Drop the name or\n"
-        'genericise it ("another project"). See docs/CONTRIBUTING.md.',
+        'genericise it ("another project"). See docs/security-review-playbook.md.',
     ),
     CHECK_HOME_PATH: (
         "error: tracked files contain bare home-directory paths:",
-        "An absolute /home/<user>/ or /Users/<user>/ path leaks the author's\n"
-        "username and local layout, breaks in every other clone, and if it\n"
-        "points into a sibling project leaks that project's existence.\n"
-        "Rewrite as a repo-relative path, a bare project/file reference, or a\n"
-        "username-agnostic ~/ path. See docs/CONTRIBUTING.md.",
+        "An absolute /home/<user>/ or /Users/<user>/ path (or /home/<user> alone,\n"
+        "or the dash-encoded -home-<user>-... form in a ~/.claude/projects/ or\n"
+        "/tmp/claude-<uid>/ path) leaks the author's username and local layout,\n"
+        "breaks in every other clone, and if it points into a sibling project\n"
+        "leaks that project's existence. Rewrite as a repo-relative path, a bare\n"
+        "project/file reference, or a username-agnostic ~/ path. See\n"
+        "docs/security-review-playbook.md.",
     ),
     CHECK_SSH_TARGET: (
         "error: tracked files name a machine by user and routable IP:",

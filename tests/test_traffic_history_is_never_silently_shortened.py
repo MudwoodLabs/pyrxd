@@ -189,3 +189,73 @@ def test_no_token_at_all_exits_nonzero_and_names_the_fix(
     assert mod.main() == 2
     err = capsys.readouterr().err
     assert "TRAFFIC_TOKEN" in err and "Administration" in err, err
+
+
+@pytest.mark.parametrize("failure", ["no-token", 401, 403])
+def test_the_remediation_asks_for_a_fine_grained_read_only_token_in_the_environment(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure
+) -> None:
+    """Both remediation paths used to offer "classic: `repo`" first. That scope is full control
+    of every repository the token's owner can reach, handed to a job that reads a view count.
+    The only token worth suggesting is fine-grained, this repository only, Administration:
+    Read-only, kept as a secret of the `traffic` environment (which only main can use)."""
+    import urllib.error
+
+    mod = _load(tmp_path, monkeypatch)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    if failure == "no-token":
+        monkeypatch.delenv("TRAFFIC_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("TRAFFIC_TOKEN", "t")
+
+        def _refuse(req, timeout=None):
+            raise urllib.error.HTTPError(getattr(req, "full_url", "u"), failure, "nope", {}, None)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", _refuse)
+
+    assert mod.main() == 2
+    err = " ".join(capsys.readouterr().err.split())
+    for needed in ("FINE-GRAINED", "only this repository", "Administration: Read-only", "`traffic` environment"):
+        assert needed in err, f"{needed!r} missing from: {err}"
+    assert "classic" not in err.lower() and "`repo`" not in err, err
+
+
+def test_an_interrupted_write_leaves_the_previous_history_intact(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled run signals the collector, and the commit step used to run on `always()`. A
+    write cut off halfway then left a truncated `traffic.json` to be committed over months of
+    history. Here the write is interrupted after half its bytes, the way a cancel would: the old
+    file must survive byte for byte, and no temporary file may be left beside it."""
+    mod = _load(tmp_path, monkeypatch)
+    monkeypatch.setenv("TRAFFIC_TOKEN", "t")
+    monkeypatch.setattr(mod, "_get", lambda path, token: _payload("views" if "views" in path else "clones"))
+    out = tmp_path / "traffic.json"
+    out.write_text(json.dumps({"views": {"2026-01-01": {"count": 9, "uniques": 9}}}, indent=2) + "\n")
+    before = out.read_bytes()
+
+    real_write_text = pathlib.Path.write_text
+
+    def _half_then_interrupted(self, data, *args, **kwargs):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pathlib.Path, "write_text", _half_then_interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        mod.main()
+    monkeypatch.undo()
+
+    assert out.read_bytes() == before, "an interrupted write truncated the history file"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["traffic.json"], "a temporary file was left behind"
+
+
+def test_a_completed_write_leaves_only_the_history_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honest path of the atomic write: the temporary file is renamed INTO place, not left."""
+    mod = _load(tmp_path, monkeypatch)
+    monkeypatch.setenv("TRAFFIC_TOKEN", "t")
+    monkeypatch.setattr(mod, "_get", lambda path, token: _payload("views" if "views" in path else "clones"))
+    assert mod.main() == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["traffic.json"]
+    assert len(json.loads((tmp_path / "traffic.json").read_text())["views"]) == 14

@@ -20,7 +20,16 @@ repository *Administration* access, which is not among the permissions grantable
 to `GITHUB_TOKEN` (`actions`, `attestations`, `checks`, `contents`,
 `deployments`, `discussions`, `id-token`, `issues`, `packages`, `pages`,
 `pull-requests`, `security-events`, `statuses` and friends — no
-`administration`). A PAT is required, so the workflow passes one in.
+`administration`). A PAT is required, so the workflow passes one in: a
+FINE-GRAINED token scoped to this repository only, with Repository permissions ->
+Administration: Read-only and nothing else, stored as a secret of the `traffic`
+environment (see the header of .github/workflows/traffic.yml). NOT a classic PAT:
+the `repo` scope a classic one needs grants full control of every repository its
+owner can access, for a job that only reads a view count.
+
+THE WRITE IS ATOMIC. The merged history goes to a temporary file beside the target
+and replaces it with ``os.replace``, so a run interrupted mid-write (a cancelled
+workflow signals the process) leaves the previous file intact, not a truncated one.
 
 FAILURE IS LOUD, deliberately. An auth failure, a network blip and a genuinely
 quiet fortnight all produce "no new rows", and the first two must never be
@@ -43,6 +52,15 @@ _OUT = pathlib.Path(os.environ.get("TRAFFIC_FILE", "traffic.json"))
 
 #: (endpoint, the key its per-day list is stored under in the response)
 _SERIES = (("views", "views"), ("clones", "clones"))
+
+#: What to set, printed by BOTH failure paths (no token at all; a 401/403/404). A classic
+#: PAT with `repo` would work, and would grant write access to every repository its owner
+#: can reach, so it is deliberately not offered.
+_TOKEN_REMEDIATION = (
+    "Set TRAFFIC_TOKEN as a secret of the `traffic` environment (Settings -> Environments -> "
+    "traffic), holding a FINE-GRAINED personal access token with Repository access: only this "
+    "repository, and Repository permissions -> Administration: Read-only, nothing else."
+)
 
 
 class TrafficError(RuntimeError):
@@ -75,8 +93,7 @@ def _get(path: str, token: str) -> dict:
             raise TrafficError(
                 f"{path} returned HTTP {exc.code}. These endpoints need repository "
                 "Administration (read) access, which the Actions GITHUB_TOKEN cannot be "
-                "granted. Set a TRAFFIC_TOKEN secret to a PAT with that permission "
-                "(classic: `repo`; fine-grained: Administration -> Read-only)."
+                f"granted. {_TOKEN_REMEDIATION}"
             ) from exc
         raise TrafficError(f"{path} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -104,6 +121,23 @@ def fetch(token: str) -> dict[str, dict[str, dict[str, int]]]:
             str(r["timestamp"])[:10]: {"count": int(r["count"]), "uniques": int(r["uniques"])} for r in rows
         }
     return out
+
+
+def _write_atomic(path: pathlib.Path, text: str) -> None:
+    """Replace *path* with *text* so that no reader, and no later step, can see a partial file.
+
+    Written to a temporary file in the same directory (so ``os.replace`` is a rename on one
+    filesystem, which is atomic) and then swapped in. An interruption before the swap leaves
+    the old file untouched and removes the temporary one. The workflow's commit step would
+    otherwise commit whatever bytes a cancelled write had got to.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def merge(existing: dict, fresh: dict) -> tuple[dict, int]:
@@ -138,8 +172,7 @@ def main() -> int:
         print(
             "error: no TRAFFIC_TOKEN in the environment. The traffic endpoints need "
             "repository Administration (read) access, which the Actions GITHUB_TOKEN "
-            "cannot be granted. Set a TRAFFIC_TOKEN repository secret to a PAT with that "
-            "permission (classic: `repo`; fine-grained: Administration -> Read-only).",
+            f"cannot be granted. {_TOKEN_REMEDIATION}",
             file=sys.stderr,
         )
         return 2
@@ -168,7 +201,7 @@ def main() -> int:
             return 2
 
     merged, changed = merge(existing, fresh)
-    _OUT.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_atomic(_OUT, json.dumps(merged, indent=2, sort_keys=True) + "\n")
 
     days = merged.get("views", {})
     span = f"{min(days)}..{max(days)}" if days else "(none)"

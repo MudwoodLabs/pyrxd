@@ -1,9 +1,9 @@
 """A pull request into ANY base branch must get the checks a pull request into main gets.
 
-Branch protection requires five status checks on `main`. It requires nothing on any other
-branch. Until this file existed, seven workflows (ci, lint, codeql, docs, osv-scanner,
-trufflehog, integration) also filtered their `pull_request` trigger with
-`branches: [main]` or `branches: [main, dev]`. So a stacked PR, one whose base is another
+Branch protection requires six status checks on `main` (`_REQUIRED_CHECKS` below; the
+count is checked against it). It requires nothing on any other branch. Until this file
+existed, seven workflows (ci, lint, codeql, docs, osv-scanner, trufflehog, integration) also
+filtered their `pull_request` trigger with `branches: [main]` or `branches: [main, dev]`. So a stacked PR, one whose base is another
 feature branch, ran NO checks at all: no tests, lint, CodeQL, docs build, OSV scan, secret
 scan or regtest. Measured before the change: this repository has had four PRs with a
 non-main base (#141, #231, #498, #664), and the head commit of each carries zero check
@@ -14,7 +14,8 @@ A gate protects a PLACE, not a change: the required checks are scoped to main, a
 stacked PR merges somewhere else. Its change then travels to main inside its base PR, and
 the only later chance to catch it is that PR's CI: a different PR from the one that caused
 the failure, and only if it runs after the stack lands and nobody bypasses protection
-(`enforce_admins` is off here). For #141 that chance did come: #155 took it to main with
+(`enforce_admins` was off when this was written; read as ON 2026-09-25, so an admin merge no
+longer skips the checks on main). For #141 that chance did come: #155 took it to main with
 11 check runs on a head that contained it. The stacked PR itself was still merged with no
 check having run on it.
 
@@ -59,7 +60,8 @@ _BASE_FILTER_EXEMPTIONS: dict[str, str] = {}
 
 #: The status checks branch protection requires on `main`. REVIEWED, not derived: CI cannot
 #: read branch protection. Read 2026-09-22, and again 2026-09-23 after `leak-scan` was added, with
-#: `gh api repos/MudwoodLabs/pyrxd/branches/main/protection --jq .required_status_checks.contexts`.
+#: `gh api repos/MudwoodLabs/pyrxd/branches/main/protection --jq .required_status_checks.contexts`,
+#: and again 2026-09-25: the same six, each now bound to the GitHub Actions app (app_id 15368).
 #: The workflow that produces each one is NOT written here; it is derived from the workflows' job
 #: names, so a renamed job fails this file rather than silently leaving a check unguarded.
 _REQUIRED_CHECKS = (
@@ -231,3 +233,85 @@ def test_pending_required_checks_are_still_pending() -> None:
         f"{arrived} now exist. Move each check name from _PENDING_REQUIRED_CHECKS into "
         f"_REQUIRED_CHECKS in {Path(__file__).name} (and confirm branch protection requires it)."
     )
+
+
+_NUMBER_WORDS = {
+    w: n
+    for n, w in enumerate(
+        ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve")
+    )
+}
+
+
+def test_the_docstring_states_the_same_number_of_required_checks_as_the_tuple() -> None:
+    """The docstring said "five status checks" after `leak-scan` had made it six: prose beside a
+    reviewed list drifts silently, because nothing reads it. So every count of status checks
+    this file's docstring states is checked against `_REQUIRED_CHECKS`. Whitespace is flattened
+    first, so a count wrapped onto the next line is still found; and at least one count must be
+    found, so rewording it away cannot turn this into a test of nothing."""
+    doc = " ".join((__doc__ or "").split())
+    words = "|".join(_NUMBER_WORDS)
+    counts = re.findall(rf"\b({words}|\d+) (?:required )?status checks\b", doc, re.IGNORECASE)
+    assert counts, "the module docstring no longer states how many checks are required; this test found nothing"
+    stated = {int(c) if c.isdigit() else _NUMBER_WORDS[c.lower()] for c in counts}
+    assert stated == {len(_REQUIRED_CHECKS)}, (
+        f"the docstring says {counts} status checks, but _REQUIRED_CHECKS lists {len(_REQUIRED_CHECKS)}"
+    )
+
+
+#: The script that WRITES branch protection. A re-run applies whatever it holds.
+_PROTECTION_SCRIPT = _ROOT / "scripts" / "post-public-flip.sh"
+#: The GitHub Actions app. A required check bound to it cannot be satisfied by a status that
+#: any other integration (or a token with `statuses: write`) posts under the same name.
+_GITHUB_ACTIONS_APP_ID = 15368
+
+
+def test_the_protection_script_would_not_downgrade_the_live_rules() -> None:
+    """`scripts/post-public-flip.sh` calls itself idempotent and safe to re-run, and it PUTs a
+    whole branch-protection document. It held `enforce_admins: false`, one required approval,
+    and a `typecheck` check that no workflow produces, while the live rules had moved on to six
+    app-bound checks enforced for admins. A re-run would have silently switched the admin bypass
+    back on. So its payload is pinned to `_REQUIRED_CHECKS`, the REVIEWED copy of the live list."""
+    import json
+
+    bodies = re.findall(r"<<'EOF'[^\n]*\n(\{.*?\n\})\nEOF\n", _PROTECTION_SCRIPT.read_text(encoding="utf-8"), re.S)
+    assert len(bodies) == 1, (
+        f"expected exactly one JSON protection payload in {_PROTECTION_SCRIPT.name}, found {len(bodies)}"
+    )
+    payload = json.loads(bodies[0])
+    status = payload["required_status_checks"]
+    assert "contexts" not in status, "bind each check to an app with `checks`, not the unbound `contexts` list"
+    checks = status["checks"]
+    assert sorted(c["context"] for c in checks) == sorted(_REQUIRED_CHECKS), (
+        f"{_PROTECTION_SCRIPT.name} would require {sorted(c['context'] for c in checks)}; "
+        f"the live rules (per _REQUIRED_CHECKS) require {sorted(_REQUIRED_CHECKS)}"
+    )
+    assert all(c.get("app_id") == _GITHUB_ACTIONS_APP_ID for c in checks), checks
+    assert status["strict"] is True
+    assert payload["enforce_admins"] is True, "a re-run would let admins merge past red or missing checks again"
+
+
+def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:
+    """The release runbook merged with `gh pr merge ... --admin`. That flag merges a PR that fails
+    ANY requirement, required checks included, and with `enforce_admins` on it no longer works at
+    all, so an instruction to use it is now wrong twice. Every tracked file except the frozen
+    CHANGELOG and the tests is read; backslash-continued command lines are joined first, so the
+    flag cannot hide on the next line. The runbook's own (flagless) merge command must be SEEN,
+    so a scan that read nothing cannot pass."""
+    import subprocess
+
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=_ROOT, capture_output=True, check=True).stdout
+    paths = [p for p in listed.decode().split("\0") if p and p != "CHANGELOG.md" and not p.startswith("tests/")]
+    merge = re.compile(r"\bgh\s+pr\s+merge\b[^\n]*")
+    seen, admin = [], []
+    for rel in paths:
+        try:
+            text = (_ROOT / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
+            continue
+        for m in merge.finditer(re.sub(r"\\\r?\n", " ", text)):
+            seen.append(rel)
+            if re.search(r"(?<![\w-])--admin\b", m.group(0)):
+                admin.append(f"{rel}: {m.group(0).strip()}")
+    assert "docs/runbooks/cutting-a-release.md" in seen, f"the scan did not see the runbook's merge command: {seen}"
+    assert not admin, "these tell someone to merge with --admin, past the required checks:\n" + "\n".join(admin)

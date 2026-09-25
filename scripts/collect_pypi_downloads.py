@@ -23,6 +23,10 @@ failed fetch and a genuinely quiet period both produce "no new rows", and the
 first must never be written into the history as the second. This script raises
 rather than writing a partial or empty merge, and the caller must not commit on a
 non-zero exit. No token is needed; the API is public and rate-limited.
+
+THE WRITE IS ATOMIC, for the same reason as the traffic collector's: the merged
+history goes to a temporary file and replaces the target with ``os.replace``, so an
+interrupted run leaves the previous file intact rather than a truncated one.
 """
 
 from __future__ import annotations
@@ -124,6 +128,23 @@ def fetch(package: str) -> dict[str, dict[str, int]]:
     return out
 
 
+def _write_atomic(path: pathlib.Path, text: str) -> None:
+    """Replace *path* with *text* so that no reader, and no later step, can see a partial file.
+
+    Written to a temporary file in the same directory (so ``os.replace`` is a rename on one
+    filesystem, which is atomic) and then swapped in. An interruption before the swap leaves
+    the old file untouched and removes the temporary one. The workflow's commit step would
+    otherwise commit whatever bytes a cancelled write had got to.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def merge(existing: dict, fresh: dict) -> tuple[dict, int]:
     """Newest wins, and return how many day-entries actually changed.
 
@@ -167,7 +188,7 @@ def main() -> int:
             return 2
 
     merged, changed = merge(existing, fresh)
-    _OUT.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_atomic(_OUT, json.dumps(merged, indent=2, sort_keys=True) + "\n")
 
     days = merged.get("without_mirrors", {})
     span = f"{min(days)}..{max(days)}" if days else "(none)"

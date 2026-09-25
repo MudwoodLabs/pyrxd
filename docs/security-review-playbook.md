@@ -421,7 +421,11 @@ Four checks:
 
 1. Link-target check — link is gitignored (tracked docs).
 2. Home-path regex check — `/home/<user>/...` or
-   `/Users/<user>/...` in any tracked text file.
+   `/Users/<user>/...` in any tracked text file, a bare `/home/<user>`
+   with nothing after it, and the dash-encoded `-home-<user>-…` that
+   tools derive from an absolute path (`~/.claude/projects/-home-<user>-…`,
+   `/tmp/claude-<uid>/-home-<user>-…`). The last two were added after a
+   2026-09-25 probe: a repo holding only those forms scanned clean.
 3. Private-project-name check — names listed in a local, gitignored
    `.private-names` file. It runs only where that file exists, so
    never in CI.

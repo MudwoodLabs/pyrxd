@@ -50,29 +50,52 @@ gh api -X PUT "repos/${REPO}/private-vulnerability-reporting" --silent || warn "
 ok "private vulnerability reporting enabled"
 
 say "Applying branch protection to ${BRANCH}"
-# Required: PR review (1 approver), up-to-date branch, CI passing, no force push, no deletion.
-# Note: on a solo-maintainer repo, "require PR" can be bypassed with admin override.
-# We deliberately do NOT enforce admins so the maintainer can push hotfixes if CI is wedged.
+# MIRRORS THE LIVE SETTING, read 2026-09-25 with
+#   gh api repos/MudwoodLabs/pyrxd/branches/main/protection
+# A re-run must not DOWNGRADE it. This block used to require one approval and
+# enforce_admins=false ("so the maintainer can push hotfixes if CI is wedged"), with a
+# `typecheck` check no workflow produces. Re-running that would have switched the admin
+# bypass back on and made every PR wait for a check that never reports.
+#
+# Every rule applies to admins too, so nobody can merge past a red or missing required
+# check (docs/runbooks/cutting-a-release.md). A PR is required, but no approving review,
+# so a solo maintainer can merge their own PR once it is green. Each check is bound to the
+# GitHub Actions app (app_id 15368), so a status posted by anything else cannot satisfy it.
+# The check list must equal `_REQUIRED_CHECKS` in
+# tests/test_ci_workflows_check_every_pr_base.py, which fails if the two differ.
 gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
   --input - <<'EOF' >/dev/null
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": ["test (3.12)", "lint", "typecheck"]
+    "checks": [
+      {"context": "test (3.12)", "app_id": 15368},
+      {"context": "lint", "app_id": 15368},
+      {"context": "Scan for leaked secrets", "app_id": 15368},
+      {"context": "Analyze (Python)", "app_id": 15368},
+      {"context": "scan-pr / osv-scan", "app_id": 15368},
+      {"context": "leak-scan", "app_id": 15368}
+    ]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 1,
+    "required_approving_review_count": 0,
     "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": false
+    "require_code_owner_reviews": false,
+    "require_last_push_approval": false
   },
   "restrictions": null,
   "allow_force_pushes": false,
   "allow_deletions": false,
+  "block_creations": false,
   "required_linear_history": true,
-  "required_conversation_resolution": true
+  "required_conversation_resolution": true,
+  "lock_branch": false,
+  "allow_fork_syncing": false
 }
 EOF
+# Signed commits are a separate endpoint; the live setting has them on.
+gh api -X POST "repos/${REPO}/branches/${BRANCH}/protection/required_signatures" --silent
 ok "branch protection applied to ${BRANCH}"
 
 say "Confirming current state"
