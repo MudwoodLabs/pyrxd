@@ -56,8 +56,7 @@ This runs [`scripts/mutation_test.sh`](../../scripts/mutation_test.sh). It mutat
 `src/pyrxd/<scope>/<file>.py` **in place** (the editable install picks it up), runs a scope-targeted
 fast test command per mutant, and restores via `git`. It is an **occasional gate, not part of
 `task ci`** (slow). Don't run concurrent git ops on `src/pyrxd` while it runs — when other
-sessions/worktrees are active, run the whole thing in a detached worktree (see
-`docs/solutions/integration-issues/task-ci-spurious-failures-from-concurrent-worktrees.md`).
+sessions/worktrees are active, run the whole thing in a detached worktree.
 
 Useful environment knobs:
 
