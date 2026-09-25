@@ -491,11 +491,13 @@ those for depth; use this page to look something up mid-task.
   `glyph/types.py`) for on-chain naming, Photonic-compatible. Requires
   `[NFT, MUT, WAVE]` together; pyrxd ships a dedicated `wave.py` module with
   a full `prepare_wave_reveal` builder. Registering a name pays the protocol's
-  **registration fee** (100, 50, 10 or 5 RXD for a 3, 4, 5 or 6+ character
-  name) to the WAVE treasury, and pyrxd pays it by default: every reveal
-  builder that can register a name returns it as `registration_fee_output`
-  (`glyph/wave_rules.py`). `pay_registration_fee=False` opts out; the name
-  still registers, since the indexer checks the payment only on renewal.
+  **registration fee** (100, 50, 10 or 5 RXD for a name of up to 3, 4, 5 or
+  6+ characters) to the WAVE treasury. Every reveal builder that can register
+  a name returns it as `registration_fee_output` (`glyph/wave_rules.py`) for
+  the caller to add, funded from a plain wallet input rather than the commit;
+  `pyrxd glyph mint-nft` pays it, after checking the name is free.
+  `pay_registration_fee=False` opts out; the name still registers, since the
+  indexer checks the payment only on renewal.
 - **watchtower** — the persistent monitoring loop
   (`pyrxd.gravity.watch`) that watches BTC and ETH counter-legs for
   in-flight swaps and pages an operator on anomalies. **Alert-only by

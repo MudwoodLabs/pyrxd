@@ -42,8 +42,9 @@ from ``attrs.name``, falling back to ``app.data.name``, and the parent from
 ``app.data``, straight past. The top-level ``name`` is what the indexer's one-time backfill
 reads (``wave_index.py:1378-1391``), so it must name the same claim or be absent.
 
-THE REGISTRATION FEE. A registration pays a length-priced fee to the protocol treasury, and
-pyrxd pays it by default. The sources:
+THE REGISTRATION FEE. A registration pays a length-priced fee to the protocol treasury. Every
+pyrxd builder that can register a name RETURNS that output for its caller to put in the
+reveal, and ``pyrxd glyph mint-nft`` PAYS it by default. The sources:
 
 - the WAVE protocol: "Registration — a one-time, length-based fee registers the name for two
   years", renewal pays "the name's registration price to the protocol treasury", and the fees
@@ -71,6 +72,15 @@ outputs as the minted token outputs, then related tokens, then the extra outputs
 (``packages/lib/src/mint.ts:877-881``), then change (``mint.ts:905-907``); a WAVE claim's
 token outputs are the NFT and then the mutable contract (``mint.ts:460``, ``:564``).
 
+THE FEE IS FUNDED AT REVEAL TIME, FROM THE WALLET. Photonic's commit output holds 1 photon; the
+reveal is funded by wallet inputs chosen by ``fundTx`` (``mint.ts:883-904``) from an unspent
+set that includes the commit's own change (``updateUnspent``, ``mint.ts:827``; the commit's
+outputs are the commit, the mutable seed, then change, ``mint.ts:818``). Mainnet claim
+``f644794b…``'s third input is exactly that: its commit transaction's vout 2. So the fee sits in
+the wallet until the reveal that registers the name spends it, and a reveal that does not pay
+it (because the name was taken in between) leaves it there. pyrxd does the same: nothing for the
+fee goes in the commit output.
+
 Both WAVE envelope writers (:func:`~pyrxd.glyph.payload.build_reveal_scriptsig_suffix`,
 :func:`~pyrxd.glyph.payload.build_mutable_scriptsig`) refuse a payload that registers a name
 unless the caller states what the transaction pays for it
@@ -79,6 +89,10 @@ register a name hands back the fee output it stated, as ``registration_fee_outpu
 that cannot are the FT deploy reveal, which refuses a WAVE claim, and the DAT reveal, whose
 envelope the indexer does not read. The way out is ``pay_registration_fee=False``, which is
 never the default.
+
+WHETHER A PAYLOAD REGISTERS A NAME — and so owes the fee — is decided by the INDEXER's rule
+(:func:`wave_registered_label`), not by the stricter rule pyrxd writes by: the fee must be paid
+for every claim the indexer registers, including ones pyrxd would not have written.
 """
 
 from __future__ import annotations
@@ -289,36 +303,96 @@ def refuse_unregistrable_wave_claim(cbor: bytes | dict[str, Any], *, allow_unreg
 WAVE_TREASURY_ADDRESS: Final = "1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG"
 
 _PHOTONS_PER_RXD: Final = 100_000_000
-#: Photons by bare-label length: ``calculateNameCost`` (``packages/lib/src/wave.ts:62-65``) and
-#: ``wave_name_price`` (``electrumx/server/wave_index.py:79-86``) both write ``<= 3``, 4, 5, and
-#: everything longer, as 10_000_000_000, 5_000_000_000, 1_000_000_000 and 500_000_000 photons —
-#: 100, 50, 10 and 5 RXD, the amounts both sources' comments give. Written in RXD here.
-#: pyrxd writes only 3-63 character labels, so ``<= 3`` is exactly 3.
-_PRICE_BY_LENGTH: Final = {3: 100 * _PHOTONS_PER_RXD, 4: 50 * _PHOTONS_PER_RXD, 5: 10 * _PHOTONS_PER_RXD}
-_PRICE_6_OR_MORE: Final = 5 * _PHOTONS_PER_RXD
+
+#: RXinDexer's ``WAVE_MAX_NAME_LENGTH`` (``electrumx/server/wave_index.py:42`` at ``ca8a6a4e``).
+_INDEXER_MAX_NAME_LENGTH: Final = 63
+
+
+def _indexer_name_problem(name: object) -> str | None:
+    """Why RXinDexer's ``validate_wave_name`` refuses ``name``, or ``None`` if it accepts it.
+
+    ``electrumx/server/wave_index.py:287-310`` at ``ca8a6a4e``, line for line: non-empty, at
+    most 63 characters, no leading or trailing ``-``, no ``--`` unless the name lower-cased
+    starts ``xn--``, and every character of the name LOWER-CASED in ``a-z 0-9 -``. There is no
+    minimum beyond non-empty (``WAVE_MIN_NAME_LENGTH`` is 1, line 41), and upper case passes
+    because the check runs on ``name.lower()``; the indexer then keys the name by its
+    lower-cased form (``name_to_hash``, lines 344-351).
+
+    This is NOT the rule pyrxd writes by (:func:`wave_label_problem`, which is stricter on
+    purpose). It is the rule that decides whether the indexer REGISTERS a claim, so it is the
+    one the registration fee is keyed on: a claim the indexer registers owes the fee whether or
+    not pyrxd would have written it.
+
+    A name that is not text makes upstream's ``len(name)`` raise inside ``process_tx``, so
+    nothing is registered; that is reported here as a refusal too.
+    """
+    if not isinstance(name, str):
+        return f"is {type(name).__name__}, not text"
+    if not name:
+        return "is empty"
+    if len(name) > _INDEXER_MAX_NAME_LENGTH:
+        return f"is longer than {_INDEXER_MAX_NAME_LENGTH} characters"
+    if name.startswith("-") or name.endswith("-"):
+        return "starts or ends with '-'"
+    if "--" in name and not name.lower().startswith("xn--"):
+        return "contains '--' outside an xn-- prefix"
+    for char in name.lower():
+        if char not in WAVE_LABEL_CHARS:
+            return f"contains {char!r}"
+    return None
+
+
+def _indexer_label(name: object) -> str:
+    """``name`` as a label the indexer registers: a bare label, or the label plus ``.rxd``.
+
+    Refused with ``ValidationError`` when RXinDexer's ``validate_wave_name`` would refuse the
+    label (:func:`_indexer_name_problem`).
+    """
+    if isinstance(name, str) and name.endswith("." + WAVE_ROOT_DOMAIN):
+        name = name[: -len(WAVE_ROOT_DOMAIN) - 1]
+    problem = _indexer_name_problem(name)
+    # _indexer_name_problem refuses a non-str too; the isinstance is for the type checker.
+    if problem or not isinstance(name, str):
+        raise ValidationError(f"{name!r} is not a WAVE name RXinDexer registers: it {problem}")
+    return name
+
+
+def _price_for_length(length: int) -> int:
+    """``calculateNameCost`` (``packages/lib/src/wave.ts:59-65`` at ``becf41a7``) and
+    ``wave_name_price`` (``electrumx/server/wave_index.py:79-86`` at ``ca8a6a4e``), which read
+    the same: ``<= 3`` → 100 RXD, 4 → 50, 5 → 10, anything longer → 5. Written in RXD, the unit
+    both sources' comments give."""
+    if length <= 3:
+        return 100 * _PHOTONS_PER_RXD
+    if length == 4:
+        return 50 * _PHOTONS_PER_RXD
+    if length == 5:
+        return 10 * _PHOTONS_PER_RXD
+    return 5 * _PHOTONS_PER_RXD
 
 
 def wave_registration_price(name: str) -> int:
-    """Registration price in photons for ``name`` (``"alice"`` or ``"alice.rxd"``).
+    """Registration price in photons for ``name`` (a bare label, or the label plus ``.rxd``).
 
-    Tiered by the length of the bare label, as Photonic's ``calculateNameCost`` and RXinDexer's
+    Tiered by the length of the label, as Photonic's ``calculateNameCost`` and RXinDexer's
     ``wave_name_price`` are (see the module docstring):
 
     ======  ===============  =======
     label   photons          RXD
     ======  ===============  =======
-    3       10,000,000,000   100
+    1-3     10,000,000,000   100
     4        5,000,000,000    50
     5        1,000,000,000    10
     6-63       500,000,000     5
     ======  ===============  =======
 
-    Both sources price "3 or fewer" at 100 RXD. pyrxd refuses a label under 3 characters
-    (:func:`parse_wave_name`), so here that tier is labels of exactly 3. The name is held to the
-    same rule as every claim pyrxd writes, and refused with ``ValidationError`` if it fails it.
+    Any label RXinDexer registers has a price, including the 1-2 character labels and the
+    upper-case ones pyrxd itself will not write: the indexer registers those
+    (:func:`_indexer_name_problem`), and both sources price "3 or fewer" at 100 RXD, so a
+    1-2 character label costs 100 RXD, never less. A name RXinDexer refuses (a ``.`` in the
+    label, over 63 characters, a leading ``-``) has no price and raises ``ValidationError``.
     """
-    label = parse_wave_name(name)
-    return _PRICE_BY_LENGTH.get(len(label), _PRICE_6_OR_MORE)
+    return _price_for_length(len(_indexer_label(name)))
 
 
 def _treasury_script(address: object) -> bytes:
@@ -348,16 +422,18 @@ class WaveRegistrationFee:
     """The output a reveal that registers a WAVE name pays to the protocol treasury.
 
     Put ``TransactionOutput(Script(fee.locking_script), fee.value)`` in the reveal after the
-    token outputs and before change. For a WAVE claim that is vout 2, after the NFT and the
-    mutable contract, which is where Photonic puts it (see the module docstring).
+    token outputs and before change — for a WAVE claim, vout 2, after the NFT and the mutable
+    contract — and FUND IT FROM A PLAIN WALLET INPUT added to the reveal, not from the commit.
+    That is Photonic's shape (see the module docstring), and it keeps the fee in the wallet,
+    where it can simply not be spent, until the moment the name is registered.
 
     ``value`` and ``locking_script`` are DERIVED from the label and the treasury address and
     cannot be passed in, so a fee at the wrong tier, or paying a script that is not the
     treasury's P2PKH, is not a value this type can hold.
     """
 
-    #: The bare label the claim registers (``"alice"``). ``"alice.rxd"`` is accepted and stored
-    #: as ``"alice"``.
+    #: The label the claim registers, as the indexer reads it (``"alice"``). ``"alice.rxd"`` is
+    #: accepted and stored as ``"alice"``.
     label: str
     #: Where the fee goes: the published MAINNET treasury unless the caller names another.
     treasury_address: str = WAVE_TREASURY_ADDRESS
@@ -367,8 +443,8 @@ class WaveRegistrationFee:
     locking_script: bytes = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "label", parse_wave_name(self.label))
-        object.__setattr__(self, "value", wave_registration_price(self.label))
+        object.__setattr__(self, "label", _indexer_label(self.label))
+        object.__setattr__(self, "value", _price_for_length(len(self.label)))
         object.__setattr__(self, "locking_script", _treasury_script(self.treasury_address))
 
     @property
@@ -393,13 +469,25 @@ class WaveRegistrationFee:
 
 
 def wave_registered_label(cbor: bytes | dict[str, Any]) -> str | None:
-    """The label RXinDexer's claim path would register from this payload, or ``None``.
+    """The name RXinDexer's claim path would register from this payload, or ``None``.
 
-    ``None`` for a payload that is not WAVE-marked (the indexer's own membership test, see
-    :func:`_is_wave_marked`) and for a WAVE-marked payload the indexer would skip
-    (:func:`wave_claim_problem`). The writers reach the second only through
-    ``allow_unregistrable_wave=True``, the recovery of a commit pyrxd ≤0.24.0 made. That reveal
-    registers nothing, so it owes no registration fee.
+    Decided by the INDEXER'S rule, not pyrxd's stricter write rule: the payload is WAVE-marked
+    by the indexer's own membership test (:func:`_is_wave_marked`), its ``attrs``, ``app`` and
+    ``app.data`` are maps the claim path can read, and the name it reads — ``attrs.name``,
+    falling back to ``app.data.name`` (``wave_index.py:711-713``) — passes upstream's
+    ``validate_wave_name`` (:func:`_indexer_name_problem`). So ``ab`` (2 characters), ``ALICE``
+    (the indexer lower-cases it), a claim whose top-level ``name`` or ``app.data.name`` names
+    something else (the indexer reads ``attrs.name`` first) all REGISTER, and all owe the fee,
+    even though pyrxd refuses to write them without ``allow_unregistrable_wave=True``.
+
+    ``None`` only for a payload the indexer truly skips: not WAVE-marked, unreadable maps, no
+    name, or a name ``validate_wave_name`` refuses — the dotted ``alice.rxd`` that pyrxd
+    ≤0.24.0 wrote is the case that matters.
+
+    What this does not consider: the parent. A claim whose parent is not the ``rxd`` root
+    registers only if that parent name exists in the index (``wave_index.py:732-746``), which
+    no offline check can know. pyrxd refuses to write such a claim; one revealed through
+    ``allow_unregistrable_wave=True`` is treated as registering, so the fee is never under-paid.
     """
     if isinstance(cbor, (bytes, bytearray)):
         try:
@@ -408,10 +496,15 @@ def wave_registered_label(cbor: bytes | dict[str, Any]) -> str | None:
             return None
     else:
         d = cbor
-    if not isinstance(d, dict) or not _is_wave_marked(d) or wave_claim_problem(d) is not None:
+    if not isinstance(d, dict) or not _is_wave_marked(d):
         return None
-    name, _parent = indexed_wave_name(d)
-    return name if isinstance(name, str) else None
+    try:
+        name, _parent = indexed_wave_name(d)
+    except ValidationError:  # a non-map attrs / app / app.data: the claim path raises and skips it
+        return None
+    if not isinstance(name, str) or _indexer_name_problem(name) is not None:
+        return None
+    return name
 
 
 def wave_registration_fee_for(
@@ -422,9 +515,8 @@ def wave_registration_fee_for(
 ) -> WaveRegistrationFee | None:
     """The registration fee a transaction carrying ``cbor`` pays, or ``None`` when it pays none.
 
-    :meth:`~pyrxd.glyph.builder.GlyphBuilder.prepare_commit`, every
-    :class:`~pyrxd.glyph.builder.GlyphBuilder` reveal method that can register a name, the
-    reveal-fee estimator in :mod:`pyrxd.glyph.fees` and ``pyrxd glyph mint-nft`` derive the
+    Every :class:`~pyrxd.glyph.builder.GlyphBuilder` reveal method that can register a name,
+    the reveal-fee estimator in :mod:`pyrxd.glyph.fees` and ``pyrxd glyph mint-nft`` derive the
     fee here.
 
     ``None`` when ``cbor`` registers no name (:func:`wave_registered_label`) or when
@@ -436,9 +528,11 @@ def wave_registration_fee_for(
         check it at registration, so the name still registers and resolves: its claim path
         (``wave_index.py:706-807`` at ``ca8a6a4e``) never reads the outputs. And renewing the
         name takes a transaction that spends its claim token and pays the name's price to the
-        treasury (``wave_index.py:581-642``; WAVE-Protocol ``ANNOUNCEMENT.md:52``). Must be a
-        ``bool``: a truthy string such as ``"False"`` would otherwise pay, and ``0`` would opt
-        out without saying so.
+        treasury (``wave_index.py:581-642``; WAVE-Protocol ``ANNOUNCEMENT.md:52``). ``False`` is
+        also the way to recover a commit whose name was taken before it could be revealed: the
+        reveal is then a duplicate claim the indexer does not register, and the commit's value
+        comes back as an NFT carrier plus change. Must be a ``bool``: a truthy string such as
+        ``"False"`` would otherwise pay, and ``0`` would opt out without saying so.
     :param registration_treasury: a P2PKH address to pay instead of :data:`WAVE_TREASURY_ADDRESS`.
         The published treasury is a MAINNET address and no testnet or regtest treasury is
         published, so on those chains name one here or pass ``pay_registration_fee=False``.
@@ -460,13 +554,23 @@ def wave_registration_fee_for(
     return WaveRegistrationFee(label, registration_treasury)
 
 
-#: The default of a WAVE envelope writer's ``registration_fee``: the caller has not said what
-#: the transaction pays. A string, so the writers can type it as ``Literal["unstated"]``.
+#: The default of a WAVE envelope writer's (and :func:`~pyrxd.glyph.fees.measure_reveal_fee`'s)
+#: ``registration_fee``: the caller has not said what the transaction pays. A string, so it can
+#: be typed ``Literal["unstated"]``.
 FEE_UNSTATED: Final = "unstated"
+
+#: ``registration_fee=FEE_DECLINED`` tells :func:`~pyrxd.glyph.fees.measure_reveal_fee` that a
+#: reveal whose envelope registers a name deliberately pays no fee
+#: (``pay_registration_fee=False``). ``None`` there means "this reveal registers nothing", and is
+#: refused for one that does.
+FEE_DECLINED: Final = "declined"
 
 
 def refuse_unstated_wave_fee(
-    cbor: bytes | dict[str, Any], registration_fee: WaveRegistrationFee | Literal["unstated"] | None
+    cbor: bytes | dict[str, Any],
+    registration_fee: WaveRegistrationFee | Literal["unstated"] | None,
+    *,
+    what: Literal["reveal", "update"] = "reveal",
 ) -> None:
     """Refuse to write a payload that registers a WAVE name until its fee has been stated.
 
@@ -493,13 +597,31 @@ def refuse_unstated_wave_fee(
         return
     if registration_fee == FEE_UNSTATED:
         owed = WaveRegistrationFee(label)
+        if what == "update":
+            # An update is a claim to the indexer (wave_index.py:684-699), but what it does
+            # depends on the name: a DUPLICATE while the name is held and live (767-781),
+            # a new registration only once it has lapsed or for another name (782-807). And a
+            # treasury payment in a transaction that spends the name's claim token is a RENEWAL
+            # (_maybe_process_renewal, 581-642), whatever the envelope says.
+            situation = (
+                f"this update's payload is marked WAVE and names {label}.{WAVE_ROOT_DOMAIN}, so RXinDexer "
+                f"reads it as a claim: a duplicate it does not register while that name is held and "
+                f"live, a new registration if the name has lapsed or is not the one this token holds. "
+                f"A registration's published fee is {owed.describe()}; a payment of that price to the "
+                f"treasury in a transaction that spends the name's claim token counts as a RENEWAL "
+                f"(RXinDexer _maybe_process_renewal)."
+            )
+        else:
+            situation = (
+                f"this reveal's payload registers the WAVE name {label}.{WAVE_ROOT_DOMAIN} if the name is "
+                f"free, and the published WAVE protocol charges {owed.describe()} for it (Photonic pays "
+                f"it; RXinDexer checks it on renewal but not at registration)."
+            )
         raise ValidationError(
-            f"this payload registers the WAVE name {label}.{WAVE_ROOT_DOMAIN}, and the published WAVE "
-            f"protocol charges {owed.describe()} for it (Photonic pays it; RXinDexer checks it on renewal "
-            f"but not at registration). This function writes script bytes and cannot add that output, "
-            f"so say what the transaction pays: registration_fee=wave_registration_fee_for(cbor), and put "
-            f"that output in the transaction, or registration_fee=None to register without paying. "
-            f"GlyphBuilder's reveal methods do this and return the output as registration_fee_output."
+            f"{situation} This function writes script bytes and cannot add that output, so say what "
+            f"the transaction pays: registration_fee=wave_registration_fee_for(cbor), and put that "
+            f"output in the transaction, or registration_fee=None to pay nothing. GlyphBuilder's "
+            f"reveal methods do this and return the output as registration_fee_output."
         )
     if registration_fee is None:
         return
@@ -511,3 +633,58 @@ def refuse_unstated_wave_fee(
         raise ValidationError(
             f"the registration fee is for {registration_fee.label!r}, but this payload registers {label!r}"
         )
+
+
+def _script_pushes(script: bytes) -> list[bytes]:
+    """The data pushes of ``script``, in order; opcodes that push nothing are skipped."""
+    out: list[bytes] = []
+    i = 0
+    while i < len(script):
+        op = script[i]
+        i += 1
+        if 1 <= op <= 75:
+            n = op
+        elif op == 0x4C:
+            if i + 1 > len(script):
+                break
+            n, i = script[i], i + 1
+        elif op == 0x4D:
+            if i + 2 > len(script):
+                break
+            n, i = int.from_bytes(script[i : i + 2], "little"), i + 2
+        elif op == 0x4E:
+            if i + 4 > len(script):
+                break
+            n, i = int.from_bytes(script[i : i + 4], "little"), i + 4
+        else:
+            continue
+        out.append(script[i : i + n])
+        i += n
+    return out
+
+
+def registered_label_in_scriptsig(scriptsig: bytes) -> str | None:
+    """The WAVE name a reveal input's scriptSig registers, read as RXinDexer reads it, or ``None``.
+
+    RXinDexer's ``parse_glyph_envelope`` takes a standalone ``gly`` push and decodes the NEXT
+    push as the reveal's CBOR (``electrumx/lib/glyph.py:214-232`` at ``ca8a6a4e``); the name is
+    then :func:`wave_registered_label` of that payload. A DAT envelope (``gly``, ``dat``, CBOR)
+    registers nothing: the push after ``gly`` is ``dat``, which is not a CBOR map.
+    """
+    pushes = _script_pushes(bytes(scriptsig))
+    for i, push in enumerate(pushes):
+        if push != b"gly" or i + 1 >= len(pushes) or len(pushes[i + 1]) < 2:
+            continue
+        payload = _cbor_map_or_none(pushes[i + 1])
+        if payload is not None:
+            return wave_registered_label(payload)
+    return None
+
+
+def _cbor_map_or_none(data: bytes) -> dict[Any, Any] | None:
+    """``data`` decoded, if it is a CBOR map; upstream tries the v2 structured form otherwise."""
+    try:
+        decoded = cbor2.loads(data)
+    except Exception:  # not CBOR at all: not a reveal payload, as upstream's own try/except treats it
+        return None
+    return decoded if isinstance(decoded, dict) else None

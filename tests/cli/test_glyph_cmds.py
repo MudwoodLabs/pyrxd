@@ -802,6 +802,15 @@ from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
 
 
+def _plain_source_tx(key: PrivateKey, vout: int, value: int) -> bytes:
+    """A transaction whose output ``vout`` pays ``value`` to ``key``'s P2PKH, serialized."""
+    from pyrxd.script.type import P2PKH
+
+    outs = [TransactionOutput(Script(b"\x6a"), 0) for _ in range(vout)]
+    outs.append(TransactionOutput(P2PKH().lock(key.address()), value))
+    return bytes(Transaction(tx_inputs=[], tx_outputs=outs).serialize())
+
+
 class TestDmintCliAssembly:
     """Drive the real build->fee->sign tx-assembly (the part the validation
     tests don't reach, and the part with no regtest-ElectrumX e2e)."""
@@ -1139,6 +1148,9 @@ class TestMultiTxGlyphAssembly:
         client = MagicMock()
         client.broadcast = _bcast
         client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        # mint-nft checks its funding UTXO's on-chain script is a bare P2PKH (a token UTXO is
+        # never spent as funding), so the fake serves the transaction that UTXO sits in.
+        client.get_transaction = AsyncMock(return_value=_plain_source_tx(key, utxo.tx_pos, utxo.value))
         return key, _Wallet(), client, captured
 
     def test_deploy_ft_inner_funds_from_vout_nonzero(self, cli_context, tmp_path) -> None:
@@ -1667,6 +1679,9 @@ class TestRevealFeeGuard:
         client = MagicMock()
         client.broadcast = _bcast
         client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        # mint-nft checks its funding UTXO's on-chain script is a bare P2PKH (a token UTXO is
+        # never spent as funding), so the fake serves the transaction that UTXO sits in.
+        client.get_transaction = AsyncMock(return_value=_plain_source_tx(key, utxo.tx_pos, utxo.value))
         return key, _Wallet(), client, captured
 
     def test_mint_nft_sizes_the_commit_from_the_real_reveal_estimate(self, cli_context, tmp_path) -> None:
@@ -2131,15 +2146,23 @@ class TestTheCommitTxidHelperCannotStrandACommit:
         assert echoed in rendered, "the echoed txid is the only handle left on a relayed commit"
         assert "explorer" in rendered
         # The advice must name a recovery that EXISTS. An earlier version sent the user to
-        # a "PendingMint record still in the store"; this CLI has no PendingStore at all,
-        # so that was fiction on a path where the commit is an unspendable hashlock unless
+        # a "PendingMint record still in the store" when no command kept one (deploy-ft and
+        # deploy-dmint, which reach this helper, still keep none), so that was fiction on a
+        # path where the commit is an unspendable hashlock unless
         # the reveal carries byte-identical CBOR. `_wait_for_tx` had this bug once and its
         # docstring calls it "the worst possible answer".
         assert "prepare_reveal" in rendered
         assert "store" not in rendered.lower(), "names a recovery this CLI does not have"
 
-    def test_the_cli_really_has_no_pending_store_to_point_at(self) -> None:
-        """The premise behind the assertion above, checked rather than assumed."""
+    def test_only_the_mint_flow_has_a_pending_store(self) -> None:
+        """The premise behind the assertion above, checked rather than assumed.
+
+        This helper's own advice names the SDK, because `deploy-ft` and `deploy-dmint` reach it
+        and keep no record. `mint-nft` (and `timelock-mint` through it) now DOES save a
+        PendingMint before broadcasting, and every exit after its commit — this helper's
+        refusal included — gains the `glyph resume-mint` recovery from `_after_commit`
+        (tests/cli/test_wave_registration_fee_cli.py pins those messages). So a store is reached from
+        glyph_cmds.py, and from no other CLI module."""
         import ast
 
         import pyrxd.cli
@@ -2161,7 +2184,7 @@ class TestTheCommitTxidHelperCannotStrandACommit:
                     offenders.append(path.name)
                 if isinstance(node, ast.Import) and any(a.name.endswith("glyph.mint") for a in node.names):
                     offenders.append(path.name)
-        assert not offenders, f"the CLI now reaches a PendingStore ({offenders}) — revisit the advice"
+        assert set(offenders) == {"glyph_cmds.py"}, f"PendingStore reached from {offenders} — revisit the advice"
 
 
 class TestALyingRevealEchoIsRefused:

@@ -5,8 +5,8 @@ Why this exists (C-1)
 The reveal transaction's **scriptSig carries the entire CBOR payload**
 (:func:`~pyrxd.glyph.payload.build_reveal_scriptsig_suffix`), so the reveal's
 serialized size — and therefore its fee — scales linearly with metadata size. The
-reveal's only input is the commit output, so the whole reveal fee is paid out of the
-commit's value.
+whole reveal miner fee is paid out of the commit output's value (the wallet input a WAVE
+registration adds pays only the registration fee; see below).
 
 ``MIN_FEE_RATE`` is 10,000 photons **per byte**. At that rate the historical
 hard-coded 5,000,000-photon commit value covers a reveal of roughly 500 bytes total,
@@ -52,19 +52,27 @@ one) at the last moment before the commit is broadcast.
 The WAVE registration fee
 -------------------------
 A reveal that registers a WAVE name also pays the protocol's registration fee to the treasury
-(:mod:`pyrxd.glyph.wave_rules`). That is one more output (a 25-byte P2PKH) and, in pyrxd's own
-flows, where the commit output funds the reveal, 5 to 100 RXD more that the commit must hold.
-:func:`estimate_reveal_fee` adds both unless ``pay_registration_fee=False``;
-:meth:`RevealFeeEstimate.required_commit_value`, :func:`commit_value_for_reveal` and
-:func:`check_reveal_funding` count the fee's value; and :func:`measure_reveal_fee` requires
-the caller to say which fee the built reveal pays, and refuses a reveal that does not carry
-that output.
+(:mod:`pyrxd.glyph.wave_rules`), and it pays it from a SECOND, plain wallet input added to the
+reveal — Photonic's shape — never from the commit. So the reveal has one more input (a P2PKH
+unlock) and one more output (the 25-byte treasury P2PKH):
+
+- :func:`estimate_reveal_fee` sizes both, unless ``pay_registration_fee=False``, and records the
+  fee as :attr:`RevealFeeEstimate.registration_fee`. The miner fee for the bigger reveal still
+  comes out of the commit, as every reveal's fee always has; the fee's VALUE does not.
+  :meth:`RevealFeeEstimate.required_commit_value` and :func:`commit_value_for_reveal` therefore
+  do not count it, and :attr:`RevealFeeEstimate.required_funding_value` is what the extra input
+  must hold.
+- :func:`measure_reveal_fee` reads the reveal's own envelope, refuses to measure one that
+  registers a name unless the caller says what it pays, and checks exactly one output pays the
+  treasury exactly the tier value.
+- :func:`assert_reveal_balances` is the whole pre-broadcast gate: that measurement, then inputs
+  covering every output plus the miner fee, with the change output surviving.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ..fee_models import SatoshisPerKilobyte
 from ..security.errors import InsufficientFundsError, ValidationError
@@ -73,7 +81,13 @@ from .builder import MIN_FEE_RATE
 from .payload import build_reveal_scriptsig_suffix, encode_payload
 from .script import build_ft_locking_script, build_nft_locking_script
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
-from .wave_rules import WaveRegistrationFee, wave_registration_fee_for
+from .wave_rules import (
+    FEE_DECLINED,
+    FEE_UNSTATED,
+    WaveRegistrationFee,
+    registered_label_in_scriptsig,
+    wave_registration_fee_for,
+)
 
 __all__ = [
     "MIN_COMMIT_OVERHEAD",
@@ -81,6 +95,7 @@ __all__ = [
     "REVEAL_SIG_PREFIX_BYTES",
     "REVEAL_SIZE_SLACK_BYTES",
     "RevealFeeEstimate",
+    "assert_reveal_balances",
     "check_reveal_funding",
     "commit_value_for_reveal",
     "estimate_reveal_fee",
@@ -148,8 +163,9 @@ class RevealFeeEstimate:
         cbor_bytes_len: encoded metadata length that drove the size.
         scriptsig_bytes: full reveal scriptSig length (sig + pubkey + 'gly' + CBOR).
         registration_fee: the WAVE registration fee output the reveal pays, or ``None``. Its
-            output is counted in ``size_bytes``; its VALUE is not part of ``fee`` (it is paid to
-            the treasury, not to miners) but is part of :meth:`required_commit_value`.
+            output, and the wallet input that funds it, are counted in ``size_bytes`` and so in
+            ``fee``; its VALUE is not part of ``fee`` (it goes to the treasury, not to miners)
+            and is not part of :meth:`required_commit_value` (the wallet input pays it).
     """
 
     size_bytes: int
@@ -157,16 +173,30 @@ class RevealFeeEstimate:
     fee_rate: int
     cbor_bytes_len: int
     scriptsig_bytes: int
-    registration_fee: WaveRegistrationFee | None = field(kw_only=True)
+    registration_fee: WaveRegistrationFee | None = field(default=None, kw_only=True)
 
     @property
     def registration_fee_value(self) -> int:
         """Photons the reveal pays the WAVE treasury; 0 when it registers no name or declined."""
         return self.registration_fee.value if self.registration_fee is not None else 0
 
+    @property
+    def required_funding_value(self) -> int:
+        """What the reveal's extra, plain wallet input must hold at least: the registration fee.
+
+        0 when the reveal pays no fee (and then has no such input). Anything above it comes back
+        as change; the reveal's miner fee is the commit's to pay (:meth:`required_commit_value`).
+        """
+        return self.registration_fee_value
+
     def required_commit_value(self, carrier_value: int) -> int:
-        """Minimum commit-output value that lets the reveal pay its own fee and any WAVE registration fee."""
-        return carrier_value + self.fee + self.registration_fee_value
+        """Minimum commit-output value that lets the reveal pay its own miner fee.
+
+        Not the WAVE registration fee: a plain wallet input added to the reveal pays that
+        (:attr:`required_funding_value`), so the commit holds exactly what it would for the
+        same reveal with no fee to pay, plus the miner fee for that input's and output's bytes.
+        """
+        return carrier_value + self.fee
 
 
 def reveal_locking_script_size(*, is_nft: bool) -> int:
@@ -201,11 +231,11 @@ def estimate_reveal_fee(
         extra_output_script_sizes: locking-script lengths of the reveal's *other*
             outputs beyond the token carrier. Defaults to a single P2PKH change
             output, which is what both CLI mint paths build.
-        pay_registration_fee: when ``cbor_bytes`` registers a WAVE name, the reveal pays
-            the registration fee, so the estimate adds its output to the size and records
-            it as :attr:`RevealFeeEstimate.registration_fee` (whose value
-            :meth:`~RevealFeeEstimate.required_commit_value` counts). ``False`` declines it;
-            see :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`. Not added to
+        pay_registration_fee: when ``cbor_bytes`` registers a WAVE name, the reveal pays the
+            registration fee from a second, plain P2PKH wallet input, so the estimate adds that
+            input and the fee's output to the size and records the fee as
+            :attr:`RevealFeeEstimate.registration_fee`. ``False`` declines it; see
+            :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`. Not added to
             ``extra_output_script_sizes`` by the caller: this adds it.
         registration_treasury: pay the fee to this P2PKH address instead of the published
             mainnet treasury.
@@ -230,9 +260,15 @@ def estimate_reveal_fee(
     )
     scriptsig_bytes = REVEAL_SIG_PREFIX_BYTES + len(suffix)
     fee_output = () if registration_fee is None else (len(registration_fee.locking_script),)
+    # The fee is funded by a plain P2PKH wallet input — the same sig + pubkey unlock the reveal
+    # input carries ahead of its envelope, so the same constant sizes it.
+    funding_input = () if registration_fee is None else (REVEAL_SIG_PREFIX_BYTES,)
 
     tx = _ShimTx(
-        inputs=[_ShimInput(unlocking_script=_FixedSizeScript(scriptsig_bytes))],
+        inputs=[
+            _ShimInput(unlocking_script=_FixedSizeScript(scriptsig_bytes)),
+            *(_ShimInput(unlocking_script=_FixedSizeScript(n)) for n in funding_input),
+        ],
         outputs=[
             _ShimOutput(locking_script=_FixedSizeScript(reveal_locking_script_size(is_nft=is_nft))),
             *(_ShimOutput(locking_script=_FixedSizeScript(n)) for n in fee_output),
@@ -269,12 +305,88 @@ def _measure(
     )
 
 
+def _reveal_envelope_label(reveal_tx: Any) -> tuple[bool, str | None]:
+    """``(seen, label)``: whether any input's glyph envelope could be read, and the WAVE name it
+    registers (by the indexer's rule), if any.
+
+    Read from each input's unlocking script, or — before signing — from a template built by
+    :func:`~pyrxd.glyph.mint.build_reveal_unlock_template`, which carries its envelope as
+    ``glyph_scriptsig_suffix``. A plain P2PKH unlock has no envelope. A hand-rolled template's
+    envelope cannot be seen here at all.
+    """
+    seen = False
+    for tx_input in reveal_tx.inputs:
+        script = getattr(tx_input, "unlocking_script", None)
+        template = getattr(tx_input, "unlocking_script_template", None)
+        if script:
+            raw = script.serialize()
+        elif template is not None and isinstance(getattr(template, "glyph_scriptsig_suffix", None), bytes):
+            raw = template.glyph_scriptsig_suffix
+        else:
+            continue
+        if b"gly" in raw:
+            seen = True
+        label = registered_label_in_scriptsig(raw)
+        if label is not None:
+            return True, label
+    return seen, None
+
+
+def _check_the_fee_the_reveal_pays(reveal_tx: Any, registration_fee: object) -> WaveRegistrationFee | None:
+    """Hold ``reveal_tx``'s outputs to the fee the caller says it pays. Returns that fee, or ``None``."""
+    seen, label = _reveal_envelope_label(reveal_tx)
+    if registration_fee == FEE_UNSTATED or registration_fee is None:
+        if label is not None:
+            said = "that it registers nothing (registration_fee=None)" if registration_fee is None else "nothing"
+            raise ValidationError(
+                f"this reveal's envelope registers the WAVE name {label}.rxd, and the caller said {said} "
+                f"about its registration fee. Pass registration_fee=<the builder result's "
+                f"registration_fee_output>, the output this reveal must carry, or "
+                f"registration_fee=FEE_DECLINED if it deliberately pays none (pay_registration_fee=False)."
+            )
+        return None
+    if registration_fee == FEE_DECLINED:
+        if seen and label is None:
+            raise ValidationError(
+                "registration_fee=FEE_DECLINED was given, but this reveal's envelope registers no WAVE name"
+            )
+        return None
+    if not isinstance(registration_fee, WaveRegistrationFee):
+        raise ValidationError(
+            "measure_reveal_fee registration_fee must be a WaveRegistrationFee, FEE_DECLINED or None, got "
+            f"{type(registration_fee).__name__}"
+        )
+    if seen and label != registration_fee.label:
+        registers = f"registers {label!r}" if label is not None else "registers no WAVE name"
+        raise ValidationError(
+            f"the registration fee is for {registration_fee.label!r}, but this reveal's envelope {registers}"
+        )
+    to_treasury = [o for o in reveal_tx.outputs if o.locking_script.serialize() == registration_fee.locking_script]
+    if not to_treasury:
+        raise ValidationError(
+            f"the reveal does not carry its WAVE registration fee: no output pays "
+            f"{registration_fee.describe()} (script {registration_fee.locking_script.hex()}). "
+            f"Add registration_fee_output to the reveal's outputs."
+        )
+    if len(to_treasury) != 1:
+        raise ValidationError(
+            f"the reveal pays the WAVE treasury script {len(to_treasury)} times; exactly one output must "
+            f"pay the registration fee ({registration_fee.describe()})"
+        )
+    if to_treasury[0].satoshis != registration_fee.value:
+        raise ValidationError(
+            f"the reveal's treasury output pays {to_treasury[0].satoshis:,} photons, but the registration fee "
+            f"for {registration_fee.label}.rxd is {registration_fee.value:,}"
+        )
+    return registration_fee
+
+
 def measure_reveal_fee(
     reveal_tx: Any,
     *,
     fee_rate: int = MIN_FEE_RATE,
     cbor_bytes_len: int = 0,
-    registration_fee: WaveRegistrationFee | None,
+    registration_fee: WaveRegistrationFee | Literal["unstated", "declined"] | None = FEE_UNSTATED,
 ) -> RevealFeeEstimate:
     """Measure an **already-built** reveal transaction instead of estimating one.
 
@@ -301,31 +413,25 @@ def measure_reveal_fee(
             an unlocking script or an unlocking-script template.
         fee_rate: photons per byte — the same rate the transaction will be fee'd at.
         cbor_bytes_len: payload length, carried through for the error message only.
-        registration_fee: the WAVE registration fee this reveal pays — the builder result's
-            ``registration_fee_output`` — or ``None``. REQUIRED, with no default: its value is
-            part of what the commit must fund (:meth:`RevealFeeEstimate.required_commit_value`),
-            and a measurement that forgot it would pass a commit that cannot pay it.
+        registration_fee: what the reveal pays for a WAVE name, checked against the reveal's
+            OWN envelope (read from its unlocking scripts, or from a
+            :func:`~pyrxd.glyph.mint.build_reveal_unlock_template` template before signing):
+
+            - left out (``FEE_UNSTATED``): fine for a reveal that registers no name, which is
+              every non-WAVE reveal; refused for one that does;
+            - ``None``: "this reveal registers nothing" — refused for one that does;
+            - ``FEE_DECLINED``: the reveal registers a name and deliberately pays nothing
+              (``pay_registration_fee=False``);
+            - a :class:`~pyrxd.glyph.wave_rules.WaveRegistrationFee` (the builder result's
+              ``registration_fee_output``): the envelope must register that label, and exactly
+              one output must pay the treasury script, at exactly the tier value.
 
     Raises:
-        ValidationError: on a non-positive ``fee_rate``, or when ``registration_fee`` is given
-            and ``reveal_tx`` has no output paying exactly its value to exactly its script —
-            the assembler dropped the fee, which the measurement is here to catch.
+        ValidationError: on a non-positive ``fee_rate``, or any registration-fee mismatch above.
     """
     if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
         raise ValidationError("measure_reveal_fee fee_rate must be a positive int")
-    if registration_fee is not None:
-        if not isinstance(registration_fee, WaveRegistrationFee):
-            raise ValidationError("measure_reveal_fee registration_fee must be a WaveRegistrationFee or None")
-        paid = any(
-            out.locking_script.serialize() == registration_fee.locking_script and out.satoshis == registration_fee.value
-            for out in reveal_tx.outputs
-        )
-        if not paid:
-            raise ValidationError(
-                f"the reveal does not carry its WAVE registration fee: no output pays "
-                f"{registration_fee.describe()} (script {registration_fee.locking_script.hex()}). "
-                f"Add registration_fee_output to the reveal's outputs."
-            )
+    checked = _check_the_fee_the_reveal_pays(reveal_tx, registration_fee)
     scriptsig_bytes = 0
     for tx_input in reveal_tx.inputs:
         script = getattr(tx_input, "unlocking_script", None)
@@ -339,8 +445,83 @@ def measure_reveal_fee(
         fee_rate=fee_rate,
         cbor_bytes_len=cbor_bytes_len,
         scriptsig_bytes=scriptsig_bytes,
-        registration_fee=registration_fee,
+        registration_fee=checked,
     )
+
+
+def assert_reveal_balances(
+    reveal_tx: Any,
+    *,
+    fee_rate: int = MIN_FEE_RATE,
+    cbor_bytes_len: int = 0,
+    registration_fee: WaveRegistrationFee | Literal["unstated", "declined"] | None = FEE_UNSTATED,
+) -> RevealFeeEstimate:
+    """The whole pre-broadcast gate for a built reveal: its fee output, and that it balances.
+
+    :func:`measure_reveal_fee` first (the envelope, exactly one treasury output at exactly the
+    tier value), then the arithmetic a node will do: the inputs must cover every non-change
+    output plus the measured miner fee, and the change output must survive. Before
+    ``Transaction.fee()`` is called, the amount left for change must exceed what ``fee()``
+    drops (``change <= change_count``); after, what the inputs leave over the outputs must pay
+    the measured fee. A reveal that "balances" by losing its change, or by leaving the miner
+    fee short, is refused here with the numbers.
+
+    Works on an unsigned, un-fee'd reveal (the dry run) and on a signed one. Every input must
+    carry its value (``satoshis``).
+
+    Raises:
+        InsufficientFundsError: the inputs do not cover the outputs and the fee, or the change
+            would be dropped; itemised.
+        ValidationError: anything :func:`measure_reveal_fee` refuses, or an input with no value.
+    """
+    measured = measure_reveal_fee(
+        reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len, registration_fee=registration_fee
+    )
+    values = [getattr(i, "satoshis", None) for i in reveal_tx.inputs]
+    ints = [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
+    if len(ints) != len(values):
+        raise ValidationError("cannot check the balance of a reveal whose inputs do not carry their value")
+    total_in = sum(ints)
+    change = [o for o in reveal_tx.outputs if getattr(o, "change", False)]
+    fixed = [o for o in reveal_tx.outputs if not getattr(o, "change", False)]
+    fixed_value = sum(o.satoshis for o in fixed)
+    change_value = sum(o.satoshis for o in change)
+    fee_part = measured.registration_fee_value
+    treasury = (
+        f" + {fee_part:,} WAVE registration fee for {measured.registration_fee.label}.rxd to "
+        f"{measured.registration_fee.treasury_address}"
+        if measured.registration_fee is not None
+        else ""
+    )
+    itemised = (
+        f"inputs {total_in:,} photons ({', '.join(f'{v:,}' for v in ints)}); outputs "
+        f"{fixed_value - fee_part:,} photons{treasury}; miner fee {measured.fee:,} for "
+        f"{measured.size_bytes:,} bytes at {measured.fee_rate:,} photons/byte"
+    )
+    if change and change_value == 0:
+        left = total_in - fixed_value - measured.fee
+        if left < 0:
+            raise InsufficientFundsError(
+                f"the reveal does not balance: {itemised} — short by {-left:,}",
+                available=total_in,
+                required=fixed_value + measured.fee,
+            )
+        if left <= len(change):
+            raise InsufficientFundsError(
+                f"the reveal balances only by dropping its change: {itemised}, leaving {left:,} for "
+                f"{len(change)} change output(s), which Transaction.fee() removes",
+                available=total_in,
+                required=fixed_value + measured.fee + len(change) + 1,
+            )
+        return measured
+    paid = total_in - fixed_value - change_value
+    if paid < measured.fee:
+        raise InsufficientFundsError(
+            f"the reveal does not pay its fee: {itemised}; change {change_value:,} leaves {paid:,} for the miner",
+            available=total_in,
+            required=fixed_value + change_value + measured.fee,
+        )
+    return measured
 
 
 def estimate_reveal_fee_for_metadata(
@@ -396,12 +577,12 @@ def commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) -> 
     the direction they drift matters — under-sizing the commit strands it permanently
     (see the module docstring).
 
-    A reveal that registers a WAVE name also pays ``estimate.registration_fee`` to the
-    treasury out of the commit, so its value is added on top, outside the floor: the floor
-    is about the reveal's miner fee and must not absorb it.
+    A WAVE registration fee is NOT in it: a plain wallet input added to the reveal pays that
+    (:attr:`RevealFeeEstimate.required_funding_value`). The commit pays the reveal's miner fee,
+    which the estimate sizes with that input and the fee's output included.
     """
     slack = REVEAL_SIZE_SLACK_BYTES * estimate.fee_rate
-    return carrier_value + estimate.registration_fee_value + max(MIN_COMMIT_OVERHEAD, estimate.fee + slack)
+    return carrier_value + max(MIN_COMMIT_OVERHEAD, estimate.fee + slack)
 
 
 def check_reveal_funding(
@@ -413,17 +594,18 @@ def check_reveal_funding(
     """Assert the commit output can fund the reveal. Call **before** broadcasting it.
 
     Args:
-        commit_value: photons the commit output will hold — the reveal's only input.
+        commit_value: photons the commit output will hold — the reveal's input from the commit
+            (a reveal that pays a WAVE registration fee also spends a wallet input for it).
         carrier_value: photons the reveal must place on the token output (pyrxd's
             conventional 546 for an NFT carrier; the full supply for an FT premine).
         estimate: from :func:`estimate_reveal_fee` / :func:`estimate_reveal_fee_for_metadata`.
 
     Raises:
-        InsufficientFundsError: naming the shortfall, when ``commit_value`` is below
-            ``carrier_value + estimate.fee`` plus any WAVE registration fee the reveal pays
-            (:meth:`RevealFeeEstimate.required_commit_value`), and naming that fee and its
-            treasury when there is one. Raised before any broadcast, so nothing is stranded
-            on-chain.
+        InsufficientFundsError: naming the shortfall, when
+            ``commit_value < carrier_value + estimate.fee``. Raised before any
+            broadcast, so nothing is stranded on-chain. A WAVE registration fee is not the
+            commit's to fund (:meth:`RevealFeeEstimate.required_commit_value`);
+            :func:`assert_reveal_balances` checks the whole reveal, fee input included.
         ValidationError: on negative values.
     """
     if commit_value < 0 or carrier_value < 0:
@@ -432,19 +614,11 @@ def check_reveal_funding(
     if commit_value >= required:
         return
     shortfall = required - commit_value
-    registration = (
-        ""
-        if estimate.registration_fee is None
-        else (
-            f" + {estimate.registration_fee.value:,} WAVE registration fee for "
-            f"{estimate.registration_fee.label}.rxd to {estimate.registration_fee.treasury_address}"
-        )
-    )
     raise InsufficientFundsError(
         f"commit value cannot fund the reveal: {commit_value:,} photons available, "
         f"{required:,} required ({carrier_value:,} carrier + {estimate.fee:,} reveal fee for a "
         f"{estimate.size_bytes:,}-byte reveal carrying {estimate.cbor_bytes_len:,} bytes of CBOR at "
-        f"{estimate.fee_rate:,} photons/byte{registration}) — short by {shortfall:,}",
+        f"{estimate.fee_rate:,} photons/byte) — short by {shortfall:,}",
         available=commit_value,
         required=required,
     )

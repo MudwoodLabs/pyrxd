@@ -1,8 +1,11 @@
-"""pyrxd pays the WAVE registration fee by default, on every path that registers a name.
+"""pyrxd pays the WAVE registration fee by default: the library half.
 
 The decision is the maintainer's: registering a WAVE name pays the protocol's registration
 fee, as the published WAVE protocol and Photonic do, and the only way out is an explicit
-``pay_registration_fee=False`` (``--no-wave-registration-fee`` on the CLI).
+``pay_registration_fee=False`` (``--no-wave-registration-fee`` on the CLI). Every builder that
+can register a name RETURNS the fee output for its caller to add; ``pyrxd glyph mint-nft`` PAYS
+it (``tests/cli/test_wave_registration_fee_cli.py``). The fee is funded at REVEAL time from a plain
+wallet input, as Photonic does — never from the commit.
 
 What the fee IS comes from two sources pyrxd did not write, transcribed below and cited in
 ``src/pyrxd/glyph/wave_rules.py``:
@@ -11,11 +14,13 @@ What the fee IS comes from two sources pyrxd did not write, transcribed below an
   (``packages/lib/src/wave.ts:55-66``) and the register page, which pays it to
   ``1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG`` (``packages/app/src/pages/WaveRegister.tsx:132-152``);
 - RXinDexer at ``ca8a6a4e77ef0ad3f24ec6f41cb0a73eb5f3651e``: ``wave_name_price``
-  (``electrumx/server/wave_index.py:73-86``) and ``WAVE_TREASURY_ADDRESS_DEFAULT``
-  (``wave_index.py:65``).
+  (``electrumx/server/wave_index.py:73-86``), ``WAVE_TREASURY_ADDRESS_DEFAULT``
+  (``wave_index.py:65``) and ``validate_wave_name`` (``wave_index.py:287-310``), which decides
+  what REGISTERS — and so what owes the fee.
 
 And from one thing on chain: mainnet claim ``f644794b…`` (``fixtures/wave_update_chain_mainnet.json``)
-pays the 6+ tier to that treasury at vout 2. Every upstream file cited here is digest-pinned in
+pays the 6+ tier to that treasury at vout 2, funded by a third input from its commit
+transaction. Every upstream file cited here is digest-pinned in
 ``fixtures/photonic_upstream_pin.json`` or ``fixtures/rxindexer_upstream_pin.json`` and watched by
 ``scripts/check_photonic_drift.py``.
 
@@ -26,6 +31,7 @@ table below.
 from __future__ import annotations
 
 import ast
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -35,16 +41,17 @@ from typing import Any
 
 import cbor2
 import pytest
-from click.testing import CliRunner
 
 from pyrxd.cli import glyph_cmds
-from pyrxd.cli.main import cli
 from pyrxd.constants import Network
+from pyrxd.fee_models import SatoshisPerKilobyte
 from pyrxd.glyph import builder as builder_module
-from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
+from pyrxd.glyph.builder import CommitParams, CommitResult, GlyphBuilder, RevealParams
 from pyrxd.glyph.fees import (
     MIN_COMMIT_OVERHEAD,
+    REVEAL_SIG_PREFIX_BYTES,
     REVEAL_SIZE_SLACK_BYTES,
+    assert_reveal_balances,
     check_reveal_funding,
     commit_value_for_reveal,
     estimate_reveal_fee,
@@ -58,19 +65,21 @@ from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_sc
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.glyph.wave import build_wave_metadata
 from pyrxd.glyph.wave_rules import (
+    FEE_DECLINED,
     WAVE_TREASURY_ADDRESS,
     WaveRegistrationFee,
     format_rxd,
+    registered_label_in_scriptsig,
     wave_registered_label,
     wave_registration_fee_for,
     wave_registration_price,
 )
 from pyrxd.keys import PrivateKey
-from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.type import P2PKH
 from pyrxd.security.errors import InsufficientFundsError, ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_output import TransactionOutput
 
 _FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "wave_update_chain_mainnet.json"
 _MINT = next(t for t in json.loads(_FIXTURE.read_text())["transactions"] if t["txid"].startswith("f644794b"))
@@ -113,6 +122,22 @@ def _rxindexer_wave_name_price(bare_name: str) -> int:
     return 500_000_000
 
 
+_WAVE_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"  # wave_index.py:37
+
+
+def _rxindexer_validate_wave_name(name: str) -> bool:
+    """``validate_wave_name``, ``electrumx/server/wave_index.py:287-310`` at ``ca8a6a4e``."""
+    if not name:
+        return False
+    if len(name) > 63:
+        return False
+    if name.startswith("-") or name.endswith("-"):
+        return False
+    if "--" in name and not name.lower().startswith("xn--"):
+        return False
+    return all(char in _WAVE_CHARS for char in name.lower())
+
+
 #: ``const feeAddress = "1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG";`` (``WaveRegister.tsx:133``)
 _PHOTONIC_FEE_ADDRESS = "1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG"
 #: ``WAVE_TREASURY_ADDRESS_DEFAULT = '1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG'`` (``wave_index.py:65``)
@@ -144,17 +169,10 @@ def _metadata(d: dict) -> GlyphMetadata:
 _OTHER_REF = GlyphRef(txid=Txid("cd" * 32), vout=0)
 _OTHER_SCRIPT = build_nft_locking_script(PKH, _OTHER_REF)
 
-#: Every pyrxd path that registers a WAVE name — builds the transaction's pieces or prices it —
-#: fed a claim and extra keyword arguments, returning the fee that path reports. Which paths
-#: EXIST is derived in ``TestThePathSetIsDerived``; this table must cover what that finds.
+#: Every pyrxd path that builds a registering reveal's pieces or prices it, fed a claim and extra
+#: keyword arguments, returning the fee that path reports. Which reveal builders EXIST is derived
+#: in ``TestThePathSetIsDerived``; this table must cover what that finds.
 _DOORS: dict[str, Callable[[dict, dict], WaveRegistrationFee | None]] = {
-    "prepare_commit": lambda d, kw: (
-        GlyphBuilder()
-        .prepare_commit(
-            CommitParams(metadata=_metadata(d), owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000, **kw)
-        )
-        .registration_fee_output
-    ),
     "prepare_reveal": lambda d, kw: (
         GlyphBuilder()
         .prepare_reveal(
@@ -207,8 +225,8 @@ _DOORS: dict[str, Callable[[dict, dict], WaveRegistrationFee | None]] = {
     ),
 }
 
-#: One label per price tier, the tier edges included: 3 (the "<= 3" tier, which pyrxd's 3-63
-#: rule makes exactly 3), 4, 5, 6 (the first "6+") and 63 (the longest pyrxd writes).
+#: One label per price tier, the tier edges included: 3 (the "<= 3" tier), 4, 5, 6 (the first
+#: "6+") and 63 (the longest the indexer registers).
 _TIER_LABELS = ["abc", "abcd", "abcde", "abcdef", "a" * 63]
 
 
@@ -219,6 +237,8 @@ class TestThePrice:
     @pytest.mark.parametrize(
         ("label", "photons"),
         [
+            ("a", 10_000_000_000),
+            ("ab", 10_000_000_000),
             ("abc", 10_000_000_000),
             ("abcd", 5_000_000_000),
             ("abcde", 1_000_000_000),
@@ -236,15 +256,22 @@ class TestThePrice:
         """Photonic prices ``fullName`` by the text before the first ``.``."""
         assert wave_registration_price(f"{label}.rxd") == wave_registration_price(label)
 
-    def test_under_three_characters_is_refused_not_priced(self) -> None:
-        """Both sources price 1-2 character names at the 3-character tier. pyrxd writes no
-        label under 3 characters (#733), so it prices none: "<= 3" is exactly 3 here."""
-        assert _photonic_calculate_name_cost("ab.rxd") == _rxindexer_wave_name_price("ab") == 10_000_000_000
-        with pytest.raises(ValidationError, match="is 2 characters"):
-            wave_registration_price("ab")
+    def test_a_1_or_2_character_name_the_indexer_registers_costs_100_rxd(self) -> None:
+        """RXinDexer registers 1-2 character labels (``WAVE_MIN_NAME_LENGTH`` is 1), and both
+        sources price "3 or fewer" at 100 RXD: never less. pyrxd will not WRITE such a label,
+        but when one is revealed it owes the top tier."""
+        for label in ("a", "ab", "7"):
+            assert _rxindexer_validate_wave_name(label)
+            assert wave_registration_price(label) == 100 * 100_000_000
 
-    @pytest.mark.parametrize("bad", ["a" * 64, "Alice", "sub.alice.rxd", "alice.eth", b"alice"])
-    def test_a_name_pyrxd_will_not_write_has_no_price(self, bad: object) -> None:
+    def test_upper_case_is_priced_the_indexer_lower_cases_it(self) -> None:
+        assert _rxindexer_validate_wave_name("ALICE")
+        assert wave_registration_price("ALICE") == wave_registration_price("alice") == 1_000_000_000
+
+    @pytest.mark.parametrize("bad", ["a" * 64, "", "-abc", "abc-", "a--b", "sub.alice.rxd", "alice.eth", b"alice", 5])
+    def test_a_name_the_indexer_refuses_has_no_price(self, bad: object) -> None:
+        if isinstance(bad, str) and "." not in bad:
+            assert not _rxindexer_validate_wave_name(bad)
         with pytest.raises(ValidationError):
             wave_registration_price(bad)  # type: ignore[arg-type]
 
@@ -313,6 +340,18 @@ class TestTheMainnetClaimPaysItAtVout2:
         assert [i for i, (_, script) in enumerate(outs) if script == _TREASURY_SCRIPT_ON_CHAIN] == [2]
         assert len(outs) == 4  # vout 3 is change
 
+    def test_the_fee_was_funded_by_a_third_input_from_the_commit_transaction(self) -> None:
+        """Photonic funds the reveal from wallet inputs, and its commit's change is among them
+        (``mint.ts:818``, ``:827``): inputs 0 and 1 are the commit and the mutable seed, input 2
+        the commit transaction's vout 2 — not the commit output."""
+        commit_txid = _MINT_TX.inputs[0].source_txid
+        assert [(i.source_txid, i.source_output_index) for i in _MINT_TX.inputs] == [
+            (commit_txid, 0),
+            (commit_txid, 1),
+            (commit_txid, 2),
+        ]
+        assert len(_MINT_TX.inputs[2].unlocking_script.serialize()) < 110  # a plain P2PKH unlock
+
     def test_what_pyrxd_builds_for_that_name_is_that_output(self) -> None:
         scripts = GlyphBuilder().prepare_wave_reveal(TXID, 0, _MINT_CBOR, PKH, _MINT_DICT["name"])
         fee = scripts.registration_fee_output
@@ -326,7 +365,7 @@ class TestTheMainnetClaimPaysItAtVout2:
 # ─────────────────────────────────── (4) on every path, by default, exactly ──
 
 
-class TestEveryPathPaysByDefault:
+class TestEveryPathReturnsTheFeeByDefault:
     @pytest.mark.parametrize("door", sorted(_DOORS))
     @pytest.mark.parametrize("label", _TIER_LABELS, ids=lambda s: f"len{len(s)}")
     def test_the_fee_is_there_with_the_treasury_script_and_the_tier_value(self, door: str, label: str) -> None:
@@ -339,28 +378,35 @@ class TestEveryPathPaysByDefault:
     @pytest.mark.parametrize("door", sorted(_DOORS))
     def test_a_payload_that_registers_nothing_owes_nothing(self, door: str) -> None:
         """The honest half: a mutable NFT with no WAVE marker is not charged."""
-        if door in ("prepare_commit", "estimate_reveal_fee_for_metadata"):
+        if door == "estimate_reveal_fee_for_metadata":
             md = GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT], name="plain")
-            fee = (
-                GlyphBuilder()
-                .prepare_commit(CommitParams(metadata=md, owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000))
-                .registration_fee_output
-                if door == "prepare_commit"
-                else estimate_reveal_fee_for_metadata(md).registration_fee
-            )
-        elif door == "prepare_wave_reveal":
+            assert estimate_reveal_fee_for_metadata(md).registration_fee is None
+            return
+        if door == "prepare_wave_reveal":
             # Refuses anything not marked WAVE outright, so it cannot charge one.
             with pytest.raises(ValidationError, match="must include GlyphProtocol.WAVE"):
                 _DOORS[door](_claim("alice", p=[GlyphProtocol.NFT, GlyphProtocol.MUT]), {})
             return
-        else:
-            fee = _DOORS[door](_claim("alice", p=[GlyphProtocol.NFT, GlyphProtocol.MUT]), {})
-        assert fee is None
+        assert _DOORS[door](_claim("alice", p=[GlyphProtocol.NFT, GlyphProtocol.MUT]), {}) is None
+
+    def test_the_commit_carries_nothing_for_the_fee(self) -> None:
+        """The fee is funded at reveal time from the wallet, so the commit knows nothing of it:
+        CommitParams takes no fee arguments and CommitResult reports none, exactly as on main."""
+        assert "pay_registration_fee" not in CommitParams.__dataclass_fields__
+        assert "registration_treasury" not in CommitParams.__dataclass_fields__
+        assert "registration_fee_output" not in CommitResult.__dataclass_fields__
+        md = build_wave_metadata(qualified_name="alice.rxd", target=TARGET)
+        result = GlyphBuilder().prepare_commit(
+            CommitParams(metadata=md, owner_pkh=PKH, change_pkh=PKH, funding_satoshis=10_000)
+        )
+        assert wave_registration_fee_for(result.cbor_bytes) == WaveRegistrationFee("alice")
 
     def test_the_recovery_of_a_0_24_commit_owes_nothing(self) -> None:
-        """``allow_unregistrable_wave=True`` reveals a claim the indexer skips: no name, no fee."""
+        """``allow_unregistrable_wave=True`` reveals ≤0.24.0's dotted ``alice.rxd``, which the
+        indexer's ``validate_wave_name`` REFUSES: no name registers, so no fee is owed."""
         old = {**_claim(), "attrs": {**_claim()["attrs"], "name": "alice.rxd"}}
         del old["name"], old["v"], old["type"]
+        assert not _rxindexer_validate_wave_name("alice.rxd")
         assert wave_registered_label(old) is None
         scripts = GlyphBuilder().prepare_wave_reveal(
             TXID, 0, cbor2.dumps(old), PKH, "alice.rxd", allow_unregistrable_wave=True
@@ -368,11 +414,44 @@ class TestEveryPathPaysByDefault:
         assert scripts.registration_fee_output is None
         assert estimate_reveal_fee(cbor_bytes=cbor2.dumps(old), is_nft=True).registration_fee is None
 
-    def test_a_registrable_claim_revealed_through_the_escape_still_pays(self) -> None:
-        scripts = GlyphBuilder().prepare_wave_reveal(
-            TXID, 0, cbor2.dumps(_claim()), PKH, "alice.rxd", allow_unregistrable_wave=True
-        )
-        assert scripts.registration_fee_output == WaveRegistrationFee("alice")
+
+class TestTheIndexerRuleDecidesWhatOwesTheFee:
+    """L1: ``allow_unregistrable_wave=True`` must not waive the fee for a payload the indexer DOES
+    register. pyrxd's write rule is stricter than the indexer's; the fee follows the indexer."""
+
+    @pytest.mark.parametrize(
+        ("claim", "registers"),
+        [
+            (_claim("ab"), "ab"),  # 2 characters: the indexer's minimum is 1
+            (_claim("ALICE"), "ALICE"),  # the indexer lower-cases before its check
+            (_claim("alice", name="bob.rxd"), "alice"),  # the live path ignores the top-level name
+            (_claim("alice", app={"data": {"name": "bob"}}), "alice"),  # attrs.name is read first
+            (  # attrs.name empty: the indexer falls back to app.data.name
+                {**_claim(""), "app": {"data": {"name": "carol"}}},
+                "carol",
+            ),
+        ],
+        ids=["2-chars", "upper-case", "other-top-level-name", "other-app-data-name", "app-data-fallback"],
+    )
+    def test_a_payload_the_indexer_registers_owes_the_fee_through_the_escape(self, claim: dict, registers: str) -> None:
+        read = claim["attrs"].get("name") or claim.get("app", {}).get("data", {}).get("name")
+        assert read == registers and _rxindexer_validate_wave_name(read)
+        assert wave_registered_label(claim) == registers
+        scripts = GlyphBuilder().prepare_mutable_reveal(TXID, 0, cbor2.dumps(claim), PKH, allow_unregistrable_wave=True)
+        assert scripts.registration_fee_output == WaveRegistrationFee(registers)
+        assert scripts.registration_fee_output.value == _rxindexer_wave_name_price(registers)
+
+    @pytest.mark.parametrize("label", ["alice.rxd", "a" * 64, "-abc", "a--b", 5])
+    def test_only_what_the_indexer_refuses_is_waived(self, label: object) -> None:
+        claim = _claim("x")
+        claim["attrs"]["name"] = label
+        assert wave_registered_label(claim) is None
+
+    def test_the_label_is_read_from_the_envelope_as_the_indexer_reads_it(self) -> None:
+        suffix = build_reveal_scriptsig_suffix(cbor2.dumps(_claim("abcd")), registration_fee=None)
+        assert registered_label_in_scriptsig(b"\x47" + b"\x00" * 71 + suffix) == "abcd"
+        dat = b"\x03gly\x03dat" + bytes([len(cbor2.dumps(_claim("abcd")))]) + cbor2.dumps(_claim("abcd"))
+        assert registered_label_in_scriptsig(dat) is None  # the indexer does not read a DAT envelope
 
 
 # ───────────────────────────────────────────────────────────── (5) the opt-out ──
@@ -427,10 +506,8 @@ class TestTheOptOutIsExplicit:
                         assert all(p.kind is not p.VAR_KEYWORD for p in params.values()), (name, target)
         for fn in (estimate_reveal_fee, estimate_reveal_fee_for_metadata, wave_registration_fee_for):
             assert inspect.signature(fn).parameters["pay_registration_fee"].default is True
-        # Non-vacuity: the scan reached the builders, the params classes and the CLI.
-        assert {"CommitParams.CommitParams", "RevealParams.RevealParams", "_mint_nft_inner._mint_nft_inner"} <= set(
-            found
-        ), found
+        # Non-vacuity: the scan reached the builders, the params class and the CLI.
+        assert {"RevealParams.RevealParams", "_mint_nft_inner._mint_nft_inner"} <= set(found), found
         assert len(found) >= 8, found
 
 
@@ -442,16 +519,22 @@ class TestTheRawWritersRequireAStatement:
     every reveal and update crosses. They write bytes and cannot add an output, so they refuse a
     payload that registers a name until the caller has said what it pays."""
 
-    @pytest.mark.parametrize("writer", ["reveal", "mutable"])
-    def test_saying_nothing_is_refused_and_the_message_names_the_fee(self, writer: str) -> None:
-        cbor = cbor2.dumps(_claim("abcd"))
+    def test_a_reveal_that_says_nothing_is_refused_and_the_message_names_the_fee(self) -> None:
         with pytest.raises(ValidationError) as exc:
-            if writer == "reveal":
-                build_reveal_scriptsig_suffix(cbor)
-            else:
-                build_mutable_scriptsig("mod", cbor, 1, 1, 0, 0)
+            build_reveal_scriptsig_suffix(cbor2.dumps(_claim("abcd")))
         message = str(exc.value)
         assert "abcd.rxd" in message and "50 RXD" in message and WAVE_TREASURY_ADDRESS in message
+        assert "registers the WAVE name abcd.rxd if the name is free" in message
+
+    def test_an_update_that_says_nothing_is_told_it_is_a_duplicate_or_a_renewal(self) -> None:
+        """L4: a WAVE-marked update of a live name is a DUPLICATE to the indexer, and a treasury
+        payment in a transaction spending the claim token is a RENEWAL — not a registration."""
+        with pytest.raises(ValidationError) as exc:
+            build_mutable_scriptsig("mod", cbor2.dumps(_claim("abcd")), 1, 1, 0, 0)
+        message = str(exc.value)
+        assert "a duplicate it does not register while that name is held and live" in message
+        assert "RENEWAL" in message
+        assert "registers the WAVE name" not in message
 
     @pytest.mark.parametrize("writer", ["reveal", "mutable"])
     def test_a_stated_fee_or_an_explicit_none_is_accepted(self, writer: str) -> None:
@@ -485,11 +568,22 @@ class TestTheRawWritersRequireAStatement:
             GlyphBuilder().prepare_ft_deploy_reveal(TXID, 0, 10_000, cbor, PKH, 1_000)
 
 
-# ────────────────────────────────── (7) the estimator and the funding checks ──
+# ────────────────────────────────── (7) the estimator, the measurement, the gate ──
 
 
-def _reveal_with(fee: WaveRegistrationFee | None, cbor: bytes, *, commit_value: int) -> Transaction:
-    """A reveal assembled the way ``pyrxd glyph mint-nft`` assembles it."""
+def _fee_funding(key: PrivateKey, value: int) -> Any:
+    return glyph_cmds._FeeFunding(txid="ef" * 32, vout=1, value=value, address=key.address(), key=key)
+
+
+def _reveal_with(
+    fee: WaveRegistrationFee | None,
+    cbor: bytes,
+    *,
+    commit_value: int,
+    funding_value: int = 0,
+    pay: bool | None = None,
+) -> Transaction:
+    """A reveal assembled by ``pyrxd glyph mint-nft``'s own ``_build_reveal_tx``."""
     key = PrivateKey()
     pkh = Hex20(key.public_key().hash160())
     commit_script = build_commit_locking_script(hash_payload(cbor), pkh, is_nft=True)
@@ -501,7 +595,7 @@ def _reveal_with(fee: WaveRegistrationFee | None, cbor: bytes, *, commit_value: 
             cbor_bytes=cbor,
             owner_pkh=pkh,
             is_nft=True,
-            pay_registration_fee=fee is not None,
+            pay_registration_fee=(fee is not None) if pay is None else pay,
         )
     )
     return glyph_cmds._build_reveal_tx(
@@ -514,247 +608,157 @@ def _reveal_with(fee: WaveRegistrationFee | None, cbor: bytes, *, commit_value: 
         funding_key=key,
         scriptsig_suffix=scripts.scriptsig_suffix,
         registration_fee=fee,
+        fee_funding=_fee_funding(key, funding_value) if fee is not None else None,
     )
 
 
-class TestTheEstimatorAndTheFundingChecksCountIt:
+class TestTheEstimatorSizesTheFundingInputAndNotTheCommit:
     CBOR = cbor2.dumps(_claim("abcdef"))
 
-    def test_the_output_is_sized_and_its_value_is_required(self) -> None:
+    def test_the_input_and_output_are_sized_and_the_value_is_the_inputs_not_the_commits(self) -> None:
         paid = estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True)
         declined = estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True, pay_registration_fee=False)
-        # 8-byte value + 1-byte script length + the 25-byte P2PKH.
-        assert paid.size_bytes - declined.size_bytes == 8 + 1 + len(_TREASURY_SCRIPT_ON_CHAIN) == 34
-        # SatoshisPerKilobyte rounds each fee UP (a float ceil: 404 B came to 4,040,001), so the
-        # difference is 34 bytes' worth to within that one photon.
-        assert abs((paid.fee - declined.fee) - 34 * paid.fee_rate) <= 1
+        # The fee output: 8-byte value + 1-byte script length + the 25-byte P2PKH. The funding
+        # input: 32-byte txid + 4-byte vout + 1-byte scriptSig length + the P2PKH unlock + 4-byte
+        # sequence.
+        output_bytes = 8 + 1 + len(_TREASURY_SCRIPT_ON_CHAIN)
+        input_bytes = 32 + 4 + 1 + REVEAL_SIG_PREFIX_BYTES + 4
+        assert paid.size_bytes - declined.size_bytes == output_bytes + input_bytes == 34 + 148
+        # SatoshisPerKilobyte rounds each fee UP (a float ceil), so the difference is those
+        # bytes' worth to within one photon.
+        assert abs((paid.fee - declined.fee) - (output_bytes + input_bytes) * paid.fee_rate) <= 1
         assert paid.registration_fee_value == 500_000_000 and declined.registration_fee_value == 0
-        assert paid.required_commit_value(546) == 546 + paid.fee + 500_000_000
+        assert paid.required_funding_value == 500_000_000 and declined.required_funding_value == 0
+        # The commit pays the reveal's MINER fee, never the registration fee.
+        assert paid.required_commit_value(546) == 546 + paid.fee
         assert declined.required_commit_value(546) == 546 + declined.fee
 
-    def test_the_commit_value_carries_it_outside_the_floor(self) -> None:
+    def test_the_commit_value_is_carrier_plus_miner_fee_with_no_registration_fee_in_it(self) -> None:
         paid = estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True)
-        expected = 546 + 500_000_000 + max(MIN_COMMIT_OVERHEAD, paid.fee + REVEAL_SIZE_SLACK_BYTES * paid.fee_rate)
+        expected = 546 + max(MIN_COMMIT_OVERHEAD, paid.fee + REVEAL_SIZE_SLACK_BYTES * paid.fee_rate)
         assert commit_value_for_reveal(546, paid) == expected
-        assert commit_value_for_reveal(546, paid) >= paid.required_commit_value(546)
+        assert commit_value_for_reveal(546, paid) < paid.registration_fee_value
 
-    def test_a_shortfall_names_the_fee_and_the_treasury(self) -> None:
+    def test_check_reveal_funding_is_about_the_commit_only(self) -> None:
         paid = estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True)
-        enough_without_it = 546 + paid.fee + REVEAL_SIZE_SLACK_BYTES * paid.fee_rate
-        with pytest.raises(InsufficientFundsError) as exc:
-            check_reveal_funding(commit_value=enough_without_it, carrier_value=546, estimate=paid)
-        assert "500,000,000 WAVE registration fee for abcdef.rxd" in str(exc.value)
-        assert WAVE_TREASURY_ADDRESS in str(exc.value)
-        # ...and the honest half: the same commit funds the reveal that declined the fee.
-        declined = estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True, pay_registration_fee=False)
-        check_reveal_funding(commit_value=enough_without_it, carrier_value=546, estimate=declined)
+        check_reveal_funding(commit_value=546 + paid.fee, carrier_value=546, estimate=paid)
+        with pytest.raises(InsufficientFundsError, match="short by 1"):
+            check_reveal_funding(commit_value=546 + paid.fee - 1, carrier_value=546, estimate=paid)
 
-    def test_measuring_a_reveal_that_dropped_the_output_is_refused(self) -> None:
-        fee = WaveRegistrationFee("abcdef")
-        commit_value = 1_000_000_000
-        with pytest.raises(ValidationError, match="does not carry its WAVE registration fee"):
-            measure_reveal_fee(_reveal_with(None, self.CBOR, commit_value=commit_value), registration_fee=fee)
-        measured = measure_reveal_fee(_reveal_with(fee, self.CBOR, commit_value=commit_value), registration_fee=fee)
-        assert measured.registration_fee == fee
-        assert measured.required_commit_value(546) == 546 + measured.fee + fee.value
 
-    def test_the_measurement_agrees_with_the_estimate(self) -> None:
-        """The shim's added output is the one the real reveal carries: same size to the byte."""
-        fee = WaveRegistrationFee("abcdef")
-        measured = measure_reveal_fee(_reveal_with(fee, self.CBOR, commit_value=1_000_000_000), registration_fee=fee)
+class TestMeasuringAReveal:
+    CBOR = cbor2.dumps(_claim("abcdef"))
+    FEE = WaveRegistrationFee("abcdef")
+
+    def test_a_reveal_carrying_its_fee_measures_the_same_as_the_estimate(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        measured = measure_reveal_fee(tx, registration_fee=self.FEE)
+        assert measured.registration_fee == self.FEE
         assert measured.size_bytes == estimate_reveal_fee(cbor_bytes=self.CBOR, is_nft=True).size_bytes
 
+    def test_a_non_wave_reveal_needs_no_statement(self) -> None:
+        """L3: the new keyword has a sentinel default, so no existing caller breaks."""
+        cbor = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT], name="plain"))[0]
+        assert measure_reveal_fee(_reveal_with(None, cbor, commit_value=10_000_000)).registration_fee is None
 
-# ───────────────────────────── (8) through the production entry point: the CLI ──
+    def test_saying_nothing_about_a_registering_reveal_is_refused(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        with pytest.raises(ValidationError, match="registers the WAVE name abcdef.rxd"):
+            measure_reveal_fee(tx)
 
+    def test_none_on_a_registering_reveal_is_refused(self) -> None:
+        """L2: ``None`` means "registers nothing"; for a reveal whose own envelope registers a
+        name, it passed silently before."""
+        tx = _reveal_with(None, self.CBOR, commit_value=10_000_000, pay=False)
+        with pytest.raises(ValidationError, match="registers nothing"):
+            measure_reveal_fee(tx, registration_fee=None)
+        assert measure_reveal_fee(tx, registration_fee=FEE_DECLINED).registration_fee is None
 
-class _Net:
-    """The two ElectrumX calls ``glyph mint-nft`` makes; every broadcast is recorded."""
+    def test_a_reveal_that_dropped_the_output_is_refused(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        tx.outputs = [o for o in tx.outputs if o.locking_script.serialize() != self.FEE.locking_script]
+        with pytest.raises(ValidationError, match="does not carry its WAVE registration fee"):
+            measure_reveal_fee(tx, registration_fee=self.FEE)
 
-    def __init__(self) -> None:
-        self.broadcasts: list[bytes] = []
+    def test_the_wrong_value_to_the_right_script_is_refused(self) -> None:
+        """P4: checking the script and not the VALUE let a 1-photon "fee" through."""
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        for out in tx.outputs:
+            if out.locking_script.serialize() == self.FEE.locking_script:
+                out.satoshis = 1
+        with pytest.raises(ValidationError, match="pays 1 photons"):
+            measure_reveal_fee(tx, registration_fee=self.FEE)
 
-    async def __aenter__(self) -> _Net:
-        return self
+    def test_two_treasury_outputs_are_refused(self) -> None:
+        """L2: a doubled fee output passed the old check."""
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=1_200_000_000)
+        tx.outputs.insert(1, TransactionOutput(P2PKH().lock(WAVE_TREASURY_ADDRESS), self.FEE.value))
+        with pytest.raises(ValidationError, match="2 times"):
+            measure_reveal_fee(tx, registration_fee=self.FEE)
 
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
-
-    async def broadcast(self, raw: bytes) -> str:
-        self.broadcasts.append(bytes(raw))
-        return str(Transaction.from_hex(bytes(raw)).txid())
-
-    async def get_transaction_verbose(self, txid: str) -> dict:
-        return {"confirmations": 1}
-
-
-def _wire_cli(monkeypatch: pytest.MonkeyPatch, *, funding: int = 20_000_000_000) -> tuple[_Net, PrivateKey]:
-    """A fake wallet and network around the REAL command: metadata parsing, the builder, the
-    commit sizing, the dry-run measurement, both transactions and the JSON result all run."""
-    for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX", "PYRXD_FEE_RATE", "PYRXD_WALLET_PATH"):
-        monkeypatch.delenv(var, raising=False)  # hermetic: the fee rate is the default relay floor
-    key = PrivateKey()
-    net = _Net()
-    utxo = UtxoRecord(tx_hash="ef" * 32, tx_pos=0, value=funding, height=100)
-
-    class _Wallet:
-        async def collect_spendable(self, client: object) -> list:
-            return [(utxo, key.address(), key)]
-
-    monkeypatch.setattr(glyph_cmds, "_load_wallet", lambda ctx, **kw: _Wallet())
-    monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: net)
-    return net, key
-
-
-def _wave_metadata_file(tmp_path: pathlib.Path, label: str) -> pathlib.Path:
-    """A metadata.json that registers ``label``.rxd, in the file format ``mint-nft`` reads."""
-    path = tmp_path / "wave.json"
-    path.write_text(
-        json.dumps(
-            {
-                "protocol": ["NFT", "MUT", "WAVE"],
-                "name": f"{label}.rxd",
-                "token_type": "wave_name",
-                "attrs": {"name": label, "domain": "rxd", "target": TARGET, "target_type": "address"},
-            }
-        )
-    )
-    return path
+    def test_a_fee_for_another_name_than_the_envelopes_is_refused(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        with pytest.raises(ValidationError, match="envelope registers 'abcdef'"):
+            measure_reveal_fee(tx, registration_fee=WaveRegistrationFee("abcdefg"))
 
 
-def _global_args(tmp_path: pathlib.Path, network: str = "mainnet") -> list[str]:
-    # --config at a path that does not exist: defaults only, never the developer's own file.
-    return ["--config", str(tmp_path / "absent.toml"), "--network", network, "--wallet", str(tmp_path / "w.dat")]
+class TestTheBalanceGate:
+    CBOR = cbor2.dumps(_claim("abcdef"))
+    FEE = WaveRegistrationFee("abcdef")
 
-
-def _mint(tmp_path: pathlib.Path, label: str, *extra: str, network: str = "mainnet") -> Any:
-    args = [*_global_args(tmp_path, network), "--json", "--yes"]
-    return CliRunner().invoke(cli, [*args, "glyph", "mint-nft", str(_wave_metadata_file(tmp_path, label)), *extra])
-
-
-class TestThroughTheCli:
-    @pytest.mark.parametrize("label", ["abcd", "custodian-gate-x7f3"])
-    def test_the_reveal_pays_the_treasury_the_tier_value_at_vout_1(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, label: str
-    ) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        result = _mint(tmp_path, label)
-        assert result.exit_code == 0, result.output
-        commit, reveal = (Transaction.from_hex(raw) for raw in net.broadcasts)
-        price = _photonic_calculate_name_cost(f"{label}.rxd")
-        assert price == _rxindexer_wave_name_price(label)
-        # vout 0 the NFT, vout 1 the fee, then change: Photonic's order, minus the contract.
-        assert reveal.outputs[1].locking_script.serialize() == _TREASURY_SCRIPT_ON_CHAIN
-        assert reveal.outputs[1].satoshis == price
-        assert [o.locking_script.serialize() for o in reveal.outputs].count(_TREASURY_SCRIPT_ON_CHAIN) == 1
-        # The commit funded it, and the reveal still pays its own fee out of what is left (the
-        # reveal's only input is the commit output, so its fee is that value less its outputs).
-        reveal_fee = commit.outputs[0].satoshis - sum(o.satoshis for o in reveal.outputs)
-        assert reveal_fee >= len(reveal.serialize()) * 10_000  # the mainnet relay floor, per byte
-        # The registration the indexer would read is the one that was paid for.
-        assert (
-            wave_registered_label(GlyphInspector().extract_reveal_cbor(reveal.inputs[0].unlocking_script.serialize()))
-            == label
-        )
-
-    def test_the_json_and_the_disclosure_show_the_fee_in_rxd_and_the_treasury(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _wire_cli(monkeypatch)
-        result = _mint(tmp_path, "abcde")
-        assert result.exit_code == 0, result.output
-        payload = json.loads(result.stdout)
-        assert payload["wave_registration"] == {
-            "name": "abcde.rxd",
-            "fee_paid": True,
-            "fee": {
-                "name": "abcde.rxd",
-                "photons": 1_000_000_000,
-                "rxd": "10",
-                "treasury": WAVE_TREASURY_ADDRESS,
-                "published_treasury": True,
-                "locking_script": _TREASURY_SCRIPT_ON_CHAIN.hex(),
-            },
-            "fee_vout": 1,
+    def test_the_cli_cannot_build_a_fee_without_the_input_that_funds_it(self) -> None:
+        """The two go together: a fee output with no funding input would take the fee out of the
+        commit (which is not sized for it), and a funding input with no fee is a stray spend."""
+        key = PrivateKey()
+        pkh = Hex20(key.public_key().hash160())
+        common = {
+            "commit_txid": TXID,
+            "commit_value": 10_000_000,
+            "commit_script": build_commit_locking_script(hash_payload(self.CBOR), pkh, is_nft=True),
+            "reveal_locking_script": build_nft_locking_script(pkh, GlyphRef(txid=Txid(TXID), vout=0)),
+            "carrier_value": 546,
+            "change_locking": P2PKH().lock(key.address()),
+            "funding_key": key,
+            "scriptsig_suffix": b"",
         }
-        # --yes still discloses; --json sends the disclosure to stderr.
-        assert "WAVE registration fee" in result.stderr
-        assert "10.00000000 RXD" in result.stderr and WAVE_TREASURY_ADDRESS in result.stderr
+        with pytest.raises(ValueError, match="go together"):
+            glyph_cmds._build_reveal_tx(**common, registration_fee=self.FEE, fee_funding=None)
+        with pytest.raises(ValueError, match="go together"):
+            glyph_cmds._build_reveal_tx(**common, registration_fee=None, fee_funding=_fee_funding(key, 600_000_000))
 
-    def test_the_opt_out_removes_it_and_says_so(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        result = _mint(tmp_path, "abcde", "--no-wave-registration-fee")
-        assert result.exit_code == 0, result.output
-        reveal = Transaction.from_hex(net.broadcasts[1])
-        assert _TREASURY_SCRIPT_ON_CHAIN not in [o.locking_script.serialize() for o in reveal.outputs]
-        assert json.loads(result.stdout)["wave_registration"]["fee_paid"] is False
-        assert "NOT PAID" in result.stderr and "renewing it" in result.stderr
+    def test_a_reveal_funded_by_its_wallet_input_balances(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        measured = assert_reveal_balances(tx, registration_fee=self.FEE)
+        assert measured.registration_fee == self.FEE
 
-    def test_a_plain_nft_is_untouched(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        meta = tmp_path / "nft.json"
-        meta.write_text(json.dumps({"protocol": ["NFT"], "name": "plain"}))
-        result = CliRunner().invoke(cli, [*_global_args(tmp_path), "--json", "--yes", "glyph", "mint-nft", str(meta)])
-        assert result.exit_code == 0, result.output
-        assert "wave_registration" not in json.loads(result.stdout)
-        assert len(Transaction.from_hex(net.broadcasts[1]).outputs) == 2  # NFT + change
+    def test_a_funding_input_short_of_the_fee_is_refused_with_the_numbers(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=400_000_000)
+        with pytest.raises(InsufficientFundsError) as exc:
+            assert_reveal_balances(tx, registration_fee=self.FEE)
+        message = str(exc.value)
+        assert "does not balance" in message and "500,000,000 WAVE registration fee for abcdef.rxd" in message
+        assert WAVE_TREASURY_ADDRESS in message
 
-    @pytest.mark.parametrize("network", ["regtest", "testnet"])
-    def test_off_mainnet_it_needs_a_treasury_or_the_opt_out(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, network: str
-    ) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        result = _mint(tmp_path, "abcde", network=network)
-        assert result.exit_code != 0
-        assert f"no WAVE treasury is published for {network}" in result.output
-        assert net.broadcasts == []
+    def test_a_reveal_that_would_lose_its_change_is_refused(self) -> None:
+        """L2: balancing by dropping the change output is not balancing."""
+        probe = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        miner_fee = measure_reveal_fee(probe, registration_fee=self.FEE).fee
+        exact = 546 + self.FEE.value + miner_fee  # nothing left for change
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=exact - self.FEE.value, funding_value=self.FEE.value)
+        with pytest.raises(InsufficientFundsError, match="only by dropping its change"):
+            assert_reveal_balances(tx, registration_fee=self.FEE)
 
-    def test_off_mainnet_a_named_treasury_is_paid(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        treasury = PrivateKey().public_key().address(network=Network.TESTNET)
-        result = _mint(tmp_path, "abcde", "--wave-treasury", treasury, network="regtest")
-        assert result.exit_code == 0, result.output
-        reveal = Transaction.from_hex(net.broadcasts[1])
-        assert reveal.outputs[1].locking_script.serialize() == P2PKH().lock(treasury).serialize()
-        assert reveal.outputs[1].satoshis == 1_000_000_000
-        assert json.loads(result.stdout)["wave_registration"]["fee"]["published_treasury"] is False
-
-    def test_a_treasury_on_the_wrong_network_is_refused(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        net, _key = _wire_cli(monkeypatch)
-        result = _mint(tmp_path, "abcde", "--wave-treasury", WAVE_TREASURY_ADDRESS, network="regtest")
-        assert result.exit_code != 0 and "--wave-treasury" in result.output
-        assert net.broadcasts == []
-
-    def test_a_funding_shortfall_names_the_fee(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A UTXO that would fund the plain mint cannot fund the name, and the refusal says why."""
-        net, _key = _wire_cli(monkeypatch, funding=100_000_000)
-        result = _mint(tmp_path, "abc")
-        assert result.exit_code != 0
-        assert "100 RXD WAVE registration fee for abc.rxd" in result.output
-        assert net.broadcasts == []
-        # The honest half: the same UTXO mints the same name with the fee declined.
-        result = _mint(tmp_path, "abc", "--no-wave-registration-fee")
-        assert result.exit_code == 0, result.output
-
-    def test_a_reveal_assembler_that_drops_the_fee_is_caught_before_the_commit(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The dry-run measurement is the backstop for the assembler: planted here, the CLI's
-        own reveal builder loses the output, and nothing is broadcast."""
-        net, _key = _wire_cli(monkeypatch)
-        real = glyph_cmds._build_reveal_tx
-        monkeypatch.setattr(glyph_cmds, "_build_reveal_tx", lambda **kw: real(**{**kw, "registration_fee": None}))
-        result = _mint(tmp_path, "abcde")
-        assert result.exit_code != 0
-        assert "does not carry its WAVE registration fee" in result.output
-        assert net.broadcasts == []
+    def test_the_signed_reveal_is_held_to_its_real_size(self) -> None:
+        tx = _reveal_with(self.FEE, self.CBOR, commit_value=10_000_000, funding_value=600_000_000)
+        tx.fee(SatoshisPerKilobyte(10_000_000))
+        assert_reveal_balances(tx, registration_fee=self.FEE)  # the honest half: it pays
+        change = next(o for o in tx.outputs if o.change)
+        change.satoshis += 1_000_000  # the miner is now paid 1,000,000 photons less than fee() set
+        with pytest.raises(InsufficientFundsError, match="does not pay its fee"):
+            assert_reveal_balances(tx, registration_fee=self.FEE)
 
 
-# ──────────────────────────── (9) GlyphMinter, which does not commit WAVE ──
+# ──────────────────────────── (8) GlyphMinter, which does not register names ──
 
 
 class _MinterClient:
@@ -771,24 +775,8 @@ class _MinterClient:
 
 @pytest.mark.filterwarnings("ignore:UnsafeNullPendingStore discards")
 class TestGlyphMinter:
-    """``GlyphMinter`` refuses to COMMIT a WAVE claim. A pending record it did not write can still
-    reach its reveal; the reveal then carries the fee, and is refused unfunded."""
-
-    def _pending(self, key: PrivateKey, commit_value: int) -> PendingMint:
-        cbor = encode_payload(build_wave_metadata(qualified_name="abcdef.rxd", target=TARGET))[0]
-        pkh = Hex20(key.public_key().hash160())
-        return PendingMint(
-            commit_txid="12" * 32,
-            commit_vout=0,
-            commit_value=commit_value,
-            commit_script=build_commit_locking_script(hash_payload(cbor), pkh, is_nft=True),
-            cbor_bytes=cbor,
-            owner_pkh=bytes(pkh),
-            is_nft=True,
-            carrier_value=546,
-            fee_rate=10_000,
-            funding_address=key.address(),
-        )
+    """``GlyphMinter`` refuses to COMMIT a WAVE claim, and refuses to reveal a record that
+    registers one, since it neither pays the fee nor funds it from the commit."""
 
     def _minter(self, key: PrivateKey, client: _MinterClient) -> GlyphMinter:
         class _Wallet:
@@ -798,8 +786,6 @@ class TestGlyphMinter:
         return GlyphMinter(client, _Wallet(), UnsafeNullPendingStore(), poll_interval_s=0.01)
 
     def test_the_commit_is_refused(self) -> None:
-        import asyncio
-
         key = PrivateKey()
         client = _MinterClient()
         with pytest.raises(ValidationError, match="cannot mint a MUT glyph|cannot mint a WAVE glyph"):
@@ -808,24 +794,30 @@ class TestGlyphMinter:
             )
         assert client.broadcasts == []
 
-    def test_its_reveal_assembler_includes_the_fee(self) -> None:
+    def test_a_record_that_registers_a_name_is_refused_with_its_recovery(self) -> None:
         key = PrivateKey()
-        pending = self._pending(key, 1_000_000_000)
-        tx = self._minter(key, _MinterClient())._build_reveal_tx(pending, key, P2PKH().lock(key.address()))
-        assert tx.outputs[1].locking_script.serialize() == _TREASURY_SCRIPT_ON_CHAIN
-        assert tx.outputs[1].satoshis == 500_000_000
-
-    def test_an_unfunded_reveal_is_refused_naming_the_fee(self) -> None:
-        import asyncio
-
-        key = PrivateKey()
+        cbor = encode_payload(build_wave_metadata(qualified_name="abcdef.rxd", target=TARGET))[0]
+        pkh = Hex20(key.public_key().hash160())
+        pending = PendingMint(
+            commit_txid="12" * 32,
+            commit_vout=0,
+            commit_value=10_000_000,
+            commit_script=build_commit_locking_script(hash_payload(cbor), pkh, is_nft=True),
+            cbor_bytes=cbor,
+            owner_pkh=bytes(pkh),
+            is_nft=True,
+            carrier_value=546,
+            fee_rate=10_000,
+            funding_address=key.address(),
+        )
         client = _MinterClient()
-        with pytest.raises(ValidationError, match="registration fee"):
-            asyncio.run(self._minter(key, client).reveal_nft(self._pending(key, 5_000_546)))
+        with pytest.raises(ValidationError) as exc:
+            asyncio.run(self._minter(key, client).reveal_nft(pending))
+        assert "resume-mint" in str(exc.value) and "pay_registration_fee=False" in str(exc.value)
         assert client.broadcasts == []
 
 
-# ────────────────────────────────────────── (10) the path set is derived ──
+# ────────────────────────────────────────── (9) the path set is derived ──
 
 
 def _callers(names: set[str]) -> dict[tuple[str, str], list[ast.Call]]:
@@ -849,7 +841,7 @@ class TestThePathSetIsDerived:
     #: does about the fee. Pinned exactly, so a new caller fails here until someone says.
     _WRITER_CALLERS = {
         ("glyph/builder.py", "_reveal_envelope"): "STATES — every GlyphBuilder reveal builder gets its suffix here",
-        ("glyph/fees.py", "estimate_reveal_fee"): "STATES — sizing only; adds the fee output",
+        ("glyph/fees.py", "estimate_reveal_fee"): "STATES — sizing only; adds the fee output and its funding input",
         ("glyph/builder.py", "build_reveal_outputs"): "UNSTATED — dMint FT deploys; see the test below",
     }
 
@@ -863,7 +855,8 @@ class TestThePathSetIsDerived:
 
     def test_the_unstated_callers_cannot_be_handed_a_claim(self) -> None:
         """The dMint deploy's CBOR comes from a GlyphMetadata with FT, which cannot carry WAVE
-        (WAVE needs NFT, and FT excludes NFT). Were it handed one anyway, the writer refuses it."""
+        (WAVE needs NFT, and FT excludes NFT); the deploy also refuses one at commit time. Were a
+        claim handed to the writer anyway, it refuses it."""
         for protocol in (
             [GlyphProtocol.FT, GlyphProtocol.DMINT, GlyphProtocol.WAVE],
             [GlyphProtocol.FT, GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
@@ -886,7 +879,7 @@ class TestThePathSetIsDerived:
         exempt = {
             # prepare_ft_deploy_reveal refuses a claim (TestTheRawWritersRequireAStatement).
             "FtDeployRevealScripts",
-            # build_reveal_outputs states nothing, so the writer refuses a claim (above).
+            # the dMint deploys refuse a claim at commit time, and their reveal states nothing.
             "DmintV1RevealScripts",
         }
         results = {
@@ -905,5 +898,3 @@ class TestThePathSetIsDerived:
             assert fee is not None, f"{name} carries a reveal envelope and no registration_fee_output"
             assert fee.default is dataclasses.MISSING and fee.default_factory is dataclasses.MISSING, name
             assert fee.kw_only, name
-        commit_fee = {f.name: f for f in dataclasses.fields(builder_module.CommitResult)}["registration_fee_output"]
-        assert commit_fee.default is dataclasses.MISSING

@@ -101,7 +101,7 @@ from ..security.types import Hex20, Txid
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
-from .builder import MIN_FEE_RATE, CommitParams, GlyphBuilder, RevealParams, RevealScripts
+from .builder import MIN_FEE_RATE, CommitParams, GlyphBuilder, RevealParams
 from .fees import (
     REVEAL_SIG_PREFIX_BYTES,
     check_reveal_funding,
@@ -111,6 +111,7 @@ from .fees import (
 )
 from .script import build_commit_locking_script, hash_payload
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
+from .wave_rules import wave_registered_label
 
 __all__ = [
     "DEFAULT_MINT_CONFIRMATIONS",
@@ -272,7 +273,11 @@ def build_reveal_unlock_template(private_key: Any, scriptsig_suffix: bytes) -> A
     def estimated_unlocking_byte_length() -> int:
         return REVEAL_SIG_PREFIX_BYTES + len(suffix)
 
-    return to_unlock_script_template(sign, estimated_unlocking_byte_length)
+    template = to_unlock_script_template(sign, estimated_unlocking_byte_length)
+    # The envelope, readable before signing: pyrxd.glyph.fees.measure_reveal_fee checks what a
+    # reveal pays for a WAVE name against the name its OWN envelope registers.
+    template.glyph_scriptsig_suffix = suffix
+    return template
 
 
 # ---------------------------------------------------------------------------
@@ -1054,14 +1059,8 @@ class GlyphMinter:
         #    that same estimate is a tautology; measuring the built reveal is an
         #    independent check that fires if the estimator's shim has stopped describing
         #    what we actually build. Still nothing spent at this point.
-        dry_pending = replace(pending, commit_txid=_PLACEHOLDER_COMMIT_TXID)
-        dry_run = self._build_reveal_tx(dry_pending, funding_key, locking)
-        measured = measure_reveal_fee(
-            dry_run,
-            fee_rate=fee_rate,
-            cbor_bytes_len=len(pending.cbor_bytes),
-            registration_fee=self._reveal_scripts(dry_pending).registration_fee_output,
-        )
+        dry_run = self._build_reveal_tx(replace(pending, commit_txid=_PLACEHOLDER_COMMIT_TXID), funding_key, locking)
+        measured = measure_reveal_fee(dry_run, fee_rate=fee_rate, cbor_bytes_len=len(pending.cbor_bytes))
         check_reveal_funding(
             commit_value=pending.commit_value,
             carrier_value=carrier_value,
@@ -1132,6 +1131,21 @@ class GlyphMinter:
     ) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
         self._assert_payload_still_matches(pending, funding_key)
+        # A WAVE claim's reveal pays the registration fee from a second, plain wallet input
+        # (pyrxd.glyph.wave_rules), and this facade builds a one-input reveal: it neither
+        # commits WAVE claims (_UNSUPPORTED_PROTOCOLS) nor pays their fee. So a record that
+        # registers a name was not written here, and is refused BEFORE anything else happens,
+        # rather than revealed without its fee or with the fee taken out of the commit.
+        label = wave_registered_label(pending.cbor_bytes)
+        if label is not None:
+            raise ValidationError(
+                f"pending mint {pending.commit_txid} registers the WAVE name {label}.rxd; GlyphMinter does not "
+                "register WAVE names and did not write this record. Reveal it with `pyrxd glyph resume-mint "
+                f"{pending.commit_txid}` (pays the registration fee from a wallet input if the name is still "
+                "free), or with GlyphBuilder.prepare_reveal plus a wallet input that funds its "
+                "registration_fee_output — or pay_registration_fee=False there to recover the commit without "
+                "registering. The record is kept."
+            )
 
         await wait_for_confirmation(
             self._client,
@@ -1143,16 +1157,6 @@ class GlyphMinter:
 
         locking = P2PKH().lock(pending.funding_address)
         reveal_tx = self._build_reveal_tx(pending, funding_key, locking)
-        registration_fee = self._reveal_scripts(pending).registration_fee_output
-        if registration_fee is not None and pending.commit_value < pending.carrier_value + registration_fee.value:
-            raise ValidationError(
-                f"pending mint {pending.commit_txid} registers the WAVE name {registration_fee.label}.rxd, whose "
-                f"reveal pays the registration fee ({registration_fee.describe()}), but its commit holds "
-                f"{pending.commit_value:,} photons: not enough for the {pending.carrier_value:,}-photon carrier and "
-                "the fee. This facade does not commit WAVE claims, so it did not write this record. Build the "
-                "reveal with GlyphBuilder.prepare_reveal and add an input that funds the fee (or decline it "
-                "there with pay_registration_fee=False). The record is kept."
-            )
         effective_rate = pending.fee_rate if fee_rate is None else fee_rate
         if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:
             raise ValidationError("reveal fee_rate must be a positive int")
@@ -1342,8 +1346,18 @@ class GlyphMinter:
                 "rediscovered) and retry — the pending record is left untouched."
             ) from exc
 
-    def _reveal_scripts(self, pending: PendingMint) -> RevealScripts:
-        return self._builder.prepare_reveal(
+    def _build_reveal_tx(self, pending: PendingMint, funding_key: Any, change_locking: Script) -> Transaction:
+        """Build the (unsigned, un-fee'd) reveal that spends the commit output.
+
+        Shared by the pre-broadcast dry run and the real post-confirmation build so the
+        two cannot diverge — a dry run that measured a *different* transaction would be
+        worth no more than the tautology it replaced.
+
+        One input, the commit: this facade builds no reveal that registers a WAVE name, whose
+        registration fee is funded from a second, wallet input (:meth:`_reveal` refuses those
+        records before reaching here, and :meth:`_commit` never writes one).
+        """
+        scripts = self._builder.prepare_reveal(
             RevealParams(
                 commit_txid=pending.commit_txid,
                 commit_vout=pending.commit_vout,
@@ -1353,21 +1367,6 @@ class GlyphMinter:
                 is_nft=pending.is_nft,
             )
         )
-
-    def _build_reveal_tx(self, pending: PendingMint, funding_key: Any, change_locking: Script) -> Transaction:
-        """Build the (unsigned, un-fee'd) reveal that spends the commit output.
-
-        Shared by the pre-broadcast dry run and the real post-confirmation build so the
-        two cannot diverge — a dry run that measured a *different* transaction would be
-        worth no more than the tautology it replaced.
-
-        A payload that registers a WAVE name gets its registration fee output after the
-        token, from the builder's ``registration_fee_output``. This facade refuses to COMMIT
-        a WAVE claim (:data:`_UNSUPPORTED_PROTOCOLS`), so that is reached only by a
-        :class:`PendingMint` it did not write; its commit was not sized for the fee, and the
-        reveal is then refused unfunded before anything is broadcast (:meth:`_reveal`).
-        """
-        scripts = self._reveal_scripts(pending)
 
         shim_out = TransactionOutput(Script(pending.commit_script), pending.commit_value)
         src_tx = Transaction(tx_inputs=[], tx_outputs=[shim_out])
@@ -1384,12 +1383,10 @@ class GlyphMinter:
         # The token sits on vout[0] — a dust carrier for an NFT, the whole supply for an
         # FT premine — and the rest of the commit value returns as change rather than
         # being burned to fee.
-        fee = scripts.registration_fee_output
         return Transaction(
             tx_inputs=[reveal_input],
             tx_outputs=[
                 TransactionOutput(Script(scripts.locking_script), pending.carrier_value),
-                *([] if fee is None else [TransactionOutput(Script(fee.locking_script), fee.value)]),
                 TransactionOutput(change_locking, 0, change=True),
             ],
         )

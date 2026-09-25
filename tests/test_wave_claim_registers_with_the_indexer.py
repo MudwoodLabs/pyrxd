@@ -885,6 +885,9 @@ class TestTheWriterSetIsDerived:
         ("glyph/inspector.py", "extract_reveal_cbor"): "reader",
         ("glyph/mutable_chain.py", "_envelope_of"): "reader",
         ("glyph/timelock_reveal_tx.py", "parse_reveal_proof_script"): "reader",
+        # The registration fee reads a reveal's envelope to learn the name it registers.
+        ("glyph/wave_rules.py", "registered_label_in_scriptsig"): "reader",
+        ("glyph/fees.py", "_reveal_envelope_label"): "reader",
     }
 
     @staticmethod

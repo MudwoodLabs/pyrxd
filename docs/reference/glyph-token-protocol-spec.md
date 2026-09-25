@@ -844,23 +844,45 @@ the amounts and the address are Photonic's (`calculateNameCost`,
 `packages/app/src/pages/WaveRegister.tsx:132-152`) and RXinDexer's
 (`WAVE_TREASURY_ADDRESS_DEFAULT` and `wave_name_price`,
 `electrumx/server/wave_index.py:65` and `:73-86` at `ca8a6a4e`). Both sources price 1-2
-character names at the 3-character tier; pyrxd writes no label under 3
+character names at the 3-character tier (100 RXD); pyrxd writes no label under 3
 characters. Photonic puts the output after the token outputs and before change
 (`packages/lib/src/mint.ts:877-881`), so vout 2 for a WAVE claim, after the NFT
-and the mutable contract; mainnet claim `f644794b…` pays 5 RXD there.
+and the mutable contract, and funds it from wallet inputs at reveal time
+(`mint.ts:883-904`): mainnet claim `f644794b…` pays 5 RXD at vout 2, from a third
+input that is its commit transaction's vout 2, not the commit output.
 
 Neither consensus nor RXinDexer's claim path checks the fee: the indexer's
 `process_tx` registers the name without reading the outputs
 (`electrumx/server/wave_index.py:706-807`), and it checks the treasury payment only on renewal,
 when a transaction spends the name's claim token (`_maybe_process_renewal`,
-`electrumx/server/wave_index.py:581-642`). pyrxd pays it by default on every path that
-registers a name (`src/pyrxd/glyph/wave_rules.py`, `wave_registration_fee_for`):
-each `GlyphBuilder` reveal that can register one returns it as
-`registration_fee_output`, the fee estimator sizes it and the funding checks count its value, and
-`pyrxd glyph mint-nft` puts it in the reveal (at vout 1: that reveal carries no
-mutable contract). `pay_registration_fee=False` (`--no-wave-registration-fee`)
-registers without paying. The published treasury is a mainnet address; no
-testnet or regtest treasury is published.
+`electrumx/server/wave_index.py:581-642`). A WAVE-marked update of a name that is
+held and live is a duplicate to the indexer, not a registration; a treasury
+payment in a transaction that spends the claim token is a renewal.
+
+pyrxd's builders RETURN the fee; the CLI pays it. Each `GlyphBuilder` reveal
+builder that can register a name returns the output as `registration_fee_output`
+(`src/pyrxd/glyph/wave_rules.py`, `wave_registration_fee_for`) for the caller to
+add to the reveal, funded from a plain wallet input as Photonic funds it; the
+commit output carries only the token carrier and the reveal's miner fee. Whether
+a payload registers a name, and so owes the fee, is decided by RXinDexer's rule
+(`validate_wave_name`, `electrumx/server/wave_index.py:287-310`, applied to
+`attrs.name`, else `app.data.name`), not by pyrxd's stricter write rule: a 1-2
+character or upper-case label revealed under `allow_unregistrable_wave=True` owes
+the fee, and a dotted `alice.rxd` label, which the indexer refuses, owes none. The
+fee estimator sizes the funding input and the fee output, and
+`measure_reveal_fee` / `assert_reveal_balances` refuse a registering reveal that
+does not carry exactly one treasury output at exactly the tier value, or does not
+balance. `pyrxd glyph mint-nft` pays it: it asks the indexer
+(`wave.check_available`) before the commit and again before the reveal, refuses a
+name that is taken, and refuses one no indexer vouches for unless
+`--allow-unverified-wave-name` is given; its reveal spends the commit and the
+commit's change, pays the fee at vout 1 (that reveal carries no mutable contract)
+and returns change. If the name is taken after the commit, it pays nothing and
+prints how to reveal the commit without the fee (`pyrxd glyph resume-mint <txid>
+--no-wave-registration-fee`). `GlyphMinter` mints no WAVE claims.
+`pay_registration_fee=False` (`--no-wave-registration-fee`) registers without
+paying. The published treasury is a mainnet address; no testnet or regtest
+treasury is published.
 
 ### 8.2 On-chain distinguishability
 

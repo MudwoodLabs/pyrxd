@@ -687,7 +687,7 @@ def build_mutable_scriptsig(
     # An update envelope carrying WAVE in `p` is read as a registration by RXinDexer. No
     # escape here: an update payload is chosen fresh, so refusing one strands nothing.
     refuse_unregistrable_wave_claim(cbor_bytes)
-    refuse_unstated_wave_fee(cbor_bytes, registration_fee)
+    refuse_unstated_wave_fee(cbor_bytes, registration_fee, what="update")
     for name, val in (
         ("contract_output_index", contract_output_index),
         ("ref_hash_index", ref_hash_index),

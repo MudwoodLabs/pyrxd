@@ -138,15 +138,19 @@ From `glyph mint-nft` (`_mint_nft_inner`), `glyph deploy-ft`
 (`_deploy_ft_inner`) and `glyph deploy-dmint` (`_deploy_dmint_inner`)
 respectively, all in
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py). The `cause` line names the exact shortfall (`need ≥ N photons
-in one UTXO; largest is M`). When the metadata registers a WAVE name, `mint-nft`'s
-cause also names the registration fee it includes (`…, including the 5 RXD WAVE
-registration fee for alice-name.rxd; …`).
+in one UTXO; largest is M`; `mint-nft` says `in one plain-RXD (token-free) UTXO`
+and `largest in the wallet is M`, because it never spends a UTXO that carries a
+token). When the metadata registers a WAVE name, `mint-nft`'s cause also names
+the registration fee it includes (`…, including the 5 RXD WAVE registration fee
+for alice-name.rxd, which the reveal pays from this UTXO's change; …`).
 
 **Cause:** the commit/deploy builder needs **one single UTXO** that covers
 the commit value plus both the commit's own fee estimate and slack for the
 reveal — it does not combine multiple smaller UTXOs for this step. For a WAVE
-name the commit value includes the registration fee (100, 50, 10 or 5 RXD for
-a 3, 4, 5 or 6+ character name), which the reveal pays to the WAVE treasury.
+name the same UTXO must also hold the registration fee (100, 50, 10 or 5 RXD
+for a name of up to 3, 4, 5 or 6+ characters). The commit output does not
+carry it: it stays in the commit's change, and the reveal spends that change as
+a second input to pay the WAVE treasury.
 
 **Fix (all three, same text):** `consolidate UTXOs first, or fund the wallet
 from a single source`.
@@ -169,10 +173,12 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
-(`src/pyrxd/glyph/fees.py:407-450`). When the metadata registers a WAVE name, the
-message reads `commit value cannot cover the reveal fee and the WAVE registration fee`,
-and the parenthesis gains `+ <photons> WAVE registration fee for <name>.rxd to <treasury>`:
-the reveal pays that fee out of the commit too.
+(`src/pyrxd/glyph/fees.py:588-624`). Before that, the whole reveal is measured by
+`assert_reveal_balances` (same file): when the metadata registers a WAVE name its
+reveal also spends the wallet input that pays the fee, and a shortfall reads
+`the reveal does not balance: inputs … ; outputs … + <photons> WAVE registration
+fee for <name>.rxd to <treasury>; miner fee … — short by <n>` (or `balances only by
+dropping its change`). The registration fee never comes out of the commit.
 
 **Cause:** the reveal transaction's scriptSig carries the **entire CBOR
 metadata payload**, so a large `metadata.json` (a long image URL, several
@@ -398,20 +404,35 @@ up." At the CLI, a poll that never confirms surfaces as:
 ```
 error: timed out waiting for confirmation
   cause: tx has <N> confirmations, required <M> (timeout (last poll error: <text>))
-  fix: check the txid on a block explorer. Not confirmed: nothing is stranded — re-run the
-       command. Confirmed: this CLI has no resume flag, so rebuild the reveal with the SDK …
+  fix: the transaction <txid> was broadcast and has not confirmed yet. It may still confirm, so do
+       not simply re-run the command: that would commit, and spend, again. …
 ```
 
 — [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py),
-exit code 2. **Fix:** check the commit txid on a block explorer.
+exit code 2. **Fix:** check the commit txid on a block explorer, and do not
+re-run the mint while the commit may still confirm.
 
-- **It never confirmed.** Nothing was spent that you cannot re-spend. Re-run
-  the command.
-- **It confirmed.** There is no `--resume` flag and no `COMMIT_TXID`
-  environment variable in this CLI — earlier versions of this page and of the
-  error hint said otherwise, and were wrong. (`COMMIT_TXID` is read by the
-  standalone `examples/*.py` demo scripts, which carry their own hard-coded
-  metadata and cannot resume a CLI mint.) Recover through the SDK instead:
+- **`glyph mint-nft` or `glyph timelock-mint`.** The command saved a record of
+  the commit before broadcasting it, in `pending-mints/` beside the wallet file
+  (`~/.pyrxd/pending-mints` for the default wallet), and the error names the
+  commit's txid, its value and that record. Once the commit confirms, `pyrxd
+  glyph resume-mint <commit txid>` builds, checks and broadcasts its reveal.
+  For a WAVE name it asks the indexer again and pays the registration fee from
+  a plain wallet input only if the name is still free; if the name has been
+  taken, `pyrxd glyph resume-mint <commit txid> --no-wave-registration-fee`
+  reveals the commit without the fee (a duplicate claim the indexer does not
+  register; the carrier and the change come back to the wallet). Every exit
+  after the commit is broadcast (a declined reveal prompt, a network error, this
+  timeout, Ctrl-C) prints the same recovery, and in `--json` mode also writes it
+  to stdout as a JSON document.
+- **It never confirms.** If the commit leaves the mempool without confirming,
+  its inputs were never spent, and `resume-mint` will not find it confirmed.
+- **`glyph deploy-ft` or `glyph deploy-dmint`, or no record.** There is no
+  `--resume` flag and no `COMMIT_TXID` environment variable for these — earlier
+  versions of this page and of the error hint said otherwise, and were wrong.
+  (`COMMIT_TXID` is read by the standalone `examples/*.py` demo scripts, which
+  carry their own hard-coded metadata and cannot resume a CLI mint.) Recover
+  through the SDK instead:
 
   ```python
   from pyrxd.glyph.builder import GlyphBuilder, RevealParams
@@ -432,7 +453,10 @@ exit code 2. **Fix:** check the commit txid on a block explorer.
 
   Then build the reveal transaction spending `commit_txid:0` with
   `scripts.scriptsig_suffix` appended to a normal P2PKH unlock — see
-  `examples/glyph_mint_demo.py` for the shape.
+  `examples/glyph_mint_demo.py` for the shape. If the metadata registers a WAVE
+  name, `scripts.registration_fee_output` is the fee: add it, funded from a
+  plain wallet input, only if `WaveResolver.check_available` says the name is
+  still free; if it is taken, build with `pay_registration_fee=False` instead.
 
   **The metadata file must be byte-identical.** The commit output's script is
   `OP_HASH256 <payload_hash> OP_EQUALVERIFY …` before its P2PKH tail, so it can

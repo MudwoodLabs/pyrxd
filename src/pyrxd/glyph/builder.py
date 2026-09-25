@@ -167,8 +167,8 @@ def _refuse_a_wave_claim(cbor_bytes: bytes, what: str) -> None:
     """Refuse a commit whose reveal cannot carry a WAVE registration fee, if its CBOR registers a name.
 
     The dMint deploys are FT, and a WAVE claim needs NFT: ``GlyphMetadata`` refuses WAVE
-    without NFT and MUT, and FT with NFT. So their CBOR registers no name, their commits
-    report ``registration_fee_output=None``, and their reveals (``build_reveal_outputs``) state
+    without NFT and MUT, and FT with NFT. So their CBOR registers no name, and their reveals
+    (``build_reveal_outputs``) state
     no fee to the envelope writer. That is checked here, not assumed: if it ever stops being
     true, the commit is refused before it exists, rather than at a reveal that would then
     strand it.
@@ -198,12 +198,6 @@ class CommitParams:
     #: the matching burn output — see :class:`RevealParams`. Leave ``None`` to
     #: back relationships directly (spend-and-recreate) or not at all.
     delegate_ref: GlyphRef | None = None
-    #: WAVE only: pay the registration fee (the default). ``False`` opts out; see
-    #: :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for` for what that means before
-    #: choosing it. Pass the same choice to the reveal, which is where the fee is paid.
-    pay_registration_fee: bool = True
-    #: WAVE only: pay the fee to this P2PKH address instead of the published mainnet treasury.
-    registration_treasury: str | None = None
 
 
 @dataclass
@@ -219,13 +213,6 @@ class CommitResult:
     #: is rejected by the covenant, stranding the commit value until a correct
     #: reveal is built — so keep this alongside ``cbor_bytes``.
     delegate_ref: GlyphRef | None = None
-    #: The WAVE registration fee the REVEAL of this commit will pay, or ``None`` when the
-    #: payload registers no name or the fee was declined. Known here, before anything is
-    #: broadcast, so the caller can fund it: the reveal's inputs must cover this value on top
-    #: of the carrier outputs and the reveal's own fee. Not included in ``estimated_fee``,
-    #: which is the COMMIT transaction's fee. Required, with no default, so that no code path
-    #: can build a result that is silent about it.
-    registration_fee_output: WaveRegistrationFee | None = dc_field(kw_only=True)
 
 
 @dataclass
@@ -286,9 +273,13 @@ class RevealScripts:
     #: (the WAVE treasury), after the token output(s) and before change. Neither the chain nor
     #: RXinDexer's claim path checks it, so a reveal without it registers the name UNPAID.
     #: ``None`` when the payload registers no name, or with ``pay_registration_fee=False``.
-    #: REQUIRED, with no default, on every reveal result that carries an envelope, so a
-    #: builder that forgot it fails to construct its result instead of returning one that is
-    #: silent about the fee.
+    #: Fund it from a second, plain wallet input, not from the commit (see
+    #: :meth:`GlyphBuilder.prepare_wave_reveal`). REQUIRED, with no default, on every reveal
+    #: result whose builder can register a name, so a builder that forgot it fails to construct
+    #: its result instead of returning one that is silent about the fee. The two reveal results
+    #: without it, ``FtDeployRevealScripts`` and ``DmintV1RevealScripts``, belong to builders
+    #: that REFUSE a payload that registers a name (``prepare_ft_deploy_reveal`` at reveal
+    #: time; the dMint deploys at commit time) instead of carrying its fee.
     registration_fee_output: WaveRegistrationFee | None = dc_field(kw_only=True)
 
 
@@ -489,19 +480,14 @@ class GlyphBuilder:
         it commits to, so a refusal at reveal time would strand its value. There is no
         override on this path (see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`).
 
-        A WAVE claim's registration fee is reported here, as
-        :attr:`CommitResult.registration_fee_output`, because this is the last moment before
-        anything is broadcast: the reveal pays it, so whatever funds the reveal (in pyrxd's own
-        flows, the commit output) must cover it. ``params.pay_registration_fee=False`` declines
-        it; see :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`.
+        Nothing for a WAVE claim's registration fee goes in the commit. The reveal pays it,
+        from a second, plain wallet input (Photonic's shape; see
+        :meth:`prepare_wave_reveal`), so the fee stays in the wallet until the reveal that
+        registers the name spends it. ``wave_registration_fee_for(result.cbor_bytes)`` gives
+        the amount before anything is broadcast.
         """
         cbor_bytes, payload_hash = encode_payload(params.metadata)
         refuse_unregistrable_wave_claim(cbor_bytes)
-        registration_fee = wave_registration_fee_for(
-            cbor_bytes,
-            pay_registration_fee=params.pay_registration_fee,
-            registration_treasury=params.registration_treasury,
-        )
         is_nft = GlyphProtocol.NFT in params.metadata.protocol
         commit_script = build_commit_locking_script(
             payload_hash,
@@ -518,7 +504,6 @@ class GlyphBuilder:
             payload_hash=payload_hash,
             estimated_fee=estimated_fee,
             delegate_ref=params.delegate_ref,
-            registration_fee_output=registration_fee,
         )
 
     def prepare_reveal(self, params: RevealParams) -> RevealScripts:
@@ -812,7 +797,6 @@ class GlyphBuilder:
             cbor_bytes=cbor_bytes,
             payload_hash=payload_hash,
             estimated_fee=estimated_commit_fee,
-            registration_fee_output=None,  # checked by _refuse_a_wave_claim above
         )
 
         # 3. Pre-build placeholder contract scripts so the caller can
@@ -909,7 +893,6 @@ class GlyphBuilder:
             cbor_bytes=cbor_bytes,
             payload_hash=payload_hash,
             estimated_fee=276 * MIN_FEE_RATE,
-            registration_fee_output=None,  # checked by _refuse_a_wave_claim above
         )
 
         # 3. Pre-build placeholder V2 contract scripts (height=0) so the caller can
@@ -982,9 +965,9 @@ class GlyphBuilder:
         ≤0.24.0 already broadcast; the claim so revealed will not register. How to rebuild
         that commit's exact bytes is in :meth:`prepare_wave_reveal`.
 
-        A payload that registers a WAVE name pays the registration fee:
-        ``registration_fee_output`` on the result, which goes at vout 2 (see
-        :meth:`prepare_wave_reveal`). ``pay_registration_fee=False`` declines it and
+        A payload that registers a WAVE name owes the registration fee:
+        ``registration_fee_output`` on the result, which the caller puts at vout 2 and funds
+        from a plain wallet input (see :meth:`prepare_wave_reveal`). ``pay_registration_fee=False`` declines it and
         ``registration_treasury`` redirects it; see
         :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`.
 
@@ -1196,10 +1179,6 @@ class GlyphBuilder:
             payload_hash=payload_hash,
             estimated_fee=(276 if params.delegate_ref is None else 276 + 148 + 56) * MIN_FEE_RATE,
             delegate_ref=params.delegate_ref,
-            # A DAT reveal registers nothing: RXinDexer's envelope parser takes the push after
-            # 'gly' as the payload, and here that push is 'dat', which is neither a CBOR map nor
-            # a v1/v2 structured payload (electrumx/lib/glyph.py:214-241 at ca8a6a4e).
-            registration_fee_output=None,
         )
 
     def prepare_dat_reveal(self, cbor_bytes: bytes, *, delegate_ref: GlyphRef | None = None) -> RevealScripts:
@@ -1220,7 +1199,10 @@ class GlyphBuilder:
             locking_script=None,
             scriptsig_suffix=build_dat_reveal_scriptsig_suffix(cbor_bytes),
             delegate_burn_script=(build_delegate_burn_script(delegate_ref) if delegate_ref is not None else None),
-            # Registers nothing, whatever its CBOR says: see prepare_dat_commit.
+            # A DAT reveal registers nothing, whatever its CBOR says: RXinDexer's envelope
+            # parser takes the push after 'gly' as the payload, and here that push is 'dat',
+            # neither a CBOR map nor a v1/v2 structured payload (electrumx/lib/glyph.py:214-241
+            # at ca8a6a4e).
             registration_fee_output=None,
         )
 
@@ -1602,26 +1584,36 @@ class GlyphBuilder:
     ) -> MutableRevealScripts:
         """Prepare scripts for a WAVE (on-chain naming) reveal.
 
-        THE REGISTRATION FEE IS PAID BY DEFAULT. The result's ``registration_fee_output`` is a
-        :class:`~pyrxd.glyph.wave_rules.WaveRegistrationFee`: an output of
-        ``wave_registration_price(name)`` photons — 100 RXD for a 3-character label, 50 for 4,
-        10 for 5, 5 for 6 to 63 — to the P2PKH of the WAVE treasury
-        (:data:`~pyrxd.glyph.wave_rules.WAVE_TREASURY_ADDRESS`). Put it at vout 2::
+        THE RESULT CARRIES THE REGISTRATION FEE, AND THE CALLER PAYS IT. ``registration_fee_output``
+        is a :class:`~pyrxd.glyph.wave_rules.WaveRegistrationFee`: an output of
+        ``wave_registration_price(name)`` photons — 100 RXD for a label of 3 characters or
+        fewer, 50 for 4, 10 for 5, 5 for 6 to 63 — to the P2PKH of the WAVE treasury
+        (:data:`~pyrxd.glyph.wave_rules.WAVE_TREASURY_ADDRESS`). This method returns scripts; the
+        caller builds the transaction, in Photonic's shape (``mintToken``) and mainnet claim
+        ``f644794b…``'s::
 
-            vout 0  nft_script                          (the name's claim token)
-            vout 1  contract_script                     (the mutable contract)
-            vout 2  registration_fee_output             (value, locking_script)
-            vout 3+ change
+            input 0   commit_txid:commit_vout       the commit (scriptSig: sig, pubkey, envelope)
+            input 1   commit_txid:commit_vout + 1   the seed for the contract's ref
+            input 2   a plain P2PKH wallet UTXO     funds the fee (f644794b: the commit's change)
+            vout 0    nft_script                    the name's claim token
+            vout 1    contract_script               the mutable contract
+            vout 2    registration_fee_output       (value, locking_script)
+            vout 3+   change back to the wallet
 
-        which is where Photonic's ``mintToken`` puts it and where mainnet claim ``f644794b…``
-        has it (:mod:`pyrxd.glyph.wave_rules` cites both). The reveal's inputs must fund it.
+        FUND THE FEE FROM THE WALLET INPUT, NOT FROM THE COMMIT: then the fee is spent only by
+        the reveal that registers the name, and a reveal that does not pay it (say, because the
+        name was taken after the commit) leaves it in the wallet. Check the name is still free
+        (:meth:`pyrxd.glyph.wave.WaveResolver.check_available`) just before broadcasting;
+        ``pyrxd glyph mint-nft`` does all of this. :mod:`pyrxd.glyph.wave_rules` cites the sources.
 
         ``pay_registration_fee=False`` registers the name without paying. The published
         protocol and Photonic expect the fee; RXinDexer does not check it at registration, so
         the name still resolves; renewing it later takes a transaction that spends the claim
-        token and pays the price to the treasury. ``registration_treasury`` pays another P2PKH
-        address instead — the published treasury is a MAINNET address, and no testnet or
-        regtest one exists. See :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`.
+        token and pays the price to the treasury. It is also how a commit whose name was taken
+        in the meantime is recovered: the reveal is then a duplicate the indexer does not
+        register. ``registration_treasury`` pays another P2PKH address instead — the published
+        treasury is a MAINNET address, and no testnet or regtest one exists. See
+        :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for`.
 
         ``name`` is the name being claimed: ``"alice.rxd"``, or a bare ``"alice"``, which
         means the same. It must already be embedded in ``cbor_bytes``, with the fields

@@ -46,8 +46,11 @@ a real consumer surfacing. Until then, do not invest design effort.
 > registration price to the protocol treasury", which RXinDexer does check
 > (`_maybe_process_renewal`, `wave_index.py:581-642` at `ca8a6a4e`). The
 > maintainer's decision: pyrxd pays the fee by default, as Photonic's register
-> page does, to the treasury Photonic and RXinDexer both name, on every path that
-> registers a name; `pay_registration_fee=False` is the only way out. See the
+> page does, to the treasury Photonic and RXinDexer both name. The reveal
+> builders return the fee output for the caller to add, funded from a wallet
+> input at reveal time as Photonic funds it, and `pyrxd glyph mint-nft` pays it
+> after checking the name is free; `pay_registration_fee=False` is the only way
+> out. See the
 > "WAVE registration fee" paragraph in §8.1 of
 > `docs/reference/glyph-token-protocol-spec.md` and `src/pyrxd/glyph/wave_rules.py`.
 
