@@ -13,10 +13,12 @@ fee, and never registers — the class #728 is about. So the honest-path set her
 the defect, and it is now refused. The name a person means by ``café`` is written as its
 punycode, ``xn--caf-dma``, which every source accepts; that is the honest path pinned below.
 
-With an ASCII-only label rule the homograph question does not arise for a WAVE label: every
-look-alike character is non-ASCII and refused by the rule, with no Unicode table involved and
-no override to route around. ``validate_wave_text`` and ``allow_confusable`` were removed
-(#698 was merged but unreleased). The spoofs below are kept to prove that, on every door.
+With an ASCII-only label rule the question #698 answered does not arise for a WAVE label: a
+look-alike built from non-ASCII characters is refused by the rule, with no Unicode table
+involved and no override to route around. ``validate_wave_text`` and ``allow_confusable`` were
+removed (#698 was merged but unreleased). The spoofs below are kept to prove that, on every
+door. An ALL-ASCII look-alike (``paypa1``) is a different question, which neither #698 nor
+this rule answers; ``test_an_ascii_look_alike_is_not_refused`` pins that the claim is scoped.
 """
 
 from __future__ import annotations
@@ -137,6 +139,12 @@ class TestTheHonestPathStillWorks:
     def test_the_label_is_the_claim(self, kind: str) -> None:
         md = build_wave_metadata(qualified_name=f"{HONEST[kind]}.rxd", target=TARGET)
         assert (md.attrs["name"], md.name) == (HONEST[kind], f"{HONEST[kind]}.rxd")
+
+
+def test_an_ascii_look_alike_is_not_refused() -> None:
+    """The docstrings say NON-ASCII look-alikes are refused. This pins the limit of that claim:
+    ``paypa1`` (digit one for ``l``) is plain ASCII and builds. #698's check passed it too."""
+    assert build_wave_metadata(qualified_name="paypa1.rxd", target=TARGET).attrs["name"] == "paypa1"
 
 
 def test_there_is_no_override_to_route_around() -> None:

@@ -232,8 +232,10 @@ def build_wave_metadata(
     indexer's source no claim this function built was registered (#728; read from source,
     not observed against a live indexer).
 
-    There is no homograph option. The label rule is ASCII-only, so a look-alike label is
-    refused by construction; a non-ASCII name is written as its ``xn--`` punycode.
+    There is no homograph option. The label rule is ASCII-only, so a NON-ASCII look-alike
+    label is refused by construction; a non-ASCII name is written as its ``xn--`` punycode.
+    An all-ASCII look-alike (``paypa1``) is not refused, and #698's check did not refuse one
+    either.
     """
     label = parse_wave_name(qualified_name)
     if not target:

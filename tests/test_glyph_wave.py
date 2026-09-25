@@ -86,8 +86,9 @@ class TestBuildWaveMetadata:
 
     def test_attrs_match_photonic_shape(self):
         """The BARE LABEL in attrs.name. The qualified name here was #728: RXinDexer refuses
-        the '.', so nothing pyrxd built through 0.24.0 was ever indexed. The byte-level proof
-        against a real Photonic claim is in test_wave_claim_registers_with_the_indexer.py."""
+        the '.', so by its source no claim build_wave_metadata built through 0.24.0 was indexed.
+        test_wave_claim_registers_with_the_indexer.py shows the field set is Photonic's and the
+        bytes equal a mainnet claim the indexer resolves (not a claim Photonic encoded)."""
         md = build_wave_metadata(qualified_name="alice.rxd", target=ADDR)
         assert md.attrs == {
             "name": "alice",

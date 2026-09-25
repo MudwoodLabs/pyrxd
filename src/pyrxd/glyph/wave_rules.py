@@ -26,9 +26,10 @@ So a label is 3-63 characters of ``a-z``, ``0-9`` and ``-``; it does not start o
 lower-cased: the indexer would register ``alice`` for ``Alice``, but the claim would then
 carry text that is not the name it registers, and Photonic refuses it outright. A non-ASCII
 name is written as punycode (``xn--caf-dma`` for ``café``) — the one form every source above
-accepts. Because the rule is ASCII-only, a look-alike label (Cyrillic ``і`` in ``casіno``,
-U+212A KELVIN SIGN for ``k``) is refused by construction; no separate homograph check is
-needed for a WAVE label.
+accepts. Because the rule is ASCII-only, a NON-ASCII look-alike label (Cyrillic ``і`` in
+``casіno``, U+212A KELVIN SIGN for ``k``) is refused by construction, with no Unicode table.
+An ASCII look-alike (``paypa1``, ``rn`` for ``m``) is NOT refused — no rule here, and none in
+#698's homograph check before it, judges which all-ASCII names are too similar to another.
 
 THE DOMAIN is exactly ``rxd``. Subdomains (``pay.alice.rxd``) are "Planned" in the WAVE
 protocol (``ANNOUNCEMENT.md:70``), and RXinDexer compares the parent against ``'rxd'``
@@ -116,10 +117,29 @@ def parse_wave_name(qualified: object) -> str:
 
 
 def _is_wave_marked(d: object) -> bool:
+    """Whether RXinDexer treats this payload as WAVE-marked — its own test, transcribed.
+
+    RXinDexer takes ``protocols = metadata.get('p', [])`` (``electrumx/server/glyph_index.py:872``
+    and ``:879``) and asks ``GlyphProtocol.GLYPH_WAVE not in protocols``
+    (``electrumx/server/wave_index.py:685``), where ``GLYPH_WAVE`` is the plain int 11
+    (``electrumx/lib/glyph.py:47``). That is Python's ``in``, so it holds for EVERY container
+    CBOR decodes to, not only a list: an array (an element equal to 11), a byte string (a byte
+    of value 11 — ``h'02050b'`` is WAVE-marked), and a map (a KEY equal to 11). This checked for
+    a list or tuple only, so a payload with ``p: h'02050b'`` and ``attrs.name: "alice.rxd"``
+    passed every writer while the indexer read it as a registration and refused the name.
+
+    Where ``in`` cannot search the value (text, a number, null) it raises ``TypeError`` there,
+    before the claim path — ``get_token_type`` (``electrumx/lib/glyph.py:727``) is the first
+    ``in`` it meets — and the block processor skips that transaction's glyph overlay. So that
+    is not a claim, and it is not one here either.
+    """
     if not isinstance(d, dict):
         return False
-    protocol = d.get("p")
-    return isinstance(protocol, (list, tuple)) and GlyphProtocol.WAVE in protocol
+    protocol = d.get("p", [])
+    try:
+        return int(GlyphProtocol.WAVE) in protocol
+    except TypeError:
+        return False
 
 
 def indexed_wave_name(d: dict[str, Any]) -> tuple[object, object]:
@@ -190,7 +210,9 @@ def refuse_unregistrable_wave_claim(cbor: bytes | dict[str, Any], *, allow_unreg
     commit that is already on chain, made by pyrxd ≤0.24.0, whose committed CBOR has the old
     shape. That commit can only be spent by revealing those exact bytes, so refusing them
     would strand its value. The claim so revealed WILL NOT REGISTER with the indexer. It is
-    accepted only by the reveal paths, never by :meth:`GlyphBuilder.prepare_commit`.
+    accepted only by the reveal paths, never by :meth:`GlyphBuilder.prepare_commit`. How to
+    rebuild that commit's exact bytes, and what happens if they are wrong, is in
+    :meth:`GlyphBuilder.prepare_wave_reveal`.
 
     Bytes that are not a CBOR map are left alone: they are not a WAVE claim to any indexer,
     and the callers' own checks own them.

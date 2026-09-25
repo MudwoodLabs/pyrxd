@@ -197,8 +197,8 @@ class RevealParams:
     delegate_ref: GlyphRef | None = None
     #: Recovery only: reveal a WAVE-marked payload the indexer will not register. For a
     #: commit pyrxd ≤0.24.0 already broadcast, which can only be spent by revealing its
-    #: old-shape CBOR. The claim WILL NOT REGISTER. See
-    #: :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`.
+    #: old-shape CBOR. The claim WILL NOT REGISTER. How to rebuild those exact bytes is in
+    #: :meth:`GlyphBuilder.prepare_wave_reveal`.
     allow_unregistrable_wave: bool = False
 
 
@@ -853,7 +853,8 @@ class GlyphBuilder:
         A payload marked WAVE is held to the WAVE claim rule
         (:func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`) unless
         ``allow_unregistrable_wave=True``, which exists only to reveal a commit pyrxd
-        ≤0.24.0 already broadcast; the claim so revealed will not register.
+        ≤0.24.0 already broadcast; the claim so revealed will not register. How to rebuild
+        that commit's exact bytes is in :meth:`prepare_wave_reveal`.
 
         Returns the two output locking scripts the caller must place in the
         reveal tx:
@@ -1457,6 +1458,36 @@ class GlyphBuilder:
         broadcast, whose CBOR has the old shape. That commit can only be spent by revealing
         exactly those bytes, so refusing them would strand its value. THE CLAIM SO REVEALED
         WILL NOT REGISTER with the indexer; the reveal only recovers the commit.
+
+        REBUILDING THOSE BYTES. Use the ``cbor_bytes`` stored when the commit was made
+        (``CommitResult.cbor_bytes``) if you have them. :func:`~pyrxd.glyph.wave.build_wave_metadata`
+        no longer produces them, but every release that shipped it (v0.6.0 to v0.24.0) wrote the
+        same bytes, and this reproduces them::
+
+            from pyrxd.glyph.payload import encode_payload
+            from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+            old_cbor, _ = encode_payload(
+                GlyphMetadata(
+                    protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
+                    attrs={
+                        "name": qualified_name,  # EXACTLY the string passed then: "alice.rxd"
+                        "domain": domain,  # the text after its LAST ".", or "rxd" if none
+                        "target": target,
+                        "target_type": target_type,  # "address" unless another was passed
+                    },
+                    description=description,  # the same description, "" if none was passed
+                )
+            )
+
+        Checked byte for byte against the output of every tagged release from v0.6.0 to v0.24.0,
+        recorded in ``tests/fixtures/wave_build_metadata_v0_6_to_v0_24.json``
+        (``tests/test_wave_claim_registers_with_the_indexer.py``, ``TestTheRecoveryRecipe``).
+        Before broadcasting, confirm
+        ``hash_payload(old_cbor) == extract_payload_hash_from_commit_script(commit_script)``.
+        If the bytes differ in any way, the commit script's ``OP_HASH256 <hash> OP_EQUALVERIFY``
+        fails and consensus rejects the reveal. Nothing is lost: the commit stays unspent, and
+        the reveal can be rebuilt with the right bytes and tried again.
 
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
 

@@ -43,8 +43,11 @@ holds every claim to is in ``src/pyrxd/glyph/wave_rules.py``.
 from __future__ import annotations
 
 import ast
+import functools
+import inspect
 import json
 import pathlib
+import textwrap
 
 import cbor2
 import pytest
@@ -60,7 +63,7 @@ from pyrxd.glyph.payload import (
     decode_payload,
     encode_payload,
 )
-from pyrxd.glyph.script import hash_payload
+from pyrxd.glyph.script import build_commit_locking_script, extract_payload_hash_from_commit_script, hash_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.wave import (
     build_wave_metadata,
@@ -110,14 +113,16 @@ def _old_pyrxd_claim(qualified: str = "alice.rxd", target: str = TARGET) -> dict
     }
 
 
+#: What each release from v0.6.0 to v0.24.0 produced, run from its own source.
+_LEGACY: dict = json.loads(
+    (pathlib.Path(__file__).parent / "fixtures" / "wave_build_metadata_v0_6_to_v0_24.json").read_text()
+)
+
+
 def _old_commit_bytes() -> bytes:
-    """The bytes a 0.24.0 commit committed to: its builder's metadata through the same
-    canonical encoder, which is unchanged."""
-    return encode_payload(
-        GlyphMetadata(
-            protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], attrs=_old_pyrxd_claim()["attrs"]
-        )
-    )[0]
+    """The bytes a 0.24.0 commit committed to for ``alice.rxd`` — recorded from the release."""
+    assert _LEGACY["cases"]["plain"] == {"qualified_name": "alice.rxd", "target": TARGET}
+    return bytes.fromhex(_LEGACY["cbor_hex"]["plain"])
 
 
 # ─────────────────────────────── RXinDexer, transcribed (ca8a6a4e) ──
@@ -231,6 +236,7 @@ class TestTheTranscriptionAgreesWithCasesWhoseAnswerIsKnown:
             ("alice.rxd", "Invalid character: ."),
             ("-alice", "Name cannot start with hyphen"),
             ("a--b", "Name cannot contain consecutive hyphens (except Punycode prefix)"),
+            ("ab-xn--c", "Name cannot contain consecutive hyphens (except Punycode prefix)"),
             ("a" * 64, "Name exceeds maximum length of 63"),
             ("", "Name cannot be empty"),
         ],
@@ -392,6 +398,9 @@ _REFUSED_LABELS = [
     ("-abc", "starts or ends with '-'"),
     ("abc-", "starts or ends with '-'"),
     ("a--b", "contains '--'"),
+    # The xn-- exception is for a label that STARTS xn-- (upstream: name.lower().startswith).
+    # One that merely contains it elsewhere is refused by the indexer, so it is refused here.
+    ("ab-xn--c", "contains '--'"),
     ("ab", "is 2 characters"),
     ("a" * 64, "is 64 characters"),
     (b"alice", "must be text"),
@@ -496,11 +505,81 @@ class TestTheDomainAndTheNameTheIndexerReads:
             _DOORS[door](claim)
 
     @pytest.mark.parametrize("door", _CBOR_DOORS)
+    def test_a_top_level_n_naming_something_else_is_refused(self, door: str) -> None:
+        """``n`` is the short key the glyph index reads when ``name`` is absent
+        (lib/glyph.py:672, ``metadata.get('name') or metadata.get('n')``), so the backfill would
+        register ``bob`` from it. ``GlyphMetadata`` cannot write ``n``; the CBOR doors can."""
+        claim = _claim("alice", n="bob.rxd")
+        assert _indexer_registers(claim) == ("alice", None) and _indexer_backfills(claim) == "bob"
+        with pytest.raises(ValidationError, match="top-level n 'bob.rxd' names a different claim"):
+            _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
     def test_unreadable_attrs_is_refused(self, door: str) -> None:
         claim = _claim("alice")
         claim["attrs"] = ["alice"]
         with pytest.raises(ValidationError, match="not a map"):
             _DOORS[door](claim)
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    @pytest.mark.parametrize("app", ["not-a-map", {"data": "not-a-map"}, {"data": ["x"]}], ids=["app", "data", "list"])
+    def test_an_unreadable_app_or_app_data_is_refused_not_crashed(self, door: str, app: object) -> None:
+        """RXinDexer does ``metadata.get('app', {}).get('data', {})`` (wave_index.py:712): a
+        non-map there raises inside the indexer, which skips the claim. The rule must say so as
+        a ``ValidationError`` — an ``AttributeError`` escaping it would reach callers as a crash
+        from a builder, not a refusal they can read."""
+        claim = _claim("alice", app=app)
+        with pytest.raises(ValidationError, match=r"attrs, app or app\.data is not a map"):
+            _DOORS[door](claim)
+
+
+class TestPInEveryContainerTheIndexerSearches:
+    """RXinDexer asks ``GLYPH_WAVE not in protocols`` (``wave_index.py:685``) of
+    ``protocols = metadata.get('p', [])`` (``glyph_index.py:872``), with GLYPH_WAVE the int 11.
+    That is Python's ``in``: true for a byte string and a map as well as a list. The rule
+    checked a list or tuple only, so ``p: h'02050b'`` with ``attrs.name: "alice.rxd"`` passed
+    every writer while the indexer read it as a registration and refused the name."""
+
+    FORMS = {"bytes": b"\x02\x05\x0b", "map": {2: True, 5: True, 11: True}}
+
+    @pytest.mark.parametrize("form", sorted(FORMS))
+    def test_the_indexer_reads_it_as_wave_marked(self, form: str) -> None:
+        assert 11 in self.FORMS[form]  # wave_index.py:685, transcribed
+
+    @pytest.mark.parametrize("door", _CBOR_DOORS)
+    @pytest.mark.parametrize("form", sorted(FORMS))
+    def test_an_unregistrable_claim_is_refused(self, door: str, form: str) -> None:
+        claim = _old_pyrxd_claim()
+        claim["p"] = self.FORMS[form]
+        with pytest.raises(ValidationError) as exc:
+            _DOORS[door](claim)
+        # prepare_wave_reveal wants p as an array and says so first; every other door is
+        # reached only through the rule.
+        expected = "must include GlyphProtocol.WAVE" if door == "prepare_wave_reveal" else "indexer will not register"
+        assert expected in str(exc.value)
+
+    @pytest.mark.parametrize("door", [d for d in _CBOR_DOORS if d != "prepare_wave_reveal"])
+    @pytest.mark.parametrize("form", sorted(FORMS))
+    def test_a_registrable_claim_is_accepted(self, door: str, form: str) -> None:
+        """The honest half: the rule judges the NAME, not the container ``p`` came in."""
+        claim = _claim("alice")
+        claim["p"] = self.FORMS[form]
+        assert _DOORS[door](claim) is not None
+
+    def test_prepare_commit_cannot_write_one(self) -> None:
+        with pytest.raises(ValidationError, match="protocol must be a list"):
+            GlyphMetadata(protocol=self.FORMS["bytes"], attrs={"name": "alice.rxd"})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("p", ["\x02\x05\x0b", 11, None], ids=["text", "int", "null"])
+    def test_a_p_the_indexer_cannot_search_is_not_a_claim(self, p: object) -> None:
+        """For these ``in`` raises TypeError in the indexer — first at ``get_token_type``
+        (lib/glyph.py:727) — which aborts that transaction's glyph overlay, so nothing is
+        registered and nothing is refused here either."""
+        with pytest.raises(TypeError):
+            assert 11 in p  # type: ignore[operator]  # raises before it can assert
+        claim = _old_pyrxd_claim()
+        claim["p"] = p
+        assert wave_claim_problem(claim) is None
 
 
 class TestATopLevelOnlyClaimIsRefused:
@@ -601,9 +680,184 @@ class TestACommitMadeBy024CanStillBeRevealed:
             build_mutable_scriptsig("mod", _old_commit_bytes(), 1, 1, 0, 0, allow_unregistrable_wave=True)  # type: ignore[call-arg]
 
 
+_HEX_MARKER = "676c79"  # b"gly".hex()
+
+
+def _is_marker_literal(node: ast.AST) -> bool:
+    """A literal that IS the marker: ``b"gly"``, ``"gly"``, or its hex ``"676c79"`` (str or bytes)."""
+    return isinstance(node, ast.Constant) and node.value in (b"gly", "gly", _HEX_MARKER, _HEX_MARKER.encode())
+
+
+def _carries_marker_literal(node: ast.AST) -> bool:
+    """A literal that CARRIES the marker somewhere in it: bytes containing ``b"gly"`` or its hex,
+    or text containing the hex (``"aa20…03676c7988"``). Text containing ``"gly"`` is NOT matched —
+    every docstring that says "glyph" would — only text that is exactly ``"gly"``."""
+    if not isinstance(node, ast.Constant):
+        return False
+    value = node.value
+    if isinstance(value, bytes):
+        return b"gly" in value or _HEX_MARKER.encode() in value
+    if isinstance(value, str):
+        return value == "gly" or _HEX_MARKER in value
+    return False
+
+
+def _marker_names(trees: list[ast.Module]) -> set[str]:
+    """Every name that holds the marker, derived to a fixpoint across ``src/pyrxd``.
+
+    A name joins when it is the target of an assignment at module or class level, or of an
+    attribute assignment anywhere (``self._m = ...``), whose value mentions an exact marker
+    literal or a name already found — so ``GLY_MARKER = b"gly"``, ``GLYPH_MAGIC_BYTES =
+    bytes.fromhex("676c79")`` and ``_MARK = GLY_MARKER`` are all found without being listed —
+    and when it is the ``as`` name of an import of a name already found.
+    """
+
+    def mentions(value: ast.AST, names: set[str]) -> bool:
+        return any(
+            _is_marker_literal(n)
+            or (isinstance(n, ast.Name) and n.id in names)
+            or (isinstance(n, ast.Attribute) and n.attr in names)
+            for n in ast.walk(value)
+        )
+
+    def scoped(tree: ast.Module) -> list[ast.stmt]:
+        out = list(tree.body)
+        for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+            out.extend(cls.body)
+        out.extend(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Attribute) for t in n.targets)
+        )
+        return out
+
+    statements = [stmt for tree in trees for stmt in scoped(tree)]
+    names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for stmt in statements:
+            new: set[str] = set()
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None and mentions(stmt.value, names):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                for target in targets:
+                    new |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                    new |= {n.attr for n in ast.walk(target) if isinstance(n, ast.Attribute)}
+            elif isinstance(stmt, ast.ImportFrom):
+                new = {a.asname for a in stmt.names if a.name in names and a.asname}
+            if new - names:
+                names |= new
+                changed = True
+    return names
+
+
+@functools.lru_cache(maxsize=1)
+def _src_trees() -> dict[str, ast.Module]:
+    """Every module under src/pyrxd, parsed once per session."""
+    return {str(p.relative_to(_SRC)): ast.parse(p.read_text(encoding="utf-8")) for p in sorted(_SRC.rglob("*.py"))}
+
+
+def _marker_functions(extra_files: dict[str, str] | None = None) -> set[tuple[str, str]]:
+    """Every function in ``src/pyrxd`` that touches the ``gly`` marker, in any spelling
+    :func:`_marker_names` and :func:`_carries_marker_literal` recognise. ``extra_files`` adds
+    source as if it were in the tree — how the plants in ``TestTheWriterScanSeesEverySpelling``
+    are fed in without writing into ``src/``."""
+    trees = dict(_src_trees())
+    trees.update({rel: ast.parse(text) for rel, text in (extra_files or {}).items()})
+    names = _marker_names(list(trees.values()))
+    found = set()
+    for rel, tree in trees.items():
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                (isinstance(n, ast.Name) and n.id in names)
+                or (isinstance(n, ast.Attribute) and n.attr in names)
+                or _carries_marker_literal(n)
+                for n in ast.walk(fn)
+            ):
+                found.add((rel, fn.name))
+    return found
+
+
+class TestTheRecoveryRecipe:
+    """``prepare_wave_reveal`` documents how to rebuild a <=0.24.0 commit's bytes. The recipe is
+    run here FROM THE DOCSTRING and held to what every release that shipped
+    ``build_wave_metadata`` actually produced (``scripts/record_legacy_wave_bytes.py`` ran each
+    release's own source), so neither the prose nor the fixture can drift from the other."""
+
+    @staticmethod
+    def _docstring_block() -> str:
+        doc = inspect.getdoc(GlyphBuilder.prepare_wave_reveal) or ""
+        lines = doc.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.rstrip().endswith("reproduces them::")) + 1
+        block: list[str] = []
+        for line in lines[start:]:
+            if line.strip() and not line.startswith("    "):
+                break
+            block.append(line)
+        return textwrap.dedent("\n".join(block))
+
+    @classmethod
+    def _run(cls, case: dict, *, domain: str | None = None) -> bytes:
+        qualified = case["qualified_name"]
+        namespace = {
+            "qualified_name": qualified,
+            # "the text after its LAST '.', or 'rxd' if none", as the docstring says
+            "domain": domain if domain is not None else (qualified.rpartition(".")[2] if "." in qualified else "rxd"),
+            "target": case["target"],
+            "target_type": case.get("target_type", "address"),
+            "description": case.get("description", ""),
+        }
+        exec(compile(cls._docstring_block(), "prepare_wave_reveal docstring", "exec"), namespace)
+        out: bytes = namespace["old_cbor"]
+        return out
+
+    def test_the_record_covers_every_release_and_they_all_agree(self) -> None:
+        assert _LEGACY["releases"][0] == "v0.6.0" and _LEGACY["releases"][-1] == "v0.24.0"
+        assert _LEGACY["disagreements"] == {}
+        assert set(_LEGACY["cbor_hex"]) == set(_LEGACY["cases"])
+
+    def test_the_docstring_block_is_the_recipe(self) -> None:
+        """Non-vacuity: the extraction found code, not an empty block."""
+        block = self._docstring_block()
+        assert "encode_payload(" in block and "old_cbor" in block
+
+    @pytest.mark.parametrize("case", sorted(_LEGACY["cases"]))
+    def test_the_recipe_reproduces_what_the_releases_wrote(self, case: str) -> None:
+        assert self._run(_LEGACY["cases"][case]).hex() == _LEGACY["cbor_hex"][case]
+
+    def test_the_last_dot_instruction_is_load_bearing(self) -> None:
+        """Split on the FIRST dot, as the current builder does, and the multi-dot case no
+        longer matches — so a recovery that reused parse_wave_name's split would be rejected."""
+        case = _LEGACY["cases"]["multi-dot"]
+        assert self._run(case, domain="alice.rxd").hex() != _LEGACY["cbor_hex"]["multi-dot"]
+
+    def test_the_hand_written_old_shape_is_what_the_releases_wrote(self) -> None:
+        assert cbor2.loads(bytes.fromhex(_LEGACY["cbor_hex"]["plain"])) == _old_pyrxd_claim()
+
+    def test_the_rebuilt_bytes_match_the_commit_and_the_reveal_spends_it(self) -> None:
+        old = self._run(_LEGACY["cases"]["plain"])
+        commit_script = build_commit_locking_script(hash_payload(old), PKH, is_nft=True)
+        assert extract_payload_hash_from_commit_script(commit_script) == hash_payload(old)
+        scripts = GlyphBuilder().prepare_wave_reveal(TXID, 0, old, PKH, "alice.rxd", allow_unregistrable_wave=True)
+        assert scripts.payload_hash == hash_payload(old)
+
+
 class TestTheWriterSetIsDerived:
     """Every function in src/pyrxd that touches the ``gly`` marker, found by walking the AST —
-    not a hand-kept list of doors. A new one fails here until someone says what it is."""
+    not a hand-kept list of doors. A new one fails here until someone says what it is.
+
+    WHAT THE SCAN SEES: a reference, by bare name or as an attribute (``payload.GLY_MARKER``),
+    to any name that holds the marker, where those names are DERIVED (module- and class-level
+    assignments, attribute assignments, ``import ... as``, to a fixpoint — see
+    :func:`_marker_names`); a bytes literal containing ``b"gly"``; a literal exactly ``"gly"``;
+    and a str or bytes literal containing the hex ``676c79``, which covers
+    ``bytes.fromhex("676c79")``.
+
+    WHAT IT DOES NOT SEE: a marker assembled at run time (``b"g" + b"ly"``,
+    ``bytes([0x67, 0x6C, 0x79])``, ``getattr(payload, "GLY_" + "MARKER")``), a marker that
+    reaches a function only as an argument (the caller is found, the callee is not), and a
+    function-local alias used in some OTHER function. Those are not claimed.
+    """
 
     #: REVIEWED, not derived: why each member is or is not a WAVE door. The membership is
     #: pinned exactly, so adding or removing a function forces this table to be re-read.
@@ -635,14 +889,13 @@ class TestTheWriterSetIsDerived:
                     found.add((str(path.relative_to(_SRC)), fn.name))
         return found
 
+    def test_the_marker_names_are_derived_not_listed(self) -> None:
+        """Non-vacuity for the derivation: the two names the code really uses are FOUND, from
+        their literals, not seeded."""
+        assert {"GLY_MARKER", "GLYPH_MAGIC_BYTES"} <= _marker_names(list(_src_trees().values()))
+
     def test_the_set_is_exactly_the_reviewed_one(self) -> None:
-        marks = {"GLY_MARKER", "GLYPH_MAGIC_BYTES"}
-        found = self._functions(
-            lambda n: (
-                (isinstance(n, ast.Name) and n.id in marks)
-                or (isinstance(n, ast.Constant) and isinstance(n.value, bytes) and b"gly" in n.value)
-            )
-        )
+        found = _marker_functions()
         assert found, "the scan found nothing — it is broken, not the codebase"
         assert found == set(self._MEMBERS)
 
@@ -657,6 +910,43 @@ class TestTheWriterSetIsDerived:
         writers = {k for k, why in self._MEMBERS.items() if why.startswith("WRITER")}
         assert writers <= callers
         assert ("glyph/builder.py", "prepare_commit") in callers
+
+
+#: Each a spelling of the marker the scan must see, fed in as an extra source file or appended
+#: to a real one. The review planted these into the tree and the previous scan missed all four.
+_SPELLINGS = {
+    "A1-attribute-in-new-file": (
+        "glyph/_planted_writer.py",
+        "sneak",
+        "from . import payload\n\n\ndef sneak(cbor):\n    return b'\\x03' + payload.GLY_MARKER + cbor\n",
+    ),
+    "A2-module-level-fromhex": (
+        "glyph/_planted_fromhex.py",
+        "sneak",
+        "_M = bytes.fromhex('676c79')\n\n\ndef sneak(cbor):\n    return b'\\x03' + _M + cbor\n",
+    ),
+    "A3-attribute-in-builder": (
+        "glyph/builder.py",
+        "_sneak",
+        "\n\nfrom . import payload as _p\n\n\ndef _sneak(cbor):\n    return b'\\x03' + _p.GLY_MARKER + cbor\n",
+    ),
+    "A4-alias-in-payload": (
+        "glyph/payload.py",
+        "_sneak",
+        "\n\n_MARK = GLY_MARKER\n\n\ndef _sneak(cbor):\n    return b'\\x03' + _MARK + cbor\n",
+    ),
+}
+
+
+class TestTheWriterScanSeesEverySpelling:
+    @pytest.mark.parametrize("spelling", sorted(_SPELLINGS))
+    def test_a_planted_writer_is_found(self, spelling: str) -> None:
+        rel, function, code = _SPELLINGS[spelling]
+        existing = _SRC / rel
+        source = (existing.read_text(encoding="utf-8") if existing.exists() else "") + code
+        found = _marker_functions({rel: source})
+        assert (rel, function) in found
+        assert found != set(TestTheWriterSetIsDerived._MEMBERS)  # so the pinned test would fail
 
 
 # ──────────────────────────────── (d) readers accept both shapes, verbatim ──
