@@ -881,6 +881,33 @@ def _require_min_confirmations(
         )
 
 
+def _require_wave_name(name: str | None) -> str | None:
+    """``None`` when ``--wave-name`` was not given, the name when it was — and a ``UserError`` when
+    it was given EMPTY.
+
+    ABSENT IS ``None``, NEVER "FALSY". Both commands tested ``if wave_name:``, so an empty value
+    was indistinguishable from the flag not being passed: ``pyrxd verify`` then reported ``name:
+    NOT CHECKED — --wave-name was not given`` (a state that HOLDS) and exited 0. The way an empty
+    value arrives is an unset shell variable — ``pyrxd verify T --wave-name "$PUBLISHER" && deploy``
+    with ``PUBLISHER`` unset — so the gate passed an attacker's mark while the caller believed it
+    had checked the name. Whitespace-only is refused too: it is no name either, and it used to go
+    on to a name lookup as though it were one.
+
+    ONE RULE, BOTH COMMANDS, AND THE FUNNEL. Called by ``glyph inspect`` and ``pyrxd verify``
+    before anything touches the network, and again by :func:`_attach_name_at_mark`, which is where
+    every name lookup goes, so a third caller cannot route around it.
+    """
+    if name is None:
+        return None
+    if not name.strip():
+        raise UserError(
+            "--wave-name was given an empty name",
+            cause=f'got {name!r} — usually an unset shell variable, e.g. --wave-name "$PUBLISHER"',
+            fix="pass the WAVE name to check (e.g. company.rxd), or leave --wave-name out entirely",
+        )
+    return name
+
+
 def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     """Two clients pinned to two DIFFERENT configured endpoints, each labelled by its URL.
 
@@ -924,6 +951,7 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
     classification the user asked for. The mark's txid comes from the fetched transaction; a
     pasted script has none, and form 2 is then unavailable by construction.
     """
+    _require_wave_name(name)
     mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
     # ONE LOOKUP PER SIGNER, NOT PER RECORD. A lookup is a name resolution, an anchor and a chain
     # walk across two servers, and it was run once for EVERY verified record — so a transaction
@@ -1605,6 +1633,8 @@ def inspect_cmd(
     returned tx is verified against the requested txid by sha256d roundtrip.
     """
     form, value = _classify_input(inspect_input)
+    # Before any fetch: an empty --wave-name is refused, not read as "not given".
+    wave_name = _require_wave_name(wave_name)
 
     # Forms that need a network fetch.
     needs_fetch = (form == "txid") or (form == "outpoint" and resolve)
@@ -1638,7 +1668,7 @@ def inspect_cmd(
 
     if verify_wave:
         _attach_wave_identity(ctx, payload)
-    if wave_name:
+    if wave_name is not None:
         _require_min_confirmations(min_confirmations)
         _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 

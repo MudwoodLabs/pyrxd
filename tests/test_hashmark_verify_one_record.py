@@ -431,6 +431,86 @@ class TestAQuestionAskedAndNotAnsweredFails:
         assert "record:     vout 0" in _summary(r.output)
 
 
+class TestAnEmptyWaveNameIsRefusedNotReadAsAbsent:
+    """``--wave-name ""`` is a question typed wrong, not a question not asked.
+
+    Both commands tested ``if wave_name:``, so an empty value — what an unset shell variable
+    expands to — read as the flag being absent. ``verify`` then printed ``name: NOT CHECKED —
+    --wave-name was not given``, a state that HOLDS, and exited 0 over the ATTACKER's mark while
+    the name pointed at the victim: ``pyrxd verify T --wave-name "$PUBLISHER" && deploy`` with
+    ``PUBLISHER`` unset deployed it. Whitespace-only was sent to the indexer as a name.
+    """
+
+    @pytest.mark.parametrize("name", ["", " ", "\t"])
+    def test_verify_refuses_it_before_the_network_in_every_output_mode(self, monkeypatch, tmp_path, world, name):
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        fetched: list = []
+        real_fetch = hashmark_cmds._run_fetch_inspect
+        monkeypatch.setattr(
+            hashmark_cmds, "_run_fetch_inspect", lambda ctx, **kw: fetched.append(kw) or real_fetch(ctx, **kw)
+        )
+        args = ["verify", txid, "--wave-name", name, "--min-confirmations", "6"]
+        for mode in ([], ["--quiet"], ["--json"]):
+            r = _run(monkeypatch, {txid: raw}, [*mode, *args], tmp_path, name_target=world["victim_addr"])
+            assert r.exit_code == 1, (mode, r.output)
+            assert "--wave-name was given an empty name" in r.output, (mode, r.output)
+            assert r.stdout.strip() == "", f"nothing on stdout for a script to read as a verdict: {r.stdout!r}"
+        assert fetched == [], "refused before the transaction was fetched"
+
+    def test_the_honest_pair_a_real_name_is_asked_and_refuses_the_attackers_mark(
+        self, monkeypatch, tmp_path, world
+    ) -> None:
+        """The same command with the variable SET: the name is asked, and the attacker's mark fails
+        it. This is what the empty value was silently skipping."""
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        args = ["verify", txid, "--wave-name", NAME, "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=world["victim_addr"])
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        assert "name:       NOT THE SIGNER" in _summary(r.output)
+
+    def test_past_the_refusal_an_empty_name_is_still_asked_never_NOT_CHECKED(self, monkeypatch, tmp_path, world):
+        """Defence in depth, pinned on its own. With the up-front refusal routed around, the
+        verdict must still treat a present-but-empty name as ASKED — so it fails — rather than as
+        absent, which holds. Without this, ``name_asked = bool(wave_name)`` is unreachable behind
+        the refusal and any regression in it would go unseen."""
+
+        def _no_refusal(name):
+            return name
+
+        monkeypatch.setattr(hashmark_cmds, "_require_wave_name", _no_refusal)
+        monkeypatch.setattr(glyph_inspect, "_require_wave_name", _no_refusal)
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        args = ["--json", "verify", txid, "--wave-name", "", "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=world["victim_addr"])
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        name_check = json.loads(r.stdout)["checks"]["name"]
+        assert name_check["state"] == "NOT ESTABLISHED", name_check
+
+    @pytest.mark.parametrize("name", ["", "  "])
+    def test_glyph_inspect_refuses_it_too_before_the_network(self, monkeypatch, tmp_path, name) -> None:
+        """``glyph inspect`` had the same ``if wave_name:``. It has no verdict to pass, but it
+        printed a classification with no name answer and exit 0, as though none had been asked."""
+        txid, raw = _tx(_raw_record(1, 1, b"\x11" * 32))
+        fetched: list = []
+        real_fetch = glyph_inspect._run_fetch_inspect
+        monkeypatch.setattr(
+            glyph_inspect, "_run_fetch_inspect", lambda ctx, **kw: fetched.append(kw) or real_fetch(ctx, **kw)
+        )
+        args = ["glyph", "inspect", txid, "--fetch", "--wave-name", name, "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path)
+        assert r.exit_code == 1, r.output
+        assert "--wave-name was given an empty name" in r.output
+        assert fetched == [], "refused before the transaction was fetched"
+
+    def test_the_lookup_funnel_refuses_it_for_any_future_caller(self) -> None:
+        """Every name lookup goes through ``_attach_name_at_mark``; a third command that forgot the
+        early check still cannot run one on an empty name."""
+        from pyrxd.cli.errors import UserError
+
+        with pytest.raises(UserError, match="empty name"):
+            glyph_inspect._attach_name_at_mark(object(), {"txid": "cd" * 32}, name=" ", min_confirmations=6)
+
+
 # --------------------------------------------------------------------------- the honest paths
 
 

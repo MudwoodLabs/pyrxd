@@ -274,6 +274,30 @@ class TestThePlanCannotHoldAnUnverifiedRecord:
         with pytest.raises(ValidationError, match="not a publishable HashMark record"):
             MarkPlan(op_return_script=hand)
 
+    def test_an_UNVERIFIABLE_attestation_cannot_become_a_plan(self) -> None:
+        """UNVERIFIABLE means "no curve here checked it", and a mark nobody could self-check
+        must not be funded. Every other case in this class fails with INVALID_SIGNATURE, so a
+        refusal narrowed to ``outcome == 'invalid_signature'`` passed them all and survived the
+        full suite as a plant. A backend that cannot run is what produces UNVERIFIABLE; it is
+        registered only around the construction, and the same bytes are then a plan again."""
+        from pyrxd.script.hashmark import RecoveryUnavailable, set_recovery_backend
+
+        script = encode_hashmark(hashlib.sha256(b"honest").digest(), PrivateKey())
+
+        def _cannot_run(*_args: object) -> bytes:
+            raise RecoveryUnavailable("no curve library on this machine")
+
+        set_recovery_backend(_cannot_run)
+        try:
+            assert verify_attestation(decode_hashmark(script)).outcome is AttestationOutcome.UNVERIFIABLE, (
+                "non-vacuity: the registered backend must be what answers, or this tests coincurve"
+            )
+            with pytest.raises(ValidationError, match="unverifiable"):
+                MarkPlan(op_return_script=script)
+        finally:
+            set_recovery_backend(None)
+        assert MarkPlan(op_return_script=script).attestation.valid, "the honest pair: with a curve, it plans"
+
     def test_the_derived_fields_cannot_be_supplied(self) -> None:
         """``record`` and ``attestation`` are ``init=False``, so they are always the bytes'
         own answer rather than whatever a caller asserted about them."""
@@ -282,6 +306,121 @@ class TestThePlanCannotHoldAnUnverifiedRecord:
                 op_return_script=encode_hashmark(hashlib.sha256(b"x").digest(), PrivateKey()),
                 record="anything",
             )
+
+
+def _hand_signed_for(genesis: str, key: PrivateKey | None = None) -> bytes:
+    """A well-formed v2 record signed for *genesis* WITHOUT the encoder.
+
+    The encoder now refuses a genesis nobody can verify against, so the only way to hold such
+    bytes is to sign them by hand — which is exactly the door ``MarkPlan`` has to close on its own.
+    """
+    from base64 import b64decode
+
+    from pyrxd.script.hashmark import HashMarkOutcome, HashMarkRecord, canonical_statement
+    from pyrxd.utils import encode_data_push, stringify_ecdsa_recoverable, text_digest
+
+    key = key or PrivateKey()
+    digest = hashlib.sha256(b"a statement about some chain").digest()
+    signer = key.public_key().hash160(key.compressed)
+    draft = HashMarkRecord(
+        HashMarkOutcome.OK, version=2, algorithm_id=1, digest_hex=digest.hex(), signer_hash160_hex=signer.hex()
+    )
+    statement = canonical_statement(draft, network_genesis=genesis)
+    sig = b64decode(stringify_ecdsa_recoverable(key.sign_recoverable(text_digest(statement)), key.compressed))
+    return b"\x6a" + b"".join(encode_data_push(p) for p in (b"HASHMARK", bytes([2, 1]), digest, signer, sig))
+
+
+_MAINNET_REVERSED = bytes.fromhex(RADIANT_MAINNET_GENESIS)[::-1].hex()
+
+
+class TestThePlanIsForAChainSomeoneCanCheck:
+    """The genesis is in the signed statement and NOT in the record, and the plan's own check
+    verifies against the SAME string it was signed with — so it is circular for exactly this
+    field. Bytes signed for ``"mainnet"`` verify against ``"mainnet"``, planned, funded, and would
+    have published a record that verifies on no chain at all. §5.6: "A network whose genesis hash
+    is unknown cannot be attested to at all."
+    """
+
+    @pytest.mark.parametrize(
+        "genesis",
+        ["mainnet", "", RADIANT_MAINNET_GENESIS.upper(), _MAINNET_REVERSED, "00" * 32],
+        ids=["a-network-name", "empty", "uppercase", "reversed-byte-order", "well-formed-but-unknown"],
+    )
+    def test_bytes_that_self_verify_for_a_non_genesis_cannot_become_a_plan(self, genesis: str) -> None:
+        script = _hand_signed_for(genesis)
+        assert verify_attestation(decode_hashmark(script), network_genesis=genesis).valid, (
+            "non-vacuity: these bytes DO self-verify against the string they were signed for — "
+            "that circularity is the defect"
+        )
+        with pytest.raises(ValidationError, match="network_genesis"):
+            MarkPlan(op_return_script=script, network_genesis=genesis)
+
+    @pytest.mark.parametrize("genesis", ["mainnet", RADIANT_MAINNET_GENESIS.upper(), _MAINNET_REVERSED])
+    def test_plan_hashmark_refuses_before_signing(self, genesis: str) -> None:
+        with pytest.raises(ValidationError, match="network_genesis"):
+            plan_hashmark(hashlib.sha256(b"x").digest(), PrivateKey(), network_genesis=genesis)
+
+    def test_reversed_byte_order_is_named_for_what_it_is(self) -> None:
+        with pytest.raises(ValidationError, match="reversed"):
+            plan_hashmark(hashlib.sha256(b"x").digest(), PrivateKey(), network_genesis=_MAINNET_REVERSED)
+
+    @pytest.mark.parametrize("network", sorted(GENESIS_BLOCK_HASHES))
+    def test_the_honest_pair_every_chain_pyrxd_knows_plans(self, network: str) -> None:
+        genesis = GENESIS_BLOCK_HASHES[network]
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), PrivateKey(), network_genesis=genesis)
+        assert plan.network_genesis == genesis and plan.attestation.valid
+        assert MarkPlan(op_return_script=plan.op_return_script, network_genesis=genesis).attestation.valid
+
+    def test_another_chain_plans_only_when_the_caller_says_so_and_never_with_a_bad_spelling(self) -> None:
+        other = "00" * 31 + "01"
+        digest, key = hashlib.sha256(b"x").digest(), PrivateKey()
+        with pytest.raises(ValidationError, match="allow_unknown_genesis"):
+            plan_hashmark(digest, key, network_genesis=other)
+        plan = plan_hashmark(digest, key, network_genesis=other, allow_unknown_genesis=True)
+        assert plan.attestation.valid and plan.network_genesis == other
+        with pytest.raises(ValidationError, match="allow_unknown_genesis"):
+            MarkPlan(op_return_script=plan.op_return_script, network_genesis=other)
+        with pytest.raises(ValidationError, match="64 lowercase hex"):
+            plan_hashmark(digest, key, network_genesis="mainnet", allow_unknown_genesis=True)
+
+
+class TestTheBuilderComparesThePlansChainWithTheClients:
+    """A plan says which chain its statement is about; a client says which chain it is on.
+    Nothing compared the two, so a mainnet plan built and would broadcast through a testnet
+    client — a record that verifies on neither chain it could be read on."""
+
+    @staticmethod
+    def _client_on(h: _MarkHarness, network: str) -> None:
+        from pyrxd.network.registry import NetworkProfile
+
+        h.client.profile = NetworkProfile.build(network, ["wss://electrumx.invalid:50022"])
+
+    def test_a_mainnet_plan_through_a_testnet_client_is_refused_before_anything_is_funded(self) -> None:
+        h = _MarkHarness()
+        self._client_on(h, "testnet")
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)  # mainnet, the default
+        with pytest.raises(ValidationError, match="but the client is on the chain"):
+            asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
+        assert h.client.get_transaction.await_count == 0, "no funding UTXO was even looked at"
+        assert h.broadcast_calls == []
+
+    @pytest.mark.parametrize("network", sorted(GENESIS_BLOCK_HASHES))
+    def test_the_honest_pair_a_plan_through_a_client_on_its_own_chain_builds(self, network: str) -> None:
+        h = _MarkHarness()
+        self._client_on(h, network)
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key, network_genesis=GENESIS_BLOCK_HASHES[network])
+        build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
+        assert bytes(build.tx.outputs[0].locking_script.serialize()) == plan.op_return_script
+
+    def test_a_client_that_names_no_chain_is_not_refused_for_it(self) -> None:
+        """A plain ``ElectrumXClient`` carries no profile. Refusing it would refuse every honest
+        caller using one; the comparison is made only when there is something to compare."""
+        h = _MarkHarness()
+        del h.client.profile  # a MagicMock answers every attribute; a plain client has no `profile`
+        assert not hasattr(h.client, "profile")
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)
+        build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
+        assert bytes(build.tx.outputs[0].locking_script.serialize()) == plan.op_return_script
 
 
 class TestTheBuilderTakesAPlanAndNothingElse:
@@ -483,6 +622,135 @@ class TestTheCommandShowsWhatWillBeSigned:
         )
         assert result.exit_code == 0, result.output
         assert "223 B of the 223-byte ceiling" in result.output
+
+
+#: Unicode TAG characters (category Cf) spelling "pay 9999", then WORD JOINER and SOFT HYPHEN.
+#: None is in §5.4's reject table, so the encoder signs them; a terminal that does not render
+#: format characters shows only "invoice 42".
+_HIDDEN = "".join(chr(0xE0000 + ord(c)) for c in "pay 9999") + "⁠­"
+_HIDDEN_LABEL = "invoice 42" + _HIDDEN
+
+
+class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
+    """What the operator agrees to must be what is signed, character for character.
+
+    The confirmation printed the label raw, and the canonicalisation banner fires only when
+    canonicalising CHANGED the label — which it does not for these characters. So the whole string
+    was signed while the screen showed ``invoice 42``, and ``pyrxd verify`` later printed it as
+    ``invoice 42??????????``.
+    """
+
+    @pytest.mark.parametrize(("top", "extra"), [(["--yes"], []), ([], ["--dry-run"])], ids=["confirm", "dry-run"])
+    def test_every_hidden_character_is_escaped_named_and_still_signed(
+        self, runner, tmp_path, monkeypatch, top, extra
+    ) -> None:
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=top, extra=["--label", _HIDDEN_LABEL, *extra])
+        assert result.exit_code == 0, result.output
+        leaked = set(_HIDDEN) & set(result.output)
+        assert not leaked, f"reached the terminal raw: {sorted(f'U+{ord(c):04X}' for c in leaked)}"
+        escaped = "".join(f"<U+{ord(c):04X}>" for c in _HIDDEN)
+        assert f"label:       invoice 42{escaped}" in result.output
+        assert "THE LABEL HOLDS 10 CHARACTER(S) THAT DO NOT PRINT AS THEMSELVES" in result.output
+        for name in ("TAG LATIN SMALL LETTER P", "TAG DIGIT NINE", "WORD JOINER", "SOFT HYPHEN"):
+            assert name in result.output, name
+        assert "will print this label as: invoice 42??????????" in result.output
+        if not extra:
+            assert f"label:      invoice 42{escaped}" in result.output, "the post-broadcast summary too"
+            assert decode_hashmark(_published_script(h)).label == _HIDDEN_LABEL, "shown, and signed as typed"
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "नमस्ते",  # Devanagari: U+094D VIRAMA and U+0947 are combining marks
+            "\U0001f468‍\U0001f469‍\U0001f467",  # family emoji, joined by ZWJ
+            "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f",  # Scotland flag: TAG chars
+        ],
+        ids=["devanagari", "zwj-emoji", "tag-flag"],
+    )
+    def test_the_honest_pair_text_5_4_permits_is_disclosed_never_refused(
+        self, runner, tmp_path, monkeypatch, label
+    ) -> None:
+        """§5.4 calls ZWJ and ZWNJ "load-bearing in Devanagari and emoji sequences", and does not
+        reject combining marks or TAG characters, which honest labels use. Refusing them at the
+        CLI would refuse a label the spec allows; the banner is the answer instead."""
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
+        assert result.exit_code == 0, result.output
+        assert "DO NOT PRINT AS THEMSELVES" in result.output
+        assert decode_hashmark(_published_script(h)).label == label
+
+    def test_an_ordinary_label_is_printed_as_typed_with_no_banner(self, runner, tmp_path, monkeypatch) -> None:
+        """A banner on every labelled mark is a banner nobody reads by the third one."""
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", "facture café ☀"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "label:       facture café ☀" in result.output
+        assert "DO NOT PRINT AS THEMSELVES" not in result.output and "<U+" not in result.output
+
+
+class TestTheFilePathCannotDriveTheTerminal:
+    """``verify`` sanitised the path it printed; ``mark`` printed it raw.
+
+    A file named ``report.pdf\\x1b[8m`` — SGR 8, "concealed" — made a VT100-family terminal render
+    every line after the path invisible: the fee, the label and the irreversibility warning. The
+    operator marks files other people named, so the name is not the operator's text.
+    """
+
+    _NAME = "report.pdf\x1b[8m"
+
+    @staticmethod
+    def _mark(runner, tmp_path, monkeypatch, h, name: str, top=(), extra=()):
+        import pyrxd.cli.hashmark_cmds as hc
+        from pyrxd.cli.main import cli
+
+        target = tmp_path / name
+        target.write_bytes(b"x")
+        monkeypatch.setattr(hc, "_load_wallet", lambda ctx, **kw: h.wallet)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: h.client)
+        # color=True, or click strips ANSI sequences from the captured output and this passes
+        # whether or not the command sanitised anything.
+        args = ["--wallet", str(tmp_path / "w.dat"), *top, "mark", str(target), "--label", "ok", *extra]
+        return runner.invoke(cli, args, color=True), target
+
+    def test_the_runner_really_does_keep_escape_bytes(self, runner) -> None:
+        """Non-vacuity for the class: an ESC this runner dropped would make every test here green."""
+        import click
+
+        assert "\x1b[8m" in runner.invoke(click.Command("e", callback=lambda: click.echo("\x1b[8m")), color=True).output
+
+    @pytest.mark.parametrize(("top", "extra"), [(["--yes"], []), ([], ["--dry-run"])], ids=["confirm", "dry-run"])
+    def test_an_escape_sequence_in_the_filename_never_reaches_the_terminal(
+        self, runner, tmp_path, monkeypatch, top, extra
+    ) -> None:
+        h = _MarkHarness()
+        result, _ = self._mark(runner, tmp_path, monkeypatch, h, self._NAME, top, extra)
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output
+        assert "report.pdf?[8m" in result.output, "shown, sanitised — not dropped"
+
+    def test_nor_through_the_could_not_read_error(self, runner, tmp_path, monkeypatch) -> None:
+        """The read fails AFTER click's own checks passed (a file that vanished or went unreadable
+        in between, an I/O error). Driven by making the read raise, because a mode-000 file is
+        refused by ``click.Path``'s readability check before this handler is ever reached — that
+        message is click's, and is not this command's to sanitise."""
+        import pyrxd.hashmark_tx as hx
+
+        def _unreadable(path, *_a, **_k):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(hx, "plan_hashmark_for_file", _unreadable)
+        result, _ = self._mark(runner, tmp_path, monkeypatch, _MarkHarness(), self._NAME)
+        assert result.exit_code == 1, result.output
+        assert "could not read" in result.output and "report.pdf?[8m" in result.output
+        assert "\x1b" not in result.output
+
+    def test_the_honest_pair_an_ordinary_path_is_printed_as_it_is(self, runner, tmp_path, monkeypatch) -> None:
+        h = _MarkHarness()
+        result, target = self._mark(runner, tmp_path, monkeypatch, h, "report.pdf", extra=["--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert f"file:        {target}" in result.output
 
 
 class TestTheCommandPublishesWhatItShowed:

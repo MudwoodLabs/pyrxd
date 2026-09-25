@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NoReturn
 
-from ..constants import OpCode
+from ..constants import GENESIS_BLOCK_HASHES, OpCode
 from ..security.errors import ValidationError
 from .script import data_pushes_after_op_return
 
@@ -378,8 +378,11 @@ RecoveryBackend = Callable[[bytes, bytes, bytes, int, bool], bytes]
 #: It is deliberately NOT a fallback-when-coincurve-is-missing: a registered backend
 #: wins outright, so a test can pin one implementation against the other over the
 #: same records. Nothing in ``src/`` calls the setter — ``tests/
-#: test_signature_backend_differential.py`` asserts that, so the CLI and SDK keep
-#: using coincurve and this value keeps being ``None`` everywhere but the browser.
+#: test_signature_backend_differential.py`` asserts that by name, and separately that
+#: importing every shipped module leaves this ``None`` — which catches a registration made
+#: at import time without naming the setter, e.g. a direct assignment to this variable.
+#: Neither catches such an assignment inside a function that runs later. So the CLI and SDK
+#: keep using coincurve and this value keeps being ``None`` everywhere but the browser.
 _recovery_backend: RecoveryBackend | None = None
 
 
@@ -475,6 +478,98 @@ def _json_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _statement_field_defect(record: HashMarkRecord, network_genesis: object) -> str | None:
+    """Why *record* cannot be turned into a §5.6 statement, or ``None`` if it can.
+
+    Only TYPES are checked — whether each field is the kind of value the statement is built
+    from. Whether the values are RIGHT is the signature's job, and a wrong value simply fails to
+    verify. The point is that a hand-built record with a field of the wrong type gets one of
+    :func:`verify_attestation`'s outcomes instead of a ``TypeError`` / ``AttributeError``.
+    """
+    algorithm_id = record.algorithm_id
+    # `bool` is an `int`, and `f"{True:02x}"` is "01": a record claiming algorithm `True` would
+    # otherwise be verified as algorithm 1. Not a header byte, so not a statement.
+    if not isinstance(algorithm_id, int) or isinstance(algorithm_id, bool) or not 0 <= algorithm_id <= 0xFF:
+        return f"algorithm id {algorithm_id!r} is not a header byte, so no statement can be built from this record"
+    for name in ("digest_hex", "signer_hash160_hex"):
+        if not isinstance(getattr(record, name), str):
+            return f"{name} is {type(getattr(record, name)).__name__}, not a hex string"
+    if record.label is not None and not isinstance(record.label, str):
+        return f"label is {type(record.label).__name__}, not a string"
+    if not isinstance(network_genesis, str):
+        return f"network_genesis is {type(network_genesis).__name__}, not a genesis hash string"
+    return None
+
+
+def _public_key_shape_defect(public_key: object, *, compressed: bool) -> str | None:
+    """What is wrong with a recovery backend's return, or ``None`` if it is a SEC1 key of the asked form.
+
+    Length and prefix only — SEC1's own framing: 33 bytes led by 0x02/0x03 when *compressed*,
+    65 bytes led by 0x04 when not. It does NOT check the point is on the curve; that is
+    arithmetic, and the backend is the arithmetic. What it does rule out is a backend ignoring
+    the ``compressed`` flag, or returning bytes that are not framed as a key at all.
+    """
+    if not isinstance(public_key, (bytes, bytearray)):
+        return f"{type(public_key).__name__}, not bytes"
+    want_len, want_prefixes = (33, (0x02, 0x03)) if compressed else (65, (0x04,))
+    form = "compressed" if compressed else "uncompressed"
+    if len(public_key) != want_len:
+        return f"a {len(public_key)}-byte value where a {want_len}-byte {form} SEC1 key was asked for"
+    if public_key[0] not in want_prefixes:
+        return f"a value led by 0x{public_key[0]:02x}, which does not frame a {form} SEC1 key"
+    return None
+
+
+def _require_signable_genesis(network_genesis: object, *, allow_unknown_genesis: bool = False) -> str:
+    """*network_genesis*, if a v2 statement may be SIGNED against it — otherwise raise.
+
+    THIS IS THE WRITE SIDE ONLY. :func:`verify_attestation` takes whatever genesis its caller
+    has, because a reader checks a record against the chain it was found on and cannot choose.
+    A WRITER chooses, and a wrong choice is permanent: the statement is signed, published, and
+    — because the genesis is not carried by the record — verifies against nothing but the exact
+    string it was signed with, which no verifier on a real chain will supply.
+    The encoder's own sign-then-verify cannot see it either, since it verifies against the same
+    wrong string it signed. ``"mainnet"``, the mainnet hash in reversed (internal) byte order,
+    the same hash in uppercase, and ``""`` all used to be signed and self-attest VALID.
+
+    Two rules, from §5.6 ("``network`` is the chain's genesis hash in RPC/display byte order,
+    64 lowercase hex ... A network whose genesis hash is unknown cannot be attested to at all"):
+
+    * **The spelling** — exactly 64 lowercase hex characters. Refused, never normalised: a caller
+      who passed uppercase has the value from somewhere this code cannot see, and lowercasing it
+      would sign a string they did not pass.
+    * **The chain** — one pyrxd ships a genesis for (mainnet, testnet, regtest), unless the caller
+      passes ``allow_unknown_genesis=True``. That is for a chain pyrxd has no constant for (a
+      private fork); it relaxes ONLY this rule, never the spelling.
+    """
+    if (
+        not isinstance(network_genesis, str)
+        or len(network_genesis) != 64
+        or any(c not in "0123456789abcdef" for c in network_genesis)
+    ):
+        raise ValidationError(
+            f"network_genesis must be the chain's genesis hash as 64 lowercase hex characters in "
+            f"RPC/display byte order (spec 5.6), got {network_genesis!r} — a network NAME or an "
+            f"uppercase spelling is a different statement from the one a verifier checks, so the "
+            f"mark would never verify"
+        )
+    if allow_unknown_genesis or network_genesis in GENESIS_BLOCK_HASHES.values():
+        return network_genesis
+    reversed_hex = bytes.fromhex(network_genesis)[::-1].hex()
+    for name, genesis in GENESIS_BLOCK_HASHES.items():
+        if reversed_hex == genesis:
+            raise ValidationError(
+                f"network_genesis is the {name} genesis hash in INTERNAL (reversed) byte order; "
+                f"the signed statement uses RPC/display order, {genesis} (spec 5.6)"
+            )
+    raise ValidationError(
+        f"network_genesis {network_genesis} is not the genesis of any chain pyrxd knows "
+        f"({', '.join(sorted(GENESIS_BLOCK_HASHES))}); a statement signed for it cannot be checked by "
+        f"anyone on those chains. Pass allow_unknown_genesis=True only if you really are publishing "
+        f"on another chain."
+    )
+
+
 def canonical_statement(record: HashMarkRecord, *, network_genesis: str = RADIANT_MAINNET_GENESIS) -> str:
     """The exact single-line JSON a v2 signature covers (§5.6).
 
@@ -555,6 +650,11 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # directly. Without the check a 33-byte value slices to an EMPTY s, which is int 0 —
     # a wrong-but-typed answer rather than a refusal — and malformed hex escaped as an
     # uncaught ValueError instead of one of this function's own outcomes.
+    if not isinstance(record.signature_hex, str):
+        return AttestationResult(
+            AttestationOutcome.INVALID_SIGNATURE,
+            detail=f"signature_hex is {type(record.signature_hex).__name__}, not a hex string",
+        )
     try:
         sig = bytes.fromhex(record.signature_hex)
     except ValueError:
@@ -581,6 +681,15 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     if not 1 <= s_val <= _SECP256K1_N // 2:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="s is not low-S")
 
+    # A HAND-BUILT RECORD GETS A VERDICT, NOT A TRACEBACK. `decode_hashmark` never produces a
+    # field of the wrong type, but this function is public and an offline verifier builds the
+    # record from stored fields: `algorithm_id=None` reached `f"{None:02x}"` in
+    # `canonical_statement` and raised TypeError out of a function whose whole contract is
+    # "return one of four outcomes". Checked HERE, where the statement is built — after §6.3's
+    # signature checks, so a record whose signature is malformed is still told that first.
+    field_defect = _statement_field_defect(record, network_genesis)
+    if field_defect is not None:
+        return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail=field_defect)
     statement = canonical_statement(record, network_genesis=network_genesis)
     # §5.6: the header's +4 says the signer's hash160 was taken over the COMPRESSED
     # form. It selects how the recovered key is serialised before hashing; it is not
@@ -599,7 +708,7 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # the one thing about this call a JavaScript implementation can get wrong in a
     # way that still returns a key.
     try:
-        recovered = hash160(backend(hash256(message), r_bytes, s_bytes, rec_id, compressed)).hex()
+        public_key = backend(hash256(message), r_bytes, s_bytes, rec_id, compressed)
     except RecoveryUnavailable as exc:
         # NOT a verdict. The backend could not run; the record is untouched by that,
         # and telling a reader an honest mark's claim does not hold on the strength of
@@ -610,6 +719,24 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
         )
     except Exception as exc:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail=f"recovery failed: {exc}")
+
+    # THE BACKEND'S ANSWER IS CHECKED HERE, NOT TRUSTED. A registered backend is process-global
+    # and wins over coincurve, and the only thing this function does with its return is hash it
+    # — so ANY 33 bytes whose hash160 equals the committed signer used to make the record VALID,
+    # whether or not they were a public key, and whether or not they were in the form `compressed`
+    # asked for. The glue that installs the browser's backend checks the length too; this is the
+    # same rule at the one place every backend's answer passes, including one that forgot.
+    #
+    # A wrong SHAPE is a broken verifier, never a verdict on the record: a correct backend always
+    # returns the form it was asked for, so the honest reading is "not checked here". Reporting
+    # INVALID_SIGNATURE would accuse an honest signer on the strength of a bad backend.
+    shape_defect = _public_key_shape_defect(public_key, compressed=compressed)
+    if shape_defect is not None:
+        return AttestationResult(
+            AttestationOutcome.UNVERIFIABLE,
+            detail=f"the signature was not checked here: the recovery backend returned {shape_defect}",
+        )
+    recovered = hash160(bytes(public_key)).hex()
 
     if recovered != record.signer_hash160_hex:
         return AttestationResult(
@@ -745,6 +872,7 @@ def encode_hashmark(
     label: str | None = None,
     algorithm_id: int = 0x01,
     network_genesis: str = RADIANT_MAINNET_GENESIS,
+    allow_unknown_genesis: bool = False,
 ) -> bytes:
     """Build a signed v2 HashMark ``scriptPubKey`` committing to *digest*.
 
@@ -762,12 +890,21 @@ def encode_hashmark(
         broadcast to, in RPC/display order. It is NOT carried by the record: it
         is part of the signed statement, so the same bytes on another chain make
         a different statement and will not verify there (§5.6, §2.10). Defaulting
-        to mainnet is deliberate — a testnet mark must be an explicit act.
+        to mainnet is deliberate — a testnet mark must be an explicit act. Must be
+        64 lowercase hex and the genesis of a chain pyrxd knows; see
+        :func:`_require_signable_genesis` for why each is refused rather than signed.
+    :param allow_unknown_genesis: sign for a well-formed genesis pyrxd has no
+        constant for (a chain other than mainnet, testnet or regtest). Relaxes the
+        known-chain rule only, never the spelling.
 
     The label is **permanently public** and the signature permanently links this
     mark to that key and to every other mark it signed (§5.4, §14.1). A caller
     with a user in front of it must say so before this is broadcast.
     """
+    # FIRST, before anything is signed. The sign-then-verify below cannot catch a wrong
+    # genesis: it verifies against the same string it signed, so it is circular for exactly
+    # this field.
+    _require_signable_genesis(network_genesis, allow_unknown_genesis=allow_unknown_genesis)
     if algorithm_id not in _ALGORITHMS:
         raise ValidationError(f"algorithm id {algorithm_id:#04x} is not implemented")
     algorithm, digest_len = _ALGORITHMS[algorithm_id]

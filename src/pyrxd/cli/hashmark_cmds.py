@@ -32,6 +32,7 @@ publish a permanent claim about a chain nobody chose.
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,7 @@ from .glyph_inspect import (
     _attach_wave_identity,
     _op_return_payload_lines,
     _require_min_confirmations,
+    _require_wave_name,
     _run_fetch_inspect,
     _sanitize_display_string,
     hashmark_records,
@@ -104,6 +106,68 @@ def _canonical_label(label: str | None) -> tuple[str | None, bool]:
     return canonical, canonical != label
 
 
+#: How many distinct non-printing codepoints the label banner names one by one before summarising.
+_MAX_NAMED_LABEL_CODEPOINTS = 8
+
+
+def _prints_as_itself(ch: str) -> bool:
+    """Whether a terminal shows *ch* as a character of its own.
+
+    Decided by the SAME predicate `pyrxd verify` and `glyph inspect` use to sanitise what they
+    print (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`), so what `mark` flags is
+    exactly what those two will later print as ``?``: control and format characters, private-use
+    and unassigned codepoints, line/paragraph separators, and combining marks.
+    """
+    return _sanitize_display_string(ch) == ch
+
+
+def _label_for_display(label: str | None) -> str:
+    """The label as `mark` prints it: every character that does not print as itself becomes ``<U+XXXX>``.
+
+    The raw label is what gets SIGNED, and printing it raw hid part of it: ``invoice 42`` followed
+    by Unicode TAG characters spelling ``pay 9999`` showed as ``invoice 42`` on a terminal that
+    does not render format characters, while the whole string went into the signature. §5.4's
+    reject table does not list those characters, so the encoder accepts them; the defence is to
+    make them visible before the operator agrees.
+    """
+    if label is None:
+        return "(none)"
+    return "".join(ch if _prints_as_itself(ch) else f"<U+{ord(ch):04X}>" for ch in label)
+
+
+def _hidden_label_lines(label: str | None) -> list[str]:
+    """The banner for a label with characters that do not print as themselves, or ``[]``.
+
+    SHOWN, NOT REFUSED — and that is a reading of HashMark §5.4, not a convenience. §5.4 names the
+    characters an encoder must reject and says outright that ZWJ and ZWNJ are "load-bearing in
+    Devanagari and emoji sequences". Refusing everything outside that table that a terminal cannot
+    print would refuse text §5.4 permits: combining marks are ordinary in Indic scripts, TAG
+    characters spell the England, Scotland and Wales flag emoji, and an emoji newer than this
+    Python's Unicode tables is "unassigned" here. pyrxd must not refuse an honest label, so it discloses: the
+    codepoints, their names, and how pyrxd's own readers will print the result.
+    """
+    if label is None:
+        return []
+    hidden = [ch for ch in label if not _prints_as_itself(ch)]
+    if not hidden:
+        return []
+    distinct = list(dict.fromkeys(hidden))
+    lines = [
+        "",
+        f"*** THE LABEL HOLDS {len(hidden)} CHARACTER(S) THAT DO NOT PRINT AS THEMSELVES — each is shown",
+        "*** above as <U+XXXX>, and EVERY ONE OF THEM IS SIGNED AND PUBLISHED:",
+    ]
+    for ch in distinct[:_MAX_NAMED_LABEL_CODEPOINTS]:
+        lines.append(f"***   U+{ord(ch):04X}  {unicodedata.name(ch, '(no Unicode name: unassigned or private use)')}")
+    if len(distinct) > _MAX_NAMED_LABEL_CODEPOINTS:
+        lines.append(f"***   ... and {len(distinct) - _MAX_NAMED_LABEL_CODEPOINTS} more distinct codepoint(s)")
+    lines.append(f"*** `pyrxd verify` and `glyph inspect` will print this label as: {_sanitize_display_string(label)}")
+    lines.append("*** HashMark 5.4 does not forbid these — joiners, emoji tag sequences and combining marks are")
+    lines.append("*** ordinary text in many scripts — so they are shown, not refused. If you did not put them")
+    lines.append("*** there, do not publish this: retype the label.")
+    return lines
+
+
 def _mark_lines(
     build: MarkBuild,
     *,
@@ -118,13 +182,18 @@ def _mark_lines(
     statement that is NOT recoverable from the record, so an operator reading the record
     back later cannot tell from it which chain it was signed for — this prompt is the
     only place the two are ever seen together.
+
+    NOTHING HERE IS PRINTED RAW THAT SOMEONE ELSE COULD HAVE CHOSEN. The file path is sanitised
+    the way `verify` already sanitised it — a file named ``report.pdf\\x1b[8m`` switched the
+    terminal to concealed text for every line after it, the fee and the warnings included — and
+    the label is escaped, see :func:`_label_for_display`.
     """
     plan = build.plan
     raw = build.serialize()
     lines = [
-        f"file:        {plan.source}",
+        f"file:        {_sanitize_display_string(plan.source) if plan.source is not None else '(not recorded)'}",
         f"{plan.algorithm}:      {plan.digest_hex}",
-        f"label:       {plan.label if plan.label is not None else '(none)'}",
+        f"label:       {_label_for_display(plan.label)}",
         f"signer:      {signer_address}",
         f"             hash160 {plan.signer_hash160_hex} — committed in the record and in the statement",
         f"network:     {network} (genesis {plan.network_genesis})",
@@ -133,6 +202,7 @@ def _mark_lines(
         f"fee:         {build.fee:,} photons ({len(raw)} B @ {fee_rate:,}/B)"
         + ("" if build.has_change else " — no change: the whole funding UTXO is the fee"),
     ]
+    lines.extend(_hidden_label_lines(plan.label))
     if typed_label is not None and plan.label != typed_label:
         lines.append("")
         lines.append("*** LABEL CANONICALISED — what gets signed is NOT what you typed:")
@@ -248,7 +318,9 @@ def mark_cmd(
             "everything else in the record is fixed-width",
         ) from exc
     except OSError as exc:
-        raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
+        raise UserError(
+            f"could not read {_sanitize_display_string(str(file_path))}", cause=_sanitize_display_string(str(exc))
+        ) from exc
 
     async def _do_build() -> Any:
         client = ctx.make_client()
@@ -366,9 +438,9 @@ def mark_cmd(
         click.echo("\n  Re-run without --dry-run to publish it.")
     else:
         click.echo(f"\nMarked: {txid}")
-        click.echo(f"  file:       {file_path}")
+        click.echo(f"  file:       {_sanitize_display_string(str(file_path))}")
         click.echo(f"  {build.plan.algorithm}:     {build.plan.digest_hex}")
-        click.echo(f"  label:      {build.plan.label if build.plan.label is not None else '(none)'}")
+        click.echo(f"  label:      {_label_for_display(build.plan.label)}")
         click.echo(f"  signer:     {signer_address}")
         click.echo(f"  network:    {ctx.network} (genesis {build.plan.network_genesis})")
         click.echo(f"  record:     {build.plan.size_bytes} B")
@@ -462,7 +534,9 @@ def _digest_expectation(
     try:
         return digest_file(file_path, algorithm_id=next(iter(ids))).hex(), ""
     except OSError as exc:
-        raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
+        raise UserError(
+            f"could not read {_sanitize_display_string(str(file_path))}", cause=_sanitize_display_string(str(exc))
+        ) from exc
 
 
 def _why_no_digest_to_compare(record: dict) -> str:
@@ -1000,6 +1074,9 @@ def verify_cmd(
                 cause=f"got {digest_hex!r}",
                 fix="pass the digest as hex, e.g. the output of `sha256sum <file>`",
             )
+    # The same shape of refusal as --digest "" above, and for the same reason: an empty value is
+    # a question typed wrong, not a question not asked. See `_require_wave_name`.
+    wave_name = _require_wave_name(wave_name)
     wanted = txid.strip().lower()
     try:
         Txid(wanted)
@@ -1031,13 +1108,16 @@ def verify_cmd(
             "what you have, give the mark's txid and pass the digest with --digest.",
         )
 
+    # `is not None`, NEVER truthiness, for every "was this asked?" below. A falsy-but-present value
+    # read as "not asked" is how `--wave-name ""` passed the gate; see `_require_wave_name`.
+    name_asked = wave_name is not None
     if verify_wave:
         _attach_wave_identity(ctx, payload)
-    if wave_name:
+    if name_asked:
         _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 
     expected, absent_reason = _digest_expectation(records, file_path=file_path, digest_hex=digest_hex)
-    source = "--digest" if digest_hex is not None else (str(file_path) if file_path else "")
+    source = "--digest" if digest_hex is not None else (str(file_path) if file_path is not None else "")
     for hm in records:
         hm["digest_match"] = judge_digest_match(
             hm,
@@ -1050,7 +1130,7 @@ def verify_cmd(
     # ONE RECORD, EVERY CHECK. Each record is judged alone; the summary is ONE record's checks
     # (the witness), plus the transaction-wide refusal and the block. See `_signature_check`.
     per_record = [
-        (row.get("vout"), row["hashmark"], _record_checks(row["hashmark"], name_asked=bool(wave_name))) for row in rows
+        (row.get("vout"), row["hashmark"], _record_checks(row["hashmark"], name_asked=name_asked)) for row in rows
     ]
     w_vout, w_hm, w_checks = _choose_witness(per_record)
     refusal = _tx_refusal(per_record)
