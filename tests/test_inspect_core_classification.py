@@ -32,6 +32,7 @@ from pyrxd.glyph.encrypted_content import CryptoMetadata, TimelockSpec
 from pyrxd.glyph.payload import build_reveal_scriptsig_suffix, encode_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.wave import build_wave_metadata
+from pyrxd.glyph.wave_rules import wave_registration_fee_for
 from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction import Transaction
@@ -131,7 +132,8 @@ def _build_reveal_tx(metadata: GlyphMetadata) -> tuple[bytes, str]:
     walker, which scans for the marker anywhere in the pushes).
     """
     cbor_bytes, _ = encode_payload(metadata)
-    scriptsig = build_reveal_scriptsig_suffix(cbor_bytes)
+    # A WAVE claim's envelope needs its registration fee stated; this builds only the input.
+    scriptsig = build_reveal_scriptsig_suffix(cbor_bytes, registration_fee=wave_registration_fee_for(cbor_bytes))
     tx = Transaction(
         tx_inputs=[
             TransactionInput(

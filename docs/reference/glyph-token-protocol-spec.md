@@ -832,6 +832,36 @@ envelope that violates them confirms normally. A decoder MAY apply them as a
 sanity check but MUST be prepared to encounter tokens that do not satisfy them —
 pyrxd's own decoder does not re-check the combination rules on the decode path.
 
+**WAVE registration fee.** A reveal that registers a WAVE name pays the
+protocol's registration fee: an output of the name's price to the P2PKH of the
+WAVE treasury, `1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG`. The price is set by the
+length of the bare label: 100 RXD for 3 characters, 50 for 4, 10 for 5, and 5
+for 6 to 63. The WAVE protocol says registration is "a one-time, length-based
+fee" and that renewal pays "the name's registration price to the protocol
+treasury" (Radiant-Core/WAVE-Protocol `ANNOUNCEMENT.md:51-52` at `c05b8e7a`);
+the amounts and the address are Photonic's (`calculateNameCost`,
+`packages/lib/src/wave.ts:55-66`;
+`packages/app/src/pages/WaveRegister.tsx:132-152`) and RXinDexer's
+(`WAVE_TREASURY_ADDRESS_DEFAULT` and `wave_name_price`,
+`electrumx/server/wave_index.py:65` and `:73-86` at `ca8a6a4e`). Both sources price 1-2
+character names at the 3-character tier; pyrxd writes no label under 3
+characters. Photonic puts the output after the token outputs and before change
+(`packages/lib/src/mint.ts:877-881`), so vout 2 for a WAVE claim, after the NFT
+and the mutable contract; mainnet claim `f644794b…` pays 5 RXD there.
+
+Neither consensus nor RXinDexer's claim path checks the fee: the indexer's
+`process_tx` registers the name without reading the outputs
+(`electrumx/server/wave_index.py:706-807`), and it checks the treasury payment only on renewal,
+when a transaction spends the name's claim token (`_maybe_process_renewal`,
+`electrumx/server/wave_index.py:581-642`). pyrxd pays it by default on every path that
+registers a name (`src/pyrxd/glyph/wave_rules.py`, `wave_registration_fee_for`):
+each `GlyphBuilder` reveal that can register one returns it as
+`registration_fee_output`, the fee estimator sizes it and the funding checks count its value, and
+`pyrxd glyph mint-nft` puts it in the reveal (at vout 1: that reveal carries no
+mutable contract). `pay_registration_fee=False` (`--no-wave-registration-fee`)
+registers without paying. The published treasury is a mainnet address; no
+testnet or regtest treasury is published.
+
 ### 8.2 On-chain distinguishability
 
 This is the part that matters for an indexer, and the honest summary is that the

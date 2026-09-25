@@ -1149,6 +1149,7 @@ class TestDeprecationAliases:
             cbor_bytes=b"",
             payload_hash=b"\x00" * 32,
             estimated_fee=0,
+            registration_fee_output=None,
         )
         with pytest.warns(DeprecationWarning, match="DmintDeployResult"):
             instance = DmintDeployResult(

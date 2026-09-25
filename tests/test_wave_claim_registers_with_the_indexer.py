@@ -71,7 +71,7 @@ from pyrxd.glyph.wave import (
     extract_wave_attrs,
     wave_attrs_from_metadata,
 )
-from pyrxd.glyph.wave_rules import wave_claim_problem
+from pyrxd.glyph.wave_rules import wave_claim_problem, wave_registration_fee_for
 from pyrxd.hash import hash256
 from pyrxd.script.script import Script
 from pyrxd.security.errors import ValidationError
@@ -381,8 +381,15 @@ _DOORS = {
             commit_txid=TXID, commit_vout=0, commit_value=10_000, cbor_bytes=cbor2.dumps(d), owner_pkh=PKH, is_nft=True
         )
     ),
-    "build_reveal_scriptsig_suffix": lambda d: build_reveal_scriptsig_suffix(cbor2.dumps(d)),
-    "build_mutable_scriptsig": lambda d: build_mutable_scriptsig("mod", cbor2.dumps(d), 1, 1, 0, 0),
+    # The two raw writers also require the caller to state the WAVE registration fee for a
+    # claim that registers (tests/test_wave_registration_fee.py); stated here as the fee
+    # wave_registration_fee_for derives, so these cases exercise the label rule alone.
+    "build_reveal_scriptsig_suffix": lambda d: build_reveal_scriptsig_suffix(
+        cbor2.dumps(d), registration_fee=wave_registration_fee_for(d)
+    ),
+    "build_mutable_scriptsig": lambda d: build_mutable_scriptsig(
+        "mod", cbor2.dumps(d), 1, 1, 0, 0, registration_fee=wave_registration_fee_for(d)
+    ),
 }
 
 #: (attrs.name, the reason it must be refused for). Asserting the REASON, not just a refusal,

@@ -86,6 +86,7 @@ from ..glyph.fees import (
     estimate_reveal_fee_for_metadata,
     measure_reveal_fee,
 )
+from ..glyph.payload import encode_payload
 from ..glyph.scanner import GlyphScanner
 from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdrop
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
@@ -95,6 +96,7 @@ from ..glyph.transfer import ft_funding as lib_ft_funding
 from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
 from ..glyph.transfer import single_ft_signing_key as lib_single_ft_signing_key
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
+from ..glyph.wave_rules import WAVE_TREASURY_ADDRESS, WaveRegistrationFee, format_rxd, wave_registered_label
 from ..hd.wallet import HdWallet
 from ..network.confirm import (
     DEFAULT_CONFIRMATION_TIMEOUT_S,
@@ -121,7 +123,7 @@ from ..transaction.transaction_output import TransactionOutput
 from ..utils import validate_address
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
-from .format import emit, emit_table
+from .format import emit, emit_table, format_photons
 from .glyph_estimate import MiningDeadline, _MiningReporter, dmint_estimate_cmd
 from .glyph_helpers import (
     _TEMPLATE_TYPES,
@@ -206,14 +208,43 @@ def init_metadata_cmd(ctx: CliContext, kind: str, out_path: Path | None) -> None
     default=False,
     help="Prompt for the BIP39 passphrase used at wallet creation.",
 )
+@click.option(
+    "--wave-registration-fee/--no-wave-registration-fee",
+    "pay_wave_fee",
+    default=True,
+    show_default=True,
+    help=(
+        "When the metadata registers a WAVE name, pay the protocol's registration fee to the WAVE "
+        "treasury in the reveal (100/50/10/5 RXD for a 3/4/5/6+ character name). "
+        "--no-wave-registration-fee registers the name without paying: the published protocol "
+        "expects the fee, the indexer does not check it at registration (so the name still "
+        "resolves), and renewing the name requires paying its price to the treasury."
+    ),
+)
+@click.option(
+    "--wave-treasury",
+    "wave_treasury",
+    default=None,
+    metavar="ADDRESS",
+    help=(
+        "Pay the WAVE registration fee to this address instead of the published mainnet treasury. "
+        "Required to pay the fee on testnet or regtest, where no treasury is published."
+    ),
+)
 @click.pass_obj
-def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None:
+def mint_nft_cmd(
+    ctx: CliContext, metadata_file: Path, passphrase: bool, pay_wave_fee: bool, wave_treasury: str | None
+) -> None:
     """Mint a Glyph NFT via two-phase commit + reveal.
 
     Builds and broadcasts the commit transaction, polls for
     confirmation, then builds and broadcasts the reveal. Both txs
     require a separate confirmation in human mode (or a single
     --yes for both in scripted mode).
+
+    If the metadata registers a WAVE name, the reveal pays the WAVE
+    registration fee to the treasury unless --no-wave-registration-fee
+    is given, and the confirmation shows the amount and the address.
     """
     metadata = _read_metadata_file(metadata_file)
     if GlyphProtocol.NFT not in metadata.protocol:
@@ -222,12 +253,27 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
             cause=f"got protocol={list(metadata.protocol)}",
             fix='set "protocol": ["NFT"] (or ["NFT", "MUT"], etc.) in the metadata file',
         )
+    if wave_treasury is not None:
+        if not pay_wave_fee:
+            raise UserError(
+                "--wave-treasury was given with --no-wave-registration-fee",
+                cause="nothing would be paid to the treasury named",
+                fix="drop one of the two",
+            )
+        _require_address_on_network(ctx, wave_treasury, what="--wave-treasury")
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
     async def _do_mint() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _mint_nft_inner(ctx, wallet, metadata, client)
+            return await _mint_nft_inner(
+                ctx,
+                wallet,
+                metadata,
+                client,
+                pay_registration_fee=pay_wave_fee,
+                registration_treasury=wave_treasury,
+            )
 
     try:
         result = asyncio.run(_do_mint())
@@ -247,6 +293,14 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
         click.echo(f"  commit txid: {result['commit_txid']}")
         click.echo(f"  reveal txid: {result['reveal_txid']}")
         click.echo(f"  glyph ref:   {result['ref']}")
+        wave = result.get("wave_registration")
+        if wave is not None:
+            fee = wave["fee"]
+            click.echo(
+                f"  WAVE fee:    {fee['rxd']} RXD to {fee['treasury']} (reveal vout {wave['fee_vout']})"
+                if fee is not None
+                else f"  WAVE fee:    NOT PAID for {wave['name']} (--no-wave-registration-fee)"
+            )
 
 
 # Commit sizing now lives in ``pyrxd.glyph.fees`` — the library-side mint facade
@@ -270,6 +324,8 @@ def _assert_reveal_is_fundable(
     reveal_tx: Transaction,
     fee_rate: int,
     cbor_bytes_len: int,
+    *,
+    registration_fee: WaveRegistrationFee | None,
 ) -> RevealFeeEstimate:
     """Fail the mint *before* the commit is broadcast if the reveal cannot pay its fee.
 
@@ -285,15 +341,27 @@ def _assert_reveal_is_fundable(
     Returns the measured estimate so the caller can display the real number. Raises
     :class:`UserError` naming the shortfall while the money is still in the wallet,
     instead of leaving a rejected reveal and a commit output nothing can spend.
+
+    ``registration_fee`` is the WAVE registration fee the reveal pays (the builder's
+    ``registration_fee_output``). The measurement refuses a reveal that does not carry it, and
+    counts its value in what the commit must hold.
     """
-    measured = measure_reveal_fee(reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len)
     try:
+        measured = measure_reveal_fee(
+            reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len, registration_fee=registration_fee
+        )
         check_reveal_funding(commit_value=commit_value, carrier_value=carrier_value, estimate=measured)
     except InsufficientFundsError as exc:
         raise UserError(
-            "commit value cannot cover the reveal fee — refusing to broadcast the commit",
+            "commit value cannot cover the reveal fee"
+            + (" and the WAVE registration fee" if registration_fee is not None else "")
+            + " — refusing to broadcast the commit",
             cause=str(exc),
             fix=("shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate"),
+        ) from exc
+    except ValidationError as exc:
+        raise UserError(
+            "the reveal this mint would broadcast is wrong — refusing to broadcast the commit", cause=str(exc)
         ) from exc
     return measured
 
@@ -308,12 +376,19 @@ def _build_reveal_tx(
     change_locking: Script,
     funding_key: PrivateKey,
     scriptsig_suffix: bytes,
+    registration_fee: WaveRegistrationFee | None,
 ) -> Transaction:
     """Build (unsigned, un-fee'd) the reveal that spends the commit output.
 
     Shared by the pre-broadcast dry run and the real post-confirmation build so the two
     cannot diverge — a dry run that measured a *different* transaction would be worth no
     more than the tautology it replaced.
+
+    ``registration_fee`` (required: pass the builder result's ``registration_fee_output``)
+    puts the WAVE registration fee at vout 1, right after the token and before change: the
+    order Photonic's ``mintToken`` uses (token outputs, then the extra outputs, then change;
+    see :mod:`pyrxd.glyph.wave_rules`). Photonic's WAVE reveal also carries the mutable
+    contract, so its fee lands at vout 2; this reveal has no contract output.
     """
     shim_commit_out = TransactionOutput(Script(commit_script), commit_value)
     src_commit_tx = Transaction(tx_inputs=[], tx_outputs=[shim_commit_out])
@@ -330,13 +405,46 @@ def _build_reveal_tx(
     # The token sits on vout[0] (a dust carrier for an NFT, the whole supply for an FT
     # premine); the rest of the commit value returns as change (fee() sized from the real
     # length) instead of being burned to fee.
+    fee_outputs = (
+        []
+        if registration_fee is None
+        else [TransactionOutput(Script(registration_fee.locking_script), registration_fee.value)]
+    )
     return Transaction(
         tx_inputs=[reveal_input],
         tx_outputs=[
             TransactionOutput(Script(reveal_locking_script), carrier_value),
+            *fee_outputs,
             TransactionOutput(change_locking, 0, change=True),
         ],
     )
+
+
+def _wave_registration_summary(label: str | None, fee: WaveRegistrationFee | None) -> list[_BroadcastSummary]:
+    """The confirmation section for a mint that registers a WAVE name; nothing otherwise."""
+    if label is None:
+        return []
+    if fee is None:
+        lines = [
+            f"name:          {label}.rxd",
+            "fee:           NOT PAID (--no-wave-registration-fee)",
+            "               The published WAVE protocol expects this fee. The indexer does not",
+            "               check it at registration, so the name still resolves; renewing it",
+            "               requires paying the name's price to the WAVE treasury.",
+        ]
+    else:
+        lines = [
+            f"name:          {label}.rxd",
+            f"fee:           {format_photons(fee.value)}",
+            f"treasury:      {fee.treasury_address}"
+            + ("" if fee.is_published_treasury else "  (NOT the published WAVE treasury)"),
+            f"paid:          in the reveal, vout {_REVEAL_FEE_VOUT}, out of the commit value",
+        ]
+    return [_BroadcastSummary(title="WAVE registration fee", lines=lines)]
+
+
+#: Where ``_build_reveal_tx`` puts a WAVE registration fee: right after the token.
+_REVEAL_FEE_VOUT = 1
 
 
 async def _mint_nft_inner(
@@ -344,8 +452,47 @@ async def _mint_nft_inner(
     wallet: HdWallet,
     metadata: GlyphMetadata,
     client: ElectrumXClient,
+    *,
+    pay_registration_fee: bool = True,
+    registration_treasury: str | None = None,
 ) -> dict:
-    """Heavy lifting for `glyph mint-nft`. Returns a result dict."""
+    """Heavy lifting for `glyph mint-nft`. Returns a result dict.
+
+    A metadata file that registers a WAVE name gets the WAVE registration fee in its reveal
+    unless ``pay_registration_fee`` is ``False``; the commit is sized to fund it.
+    """
+    fee_rate = ctx.fee_rate
+    # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
+    # scales with metadata size and is paid entirely out of the commit output. Size
+    # the commit from the real estimate instead of the old flat 5,000,000, which at
+    # 10,000 photons/byte only covered ~230 bytes of CBOR. A WAVE registration fee is
+    # paid out of the commit too: the estimate carries it (and its output's size), and
+    # the commit value includes it. Worked out before the wallet is scanned, so a
+    # network with no treasury is refused before anything else happens.
+    try:
+        reveal_estimate = estimate_reveal_fee_for_metadata(
+            metadata,
+            fee_rate=fee_rate,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
+        )
+    except ValidationError as exc:
+        raise UserError("could not size the reveal", cause=str(exc)) from exc
+    registered_label = wave_registered_label(encode_payload(metadata)[0])
+    registration_fee = reveal_estimate.registration_fee
+    if registration_fee is not None and registration_treasury is None and ctx.network != Network.MAINNET.value:
+        raise UserError(
+            f"no WAVE treasury is published for {ctx.network}",
+            cause=(
+                f"this metadata registers {registered_label}.rxd, and the WAVE registration fee is paid by "
+                f"default; the only published treasury, {WAVE_TREASURY_ADDRESS}, is a mainnet address"
+            ),
+            fix=(
+                f"pass --wave-treasury <a {ctx.network} address> to pay one you choose, or "
+                "--no-wave-registration-fee to register without paying"
+            ),
+        )
+
     # 1) Pick a funding UTXO.
     builder = GlyphBuilder()
     triples = await wallet.collect_spendable(client)
@@ -357,17 +504,11 @@ async def _mint_nft_inner(
         )
 
     # Estimate funding requirement: commit value + commit fee + reveal fee buffer.
-    fee_rate = ctx.fee_rate
     # The NFT's carrier value on the reveal. Same number as
     # ``pyrxd.glyph.mint.NFT_CARRIER_VALUE``, which derives from the same constant.
     # It is a pyrxd convention, not a chain minimum: Radiant would carry the NFT on
     # 1 photon (`GetDustThreshold` returns 1) — dMint contracts do exactly that.
     carrier_value = DUST_THRESHOLD_PHOTONS
-    # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
-    # scales with metadata size and is paid entirely out of the commit output. Size
-    # the commit from the real estimate instead of the old flat 5,000,000, which at
-    # 10,000 photons/byte only covered ~230 bytes of CBOR.
-    reveal_estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=fee_rate)
     commit_value = _commit_value_for_reveal(carrier_value, reveal_estimate)
     commit_fee_estimate = 300 * fee_rate  # ~300-byte commit
     # The reveal fee comes out of commit_value (sized above), so the funding UTXO needs
@@ -378,9 +519,17 @@ async def _mint_nft_inner(
     triples.sort(key=lambda t: t[0].value, reverse=True)
     funding = next((t for t in triples if t[0].value >= total_required), None)
     if funding is None:
+        includes = (
+            ""
+            if registration_fee is None
+            else (
+                f", including the {format_rxd(registration_fee.value)} WAVE registration fee for "
+                f"{registration_fee.label}.rxd"
+            )
+        )
         raise UserError(
             "no single UTXO is large enough to fund the mint",
-            cause=f"need ≥ {total_required:,} photons in one UTXO; largest is {triples[0][0].value:,}",
+            cause=f"need ≥ {total_required:,} photons in one UTXO{includes}; largest is {triples[0][0].value:,}",
             fix="consolidate UTXOs first, or fund the wallet from a single source",
         )
     funding_utxo, funding_addr, funding_key = funding
@@ -393,6 +542,8 @@ async def _mint_nft_inner(
             owner_pkh=funding_pkh,
             change_pkh=funding_pkh,
             funding_satoshis=funding_utxo.value,
+            pay_registration_fee=pay_registration_fee,
+            registration_treasury=registration_treasury,
         )
     )
 
@@ -441,6 +592,8 @@ async def _mint_nft_inner(
                 cbor_bytes=cbor_bytes,
                 owner_pkh=funding_pkh,
                 is_nft=is_nft,
+                pay_registration_fee=pay_registration_fee,
+                registration_treasury=registration_treasury,
             )
         )
 
@@ -454,18 +607,35 @@ async def _mint_nft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+        registration_fee=dry_run_scripts.registration_fee_output,
     )
-    measured = _assert_reveal_is_fundable(commit_value, carrier_value, dry_run_reveal, fee_rate, len(cbor_bytes))
+    # The fee the estimate sized the commit for must be the fee the reveal pays. Both come
+    # from wave_registration_fee_for with the same arguments, so a difference is a bug here.
+    if dry_run_scripts.registration_fee_output != registration_fee:
+        raise UserError(
+            "internal error: the reveal's WAVE registration fee is not the one the commit was sized for",
+            cause=f"estimate {registration_fee!r}, reveal {dry_run_scripts.registration_fee_output!r}",
+        )
+    measured = _assert_reveal_is_fundable(
+        commit_value,
+        carrier_value,
+        dry_run_reveal,
+        fee_rate,
+        len(cbor_bytes),
+        registration_fee=dry_run_scripts.registration_fee_output,
+    )
 
+    commit_value_note = "" if registration_fee is None else "  (carrier + WAVE registration fee + reveal fee)"
     sections = [
         _metadata_summary(metadata),
+        *_wave_registration_summary(registered_label, registration_fee),
         _BroadcastSummary(
             title="Commit transaction",
             lines=[
                 f"funding addr:  {funding_addr}",
                 f"funding utxo:  {funding_utxo.tx_hash}:{funding_utxo.tx_pos}",
                 f"funding value: {funding_utxo.value:,} photons",
-                f"commit value:  {commit_value:,} photons",
+                f"commit value:  {commit_value:,} photons{commit_value_note}",
                 f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
                 f"reveal fee:    {measured.fee:,} photons "
                 f"({measured.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
@@ -495,23 +665,23 @@ async def _mint_nft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+        registration_fee=reveal_scripts.registration_fee_output,
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()
     reveal_hex = reveal_tx.serialize()
 
-    _confirm_or_abort(
-        ctx,
-        [
-            _BroadcastSummary(
-                title="Reveal transaction",
-                lines=[
-                    f"commit txid:   {commit_txid}",
-                    f"nft to:        {funding_pkh.hex()}  ({carrier_value}-photon carrier; change returned)",
-                ],
-            )
-        ],
-    )
+    reveal_lines = [
+        f"commit txid:   {commit_txid}",
+        f"nft to:        {funding_pkh.hex()}  ({carrier_value}-photon carrier; change returned)",
+    ]
+    if reveal_scripts.registration_fee_output is not None:
+        reveal_lines.append(
+            f"WAVE fee:      {reveal_scripts.registration_fee_output.describe()} (vout {_REVEAL_FEE_VOUT})"
+        )
+    elif registered_label is not None:
+        reveal_lines.append(f"WAVE fee:      NOT PAID for {registered_label}.rxd (--no-wave-registration-fee)")
+    _confirm_or_abort(ctx, [_BroadcastSummary(title="Reveal transaction", lines=reveal_lines)])
     _echoed_reveal = await client.broadcast(reveal_hex)
     reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
@@ -520,12 +690,21 @@ async def _mint_nft_inner(
     # back — so it is what `transfer-nft` / `transfer-ft` match on.
     ref = GlyphRef(txid=Txid(str(commit_txid)), vout=0)
 
-    return {
+    result: dict[str, object] = {
         "commit_txid": str(commit_txid),
         "reveal_txid": str(reveal_txid),
         "ref": f"{ref.txid}:{ref.vout}",
         "owner_address": funding_addr,
     }
+    if registered_label is not None:
+        paid = reveal_scripts.registration_fee_output
+        result["wave_registration"] = {
+            "name": f"{registered_label}.rxd",
+            "fee_paid": paid is not None,
+            "fee": None if paid is None else paid.to_dict(),
+            "fee_vout": None if paid is None else _REVEAL_FEE_VOUT,
+        }
+    return result
 
 
 def _poll_interval_for(ctx: CliContext) -> float:
@@ -582,7 +761,9 @@ async def _wait_for_tx(
                 "`glyph mint-nft` the bytes come from re-encoding the SAME unmodified metadata file; for "
                 "`glyph timelock-mint` they are the file --envelope-out wrote, which is the only source "
                 "(a timelocked envelope with --recipient is NOT reproducible from the same inputs — each "
-                "wrap draws a fresh ephemeral key and nonce). See docs/how-to/troubleshoot-common-errors.md"
+                "wrap draws a fresh ephemeral key and nonce). For a WAVE name, add the result's "
+                "registration_fee_output to the reveal's outputs after the NFT: the commit holds its value. "
+                "See docs/how-to/troubleshoot-common-errors.md"
             ),
         ) from exc
 
@@ -750,6 +931,8 @@ async def _deploy_ft_inner(
         )
 
     dry_run_scripts = _ft_reveal_scripts(_PLACEHOLDER_COMMIT_TXID)
+    # No WAVE registration fee on an FT deploy: prepare_ft_deploy_reveal refuses a payload
+    # that would register a WAVE name rather than return one without its fee.
     dry_run_reveal = _build_reveal_tx(
         commit_txid=_PLACEHOLDER_COMMIT_TXID,
         commit_value=commit_value,
@@ -759,9 +942,10 @@ async def _deploy_ft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+        registration_fee=None,
     )
     measured = _assert_reveal_is_fundable(
-        commit_value, carrier_value, dry_run_reveal, fee_rate, len(commit_result.cbor_bytes)
+        commit_value, carrier_value, dry_run_reveal, fee_rate, len(commit_result.cbor_bytes), registration_fee=None
     )
 
     _confirm_or_abort(
@@ -803,6 +987,7 @@ async def _deploy_ft_inner(
         change_locking=locking,
         funding_key=funding_key,
         scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+        registration_fee=None,
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()

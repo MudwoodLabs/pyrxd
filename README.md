@@ -245,6 +245,11 @@ result = await minter.deploy_ft(metadata, supply=1_000_000)
 `GlyphBuilder` remains the lower-level API when you need to compose the
 transactions yourself (mutable NFTs, WAVE names, dMint deploys and minting into
 a collection have different reveal shapes and are built through it directly).
+Registering a WAVE name pays the protocol's registration fee to the WAVE
+treasury (5 to 100 RXD by name length) by default: `prepare_wave_reveal` (and
+every other reveal builder that can register a name) returns it as
+`registration_fee_output`, and the reveal must carry it unless you pass
+`pay_registration_fee=False`.
 A collection itself (`CONTAINER`) is an ordinary NFT and mints through
 `GlyphMinter` — see
 [Create a token collection](https://mudwoodlabs.github.io/pyrxd/how-to/create-a-token-collection.html).

@@ -164,6 +164,7 @@ jobs:
             tests/test_wallet_send_regtest_e2e.py \
             tests/test_container_regtest_e2e.py \
             tests/test_mut_wave_regtest_e2e.py \
+            tests/test_wave_registration_fee_regtest_e2e.py \
             tests/test_ft_airdrop_regtest_e2e.py \
             tests/test_ft_transfer_regtest_e2e.py \
             tests/test_gravity_maker_offer_regtest_e2e.py \

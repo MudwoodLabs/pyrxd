@@ -150,6 +150,9 @@ _OUT_OF_SCOPE: dict[str, str] = {
     "tx.ts": "Photonic Wallet",
     "types.ts": "Photonic Wallet",
     "packages/lib/src/wave.ts": "Photonic Wallet",
+    # The WAVE register page, which pays the registration fee; digest-pinned in
+    # tests/fixtures/photonic_upstream_pin.json at becf41a7.
+    "packages/app/src/pages/WaveRegister.tsx": "Photonic Wallet",
     # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. Not vendored; the
     # files pyrxd cites are digest-pinned in tests/fixtures/rxindexer_upstream_pin.json
     # and watched by scripts/check_photonic_drift.py --target rxindexer.

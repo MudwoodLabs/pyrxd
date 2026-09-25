@@ -21,6 +21,7 @@
     "packages/app/src/keys.ts": "7878c888da260a203d65b67fcad9715320e589e804e25f5791d15c09322677cd",
     "packages/app/src/pages/Mint.tsx": "f6948dafe9dc7495d8a150cd5adb88aff437d23054547f0371b7065a40eb6345",
     "packages/app/src/pages/Swap.tsx": "47bb53fedb1c4eade74875679354d0368e6323a44291247916b7db2b2fbfccb3",
+    "packages/app/src/pages/WaveRegister.tsx": "cdf973cabc9ed3666b69f0f88ca3fcdea347cfdfb5f1007aef771ff5e2c1429e",
     "packages/app/src/shareLink.ts": "ae96aa2b0e6858b4f07c34fefe65e1eb2bdfdf35303b71429dc7d2702b656dea",
     "packages/app/src/swap.ts": "4a2ab4a48a61004b6c51fce0c947245462a622ae0d76c880645a11d16f89afc7",
     "packages/app/src/swapBroadcast.ts": "3edf70660dd8e967b1f3c51ba9e8b4d2709521b977652a35db0770439d12377c",

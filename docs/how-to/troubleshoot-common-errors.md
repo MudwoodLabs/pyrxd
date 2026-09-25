@@ -138,11 +138,15 @@ From `glyph mint-nft` (`_mint_nft_inner`), `glyph deploy-ft`
 (`_deploy_ft_inner`) and `glyph deploy-dmint` (`_deploy_dmint_inner`)
 respectively, all in
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py). The `cause` line names the exact shortfall (`need ≥ N photons
-in one UTXO; largest is M`).
+in one UTXO; largest is M`). When the metadata registers a WAVE name, `mint-nft`'s
+cause also names the registration fee it includes (`…, including the 5 RXD WAVE
+registration fee for alice-name.rxd; …`).
 
 **Cause:** the commit/deploy builder needs **one single UTXO** that covers
 the commit value plus both the commit's own fee estimate and slack for the
-reveal — it does not combine multiple smaller UTXOs for this step.
+reveal — it does not combine multiple smaller UTXOs for this step. For a WAVE
+name the commit value includes the registration fee (100, 50, 10 or 5 RXD for
+a 3, 4, 5 or 6+ character name), which the reveal pays to the WAVE treasury.
 
 **Fix (all three, same text):** `consolidate UTXOs first, or fund the wallet
 from a single source`.
@@ -165,7 +169,10 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
-(`src/pyrxd/glyph/fees.py:211-244`).
+(`src/pyrxd/glyph/fees.py:407-450`). When the metadata registers a WAVE name, the
+message reads `commit value cannot cover the reveal fee and the WAVE registration fee`,
+and the parenthesis gains `+ <photons> WAVE registration fee for <name>.rxd to <treasury>`:
+the reveal pays that fee out of the commit too.
 
 **Cause:** the reveal transaction's scriptSig carries the **entire CBOR
 metadata payload**, so a large `metadata.json` (a long image URL, several
