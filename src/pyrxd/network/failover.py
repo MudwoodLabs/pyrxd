@@ -36,11 +36,13 @@ What is retried, and what is not
   extension method is a pure read opt in with ``idempotent=True`` —
   :class:`~pyrxd.network.rxindexer.RxinDexerClient` does, for every method it wraps.
 * **"Method not found"** (:class:`~pyrxd.security.errors.RpcMethodNotFound`, JSON-RPC
-  ``-32601``) — a retryable call moves on to the next endpoint, but the server that said it
-  is NOT treated as failed: it answered, so its connection stays open, and that answer does
-  not demote it (see :meth:`FailoverElectrumXClient._run` for the one case where the winner
-  is still promoted). Only one of the shipped mainnet servers runs the RXinDexer extension,
-  and it is not the first.
+  ``-32601``) — for an idempotent ``call_extension`` only, the call moves on to the next
+  endpoint and the server that said it is NOT treated as failed: its client is kept (calls
+  pending on it are not failed), and that answer does not demote it (see
+  :meth:`FailoverElectrumXClient._run` for the one case where the winner is still promoted).
+  Only one of the shipped mainnet servers runs the RXinDexer extension, and it is not the
+  first (measured 2026-09-24). On a core read, a non-idempotent extension call, or the chain
+  check, a ``-32601`` is a fault like any other.
 * **Node verdicts** (:class:`~pyrxd.security.errors.PolicyRejection`) — never
   retried, on any method. "Your transaction is invalid / underpriced / already
   known" is an answer, not a failure; re-asking a different node mostly produces
@@ -252,14 +254,16 @@ class FailoverElectrumXClient:
         this module is careful to avoid. Pass ``idempotent=True`` for a read
         (``glyph.get_token``, ``wave.resolve``, ...).
 
-        An idempotent call also moves past an endpoint that answers "method not found"
-        (a server without the indexer extension), without counting that answer against the
-        endpoint — see :meth:`_run`.
+        An idempotent call also moves past an endpoint that answers this method with "method
+        not found" (a server without the indexer extension), without dropping or demoting the
+        endpoint for it — see :meth:`_run`. A non-idempotent call treats that answer as a
+        fault, as every other call does.
         """
         return await self._run(
             f"call_extension:{method}",
             lambda c: c.call_extension(method, params),
             retryable=idempotent,
+            skip_unsupported=idempotent,
         )
 
     async def assert_chain(self, expected_genesis_hash: str) -> str:
@@ -464,6 +468,7 @@ class FailoverElectrumXClient:
         op: Callable[[ElectrumXClient], Awaitable[_T]],
         *,
         retryable: bool = True,
+        skip_unsupported: bool = False,
     ) -> _T:
         """Run *op* against the preferred endpoint, failing over on transport errors.
 
@@ -471,39 +476,45 @@ class FailoverElectrumXClient:
         mismatch raises) propagate immediately — neither is a transport fault, and
         both mean "trying another server is the wrong move".
 
-        ``RpcMethodNotFound`` is an ANSWER from a working server that lacks the method, so it
-        is kept apart from a transport fault in two ways:
+        ``skip_unsupported`` is set ONLY by an idempotent :meth:`call_extension` — an indexer
+        read. For that call, an ``RpcMethodNotFound`` raised by *op itself* is an ANSWER from a
+        server that is up but does not run the extension, and it is kept apart from a fault:
 
-        * The endpoint is **not** discarded. ``_discard`` closes the client, and closing it
-          fails every other call in flight on that socket (``ElectrumXClient.close`` fails all
-          pending futures) — so treating "I don't run the indexer" as a fault would abort an
-          unrelated ``get_transaction`` running concurrently on a healthy server.
+        * The endpoint is **not** discarded. ``_discard`` drops the client and calls
+          ``ElectrumXClient.close``, which fails every call still pending on it — so treating
+          "I don't run the indexer" as a fault would abort an unrelated ``get_transaction``
+          running concurrently on the same server.
         * The winner is **not** promoted past it. Promotion exists to stop re-paying a dead
           primary's timeout. If every endpoint passed over merely lacked the method, nothing
           was dead, and promoting would move core reads (balance, UTXOs, fetches) off the
           current primary because of an extension it was never required to run. When a
-          real transport fault was also passed over, promotion happens as before.
+          real fault was also passed over, promotion happens as before.
+
+        Everywhere else a ``-32601`` stays what it always was here — a fault: on a core read,
+        on a non-idempotent extension call, and on the chain check that :meth:`_client_for`
+        runs before *op*. A server that cannot answer ``blockchain.block.header [0]`` has not
+        been verified to be on the right chain, so it must not be kept, and its answer must
+        not be reported as "does not implement <the method we were asked for>".
         """
         last_exc: Exception | None = None
-        faulted = False  # some endpoint failed at the transport level during this call
-        unsupported = 0  # endpoints that answered "method not found"
+        faulted = False  # some endpoint failed during this call (discarded)
+        unsupported = 0  # endpoints whose answer to THIS extension method was "not found"
         for endpoint in self._candidates():
+            reached_op = False  # False while the failure can only have come from _client_for
             try:
                 client = await self._client_for(endpoint)
+                reached_op = True
                 result = await op(client)
             except PolicyRejection:
                 raise
             except TlsPinMismatchError:
                 raise  # a substituted server must never be silently routed around
-            except RpcMethodNotFound as exc:
-                last_exc = exc
-                unsupported += 1
-                logger.info("%s is not implemented by %s; next endpoint", description, endpoint.url)
-                if not retryable:
-                    raise
-                continue
             except NetworkError as exc:
                 last_exc = exc
+                if skip_unsupported and reached_op and isinstance(exc, RpcMethodNotFound):
+                    unsupported += 1
+                    logger.info("%s is not implemented by %s; next endpoint", description, endpoint.url)
+                    continue
                 faulted = True
                 logger.warning("%s failed on %s (%s)", description, endpoint.url, type(exc).__name__)
                 await self._discard(endpoint)

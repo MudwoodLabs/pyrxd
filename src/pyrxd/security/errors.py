@@ -506,11 +506,15 @@ class RpcMethodNotFound(NetworkError):
     the method.
 
     That is how a plain ElectrumX server answers an RXinDexer extension (``wave.*``,
-    ``glyph.*``, ``swap.*``) it does not run. It is an answer, not a transport fault: the
-    server is up and responding, so the answer alone says nothing against its health.
-    :class:`~pyrxd.network.failover.FailoverElectrumXClient` uses the distinction to skip such
-    a server for an idempotent call without closing its connection, and without that answer
-    demoting it in the preference order.
+    ``glyph.*``, ``swap.*``) it does not run. For an INDEXER EXTENSION call, then, it is an
+    answer rather than a fault: a plain ElectrumX server is not expected to run the extension,
+    so lacking it counts nothing against the server.
+    :class:`~pyrxd.network.failover.FailoverElectrumXClient` uses the distinction only
+    there — for an idempotent ``call_extension`` it skips such a server without dropping its
+    client, and without that answer demoting it. The same code on a core method, or on the
+    genesis read behind the
+    chain check, means the server cannot do what every ElectrumX server must, and it is
+    handled as a fault.
 
     A subclass of :class:`NetworkError`, so every existing ``except NetworkError`` handler
     still catches it.

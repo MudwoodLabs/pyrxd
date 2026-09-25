@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 from pathlib import Path
 
@@ -37,7 +38,7 @@ from pyrxd.network import rxindexer as rxindexer_mod
 from pyrxd.network.electrumx import ElectrumXClient, _rpc_error, script_hash_for_address
 from pyrxd.network.failover import FailoverElectrumXClient
 from pyrxd.network.registry import DEFAULT_ENDPOINTS, NetworkProfile
-from pyrxd.network.rxindexer import RxinDexerClient, RxinDexerError
+from pyrxd.network.rxindexer import IndexerStats, RxinDexerClient, RxinDexerError
 from pyrxd.security.errors import NetworkError, PolicyRejection, RpcMethodNotFound
 from pyrxd.security.types import Txid
 from tests.test_hashmark_verify_cli import _mark_script, _tx_with
@@ -99,29 +100,41 @@ def _entry(label: str) -> dict:
 class _Server:
     """One ElectrumX server as the wire sees it: a JSON-RPC frame in, a frame out."""
 
-    def __init__(self, url: str, *, indexer: bool, txs: dict[str, bytes] | None = None, names=None) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        indexer: bool,
+        txs: dict[str, bytes] | None = None,
+        names=None,
+        results: dict[str, object] | None = None,
+        unknown: frozenset[str] = frozenset(),
+    ) -> None:
         self.url = url
         self.indexer = indexer
         self.txs = txs or {}
         self.names: dict[str, list[dict]] = names or {}  # scripthash hex -> reverse_lookup rows
+        self.results: dict[str, object] = results or {}  # indexer method -> its result
+        self.unknown = unknown  # methods (core ones too) this server answers with -32601
         self.received: list[str] = []  # methods, in arrival order
         self.unexpected: list[str] = []
-        self.sockets: list[_Socket] = []
+        self.sockets: list[_Socket] = []  # one per connect: a second one means a reconnect
         self.hold: set[str] = set()  # methods whose answer waits for `released`
         self.released = asyncio.Event()
 
     def answer(self, req: dict) -> dict:
         method, params, rid = req["method"], req.get("params") or [], req["id"]
+        if method in self.unknown or (method.startswith(("wave.", "glyph.", "swap.")) and not self.indexer):
+            # What a plain ElectrumX says — the exact frame measured, see the module docstring.
+            return {"jsonrpc": "2.0", "error": {"code": -32601, "message": f'unknown method "{method}"'}, "id": rid}
         if method == "blockchain.block.header" and params == [0]:
             return {"jsonrpc": "2.0", "result": _MAINNET_GENESIS_HEADER_HEX, "id": rid}
         if method == "blockchain.transaction.get" and len(params) == 2 and params[1] is False and params[0] in self.txs:
             return {"jsonrpc": "2.0", "result": self.txs[params[0]].hex(), "id": rid}
-        if method.startswith(("wave.", "glyph.", "swap.")):
-            if not self.indexer:
-                # What a plain ElectrumX says — the exact frame measured, see the module docstring.
-                return {"jsonrpc": "2.0", "error": {"code": -32601, "message": f'unknown method "{method}"'}, "id": rid}
-            if method == "wave.reverse_lookup":
-                return {"jsonrpc": "2.0", "result": self.names.get(params[0], []), "id": rid}
+        if self.indexer and method in self.results:
+            return {"jsonrpc": "2.0", "result": self.results[method], "id": rid}
+        if self.indexer and method == "wave.reverse_lookup":
+            return {"jsonrpc": "2.0", "result": self.names.get(params[0], []), "id": rid}
         self.unexpected.append(f"{method} {params!r}")
         return {"jsonrpc": "2.0", "error": {"code": -32603, "message": "not scripted in this test"}, "id": rid}
 
@@ -130,7 +143,6 @@ class _Socket:
     def __init__(self, server: _Server) -> None:
         self.server = server
         self.outbox: asyncio.Queue[str] = asyncio.Queue()
-        self.closed = False
         self._held: list[asyncio.Task] = []
 
     async def send(self, payload: str) -> None:
@@ -150,7 +162,11 @@ class _Socket:
         return await self.outbox.get()
 
     async def close(self) -> None:
-        self.closed = True
+        # Deliberately records nothing. `ElectrumXClient.close()` does not reach this today (the
+        # cancelled reader clears `_ws` first — a known leak, tracked separately), so a "was it
+        # closed?" flag here would be false whatever the code under test did. Assert on what
+        # dropping a client really does instead: a reconnect (`sockets`) or failed pending calls.
+        return None
 
 
 def _wire(monkeypatch, *servers: _Server) -> None:
@@ -210,40 +226,97 @@ def test_no_wrapped_method_name_is_mistaken_for_a_node_verdict(method) -> None:
 
 @pytest.mark.asyncio
 async def test_the_first_servers_minus_32601_is_not_final_and_costs_it_nothing(monkeypatch) -> None:
-    plain = _Server(PLAIN_URL, indexer=False)
-    idx = _Server(INDEXER_URL, indexer=True, names={SH: [_entry("create")]})
+    key = PrivateKey()
+    txid, raw = _tx_with(_mark_script(b"after the miss\n", key))
+    plain = _Server(PLAIN_URL, indexer=False, txs={txid: raw})
+    idx = _Server(INDEXER_URL, indexer=True, txs={txid: raw}, names={SH: [_entry("create")]})
     _wire(monkeypatch, plain, idx)
 
     async with FailoverElectrumXClient(_default_profile()) as client:
         assert await client.call_extension("wave.reverse_lookup", [SH], idempotent=True) == [_entry("create")]
         # The plain server really was asked first, and answered -32601 (not vacuous).
         assert plain.received == ["blockchain.block.header", "wave.reverse_lookup"]
-        # It answered, so it is healthy: its socket stays open and it stays the primary.
-        assert [s.closed for s in plain.sockets] == [False]
-        assert client.active_url == PLAIN_URL
+        assert client.active_url == PLAIN_URL  # not demoted
+
+        # Then an ordinary read goes to it, on the SAME connection and chain verification. Had
+        # the -32601 dropped its client, this would reconnect (a second socket) and re-run the
+        # genesis check; had it demoted the server, the fetch would go to the indexer server.
+        assert bytes(await client.get_transaction(Txid(txid))) == raw
+        assert plain.received == ["blockchain.block.header", "wave.reverse_lookup", "blockchain.transaction.get"]
+        assert len(plain.sockets) == 1
+        assert "blockchain.transaction.get" not in idx.received
     assert plain.unexpected == idx.unexpected == []
 
 
 @pytest.mark.asyncio
 async def test_a_core_read_in_flight_on_that_server_survives_its_minus_32601(monkeypatch) -> None:
-    """Why the server is not discarded. `_discard` closes its client, and closing fails every call
-    in flight on that socket — so an indexer miss would abort an unrelated fetch on a healthy
-    server (which then re-ran on the other one)."""
+    """Why the server is not discarded. `_discard` drops its client and calls
+    `ElectrumXClient.close()`, which fails every call still pending on it — so an indexer miss
+    would abort an unrelated fetch on the same server (which then re-ran on the other one)."""
     key = PrivateKey()
     txid, raw = _tx_with(_mark_script(b"in flight\n", key))
     plain = _Server(PLAIN_URL, indexer=False, txs={txid: raw})
     plain.hold = {"blockchain.transaction.get"}
     idx = _Server(INDEXER_URL, indexer=True, txs={txid: raw}, names={SH: [_entry("create")]})
     _wire(monkeypatch, plain, idx)
+    plain_key = _default_profile().endpoints[0].key
 
     async with FailoverElectrumXClient(_default_profile()) as client:
         fetch = asyncio.create_task(client.get_transaction(Txid(txid)))
         await _until(lambda: "blockchain.transaction.get" in plain.received)
+        before = client._clients[plain_key]
         assert await client.call_extension("wave.reverse_lookup", [SH], idempotent=True) == [_entry("create")]
+        assert client._clients.get(plain_key) is before  # the client was not dropped
         plain.released.set()
-        assert bytes(await fetch) == raw
-        assert "blockchain.transaction.get" not in idx.received  # answered by the primary, once
-        assert [s.closed for s in plain.sockets] == [False]
+        assert bytes(await fetch) == raw  # its pending call was not failed ...
+        assert "blockchain.transaction.get" not in idx.received  # ... so it was answered once, by the primary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["indexer read", "core read"])
+async def test_a_minus_32601_on_the_chain_check_is_a_fault_not_an_answer(monkeypatch, call) -> None:
+    """The genesis read runs before the operation, inside the same failover step. A server that
+    answers it -32601 has NOT been shown to be on the right chain: it must never be marked
+    verified, never be sent the operation, and be dropped and routed around like any fault —
+    even for an indexer read, where a -32601 from the operation itself would be an answer."""
+    key = PrivateKey()
+    txid, raw = _tx_with(_mark_script(b"chain check\n", key))
+    first = _Server(
+        PLAIN_URL,
+        indexer=True,
+        txs={txid: raw},
+        names={SH: [_entry("wrong")]},
+        unknown=frozenset({"blockchain.block.header"}),
+    )
+    idx = _Server(INDEXER_URL, indexer=True, txs={txid: raw}, names={SH: [_entry("create")]})
+    _wire(monkeypatch, first, idx)
+    first_key = _default_profile().endpoints[0].key
+
+    async with FailoverElectrumXClient(_default_profile()) as client:
+        if call == "indexer read":
+            assert await client.call_extension("wave.reverse_lookup", [SH], idempotent=True) == [_entry("create")]
+        else:
+            assert bytes(await client.get_transaction(Txid(txid))) == raw
+        assert first.received == ["blockchain.block.header"]  # never sent the operation
+        assert first_key not in client._chain_verified  # never marked verified
+        assert first_key not in client._clients  # dropped, as a fault is
+        assert client.active_url == INDEXER_URL  # and the server that answered is promoted
+    assert first.unexpected == idx.unexpected == []
+
+
+@pytest.mark.asyncio
+async def test_when_the_chain_check_is_what_failed_no_method_is_blamed(monkeypatch) -> None:
+    """The "none of the N endpoints implements this method" error names the OPERATION. If the
+    -32601 came from the genesis read, saying the server lacks `wave.reverse_lookup` is false."""
+    plain = _Server(
+        PLAIN_URL, indexer=True, names={SH: [_entry("create")]}, unknown=frozenset({"blockchain.block.header"})
+    )
+    _wire(monkeypatch, plain)
+    async with FailoverElectrumXClient(NetworkProfile.build("mainnet", [PLAIN_URL])) as client:
+        with pytest.raises(NetworkError) as exc:
+            await client.call_extension("wave.reverse_lookup", [SH], idempotent=True)
+    assert type(exc.value) is NetworkError
+    assert str(exc.value) == "call_extension:wave.reverse_lookup failed on all 1 ElectrumX endpoint(s)"
 
 
 # ── the funnel every indexer read crosses: RxinDexerClient._call ──────────────
@@ -258,6 +331,52 @@ async def test_rxindexer_over_the_default_profile_reads_from_the_indexer(monkeyp
     async with FailoverElectrumXClient(_default_profile()) as client:
         assert await RxinDexerClient(client).wave_reverse_lookup(ADDRESS) == ["create.rxd", "explorer.rxd"]
     assert "wave.reverse_lookup" in plain.received  # the -32601 happened and was moved past
+
+
+# Every public RxinDexerClient method: (its RPC, call args, what the indexer serves, what the
+# method returns). Checked in both directions against the class and _REVIEWED_READS below, so
+# a method cannot be added to the client without being driven here.
+REF = "9044a9f66bc747bff06f5496e1bf4d89eb78b3f1cb291722525832bc655fed11_0"
+_STATS = {"total_names": 14, "tip_height": 400_000}
+_PAGE = {"tokens": [{"ref": REF}], "next_cursor": None}
+_EVERY_METHOD = {
+    "wave_resolve": ("wave.resolve", ("create",), {"name": "create", "ref": REF}, {"name": "create", "ref": REF}),
+    "wave_check_available": ("wave.check_available", ("create",), {"available": False, "ref": REF}, False),
+    "wave_reverse_lookup": ("wave.reverse_lookup", (ADDRESS,), [_entry("create")], ["create.rxd"]),
+    "wave_get_subdomains": ("wave.get_subdomains", ("create",), ["a.create.rxd"], ["a.create.rxd"]),
+    "wave_stats": ("wave.stats", (), _STATS, IndexerStats.from_response(_STATS)),
+    "glyph_get_token": ("glyph.get_token", (REF,), {"ref": REF}, {"ref": REF}),
+    "glyph_get_balance": ("glyph.get_balance", (ADDRESS,), {"confirmed": 5}, {"confirmed": 5}),
+    "glyph_get_metadata": ("glyph.get_metadata", (REF,), {"name": "x"}, {"name": "x"}),
+    "glyph_get_recent": ("glyph.get_recent", (), _PAGE, _PAGE),
+    "glyph_get_tokens_by_type": ("glyph.get_tokens_by_type", (2,), _PAGE, _PAGE),
+    "swap_get_orders": ("swap.get_orders", (REF,), [{"order": 1}], [{"order": 1}]),
+}
+
+
+def test_the_every_method_table_is_every_method() -> None:
+    public = {n for n, _ in inspect.getmembers(RxinDexerClient, inspect.iscoroutinefunction) if not n.startswith("_")}
+    assert set(_EVERY_METHOD) == public
+    assert {rpc for rpc, *_ in _EVERY_METHOD.values()} == _REVIEWED_READS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", sorted(_EVERY_METHOD))
+async def test_every_indexer_method_moves_past_a_server_without_the_extension(monkeypatch, name) -> None:
+    """Each method, driven through the real failover client with the plain server first. The
+    membership pin checks the NAMES `_call` sends; this checks each one is actually sent in a
+    way that fails over — radiant4people answered -32601 to glyph.* and swap.* too."""
+    rpc, args, served, expected = _EVERY_METHOD[name]
+    plain = _Server(PLAIN_URL, indexer=False)
+    idx = _Server(INDEXER_URL, indexer=True, results={rpc: served})
+    _wire(monkeypatch, plain, idx)
+
+    async with FailoverElectrumXClient(_default_profile()) as client:
+        assert await getattr(RxinDexerClient(client), name)(*args) == expected
+        assert client.active_url == PLAIN_URL
+    assert plain.received == ["blockchain.block.header", rpc]  # asked first; answered -32601
+    assert idx.received == ["blockchain.block.header", rpc]
+    assert plain.unexpected == idx.unexpected == []
 
 
 @pytest.mark.asyncio

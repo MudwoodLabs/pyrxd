@@ -263,14 +263,34 @@ async def test_a_dead_endpoint_passed_over_on_the_way_still_promotes_the_winner(
     assert fakes[A].closed == 0
 
 
-async def test_not_idempotent_the_answer_surfaces_and_the_endpoint_is_not_closed() -> None:
+async def test_not_idempotent_a_missing_method_is_still_a_fault() -> None:
+    """Only an idempotent extension call treats -32601 as an answer. A caller that did not
+    declare its call a read gets exactly the old behaviour: no retry, and the endpoint dropped."""
     client, fakes = build([A, B])
     fakes[A].extension_error = _method_not_found("some.method")
 
-    with pytest.raises(RpcMethodNotFound):
+    with pytest.raises(NetworkError, match=r"^ElectrumX RPC error \(code -32601\)$"):
         await client.call_extension("some.method")
     assert fakes[B].calls == []
-    assert fakes[A].closed == 0
+    assert fakes[A].closed == 1
+
+
+async def test_on_a_core_read_a_missing_method_is_still_a_fault() -> None:
+    """A server that cannot answer a CORE method is broken for our purposes, not merely
+    without an extension: dropped, routed around, and the all-endpoints error is unchanged."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _method_not_found("blockchain.headers.subscribe")
+    fakes[B].tip_value = 4242
+
+    assert int(await client.get_tip_height()) == 4242
+    assert fakes[A].closed == 1
+    assert client.active_url == B
+
+    fakes[B].tip_error = _method_not_found("blockchain.headers.subscribe")
+    with pytest.raises(NetworkError) as exc:
+        await client.get_tip_height()
+    assert type(exc.value) is NetworkError
+    assert str(exc.value) == "get_tip_height failed on all 2 ElectrumX endpoint(s)"
 
 
 @pytest.mark.parametrize("urls", [[A], [A, B]], ids=["one endpoint", "two endpoints"])
