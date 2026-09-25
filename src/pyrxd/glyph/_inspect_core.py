@@ -1382,11 +1382,12 @@ def _classify_self_replicating(script: bytes, base: dict) -> dict:
 def _confusable_warnings(metadata) -> dict[str, str]:
     """Fields whose text mimics Latin characters, per the TR39 skeleton check.
 
-    Only reports MIMICRY. A name in a wholly non-Latin script is not flagged —
-    ``looks_confusable_with_latin`` says so explicitly, listing "トークン" and "中文"
-    among its non-flagged examples. That distinction is the point: a warning that
-    fires on every legitimate Japanese token is the false positive that trains a
-    reader to ignore the real one, which this repo names as a hazard elsewhere.
+    A name in a script with no Latin look-alike letters is not flagged: "トークン",
+    "中文" and "한국" pass. But ``looks_confusable_with_latin`` judges each character on
+    its own, so a whole word in Cyrillic, Greek, Hebrew or Arabic IS flagged ("москва",
+    "σοφία", "שלום", "مرحبا"), mimicry or not. A warning that fires on every legitimate
+    token in those scripts is the false positive that trains a reader to ignore the real
+    one, which this repo names as a hazard elsewhere; it is a known limit, not the intent.
 
     Returns ``{}`` when nothing is suspicious, so a caller can treat presence as
     the signal and absence as silence.
