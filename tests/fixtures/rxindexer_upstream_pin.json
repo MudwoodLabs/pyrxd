@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Baseline for scripts/check_photonic_drift.py. Each digest is the sha256 of",
+    "that file in Radiant-Core/RXinDexer at the commit below.",
+    "Do NOT hand-edit. Refresh with: python scripts/check_photonic_drift.py --target rxindexer --update-pin",
+    "and say in the commit message WHY each changed file is still consistent with",
+    "what pyrxd claims about it \u2014 that review is the entire point of the pin."
+  ],
+  "repo": "Radiant-Core/RXinDexer",
+  "commit": "ca8a6a4e77ef0ad3f24ec6f41cb0a73eb5f3651e",
+  "also_watch": [],
+  "not_found_at_this_commit": [],
+  "files": {
+    "electrumx/lib/glyph.py": "bdad3e8cd043bb423713ff07acc82883ea3228ac848b2d32439ef2ba999615db",
+    "electrumx/server/glyph_api.py": "27f8816e43c40d2f50e2daafce423dfd62d2bda269af871254097350e4dff061",
+    "electrumx/server/glyph_index.py": "8fdbf57ebd23a6ba58f95430bd582f7375d5903a839c07a032e7946ddea03fe2",
+    "electrumx/server/rest_api.py": "91fb253c2b4c325c56cdc5b957f63d3273dd3a6f6f43bcaa7e8a716fc995158a",
+    "electrumx/server/swap_index.py": "683c98f512a1fae1e8c32ccd7519ea9f764be87aa7be0d4a18a2d96b3db7b627",
+    "electrumx/server/wave_index.py": "2724f291a55e83751fdf553e52dd68413e66cde0a7e879ec91391241c99afe53"
+  }
+}

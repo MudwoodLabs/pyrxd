@@ -188,7 +188,10 @@ def estimate_reveal_fee(
     if not isinstance(cbor_bytes, (bytes, bytearray)):
         raise ValidationError("estimate_reveal_fee cbor_bytes must be bytes")
 
-    suffix = build_reveal_scriptsig_suffix(bytes(cbor_bytes))
+    # Sizing only, never written: the WAVE claim rule is enforced where a claim is actually
+    # built. Refusing here would also block pricing the one reveal the rule's escape exists
+    # for — recovering a commit pyrxd <=0.24.0 already broadcast.
+    suffix = build_reveal_scriptsig_suffix(bytes(cbor_bytes), allow_unregistrable_wave=True)
     scriptsig_bytes = REVEAL_SIG_PREFIX_BYTES + len(suffix)
 
     tx = _ShimTx(

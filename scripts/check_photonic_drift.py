@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report when Photonic Wallet moves under a claim pyrxd makes about it.
+"""Report when Photonic Wallet (or RXinDexer) moves under a claim pyrxd makes about it.
 
 pyrxd cites Photonic Wallet source in 170-odd places — docstrings that say what
 its verifiers do, §15 of the protocol spec, and the interop fixtures generated
@@ -8,19 +8,26 @@ else's repository, and **no test in pyrxd can evaluate one**: the suite passes
 whether or not the sentence is still true. Photonic is actively maintained, so
 those claims decay silently, in the direction of looking correct.
 
+The same holds for Radiant-Core/RXinDexer, the indexer that registers WAVE names:
+pyrxd transcribes its claim rule (``validate_wave_name`` and the claim path in
+``electrumx/server/wave_index.py``) into ``pyrxd.glyph.wave_rules`` and into
+``tests/test_wave_claim_registers_with_the_indexer.py``. ``--target rxindexer``
+watches the RXinDexer files pyrxd cites, against their own pin.
+
 This script is the check that closes that gap. It does NOT decide anything —
 it reports drift and leaves the judgement to a human, because "upstream changed"
 can mean any of: they fixed a defect we reported (mark the §15 row as history),
-they changed a byte we emit (we have real work), or they touched a line number
-we cite (a citation refresh). Only a person can tell those apart.
+they changed a byte we emit or a rule we transcribe (we have real work), or they
+touched a line number we cite (a citation refresh). Only a person can tell those
+apart.
 
 TWO DESIGN CHOICES, both of them scars from this codebase's own history:
 
-1. **The watch set is DERIVED, never hand-typed.** It is every Photonic path
+1. **The watch set is DERIVED, never hand-typed.** It is every upstream path
    this repository cites, recovered by scanning the tree. A hand-kept list is
    the failure this project keeps repeating — a guard that is structural about
    the thing it checks and hand-maintained about the SET it runs over passes
-   vacuously over exactly the case it was written for. Cite a new Photonic file
+   vacuously over exactly the case it was written for. Cite a new upstream file
    anywhere and it is watched on the next run, with nobody having to remember.
 
 2. **It fails loudly rather than reporting "clean" when it cannot do its job.**
@@ -40,10 +47,43 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-REPO = "Radiant-Core/Photonic-Wallet"
-PIN_PATH = Path("tests/fixtures/photonic_upstream_pin.json")
+
+class Target(NamedTuple):
+    """One upstream repository whose cited files are pinned.
+
+    A NamedTuple, not a dataclass: the tests load this script with
+    ``importlib.util.spec_from_file_location`` without registering it in ``sys.modules``,
+    and ``@dataclass`` looks its own module up there and fails.
+    """
+
+    name: str
+    repo: str
+    pin_path: Path
+    #: An upstream source path as pyrxd writes it in prose and code comments.
+    citation_re: re.Pattern[str]
+
+
+PHOTONIC = Target(
+    name="photonic",
+    repo="Radiant-Core/Photonic-Wallet",
+    pin_path=Path("tests/fixtures/photonic_upstream_pin.json"),
+    citation_re=re.compile(r"packages/(?:lib|app)/src/[A-Za-z0-9_/.-]+\.tsx?"),
+)
+RXINDEXER = Target(
+    name="rxindexer",
+    repo="Radiant-Core/RXinDexer",
+    pin_path=Path("tests/fixtures/rxindexer_upstream_pin.json"),
+    citation_re=re.compile(r"electrumx/(?:server|lib)/[A-Za-z0-9_/.-]+\.py"),
+)
+TARGETS = {t.name: t for t in (PHOTONIC, RXINDEXER)}
+
+#: The Photonic target's values, kept as module names because existing callers read them.
+REPO = PHOTONIC.repo
+PIN_PATH = PHOTONIC.pin_path
+CITATION_RE = PHOTONIC.citation_re
+
 #: DERIVED, not listed. This was an allowlist of four top-level directories, which
 #: made the scan structural about WHICH FILES it read and hand-kept about WHERE it
 #: looked — the same shape this script exists to avoid. It missed `ci`,
@@ -53,9 +93,6 @@ PIN_PATH = Path("tests/fixtures/photonic_upstream_pin.json")
 #: the repo root and subtracting SKIP_DIRS means a new directory is covered the day
 #: it is created.
 SEARCH_SUFFIXES = {".py", ".md", ".ts", ".json", ".yml", ".yaml", ".rst", ".toml"}
-
-#: A Photonic source path as pyrxd writes it in prose and code comments.
-CITATION_RE = re.compile(r"packages/(?:lib|app)/src/[A-Za-z0-9_/.-]+\.tsx?")
 
 #: Directories that hold COPIES of this repository (agent worktrees) or vendored
 #: third-party trees. Scanning them double-counts and can resurrect deleted
@@ -80,31 +117,32 @@ def _urlopen(req: urllib.request.Request, what: str) -> Any:
     return urllib.request.urlopen(req, timeout=30)  # noqa: S310 - scheme checked above
 
 
-def cited_paths(root: Path) -> dict[str, list[str]]:
-    """Every Photonic path this repo cites -> the pyrxd files citing it."""
+def cited_paths(root: Path, target: Target = PHOTONIC) -> dict[str, list[str]]:
+    """Every upstream path of ``target`` this repo cites -> the pyrxd files citing it."""
+    # Every pin lists its watched paths, so scanning one would make each entry "cited"
+    # by the pin itself and turn the completeness test vacuously true — a guard passing
+    # because it reads its own answer. All pins are skipped, not only this target's.
+    pins = {(root / t.pin_path).resolve() for t in TARGETS.values()}
     found: dict[str, list[str]] = {}
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix not in SEARCH_SUFFIXES:
             continue
         if SKIP_DIRS & set(path.relative_to(root).parts):
             continue
-        # The pin lists every watched path, so scanning it would make each
-        # entry "cited" by the pin itself and turn the completeness test
-        # vacuously true — a guard passing because it reads its own answer.
-        if path.resolve() == (root / PIN_PATH).resolve():
+        if path.resolve() in pins:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for hit in CITATION_RE.findall(text):
+        for hit in target.citation_re.findall(text):
             found.setdefault(hit, []).append(str(path.relative_to(root)))
     return found
 
 
-def fetch(path: str, ref: str) -> bytes:
-    url = f"https://raw.githubusercontent.com/{REPO}/{ref}/{path}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pyrxd-photonic-drift"})
+def fetch(path: str, ref: str, target: Target = PHOTONIC) -> bytes:
+    url = f"https://raw.githubusercontent.com/{target.repo}/{ref}/{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": f"pyrxd-{target.name}-drift"})
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
@@ -120,55 +158,56 @@ def fetch(path: str, ref: str) -> bytes:
         raise HarnessError(f"network error fetching {path}: {exc.reason}") from exc
 
 
-def load_pin() -> dict[str, Any]:
-    if not PIN_PATH.exists():
-        raise HarnessError(f"{PIN_PATH} is missing — run with --update-pin to create it")
-    pin: dict[str, Any] = json.loads(PIN_PATH.read_text(encoding="utf-8"))
+def load_pin(target: Target = PHOTONIC) -> dict[str, Any]:
+    if not target.pin_path.exists():
+        raise HarnessError(f"{target.pin_path} is missing — run with --update-pin to create it")
+    pin: dict[str, Any] = json.loads(target.pin_path.read_text(encoding="utf-8"))
     return pin
 
 
-def resolve_head() -> str:
+def resolve_head(target: Target = PHOTONIC) -> str:
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{REPO}/commits/main",
-        headers={"User-Agent": "pyrxd-photonic-drift", "Accept": "application/vnd.github+json"},
+        f"https://api.github.com/repos/{target.repo}/commits/main",
+        headers={"User-Agent": f"pyrxd-{target.name}-drift", "Accept": "application/vnd.github+json"},
     )
     if token := os.environ.get("GITHUB_TOKEN"):
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with _urlopen(req, f"{REPO}@main") as resp:
+        with _urlopen(req, f"{target.repo}@main") as resp:
             sha: str = json.load(resp)["sha"]
             return sha
     except (urllib.error.URLError, KeyError, ValueError) as exc:
-        raise HarnessError(f"could not resolve {REPO}@main: {exc}") from exc
+        raise HarnessError(f"could not resolve {target.repo}@main: {exc}") from exc
 
 
-def update_pin(root: Path, commit: str) -> int:
-    cites = cited_paths(root)
+def update_pin(root: Path, commit: str, target: Target = PHOTONIC) -> int:
+    cites = cited_paths(root, target)
     if not cites:
-        raise HarnessError("no Photonic citations found — refusing to write an empty pin")
+        raise HarnessError(f"no {target.name} citations found — refusing to write an empty pin")
     # Files we depend on whose CITATION has not landed yet — an in-flight branch,
     # or a dependency expressed in something this scan cannot see. Preserved across
     # refreshes so a refresh cannot silently stop watching one.
-    also = list(load_pin().get("also_watch", [])) if PIN_PATH.exists() else []
+    also = list(load_pin(target).get("also_watch", [])) if target.pin_path.exists() else []
     files: dict[str, str] = {}
     missing: list[str] = []
     for path in sorted(set(cites) | set(also)):
         try:
-            files[path] = hashlib.sha256(fetch(path, commit)).hexdigest()
+            files[path] = hashlib.sha256(fetch(path, commit, target)).hexdigest()
         except FileNotFoundError:
             missing.append(path)
-    PIN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PIN_PATH.write_text(
+    flag = "" if target is PHOTONIC else f" --target {target.name}"
+    target.pin_path.parent.mkdir(parents=True, exist_ok=True)
+    target.pin_path.write_text(
         json.dumps(
             {
                 "_comment": [
                     "Baseline for scripts/check_photonic_drift.py. Each digest is the sha256 of",
-                    "that file in Radiant-Core/Photonic-Wallet at the commit below.",
-                    "Do NOT hand-edit. Refresh with: python scripts/check_photonic_drift.py --update-pin",
+                    f"that file in {target.repo} at the commit below.",
+                    f"Do NOT hand-edit. Refresh with: python scripts/check_photonic_drift.py{flag} --update-pin",
                     "and say in the commit message WHY each changed file is still consistent with",
                     "what pyrxd claims about it — that review is the entire point of the pin.",
                 ],
-                "repo": REPO,
+                "repo": target.repo,
                 "commit": commit,
                 "also_watch": sorted(also),
                 "not_found_at_this_commit": missing,
@@ -183,15 +222,15 @@ def update_pin(root: Path, commit: str) -> int:
     return 0
 
 
-def check(root: Path) -> int:
-    pin = load_pin()
-    cites = cited_paths(root)
+def check(root: Path, target: Target = PHOTONIC) -> int:
+    pin = load_pin(target)
+    cites = cited_paths(root, target)
     if not cites:
         raise HarnessError(
-            "no Photonic citations found in the tree. Either the citation format changed "
+            f"no {target.name} citations found in the tree. Either the citation format changed "
             "or the scan is broken — this is a harness failure, NOT 'no drift'."
         )
-    head = resolve_head()
+    head = resolve_head(target)
     pinned: dict[str, str] = pin["files"]
 
     changed, vanished, unpinned, stale_pin = [], [], [], []
@@ -203,7 +242,7 @@ def check(root: Path) -> int:
         if path not in pinned:
             continue
         try:
-            digest = hashlib.sha256(fetch(path, head)).hexdigest()
+            digest = hashlib.sha256(fetch(path, head, target)).hexdigest()
         except FileNotFoundError:
             vanished.append(path)
             continue
@@ -215,12 +254,13 @@ def check(root: Path) -> int:
         if path not in cites and path not in also:
             stale_pin.append(path)
 
+    print(f"target   : {target.repo}")
     print(f"pin      : {pin['commit'][:7]}  ({len(pinned)} files)")
     print(f"upstream : {head[:7]}")
-    print(f"cited    : {len(cites)} distinct Photonic paths\n")
+    print(f"cited    : {len(cites)} distinct {target.name} paths\n")
 
     if not (changed or vanished or unpinned or stale_pin):
-        print("No drift. Every cited Photonic file is byte-identical to the pin.")
+        print(f"No drift. Every cited {target.name} file is byte-identical to the pin.")
         return 0
 
     if changed:
@@ -229,7 +269,7 @@ def check(root: Path) -> int:
             print(f"  {p}")
             for citer in sorted(set(cites[p]))[:4]:
                 print(f"      cited by {citer}")
-        print(f"\n  Diff: https://github.com/{REPO}/compare/{pin['commit'][:7]}...{head[:7]}\n")
+        print(f"\n  Diff: https://github.com/{target.repo}/compare/{pin['commit'][:7]}...{head[:7]}\n")
     if vanished:
         print(f"GONE upstream ({len(vanished)}) — renamed or deleted; every citation is now dangling:")
         for p in vanished:
@@ -248,7 +288,7 @@ def check(root: Path) -> int:
 
     print("This is a REPORT, not a verdict. Read the diff and decide which applies:")
     print("  - upstream fixed something we reported -> mark the §15 row as history, keep the row")
-    print("  - upstream changed bytes we emit       -> real work in pyrxd")
+    print("  - upstream changed bytes we emit, or a rule we transcribe -> real work in pyrxd")
     print("  - upstream moved lines we cite         -> refresh citations")
     print("Then re-pin with --update-pin and say which it was.")
     return 1
@@ -256,15 +296,17 @@ def check(root: Path) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--target", choices=sorted(TARGETS), default=PHOTONIC.name, help="which upstream to check")
     ap.add_argument("--update-pin", action="store_true", help="rewrite the baseline from upstream main")
     ap.add_argument("--commit", help="pin to this commit instead of current main")
     args = ap.parse_args()
+    target = TARGETS[args.target]
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
     try:
         if args.update_pin:
-            return update_pin(root, args.commit or resolve_head())
-        return check(root)
+            return update_pin(root, args.commit or resolve_head(target), target)
+        return check(root, target)
     except HarnessError as exc:
         print(f"HARNESS FAILURE: {exc}", file=sys.stderr)
         print("Reported as failure, not as 'no drift'.", file=sys.stderr)

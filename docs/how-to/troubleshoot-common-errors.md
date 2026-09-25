@@ -165,7 +165,7 @@ error: commit value cannot cover the reveal fee — refusing to broadcast the co
 [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py)
 wraps the library's `InsufficientFundsError` from
 [`check_reveal_funding`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/fees.py)
-(`src/pyrxd/glyph/fees.py:208-241`).
+(`src/pyrxd/glyph/fees.py:211-244`).
 
 **Cause:** the reveal transaction's scriptSig carries the **entire CBOR
 metadata payload**, so a large `metadata.json` (a long image URL, several

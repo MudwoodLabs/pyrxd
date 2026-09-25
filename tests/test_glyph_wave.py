@@ -85,18 +85,25 @@ class TestBuildWaveMetadata:
         assert GlyphProtocol.WAVE in md.protocol
 
     def test_attrs_match_photonic_shape(self):
+        """The BARE LABEL in attrs.name. The qualified name here was #728: RXinDexer refuses
+        the '.', so by its source no claim build_wave_metadata built through 0.24.0 was indexed.
+        test_wave_claim_registers_with_the_indexer.py shows the field set is Photonic's and the
+        bytes equal a mainnet claim the indexer resolves (not a claim Photonic encoded)."""
         md = build_wave_metadata(qualified_name="alice.rxd", target=ADDR)
         assert md.attrs == {
-            "name": "alice.rxd",
+            "name": "alice",
             "domain": "rxd",
             "target": ADDR,
             "target_type": "address",
         }
 
-    def test_top_level_name_is_empty(self):
-        """The canonical shape puts name in attrs.name, NOT top-level."""
+    def test_top_level_name_is_the_qualified_name(self):
+        """Photonic writes the qualified name at the top level (createWaveNameMetadata's
+        `name: fullName`); pyrxd left it empty through 0.24.0."""
         md = build_wave_metadata(qualified_name="alice.rxd", target=ADDR)
-        assert md.name == ""
+        assert md.name == "alice.rxd"
+        assert md.v == 2
+        assert md.token_type == "wave_name"
 
     def test_description_at_top_level(self):
         """Description is a regular Glyph field, NOT in attrs."""
@@ -116,8 +123,10 @@ class TestBuildWaveMetadata:
         decoded = cbor2.loads(cbor_bytes)
         attrs = extract_wave_attrs(decoded)
         assert attrs is not None
-        assert attrs.name == "alice.rxd"
+        assert attrs.name == "alice"
+        assert attrs.domain == "rxd"
         assert attrs.target == ADDR
+        assert decoded["name"] == "alice.rxd"
 
     def test_no_domain_in_name_defaults_to_rxd(self):
         md = build_wave_metadata(qualified_name="alice", target=ADDR)
@@ -138,7 +147,7 @@ class TestExtractWaveAttrs:
         cbor_bytes, _ = encode_payload(md)
         attrs = extract_wave_attrs(cbor2.loads(cbor_bytes))
         assert attrs is not None
-        assert attrs.name == "alice.rxd"
+        assert attrs.name == "alice"
 
     def test_returns_none_for_non_wave(self):
         md = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="just-an-nft")
@@ -163,7 +172,7 @@ class TestWaveAttrsFromMetadata:
         md = build_wave_metadata(qualified_name="alice.rxd", target=ADDR)
         attrs = wave_attrs_from_metadata(md)
         assert attrs is not None
-        assert attrs.name == "alice.rxd"
+        assert attrs.name == "alice"
 
     def test_returns_none_for_plain_nft(self):
         md = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="just-an-nft")

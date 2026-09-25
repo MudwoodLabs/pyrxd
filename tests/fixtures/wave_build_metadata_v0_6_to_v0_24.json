@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "What build_wave_metadata + encode_payload produced in every tagged pyrxd release that",
+    "shipped them, run from each release's own source. Regenerate with",
+    "python scripts/record_legacy_wave_bytes.py; do not hand-edit."
+  ],
+  "releases": [
+    "v0.6.0",
+    "v0.6.1",
+    "v0.7.0",
+    "v0.8.0",
+    "v0.9.0",
+    "v0.10.0",
+    "v0.11.0",
+    "v0.11.1",
+    "v0.11.2",
+    "v0.12.0",
+    "v0.13.0",
+    "v0.14.0",
+    "v0.15.0",
+    "v0.16.0",
+    "v0.17.0",
+    "v0.18.0",
+    "v0.19.0",
+    "v0.20.0",
+    "v0.21.0",
+    "v0.22.0",
+    "v0.23.0",
+    "v0.24.0"
+  ],
+  "cases": {
+    "plain": {
+      "qualified_name": "alice.rxd",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7"
+    },
+    "description": {
+      "qualified_name": "alice.rxd",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7",
+      "description": "my name"
+    },
+    "no-dot": {
+      "qualified_name": "alice",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7"
+    },
+    "multi-dot": {
+      "qualified_name": "pay.alice.rxd",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7"
+    },
+    "non-ascii": {
+      "qualified_name": "トークン.rxd",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7"
+    },
+    "target-type": {
+      "qualified_name": "custodian-gate-x7f3.rxd",
+      "target": "1CPfirXZahPrTb93QouwBfKDoz1ykfcBb7",
+      "target_type": "cross_chain"
+    }
+  },
+  "cbor_hex": {
+    "plain": "a261708302050b656174747273a4646e616d6569616c6963652e72786466646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656761646472657373",
+    "description": "a361708302050b6464657363676d79206e616d65656174747273a4646e616d6569616c6963652e72786466646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656761646472657373",
+    "no-dot": "a261708302050b656174747273a4646e616d6565616c69636566646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656761646472657373",
+    "multi-dot": "a261708302050b656174747273a4646e616d656d7061792e616c6963652e72786466646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656761646472657373",
+    "non-ascii": "a261708302050b656174747273a4646e616d6570e38388e383bce382afe383b32e72786466646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656761646472657373",
+    "target-type": "a261708302050b656174747273a4646e616d6577637573746f6469616e2d676174652d783766332e72786466646f6d61696e63727864667461726765747822314350666972585a6168507254623933516f757742664b446f7a31796b66634262376b7461726765745f747970656b63726f73735f636861696e"
+  },
+  "disagreements": {}
+}

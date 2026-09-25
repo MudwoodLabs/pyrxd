@@ -413,7 +413,7 @@ class TestDecodePayloadSecurityAudit2026:
     @pytest.mark.parametrize(
         ("field", "value", "protocol"),
         [
-            ("name", "x" * 65, [2]),
+            ("name", "x" * 201, [2]),
             ("desc", "x" * 1001, [2]),
             ("ticker", "x" * 17, [1]),
             ("image", "https://example.com/" + "x" * 500, [2]),
@@ -780,7 +780,7 @@ class TestScriptSigSuffixEncoding:
         inspector = GlyphInspector()
         for size_hint in (1, 74, 75, 76, 200, 255, 256, 300):
             # Pad description (limit 1000) so CBOR comes out at approximately size_hint.
-            # name is capped at 64 chars; description allows up to 1000.
+            # name is capped at 200 chars; description allows up to 1000.
             meta = GlyphMetadata(protocol=[2], description="x" * max(0, size_hint - 10))
             cbor_bytes = cbor2.dumps(meta.to_cbor_dict())
             suffix = build_reveal_scriptsig_suffix(cbor_bytes)

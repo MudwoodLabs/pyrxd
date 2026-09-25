@@ -21,6 +21,7 @@ from .types import (
     GlyphRights,
     GlyphRoyalty,
 )
+from .wave_rules import refuse_unregistrable_wave_claim
 
 _log = logging.getLogger(__name__)
 
@@ -518,7 +519,11 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         crypto=crypto,
         container_refs=_decode_rel_refs(d.get("in"), "in"),
         author_refs=_decode_rel_refs(d.get("by"), "by"),
-        name=_cbor_str(d, "name", 64),
+        # 200, the cap RXinDexer's glyph index applies to token names
+        # (electrumx/server/glyph_index.py:1465 at ca8a6a4e). It was 64, which dropped every
+        # WAVE name with a 61-63 character label: the qualified name is the label plus ".rxd",
+        # up to 67 characters.
+        name=_cbor_str(d, "name", 200),
         ticker=_cbor_str(d, "ticker", 16),
         description=_cbor_str(d, "desc", 1000),
         token_type=_cbor_str(d, "type", 64),
@@ -561,7 +566,7 @@ def build_dat_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     return b"\x03" + GLY_MARKER + b"\x03" + DAT_MARKER + _encode_payload_push(cbor_bytes)
 
 
-def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
+def build_reveal_scriptsig_suffix(cbor_bytes: bytes, *, allow_unregistrable_wave: bool = False) -> bytes:
     """
     Return the 'gly' + CBOR portion of the reveal scriptSig.
 
@@ -575,7 +580,12 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
     — capping at PUSHDATA2 would have left pyrxd unable to build the
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
+
+    Refuses a WAVE claim the indexer would not register, unless ``allow_unregistrable_wave``
+    — see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`, which says what
+    that escape is for.
     """
+    refuse_unregistrable_wave_claim(cbor_bytes, allow_unregistrable_wave=allow_unregistrable_wave)
     return b"\x03" + GLY_MARKER + _encode_payload_push(cbor_bytes)
 
 
@@ -645,6 +655,9 @@ def build_mutable_scriptsig(
         raise ValidationError(f"operation must be 'mod' or 'sl', got {operation!r}")
     if not cbor_bytes:
         raise ValidationError("cbor_bytes must not be empty")
+    # An update envelope carrying WAVE in `p` is read as a registration by RXinDexer. No
+    # escape here: an update payload is chosen fresh, so refusing one strands nothing.
+    refuse_unregistrable_wave_claim(cbor_bytes)
     for name, val in (
         ("contract_output_index", contract_output_index),
         ("ref_hash_index", ref_hash_index),

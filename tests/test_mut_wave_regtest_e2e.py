@@ -69,6 +69,7 @@ from pyrxd.glyph.builder import CommitParams, GlyphBuilder, TransferParams
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import build_mutable_scriptsig, encode_payload
 from pyrxd.glyph.script import (
+    build_commit_locking_script,
     build_mutable_nft_script,
     build_nft_locking_script,
     hash_payload,
@@ -765,7 +766,12 @@ def test_the_wave_name_resolves_off_the_confirmed_reveal(node, wave):  # noqa: F
 
     attrs = wave_attrs_from_metadata(metadata)
     assert attrs is not None, "the registration is not indexer-visible — attrs.name is missing"
-    assert attrs.name == "regtest-alice.rxd"
+    # The BARE LABEL, which is what RXinDexer registers from. This line asserted
+    # "regtest-alice.rxd" through 0.24.0 — the shape the indexer refuses (#728) — so the
+    # assertion described as separating an indexable claim from an invisible one was pinning
+    # the invisible one.
+    assert attrs.name == "regtest-alice"
+    assert metadata.name == "regtest-alice.rxd"
     assert attrs.domain == "rxd"
     assert attrs.target == wave["target"]
     assert attrs.target_type == "address"
@@ -801,3 +807,79 @@ def test_the_wave_token_is_discoverable_and_spendable(node, wave):  # noqa: F811
     # the name, not what it points at.
     attrs = wave_attrs_from_metadata(_envelope_from_confirmed(node, wave["reveal_txid"]))
     assert attrs is not None and attrs.target == wave["target"]
+
+
+def test_a_commit_made_by_0_24_is_recovered_and_a_wrong_rebuild_is_rejected(node):  # noqa: F811
+    """``prepare_wave_reveal``'s ``allow_unregistrable_wave`` docstring, both halves on a node.
+
+    A 0.24.0 commit locks the hash of CBOR the current builders refuse to write, so it is
+    spent through the escape, with bytes rebuilt by the documented recipe. The docstring says
+    that if the rebuilt bytes differ in any way, consensus rejects the reveal and the commit
+    stays unspent, so it can be retried. This builds such a commit (``prepare_commit`` refuses
+    the shape, so its script is built directly, as 0.24.0's ``prepare_commit`` did), offers a
+    wrong rebuild, then the right one.
+    """
+    owner = PrivateKey()
+    owner_pkh = Hex20(owner.public_key().hash160())
+    name = "regtest-old.rxd"
+    target = PrivateKey().public_key().address()
+
+    def old_shape(description: str = "") -> bytes:
+        # The recipe from prepare_wave_reveal's docstring.
+        return encode_payload(
+            GlyphMetadata(
+                protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE],
+                attrs={"name": name, "domain": "rxd", "target": target, "target_type": "address"},
+                description=description,
+            )
+        )[0]
+
+    committed = old_shape()
+    commit_script = build_commit_locking_script(hash_payload(committed), owner_pkh, is_nft=True)
+    seed_key = PrivateKey()
+    seed_spk = P2PKH().lock(seed_key.public_key().hash160()).serialize()
+    commit_txid = _pay_outputs(node, [(commit_script, _COMMIT_VALUE), (seed_spk, _SEED_VALUE)])
+
+    def reveal(cbor: bytes) -> str:
+        scripts = GlyphBuilder().prepare_wave_reveal(
+            commit_txid, 0, cbor, owner_pkh, name, allow_unregistrable_wave=True
+        )
+        tx = Transaction(
+            tx_inputs=[
+                TransactionInput(
+                    source_transaction=_src(commit_txid, 0, commit_script, _COMMIT_VALUE),
+                    source_txid=commit_txid,
+                    source_output_index=0,
+                    unlocking_script_template=_reveal_unlock(owner, scripts.scriptsig_suffix),
+                ),
+                TransactionInput(
+                    source_transaction=_src(commit_txid, 1, seed_spk, _SEED_VALUE),
+                    source_txid=commit_txid,
+                    source_output_index=1,
+                    unlocking_script_template=_p2pkh_unlock(seed_key),
+                ),
+            ],
+            tx_outputs=[
+                TransactionOutput(Script(scripts.nft_script), _CARRIER),
+                TransactionOutput(Script(scripts.contract_script), _CARRIER),
+                TransactionOutput(
+                    P2PKH().lock(owner.public_key().hash160()), _COMMIT_VALUE + _SEED_VALUE - 2 * _CARRIER - _FEE
+                ),
+            ],
+        )
+        tx.sign()
+        return _assert_fee_covers(tx, _FEE)
+
+    wrong = old_shape(description="a description the commit never had")
+    assert hash_payload(wrong) != hash_payload(committed)
+    refused = node.accepts(reveal(wrong))
+    assert refused.get("allowed") is False, f"a reveal of bytes the commit did not lock was ACCEPTED: {refused}"
+    assert "script" in str(refused.get("reject-reason", "")).lower(), refused
+    assert node.cli("gettxout", commit_txid, "0"), "the commit output should still be unspent"
+
+    right = reveal(committed)
+    accepted = node.accepts(right)
+    assert accepted.get("allowed") is True, f"the recovery reveal was REJECTED: {accepted}"
+    txid = str(node.cli("sendrawtransaction", right))
+    node.mine(1)
+    _confirmed(node, txid)

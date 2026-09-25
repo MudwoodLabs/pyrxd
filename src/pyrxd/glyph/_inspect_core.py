@@ -1415,9 +1415,11 @@ def _classify_metadata_protocol(metadata) -> str:
     test suite against both.
 
     Operates on a parsed :class:`~pyrxd.glyph.types.GlyphMetadata` so the
-    WAVE case can require a resolvable ``attrs.name`` (legacy top-level-name
-    WAVE tokens exist on-chain but RXinDexer won't index them, so they
-    classify as their underlying ``mut``).
+    WAVE case can require an ``attrs.name`` (legacy top-level-name WAVE
+    tokens exist on-chain but RXinDexer won't index them, so they classify
+    as their underlying ``mut``). PRESENT, not resolvable: a pyrxd ≤0.24.0
+    claim carries a qualified ``attrs.name`` RXinDexer does not index, and it
+    still classifies as ``wave`` here, as it does in ``wave.py``.
 
     Ordering is highest-specificity-first; TIMELOCK is checked before
     ENCRYPTED because TIMELOCK *requires* ENCRYPTED (see the protocol rules
@@ -2134,8 +2136,9 @@ def _classify_raw_tx(
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             # Human-friendly highest-specificity protocol label (e.g. "wave",
             # "container", "timelock", "authority", "dat"). Computed from the
-            # real GlyphMetadata so the WAVE case can require a resolvable
-            # attrs.name. The label is drawn from a fixed internal vocabulary,
+            # real GlyphMetadata so the WAVE case can require an attrs.name
+            # (present, not proven resolvable — see _classify_metadata_protocol).
+            # The label is drawn from a fixed internal vocabulary,
             # not user-controllable CBOR text, so no sanitization is needed.
             "classification": _classify_metadata_protocol(metadata),
             "name": _sanitize_display_string(metadata.name) if metadata.name else "",

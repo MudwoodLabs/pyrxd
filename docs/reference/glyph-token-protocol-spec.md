@@ -177,7 +177,7 @@ bytes and is **not** covered by the payload hash
 (`src/pyrxd/glyph/payload.py:16, 22-24`).
 
 The push opcode for the CBOR body MUST be selected by length
-(`src/pyrxd/glyph/payload.py:504-519`; pinned across boundary lengths at
+(`src/pyrxd/glyph/payload.py:505-520`; pinned across boundary lengths at
 `tests/test_glyph_cbor_roundtrip.py:184-232`):
 
 | CBOR length `n` | Push encoding |
@@ -206,7 +206,7 @@ This is the most consequential detail in the envelope, and it is easy to get
 backwards.
 
 **Producer rule.** pyrxd encodes with `cbor2.dumps(payload, canonical=True)`
-(`src/pyrxd/glyph/payload.py:67`) — RFC 8949 deterministic form: map keys sorted
+(`src/pyrxd/glyph/payload.py:68`) — RFC 8949 deterministic form: map keys sorted
 length-first then bytewise, shortest-form integer and length encodings, shortest
 unambiguous floats. Producers SHOULD use this form. It makes an envelope a pure
 function of its logical content, independent of field-declaration order in the
@@ -242,13 +242,13 @@ Three normative consequences follow:
 All fields are OPTIONAL except `p`. Unknown fields MUST be ignored by a decoder
 rather than treated as an error (see §16.1 for what pyrxd does with them today).
 Field names, decoder types, and limits are from
-`src/pyrxd/glyph/payload.py:95-261` and `src/pyrxd/glyph/types.py:314-408`.
+`src/pyrxd/glyph/payload.py:96-262` and `src/pyrxd/glyph/types.py:314-408`.
 
 | Key | CBOR type | Required | Max length | Meaning |
 |---|---|---|---|---|
 | `p` | array of uint | **yes** | — | Protocol markers (§8.1) |
 | `v` | uint | no | — | Envelope version. Absent = V1; `2` = V2 |
-| `name` | text | no | 64 | Display name |
+| `name` | text | no | 200 | Display name. 200 is the cap RXinDexer's glyph index applies (`electrumx/server/glyph_index.py:1465` at `ca8a6a4e`, which truncates; pyrxd's decoder drops). It was 64 until #728, which dropped the qualified name of every WAVE claim with a 61-63 character label: the label plus `.rxd` is up to 67 characters, and Photonic writes it |
 | `ticker` | text | no | 16 | FT ticker symbol |
 | `desc` | text | no | 1000 | Description |
 | `type` | text | no | 64 | Free-form NFT type tag |
@@ -278,17 +278,17 @@ Notes on individual fields:
   the refs it parsed out of the reveal's *output* scripts, which is the only
   check either field admits (§7.5, §9.4). Entries MAY be raw byte strings or
   wrapped in **CBOR tag 64**, like `main.b`; a decoder MUST accept both
-  (`src/pyrxd/glyph/payload.py:140-179`). pyrxd emits raw byte strings.
+  (`src/pyrxd/glyph/payload.py:141-180`). pyrxd emits raw byte strings.
   A decoder SHOULD drop a malformed entry rather than fail the whole envelope —
   this is advisory metadata on an attacker-controlled payload.
 
 - **`main.b`** MAY be a raw byte string or a byte string wrapped in **CBOR tag 64**
   (uint8 array). Photonic emits tag 64; a decoder MUST unwrap it
-  (`src/pyrxd/glyph/payload.py:217-224`). The mainnet fixture uses tag 64 for a
+  (`src/pyrxd/glyph/payload.py:218-225`). The mainnet fixture uses tag 64 for a
   65,430-byte PNG (verified by decoding the fixture).
 - **`decimals`** is display metadata only. On chain, one photon is one FT unit;
   nothing scales by `decimals`. A decoder MUST reject a float or boolean here —
-  CBOR floats truncate silently (`src/pyrxd/glyph/payload.py:79-89`).
+  CBOR floats truncate silently (`src/pyrxd/glyph/payload.py:80-90`).
 - **`policy.transferable = false`** is an advisory soulbound marker. It is not
   enforced by any script pyrxd builds for an ordinary NFT; see §9.4.
 - **`commit_outpoint`** is self-declared metadata. Nothing checks it against the
@@ -324,7 +324,7 @@ over it.** The cap is gone; this sentence is restored.
 
 ### 4.5 What a decoder MUST reject
 
-`src/pyrxd/glyph/payload.py:95-261`:
+`src/pyrxd/glyph/payload.py:96-262`:
 
 - A body larger than 262,144 bytes.
 - Bytes that are not decodable CBOR.
@@ -345,8 +345,8 @@ behaviour, including Photonic-minted glyphs carrying `loc` as an integer.
 
 A decoder SHOULD NOT reject the whole envelope because one optional sub-object is
 malformed. pyrxd logs and drops a malformed `creator`, `royalty`, `policy`, or
-`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:450-477`). A malformed
-`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:443-448`) — an
+`rights` and keeps the rest (`src/pyrxd/glyph/payload.py:451-478`). A malformed
+`dmint` object, by contrast, raises (`src/pyrxd/glyph/payload.py:444-449`) — an
 asymmetry that is deliberate for a field indexers price tokens from, but it is an
 asymmetry, and an interoperating implementation should know about it.
 
@@ -585,7 +585,7 @@ PUSH3 "gly" PUSH <cbor> PUSH <op> <contract_output_index> <ref_hash_index> <ref_
 
 where `op` is `"mod"` (update the payload hash) or `"sl"` (seal — burn the
 contract). Index integers use minimal push encoding
-(`src/pyrxd/glyph/payload.py:522-541`).
+(`src/pyrxd/glyph/payload.py:527-546`).
 
 This specification reproduces the body as a constant and does not restate a
 stack-level derivation of it. Note that pyrxd's own size constant is **174**
@@ -850,7 +850,7 @@ envelope carries more type information than the chain does.
 
 `src/pyrxd/glyph/_inspect_core.py:1073-1228` is the dispatch order pyrxd uses — NFT, FT,
 container-legacy, MUT, commit-NFT, commit-FT, in that order — and
-`src/pyrxd/glyph/_inspect_core.py:1404-1466` is the envelope-side classification, which returns
+`src/pyrxd/glyph/_inspect_core.py:1404-1468` is the envelope-side classification, which returns
 the highest-specificity marker present.
 
 (Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,
@@ -973,7 +973,7 @@ with an `02` or `03` prefix (`src/pyrxd/glyph/types.py:207-215`).
 
 The signing encoder is `cbor2.dumps(d, canonical=True)`
 (`src/pyrxd/glyph/creator.py:117`) — the **same** canonical form the on-chain
-envelope is encoded with (`src/pyrxd/glyph/payload.py:67`). Signing and
+envelope is encoded with (`src/pyrxd/glyph/payload.py:68`). Signing and
 publication therefore agree byte-for-byte for a pyrxd-minted token, which is
 what makes such a signature verifiable from the chain at all.
 
@@ -1333,7 +1333,7 @@ behaviour stay on chain and a reader still has to handle them.
 
 | Area | Photonic | pyrxd | Reason |
 |---|---|---|---|
-| Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:28-68`). Consumers on both sides must accept either (§4.2). |
+| Envelope encoding | Producer-order CBOR (the mainnet fixture is non-canonical — §14) | RFC 8949 canonical | Determinism across source refactors and re-encoders (`src/pyrxd/glyph/payload.py:29-69`). Consumers on both sides must accept either (§4.2). |
 | Royalty `minimum` with `splits` | Each split computed independently; `minimum` never consulted, so a royalty declaring `bps=100, minimum=50000` pays the minimum with one recipient and ignores it with two | Total computed once, then divided | Photonic's version can pay the creator less than the recorded terms (`src/pyrxd/glyph/royalty.py:56-68`). |
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
@@ -1345,7 +1345,7 @@ behaviour stay on chain and a reader still has to handle them.
 | V1 dMint `maxHeight` at deploy | `dMintScript` builds any `maxHeight`; mainnet has V1 contracts above 2^31 (`$BRO`: 696,969,000,000) | Refused above 2^31. Such contracts are still read and minted up to height 2^31 − 1, and the mint from there is refused | A V1 contract's height is a 4-byte field that every mint but the last rewrites as `NUM2BIN(height + 1, 4)`, which cannot encode 2^31, so above that `maxHeight` the contract stops at height 2^31 − 1 with mints left (`src/pyrxd/glyph/dmint/types.py` `MAX_V1_MAX_HEIGHT`, `check_dmint_v1_bounds`). |
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
 | V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
-| WAVE name location | `attrs.name` | Accepts `attrs.name` (canonical) or a top-level `name` (legacy) | Legacy pyrxd tokens exist on chain; they are accepted but will not resolve against RXinDexer (`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_wave_reveal`). |
+| WAVE name location | Bare label in `attrs.name`, domain in `attrs.domain`, qualified name at top-level `name`, plus `v: 2` and `type: "wave_name"` (`createWaveNameMetadata`, `packages/lib/src/wave.ts`). Its `validateWaveName` refuses a label under 3 characters (`packages/lib/src/wave.ts:32`) | The same fields since #728 (`attrs.expires` only when asked). The bytes equal those of mainnet claim `f644794b…`, which the public indexer resolves; that claim is canonical CBOR and was not encoded by Photonic's `cbor-x`, so this is a field-level match with Photonic, not a byte-level one (`tests/test_wave_claim_registers_with_the_indexer.py`). **Through 0.24.0 pyrxd put the qualified name in `attrs.name` and left top-level `name` empty.** RXinDexer's `validate_wave_name` refuses the `.`, so by its source no claim `build_wave_metadata` built was indexed (read from source; no pyrxd-built claim has been checked against a live indexer). Readers still accept that shape and report it verbatim. Every write door now holds a WAVE claim to one rule (`src/pyrxd/glyph/wave_rules.py`): a 3-63 character label of lowercase `a-z`, `0-9` and `-`, no leading or trailing `-`, `--` only after `xn--`, domain exactly `rxd`, a name in `attrs.name`, and no top-level or `app.data` name naming another claim. A top-level-only `name` (older pyrxd) is refused: RXinDexer's LIVE claim path skips it (`electrumx/server/wave_index.py:719-721`), and only a backfill of an empty index would register it. `allow_unregistrable_wave=True` on the reveal paths reveals a commit pyrxd ≤0.24.0 already broadcast; that claim does not register | RXinDexer registers from `attrs.name` and rebuilds from the top-level name on a backfill; pyrxd's shape was checked against neither until #728. The label rule is the intersection of the WAVE protocol (Radiant-Core/WAVE-Protocol `ANNOUNCEMENT.md:65`, 3-63), Photonic, and RXinDexer (whose own minimum, 1, is the outlier). Photonic always writes `attrs.expires` (now + 2 years); pyrxd writes it only when given, since RXinDexer takes the term from the block time. |
 | Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:638`, `:1109`). |
 | Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
 | `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |

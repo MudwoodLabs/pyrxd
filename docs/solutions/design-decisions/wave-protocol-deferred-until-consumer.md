@@ -15,6 +15,29 @@ related_files:
 pyrxd has ~80% of the building blocks already; full support is gated on
 a real consumer surfacing. Until then, do not invest design effort.
 
+> **Update 2026-09-24 (#728).** The `WaveAttrs` shape this record asks for
+> was added in #102, and it put the QUALIFIED name in `attrs.name`
+> (`"alice.rxd"`) with the top-level `name` empty. Photonic puts the bare
+> label there (`attrs.name = "alice"`, `attrs.domain = "rxd"`) and the
+> qualified name at the top level (`createWaveNameMetadata`,
+> `packages/lib/src/wave.ts`), and RXinDexer's `validate_wave_name` refuses the
+> `.` — so by the indexer's source no claim `build_wave_metadata` built through
+> 0.24.0 was registered (hand-built CBOR of the right shape could always be
+> revealed through `prepare_wave_reveal`). This is the silent-divergence risk
+> described below, arriving by a different route.
+>
+> The "byte-equivalence test against Photonic-emitted mainnet tokens" named
+> under *Why deferred* exists only in part, and the difference matters.
+> `tests/test_wave_claim_registers_with_the_indexer.py` shows that pyrxd writes
+> the FIELD SET and values of `createWaveNameMetadata`, and that its bytes equal
+> those of a mainnet claim the public indexer resolves. That claim was not
+> encoded by Photonic: it is canonical CBOR with no `desc`, while Photonic's
+> `cbor-x` writes 16-bit map headers in object order and its register page
+> always sets `desc`. No Photonic-emitted claim has been compared byte for
+> byte. The inspector classifier and `WaveResolver` also exist now, and every
+> claim pyrxd writes is held to one rule (`src/pyrxd/glyph/wave_rules.py`). The
+> sections below are the record as written on 2026-05-13.
+
 ## What WAVE actually is (verified 2026-05-13)
 
 Two specs exist under the "WAVE" name:
