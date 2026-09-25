@@ -33,7 +33,14 @@ What is retried, and what is not
   the retry rule wrong can cost money.
 * **``call_extension``** — NOT retried by default. It reaches arbitrary indexer
   RPCs whose side effects this module cannot know. Callers that know a specific
-  extension method is a pure read opt in with ``idempotent=True``.
+  extension method is a pure read opt in with ``idempotent=True`` —
+  :class:`~pyrxd.network.rxindexer.RxinDexerClient` does, for every method it wraps.
+* **"Method not found"** (:class:`~pyrxd.security.errors.RpcMethodNotFound`, JSON-RPC
+  ``-32601``) — a retryable call moves on to the next endpoint, but the server that said it
+  is NOT treated as failed: it answered, so its connection stays open, and that answer does
+  not demote it (see :meth:`FailoverElectrumXClient._run` for the one case where the winner
+  is still promoted). Only one of the shipped mainnet servers runs the RXinDexer extension,
+  and it is not the first.
 * **Node verdicts** (:class:`~pyrxd.security.errors.PolicyRejection`) — never
   retried, on any method. "Your transaction is invalid / underpriced / already
   known" is an answer, not a failure; re-asking a different node mostly produces
@@ -50,7 +57,13 @@ from typing import Any, TypeVar
 
 from ..hash import double_sha256
 from ..merkle_path import MerklePath
-from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
+from ..security.errors import (
+    NetworkError,
+    PolicyRejection,
+    RpcMethodNotFound,
+    TlsPinMismatchError,
+    ValidationError,
+)
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from .electrumx import ElectrumXClient, UtxoRecord
 from .registry import Endpoint, NetworkProfile
@@ -238,6 +251,10 @@ class FailoverElectrumXClient:
         would be exactly the blind retry of a possibly-non-idempotent call that
         this module is careful to avoid. Pass ``idempotent=True`` for a read
         (``glyph.get_token``, ``wave.resolve``, ...).
+
+        An idempotent call also moves past an endpoint that answers "method not found"
+        (a server without the indexer extension), without counting that answer against the
+        endpoint — see :meth:`_run`.
         """
         return await self._run(
             f"call_extension:{method}",
@@ -453,8 +470,23 @@ class FailoverElectrumXClient:
         ``PolicyRejection`` and ``ValidationError`` (which is what a chain-binding
         mismatch raises) propagate immediately — neither is a transport fault, and
         both mean "trying another server is the wrong move".
+
+        ``RpcMethodNotFound`` is an ANSWER from a working server that lacks the method, so it
+        is kept apart from a transport fault in two ways:
+
+        * The endpoint is **not** discarded. ``_discard`` closes the client, and closing it
+          fails every other call in flight on that socket (``ElectrumXClient.close`` fails all
+          pending futures) — so treating "I don't run the indexer" as a fault would abort an
+          unrelated ``get_transaction`` running concurrently on a healthy server.
+        * The winner is **not** promoted past it. Promotion exists to stop re-paying a dead
+          primary's timeout. If every endpoint passed over merely lacked the method, nothing
+          was dead, and promoting would move core reads (balance, UTXOs, fetches) off the
+          current primary because of an extension it was never required to run. When a
+          real transport fault was also passed over, promotion happens as before.
         """
         last_exc: Exception | None = None
+        faulted = False  # some endpoint failed at the transport level during this call
+        unsupported = 0  # endpoints that answered "method not found"
         for endpoint in self._candidates():
             try:
                 client = await self._client_for(endpoint)
@@ -463,13 +495,30 @@ class FailoverElectrumXClient:
                 raise
             except TlsPinMismatchError:
                 raise  # a substituted server must never be silently routed around
+            except RpcMethodNotFound as exc:
+                last_exc = exc
+                unsupported += 1
+                logger.info("%s is not implemented by %s; next endpoint", description, endpoint.url)
+                if not retryable:
+                    raise
+                continue
             except NetworkError as exc:
                 last_exc = exc
+                faulted = True
                 logger.warning("%s failed on %s (%s)", description, endpoint.url, type(exc).__name__)
                 await self._discard(endpoint)
                 if not retryable:
                     raise
                 continue
-            self._promote(endpoint)
+            if faulted or not unsupported:
+                self._promote(endpoint)
             return result
-        raise NetworkError(f"{description} failed on all {len(self._order)} ElectrumX endpoint(s)") from last_exc
+        if unsupported and not faulted:
+            raise RpcMethodNotFound(
+                f"{description}: none of the {unsupported} ElectrumX endpoint(s) tried implements this method "
+                "(JSON-RPC -32601)"
+            ) from last_exc
+        detail = f"; {unsupported} of them do not implement the method" if unsupported else ""
+        raise NetworkError(
+            f"{description} failed on all {len(self._order)} ElectrumX endpoint(s){detail}"
+        ) from last_exc
