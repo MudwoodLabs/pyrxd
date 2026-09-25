@@ -1,4 +1,5 @@
-# Keep GitHub's traffic numbers past the 14 days GitHub keeps them.
+# Keep GitHub's traffic numbers past the 14 days GitHub keeps them, and PyPI's
+# daily downloads past the ~180 days pypistats keeps them.
 #
 # The traffic API returns AT MOST 14 days and is not retroactive — a day that
 # falls off is gone from the API and from the Insights page alike, and no
@@ -15,11 +16,18 @@
 # (there is no `administration` key). A PAT in TRAFFIC_TOKEN is required; the
 # collector exits 2 with the remediation text if it is missing or wrong.
 #
+# PYPI DOWNLOADS go to `pypi.json` on the same branch, from pypistats.org (public,
+# no token). pyrxd's first downloads (2026-04-29) were ~150 days back when this was
+# added, so without it the start of the history would age out in about a month.
+#
 # FAILURE IS RED, NOT QUIET. An auth failure and a genuinely idle fortnight both
 # produce "no new rows". The collector treats a non-200, a shape change and an
 # empty day list as errors and writes nothing, so a broken run can never be
-# committed as a quiet week. Guarded by
-# tests/test_traffic_history_is_never_silently_shortened.py, which runs in
+# committed as a quiet week. The two collectors run independently
+# (continue-on-error), so one source's outage does not lose the other's day, and
+# the last step turns the run red if either failed. Guarded by
+# tests/test_traffic_history_is_never_silently_shortened.py and
+# tests/test_pypi_download_history_is_never_silently_shortened.py, which run in
 # ordinary CI.
 
 name: Traffic history
@@ -41,6 +49,7 @@ on:
     # Exercise the mechanism on the PR that changes it.
     paths:
       - "scripts/collect_traffic.py"
+      - "scripts/collect_pypi_downloads.py"
       - ".github/workflows/traffic.yml"
 
 concurrency:
@@ -79,14 +88,17 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           python -c "
-          import importlib.util, pathlib
-          spec = importlib.util.spec_from_file_location('ct', 'scripts/collect_traffic.py')
-          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-          print('collector imports cleanly; merge() is pure:', m.merge({}, {})[1] == 0)
+          import importlib.util
+          for name, path in (('ct', 'scripts/collect_traffic.py'), ('cp', 'scripts/collect_pypi_downloads.py')):
+              spec = importlib.util.spec_from_file_location(name, path)
+              m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+              print(path, 'imports cleanly; merge() is pure:', m.merge({}, {})[1] == 0)
           "
 
-      - name: Collect
+      - name: Collect GitHub traffic
+        id: traffic
         if: github.event_name != 'pull_request'
+        continue-on-error: true
         env:
           # A PAT with Administration:read. GITHUB_TOKEN cannot do this.
           TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
@@ -94,19 +106,38 @@ jobs:
           TRAFFIC_FILE: data/traffic.json
         run: python scripts/collect_traffic.py
 
-      # Only reached when the collector exited 0, so there is no path on which a
-      # failed fetch gets committed.
-      - name: Commit if anything changed
+      - name: Collect PyPI downloads
+        id: pypi
         if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          PYPI_PACKAGE: pyrxd
+          PYPI_DOWNLOADS_FILE: data/pypi.json
+        run: python scripts/collect_pypi_downloads.py
+
+      # A failed collector writes nothing (both scripts exit 2 before any write), so
+      # committing whatever changed can never commit a failed fetch. Runs even when
+      # one collector failed, so the other's day is not lost.
+      - name: Commit if anything changed
+        if: always() && github.event_name != 'pull_request'
         working-directory: data
         run: |
-          if git diff --quiet -- traffic.json; then
+          if git diff --quiet -- traffic.json pypi.json && [ -z "$(git ls-files --others --exclude-standard -- pypi.json)" ]; then
             echo "no change today"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add traffic.json
+          if [ -f pypi.json ]; then git add pypi.json; fi
           git commit -m "traffic: $(date -u +%Y-%m-%d)"
           git push origin HEAD:traffic-data
           echo "committed $(git rev-parse --short HEAD)"
+
+      # continue-on-error keeps one source's outage from losing the other's day, but
+      # it also turns a failed collector green. This puts the red back.
+      - name: Fail the run if a collector failed
+        if: always() && github.event_name != 'pull_request' && (steps.traffic.outcome == 'failure' || steps.pypi.outcome == 'failure')
+        run: |
+          echo "traffic: ${{ steps.traffic.outcome }} · pypi: ${{ steps.pypi.outcome }}"
+          exit 1

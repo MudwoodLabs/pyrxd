@@ -1,0 +1,59 @@
+{
+  "_source": "https://pypistats.org/api/packages/pyrxd/overall, fetched 2026-09-25; the first five rows of each category, unmodified",
+  "response": {
+    "data": [
+      {
+        "category": "with_mirrors",
+        "date": "2026-04-29",
+        "downloads": 274
+      },
+      {
+        "category": "with_mirrors",
+        "date": "2026-04-30",
+        "downloads": 37
+      },
+      {
+        "category": "with_mirrors",
+        "date": "2026-05-01",
+        "downloads": 26
+      },
+      {
+        "category": "with_mirrors",
+        "date": "2026-05-02",
+        "downloads": 8
+      },
+      {
+        "category": "with_mirrors",
+        "date": "2026-05-03",
+        "downloads": 4
+      },
+      {
+        "category": "without_mirrors",
+        "date": "2026-04-29",
+        "downloads": 118
+      },
+      {
+        "category": "without_mirrors",
+        "date": "2026-04-30",
+        "downloads": 10
+      },
+      {
+        "category": "without_mirrors",
+        "date": "2026-05-01",
+        "downloads": 8
+      },
+      {
+        "category": "without_mirrors",
+        "date": "2026-05-03",
+        "downloads": 4
+      },
+      {
+        "category": "without_mirrors",
+        "date": "2026-05-04",
+        "downloads": 93
+      }
+    ],
+    "package": "pyrxd",
+    "type": "overall_downloads"
+  }
+}
