@@ -774,8 +774,8 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     two agreeing servers did not catch it: ``verify`` printed a block the mark is not in, and
     form 2 folded against it. ``fetch_header`` makes the height the one whose header hashes to
     the block the node says holds the mark, or raises. It is passed unconditionally because this
-    is the one door every CLI anchor comes through; the browser pages call the library directly
-    and do not bind yet.
+    is the one door every CLI anchor comes through; the browser pages make the same call, through
+    ``glue.mark_anchor``, with the headers they fetch.
     """
     from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
 

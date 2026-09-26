@@ -83,7 +83,7 @@ let pySpentBinding = null;  // glue.spent_output_bindings(txid, raw_hex, prevs_j
 // and the digest comparison and its wording from `_inspect_core`. None of the
 // three is reimplemented here, which is the point of routing them through Python
 // at all rather than doing the obvious one-liners in JS.
-let pyMarkAnchor = null;      // glue.mark_anchor(txid, verbose_json, tip) -> dict
+let pyMarkAnchor = null;      // glue.mark_anchor(txid, verbose_json, tip, headers_json) -> dict
 let pyFileCheckPlan = null;   // glue.file_check_plan(algorithm_id) -> dict
 let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo) -> dict
 
@@ -1172,11 +1172,13 @@ function verdictBlock(label, status, meaning, detail) {
 // The block a mark's transaction sits in, or the reason there isn't one.
 //
 // `resolve_mark_anchor` produced this, not JS: it binds the echoed txid, refuses an
-// unreadable depth rather than reading it as zero, and derives the height from the
-// chain tip because the verbose reply carries no height field of its own (measured
-// against both shipped public servers). What is rendered here is that result plus
-// the caveat it carries — the height is the endpoint's CLAIM, and pyrxd has no
-// Radiant header, proof-of-work or merkle check to test it with.
+// unreadable depth rather than reading it as zero, and BINDS the height to the server's
+// own header — the height shown is the one whose header hashes to the block the server's
+// node names (`resolveMarkAnchor` in shared.js fetches the headers it asks for). What is
+// rendered here is that result plus the caveat it carries, which says exactly that much and
+// no more: the height was checked against the endpoint ITSELF, and nothing checks
+// proof-of-work or merkle inclusion. When no header binds it, there is no height here at
+// all — only the reason, in the `!anchor.resolved` branch.
 function appendAnchor(dl, caveats, anchor, anchorReason) {
   if (!anchor) {
     // NOT a warning. Nothing went wrong: this input never had a transaction to look
@@ -2762,11 +2764,13 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole
   // claim is "no later than the block that confirms this", so the block is not
-  // decoration — but it costs two more round trips, and an ordinary transfer has
-  // nothing to gain from them.
+  // decoration — but it costs more round trips (the depth, the tip, and a header or
+  // two to bind the height), and an ordinary transfer has nothing to gain from them.
+  // `superseded` goes in too: the lookup checks it after each header wait and stops
+  // fetching once the reader has moved on.
   if (carriesAMark(result)) {
     statusEl.textContent = "placing the mark in a block…";
-    result.payload.mark_anchor = await resolveMarkAnchor(pyMarkAnchor, txid);
+    result.payload.mark_anchor = await resolveMarkAnchor(pyMarkAnchor, txid, superseded);
     if (superseded()) return;
   }
 

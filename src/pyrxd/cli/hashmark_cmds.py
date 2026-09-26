@@ -1092,15 +1092,30 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
     try:
         return asyncio.run(_do())
     except AnchorBindingError as exc:
-        # THE ENDPOINT ANSWERED. Its node named a block and no header near the derived height hashes
-        # to it — its index and its node disagree, or it served inconsistent data. "Check that it is
-        # reachable" sent people to debug a connection that worked (0.25.0 panel, round 3).
+        # THE ENDPOINT ANSWERED. "Check that it is reachable" sent people to debug a connection that
+        # worked (0.25.0 panel, round 3). WHICH failure it was comes from the exception's attributes,
+        # not its words: "its index and its node disagree" only when every header in the window was
+        # served and none matched — with one missing, the missing one may be the match, and the
+        # sentence would accuse an honest server (0.25.0 review, round 2).
         where = asked[0] if asked else ctx.electrumx_url
+        retry = "re-run in a moment, or ask another server with --electrumx URL"
+        if exc.disagrees:
+            fix = (
+                f"{where} answered, but its index and its node disagree about the mark's block — re-run in "
+                "a moment (a new block usually settles it), or ask another server with --electrumx URL"
+            )
+        elif exc.unserved:
+            heights = ", ".join(map(str, sorted(exc.unserved)))
+            fix = (
+                f"{where} answered, but did not serve the block headers at heights {heights}, so the "
+                f"mark's block could not be checked — {retry}"
+            )
+        else:
+            fix = f"{where} answered, but named no block for the mark's transaction — {retry}"
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
             cause=str(exc),
-            fix=f"{where} answered, but its index and its node disagree about the mark's block — re-run in "
-            "a moment (a new block usually settles it), or ask another server with --electrumx URL",
+            fix=fix,
         ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(

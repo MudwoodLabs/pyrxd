@@ -222,8 +222,9 @@ def test_the_wave_banner_says_what_the_page_does_with_a_claim() -> None:
 def test_the_wave_banners_claim_about_the_page_is_true() -> None:
     """The banner says the page asks no WAVE indexer. That is a claim about the page's code, so it
     is checked against it: the page's one socket is opened inside `electrumxRpc`, and every call of
-    that sends one of the two ElectrumX reads. A page that learned to resolve a name would fail
-    here, and its banner with it."""
+    that sends one of three plain ElectrumX reads — a transaction, the tip, and a block header (the
+    last binds a mark's height to its block). None of them is a WAVE indexer method. A page that
+    learned to resolve a name would fail here, and its banner with it."""
     scripts = "".join(
         (_REPO_ROOT / "docs" / "inspect_static" / "inspect" / name).read_text(encoding="utf-8")
         for name in ("inspect.js", "shared.js")
@@ -232,7 +233,9 @@ def test_the_wave_banners_claim_about_the_page_is_true() -> None:
     methods = re.findall(r'electrumxRpc\("([^"]+)"', scripts)
     calls = re.findall(r"(?<!function )electrumxRpc\(", scripts)
     assert len(calls) == len(methods) > 0, "a call whose method is not a literal escapes the check"
-    assert set(methods) == {"blockchain.transaction.get", "blockchain.headers.subscribe"}, methods
+    assert set(methods) == {"blockchain.transaction.get", "blockchain.headers.subscribe", "blockchain.block.header"}, (
+        methods
+    )
 
 
 def test_no_surface_still_says_wave_support_is_deferred() -> None:
