@@ -49,6 +49,17 @@ UNLOCK_AT = 500_000
 TOKEN_REF = "ab" * 32 + ":0"
 
 
+#: The rest of what ``_mint_nft_inner`` returns after a reported confirmation (PR #742 round 3):
+#: timelock-mint's human output prints where the record is and how to recover.
+_REPORTED = {
+    "reveal_confirmed": "reported by the server; not independently verified",
+    "record": "/nonexistent/pending-mints/done/" + "aa" * 32 + ".json",
+    "record_archive_error": None,
+    "recover_if_not_mined": "pyrxd --electrumx '<another-server-url>' glyph resume-mint " + "aa" * 32,
+    "recover_note": None,
+}
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -475,7 +486,13 @@ class TestTheMintSavesTheBytesItsRevealNeeds:
 
         async def _inner(ctx, wallet, metadata, client):
             captured["cbor"] = encode_payload(metadata)[0]
-            return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+            return {
+                "commit_txid": "aa" * 32,
+                "reveal_txid": "bb" * 32,
+                "ref": TOKEN_REF,
+                "owner_address": "x",
+                **_REPORTED,
+            }
 
         result = self._mint(runner, tmp_path, monkeypatch, inner=_inner)
         assert result.exit_code == 0, result.output
@@ -531,7 +548,13 @@ class TestTheMintSavesTheBytesItsRevealNeeds:
         complete, and an operator has to be told what the third file is for."""
 
         async def _inner(ctx, wallet, metadata, client):
-            return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+            return {
+                "commit_txid": "aa" * 32,
+                "reveal_txid": "bb" * 32,
+                "ref": TOKEN_REF,
+                "owner_address": "x",
+                **_REPORTED,
+            }
 
         result = self._mint(runner, tmp_path, monkeypatch, inner=_inner)
         assert result.exit_code == 0, result.output

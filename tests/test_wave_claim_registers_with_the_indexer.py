@@ -3,10 +3,12 @@
 Through 0.24.0 ``build_wave_metadata("alice.rxd", ...)`` wrote ``attrs.name = "alice.rxd"``
 and left the top-level ``name`` empty. RXinDexer registers a claim from ``attrs.name`` and its
 ``validate_wave_name`` refuses the ``.``, logging at debug level and returning. So, by the
-indexer's source, no claim ``build_wave_metadata`` built was registered: such a reveal confirms,
-spends its fee, and registers nothing. (Read from source: no pyrxd-built claim has been put to
-a live indexer. Hand-built CBOR of the right shape could always be revealed through
-``prepare_wave_reveal``, so the statement is about the helper, not about every pyrxd claim.)
+indexer's source, no claim ``build_wave_metadata`` built from a QUALIFIED name was registered:
+such a reveal confirms, spends its fee, and registers nothing. Given a bare label
+(``build_wave_metadata("alice", ...)``) it wrote ``attrs.name = "alice"``, which does register
+``alice.rxd``; ``tests/test_wave_fee_matches_the_pinned_indexer.py`` runs the indexer's own code
+on both. (No pyrxd-built claim has been put to a live indexer. Hand-built CBOR of the right
+shape could always be revealed through ``prepare_wave_reveal``.)
 Every existing test passed, because each one checked pyrxd's output against pyrxd's own idea of
 the shape; none ran it past the indexer's rule, and the one that compared against "the Photonic
 shape" had hand-typed it wrong.
@@ -31,7 +33,9 @@ This file checks the shape against two things pyrxd did not write:
    address in ``WaveZoneRecords.from_metadata`` (189-197) and the backfill path in
    ``backfill_from_glyph_db`` (1378-1391); and ``electrumx/lib/glyph.py`` — the envelope's
    standalone-``gly`` case in ``parse_glyph_envelope`` (214-232) and the token name (672).
-   Transcribed, not imported: the indexer is not a dependency. Both files are pinned by
+   Transcribed, not imported, in this file (the indexer is not a dependency);
+   ``tests/test_wave_fee_matches_the_pinned_indexer.py`` runs verbatim vendored copies of
+   the same code (``tests/vendor/rxindexer/``). Both files are pinned by
    digest in ``fixtures/rxindexer_upstream_pin.json`` at that commit, and
    ``scripts/check_photonic_drift.py --target rxindexer`` reports when upstream moves.
 
@@ -420,7 +424,7 @@ class TestTheLabelRuleOnEveryDoor:
     @pytest.mark.parametrize("door", sorted(_DOORS))
     @pytest.mark.parametrize(("label", "reason"), _REFUSED_LABELS, ids=[repr(c[0])[:12] for c in _REFUSED_LABELS])
     def test_refused_for_its_reason(self, door: str, label: object, reason: str) -> None:
-        with pytest.raises(ValidationError, match="indexer will not register") as exc:
+        with pytest.raises(ValidationError, match="outside the rule pyrxd writes claims by") as exc:
             _DOORS[door](_claim(label))
         assert reason in str(exc.value)
 
@@ -562,7 +566,11 @@ class TestPInEveryContainerTheIndexerSearches:
             _DOORS[door](claim)
         # prepare_wave_reveal wants p as an array and says so first; every other door is
         # reached only through the rule.
-        expected = "must include GlyphProtocol.WAVE" if door == "prepare_wave_reveal" else "indexer will not register"
+        expected = (
+            "must include GlyphProtocol.WAVE"
+            if door == "prepare_wave_reveal"
+            else "outside the rule pyrxd writes claims by"
+        )
         assert expected in str(exc.value)
 
     @pytest.mark.parametrize("door", [d for d in _CBOR_DOORS if d != "prepare_wave_reveal"])
@@ -640,7 +648,7 @@ class TestACommitMadeBy024CanStillBeRevealed:
     The commit path does not: a new commit with this shape is the bug."""
 
     def test_the_commit_path_refuses_and_has_no_escape(self) -> None:
-        with pytest.raises(ValidationError, match="indexer will not register"):
+        with pytest.raises(ValidationError, match="outside the rule pyrxd writes claims by"):
             _commit(_old_pyrxd_claim())
         assert "allow_unregistrable_wave" not in CommitParams.__dataclass_fields__
 
