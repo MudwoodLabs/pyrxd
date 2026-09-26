@@ -419,22 +419,38 @@ re-run the mint while the commit may still confirm.
   once the commit confirms: `pyrxd --network <net> --wallet <path> glyph
   resume-mint <commit txid>` (the wallet path home-relative, `~/…`; with
   `--electrumx` if the mint named a server, and `--passphrase` if the wallet was
-  opened with one — the passphrase itself is never printed), with the mint's
-  WAVE choices repeated (`--no-wave-registration-fee` if it declined the fee,
-  `--wave-treasury` if it named a treasury, `--allow-unverified-wave-name` if it
-  went ahead without an indexer's answer). `resume-mint` does what the mint
-  chose, which the record keeps: it refuses a flag that would pay a fee the mint
-  declined, or pay a different treasury, and it pays a treasury other than the
-  published one only if its own command line names it. For a WAVE name the mint
-  paid for, it asks an indexer again — before and after its confirmation prompt —
-  and pays from a plain wallet input only if the answer is that the name is
-  free; if the indexer says the name has been taken, the same command with
-  `--no-wave-registration-fee` reveals the commit without the fee (if the name
-  is taken, a duplicate claim the indexer does not register; if that one
-  server's answer was wrong, the reveal registers the name unpaid; either way
-  the carrier and the change come back to the wallet). A second `mint-nft` for a
-  name that still has an unrevealed record is refused unless it is given
-  `--ignore-pending-mint`.
+  opened with one — the passphrase itself is never printed), and with the
+  mint's WAVE fee choice STATED: `--wave-registration-fee` if it paid the
+  published treasury, `--no-wave-registration-fee` if it declined,
+  `--wave-treasury <ADDRESS>` if it named another treasury — with `<ADDRESS>`
+  left for you to type: pyrxd never prints a paying command for a treasury
+  other than the published one, because the address would come from the
+  record, and a record can be changed after the mint. `--allow-unverified-wave-name`
+  is repeated if the mint went ahead without an indexer's answer.
+  `resume-mint` takes the fee choice from its command line, never from the
+  record: a bare `resume-mint <txid>` of a WAVE claim is refused and prints the
+  commands that state it, and a choice that disagrees with the record (paying
+  what it says was declined, or another treasury) is refused. Declining is
+  always accepted. For a WAVE name it pays for, it asks an indexer again —
+  before and after its confirmation prompt — and pays from a plain wallet input
+  only if the answer is no confirmed registration; if the indexer says the name
+  has been taken, the same command with `--no-wave-registration-fee` reveals the
+  commit without the fee (if the name is taken, a duplicate claim the indexer
+  does not register; if that one server's answer was wrong, the reveal
+  registers the name unpaid; either way the carrier and the change come back to
+  the wallet). A second `mint-nft` for a name that still has an unrevealed
+  record on the same network is refused unless it is given
+  `--ignore-pending-mint`. Records carry their network (one directory serves
+  every network a wallet is used on); `resume-mint` refuses a record for
+  another network and names the `--network` to use.
+- **The window no check closes.** RXinDexer answers `wave.check_available`
+  from the blocks it has indexed, not from the mempool
+  (`electrumx/server/glyph_api.py:1498-1515` calls `WaveIndex.check_available`,
+  `electrumx/server/wave_index.py:1773-1800` at `ca8a6a4e`). A rival claim that
+  is broadcast but not yet mined is invisible to every check, and the last
+  check runs just before the reveal is broadcast, not when it is mined. If a
+  rival claim for the name is mined first, this reveal is a duplicate the
+  indexer does not register, and the registration fee it paid buys nothing.
 - **What `resume-mint` checks first.** The record must be the one for that
   txid, its commit script must re-derive from its payload and this wallet's
   key, the NFT must go to this wallet, the server must list the commit output
@@ -445,12 +461,16 @@ re-run the mint while the commit may still confirm.
   A value the server lists differently from the record is refused without
   blaming either: retry against another server (`--electrumx`) before deciding
   the record was changed.
-- **When the record is deleted.** Only once the reveal CONFIRMS: a reveal that
-  is broadcast and then dropped from the mempool needs the record to be built
-  again. `resume-mint` deletes a record only on positive evidence — a confirmed
-  transaction that spends the commit output and pushes the record's exact
-  payload, which a server cannot invent without knowing the payload. If the server lists the
-  commit output as neither unspent nor spent, it says so and keeps the record.
+- **The record is never deleted.** Once a reveal is reported confirmed — by
+  `mint-nft` or `resume-mint`, or by `resume-mint` finding a confirmed spend of
+  the commit that pushes the record's exact payload — the record is moved to
+  `pending-mints/done/`, not deleted. "Confirmed" is the server's word: a server
+  can echo a reveal it never relayed, or invent a spend around a payload it
+  reconstructed. If an explorer shows the commit output still unspent, run
+  `resume-mint <commit txid>` against another server (`--electrumx`): it finds
+  an archived record as well as a live one, moves it back, and reveals the
+  commit. If the server lists the commit output as neither unspent nor spent, it
+  says so and keeps the record where it is.
 - **Every exit after the commit is broadcast** — a declined reveal prompt, a
   network error, a node rejecting the reveal, this timeout, Ctrl-C — prints the
   recovery, and in `--json` mode also writes it to stdout as a JSON document.

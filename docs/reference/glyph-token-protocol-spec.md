@@ -873,18 +873,21 @@ fee estimator sizes the funding input and the fee output, and
 `measure_reveal_fee` / `assert_reveal_balances` refuse a registering reveal that
 does not carry exactly one treasury output at exactly the tier value, or does not
 balance. `pyrxd glyph mint-nft` pays it: it asks the indexer
-(`wave.check_available`; one server's answer) before the commit, before the
-reveal's confirmation and again after it, immediately before the broadcast;
-refuses a name the indexer reports taken, and one no indexer vouches for unless
+(`wave.check_available`; one server's answer, from mined blocks only — a rival
+claim still in the mempool is not seen) before the commit, before the reveal's
+confirmation and again after it, immediately before the broadcast; refuses a
+name the indexer reports taken, and one no indexer vouches for unless
 `--allow-unverified-wave-name` is given; its reveal spends the commit and the
 commit's change, pays the fee at vout 1 (that reveal carries no mutable contract)
 and returns change. If the indexer reports the name taken after the commit, it
 pays nothing and prints how to reveal the commit without the fee (`pyrxd glyph
 resume-mint <txid> --no-wave-registration-fee`); if that report was wrong and the
-name is free, such a reveal registers the name without paying. `resume-mint`
-pays a treasury other than the published one only when its command line names it
-(`--wave-treasury`), whatever the pending record says. `GlyphMinter` mints no WAVE
-claims.
+name has no registration, such a reveal registers the name without paying.
+`resume-mint` takes the fee choice from its own command line
+(`--wave-registration-fee`, `--wave-treasury ADDRESS` or
+`--no-wave-registration-fee`), never from the pending record, which only
+cross-checks it; no command pyrxd prints pays a treasury other than the published
+one. `GlyphMinter` mints no WAVE claims.
 `pay_registration_fee=False` (`--no-wave-registration-fee`) registers without
 paying. The published treasury is a mainnet address; no testnet or regtest
 treasury is published.

@@ -25,6 +25,7 @@ from pyrxd.glyph.mint import (
     DEFAULT_MINT_CONFIRMATIONS,
     NFT_CARRIER_VALUE,
     PENDING_MINT_SCHEMA_VERSION,
+    PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK,
     PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE,
     GlyphMinter,
     JsonFilePendingStore,
@@ -163,7 +164,7 @@ class TestPendingMint:
     def test_to_dict_carries_the_schema_version(self):
         assert _pending().to_dict()["schema_version"] == PENDING_MINT_SCHEMA_VERSION
 
-    @pytest.mark.parametrize("version", [None, 0, 3, "1", True, PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE + 1])
+    @pytest.mark.parametrize("version", [None, 0, 4, "1", True, PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK + 1])
     def test_from_dict_rejects_an_unknown_schema_version(self, version):
         d = _pending().to_dict()
         d["schema_version"] = version

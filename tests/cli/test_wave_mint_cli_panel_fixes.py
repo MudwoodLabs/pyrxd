@@ -28,6 +28,8 @@ from pyrxd.security.errors import NetworkError
 from tests import rxindexer_oracle as oracle
 
 from .test_wave_registration_fee_cli import (
+    _DECLINE,
+    _PAY,
     _TREASURY_SCRIPT,
     _assert_recovery,
     _Chain,
@@ -86,27 +88,45 @@ class TestAnEditedTreasuryIsNotPaidOnTheRecordsWord:
     say it was not the published treasury."""
 
     @pytest.mark.parametrize("mode", [("--json", "--yes"), ("--yes",)], ids=["json", "human"])
-    def test_a_bare_resume_refuses_a_treasury_the_command_line_does_not_name(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mode: tuple[str, ...]
+    @pytest.mark.parametrize("stated", [(), (_PAY,)], ids=["bare", "the-printed-command"])
+    def test_an_edited_treasury_is_paid_by_no_command_pyrxd_prints(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mode: tuple[str, ...], stated: tuple[str, ...]
     ) -> None:
+        """Round 2: neither a bare resume nor the command the mint printed pays an edited
+        treasury, and no refusal prints a ready-to-run command naming it (lane D ran the one
+        round 1 printed, and it paid 10 RXD to the edited address)."""
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)  # pays the PUBLISHED treasury
         assert _store(tmp_path).load(txid).wave_treasury is None
         other = PrivateKey().address()
         _edit_record(tmp_path, txid, wave_treasury=other)
 
-        result = CliRunner().invoke(cli, [*_global(tmp_path, mode=mode), "glyph", "resume-mint", txid])
+        result = CliRunner().invoke(cli, [*_global(tmp_path, mode=mode), "glyph", "resume-mint", txid, *stated])
         assert result.exit_code == 1, result.output
         assert len(chain.broadcasts) == 1  # the commit; nothing paid anywhere
         said = _said(result)
-        assert (
-            f"the record pays the WAVE registration fee to {other}, which is NOT the published WAVE treasury — "
-            "resume-mint pays it only if this command names it too" in said
-        )
-        # It does not steer the operator into paying it: it says which command would, and which pays nothing.
-        assert "If it is not, the record was changed after the mint: do not pay it." in said
-        assert f"`{_command(tmp_path, txid, '--no-wave-registration-fee')}`" in said
+        assert other not in said  # not in a command, and not anywhere else
+        assert f"`{_command(tmp_path, txid, _DECLINE)}`" in said
+        assert "--wave-treasury '<ADDRESS>'" in said and "pyrxd does not print it for you" in said
+        if stated:
+            assert "the treasury this run names is not the one the record says the mint chose" in said
+            assert "If the record does not describe the mint you made, it was changed after the mint" in said
+        else:
+            assert "resume-mint needs the WAVE registration fee choice for abcde.rxd on its command line" in said
         assert _store(tmp_path).list_pending() == [txid]
+
+    def test_the_record_cannot_pay_it_but_the_operator_can_by_typing_it(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cross-check, not a ban: an address typed on the command line that agrees with the
+        record is paid — the operator said it out loud."""
+        chain, _wallet = _wire(monkeypatch)
+        txid = _timed_out_mint(tmp_path, monkeypatch, chain)
+        other = PrivateKey().address()
+        _edit_record(tmp_path, txid, wave_treasury=other)
+        result = _resume(tmp_path, txid, "--wave-treasury", other)
+        assert result.exit_code == 0, result.output
+        assert _tx(chain.broadcasts[1]).outputs[1].locking_script.serialize() == P2PKH().lock(other).serialize()
 
     def test_naming_it_pays_it_and_the_reveal_prompt_says_it_is_not_the_published_treasury(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -160,7 +180,9 @@ class TestTheNameIsAskedAgainAfterTheRevealPrompt:
         seen = _capture_prompts(monkeypatch, _taken_during_the_reveal_prompt)
         result = _mint(tmp_path, "abcde", mode=())
         assert result.exit_code == 1, result.output
-        assert len(seen) == 2 and "    name free:     yes (the indexer says it is free)" in seen[1]
+        assert len(seen) == 2 and (
+            "    registered:    none confirmed (the indexer does not see a claim that is not yet mined)" in seen[1]
+        )
         assert len(chain.broadcasts) == 1  # the commit, and no reveal
         assert chain.asked == [["abcde"]] * 3
         commit = _tx(chain.broadcasts[0])
@@ -191,7 +213,7 @@ class TestTheNameIsAskedAgainAfterTheRevealPrompt:
             chain.answers = [{"available": False, "name": "abcde"}]
 
         _capture_prompts(monkeypatch, _taken_during_the_reveal_prompt)
-        result = CliRunner().invoke(cli, [*_global(tmp_path, mode=()), "glyph", "resume-mint", txid])
+        result = CliRunner().invoke(cli, [*_global(tmp_path, mode=()), "glyph", "resume-mint", txid, _PAY])
         assert result.exit_code == 1, result.output
         assert len(chain.broadcasts) == 1 and chain.asked == [["abcde"]] * 3
         assert "registered now — NOT paying" in _said(result)
@@ -221,8 +243,26 @@ class TestNamingThePublishedTreasuryIsTheDefault:
         result = _resume(tmp_path, txid, "--wave-treasury", other)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = _said(result)
-        assert f"the record pays {WAVE_TREASURY_ADDRESS}; this run names {other}" in said
+        assert f"the record says the mint paid the published WAVE treasury; this run names {other}" in said
         assert f"this run names {WAVE_TREASURY_ADDRESS}" not in said
+
+    def test_a_mint_that_named_the_published_treasury_is_the_published_case(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 2, finding 4: a record keeping the published address explicitly was told it was
+        "NOT the published WAVE treasury". Its printed command is the published-treasury one, and
+        it runs."""
+        chain, _wallet = _wire(monkeypatch)
+        txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain, "--wave-treasury", WAVE_TREASURY_ADDRESS)
+        assert _store(tmp_path).load(txid).wave_treasury == WAVE_TREASURY_ADDRESS
+        doc = json.loads(stopped.stdout)
+        assert doc["recover"] == _command(tmp_path, txid, _PAY)
+        bare = _resume(tmp_path, txid)
+        assert bare.exit_code == 1 and "NOT the published" not in _said(bare)
+        assert f"`{_command(tmp_path, txid, _PAY)}`" in _said(bare)
+        recovered = _run_printed(tmp_path, doc["recover"])
+        assert recovered.exit_code == 0, recovered.output
+        assert _scripts(_tx(chain.broadcasts[1])).count(_TREASURY_SCRIPT) == 1
 
 
 # ───────────────────── E-L2: a value the server disputes blames neither side outright ──
@@ -239,7 +279,7 @@ class TestAValueTheServerDisputesKeepsTheRecovery:
         before = _record_path(tmp_path, txid).read_text()
         script, value = chain.utxos[(txid, 0)]
         chain.utxos[(txid, 0)] = (script, value - 1)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = _said(result)
         assert "The record or the server is wrong" in said
@@ -249,7 +289,7 @@ class TestAValueTheServerDisputesKeepsTheRecovery:
         assert f"Its record says it holds {value:,} photons (" in said
         assert f"; the server lists {value - 1:,} photons." in said
         assert f"was broadcast and holds {value:,} photons" not in said  # the record's number, not asserted
-        assert f"To reveal this one, run `{_command(tmp_path, txid)}`" in said
+        assert f"To reveal this one, run `{_command(tmp_path, txid, _PAY)}`" in said
         assert _record_path(tmp_path, txid).read_text() == before
         assert json.loads(result.stdout)["commit_txid"] == txid
 
@@ -272,7 +312,7 @@ class TestASecondCommitForAPendingNameIsRefused:
             in said
         )
         assert f"records the commit {txid}:0" in said
-        assert f"`{_command(tmp_path, txid)}`" in said
+        assert f"`{_command(tmp_path, txid, _PAY)}`" in said
         assert "--ignore-pending-mint" in said and "Nothing was broadcast." in said
         assert chain.asked == [["abcde"]]  # refused before the indexer was asked again
 
@@ -325,7 +365,7 @@ class TestTheUnverifiedChoiceSurvivesRecovery:
         chain, _wallet = _wire(monkeypatch, available=[NetworkError("no indexer")])
         txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain, "--allow-unverified-wave-name")
         doc = json.loads(stopped.stdout)
-        assert doc["recover"] == _command(tmp_path, txid, "--allow-unverified-wave-name")
+        assert doc["recover"] == _command(tmp_path, txid, _PAY, "--allow-unverified-wave-name")
         # Declining pays nothing and checks nothing, so it has no use for the flag.
         assert doc["recover_without_wave_fee"] == _command(tmp_path, txid, "--no-wave-registration-fee")
         recovered = _run_printed(tmp_path, doc["recover"])
@@ -336,19 +376,19 @@ class TestTheUnverifiedChoiceSurvivesRecovery:
     def test_a_verified_mint_does_not_gain_it(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
         chain, _wallet = _wire(monkeypatch)
         txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain)
-        assert json.loads(stopped.stdout)["recover"] == _command(tmp_path, txid)
+        assert json.loads(stopped.stdout)["recover"] == _command(tmp_path, txid, _PAY)
 
     def test_a_resume_refused_for_want_of_an_answer_offers_the_flag_as_well_as_the_decline(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         chain, _wallet = _wire(monkeypatch, available=[{"available": True}, NetworkError("gone")])
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = _said(result)
         assert "could not confirm the WAVE name abcde.rxd is still available — NOT paying" in said
         assert (
-            f"`{_command(tmp_path, txid, '--allow-unverified-wave-name')}` — if the name is already registered, "
+            f"`{_command(tmp_path, txid, _PAY, '--allow-unverified-wave-name')}` — if the name is already registered, "
             "the registration fee buys nothing" in said
         )
         assert f"`{_command(tmp_path, txid, '--no-wave-registration-fee')}`" in said
@@ -367,7 +407,7 @@ class TestOnlyARealRevealDeletesTheRecord:
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         invented = chain.spend((txid, 0))
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 2, result.output
         said = _said(result)
         assert f"the server lists the commit {txid}:0 neither as unspent nor as spent — the record is kept" in said
@@ -397,25 +437,27 @@ class TestOnlyARealRevealDeletesTheRecord:
 
         monkeypatch.setattr(chain, "get_history", _history)
         monkeypatch.setattr(chain, "get_transaction", _get)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 2, result.output
         said = _said(result)
         assert f"the reveal {reveal_txid} was broadcast and has not confirmed yet" in said
         assert forged not in said
         assert _store(tmp_path).list_pending() == [txid]
 
-    def test_the_real_reveal_still_deletes_it(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The honest half, end to end: mint-nft's own reveal, left unconfirmed, then mined."""
+    def test_the_real_reveal_still_retires_it(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The honest half, end to end: mint-nft's own reveal, left unconfirmed, then mined. The
+        record leaves the live directory — archived, not deleted (round 2)."""
         chain, _wallet = _wire(monkeypatch)
         _no_wait(monkeypatch)
         chain.unconfirmed_from = 1
         assert _mint(tmp_path, "abcde").exit_code == 2
         txid, reveal_txid = (str(_tx(raw).txid()) for raw in chain.broadcasts)
         chain.unconfirmed.discard(reveal_txid)
-        done = _resume(tmp_path, txid)
+        done = _resume(tmp_path, txid, _PAY)
         assert done.exit_code == 1
         assert f"is already revealed, by {reveal_txid}" in done.stderr
         assert _store(tmp_path).list_pending() == []
+        assert (tmp_path / "pending-mints" / "done" / f"{txid}.json").exists()
 
 
 # ─────────────── #737: the printed command names no home directory, and runs as printed ──
@@ -429,7 +471,7 @@ class TestThePrintedCommandIsPortable:
         chain, _wallet = _wire(monkeypatch)
         txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain)
         doc = json.loads(stopped.stdout)
-        assert doc["recover"] == f"pyrxd --network mainnet --wallet ~/w.dat glyph resume-mint {txid}"
+        assert doc["recover"] == f"pyrxd --network mainnet --wallet ~/w.dat glyph resume-mint {txid} {_PAY}"
         assert str(tmp_path) not in doc["recover"] + doc["recover_without_wave_fee"]
         assert "its record is saved in ~/pending-mints." in _said(stopped)
         # shlex keeps "~/w.dat" literal, as a quoted ~ would reach pyrxd; --wallet expands it.
@@ -460,8 +502,8 @@ class TestThePrintedCommandIsPortable:
         flag = ("--passphrase",) if with_passphrase else ()
         txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain, *flag)
         doc = json.loads(stopped.stdout)
-        assert doc["recover"] == _command(tmp_path, txid, *flag)
-        assert doc["recover_without_wave_fee"] == _command(tmp_path, txid, *flag, "--no-wave-registration-fee")
+        assert doc["recover"] == _command(tmp_path, txid, *flag, _PAY)
+        assert doc["recover_without_wave_fee"] == _command(tmp_path, txid, *flag, _DECLINE)
         assert secret not in stopped.output
         assert ("prompts for this wallet's BIP39 passphrase, which is not printed" in _said(stopped)) is with_passphrase
 
@@ -482,7 +524,19 @@ class TestThePrintedCommandIsPortable:
         txid = str(_tx(chain.broadcasts[-1]).txid())
         wallet = str((tmp_path / "w.dat").absolute())
         expected = shlex.join(
-            ["pyrxd", "--electrumx", url, "--network", "mainnet", "--wallet", wallet, "glyph", "resume-mint", txid]
+            [
+                "pyrxd",
+                "--electrumx",
+                url,
+                "--network",
+                "mainnet",
+                "--wallet",
+                wallet,
+                "glyph",
+                "resume-mint",
+                txid,
+                _PAY,
+            ]
         )
         assert json.loads(stopped.stdout)["recover"] == expected
 
@@ -509,4 +563,4 @@ class TestThePrintedCommandIsPortable:
         chain, _wallet = _wire(monkeypatch)
         monkeypatch.setenv("PYRXD_ELECTRUMX", "wss://electrumx.example.invalid:50022")
         txid, stopped = _stopped_mint(tmp_path, monkeypatch, chain)
-        assert json.loads(stopped.stdout)["recover"] == _command(tmp_path, txid)
+        assert json.loads(stopped.stdout)["recover"] == _command(tmp_path, txid, _PAY)

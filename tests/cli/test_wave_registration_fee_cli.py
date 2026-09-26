@@ -355,7 +355,7 @@ class TestTheFeeIsFundedAtRevealTimeFromAWalletInput:
             },
             "fee_vout": 1,
             "fee_input": f"{commit_txid}:1",
-            "name_available": "yes (the indexer says it is free)",
+            "name_available": "none confirmed (the indexer does not see a claim that is not yet mined)",
         }
         # --yes still discloses; --json sends the disclosure to stderr. Both confirmations.
         err = result.stderr
@@ -543,12 +543,18 @@ class TestTheNameMustBeFree:
         first = _mint(tmp_path, "abcde")
         txid = str(_tx(chain.broadcasts[0]).txid())
         assert first.exit_code == 1
-        again = _resume(tmp_path, txid)  # still taken
+        again = _resume(tmp_path, txid, _PAY)  # still taken
         assert again.exit_code == 1 and "NOT paying" in again.stderr and len(chain.broadcasts) == 1
         assert f"resume-mint {txid} --no-wave-registration-fee" in again.stderr
 
 
 # ─────────────────────────────── (3) every exit after the commit names the recovery ──
+
+
+#: The fee choice a resume of a WAVE claim states on its command line (panel D round 2: the
+#: record's word never decides a money question, so a bare resume-mint of a claim is refused).
+_PAY = "--wave-registration-fee"
+_DECLINE = "--no-wave-registration-fee"
 
 
 def _command(tmp_path: pathlib.Path, txid: str, *extra: str, network: str = "mainnet") -> str:
@@ -564,7 +570,8 @@ def _assert_recovery(
     said = " ".join(result.output.split())
     assert f"The commit {txid}:0 was broadcast and holds {value:,} photons" in said
     assert f"its record is saved in {tmp_path / 'pending-mints'}" in said
-    resume = _command(tmp_path, txid, *(["--no-wave-registration-fee"] if declined else []))
+    # The printed command STATES the fee choice for a claim: resume-mint takes it from there.
+    resume = _command(tmp_path, txid, *([_DECLINE] if declined else [_PAY] if wave else []))
     assert (
         f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run `{resume}`." in said
     )
@@ -574,23 +581,21 @@ def _assert_recovery(
         assert "--no-wave-registration-fee" not in said
     elif declined:
         # M2: the mint's opt-out is repeated, never replaced by the paying default.
-        assert (
-            f"This mint declined the WAVE registration fee for {wave}.rxd, and that command keeps that choice" in said
-        )
+        assert f"This mint declined the WAVE registration fee for {wave}.rxd, and that command says so" in said
         assert "pays the registration fee from a wallet input only if" not in said
     else:
-        # Pay only if an indexer says the name is still free; otherwise reveal without the fee —
-        # and say that a "taken" answer is one server's, so the fee-less reveal of a name that is
-        # in fact free registers it unpaid (panel D-I3: "a duplicate the indexer does not
+        # Pay only if an indexer reports no confirmed registration; otherwise reveal without the
+        # fee — and say that a "taken" answer is one server's, so the fee-less reveal of a name
+        # with no registration registers it unpaid (panel D-I3: "a duplicate the indexer does not
         # register" was false exactly when the answer was).
         assert (
-            f"resume-mint asks an indexer whether {wave}.rxd is still free and pays the registration fee from a "
-            "wallet input only if it says so" in said
+            f"resume-mint asks an indexer whether {wave}.rxd has a confirmed registration and pays the "
+            "registration fee from a wallet input only if it reports none" in said
         )
-        assert f"`{_command(tmp_path, txid, '--no-wave-registration-fee')}`" in said
+        assert f"`{_command(tmp_path, txid, _DECLINE)}`" in said
         assert (
-            'A "taken" answer is one server\'s: if the name is in fact free, that reveal registers it without '
-            "paying the fee." in said
+            'A "taken" answer is one server\'s: if it is wrong and the name has no registration, that reveal '
+            "registers it without paying the fee." in said
         )
     record = _store(tmp_path).load(txid)
     assert (record.commit_txid, record.commit_value) == (txid, value)
@@ -709,8 +714,8 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
             "pending_record": str(tmp_path / "pending-mints" / f"{txid}.json"),
             "wave_name": "abcde.rxd",
             "wave_fee": "pay",
-            "recover": _command(tmp_path, txid),
-            "recover_without_wave_fee": _command(tmp_path, txid, "--no-wave-registration-fee"),
+            "recover": _command(tmp_path, txid, _PAY),
+            "recover_without_wave_fee": _command(tmp_path, txid, _DECLINE),
         }
 
     @pytest.mark.parametrize("mode", [("--json", "--yes"), ("--yes",)], ids=["json", "human"])
@@ -732,7 +737,7 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
         said = " ".join(result.output.split())
         assert "the commit broadcast failed, and the commit may or may not have reached the network" in said
         assert f"look up {txid} on a block explorer before running anything else" in said
-        assert f"`{_command(tmp_path, txid)}`" in said
+        assert f"`{_command(tmp_path, txid, _PAY)}`" in said
         assert f"If it never appears, nothing was spent: delete {tmp_path / 'pending-mints' / (txid + '.json')}" in said
         if mode[0] == "--json":
             assert json.loads(result.stdout)["status"] == "commit_broadcast_failed_may_have_relayed"
@@ -764,7 +769,7 @@ class TestEveryExitAfterTheCommitNamesTheRecovery:
         assert "print, with this error, the exact `pyrxd glyph resume-mint` command" in fix
         assert "only source" not in fix
         assert "If it declined the fee, build with pay_registration_fee=False" in fix
-        assert "ONLY if WaveResolver.check_available says the name is still free" in fix
+        assert "ONLY if WaveResolver.check_available reports no confirmed registration of the name" in fix
         assert "build with pay_registration_fee=False" in fix
 
 
@@ -783,7 +788,7 @@ class TestResumeMint:
         txid = str(commit.txid())
 
         chain.confirmations = 1
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 0, result.output
         reveal = _tx(chain.broadcasts[1])
         # The commit, then a plain wallet UTXO (here the commit's change, which the wallet now
@@ -810,7 +815,7 @@ class TestResumeMint:
         # Revealed elsewhere, and mined. A real reveal pushes the committed payload — the commit
         # output is a hashlock over it — and resume-mint accepts nothing less as the spend (#736).
         spender = chain.spend((txid, 0), unlocking=reveal_envelope(_store(tmp_path).load(txid).cbor_bytes))
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1
         assert f"the commit {txid}:0 is already revealed, by {spender}" in result.stderr
         assert "Do not re-run the mint" not in result.stderr  # not pointed at a recovery that finds nothing
@@ -846,7 +851,7 @@ class TestResumeMint:
         txid = str(commit.txid())
         chain.utxos.pop((txid, 1))  # the wallet spent its change elsewhere; nothing else holds 10 RXD
         chain.confirmations = 1
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         assert "no plain-RXD wallet UTXO holds the 10 RXD WAVE registration fee for abcde.rxd" in result.stderr
         _assert_recovery(result, tmp_path, txid, commit.outputs[0].satoshis, wave="abcde")
@@ -924,7 +929,7 @@ class TestResumeMintReadsTheRecordWithSuspicion:
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         on_chain = chain.utxos[(txid, 0)][1]
         _edit_record(tmp_path, txid, commit_value=on_chain + 1_000_000)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = " ".join(result.output.split())
         # Refused, and neither side blamed: from here an edited record and a lying server look
@@ -952,7 +957,7 @@ class TestResumeMintReadsTheRecordWithSuspicion:
         """The other half of every refusal above: the untouched record goes through."""
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
-        assert _resume(tmp_path, txid).exit_code == 0
+        assert _resume(tmp_path, txid, _PAY).exit_code == 0
         assert len(chain.broadcasts) == 2 and _store(tmp_path).list_pending() == []
 
 
@@ -967,7 +972,7 @@ class TestResumeMintNeverOverpays:
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         _edit_record(tmp_path, txid, fee_rate=rate)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = " ".join(result.output.split())
         assert (
@@ -985,7 +990,7 @@ class TestResumeMintNeverOverpays:
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         _edit_record(tmp_path, txid, fee_rate=100_000)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         assert "so the wallet input would pay the miner" in " ".join(result.output.split())
 
@@ -995,7 +1000,7 @@ class TestResumeMintNeverOverpays:
         """The honest half, measured: the wallet input pays the registration fee and gets the rest back."""
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
-        assert _resume(tmp_path, txid).exit_code == 0
+        assert _resume(tmp_path, txid, _PAY).exit_code == 0
         reveal = _tx(chain.broadcasts[1])
         commit_in, fee_in = (_spent_value(chain, i) for i in reveal.inputs)
         nft, fee_out, change = (o.satoshis for o in reveal.outputs)
@@ -1050,13 +1055,21 @@ class TestAnOptOutSurvivesRecovery:
         assert recovered.exit_code == 0, recovered.output
         assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
 
-    def test_the_stored_decline_holds_even_for_a_bare_resume(
+    def test_a_bare_resume_of_a_declined_mint_is_refused_and_offers_only_the_decline(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Round 2: resume-mint takes the fee choice from its command line, never the record, so
+        a bare resume states nothing and is refused — pointing at the command that declines."""
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain, "--no-wave-registration-fee")
         bare = _resume(tmp_path, txid)
-        assert bare.exit_code == 0, bare.output
+        assert bare.exit_code == 1 and len(chain.broadcasts) == 1
+        said = " ".join(bare.output.split())
+        assert "resume-mint needs the WAVE registration fee choice for abcde.rxd on its command line" in said
+        assert f"`{_command(tmp_path, txid, _DECLINE)}`" in said
+        assert _PAY not in said.replace(_DECLINE, "")
+        declined = _resume(tmp_path, txid, _DECLINE)
+        assert declined.exit_code == 0, declined.output
         assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
 
     @pytest.mark.parametrize(
@@ -1069,7 +1082,7 @@ class TestAnOptOutSurvivesRecovery:
         txid = _timed_out_mint(tmp_path, monkeypatch, chain, "--no-wave-registration-fee")
         result = _resume(tmp_path, txid, *flags)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
-        assert "resume-mint will not pay what the mint declined" in " ".join(result.output.split())
+        assert "resume-mint will not pay what the record says was declined" in " ".join(result.output.split())
 
     def test_a_named_treasury_is_repeated_and_honoured(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -1082,12 +1095,17 @@ class TestAnOptOutSurvivesRecovery:
         assert result.exit_code == 2
         txid = str(_tx(chain.broadcasts[0]).txid())
         doc = json.loads(result.stdout)
-        assert doc["recover"] == _command(tmp_path, txid, "--wave-treasury", treasury, network="regtest")
+        # Round 2: no printed command pays a treasury other than the published one; the operator
+        # types the address back in place of the placeholder.
+        assert doc["recover"] == _command(tmp_path, txid, "--wave-treasury", "<ADDRESS>", network="regtest")
+        # The mint's own summary shows the treasury it was given; the recovery never repeats it.
+        assert treasury not in " ".join(result.stderr.split()).split("fix:", 1)[1]
         other = PrivateKey().public_key().address(network=Network.TESTNET)
         chain.confirmations = 1
         refused = _resume(tmp_path, txid, "--wave-treasury", other, network="regtest")
-        assert refused.exit_code == 1 and "--wave-treasury is not the treasury the mint chose" in refused.stderr
-        recovered = _run_printed(tmp_path, doc["recover"])
+        assert refused.exit_code == 1
+        assert "the treasury this run names is not the one the record says the mint chose" in refused.stderr
+        recovered = _run_printed(tmp_path, doc["recover"].replace("'<ADDRESS>'", treasury))
         assert recovered.exit_code == 0, recovered.output
         assert _tx(chain.broadcasts[1]).outputs[1].locking_script.serialize() == P2PKH().lock(treasury).serialize()
 
@@ -1119,11 +1137,13 @@ class TestAnOptOutSurvivesRecovery:
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         d = json.loads(_record_path(tmp_path, txid).read_text())
         del d["wave_fee"], d["wave_treasury"]
-        d["schema_version"] = 1
+        assert d["schema_version"] == 3  # the version that carries the network; the fee keys are optional
         _record_path(tmp_path, txid).write_text(json.dumps(d))
         refused = _resume(tmp_path, txid)
         assert refused.exit_code == 1 and len(chain.broadcasts) == 1
-        assert "does not say whether the WAVE registration fee is paid" in " ".join(refused.output.split())
+        assert "needs the WAVE registration fee choice for abcde.rxd on its command line" in " ".join(
+            refused.output.split()
+        )
         declined = _resume(tmp_path, txid, "--no-wave-registration-fee")
         assert declined.exit_code == 0, declined.output
         assert _TREASURY_SCRIPT not in _scripts(_tx(chain.broadcasts[1]))
@@ -1139,7 +1159,7 @@ class TestTheRecordIsDeletedOnlyOnPositiveEvidence:
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
         chain.hidden.add((txid, 0))  # unspent on chain; the server lists nothing
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 2 and len(chain.broadcasts) == 1
         said = " ".join(result.output.split())
         assert f"the server lists the commit {txid}:0 neither as unspent nor as spent — the record is kept" in said
@@ -1163,15 +1183,17 @@ class TestTheRecordIsDeletedOnlyOnPositiveEvidence:
         assert (doc["status"], doc["reveal_txid"]) == ("reveal_broadcast_not_confirmed", reveal_txid)
 
         # Still in the mempool: resume-mint finds it, waits, and keeps the record.
-        waiting = _resume(tmp_path, txid)
+        waiting = _resume(tmp_path, txid, _PAY)
         assert waiting.exit_code == 2 and _store(tmp_path).list_pending() == [txid]
         assert f"the reveal {reveal_txid} was broadcast and has not confirmed yet" in " ".join(waiting.output.split())
         assert len(chain.broadcasts) == 2
-        # Mined: resume-mint finds the confirmed reveal and only then deletes the record.
+        # Mined: resume-mint finds the confirmed reveal and only then moves the record out of the
+        # live directory — archived, never deleted (round 2, #736).
         chain.unconfirmed.discard(reveal_txid)
-        done = _resume(tmp_path, txid)
+        done = _resume(tmp_path, txid, _PAY)
         assert f"is already revealed, by {reveal_txid}" in done.stderr
         assert _store(tmp_path).list_pending() == [] and len(chain.broadcasts) == 2
+        assert (tmp_path / "pending-mints" / "done" / f"{txid}.json").exists()
 
 
 class TestExitsTheBroadcastsThemselvesCanTake:
@@ -1192,7 +1214,7 @@ class TestExitsTheBroadcastsThemselvesCanTake:
         [txid] = _store(tmp_path).list_pending()
         said = " ".join(result.stderr.split())
         assert "interrupted while the commit was being broadcast: it may or may not have reached the network" in said
-        assert f"look up {txid} on a block explorer" in said and f"`{_command(tmp_path, txid)}`" in said
+        assert f"look up {txid} on a block explorer" in said and f"`{_command(tmp_path, txid, _PAY)}`" in said
 
     def test_a_node_refusing_the_reveal_is_named_as_a_refusal(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -1227,7 +1249,7 @@ class TestResumeMintPaysFromPlainRxdOnly:
             return [(token, wallet.address, wallet.key), (plain, wallet.address, wallet.key)]
 
         monkeypatch.setattr(wallet, "collect_spendable", _both)
-        result = _resume(tmp_path, txid)
+        result = _resume(tmp_path, txid, _PAY)
         assert result.exit_code == 0, result.output
         assert _outpoints(_tx(chain.broadcasts[1]))[1] == (plain.tx_hash, 1)
         assert (token.tx_hash, 1) in chain.utxos

@@ -155,10 +155,12 @@ _OUT_OF_SCOPE: dict[str, str] = {
     # The WAVE register page, which pays the registration fee; digest-pinned in
     # tests/fixtures/photonic_upstream_pin.json at becf41a7.
     "packages/app/src/pages/WaveRegister.tsx": "Photonic Wallet",
-    # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. glyph_index.py is not
-    # vendored (wave_index.py and lib/glyph.py are, under tests/vendor/rxindexer/, and resolve
-    # through _upstream_index); it is digest-pinned in tests/fixtures/rxindexer_upstream_pin.json
-    # and watched by scripts/check_photonic_drift.py --target rxindexer.
+    # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. glyph_index.py and
+    # glyph_api.py are not vendored (wave_index.py and lib/glyph.py are, under
+    # tests/vendor/rxindexer/, and resolve through _upstream_index); both are digest-pinned in
+    # tests/fixtures/rxindexer_upstream_pin.json and watched by
+    # scripts/check_photonic_drift.py --target rxindexer.
+    "electrumx/server/glyph_api.py": "Radiant-Core/RXinDexer, pinned by digest",
     "electrumx/server/glyph_index.py": "Radiant-Core/RXinDexer, pinned by digest",
     # Radiant-Core/WAVE-Protocol, the WAVE protocol description (3-63 character names).
     "ANNOUNCEMENT.md": "Radiant-Core/WAVE-Protocol",

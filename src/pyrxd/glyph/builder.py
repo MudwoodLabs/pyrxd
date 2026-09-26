@@ -1605,9 +1605,10 @@ class GlyphBuilder:
 
         FUND THE FEE FROM THE WALLET INPUT, NOT FROM THE COMMIT: then the fee is spent only by
         the reveal that registers the name, and a reveal that does not pay it (say, because the
-        name was taken after the commit) leaves it in the wallet. Check the name is still free
-        (:meth:`pyrxd.glyph.wave.WaveResolver.check_available`) just before broadcasting;
-        ``pyrxd glyph mint-nft`` does all of this. :mod:`pyrxd.glyph.wave_rules` cites the sources.
+        name was taken after the commit) leaves it in the wallet. Check that
+        :meth:`pyrxd.glyph.wave.WaveResolver.check_available` still reports no confirmed
+        registration just before broadcasting (it does not see a rival claim that is not yet
+        mined); ``pyrxd glyph mint-nft`` does all of this. :mod:`pyrxd.glyph.wave_rules` cites the sources.
 
         ``pay_registration_fee=False`` registers the name without paying. The published
         protocol and Photonic expect the fee; RXinDexer does not check it at registration, so

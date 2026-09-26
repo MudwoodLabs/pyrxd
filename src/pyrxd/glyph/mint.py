@@ -94,6 +94,7 @@ from ..network.confirm import (
     _assert_positive_finite,
     wait_for_confirmation,
 )
+from ..network.registry import KNOWN_NETWORKS
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
 from ..security.errors import InsufficientFundsError, RxdSdkError, ValidationError
@@ -117,6 +118,7 @@ __all__ = [
     "DEFAULT_MINT_CONFIRMATIONS",
     "NFT_CARRIER_VALUE",
     "PENDING_MINT_SCHEMA_VERSION",
+    "PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK",
     "PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE",
     "GlyphMinter",
     "JsonFilePendingStore",
@@ -188,6 +190,14 @@ PENDING_MINT_SCHEMA_VERSION = 1
 # the decision they carry is whether the reveal spends 5-100 RXD of the user's money. An older
 # pyrxd refuses a version-2 record instead of revealing it on a guess.
 PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE = 2
+
+# The version of a record that also says which network its commit was broadcast on
+# (:attr:`PendingMint.network`), with or without a WAVE fee decision. ``pyrxd glyph mint-nft``
+# writes it: its records live beside the wallet file, one directory for every network the
+# wallet is used on, and a record that does not say its network was taken for another
+# network's (a regtest record refused a mainnet mint of the same name). A separate number for
+# the same reason as version 2: an older reader ignoring the key would resume on any network.
+PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK = 3
 
 # Protocol tags whose reveal is NOT the single-output shape this module builds. MUT and
 # WAVE need a second contract output AND a second commit outpoint to seed its singleton
@@ -330,6 +340,14 @@ class PendingMint:
         wave_treasury: the address the fee is paid to when the minter named one
             (``--wave-treasury``); ``None`` for the published treasury. Only with
             ``wave_fee="pay"``.
+        network: the network the commit was broadcast on (``mainnet``, ``testnet`` or
+            ``regtest``), or ``None`` when the writer did not say. ``pyrxd glyph mint-nft``
+            always says: one pending-mints directory serves every network a wallet is used on.
+
+    ``wave_fee``, ``wave_treasury`` and ``network`` are the writer's word, kept for comparison.
+    ``pyrxd glyph resume-mint`` never lets them decide what is paid: a record is a file that can
+    be changed after the mint, so the fee choice is stated on the resume command line and the
+    record only cross-checks it.
     """
 
     commit_txid: str
@@ -344,6 +362,7 @@ class PendingMint:
     funding_address: str
     wave_fee: str | None = None
     wave_treasury: str | None = None
+    network: str | None = None
 
     def __post_init__(self) -> None:
         # Txid() rejects anything that is not 64 lowercase hex. This also makes the
@@ -381,6 +400,10 @@ class PendingMint:
             raise ValidationError("PendingMint.wave_treasury is only meaningful with wave_fee='pay'")
         if self.wave_fee is not None and wave_registered_label(self.cbor_bytes) is None:
             raise ValidationError("PendingMint.wave_fee is set, but the payload registers no WAVE name")
+        if self.network is not None and self.network not in KNOWN_NETWORKS:
+            raise ValidationError(
+                f"PendingMint.network must be one of {', '.join(KNOWN_NETWORKS)} or None, got {self.network!r}"
+            )
 
     @property
     def ref(self) -> GlyphRef:
@@ -416,6 +439,9 @@ class PendingMint:
             d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
             d["wave_fee"] = self.wave_fee
             d["wave_treasury"] = self.wave_treasury
+        if self.network is not None:
+            d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK
+            d["network"] = self.network
         return d
 
     @classmethod
@@ -430,21 +456,42 @@ class PendingMint:
         if not isinstance(d, dict):
             raise ValidationError("PendingMint.from_dict expects a dict")
         version = d.get("schema_version")
-        known = (PENDING_MINT_SCHEMA_VERSION, PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE)
+        known = (
+            PENDING_MINT_SCHEMA_VERSION,
+            PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE,
+            PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK,
+        )
         if version not in known or isinstance(version, bool):
             raise ValidationError(
                 f"unsupported PendingMint schema_version {version!r} "
-                f"(this build understands {' and '.join(map(str, known))}) — refusing to guess at a "
+                f"(this build understands {', '.join(map(str, known))}) — refusing to guess at a "
                 "record that decides whether a commit output can be spent"
             )
-        # Version 1 carries no fee decision and version 2 must: a version-1 record with the keys,
-        # or a version-2 record without them, was not written by this code.
+        # Version 1 carries no fee decision and version 2 must; version 3 carries the network and
+        # a fee decision exactly when its payload registers a WAVE name (checked on construction).
+        # A record with keys its version cannot hold, or without the ones it must, was not written
+        # by this code.
         has_fee = "wave_fee" in d or "wave_treasury" in d
-        if has_fee != (version == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE):
+        has_network = "network" in d
+        if has_network != (version == PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK):
+            raise ValidationError(
+                f"PendingMint schema_version {version} record "
+                + ("carries a network it cannot hold" if has_network else "is missing its network")
+            )
+        if version != PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK and has_fee != (
+            version == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
+        ):
             raise ValidationError(
                 f"PendingMint schema_version {version} record "
                 + ("carries a WAVE fee decision it cannot hold" if has_fee else "is missing its WAVE fee decision")
             )
+        if has_network and not isinstance(d["network"], str):
+            raise ValidationError(
+                f"PendingMint schema_version {version} record's network must be one of {', '.join(KNOWN_NETWORKS)}, "
+                f"got {d['network']!r}"
+            )
+        if has_fee and ("wave_fee" not in d or "wave_treasury" not in d):
+            raise ValidationError(f"PendingMint schema_version {version} record has half a WAVE fee decision")
         if has_fee and d.get("wave_fee") not in ("pay", "decline"):
             raise ValidationError(f"PendingMint schema_version {version} record has wave_fee {d.get('wave_fee')!r}")
         try:
@@ -461,6 +508,7 @@ class PendingMint:
                 funding_address=d["funding_address"],
                 wave_fee=d["wave_fee"] if has_fee else None,
                 wave_treasury=d["wave_treasury"] if has_fee else None,
+                network=d["network"] if has_network else None,
             )
         except KeyError as exc:
             raise ValidationError(f"PendingMint record is missing field {exc.args[0]!r}") from exc

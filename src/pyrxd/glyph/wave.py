@@ -385,7 +385,13 @@ class WaveResolver:
         return WaveRecord.from_indexer_response(result)
 
     async def check_available(self, name: str) -> bool:
-        """Return True if `name` is not yet registered.
+        """Return True if the indexer has no confirmed registration of `name`.
+
+        RXinDexer answers from the blocks it has indexed, not from the mempool
+        (``electrumx/server/glyph_api.py:1498-1515`` calls ``WaveIndex.check_available``,
+        ``electrumx/server/wave_index.py:1773-1800`` at ``ca8a6a4e``), so a rival claim that
+        is broadcast but not yet mined is not seen: True is "no confirmed registration", not
+        "nobody else is registering it".
 
         SENDS THE LABEL, NOT THE QUALIFIED NAME — the same rule :meth:`resolve` documents.
         ``resolve`` was corrected in #695 and this twin was left sending ``"alice.rxd"``, which

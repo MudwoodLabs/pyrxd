@@ -36,12 +36,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import click
 
@@ -169,7 +170,7 @@ def glyph_group() -> None:
 
 
 _UNVERIFIED_FLAG_HELP = (
-    "Go ahead when no indexer can say whether the WAVE name is free. If the name is already "
+    "Go ahead when no indexer can say whether the WAVE name has a confirmed registration. If the name is already "
     "registered, the reveal is a duplicate claim the indexer does not register, and the "
     "registration fee buys NOTHING."
 )
@@ -253,7 +254,8 @@ def init_metadata_cmd(ctx: CliContext, kind: str, out_path: Path | None) -> None
     "ignore_pending_mint",
     is_flag=True,
     help=(
-        "Commit even though this wallet's pending-mints/ holds an unrevealed commit for the same WAVE name. "
+        "Commit even though this wallet's pending-mints/ holds an unrevealed commit for the same WAVE name on "
+        "this network. "
         "That commit keeps its value until it is revealed; a second one spends again, and at most one of the "
         "two claims can register the name."
     ),
@@ -277,9 +279,10 @@ def mint_nft_cmd(
     before it is broadcast; if the reveal does not happen, every exit
     says how to finish it with `glyph resume-mint`.
 
-    If the metadata registers a WAVE name, an indexer must say the name
-    is free (it is asked before the commit, before the reveal's
-    confirmation and again just before the reveal is broadcast), no
+    If the metadata registers a WAVE name, an indexer must report no
+    confirmed registration of it (it is asked before the commit, before
+    the reveal's confirmation and again just before the reveal is
+    broadcast; a rival claim not yet mined is not seen), no
     unrevealed commit for the same name may be pending in this wallet
     (--ignore-pending-mint overrides), and the reveal pays the WAVE
     registration fee to the treasury from a wallet input unless
@@ -362,11 +365,13 @@ def _echo_mint_result(ctx: CliContext, result: dict[str, Any]) -> None:
     "pay_wave_fee",
     default=None,
     help=(
-        "Normally unnecessary: resume-mint does what the mint chose, which its record keeps. "
-        "--no-wave-registration-fee reveals without paying: the way to recover a commit whose name was "
-        "taken in the meantime (the reveal is then a duplicate claim the indexer does not register; the "
-        "carrier and the change come back to this wallet). A mint that declined the fee is never made to "
-        "pay here: --wave-registration-fee against such a record is refused."
+        "REQUIRED for a commit that registers a WAVE name (or --wave-treasury): the fee is money, so "
+        "resume-mint takes the choice from this command line, never from the pending record, which only "
+        "cross-checks it. The command glyph mint-nft printed states it. --wave-registration-fee pays the "
+        "published treasury; --no-wave-registration-fee reveals without paying, which is also the way to "
+        "recover a commit whose name was taken in the meantime (the reveal is then a duplicate claim the "
+        "indexer does not register; the carrier and the change come back to this wallet). Paying against a "
+        "record that says the mint declined is refused."
     ),
 )
 @click.option(
@@ -375,9 +380,8 @@ def _echo_mint_result(ctx: CliContext, result: dict[str, Any]) -> None:
     default=None,
     metavar="ADDRESS",
     help=(
-        "The treasury the mint named with --wave-treasury. REQUIRED when the record keeps one: the fee goes to an "
-        "address other than the published WAVE treasury only if this command line names it too. Refused if it is "
-        "not the one the record keeps."
+        "Pay the fee to the treasury the mint named with --wave-treasury. pyrxd never prints this address back "
+        "in a command: type it yourself. Refused if it is not the one the record keeps."
     ),
 )
 @click.option("--allow-unverified-wave-name", "allow_unverified_wave_name", is_flag=True, help=_UNVERIFIED_FLAG_HELP)
@@ -395,10 +399,12 @@ def resume_mint_cmd(
     Reads the record mint-nft saved before broadcasting the commit, checks it against this
     wallet and the chain, waits for the commit to confirm, and builds, checks and (after
     confirmation) broadcasts its reveal. For a WAVE name it does what the mint chose: it
-    pays the fee from a plain wallet input only if the mint chose to pay it and an indexer
-    still says the name is free, and it pays a treasury other than the published one only if
-    this command names it with --wave-treasury. The record is deleted once the reveal
-    confirms.
+    pays the fee from a plain wallet input only if this command says to pay it (the fee
+    choice is stated here, never taken from the record, which only cross-checks it) and an
+    indexer still reports no confirmed registration of the name. A treasury other than the
+    published one is paid only if this command names it with --wave-treasury. The record is
+    archived to pending-mints/done/ once the reveal is reported confirmed, never deleted, and
+    this command finds an archived record too.
     """
     try:
         Txid(commit_txid)
@@ -615,7 +621,7 @@ def _wave_registration_summary(
     """The confirmation section for a mint that registers a WAVE name; nothing otherwise."""
     if label is None:
         return []
-    lines = [f"name:          {label}.rxd", f"available:     {name_status or 'not checked'}"]
+    lines = [f"name:          {label}.rxd", f"registered:    {name_status or 'not checked'}"]
     if fee is None:
         lines += [
             "fee:           NOT PAID (--no-wave-registration-fee)",
@@ -643,8 +649,17 @@ def _wave_registration_summary(
 # ---------------------------------------------------------------------------
 
 
+#: What a name check that passed may say. RXinDexer answers ``wave.check_available`` from the
+#: blocks it has indexed: its handler calls ``WaveIndex.check_available``, which reads the name
+#: index and nothing in the mempool (``electrumx/server/glyph_api.py:1498-1515``,
+#: ``electrumx/server/wave_index.py:1773-1800`` at ``ca8a6a4e``). So "available" means "no
+#: confirmed registration": a rival claim broadcast but not yet mined is invisible to it.
+_NO_CONFIRMED_REGISTRATION = "none confirmed (the indexer does not see a claim that is not yet mined)"
+
+
 async def _wave_name_available(client: ElectrumXClient, label: str) -> bool | None:
-    """The indexer's answer to "is ``label`` free?", or ``None`` if no server could answer.
+    """The indexer's answer to "does ``label`` have a confirmed registration?" — ``True`` for none
+    (:data:`_NO_CONFIRMED_REGISTRATION`) — or ``None`` if no server could answer.
 
     :meth:`~pyrxd.glyph.wave.WaveResolver.check_available`, which fails over to a server
     running the RXinDexer extension (#730) and raises rather than guessing on any answer that
@@ -680,7 +695,7 @@ async def _require_wave_name_free_before_commit(client: ElectrumXClient, label: 
                 ),
             )
         return "NOT VERIFIED (--allow-unverified-wave-name): if it is taken, the fee buys nothing"
-    return "yes (the indexer says it is free)"
+    return _NO_CONFIRMED_REGISTRATION
 
 
 class _RevealRefused(UserError):
@@ -739,7 +754,7 @@ async def _require_wave_name_free_before_reveal(
                 ),
             )
         return "NOT VERIFIED (--allow-unverified-wave-name): if it is taken, the fee buys nothing"
-    return "yes (the indexer says it is free)"
+    return _NO_CONFIRMED_REGISTRATION
 
 
 # ---------------------------------------------------------------------------
@@ -754,12 +769,74 @@ def _pending_dir(ctx: CliContext) -> Path:
     return base / "pending-mints"
 
 
-def _pending_store(ctx: CliContext) -> JsonFilePendingStore:
+class _ArchivingPendingStore(JsonFilePendingStore):
+    """The CLI's pending store: a record is NEVER deleted, only moved to ``done/`` beside it.
+
+    Every "the commit is spent" or "the reveal confirmed" this CLI acts on is a server's word,
+    and a server can be wrong or lie: it can invent a spend that pushes a payload it
+    reconstructed, or echo a reveal it never relayed and report it confirmed (#736, panel D
+    round 2). Deleting the record on that word destroyed the one copy of the payload the commit
+    can be spent with. Archiving costs a file; ``resume-mint <txid>`` finds an archived record
+    as well as a live one, so a wrong answer is recoverable by asking another server.
+
+    ``delete`` is overridden to archive, so there is no second door: code in this CLI that
+    "deletes" a record archives it. The move is a rename, so the record keeps its 0600 mode,
+    into a 0700 directory. Live records are what :meth:`list_pending` returns (it does not
+    descend into ``done/``), which is what the pending-name check reads.
+    """
+
+    ARCHIVE_DIRNAME: ClassVar[str] = "done"
+
+    @property
+    def archive_directory(self) -> Path:
+        return self.directory / self.ARCHIVE_DIRNAME
+
+    def _archived_path(self, commit_txid: str) -> Path:
+        return self.archive_directory / f"{Txid(commit_txid)}.json"
+
+    def delete(self, commit_txid: str) -> None:
+        self.archive(commit_txid)
+
+    def archive(self, commit_txid: str) -> None:
+        """Move the live record to ``done/``. Does nothing if there is no live record."""
+        live = self.directory / f"{Txid(commit_txid)}.json"
+        if not live.exists():
+            return
+        self.archive_directory.mkdir(mode=0o700, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(self.archive_directory, 0o700)
+        os.replace(live, self._archived_path(commit_txid))
+        self._fsync_dir()
+
+    def load_archived(self, commit_txid: str) -> PendingMint:
+        """The archived record for ``commit_txid``; ``PendingMintNotFound`` if there is none."""
+        from ..glyph.mint import PendingMintNotFound
+
+        path = self._archived_path(commit_txid)
+        if not path.exists():
+            raise PendingMintNotFound(
+                f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
+            )
+        return JsonFilePendingStore(self.archive_directory).load(commit_txid)
+
+    def restore(self, commit_txid: str) -> None:
+        """Move an archived record back to the live directory (resume-mint is about to use it)."""
+        os.replace(self._archived_path(commit_txid), self.directory / f"{Txid(commit_txid)}.json")
+        self._fsync_dir()
+
+    def list_archived(self) -> list[str]:
+        if not self.archive_directory.is_dir():
+            return []
+        return sorted(p.stem for p in self.archive_directory.glob("*.json"))
+
+
+def _pending_store(ctx: CliContext) -> _ArchivingPendingStore:
     """Where ``mint-nft`` keeps the record that lets a broadcast commit be revealed later.
 
-    :func:`_pending_dir`, owner-only. Creates the directory.
+    :func:`_pending_dir`, owner-only. Creates the directory. Records are archived, never
+    deleted (:class:`_ArchivingPendingStore`).
     """
-    return JsonFilePendingStore(_pending_dir(ctx))
+    return _ArchivingPendingStore(_pending_dir(ctx))
 
 
 def _refuse_a_second_commit_for(ctx: CliContext, label: str, *, allow_unverified: bool) -> None:
@@ -768,8 +845,14 @@ def _refuse_a_second_commit_for(ctx: CliContext, label: str, *, allow_unverified
     Every exit after a commit says "do not re-run the mint command", and nothing enforced it: a
     second ``mint-nft`` for the same name committed, and paid, again (panel D-I1). At most one of
     the two claims can register the name, so the second fee — or the first commit's reveal —
-    buys a duplicate. A record is deleted only once its reveal confirms, so a record for the
-    name means that name's earlier commit is not known to be revealed.
+    buys a duplicate. A record leaves the live directory only once its reveal is reported
+    confirmed, so a live record for the name means that name's earlier commit is not known to be
+    revealed. Archived records (``done/``) are not consulted.
+
+    Only records for THIS network count: one pending-mints directory serves every network the
+    wallet is used on, and a regtest commit is no reason to refuse a mainnet mint (panel D
+    round 2). A record that does not say its network (written before records carried one) is
+    counted, and the refusal says it may be another network's.
 
     Reads the directory without creating it. A record that cannot be read is skipped: it cannot
     be resumed either, and refusing every future mint over a damaged file is not this check's
@@ -780,12 +863,14 @@ def _refuse_a_second_commit_for(ctx: CliContext, label: str, *, allow_unverified
     directory = _pending_dir(ctx)
     if not directory.is_dir():
         return
-    store = JsonFilePendingStore(directory)
+    store = _ArchivingPendingStore(directory)
     waiting: list[PendingMint] = []
     for txid in store.list_pending():
         try:
             record = store.load(txid)
         except (ValidationError, PendingMintNotFound, OSError):
+            continue
+        if record.network not in (None, ctx.network):
             continue
         if wave_registered_label(record.cbor_bytes) == label:
             waiting.append(record)
@@ -793,19 +878,26 @@ def _refuse_a_second_commit_for(ctx: CliContext, label: str, *, allow_unverified
         return
     first = waiting[0]
     resumes = "; ".join(f"`{_resume_command(ctx, p, allow_unverified=allow_unverified)}`" for p in waiting)
+    unknown = [p.commit_txid for p in waiting if p.network is None]
+    unknown_note = (
+        f" The record for {', '.join(unknown)} does not say which network its commit is on (it was written "
+        f"before records carried one); if it is not {ctx.network}'s, it is no reason to refuse this mint."
+        if unknown
+        else ""
+    )
     raise UserError(
         f"this wallet already has an unrevealed commit for the WAVE name {label}.rxd — refusing to commit again",
         cause=(
             f"{_shown_path(directory / (first.commit_txid + '.json'))} records the commit {first.commit_txid}:"
             f"{first.commit_vout} ({first.commit_value:,} photons)"
             + (f" and {len(waiting) - 1} more" if len(waiting) > 1 else "")
-            + "; a record is deleted only once its reveal confirms. A second commit spends again, and at most "
-            "one of the claims can register the name"
+            + "; a record leaves that directory only once its reveal is reported confirmed. A second commit "
+            "spends again, and at most one of the claims can register the name"
         ),
         fix=(
             f"reveal the one you have: {resumes}. If that commit never confirmed and has left the mempool, "
-            f"nothing was spent: delete its record and mint again. To commit a second claim anyway, pass "
-            f"--ignore-pending-mint. Nothing was broadcast."
+            f"nothing was spent: move its record out of the way and mint again. To commit a second claim "
+            f"anyway, pass --ignore-pending-mint.{unknown_note} Nothing was broadcast."
         ),
     )
 
@@ -870,38 +962,85 @@ def _shown_url(url: str) -> str:
     return urlunsplit(parts._replace(netloc=netloc))
 
 
+#: What a printed command says in place of a treasury other than the published one. pyrxd never
+#: prints a paying command for such a treasury (panel D round 2): the address would come from a
+#: pending record, which can be changed after the mint, and a ready-to-run command naming it is
+#: exactly what an edited record needs to redirect the fee. The operator types the address.
+_TREASURY_PLACEHOLDER = "<ADDRESS>"
+
+
+def _record_network(ctx: CliContext, pending: PendingMint) -> str:
+    """The network ``pending``'s commit is on: the record's, or this run's for a record that does not say."""
+    return pending.network or ctx.network
+
+
+def _pays_published_treasury(ctx: CliContext, pending: PendingMint) -> bool:
+    """Whether a paying reveal of ``pending`` pays the PUBLISHED treasury — the one fee a printed
+    command may name. The record's treasury is compared by address, so a mint that named the
+    published treasury explicitly is the published case (panel D round 2, finding 4). Off mainnet
+    no treasury is published."""
+    return _record_network(ctx, pending) == Network.MAINNET.value and pending.wave_treasury in (
+        None,
+        WAVE_TREASURY_ADDRESS,
+    )
+
+
 def _resume_command(ctx: CliContext, pending: PendingMint, *, allow_unverified: bool, decline: bool = False) -> str:
-    """The exact command that finishes ``pending``, with the options it needs to find it.
+    """The command that finishes ``pending``, with the options it needs to find it and the fee choice stated.
 
     The global options come first because the record lives beside the wallet file and the
     commit on one network: a bare ``pyrxd glyph resume-mint <txid>`` run with a different
-    ``--wallet`` or ``--network`` looks in the wrong place, and a mint run against a server named
-    with ``--electrumx`` resumes against that server. The wallet path is shown home-relative
-    (#737). A wallet opened with a BIP39 passphrase gets ``--passphrase``, which prompts for it:
-    without it the same wallet cannot re-derive the commit's key. And the mint's WAVE fee choice
-    is repeated, so the printed command is exactly what the mint agreed to: a declined fee stays
-    declined, a named treasury stays named, and a mint that went ahead on an unverified name
-    (``allow_unverified``, this run's ``--allow-unverified-wave-name``) says so again — resume-mint
-    does not carry that choice over from anywhere else.
+    ``--wallet`` or ``--network`` looks in the wrong place (``--network`` is the record's), and a
+    mint run against a server named with ``--electrumx`` resumes against that server. The wallet
+    path is shown home-relative (#737). A wallet opened with a BIP39 passphrase gets
+    ``--passphrase``, which prompts for it.
+
+    For a payload that registers a WAVE name the command STATES the fee choice, because
+    ``resume-mint`` takes it from its command line, never from the record: a declining mint's
+    command says ``--no-wave-registration-fee`` (as does ``decline=True``), a paying mint's says
+    ``--wave-registration-fee`` — or, for a treasury other than the published one,
+    ``--wave-treasury <ADDRESS>`` with the address left for the operator to type
+    (:data:`_TREASURY_PLACEHOLDER`). A mint that went ahead on an unverified name
+    (``allow_unverified``, this run's ``--allow-unverified-wave-name``) says so again.
     """
+    network = _record_network(ctx, pending)
     args = [shlex.quote("pyrxd")]
     source = ctx.config.source_path
     if source is not None and Path(source) != DEFAULT_CONFIG_PATH:
         args += ["--config", _shell_path(source)]
-    if ctx.electrumx_override:
+    if ctx.electrumx_override and network == ctx.network:
         args += ["--electrumx", shlex.quote(_shown_url(ctx.electrumx_override))]
-    args += ["--network", shlex.quote(ctx.network), "--wallet", _shell_path(ctx.wallet_path)]
+    args += ["--network", shlex.quote(network), "--wallet", _shell_path(ctx.wallet_path)]
     args += ["glyph", "resume-mint", shlex.quote(pending.commit_txid)]
     if ctx.opened_with_passphrase:
         args.append("--passphrase")
+    if wave_registered_label(pending.cbor_bytes) is None:
+        return " ".join(args)
     if decline or pending.wave_fee == "decline":
         args.append("--no-wave-registration-fee")
+        return " ".join(args)
+    if _pays_published_treasury(ctx, pending):
+        args.append("--wave-registration-fee")
     else:
-        if pending.wave_treasury is not None:
-            args += ["--wave-treasury", shlex.quote(pending.wave_treasury)]
-        if allow_unverified and pending.wave_fee == "pay":
-            args.append("--allow-unverified-wave-name")
+        args += ["--wave-treasury", shlex.quote(_TREASURY_PLACEHOLDER)]
+    if allow_unverified:
+        args.append("--allow-unverified-wave-name")
     return " ".join(args)
+
+
+def _typed_treasury_note(ctx: CliContext, pending: PendingMint) -> str:
+    """The sentence that goes with a printed command carrying :data:`_TREASURY_PLACEHOLDER`, or ""."""
+    if (
+        wave_registered_label(pending.cbor_bytes) is None
+        or pending.wave_fee == "decline"
+        or _pays_published_treasury(ctx, pending)
+    ):
+        return ""
+    return (
+        f" Replace {_TREASURY_PLACEHOLDER} with the treasury address you gave this mint's --wave-treasury: pyrxd "
+        "never prints a paying command for a treasury other than the published one, because it would come from "
+        "a pending record, and a record can be changed after the mint."
+    )
 
 
 def _commit_recovery(
@@ -912,7 +1051,7 @@ def _commit_recovery(
     registered_label = wave_registered_label(pending.cbor_bytes)
     resume = _resume_command(ctx, pending, allow_unverified=allow_unverified)
     shown_dir = _shown_path(store_dir)
-    passphrase_note = (
+    notes = _typed_treasury_note(ctx, pending) + (
         " `--passphrase` there prompts for this wallet's BIP39 passphrase, which is not printed."
         if ctx.opened_with_passphrase
         else ""
@@ -920,9 +1059,10 @@ def _commit_recovery(
     if progress.reveal_txid is not None:
         return (
             f"The reveal {progress.reveal_txid} of the commit {txid}:{pending.commit_vout} was broadcast and has not "
-            f"been seen to confirm. The commit's record is kept in {shown_dir} until it does. Do not re-run the mint "
-            f"command. Run `{resume}`: it finds the reveal, waits for it to confirm and deletes the record — or, "
-            f"if the reveal was dropped from the mempool, reveals the commit again.{passphrase_note}"
+            f"been seen to confirm. The commit's record is kept in {shown_dir} until it is reported confirmed, and "
+            f"then archived to {_shown_path(store_dir / _ArchivingPendingStore.ARCHIVE_DIRNAME)}. Do not re-run the "
+            f"mint command. Run `{resume}`: it finds the reveal and waits for it to confirm — or, if the reveal "
+            f"was dropped from the mempool, reveals the commit again.{notes}"
         )
     holds = (
         f"holds {pending.commit_value:,} photons ({pending.carrier_value:,} for the NFT carrier; the rest pays the "
@@ -938,22 +1078,21 @@ def _commit_recovery(
         opening = f"The commit {txid}:{pending.commit_vout} was broadcast and {holds}."
     lines = [
         f"{opening} Only a reveal of its exact envelope can spend it, and its record is saved in {shown_dir}.",
-        f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run `{resume}`."
-        + passphrase_note,
+        f"Do not re-run the mint command: that commits, and spends, again. To reveal this one, run `{resume}`." + notes,
     ]
     if registered_label is not None and pending.wave_fee == "decline":
         lines.append(
-            f"This mint declined the WAVE registration fee for {registered_label}.rxd, and that command keeps "
-            "that choice: it reveals without paying."
+            f"This mint declined the WAVE registration fee for {registered_label}.rxd, and that command says so: "
+            "it reveals without paying."
         )
     elif registered_label is not None:
         lines.append(
-            f"resume-mint asks an indexer whether {registered_label}.rxd is still free and pays the registration "
-            f"fee from a wallet input only if it says so. If the name is taken, reveal without the fee: "
-            f"`{_resume_command(ctx, pending, allow_unverified=allow_unverified, decline=True)}` — the reveal is "
-            f"then a duplicate claim the indexer does not register, and the carrier and the change come back to "
-            f'this wallet. A "taken" answer is one server\'s: if the name is in fact free, that reveal registers '
-            f"it without paying the fee."
+            f"resume-mint asks an indexer whether {registered_label}.rxd has a confirmed registration and pays the "
+            f"registration fee from a wallet input only if it reports none. If the name is taken, reveal without "
+            f"the fee: `{_resume_command(ctx, pending, allow_unverified=allow_unverified, decline=True)}` — the "
+            f"reveal is then a duplicate claim the indexer does not register, and the carrier and the change come "
+            f'back to this wallet. A "taken" answer is one server\'s: if it is wrong and the name has no '
+            f"registration, that reveal registers it without paying the fee."
         )
     lines.append(
         "If the commit never confirms and leaves the mempool, its inputs were never spent and the record can "
@@ -1044,13 +1183,13 @@ async def _reveal_committed(
     registration_treasury: str | None,
     allow_unverified_wave_name: bool,
     fee_funding: _FeeFunding | None,
-    store: JsonFilePendingStore,
+    store: _ArchivingPendingStore,
     progress: _Progress,
 ) -> dict[str, Any]:
     """Reveal a CONFIRMED commit. Every refusal here happens before anything is broadcast.
 
     The record's fee rate is judged first (:func:`_reveal_fee_rate`). For a claim that
-    registers a WAVE name and pays for it: the indexer must still say the name is free (asked
+    registers a WAVE name and pays for it: the indexer must still report no confirmed registration (asked
     again now, since the commit, and once more AFTER the confirmation prompt, immediately before
     the broadcast — a prompt can wait for as long as the operator reads it, and a name taken in
     that time would be paid for as a duplicate), and the wallet input that funds the fee must
@@ -1142,7 +1281,7 @@ async def _reveal_committed(
             f"fee input:     {fee_funding.txid}:{fee_funding.vout}  ({fee_funding.value:,} photons, {fee_funding.address})",
             f"WAVE fee:      {fee.describe()} (vout {_REVEAL_FEE_VOUT})"
             + ("" if fee.is_published_treasury else "  (NOT the published WAVE treasury)"),
-            f"name free:     {name_status}",
+            f"registered:    {name_status}",
         ]
     elif registered_label is not None:
         reveal_lines.append(f"WAVE fee:      NOT PAID for {registered_label}.rxd (--no-wave-registration-fee)")
@@ -1170,7 +1309,9 @@ async def _reveal_committed(
         click.echo(f"\nreveal broadcast: {reveal_txid}")
         click.echo("waiting for it to confirm before deleting the commit's record...")
     await _await_reveal(ctx, client, str(reveal_txid))
-    store.delete(pending.commit_txid)
+    # Archived, not deleted: "confirmed" is the server's word, and a server that echoed the reveal
+    # without relaying it can say it (#736, panel D round 2). resume-mint finds it in done/.
+    store.archive(pending.commit_txid)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -1208,7 +1349,7 @@ async def _await_reveal(ctx: CliContext, client: ElectrumXClient, reveal_txid: s
 async def _after_commit(
     ctx: CliContext,
     pending: PendingMint,
-    store: JsonFilePendingStore,
+    store: _ArchivingPendingStore,
     step: Callable[[_Progress], Awaitable[dict[str, Any]]],
     *,
     allow_unverified: bool,
@@ -1275,7 +1416,7 @@ async def _mint_nft_inner(
 ) -> dict:
     """Heavy lifting for `glyph mint-nft`. Returns a result dict.
 
-    A metadata file that registers a WAVE name: the indexer must say the name is free (asked
+    A metadata file that registers a WAVE name: the indexer must report no confirmed registration (asked
     before the commit, before the reveal's confirmation and again right before its broadcast),
     and the reveal pays the registration fee from a wallet input — the commit's own change —
     unless ``pay_registration_fee`` is ``False``. Nothing for the fee goes in the commit output.
@@ -1514,6 +1655,7 @@ async def _mint_nft_inner(
         funding_address=funding_addr,
         wave_fee=None if registered_label is None else ("pay" if registration_fee is not None else "decline"),
         wave_treasury=registration_treasury if registration_fee is not None else None,
+        network=ctx.network,
     )
     store = _pending_store(ctx)
     store.save(pending)
@@ -1552,7 +1694,7 @@ async def _mint_nft_inner(
 
 
 def _commit_broadcast_uncertain(
-    ctx: CliContext, pending: PendingMint, store: JsonFilePendingStore, exc: BaseException, *, allow_unverified: bool
+    ctx: CliContext, pending: PendingMint, store: _ArchivingPendingStore, exc: BaseException, *, allow_unverified: bool
 ) -> None:
     """Say what is true when the commit broadcast did not return: it may have relayed.
 
@@ -1654,6 +1796,27 @@ class _ValueDisputed(UserError):
     """
 
 
+def _fee_choice_commands(ctx: CliContext, pending: PendingMint, *, allow_unverified: bool) -> str:
+    """The resume commands that STATE a fee choice for ``pending``, for a refusal to print.
+
+    At most two: one that pays the PUBLISHED treasury (only where the record says the mint paid
+    it, on mainnet) and one that declines. Never a paying command for any other treasury: that
+    address would come from the record, and a ready-to-run command naming an edited address is
+    how an edited record redirected the fee (panel D round 2). For that case the paying form is
+    shown with :data:`_TREASURY_PLACEHOLDER`, for the operator to fill in.
+    """
+    decline = _resume_command(ctx, pending, allow_unverified=allow_unverified, decline=True)
+    if pending.wave_fee == "decline":
+        return f"to reveal without paying, as the record says the mint chose: `{decline}`"
+    paying = _resume_command(ctx, pending, allow_unverified=allow_unverified)
+    if _pays_published_treasury(ctx, pending):
+        return f"to pay the published WAVE treasury: `{paying}`; to reveal without paying: `{decline}`"
+    return (
+        f"to reveal without paying: `{decline}`; to pay a treasury you name, `{paying}` with "
+        f"{_TREASURY_PLACEHOLDER} replaced by that address — pyrxd does not print it for you"
+    )
+
+
 def _resume_fee_choice(
     ctx: CliContext,
     pending: PendingMint,
@@ -1663,76 +1826,64 @@ def _resume_fee_choice(
     *,
     allow_unverified: bool,
 ) -> tuple[bool, str | None]:
-    """``(pay, treasury)`` for this reveal: the mint's recorded choice, never a guess (M2).
+    """``(pay, treasury)`` for this reveal: the COMMAND LINE's choice, cross-checked against the record.
 
-    The recorded choice wins. A flag may only DECLINE a recorded payment — the recovery for a
-    name that was taken after the commit, which spends nothing the mint did not agree to. A
-    flag that would pay what the mint declined, or pay a different treasury, is refused. A
-    record with no choice (not written by ``glyph mint-nft``) needs the flag said out loud.
+    The record's word never decides a money question (panel D round 2). A pending record is a
+    file anyone with write access to the wallet directory can change after the mint; round 1
+    stopped it redirecting the fee to another treasury, and an edit from ``decline`` to ``pay``
+    then made a bare ``resume-mint`` pay 100 RXD the mint had declined. So, for a payload that
+    registers a WAVE name:
 
-    A recorded treasury that is NOT the published one is paid only when this command line names
-    it too (panel D-L1). The record is a file anyone with write access to the wallet directory
-    can change, and it is read with the same suspicion as its ``fee_rate`` (M1): taken on its
-    own word, an edited ``wave_treasury`` sent the whole fee to another address. The command the
-    mint printed already carries ``--wave-treasury``, so the honest path is unchanged. Naming
-    the published treasury is the same choice as naming none (D-L3).
+    - The choice must be stated: ``--wave-registration-fee`` (the published treasury),
+      ``--wave-treasury ADDRESS`` (another), or ``--no-wave-registration-fee``. The command the
+      mint printed states it. A bare ``resume-mint`` is refused, and prints the commands that
+      state it (:func:`_fee_choice_commands`).
+    - Declining is always accepted: it pays nothing, whatever the record says — it is also the
+      recovery for a name taken after the commit.
+    - Paying must agree with the record: a record that says the mint declined, or names another
+      treasury, refuses. The published treasury named by address is the published treasury
+      (D-L3), however the record spells it.
+    - A record that states no choice (not written by ``glyph mint-nft``) takes the stated one.
+
+    Returns ``treasury=None`` for the published treasury.
     """
     if registered_label is None:
         return False, None
-    stored = pending.wave_fee
-    if stored is None:
-        if flag is None:
-            raise UserError(
-                f"the record for {pending.commit_txid} registers {registered_label}.rxd but does not say whether "
-                "the WAVE registration fee is paid",
-                cause="it was not written by glyph mint-nft, which always records the choice",
-                fix="say which: --wave-registration-fee or --no-wave-registration-fee",
-            )
-        return flag, treasury
-    if stored == "decline":
-        if flag is True or treasury is not None:
-            raise UserError(
-                f"the mint declined the WAVE registration fee for {registered_label}.rxd, and resume-mint will not "
-                "pay what the mint declined",
-                cause="the record says --no-wave-registration-fee; this run says "
-                + ("--wave-registration-fee" if flag is True else f"--wave-treasury {treasury}"),
-                fix=(
-                    f"run `{_resume_command(ctx, pending, allow_unverified=allow_unverified)}`, which reveals "
-                    "without paying, as the mint chose"
-                ),
-            )
-        return False, None
-    recorded = pending.wave_treasury or WAVE_TREASURY_ADDRESS
-    # Either refusal below may be facing an edited record, so neither tells the operator to
-    # pay the recorded address: it says which command pays it, and which pays nothing.
-    choose = (
-        f"If {recorded} is where the mint was to pay the fee, run "
-        f"`{_resume_command(ctx, pending, allow_unverified=allow_unverified)}` (the command the mint printed). If it "
-        "is not, the record was changed after the mint: do not pay it. "
-        f"`{_resume_command(ctx, pending, allow_unverified=allow_unverified, decline=True)}` reveals without paying "
-        "(if the name is free it still registers, unpaid). Nothing was broadcast."
-    )
-    if treasury is not None and treasury != recorded:
+    choices = _fee_choice_commands(ctx, pending, allow_unverified=allow_unverified)
+    if flag is None and treasury is None:
         raise UserError(
-            "--wave-treasury is not the treasury the mint chose",
-            cause=f"the record pays {recorded}; this run names {treasury}",
-            fix=choose,
+            f"resume-mint needs the WAVE registration fee choice for {registered_label}.rxd on its command line",
+            cause=(
+                "the fee is money, and a pending record can be changed after the mint, so resume-mint does not "
+                "take the record's word for it; the command glyph mint-nft printed states the choice"
+            ),
+            fix=f"run the command mint-nft printed, or: {choices}. Nothing was broadcast.",
         )
     if flag is False:
-        # The recovery for a name taken after the commit: nothing is paid, so no treasury.
         return False, None
-    if pending.wave_treasury is not None and treasury is None:
+    stated_published = treasury is None or treasury == WAVE_TREASURY_ADDRESS
+    stated = WAVE_TREASURY_ADDRESS if stated_published else treasury
+    if pending.wave_fee is None:
+        return True, None if stated_published else treasury
+    if pending.wave_fee == "decline":
         raise UserError(
-            f"the record pays the WAVE registration fee to {pending.wave_treasury}, which is NOT the published "
-            "WAVE treasury — resume-mint pays it only if this command names it too",
-            cause=(
-                f"the record keeps the address the mint named with --wave-treasury; the published treasury is "
-                f"{WAVE_TREASURY_ADDRESS}. A record can be changed after the mint, so its word alone does not "
-                "choose where the fee goes"
-            ),
-            fix=choose,
+            f"the record says the mint declined the WAVE registration fee for {registered_label}.rxd, and "
+            "resume-mint will not pay what the record says was declined",
+            cause=f"the record says --no-wave-registration-fee; this run says to pay {stated}",
+            fix=f"{choices}. If you did not decline the fee at mint time, the record was changed. Nothing was broadcast.",
         )
-    return True, pending.wave_treasury
+    record_published = pending.wave_treasury in (None, WAVE_TREASURY_ADDRESS)
+    if stated_published != record_published or (not stated_published and treasury != pending.wave_treasury):
+        recorded = "the published WAVE treasury" if record_published else "a treasury other than the published one"
+        raise UserError(
+            "the treasury this run names is not the one the record says the mint chose",
+            cause=f"the record says the mint paid {recorded}; this run names {stated}",
+            fix=(
+                f"{choices}. If the record does not describe the mint you made, it was changed after the mint: do "
+                "not pay it. Nothing was broadcast."
+            ),
+        )
+    return True, None if stated_published else treasury
 
 
 async def _resume_mint_inner(
@@ -1747,29 +1898,47 @@ async def _resume_mint_inner(
 ) -> dict[str, Any]:
     """Heavy lifting for `glyph resume-mint`: reveal a commit from its saved record.
 
-    The record is checked before anything else: it must be the record for THIS txid, its
-    commit script must re-derive from its payload and this wallet's key, the NFT must go to
-    this wallet, and (once the commit is confirmed) the server must list the commit output at
-    the value the record says. The record is deleted only on POSITIVE evidence that the commit
-    is spent — a transaction whose input spends it, confirmed — never because the server
-    lists nothing.
+    The record is checked before anything else: it must be the record for THIS txid and this
+    network, its commit script must re-derive from its payload and this wallet's key, the NFT
+    must go to this wallet, the fee choice must be stated on the command line and agree with the
+    record, and (once the commit is confirmed) the server must list the commit output at the
+    value the record says. A record is never deleted: it is archived to ``done/`` once a spend of
+    the commit is reported confirmed, and an archived record is found here too — so a server
+    that reported a spend falsely costs a second run against another server, not the record
+    (#736, panel D round 2). An archived record is moved back to the live directory before it is
+    used, and archived again when its reveal is reported confirmed.
     """
     from ..glyph.mint import GlyphMinter, PendingMintNotFound
     from ..network.electrumx import script_hash_for_script
 
     store = _pending_store(ctx)
+    archived = False
     try:
         pending = store.load(commit_txid)
     except PendingMintNotFound as exc:
-        listed = ", ".join(store.list_pending()) or "none"
-        raise UserError(
-            f"no pending mint recorded for {commit_txid}",
-            cause=f"looked in {_shown_path(store.directory)}; records there: {listed}",
-            fix="pass the commit txid mint-nft printed, with the same --wallet",
-        ) from exc
+        try:
+            pending = store.load_archived(commit_txid)
+            archived = True
+        except PendingMintNotFound:
+            listed = ", ".join(store.list_pending()) or "none"
+            archived_list = ", ".join(store.list_archived()) or "none"
+            raise UserError(
+                f"no pending mint recorded for {commit_txid}",
+                cause=(
+                    f"looked in {_shown_path(store.directory)} (records: {listed}) and "
+                    f"{_shown_path(store.archive_directory)} (archived: {archived_list})"
+                ),
+                fix="pass the commit txid mint-nft printed, with the same --wallet",
+            ) from exc
     if pending.commit_txid != commit_txid:
         raise _refuse_record(
             store, commit_txid, "commit_txid", f"the file for {commit_txid} holds {pending.commit_txid}"
+        )
+    if pending.network is not None and pending.network != ctx.network:
+        raise UserError(
+            f"the record for {commit_txid} is for {pending.network}, and this run is on {ctx.network}",
+            cause="one pending-mints directory serves every network this wallet is used on",
+            fix=f"run `{_resume_command(ctx, pending, allow_unverified=allow_unverified_wave_name)}`",
         )
     registered_label = wave_registered_label(pending.cbor_bytes)
     try:
@@ -1798,13 +1967,19 @@ async def _resume_mint_inner(
         allow_unverified=allow_unverified_wave_name,
     )
     if treasury is not None:
-        _require_address_on_network(ctx, treasury, what="the recorded WAVE treasury")
+        _require_address_on_network(ctx, treasury, what="--wave-treasury")
     if pay and registered_label is not None and treasury is None and ctx.network != Network.MAINNET.value:
         raise UserError(
             f"no WAVE treasury is published for {ctx.network}",
-            cause=f"this commit registers {registered_label}.rxd and the mint chose to pay the fee",
+            cause=f"this commit registers {registered_label}.rxd and this run says to pay the fee",
             fix=f"pass --wave-treasury <a {ctx.network} address>, or --no-wave-registration-fee",
         )
+    if archived:
+        # Used again: back where a live record lives, so every exit below names it as usual and
+        # a confirmed reveal archives it again.
+        store.restore(commit_txid)
+        if ctx.output_mode == "human":
+            click.echo(f"restored the archived record for {commit_txid} to {_shown_path(store.directory)}")
 
     async def _step(progress: _Progress) -> dict[str, Any]:
         await _wait_for_tx(client, pending.commit_txid, interval_s=_poll_interval_for(ctx))
@@ -1829,11 +2004,15 @@ async def _resume_mint_inner(
             if height <= 0:
                 progress.reveal_txid = spender
                 await _await_reveal(ctx, client, spender)
-            store.delete(pending.commit_txid)
+            store.archive(pending.commit_txid)
             raise _NothingToRecover(
                 f"the commit {pending.commit_txid}:{pending.commit_vout} is already revealed, by {spender}",
-                cause=f"{spender} spends the commit output and is confirmed",
-                fix=f"nothing to recover; the record in {_shown_path(store.directory)} has been deleted",
+                cause=f"the server reports that {spender} spends the commit output and is confirmed",
+                fix=(
+                    f"nothing to recover; the record is archived in {_shown_path(store.archive_directory)}. If an "
+                    "explorer shows the commit output still unspent, the server was wrong: run this command again "
+                    "against another server (--electrumx), which finds the archived record"
+                ),
             )
         if listed[0].value != pending.commit_value:
             # The signature commits to the value, so signing at either number risks a reveal the
@@ -1946,8 +2125,8 @@ async def _wait_for_tx(
                 "(a timelocked envelope with --recipient is NOT reproducible from the same inputs — each "
                 "wrap draws a fresh ephemeral key and nonce). A WAVE claim: keep the mint's fee choice. If it "
                 "declined the fee, build with pay_registration_fee=False. Otherwise pay its "
-                "registration_fee_output from a wallet input ONLY if WaveResolver.check_available says the "
-                "name is still free; if it is taken, build with pay_registration_fee=False, which reveals a "
+                "registration_fee_output from a wallet input ONLY if WaveResolver.check_available reports no "
+                "confirmed registration of the name; if it is taken, build with pay_registration_fee=False, which reveals a "
                 "duplicate the indexer does not register and returns the value. If the commit is never mined "
                 "and leaves the mempool, its inputs were never spent. See docs/how-to/troubleshoot-common-errors.md"
             ),

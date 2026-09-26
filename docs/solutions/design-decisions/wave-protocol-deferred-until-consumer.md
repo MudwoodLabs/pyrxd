@@ -51,8 +51,8 @@ a real consumer surfacing. Until then, do not invest design effort.
 > page does, to the treasury Photonic and RXinDexer both name. The reveal
 > builders return the fee output for the caller to add, funded from a wallet
 > input at reveal time as Photonic funds it, and `pyrxd glyph mint-nft` pays it
-> if an indexer (one server's `wave.check_available` answer) says the name is
-> free; `pay_registration_fee=False` is the only way
+> if an indexer (one server's `wave.check_available` answer) reports no
+> confirmed registration of the name; `pay_registration_fee=False` is the only way
 > out. See the
 > "WAVE registration fee" paragraph in §8.1 of
 > `docs/reference/glyph-token-protocol-spec.md` and `src/pyrxd/glyph/wave_rules.py`.

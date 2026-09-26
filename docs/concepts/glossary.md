@@ -496,9 +496,10 @@ those for depth; use this page to look something up mid-task.
   a name returns it as `registration_fee_output` (`glyph/wave_rules.py`) for
   the caller to add, funded from a plain wallet input rather than the commit;
   `pyrxd glyph mint-nft` pays it if an indexer (one server's `wave.check_available`
-  answer, asked before the commit and again just before the reveal) says the
-  name is free — or, with `--allow-unverified-wave-name`, when no server
-  answers at all.
+  answer, asked before the commit and again just before the reveal) reports
+  no confirmed registration of the name — or, with
+  `--allow-unverified-wave-name`, when no server answers at all. The indexer
+  answers from mined blocks: a rival claim not yet mined is not seen.
   `pay_registration_fee=False` opts out; the name still registers, since the
   indexer checks the payment only on renewal.
 - **watchtower** — the persistent monitoring loop
