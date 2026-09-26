@@ -77,7 +77,7 @@ const CURVE_URL = new URL("./secp256k1-bridge.js", document.baseURI).toString();
 // global namespace and keeps the surface explicit.
 let pyGlue = null;          // glue.run(text) -> dict
 let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex, attest_limit, max_rows) -> dict
-let pySpentBinding = null;  // glue.spent_output_binding(txid, raw_hex, prev_raw_hex, prev_error) -> dict
+let pySpentBinding = null;  // glue.spent_output_bindings(txid, raw_hex, prevs_json, errors_json, attest_limit, max_rows) -> dict
 // The verdict view's three extra bridges. Each is a thin forward to pyrxd: the
 // block comes from `resolve_mark_anchor`, the hash choice from `algorithm_for`,
 // and the digest comparison and its wording from `_inspect_core`. None of the
@@ -113,6 +113,11 @@ let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo
 // shows everything: `pyrxd glyph inspect <txid> --fetch` has no screen to fill, lists every
 // entry and checks every record.
 const MAX_ROWS_SHOWN = 100;
+
+// The `payload_binding` states drawn as a warning: a node would REJECT the transaction as shown,
+// so its envelope is unattributed. `PAYLOAD_BINDING_WARNING_STATES` in `_inspect_core.py`, which
+// the CLI reads; `tests/web/test_payload_binding_warning_is_drawn.py` pins the two equal.
+const PAYLOAD_BINDING_WARNING_STATES = ["mismatch", "commit-unsatisfied"];
 
 // The ElectrumX endpoint, the wire timeout and the transaction size cap are
 // `ELECTRUMX_WSS_URL` / `FETCH_TIMEOUT_MS` / `MAX_FETCHED_TX_HEX_LEN` in shared.js,
@@ -175,7 +180,7 @@ async function boot() {
 
   pyGlue = runtime.bridges.run;
   pyGlueFetch = runtime.bridges.inspectTxidWithRaw;
-  pySpentBinding = runtime.bridges.spentOutputBinding;
+  pySpentBinding = runtime.bridges.spentOutputBindings;
   pyMarkAnchor = runtime.bridges.markAnchor;
   pyFileCheckPlan = runtime.bridges.fileCheckPlan;
   pyJudgeFileDigest = runtime.bridges.judgeFileDigest;
@@ -540,7 +545,8 @@ function renderFetchedTxCard(payload) {
   // Reveal metadata (if present).
   //
   // WHICH GLYPH THIS IS (#577). A multi-glyph reveal carries one payload per
-  // minted glyph. The Python reports the FIRST decodable one as `metadata`,
+  // minted glyph. The Python reports one as `metadata` (the first whose outpoint the
+  // outputs mint, else the first decodable one),
   // stamps `of_n_payloads` on it when there is more than one, and lists every
   // payload-carrying input in `metadata_inputs` — and this card read neither.
   // Under a bare "Reveal metadata" heading, one name, ticker, description and
@@ -551,30 +557,43 @@ function renderFetchedTxCard(payload) {
   const metadata = payload.metadata;
   const metadataInputs = Array.isArray(payload.metadata_inputs) ? payload.metadata_inputs : [];
   if (metadata) {
+    // MINTED is counted from the outputs (`of_n_minted`), not from the envelopes: an input can
+    // carry a payload and mint nothing. Worded exactly as the CLI words it.
     const ofN = metadata.of_n_payloads;
+    const minted = metadata.of_n_minted === undefined ? ofN : metadata.of_n_minted;
+    const said = minted === ofN
+      ? `1 of ${ofN} glyphs minted here`
+      : `1 of ${ofN} payloads here, ${minted} minting a token`;
     wrapper.appendChild(el("h3", {
       class: "result-subhead",
       text: ofN
-        ? `Reveal metadata (from input ${metadata.input_index} — 1 of ${ofN} glyphs minted here)`
+        ? `Reveal metadata (from input ${metadata.input_index} — ${said})`
         : `Reveal metadata (from input ${metadata.input_index})`,
     }));
     const mdl = el("dl", { class: "kv-list" });
     const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
-    // WHAT THE ATTRIBUTION IS WORTH. Both readers take the first `gly` push in the
-    // first input that decodes, so the name shown need not be the one the commit
+    if (metadata.mints === false) mdl.appendChild(kv("token", "none — this input mints no token here"));
+    // WHAT THE ATTRIBUTION IS WORTH. The headline is chosen from the inputs'
+    // envelopes, so the name shown need not be the one the commit
     // committed to. `mismatch` means it demonstrably is not. Rendered for every
     // state, because "not checked" and "checked and held" are opposite facts and
-    // omitting the weak one leaves the confident reading in place.
+    // omitting the weak one leaves the confident reading in place. Flagged: the
+    // states that say a node would REJECT this transaction as shown — the same set
+    // as `PAYLOAD_BINDING_WARNING_STATES` in `_inspect_core.py`.
     if (metadata.payload_binding) {
       const pb = metadata.payload_binding;
-      const cls = pb.state === "mismatch" ? "kv-warning" : undefined;
+      const cls = PAYLOAD_BINDING_WARNING_STATES.includes(pb.state) ? "kv-warning" : undefined;
       mdl.appendChild(kv("payload binding", `${pb.state} — ${pb.reason}`, cls));
       // WHY, when the page asked for the spent transaction and could not use what it got:
       // the server's refusal, or what was wrong with its answer — including an answer that
       // was not the transaction asked for. From `glue.py`, which says it rather than letting
       // "was not supplied" stand for a transaction that was.
       if (pb.detail) mdl.appendChild(kv("payload binding detail", pb.detail));
+      // NOT SETTLED: the headline is not bound and a check that could have moved it did not
+      // happen (a fetch failed, or the payload was past the fetch limit). Flagged, as the CLI
+      // flags it.
+      if (pb.unsettled) mdl.appendChild(kv("payload binding caveat", pb.unsettled, "kv-warning"));
     }
     // Named whatever the verdict. On `unchecked` it is the outpoint someone would
     // fetch to settle it; on `mismatch` it is where the committed payload lives.
@@ -753,10 +772,17 @@ function renderFetchedTxCard(payload) {
   // At most MAX_ROWS_SHOWN are listed, like the outputs: one row per payload-carrying input,
   // and nothing else bounds how many inputs carry one. The rest are counted by the classifier.
   const hiddenGlyphs = payload.metadata_inputs_not_listed ? payload.metadata_inputs_not_listed.count : 0;
+  const hiddenMinting = payload.metadata_inputs_not_listed ? (payload.metadata_inputs_not_listed.minting || 0) : 0;
   if (otherGlyphs.length > 0 || hiddenGlyphs > 0) {
+    // Minted is what the outputs create (`mints`), so a payload on an input that mints nothing
+    // is listed as that, and the heading counts only the others that do. As the CLI words it.
+    const total = otherGlyphs.length + hiddenGlyphs;
+    const minting = otherGlyphs.filter((row) => row.mints !== false).length + hiddenMinting;
     wrapper.appendChild(el("h3", {
       class: "result-subhead",
-      text: `Other glyphs minted in this transaction (${otherGlyphs.length + hiddenGlyphs})`,
+      text: minting === total
+        ? `Other glyphs minted in this transaction (${total})`
+        : `Other payloads in this transaction (${total}), ${minting} minting a token`,
     }));
     const odl = el("dl", { class: "kv-list" });
     for (const row of otherGlyphs) {
@@ -764,14 +790,36 @@ function renderFetchedTxCard(payload) {
       // and shown one of them is the same "you were told about a different
       // token" failure one level down.
       const label = [row.name, row.ticker].filter(Boolean).join(" / ") || "(unnamed)";
-      odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}`));
+      let tail = row.mints === false ? " — mints no token" : "";
+      // Its commit's verdict — `unchecked` with the reason where the fetch failed or was never
+      // made — and flagged when a node rejects it, or when it spent no commit pyrxd recognises
+      // beside one that binds. Worded as the CLI words it.
+      if (row.binding_state) {
+        tail += ` — payload binding: ${row.binding_state}`;
+        if (row.binding_detail) tail += ` (${row.binding_detail})`;
+        if (row.binding_warning) tail += " *** treat as unattributed";
+      }
+      odl.appendChild(kv(
+        `input ${row.input_index}`,
+        `${row.classification || "?"} — ${label}${tail}`,
+        row.binding_warning ? "kv-warning" : undefined,
+      ));
     }
     wrapper.appendChild(odl);
+    const pastCap = metadata ? metadata.bindings_past_cap : null;
+    if (pastCap) {
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: `(${pastCap.count} minting payload(s) past the limit of ${pastCap.cap} ` +
+              "commits fetched were not checked)",
+      }));
+    }
     if (hiddenGlyphs > 0) {
       wrapper.appendChild(el("p", {
         class: "card-note hidden-rows-note",
         text: `The first ${otherGlyphs.length} are listed; ${hiddenGlyphs} more ` +
-              `${hiddenGlyphs === 1 ? "is" : "are"} not shown here. ${seeEverything(payload.txid)}`,
+              `${hiddenGlyphs === 1 ? "is" : "are"} not shown here, ${hiddenMinting} of them minting a token. ` +
+              `${seeEverything(payload.txid)}`,
       }));
     }
   }
@@ -1644,6 +1692,16 @@ function _outputShape(payload) {
 // `_outputShape`, never from `payload.outputs`, which holds at most MAX_ROWS_SHOWN rows. The one
 // thing still read off the rows is a POSITION (which vout the minted FT sits at, whether the
 // outputs are in the canonical mint order), and only when the rows are every output.
+// What a marker banner may say about the outputs: exactly what `metadata.mints` says — the field
+// the headline's "token" row reads — so the banner and that row cannot disagree. Empty when the
+// classifier did not say.
+function _mintSentence(metadata) {
+  if (!metadata || typeof metadata.mints !== "boolean") return "";
+  return metadata.mints
+    ? " An output of this transaction creates a token ref from the payload's input; the output rows say what its script is."
+    : " No output of this transaction creates a token ref from the payload's input: it mints no token here.";
+}
+
 function _detectTxShape(payload) {
   const outputs = payload.outputs || [];
   const shape = _outputShape(payload);
@@ -1682,30 +1740,35 @@ function _detectTxShape(payload) {
     );
   }
 
-  // Rarer Glyph protocol markers — detected from reveal-metadata protocol
-  // list, not from output shapes (the locking scripts are ordinary NFT/MUT
-  // shapes; the marker is purely a CBOR metadata flag). These are structural
-  // pattern matches only; semantic correctness is not verified.
+  // Rarer Glyph protocol markers — detected from the reveal-metadata protocol list, not from
+  // output shapes. The marker is purely a CBOR metadata flag. These are structural pattern
+  // matches only; semantic correctness is not verified.
+  //
+  // WHAT A BANNER MAY SAY ABOUT THE OUTPUTS: only what `metadata.mints` says (`_mintSentence`),
+  // the field the "token" row reads. Five of these banners used to say the locking script "is
+  // an ordinary Glyph NFT" (DAT's: "singleton") — read off the marker, never off the bytes — so
+  // on the mainnet DAT reveal e5c67100…be5d, whose outputs are P2PKH, the card said the payload
+  // mints no token AND that the locking script was an NFT singleton (#743 round 3).
+  const mintSentence = _mintSentence(payload.metadata);
 
-  // CONTAINER (7) — an NFT that groups other tokens/NFTs into a collection.
+  // CONTAINER (7) — a collection envelope other tokens reference.
   if (protocol.includes("7") || protocol.some((p) => p.endsWith("CONTAINER"))) {
     return (
       "This transaction carries the Glyph CONTAINER marker (protocol = 7). " +
-      "A CONTAINER is an NFT that acts as a collection envelope — other tokens " +
-      "or NFTs reference it to signal membership in the collection. The locking " +
-      "script is an ordinary Glyph NFT singleton; the CONTAINER role is " +
-      "declared only in the reveal metadata."
+      "A CONTAINER is a collection envelope — other tokens or NFTs reference " +
+      "it to signal membership in the collection. The CONTAINER role is " +
+      "declared only in the reveal metadata." + mintSentence
     );
   }
 
-  // ENCRYPTED (8) — an NFT whose payload is encrypted; requires companion key NFT.
+  // ENCRYPTED (8) — a payload that is encrypted; requires companion key NFT.
   if (protocol.includes("8") || protocol.some((p) => p.endsWith("ENCRYPTED"))) {
     return (
       "This transaction carries the Glyph ENCRYPTED marker (protocol = 8). " +
-      "The payload embedded in this NFT's reveal metadata is encrypted. " +
+      "The payload embedded in the reveal metadata is encrypted. " +
       "Decrypting it typically requires a companion key NFT held by the " +
-      "intended recipient. The on-chain shape is an ordinary Glyph NFT; " +
-      "the encryption is a metadata-layer convention, not enforced by script."
+      "intended recipient. The encryption is a metadata-layer convention, " +
+      "not enforced by script." + mintSentence
     );
   }
 
@@ -1716,41 +1779,44 @@ function _detectTxShape(payload) {
       "A TIMELOCK signals that the reveal or transfer is subject to a " +
       "time-based condition encoded in the metadata. Per the Glyph protocol " +
       "spec, TIMELOCK requires ENCRYPTED to also be present. " +
-      "The on-chain locking script is an ordinary Glyph NFT; " +
-      "the time condition is a metadata-layer convention."
+      "The time condition is a metadata-layer convention." + mintSentence
     );
   }
 
-  // AUTHORITY (10) — an issuer authority NFT; grants permission to modify/issue tokens.
+  // AUTHORITY (10) — an issuer authority; grants permission to modify/issue tokens.
   if (protocol.includes("10") || protocol.some((p) => p.endsWith("AUTHORITY"))) {
     return (
       "This transaction carries the Glyph AUTHORITY marker (protocol = 10). " +
-      "An AUTHORITY is a special NFT that confers issuer rights — the holder " +
-      "can authorize operations (such as additional mints or metadata updates) " +
-      "on a related token family. The on-chain script is an ordinary Glyph NFT; " +
-      "the authority role is declared in the reveal metadata."
+      "An AUTHORITY confers issuer rights — its holder can authorize " +
+      "operations (such as additional mints or metadata updates) on a " +
+      "related token family. The authority role is declared in the reveal " +
+      "metadata." + mintSentence
     );
   }
 
-  // WAVE (11) — an on-chain name-claim NFT (requires NFT + MUT per spec).
+  // WAVE (11) — an on-chain name claim (requires NFT + MUT per spec).
+  //
+  // WHAT THIS PAGE DOES WITH ONE: shows the claim as the payload states it, and nothing more. It
+  // talks to ElectrumX only (`blockchain.transaction.get`, `blockchain.headers.subscribe` in
+  // shared.js), never to a WAVE indexer, so it cannot say whether the name is registered or
+  // what it resolves to. The banner used to add that pyrxd's WAVE support was deferred, which
+  // was false by 0.25.0 — pyrxd builds WAVE claims and pays their registration fee.
   if (protocol.includes("11") || protocol.some((p) => p.endsWith("WAVE"))) {
     return (
       "This transaction carries the Glyph WAVE marker (protocol = 11). " +
-      "WAVE is the Glyph on-chain naming protocol — this NFT claims a " +
-      "human-readable name on Radiant. The name can be updated by spending " +
-      "this output (it requires NFT + MUT per the protocol spec). " +
-      "Note: WAVE support in pyrxd is currently deferred; this banner is " +
-      "informational only."
+      "WAVE is the Glyph on-chain naming protocol — this payload claims a " +
+      "human-readable name on Radiant (the protocol spec requires NFT + MUT). " +
+      "This page shows the claim as the payload states it; it does not ask a " +
+      "WAVE indexer whether the name is registered or what it resolves to." + mintSentence
     );
   }
 
-  // DAT (3) — a data-storage NFT (raw data anchored on-chain).
+  // DAT (3) — data anchored on-chain in a reveal payload.
   if (protocol.includes("3") || protocol.some((p) => p.endsWith("DAT"))) {
     return (
       "This transaction carries the Glyph DAT marker (protocol = 3). " +
-      "DAT anchors arbitrary data on-chain inside a Glyph NFT's reveal " +
-      "payload. The data blob is embedded in the CBOR metadata; the " +
-      "locking script is an ordinary Glyph NFT singleton."
+      "DAT anchors data on-chain in a Glyph reveal payload: the data is " +
+      "embedded in the CBOR metadata." + mintSentence
     );
   }
 
@@ -2615,39 +2681,58 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // output's script hex, the headline payload's protocol list — which only the transaction's
   // bytes bound.
   //
-  // PAYLOAD BINDING — a SECOND fetch, and NOT a second classification. The first pass names
-  // the outpoint the reveal's attributed input spent. That output is the commit whose
-  // `payload_hash` is the only thing binding the displayed name/attrs to anything, and the
+  // PAYLOAD BINDING — more fetches, and usually NOT a second classification. The first pass
+  // names, in `binding_candidates`, the outpoints the minting payloads' inputs spent (at most
+  // a handful; one for a reveal minting one glyph). Those outputs are the commits whose
+  // `payload_hash` is the only thing binding a displayed name/attrs to anything, and the
   // classifier is network-free, so without this the verdict can only ever read "unchecked".
-  // `spent_output_binding` answers for that one field — it reads the attributed input's
-  // envelope and the one output it spent — and the CLI's `--fetch` asks the same function.
+  // `spent_output_bindings` answers — the headline's verdict, and the headline itself, which
+  // goes to a payload that is bound over one that merely mints (#743 round 3) — and the CLI's
+  // `--fetch` asks the same function. It classifies again only when it has to (the headline
+  // moved, or another payload's row has a verdict to show), and then hands back the payload.
   //
-  // BOUNDED BY CONSTRUCTION: one attributed input, one prevout, one extra round trip.
+  // BOUNDED by the classifier: `binding_candidates` is capped there.
   // A failure here leaves the rest of the report standing — and is SAID: the refusal or the
-  // unusable answer goes to Python as `prevError`, and the verdict reads "unchecked" with
-  // that as its detail. It used to be swallowed, and the report then said the spent
-  // transaction "was not supplied" when the page had asked for it and been lied to.
+  // unusable answer goes to Python in `errors`, and that verdict reads "unchecked" with it as
+  // its detail. It used to be swallowed, and the report then said the spent transaction "was
+  // not supplied" when the page had asked for it and been lied to.
   let result;
   try {
     result = fromPy(pyGlueFetch(txid, rawHex, MAX_ROWS_SHOWN, MAX_ROWS_SHOWN));
 
     const metadata = result && result.ok && result.payload ? result.payload.metadata : null;
-    const outpoint = metadata ? metadata.input_outpoint : null;
-    if (outpoint) {
+    const candidates = metadata && Array.isArray(result.payload.binding_candidates)
+      ? result.payload.binding_candidates
+      : [];
+    if (candidates.length > 0) {
       statusEl.textContent = "checking payload binding…";
-      const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
-      let prevRawHex = "";
-      let prevError = "";
-      try {
-        // Hash-checked against `prevTxid` inside the fetch: a server that answers with any
-        // other transaction is refused there, before a byte of it reaches the classifier.
-        prevRawHex = await fetchRawTxFromElectrumx(prevTxid);
-      } catch (err) {
-        prevError = stripControlChars(String((err && err.message) || err));
+      const prevs = {};
+      const errors = {};
+      for (const outpoint of candidates) {
+        const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
+        try {
+          // Hash-checked against `prevTxid` inside the fetch: a server that answers with any
+          // other transaction is refused there, before a byte of it reaches the classifier.
+          prevs[outpoint] = await fetchRawTxFromElectrumx(prevTxid);
+        } catch (err) {
+          errors[outpoint] = stripControlChars(String((err && err.message) || err));
+        }
+        // AFTER EACH CANDIDATE, answered or refused (#743 round 5): a reader who moved on during
+        // it gets no further fetches for the old transaction, and no binding step. There are up
+        // to _MAX_BINDING_FETCHES of these waits; one check after the loop stopped the drawing
+        // but still paid for the rest of them and for the Python below.
+        if (superseded()) return;
       }
-      const bound = fromPy(pySpentBinding(txid, rawHex, prevRawHex, prevError));
+      // No check after this call or inside it: `pySpentBinding` is a synchronous call into
+      // Pyodide on this thread (so is the re-classification it may do), and a click cannot be
+      // handled until it returns. The wait before it is the last candidate fetch, checked above.
+      // `test_the_page_awaits_only_the_network` pins that it is not awaited.
+      const bound = fromPy(pySpentBinding(
+        txid, rawHex, JSON.stringify(prevs), JSON.stringify(errors), MAX_ROWS_SHOWN, MAX_ROWS_SHOWN,
+      ));
       if (bound && bound.ok) {
-        if (bound.binding) metadata.payload_binding = bound.binding;
+        if (bound.payload) result.payload = bound.payload;
+        else if (bound.binding) metadata.payload_binding = bound.binding;
       } else {
         // Not reachable for a transaction the first call accepted — the bridge re-reads the
         // same bytes — but if it ever is, the first pass's "was not supplied" must not stand.
@@ -2670,7 +2755,9 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
     });
     return;
   }
-  // The spent-transaction fetch above is awaited too, so the reader may have moved on during it.
+  // Every wait inside the try above is a spent-transaction fetch, and each is checked where it
+  // ends, so this (and the one in the catch) cannot fire today. Kept so that a wait added
+  // there later still cannot draw a stale result.
   if (superseded()) return;
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole

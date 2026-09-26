@@ -202,13 +202,39 @@ for every output.
 Every raw transaction either page fetches is hashed and compared with
 the txid it asked for before anything reads it, so a server that
 answers with some other transaction is refused. That includes
-`/inspect/`'s second fetch, of the commit a reveal spent, which is what
-decides `payload_binding`. That step does not classify the transaction
-again: `spent_output_binding` reads the attributed input's envelope and
-the one output it spent, and `pyrxd glyph inspect <txid> --fetch` asks
-the same function, so the page and the CLI word the same fetch the same
-way. When the fetch fails or is refused, the verdict reads `unchecked`
-and says why — not that the spent output "was not supplied".
+`/inspect/`'s second step, which fetches the commits the reveal's
+minting payloads spent — the outpoints the first classification names
+in `binding_candidates`, at most 8, and one for a reveal minting one
+glyph — and decides `payload_binding` and which payload heads the
+card. A payload whose commit binds it heads it over one that merely
+mints: `spent_output_bindings` ranks a bound payload first, then one
+that spent a commit pyrxd recognises, then the first that mints. Only
+when that moves the headline, or another minting payload has a verdict
+to show, is the transaction classified again, with those commits;
+otherwise the binding is the one field that changes. `pyrxd glyph
+inspect <txid> --fetch` fetches the same outpoints and asks the same
+function, so the page and the CLI word the same fetch the same way.
+Every minting payload gets a verdict. One that spent no commit pyrxd
+recognises, beside one that IS bound, is flagged ("treat as
+unattributed"). One whose fetch failed, was refused, or was answered
+with another transaction reads `unchecked` with the reason; one past
+the limit of 8 reads `unchecked` too, and the card counts those. When
+the headline is not bound and any other minting payload went unchecked,
+the headline says so, flagged: a bound one among them would have headed
+the card. For the headline's own fetch, a failure or refusal likewise
+reads `unchecked` and says why — not that the spent output
+"was not supplied".
+
+What each `payload_binding` state establishes:
+
+| state | what it means | what it does NOT mean |
+|---|---|---|
+| `bound` | The attributed input spent an NFT or FT commit whose payload hash is the envelope shown, and this transaction's outputs carry that commit's outpoint as the ref type the commit demands. `first_ref_output` and `ref_output_count` say where; the reason names up to three. | That the name belongs to any OTHER output. A reveal minting two tokens is `bound` for whichever input is attributed, and only for that input's token. That a node would accept the transaction: signatures are not checked, nor the rest of the reference rules — a singleton beside a normal push of the same ref reads `bound`, and a node refuses it. |
+| `bound-no-token` | The same hash match against a DAT commit. A DAT commit demands no ref, so the payload is data and describes no output — whatever protocol it declares. | That a token was created. A DAT commit mints nothing, which makes it exactly what a decoy input placed first could spend. |
+| `mismatch` | The spent commit committed to a different payload. A node rejects that spend, so these are bytes that were never mined (pasted raw, or served for a txid no block holds). Flagged. | — |
+| `commit-unsatisfied` | The hash matches, and the outputs do not carry the commit's ref as it demands. A node rejects that spend too. Flagged. | — |
+| `not-a-commit` | The output the attributed input spent is not a commit template pyrxd recognises: the NFT, FT and DAT commits pyrxd and Photonic build (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing). | That nobody committed to the envelope. A script pyrxd does not recognise may still hash-lock it: the mainnet DAT reveal `e5c67100…be5d` spends a 65-byte commit with no `"dat"` push that neither builder emits, and reads `not-a-commit`. |
+| `unchecked` | The spent output, or the envelope's bytes, was not available. | — |
 
 ---
 

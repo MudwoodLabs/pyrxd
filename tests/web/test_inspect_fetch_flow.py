@@ -3,7 +3,7 @@ Python bridge, and what it then DRAWS.
 
 ``inspect_fetch_flow_harness.mjs`` runs the page's own ``onFetchTxid`` against a stub ElectrumX
 server and records every argument it passes to the two bridges — the classifier
-(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_binding``). Each bridge
+(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_bindings``). Each bridge
 answers from a canned list, and every canned answer here is computed by the REAL ``glue.py`` on
 the arguments the page really passed: a first run records the binding step's arguments, the real
 glue answers them, and a second run renders that answer after checking the page passed the same
@@ -21,7 +21,7 @@ Properties, each a defect this change fixes:
 * **A spent transaction the page could not get is SAID, not swallowed** — in the drawn
   ``payload binding`` row and its ``detail``, not "was not supplied".
 * **The binding step does not classify the transaction again.** It used to be a second full
-  ``inspect_txid_with_raw``; it is one ``spent_output_binding`` call.
+  ``inspect_txid_with_raw``; it is one ``spent_output_bindings`` call.
 * **A failed first fetch is advised by what failed.** A server that answered with a different
   transaction was reachable, and is not told to be checked for reachability.
 * **The page passes its row limit as the classifier's checking limit AND its listing limit.**
@@ -97,12 +97,19 @@ def _commit_for(cbor: bytes, amount: int = 1000):
 
 
 def _world(shown: str = "honest", committed: str | None = None):
-    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen)."""
+    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen). The reveal
+    mints the singleton its commit demands; ``committed`` differing from ``shown`` is a spend no
+    node accepts, which is what ``mismatch`` reports."""
+    from pyrxd.glyph.script import build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.security.types import Hex20
+
     suffix, shown_cbor = _envelope(shown)
     _, committed_cbor = _envelope(committed if committed is not None else shown)
     commit = _commit_for(committed_cbor)
     unlocking = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + suffix
-    reveal = _tx([(b"\x6a" + b"\x00" * 8, 0)], [(commit.txid(), 0, unlocking)])
+    minted = build_nft_locking_script(Hex20(b"\x33" * 20), GlyphRef(txid=commit.txid(), vout=0))
+    reveal = _tx([(minted, 1)], [(commit.txid(), 0, unlocking)])
     forged = _commit_for(shown_cbor, amount=999)
     assert forged.txid() != commit.txid()
     return reveal, commit, forged
@@ -162,7 +169,7 @@ def _run(reveal, server: dict, limit: int) -> dict:
     what pass 2 draws is the page's drawing of the real binding for the real arguments."""
     first = [_first_pass(reveal, limit)]
     recorded = _flow(reveal.txid(), server, first)
-    answers = [_glue().spent_output_binding(*call) for call in recorded["binding_calls"]]
+    answers = [_glue().spent_output_bindings(*call) for call in recorded["binding_calls"]]
     flow = _flow(reveal.txid(), server, first, answers)
     assert flow["glue_calls"] == recorded["glue_calls"]
     assert flow["binding_calls"] == recorded["binding_calls"]
@@ -193,9 +200,18 @@ class TestTheSpentTransactionTheServerSends:
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         raw = reveal.serialize().hex()
         assert flow["glue_calls"] == [[reveal.txid(), raw, limit, limit]], "the transaction was classified twice"
-        assert flow["binding_calls"] == [[reveal.txid(), raw, commit.serialize().hex(), ""]]
-        assert flow["binding_answers"][0]["binding"]["state"] == "bound"
-        assert _drawn_binding(flow) == ("bound — the spent commit committed to exactly this payload", None)
+        (call,) = flow["binding_calls"]
+        # The page hands the prevouts as JSON objects keyed by outpoint, and its row limit twice.
+        assert call[:2] == [reveal.txid(), raw] and call[4:] == [limit, limit]
+        assert json.loads(call[2]) == {f"{commit.txid()}:0": commit.serialize().hex()}
+        assert json.loads(call[3]) == {}
+        binding = flow["binding_answers"][0]["binding"]
+        assert binding["state"] == "bound" and binding["first_ref_output"] == 0
+        assert _drawn_binding(flow) == (
+            "bound — the spent NFT commit committed to exactly this payload, and this transaction creates its ref "
+            "as a singleton at output 0: that token's payload, not every output's",
+            None,
+        )
 
     def test_a_commit_to_a_different_payload_is_drawn_as_a_mismatch(self, limit) -> None:
         """The honest server, the dishonest reveal: the real commit committed to another payload."""
@@ -218,9 +234,9 @@ class TestTheSpentTransactionTheServerSends:
         flow = _run(reveal, server, limit)
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         (call,) = flow["binding_calls"]
-        assert call[2] == "", "the forged transaction reached the binding step"
+        assert json.loads(call[2]) == {}, "the forged transaction reached the binding step"
         said = f"the server's answer is not the transaction asked for: it hashes to {forged.txid()}"
-        assert call[3] == said
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": said}
         value, detail = _drawn_binding(flow)
         assert value == f"unchecked — {SPENT_TX_NOT_OBTAINED}"
         assert detail == said
@@ -233,7 +249,8 @@ class TestTheSpentTransactionTheServerSends:
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"error": "daemon busy"}}
         flow = _run(reveal, server, limit)
         (call,) = flow["binding_calls"]
-        assert call[2:] == ["", "server error: daemon busy"]
+        assert json.loads(call[2]) == {}
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": "server error: daemon busy"}
         assert _drawn_binding(flow) == (f"unchecked — {SPENT_TX_NOT_OBTAINED}", "server error: daemon busy")
         assert "was not supplied" not in flow["rendered"]
 
@@ -531,13 +548,18 @@ class TestEveryLaterWaitIsGuardedToo:
         assert len(flow["binding_calls"]) == 1
         assert "bridge error: harness: the binding bridge raised" in flow["rendered"]
 
-    def test_a_bridge_that_raises_after_the_reader_moved_on_draws_nothing(self, limit) -> None:
-        """The fifth stale-check, in the bridge-error branch — the one path that renders from
-        inside the catch. Interrupted during the spent-transaction fetch, then the binding step
-        raises: a page that checked only on the success path would draw the error card."""
+    def test_a_bridge_that_would_raise_is_not_reached_after_the_reader_moved_on(self, limit) -> None:
+        """The bridge-error branch — the one path that renders from inside the catch. Interrupted
+        during the spent-transaction fetch, with a binding step that raises.
+
+        Until #743 round 5 the superseded fetch still CALLED the binding step, which raised, and
+        only the check in the catch kept the error card off the screen. Now the check after each
+        candidate fetch returns before the bridge is called at all — the stronger property, and
+        the one asserted: no call, nothing drawn. A page that reaches the bridge again after the
+        reader moved on fails the first assertion whether or not the catch still checks."""
         reveal, _commit, server, first = self._reveal(limit)
         flow = _flow(reveal.txid(), server, first, interleave="clear", on_request=2, binding_throws=True)
-        assert len(flow["binding_calls"]) == 1, "the premise: the binding step ran and raised"
+        assert flow["binding_calls"] == [], "a superseded fetch went on to the binding step"
         assert flow["rendered"] == "", f"a superseded fetch drew its bridge error:\n{flow['rendered']}"
 
     @pytest.mark.parametrize("action", ["clear", "classify"])

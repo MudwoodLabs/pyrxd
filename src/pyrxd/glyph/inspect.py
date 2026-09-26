@@ -25,8 +25,15 @@ Public surface:
   the CLI uses
 * :func:`spent_output_binding` — ``payload_binding`` for a reveal, from what
   fetching the transaction its attributed input spent gave: the bytes, or why
-  there are none. The CLI's ``--fetch`` and the browser page both call it, so
-  the two cannot word the same fetch differently
+  there are none
+* :func:`spent_output_bindings` — the same for every outpoint a classification's
+  ``binding_candidates`` names, with the headline those spent scripts rank first
+  (a bound payload over one that merely mints). The CLI's ``--fetch`` and the
+  browser page both call it, so the two cannot word the same fetch differently
+* :func:`apply_bindings` / :func:`classify_with_bindings` — write what those
+  fetches found into a classification: the headline's verdict, every other
+  minting payload's (``unchecked`` with the reason where a fetch failed or was
+  never made), and how many went unchecked past the fetch limit
 * :func:`inspect_contract` — decode a 72-char Glyph contract id
 * :func:`inspect_outpoint` — decode a ``txid:vout`` outpoint
 * :func:`inspect_script` — classify a hex-encoded locking script and
@@ -60,10 +67,16 @@ from __future__ import annotations
 # coincurve, aiohttp, websockets, or Cryptodome.Cipher. That property
 # is asserted by ``tests/web/test_inspect_imports_pyodide_clean.py``.
 from ._inspect_core import (
+    _apply_bindings as apply_bindings,
+)
+from ._inspect_core import (
     _classify_input as classify_input,
 )
 from ._inspect_core import (
     _classify_raw_tx as classify_raw_tx,
+)
+from ._inspect_core import (
+    _classify_with_bindings as classify_with_bindings,
 )
 from ._inspect_core import (
     _file_check_plan as file_check_plan,
@@ -87,6 +100,9 @@ from ._inspect_core import (
     _spent_output_binding as spent_output_binding,
 )
 from ._inspect_core import (
+    _spent_output_bindings as spent_output_bindings,
+)
+from ._inspect_core import (
     _truncate_for_human as truncate_for_human,
 )
 from .confusables import looks_confusable_with_latin, skeleton
@@ -101,8 +117,10 @@ from .confusables import looks_confusable_with_latin, skeleton
 # ``_inspect_txid_inner`` here.
 
 __all__ = [
+    "apply_bindings",
     "classify_input",
     "classify_raw_tx",
+    "classify_with_bindings",
     "file_check_plan",
     "inspect_contract",
     "inspect_outpoint",
@@ -112,5 +130,6 @@ __all__ = [
     "sanitize_display_string",
     "skeleton",
     "spent_output_binding",
+    "spent_output_bindings",
     "truncate_for_human",
 ]

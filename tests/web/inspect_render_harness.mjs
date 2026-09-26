@@ -44,7 +44,8 @@
 //               also reports `fetched_tx_card_elements` and
 //               `fetched_tx_card_file_inputs` — how MUCH page one transaction built,
 //               which no amount of text can show. `__constants__` carries the page's
-//               own MAX_ROWS_SHOWN, read from inspect.js rather than retyped.
+//               own MAX_ROWS_SHOWN and PAYLOAD_BINDING_WARNING_STATES, read from
+//               inspect.js rather than retyped.
 //
 // `tx` drives `renderFetchedTxCard`, which is where the TX-LEVEL prose lives:
 // the shape banner (`_detectTxShape`) and the reveal-metadata block. Those are
@@ -233,6 +234,10 @@ function loadRenderer() {
   sandbox.__constants__ = {
     max_rows_shown: vm.runInContext(
       'typeof MAX_ROWS_SHOWN === "number" ? MAX_ROWS_SHOWN : null',
+      sandbox,
+    ),
+    payload_binding_warning_states: vm.runInContext(
+      "typeof PAYLOAD_BINDING_WARNING_STATES === 'undefined' ? null : [...PAYLOAD_BINDING_WARNING_STATES]",
       sandbox,
     ),
   };

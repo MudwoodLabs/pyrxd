@@ -31,7 +31,13 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_binding, _truncate_for_human
+from ..glyph._inspect_core import (
+    _HUMAN_ENTRY_CAP,
+    _apply_bindings,
+    _attestation_verdict,
+    _spent_output_bindings,
+    _truncate_for_human,
+)
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -274,41 +280,48 @@ async def _inspect_txid_inner(
     # is the thing the report exists to eliminate, so resolve it here, where a network
     # connection is already in hand.
     #
-    # EXACTLY ONE round trip, bounded by construction rather than by a cap: there is
-    # one attributed input and it has one prevout. No loop, so nothing to bound.
+    # WHICH round trips: the ones the classification names in `binding_candidates` — the spent
+    # transactions of the minting payloads' inputs, at most `_MAX_BINDING_FETCHES`, so a reveal
+    # minting one glyph costs the one it always did. More than one because the headline is
+    # chosen by what they say (#743 round 3): a payload that mints and was never committed to,
+    # placed first, used to headline over the bound one beside it.
     #
-    # THE VERDICT COMES FROM `_spent_output_binding`, the function the browser page calls too,
+    # THE VERDICT COMES FROM `_spent_output_bindings`, the function the browser page calls too,
     # so the two surfaces cannot word one fetch differently. A failure here used to fall back
     # to the classifier's "was not supplied" — including when the server answered with a
     # DIFFERENT transaction, which `get_transaction` refuses. It now says it asked, and why
     # nothing usable came back.
-    binding: dict | None = None
-    meta = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}) or {}
-    outpoint = meta.get("input_outpoint")
-    if outpoint:
-        prev_txid = str(outpoint).rpartition(":")[0]
-        spent_raw: bytes | None = None
-        spent_error = ""
-        try:
-            spent_raw = bytes(await client.get_transaction(Txid(prev_txid.lower())))
-        except Exception as exc:
-            # Same contract as the delegate block above: a failed fetch leaves the verdict
-            # "unchecked" rather than failing the whole inspect — and the reason is carried
-            # into the verdict's `detail` rather than only logged.
-            spent_error = str(exc) or type(exc).__name__
-            _log.debug("could not fetch the attributed input's prevout %s: %s", outpoint, exc)
-        binding = _spent_output_binding(str(txid), bytes(raw), spent_raw, spent_error=spent_error)
+    bindings: dict | None = None
+    candidates = (payload.get("binding_candidates") or []) if isinstance(payload, dict) else []
+    if candidates:
+        spent: dict[str, bytes | None] = {}
+        errors: dict[str, str] = {}
+        for outpoint in candidates:
+            try:
+                spent[outpoint] = bytes(await client.get_transaction(Txid(str(outpoint).rpartition(":")[0].lower())))
+            except Exception as exc:
+                # Same contract as the delegate block above: a failed fetch leaves that verdict
+                # "unchecked" rather than failing the whole inspect — and the reason is carried
+                # into the verdict's `detail` rather than only logged.
+                spent[outpoint] = None
+                errors[outpoint] = str(exc) or type(exc).__name__
+                _log.debug("could not fetch the prevout %s: %s", outpoint, exc)
+        bindings = _spent_output_bindings(str(txid), bytes(raw), spent, errors)
 
-    if resolved:
+    if resolved or (bindings is not None and bindings["reclassify"]):
         payload = _classify_raw_tx(
             str(txid),
             bytes(raw),
             only_vout=only_vout,
             network=network,
-            delegated_refs=resolved,
+            delegated_refs=resolved or None,
+            spent_scripts=None if bindings is None else bindings["spent_scripts"],
         )
-    if binding is not None and isinstance(payload, dict) and payload.get("metadata"):
-        payload["metadata"]["payload_binding"] = binding
+    # The headline's verdict, every other minting payload's — `unchecked` with the reason where its
+    # fetch failed or was never made — and the count past the fetch limit: `_apply_bindings`, the
+    # step the page's glue takes too.
+    if bindings is not None and isinstance(payload, dict):
+        _apply_bindings(payload, bindings)
     if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
@@ -439,23 +452,40 @@ def _render_txid_human(payload: dict) -> str:
         # payload per minted glyph; printing one under a bare "Reveal metadata"
         # heading told the reader it described the transaction. One observed
         # mainnet reveal mints 35 refs from 36 inputs.
+        # And MINTED is counted from the outputs (`of_n_minted`), not from the envelopes: an input
+        # can carry a payload and mint nothing. The page words it identically (`inspect.js`).
         n_payloads = metadata.get("of_n_payloads")
         if n_payloads:
+            n_minted = metadata.get("of_n_minted", n_payloads)
+            said = (
+                f"1 of {n_payloads} glyphs minted here"
+                if n_minted == n_payloads
+                else f"1 of {n_payloads} payloads here, {n_minted} minting a token"
+            )
             lines.append(
-                f"Reveal metadata (from input {metadata['input_index']} — "
-                f"1 of {n_payloads} glyphs minted here; see metadata_inputs for the rest):"
+                f"Reveal metadata (from input {metadata['input_index']} — {said}; see metadata_inputs for the rest):"
             )
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        if metadata.get("mints") is False:
+            lines.append("  token:    none — this input mints no token here")
         _pb = metadata.get("payload_binding")
         if _pb:
-            # Same reasoning as the browser: every state, including "unchecked".
-            _mark = "  *** " if _pb.get("state") == "mismatch" else "  "
+            # Same reasoning as the browser: every state, including "unchecked". Flagged: the
+            # states that say a node would reject this transaction as shown.
+            from ..glyph._inspect_core import PAYLOAD_BINDING_WARNING_STATES
+
+            _mark = "  *** " if _pb.get("state") in PAYLOAD_BINDING_WARNING_STATES else "  "
             lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
             # WHY, when the spent transaction was asked for and nothing usable came back. Already
-            # sanitised and capped by `_spent_output_binding`: it can quote a server.
+            # sanitised and capped by `_spent_output_bindings`: it can quote a server.
             if _pb.get("detail"):
                 lines.append(f"    why: {_pb['detail']}")
+            # NOT SETTLED: the headline is not bound and a check that could have moved it did not
+            # happen (a fetch failed, or the payload was past the fetch limit). Flagged, as the
+            # page flags it.
+            if _pb.get("unsettled"):
+                lines.append(f"  *** {_pb['unsettled']}")
             # Named whatever the verdict. On `unchecked` it is what someone would
             # fetch to settle it; on `mismatch` it is where the real payload is.
             if metadata.get("input_outpoint"):
@@ -567,12 +597,36 @@ def _render_txid_human(payload: dict) -> str:
         for row in (payload.get("metadata_inputs") or [])
         if row["input_index"] != (metadata or {}).get("input_index")
     ]
-    if others:
+    # Minted is what the outputs create (`mints`), so a payload on an input that mints nothing is
+    # listed as that, and the heading counts only the others that do. Worded as the page words it.
+    hidden = payload.get("metadata_inputs_not_listed") or {}
+    if others or hidden.get("count"):
+        total = len(others) + int(hidden.get("count") or 0)
+        minting = sum(1 for row in others if row.get("mints", True)) + int(hidden.get("minting") or 0)
         lines.append("")
-        lines.append(f"Other glyphs minted in this transaction ({len(others)}):")
+        if minting == total:
+            lines.append(f"Other glyphs minted in this transaction ({total}):")
+        else:
+            lines.append(f"Other payloads in this transaction ({total}), {minting} minting a token:")
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
-            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
+            tail = "" if row.get("mints", True) else " — mints no token"
+            # Its commit's verdict — `unchecked` with the reason where the fetch failed or was
+            # never made — and flagged when a node rejects it, or when it spent no commit pyrxd
+            # recognises beside one that binds.
+            if row.get("binding_state"):
+                tail += f" — payload binding: {row['binding_state']}"
+                if row.get("binding_detail"):
+                    tail += f" ({row['binding_detail']})"
+                if row.get("binding_warning"):
+                    tail += " *** treat as unattributed"
+            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}{tail}")
+        past_cap = (metadata or {}).get("bindings_past_cap")
+        if past_cap:
+            lines.append(
+                f"  ({past_cap['count']} minting payload(s) past the limit of {past_cap['cap']} "
+                "commits fetched were not checked)"
+            )
 
     # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
     # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —
