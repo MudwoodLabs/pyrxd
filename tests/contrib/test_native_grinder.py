@@ -751,6 +751,8 @@ def _alive(pid: int) -> bool:
     """Running, as opposed to exited (a zombie waiting to be reaped counts as exited)."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # ProcessLookupError (ESRCH): the process exited between open() and read() — the very
+        # exit this helper is polled to observe. Seen once in CI on PR #733's test (3.12) job.
         return False
     return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
