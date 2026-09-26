@@ -1,5 +1,7 @@
 This release fixes WAVE names that pyrxd built but the public indexer never registered, and makes pyrxd pay the WAVE protocol's registration fee when it registers one. It also fixes dMint contracts pyrxd deployed that could never be minted, and adds `pyrxd mark` and `pyrxd verify` for publishing and checking HashMark records. **Several changes break callers.** Read the last section if you build WAVE names, construct reveal results yourself, read `parse_mint_scriptsig`, call `judge_name_at_mark` or `verify_attestation`, implement a `PendingStore`, or exchange encrypted Glyph content with pyrxd 0.24.0.
 
+> **Known issue ([#759](https://github.com/MudwoodLabs/pyrxd/issues/759)):** `pyrxd mark` cannot find the funds of a wallet created with `pyrxd wallet new`, and wrongly reports that the wallet needs funding. From reading the code, the `glyph` commands that spend from the wallet are affected the same way; only `mark` has been seen to fail. A fix is planned for 0.25.1. SDK callers can run `await wallet.refresh(client)` before building a spend; there is no CLI workaround yet.
+
 ## WAVE names built by `build_wave_metadata` from a qualified name never registered
 
 Given a qualified name such as `alice.rxd`, the form its docstring showed, `build_wave_metadata` wrote it into `attrs.name` and left the top-level `name` empty. RXinDexer registers a claim from `attrs.name` and refuses any character outside `a-z 0-9 -`, so it skipped every such claim without an error. The reveal confirmed, the fee was spent, and the name never resolved. (Given a bare label such as `alice`, it wrote a claim the indexer registers.) This was checked by running RXinDexer's own claim path at a pinned commit; no pyrxd-built claim was checked against a live indexer.
@@ -43,7 +45,7 @@ pyrxd can now also build a contract's **final** mint, and it parses mainnet V1 c
 
 ## `pyrxd mark`: publish a HashMark record
 
-`pyrxd mark <file>` hashes a file on your machine, signs a v2 HashMark record with the wallet's first receive key, funds it from plain RXD and broadcasts it. The file itself never goes on chain: the record holds its digest, the signer's hash160, a signature over both, and an optional label. `--dry-run` prints the record and its decoded fields and sends nothing. A label character that could be signed without being seen is shown as `<U+XXXX>` in the confirmation, with a banner saying how `pyrxd verify` will print it. On a Radiant Core regtest node, a file marked this way verifies with `pyrxd verify`.
+`pyrxd mark <file>` hashes a file on your machine, signs a v2 HashMark record with the wallet's first receive key, funds it from plain RXD and broadcasts it (but see the known issue above). The file itself never goes on chain: the record holds its digest, the signer's hash160, a signature over both, and an optional label. `--dry-run` prints the record and its decoded fields and sends nothing. A label character that could be signed without being seen is shown as `<U+XXXX>` in the confirmation, with a banner saying how `pyrxd verify` will print it. On a Radiant Core regtest node, a file marked this way verifies with `pyrxd verify`.
 
 ## `pyrxd verify`: check a HashMark record with one command
 
