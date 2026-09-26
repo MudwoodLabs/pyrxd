@@ -23,8 +23,9 @@ Two things that measurement settled which the plan had only guessed at:
   touching the token — does not appear at all. A mutable output's scripthash history holds the
   transactions that touch THAT OUTPUT, so discovery by scripthash is narrower than discovery by
   name, and the walker's ``excluded`` list is normally empty.
-* Block heights ride along with every history entry — exactly the ``step_heights`` input
-  ``judge_name_at_mark`` needs, which nothing else was supplying.
+* Block heights ride along with every history entry — the step heights ``judge_name_at_mark``
+  needs, which nothing else was supplying. They are ONE server's word, though, and the judge now
+  needs two (see "WHAT IS AND IS NOT A SERVER CLAIM" below).
 
 WHAT THIS DOES NOT DO. It decides nothing. The candidate set and the heights are returned to be
 handed to ``walk_mutable_chain``, which re-verifies every spend link and the ref continuity, and
@@ -42,14 +43,30 @@ default is NOT single-server: ``network/registry.py`` ships two independent endp
 
 WHAT IS AND IS NOT A SERVER CLAIM HERE. Every transaction is fetched txid-bound (the bytes must hash
 to the txid asked for), so the CONTENT of a transaction cannot be forged by either server. What a
-server can lie about is EXISTENCE — which transactions are in a history — and SPENTNESS. The
-two-source rule covers exactly those two, and nothing else needs covering.
+server CAN lie about is three things, and each is covered differently:
+
+* EXISTENCE — which transactions are in a history. Candidates come from the discovery server.
+* SPENTNESS — whether an outpoint is unspent. The tip proof comes from the OTHER server, so one
+  server cannot both omit the later updates and certify the earlier tip.
+* BLOCK HEIGHT — where each history entry was mined. This is NOT covered by the rule above, and
+  this docstring used to say nothing else needed covering. It did: the heights decide which update
+  was current at a mark's block, and one server that reports one update a few blocks late — still
+  monotonic, still plausible — moves a HashMark §7.6 form-2 verdict from one target to another.
+  ``discovery.heights`` is the DISCOVERY server's word alone. :func:`walk_discovered_chain` also
+  asks the TIP server, independently, where each walked step is (``tip_heights``), and
+  :func:`~pyrxd.glyph.wave_identity.judge_name_at_mark` refuses form 2 unless the two agree on
+  every step. Agreement is not proof — two servers that tell the same lie still move it.
+
+THE FETCH CAP BOUNDS THE WHOLE WALK, not just discovery. A history is a server's list, and a hostile
+one can pad it; each entry it names costs a fetch to examine. Discovery hands the walker ONLY the
+transactions it actually fetched, so the walker (which fetches every candidate it is given) cannot
+be made to fetch past ``max_fetches`` by entries discovery named and never examined.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pyrxd.security.errors import ValidationError
@@ -109,8 +126,10 @@ class ChainDiscovery:
     """What one server said about which transactions touch this token's mutable outputs."""
 
     mint_txid: str
-    #: Every transaction that appeared in any hop's scripthash history, other than the mint.
-    #: A HINT for the walker, which decides membership itself.
+    #: Every transaction discovery FETCHED while looking for spenders, other than the mint — a
+    #: HINT for the walker, which decides membership itself. Only fetched ones: an entry a history
+    #: NAMED but discovery never examined (the fetch cap, the hop cap) is not handed on, because
+    #: the walker fetches every candidate it is given and the cap would otherwise bound nothing.
     candidates: tuple[str, ...]
     #: txid -> block height, CONFIRMED entries only (ElectrumX reports 0 / -1 for mempool). The
     #: mint is included. An unconfirmed step is simply absent, and ``judge_name_at_mark`` treats
@@ -118,6 +137,8 @@ class ChainDiscovery:
     heights: Mapping[str, int]
     #: Mutable outputs followed. Two hops means three chain steps.
     hops: int
+    #: DISTINCT transactions fetched, the mint included — the quantity ``max_fetches`` bounds. A
+    #: repeat is served from the cache and not counted.
     fetches: int
     #: ``MAX_DISCOVERY_FETCHES`` was hit. The candidate set is then a PREFIX and must not be read
     #: as the whole history; the walker's tip proof will fail on it, which is the point.
@@ -152,11 +173,16 @@ async def discover_mutable_chain(
 
     fetch = fetch_tx or cached_fetcher(client)
     inspector = GlyphInspector()
+    # DISTINCT transactions fetched — the budget. A history that names one txid ten thousand times
+    # costs one fetch, not ten thousand; the cache makes the repeats free, so they are not charged.
+    fetched: set[str] = set()
     fetches = 0
 
     async def _fetch(txid: str) -> Any:
         nonlocal fetches
-        fetches += 1
+        if txid not in fetched:
+            fetched.add(txid)
+            fetches += 1
         return await fetch(txid)
 
     mint_txid = mint_txid.lower()
@@ -178,6 +204,10 @@ async def discover_mutable_chain(
     cur_vout, ref, _payload_hash = found
     cur_txid = mint_txid
     cur_tx = mint
+    # Membership of `candidates`, as a SET. It was `txid not in candidates` on the list itself,
+    # once per history entry: quadratic in what a hostile server chooses to send (measured by the
+    # 0.25.0 panel: 10k / 20k / 40k padding entries took 0.2 / 0.9 / 4.6 s).
+    offered: set[str] = set()
 
     hops = 0
     stopped = ""
@@ -193,8 +223,6 @@ async def discover_mutable_chain(
             height = entry.get("height")
             if isinstance(height, int) and not isinstance(height, bool) and height > 0:
                 heights.setdefault(txid, height)
-            if txid != mint_txid and txid not in candidates:
-                candidates.append(txid)
 
         if hops >= max_steps:
             stopped = f"stopped at the {max_steps}-hop cap — the chain may continue"
@@ -205,14 +233,19 @@ async def discover_mutable_chain(
         # pay to the same script. Only a spender advances the walk. This check is enough to
         # choose the next output to ask about; the walker re-does it with the ref check.
         spenders = []
+        examined: set[str] = {cur_txid}
         for entry in history:
             txid = str(entry["tx_hash"]).lower()
-            if txid == cur_txid:
-                continue
-            if fetches >= max_fetches:
+            if txid in examined:
+                continue  # the creator, or a repeat of an entry already examined this hop
+            examined.add(txid)
+            if txid not in fetched and fetches >= max_fetches:
                 capped = True
                 break
             tx = await _fetch(txid)
+            if txid != mint_txid and txid not in offered:
+                offered.add(txid)
+                candidates.append(txid)
             if any(
                 str(getattr(i, "source_txid", "")).lower() == cur_txid and i.source_output_index == cur_vout
                 for i in tx.inputs
@@ -277,10 +310,50 @@ def electrumx_tip_prover(
     return is_unspent
 
 
+async def step_heights_from(
+    client: Any, walk: MutableChainWalk, *, fetch_tx: Callable[[str], Awaitable[Any]]
+) -> dict[str, int]:
+    """Where ``client`` places each walked step — asked INDEPENDENTLY of whoever discovered it.
+
+    For each step, the scripthash history of THAT step's own mutable output: the step created the
+    output, so it is listed there with its block height. The same query shape discovery used, so
+    two honest ElectrumX servers answer from the same kind of index and agree; a server that was
+    not told what the other said cannot echo it. Confirmed entries only, first one wins — exactly
+    discovery's rule, so a disagreement is about the chain and not about the two readings.
+
+    A step this server does not place (unconfirmed, or absent from its history) is simply absent.
+    The step's bytes come through ``fetch_tx`` (txid-bound), so which server served them is moot.
+
+    :raises NetworkError: when the server cannot answer; the caller reports that, it does not read
+        it as "nothing is confirmed".
+    """
+    from pyrxd.network.electrumx import script_hash_for_script
+
+    heights: dict[str, int] = {}
+    for step in walk.steps:
+        tx = await fetch_tx(step.txid)
+        script = bytes(tx.outputs[step.mut_vout].locking_script.serialize())
+        want = step.txid.lower()
+        for entry in await client.get_history(script_hash_for_script(script)):
+            if str(entry.get("tx_hash", "")).lower() != want:
+                continue
+            height = entry.get("height")
+            if isinstance(height, int) and not isinstance(height, bool) and height > 0:
+                heights.setdefault(step.txid, height)
+    return heights
+
+
 @dataclass(frozen=True)
 class DiscoveredWalk:
     walk: MutableChainWalk
     discovery: ChainDiscovery
+    #: Where the TIP server places each walked step, asked independently (:func:`step_heights_from`).
+    #: ``discovery.heights`` is the discovery server's word; this is the second one, and
+    #: ``judge_name_at_mark`` needs both to agree. Empty by default, which fails CLOSED: a walk
+    #: built without asking has no second word, and the judge then degrades rather than trusting one.
+    tip_heights: Mapping[str, int] = field(default_factory=dict)
+    #: Why ``tip_heights`` could not be obtained, or ``""``.
+    tip_heights_error: str = ""
 
 
 async def walk_discovered_chain(
@@ -293,7 +366,8 @@ async def walk_discovered_chain(
     max_steps: int = MAX_CHAIN_STEPS,
     max_fetches: int = MAX_DISCOVERY_FETCHES,
 ) -> DiscoveredWalk:
-    """Discover from one server, prove the tip on another, and walk.
+    """Discover from one server, prove the tip on another, walk — and ask the tip server too
+    where each walked step is, so the step heights have a second, independent source.
 
     The two clients MAY be the same endpoint. The walk then reports ``complete=False`` with the
     source-conflict reason, because that is the truth of a single-server configuration: it cannot
@@ -318,7 +392,15 @@ async def walk_discovered_chain(
         tip_source=tip_source,
         max_steps=max_steps,
     )
-    return DiscoveredWalk(walk=walk, discovery=discovery)
+    from pyrxd.security.errors import NetworkError
+
+    tip_heights: dict[str, int] = {}
+    tip_heights_error = ""
+    try:
+        tip_heights = await step_heights_from(tip_client, walk, fetch_tx=fetch)
+    except (NetworkError, IndexError) as exc:
+        tip_heights_error = str(exc) or type(exc).__name__
+    return DiscoveredWalk(walk=walk, discovery=discovery, tip_heights=tip_heights, tip_heights_error=tip_heights_error)
 
 
 __all__ = [
@@ -328,5 +410,6 @@ __all__ = [
     "cached_fetcher",
     "discover_mutable_chain",
     "electrumx_tip_prover",
+    "step_heights_from",
     "walk_discovered_chain",
 ]

@@ -31,7 +31,7 @@ from pyrxd.glyph.mutable_chain_discovery import (
     electrumx_tip_prover,
     walk_discovered_chain,
 )
-from pyrxd.glyph.wave_identity import judge_name_at_mark
+from pyrxd.glyph.wave_identity import HeightReport, judge_name_at_mark
 from pyrxd.network.electrumx import script_hash_for_script
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.transaction.transaction import Transaction
@@ -291,15 +291,17 @@ async def test_a_history_entry_that_does_not_spend_the_output_does_not_advance_t
 
 
 async def test_a_cap_that_truncates_the_candidate_set_cannot_prove_the_tip() -> None:
-    """A padded history costs a fetch per entry. With one fetch allowed, discovery sees the
-    mint's history name UPDATE_A and can go no further — UPDATE_B is never seen. The walker
-    then stops at UPDATE_A:1, the honest tip server says it is spent, and the verdict degrades
-    instead of truncating quietly. `capped` is set so a reader knows WHY the set is short."""
+    """A padded history costs a fetch per entry. With one fetch allowed (the mint), discovery sees
+    the mint's history NAME UPDATE_A and cannot examine it. It is not handed on — the walker
+    fetches every candidate it is given, so a named-but-unexamined entry would be a fetch past the
+    cap. The walker then stops at the mint, the honest tip server says MINT:1 is spent, and the
+    verdict degrades instead of truncating quietly. `capped` is set so a reader knows WHY."""
     server = FakeChainServer()
     d = await discover_mutable_chain(server, MINT, source="A", max_fetches=1)
     assert d.capped
     assert "cap" in d.stopped
-    assert d.candidates == (UPDATE_A,), "UPDATE_B was beyond the cap and must not appear"
+    assert d.candidates == (), "UPDATE_A was named, never fetched, and must not be handed on"
+    server = FakeChainServer()  # fresh, so the fetch count below is this walk's alone
     result = await walk_discovered_chain(
         mint_txid=MINT,
         discovery_client=server,
@@ -310,25 +312,35 @@ async def test_a_cap_that_truncates_the_candidate_set_cannot_prove_the_tip() -> 
     )
     assert result.discovery.capped
     assert not result.walk.complete
-    assert f"{UPDATE_A}:1 is not proved unspent" in result.walk.reason
+    assert f"{MINT}:1 is not proved unspent" in result.walk.reason
+    fetched = [c for c in server.calls if c[0] == "get_transaction"]
+    assert len(fetched) == 1, f"one fetch allowed, {len(fetched)} made: {fetched}"
 
 
-async def test_a_cap_hit_after_the_history_already_named_the_tip_still_walks_completely() -> None:
-    """`capped` is about discovery EFFORT, not about truth. With two fetches allowed, discovery
-    stops before fetching UPDATE_B — but UPDATE_A's history had already named it, so the walker,
-    which verifies every link itself, reaches and proves the real tip. `complete=True` is correct
-    here; `capped=True` still reports honestly that discovery did not finish on its own."""
+async def test_a_cap_hit_after_the_history_named_the_tip_bounds_the_walker_too() -> None:
+    """THE CAP BOUNDS THE WHOLE WALK (0.25.0 panel, C-L1). This used to pass `complete=True`:
+    with two fetches allowed, discovery stopped before fetching UPDATE_B, but UPDATE_A's history
+    had NAMED it, so the name went into the candidate set and the walker fetched it anyway —
+    which is exactly how a padded history made 3,002 fetches against a cap of 256. Discovery now
+    hands on only what it examined, so the walk ends at UPDATE_A, the honest tip server says
+    UPDATE_A:1 is spent, and the verdict degrades. That refuses a whole chain only when discovery
+    ran out of budget — i.e. when a history was padded past `max_fetches`, never on an honest
+    chain, where each hop costs one fetch (see the honest-path tests above)."""
+    server = FakeChainServer()
     result = await walk_discovered_chain(
         mint_txid=MINT,
-        discovery_client=FakeChainServer(),
+        discovery_client=server,
         tip_client=FakeChainServer(),
         discovery_source="A",
         tip_source="B",
         max_fetches=2,
     )
     assert result.discovery.capped
-    assert UPDATE_B in result.discovery.candidates
-    assert result.walk.complete and result.walk.tip_txid == UPDATE_B
+    assert result.discovery.candidates == (UPDATE_A,), "UPDATE_B was named, never fetched"
+    assert not result.walk.complete
+    assert f"{UPDATE_A}:1 is not proved unspent" in result.walk.reason
+    fetched = {c[1] for c in server.calls if c[0] == "get_transaction"}
+    assert fetched == {MINT, UPDATE_A}, fetched
 
 
 async def test_an_unconfirmed_step_has_no_height_rather_than_height_zero() -> None:
@@ -404,24 +416,33 @@ async def test_max_fetches_must_be_a_positive_int() -> None:
 
 
 async def _verdict_at(mark_height: int):
-    discovery_server = FakeChainServer()
+    discovery_server = FakeChainServer(mark_heights={MARK: mark_height})
     tip_server = FakeChainServer(mark_heights={MARK: mark_height})
     result = await walk_discovered_chain(
         mint_txid=MINT, discovery_client=discovery_server, tip_client=tip_server, discovery_source="A", tip_source="B"
     )
-    anchor = await resolve_mark_anchor(
-        txid=MARK,
-        fetch_verbose=tip_server.get_transaction_verbose,
-        source="B",
-        min_confirmations=6,
-        tip_height=await tip_server.get_tip_height(),
-    )
+    anchors = {}
+    for label, server in (("A", discovery_server), ("B", tip_server)):
+        anchors[label] = await resolve_mark_anchor(
+            txid=MARK,
+            fetch_verbose=server.get_transaction_verbose,
+            source=label,
+            min_confirmations=6,
+            tip_height=await server.get_tip_height(),
+        )
+    # EACH SERVER'S OWN WORD: A's step heights are what discovery read from A's histories, B's are
+    # what B reported when asked separately (`tip_heights`). No height here is typed by hand.
+    assert result.tip_heights == result.discovery.heights, "two honest servers must agree, or form 2 is unreachable"
     return judge_name_at_mark(
         ref=result.walk.ref,
+        name="custodian-gate-x7f3.rxd",
         binding_source="operator",  # the name→glyph binding is the caller's; here it is asserted, not verified
-        anchor=anchor,
+        anchor=anchors["B"],
         walk=result.walk,
-        step_heights=result.discovery.heights,
+        height_reports=[
+            HeightReport(source="A", mark_height=anchors["A"].height, step_heights=result.discovery.heights),
+            HeightReport(source="B", mark_height=anchors["B"].height, step_heights=result.tip_heights),
+        ],
     )
 
 
@@ -568,9 +589,12 @@ async def test_the_hop_cap_stops_at_exactly_max_steps() -> None:
     d = await discover_mutable_chain(FakeChainServer(), MINT, source="A", max_steps=1)
     assert d.hops == 1
     assert d.stopped == "stopped at the 1-hop cap — the chain may continue"
-    assert d.candidates == (UPDATE_A, UPDATE_B)
+    # UPDATE_B is NAMED in UPDATE_A:1's history but never examined at the cap, so it is not
+    # handed on (a named-but-unfetched candidate is a fetch the walker would make past the cap).
+    assert d.candidates == (UPDATE_A,)
+    assert d.heights[UPDATE_B] == 458601, "its height was still read — the history WAS asked for"
     d0 = await discover_mutable_chain(FakeChainServer(), MINT, source="A", max_steps=0)
-    assert (d0.hops, d0.candidates) == (0, (UPDATE_A,))
+    assert (d0.hops, d0.candidates) == (0, ())
 
 
 async def test_a_non_mutable_mint_is_not_reported_as_capped() -> None:
@@ -684,3 +708,72 @@ async def test_discovery_results_are_frozen() -> None:
         result.discovery.capped = True  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.walk = None  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# The fetch cap bounds what a hostile history can cost (0.25.0 panel, C-L1)
+# ---------------------------------------------------------------------------
+
+
+def _padding(n: int) -> dict[str, tuple[bytes, int]]:
+    """``n`` REAL transactions a padding server can list: the sibling re-serialized with its
+    locktime moved, so each has its own txid, passes the txid-bound fetch, and spends nothing
+    this chain cares about. Derived, not typed — the panel's own construction."""
+    out = {}
+    for i in range(n):
+        txid, raw = _derived(SIBLING, lambda tx, i=i: setattr(tx, "locktime", 1_000_000 + i))
+        out[txid] = (raw, 458590)
+    return out
+
+
+@pytest.mark.parametrize(("padding", "cap"), [(40, 8), (300, 256)])
+async def test_the_fetch_cap_bounds_every_fetch_the_walk_makes(padding: int, cap: int) -> None:
+    """THE PANEL'S PROBE (``panel-c/test_panelc_probe_cap.py``): a history padded with real,
+    txid-bound non-spenders. Discovery stopped at the cap — and then handed EVERY named entry to
+    the walker, which fetched them all: 302 fetches at 300 padding, 3,002 at 3,000, against a cap
+    of 256. The cap now bounds the discovery server's transaction fetches for the whole walk."""
+    pad = _padding(padding)
+    a = FakeChainServer(extra=pad, inject_history={_sh_of(MINT, 1): [(t, 458590) for t in pad]})
+    result = await walk_discovered_chain(
+        mint_txid=MINT,
+        discovery_client=a,
+        tip_client=FakeChainServer(),
+        discovery_source="A",
+        tip_source="B",
+        max_fetches=cap,
+    )
+    fetched = [c for c in a.calls if c[0] == "get_transaction"]
+    assert result.discovery.capped, "the premise: the padding is past the cap"
+    assert len(fetched) <= cap, f"{len(fetched)} fetches against a cap of {cap}"
+    assert not result.walk.complete, "a capped discovery cannot prove the tip"
+
+
+async def test_a_history_that_repeats_one_entry_costs_one_fetch() -> None:
+    """The budget counts DISTINCT transactions. A history naming the sibling five thousand times
+    cost five thousand "fetches" (all served from cache), hit the cap, and silenced a name whose
+    chain is whole — a guard refusing valid work, triggered by a free repetition."""
+    a = FakeChainServer(inject_history={_sh_of(MINT, 1): [(SIBLING, 458591)] * 5000})
+    result = await walk_discovered_chain(
+        mint_txid=MINT, discovery_client=a, tip_client=FakeChainServer(), discovery_source="A", tip_source="B"
+    )
+    assert not result.discovery.capped
+    assert result.discovery.fetches == 4, "the mint, UPDATE_A, the sibling (once) and UPDATE_B"
+    assert result.walk.complete and result.walk.tip_txid == UPDATE_B, result.walk.reason
+    assert result.walk.excluded == (SIBLING,)
+
+
+async def test_candidate_bookkeeping_is_linear_in_what_a_server_sends() -> None:
+    """Membership was `txid not in candidates` on a LIST, once per history entry: quadratic in a
+    number the server chooses. Measured by the panel: 10k / 20k / 40k entries → 0.2 / 0.9 / 4.6 s.
+    Here 40,000 never-fetched entries (one fetch allowed, so none is examined) must be read in well
+    under a second; the quadratic version takes seconds. The bound is loose on purpose — this is
+    an order-of-growth check, not a benchmark."""
+    import time
+
+    entries = [(f"{i:064x}", 458590) for i in range(40_000)]
+    a = FakeChainServer(inject_history={_sh_of(MINT, 1): entries})
+    started = time.perf_counter()
+    d = await discover_mutable_chain(a, MINT, source="A", max_fetches=1)
+    elapsed = time.perf_counter() - started
+    assert d.capped and len(d.heights) >= 40_000, "the premise: every entry was read"
+    assert elapsed < 1.0, f"40,000 history entries took {elapsed:.2f}s"

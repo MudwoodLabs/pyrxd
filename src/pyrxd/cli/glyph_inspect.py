@@ -39,7 +39,7 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
-from ..glyph.mark_anchor import mark_anchor_dict
+from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, mark_anchor_dict
 from ..glyph.payload import _MAX_ATTRS_LIST_LEN
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
@@ -851,8 +851,16 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
     ]
     if nam.get("provisional"):
         lines.append(f"{indent}  PROVISIONAL: the mark is below the confirmation floor you set")
+    # EXPIRY IS A STATE, AND IT IS PRINTED. `expiry` has only ever been "unknown" — renewals are
+    # decided by treasury payments the walk does not observe — and it reached --json but no
+    # terminal, so a reader of "pointed at X at block N" had no way to learn the name might have
+    # lapsed by then. A qualifier that only JSON carries is one a human never sees.
+    lines.append(f"{indent}  expiry at that block: {nam.get('expiry')}")
     lines.append(f"{indent}  ({nam.get('caveat')})")
-    lines.append(f"{indent}  (name→glyph binding is {nam.get('binding_source')}'s claim, not verified on chain)")
+    lines.append(
+        f"{indent}  (name→glyph binding is {nam.get('binding_source')}'s claim: the glyph's own mint does name "
+        f"{name}, but which registration of it is in force is not verified on chain)"
+    )
     return lines
 
 
@@ -876,18 +884,21 @@ def _require_min_confirmations(
         raise UserError(
             f"{needed_by} needs --min-confirmations",
             cause="confirmation depth is value-scaled per chain and deliberately has no default",
-            fix=f"add --min-confirmations N {where}: N is how many blocks must sit on top of the mark's "
-            "block before you rely on it; below that the block is treated as provisional",
+            fix=f"add --min-confirmations N {where} — {MIN_CONFIRMATIONS_MEANING} (the mark's block); "
+            "with fewer, the block is treated as provisional",
         )
 
 
 def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     """Two clients pinned to two DIFFERENT configured endpoints, each labelled by its URL.
 
-    Form 2 needs two independent sources twice over: the walker refuses a tip proof from the
-    server that supplied the candidates, and the judge refuses a block height from the server
-    that supplied the name→glyph binding. With ONE configured endpoint both clients are that
-    endpoint and both labels are equal, so each of those rules degrades with its reason — which
+    Form 2 needs two independent sources three times over: the walker refuses a tip proof from
+    the server that supplied the candidates, the judge refuses a mark height from the server that
+    supplied the name→glyph binding, and the judge refuses any block height — the mark's or a chain
+    step's — that both endpoints do not report identically. The LABEL is what those rules compare,
+    so a label must name the endpoint that really answers: one endpoint must never carry two
+    labels. With ONE configured endpoint both clients are that endpoint and both labels are
+    equal, so each of those rules degrades with its reason — which
     is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
     config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
     ships two independent operators, so with no configuration at all these are two different
@@ -994,16 +1005,18 @@ def _judge_one_name_at_mark(
 async def _name_at_mark(
     ctx: CliContext, *, name: str, mark_txid: str | None, min_confirmations: int, signer_hash160: bytes
 ) -> dict:
-    """Binding from one endpoint, height from the other; candidates from one, tip proof from
-    the other. Then the pure judge. Every source is labelled by URL so the two rules that refuse
-    a shared source can see when it IS shared."""
+    """Binding from one endpoint, the mark's block from the other; candidates from one, tip proof
+    from the other; and EVERY block height — the mark's and each chain step's — from both. Then
+    the pure judge. Every source is labelled by URL so the rules that refuse a shared or a
+    disagreeing source can see when it IS shared, or does disagree."""
     from contextlib import AsyncExitStack
 
     from ..base58 import base58check_encode
     from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
     from ..glyph.mutable_chain_discovery import walk_discovered_chain
-    from ..glyph.wave import WaveNameNotFound, WaveResolver
-    from ..glyph.wave_identity import judge_name_at_mark
+    from ..glyph.wave import WaveNameNotFound, WaveResolver, split_qualified_name
+    from ..glyph.wave_identity import HeightReport, judge_name_at_mark
+    from ..security.errors import NetworkError
 
     san = _sanitize_display_string
     shown = san(name)
@@ -1059,7 +1072,8 @@ async def _name_at_mark(
             anchor_client, anchor_label, mark_txid=mark_txid, min_confirmations=min_confirmations
         )
 
-        # 3. THE CHAIN: discovered on A, tip proved on B.
+        # 3. THE CHAIN: discovered on A, tip proved on B — and B asked, independently, where each
+        #    walked step is (`found.tip_heights`). A's step heights alone decided the answer before.
         found = await walk_discovered_chain(
             mint_txid=mint,
             discovery_client=client_a,
@@ -1068,23 +1082,69 @@ async def _name_at_mark(
             tip_source=label_b,
         )
 
+        # 4. THE MARK'S BLOCK, A SECOND TIME, from the endpoint that did NOT supply the anchor. The
+        #    anchor is one endpoint's word; the judge wants both endpoints to place the mark in the
+        #    same block. Only when the anchor could be used at all — otherwise the judge refuses on
+        #    the anchor first and a second lookup buys nothing.
+        other_label, other_mark, other_error = "", None, ""
+        if label_a != label_b and anchor.usable_for_point_in_time:
+            other_client, other_label = (client_b, label_b) if anchor_label == label_a else (client_a, label_a)
+            try:
+                other_anchor = await resolve_anchor_from(
+                    other_client, other_label, mark_txid=mark_txid, min_confirmations=min_confirmations
+                )
+                other_mark = other_anchor.height
+            except NetworkError as exc:
+                other_error = f"could not place the mark: {exc}"
+
     walk, discovery = found.walk, found.discovery
-    # 4. THE VERDICT — pure. `ref` is the walk's own, so the "walk is of another ref" rule can
-    #    never fire here; what the binding asserts is that THIS chain is the name, and that stays
-    #    `binding_verified=False` because nothing checked it on chain.
+    mark_by_label = {anchor_label: anchor.height, **({other_label: other_mark} if other_label else {})}
+    # ONE REPORT PER ENDPOINT, each labelled with the URL that answered: A's step heights are the
+    # ones discovery read from A's histories, B's the ones B reported when asked separately. The
+    # judge compares them — a report is a claim, and corroboration by assertion is not corroboration.
+    reports = [
+        HeightReport(
+            source=label_a,
+            mark_height=mark_by_label.get(label_a),
+            step_heights=discovery.heights,
+            error=other_error if other_label == label_a else "",
+        )
+    ]
+    if label_b != label_a:
+        reports.append(
+            HeightReport(
+                source=label_b,
+                mark_height=mark_by_label.get(label_b),
+                step_heights=found.tip_heights,
+                error="; ".join(
+                    e for e in (found.tip_heights_error, other_error if other_label == label_b else "") if e
+                ),
+            )
+        )
+    # 5. THE VERDICT — pure. `ref` is the walk's own, so the "walk is of another ref" rule can
+    #    never fire here; `name` is what was ASKED, and the judge compares it with the name the
+    #    glyph's own mint payload claims. `binding_verified` stays False: which registration of a
+    #    name is in force is still the indexer's word.
     verdict = judge_name_at_mark(
         ref=walk.ref or mint,
+        name=name,
         binding_source=binding_label,
         anchor=anchor,
         walk=walk,
-        step_heights=discovery.heights,
+        height_reports=reports,
     )
     network = Network(ctx.network) if ctx.network in {n.value for n in Network} else Network.TESTNET
     signer_address = base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[network] + signer_hash160)
     same: bool | None = (verdict.target_at_height == signer_address) if verdict.form == 2 else None
+    # THE NAME SHOWN IS THE NAME CHECKED. This was the indexer's echo (`record.name`), which the
+    # indexer chooses: asked about one name, it could answer with another's glyph under a third
+    # name, and every sentence below — "NAME pointed at …", ESTABLISHED, "the glyph's own mint does
+    # name NAME" — would print its choice. The judge compared the label that was ASKED with the
+    # glyph's own mint, so that label, qualified, is the one a human reads.
+    asked_label, _domain = split_qualified_name(name)
     return {
         "resolved": True,
-        "name": san(record.name),
+        "name": san(f"{asked_label.strip().lower()}.rxd"),
         "ref": san(verdict.ref),
         "reveal_txid": mint,
         "form": verdict.form,
@@ -1119,6 +1179,21 @@ async def _name_at_mark(
             "hops": discovery.hops,
             "fetches": discovery.fetches,
             "capped": discovery.capped,
+        },
+        # WHO SAID WHICH HEIGHT. The verdict's heights are the mark's and each walked step's, and
+        # form 2 needs every one of them from both endpoints; this is each endpoint's own word, so
+        # a reader can see which server disagreed rather than only that one did.
+        "heights": {
+            "agreed_by": [san(s) for s in verdict.height_sources],
+            "by_source": [
+                {
+                    "source": san(r.source),
+                    "mark": r.mark_height,
+                    "steps": {step.txid: r.step_heights.get(step.txid) for step in walk.steps},
+                    "error": san(r.error),
+                }
+                for r in reports
+            ],
         },
     }
 
@@ -1189,6 +1264,17 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                     # "we do not know" rather than toward either verdict.
                     out.append(f"{indent}  signature {status} — {att.get('detail') or meaning}")
                     out.append(f"{indent}    ({meaning})")
+                    # THE CHAIN, FOR EVERY OUTCOME, not only beside VERIFIED. The genesis hash is
+                    # inside the signed statement, so a record honestly signed for testnet DOES
+                    # NOT VERIFY against mainnet — and printed without the chain it was held to,
+                    # that honest record read as a plain forgery on the default run. Name the
+                    # chain it was checked against (or would be), and how to ask about another.
+                    net = att.get("assumed_network")
+                    if net:
+                        held = "checked against" if outcome == "invalid_signature" else "would be checked against"
+                        out.append(f"{indent}    ({held} {net}: the chain is part of the signed statement, so a")
+                        out.append(f"{indent}     record signed for another chain does not verify here — if it was")
+                        out.append(f"{indent}     made on another network, re-run with that --network)")
             elif outcome == "not_attested":
                 # v1. There IS no signature, and the absence is the finding: a v1 mark
                 # fixes a time and names nobody. Printing nothing here left the reader
@@ -1485,8 +1571,9 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     help=(
         "HashMark §7.6 form 2: what did NAME (e.g. company.rxd) point at AT THE BLOCK THAT "
         "CARRIED THIS MARK, and was it the signing key? Needs --min-confirmations and two "
-        "configured ElectrumX servers; with one it degrades to the present-tense answer and "
-        "says why. Never runs on an unverified signature."
+        "configured ElectrumX servers that report the same block heights; with one, or if they "
+        "disagree, it degrades to the present-tense answer and says why. Never runs on an "
+        "unverified signature."
     ),
 )
 @click.option(
@@ -1496,8 +1583,9 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     default=None,
     metavar="N",
     help=(
-        "Depth below which the mark's block is too shallow to build a form-2 claim on. "
-        "Required with --wave-name; deliberately has no default (depth is value-scaled)."
+        f"The confirmation floor for the mark's block — {MIN_CONFIRMATIONS_MEANING}. Below it the "
+        "block is too shallow to build a form-2 claim on. Required with --wave-name; deliberately "
+        "has no default (depth is value-scaled)."
     ),
 )
 @click.pass_obj

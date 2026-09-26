@@ -113,10 +113,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "fold_chain": ("pyrxd.glyph.mutable_chain", "fold_chain"),
     "MAX_CHAIN_STEPS": ("pyrxd.glyph.mutable_chain", "MAX_CHAIN_STEPS"),
     "RECORD_UNKNOWN_KINDS": ("pyrxd.glyph.mutable_chain", "RECORD_UNKNOWN_KINDS"),
-    # HashMark §7.6 form 2. Consumer surface for the same reason as the walker above: the CLI
-    # cannot drive it yet because pyrxd has no way to enumerate a token's transactions (the
-    # indexer client has `glyph_get_token`, which returns a record, not a history), so the
-    # candidate set has to come from the consumer's own index for now.
+    # HashMark §7.6 form 2. Consumer surface for the same reason as the walker above. The CLI now
+    # drives it too (`glyph inspect --wave-name`, `verify --wave-name`, through
+    # `mutable_chain_discovery`); a consumer with its own index or endpoints calls the judge
+    # directly, and must hand it one `HeightReport` per endpoint.
     "MarkAnchor": ("pyrxd.glyph.mark_anchor", "MarkAnchor"),
     "resolve_mark_anchor": ("pyrxd.glyph.mark_anchor", "resolve_mark_anchor"),
     # The display shape of an anchor, moved here from `cli.glyph_inspect` so the
@@ -126,6 +126,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "mark_anchor_dict": ("pyrxd.glyph.mark_anchor", "mark_anchor_dict"),
     "WaveIdentityVerdict": ("pyrxd.glyph.wave_identity", "WaveIdentityVerdict"),
     "judge_name_at_mark": ("pyrxd.glyph.wave_identity", "judge_name_at_mark"),
+    # The judge's height input: one per endpoint, compared by the judge itself. Exported because
+    # a consumer calling `judge_name_at_mark` cannot build its required `height_reports` without it.
+    "HeightReport": ("pyrxd.glyph.wave_identity", "HeightReport"),
     # The two sentinels a consumer has to be able to COMPARE AGAINST rather than retype. Without
     # them exported, reading `verdict.expiry` means hardcoding the string from a private module -
     # which is how a consumer ends up silently treating "unknown" as "not expired".

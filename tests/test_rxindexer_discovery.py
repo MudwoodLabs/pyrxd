@@ -100,3 +100,38 @@ class TestGlyphGetTokensByType:
         idx = RxinDexerClient(client)
         with pytest.raises(RxinDexerError, match="expected dict"):
             await idx.glyph_get_tokens_by_type(2)
+
+
+# The docstrings promised ``{"tokens": [...], "next_cursor": str | None}`` and nothing checked it
+# (#696; 0.25.0 panel, three reviewers). Upstream answers ``{"error": "Glyph indexing not
+# enabled"}`` when its index is off (``electrumx/server/glyph_api.py``), and that came back as a
+# page. Both wrappers, every malformed shape, and the honest last page.
+_CALLS = [
+    pytest.param("glyph.get_recent", lambda idx: idx.glyph_get_recent(), id="get_recent"),
+    pytest.param("glyph.get_tokens_by_type", lambda idx: idx.glyph_get_tokens_by_type(2), id="get_tokens_by_type"),
+]
+
+
+@pytest.mark.parametrize(("method", "call"), _CALLS)
+@pytest.mark.parametrize(
+    ("page", "says"),
+    [
+        pytest.param({"error": "Glyph indexing not enabled"}, "refused by the indexer", id="indexer-error"),
+        pytest.param({"tokens": "abc", "next_cursor": None}, "no list of token records", id="tokens-not-a-list"),
+        pytest.param({"tokens": [1, 2], "next_cursor": None}, "no list of token records", id="tokens-not-records"),
+        pytest.param({"next_cursor": None}, "no list of token records", id="no-tokens"),
+        pytest.param({"tokens": []}, "no 'next_cursor'", id="no-cursor"),
+        pytest.param({"tokens": [], "next_cursor": 7}, "next_cursor is int", id="cursor-not-a-string"),
+    ],
+)
+async def test_a_page_that_is_not_the_promised_shape_raises(method, call, page, says):
+    idx = RxinDexerClient(FakeElectrumXClient({method: page}))
+    with pytest.raises(RxinDexerError, match=says):
+        await call(idx)
+
+
+@pytest.mark.parametrize(("method", "call"), _CALLS)
+async def test_the_honest_last_page_is_returned(method, call):
+    """The honest pair: an empty page with a null cursor is the END of a listing, not an error."""
+    idx = RxinDexerClient(FakeElectrumXClient({method: {"tokens": [], "next_cursor": None}}))
+    assert await call(idx) == {"tokens": [], "next_cursor": None}

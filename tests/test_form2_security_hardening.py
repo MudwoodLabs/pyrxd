@@ -16,12 +16,13 @@ import re
 import cbor2
 import pytest
 
+from pyrxd.glyph import wave_identity as _wave_identity
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
 from pyrxd.glyph.mutable_chain import ChainStep, MutableChainWalk, fold_chain, walk_mutable_chain
 from pyrxd.glyph.payload import GLY_MARKER
 from pyrxd.glyph.wave import WaveAttrs, classify_glyph_metadata, wave_attrs_from_metadata
-from pyrxd.glyph.wave_identity import judge_name_at_mark
+from pyrxd.glyph.wave_identity import HeightReport
 from pyrxd.hash import hash256
 from pyrxd.security.errors import NetworkError
 from pyrxd.transaction.transaction import Transaction
@@ -59,6 +60,19 @@ def _anchor(height: int, *, source: str = "node") -> MarkAnchor:
     return MarkAnchor(txid="ma" * 32, height=height, confirmations=50, min_confirmations=6, source=source)
 
 
+NAME = "custodian-gate-x7f3.rxd"  # what the fixture mint's own payload names (attrs.name)
+
+
+def _judge(*, anchor: MarkAnchor, step_heights, **kw):
+    """`judge_name_at_mark` with every height reported IDENTICALLY by two sources ("node", and a
+    second one) that agree with the anchor, and the name the fixture mint claims — so each test
+    here reaches the rule it is about. The height and name rules are attacked in their own files."""
+    reports = [
+        HeightReport(source=s, mark_height=anchor.height, step_heights=step_heights) for s in ("node", "second-node")
+    ]
+    return _wave_identity.judge_name_at_mark(name=NAME, anchor=anchor, height_reports=reports, **kw)
+
+
 # ---------------------------------------------------------------------------
 # 1. The fold folded steps the range calculation had excluded
 # ---------------------------------------------------------------------------
@@ -75,12 +89,18 @@ async def test_non_monotonic_heights_degrade_instead_of_folding_an_excluded_step
     the filter a prefix, so the fold is correct by construction rather than by luck.
     """
     steps = (
-        ChainStep(txid="aaaa", mut_vout=1, kind="mint", attrs={"target": "HONEST"}),
+        ChainStep(
+            txid="aaaa",
+            mut_vout=1,
+            kind="mint",
+            attrs={"target": "HONEST"},
+            envelope_cbor=cbor2.dumps({"attrs": {"name": "custodian-gate-x7f3", "target": "HONEST"}}),
+        ),
         ChainStep(txid="bbbb", mut_vout=1, kind="update", attrs={"target": "ATTACKER"}),
         ChainStep(txid="cccc", mut_vout=1, kind="update", attrs={"note": "cosmetic"}),
     )
     walk = MutableChainWalk(ref="r", steps=steps, tip_txid="cccc", tip_vout=1, tip_proved_unspent=True, complete=True)
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref="r",
         binding_source="index",
         anchor=_anchor(1000),
@@ -103,9 +123,7 @@ async def test_unusable_step_heights_degrade(bad: object) -> None:
     """
     walk = await _walk()
     heights = {**_HEIGHTS, walk.steps[0].txid: bad}
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source="index", anchor=_anchor(458605), walk=walk, step_heights=heights
-    )
+    verdict = _judge(ref=walk.ref, binding_source="index", anchor=_anchor(458605), walk=walk, step_heights=heights)
     assert verdict.form == 1
     assert verdict.target_at_height is None
 
@@ -114,7 +132,7 @@ async def test_a_verdict_is_refused_when_the_walk_is_of_another_glyph() -> None:
     """`walk.ref` was never compared to `ref`, so a form-2 sentence could name one glyph while
     reporting a target folded from another's chain — false about both halves, no reason given."""
     walk = await _walk()
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref="SOME-OTHER-TOKEN:0",
         binding_source="index",
         anchor=_anchor(458605),
@@ -474,7 +492,7 @@ async def test_a_step_that_reveals_no_envelope_is_unknown_not_unchanged() -> Non
 async def test_rule_3_degrades_the_verdict_for_every_unknown_record(build) -> None:
     """Rule 3 of the module docstring, run rather than read, for all three of its cases."""
     walk = await _walk_with(build())
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=walk.ref,
         binding_source="index",
         anchor=_anchor(458605),

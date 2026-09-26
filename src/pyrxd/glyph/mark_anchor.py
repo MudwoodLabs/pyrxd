@@ -26,9 +26,12 @@ paragraph above as "nothing short of full SPV is worth doing":
     is a weaker claim than consensus, and it is the same independence argument ``source`` exists to
     make checkable one level up.
 
-What this module ships today is the caveat, because neither of those is built here yet. The honest
-ordering is: caveat now, the two steps above as real improvements, a Radiant SPV client for a claim
-that does not need a caveat at all.
+This module builds neither: an anchor is ONE endpoint's word, and it ships the caveat. The second
+step IS taken one level up, for HashMark §7.6 form 2 only — ``judge_name_at_mark`` refuses unless a
+second endpoint places the mark in the same block (and agrees on every chain step's height). An
+anchor used anywhere else — ``pyrxd verify``'s block line, for one — is still a single endpoint's
+claim. The honest ordering is: caveat now, the two steps above as real improvements, a Radiant SPV
+client for a claim that does not need a caveat at all.
 
 WHAT IT IS. ``get_transaction_verbose`` binds the echoed txid, so an endpoint cannot answer about a
 DIFFERENT transaction — that much is checked. Beyond it, an endpoint that lies about the height
@@ -59,6 +62,14 @@ UNVERIFIED_CAVEAT = (
     "proof-of-work or merkle-inclusion check, so an endpoint that lies about the height moves "
     "the point in time this answer is about"
 )
+
+
+#: What ``--min-confirmations N`` MEANS, worded to match :attr:`MarkAnchor.provisional` below:
+#: the floor holds when ``confirmations >= N``, and an endpoint's confirmation count INCLUDES the
+#: block the transaction is in (``height = tip - confirmations + 1``). So N counts the block itself.
+#: The CLI said "N is how many blocks must sit on top of the mark's block", which is one more than
+#: the check requires. One sentence, next to the check, for every surface that explains the flag.
+MIN_CONFIRMATIONS_MEANING = "N confirmations: the block itself and N−1 built on top of it"
 
 
 @dataclass(frozen=True)

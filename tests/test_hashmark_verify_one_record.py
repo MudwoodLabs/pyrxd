@@ -30,6 +30,7 @@ import json
 import os
 from pathlib import Path
 
+import cbor2
 import pytest
 from click.testing import CliRunner
 
@@ -122,12 +123,24 @@ class _Server:
 
 def _fake_walk(monkeypatch, name_target: str | None, *, walks: list | None = None) -> None:
     """A complete walk whose one step folds ``target`` to ``name_target`` — the name pointed there.
-    ``walks``, when given, records one entry per walk, so a test can count them."""
+    ``walks``, when given, records one entry per walk, so a test can count them.
+
+    The mint step carries the committed envelope a real walk carries (``envelope_cbor``), naming
+    ``LABEL`` in ``attrs.name`` as a Photonic WAVE mint does — the judge compares it with the name
+    asked about. Both servers place that one step at the same height (``discovery.heights`` from
+    the discovery server, ``tip_heights`` from the tip server), as two honest servers would."""
 
     async def walk(*, mint_txid, discovery_source, tip_source, **_):
         if walks is not None:
             walks.append(mint_txid)
-        step = ChainStep(txid=mint_txid, mut_vout=1, kind="mint", attrs={"target": name_target})
+        attrs = {"name": LABEL, "domain": "rxd", "target": name_target}
+        step = ChainStep(
+            txid=mint_txid,
+            mut_vout=1,
+            kind="mint",
+            attrs={"target": name_target},
+            envelope_cbor=cbor2.dumps({"p": [2, 5, 11], "name": NAME, "attrs": attrs}),
+        )
         w = MutableChainWalk(
             ref=f"{mint_txid}:1",
             steps=(step,),
@@ -146,7 +159,7 @@ def _fake_walk(monkeypatch, name_target: str | None, *, walks: list | None = Non
             stopped="tip",
             source=discovery_source,
         )
-        return mcd.DiscoveredWalk(walk=w, discovery=d)
+        return mcd.DiscoveredWalk(walk=w, discovery=d, tip_heights={mint_txid: 600_000})
 
     monkeypatch.setattr(mcd, "walk_discovered_chain", walk)
 
@@ -453,6 +466,11 @@ class TestHonestWorkStillHolds:
         s = _summary(r.output)
         assert "name:       ESTABLISHED" in s and "file:       MATCHES" in s and "signature:  VERIFIED" in s
         assert "the only HashMark record" in s
+        # The qualifiers of an ESTABLISHED name reach the terminal through the real command: the
+        # expiry state (it was JSON-only) and which endpoints the heights came from.
+        flat = " ".join(r.output.split())
+        assert "expiry at that block: unknown: renewals are decided by treasury payments" in flat
+        assert "reported identically by 'wss://a' and 'wss://b'" in flat
 
     def test_two_records_by_one_signer_each_answer_for_their_own_file(self, monkeypatch, tmp_path, world) -> None:
         key = world["victim"]
