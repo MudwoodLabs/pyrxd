@@ -256,3 +256,91 @@ class TestEveryAttestationOutcomeIsDocumented:
             f"this tool proves; a list missing one is a reader told the wrong set.\n"
             f"--- the list ---\n{self._the_list()}"
         )
+
+
+_STATIC = _ROOT / "docs" / "inspect_static"
+_DOCS_WORKFLOW = _ROOT / ".github" / "workflows" / "docs.yml"
+
+
+def _flat(text: str) -> str:
+    """Hard-wrapped prose, searchable: a phrase that wraps is invisible to a line grep."""
+    return " ".join(text.split())
+
+
+def _section(heading: str) -> str:
+    """One ``## `` section of the doc, up to the next one."""
+    text = _doc_text()
+    start = text.index(heading)
+    end = text.find("\n## ", start + len(heading))
+    return text[start : end if end != -1 else len(text)]
+
+
+class TestTheIntegrityStoryIsTheOneTheCodeTells:
+    """Three sentences about the browser pages' integrity checks had drifted from the code: the
+    doc's table of what is SHA-256 checked omitted the two curve files the page checks; the doc
+    still said HashMark decoding was CLI-only, after both pages gained a curve; and
+    ``shared.js`` claimed its check held "even if the GitHub Pages deploy is compromised",
+    which the doc's own section on the manifest says it does not."""
+
+    @staticmethod
+    def _page_files_the_manifest_pins() -> set[str]:
+        """DERIVED from the docs build: every page file whose digest ``docs.yml`` writes into
+        the manifest (``sha256sum ../<file>`` from the wheels directory). The wheels are named
+        by variable there and described by name in the table, so they are not in this set."""
+        found = set(re.findall(r"sha256sum \.\./([\w./-]+)", _DOCS_WORKFLOW.read_text(encoding="utf-8")))
+        return {Path(p).name for p in found}
+
+    def test_the_derivation_finds_the_files_it_must(self) -> None:
+        files = self._page_files_the_manifest_pins()
+        assert {"glue.py", "secp256k1-bridge.js", "noble-secp256k1.js"} <= files, (
+            f"derived only {sorted(files)} from docs.yml — this scan is broken, not the doc"
+        )
+
+    def test_every_file_the_manifest_pins_is_in_the_integrity_table(self) -> None:
+        table = _section("## Browser variant: install-time integrity")
+        missing = sorted(f for f in self._page_files_the_manifest_pins() if f not in table)
+        assert not missing, f"the docs build SHA-256 pins {missing} and the integrity table never names them"
+
+    def test_the_doc_does_not_call_hashmark_checking_cli_only_while_the_pages_install_a_curve(self) -> None:
+        """A PHRASE PIN, reviewed rather than derived — but gated on the fact that makes it
+        false: while some page hands the boot a curve, the doc must not say the browser cannot
+        decode or check a HashMark."""
+        pages_with_a_curve = [
+            p for p in _STATIC.glob("*/*.js") if p.name != "shared.js" and "curveUrl:" in p.read_text(encoding="utf-8")
+        ]
+        assert pages_with_a_curve, "no page installs a curve — re-read the doc's HashMark section, then this test"
+        flat = _flat(_doc_text())
+        assert "HashMark decoding is a **CLI-only**" not in flat
+        assert "a HashMark OP_RETURN fails to classify there" not in flat
+
+    def test_no_comment_says_the_manifest_check_survives_a_compromised_deploy(self) -> None:
+        """The manifest is served by the same deploy as the files it pins, so a compromised
+        deploy rewrites both. The doc says so; the code's comments must not say the opposite.
+
+        A PHRASE PIN on the two affirmative forms that shipped ("even if the GitHub Pages deploy
+        is compromised", "Defends against a compromised GitHub Pages deploy"). Deliberately NOT
+        a negation heuristic: "does NOT defend against a compromised deploy" is the correct
+        sentence and says "defend", which neither pattern matches."""
+        sources = sorted(_STATIC.glob("*/*.js")) + sorted(_STATIC.glob("*/*.html"))
+        assert len(sources) >= 5, f"only {len(sources)} page sources found — this scan is broken"
+        claim = re.compile(
+            r"\bdefends against (a |the )?compromised (GitHub )?Pages deploy"
+            r"|even if the (GitHub )?Pages deploy is compromised",
+            re.IGNORECASE,
+        )
+        wrong = [
+            f"{p.relative_to(_ROOT)}: {m.group(0)!r}"
+            for p in sources
+            for m in claim.finditer(_flat(p.read_text(encoding="utf-8")))
+        ]
+        assert not wrong, "these comments claim a defence the doc says does not exist:\n" + "\n".join(wrong)
+        assert "does **not** defend the deployed origin against itself" in _flat(_doc_text())
+
+    def test_the_shared_origin_is_stated_with_its_consequence(self) -> None:
+        """A PHRASE PIN, reviewed rather than derived. Saying the Pages origin is shared is only
+        half a fact: the half a reader needs is that any page on it can script /verify/, so a
+        compromised deploy of another site there can rewrite the verdict a reader sees."""
+        section = _flat(_section("## Browser variant: install-time integrity"))
+        assert "shared by every Pages site published from the same account" in section
+        assert "Documents on one origin can script each other" in section
+        assert "rewrite the verdict a reader sees there" in section
