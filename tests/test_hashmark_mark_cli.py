@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -754,6 +755,20 @@ _HIDDEN_LABEL = "invoice 42" + _HIDDEN
 _DEVANAGARI = "\u0928\u092e\u0938\u094d\u0924\u0947"  # namaste; U+094D and U+0947 are combining marks
 _ZWJ_FAMILY = "\U0001f468\u200d\U0001f469\u200d\U0001f467"  # one emoji: three people joined by ZWJ
 _SCOTLAND = "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f"  # a flag in TAG chars
+#: The banner's opening words, whatever it goes on to list.
+_BANNER = "THE LABEL HOLDS"
+
+
+def _vs_encode(data: bytes) -> str:
+    """The published variation-selector byte encoding: byte b as VS1-16 (b < 16) or VS17-256 (b >= 16).
+    Every one of those codepoints is default-ignorable, and VS17-256 are category Mn."""
+    return "".join(chr(0xFE00 + b) if b < 16 else chr(0xE0100 + b - 16) for b in data)
+
+
+def _as_the_reader_prints(label: str) -> str:
+    from pyrxd.glyph._inspect_core import _sanitize_display_string
+
+    return _sanitize_display_string(label)
 
 
 class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
@@ -777,29 +792,14 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         escaped = "".join(f"<U+{ord(c):04X}>" for c in _HIDDEN)
         assert f"label:       invoice 42{escaped}" in result.output
         assert f"ascii: {_HIDDEN_LABEL!a}" in result.output
-        assert "THE LABEL HOLDS 10 CHARACTER(S) THAT DO NOT PRINT AS THEMSELVES" in result.output
+        assert f"{_BANNER} 10 CHARACTER(S) THAT RENDER AS NOTHING HERE" in result.output
         for name in ("TAG LATIN SMALL LETTER P", "TAG DIGIT NINE", "WORD JOINER", "SOFT HYPHEN"):
             assert name in result.output, name
+        assert "shown above as <U+E0070>; verify prints it as ?" in result.output
         assert "will print this label as: invoice 42??????????" in result.output
         if not extra:
             assert f"label:      invoice 42{escaped}" in result.output, "the post-broadcast summary too"
             assert decode_hashmark(_published_script(h)).label == _HIDDEN_LABEL, "shown, and signed as typed"
-
-    @pytest.mark.parametrize("label", [_DEVANAGARI, _ZWJ_FAMILY], ids=["devanagari", "zwj-emoji"])
-    def test_the_honest_pair_script_shaping_reads_naturally_with_its_ascii_form_beside_it(
-        self, runner, tmp_path, monkeypatch, label
-    ) -> None:
-        """§5.4 calls ZWJ and ZWNJ "load-bearing in Devanagari and emoji sequences". Escaping
-        combining marks and joiners made these labels unreadable on the one screen where the
-        operator checks them; they print as written now, and the ``ascii()`` form beside them
-        still names every codepoint. Not refused, and no banner: nothing here is hidden."""
-        h = _MarkHarness()
-        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
-        assert result.exit_code == 0, result.output
-        assert f"label:       {label}" in result.output and f"label:      {label}" in result.output
-        assert f"ascii: {label!a}" in result.output
-        assert "DO NOT PRINT AS THEMSELVES" not in result.output and "<U+" not in result.output
-        assert decode_hashmark(_published_script(h)).label == label
 
     def test_a_flag_spelled_in_tag_characters_is_disclosed_never_refused(self, runner, tmp_path, monkeypatch) -> None:
         """TAG characters are what hid "pay 9999" above, and nothing tells an honest flag's from an
@@ -807,27 +807,20 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         h = _MarkHarness()
         result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", _SCOTLAND])
         assert result.exit_code == 0, result.output
-        assert "DO NOT PRINT AS THEMSELVES" in result.output and f"ascii: {_SCOTLAND!a}" in result.output
+        assert _BANNER in result.output and f"ascii: {_SCOTLAND!a}" in result.output
         assert decode_hashmark(_published_script(h)).label == _SCOTLAND
 
     @pytest.mark.parametrize(
         "label",
-        [
-            "inv\u043eice 42",  # a CYRILLIC small o between Latin letters
-            "pay\u2800me",  # BRAILLE PATTERN BLANK — renders as a space
-            "pay\u3164me",  # HANGUL FILLER — default-ignorable, a Letter
-            "pay\uffa0me",  # HALFWIDTH HANGUL FILLER
-            "pay\u115fme",  # HANGUL CHOSEONG FILLER
-            "pay\u1160me",  # HANGUL JUNGSEONG FILLER
-        ],
-        ids=["cyrillic-o", "braille-blank", "hangul-filler", "halfwidth-filler", "choseong-filler", "jungseong-filler"],
+        ["inv\u043eice 42", "pay\u2800me"],  # a CYRILLIC small o; BRAILLE PATTERN BLANK
+        ids=["cyrillic-o", "braille-blank"],
     )
     def test_a_character_that_looks_like_something_else_is_named_by_the_ascii_form(
         self, runner, tmp_path, monkeypatch, label
     ) -> None:
-        """None of these is a control or format character, so none is escaped and none raises the
-        banner; each prints as SOMETHING, just not what it is. The ``ascii()`` form is the only
-        place the operator can see the codepoint about to be signed."""
+        """Neither is default-ignorable and neither is replaced by the reader: each renders as
+        SOMETHING, just not what it is, so neither is escaped and the banner stays quiet. The
+        ``ascii()`` form is the only place the operator can see the codepoint about to be signed."""
         result, _ = _invoke(
             runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
         )
@@ -835,6 +828,21 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         odd = next(c for c in label if not c.isascii())
         assert f"ascii: {label!a}" in result.output
         assert f"\\u{ord(odd):04x}" in result.output.split("ascii: ", 1)[1].splitlines()[0]
+        assert "<U+" not in result.output and _BANNER not in result.output
+
+    @pytest.mark.parametrize(
+        "filler", ["\u3164", "\uffa0", "\u115f", "\u1160"], ids=["hangul", "halfwidth", "choseong", "jungseong"]
+    )
+    def test_a_hangul_filler_is_default_ignorable_and_escaped(self, runner, tmp_path, monkeypatch, filler) -> None:
+        """Letters (Lo) that render as nothing: the reader prints them as written, so only the
+        default-ignorable table catches them."""
+        label = "pay" + filler + "me"
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"label:       pay<U+{ord(filler):04X}>me" in result.output
+        assert filler not in result.output and "verify prints it as written" in result.output
 
     def test_an_ordinary_label_is_printed_as_typed_with_no_banner(self, runner, tmp_path, monkeypatch) -> None:
         """A banner on every labelled mark is a banner nobody reads by the third one."""
@@ -844,7 +852,7 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         )
         assert result.exit_code == 0, result.output
         assert f"label:       {label}" in result.output and f"ascii: {label!a}" in result.output
-        assert "DO NOT PRINT AS THEMSELVES" not in result.output and "<U+" not in result.output
+        assert _BANNER not in result.output and "<U+" not in result.output
 
     def test_an_ascii_label_gets_no_ascii_line(self, runner, tmp_path, monkeypatch) -> None:
         result, _ = _invoke(
@@ -852,6 +860,137 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         )
         assert result.exit_code == 0, result.output
         assert "label:       advisory" in result.output and "ascii: " not in result.output
+
+
+#: Round 3. Every label here reached the signature with NO escape and NO banner in round 2, which
+#: exempted every combining mark and both joiners by category. The expected line is written out.
+_HIDES = [
+    (
+        "vs-encoded-sentence",
+        "invoice 42" + _vs_encode(b"pay 9999 to Mallory"),
+        "invoice 42" + "".join(f"<U+{ord(c):04X}>" for c in _vs_encode(b"pay 9999 to Mallory")),
+    ),
+    ("zwj-between-ascii", "pay\u200dpal invoice", "pay<U+200D>pal invoice"),
+    ("cgj-in-invoice", "invoice\u034f 42", "invoice<U+034F> 42"),
+    ("vs17-run-after-ascii", "a" + "\U000e0100" * 3 + "b", "a<U+E0100><U+E0100><U+E0100>b"),
+    ("cgj-between-ascii", "ab\u034fcd", "ab<U+034F>cd"),
+    ("fe0f-after-ascii", "ok\ufe0f", "ok<U+FE0F>"),
+]
+
+#: Honest text that must still read naturally: (typed, what is published and printed).
+_READS_NATURALLY = [
+    ("devanagari", _DEVANAGARI, _DEVANAGARI),
+    ("zwj-family", _ZWJ_FAMILY, _ZWJ_FAMILY),
+    ("heart-fe0f", "\u2764\ufe0f thanks", "\u2764\ufe0f thanks"),
+    ("e-plus-0301", "cafe\u0301", "caf\u00e9"),  # NFC composes it before signing
+    ("a-plus-0331", "a\u0331b", "a\u0331b"),  # no precomposed form: the combining mark stays
+]
+
+
+class TestWhatRendersAsNothingIsEscapedWhereverItSits:
+    """Escaping is decided by what RENDERS, and where — not by general category.
+
+    The default-ignorable codepoints (Unicode's own list, pinned below) render as nothing, and
+    several are combining marks (U+034F, VS17-256) or joiners. A run of variation selectors after a
+    letter is a published way to carry bytes in text that looks unchanged: ``invoice 42`` followed
+    by "pay 9999 to Mallory" encoded that way printed as ``invoice 42``.
+    """
+
+    @pytest.mark.parametrize(("top", "extra"), [(["--yes"], []), ([], ["--dry-run"])], ids=["confirm", "dry-run"])
+    @pytest.mark.parametrize(("label", "shown"), [c[1:] for c in _HIDES], ids=[c[0] for c in _HIDES])
+    def test_it_is_escaped_bannered_and_still_signed(
+        self, runner, tmp_path, monkeypatch, label, shown, top, extra
+    ) -> None:
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=top, extra=["--label", label, *extra])
+        assert result.exit_code == 0, result.output
+        leaked = {c for c in label if not c.isascii()} & set(result.output)
+        assert not leaked, f"reached the terminal raw: {sorted(f'U+{ord(c):04X}' for c in leaked)}"
+        assert f"label:       {shown}" in result.output
+        assert _BANNER in result.output
+        assert f"will print this label as: {_as_the_reader_prints(label)}" in result.output
+        if not extra:
+            assert f"label:      {shown}" in result.output, "the post-broadcast summary too"
+            assert decode_hashmark(_published_script(h)).label == label
+
+    @pytest.mark.parametrize(
+        ("typed", "published"), [c[1:] for c in _READS_NATURALLY], ids=[c[0] for c in _READS_NATURALLY]
+    )
+    def test_the_honest_pair_it_reads_naturally_and_is_published(
+        self, runner, tmp_path, monkeypatch, typed, published
+    ) -> None:
+        """No escape on the line the operator reads. When the reader will print it differently —
+        it replaces combining marks and joiners with ``?`` — the banner says so, truthfully, and
+        names each such character as "printed above as written"."""
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", typed])
+        assert result.exit_code == 0, result.output
+        assert f"label:       {published}" in result.output and f"label:      {published}" in result.output
+        assert "<U+" not in result.output
+        assert decode_hashmark(_published_script(h)).label == published
+        as_read = _as_the_reader_prints(published)
+        if as_read != published:
+            assert _BANNER in result.output and "printed above as written" in result.output
+            assert f"will print this label as: {as_read}" in result.output
+        else:
+            assert _BANNER not in result.output
+
+    @pytest.mark.parametrize("label", [_HIDES[0][1], _DEVANAGARI], ids=["vs-encoded-sentence", "devanagari"])
+    def test_the_banner_says_what_the_reader_REALLY_prints(self, runner, tmp_path, monkeypatch, label) -> None:
+        """ "will print this label as" is a claim about another command. Checked against it: the
+        published record, classified by the same core `pyrxd verify` and `glyph inspect` use."""
+        from pyrxd.glyph._inspect_core import _inspect_script
+
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
+        assert result.exit_code == 0, result.output
+        read_back = _inspect_script(_published_script(h).hex())["hashmark"]["label"]
+        assert f"will print this label as: {read_back}" in result.output
+
+    def test_the_canonicalisation_banner_and_the_decoded_line_do_not_leak_either(
+        self, runner, tmp_path, monkeypatch
+    ) -> None:
+        """Both printed the label through ``repr()``, which leaves every Mn character raw — VS17-256
+        and U+034F included. A leading space makes canonicalisation fire, so both lines print."""
+        typed = " " + _HIDES[0][1]
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", typed]
+        )
+        assert result.exit_code == 0, result.output
+        assert "LABEL CANONICALISED" in result.output and "decoded:" in result.output
+        leaked = {c for c in typed if not c.isascii()} & set(result.output)
+        assert not leaked, f"reached the terminal raw: {sorted(f'U+{ord(c):04X}' for c in leaked)}"
+
+    def test_the_default_ignorable_table_is_the_reviewed_unicode_17_set(self) -> None:
+        """REVIEWED, NOT DERIVED. Python's ``unicodedata`` cannot answer Default_Ignorable_Code_Point,
+        so ``hashmark_cmds._DEFAULT_IGNORABLE`` was generated once from Unicode 17.0.0's
+        DerivedCoreProperties.txt (sha256 24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08;
+        the 16.0.0 file gives the identical set) and checked in. This pins the membership, so any
+        change to the table is made on purpose and reviewed against that file."""
+        from pyrxd.cli.hashmark_cmds import _DEFAULT_IGNORABLE
+
+        assert _DEFAULT_IGNORABLE == (
+            (0x00AD, 0x00AD),
+            (0x034F, 0x034F),
+            (0x061C, 0x061C),
+            (0x115F, 0x1160),
+            (0x17B4, 0x17B5),
+            (0x180B, 0x180F),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x206F),
+            (0x3164, 0x3164),
+            (0xFE00, 0xFE0F),
+            (0xFEFF, 0xFEFF),
+            (0xFFA0, 0xFFA0),
+            (0xFFF0, 0xFFF8),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0000, 0xE0FFF),
+        )
+        assert sum(hi - lo + 1 for lo, hi in _DEFAULT_IGNORABLE) == 4174
+        # Merged: sorted, and no two ranges touch — so a lookup cannot depend on which one it hits.
+        assert all(a[1] + 1 < b[0] for a, b in itertools.pairwise(_DEFAULT_IGNORABLE))
 
 
 class TestTheFilePathCannotDriveTheTerminal:

@@ -106,52 +106,120 @@ def _canonical_label(label: str | None) -> tuple[str | None, bool]:
     return canonical, canonical != label
 
 
-#: How many distinct non-printing codepoints the label banner names one by one before summarising.
+#: How many distinct codepoints the label banner names one by one before summarising.
 _MAX_NAMED_LABEL_CODEPOINTS = 8
 
+#: Unicode's Default_Ignorable_Code_Point property, as merged codepoint ranges: what a renderer
+#: draws as NOTHING when it has no special handling for it. The variation selectors
+#: (U+FE00-FE0F, U+E0100-E01EF), U+034F COMBINING GRAPHEME JOINER, the TAG block and the Hangul
+#: fillers are all here — including ones whose general category is Mn or Lo, which is why a
+#: category test cannot find them: VS-17..256 are "combining marks", and a run of them after any
+#: letter is a published way to carry arbitrary bytes inside text that looks unchanged.
+#:
+#: GENERATED, NOT HAND-TYPED, AND NOT DERIVED AT RUN TIME. Python's ``unicodedata`` has no accessor
+#: for this property, so the ranges were extracted once from DerivedCoreProperties.txt of Unicode
+#: 17.0.0 (https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt, file sha256
+#: 24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08), merged, and checked in; the
+#: 16.0.0 file yields the identical set. A test pins the membership
+#: (`test_the_default_ignorable_table_is_the_reviewed_unicode_17_set`), so a change to it has to be
+#: made — and reviewed — on purpose.
+_DEFAULT_IGNORABLE: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 
 #: The two joiners §5.4 calls "load-bearing in Devanagari and emoji sequences".
 _JOINERS = frozenset({"\u200c", "\u200d"})
 
+#: Text / emoji presentation selectors. The only default-ignorables an honest label routinely
+#: carries on their own, and only straight after a symbol (a heart followed by U+FE0F).
+_PRESENTATION_SELECTORS = frozenset({"\ufe0e", "\ufe0f"})
 
-def _hides_on_screen(ch: str) -> bool:
-    """Whether *ch* can be signed without being seen — so `mark` prints it as ``<U+XXXX>``.
 
-    Starts from the predicate `pyrxd verify` and `glyph inspect` sanitise with
-    (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`): control and format characters,
-    private-use and unassigned codepoints, line/paragraph separators, combining marks. Two kinds
-    are then left to print as themselves, because they are how honest text is WRITTEN and
-    escaping them made a Devanagari label or a joined emoji unreadable on the one screen where the
-    operator checks it: combining marks (Mn, Me), which render ON their base character, and the
-    two joiners. Nothing escapes disclosure for it — every non-ASCII label also gets its
-    ``ascii()`` form, see :func:`_label_lines`.
+def _is_default_ignorable(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE)
+
+
+def _follows_a_symbol(label: str, i: int) -> bool:
+    """Whether position *i* comes straight after a non-ASCII symbol (So, Sm) — an emoji base."""
+    return i > 0 and not label[i - 1].isascii() and unicodedata.category(label[i - 1]) in ("So", "Sm")
+
+
+def _escaped_positions(label: str) -> list[bool]:
+    """For each character of *label*, whether `mark` must print it as ``<U+XXXX>``.
+
+    The rule is "escape whatever can be signed without being SEEN", with exactly three ways honest
+    text is written left to print as itself — each narrowed to where honest text puts it:
+
+    * a combining mark (Mn, Me) that is NOT default-ignorable. It renders ON its base character:
+      the virama and vowel signs of Devanagari, an accent written as a separate mark. The
+      default-ignorable combining marks (U+034F, the variation selectors, U+17B4-17B5,
+      U+180B-180F) render as nothing and are escaped wherever they are.
+    * U+FE0E / U+FE0F straight after a non-ASCII symbol (So, Sm), and nowhere else.
+    * ZWJ / ZWNJ between two non-ASCII characters that are themselves printed as written — a
+      joined emoji, a Devanagari conjunct. Between ASCII letters (``pay`` + ZWJ + ``pal``) a
+      joiner joins nothing visible, so it is escaped.
+
+    Everything else the reader's sanitiser replaces, and every other default-ignorable, is
+    escaped. Round 2 exempted every Mn/Me and both joiners by CATEGORY, which let a run of
+    variation selectors after ``invoice 42`` — a whole hidden sentence — print as ``invoice 42``
+    with no banner. The exemption is now by what renders, and where.
     """
-    if _sanitize_display_string(ch) == ch:
-        return False
-    return not (ch in _JOINERS or unicodedata.category(ch) in ("Mn", "Me"))
+    n = len(label)
+    escaped = [False] * n
+    for i, ch in enumerate(label):  # everything but the joiners, which depend on their neighbours
+        if ch in _JOINERS:
+            continue
+        if _is_default_ignorable(ch):
+            escaped[i] = not (ch in _PRESENTATION_SELECTORS and _follows_a_symbol(label, i))
+        elif _sanitize_display_string(ch) != ch:
+            escaped[i] = unicodedata.category(ch) not in ("Mn", "Me")
+
+    def _printed_non_ascii(j: int) -> bool:
+        return 0 <= j < n and label[j] not in _JOINERS and not label[j].isascii() and not escaped[j]
+
+    for i, ch in enumerate(label):
+        if ch in _JOINERS:
+            escaped[i] = not (_printed_non_ascii(i - 1) and _printed_non_ascii(i + 1))
+    return escaped
 
 
 def _label_for_display(label: str | None) -> str:
-    """The label as `mark` prints it: every character that does not print as itself becomes ``<U+XXXX>``.
+    """The label as `mark` prints it: every character that could be signed unseen becomes ``<U+XXXX>``.
 
     The raw label is what gets SIGNED, and printing it raw hid part of it: ``invoice 42`` followed
     by Unicode TAG characters spelling ``pay 9999`` showed as ``invoice 42`` on a terminal that
     does not render format characters, while the whole string went into the signature. §5.4's
     reject table does not list those characters, so the encoder accepts them; the defence is to
-    make them visible before the operator agrees.
+    make them visible before the operator agrees. See :func:`_escaped_positions` for which ones.
     """
     if label is None:
         return "(none)"
-    return "".join(f"<U+{ord(ch):04X}>" if _hides_on_screen(ch) else ch for ch in label)
+    return "".join(f"<U+{ord(ch):04X}>" if esc else ch for ch, esc in zip(label, _escaped_positions(label)))
 
 
 def _label_lines(label: str | None, *, head: str, indent: str) -> list[str]:
     """The ``label:`` line, and — for any label with a non-ASCII character — its ``ascii()`` form.
 
-    THE ESCAPES ABOVE ARE NOT THE WHOLE OF WHAT HIDES. Some characters print as something while
-    meaning something else: a Cyrillic ``о`` beside Latin letters, a Hangul filler (U+3164,
-    U+FFA0, U+115F, U+1160) or a blank Braille pattern (U+2800) that renders as white space. None
-    is a control or format character, so none is escaped, and none triggers the banner. The
+    THE ESCAPES ARE NOT THE WHOLE OF WHAT MISLEADS. Some characters print as something while
+    meaning something else: a Cyrillic ``о`` beside Latin letters, a blank Braille pattern
+    (U+2800) that renders as white space. Neither renders as nothing, so neither is escaped. The
     ``ascii()`` form names every codepoint, so the operator can see what is about to be signed
     whatever it looks like. An ASCII label gets no second line: its ``ascii()`` would say nothing new.
     """
@@ -162,7 +230,14 @@ def _label_lines(label: str | None, *, head: str, indent: str) -> list[str]:
 
 
 def _hidden_label_lines(label: str | None) -> list[str]:
-    """The banner for a label with characters that do not print as themselves, or ``[]``.
+    """The banner for a label that renders as less than it is, or that readers print differently.
+
+    IT FIRES WHENEVER ``pyrxd verify`` AND ``glyph inspect`` WILL PRINT THE LABEL DIFFERENTLY —
+    derived from the very function they print it through
+    (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`), not from a list kept here — and
+    whenever this screen escaped anything. So the signer is warned exactly when the reader will
+    show something other than what they saw. That includes honest text: a Devanagari label prints
+    naturally above and reads ``?`` for its combining marks in the reader, and the banner says so.
 
     SHOWN, NOT REFUSED — and that is a reading of HashMark §5.4, not a convenience. §5.4 names the
     characters an encoder must reject and says outright that ZWJ and ZWNJ are "load-bearing in
@@ -170,28 +245,38 @@ def _hidden_label_lines(label: str | None) -> list[str]:
     print would refuse text §5.4 permits: combining marks are ordinary in Indic scripts, TAG
     characters spell the England, Scotland and Wales flag emoji, and an emoji newer than this
     Python's Unicode tables is "unassigned" here. pyrxd must not refuse an honest label, so it
-    discloses: the codepoints, their names, and how pyrxd's own readers will print the result.
-    Combining marks and the joiners are not listed here at all (see :func:`_hides_on_screen`).
+    discloses: the codepoints, their names, where each appears above, and how the reader prints it.
     """
     if label is None:
         return []
-    hidden = [ch for ch in label if _hides_on_screen(ch)]
-    if not hidden:
+    escaped = _escaped_positions(label)
+    as_read = _sanitize_display_string(label)
+    flagged = [i for i, ch in enumerate(label) if escaped[i] or _sanitize_display_string(ch) != ch]
+    if not flagged:
         return []
-    distinct = list(dict.fromkeys(hidden))
     lines = [
         "",
-        f"*** THE LABEL HOLDS {len(hidden)} CHARACTER(S) THAT DO NOT PRINT AS THEMSELVES — each is shown",
-        "*** above as <U+XXXX>, and EVERY ONE OF THEM IS SIGNED AND PUBLISHED:",
+        f"*** THE LABEL HOLDS {len(flagged)} CHARACTER(S) THAT RENDER AS NOTHING HERE OR THAT `pyrxd verify`",
+        "*** PRINTS DIFFERENTLY — EVERY ONE OF THEM IS SIGNED AND PUBLISHED:",
     ]
+    distinct = list(dict.fromkeys(label[i] for i in flagged))
     for ch in distinct[:_MAX_NAMED_LABEL_CODEPOINTS]:
-        lines.append(f"***   U+{ord(ch):04X}  {unicodedata.name(ch, '(no Unicode name: unassigned or private use)')}")
+        at = [escaped[i] for i in flagged if label[i] == ch]
+        if all(at):
+            here = f"shown above as <U+{ord(ch):04X}>"
+        elif not any(at):
+            here = "printed above as written"
+        else:
+            here = f"printed as written in one place, as <U+{ord(ch):04X}> in another"
+        read = "verify prints it as ?" if _sanitize_display_string(ch) != ch else "verify prints it as written"
+        name = unicodedata.name(ch, "(no Unicode name: unassigned or private use)")
+        lines.append(f"***   U+{ord(ch):04X}  {name} — {here}; {read}")
     if len(distinct) > _MAX_NAMED_LABEL_CODEPOINTS:
         lines.append(f"***   ... and {len(distinct) - _MAX_NAMED_LABEL_CODEPOINTS} more distinct codepoint(s)")
-    lines.append(f"*** `pyrxd verify` and `glyph inspect` will print this label as: {_sanitize_display_string(label)}")
-    lines.append("*** HashMark 5.4 does not forbid these — TAG characters spell flag emoji, and an emoji newer")
-    lines.append("*** than this Python is 'unassigned' here — so they are shown, not refused. If you did not")
-    lines.append("*** put them there, do not publish this: retype the label.")
+    if as_read != label:
+        lines.append(f"*** `pyrxd verify` and `glyph inspect` will print this label as: {as_read}")
+    lines.append("*** HashMark 5.4 does not forbid these, and honest text uses some of them, so they are shown,")
+    lines.append("*** not refused. If you did not put them there, do not publish this: retype the label.")
     return lines
 
 
@@ -233,8 +318,8 @@ def _mark_lines(
     if typed_label is not None and plan.label != typed_label:
         lines.append("")
         lines.append("*** LABEL CANONICALISED — what gets signed is NOT what you typed:")
-        lines.append(f"***   you typed:  {typed_label!r}")
-        lines.append(f"***   published:  {plan.label!r}")
+        lines.append(f"***   you typed:  {typed_label!a}")
+        lines.append(f"***   published:  {plan.label!a}")
         lines.append("*** HashMark 5.4 requires the label be trimmed and NFC-normalised before")
         lines.append("*** signing. The published spelling above is the one inside the signature.")
     lines.append("")
@@ -459,7 +544,7 @@ def mark_cmd(
             click.echo(f"  {line}")
         click.echo(f"\n  record:      {build.plan.op_return_script.hex()}")
         click.echo(f"  decoded:     v{record.version} {record.algorithm} digest={record.digest_hex}")
-        click.echo(f"               label={record.label!r} signer={record.signer_hash160_hex}")
+        click.echo(f"               label={record.label!a} signer={record.signer_hash160_hex}")
         click.echo(f"               signature (unverified by a third party)={record.signature_hex}")
         click.echo(f"  raw tx:      {payload['raw_tx_hex']}")
         click.echo("\n  Re-run without --dry-run to publish it.")
