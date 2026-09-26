@@ -47,11 +47,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuse a WAVE claim whose label is not 3–63 characters of lowercase `a`–`z`, `0`–`9` and `-`,
   whose label starts or ends with `-` or contains `--` without an `xn--` prefix, whose domain is
   not exactly `rxd`, or whose top-level name disagrees with the label. 0.24.0 accepted any
-  printable text up to 255 characters. Every label now refused is one RXinDexer's
-  `validate_wave_name` refuses, so the claim would confirm, spend its fee and never resolve. The
-  exception is a 1- or 2-character label: RXinDexer indexes it, but the WAVE protocol
+  printable text up to 255 characters. Some claims now refused would never register: RXinDexer's
+  `validate_wave_name` refuses the label (0.24.0's `alice.rxd` in `attrs.name` is one), so the
+  claim would confirm, spend its fee and never resolve. Others RXinDexer would register, and
+  pyrxd refuses them anyway: a 1- or 2-character label, which the WAVE protocol
   (Radiant-Core/WAVE-Protocol `ANNOUNCEMENT.md`, "Register names 3-63 chars") and Photonic's
-  register page and resolver refuse it. Uppercase is refused, not lower-cased. Write a
+  register page and resolver refuse, and an uppercase label, which the indexer lower-cases and
+  Photonic refuses. Uppercase is refused, not lower-cased. Write a
   non-ASCII name as `xn--` punycode (`café` is `xn--caf-dma`). The rule is
   `pyrxd.glyph.wave_rules`, and it reads the name and parent the way the indexer does
   (`attrs.name`, then `app.data.name`). A WAVE payload with only a top-level `name` is refused
@@ -71,13 +73,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on renewal, so a name registered without it still resolves for its term.
   - `pyrxd glyph mint-nft` with WAVE metadata pays it from a wallet input at reveal time (the
     commit's change output), so the fee leaves the wallet only in the reveal that registers the
-    name. The confirmation shows the fee, the treasury, the input that pays it, and the total.
-    On testnet and regtest the command refuses unless given `--wave-treasury ADDRESS` or
-    `--no-wave-registration-fee`.
-  - `mint-nft` checks that the name is available before the commit and again just before the
-    reveal. It refuses a name that is taken. It also refuses when the indexer cannot answer,
-    unless `--allow-unverified-wave-name` is given. If the name is taken while the commit
-    confirms, the fee is not paid, and the command prints how to recover the commit without it.
+    name. The confirmation shows the fee, the treasury, the input that pays it, and the total,
+    and marks a treasury other than the published one. On testnet and regtest the command
+    refuses unless given `--wave-treasury ADDRESS` or `--no-wave-registration-fee`.
+  - `mint-nft` asks the indexer whether the name has a confirmed registration before the
+    commit, before the reveal's confirmation prompt, and again just before the reveal is
+    broadcast. It refuses a name that is registered. The indexer answers from mined blocks, so a
+    rival claim that is not yet mined is not seen. It also refuses when the indexer cannot
+    answer, unless `--allow-unverified-wave-name` is given. If the name is taken after the
+    commit, the fee is not paid, and the command prints how to recover the commit without it.
+  - `mint-nft` refuses to commit a claim for a name that already has an unrevealed commit
+    recorded in this wallet's `pending-mints/` for the same network, and prints the command that
+    reveals that commit. `--ignore-pending-mint` overrides it.
   - The SDK builders do not pay: they RETURN the fee output, as a required
     `registration_fee_output` on `RevealScripts`, `AuthorityGatedRevealScripts`,
     `MutableRevealScripts`, `ContainerRevealScripts` and `ContainerChildRevealScripts`, for
@@ -96,13 +103,61 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Which payloads owe the fee is decided by RXinDexer's own name rule, so a label the indexer
     would register always pays, including one pyrxd's stricter build rule would refuse. A 1- or
     2-character label pays the 100 RXD tier. Only a claim the indexer refuses, such as the
-    0.24.0 `alice.rxd` shape, owes nothing.
+    0.24.0 `alice.rxd` shape, owes nothing. `tests/test_wave_fee_matches_the_pinned_indexer.py`
+    runs RXinDexer's own claim path, from its files vendored at the pinned commit `ca8a6a4e`,
+    and holds pyrxd's fee decision, price and treasury to it.
 
 - **`pyrxd glyph mint-nft` and `timelock-mint` now wait for the reveal to confirm before
   reporting success.** Before, they returned as soon as the reveal was broadcast. A reveal still
   unconfirmed at the timeout exits 2 with status `reveal_broadcast_not_confirmed` and names the
   reveal txid. Scripts that treated a broadcast as success will now see a slow block as an exit
-  code of 2.
+  code of 2. The confirmation is the server's word, and success says so: "The server reports
+  the reveal confirmed." replaces "NFT minted!" (for `timelock-mint`, "The server reports the
+  timelocked NFT's reveal confirmed." replaces "Timelocked NFT minted."), followed by where the
+  commit's record is kept and the `resume-mint` command that reveals the commit again through
+  another server if a block explorer does not show the reveal. `--json` gains
+  `reveal_confirmed`, `record`, `record_archive_error`, `recover_if_not_mined` and
+  `recover_note`.
+
+- **`pyrxd.glyph.judge_name_at_mark` needs `name=` and `height_reports=`; `step_heights=` is
+  gone.** In 0.24.0 it took `step_heights=`, one mapping of block heights from one source. It
+  now takes one `HeightReport` (new, exported from `pyrxd.glyph`) per endpoint, and refuses
+  form 2 unless at least two distinct sources agree on the mark's height, which must also equal
+  the anchor's, and on the height of every walked chain step. `name` is the name asked about,
+  and form 2 is refused unless the glyph's own mint payload names that label (see the
+  `glyph inspect --wave-name` entry under Added). A 0.24.0 call raises `TypeError`.
+
+- **A walk of `ChainStep`s built as in 0.24.0 now always degrades form 2.** `ChainStep`,
+  exported in 0.24.0, gains `envelope_cbor`, the committed envelope bytes, defaulting to `b""`.
+  `judge_name_at_mark` reads the glyph's own name from the first step's `envelope_cbor`, so a
+  walk whose steps lack it degrades to form 1 ("the walk carries no readable mint payload to
+  take the glyph's own name from"). Nothing raises. Steps built by `walk_mutable_chain` carry
+  the bytes.
+
+- **`GlyphMinter` archives a finished mint's pending record instead of deleting it, so a
+  `PendingStore` written for 0.24.0 keeps its records.** "Confirmed" is the server's word. A
+  server that echoed a reveal it never relayed, and reported it confirmed, got the record
+  deleted: the only copy of the payload the still-unspent commit can be spent with.
+  Once a reveal is reported confirmed, `GlyphMinter` now calls the new `PendingStore.archive()`,
+  never `delete()`. The base `archive()` leaves the record where it is, so a custom store's
+  `list_pending()` goes on listing finished mints until it overrides `archive()`.
+  `JsonFilePendingStore` moves the record to `done/` beside it. `GlyphMinter` also asks the new
+  `PendingStore.archive_problem()` before broadcasting the commit and again before the reveal,
+  and refuses on an answer. An archive that fails after the reveal is reported confirmed is a
+  `UserWarning`, and the record stays where it was.
+
+- **`verify_attestation` raises `ValidationError` for a `network_genesis` that is not 64
+  lowercase hex.** In 0.24.0, `pyrxd.script.hashmark.verify_attestation` returned
+  `INVALID_SIGNATURE` for a misspelled genesis (uppercase, or a network name), a verdict against
+  the record for the caller's mistake. Any correctly spelled genesis is still accepted, whether
+  or not pyrxd knows the chain.
+
+- **A commit script whose ref-type operand is not `OP_1` or `OP_2` is no longer a commit.**
+  `pyrxd.glyph.script.COMMIT_SCRIPT_RE` accepted any byte there, so `is_commit_script`,
+  `extract_payload_hash_from_commit_script` and `extract_owner_pkh_from_commit_script` accepted,
+  for example, an `OP_0` commit, which demands that the reveal create no ref for it and so mints
+  nothing. They now return `False` or raise `ValidationError` for it. pyrxd's builders and
+  Photonic's emit only `OP_1` (FT) and `OP_2` (NFT).
 
 ### Added
 
@@ -141,7 +196,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it merges into this one; pyrxd read `loc` only as text, so such a token decoded as though it
   had no `loc` at all. Read path only, and the merge is NOT implemented: `loc_vout` tells a
   caller the metadata is incomplete and where the rest is. `None` means no integer `loc` was
-  present, not that a merge happened.
+  present, not that a merge happened. An integer `loc` that is negative or above 2**32 − 1 is
+  dropped with one warning that gives its bit width, not its value, so an integer too wide to
+  print cannot break the log.
 - **`pyrxd.glyph.timelock.cek_wrap_aad`** — the AAD a Glyph recipient wrap is bound to, for
   readers calling `unwrap_cek_x25519` themselves. Pass the on-chain string verbatim; it refuses
   `bytes`, because handing it the digest is the 0.24.0 mistake.
@@ -153,10 +210,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and, when the canonical spelling differs from what was typed, BOTH are shown in
   the confirmation summary under their own banner — the label is inside the signed
   statement, so a silently trimmed one would mean the string the operator believes
-  they published is not the string anyone reads back. `--network` selects what is
-  SIGNED, not merely where it is sent: the genesis hash is part of the statement and
-  is not carried by the record, so an unknown network is refused rather than assumed.
-  Top level rather than under `glyph`, because HashMark is a third-party format.
+  they published is not the string anyone reads back. A label character that could be
+  signed without being seen (a default-ignorable codepoint such as a variation selector
+  or a TAG character) is printed as `<U+XXXX>`, except a joiner between two printed
+  non-ASCII characters and a presentation selector after a symbol, where honest text puts
+  them. A non-ASCII label gets a second line with its `ascii()` form, and a banner names
+  each flagged codepoint and says how `pyrxd verify` and `glyph inspect` will print it.
+  These characters are shown, not refused: §5.4 permits them, and honest text
+  (Devanagari, joined emoji, flag emoji) uses some of them. The file path is printed
+  sanitised. `--network` selects what is SIGNED, not merely where it is sent: the
+  genesis hash is part of the statement and is not carried by the record, so an unknown
+  network is refused rather than assumed. Top level rather than under `glyph`, because
+  HashMark is a third-party format.
 
   New `pyrxd.hashmark_tx`: `plan_hashmark` / `plan_hashmark_for_file` / `MarkPlan` /
   `build_hashmark_mark` / `broadcast_hashmark_mark` / `hashmark_mark_funding_bar`.
@@ -165,8 +230,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   canonicalisation and the signature check and still get signed bytes back.
   `MarkPlan` decodes and attests its own bytes in `__post_init__`, so an unchecked
   one cannot exist; `record` and `attestation` are derived, not constructor
-  arguments. Funding uses `find_plain_rxd_utxo`, so a token-bearing UTXO is never
-  spent to publish a mark. This also closes the encoder's reachability gap:
+  arguments. `MarkPlan` and `plan_hashmark` refuse a genesis that is not 64 lowercase
+  hex, or is not mainnet's, testnet's or regtest's; `allow_unknown_genesis=True` relaxes
+  only the second rule, and never accepts a known genesis in reversed byte order. The
+  plan's own attestation check cannot catch a wrong genesis, because it verifies against
+  the same string it signed. `build_hashmark_mark` refuses a plan for a chain other than
+  the client's declared one, then asks the client's server which chain it is on
+  (`assert_chain`) before any funding read, and refuses a client that cannot be asked.
+  Funding uses `find_plain_rxd_utxo`, so a token-bearing UTXO is never spent to
+  publish a mark. This also closes the encoder's reachability gap:
   `encode_hashmark` previously had no caller in shipped code outside
   `pyrxd.script`'s lazy-export map.
 
@@ -188,16 +260,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transaction, decodes every HashMark output in it, and prints a verdict over four checks, each
   with a reason, then every record in full:
   - `signature`: `VERIFIED`, `DOES NOT VERIFY`, `RECORD DOES NOT DECODE`, `NOT CHECKED`, or
-    `NO SIGNATURE` for a v1 record.
+    `NO SIGNATURE` for a v1 record. Every outcome that involves a key names the chain it was
+    (or would be) checked against. The genesis hash is part of the signed statement, so a
+    genuine record made for testnet does not verify on mainnet, and `DOES NOT VERIFY` says to
+    re-run with that `--network` if the record was made on another network.
   - `file`: `--file PATH` is hashed on this machine with the algorithm the record names, or
     `--digest HEX` is compared as given (one or the other): `MATCHES`, `DOES NOT MATCH`,
     `CANNOT COMPARE`, or `NOT CHECKED` when neither was given.
   - `name`: `--wave-name NAME` asks HashMark §7.6 form 2 — did NAME point at the signing key at
     the block that carried the mark? `ESTABLISHED`, `NOT THE SIGNER`, `NOT ESTABLISHED`, or
-    `NOT CHECKED`. It needs two ElectrumX endpoints; the default mainnet configuration lists two.
+    `NOT CHECKED`. It needs two ElectrumX endpoints on different hosts that report the same
+    block heights; the default mainnet configuration lists two. An empty or whitespace-only
+    name, and a name whose domain is not exactly `rxd` (`alice.evil`, `sub.alice.rxd`,
+    `alice.RXD`), are refused with exit 1 before anything is fetched.
   - `block`: `CONFIRMED`, `PROVISIONAL` (fewer confirmations than `--min-confirmations`) or
     `NO BLOCK` (still in the mempool). `--min-confirmations N` is required on every run and has
-    no default. The height is one endpoint's claim, and is printed with a caveat saying so.
+    no default; N counts confirmations, the block itself and N−1 built on top of it. The block
+    is one endpoint's claim: the height printed is the one whose header, from that endpoint,
+    hashes to the block hash the endpoint gives for the transaction, and the caveat printed
+    with it says the header was checked only against the endpoint itself. If no header within
+    two blocks of `tip - confirmations + 1` matches, the command exits 2 saying the server's
+    index and node disagree, rather than print a block no header confirmed.
 
   `--verify-wave` adds the WAVE names that resolve to the signing key now, as context outside
   the verdict. No wallet is opened and nothing is broadcast.
@@ -235,34 +318,67 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The judge, walker and anchor shipped in 0.24.0 with no CLI caller, because nothing produced the
   transactions a walk needs. New module `pyrxd.glyph.mutable_chain_discovery` produces them from
   the chain: `discover_mutable_chain` follows each mutable output's ElectrumX scripthash history
-  to the transaction that spent it (at most `MAX_DISCOVERY_FETCHES` = 256 fetches, reported as
-  `capped` when reached), and `walk_discovered_chain` discovers on one endpoint, proves the tip
-  unspent on another, and hands both to `walk_mutable_chain`, which re-checks every link. Every
-  fetched transaction must hash to the txid asked for.
+  to the transaction that spent it (at most `MAX_DISCOVERY_FETCHES` = 256 distinct transactions
+  fetched, reported as `capped` when reached; `ChainDiscovery.candidates` lists only the
+  transactions discovery fetched, so the cap bounds the whole walk), and `walk_discovered_chain`
+  discovers on one endpoint, proves the tip unspent on another, hands both to
+  `walk_mutable_chain`, which re-checks every link, and asks the tip endpoint separately where
+  each walked step is (`DiscoveredWalk.tip_heights`, from `step_heights_from`). Every fetched
+  transaction must hash to the txid asked for.
 
   What a form-2 answer says, and no more: "at the mark's block (N), NAME pointed at ADDRESS", then
   either "the signing key IS that address — that key had signed this by that block; not that its
   holder put it here, not authorship, not location" or "the signing key is NOT that address".
-  None of its inputs is verified, and each caveat is printed beside it:
-  - the block height is the endpoint's report; pyrxd has no Radiant header, proof-of-work or
-    merkle check;
-  - which glyph is the name is the indexer's claim; `binding_verified` is always `false`;
-  - a `complete` walk means two endpoints agreed; two that both omit the latest update produce a
-    complete walk over a stale record;
-  - whether the name had expired by that block is unknown, and `expiry` says so.
+  Form 2 needs all of these, and each caveat is printed beside the answer:
+  - every block height it compares — the mark's and each chain step's — reported identically by
+    two endpoints on different hosts. The mark's height is also checked against each endpoint's
+    own block header: the header at that height must hash to the block the endpoint says holds
+    the mark. The step heights are not. Nothing checks proof-of-work or merkle inclusion, so two
+    endpoints that report the same wrong heights still move the answer;
+  - the glyph's own mint payload names the label asked about, read as RXinDexer reads it
+    (`attrs.name`, else `app.data.name`, lower-cased, with the root as parent). Which
+    registration of the name is in force is still the indexer's claim, so `binding_verified` is
+    always `false`;
+  - a `complete` walk, which means two endpoints agreed; two that both omit the latest update
+    produce a complete walk over a stale record;
+  - whether the name had expired by that block is unknown; every form-2 answer prints
+    `expiry at that block: unknown …`.
 
   It degrades to form 1 with the reason printed: for a signature that did not verify (nothing is
   looked up), a pasted script (no block), a mark shallower than `--min-confirmations`, a name the
   indexer does not have, no endpoint running the indexer, an incomplete walk, a `target` that is
-  not text, and a height and binding from the same server. `--min-confirmations` has no default,
-  and `--wave-name` without it is refused. With one server (`--electrumx URL`, `PYRXD_ELECTRUMX`,
-  or a config naming one) it degrades with the same-source reason. **This adds to `--json`
-  output**, only when `--wave-name` is passed: a `name_at_mark` object on each HashMark record.
+  not text, a height and binding from the same server, endpoints that disagree about any block
+  height (naming which said what), an endpoint that could not report its heights, and a glyph
+  whose own mint does not name the label. `--min-confirmations` has no default (N counts
+  confirmations, the block itself and N−1 built on top of it), and `--wave-name` without it is
+  refused. So is an empty `--wave-name`, or one whose domain is not exactly `rxd`, before
+  anything is fetched. With one server (`--electrumx URL`, `PYRXD_ELECTRUMX`, or a config naming
+  one), or two on the same host (`Endpoint.source`: the host lower-cased, without a trailing dot,
+  IP literals in one spelling), it degrades with the same-source reason. A hostname and its IP
+  address count as two sources; that cannot be seen from a URL. **This adds to `--json`
+  output**, only when `--wave-name` is passed: a `name_at_mark` object on each HashMark record,
+  whose `name` is the name asked about and whose `heights.by_source` lists each endpoint's
+  reported heights.
+
+  New in the SDK for this: `HeightReport`, `AnchorBindingError`, `BOUND_CAVEAT`,
+  `MAX_INDEX_LAG_BLOCKS` and `MIN_CONFIRMATIONS_MEANING` (exported from `pyrxd.glyph`),
+  `resolve_mark_anchor(fetch_header=...)`, `MarkAnchor.header_bound`,
+  `WaveIdentityVerdict.height_sources` and `pyrxd.hash.radiant_block_hash`. With `fetch_header`,
+  `resolve_mark_anchor` returns the height, searched up to `MAX_INDEX_LAG_BLOCKS` (2) either
+  side of `tip - confirmations + 1`, whose header hashes to the endpoint's `blockhash`, and
+  raises `AnchorBindingError` if none does. The formula alone can be one block low: a
+  pre-release review measured both default mainnet servers one block low together in 7 of 470
+  paired samples, and in one of 12 live `verify --wave-name` runs saw ESTABLISHED printed at
+  block 460571 for a mark in block 460572. The CLI always passes `fetch_header`; the
+  `/inspect/` and `/verify/` pages do not, and show the unbound caveat.
 
 - **`pyrxd glyph inspect` prints a line for a v1 HashMark record's missing signature, and
   `--json` carries the verdict words and the record's algorithm id.** A v1 record now prints
   `signature NO SIGNATURE — a v1 record carries no signer, so it says WHEN and never WHO`; before,
-  it printed no signature line. **This changes human output** for v1 records. In `--json`, and in
+  it printed no signature line. **This changes human output** for v1 records. It also changes it
+  for a v2 record whose signature does not verify or was not checked: the chain it was checked
+  against (or would be) is printed, with a note that a record signed for another chain does not
+  verify here and to re-run with that `--network`. In `--json`, and in
   what `pyrxd.glyph.inspect.inspect_script` / `classify_raw_tx` return, each HashMark record gains
   `algorithm_id` (present even when this build does not implement the algorithm, in which case
   `algorithm` is `null`) and `committed_signer_address` (the address form of the hash160 the
@@ -274,8 +390,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RecoveryUnavailable`) lets `verify_attestation` run where `coincurve` is not installed. A
   registered function replaces coincurve for the one curve operation it needs, public-key
   recovery, after pyrxd's own range and low-S checks. If it raises `RecoveryUnavailable` the
-  outcome is `UNVERIFIABLE`; any other exception is `INVALID_SIGNATURE`. Nothing in the package
-  registers one, so the CLI and SDK still use coincurve; the browser pages register a vendored
+  outcome is `UNVERIFIABLE`; any other exception is `INVALID_SIGNATURE`. What it returns must be
+  a SEC1 public key in the form asked for (33 bytes led by `02`/`03` when compressed, 65 led by
+  `04` when not); anything else is `UNVERIFIABLE`, a broken verifier rather than a verdict on
+  the record. Nothing in the package registers one, so the CLI and SDK still use coincurve;
+  the browser pages register a vendored
   `@noble/secp256k1`. `tests/test_signature_backend_differential.py` runs both over a real mainnet
   mark, tampered copies of it and the eight cross-implementation vectors, and fails if the outcome
   or the recovered hash160 ever differ.
@@ -291,19 +410,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `pyrxd.glyph.mark_anchor` now imports without `coincurve`, `aiohttp` or `websockets`.
 
 - **A public `/verify/` page on the documentation site, for checking a HashMark without
-  installing anything.** Paste a transaction id, or open a `?input=` link. The page answers who
-  vouched for it, what was fingerprinted, when it was published, and whether a file you choose is
-  the one that was marked; the file is hashed in the browser. It checks signatures in the browser
-  with the same vendored curve as `/inspect/`, draws at most 50 marks per transaction, and prints
-  the `pyrxd verify <txid> --min-confirmations N` command that checks every one. Served from the
-  documentation site; shipped in the sdist, not the wheel.
+  installing anything.** Paste a transaction id, an outpoint (`<txid>:N`) or a contract id, or
+  open a `?input=` link. For an outpoint or contract id the page looks up the transaction and
+  says, before any verdict, whether output N holds the record, is not a record (and which output
+  holds one), or does not exist. The page answers who vouched for it, what was fingerprinted,
+  when it was published, and whether a file you choose is the one that was marked; the file is
+  hashed in the browser. It checks signatures in the browser with the same vendored curve as
+  `/inspect/`, draws at most 50 marks per transaction, and prints the
+  `pyrxd verify <txid> --min-confirmations N` command that checks every one. It states burial
+  as confirmations, the block itself and N−1 built on top of it, and does not check the block
+  height against a header as the CLI does. A signature that fails is reported as not verifying
+  against that key on Radiant mainnet, with a note that a genuine record made for another
+  Radiant network lands there too. Served from the documentation site; shipped in the sdist,
+  not the wheel.
 
 - **HashMark v2 encoder** (`pyrxd.script.encode_hashmark`) — pyrxd could verify
   HashMark records other people wrote and could not write one. Takes a digest, a
   signing key and an optional label; returns a 133-byte signed `OP_RETURN`
   scriptPubKey (223 with a label at the derived 88-byte cap). Minimal pushes,
   low-S enforced, a non-canonical label refused rather than silently trimmed,
-  and the record verified through `verify_attestation` before it is returned.
+  and the record verified through `verify_attestation` before it is returned. It refuses
+  to sign for a `network_genesis` that is not 64 lowercase hex, or is not mainnet's,
+  testnet's or regtest's (`allow_unknown_genesis=True` relaxes only the second rule).
   `canonicalize_label` and `max_label_bytes` are exported alongside it, with
   `decode_hashmark` and `verify_attestation`, so a consumer can encode and read
   back without reaching into the submodule.
@@ -324,7 +452,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`{"tokens", "next_cursor"}`); `order="recent"` on the by-type call is
   newest-deployed-first, default `"ref"` keeps the legacy order. Enables
   incremental watermark sync: page newest-first, stop when `deploy_height`
-  drops below the last run's watermark.
+  drops below the last run's watermark. Each page is checked: any other shape, or the
+  indexer's `{"error": ...}` answer, raises `RxinDexerError`.
   Cherry-picked from `Radiant-Core:pyrxd` `4e4e4bee` (theartofsatoshi, 2026-07-19); the
   RPC was re-confirmed live on `electrumx.radiantcore.org` on 2026-09-16.
 
@@ -342,16 +471,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`pyrxd glyph resume-mint COMMIT_TXID`, and a saved record for every mint in flight.**
   `mint-nft` and `timelock-mint` write a pending record to `<wallet dir>/pending-mints/` (mode
-  0600, no key material) before the commit is broadcast. `resume-mint` reveals that commit
-  later. It checks the record before building anything:
-  - the record must belong to this wallet, be filed under the txid given, and name the value
-    the server lists;
+  0600, no key material, naming the network) before the commit is broadcast. `resume-mint`
+  reveals that commit later. It checks the record before building anything:
+  - the record must belong to this wallet and this network, and be filed under the txid given;
   - the payload must re-derive the commit script;
   - the fee rate must be within the relay floor and 10x;
-  - it keeps the mint's registration-fee choice, and refuses to pay a fee the mint declined.
+  - for a commit that registers a WAVE name, the fee choice must be stated on the command line
+    (`--wave-registration-fee`, `--wave-treasury ADDRESS` or `--no-wave-registration-fee`),
+    because a record is a file that can be changed after the mint. The record only cross-checks
+    the choice: paying against a record that says the mint declined, or naming a treasury the
+    record does not, is refused, and declining is always accepted. The command `mint-nft` prints
+    states the choice;
+  - once the commit confirms, the server must list the commit output at the value the record
+    says. If it does not, nothing is revealed, and the error says the record or the server is
+    wrong and keeps the recovery.
 
-  A record is deleted only once its reveal confirms. It is never deleted because a server
-  listed nothing (tracked further in #736).
+  A record is never deleted. Once its reveal is reported confirmed it is moved to
+  `pending-mints/done/`, and `resume-mint` finds an archived record as well as a live one, so a
+  server that reported a reveal it never relayed costs a second run against another server,
+  not the record. A spend of the commit counts only if the spending input pushes the record's
+  exact envelope. A `done/` that is a regular file or a symbolic link is refused before anything
+  is broadcast, and on POSIX every archive operation acts on a descriptor opened with
+  `O_NOFOLLOW`, never on the path. `JsonFilePendingStore` gains
+  `archive`, `load_archived`, `restore`, `list_archived`, `archive_directory` and
+  `archive_directory_problem`; `PendingStore` gains `archive` and `archive_problem` (see
+  Changed (breaking)).
 
 - **WAVE registration-fee API** in `pyrxd.glyph.wave_rules`: `wave_registration_price(name)`,
   `WAVE_TREASURY_ADDRESS`, `WaveRegistrationFee` (its value and script are derived, so it
@@ -360,7 +504,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before signing, that exactly one output pays the treasury at the tier value, that the
   commit input pays the carrier and the miner fee by itself, and that the miner fee is within
   10x of the relay floor. `PendingMint` gains `wave_fee` and `wave_treasury`, written at
-  schema version 2 (`PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE`).
+  schema version 2 (`PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE`), and `network`, written at
+  schema version 3 (`PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK`), with or without a fee
+  decision. A record's fee fields are the writer's word, kept for comparison; `resume-mint`
+  never lets them decide what is paid.
 
 ### Fixed
 
@@ -723,31 +870,68 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`pyrxd glyph inspect` showed a reveal's name, ticker and attributes without checking them
   against the commit they were revealed from.** A commit output carries `payload_hash`, the
-  `sha256d` of the envelope CBOR it commits to. Both envelope readers take the first `gly` push in
-  the first input that decodes, and nothing compared that envelope with the hash, so the metadata
-  on screen need not be what the commit committed to: given inputs `[decoy, real]`, the decoy's
-  envelope is the one shown. That ordering has been shown at library level only, not on a node,
-  and nothing is refused, because honest multi-input reveals must keep working. Instead the
-  metadata block now says what the attribution is worth, as `metadata.payload_binding`
-  (`{"state", "reason"}`):
-  - `bound` — the output the attributed input spent is a commit whose `payload_hash` is the
-    `sha256d` of exactly the envelope shown. It says nothing about who wrote either.
-  - `mismatch` — that commit committed to a different payload; treat the metadata as
-    unattributed.
-  - `not-a-commit` — the attributed input spent something other than a commit output.
-  - `unchecked` — the spent output was not supplied (an offline `classify_raw_tx` call), or it
-    was fetched and could not be used, in which case a `detail` key says why.
+  `sha256d` of the envelope CBOR it commits to. The headline payload was the first `gly` push in
+  the first input that decodes, and nothing compared it with any hash or with the outputs, so the
+  metadata on screen need not be what any commit committed to, nor describe any token the
+  transaction created: given inputs `[decoy, real]`, the decoy's envelope was the one shown.
+  Nothing is refused, because honest multi-input reveals must keep working. Instead:
+  - **The headline is a payload that mints.** It is now the first payload whose input's outpoint
+    the transaction's outputs push as a ref (`OP_PUSHINPUTREF` or `OP_PUSHINPUTREFSINGLETON`,
+    found by walking the opcodes, not by a byte search); only if none mints is it the first
+    payload, as before. `GlyphInspector.find_reveal_metadata` keeps its first-wins rule.
+    `metadata.mints` and each `metadata_inputs` row's `mints` say whether the transaction
+    creates a ref from that input's outpoint, `metadata.of_n_minted` counts those, and
+    `metadata_inputs_not_listed` gains a `minting` count. When not every payload mints, the
+    headings read "1 of N payloads here, M minting a token" and "Other payloads in this
+    transaction (k), j minting a token", a payload that mints nothing is marked "mints no
+    token", and a headline that mints nothing gets a `token:` line saying "this input mints no
+    token here". **This changes human and `--json` output** for a transaction whose first
+    payload mints nothing.
+  - **`metadata.payload_binding`** (`{"state", "reason"}`) says what the attribution is worth:
+    - `bound` — the attributed input spent an NFT or FT commit (the template whose
+      `OP_REFTYPE_OUTPUT` operand is `OP_2` or `OP_1`, bare or behind a delegate prefix) whose
+      `payload_hash` is the `sha256d` of exactly the envelope shown, AND the outputs carry that
+      commit's outpoint as the ref type it demands, read as Radiant Core's `getRefTypeOutput`
+      reads it. `first_ref_output` and `ref_output_count` say where. It says the payload is that
+      token's, and nothing about other outputs or about who wrote either. It checks no
+      signature and not the delegate burn a delegate-prefixed commit also demands, so it does
+      not mean a node would accept the transaction.
+    - `bound-no-token` — the same hash match against a DAT commit, which creates no token, so
+      the payload describes no output of the transaction.
+    - `mismatch` — the commit committed to a different payload.
+    - `commit-unsatisfied` — the hash matches, but the outputs do not carry the commit's ref as
+      it demands.
+    - `not-a-commit` — the spent output is not a commit template pyrxd recognises. That is not
+      evidence that nobody committed: mainnet has a 65-byte hash-lock commit with no `dat` push
+      that neither pyrxd's nor Photonic's builder emits, and the DAT reveal spending it reads
+      this.
+    - `unchecked` — the spent output was not supplied (an offline `classify_raw_tx` call), or it
+      was fetched and could not be used, in which case a `detail` key says why.
 
-  `metadata.input_outpoint` names the outpoint the attributed input spent. `glyph inspect <txid>
-  --fetch` fetches that one transaction (one extra `blockchain.transaction.get` for a transaction
-  with a reveal), and /inspect/ does the same; a failed fetch leaves the rest of the report
-  standing. **This adds to `--json` and human output:** the two `metadata` keys above, and under
-  "Reveal metadata" the lines `payload_binding=<state> — <reason>` (marked `***` on `mismatch`),
-  `why: <detail>` when there is one, and `spent outpoint: <txid:vout>`. No existing key or line
-  changes. New in the SDK: `classify_raw_tx(..., spent_scripts={input_index: locking_script})`,
-  `pyrxd.glyph.inspect.spent_output_binding`, and `GlyphInspector.extract_reveal_cbor`, which
-  picks the push by the rule the metadata decoder uses, so the hash is over the envelope actually
-  displayed.
+    A node rejects the spend in `mismatch` and `commit-unsatisfied`, so both are marked `***` in
+    the terminal and drawn as a warning on /inspect/ (`PAYLOAD_BINDING_WARNING_STATES`). A
+    pre-release review ran these cases against a regtest node: it rejected every
+    `commit-unsatisfied` case and the `mismatch` case, and accepted the honest NFT and FT
+    reveals, which read `bound`.
+  - **`glyph inspect <txid> --fetch` and /inspect/ fetch the spent transaction of each minting
+    payload's input**, at most 8 per transaction; the classification lists them as
+    `binding_candidates`, and a reveal minting one glyph costs one extra
+    `blockchain.transaction.get`. A `bound` payload then heads the card over one that merely
+    mints. Every other minting payload's row gets `binding_state` (with `binding_detail` and
+    `binding_warning`); one whose fetch failed or was past the limit reads `unchecked` with the
+    reason, `metadata.bindings_past_cap` counts those past the limit, and a headline that is not
+    `bound` while another minting payload went unchecked carries `payload_binding.unsettled`,
+    saying it is not settled. A failed fetch leaves the rest of the report standing.
+
+  `metadata.input_outpoint` names the outpoint the attributed input spent. **This adds to
+  `--json` and human output:** the `metadata` keys above, and under "Reveal metadata" the lines
+  `payload_binding=<state> — <reason>` (marked `***` on `mismatch` and `commit-unsatisfied`),
+  `why: <detail>` when there is one, the `unsettled` line when there is one, and
+  `spent outpoint: <txid:vout>`. New in the SDK:
+  `classify_raw_tx(..., spent_scripts={input_index: locking_script})`, and in
+  `pyrxd.glyph.inspect`: `spent_output_binding`, `spent_output_bindings`, `apply_bindings` and
+  `classify_with_bindings`; and `GlyphInspector.extract_reveal_cbor`, which picks the push by the
+  rule the metadata decoder uses, so the hash is over the envelope actually displayed.
 
 - **One oversized or self-referencing value in a transaction's Glyph data could crash or stall
   `pyrxd glyph inspect` (0.24.0).** CPython refuses to turn an integer of more than 4,300 digits
@@ -791,13 +975,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   encrypted-`main` field drops that field. A CBOR value with a repeated container now fails to
   decode. No mainnet payload corpus has been run against these refusals.
 
-- **WAVE names built by `build_wave_metadata` were never registered by the public indexer
-  (v0.6.0–0.24.0).** It wrote the qualified name into `attrs.name` (`"alice.rxd"`) and left the
-  top-level `name` empty. RXinDexer's claim path validates `attrs.name` against `a-z 0-9 -`,
-  refuses the `.`, and skips the claim without an error, so the reveal confirmed, its fee was
-  spent, and the name never resolved. This is read from RXinDexer's source
-  (`electrumx/server/wave_index.py` at `ca8a6a4e`, which pyrxd now drift-pins); no pyrxd-built
-  claim has been checked against a live indexer. pyrxd now writes Photonic's field set
+- **WAVE names built by `build_wave_metadata` from a qualified name were never registered by
+  the public indexer (v0.6.0–0.24.0).** It wrote the string it was given into `attrs.name` and
+  left the top-level `name` empty. Given a qualified name (`"alice.rxd"`, the form its docstring
+  showed), RXinDexer's claim path validates `attrs.name` against `a-z 0-9 -`, refuses the `.`,
+  and skips the claim without an error, so the reveal confirmed, its fee was spent, and the name
+  never resolved. Given a bare label (`"alice"`), it wrote `attrs.name = "alice"`, which the
+  indexer registers. Both are checked by running RXinDexer's own claim path, from its files
+  vendored at `ca8a6a4e` (`electrumx/server/wave_index.py` among them, which pyrxd also
+  drift-pins); no pyrxd-built claim has been checked against a live indexer. pyrxd now writes
+  Photonic's field set
   (`createWaveNameMetadata`, Photonic-Wallet `packages/lib/src/wave.ts` at `becf41a7`). The bytes
   equal those of mainnet claim `f644794b…`, which the public indexer resolves. A regtest node
   confirms the new claim.
@@ -805,8 +992,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Names already minted this way cannot be repaired by an update envelope, because the indexer
   applies updates only to names it registered. Registering the label again is a new, first-come
   claim. A commit made by 0.24.0 and not yet revealed can still be revealed with
-  `allow_unregistrable_wave=True`. That recovers the commit's value, and the name will not
-  register. `GlyphBuilder.prepare_wave_reveal`'s docstring gives the recipe for rebuilding the
+  `allow_unregistrable_wave=True`, which recovers the commit's value. Whether that claim
+  registers is the indexer's rule, not pyrxd's: the dotted `alice.rxd` shape does not; a bare
+  label the indexer accepts and pyrxd now refuses (`ab`, `Alice`) does, and owes the
+  registration fee, which the reveal builders return for it.
+  `GlyphBuilder.prepare_wave_reveal`'s docstring gives the recipe for rebuilding the
   0.24.0 bytes, checked against every release from v0.6.0 to v0.24.0. A wrong rebuild is
   rejected by consensus and the commit stays unspent to retry; a regtest case proves both.
 
@@ -857,7 +1047,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RxinDexerError` for an `error` answer, for an answer that is not a mapping, and for one with no
   boolean `available` (`WaveResolver.check_available` wraps these in `WaveResolverError`).
   `RxinDexerClient.wave_check_available` expects the bare label: passed `alice.rxd`, it now raises
-  where it used to return `True`.
+  where it used to return `True`. RXinDexer answers from the blocks it has indexed, not the
+  mempool, so `True` means no confirmed registration: a rival claim that is not yet mined is not
+  seen (read from RXinDexer's source at `ca8a6a4e`).
 
 - **`mnemonic_from_entropy(b"")` and `mnemonic_from_entropy("")` returned a random mnemonic
   instead of an error (v0.2.0–0.24.0).** The function tested `if entropy:`, so empty entropy took
@@ -870,12 +1062,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The `/inspect/` page showed a HashMark v2 record's signer and said nothing about its
   signature (0.24.0).** pyrxd runs in the page under Pyodide without `coincurve`, so
   `verify_attestation` returned `UNVERIFIABLE` for every record, and the page had no branch for
-  that outcome. `/inspect/` and `/verify/` now load a vendored `@noble/secp256k1` 3.2.0 (MIT),
-  checked against a SHA-256 digest before it loads, and register it with `set_recovery_backend`,
-  so a v2 record reads `VERIFIED` or `DOES NOT VERIFY`. Only the public-key recovery runs in
-  JavaScript; the signed statement, the hashing, the range and low-S checks and the comparison
-  with the committed signer stay in pyrxd's Python. If the curve cannot load, records read
-  `NOT CHECKED`, not `DOES NOT VERIFY`. Served from the documentation site; not in the wheel.
+  that outcome. `/inspect/` and `/verify/` now load a vendored `@noble/secp256k1` 3.2.0 (MIT)
+  and register it with `set_recovery_backend`, so a v2 record reads `VERIFIED` or
+  `DOES NOT VERIFY`. The curve library and its bridge are each downloaded once and checked
+  against the SHA-256 digests in the site's manifest, and the page imports those checked bytes
+  (from `blob:` URLs), never the files' own URLs. The manifest is served by the same deploy, so
+  this does not hold against a compromised deploy of the documentation site. Only the
+  public-key recovery runs in JavaScript; the signed statement, the hashing, the range and
+  low-S checks and the comparison with the committed signer stay in pyrxd's Python. If the curve
+  cannot load, records read `NOT CHECKED`, not `DOES NOT VERIFY`. Every signature outcome names
+  the chain it was checked against, or assumed when no check ran. Served from the documentation
+  site; not in the wheel.
+
+- **`/inspect/` drew a fetch that finished after the reader had moved on (0.24.0).** A slow
+  Fetch overwrote the result of a later Clear or of a newer input. The page now draws nothing
+  from a fetch the reader has moved on from, and a superseded fetch makes no further requests.
+
+- **`/inspect/`'s protocol banners described the output script from the payload's marker
+  (0.24.0).** CONTAINER, ENCRYPTED, TIMELOCK, AUTHORITY and DAT payloads were said to sit on
+  "an ordinary Glyph NFT" whatever the outputs held. Each banner's sentence about the outputs now
+  comes from whether the input mints a token. The WAVE banner no longer says WAVE support in
+  pyrxd is deferred; it says the page shows the claim as the payload states it and does not ask
+  an indexer.
+
+- **`verify_attestation` raised `TypeError` for a hand-built record with a field of the wrong
+  type (0.24.0).** `algorithm_id=None`, for one, reached a format call. Such a record now gets
+  `INVALID_SIGNATURE` with the reason, after the signature's own checks, and `algorithm_id=True`
+  is refused rather than verified as algorithm 1.
 
 - **After a mint's commit was broadcast, `mint-nft` could lose track of it (0.24.0 and
   earlier).** Declining the reveal prompt printed "aborted by user … re-run". A network failure
@@ -883,9 +1096,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Not confirmed: nothing is stranded — re-run the command", which is false when the commit
   confirms later. Ctrl-C left no record at all. Re-running minted a second commit, and the first
   one's value stayed locked in its hashlock output. Every exit after the commit now prints the
-  commit, the value it holds, where its record is, and the exact `resume-mint` command, which
-  carries the mint's fee choice. It never says "re-run". `--json` also puts a recovery document
-  on stdout.
+  commit, the value it holds, where its record is, and the `resume-mint` command that finishes
+  it. It never says "re-run". `--json` also puts a recovery document on stdout. The printed
+  command states the mint's fee choice, names a wallet under the home directory as `~/…`, repeats
+  `--electrumx` when one was given on the command line (with any password in the URL replaced
+  by `<password>`), and adds `--passphrase`, which prompts, when the wallet was opened with a
+  BIP39 passphrase; the passphrase is never printed. A paying command for a treasury other than
+  the published one is printed only from `mint-nft`'s own `--wave-treasury`; any other command
+  shows `<ADDRESS>` there for the operator to type, so an edited record cannot supply a
+  ready-to-run command that pays it.
 
 ### Changed
 
@@ -898,6 +1117,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two Radiant Core releases, the sources pyrxd vendors as its consensus reference differ only in
   two `src/validation.h` defaults (`DEFAULT_MAX_REORG_DEPTH` 6 → 69,
   `DEFAULT_FINALIZE_HEADERS_PENALTY` 100 → 0); the script-interpreter sources are byte-identical.
+
+- **`Endpoint.key` treats more spellings of one server as one endpoint.** It used to fold case
+  and a trailing slash. It now also folds a written-out default port (`wss://h` and
+  `wss://h:443`), a trailing dot on the host, and IP literals written in different forms, so a
+  profile that listed one server under two such URLs keeps one endpoint. The new
+  `Endpoint.source` (the canonical host alone) is what HashMark §7.6 form 2 counts as a source.
+
+- **`JsonFilePendingStore` no longer changes the mode of a directory it reaches through a
+  symbolic link.** It makes its own directory 0700 through a descriptor opened with
+  `O_NOFOLLOW`; a store directory that is itself a link is used as it is, and its target's mode
+  is left alone. Before, the target was made 0700.
+
+- **The sdist carries verbatim RXinDexer files (MIT, with their licence) under
+  `tests/vendor/rxindexer/`,** at commit `ca8a6a4e`, so the tests can run the indexer's own WAVE
+  claim path. Nothing in the installed package imports them, and they are not in the wheel.
 
 ## [0.24.0] — 2026-09-14
 
