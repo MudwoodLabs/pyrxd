@@ -162,6 +162,29 @@ def test_an_unconfirmed_tip_update_on_both_servers_does_not_refuse_an_older_mark
     assert nam["signer_is_target_at_height"] is True
 
 
+class _MinusOneWhenUnconfirmed(_Server):
+    """ElectrumX reports -1 (not 0) for an unconfirmed transaction whose parent is unconfirmed too."""
+
+    async def get_history(self, script_hash):
+        return [
+            {**e, "height": -1 if e["height"] == 0 else e["height"]} for e in await super().get_history(script_hash)
+        ]
+
+
+def test_a_tip_server_reporting_minus_one_is_unconfirmed_not_a_height(monkeypatch) -> None:
+    """Round 2 (lane H): the only -1 fixture went through DISCOVERY, so `height > 0` -> `!= 0` in the
+    TIP server's `step_heights_from` survived the suite. Both servers report UPDATE_B at -1; that is
+    "not in a block" on both, which is agreement, and a mark before UPDATE_A is still answered.
+    Stored as a height, -1 is a disagreement with A (and an unusable height) and refuses it."""
+    a = _MinusOneWhenUnconfirmed(indexer=False, unconfirmed=frozenset({UPDATE_B}), mark_heights={MARK: 458588})
+    b = _MinusOneWhenUnconfirmed(indexer=True, unconfirmed=frozenset({UPDATE_B}), mark_heights={MARK: 458588})
+    nam = _attach(monkeypatch, (a, "wss://a", b, "wss://b"), RETIRED_H160)
+    assert nam["form"] == 2, nam["degraded_reason"]
+    assert nam["signer_is_target_at_height"] is True
+    by = {r["source"]: r["steps"][UPDATE_B] for r in nam["heights"]["by_source"]}
+    assert by == {"wss://a": None, "wss://b": None}, by
+
+
 def test_a_server_that_places_a_step_the_other_does_not_disagrees(monkeypatch) -> None:
     """One says UPDATE_B is confirmed, the other says unconfirmed. That is a disagreement (one is
     behind the tip, or lying) even when the step is after the mark — ANY disagreement degrades."""

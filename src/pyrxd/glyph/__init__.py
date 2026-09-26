@@ -134,6 +134,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # which is how a consumer ends up silently treating "unknown" as "not expired".
     "EXPIRY_UNKNOWN": ("pyrxd.glyph.wave_identity", "EXPIRY_UNKNOWN"),
     "UNVERIFIED_CAVEAT": ("pyrxd.glyph.mark_anchor", "UNVERIFIED_CAVEAT"),
+    # A bound anchor's caveat, the lag window the binding searches, and what --min-confirmations
+    # N means — compared against, not retyped, for the same reason as the two above.
+    "BOUND_CAVEAT": ("pyrxd.glyph.mark_anchor", "BOUND_CAVEAT"),
+    "MAX_INDEX_LAG_BLOCKS": ("pyrxd.glyph.mark_anchor", "MAX_INDEX_LAG_BLOCKS"),
+    "MIN_CONFIRMATIONS_MEANING": ("pyrxd.glyph.mark_anchor", "MIN_CONFIRMATIONS_MEANING"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),

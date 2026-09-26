@@ -8,10 +8,13 @@ covenant. So the indexer ALONE could bind ``bank.rxd`` (or ``victimcorp.rxd``) t
 and the block, not about which name the chain is. ``verify --wave-name bank.rxd`` then reported
 ESTABLISHED for whoever ``custodian-gate-x7f3`` pointed at.
 
-THE FIX. ``judge_name_at_mark`` takes the name asked about and reads the mint payload as RXinDexer's
-claim path does (``wave_rules.indexed_wave_name``: ``attrs.name``, falling back to
-``app.data.name``), lower-cased, with a trailing ``.rxd`` dropped because pyrxd through 0.24.0
-wrote the QUALIFIED name into ``attrs.name``. A mismatch degrades, naming both.
+THE FIX. ``judge_name_at_mark`` takes the name asked about and reads the mint payload EXACTLY as
+RXinDexer's claim path does: WAVE-marked, ``attrs.name`` falling back to ``app.data.name``,
+``validate_wave_name`` on the lower-cased name, keyed lower-cased, parent the root. A mismatch
+degrades, naming both. (Round 1 also stripped spaces and a trailing ``.rxd`` — looser than the
+indexer, so a pyrxd ≤0.24.0 ``attrs.name = "alice.rxd"``, which the indexer never registered,
+read as ``alice``. Round 2 removed that; the tests below pin both directions.) The name ASKED is
+held to the maintainer's rule: the domain is exactly ``rxd``.
 
 What this does NOT establish, and the verdict still says so: that this glyph is the registration IN
 FORCE for the name. A duplicate claim, or a lapsed registration, names it too — which of them the
@@ -28,6 +31,7 @@ from pyrxd.cli import glyph_inspect, hashmark_cmds
 from pyrxd.glyph.mark_anchor import MarkAnchor
 from pyrxd.glyph.mutable_chain import ChainStep, MutableChainWalk
 from pyrxd.glyph.wave_identity import HeightReport, judge_name_at_mark
+from pyrxd.keys import PrivateKey
 from tests.test_mutable_chain_is_discovered_from_the_chain import MARK, MINT, MOVED
 from tests.test_name_at_mark_reaches_the_cli import NAME, _ctx, _payload, _Server
 
@@ -130,18 +134,68 @@ def _judge(walk: MutableChainWalk, name: str):
 PHOTONIC = {"p": [2, 5, 11], "name": "alice.rxd", "attrs": {"name": "alice", "domain": "rxd", "target": MOVED}}
 PYRXD_024 = {"p": [2, 5, 11], "attrs": {"name": "alice.rxd", "domain": "rxd", "target": MOVED}}
 APP_DATA = {"p": [2, 5, 11], "attrs": {"target": MOVED}, "app": {"data": {"name": "alice"}}}
+UPPER = {"p": [2, 5, 11], "attrs": {"name": "ALICE", "domain": "rxd", "target": MOVED}}
 
 
 @pytest.mark.parametrize(
-    "payload", [PHOTONIC, PYRXD_024, APP_DATA], ids=["photonic-bare-label", "pyrxd-0.24-qualified", "app.data.name"]
+    "payload", [PHOTONIC, APP_DATA, UPPER], ids=["photonic-bare-label", "app.data.name", "upper-case-label"]
 )
-@pytest.mark.parametrize("asked", ["alice.rxd", "alice", "ALICE.RXD", " Alice "])
-def test_every_shape_that_names_the_label_answers(payload, asked) -> None:
-    """A guard that refuses valid work is a bug: the Photonic shape, the shape pyrxd wrote through
-    0.24.0, and the ``app.data.name`` fallback all name ``alice``, however the user typed it."""
+@pytest.mark.parametrize("asked", ["alice.rxd", "alice", "ALICE.rxd", "Alice"])
+def test_every_shape_the_indexer_registers_answers(payload, asked) -> None:
+    """A guard that refuses valid work is a bug. Every mint shape the INDEXER registers as `alice`
+    answers, however the label was typed: the Photonic shape, the `app.data.name` fallback, and an
+    upper-case label (`validate_wave_name` checks the lower-cased name and keys it lower-cased)."""
     v = _judge(_walk_with_mint(payload), asked)
     assert v.form == 2, v.degraded_reason
     assert v.target_at_height == MOVED
+
+
+@pytest.mark.parametrize(
+    ("attrs_name", "says"),
+    [
+        ("alice.rxd", "contains '.'"),
+        ("alice.RXD", "contains '.'"),
+        (" alice ", "contains ' '"),
+    ],
+    ids=["pyrxd-0.24-qualified", "qualified-upper-domain", "padded"],
+)
+def test_a_mint_name_the_indexer_refuses_is_not_read_as_the_label(attrs_name, says) -> None:
+    """EXACTLY the indexer's reading, not a looser one (0.25.0 panel, round 2). The rule used to
+    strip spaces and a trailing `.rxd` first, so all three of these read as `alice` — and the
+    indexer refuses all three. The first is what pyrxd wrote through 0.24.0 and it never
+    registered (#728), so an index binding `alice` to such a glyph is evidence of a lie."""
+    payload = {"p": [2, 5, 11], "attrs": {"name": attrs_name, "domain": "rxd", "target": MOVED}}
+    v = _judge(_walk_with_mint(payload), "alice.rxd")
+    assert v.form == 1 and v.target_at_height is None
+    assert "validate_wave_name refuses" in v.degraded_reason and says in v.degraded_reason, v.degraded_reason
+
+
+def test_the_rule_is_the_indexers_rule_derived_not_restated() -> None:
+    """Agreement with `wave_registered_label` — the fee code's transcription of the indexer's claim
+    path — over every mint shape in this file. If the two readings ever drift, this fails."""
+    from pyrxd.glyph.wave_identity import _mint_claimed_label
+    from pyrxd.glyph.wave_rules import wave_registered_label
+
+    shapes = [
+        PHOTONIC,
+        PYRXD_024,
+        APP_DATA,
+        UPPER,
+        {"p": [2, 5, 11], "attrs": {"name": " alice ", "target": MOVED}},
+        {"p": [2, 5, 11], "attrs": {"name": "alice.RXD", "target": MOVED}},
+        {"p": [2, 5], "attrs": {"name": "alice", "target": MOVED}},  # not WAVE-marked
+        {"p": [2, 5, 11], "attrs": {"target": MOVED}},
+    ]
+    for payload in shapes:
+        claimed, _why = _mint_claimed_label(_walk_with_mint(payload))
+        registered = wave_registered_label(payload)
+        assert claimed == (registered.lower() if registered else None), payload
+
+
+def test_a_mint_under_another_parent_is_not_a_top_level_name() -> None:
+    payload = {"p": [2, 5, 11], "attrs": {"name": "alice", "domain": "evil", "target": MOVED}}
+    v = _judge(_walk_with_mint(payload), "alice.rxd")
+    assert v.form == 1 and "not as a top-level .rxd name" in v.degraded_reason
 
 
 @pytest.mark.parametrize(
@@ -174,3 +228,63 @@ def test_a_walk_without_the_mint_bytes_degrades_rather_than_trusting_the_index()
     )
     v = _judge(walk, "alice.rxd")
     assert v.form == 1 and "no readable mint payload" in v.degraded_reason
+
+
+# ---------------------------------------------------------------------------
+# The domain is exactly `rxd` (0.25.0 panel, round 2)
+# ---------------------------------------------------------------------------
+
+_NOT_TOP_LEVEL = {
+    "alice.evil": "domain 'evil'",
+    "sub.alice.rxd": "domain 'alice.rxd'",
+    "alice.RXD": "(it must be lowercase)",
+    " alice.rxd": "contains ' '",
+}
+
+
+@pytest.mark.parametrize("asked", sorted(_NOT_TOP_LEVEL))
+def test_the_judge_refuses_a_name_that_is_not_top_level_rxd(asked) -> None:
+    """`--wave-name alice.evil` was split on the LAST dot, the domain dropped, and the verdict
+    judged and printed as `alice.rxd` — an answer about a name nobody asked for."""
+    v = _judge(_walk_with_mint(PHOTONIC), asked)
+    assert v.form == 1 and v.target_at_height is None
+    assert _NOT_TOP_LEVEL[asked] in v.degraded_reason, v.degraded_reason
+
+
+@pytest.mark.parametrize("asked", sorted(_NOT_TOP_LEVEL))
+@pytest.mark.parametrize("command", ["verify", "inspect"])
+def test_both_commands_refuse_it_before_any_lookup(monkeypatch, tmp_path, asked, command) -> None:
+    """Through the real commands. Refused as bad input (exit 1) with the rule in the message, and
+    no server is asked to resolve anything — the refusal is at the one door both commands use."""
+    import hashlib
+
+    from click.testing import CliRunner
+
+    from pyrxd.cli.context import CliContext
+    from pyrxd.cli.main import cli
+    from tests.test_hashmark_verify_one_record import _address, _signed, _tx
+    from tests.test_hashmark_verify_one_record import _Server as _MarkServer
+
+    key = PrivateKey()
+    content = b"a press kit\n"
+    txid, raw = _tx(_signed(content, key))
+    a = _MarkServer({txid: raw}, indexer=False)
+    b = _MarkServer({txid: raw}, indexer=True, target=_address(key), mint=a.mint)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: a)
+    monkeypatch.setattr(glyph_inspect, "_endpoint_pair", lambda ctx: (a, "wss://a", b, "wss://b"))
+    base = ["--wallet", str(tmp_path / "w"), "--config", str(tmp_path / "c.toml")]
+    if command == "verify":
+        args = ["verify", txid, "--digest", hashlib.sha256(content).hexdigest()]
+    else:
+        args = ["glyph", "inspect", txid, "--fetch"]
+    r = CliRunner().invoke(cli, [*base, *args, "--wave-name", asked, "--min-confirmations", "6"])
+    assert r.exit_code == 1, r.output
+    flat = " ".join(r.output.split())
+    assert "that --wave-name is not a name this can ask about" in flat
+    assert _NOT_TOP_LEVEL[asked] in flat
+    assert not a.extension_calls and not b.extension_calls, "a name that is not top-level was still resolved"
+
+
+def test_the_honest_pair_a_top_level_name_is_still_asked(monkeypatch) -> None:
+    nam = _attach(monkeypatch, "custodian-gate-x7f3.rxd")
+    assert nam["form"] == 2 and nam["name"] == "custodian-gate-x7f3.rxd"

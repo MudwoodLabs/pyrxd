@@ -63,6 +63,26 @@ UNVERIFIED_CAVEAT = (
     "the point in time this answer is about"
 )
 
+#: The caveat for an anchor whose height was BOUND to the block the endpoint says holds the
+#: transaction (``resolve_mark_anchor(fetch_header=...)``). The unbound caveat's "no Radiant
+#: header check" is no longer true of it, so it would be a false sentence; this one says exactly
+#: what the binding is — a check of the endpoint against ITSELF — and what it is not. A hostile
+#: endpoint can serve the real header of block X at whatever height it likes, because nothing
+#: checks proof-of-work or the chain the header sits in.
+BOUND_CAVEAT = (
+    "height reported by the endpoint and checked only against the endpoint itself (its header at "
+    "that height hashes to the block it says holds the transaction), NOT verified: pyrxd checks no "
+    "proof-of-work or merkle inclusion, so an endpoint that lies about the height moves the point "
+    "in time this answer is about"
+)
+
+#: How far above ``tip - confirmations + 1`` a binding looks for the transaction's block. The
+#: formula can only come out LOW for an honest endpoint: its tip is ElectrumX's indexed height
+#: (``headers.subscribe``) while ``confirmations`` comes from its node, which is never behind it,
+#: and the tip is read before the confirmations. Measured by the 0.25.0 panel on both shipped
+#: servers: one block low in 7 of 470 paired samples, both at once. Two is headroom, not a model.
+MAX_INDEX_LAG_BLOCKS = 2
+
 
 #: What ``--min-confirmations N`` MEANS, worded to match :attr:`MarkAnchor.provisional` below:
 #: the floor holds when ``confirmations >= N``, and an endpoint's confirmation count INCLUDES the
@@ -108,11 +128,20 @@ async def resolve_mark_anchor(
     source: str,
     min_confirmations: int,
     tip_height: int | None = None,
+    fetch_header: Callable[[int], Awaitable[bytes]] | None = None,
 ) -> MarkAnchor:
     """Ask an endpoint where ``txid`` is, and return it qualified.
 
     ``fetch_verbose`` should be an ``ElectrumXClient.get_transaction_verbose``-shaped call: it
     binds the echoed txid to the one requested, which is the one thing here that IS checked.
+
+    ``fetch_header`` (``ElectrumXClient.get_block_header``-shaped) BINDS the derived height to the
+    block the endpoint says holds the transaction: the header at that height must hash to the
+    verbose reply's ``blockhash``. Without it the height is ``tip - confirmations + 1`` alone,
+    which is one block LOW whenever an endpoint's index trails its node — measured on both shipped
+    servers at once, so a second endpoint agreeing does not catch it. With it, heights up to
+    :data:`MAX_INDEX_LAG_BLOCKS` above the formula are tried, and a height no header confirms is
+    never returned: that raises instead. The CLI always passes it.
 
     :raises ValidationError: if ``min_confirmations`` is not a positive int. There is no default
         on purpose — see the module docstring.
@@ -158,8 +187,9 @@ async def resolve_mark_anchor(
     # exclusively by anomalous or hostile responses.
     #
     # `tip - confirmations + 1` uses what the endpoint really returns. It is the same endpoint's
-    # claim, which the caveat already says; a caller wanting better supplies `tip_height` from
-    # somewhere independent.
+    # claim, which the caveat already says. It is also one block LOW whenever the endpoint's index
+    # trails its node, on every endpoint at once — so a caller that can fetch headers passes
+    # `fetch_header`, and the height is then bound to the block hash below.
     height: int | None = None
     if confirmations > 0:
         if tip_height is None:
@@ -178,12 +208,67 @@ async def resolve_mark_anchor(
                 "which places it before the genesis block; fail-closed"
             )
 
+    if height is not None and fetch_header is not None:
+        height = await _bind_to_block(txid, height, info.get("blockhash"), fetch_header)
+        return MarkAnchor(
+            txid=txid,
+            height=height,
+            confirmations=confirmations,
+            min_confirmations=min_confirmations,
+            source=source,
+            caveat=BOUND_CAVEAT,
+        )
+
     return MarkAnchor(
         txid=txid,
         height=height,
         confirmations=confirmations,
         min_confirmations=min_confirmations,
         source=source,
+    )
+
+
+async def _bind_to_block(
+    txid: str, derived: int, blockhash: object, fetch_header: Callable[[int], Awaitable[bytes]]
+) -> int:
+    """The height whose header hashes to ``blockhash``, searched upward from ``derived``.
+
+    THE FORMULA WAS WRONG IN A WAY TWO SERVERS AGREE ON. ``tip`` is ElectrumX's indexed height and
+    ``confirmations`` is its node's count; for a few seconds after every block the node has the
+    new block and the index does not, so ``tip - confirmations + 1`` is one block low — on every
+    server at once. Measured by the 0.25.0 panel: both shipped servers one block low together in
+    7 of 470 paired samples, and a live ``verify --wave-name`` printed ESTABLISHED at a block the
+    mark is not in. The block HASH comes from the node and does not lag, so the height is taken
+    from the header that hashes to it rather than from the arithmetic.
+
+    Upward only: an honest endpoint's formula can only come out low (see
+    :data:`MAX_INDEX_LAG_BLOCKS`). Fail closed otherwise — a block number the header check did not
+    confirm is never returned.
+    """
+    from ..hash import radiant_block_hash  # the pure-stdlib one: this module must import under Pyodide
+
+    if not (
+        isinstance(blockhash, str) and len(blockhash) == 64 and all(c in "0123456789abcdefABCDEF" for c in blockhash)
+    ):
+        raise NetworkError(
+            f"endpoint reports {txid} as confirmed but gives no block hash to bind its height to; fail-closed"
+        )
+    want = blockhash.lower()
+    for candidate in range(derived, derived + MAX_INDEX_LAG_BLOCKS + 1):
+        try:
+            header = bytes(await fetch_header(candidate))
+            observed = radiant_block_hash(header)
+        except (NetworkError, ValidationError, TypeError, ValueError) as exc:
+            raise NetworkError(
+                f"could not read the endpoint's header at height {candidate} to place {txid}: {exc}; "
+                "no block number is reported that a header has not confirmed"
+            ) from exc
+        if observed == want:
+            return candidate
+    raise NetworkError(
+        f"the block the endpoint says holds {txid} ({want[:16]}…) is not its header at any height from "
+        f"{derived} to {derived + MAX_INDEX_LAG_BLOCKS}: its index and its node disagree by more than "
+        "that, or it is lying. Re-run; no block number is reported that a header has not confirmed"
     )
 
 
@@ -213,4 +298,12 @@ def mark_anchor_dict(anchor) -> dict:
     }
 
 
-__all__ = ["UNVERIFIED_CAVEAT", "MarkAnchor", "mark_anchor_dict", "resolve_mark_anchor"]
+__all__ = [
+    "BOUND_CAVEAT",
+    "MAX_INDEX_LAG_BLOCKS",
+    "MIN_CONFIRMATIONS_MEANING",
+    "UNVERIFIED_CAVEAT",
+    "MarkAnchor",
+    "mark_anchor_dict",
+    "resolve_mark_anchor",
+]

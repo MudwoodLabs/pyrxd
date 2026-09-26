@@ -51,6 +51,21 @@ TIP_HEIGHT = 464826  # the live tip when discovery was measured
 MARK = "ma" * 32
 
 
+def synthetic_header(height: int) -> bytes:
+    """An 80-byte header UNIQUE TO ``height`` — not a real Radiant header, and nothing here needs
+    one. The anchor binding (`resolve_mark_anchor(fetch_header=...)`) checks only that the header
+    at a height hashes to the block the verbose reply names, so a fake needs a header per height
+    whose hash it can also report; `block_hash_hex` over these bytes is that hash."""
+    return height.to_bytes(4, "little") * 20
+
+
+def block_hash_at(height: int) -> str:
+    """The block hash a fake reports for a transaction confirmed at ``height``."""
+    from pyrxd.network.registry import block_hash_hex
+
+    return block_hash_hex(synthetic_header(height))
+
+
 def _sh(sh) -> str:
     return sh if isinstance(sh, str) else bytes(sh).hex()
 
@@ -164,9 +179,20 @@ class FakeChainServer:
         return self.tip
 
     async def get_transaction_verbose(self, txid) -> dict:
+        # `blockhash` as the node reports it (measured: the verbose reply carries it, and no
+        # height). The anchor binds its derived height to the header that hashes to it.
         key = str(txid).lower()
         height = self.mark_heights.get(key) or self.heights.get(key)
-        return {"txid": key, "confirmations": (self.tip - height + 1) if height else 0}
+        if not height:
+            return {"txid": key, "confirmations": 0}
+        return {"txid": key, "confirmations": self.tip - height + 1, "blockhash": block_hash_at(height)}
+
+    async def get_block_header(self, height) -> bytes:
+        # ElectrumX serves headers only up to its OWN indexed tip.
+        self.calls.append(("get_block_header", str(int(height))))
+        if int(height) > self.tip or int(height) < 0:
+            raise NetworkError(f"height {int(height)} out of range")
+        return synthetic_header(int(height))
 
 
 # ---------------------------------------------------------------------------
@@ -777,3 +803,22 @@ async def test_candidate_bookkeeping_is_linear_in_what_a_server_sends() -> None:
     elapsed = time.perf_counter() - started
     assert d.capped and len(d.heights) >= 40_000, "the premise: every entry was read"
     assert elapsed < 1.0, f"40,000 history entries took {elapsed:.2f}s"
+
+
+async def test_a_txid_named_on_two_hops_is_counted_once() -> None:
+    """Round 2 (lane E): the repeat test above repeats WITHIN one hop, where the per-hop `examined`
+    set skips the repeats before they reach the counter — so charging every call (`if True`)
+    survived all 77 tests. Here UPDATE_B is named on hop 0 (injected into MINT:1's history, where it
+    spends nothing) AND on hop 1 (UPDATE_A:1's history, where it is the real spender). It is
+    examined on both hops, fetched from the network once, and must be charged once."""
+    server = FakeChainServer(inject_history={_sh_of(MINT, 1): [(UPDATE_B, 458601)]})
+    d = await discover_mutable_chain(server, MINT, source="A")
+    assert d.hops == 2 and "tip" in d.stopped
+    assert d.fetches == 3, "the mint, UPDATE_A and UPDATE_B — UPDATE_B once, though examined twice"
+    fetched = [c[1] for c in server.calls if c[0] == "get_transaction"]
+    assert fetched.count(UPDATE_B) == 1
+    # ...and so the cap is a count of distinct transactions: three allowed is exactly enough.
+    tight = await discover_mutable_chain(
+        FakeChainServer(inject_history={_sh_of(MINT, 1): [(UPDATE_B, 458601)]}), MINT, source="A", max_fetches=3
+    )
+    assert not tight.capped and tight.hops == 2

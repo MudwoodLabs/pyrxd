@@ -49,9 +49,11 @@ from pyrxd.hashmark_tx import digest_file, plan_hashmark
 from pyrxd.keys import PrivateKey
 from pyrxd.script.hashmark import _ALGORITHMS, decode_hashmark
 from pyrxd.script.script import Script
+from pyrxd.security.errors import NetworkError
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests.test_mutable_chain_is_discovered_from_the_chain import block_hash_at, synthetic_header
 
 MAINNET_GENESIS = genesis_hash_for("mainnet")
 TIP = 800_000
@@ -103,7 +105,16 @@ class _FakeServer:
 
     async def get_transaction_verbose(self, txid) -> dict:
         self.calls.append(("get_transaction_verbose", str(txid)))
-        return {"txid": str(txid).lower(), "confirmations": self.confirmations}
+        out = {"txid": str(txid).lower(), "confirmations": self.confirmations}
+        if self.confirmations > 0:  # the node names the block, as measured; the anchor binds to it
+            out["blockhash"] = block_hash_at(self.tip - self.confirmations + 1)
+        return out
+
+    async def get_block_header(self, height) -> bytes:
+        self.calls.append(("get_block_header", str(int(height))))
+        if int(height) > self.tip:
+            raise NetworkError(f"height {int(height)} out of range")
+        return synthetic_header(int(height))
 
     async def get_tip_height(self) -> int:
         self.calls.append(("get_tip_height", ""))
@@ -200,9 +211,16 @@ class TestTheHonestPath:
         # THE WHOLE CAVEAT, not its first 200 characters. It ran past `_truncate_for_human`'s
         # cap and was cut mid-word, dropping the half that says why the number is unverified —
         # a safety qualifier that stops halfway still reads as complete.
-        from pyrxd.glyph.mark_anchor import UNVERIFIED_CAVEAT
+        #
+        # The BOUND caveat: the CLI binds the height to the header that hashes to the block the
+        # node names, so the unbound caveat's "pyrxd has no Radiant header ... check" would now be
+        # a false sentence on this screen. The bound one says the check is against the endpoint
+        # itself and is NOT verification.
+        from pyrxd.glyph.mark_anchor import BOUND_CAVEAT, UNVERIFIED_CAVEAT
 
-        assert " ".join(r.output.split()).count(" ".join(UNVERIFIED_CAVEAT.split())) == 1
+        flat = " ".join(r.output.split())
+        assert flat.count(" ".join(BOUND_CAVEAT.split())) == 1
+        assert " ".join(UNVERIFIED_CAVEAT.split()) not in flat
         assert "…" not in r.output
 
     def test_quiet_mode_prints_the_answer_not_the_question(self, monkeypatch, tmp_path, marked) -> None:

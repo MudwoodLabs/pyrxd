@@ -714,6 +714,14 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     ``label`` is the endpoint's URL, carried into :attr:`MarkAnchor.source` so the caller's
     independence rules — the height must not come from whoever supplied the name binding —
     are checkable rather than assumed.
+
+    THE HEIGHT IS BOUND TO A HEADER, always, here. ``tip - confirmations + 1`` is one block low
+    whenever an endpoint's index trails its node, and that happens to every endpoint at once, so
+    two agreeing servers did not catch it: ``verify`` printed a block the mark is not in, and
+    form 2 folded against it. ``fetch_header`` makes the height the one whose header hashes to
+    the block the node says holds the mark, or raises. It is passed unconditionally because this
+    is the one door every CLI anchor comes through; the browser pages call the library directly
+    and do not bind yet.
     """
     from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
 
@@ -726,6 +734,7 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
         source=label,
         min_confirmations=min_confirmations,
         tip_height=int(tip_height),
+        fetch_header=client.get_block_header,  # type: ignore[attr-defined]
     )
 
 
@@ -934,7 +943,23 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
     with a reason, never raised, because a failed name resolution is not a reason to lose the
     classification the user asked for. The mark's txid comes from the fetched transaction; a
     pasted script has none, and form 2 is then unavailable by construction.
+
+    THE ONE EXCEPTION IS THE QUESTION ITSELF. A ``--wave-name`` that is not a top-level ``.rxd``
+    name is bad input, refused here with :class:`UserError` before any lookup — and here because
+    both ``glyph inspect`` and ``verify`` come through this function, so there is no second door.
+    ``alice.evil`` used to be judged and printed as ``alice.rxd``.
     """
+    from ..glyph.wave_identity import _requested_label
+    from ..security.errors import ValidationError
+
+    try:
+        _requested_label(name)
+    except ValidationError as exc:
+        raise UserError(
+            "that --wave-name is not a name this can ask about",
+            cause=str(exc),
+            fix="pass a top-level WAVE name: a label with the domain exactly 'rxd' (alice.rxd), or the bare label (alice)",
+        ) from exc
     mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
     # ONE LOOKUP PER SIGNER, NOT PER RECORD. A lookup is a name resolution, an anchor and a chain
     # walk across two servers, and it was run once for EVERY verified record — so a transaction
@@ -1014,8 +1039,8 @@ async def _name_at_mark(
     from ..base58 import base58check_encode
     from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
     from ..glyph.mutable_chain_discovery import walk_discovered_chain
-    from ..glyph.wave import WaveNameNotFound, WaveResolver, split_qualified_name
-    from ..glyph.wave_identity import HeightReport, judge_name_at_mark
+    from ..glyph.wave import WaveNameNotFound, WaveResolver
+    from ..glyph.wave_identity import HeightReport, _requested_label, judge_name_at_mark
     from ..security.errors import NetworkError
 
     san = _sanitize_display_string
@@ -1141,10 +1166,10 @@ async def _name_at_mark(
     # name, and every sentence below — "NAME pointed at …", ESTABLISHED, "the glyph's own mint does
     # name NAME" — would print its choice. The judge compared the label that was ASKED with the
     # glyph's own mint, so that label, qualified, is the one a human reads.
-    asked_label, _domain = split_qualified_name(name)
+    asked_label = _requested_label(name)  # validated at the door (`_attach_name_at_mark`); the same rule
     return {
         "resolved": True,
-        "name": san(f"{asked_label.strip().lower()}.rxd"),
+        "name": san(f"{asked_label}.rxd"),
         "ref": san(verdict.ref),
         "reveal_txid": mint,
         "form": verdict.form,

@@ -50,6 +50,7 @@ from pyrxd.script.script import Script
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests.test_mutable_chain_is_discovered_from_the_chain import block_hash_at, synthetic_header
 
 MAINNET = genesis_hash_for("mainnet")
 TIP = 800_000
@@ -106,7 +107,11 @@ class _Server:
         return self.raw[str(txid).lower()]
 
     async def get_transaction_verbose(self, txid):
-        return {"txid": str(txid).lower(), "confirmations": 100}
+        # The node names the block (measured); the anchor binds its derived height to it.
+        return {"txid": str(txid).lower(), "confirmations": 100, "blockhash": block_hash_at(TIP - 99)}
+
+    async def get_block_header(self, height):
+        return synthetic_header(int(height))
 
     async def get_tip_height(self):
         return TIP

@@ -94,7 +94,7 @@ async def test_non_monotonic_heights_degrade_instead_of_folding_an_excluded_step
             mut_vout=1,
             kind="mint",
             attrs={"target": "HONEST"},
-            envelope_cbor=cbor2.dumps({"attrs": {"name": "custodian-gate-x7f3", "target": "HONEST"}}),
+            envelope_cbor=cbor2.dumps({"p": [2, 5, 11], "attrs": {"name": "custodian-gate-x7f3", "target": "HONEST"}}),
         ),
         ChainStep(txid="bbbb", mut_vout=1, kind="update", attrs={"target": "ATTACKER"}),
         ChainStep(txid="cccc", mut_vout=1, kind="update", attrs={"note": "cosmetic"}),

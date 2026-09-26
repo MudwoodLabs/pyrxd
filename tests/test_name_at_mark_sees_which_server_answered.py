@@ -21,6 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
+
 from pyrxd.base58 import base58check_decode
 from pyrxd.cli import config as cfg_mod
 from pyrxd.cli import glyph_inspect
@@ -189,3 +191,79 @@ class TestOneConfiguredEndpointCarriesOneLabel:
         assert nam["resolved"] and nam["form"] == 1, nam
         assert nam["binding_source"] == nam["anchor_source"] == self.URL
         assert "both came from" in nam["degraded_reason"]
+
+
+_TRUE_MARK = 458586  # before the name moved to MOVED (UPDATE_A is really at 458591)
+
+
+class _OneLyingServer(_Server):
+    """Lies about ONE update's block in its history: puts it at the mark's block."""
+
+    async def get_history(self, script_hash):
+        out = await super().get_history(script_hash)
+        return [{**e, "height": _TRUE_MARK if e["tx_hash"] == UPDATE_A else e["height"]} for e in out]
+
+
+class TestOneHostUnderTwoSpellingsIsOneSource:
+    """Round 2, L1 (lane E): `Endpoint.key` folded only case and a trailing slash, and the judge
+    counts sources by label, so ONE lying server configured as `wss://evil.example/` and
+    `wss://evil.example:443/` (or `…example./`) was two "independent" sources and reached
+    ESTABLISHED. The key now also folds the scheme's default port and a trailing dot, the profile
+    de-duplicates by it, and the real `_endpoint_pair` then hands out one endpoint under one label.
+    Real config file, real loader, real `_endpoint_pair`; only the client class is replaced."""
+
+    def _attach(self, monkeypatch, tmp_path, urls, servers):
+        for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
+            monkeypatch.delenv(var, raising=False)
+        import pyrxd.network.failover as failover
+
+        built: list[str] = []
+
+        def factory(profile, *_a, **_k):
+            built.append(profile.endpoints[0].url)
+            return servers(profile.endpoints[0].url)
+
+        monkeypatch.setattr(failover, "FailoverElectrumXClient", factory)
+        path = tmp_path / "c.toml"
+        path.write_text('network = "mainnet"\nelectrumx_servers = [' + ", ".join(f'"{u}"' for u in urls) + "]\n")
+        cfg = cfg_mod.load(path).for_network("mainnet")
+        ctx = CliContext(config=cfg, output_mode="human", wallet_path=tmp_path / "w", network="mainnet")
+        payload = _payload(MOVED_H160)
+        glyph_inspect._attach_name_at_mark(ctx, payload, name=NAME, min_confirmations=6)
+        return payload["outputs"][0]["hashmark"]["name_at_mark"], built
+
+    @pytest.mark.parametrize(
+        "urls",
+        [
+            ("wss://evil.example/", "wss://evil.example:443/"),
+            ("wss://evil.example/", "wss://evil.example./"),
+            ("wss://EVIL.example:443", "wss://evil.example."),
+        ],
+    )
+    def test_two_spellings_of_one_server_are_one_source(self, monkeypatch, tmp_path, urls) -> None:
+        server = _OneLyingServer(indexer=True, mark_heights={MARK: _TRUE_MARK})
+        nam, built = self._attach(monkeypatch, tmp_path, urls, lambda url: server)
+        assert set(built) == {urls[0]}, f"the profile kept both spellings: {built}"
+        assert nam["form"] == 1, nam
+        assert "both came from" in nam["degraded_reason"]
+
+    def test_the_honest_pair_two_different_hosts_are_still_two_sources(self, monkeypatch, tmp_path) -> None:
+        """A guard that refuses valid work is a bug: distinct hosts still count as two (a
+        non-default port on a host is its own socket too), and a liar among them still shows."""
+        liar = _OneLyingServer(indexer=True, mark_heights={MARK: _TRUE_MARK})
+        honest = _Server(indexer=False, mark_heights={MARK: _TRUE_MARK})
+        urls = ("wss://evil.example/", "wss://honest.example:50022/")
+        nam, built = self._attach(monkeypatch, tmp_path, urls, lambda url: liar if "evil" in url else honest)
+        assert set(built) == set(urls)
+        assert nam["form"] == 1 and "disagree about the block of chain step" in nam["degraded_reason"]
+        honest_b = _Server(indexer=True, mark_heights={MARK: _TRUE_MARK})
+        nam, _ = self._attach(monkeypatch, tmp_path, urls, lambda url: honest_b if "evil" in url else honest)
+        assert nam["form"] == 2, nam["degraded_reason"]
+
+    def test_an_ip_alias_of_the_same_host_is_not_detectable_and_says_so(self) -> None:
+        """What a URL cannot show is stated, not solved: `Endpoint.key` does not claim to see that a
+        hostname and an IP address reach one machine."""
+        from pyrxd.network.registry import Endpoint
+
+        assert Endpoint(url="wss://evil.example/").key != Endpoint(url="wss://203.0.113.7/").key
+        assert "hostname and its IP address" in " ".join((Endpoint.key.__doc__ or "").split())

@@ -56,7 +56,6 @@ by definition a local, per-developer chain. That is honest rather than convenien
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -117,9 +116,9 @@ def block_hash_hex(header: bytes) -> str:
         raise ValidationError(f"block header must be bytes, got {type(header).__name__}")
     if len(header) != 80:
         raise ValidationError(f"block header must be 80 bytes, got {len(header)}")
-    once = hashlib.new("sha512_256", bytes(header)).digest()
-    twice = hashlib.new("sha512_256", once).digest()
-    return twice[::-1].hex()
+    from ..hash import radiant_block_hash  # the one definition; see its docstring for why it lives there
+
+    return radiant_block_hash(bytes(header))
 
 
 def default_endpoints(network: str) -> tuple[str, ...]:
@@ -175,8 +174,35 @@ class Endpoint:
 
     @property
     def key(self) -> str:
-        """Normalised identity used for de-duplication (case + trailing slash)."""
-        return self.url.rstrip("/").lower()
+        """Normalised identity used for de-duplication: ONE server, however its URL is spelled.
+
+        Case, a trailing slash, the scheme's DEFAULT PORT written out (``wss://h`` and
+        ``wss://h:443``) and a fully-qualified TRAILING DOT on the host (``h`` and ``h.``) all
+        name the same socket. The key used to fold only case and the slash, and the difference
+        was not cosmetic: HashMark §7.6 form 2 treats two endpoints as two INDEPENDENT sources,
+        so ``wss://evil.example/`` plus ``wss://evil.example:443/`` — one lying server — reached
+        ESTABLISHED as though two servers had agreed (0.25.0 panel). Profiles de-duplicate by
+        this key, so the two spellings now collapse into one endpoint and every source rule sees
+        one source.
+
+        What a URL CANNOT show is that two different names — a hostname and its IP address, or
+        two DNS names — reach one machine. That is not detectable here and is not claimed.
+        """
+        try:
+            parts = urlsplit(self.url)
+            host = (parts.hostname or "").rstrip(".")
+            port = parts.port
+        except ValueError:  # an unparseable port: fall back to the plain fold rather than raise
+            return self.url.rstrip("/").lower()
+        scheme = parts.scheme.lower()
+        if port == {"wss": 443, "ws": 80}.get(scheme):
+            port = None
+        if ":" in host:  # IPv6: urlsplit dropped the brackets
+            host = f"[{host}]"
+        netloc = host + (f":{port}" if port is not None else "")
+        path = parts.path.rstrip("/").lower()  # folded as before: collapsing more is the safe side
+        query = f"?{parts.query}" if parts.query else ""
+        return f"{scheme}://{netloc}{path}{query}"
 
 
 def _is_loopback_url(url: str) -> bool:

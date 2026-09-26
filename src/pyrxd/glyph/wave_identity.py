@@ -58,8 +58,7 @@ from pyrxd.security.errors import ValidationError
 
 from .mark_anchor import MarkAnchor
 from .mutable_chain import MutableChainWalk, fold_chain
-from .wave import split_qualified_name
-from .wave_rules import indexed_wave_name
+from .wave_rules import WAVE_ROOT_DOMAIN, _indexer_name_problem, _is_wave_marked, indexed_wave_name
 
 #: `attrs.expires` is NOT the expiry. Photonic's own source says the indexer is authoritative on
 #: renewals - it extends expiry from TREASURY PAYMENTS, which no envelope walk observes - and that
@@ -149,18 +148,48 @@ def _corroborated_caveat(sources: Sequence[str]) -> str:
 
 
 def _requested_label(name: str) -> str:
-    """The label the INDEXER was asked about — exactly what ``WaveResolver.resolve`` sends."""
-    label, _domain = split_qualified_name(name)
-    return label.strip().lower()
+    """The label a ``--wave-name`` asks about, or ``ValidationError`` when it is not a top-level name.
+
+    THE DOMAIN MUST BE EXACTLY ``rxd`` — the maintainer's rule, as
+    :func:`~pyrxd.glyph.wave_rules.parse_wave_name` states it: split on the FIRST dot, and
+    everything after it must be ``rxd``. This used to split on the LAST dot and drop the domain,
+    so ``--wave-name alice.evil`` was judged — and printed — as ``alice.rxd``: a verdict about a
+    name nobody asked for, rendered as the one they did. ``sub.alice.rxd`` is refused the same way.
+
+    THE LABEL is held to the INDEXER'S rule (:func:`~pyrxd.glyph.wave_rules._indexer_name_problem`),
+    not pyrxd's stricter write rule: this asks about names that exist, and the indexer registers
+    names pyrxd would not write (``ab``, ``ALICE``). Lower-cased as the indexer keys it.
+    """
+    if not isinstance(name, str):
+        raise ValidationError(f"a WAVE name must be text, got {type(name).__name__}")
+    label, dot, domain = name.partition(".")
+    if dot and domain != WAVE_ROOT_DOMAIN:
+        hint = " (it must be lowercase)" if domain.lower() == WAVE_ROOT_DOMAIN else ""
+        raise ValidationError(
+            f"{name!r} has domain {domain!r}; a WAVE name's domain must be exactly {WAVE_ROOT_DOMAIN!r}{hint}. "
+            "Other roots and subdomains are not resolved here"
+        )
+    problem = _indexer_name_problem(label)
+    if problem:
+        raise ValidationError(f"the label {label!r} {problem}, so the indexer never registers it")
+    return label.lower()
 
 
 def _mint_claimed_label(walk: MutableChainWalk) -> tuple[str | None, str]:
-    """``(label, why_not)`` — the WAVE label the glyph's OWN mint payload claims.
+    """``(label, why_not)`` — the name the INDEXER would register from the glyph's own mint payload.
 
-    Read as RXinDexer's claim path reads it (:func:`~pyrxd.glyph.wave_rules.indexed_wave_name`:
-    ``attrs.name``, falling back to ``app.data.name``), lower-cased as the indexer lower-cases it.
-    A trailing ``.rxd`` is dropped, because pyrxd through 0.24.0 wrote the QUALIFIED name into
-    ``attrs.name`` (``"alice.rxd"``) where Photonic writes the bare label — both name ``alice``.
+    EXACTLY the indexer's reading, and no looser. The payload must be WAVE-marked by its own
+    membership test (:func:`~pyrxd.glyph.wave_rules._is_wave_marked`); the name is ``attrs.name``,
+    falling back to ``app.data.name`` (:func:`~pyrxd.glyph.wave_rules.indexed_wave_name`); it must
+    pass ``validate_wave_name`` (:func:`~pyrxd.glyph.wave_rules._indexer_name_problem`, which
+    checks the LOWER-CASED name); it is keyed lower-cased; and its parent must be the root, since
+    only top-level names are asked about here.
+
+    This used to strip whitespace and a trailing ``.rxd`` first, so ``" alice "``, ``"alice.rxd"``
+    and ``"alice.RXD"`` all read as ``alice`` — three names the indexer REFUSES. That mattered
+    most for the middle one: pyrxd through 0.24.0 wrote ``attrs.name = "alice.rxd"``, which the
+    indexer never registered (#728), so an index that binds ``alice`` to such a glyph is itself
+    evidence of a lie. Accepting it would have waved that lie through.
     """
     mint = walk.steps[0] if walk.steps else None
     if mint is None or mint.kind != "mint" or not mint.envelope_cbor:
@@ -171,16 +200,23 @@ def _mint_claimed_label(walk: MutableChainWalk) -> tuple[str | None, str]:
         return None, "the glyph's mint payload does not decode"
     if not isinstance(payload, dict):
         return None, "the glyph's mint payload is not a CBOR map"
+    if not _is_wave_marked(payload):
+        return None, "the glyph's own mint is not WAVE-marked, so the indexer's claim path never registers it"
     try:
-        claimed, _parent = indexed_wave_name(payload)
+        claimed, parent = indexed_wave_name(payload)
     except ValidationError as exc:
         return None, f"the glyph's mint payload cannot be read as a WAVE claim: {exc}"
-    if not isinstance(claimed, str) or not claimed.strip():
+    if not isinstance(claimed, str) or not claimed:
         return None, "the glyph's own mint payload names no WAVE label (no attrs.name or app.data.name)"
-    label = claimed.strip().lower()
-    if label.endswith(".rxd"):
-        label = label[: -len(".rxd")]
-    return label, ""
+    problem = _indexer_name_problem(claimed)
+    if problem:
+        return None, (
+            f"the glyph's own mint names {claimed!r}, which the indexer's validate_wave_name refuses "
+            f"(it {problem}) — so it was never registered under any name"
+        )
+    if parent not in (None, "", WAVE_ROOT_DOMAIN):
+        return None, f"the glyph's own mint claims {claimed!r} under {parent!r}, not as a top-level .rxd name"
+    return claimed.lower(), ""
 
 
 def _placed(value: object) -> int | None:
