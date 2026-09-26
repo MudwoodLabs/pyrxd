@@ -22,9 +22,11 @@ a real consumer surfacing. Until then, do not invest design effort.
 > qualified name at the top level (`createWaveNameMetadata`,
 > `packages/lib/src/wave.ts`), and RXinDexer's `validate_wave_name` refuses the
 > `.` — so by the indexer's source no claim `build_wave_metadata` built through
-> 0.24.0 was registered (hand-built CBOR of the right shape could always be
-> revealed through `prepare_wave_reveal`). This is the silent-divergence risk
-> described below, arriving by a different route.
+> 0.24.0 from a qualified name was registered. (Given a bare label, `"alice"`,
+> it wrote `attrs.name = "alice"`, which does register `alice.rxd`; and
+> hand-built CBOR of the right shape could always be revealed through
+> `prepare_wave_reveal`.) This is the silent-divergence risk described below,
+> arriving by a different route.
 >
 > The "byte-equivalence test against Photonic-emitted mainnet tokens" named
 > under *Why deferred* exists only in part, and the difference matters.
@@ -49,7 +51,8 @@ a real consumer surfacing. Until then, do not invest design effort.
 > page does, to the treasury Photonic and RXinDexer both name. The reveal
 > builders return the fee output for the caller to add, funded from a wallet
 > input at reveal time as Photonic funds it, and `pyrxd glyph mint-nft` pays it
-> after checking the name is free; `pay_registration_fee=False` is the only way
+> if an indexer (one server's `wave.check_available` answer) says the name is
+> free; `pay_registration_fee=False` is the only way
 > out. See the
 > "WAVE registration fee" paragraph in §8.1 of
 > `docs/reference/glyph-token-protocol-spec.md` and `src/pyrxd/glyph/wave_rules.py`.

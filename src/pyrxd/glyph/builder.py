@@ -243,10 +243,12 @@ class RevealParams:
     #: Delegate BASE ref, for callers that do not have the commit script to
     #: hand. Prefer ``commit_script``.
     delegate_ref: GlyphRef | None = None
-    #: Recovery only: reveal a WAVE-marked payload the indexer will not register. For a
-    #: commit pyrxd ≤0.24.0 already broadcast, which can only be spent by revealing its
-    #: old-shape CBOR. The claim WILL NOT REGISTER. How to rebuild those exact bytes is in
-    #: :meth:`GlyphBuilder.prepare_wave_reveal`.
+    #: Recovery only: reveal a WAVE-marked payload outside the rule pyrxd writes claims by. For
+    #: a commit pyrxd ≤0.24.0 already broadcast, which can only be spent by revealing its
+    #: old-shape CBOR. Whether that claim registers is the INDEXER's rule, not pyrxd's: the
+    #: dotted ``attrs.name`` (``alice.rxd``) does not; a bare label the indexer accepts and pyrxd
+    #: refuses (``ab``, ``Alice``) does, and owes the fee, which ``registration_fee_output``
+    #: carries. How to rebuild those exact bytes is in :meth:`GlyphBuilder.prepare_wave_reveal`.
     allow_unregistrable_wave: bool = False
     #: WAVE only: pay the registration fee (the default). ``False`` opts out; see
     #: :func:`~pyrxd.glyph.wave_rules.wave_registration_fee_for` for what that means.
@@ -475,7 +477,7 @@ class GlyphBuilder:
         metadata drives it. Prior versions forced every commit to NFT
         shape; see ``build_commit_locking_script`` for the fix note.
 
-        A WAVE claim the indexer would not register is refused HERE, before the commit
+        A WAVE claim outside the rule pyrxd writes claims by is refused HERE, before the commit
         exists: once a commit is broadcast it can only be spent by revealing exactly the CBOR
         it commits to, so a refusal at reveal time would strand its value. There is no
         override on this path (see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`).
@@ -962,8 +964,9 @@ class GlyphBuilder:
         A payload marked WAVE is held to the WAVE claim rule
         (:func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`) unless
         ``allow_unregistrable_wave=True``, which exists only to reveal a commit pyrxd
-        ≤0.24.0 already broadcast; the claim so revealed will not register. How to rebuild
-        that commit's exact bytes is in :meth:`prepare_wave_reveal`.
+        ≤0.24.0 already broadcast; whether the claim so revealed registers is the indexer's
+        rule (see :meth:`prepare_wave_reveal`), and when it does it owes the fee. How to
+        rebuild that commit's exact bytes is in :meth:`prepare_wave_reveal`.
 
         A payload that registers a WAVE name owes the registration fee:
         ``registration_fee_output`` on the result, which the caller puts at vout 2 and funds
@@ -1637,18 +1640,25 @@ class GlyphBuilder:
         that would be refused here is refused before its commit can be broadcast.
 
         REFUSED, by :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim` — the one
-        rule every WAVE write door calls — any payload the indexer would not register as a
-        top-level ``.rxd`` name: a label outside 3-63 characters of lowercase ``a-z``,
-        ``0-9`` and ``-`` (so pyrxd's own ≤0.24.0 shape, ``attrs.name = "alice.rxd"``), a
-        domain other than ``rxd``, a claim with no ``attrs.name``, and a top-level or
-        ``app.data`` name naming a different claim. Then ``name`` must be the name the
-        indexer will read from the payload.
+        rule every WAVE write door calls — any payload outside the rule pyrxd writes claims
+        by, which is stricter than the indexer's: a label outside 3-63 characters of lowercase
+        ``a-z``, ``0-9`` and ``-`` (so pyrxd's own ≤0.24.0 shape, ``attrs.name = "alice.rxd"``,
+        which the indexer does not register, and ``ab`` or ``Alice``, which it does), a domain
+        other than ``rxd``, a claim with no ``attrs.name``, and a top-level or ``app.data`` name
+        naming a different claim. Then ``name`` must be the name the indexer will read from the
+        payload.
 
         ``allow_unregistrable_wave=True`` skips both checks and only confirms ``name`` is a
         name the payload carries. It is for ONE job: revealing a commit pyrxd ≤0.24.0 already
         broadcast, whose CBOR has the old shape. That commit can only be spent by revealing
-        exactly those bytes, so refusing them would strand its value. THE CLAIM SO REVEALED
-        WILL NOT REGISTER with the indexer; the reveal only recovers the commit.
+        exactly those bytes, so refusing them would strand its value. WHETHER THE CLAIM SO
+        REVEALED REGISTERS is the indexer's rule, not pyrxd's: a dotted ``attrs.name`` (the
+        qualified name pyrxd ≤0.24.0 wrote when given one) does not, and the reveal only
+        recovers the commit; a bare label the indexer accepts (≤0.24.0 wrote one when given a
+        bare name such as ``"ab"`` or ``"Alice"``, which pyrxd now refuses) does, and owes the
+        registration fee, which
+        ``registration_fee_output`` carries — the fee follows
+        :func:`~pyrxd.glyph.wave_rules.wave_registered_label`, the indexer's rule.
 
         REBUILDING THOSE BYTES. Use the ``cbor_bytes`` stored when the commit was made
         (``CommitResult.cbor_bytes``) if you have them. :func:`~pyrxd.glyph.wave.build_wave_metadata`

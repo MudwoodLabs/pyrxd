@@ -84,6 +84,8 @@ _DATED_SUBTREES = frozenset({"brainstorms", "plans", "solutions"})
 
 _VENDOR_ROOT = _ROOT / "tests" / "vendor" / "radiant_core"
 _MANIFEST = _VENDOR_ROOT / "MANIFEST.json"
+_RXINDEXER_ROOT = _ROOT / "tests" / "vendor" / "rxindexer"
+_RXINDEXER_MANIFEST = _RXINDEXER_ROOT / "MANIFEST.json"
 
 #: Directories that hold no repository source. Pruning too FEW of these can only
 #: add candidates, i.e. turn a resolvable citation into a loud "ambiguous"
@@ -153,11 +155,11 @@ _OUT_OF_SCOPE: dict[str, str] = {
     # The WAVE register page, which pays the registration fee; digest-pinned in
     # tests/fixtures/photonic_upstream_pin.json at becf41a7.
     "packages/app/src/pages/WaveRegister.tsx": "Photonic Wallet",
-    # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. Not vendored; the
-    # files pyrxd cites are digest-pinned in tests/fixtures/rxindexer_upstream_pin.json
+    # Radiant-Core/RXinDexer, the indexer that registers WAVE claims. glyph_index.py is not
+    # vendored (wave_index.py and lib/glyph.py are, under tests/vendor/rxindexer/, and resolve
+    # through _upstream_index); it is digest-pinned in tests/fixtures/rxindexer_upstream_pin.json
     # and watched by scripts/check_photonic_drift.py --target rxindexer.
     "electrumx/server/glyph_index.py": "Radiant-Core/RXinDexer, pinned by digest",
-    "electrumx/server/wave_index.py": "Radiant-Core/RXinDexer, pinned by digest",
     # Radiant-Core/WAVE-Protocol, the WAVE protocol description (3-63 character names).
     "ANNOUNCEMENT.md": "Radiant-Core/WAVE-Protocol",
     # Not a citation at all: an ElectrumX endpoint, host:port. Listed rather than
@@ -230,16 +232,23 @@ def _suffix_index(files: list[str]) -> dict[str, list[str]]:
 
 
 def _upstream_index() -> dict[str, str]:
-    """Radiant Core ``upstream_path`` -> the vendored verbatim copy of it.
+    """Upstream path -> the vendored verbatim copy of it, for every vendored upstream.
 
-    Derived from the vendor manifest the refresh script writes, so a file added to
-    or dropped from the vendor set changes this map without anyone editing it.
+    Radiant Core through its manifest's ``upstream_path`` fields; RXinDexer
+    (``tests/vendor/rxindexer/``, pinned at the commit its manifest and
+    ``tests/fixtures/rxindexer_upstream_pin.json`` name), whose files sit at their upstream
+    paths. Derived from the vendor manifests, so a file added to or dropped from either vendor
+    set changes this map without anyone editing it.
     """
     manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-    return {
+    index = {
         meta["upstream_path"]: (_VENDOR_ROOT.relative_to(_ROOT) / local).as_posix()
         for local, meta in manifest["files"].items()
     }
+    rxindexer = json.loads(_RXINDEXER_MANIFEST.read_text(encoding="utf-8"))
+    for upstream_path in rxindexer["files"]:
+        index[upstream_path] = (_RXINDEXER_ROOT.relative_to(_ROOT) / upstream_path).as_posix()
+    return index
 
 
 def _citations() -> list[Citation]:

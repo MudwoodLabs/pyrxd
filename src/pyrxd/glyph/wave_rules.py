@@ -2,9 +2,12 @@
 
 A WAVE claim is registered by an INDEXER, not by consensus. Radiant accepts any payload
 under the ``[NFT, MUT, WAVE]`` marker, so a claim the indexer declines confirms, spends its
-fee, and registers nothing, and no error reaches anyone. Through 0.24.0 every claim
-:func:`~pyrxd.glyph.wave.build_wave_metadata` built was of that kind (#728): it put
-``"alice.rxd"`` in ``attrs.name``, and the indexer refuses the ``.``.
+fee, and registers nothing, and no error reaches anyone. Through 0.24.0
+:func:`~pyrxd.glyph.wave.build_wave_metadata` built that kind of claim whenever it was given a
+qualified name, as its docstring showed (#728): it put ``"alice.rxd"`` in ``attrs.name``, and the
+indexer refuses the ``.``. Given a bare label (``"alice"``) it wrote ``attrs.name = "alice"``,
+which the indexer registers as ``alice.rxd``. Both are checked against the indexer's own code
+at the pinned commit in ``tests/test_wave_fee_matches_the_pinned_indexer.py``.
 
 THE LABEL RULE is the intersection of the three sources that define an acceptable name:
 
@@ -218,7 +221,13 @@ def indexed_wave_name(d: dict[str, Any]) -> tuple[object, object]:
 
 
 def wave_claim_problem(d: object) -> str | None:
-    """Why a WAVE-marked payload would not register as a top-level ``.rxd`` name, or ``None``.
+    """Why a WAVE-marked payload is outside the rule pyrxd writes claims by, or ``None``.
+
+    That rule (the module docstring) is the intersection of the WAVE protocol, Photonic and
+    RXinDexer, so it is STRICTER than the indexer's: some payloads refused here do not register
+    (a dotted ``attrs.name``, a parent other than ``rxd`` the index does not hold), and some do
+    (``ab``, ``Alice``, a top-level ``name`` that differs from ``attrs.name``). Whether one
+    registers is :func:`wave_registered_label`'s question.
 
     Payloads whose ``p`` does not carry WAVE (11) are not WAVE claims and return ``None``.
     """
@@ -254,20 +263,24 @@ def wave_claim_problem(d: object) -> str | None:
 
 
 def refuse_unregistrable_wave_claim(cbor: bytes | dict[str, Any], *, allow_unregistrable_wave: bool = False) -> None:
-    """Refuse a WAVE-marked payload the indexer would not register. Every write door calls this.
+    """Refuse a WAVE-marked payload outside the rule pyrxd writes claims by. Every write door calls this.
 
     Called by :meth:`GlyphBuilder.prepare_commit` — the point of no return, since a commit can
     only be spent by revealing exactly the CBOR it commits to — and by both envelope writers,
     :func:`~pyrxd.glyph.payload.build_reveal_scriptsig_suffix` (every reveal builder except the
     DAT one) and :func:`~pyrxd.glyph.payload.build_mutable_scriptsig` (an update whose ``p``
-    carries WAVE is read by the indexer as a registration).
+    carries WAVE is read by the indexer as a registration). The rule is
+    :func:`wave_claim_problem`'s, which is stricter than the indexer's.
 
     ``allow_unregistrable_wave=True`` skips the check. It exists for ONE job: revealing a
     commit that is already on chain, made by pyrxd ≤0.24.0, whose committed CBOR has the old
     shape. That commit can only be spent by revealing those exact bytes, so refusing them
-    would strand its value. The claim so revealed WILL NOT REGISTER with the indexer. It is
-    accepted only by the reveal paths, never by :meth:`GlyphBuilder.prepare_commit`. How to
-    rebuild that commit's exact bytes, and what happens if they are wrong, is in
+    would strand its value. Whether the claim so revealed registers is the INDEXER's rule
+    (:func:`wave_registered_label`), not this one: the dotted ``attrs.name`` that ≤0.24.0 wrote
+    for a qualified name does not register; a bare label the indexer accepts and this rule
+    refuses (``ab``, ``Alice``) does, and owes the fee, which the reveal builders return for it.
+    It is accepted only by the reveal paths, never by :meth:`GlyphBuilder.prepare_commit`. How
+    to rebuild that commit's exact bytes, and what happens if they are wrong, is in
     :meth:`GlyphBuilder.prepare_wave_reveal`.
 
     Bytes that are not a CBOR map are left alone: they are not a WAVE claim to any indexer,
@@ -285,8 +298,10 @@ def refuse_unregistrable_wave_claim(cbor: bytes | dict[str, Any], *, allow_unreg
     problem = wave_claim_problem(d)
     if problem:
         raise ValidationError(
-            f"refusing a WAVE claim the indexer will not register: it {problem}. The chain would "
-            f"accept it and nothing would say it failed. Build the payload with "
+            f"refusing a WAVE claim outside the rule pyrxd writes claims by: it {problem}. Outside "
+            f"that rule RXinDexer may register nothing, register a name Photonic does not accept, "
+            f"or read a different name on a backfill than on its live path — and the chain would "
+            f"accept the claim either way, with nothing to say it failed. Build the payload with "
             f"pyrxd.glyph.wave.build_wave_metadata. (Revealing a commit pyrxd <=0.24.0 already "
             f"broadcast? Pass allow_unregistrable_wave=True to the reveal; see "
             f"refuse_unregistrable_wave_claim.)"

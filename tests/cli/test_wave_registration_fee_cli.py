@@ -32,21 +32,22 @@ from click.testing import CliRunner
 from pyrxd.cli import glyph_cmds
 from pyrxd.cli.main import cli
 from pyrxd.constants import Network
-from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.mint import JsonFilePendingStore
+from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
 from pyrxd.glyph.script import build_nft_locking_script
 from pyrxd.glyph.types import GlyphRef
-from pyrxd.glyph.wave_rules import WAVE_TREASURY_ADDRESS, wave_registered_label
+from pyrxd.glyph.wave_rules import WAVE_TREASURY_ADDRESS
 from pyrxd.keys import PrivateKey
 from pyrxd.network import confirm
 from pyrxd.network.electrumx import UtxoRecord, script_hash_for_script
 from pyrxd.script.script import Script
-from pyrxd.script.type import P2PKH
+from pyrxd.script.type import P2PKH, encode_pushdata
 from pyrxd.security.errors import NetworkError, PolicyRejection
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests import rxindexer_oracle as oracle
 
 TARGET = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
 #: ``WAVE_TREASURY_ADDRESS_DEFAULT`` (RXinDexer ``wave_index.py:65``) as a script, spelled out:
@@ -133,9 +134,12 @@ class _Chain:
         self.broadcasts.append(raw)
         return self._accept(tx, raw)
 
-    def spend(self, outpoint: tuple[str, int], *, confirmed: bool = True) -> str:
-        """Another transaction spends ``outpoint`` (a reveal made elsewhere, say)."""
-        inp = TransactionInput(source_txid=outpoint[0], source_output_index=outpoint[1])
+    def spend(self, outpoint: tuple[str, int], *, confirmed: bool = True, unlocking: bytes = b"") -> str:
+        """Another transaction spends ``outpoint`` (a reveal made elsewhere, say), unlocking with
+        ``unlocking`` — empty by default, which no real spend of a commit could be (#736)."""
+        inp = TransactionInput(
+            source_txid=outpoint[0], source_output_index=outpoint[1], unlocking_script=Script(unlocking)
+        )
         tx = Transaction(tx_inputs=[inp], tx_outputs=[TransactionOutput(Script(b"\x6a"), 0)])
         txid = self._accept(tx, bytes(tx.serialize()))
         if not confirmed:
@@ -267,6 +271,13 @@ def _tx(raw: bytes) -> Transaction:
     return tx
 
 
+def reveal_envelope(cbor: bytes) -> bytes:
+    """An unlocking script that reveals ``cbor``: ``<sig> <pubkey> "gly" <cbor>``, as pyrxd's
+    builder lays it out. The signature and key are placeholders; only the envelope is read."""
+    suffix = build_reveal_scriptsig_suffix(cbor, registration_fee=None)
+    return encode_pushdata(b"\x30" * 71) + encode_pushdata(b"\x02" * 33) + suffix
+
+
 def _outpoints(tx: Transaction) -> list[tuple[str, int]]:
     return [(i.source_txid, i.source_output_index) for i in tx.inputs]
 
@@ -314,9 +325,12 @@ class TestTheFeeIsFundedAtRevealTimeFromAWalletInput:
         # It balances at the relay floor, and what the fee input held beyond the fee came back.
         assert _miner_fee(chain, reveal) >= len(reveal.serialize()) * _FEE_RATE
         assert reveal.outputs[2].satoshis > commit.outputs[1].satoshis - price - commit.outputs[0].satoshis
-        # The name the indexer would register is the one paid for.
-        cbor = GlyphInspector().extract_reveal_cbor(reveal.inputs[0].unlocking_script.serialize())
-        assert wave_registered_label(cbor) == label
+        # The name the indexer registers is the one paid for — graded by RXinDexer's own claim
+        # path (the pinned, vendored code), not by pyrxd's transcription of it, which is what
+        # decided the fee in the first place.
+        verdict = oracle.registers(oracle.to_upstream_tx(reveal))
+        assert (verdict.name, verdict.canonical) == (f"{label}.rxd", True)
+        assert price == oracle.price(label)
         # Done: the record is gone.
         assert _store(tmp_path).list_pending() == []
 
@@ -446,9 +460,11 @@ class TestTheNameMustBeFree:
     def test_the_label_the_indexer_is_asked_about_is_the_bare_one_before_the_commit_and_the_reveal(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Three times: before the commit, before the reveal's confirmation, and after it, just
+        before the broadcast (panel D-L2 — the prompt can wait while the name is taken)."""
         chain, _wallet = _wire(monkeypatch)
         assert _mint(tmp_path, "abcde").exit_code == 0
-        assert chain.asked == [["abcde"], ["abcde"]]
+        assert chain.asked == [["abcde"], ["abcde"], ["abcde"]]
 
     def test_a_taken_name_is_refused_before_anything_is_broadcast(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -563,12 +579,19 @@ def _assert_recovery(
         )
         assert "pays the registration fee from a wallet input only if" not in said
     else:
-        # Pay only if the name is still free; otherwise reveal without the fee.
+        # Pay only if an indexer says the name is still free; otherwise reveal without the fee —
+        # and say that a "taken" answer is one server's, so the fee-less reveal of a name that is
+        # in fact free registers it unpaid (panel D-I3: "a duplicate the indexer does not
+        # register" was false exactly when the answer was).
         assert (
-            f"resume-mint checks {wave}.rxd is still free and pays the registration fee from a wallet input only if it is"
-            in said
+            f"resume-mint asks an indexer whether {wave}.rxd is still free and pays the registration fee from a "
+            "wallet input only if it says so" in said
         )
         assert f"`{_command(tmp_path, txid, '--no-wave-registration-fee')}`" in said
+        assert (
+            'A "taken" answer is one server\'s: if the name is in fact free, that reveal registers it without '
+            "paying the fee." in said
+        )
     record = _store(tmp_path).load(txid)
     assert (record.commit_txid, record.commit_value) == (txid, value)
 
@@ -784,7 +807,9 @@ class TestResumeMint:
     ) -> None:
         chain, _wallet = _wire(monkeypatch)
         txid = _timed_out_mint(tmp_path, monkeypatch, chain)
-        spender = chain.spend((txid, 0))  # revealed elsewhere, and mined
+        # Revealed elsewhere, and mined. A real reveal pushes the committed payload — the commit
+        # output is a hashlock over it — and resume-mint accepts nothing less as the spend (#736).
+        spender = chain.spend((txid, 0), unlocking=reveal_envelope(_store(tmp_path).load(txid).cbor_bytes))
         result = _resume(tmp_path, txid)
         assert result.exit_code == 1
         assert f"the commit {txid}:0 is already revealed, by {spender}" in result.stderr
@@ -902,8 +927,11 @@ class TestResumeMintReadsTheRecordWithSuspicion:
         result = _resume(tmp_path, txid)
         assert result.exit_code == 1 and len(chain.broadcasts) == 1
         said = " ".join(result.output.split())
-        assert f"the record for {txid} does not match: commit_value" in said
-        assert f"the server lists {on_chain:,}" in said
+        # Refused, and neither side blamed: from here an edited record and a lying server look
+        # the same (panel E-L2 — the server-lie half is in test_wave_mint_cli_panel_fixes.py).
+        assert f"the record and the server disagree about the value of the commit {txid}:0 — NOT revealing" in said
+        assert f"the record says {on_chain + 1_000_000:,} photons; the server lists {on_chain:,}" in said
+        assert "The record or the server is wrong" in said
 
     def test_a_payload_that_does_not_reproduce_the_commit_script_is_refused(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch

@@ -1,3 +1,6 @@
+# Verbatim upstream code, held to sha256 digests by the tests: whitespace fixers and formatters
+# must not touch it (tests/vendor/rxindexer/README.md).
+exclude: ^tests/vendor/rxindexer/
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
