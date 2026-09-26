@@ -322,8 +322,11 @@ function tableServer(table, requested, onRequest) {
         // Served verbatim from the table, whatever it holds; any other height is refused the way
         // ElectrumX refuses a height past its index.
         const key = String(req.params[0]);
+        const served = table.headers[key];
+        // `{"hang": true}`: the request is never answered — the page's own timeout is what ends it.
+        if (served && typeof served === "object" && served.hang) return;
         frame = Object.prototype.hasOwnProperty.call(table.headers, key)
-          ? { id: req.id, result: table.headers[key] }
+          ? { id: req.id, result: served }
           : { id: req.id, error: { code: 1, message: `height ${key} out of range` } };
       } else if (req.method === "blockchain.transaction.get" && typeof table.raw[req.params[0]] === "string") {
         const verbose = { txid: req.params[0], confirmations: table.confirmations };

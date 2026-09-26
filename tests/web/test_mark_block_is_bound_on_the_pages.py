@@ -157,6 +157,18 @@ class TestInspectShowsTheBoundBlock:
         for height in range(H - 2, H + 3):
             assert f"{height} — " not in rendered, f"a block number ({height}) was drawn without a header binding it"
 
+    def test_a_header_the_server_refuses_is_named_not_blamed_on_a_disagreement(self, inspect_tx) -> None:
+        """ROUND 2. An HONEST chain, except the server refuses the header at the mark's own height.
+        The other headers in the window are served and — honestly — do not match; that is not the
+        server contradicting itself, and the page must not say it is. Paired with the true
+        disagreement above, where every header is served."""
+        headers = {k: v for k, v in HONEST["headers"].items() if k != str(H)}
+        out = _inspect(inspect_tx, {**HONEST, "headers": headers})
+        rendered = " ".join(out["rendered"].split())
+        assert f"not established — the server did not serve the block headers at heights {H}," in rendered
+        assert "disagree" not in rendered
+        assert f"{H} — " not in rendered
+
     def test_clearing_during_the_header_fetch_draws_nothing_and_fetches_no_more(self, inspect_tx) -> None:
         """Requests: 1 the transaction, 2 and 3 the depth and the tip, 4 the first header. Clear
         lands during 4. Nothing is drawn — and no further header is fetched, nor the bridge asked
@@ -261,6 +273,19 @@ class TestVerifyShowsTheBoundBlock:
         # them presented as the mark's block — the sentence, or the "block" fact row.
         assert "In block" not in flat
         assert "block" not in out["text"].split("\n"), "a block fact row was drawn without a header binding it"
+
+    def test_a_header_that_is_never_answered_is_named_not_blamed_on_a_disagreement(self, verify_tx) -> None:
+        """ROUND 2, the reviewer's exact case: an honest chain whose request for the mark's own
+        header is NEVER ANSWERED. The page's own 10 s timeout ends it (so this test takes that
+        long); the other headers are served and honestly do not match. The page must name the
+        height it did not get, not say the server disagrees with itself."""
+        headers = {**HONEST["headers"], str(H): {"hang": True}}
+        out = _verify(verify_tx, {**HONEST, "headers": headers})
+        flat = " ".join(out["text"].split())
+        assert _header_requests(out["requested"]) == [H, H + 1, H - 1, H + 2, H - 2], "the premise"
+        assert f"Not established — the server did not serve the block headers at heights {H}," in flat
+        assert "disagree" not in flat
+        assert "In block" not in flat
 
     def test_clearing_during_the_header_fetch_draws_nothing_and_fetches_no_more(self, verify_tx) -> None:
         """Requests: 1 the transaction, 2 and 3 the depth and the tip, 4 the first header."""

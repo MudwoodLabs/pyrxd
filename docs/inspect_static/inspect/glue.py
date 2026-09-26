@@ -809,12 +809,24 @@ def _fetched_headers(headers_json: object) -> tuple[dict[int, bytes], dict[int, 
     return headers, errors
 
 
+def _heights(heights: list[int]) -> str:
+    return ", ".join(str(h) for h in sorted(heights))
+
+
 def _unbound_reason(asked: list[int], headers: dict[int, bytes]) -> str:
     """Why no block number is shown, told by what the binding actually did.
 
-    Three different facts, and one sentence for all of them would say something false about
-    two. What decides it is what this bridge OBSERVED the rule do — which heights it asked for,
-    and which of those the server served — not a second copy of the rule.
+    Four different facts, and one sentence for all of them would say something false about the
+    others. What decides it is what this bridge OBSERVED the rule do — which heights it asked
+    for, and which of those the server served — not a second copy of the rule.
+
+    "THE SERVER DISAGREES WITH ITSELF" NEEDS EVERY HEADER. It is a claim that none of the headers
+    in the window hashes to the block the node names, and that is only established when every
+    one of them arrived. If the matching header is simply the one that never came — a request
+    that timed out, a refusal — the other headers not matching is exactly what an HONEST chain
+    looks like, so the sentence then names the heights that were not served instead. (Found by
+    review: an honest chain whose request for the mark's own height went unanswered drew the
+    "disagree" sentence after the 10 s timeout.)
     """
     if not asked:
         # The rule refused before asking for any header: the verbose reply names no block.
@@ -822,18 +834,26 @@ def _unbound_reason(asked: list[int], headers: dict[int, bytes]) -> str:
             "the server says this transaction is in a block but does not say which one, so its "
             "height could not be checked against a header, and no block number is shown"
         )
-    span = f"{min(asked)} to {max(asked)}"
-    if not any(height in headers for height in asked):
+    served = [height for height in asked if height in headers]
+    unserved = [height for height in asked if height not in headers]
+    if not served:
         return (
             "the server did not serve the block headers needed to check which block holds this "
-            f"transaction (heights {span}), so no block number is shown. Trying again in a moment, "
-            "or another server, may work"
+            f"transaction (heights {_heights(unserved)}), so no block number is shown. Trying again "
+            "in a moment, or another server, may work"
+        )
+    if unserved:
+        return (
+            f"the server did not serve the block headers at heights {_heights(unserved)}, and none "
+            f"of those it did serve (heights {_heights(served)}) is the block that holds this "
+            "transaction, so which block holds it could not be checked and no block number is "
+            "shown. Trying again in a moment, or another server, may work"
         )
     return (
         "the server's index and its node disagree about which block holds this transaction (or it "
-        f"is serving inconsistent data): none of its headers at heights {span} hashes to the block "
-        "its node names, so no block number is shown. Trying again in a moment, or another server, "
-        "may work"
+        f"is serving inconsistent data): none of its headers at heights {_heights(served)} hashes "
+        "to the block its node names, so no block number is shown. Trying again in a moment, or "
+        "another server, may work"
     )
 
 

@@ -409,6 +409,18 @@ async function bootPyrxdRuntime(options) {
     //     to be loaded BEFORE anything imports ``hashlib`` (micropip does),
     //     because ``hashlib`` decides at import time what it can build. So
     //     it is first in this, the first load.
+    //
+    //     WHAT ELSE THAT CHANGES, said plainly. Once loaded, OpenSSL computes
+    //     EVERY hash ``hashlib`` hands out, not just the block hash: measured
+    //     in headless Chromium, ``hashlib.sha256`` is ``openssl_sha256`` and
+    //     ``ripemd160`` is OpenSSL's too — so the double-SHA256 and hash160 in
+    //     the SIGNATURE verdict run on it as well. It is OpenSSL 1.1.1n, which
+    //     is end-of-life, used here for hashing only (no TLS). It is not a new
+    //     trusted party — the same CDN already serves the interpreter that
+    //     runs everything — but it is about 3.7 MB more code (1,665,188 B +
+    //     2,025,903 B, measured), and like every Pyodide package it is checked
+    //     only against a ``pyodide-lock.json`` fetched, unverified, from that
+    //     same CDN. See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
     await pyodide.loadPackage(["hashlib", "micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)

@@ -48,10 +48,15 @@ _KNOWN_HEIGHT = 460572
 #: The REAL mainnet headers around that block, and the block hash the node names for the
 #: transaction — measured 2026-09-26, read-only, from the same endpoint with
 #: ``blockchain.block.header`` and the verbose ``blockhash``. The header at 460,572 hashes to that
-#: block hash (``pyrxd.hash.radiant_block_hash``), and its neighbours do not, so a binding that
-#: lands one block off lands on a header that really exists and really does not match.
+#: block hash (``pyrxd.hash.radiant_block_hash``), and its neighbours 460,570–460,574 do not, so a
+#: binding that lands off by one or two lands on a header that really exists and really does not
+#: match — and the whole search window can be served, which a true disagreement needs.
 _MEASURED_BLOCKHASH = "000000000000003b235d5c1ae5e1015472bbbf422247513b8a2e2351977f3dd5"
 _MEASURED_HEADERS = {
+    460570: (
+        "00000020e6a6fad8395f0753067d2d69e6ba46610fd02e120b2875176400000000000000e14812ab581446bd46242e"
+        "4b80b07c4827f034e82736febc2096487d7522af4e22dd966ae9a7001a1a26f1a4"
+    ),
     460571: (
         "000000202c638907983cee25c571ef5c208bba2f85c6f6a0f5e5364d1f000000000000001796c08709e087b10fc8"
         "f034d904a8fced63aa539f3ef52c5e60dd2f20429b61e4de966ac9a9001a480ae052"
@@ -63,6 +68,10 @@ _MEASURED_HEADERS = {
     460573: (
         "00000020d53d7f9751232e8a3b51472242bfbb725401e1e51a5c5d233b000000000000008a4082936ad0e291e3ed"
         "d8b78c35af61dabe9e92fd97d91f81923080c6ff490df8e0966a6daa001a64076e42"
+    ),
+    460574: (
+        "00000020f222ea1277c0dc6efc5d825a4f500a3059a33071336368a54700000000000000f0250538068cf8e459c936"
+        "2a05ebae02f388629fd91e70766fb5b85529290b2c0fe3966a02aa001a8109ec8c"
     ),
 }
 
@@ -489,9 +498,21 @@ class TestTheBridgeBindsTheHeightThroughTheOneRule:
         assert page["height"] == cli.height == _KNOWN_HEIGHT
         assert asked == order
 
+    def test_the_matching_header_never_arriving_is_not_called_a_disagreement(self, glue) -> None:
+        """ROUND 2. An honest chain whose header at the mark's own height is not served (a timeout,
+        a refusal): every OTHER header in the window is served and, honestly, does not match. That
+        is not the server contradicting itself, and the reason must not say it is — it names the
+        height it did not get. Paired with the true disagreement below."""
+        served = {h: hx for h, hx in _MEASURED_HEADERS.items() if h != _KNOWN_HEIGHT}
+        anchor, asked = _page_loop(glue, _verbose(), _MEASURED_TIP, served)
+        assert anchor["resolved"] is False and "height" not in anchor
+        assert f"the server did not serve the block headers at heights {_KNOWN_HEIGHT}," in anchor["reason"]
+        assert "disagree" not in anchor["reason"]
+        assert sorted(asked) == list(range(_KNOWN_HEIGHT - 2, _KNOWN_HEIGHT + 3)), "the premise: every height asked"
+
     def test_a_header_that_does_not_hash_to_the_block_is_refused(self, glue) -> None:
-        """No header the server serves hashes to the block its node names: no height, and the
-        reason says the server contradicted itself. The block-number neighbours must not appear."""
+        """EVERY header in the window is served, and none hashes to the block the node names: no
+        height, and — only now — the reason says the server contradicted itself."""
         anchor, asked = _page_loop(glue, _verbose(blockhash="11" * 32), _MEASURED_TIP, _MEASURED_HEADERS)
         assert anchor["resolved"] is False
         assert "height" not in anchor
