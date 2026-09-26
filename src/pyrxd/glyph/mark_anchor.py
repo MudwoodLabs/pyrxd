@@ -89,12 +89,33 @@ MAX_INDEX_LAG_BLOCKS = 2
 
 
 class AnchorBindingError(NetworkError):
-    """The endpoint answered, but no header in the search window hashes to the block it named.
+    """The endpoint answered, but no header in the search window binds the height to its block.
 
-    Not "unreachable": the endpoint's index and its node disagree about which block holds the
-    transaction (or it served inconsistent data). A caller reporting this should say so, and
-    suggest re-running or asking another server, rather than "check that the server is reachable".
+    Not "unreachable": the endpoint answered the depth and the block hash. A caller reporting this
+    should suggest re-running or asking another server, rather than "check that the server is
+    reachable" — and should say WHICH of three things happened, from the attributes rather than by
+    parsing the message:
+
+    * ``disagrees`` — every height in the window was served and none hashes to the block the node
+      named: the endpoint's index and its node disagree (or it is serving inconsistent data).
+    * ``unserved`` non-empty — some (or all) of the headers could not be read, so nothing
+      established a disagreement: the matching header may simply be the one that never arrived.
+      "Its index and its node disagree" would be a false sentence here, and was one (0.25.0
+      review, round 2: an honest chain whose request for the mark's own header went unanswered).
+    * both empty — the endpoint named no block to bind to at all.
+
+    ``served`` and ``unserved`` are the heights, in the order they were tried.
     """
+
+    def __init__(self, message: str, *, served: tuple[int, ...] = (), unserved: tuple[int, ...] = ()) -> None:
+        super().__init__(message)
+        self.served = tuple(served)
+        self.unserved = tuple(unserved)
+
+    @property
+    def disagrees(self) -> bool:
+        """True only when every height asked was served and none matched."""
+        return bool(self.served) and not self.unserved
 
 
 #: What ``--min-confirmations N`` MEANS, worded to match :attr:`MarkAnchor.provisional` below:
@@ -276,6 +297,8 @@ async def _bind_to_block(
         )
     want = blockhash.lower()
     offsets = [0] + [sign * step for step in range(1, MAX_INDEX_LAG_BLOCKS + 1) for sign in (1, -1)]
+    served: list[int] = []
+    unserved: list[int] = []
     unreadable: list[str] = []
     for candidate in (derived + offset for offset in offsets):
         if candidate < 0:
@@ -284,17 +307,38 @@ async def _bind_to_block(
             header = bytes(await fetch_header(candidate))
             observed = radiant_block_hash(header)
         except (NetworkError, ValidationError, TypeError, ValueError) as exc:
+            unserved.append(candidate)
             unreadable.append(f"{candidate}: {exc}")
             continue
         if observed == want:
             return candidate
+        served.append(candidate)
+    tail = "Re-run in a moment, or ask another server; no block number is reported that a header has not confirmed"
+    # "ITS INDEX AND ITS NODE DISAGREE" ONLY WHEN EVERY HEADER ARRIVED. With one missing, the
+    # others not matching is exactly what an honest chain looks like — the missing one may be the
+    # match — so the message then names what was not served instead of accusing the endpoint.
+    if unserved:
+        could_not = f"(headers it could not serve: {'; '.join(unreadable)})"
+        if served:
+            message = (
+                f"the endpoint answered, but it did not serve a usable header at heights "
+                f"{', '.join(map(str, sorted(unserved)))} {could_not}, and none of the headers it did "
+                f"serve (heights {', '.join(map(str, sorted(served)))}) is the block it says holds {txid} "
+                f"({want[:16]}…), so which block that is could not be checked. {tail}"
+            )
+        else:
+            message = (
+                f"the endpoint answered, but it did not serve a usable header at any of heights "
+                f"{', '.join(map(str, sorted(unserved)))} {could_not}, so which block holds {txid} "
+                f"({want[:16]}…) could not be checked. {tail}"
+            )
+        raise AnchorBindingError(message, served=tuple(served), unserved=tuple(unserved))
     lo, hi = max(derived - MAX_INDEX_LAG_BLOCKS, 0), derived + MAX_INDEX_LAG_BLOCKS
-    detail = f" (headers it could not serve: {'; '.join(unreadable)})" if unreadable else ""
     raise AnchorBindingError(
         f"the endpoint answered, but the block it says holds {txid} ({want[:16]}…) is not its header "
-        f"at any height from {lo} to {hi}{detail}: its index and its node disagree about which block "
-        "that is, or it is serving inconsistent data. Re-run in a moment, or ask another server; no "
-        "block number is reported that a header has not confirmed"
+        f"at any height from {lo} to {hi}: its index and its node disagree about which block that is, "
+        f"or it is serving inconsistent data. {tail}",
+        served=tuple(served),
     )
 
 

@@ -813,12 +813,14 @@ def _heights(heights: list[int]) -> str:
     return ", ".join(str(h) for h in sorted(heights))
 
 
-def _unbound_reason(asked: list[int], headers: dict[int, bytes]) -> str:
-    """Why no block number is shown, told by what the binding actually did.
+def _unbound_reason(exc) -> str:
+    """Why no block number is shown, told by what the binding actually found.
 
     Four different facts, and one sentence for all of them would say something false about the
-    others. What decides it is what this bridge OBSERVED the rule do — which heights it asked
-    for, and which of those the server served — not a second copy of the rule.
+    others. Which one it was comes from the ``AnchorBindingError`` itself — its ``served`` and
+    ``unserved`` heights and ``disagrees`` — which is the same classification the CLI's message and
+    its exit-2 advice are built from, so the page and ``pyrxd verify`` cannot tell one failure two
+    ways. This function only words it for a stranger.
 
     "THE SERVER DISAGREES WITH ITSELF" NEEDS EVERY HEADER. It is a claim that none of the headers
     in the window hashes to the block the node names, and that is only established when every
@@ -828,21 +830,20 @@ def _unbound_reason(asked: list[int], headers: dict[int, bytes]) -> str:
     review: an honest chain whose request for the mark's own height went unanswered drew the
     "disagree" sentence after the 10 s timeout.)
     """
-    if not asked:
+    served, unserved = list(exc.served), list(exc.unserved)
+    if not served and not unserved:
         # The rule refused before asking for any header: the verbose reply names no block.
         return (
             "the server says this transaction is in a block but does not say which one, so its "
             "height could not be checked against a header, and no block number is shown"
         )
-    served = [height for height in asked if height in headers]
-    unserved = [height for height in asked if height not in headers]
     if not served:
         return (
             "the server did not serve the block headers needed to check which block holds this "
             f"transaction (heights {_heights(unserved)}), so no block number is shown. Trying again "
             "in a moment, or another server, may work"
         )
-    if unserved:
+    if not exc.disagrees:
         return (
             f"the server did not serve the block headers at heights {_heights(unserved)}, and none "
             f"of those it did serve (heights {_heights(served)}) is the block that holds this "
@@ -989,7 +990,7 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: 
             return _needs_header(missing[0])
         return {
             "resolved": False,
-            "reason": _unbound_reason(asked, headers),
+            "reason": _unbound_reason(exc),
             "detail": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
         }
     except Exception as exc:
