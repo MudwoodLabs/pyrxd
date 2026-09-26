@@ -323,6 +323,14 @@ _PROSE_EVIDENCE = {
     # `algorithm_id` above, and declared for the same reason: the generic short-value
     # rule would demand a standalone token the renderer correctly does not print.
     "version": {1: "v1", 2: "v2"},
+    # Whether the transaction creates a ref from that input's outpoint. A payload that mints is
+    # the ordinary case and carries no extra words; one that mints NOTHING says so, on the
+    # headline ("token: none — this input mints no token here") and on an other-glyph row.
+    "mints": {True: None, False: "mints no token"},
+    # An other-glyph row's payload binding, when another payload in the transaction IS bound and
+    # this one is not: it shouts. When it is not flagged, the row's `binding_state` word says all
+    # there is, and no warning is drawn — the absence is the rendering.
+    "binding_warning": {True: "treat as unattributed", False: None},
 }
 
 #: Below this length, "is the evidence in the text" stops being a question about the
@@ -370,8 +378,6 @@ _OMITTED_NESTED_KEYS = {
     "outcome text otherwise. The literal 'ok' would tell a reader nothing",
     "signature_unverified": "the raw 65-byte signature. The VERDICT is what a reader "
     "needs and the bytes are in the JSON drawer; the CLI omits it for the same reason",
-    "assumed_network": "shown beside a VERIFIED signature, where the assumption is "
-    "load-bearing. On a failure the reason is the detail, not the chain",
     "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
     "recovered_hash160": "identical to the committed signer whenever it is set, and "
     "the signer is already rendered; printing both invites reading them as two facts",
@@ -414,6 +420,26 @@ def _tally_keys() -> frozenset[str]:
     )
 
 
+def _without_the_chain_of_an_unsigned_record(key: str, value: dict) -> dict:
+    """``assumed_network`` IS REQUIRED — except on a record with no signature.
+
+    It used to sit in ``_OMITTED_NESTED_KEYS`` with the reason "shown beside a VERIFIED
+    signature". That stopped being true when the page began naming the chain beside EVERY
+    signature verdict (a genuine testnet record reads DOES NOT VERIFY here, and the chain is
+    why), and a blanket exemption would have gone on excusing the field on exactly the
+    outcomes it now has to appear on. So it is not exempt: it is evidence like any other
+    leaf, and the one case that still omits it is DERIVED here rather than written as prose.
+    A v1 record carries the key too (``verify_attestation`` fills it for every outcome), but
+    has no signature for the chain to bear on, and the page draws no chain line for it.
+    """
+    if key != "hashmark" or value.get("signer_hash160"):
+        return value
+    attestation = value.get("attestation")
+    if not isinstance(attestation, dict) or "assumed_network" not in attestation:
+        return value
+    return {**value, "attestation": {k: v for k, v in attestation.items() if k != "assumed_network"}}
+
+
 def _required_evidence(key: str, value) -> list[str]:
     """Substrings the rendered text must contain for *key* to count as shown."""
     if key in _PROSE_EVIDENCE and _hashable(value) and value in _PROSE_EVIDENCE[key]:
@@ -427,6 +453,7 @@ def _required_evidence(key: str, value) -> list[str]:
         # A TALLY's keys are required too: in `{"op_return": 1}` the count alone says nothing,
         # and a note that printed "1" and no type name would have passed on the count.
         words = [str(sub_key) for sub_key in value] if key in _tally_keys() else []
+        value = _without_the_chain_of_an_unsigned_record(key, value)
         return words + [
             evidence
             for sub_key, sub_value in value.items()
@@ -970,6 +997,18 @@ class TestTheNestedRequirementIsNotVACUOUS:
         block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
         assert block["attestation"]["detail"] in _required_evidence("hashmark", block)
 
+    def test_the_chain_is_required_beside_a_signature_and_only_there(self, payloads) -> None:
+        """Both directions of the one derived omission. The v2 corpus record's signature is random,
+        so its verdict is a FAILURE — the outcome on which the chain line used to be missing — and
+        its ``assumed_network`` must be demanded. The v1 record carries the same key and has no
+        signature, and must not be."""
+        signed = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert signed["attestation"]["status"] != "VERIFIED", "the premise: a non-VERIFIED signature"
+        assert signed["attestation"]["assumed_network"] in _required_evidence("hashmark", signed)
+        unsigned = payloads["op_return-hashmark-v1"]["row"]["hashmark"]
+        assert unsigned["attestation"].get("assumed_network"), "the premise: v1 carries the key too"
+        assert unsigned["attestation"]["assumed_network"] not in _required_evidence("hashmark", unsigned)
+
 
 # ───────────────────────────────────────── the transaction-level card ──
 #
@@ -1140,10 +1179,55 @@ def _tx_payload_single_vout(scriptsigs: list[bytes], outputs: list[tuple[bytes, 
     return classify_raw_tx(hash256(raw)[::-1].hex(), raw, only_vout=vout)
 
 
+def _tx_payload_after_fetches(
+    inputs: list[tuple[str, int, bytes]],
+    outputs: list[tuple[bytes, int]],
+    *,
+    prevs: dict[str, bytes] | None = None,
+    errors: dict[str, str] | None = None,
+) -> dict:
+    """The payload the page draws after its SECOND step: ``glue.spent_output_bindings`` handed
+    *prevs* (``{outpoint: the spent transaction's bytes}``) and *errors* (``{outpoint: why it
+    could not be fetched}``) for the ``(source txid, vout, scriptSig)`` *inputs*.
+
+    The cases above are all network-free, so the keys only that step writes — a row's
+    ``binding_state``, ``binding_warning`` and ``binding_detail``, ``payload_binding.unsettled``,
+    ``bindings_past_cap`` — never reached the field guard, which passed over them true and empty
+    (#743 round 4)."""
+    import json
+
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    tx = Transaction(
+        tx_inputs=[
+            TransactionInput(source_txid=txid, source_output_index=vout, unlocking_script=Script(ss))
+            for txid, vout, ss in inputs
+        ],
+        tx_outputs=[
+            TransactionOutput(locking_script=Script(spk, allow_malformed=True), satoshis=value)
+            for spk, value in outputs
+        ],
+    )
+    raw = tx.serialize()
+    result = _glue().spent_output_bindings(
+        hash256(raw)[::-1].hex(),
+        raw.hex(),
+        json.dumps({op: spent.hex() for op, spent in (prevs or {}).items()}),
+        json.dumps(errors or {}),
+    )
+    assert result["ok"] and "payload" in result, result
+    return result["payload"]
+
+
 @functools.lru_cache(maxsize=1)
 def _tx_payloads() -> dict[str, dict]:
     """One classified transaction per claim the tx card makes, each built to sit
     on a chosen side of the check that claim now depends on."""
+    from pyrxd.glyph._inspect_core import _MAX_BINDING_FETCHES
     from pyrxd.glyph.dmint.builders import build_dmint_v1_contract_script
     from pyrxd.glyph.script import (
         build_commit_locking_script,
@@ -1166,6 +1250,10 @@ def _tx_payloads() -> dict[str, dict]:
     commit_nft = build_commit_locking_script(os.urandom(32), pkh, is_nft=True)
     empty = b""
 
+    def minted_from(input_index: int) -> bytes:
+        """The singleton for the outpoint `_tx_payload`'s input *input_index* spends."""
+        return build_nft_locking_script(pkh, GlyphRef(txid="ab" * 32, vout=input_index))
+
     def dmint(height: int, *, tref: GlyphRef, reward: int = 100_000, max_height: int = 1000) -> bytes:
         return build_dmint_v1_contract_script(
             height=height,
@@ -1184,14 +1272,23 @@ def _tx_payloads() -> dict[str, dict]:
             [_reveal_scriptsig("Torch", ticker="TRCH", protocol=(1, 6))],
             [(ft, 1000), (p2pkh, 546)],
         ),
-        "single-glyph": _tx_payload([_reveal_scriptsig("Solo", ticker="SOLO")], [(nft, 546)]),
+        # These MINT: each output is the singleton for an input's outpoint (`_tx_payload` spends
+        # "ab"*32:<input index>), which is what makes a payload a glyph minted here. Before #743
+        # round 2 they carried a token ref from nowhere and still read "3 glyphs minted".
+        "single-glyph": _tx_payload([_reveal_scriptsig("Solo", ticker="SOLO")], [(minted_from(0), 546)]),
         "multi-glyph": _tx_payload(
             [
                 _reveal_scriptsig("First", ticker="ONE"),
                 _reveal_scriptsig("Second", ticker="TWO"),
                 _reveal_scriptsig("Third", ticker="THREE"),
             ],
-            [(nft, 546)],
+            [(minted_from(0), 546), (minted_from(1), 546), (minted_from(2), 546)],
+        ),
+        # The decoy a node accepts: a payload on input 0 that mints nothing, the real glyph on
+        # input 1. The headline is the one minted; the decoy is listed as minting no token.
+        "decoy-first": _tx_payload(
+            [_reveal_scriptsig("Tether USD", ticker="USDT"), _reveal_scriptsig("RealToken", ticker="REAL")],
+            [(minted_from(1), 546)],
         ),
         # A TIMELOCK envelope: the page had a banner saying a time condition
         # exists and rendered nothing about what it is.
@@ -1350,7 +1447,55 @@ def _tx_payloads() -> dict[str, dict]:
             ],
             max_rows=2,
         ),
+        # AFTER THE PAGE'S FETCHES, with every one failing: one more minting payload than the fetch
+        # limit, so each other row reads `unchecked` — why, or past the limit — and the headline,
+        # itself unchecked, says it is not settled.
+        "fetches-failed-and-past-the-limit": _tx_payload_after_fetches(
+            [("ab" * 32, i, _reveal_scriptsig(f"Glyph{i}")) for i in range(_MAX_BINDING_FETCHES + 1)],
+            [(minted_from(i), 546) for i in range(_MAX_BINDING_FETCHES + 1)],
+            errors={f"{'ab' * 32}:{i}": "daemon busy" for i in range(_MAX_BINDING_FETCHES)},
+        ),
+        # AND WITH THEM SUCCEEDING, on case K: a decoy on `OP_2DROP` + P2PKH minting its own
+        # outpoint, beside a payload whose NFT commit binds it. The bound one heads the card and
+        # the decoy's row is flagged — the one case in which `binding_warning` is true.
+        "decoy-beside-a-bound-payload": _decoy_beside_a_bound_payload(pkh, p2pkh),
     }
+
+
+def _decoy_beside_a_bound_payload(pkh, p2pkh: bytes) -> dict:
+    from pyrxd.glyph.inspector import GlyphInspector
+    from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    def paying_to(script: bytes) -> Transaction:
+        """A transaction whose output 0 is *script* — something an input can spend, hash-valid."""
+        return Transaction(
+            tx_inputs=[
+                TransactionInput(
+                    source_txid=os.urandom(32).hex(), source_output_index=0, unlocking_script=Script(b"\x00")
+                )
+            ],
+            tx_outputs=[TransactionOutput(locking_script=Script(script, allow_malformed=True), satoshis=1000)],
+        )
+
+    decoy_sig, real_sig = _reveal_scriptsig("Tether USD", ticker="USDT"), _reveal_scriptsig("RealToken", ticker="REAL")
+    decoy_prev = paying_to(b"\x6d" + p2pkh)  # OP_2DROP, then P2PKH: drops the envelope unchecked
+    commit = paying_to(
+        build_commit_locking_script(hash256(GlyphInspector().extract_reveal_cbor(real_sig)), pkh, is_nft=True)
+    )
+    return _tx_payload_after_fetches(
+        [(decoy_prev.txid(), 0, decoy_sig), (commit.txid(), 0, real_sig)],
+        [
+            (build_nft_locking_script(pkh, GlyphRef(txid=decoy_prev.txid(), vout=0)), 546),
+            (build_nft_locking_script(pkh, GlyphRef(txid=commit.txid(), vout=0)), 546),
+        ],
+        prevs={f"{decoy_prev.txid()}:0": decoy_prev.serialize(), f"{commit.txid()}:0": commit.serialize()},
+    )
 
 
 def _hashmark_v1_script(i: int) -> bytes:
@@ -1375,6 +1520,10 @@ def tx_rendered(tx_payloads) -> dict[str, str]:
 # two tables above: anything not listed must appear in the rendered text.
 _OMITTED_FROM_TX_CARD = {
     "form": "always 'txid' on this path — the card's title carries it",
+    "binding_candidates": "not a fact about the transaction but the page's fetch list: the "
+    "outpoints its second step asks the server for. What those fetches establish IS drawn — the "
+    "payload binding row, and each other payload's verdict — and "
+    "tests/web/test_the_headline_prefers_a_bound_payload.py checks the page fetches exactly these",
     "outputs": "rendered as one row per output, and every field of every row is "
     "guarded field-by-field by test_output_row_renders_every_field. Demanding them "
     "again here would re-demand `hex` and `length`, which the rows omit on purpose",
@@ -1455,6 +1604,28 @@ class TestTheTxCardRendersEveryFieldToo:
         assert len(emitted) >= 8, f"only {sorted(emitted)} derived — the extraction is broken"
         assert emitted <= exercised, f"never exercised: {sorted(emitted - exercised)}"
 
+        # What the page's fetches write into a classification — DERIVED from `_apply_bindings`, the
+        # one step both surfaces take, so a key it starts writing without a case here fails. Every
+        # case above was network-free until #743 round 4, so these passed the field guard empty.
+        tree = ast.parse(source)
+        (apply_bindings,) = [
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_apply_bindings"
+        ]
+        written = {
+            target.slice.value
+            for node in ast.walk(apply_bindings)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and isinstance(target.slice.value, str)
+        }
+        assert {"payload_binding", "binding_detail", "bindings_past_cap"} <= written, sorted(written)
+        assert written <= exercised, f"never exercised: {sorted(written - exercised)}"
+        # And the caveat the headline carries when it is not settled, which `_spent_output_bindings`
+        # puts inside `payload_binding` rather than `_apply_bindings` writing it.
+        assert "unsettled" in exercised
+
 
 def test_the_tallies_whose_words_are_required_are_derived_and_found() -> None:
     """The derivation above, checked against the tallies known today, so an extraction that
@@ -1519,6 +1690,19 @@ class TestAMultiGlyphRevealSaysWhichGlyph:
         assert "Reveal metadata (from input 0)" in text
         assert "glyphs minted here" not in text
         assert "Other glyphs" not in text
+        assert "mints no token" not in text, "a payload that mints must not be told it does not"
+
+    def test_a_payload_that_mints_nothing_is_not_counted_as_minted(self, tx_payloads, tx_rendered):
+        """#743 round 2: two payloads, one glyph minted. The page said "1 of 2 glyphs minted here"
+        and listed the decoy under "Other glyphs minted", with the decoy as the headline."""
+        payload = tx_payloads["decoy-first"]
+        assert (payload["metadata"]["of_n_payloads"], payload["metadata"]["of_n_minted"]) == (2, 1)
+        assert payload["metadata"]["input_index"] == 1 and payload["metadata"]["name"] == "RealToken"
+        text = tx_rendered["decoy-first"]
+        assert "Reveal metadata (from input 1 — 1 of 2 payloads here, 1 minting a token)" in text
+        assert "glyphs minted here" not in text and "Other glyphs minted" not in text
+        assert "Other payloads in this transaction (1), 0 minting a token" in text
+        assert "nft — Tether USD / USDT — mints no token" in text
 
 
 class TestTheCommitNftNoteStopsClaimingAnFtDeploy:

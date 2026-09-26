@@ -224,8 +224,11 @@ class TestThePayloadIsBounded:
         assert {env["kind"] for env in payload["glyph_envelopes"]} == {"unreadable"}
         assert payload["glyph_envelopes_not_listed"] == {"count": 3, "by_kind": {"unreadable": 3}}
         assert len(payload["metadata_inputs"]) == limit + 1, "the headline plus the first `limit` others"
-        assert payload["metadata_inputs_not_listed"] == {"count": 2}
+        # No output here carries an input's outpoint, so none of these payloads mints: the count of
+        # what was minted is over every payload too, listed or not, and it is zero.
+        assert payload["metadata_inputs_not_listed"] == {"count": 2, "minting": 0}
         assert payload["metadata"]["of_n_payloads"] == limit + 3, "counted over every payload, not the listed ones"
+        assert payload["metadata"]["of_n_minted"] == 0
 
     def test_the_payload_does_not_grow_with_the_transaction(self, limit) -> None:
         """THE BOUND, where the review measured it: what crosses into JavaScript. 3,000 outputs
@@ -835,13 +838,26 @@ class TestTheInputListsAreBounded:
         assert "not shown here" not in text
 
     def test_other_glyphs_past_the_limit_are_counted(self, limit) -> None:
+        """Each payload MINTS here — one output pushes every input's outpoint as a ref — so every
+        one is a glyph minted, and the ones past the limit are counted as minting too."""
         inputs = [_envelope(f"g{i}") for i in range(limit + 3)]
-        payload = _classified(b"\x6a" + b"\x00" * 30, limit=limit, inputs=inputs)
+        payload = _classified(_refs(limit + 3, 0), limit=limit, inputs=inputs)
+        assert payload["metadata_inputs_not_listed"] == {"count": 2, "minting": 2}
         text = _flat(_card(payload)["fetched_tx_card"])
         assert f"Other glyphs minted in this transaction ({limit + 2})" in text
         # The headline glyph (input 0) is not an "other" one: inputs 1..limit are listed, the rest counted.
         assert f"input {limit} " in text and f"input {limit + 1} " not in text
-        assert f"The first {limit} are listed; 2 more are not shown here." in text
+        assert f"The first {limit} are listed; 2 more are not shown here, 2 of them minting a token." in text
+
+    def test_other_payloads_that_mint_nothing_are_not_counted_as_minted(self, limit) -> None:
+        """The other side: the same envelopes with no output creating their refs. Nothing is
+        minted, so nothing is "minted in this transaction" — including the ones not listed."""
+        inputs = [_envelope(f"g{i}") for i in range(limit + 3)]
+        payload = _classified(b"\x6a" + b"\x00" * 30, limit=limit, inputs=inputs)
+        text = _flat(_card(payload)["fetched_tx_card"])
+        assert "Other glyphs minted" not in text
+        assert f"Other payloads in this transaction ({limit + 2}), 0 minting a token" in text
+        assert f"The first {limit} are listed; 2 more are not shown here, 0 of them minting a token." in text
 
 
 def _update(fields: dict) -> bytes:

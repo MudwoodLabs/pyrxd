@@ -913,9 +913,11 @@ class TestInspectFetchReveal:
 
         We can't easily craft a hostile ``protocol`` value through the live
         ``GlyphMetadata`` validator (it rejects non-int entries), so this test
-        reaches in and patches ``find_reveal_metadata`` to return metadata
-        with a hostile protocol element — ensuring the sanitization layer
-        actually runs on whatever the ``decode_payload`` path produces.
+        reaches in and patches ``extract_reveal_metadata`` — the per-input reader the
+        classifier's attribution calls; it stopped calling ``find_reveal_metadata`` when the
+        headline began to prefer a minting input — to return metadata with a hostile protocol
+        element, ensuring the sanitization layer actually runs on whatever the
+        ``decode_payload`` path produces.
         """
         raw, real_txid = _build_tx_with_reveal(_FT_REVEAL_METADATA)
         client = _mock_client(get_transaction_returns=RawTx(raw))
@@ -935,8 +937,8 @@ class TestInspectFetchReveal:
         object.__setattr__(hostile_meta, "protocol", ("gly‮bar",))
 
         with patch(
-            "pyrxd.glyph.inspector.GlyphInspector.find_reveal_metadata",
-            return_value=(0, hostile_meta),
+            "pyrxd.glyph.inspector.GlyphInspector.extract_reveal_metadata",
+            return_value=hostile_meta,
         ):
             result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
 

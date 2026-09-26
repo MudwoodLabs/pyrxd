@@ -19,9 +19,10 @@ import pathlib
 
 import pytest
 
+from pyrxd.glyph import wave_identity as _wave_identity
 from pyrxd.glyph.mark_anchor import MarkAnchor
 from pyrxd.glyph.mutable_chain import walk_mutable_chain
-from pyrxd.glyph.wave_identity import EXPIRY_UNKNOWN, judge_name_at_mark
+from pyrxd.glyph.wave_identity import EXPIRY_UNKNOWN, HeightReport
 from pyrxd.transaction.transaction import Transaction
 
 _FIX = pathlib.Path(__file__).parent / "fixtures" / "wave_update_chain_mainnet.json"
@@ -35,6 +36,7 @@ MOVED = "14XmXG3dSBWZUukGT3xzS9zxpiZ53vgx1i"
 
 BINDING = "index-B"
 NODE = "node-A"
+NAME = "custodian-gate-x7f3.rxd"  # what the fixture mint's own payload names (attrs.name)
 
 
 async def _fetch(txid: str):
@@ -60,6 +62,15 @@ def _anchor(height: int | None, *, confs: int = 50, floor: int = 6, source: str 
     return MarkAnchor(txid="ma" * 32, height=height, confirmations=confs, min_confirmations=floor, source=source)
 
 
+def _judge(*, anchor: MarkAnchor, step_heights, **kw):
+    """`judge_name_at_mark` with every height reported IDENTICALLY by two sources that agree with
+    the anchor, and the name the fixture mint really claims — the honest shape of the height and
+    name rules, so each test below exercises the rule it is named for and nothing else. The
+    height rules themselves are attacked in `test_form2_step_heights_need_two_sources.py`."""
+    reports = [HeightReport(source=s, mark_height=anchor.height, step_heights=step_heights) for s in (NODE, BINDING)]
+    return _wave_identity.judge_name_at_mark(name=NAME, anchor=anchor, height_reports=reports, **kw)
+
+
 # ---------------------------------------------------------------------------
 # 1. It answers the question form 1 cannot
 # ---------------------------------------------------------------------------
@@ -71,7 +82,7 @@ def _anchor(height: int | None, *, confs: int = 50, floor: int = 6, source: str 
 )
 async def test_it_reports_the_target_in_force_at_the_marks_block(mark_height: int, expected: str) -> None:
     walk = await _walk()
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=walk.ref,
         binding_source=BINDING,
         anchor=_anchor(mark_height),
@@ -94,21 +105,18 @@ async def test_a_form2_verdict_still_refuses_to_answer_expiry() -> None:
     walk never observes, and `attrs.expires` is display-level. A number here would be a lie
     with the shape of an answer."""
     walk = await _walk()
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=_HEIGHTS
-    )
+    verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=_HEIGHTS)
     assert verdict.form == 2
     assert verdict.expiry == EXPIRY_UNKNOWN
     assert not verdict.expiry.isdigit()
 
 
 async def test_the_binding_is_never_claimed_as_verified() -> None:
-    """Nothing checks the name→glyph binding on chain yet, so it stays False even on a form-2
-    verdict — and the verdict names the REF it is actually about."""
+    """The judge checks that the glyph's own mint NAMES the label, which a duplicate or a lapsed
+    registration also does — nothing proves on chain that this glyph is the registration in force.
+    So it stays False even on a form-2 verdict, and the verdict names the REF it is actually about."""
     walk = await _walk()
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=_HEIGHTS
-    )
+    verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=_HEIGHTS)
     assert verdict.binding_verified is False
     assert verdict.ref == walk.ref
     assert verdict.binding_source == BINDING
@@ -122,7 +130,7 @@ async def test_the_binding_is_never_claimed_as_verified() -> None:
 async def test_no_block_degrades() -> None:
     """A pasted script has no block, so form 2 is unavailable by construction."""
     walk = await _walk()
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=walk.ref, binding_source=BINDING, anchor=_anchor(None, confs=0), walk=walk, step_heights=_HEIGHTS
     )
     assert verdict.form == 1
@@ -132,7 +140,7 @@ async def test_no_block_degrades() -> None:
 
 async def test_a_shallow_mark_degrades_and_names_the_bar() -> None:
     walk = await _walk()
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=walk.ref,
         binding_source=BINDING,
         anchor=_anchor(458605, confs=2, floor=6),
@@ -147,7 +155,7 @@ async def test_one_source_for_both_answers_degrades() -> None:
     """THE independence property. An endpoint that supplies the height AND the name→glyph
     binding can choose the block, then choose what the name said at it."""
     walk = await _walk()
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=walk.ref,
         binding_source=NODE,  # same as the anchor's source
         anchor=_anchor(458605, source=NODE),
@@ -165,7 +173,7 @@ async def test_an_incomplete_walk_degrades() -> None:
         candidates=list(_RAW),
         fetch_tx=_fetch,  # no tip proof
     )
-    verdict = judge_name_at_mark(
+    verdict = _judge(
         ref=truncated.ref, binding_source=BINDING, anchor=_anchor(458605), walk=truncated, step_heights=_HEIGHTS
     )
     assert verdict.form == 1
@@ -177,9 +185,7 @@ async def test_a_step_with_no_height_degrades() -> None:
     it as 'before' would fold in an update that may have come after."""
     walk = await _walk()
     holes = {**_HEIGHTS, walk.steps[0].txid: None}
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=holes
-    )
+    verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=_anchor(458605), walk=walk, step_heights=holes)
     assert verdict.form == 1
     assert "no block height for" in verdict.degraded_reason
 
@@ -195,18 +201,14 @@ async def test_a_missing_height_AFTER_the_mark_does_not_refuse() -> None:
     """
     walk = await _walk()
     holes = {**_HEIGHTS, walk.steps[-1].txid: None}
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458586), walk=walk, step_heights=holes
-    )
+    verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=_anchor(458586), walk=walk, step_heights=holes)
     assert verdict.form == 2, verdict.degraded_reason
     assert verdict.target_at_height == MINT_TARGET
 
 
 async def test_a_mark_older_than_the_name_degrades() -> None:
     walk = await _walk()
-    verdict = judge_name_at_mark(
-        ref=walk.ref, binding_source=BINDING, anchor=_anchor(458000), walk=walk, step_heights=_HEIGHTS
-    )
+    verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=_anchor(458000), walk=walk, step_heights=_HEIGHTS)
     assert verdict.form == 1
     assert "did not exist when the mark was made" in verdict.degraded_reason
 
@@ -221,7 +223,7 @@ async def test_every_degrade_carries_a_reason_and_never_a_target() -> None:
         _anchor(458605, source=BINDING),
     ]
     for anchor in cases:
-        verdict = judge_name_at_mark(
+        verdict = _judge(
             ref=walk.ref,
             binding_source=BINDING,
             anchor=anchor,
@@ -239,7 +241,5 @@ async def test_the_caveat_survives_onto_every_verdict() -> None:
     qualifier just because it managed to answer."""
     walk = await _walk()
     for anchor in (_anchor(458605), _anchor(None, confs=0)):
-        verdict = judge_name_at_mark(
-            ref=walk.ref, binding_source=BINDING, anchor=anchor, walk=walk, step_heights=_HEIGHTS
-        )
+        verdict = _judge(ref=walk.ref, binding_source=BINDING, anchor=anchor, walk=walk, step_heights=_HEIGHTS)
         assert "NOT verified" in verdict.caveat

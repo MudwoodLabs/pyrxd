@@ -216,6 +216,10 @@ def test_the_human_renderer_prints_the_verdict_and_its_qualifiers(monkeypatch: p
     assert "not authorship" in text
     assert "not verified on chain" in text, "the binding qualifier must be printed with the claim"
     assert "proved unspent" in text
+    # EXPIRY reached --json and no terminal (0.25.0 panel, INFO): "pointed at X at block N" printed
+    # with nothing saying the name might have lapsed by then. The state is printed, not a number.
+    assert f"expiry at that block: {nam['expiry']}" in text
+    assert "renewals are decided by treasury payments" in text
 
 
 def test_the_human_renderer_prints_the_degrade_reason(monkeypatch: pytest.MonkeyPatch) -> None:

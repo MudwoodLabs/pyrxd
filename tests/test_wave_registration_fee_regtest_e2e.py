@@ -23,6 +23,13 @@ floor.
 4. **NEGATIVE** — a reveal carrying the fee output with no input to fund it (the commit sized
    for the carrier and the miner fee only, as the commit now always is) is rejected for its
    value. The commit is left unspent, so nothing is lost.
+5. **The 0.25.0 panel's money-path findings** — a name reported taken at the last check, after
+   the reveal's confirmation, puts no reveal on chain (D-L2); and a pending record edited to pay
+   another treasury pays nothing until it is put back, after which the printed command pays the
+   treasury the mint named (D-L1) — the operator typing that treasury in place of the printed
+   placeholder (round 2); and a reveal a server echoed without relaying, then reported confirmed,
+   is recovered on chain from the archived record by resume-mint against an honest server (#736,
+   round 2).
 
 After each acceptance the confirmed transaction is read back from the node and the fee output
 compared with the treasury P2PKH script the MAINNET claim paid (read from the fixture, not
@@ -82,6 +89,7 @@ from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests import rxindexer_oracle as oracle
 
 pytestmark = pytest.mark.integration
 
@@ -134,10 +142,13 @@ def _assert_the_fee_output(rt: _RegtestNode, txid: str, vout: int, label: str, r
     assert round(confirmed["vout"][vout]["value"] * 1e8) == rxd * 100_000_000
     spks = [bytes.fromhex(o["scriptPubKey"]["hex"]) for o in confirmed["vout"]]
     assert spks.count(_TREASURY_SCRIPT) == 1
-    # ...and what the chain carries registers the name that was paid for.
+    # ...and what the chain carries registers the name that was paid for: by pyrxd's rule, which
+    # decided the fee, and by RXinDexer's own claim path at the pinned commit, which is what
+    # registers names (tests/rxindexer_oracle.py).
     raw = Transaction.from_hex(bytes.fromhex(str(rt.cli("getrawtransaction", txid))))
     cbor = GlyphInspector().extract_reveal_cbor(raw.inputs[0].unlocking_script.serialize())
     assert wave_registered_label(cbor) == label
+    assert oracle.registers(oracle.to_upstream_tx(raw)) == oracle.Verdict(f"{label}.rxd", True)
     return confirmed
 
 
@@ -341,7 +352,8 @@ def test_the_cli_pays_the_fee_at_reveal_time_from_a_wallet_input(
     outs = sum(round(o["value"] * 1e8) for o in reveal["vout"])
     assert ins - outs >= reveal["size"] * _MIN_FEE_RATE  # the node took it; this is the margin, read back
     assert out["wave_registration"]["fee_input"] == f"{commit_txid}:1"
-    assert net.asked == [[label], [label]]  # before the commit, and again before the reveal
+    # Before the commit, before the reveal's confirmation, and again just before its broadcast.
+    assert net.asked == [[label], [label], [label]]
     assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
 
 
@@ -402,6 +414,165 @@ def test_a_declined_fee_survives_a_timeout_and_the_printed_recover_keeps_it(
     assert _out_spk(reveal, 1) == wallet.script
     assert not node.cli("gettxout", commit_txid, "0")
     assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
+
+
+def test_a_name_reported_taken_at_the_last_check_is_not_paid_on_chain(
+    node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Panel D-L2 against a node: the indexer is asked once more AFTER the reveal's confirmation
+    and immediately before its broadcast. Free before the commit, free when the reveal prompt is
+    built, taken at the last check: no reveal reaches the node, the fee's funding input (the
+    commit's change) stays unspent, and the printed decline still recovers the commit."""
+    label = "regtest-cli-late"
+    net, wallet = _wire(node, monkeypatch, available=[True, True, False])
+    stopped = _cli(tmp_path, "mint-nft", str(_metadata_file(tmp_path, label)), "--wave-treasury", _TREASURY_ON_REGTEST)
+    assert stopped.exit_code == 1, stopped.output
+    assert "registered now — NOT paying the registration fee" in stopped.stderr
+    assert net.asked == [[label], [label], [label]]
+    doc = json.loads(stopped.stdout)
+    commit_txid = doc["commit_txid"]
+    assert node.cli("gettxout", commit_txid, "0"), "the commit output should be confirmed and unspent"
+    assert node.cli("gettxout", commit_txid, "1"), "the fee's funding input should be unspent"
+
+    recovered = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(tmp_path / "absent.toml"),
+            "--json",
+            "--yes",
+            *shlex.split(doc["recover_without_wave_fee"])[1:],
+        ],
+    )
+    assert recovered.exit_code == 0, (recovered.output, recovered.exception)
+    reveal = _confirmed(node, json.loads(recovered.stdout)["reveal_txid"])
+    assert [(i["txid"], i["vout"]) for i in reveal["vin"]] == [(commit_txid, 0)]
+    assert _TREASURY_SCRIPT not in [bytes.fromhex(o["scriptPubKey"]["hex"]) for o in reveal["vout"]]
+    assert _out_spk(reveal, 1) == wallet.script
+
+
+def _no_wait_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _no_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        glyph_cmds,
+        "wait_for_confirmation",
+        functools.partial(confirm.wait_for_confirmation, max_iterations=1, sleep=_no_sleep),
+    )
+
+
+def _run_argv(tmp_path: pathlib.Path, argv: list[str]) -> Any:
+    return CliRunner().invoke(cli, ["--config", str(tmp_path / "absent.toml"), "--json", "--yes", *argv])
+
+
+def test_an_edited_record_treasury_is_not_paid_on_chain(
+    node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Panel D-L1 (and rounds 2-3) against a node. A mint that named a treasury times out; its
+    record is then edited to pay another address. Neither a bare resume-mint nor the command the
+    mint printed — which names the treasury the mint was given on its own command line (round 3)
+    — pays the edited one, nothing resume-mint prints names it, and the commit stays unspent on
+    the node. Once the record is put back, that command reveals and pays the treasury the mint
+    named."""
+    label = "regtest-cli-redirect"
+    net, _wallet = _wire(node, monkeypatch, available=[True])
+    net.mine_on_broadcast = False
+    _no_wait_once(monkeypatch)
+    stopped = _cli(tmp_path, "mint-nft", str(_metadata_file(tmp_path, label)), "--wave-treasury", _TREASURY_ON_REGTEST)
+    assert stopped.exit_code == 2, stopped.output
+    doc = json.loads(stopped.stdout)
+    commit_txid = doc["commit_txid"]
+    # Round 3: the mint's own command may name the treasury this process was given.
+    assert shlex.split(doc["recover"])[-2:] == ["--wave-treasury", _TREASURY_ON_REGTEST]
+    typed = shlex.split(doc["recover"])[1:]
+    node.mine(1)
+    net.mine_on_broadcast = True
+
+    record = tmp_path / "pending-mints" / f"{commit_txid}.json"
+    honest = record.read_text()
+    edited = json.loads(honest)
+    edited["wave_treasury"] = PrivateKey().public_key().address(network=Network.TESTNET)
+    record.write_text(json.dumps(edited))
+
+    printed = _run_argv(tmp_path, typed)
+    assert printed.exit_code == 1
+    assert "the treasury this run names is not the one the record says the mint chose" in printed.stderr
+    bare = _cli(tmp_path, "resume-mint", commit_txid)
+    assert bare.exit_code == 1 and "needs the WAVE registration fee choice" in bare.stderr
+    assert edited["wave_treasury"] not in bare.output + printed.output
+    # A refusal prints commands from the RECORD: the placeholder, never an address.
+    assert "'<ADDRESS>'" in printed.output
+    assert node.cli("gettxout", commit_txid, "0"), "nothing may have spent the commit"
+
+    record.write_text(honest)
+    recovered = _run_argv(tmp_path, typed)
+    assert recovered.exit_code == 0, (recovered.output, recovered.exception)
+    reveal = _assert_the_fee_output(node, json.loads(recovered.stdout)["reveal_txid"], 1, label, 5)
+    assert (reveal["vin"][0]["txid"], reveal["vin"][0]["vout"]) == (commit_txid, 0)
+    assert not node.cli("gettxout", commit_txid, "0")
+    assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
+
+
+class _WithholdsTheReveal:
+    """The node's stand-in, lying: a reveal is echoed and never relayed, then reported confirmed."""
+
+    def __init__(self, net: _NodeNet) -> None:
+        self.net = net
+        self.withheld: list[str] = []
+
+    async def __aenter__(self) -> _WithholdsTheReveal:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.net, name)
+
+    async def broadcast(self, raw: bytes) -> str:
+        tx = Transaction.from_hex(bytes(raw))
+        if any(GlyphInspector().extract_reveal_cbor(i.unlocking_script.serialize()) for i in tx.inputs):
+            self.withheld.append(str(tx.txid()))
+            return str(tx.txid())
+        return await self.net.broadcast(raw)
+
+    async def get_transaction_verbose(self, txid: Any) -> dict:
+        if str(txid) in self.withheld:
+            return {"confirmations": 1}
+        return await self.net.get_transaction_verbose(txid)
+
+
+def test_a_reveal_a_server_withheld_is_recovered_from_the_archived_record(
+    node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#736 rounds 2-3 against a node. The server echoes mint-nft's reveal without relaying it and
+    reports it confirmed: mint-nft "succeeds" while the node still holds the commit unspent. The
+    record was deleted at that point before round 2; it is archived now, the success output says
+    the server REPORTS the reveal confirmed and prints the command that reveals the commit through
+    another server (round 3), and that command, run against an honest server, reveals it on chain."""
+    label = "regtest-cli-withheld"
+    net, _wallet = _wire(node, monkeypatch, available=[True])
+    liar = _WithholdsTheReveal(net)
+    monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: liar)
+    fooled = _cli(tmp_path, "mint-nft", str(_metadata_file(tmp_path, label)), "--wave-treasury", _TREASURY_ON_REGTEST)
+    assert fooled.exit_code == 0, fooled.output
+    commit_txid = json.loads(fooled.stdout)["commit_txid"]
+    assert liar.withheld and node.cli("gettxout", commit_txid, "0"), "the commit should still be unspent"
+    assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
+    assert (tmp_path / "pending-mints" / "done" / f"{commit_txid}.json").exists()
+    said = json.loads(fooled.stdout)
+    assert said["reveal_confirmed"] == "reported by the server; not independently verified"
+    recover = shlex.split(said["recover_if_not_mined"])
+    assert recover[1:3] == ["--electrumx", "<another-server-url>"]
+    assert recover[-2:] == ["--wave-treasury", _TREASURY_ON_REGTEST]
+
+    monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: net)
+    recovered = _run_argv(tmp_path, [a.replace("<another-server-url>", "tcp://127.0.0.1:1") for a in recover[1:]])
+    assert recovered.exit_code == 0, (recovered.output, recovered.exception)
+    reveal = _assert_the_fee_output(node, json.loads(recovered.stdout)["reveal_txid"], 1, label, 5)
+    assert (reveal["vin"][0]["txid"], reveal["vin"][0]["vout"]) == (commit_txid, 0)
+    assert not node.cli("gettxout", commit_txid, "0")
 
 
 # ─────────────────────────────────────────────────────────────── (4) negative ──

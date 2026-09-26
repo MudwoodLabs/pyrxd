@@ -151,6 +151,7 @@ def cli(
         # configured — that case fails closed in CliContext.make_client() with a
         # message naming what to add, instead of silently borrowing mainnet's.
         electrumx_url=cfg.electrumx,
+        electrumx_override=electrumx_url,
         fee_rate=cfg.fee_rate,
         wallet_path=(wallet_path.expanduser() if wallet_path else cfg.wallet_path),
         output_mode=("json" if json_output else "quiet" if quiet else "human"),

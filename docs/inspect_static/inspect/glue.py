@@ -4,8 +4,8 @@ This module is loaded into the Pyodide WASM runtime by ``inspect.js`` and
 exposes, among others, :func:`run` for offline classification of a
 user-pasted string, :func:`inspect_txid_with_raw` for classifying a
 transaction whose raw bytes JS already fetched, and
-:func:`spent_output_binding` for checking a reveal's payload against the
-commit it spent. Each returns a JSON-serialisable dict that the JS side
+:func:`spent_output_bindings` for checking a reveal's payloads against the
+commits they spent (:func:`spent_output_binding` is its one-prevout form). Each returns a JSON-serialisable dict that the JS side
 renders without further parsing.
 
 Design rules:
@@ -219,8 +219,8 @@ def inspect_txid_with_raw(
     drawer — is bounded by it. The size of one entry is not (``classify_raw_tx`` says which
     entries can be large). ``None`` lists everything.
 
-    The payload binding is NOT decided here: :func:`spent_output_binding` does that, once the
-    page has fetched the transaction the reveal spent.
+    The payload binding is NOT decided here: :func:`spent_output_bindings` does that, once the
+    page has fetched the transactions the payload ``binding_candidates`` names.
 
     The JS side opens a WebSocket to the configured ElectrumX server,
     sends ``blockchain.transaction.get`` for ``txid``, and hands the
@@ -287,6 +287,18 @@ def inspect_txid_with_raw(
             ),
         )
 
+    return {
+        "ok": True,
+        "form": "txid",
+        "input": txid,
+        "payload": _finish_payload(payload),
+    }
+
+
+def _finish_payload(payload: dict) -> dict:
+    """What the page draws from a ``classify_raw_tx`` payload: its display warnings added, every
+    string sanitised and capped. ONE step, for the first classification and for the one
+    :func:`spent_output_bindings` redoes when the headline moves."""
     # Annotate metadata strings with homoglyph / script-mixing warnings.
     # The control-byte sanitizer runs in the next step, but it doesn't
     # catch a token deployer who names their token "USDC" using a
@@ -339,13 +351,7 @@ def inspect_txid_with_raw(
         if warnings:
             metadata["display_warnings"] = warnings
 
-    sanitized = _sanitize_payload_strings(payload)
-    return {
-        "ok": True,
-        "form": "txid",
-        "input": txid,
-        "payload": sanitized,
-    }
+    return _sanitize_payload_strings(payload)
 
 
 def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", prev_fetch_error: object = "") -> dict:
@@ -358,8 +364,9 @@ def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", pre
 
     It does NOT classify the transaction again. Re-running the whole classifier to change one
     field of its metadata was what this step used to cost; the answer comes from
-    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope and
-    the one output it spent, and which the CLI's ``--fetch`` calls too. The spent transaction is
+    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope, the
+    one output it spent, and the reveal's own output scripts (for the ref that output's commit
+    demands), and which the CLI's ``--fetch`` calls too. The spent transaction is
     hash-checked there against the txid in the outpoint before anything is read out of it.
 
     Returns ``{"ok": True, "binding": {...}}`` — ``binding`` is ``None`` when no input is
@@ -380,24 +387,107 @@ def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", pre
     except ValueError as exc:
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
-    spent_raw: bytes | None = None
-    text = prev_raw_hex.strip()
-    if text:
-        if len(text) > _MAX_RAW_HEX_CHARS:
-            prev_fetch_error = f"the answer is {len(text):,} hex characters, larger than any transaction"
-        else:
-            try:
-                spent_raw = bytes.fromhex(text)
-            except ValueError as exc:
-                prev_fetch_error = f"the answer is not valid hex ({_safe_error(exc)})"
-    elif not prev_fetch_error:
-        prev_fetch_error = "the page handed over no spent transaction and no reason"
-
+    spent_raw, prev_fetch_error = _spent_answer(prev_raw_hex, prev_fetch_error)
     try:
         binding = _inspect.spent_output_binding(txid.strip().lower(), raw, spent_raw, spent_error=prev_fetch_error)
     except Exception as exc:
         return _err(_safe_error(exc), form="error")
     return {"ok": True, "binding": _sanitize_payload_strings(binding)}
+
+
+def _spent_answer(prev_raw_hex: str, prev_fetch_error: str) -> tuple[bytes | None, str]:
+    """``(the spent transaction's bytes, or None; why there are none)`` from what the page's fetch
+    handed over: hex, or nothing and a reason."""
+    text = prev_raw_hex.strip()
+    if text:
+        if len(text) > _MAX_RAW_HEX_CHARS:
+            return None, f"the answer is {len(text):,} hex characters, larger than any transaction"
+        try:
+            return bytes.fromhex(text), prev_fetch_error
+        except ValueError as exc:
+            return None, f"the answer is not valid hex ({_safe_error(exc)})"
+    return None, prev_fetch_error or "the page handed over no spent transaction and no reason"
+
+
+def spent_output_bindings(
+    txid: str,
+    raw_hex: str,
+    prevs_json: object = "{}",
+    errors_json: object = "{}",
+    attest_hashmark_limit: object = None,
+    max_rows: object = None,
+) -> dict:
+    """``payload_binding`` for the reveal *raw_hex* carries, against every transaction the page
+    fetched for its ``binding_candidates`` — and the headline those rank first.
+
+    The page's SECOND step. :func:`inspect_txid_with_raw` names, in ``binding_candidates``, the
+    outpoints of the minting payloads' inputs; the page fetches each and hands them here as
+    ``prevs_json``, a JSON object of ``{outpoint: hex}``, with ``errors_json`` saying why for each
+    it could not get. JSON strings, not JavaScript objects, so what crosses the bridge is text the
+    way every other argument here is. ``pyrxd.glyph.inspect.spent_output_bindings`` hash-checks
+    each and decides; the CLI's ``--fetch`` calls the same function.
+
+    Returns ``{"ok": True, "binding": {...} | None}``, and — when that function says the
+    classification must be redone (the headline moved to a bound payload, or another payload's
+    row has a verdict to show) — ``"payload"``: the transaction classified again with the spent
+    scripts, finished exactly as :func:`inspect_txid_with_raw` finishes its own, with *max_rows*
+    and *attest_hashmark_limit* as the page passed there. Otherwise nothing is classified again.
+    Or the usual ``{"ok": False, ...}``. Never raises.
+    """
+    import json
+
+    if not isinstance(txid, str) or not isinstance(raw_hex, str):
+        return _err("txid and raw_hex must both be strings", form="error")
+    attest_hashmark_limit = _whole_number("attest_hashmark_limit", attest_hashmark_limit)
+    if isinstance(attest_hashmark_limit, dict):
+        return attest_hashmark_limit
+    max_rows = _whole_number("max_rows", max_rows)
+    if isinstance(max_rows, dict):
+        return max_rows
+    raw_hex = raw_hex.strip()
+    if len(raw_hex) > _MAX_RAW_HEX_CHARS:
+        return _err(f"raw_hex too long ({len(raw_hex):,} chars); cap is {_MAX_RAW_HEX_CHARS:,}", form="error")
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError as exc:
+        return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
+    try:
+        prevs = json.loads(prevs_json) if isinstance(prevs_json, str) else None
+        errors = json.loads(errors_json) if isinstance(errors_json, str) else None
+    except ValueError as exc:
+        return _err(f"prevs_json / errors_json is not JSON: {_safe_error(exc)}", form="error")
+    if not isinstance(prevs, dict) or not isinstance(errors, dict):
+        return _err("prevs_json and errors_json must each be a JSON object", form="error")
+
+    spent: dict[str, bytes | None] = {}
+    said: dict[str, str] = {}
+    for outpoint in list(prevs) + [op for op in errors if op not in prevs]:
+        hex_text = prevs.get(outpoint)
+        spent[str(outpoint)], said[str(outpoint)] = _spent_answer(
+            hex_text if isinstance(hex_text, str) else "", str(errors.get(outpoint) or "")
+        )
+
+    txid = txid.strip().lower()
+    try:
+        answer = _inspect.spent_output_bindings(txid, raw, spent, said)
+        if answer is None:
+            return {"ok": True, "binding": None}
+        out = {"ok": True, "binding": _sanitize_payload_strings(answer["binding"])}
+        if answer["reclassify"]:
+            # The headline's verdict, every other minting payload's and the count past the fetch
+            # limit are written by `classify_with_bindings` — the step the CLI takes too.
+            payload = _inspect.classify_with_bindings(
+                txid,
+                raw,
+                answer,
+                network=_PAGE_NETWORK,
+                attest_hashmark_limit=attest_hashmark_limit,
+                max_rows=max_rows,
+            )
+            out["payload"] = _finish_payload(payload)
+    except Exception as exc:
+        return _err(_safe_error(exc), form="error")
+    return out
 
 
 # Whether a Letter codepoint is Latin-script (A-Z, a-z, plus Latin
