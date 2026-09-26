@@ -478,8 +478,12 @@ def _json_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _statement_field_defect(record: HashMarkRecord, network_genesis: object) -> str | None:
+def _statement_field_defect(record: HashMarkRecord) -> str | None:
     """Why *record* cannot be turned into a §5.6 statement, or ``None`` if it can.
+
+    The RECORD's fields only. The genesis is the caller's context, not the record's, and a bad
+    one is the caller's error — see :func:`_genesis_spelling_defect` and where
+    :func:`verify_attestation` raises on it.
 
     Only TYPES are checked — whether each field is the kind of value the statement is built
     from. Whether the values are RIGHT is the signature's job, and a wrong value simply fails to
@@ -496,8 +500,27 @@ def _statement_field_defect(record: HashMarkRecord, network_genesis: object) -> 
             return f"{name} is {type(getattr(record, name)).__name__}, not a hex string"
     if record.label is not None and not isinstance(record.label, str):
         return f"label is {type(record.label).__name__}, not a string"
-    if not isinstance(network_genesis, str):
-        return f"network_genesis is {type(network_genesis).__name__}, not a genesis hash string"
+    return None
+
+
+def _genesis_spelling_defect(network_genesis: object) -> str | None:
+    """Why *network_genesis* is not spelled as §5.6 requires — 64 lowercase hex — or ``None``.
+
+    ONE DEFINITION, BOTH SIDES. The writer refuses to sign against a bad spelling
+    (:func:`_require_signable_genesis`); the reader refuses to verify against one
+    (:func:`verify_attestation`). The rule is the same because the statement is the same: a
+    genesis spelled any other way is a different statement from the one every conforming
+    verifier builds.
+    """
+    if (
+        not isinstance(network_genesis, str)
+        or len(network_genesis) != 64
+        or any(c not in "0123456789abcdef" for c in network_genesis)
+    ):
+        return (
+            f"network_genesis must be the chain's genesis hash as 64 lowercase hex characters in "
+            f"RPC/display byte order (spec 5.6), got {network_genesis!r}"
+        )
     return None
 
 
@@ -523,8 +546,9 @@ def _public_key_shape_defect(public_key: object, *, compressed: bool) -> str | N
 def _require_signable_genesis(network_genesis: object, *, allow_unknown_genesis: bool = False) -> str:
     """*network_genesis*, if a v2 statement may be SIGNED against it — otherwise raise.
 
-    THIS IS THE WRITE SIDE ONLY. :func:`verify_attestation` takes whatever genesis its caller
-    has, because a reader checks a record against the chain it was found on and cannot choose.
+    THIS IS THE WRITE SIDE. :func:`verify_attestation` shares only the spelling rule: it takes
+    any correctly spelled genesis its caller has, known or not, because a reader checks a record
+    against the chain it was found on and cannot choose.
     A WRITER chooses, and a wrong choice is permanent: the statement is signed, published, and
     — because the genesis is not carried by the record — verifies against nothing but the exact
     string it was signed with, which no verifier on a real chain will supply.
@@ -541,27 +565,30 @@ def _require_signable_genesis(network_genesis: object, *, allow_unknown_genesis:
     * **The chain** — one pyrxd ships a genesis for (mainnet, testnet, regtest), unless the caller
       passes ``allow_unknown_genesis=True``. That is for a chain pyrxd has no constant for (a
       private fork); it relaxes ONLY this rule, never the spelling.
+
+    A KNOWN genesis in reversed (internal) byte order is refused even with the opt-out. It is
+    well-formed hex and names no chain pyrxd knows, so the opt-out used to wave it through — and
+    it is not "another chain", it is mainnet (or testnet, or regtest) spelled backwards, a
+    statement no verifier on that chain will ever build. The check runs before the opt-out for
+    that reason.
     """
-    if (
-        not isinstance(network_genesis, str)
-        or len(network_genesis) != 64
-        or any(c not in "0123456789abcdef" for c in network_genesis)
-    ):
+    spelling = _genesis_spelling_defect(network_genesis)
+    if spelling is not None:
         raise ValidationError(
-            f"network_genesis must be the chain's genesis hash as 64 lowercase hex characters in "
-            f"RPC/display byte order (spec 5.6), got {network_genesis!r} — a network NAME or an "
-            f"uppercase spelling is a different statement from the one a verifier checks, so the "
-            f"mark would never verify"
+            f"{spelling} — a network NAME or an uppercase spelling is a different statement from the "
+            f"one a verifier checks, so the mark would never verify"
         )
-    if allow_unknown_genesis or network_genesis in GENESIS_BLOCK_HASHES.values():
-        return network_genesis
-    reversed_hex = bytes.fromhex(network_genesis)[::-1].hex()
+    genesis_hex = str(network_genesis)  # already a str: the spelling check refused anything else
+    reversed_hex = bytes.fromhex(genesis_hex)[::-1].hex()
     for name, genesis in GENESIS_BLOCK_HASHES.items():
         if reversed_hex == genesis:
             raise ValidationError(
                 f"network_genesis is the {name} genesis hash in INTERNAL (reversed) byte order; "
-                f"the signed statement uses RPC/display order, {genesis} (spec 5.6)"
+                f"the signed statement uses RPC/display order, {genesis} (spec 5.6). "
+                f"allow_unknown_genesis does not cover this: it is not another chain."
             )
+    if allow_unknown_genesis or genesis_hex in GENESIS_BLOCK_HASHES.values():
+        return genesis_hex
     raise ValidationError(
         f"network_genesis {network_genesis} is not the genesis of any chain pyrxd knows "
         f"({', '.join(sorted(GENESIS_BLOCK_HASHES))}); a statement signed for it cannot be checked by "
@@ -605,6 +632,12 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     Needs the chain's genesis hash, which is why this is not part of decoding: a
     dependency-free decoder does not have it, and the same bytes on another chain
     are a different statement.
+
+    :raises ValidationError: if *network_genesis* is not a genesis hash spelled as §5.6
+        requires (64 lowercase hex). That is the caller's error, and it is never reported as
+        a verdict on the record. Any genesis spelled correctly is accepted — including one
+        pyrxd has no constant for — because a reader verifies against the chain it found the
+        record on, and does not get to choose it.
     """
     from ..hash import hash160, hash256
     from ..utils import text_digest
@@ -630,6 +663,17 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # record, are decided by their bytes alone. They used to be decided AFTER the curve was
     # looked up — so with no backend and no coincurve every v1 record re-attempted the
     # import and came back NOT CHECKED, when the true answer (NO SIGNATURE) needs nothing.
+    #
+    # THE CALLER'S GENESIS IS CHECKED BEFORE ANYTHING ELSE, AND IT RAISES. It is not part of the
+    # record — it is the context the caller verifies in — so a bad one is the caller's error and
+    # never a verdict on the record. Returning INVALID_SIGNATURE for it (which an earlier version
+    # of this check did, for `None`, `bytes` and `int`) read as "DOES NOT VERIFY": an accusation
+    # against an honest signer on the strength of the caller's own mistake, the same wrong
+    # direction a broken backend is kept out of below. A malformed spelling (uppercase, a network
+    # name) raises too: it is a statement no signer made, so every honest record would "fail" it.
+    genesis_defect = _genesis_spelling_defect(network_genesis)
+    if genesis_defect is not None:
+        raise ValidationError(genesis_defect)
     if not record.ok:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail="record did not decode")
     if record.version != 2 or not record.signature_hex or not record.signer_hash160_hex:
@@ -687,7 +731,7 @@ def verify_attestation(record: HashMarkRecord, *, network_genesis: str = RADIANT
     # `canonical_statement` and raised TypeError out of a function whose whole contract is
     # "return one of four outcomes". Checked HERE, where the statement is built — after §6.3's
     # signature checks, so a record whose signature is malformed is still told that first.
-    field_defect = _statement_field_defect(record, network_genesis)
+    field_defect = _statement_field_defect(record)
     if field_defect is not None:
         return AttestationResult(AttestationOutcome.INVALID_SIGNATURE, detail=field_defect)
     statement = canonical_statement(record, network_genesis=network_genesis)

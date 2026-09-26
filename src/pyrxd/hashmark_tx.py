@@ -348,6 +348,40 @@ def _client_chain_genesis(client: Any) -> str | None:
     return genesis if isinstance(genesis, str) else None
 
 
+async def _require_client_on_chain(client: Any, genesis: str) -> None:
+    """Refuse unless the SERVER behind *client* is on the chain *genesis* names.
+
+    The server is asked (``assert_chain``), not only the client's own declaration read. Both
+    shipped clients implement it: :class:`~pyrxd.network.electrumx.ElectrumXClient` — the plain
+    client the docs and README construct, which carries no profile at all — and
+    :class:`~pyrxd.network.failover.FailoverElectrumXClient`, whose profile genesis may be ``None``
+    (an unknown network) or declared but never checked (``verify_chain=False``). Comparing the
+    profile alone skipped the first two outright and trusted the third.
+
+    A client that cannot be asked is REFUSED, not waved through. The statement being funded is
+    bound to one chain and cannot be edited once published; a client that cannot say which chain
+    it is on is not one to publish it through.
+
+    :raises ValidationError: the server is on another chain, or the client cannot be asked.
+    :raises NetworkError: the server could not be reached to ask.
+    """
+    import inspect
+
+    assert_chain = getattr(client, "assert_chain", None)
+    if not callable(assert_chain):
+        raise ValidationError(
+            f"{type(client).__name__} cannot say which chain it is on (it has no assert_chain), so "
+            f"a mark signed for genesis {genesis} cannot be published through it safely — use an "
+            f"ElectrumXClient or a FailoverElectrumXClient"
+        )
+    pending = assert_chain(genesis)
+    if not inspect.isawaitable(pending):
+        raise ValidationError(
+            f"{type(client).__name__}.assert_chain did not return an awaitable, so the chain was not checked"
+        )
+    await pending
+
+
 async def build_hashmark_mark(
     wallet: Any,
     plan: MarkPlan,
@@ -372,13 +406,18 @@ async def build_hashmark_mark(
     burning an NFT to publish a hash about a file would be a memorable way to close this
     issue.
 
+    *client* must be able to prove which chain it is on: its server is asked
+    (``assert_chain``) before anything is funded — see :func:`_require_client_on_chain`.
+
     Raises:
         ~pyrxd.security.errors.ValidationError: *plan* is not a :class:`MarkPlan`, or
-            *client* names a chain whose genesis is not the one the plan was signed for,
-            or the fee rate is out of bounds, or the signed transaction does not pay for
-            its own size.
+            *client*'s server is not on the chain the plan was signed for, or *client*
+            cannot be asked, or the fee rate is out of bounds, or the signed transaction
+            does not pay for its own size.
         ~pyrxd.security.errors.InsufficientFundsError: no plain-RXD UTXO large enough.
             Raised before anything is signed.
+        ~pyrxd.security.errors.NetworkError: the server could not be reached to ask which
+            chain it is on.
     """
     from .fee_models import SatoshisPerKilobyte
     from .fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
@@ -399,11 +438,9 @@ async def build_hashmark_mark(
     # THE PLAN SAYS WHICH CHAIN THE STATEMENT IS ABOUT; THE CLIENT SAYS WHICH CHAIN IT IS ON.
     # Nothing compared them, so a plan signed for mainnet was funded and signed through a testnet
     # client without complaint — and the record, once broadcast, does not verify on the chain that
-    # carries it. Compared whenever the client names its chain (a `FailoverElectrumXClient`
-    # carries its `NetworkProfile`, and by default checks each server against that genesis on first
-    # use). A client that names no chain cannot be compared, and is not refused for it: a plain
-    # `ElectrumXClient` carries no profile, and refusing it would refuse every honest caller
-    # using one.
+    # carries it. Two steps. First the client's own declaration, when it makes one — free, and the
+    # clearest message. Then, below and before any funding, the SERVER is asked; that is the step
+    # that covers a client which declares nothing.
     client_genesis = _client_chain_genesis(client)
     if client_genesis is not None and client_genesis != plan.network_genesis:
         raise ValidationError(
@@ -420,6 +457,9 @@ async def build_hashmark_mark(
         allow_below_relay_floor=allow_below_relay_floor,
         error_type=ValidationError,
     )
+
+    # After the checks that cost nothing, before the first funding read.
+    await _require_client_on_chain(client, plan.network_genesis)
 
     script = plan.op_return_script
     needed = hashmark_mark_funding_bar(script, fee_rate)

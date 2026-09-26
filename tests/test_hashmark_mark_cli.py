@@ -148,6 +148,11 @@ class _MarkHarness:
 
         self.client = MagicMock()
         self.client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        # A server that says yes to whichever chain it is asked about, and records the asking.
+        # The builder REFUSES a client it cannot ask, so the stub has to answer; the real
+        # `assert_chain`, refusing a wrong chain, is driven in
+        # `TestTheBuilderComparesThePlansChainWithTheClients` through a real `ElectrumXClient`.
+        self.client.assert_chain = AsyncMock(side_effect=lambda genesis: genesis)
         self.client.broadcast = _bcast
         self.client.__aenter__ = AsyncMock(return_value=self.client)
         self.client.__aexit__ = AsyncMock(return_value=None)
@@ -348,10 +353,11 @@ class TestThePlanIsForAChainSomeoneCanCheck:
     )
     def test_bytes_that_self_verify_for_a_non_genesis_cannot_become_a_plan(self, genesis: str) -> None:
         script = _hand_signed_for(genesis)
-        assert verify_attestation(decode_hashmark(script), network_genesis=genesis).valid, (
-            "non-vacuity: these bytes DO self-verify against the string they were signed for — "
-            "that circularity is the defect"
-        )
+        assert decode_hashmark(script).ok, "non-vacuity: a well-formed record, so only the genesis can refuse it"
+        if genesis and genesis == genesis.lower() and len(genesis) == 64:
+            # Well-formed hex: the reader still accepts it as a genesis, and the bytes DO verify
+            # against the string they were signed for — that circularity is the defect.
+            assert verify_attestation(decode_hashmark(script), network_genesis=genesis).valid
         with pytest.raises(ValidationError, match="network_genesis"):
             MarkPlan(op_return_script=script, network_genesis=genesis)
 
@@ -371,6 +377,21 @@ class TestThePlanIsForAChainSomeoneCanCheck:
         assert plan.network_genesis == genesis and plan.attestation.valid
         assert MarkPlan(op_return_script=plan.op_return_script, network_genesis=genesis).attestation.valid
 
+    def test_the_opt_out_does_not_cover_a_known_genesis_reversed(self) -> None:
+        """Through ``plan_hashmark`` and through a hand-built ``MarkPlan``, the door that skips the
+        encoder: the reversed mainnet hash is refused whether or not ``allow_unknown_genesis`` is set."""
+        with pytest.raises(ValidationError, match="reversed"):
+            plan_hashmark(
+                hashlib.sha256(b"x").digest(),
+                PrivateKey(),
+                network_genesis=_MAINNET_REVERSED,
+                allow_unknown_genesis=True,
+            )
+        script = _hand_signed_for(_MAINNET_REVERSED)
+        assert verify_attestation(decode_hashmark(script), network_genesis=_MAINNET_REVERSED).valid, "non-vacuity"
+        with pytest.raises(ValidationError, match="reversed"):
+            MarkPlan(op_return_script=script, network_genesis=_MAINNET_REVERSED, allow_unknown_genesis=True)
+
     def test_another_chain_plans_only_when_the_caller_says_so_and_never_with_a_bad_spelling(self) -> None:
         other = "00" * 31 + "01"
         digest, key = hashlib.sha256(b"x").digest(), PrivateKey()
@@ -384,10 +405,46 @@ class TestThePlanIsForAChainSomeoneCanCheck:
             plan_hashmark(digest, key, network_genesis="mainnet", allow_unknown_genesis=True)
 
 
+#: Radiant MAINNET's genesis header, 80 bytes — the value `tests/network/test_electrumx.py` and
+#: `tests/network/test_registry.py` pin to the registry constant. A server that serves THIS as block 0
+#: is a mainnet server, whatever its URL or its client's profile says.
+_MAINNET_GENESIS_HEADER = bytes.fromhex(
+    "01000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "372cbaf89794aeed5e711b02e78ec4502ad8b315a987c2e2758a85e36a3f7c02"
+    "aadeaf62"
+    "ffff001d"
+    "7980b72a"
+)
+
+
+def _plain_client_on_mainnet(h: _MarkHarness):
+    """A REAL ``ElectrumXClient`` whose server is on mainnet: block 0 is the mainnet header.
+
+    Only the two wire reads are replaced — the header and the funding transactions — so the
+    ``assert_chain`` that decides these tests is the shipped one, hashing the header itself.
+    """
+    from pyrxd.network.electrumx import ElectrumXClient
+
+    client = ElectrumXClient(["wss://electrumx.invalid:50022"])
+
+    async def _header(height):
+        assert int(height) == 0
+        return _MAINNET_GENESIS_HEADER
+
+    client.get_block_header = _header  # type: ignore[method-assign]
+    client.get_transaction = h.client.get_transaction  # type: ignore[method-assign]
+    return client
+
+
 class TestTheBuilderComparesThePlansChainWithTheClients:
     """A plan says which chain its statement is about; a client says which chain it is on.
-    Nothing compared the two, so a mainnet plan built and would broadcast through a testnet
-    client — a record that verifies on neither chain it could be read on."""
+
+    Nothing compared the two, so a mainnet plan built through a testnet client. The first fix
+    compared only a ``NetworkProfile``'s DECLARED genesis, which skipped the plain
+    ``ElectrumXClient`` the docs construct (it has no profile) and a ``FailoverElectrumXClient``
+    whose profile has none. The builder now asks the SERVER, and refuses a client it cannot ask.
+    """
 
     @staticmethod
     def _client_on(h: _MarkHarness, network: str) -> None:
@@ -395,7 +452,13 @@ class TestTheBuilderComparesThePlansChainWithTheClients:
 
         h.client.profile = NetworkProfile.build(network, ["wss://electrumx.invalid:50022"])
 
-    def test_a_mainnet_plan_through_a_testnet_client_is_refused_before_anything_is_funded(self) -> None:
+    def test_the_fixture_header_is_mainnets(self) -> None:
+        """Non-vacuity: every refusal below rests on this header hashing to mainnet's genesis."""
+        from pyrxd.network.electrumx import block_hash_hex
+
+        assert block_hash_hex(_MAINNET_GENESIS_HEADER) == GENESIS_BLOCK_HASHES["mainnet"]
+
+    def test_a_mainnet_plan_through_a_testnet_profile_is_refused_before_anything_is_funded(self) -> None:
         h = _MarkHarness()
         self._client_on(h, "testnet")
         plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)  # mainnet, the default
@@ -411,16 +474,74 @@ class TestTheBuilderComparesThePlansChainWithTheClients:
         plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key, network_genesis=GENESIS_BLOCK_HASHES[network])
         build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
         assert bytes(build.tx.outputs[0].locking_script.serialize()) == plan.op_return_script
+        h.client.assert_chain.assert_awaited_once_with(GENESIS_BLOCK_HASHES[network])
 
-    def test_a_client_that_names_no_chain_is_not_refused_for_it(self) -> None:
-        """A plain ``ElectrumXClient`` carries no profile. Refusing it would refuse every honest
-        caller using one; the comparison is made only when there is something to compare."""
+    @pytest.mark.parametrize("network", ["testnet", "regtest"])
+    def test_a_plain_electrumx_client_on_the_wrong_chain_is_refused_before_funding(self, network: str) -> None:
         h = _MarkHarness()
-        del h.client.profile  # a MagicMock answers every attribute; a plain client has no `profile`
-        assert not hasattr(h.client, "profile")
-        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)
-        build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
+        client = _plain_client_on_mainnet(h)
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key, network_genesis=GENESIS_BLOCK_HASHES[network])
+        with pytest.raises(ValidationError, match="wrong chain"):
+            asyncio.run(build_hashmark_mark(h.wallet, plan, client=client, fee_rate=FEE_RATE))
+        assert h.client.get_transaction.await_count == 0, "no funding UTXO was even looked at"
+
+    def test_the_honest_pair_a_plain_electrumx_client_on_the_plans_chain_builds(self) -> None:
+        h = _MarkHarness()
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)  # mainnet
+        build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=_plain_client_on_mainnet(h), fee_rate=FEE_RATE))
         assert bytes(build.tx.outputs[0].locking_script.serialize()) == plan.op_return_script
+
+    @pytest.mark.parametrize(
+        ("declared", "plan_network", "refused"),
+        [
+            (None, "regtest", True),  # a profile that declares no genesis: only the server can say
+            ("regtest", "regtest", True),  # declared regtest, never checked, and the server is mainnet
+            (None, "mainnet", False),  # the honest pair
+        ],
+        ids=["no-genesis-wrong-chain", "declared-but-unchecked-wrong-chain", "no-genesis-right-chain"],
+    )
+    def test_a_failover_client_that_cannot_vouch_for_its_server_is_asked(
+        self, declared: str | None, plan_network: str, refused: bool
+    ) -> None:
+        from pyrxd.network.failover import FailoverElectrumXClient
+        from pyrxd.network.registry import Endpoint, NetworkProfile
+
+        h = _MarkHarness()
+        profile = NetworkProfile(
+            network="devnet" if declared is None else declared,
+            endpoints=(Endpoint(url="wss://electrumx.invalid:50022"),),
+            genesis_hash=None if declared is None else GENESIS_BLOCK_HASHES[declared],
+        )
+        client = FailoverElectrumXClient(
+            profile, client_factory=lambda _ep: _plain_client_on_mainnet(h), verify_chain=False
+        )
+        plan = plan_hashmark(
+            hashlib.sha256(b"x").digest(), h.signer_key, network_genesis=GENESIS_BLOCK_HASHES[plan_network]
+        )
+        if refused:
+            with pytest.raises(ValidationError, match="wrong chain"):
+                asyncio.run(build_hashmark_mark(h.wallet, plan, client=client, fee_rate=FEE_RATE))
+            assert h.client.get_transaction.await_count == 0
+        else:
+            build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=client, fee_rate=FEE_RATE))
+            assert bytes(build.tx.outputs[0].locking_script.serialize()) == plan.op_return_script
+
+    def test_a_client_that_cannot_be_asked_is_refused_not_waved_through(self) -> None:
+        """It used to be waved through: "a client that names no chain cannot be compared, and is
+        not refused for it". That was the door a plain client walked through."""
+        h = _MarkHarness()
+        del h.client.assert_chain  # a MagicMock answers every attribute; this client cannot be asked
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)
+        with pytest.raises(ValidationError, match="cannot say which chain it is on"):
+            asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
+        assert h.client.get_transaction.await_count == 0
+
+    def test_an_assert_chain_that_returns_nothing_awaitable_checked_nothing_and_is_refused(self) -> None:
+        h = _MarkHarness()
+        h.client.assert_chain = MagicMock(return_value=None)
+        plan = plan_hashmark(hashlib.sha256(b"x").digest(), h.signer_key)
+        with pytest.raises(ValidationError, match="did not return an awaitable"):
+            asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=FEE_RATE))
 
 
 class TestTheBuilderTakesAPlanAndNothingElse:
@@ -626,9 +747,13 @@ class TestTheCommandShowsWhatWillBeSigned:
 
 #: Unicode TAG characters (category Cf) spelling "pay 9999", then WORD JOINER and SOFT HYPHEN.
 #: None is in §5.4's reject table, so the encoder signs them; a terminal that does not render
-#: format characters shows only "invoice 42".
-_HIDDEN = "".join(chr(0xE0000 + ord(c)) for c in "pay 9999") + "⁠­"
+#: format characters shows only "invoice 42". Every non-ASCII value below is written as an escape:
+#: this file must not itself carry the characters it is about.
+_HIDDEN = "".join(chr(0xE0000 + ord(c)) for c in "pay 9999") + "\u2060\u00ad"
 _HIDDEN_LABEL = "invoice 42" + _HIDDEN
+_DEVANAGARI = "\u0928\u092e\u0938\u094d\u0924\u0947"  # namaste; U+094D and U+0947 are combining marks
+_ZWJ_FAMILY = "\U0001f468\u200d\U0001f469\u200d\U0001f467"  # one emoji: three people joined by ZWJ
+_SCOTLAND = "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f"  # a flag in TAG chars
 
 
 class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
@@ -651,6 +776,7 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         assert not leaked, f"reached the terminal raw: {sorted(f'U+{ord(c):04X}' for c in leaked)}"
         escaped = "".join(f"<U+{ord(c):04X}>" for c in _HIDDEN)
         assert f"label:       invoice 42{escaped}" in result.output
+        assert f"ascii: {_HIDDEN_LABEL!a}" in result.output
         assert "THE LABEL HOLDS 10 CHARACTER(S) THAT DO NOT PRINT AS THEMSELVES" in result.output
         for name in ("TAG LATIN SMALL LETTER P", "TAG DIGIT NINE", "WORD JOINER", "SOFT HYPHEN"):
             assert name in result.output, name
@@ -659,35 +785,73 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
             assert f"label:      invoice 42{escaped}" in result.output, "the post-broadcast summary too"
             assert decode_hashmark(_published_script(h)).label == _HIDDEN_LABEL, "shown, and signed as typed"
 
-    @pytest.mark.parametrize(
-        "label",
-        [
-            "नमस्ते",  # Devanagari: U+094D VIRAMA and U+0947 are combining marks
-            "\U0001f468‍\U0001f469‍\U0001f467",  # family emoji, joined by ZWJ
-            "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f",  # Scotland flag: TAG chars
-        ],
-        ids=["devanagari", "zwj-emoji", "tag-flag"],
-    )
-    def test_the_honest_pair_text_5_4_permits_is_disclosed_never_refused(
+    @pytest.mark.parametrize("label", [_DEVANAGARI, _ZWJ_FAMILY], ids=["devanagari", "zwj-emoji"])
+    def test_the_honest_pair_script_shaping_reads_naturally_with_its_ascii_form_beside_it(
         self, runner, tmp_path, monkeypatch, label
     ) -> None:
-        """§5.4 calls ZWJ and ZWNJ "load-bearing in Devanagari and emoji sequences", and does not
-        reject combining marks or TAG characters, which honest labels use. Refusing them at the
-        CLI would refuse a label the spec allows; the banner is the answer instead."""
+        """§5.4 calls ZWJ and ZWNJ "load-bearing in Devanagari and emoji sequences". Escaping
+        combining marks and joiners made these labels unreadable on the one screen where the
+        operator checks them; they print as written now, and the ``ascii()`` form beside them
+        still names every codepoint. Not refused, and no banner: nothing here is hidden."""
         h = _MarkHarness()
         result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
         assert result.exit_code == 0, result.output
-        assert "DO NOT PRINT AS THEMSELVES" in result.output
+        assert f"label:       {label}" in result.output and f"label:      {label}" in result.output
+        assert f"ascii: {label!a}" in result.output
+        assert "DO NOT PRINT AS THEMSELVES" not in result.output and "<U+" not in result.output
         assert decode_hashmark(_published_script(h)).label == label
+
+    def test_a_flag_spelled_in_tag_characters_is_disclosed_never_refused(self, runner, tmp_path, monkeypatch) -> None:
+        """TAG characters are what hid "pay 9999" above, and nothing tells an honest flag's from an
+        attacker's, so they stay escaped under the banner — but the flag is still published."""
+        h = _MarkHarness()
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", _SCOTLAND])
+        assert result.exit_code == 0, result.output
+        assert "DO NOT PRINT AS THEMSELVES" in result.output and f"ascii: {_SCOTLAND!a}" in result.output
+        assert decode_hashmark(_published_script(h)).label == _SCOTLAND
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "inv\u043eice 42",  # a CYRILLIC small o between Latin letters
+            "pay\u2800me",  # BRAILLE PATTERN BLANK — renders as a space
+            "pay\u3164me",  # HANGUL FILLER — default-ignorable, a Letter
+            "pay\uffa0me",  # HALFWIDTH HANGUL FILLER
+            "pay\u115fme",  # HANGUL CHOSEONG FILLER
+            "pay\u1160me",  # HANGUL JUNGSEONG FILLER
+        ],
+        ids=["cyrillic-o", "braille-blank", "hangul-filler", "halfwidth-filler", "choseong-filler", "jungseong-filler"],
+    )
+    def test_a_character_that_looks_like_something_else_is_named_by_the_ascii_form(
+        self, runner, tmp_path, monkeypatch, label
+    ) -> None:
+        """None of these is a control or format character, so none is escaped and none raises the
+        banner; each prints as SOMETHING, just not what it is. The ``ascii()`` form is the only
+        place the operator can see the codepoint about to be signed."""
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
+        )
+        assert result.exit_code == 0, result.output
+        odd = next(c for c in label if not c.isascii())
+        assert f"ascii: {label!a}" in result.output
+        assert f"\\u{ord(odd):04x}" in result.output.split("ascii: ", 1)[1].splitlines()[0]
 
     def test_an_ordinary_label_is_printed_as_typed_with_no_banner(self, runner, tmp_path, monkeypatch) -> None:
         """A banner on every labelled mark is a banner nobody reads by the third one."""
+        label = "facture caf\u00e9 \u2600"
         result, _ = _invoke(
-            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", "facture café ☀"]
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
         )
         assert result.exit_code == 0, result.output
-        assert "label:       facture café ☀" in result.output
+        assert f"label:       {label}" in result.output and f"ascii: {label!a}" in result.output
         assert "DO NOT PRINT AS THEMSELVES" not in result.output and "<U+" not in result.output
+
+    def test_an_ascii_label_gets_no_ascii_line(self, runner, tmp_path, monkeypatch) -> None:
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", "advisory"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "label:       advisory" in result.output and "ascii: " not in result.output
 
 
 class TestTheFilePathCannotDriveTheTerminal:
@@ -977,6 +1141,7 @@ class TestTheWalletContractHoldsAgainstARealHdWallet:
 
         client = MagicMock()
         client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        client.assert_chain = AsyncMock(side_effect=lambda genesis: genesis)  # see _MarkHarness
         client.broadcast = _bcast
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=None)
@@ -1026,6 +1191,7 @@ class TestTheWalletContractHoldsAgainstARealHdWallet:
 
         client = MagicMock()
         client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        client.assert_chain = AsyncMock(side_effect=lambda genesis: genesis)  # see _MarkHarness
         client.broadcast = _bcast
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=None)

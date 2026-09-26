@@ -206,8 +206,34 @@ class TestAHandBuiltRecordGetsAVerdictNotATraceback:
         assert result.outcome is AttestationOutcome.INVALID_SIGNATURE
         assert result.detail
 
-    def test_a_genesis_that_is_not_a_string_is_refused_too(self) -> None:
-        assert verify_attestation(self._honest(), network_genesis=None).outcome is AttestationOutcome.INVALID_SIGNATURE  # type: ignore[arg-type]
+    @pytest.mark.parametrize(
+        "genesis",
+        [None, b"\x00" * 32, 0, 123, "mainnet", "", RADIANT_MAINNET_GENESIS.upper(), RADIANT_MAINNET_GENESIS + " "],
+        ids=["none", "bytes", "zero", "int", "a-network-name", "empty", "uppercase", "padded"],
+    )
+    def test_the_callers_bad_genesis_raises_and_is_never_a_verdict_on_an_honest_record(self, genesis) -> None:
+        """The genesis is the CALLER's context, not the record's. The first version of this check
+        returned INVALID_SIGNATURE for it — "DOES NOT VERIFY", an accusation against an honest
+        signer for the caller's mistake, the direction a broken backend is kept out of. It raises."""
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="network_genesis must be"):
+            verify_attestation(self._honest(), network_genesis=genesis)
+
+    def test_the_honest_pair_a_well_formed_genesis_is_accepted_known_or_not(self) -> None:
+        """Only the SPELLING is the reader's rule. A reader verifies against the chain it found the
+        record on and cannot choose it, so a well-formed genesis pyrxd has no constant for is a
+        real answer — "does not verify on that chain" — not a refusal."""
+        record = self._honest()
+        assert verify_attestation(record).valid
+        assert verify_attestation(record, network_genesis="00" * 32).outcome is AttestationOutcome.INVALID_SIGNATURE
+
+    def test_a_defect_in_the_RECORD_is_still_a_verdict_with_any_good_genesis(self) -> None:
+        """The other direction: moving the caller's error to a raise must not move the RECORD's."""
+        from dataclasses import replace
+
+        result = verify_attestation(replace(self._honest(), algorithm_id=None), network_genesis=RADIANT_MAINNET_GENESIS)
+        assert result.outcome is AttestationOutcome.INVALID_SIGNATURE and "algorithm id" in (result.detail or "")
 
     def test_the_honest_pair_the_same_record_unmodified_verifies(self) -> None:
         assert verify_attestation(self._honest()).valid

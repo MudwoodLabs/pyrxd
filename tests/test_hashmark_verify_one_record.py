@@ -366,6 +366,51 @@ class TestAQuestionAskedAndNotAnsweredFails:
         s = _summary(r.output)
         assert "file:       NOT CHECKED" in s and "signature:  NOT CHECKED" in s
 
+    def test_the_help_says_where_NOT_CHECKED_comes_from_in_THIS_command(self, tmp_path) -> None:
+        """It said NOT CHECKED holds "most often because the curve library is absent". This command
+        cannot run without one (the test below), so there it never means that. What it does mean
+        here: a question not asked, or a record this build cannot read — which the honest pair
+        above reaches through the command."""
+        flat = " ".join(_invoke(tmp_path, ["verify", "--help"]).output.split())
+        assert "curve library" not in flat
+        assert "you did not ask that question (no --file or --digest, no --wave-name)" in flat
+        assert "the record is a version or hash this build cannot read" in flat
+
+    def test_the_cli_cannot_load_without_a_curve_so_not_checked_never_means_that(self) -> None:
+        """The premise of the sentence above, made executable rather than left as prose. If the CLI
+        ever imports without coincurve, this fails, and the help must say NOT CHECKED can mean a
+        missing curve again. A fresh interpreter, so nothing already imported can hide it."""
+        import subprocess  # nosec B404 — fixed argv, no shell, this interpreter
+        import sys
+
+        import pyrxd
+
+        script = (
+            "import sys\n"
+            "class _NoCurve:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'coincurve' or name.startswith('coincurve.'):\n"
+            "            raise ImportError('coincurve blocked')\n"
+            "sys.meta_path.insert(0, _NoCurve())\n"
+            "import pyrxd.script.hashmark\n"  # control: the dependency-free half still loads
+            "try:\n"
+            "    import pyrxd.cli.main\n"
+            "except ImportError:\n"
+            "    print('CLI-REFUSED')\n"
+            "else:\n"
+            "    print('CLI-LOADED')\n"
+        )
+        src_root = str(Path(pyrxd.__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (src_root, os.environ.get("PYTHONPATH")) if p)}
+        proc = subprocess.run(  # nosec B603 — fixed argv, no shell, this interpreter
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=120, check=False
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip() == "CLI-REFUSED", (
+            "`pyrxd.cli.main` now imports without coincurve — `verify --help` says NOT CHECKED never "
+            "means a missing curve, which is no longer true"
+        )
+
     def test_the_help_says_what_HOLDS_means(self, tmp_path) -> None:
         r = _invoke(tmp_path, ["verify", "--help"])
         flat = " ".join(r.output.split())

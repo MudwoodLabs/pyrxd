@@ -110,15 +110,25 @@ def _canonical_label(label: str | None) -> tuple[str | None, bool]:
 _MAX_NAMED_LABEL_CODEPOINTS = 8
 
 
-def _prints_as_itself(ch: str) -> bool:
-    """Whether a terminal shows *ch* as a character of its own.
+#: The two joiners §5.4 calls "load-bearing in Devanagari and emoji sequences".
+_JOINERS = frozenset({"\u200c", "\u200d"})
 
-    Decided by the SAME predicate `pyrxd verify` and `glyph inspect` use to sanitise what they
-    print (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`), so what `mark` flags is
-    exactly what those two will later print as ``?``: control and format characters, private-use
-    and unassigned codepoints, line/paragraph separators, and combining marks.
+
+def _hides_on_screen(ch: str) -> bool:
+    """Whether *ch* can be signed without being seen — so `mark` prints it as ``<U+XXXX>``.
+
+    Starts from the predicate `pyrxd verify` and `glyph inspect` sanitise with
+    (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`): control and format characters,
+    private-use and unassigned codepoints, line/paragraph separators, combining marks. Two kinds
+    are then left to print as themselves, because they are how honest text is WRITTEN and
+    escaping them made a Devanagari label or a joined emoji unreadable on the one screen where the
+    operator checks it: combining marks (Mn, Me), which render ON their base character, and the
+    two joiners. Nothing escapes disclosure for it — every non-ASCII label also gets its
+    ``ascii()`` form, see :func:`_label_lines`.
     """
-    return _sanitize_display_string(ch) == ch
+    if _sanitize_display_string(ch) == ch:
+        return False
+    return not (ch in _JOINERS or unicodedata.category(ch) in ("Mn", "Me"))
 
 
 def _label_for_display(label: str | None) -> str:
@@ -132,7 +142,23 @@ def _label_for_display(label: str | None) -> str:
     """
     if label is None:
         return "(none)"
-    return "".join(ch if _prints_as_itself(ch) else f"<U+{ord(ch):04X}>" for ch in label)
+    return "".join(f"<U+{ord(ch):04X}>" if _hides_on_screen(ch) else ch for ch in label)
+
+
+def _label_lines(label: str | None, *, head: str, indent: str) -> list[str]:
+    """The ``label:`` line, and — for any label with a non-ASCII character — its ``ascii()`` form.
+
+    THE ESCAPES ABOVE ARE NOT THE WHOLE OF WHAT HIDES. Some characters print as something while
+    meaning something else: a Cyrillic ``о`` beside Latin letters, a Hangul filler (U+3164,
+    U+FFA0, U+115F, U+1160) or a blank Braille pattern (U+2800) that renders as white space. None
+    is a control or format character, so none is escaped, and none triggers the banner. The
+    ``ascii()`` form names every codepoint, so the operator can see what is about to be signed
+    whatever it looks like. An ASCII label gets no second line: its ``ascii()`` would say nothing new.
+    """
+    lines = [f"{head}{_label_for_display(label)}"]
+    if label is not None and not label.isascii():
+        lines.append(f"{indent}ascii: {label!a}  (the exact codepoints signed)")
+    return lines
 
 
 def _hidden_label_lines(label: str | None) -> list[str]:
@@ -143,12 +169,13 @@ def _hidden_label_lines(label: str | None) -> list[str]:
     Devanagari and emoji sequences". Refusing everything outside that table that a terminal cannot
     print would refuse text §5.4 permits: combining marks are ordinary in Indic scripts, TAG
     characters spell the England, Scotland and Wales flag emoji, and an emoji newer than this
-    Python's Unicode tables is "unassigned" here. pyrxd must not refuse an honest label, so it discloses: the
-    codepoints, their names, and how pyrxd's own readers will print the result.
+    Python's Unicode tables is "unassigned" here. pyrxd must not refuse an honest label, so it
+    discloses: the codepoints, their names, and how pyrxd's own readers will print the result.
+    Combining marks and the joiners are not listed here at all (see :func:`_hides_on_screen`).
     """
     if label is None:
         return []
-    hidden = [ch for ch in label if not _prints_as_itself(ch)]
+    hidden = [ch for ch in label if _hides_on_screen(ch)]
     if not hidden:
         return []
     distinct = list(dict.fromkeys(hidden))
@@ -162,9 +189,9 @@ def _hidden_label_lines(label: str | None) -> list[str]:
     if len(distinct) > _MAX_NAMED_LABEL_CODEPOINTS:
         lines.append(f"***   ... and {len(distinct) - _MAX_NAMED_LABEL_CODEPOINTS} more distinct codepoint(s)")
     lines.append(f"*** `pyrxd verify` and `glyph inspect` will print this label as: {_sanitize_display_string(label)}")
-    lines.append("*** HashMark 5.4 does not forbid these — joiners, emoji tag sequences and combining marks are")
-    lines.append("*** ordinary text in many scripts — so they are shown, not refused. If you did not put them")
-    lines.append("*** there, do not publish this: retype the label.")
+    lines.append("*** HashMark 5.4 does not forbid these — TAG characters spell flag emoji, and an emoji newer")
+    lines.append("*** than this Python is 'unassigned' here — so they are shown, not refused. If you did not")
+    lines.append("*** put them there, do not publish this: retype the label.")
     return lines
 
 
@@ -193,7 +220,7 @@ def _mark_lines(
     lines = [
         f"file:        {_sanitize_display_string(plan.source) if plan.source is not None else '(not recorded)'}",
         f"{plan.algorithm}:      {plan.digest_hex}",
-        f"label:       {_label_for_display(plan.label)}",
+        *_label_lines(plan.label, head="label:       ", indent="             "),
         f"signer:      {signer_address}",
         f"             hash160 {plan.signer_hash160_hex} — committed in the record and in the statement",
         f"network:     {network} (genesis {plan.network_genesis})",
@@ -440,7 +467,8 @@ def mark_cmd(
         click.echo(f"\nMarked: {txid}")
         click.echo(f"  file:       {_sanitize_display_string(str(file_path))}")
         click.echo(f"  {build.plan.algorithm}:     {build.plan.digest_hex}")
-        click.echo(f"  label:      {_label_for_display(build.plan.label)}")
+        for line in _label_lines(build.plan.label, head="  label:      ", indent="              "):
+            click.echo(line)
         click.echo(f"  signer:     {signer_address}")
         click.echo(f"  network:    {ctx.network} (genesis {build.plan.network_genesis})")
         click.echo(f"  record:     {build.plan.size_bytes} B")
@@ -483,12 +511,17 @@ EXIT_VERDICT_DOES_NOT_HOLD = 5
 #: Check states that leave the overall verdict standing. Everything else fails it.
 #:
 #: THE ASYMMETRY IS DELIBERATE AND IS THE ONE THING TO GET RIGHT HERE. "NOT CHECKED" holds;
-#: "NOT ESTABLISHED" does not. On the WRITE side `MarkPlan` treats an UNVERIFIABLE attestation
-#: as a refusal, because funding a broadcast needs the same curve library that signs and a mark
-#: nobody could self-check must not be published. On the READ side the same word means a missing
-#: capability in the READER — the curve library is absent — and failing the verdict on it would
-#: accuse an honest signer of forgery because of something missing on the verifier's machine.
-#: So it is reported loudly and does not fail.
+#: "NOT ESTABLISHED" does not. In THIS command "NOT CHECKED" means the tool did not examine
+#: something: a question the caller did not ask (no --file/--digest, no --wave-name), or a
+#: record this build cannot read (an unknown version or hash), which has no signature it could
+#: check. Neither is a finding against the record, and failing the verdict on it would accuse an
+#: honest signer. So it is reported loudly and does not fail.
+#:
+#: NOT "the curve library is absent", which this used to say. That is the shared inspect core's
+#: case in the BROWSER; the CLI cannot even import without coincurve, which
+#: `test_the_cli_cannot_load_without_a_curve_so_not_checked_never_means_that` pins. On the WRITE
+#: side `MarkPlan` refuses an UNVERIFIABLE attestation outright: a mark nobody could self-check
+#: must not be published.
 #:
 #: "NOT ESTABLISHED" is the opposite case: the caller ASKED a question (`--wave-name`) and it
 #: could not be answered. A gate that waves that through is the quiet, dangerous direction.
@@ -496,7 +529,7 @@ _CHECK_HOLDS = frozenset(
     {
         "VERIFIED",
         "NO SIGNATURE",  # a v1 record makes no signature claim; there is nothing to fail
-        "NOT CHECKED",  # a capability the reader lacks, or a question the caller did not ask
+        "NOT CHECKED",  # a question the caller did not ask, or a record this build cannot read
         "MATCHES",
         "ESTABLISHED",
         "CONFIRMED",
@@ -1052,9 +1085,10 @@ def verify_cmd(
 
     \b
     Exit codes: 0 the verdict holds, 5 it does not, 1 bad input, 2 network.
-    NOT CHECKED never fails the verdict — it means this tool did not check, most often because
-    the curve library is absent, and failing on it would accuse an honest signer of forgery for
-    something missing on YOUR machine. NOT ESTABLISHED and CANNOT COMPARE do fail it: you asked a
+    NOT CHECKED never fails the verdict. Here it means you did not ask that question (no --file
+    or --digest, no --wave-name), or the record is a version or hash this build cannot read, so
+    no signature in it could be checked. Neither is a finding against the record, and failing
+    on it would accuse an honest signer. NOT ESTABLISHED and CANNOT COMPARE do fail it: you asked a
     question and it could not be answered, and a gate that passes on "not answered" is worse
     than no gate.
 

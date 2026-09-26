@@ -527,6 +527,16 @@ class TestOnlyAGenesisSomeoneCanCheckIsSigned:
             decode_hashmark(encode_hashmark(_DIGEST, key, network_genesis=genesis)), network_genesis=genesis
         ).valid
 
+    @pytest.mark.parametrize("network", sorted(GENESIS_BLOCK_HASHES))
+    def test_a_known_genesis_reversed_is_refused_even_with_the_opt_out(self, key: PrivateKey, network: str) -> None:
+        """The opt-out is for ANOTHER chain. A known genesis in reversed byte order is not one —
+        it is this chain spelled backwards, well-formed hex that names nothing pyrxd knows, so the
+        opt-out used to sign it and the result self-verified VALID."""
+        reversed_hex = bytes.fromhex(GENESIS_BLOCK_HASHES[network])[::-1].hex()
+        for opt_out in (False, True):
+            with pytest.raises(ValidationError, match="reversed"):
+                encode_hashmark(_DIGEST, key, network_genesis=reversed_hex, allow_unknown_genesis=opt_out)
+
     def test_another_chain_is_signed_only_on_request_and_the_request_never_relaxes_the_spelling(
         self, key: PrivateKey
     ) -> None:
