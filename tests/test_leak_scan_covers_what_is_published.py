@@ -615,6 +615,17 @@ _HOME_LEAK_FORMS = {
     "claude-tmp-scratch": "and /tmp/claude-1000/" + _ENCODED_HOME + "/scratch",
     "macos-encoded": "under ~/.claude/projects/" + "-".join(("", "Users", _USERNAME, "src")),
     "encoded-in-backticks": "the project dir `" + _ENCODED_HOME + "`",
+    # The encoded home directory itself, as a path segment with nothing after the user.
+    "encoded-bare-home-segment": "~/.claude/projects/" + "-".join(("", "home", _USERNAME)) + "/",
+    # Windows, which the first widening did not cover: the drive letter's colon and backslash
+    # become two dashes when encoded, and the plain path uses backslashes (doubled in source).
+    "windows-encoded": "~/.claude/projects/" + "-".join(("C", "", "Users", _USERNAME, "src")) + "/memory",
+    "windows-encoded-bare": "the dir " + "-".join(("C", "", "Users", _USERNAME)),
+    "windows-backslash": "C:" + "\\".join(("", "Users", _USERNAME, "src")),
+    "windows-doubled-backslash": 'p = "C:' + "\\\\".join(("", "Users", _USERNAME, "src")) + '"',
+    # A web URL's PATH is skipped (see the look-alikes below); its QUERY STRING is not, because a
+    # real filesystem path can ride in one.
+    "in-a-url-query-string": "https://example.com/?next=/" + "/".join(("home", _USERNAME, "x")),
 }
 
 
@@ -644,10 +655,11 @@ def test_a_dash_encoded_home_path_in_a_commit_message_is_caught(repo) -> None:
 
 def test_home_path_look_alikes_are_not_flagged(repo) -> None:
     """The honest-path twin of the test above. Widening a pattern is where a scanner starts
-    refusing honest docs, so each near miss is here: placeholders in both spellings, a flag and a
+    refusing honest docs, so each near miss is here: placeholders in every spelling, a flag and a
     hyphenated word that contain `-home-`, `/home` with no user, the exempt Pyodide home in both
-    spellings and at the end of a sentence, a lowercase `/users/` URL path, and a `/tmp/claude-*/`
-    scratch path that carries no username."""
+    spellings and at the end of a sentence, web URLs whose PATH contains `/home/` or `/Users/`,
+    a bare `-home-page` in prose and in an anchor, and a `/tmp/claude-*/` scratch path that
+    carries no username."""
     base = _git(repo, "rev-parse", "HEAD")
     _commit(
         repo,
@@ -659,6 +671,9 @@ def test_home_path_look_alikes_are_not_flagged(repo) -> None:
                 "the /home directory, and /home/ itself\n"
                 "Pyodide is rooted at /home/pyodide. Its glue is -home-pyodide-glue.\n"
                 "see https://api.github.com/users/octocat and /tmp/claude-1000/scratch\n"
+                "C--Users-<user>-src and C:\\Users\\<user>\\src are placeholders\n"
+                "https://example.com/home/about and https://docs.example.org/Users/guide\n"
+                "the -home-page link, [Home](#-home-page) and https://example.com/-home-page\n"
             ),
             "shared.js": 'sys.path.insert(0, "/home/pyodide")\n',
         },
@@ -668,7 +683,7 @@ def test_home_path_look_alikes_are_not_flagged(repo) -> None:
     assert tree.returncode == 0, tree.stdout + tree.stderr
     history = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
     assert history.returncode == 0, history.stdout + history.stderr
-    assert "1 commit(s), 7 added line(s), 0 finding(s)" in history.stdout
+    assert "1 commit(s), 10 added line(s), 0 finding(s)" in history.stdout
 
 
 @pytest.mark.parametrize(

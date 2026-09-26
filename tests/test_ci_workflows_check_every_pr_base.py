@@ -3,12 +3,12 @@
 Branch protection requires six status checks on `main` (`_REQUIRED_CHECKS` below; the
 count is checked against it). It requires nothing on any other branch. Until this file
 existed, seven workflows (ci, lint, codeql, docs, osv-scanner, trufflehog, integration) also
-filtered their `pull_request` trigger with `branches: [main]` or `branches: [main, dev]`. So a stacked PR, one whose base is another
-feature branch, ran NO checks at all: no tests, lint, CodeQL, docs build, OSV scan, secret
-scan or regtest. Measured before the change: this repository has had four PRs with a
-non-main base (#141, #231, #498, #664), and the head commit of each carries zero check
-runs, while main-based PRs from the same weeks (#140, #142, #230, #497) carry 10 to 19.
-#141 was merged into its base that way.
+filtered their `pull_request` trigger with `branches: [main]` or `branches: [main, dev]`. So a
+stacked PR, one whose base is another feature branch, ran NO checks at all: no tests, lint,
+CodeQL, docs build, OSV scan, secret scan or regtest. Measured before the change: this
+repository has had four PRs with a non-main base (#141, #231, #498, #664), and the head commit
+of each carries zero check runs, while main-based PRs from the same weeks (#140, #142, #230,
+#497) carry 10 to 19. #141 was merged into its base that way.
 
 A gate protects a PLACE, not a change: the required checks are scoped to main, and the
 stacked PR merges somewhere else. Its change then travels to main inside its base PR, and
@@ -266,12 +266,50 @@ _PROTECTION_SCRIPT = _ROOT / "scripts" / "post-public-flip.sh"
 _GITHUB_ACTIONS_APP_ID = 15368
 
 
-def test_the_protection_script_would_not_downgrade_the_live_rules() -> None:
+#: The WHOLE branch-protection document the script PUTs, as it must be to reproduce the live
+#: rules exactly. REVIEWED, not derived (CI cannot read branch protection): compared field by
+#: field with `gh api repos/MudwoodLabs/pyrxd/branches/main/protection`, read 2026-09-25 after
+#: required signatures were switched off. The check list is built from `_REQUIRED_CHECKS`, so the
+#: two reviewed copies in this file cannot disagree with each other.
+_LIVE_PROTECTION: dict[str, Any] = {
+    "required_status_checks": {
+        "strict": True,
+        "checks": [{"context": c, "app_id": _GITHUB_ACTIONS_APP_ID} for c in _REQUIRED_CHECKS],
+    },
+    "enforce_admins": True,
+    "required_pull_request_reviews": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews": True,
+        "require_code_owner_reviews": False,
+        "require_last_push_approval": False,
+    },
+    "restrictions": None,
+    "allow_force_pushes": False,
+    "allow_deletions": False,
+    "block_creations": False,
+    "required_linear_history": True,
+    "required_conversation_resolution": True,
+    "lock_branch": False,
+    "allow_fork_syncing": False,
+}
+
+
+def _script_without_comments_or_heredocs() -> str:
+    """The script's COMMANDS: comment lines and heredoc bodies removed, continuations joined."""
+    text = re.sub(
+        r"<<'?(\w+)'?([^\n]*)\n.*?\n\1\n", r"<<\1\2\n", _PROTECTION_SCRIPT.read_text(encoding="utf-8"), flags=re.S
+    )
+    text = re.sub(r"\\\n", " ", text)
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def test_the_protection_script_reproduces_the_live_rules_exactly() -> None:
     """`scripts/post-public-flip.sh` calls itself idempotent and safe to re-run, and it PUTs a
     whole branch-protection document. It held `enforce_admins: false`, one required approval,
     and a `typecheck` check that no workflow produces, while the live rules had moved on to six
     app-bound checks enforced for admins. A re-run would have silently switched the admin bypass
-    back on. So its payload is pinned to `_REQUIRED_CHECKS`, the REVIEWED copy of the live list."""
+    back on. Pinning only those fields left the rest free to drift (a re-run could have allowed
+    force pushes, or dropped linear history), so the WHOLE document is compared."""
     import json
 
     bodies = re.findall(r"<<'EOF'[^\n]*\n(\{.*?\n\})\nEOF\n", _PROTECTION_SCRIPT.read_text(encoding="utf-8"), re.S)
@@ -279,16 +317,37 @@ def test_the_protection_script_would_not_downgrade_the_live_rules() -> None:
         f"expected exactly one JSON protection payload in {_PROTECTION_SCRIPT.name}, found {len(bodies)}"
     )
     payload = json.loads(bodies[0])
-    status = payload["required_status_checks"]
-    assert "contexts" not in status, "bind each check to an app with `checks`, not the unbound `contexts` list"
-    checks = status["checks"]
-    assert sorted(c["context"] for c in checks) == sorted(_REQUIRED_CHECKS), (
-        f"{_PROTECTION_SCRIPT.name} would require {sorted(c['context'] for c in checks)}; "
-        f"the live rules (per _REQUIRED_CHECKS) require {sorted(_REQUIRED_CHECKS)}"
+
+    def _normalised(doc: dict[str, Any]) -> dict[str, Any]:
+        doc = json.loads(json.dumps(doc))
+        status = doc.get("required_status_checks") or {}
+        if isinstance(status.get("checks"), list):
+            status["checks"] = sorted(status["checks"], key=lambda c: json.dumps(c, sort_keys=True))
+        return doc
+
+    got, want = _normalised(payload), _normalised(_LIVE_PROTECTION)
+    differing = sorted(k for k in set(got) | set(want) if got.get(k, "<absent>") != want.get(k, "<absent>"))
+    assert not differing, (
+        f"{_PROTECTION_SCRIPT.name} would PUT a protection document that differs from the live rules in "
+        f"{differing}: "
+        + "; ".join(f"{k}: script {got.get(k, '<absent>')!r}, live {want.get(k, '<absent>')!r}" for k in differing)
     )
-    assert all(c.get("app_id") == _GITHUB_ACTIONS_APP_ID for c in checks), checks
-    assert status["strict"] is True
-    assert payload["enforce_admins"] is True, "a re-run would let admins merge past red or missing checks again"
+
+
+def test_the_protection_script_makes_no_other_protection_call() -> None:
+    """Required signatures has its own endpoint, outside the PUT document, and the script used to
+    POST it. With admins enforced that blocked every PR, whose head commits are unsigned, so the
+    maintainer switched it off; a re-run would have switched it back on. Every command that
+    touches `branches/` is found here (comments and heredoc text removed first), and it must be
+    exactly the one PUT the test above checks."""
+    commands = _script_without_comments_or_heredocs()
+    api_calls = [line.strip() for line in commands.splitlines() if re.search(r"\bgh\s+api\b", line)]
+    assert api_calls, f"found no `gh api` call in {_PROTECTION_SCRIPT.name}; this test checked nothing"
+    branch_calls = [c for c in api_calls if "branches/" in c]
+    assert len(branch_calls) == 1 and re.search(
+        r'-X PUT "repos/\$\{REPO\}/branches/\$\{BRANCH\}/protection"', branch_calls[0]
+    ), f"{_PROTECTION_SCRIPT.name} must make exactly one branch-protection call, the PUT; found {branch_calls}"
+    assert "required_signatures" not in commands, "the script touches required signatures again"
 
 
 def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:
@@ -315,3 +374,41 @@ def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:
                 admin.append(f"{rel}: {m.group(0).strip()}")
     assert "docs/runbooks/cutting-a-release.md" in seen, f"the scan did not see the runbook's merge command: {seen}"
     assert not admin, "these tell someone to merge with --admin, past the required checks:\n" + "\n".join(admin)
+
+
+#: A LOCAL publish to PyPI given as a command: at the start of a line (after an optional `$ `
+#: prompt) or after `&&`, `||` or `;`. Prose that names the command, as a warning does, is not a
+#: command and does not match.
+_LOCAL_PUBLISH_COMMAND = re.compile(
+    r"(?:^|&&|\|\||;)[ \t]*(?:\$[ \t]*)?(?:poetry[ \t]+publish|twine[ \t]+upload|uv[ \t]+publish"
+    r"|flit[ \t]+publish|hatch[ \t]+publish)\b",
+    re.MULTILINE,
+)
+
+
+def test_no_doc_or_script_tells_anyone_to_publish_from_a_laptop() -> None:
+    """`scripts/post-public-flip.sh` ended by telling the reader to run `poetry build && poetry
+    publish` for pyrxd 0.2.0. A release is published by creating a GitHub Release, which runs
+    `publish.yml`: its verify job, the `pypi` environment's reviewer and the PEP 740 attestations.
+    A laptop publish skips all three. The same file walk as the test above; the one legitimate
+    publisher, `publish.yml`, uses the PyPA action rather than any of these commands. A known-bad
+    line is matched first, so a matcher that finds nothing cannot pass."""
+    import subprocess
+
+    assert _LOCAL_PUBLISH_COMMAND.search("     poetry build && poetry publish\n"), "the matcher misses the known case"
+    assert not _LOCAL_PUBLISH_COMMAND.search("the attestations. `poetry publish` from a laptop would skip them\n")
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=_ROOT, capture_output=True, check=True).stdout
+    paths = [p for p in listed.decode().split("\0") if p and p != "CHANGELOG.md" and not p.startswith("tests/")]
+    assert "scripts/post-public-flip.sh" in paths, (
+        "the file walk no longer reaches the script this test was written for"
+    )
+    found = []
+    for rel in paths:
+        try:
+            text = (_ROOT / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
+            continue
+        for m in _LOCAL_PUBLISH_COMMAND.finditer(re.sub(r"\\\r?\n", " ", text)):
+            line = text.count("\n", 0, m.start()) + 1
+            found.append(f"{rel}:{line}: {m.group(0).strip()}")
+    assert not found, "these tell someone to publish to PyPI outside publish.yml:\n" + "\n".join(found)

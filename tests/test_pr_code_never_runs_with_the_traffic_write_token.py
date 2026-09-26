@@ -238,29 +238,23 @@ def _run_environment_check(tmp_path: pathlib.Path, responses: dict[str, Any]) ->
     return subprocess.run(["bash", "-e", str(script)], env=env, capture_output=True, text=True, timeout=60)
 
 
+_SELECTED_BRANCHES = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+
+
 @pytest.mark.parametrize(
-    ("responses", "admits"),
-    [
-        (
-            {
-                "traffic": {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}},
-                "traffic/deployment-branch-policies": _POLICY_MAIN,
-            },
-            "the branch main",
-        ),
-        (
-            {"traffic": {"deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False}}},
-            "protected branches only",
-        ),
-    ],
-    ids=["selected-branch-main", "protected-branches-only"],
+    "policies",
+    [_POLICY_MAIN, {"branch_policies": [{"name": "main"}]}],
+    ids=["branch-main", "branch-main-without-a-type-field"],
 )
-def test_the_environment_check_passes_a_correctly_restricted_environment(tmp_path, responses, admits) -> None:
+def test_the_environment_check_passes_the_environment_the_setup_describes(tmp_path, policies) -> None:
     """The honest path: a guard that refused the environment the setup instructions describe
-    would stop the daily collection outright."""
-    proc = _run_environment_check(tmp_path, responses)
+    would stop the daily collection outright. A rule the API returns without `type` is a branch
+    rule (the field's default), so it is accepted too."""
+    proc = _run_environment_check(
+        tmp_path, {"traffic": _SELECTED_BRANCHES, "traffic/deployment-branch-policies": policies}
+    )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert f"deployments restricted to {admits}" in proc.stdout
+    assert "deployments restricted to the branch main" in proc.stdout
 
 
 @pytest.mark.parametrize(
@@ -292,8 +286,24 @@ def test_the_environment_check_passes_a_correctly_restricted_environment(tmp_pat
             },
             "must admit exactly the branch main",
         ),
+        # Admits every branch protected now OR LATER, so it can widen without this environment
+        # changing. The branch-policy list is served too, so a refusal cannot come from a 404.
+        (
+            {
+                "traffic": {"deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False}},
+                "traffic/deployment-branch-policies": _POLICY_MAIN,
+            },
+            "Protected branches only",
+        ),
     ],
-    ids=["auto-created-unrestricted", "missing", "also-admits-dev", "a-tag-named-main", "no-rules"],
+    ids=[
+        "auto-created-unrestricted",
+        "missing",
+        "also-admits-dev",
+        "a-tag-named-main",
+        "no-rules",
+        "protected-branches-only",
+    ],
 )
 def test_the_environment_check_fails_loudly_and_names_the_fix(tmp_path, responses, why) -> None:
     proc = _run_environment_check(tmp_path, responses)
