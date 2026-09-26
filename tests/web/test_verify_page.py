@@ -1647,6 +1647,28 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert "output 0" in out["panels"][0].split("\n")
         assert flat.index(said) < flat.index("VERIFIED")
 
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_the_first_output_number_past_the_end_does_not_exist(self, shape, limit) -> None:
+        """THE BOUNDARY, both sides of it. Outputs are numbered 0 to count-1, so the output
+        numbered `count` is the first that does not exist — the one value an off-by-one
+        (`n > count` for `n >= count`) gets wrong, and `:7` of a two-output transaction is too far
+        out to notice. A re-review planted exactly that change and every test stayed green; the
+        page would then have called a nonexistent output "NOT a HashMark record"."""
+        txid, raw_hex, fetched = self._mark_and_change_tx(limit)
+        count = fetched["payload"]["output_count"]
+        assert count == 2, "the premise"
+
+        past = " ".join(self._check(self._named(txid, count, shape), txid, raw_hex, fetched)["text"].split())
+        assert (
+            f"That transaction has {count} outputs (numbered 0 to {count - 1}), so there is no output {count}" in past
+        )
+        assert f"Output {count}, the one you named" not in past, "an output that does not exist was described"
+
+        # The honest neighbour: the LAST output that does exist is judged as an output, not refused.
+        last = " ".join(self._check(self._named(txid, count - 1, shape), txid, raw_hex, fetched)["text"].split())
+        assert f"Output {count - 1}, the one you named, is NOT a HashMark record" in last
+        assert "so there is no output" not in last
+
     def test_a_named_output_whose_record_does_not_decode_is_not_called_a_hashmark_record(self, limit) -> None:
         """The positive sentence must not certify what the panel below refutes: a record that
         breaks the format is red RECORD DOES NOT DECODE, and the note above it only says which
