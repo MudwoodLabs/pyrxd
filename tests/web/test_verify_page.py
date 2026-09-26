@@ -1619,7 +1619,7 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         out = self._check(self._named(txid, 0, shape), txid, raw_hex, fetched)
         flat = " ".join(out["text"].split())
         assert out["statuses"] == ["VERIFIED"]
-        assert 'Output 0, the one you named, carries a HashMark record: the panel below marked "output 0"' in flat
+        assert 'Output 0, the one you named, holds the record in the panel below marked "output 0"' in flat
         assert "output 0" in out["panels"][0].split("\n"), "the mark's panel does not say which output it is"
         assert "NOT a HashMark record" not in flat
 
@@ -1646,6 +1646,33 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert "Its HashMark record is in output 0" in flat
         assert "output 0" in out["panels"][0].split("\n")
         assert flat.index(said) < flat.index("VERIFIED")
+
+    def test_a_named_output_whose_record_does_not_decode_is_not_called_a_hashmark_record(self, limit) -> None:
+        """The positive sentence must not certify what the panel below refutes: a record that
+        breaks the format is red RECORD DOES NOT DECODE, and the note above it only says which
+        panel it is."""
+        txid, raw, fetched = _tx_result(_OUTCOME_SCRIPTS["invalid"](), limit=limit)
+        assert fetched["payload"]["outputs"][0]["hashmark"]["outcome"] == "invalid", "the premise"
+        out = self._check(f"{txid}:0", txid, raw.hex(), fetched)
+        flat = " ".join(out["text"].split())
+        assert 'Output 0, the one you named, holds the record in the panel below marked "output 0"' in flat
+        assert "carries a HashMark record" not in flat
+        assert out["statuses"] == ["RECORD DOES NOT DECODE"]
+
+    def test_a_named_output_past_the_panel_limit_is_not_pointed_at_a_panel_that_is_not_drawn(self, limit) -> None:
+        """Past MAX_MARK_PANELS a record is counted, not drawn, so "the panel below marked output
+        N" would point at nothing. The note says so instead."""
+        scripts = [_record_script(bytes([1, 1]), bytes([i % 256]) * 32) for i in range(limit + 2)]
+        txid, raw, fetched = _tx_result(*scripts, limit=limit)
+        named = limit + 1
+        out = self._check(f"{txid}:{named}", txid, raw.hex(), fetched)
+        flat = " ".join(out["text"].split())
+        assert f"Output {named}, the one you named, holds a record, but it is past the first {limit}" in flat
+        assert f'the panel below marked "output {named}"' not in flat
+        assert len(out["panels"]) == limit, "the premise: the named record is not drawn"
+        # And the honest neighbour: the last DRAWN record is still pointed at its panel.
+        last = self._check(f"{txid}:{limit - 1}", txid, raw.hex(), fetched)
+        assert f'holds the record in the panel below marked "output {limit - 1}"' in " ".join(last["text"].split())
 
     def test_a_bare_transaction_number_is_not_told_about_an_output_it_never_named(self, limit) -> None:
         """The other branch: no output was named, so there is no output note and a single mark's

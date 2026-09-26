@@ -736,9 +736,10 @@ function namedByNote(named) {
 
 // THE OUTPUT THE READER NAMED, against what the transaction actually has. Without this a
 // change output (`:1`) or an output that does not exist (`:7` of a two-output transaction)
-// sat above a green VERIFIED about a DIFFERENT output, and the page never said which. Three
-// facts, told apart: the named output carries a record; it exists and is not a record; or
-// the transaction has no such output. Null when there is nothing to compare against.
+// sat above a green VERIFIED about a DIFFERENT output, and the page never said which. The
+// facts told apart: the named output holds a record that is drawn below, or one past the
+// panel limit that is not; it exists and is not a record; or the transaction has no such
+// output. Null when there is nothing to compare against.
 function namedOutputNote(named, payload) {
   const n = named.vout;
   const count = payload.output_count;
@@ -757,8 +758,19 @@ function namedOutputNote(named, payload) {
       `so there is no output ${n}: what you were given points at nothing in it. ${where}`
     );
   }
-  if (marked.includes(n)) {
-    return `Output ${n}, the one you named, carries a HashMark record: the panel below marked "output ${n}".`;
+  const at = marked.indexOf(n);
+  if (at !== -1) {
+    // "HOLDS THE RECORD", not "carries a HashMark record": the record there may be one that
+    // does not decode, and its own panel says so in the error colour. And only a panel that is
+    // DRAWN can be pointed at — past MAX_MARK_PANELS the record is counted, not shown.
+    if (at >= MAX_MARK_PANELS) {
+      return (
+        `Output ${n}, the one you named, holds a record, but it is past the first ` +
+        `${MAX_MARK_PANELS} this page draws, so it is not shown here and nothing below is about it. ` +
+        "The note at the end counts it with the others; `pyrxd verify` in a terminal checks every mark."
+      );
+    }
+    return `Output ${n}, the one you named, holds the record in the panel below marked "output ${n}".`;
   }
   return (
     `Output ${n}, the one you named, is NOT a HashMark record, so nothing below is about it. ${where}`
