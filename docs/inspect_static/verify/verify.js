@@ -561,9 +561,15 @@ function renderReport(result) {
   const wrap = el("div", { class: "report" });
 
   // SAY WHAT WAS LOOKED UP, when it is not what was typed. A reader who pasted an outpoint
-  // or a contract id is shown the transaction it points at, and must be able to tell.
-  if (result && result.named_by) {
-    wrap.appendChild(para(namedByNote(result.named_by), "answer-body multi-note"));
+  // or a contract id is shown the transaction it points at, and must be able to tell —
+  // including when the OUTPUT they named is not the mark, or is not there at all.
+  const named = result && result.named_by;
+  if (named) {
+    wrap.appendChild(para(namedByNote(named), "answer-body multi-note"));
+    if (result.ok) {
+      const about = namedOutputNote(named, result.payload || {});
+      if (about) wrap.appendChild(para(about, "answer-body multi-note named-output"));
+    }
   }
 
   if (!result || !result.ok) {
@@ -611,6 +617,10 @@ function renderReport(result) {
       anchorReason: anchorReasonFor(result),
       ordinal: records.length > 1 ? `Mark ${index + 1} of ${records.length}` : null,
       vout: entry.vout,
+      // WHICH OUTPUT, whenever the reader named one. A single mark used to carry no output
+      // number at all, so `<txid>:1` — a change output — sat above a green VERIFIED that was
+      // about output 0, and nothing on the page said so.
+      showVout: records.length > 1 || Boolean(named),
     }));
   });
   if (hidden > 0) {
@@ -720,8 +730,38 @@ function namedByNote(named) {
   const what = named.form === "contract" ? "a contract id" : "an output reference (transaction:output)";
   return (
     `You pasted ${what}, which points at${vout} transaction ${txid}. A mark is checked by the ` +
-    "transaction that carries it, so this page looked up that transaction, and everything below " +
-    "is about the whole of it."
+    "transaction that carries it, so this page looked up that transaction."
+  );
+}
+
+// THE OUTPUT THE READER NAMED, against what the transaction actually has. Without this a
+// change output (`:1`) or an output that does not exist (`:7` of a two-output transaction)
+// sat above a green VERIFIED about a DIFFERENT output, and the page never said which. Three
+// facts, told apart: the named output carries a record; it exists and is not a record; or
+// the transaction has no such output. Null when there is nothing to compare against.
+function namedOutputNote(named, payload) {
+  const n = named.vout;
+  const count = payload.output_count;
+  if (!Number.isInteger(n) || !Number.isInteger(count)) return null;
+  const marked = hashmarkRecords(payload).map((r) => r.vout).filter((v) => Number.isInteger(v));
+  // A COUNT past one, never a list: a transaction can carry tens of thousands of records, and
+  // this sentence must not grow with it (see MAX_MARK_PANELS).
+  const where = marked.length === 0
+    ? "It carries no HashMark record in any output."
+    : marked.length === 1
+      ? `Its HashMark record is in output ${marked[0]}, and the panel below is about that output.`
+      : `It carries ${marked.length} HashMark records in other outputs; each panel below names its own.`;
+  if (n < 0 || n >= count) {
+    return (
+      `That transaction has ${count} output${count === 1 ? "" : "s"} (numbered 0 to ${count - 1}), ` +
+      `so there is no output ${n}: what you were given points at nothing in it. ${where}`
+    );
+  }
+  if (marked.includes(n)) {
+    return `Output ${n}, the one you named, carries a HashMark record: the panel below marked "output ${n}".`;
+  }
+  return (
+    `Output ${n}, the one you named, is NOT a HashMark record, so nothing below is about it. ${where}`
   );
 }
 
@@ -785,9 +825,9 @@ function renderOneMark(hm, opts) {
   if (options.ordinal) {
     const head = el("h2", { class: "mark-heading", text: options.ordinal });
     panel.appendChild(head);
-    if (options.vout !== null && options.vout !== undefined) {
-      panel.appendChild(el("p", { class: "mark-subheading", text: `output ${options.vout}` }));
-    }
+  }
+  if ((options.ordinal || options.showVout) && options.vout !== null && options.vout !== undefined) {
+    panel.appendChild(el("p", { class: "mark-subheading", text: `output ${options.vout}` }));
   }
 
   if (hm.outcome !== "ok") {

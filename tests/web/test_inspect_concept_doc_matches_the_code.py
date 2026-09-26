@@ -335,3 +335,12 @@ class TestTheIntegrityStoryIsTheOneTheCodeTells:
         ]
         assert not wrong, "these comments claim a defence the doc says does not exist:\n" + "\n".join(wrong)
         assert "does **not** defend the deployed origin against itself" in _flat(_doc_text())
+
+    def test_the_shared_origin_is_stated_with_its_consequence(self) -> None:
+        """A PHRASE PIN, reviewed rather than derived. Saying the Pages origin is shared is only
+        half a fact: the half a reader needs is that any page on it can script /verify/, so a
+        compromised deploy of another site there can rewrite the verdict a reader sees."""
+        section = _flat(_section("## Browser variant: install-time integrity"))
+        assert "shared by every Pages site published from the same account" in section
+        assert "Documents on one origin can script each other" in section
+        assert "rewrite the verdict a reader sees there" in section

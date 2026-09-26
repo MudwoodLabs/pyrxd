@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import importlib.abc
 import json
+import os
 import re
 import shutil
 import subprocess  # nosec B404 — fixed argv, no shell, repo-local script
@@ -1590,6 +1591,79 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert "not a HashMark record" not in flat
         assert "There is no HashMark here" not in flat
         assert f"which points at output 0 of transaction {txid}" in flat, "the page did not say what it looked up"
+
+    # ── the OUTPUT the reader named, not only the transaction ──
+    #
+    # Found by re-review of the fix above: `<txid>:1` (a change output) and `<txid>:7` (an output
+    # the transaction does not have) both rendered the mark's green VERIFIED under a note saying
+    # "points at output 7", and no panel said which output the mark was in. Every case below uses
+    # a real two-output transaction — the signed record at output 0 and a P2PKH change output at
+    # output 1 — so the named output and the mark's output really can differ.
+
+    @staticmethod
+    def _mark_and_change_tx(limit: int) -> tuple[str, str, dict]:
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        txid, raw, fetched = _tx_result(_signed_script(b"the advisory, as published\n"), change, limit=limit)
+        assert fetched["payload"]["output_count"] == 2, "the premise: two outputs"
+        assert [r["vout"] for r in fetched["payload"]["outputs"] if r.get("hashmark")] == [0], "the premise"
+        return txid, raw.hex(), fetched
+
+    @staticmethod
+    def _named(txid: str, vout: int, shape: str) -> str:
+        return f"{txid}:{vout}" if shape == "outpoint" else f"{txid}{vout:08x}"
+
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_naming_the_marks_own_output_says_so_and_numbers_the_panel(self, shape, limit) -> None:
+        """The honest path: output 0 IS the mark. It still verifies, and now also says so."""
+        txid, raw_hex, fetched = self._mark_and_change_tx(limit)
+        out = self._check(self._named(txid, 0, shape), txid, raw_hex, fetched)
+        flat = " ".join(out["text"].split())
+        assert out["statuses"] == ["VERIFIED"]
+        assert 'Output 0, the one you named, carries a HashMark record: the panel below marked "output 0"' in flat
+        assert "output 0" in out["panels"][0].split("\n"), "the mark's panel does not say which output it is"
+        assert "NOT a HashMark record" not in flat
+
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_naming_the_change_output_says_it_is_not_the_mark(self, shape, limit) -> None:
+        txid, raw_hex, fetched = self._mark_and_change_tx(limit)
+        out = self._check(self._named(txid, 1, shape), txid, raw_hex, fetched)
+        flat = " ".join(out["text"].split())
+        said = "Output 1, the one you named, is NOT a HashMark record, so nothing below is about it."
+        assert said in flat, f"the page did not say the named output is not the mark:\n{flat}"
+        assert "Its HashMark record is in output 0, and the panel below is about that output." in flat
+        assert "output 0" in out["panels"][0].split("\n")
+        # BEFORE the verdict, not after it: the green word is what a reader takes away, so the
+        # sentence that says it is about a different output has to come first.
+        assert flat.index(said) < flat.index("VERIFIED"), "the caveat is below the verdict it qualifies"
+
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_naming_an_output_the_transaction_does_not_have_says_so(self, shape, limit) -> None:
+        txid, raw_hex, fetched = self._mark_and_change_tx(limit)
+        out = self._check(self._named(txid, 7, shape), txid, raw_hex, fetched)
+        flat = " ".join(out["text"].split())
+        said = "That transaction has 2 outputs (numbered 0 to 1), so there is no output 7"
+        assert said in flat, f"the page did not say output 7 does not exist:\n{flat}"
+        assert "Its HashMark record is in output 0" in flat
+        assert "output 0" in out["panels"][0].split("\n")
+        assert flat.index(said) < flat.index("VERIFIED")
+
+    def test_a_bare_transaction_number_is_not_told_about_an_output_it_never_named(self, limit) -> None:
+        """The other branch: no output was named, so there is no output note and a single mark's
+        panel carries no output number — the page as it was."""
+        txid, raw_hex, fetched = self._mark_and_change_tx(limit)
+        glue = _glue()
+        case = {
+            "text": txid,
+            "raw": {txid: raw_hex},
+            "run_returns": [],
+            "fetch_returns": [fetched],
+            "anchor_returns": [glue.mark_anchor(txid, json.dumps({"txid": txid, "confirmations": 5}), 460572)],
+        }
+        out = _render({"case": {"check": case}})["case"]
+        flat = " ".join(out["text"].split())
+        assert out["statuses"] == ["VERIFIED"]
+        assert "the one you named" not in flat and "You pasted" not in flat
+        assert "output 0" not in out["panels"][0].split("\n")
 
     def test_a_raw_transaction_is_told_it_was_read_as_one_script(self, limit) -> None:
         """The classifier reads raw transaction hex as a single script (anything of script length

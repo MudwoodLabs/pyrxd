@@ -713,7 +713,12 @@ and each has a cost:
 
 `'self'` is the page's origin, which for a GitHub Pages project site is
 `https://mudwoodlabs.github.io` — shared by every Pages site published
-from the same account, not only this one.
+from the same account, not only this one. Documents on one origin can
+script each other, so a compromised deploy of any other Pages site on
+this origin could open `/verify/` in a window it controls and rewrite the
+verdict a reader sees there, and no SHA-256 check or Content-Security-Policy
+on these pages can prevent that (a pre-release review demonstrated the
+cross-page read; rewriting needs no further access).
 
 ---
 
