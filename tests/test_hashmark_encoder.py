@@ -47,7 +47,7 @@ import pathlib
 import pytest
 
 from pyrxd.base58 import base58check_encode
-from pyrxd.constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+from pyrxd.constants import GENESIS_BLOCK_HASHES, NETWORK_ADDRESS_PREFIX_DICT, Network
 from pyrxd.keys import PrivateKey
 from pyrxd.script.hashmark import (
     HASHMARK_MAGIC,
@@ -466,7 +466,11 @@ class TestMinimalPushIsMandatory:
 class TestTheNetworkBinding:
     """§2.10 and §5.6: the genesis hash is in the statement, not in the record."""
 
-    _TESTNET_GENESIS = "000000009d67e3ee6d8d1ea2e5e3f4d9eab9ee5ee2e7f4a1f9f7c9e4b5c3a2d1"
+    # THE REAL testnet genesis. This was a 64-hex string NAMED testnet that is not Radiant
+    # testnet's genesis, and the encoder signed against it without complaint — the defect
+    # `_require_signable_genesis` now refuses: a statement about a chain pyrxd has no genesis for,
+    # which verifies on none of the chains it does know.
+    _TESTNET_GENESIS = GENESIS_BLOCK_HASHES["testnet"]
 
     def test_the_genesis_hash_changes_the_signature(self, key: PrivateKey) -> None:
         mainnet = decode_hashmark(encode_hashmark(_DIGEST, key))
@@ -485,6 +489,63 @@ class TestTheNetworkBinding:
     def test_the_default_is_mainnet(self, key: PrivateKey) -> None:
         record = decode_hashmark(encode_hashmark(_DIGEST, key))
         assert verify_attestation(record, network_genesis=RADIANT_MAINNET_GENESIS).valid
+
+
+_MAINNET_REVERSED = bytes.fromhex(RADIANT_MAINNET_GENESIS)[::-1].hex()
+
+
+class TestOnlyAGenesisSomeoneCanCheckIsSigned:
+    """§5.6: ``network`` is "64 lowercase hex" in RPC/display order, and "a network whose genesis
+    hash is unknown cannot be attested to at all".
+
+    The encoder signed ANY string, and its sign-then-verify could not notice: it verifies against
+    the same string it signed. So ``"mainnet"``, the mainnet hash reversed or uppercased, and ``""``
+    each produced a record that attested VALID here and verifies on no chain anywhere — permanently,
+    under the signer's key.
+    """
+
+    @pytest.mark.parametrize(
+        "genesis",
+        ["mainnet", "", RADIANT_MAINNET_GENESIS.upper(), _MAINNET_REVERSED, "00" * 32, RADIANT_MAINNET_GENESIS + " "],
+        ids=["a-network-name", "empty", "uppercase", "reversed-byte-order", "well-formed-but-unknown", "padded"],
+    )
+    def test_a_genesis_nobody_can_verify_against_is_refused_before_signing(self, key: PrivateKey, genesis) -> None:
+        with pytest.raises(ValidationError, match="network_genesis"):
+            encode_hashmark(_DIGEST, key, network_genesis=genesis)
+
+    @pytest.mark.parametrize("genesis", [None, bytes.fromhex(RADIANT_MAINNET_GENESIS)], ids=["none", "bytes"])
+    def test_a_genesis_of_the_wrong_type_is_a_refusal_not_a_traceback(self, key: PrivateKey, genesis) -> None:
+        with pytest.raises(ValidationError, match="network_genesis"):
+            encode_hashmark(_DIGEST, key, network_genesis=genesis)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("network", sorted(GENESIS_BLOCK_HASHES))
+    def test_the_honest_pair_every_chain_pyrxd_knows_is_signed_and_verifies(
+        self, key: PrivateKey, network: str
+    ) -> None:
+        genesis = GENESIS_BLOCK_HASHES[network]
+        assert verify_attestation(
+            decode_hashmark(encode_hashmark(_DIGEST, key, network_genesis=genesis)), network_genesis=genesis
+        ).valid
+
+    @pytest.mark.parametrize("network", sorted(GENESIS_BLOCK_HASHES))
+    def test_a_known_genesis_reversed_is_refused_even_with_the_opt_out(self, key: PrivateKey, network: str) -> None:
+        """The opt-out is for ANOTHER chain. A known genesis in reversed byte order is not one —
+        it is this chain spelled backwards, well-formed hex that names nothing pyrxd knows, so the
+        opt-out used to sign it and the result self-verified VALID."""
+        reversed_hex = bytes.fromhex(GENESIS_BLOCK_HASHES[network])[::-1].hex()
+        for opt_out in (False, True):
+            with pytest.raises(ValidationError, match="reversed"):
+                encode_hashmark(_DIGEST, key, network_genesis=reversed_hex, allow_unknown_genesis=opt_out)
+
+    def test_another_chain_is_signed_only_on_request_and_the_request_never_relaxes_the_spelling(
+        self, key: PrivateKey
+    ) -> None:
+        other = "00" * 31 + "01"
+        record = decode_hashmark(encode_hashmark(_DIGEST, key, network_genesis=other, allow_unknown_genesis=True))
+        assert verify_attestation(record, network_genesis=other).valid
+        for bad in ("mainnet", RADIANT_MAINNET_GENESIS.upper(), ""):
+            with pytest.raises(ValidationError, match="64 lowercase hex"):
+                encode_hashmark(_DIGEST, key, network_genesis=bad, allow_unknown_genesis=True)
 
 
 class TestTheReferenceDecoderAcceptsOurRecords:

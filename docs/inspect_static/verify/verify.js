@@ -193,8 +193,10 @@ async function onCheck() {
 //
 // TWO SHAPES, because two things are the same shape as each other and neither is
 // the same shape as the third. A TRANSACTION NUMBER is 64 hex characters, and so is
-// a DIGEST — nothing about the string says which. Anything else is treated as a
-// pasted record and classified offline. A digest typed in here will be looked up as
+// a DIGEST — nothing about the string says which. Anything else is classified
+// offline: an outpoint (`<txid>:<vout>`) or a contract id names a transaction, and
+// that transaction is looked up; everything else is read as a pasted script. A
+// digest typed in here will be looked up as
 // a transaction, find nothing, and be told exactly that, which is the honest answer:
 // there is no digest-to-transaction index on Radiant.
 async function lookUp(text, token) {
@@ -220,10 +222,37 @@ async function lookUp(text, token) {
         detail: [classified.error, classified.hint].filter(Boolean).map(stripControlChars).join(" "),
       };
     }
+    // A POINTER TO A TRANSACTION IS LOOKED UP, NOT JUDGED. `<txid>:<vout>` and a 72-character
+    // contract id both NAME an output of a transaction; neither is a record. This page used to
+    // hand them straight to the renderer, which told the reader "it is not a HashMark record" —
+    // about a real mark, given in a form that points at it. The transaction it names is what a
+    // mark is checked by, so that is what is fetched, and the page says it did so.
+    const named = transactionNamedBy(classified);
+    if (named) {
+      const result = await lookUpTransaction(named.txid, token);
+      if (result) result.named_by = named;
+      return result;
+    }
     return classified;
   }
 
-  const txid = text.toLowerCase();
+  return lookUpTransaction(text.toLowerCase(), token);
+}
+
+// The transaction an outpoint or a contract id points at, or null. Only those two forms, and
+// only with a well-formed txid: the classifier already refused anything else, and this does not
+// get to widen what counts as a transaction number.
+function transactionNamedBy(classified) {
+  if (!classified || !classified.ok) return null;
+  if (classified.form !== "outpoint" && classified.form !== "contract") return null;
+  const payload = classified.payload || {};
+  const txid = typeof payload.txid === "string" ? payload.txid.toLowerCase() : "";
+  if (!TXID_RE.test(txid)) return null;
+  return { form: classified.form, txid, vout: payload.vout };
+}
+
+// One transaction, by number: fetch it, classify it, and place any mark in a block.
+async function lookUpTransaction(txid, token) {
   setFormStatus("Looking up the transaction…");
   let rawHex;
   try {
@@ -531,6 +560,18 @@ const MAX_MARK_PANELS = 50;
 function renderReport(result) {
   const wrap = el("div", { class: "report" });
 
+  // SAY WHAT WAS LOOKED UP, when it is not what was typed. A reader who pasted an outpoint
+  // or a contract id is shown the transaction it points at, and must be able to tell —
+  // including when the OUTPUT they named is not the mark, or is not there at all.
+  const named = result && result.named_by;
+  if (named) {
+    wrap.appendChild(para(namedByNote(named), "answer-body multi-note"));
+    if (result.ok) {
+      const about = namedOutputNote(named, result.payload || {});
+      if (about) wrap.appendChild(para(about, "answer-body multi-note named-output"));
+    }
+  }
+
   if (!result || !result.ok) {
     wrap.appendChild(renderProblem(
       safeText((result && result.error) || "This could not be checked"),
@@ -576,6 +617,10 @@ function renderReport(result) {
       anchorReason: anchorReasonFor(result),
       ordinal: records.length > 1 ? `Mark ${index + 1} of ${records.length}` : null,
       vout: entry.vout,
+      // WHICH OUTPUT, whenever the reader named one. A single mark used to carry no output
+      // number at all, so `<txid>:1` — a change output — sat above a green VERIFIED that was
+      // about output 0, and nothing on the page said so.
+      showVout: records.length > 1 || Boolean(named),
     }));
   });
   if (hidden > 0) {
@@ -623,10 +668,16 @@ function hiddenMarksNote(hiddenRecords, txid) {
   }
   // THE WHOLE COMMAND, not a placeholder that the CLI then refuses. `pyrxd verify` has no
   // default depth, on purpose, so the one thing a reader must supply is N — and what it means.
+  //
+  // N IS CONFIRMATIONS, NOT BLOCKS ON TOP. The CLI holds the mark's block to
+  // `confirmations >= N` (`MarkAnchor.provisional`), and a confirmation count includes the
+  // block itself (`mark_anchor.py` places it at `tip - confirmations + 1`). This said "blocks
+  // built on top", which is one more than the command asks for.
   lines.push(
     `To check every mark in it: pyrxd verify ${safeText(txid || "<transaction number>")} ` +
-    "--min-confirmations N — where N is how many blocks must be built on top of the mark's " +
-    "block before you rely on it. The command deliberately has no default for N.",
+    "--min-confirmations N — where N is how many confirmations the mark's block must have " +
+    "before you rely on it. The block itself is the first confirmation, so N means the block " +
+    "and N − 1 built on top of it. The command deliberately has no default for N.",
   );
   return lines;
 }
@@ -672,31 +723,105 @@ function renderProblem(title, body, detail) {
   return sec;
 }
 
+// What the reader typed, and what this page looked up because of it.
+function namedByNote(named) {
+  const txid = safeText(named.txid);
+  const vout = Number.isInteger(named.vout) ? ` output ${named.vout} of` : "";
+  const what = named.form === "contract" ? "a contract id" : "an output reference (transaction:output)";
+  return (
+    `You pasted ${what}, which points at${vout} transaction ${txid}. A mark is checked by the ` +
+    "transaction that carries it, so this page looked up that transaction."
+  );
+}
+
+// THE OUTPUT THE READER NAMED, against what the transaction actually has. Without this a
+// change output (`:1`) or an output that does not exist (`:7` of a two-output transaction)
+// sat above a green VERIFIED about a DIFFERENT output, and the page never said which. The
+// facts told apart: the named output holds a record that is drawn below, or one past the
+// panel limit that is not; it exists and is not a record; or the transaction has no such
+// output. Null when there is nothing to compare against.
+function namedOutputNote(named, payload) {
+  const n = named.vout;
+  const count = payload.output_count;
+  if (!Number.isInteger(n) || !Number.isInteger(count)) return null;
+  const marked = hashmarkRecords(payload).map((r) => r.vout).filter((v) => Number.isInteger(v));
+  // A COUNT past one, never a list: a transaction can carry tens of thousands of records, and
+  // this sentence must not grow with it (see MAX_MARK_PANELS).
+  const where = marked.length === 0
+    ? "It carries no HashMark record in any output."
+    : marked.length === 1
+      ? `Its HashMark record is in output ${marked[0]}, and the panel below is about that output.`
+      : `It carries ${marked.length} HashMark records in other outputs; each panel below names its own.`;
+  if (n < 0 || n >= count) {
+    return (
+      `That transaction has ${count} output${count === 1 ? "" : "s"} (numbered 0 to ${count - 1}), ` +
+      `so there is no output ${n}: what you were given points at nothing in it. ${where}`
+    );
+  }
+  const at = marked.indexOf(n);
+  if (at !== -1) {
+    // "HOLDS THE RECORD", not "carries a HashMark record": the record there may be one that
+    // does not decode, and its own panel says so in the error colour. And only a panel that is
+    // DRAWN can be pointed at — past MAX_MARK_PANELS the record is counted, not shown.
+    if (at >= MAX_MARK_PANELS) {
+      return (
+        `Output ${n}, the one you named, holds a record, but it is past the first ` +
+        `${MAX_MARK_PANELS} this page draws, so it is not shown here and nothing below is about it. ` +
+        "The note at the end counts it with the others; `pyrxd verify` in a terminal checks every mark."
+      );
+    }
+    return `Output ${n}, the one you named, holds the record in the panel below marked "output ${n}".`;
+  }
+  return (
+    `Output ${n}, the one you named, is NOT a HashMark record, so nothing below is about it. ${where}`
+  );
+}
+
+// NO MARK, SAID ABOUT WHAT WAS ACTUALLY READ. "It is not a HashMark record" is a claim about
+// one script, and it was being printed for every input that was not a transaction number —
+// including an outpoint and a contract id that point at a real mark, and a raw transaction,
+// which the classifier reads as ONE script. So the words now depend on the form: a transaction
+// that carries no mark, a single script that is not a record, or (for any form this page does
+// not know) only what the page did and did not find.
 function renderNoMark(result, payload) {
   const sec = el("section", { class: "problem" });
-  sec.appendChild(el("h2", { class: "problem-title", text: "There is no HashMark here" }));
   if (result.form === "txid") {
+    sec.appendChild(el("h2", { class: "problem-title", text: "There is no HashMark here" }));
     sec.appendChild(para(
       "That transaction is on the chain, and none of its outputs carries a HashMark " +
       "record. This says nothing about anyone's honesty: it is simply not a mark.",
     ));
-  } else {
+  } else if (result.form === "script") {
+    sec.appendChild(el("h2", { class: "problem-title", text: "This script is not a HashMark record" }));
     sec.appendChild(para(
-      "What you pasted was read successfully, and it is not a HashMark record.",
+      "What you pasted was read as a single output script, and this single script is not a " +
+      "HashMark record.",
+    ));
+    sec.appendChild(para(
+      "If what you pasted was a whole transaction rather than one output's script, it was read " +
+      "the wrong way: this page does not take a transaction's raw bytes. Paste its transaction " +
+      "number instead, and every output in it will be read.",
+      "answer-body muted",
+    ));
+  } else {
+    sec.appendChild(el("h2", { class: "problem-title", text: "No HashMark was found" }));
+    sec.appendChild(para("This page found no HashMark record in what you pasted."));
+  }
+  // THE MISTAKE THIS PAGE WILL ACTUALLY MEET, for a bare transaction number. A digest and
+  // a transaction number are both 64 hex characters and nothing about the string
+  // distinguishes them, so a reader given a digest will paste it here and get "not found".
+  // `pyrxd verify` says the same thing in its own help; it is worth saying twice. Not said
+  // when the reader gave an outpoint or a contract id: those are not the shape of a digest.
+  if (result.form === "txid" && !result.named_by) {
+    sec.appendChild(para(
+      "One thing worth ruling out: a fingerprint and a transaction number are the same " +
+      "shape — 64 letters and numbers — and nothing about the text says which you have. " +
+      "A fingerprint on its own locates nothing, because there is no index from " +
+      "fingerprints back to transactions. Ask whoever gave you the mark for the " +
+      "transaction number.",
+      "answer-body muted",
     ));
   }
-  // THE MISTAKE THIS PAGE WILL ACTUALLY MEET. A digest and a transaction number are
-  // both 64 hex characters and nothing about the string distinguishes them, so a
-  // reader given a digest will paste it here and get "not found". `pyrxd verify`
-  // says the same thing in its own help; it is worth saying twice.
-  sec.appendChild(para(
-    "One thing worth ruling out: a fingerprint and a transaction number are the same " +
-    "shape — 64 letters and numbers — and nothing about the text says which you have. " +
-    "A fingerprint on its own locates nothing, because there is no index from " +
-    "fingerprints back to transactions. Ask whoever gave you the mark for the " +
-    "transaction number.",
-    "answer-body muted",
-  ));
   if (payload.txid) sec.appendChild(fact("transaction", payload.txid, "mono"));
   return sec;
 }
@@ -712,9 +837,9 @@ function renderOneMark(hm, opts) {
   if (options.ordinal) {
     const head = el("h2", { class: "mark-heading", text: options.ordinal });
     panel.appendChild(head);
-    if (options.vout !== null && options.vout !== undefined) {
-      panel.appendChild(el("p", { class: "mark-subheading", text: `output ${options.vout}` }));
-    }
+  }
+  if ((options.ordinal || options.showVout) && options.vout !== null && options.vout !== undefined) {
+    panel.appendChild(el("p", { class: "mark-subheading", text: `output ${options.vout}` }));
   }
 
   if (hm.outcome !== "ok") {
@@ -853,9 +978,20 @@ function answerWhoSigned(hm, att, status) {
       "answer-body muted",
     ));
   } else if (status === "DOES NOT VERIFY") {
+    // AGAINST WHICH CHAIN, SAID IN THE SENTENCE. The chain's genesis hash is inside the signed
+    // statement, so a genuine record signed for another Radiant network (a testnet) fails here
+    // exactly as a forgery does. "The signature does not come from that key" said more than the
+    // check found: it found that the signature does not verify against that key ON THIS CHAIN.
+    const network = networkInWords(att.assumed_network);
     sec.appendChild(para(
       "Nobody that this page can confirm. The record names a key, and the signature it " +
-      "carries does not come from that key.",
+      `carries does not verify against that key on ${network}.`,
+    ));
+    sec.appendChild(para(
+      "The network is part of what a HashMark signs, so a genuine record made for a different " +
+      `Radiant network — a testnet, say — lands here too. This page checks against ${network} ` +
+      "only; `pyrxd --network testnet glyph inspect` in a terminal checks a record against testnet.",
+      "answer-body muted",
     ));
     if (att.signer_address || att.recovered_hash160) {
       // "RECOVERS TO", never "belongs to". Recovery on this curve returns a key for
@@ -917,14 +1053,29 @@ function answerWhoSigned(hm, att, status) {
       "mono warn",
     ));
   }
-  if (status === "VERIFIED" && att.assumed_network) {
-    // The assumption is load-bearing exactly where the verdict is affirmative: the
-    // chain's genesis hash is inside the signed statement, so the same bytes read
-    // against another chain recover a different key.
-    dl.appendChild(fact("checked against", att.assumed_network));
+  if (att.assumed_network) {
+    // FOR EVERY OUTCOME, not only VERIFIED. The chain's genesis hash is inside the signed
+    // statement, so the same bytes read against another chain recover a different key — which
+    // makes the assumption load-bearing for a failure as much as for a success: a testnet
+    // record read as mainnet is a red DOES NOT VERIFY, and the reader is owed the reason it
+    // might be. Where no check ran, the row says what a check WOULD assume, not "checked".
+    const checked = status === "VERIFIED" || status === "DOES NOT VERIFY";
+    dl.appendChild(fact(checked ? "checked against" : "network assumed", att.assumed_network));
   }
   sec.appendChild(dl);
   return sec;
+}
+
+// The network a check assumed, in words. The payload carries `radiant-<name>`; anything else is
+// shown as it came, sanitised, rather than guessed at.
+function networkInWords(assumed) {
+  const known = {
+    "radiant-mainnet": "Radiant mainnet",
+    "radiant-testnet": "Radiant testnet",
+    "radiant-regtest": "Radiant regtest",
+  };
+  if (typeof assumed === "string" && Object.prototype.hasOwnProperty.call(known, assumed)) return known[assumed];
+  return assumed ? safeText(assumed) : "the network this page assumes";
 }
 
 // ── 2. what ─────────────────────────────────────────────────────────────
@@ -956,6 +1107,24 @@ function answerWhatWasFingerprinted(hm) {
     ));
   }
   return sec;
+}
+
+// HOW DEEP, in words that do not add a block. `confirmations` INCLUDES the mark's own
+// block — `mark_anchor.py` derives the height as `tip - confirmations + 1`, so a mark in
+// the newest block has one confirmation and nothing on top of it. The page used to print
+// "N block(s) built on top of it", which overstated every mark's burial by one.
+function depthInWords(confirmations) {
+  const n = Number(confirmations);
+  if (!Number.isInteger(n) || n < 1) {
+    // Not reachable with a height (`resolve_mark_anchor` only derives one for n >= 1), and
+    // kept truthful for the day it is: the count as reported, with no arithmetic on it.
+    return `which the server reports has ${safeText(confirmations)} confirmation(s)`;
+  }
+  const count = `${n} confirmation${n === 1 ? "" : "s"}`;
+  if (n === 1) {
+    return `which has ${count}: the block itself, with none built on top of it yet`;
+  }
+  return `which has ${count}: the block itself and ${n - 1} built on top of it`;
 }
 
 // ── 3. when ─────────────────────────────────────────────────────────────
@@ -1005,13 +1174,13 @@ function answerWhen(anchor, anchorReason) {
     // anyone's transaction and a v1 record can carry any fingerprint its publisher was
     // given, so the block shows the fingerprint was known by then — not that whoever
     // published this transaction ever had the file.
-    `In block ${safeText(anchor.height)}, with ${safeText(anchor.confirmations)} block(s) built ` +
-    "on top of it since. So the fingerprint above existed no later than that block — whoever " +
-    "published it knew that fingerprint by then, which is not the same as having had the file.",
+    `In block ${safeText(anchor.height)}, ${depthInWords(anchor.confirmations)}. So the ` +
+    "fingerprint above existed no later than that block — whoever published it knew that " +
+    "fingerprint by then, which is not the same as having had the file.",
   ));
   const dl = el("dl", { class: "facts" });
   dl.appendChild(fact("block", anchor.height));
-  dl.appendChild(fact("blocks on top of it", anchor.confirmations));
+  dl.appendChild(fact("confirmations", anchor.confirmations));
   sec.appendChild(dl);
   // THE CAVEAT TRAVELS WITH THE NUMBER. `mark_anchor_dict` carries it precisely so a
   // height cannot reach a screen without it: pyrxd has no Radiant header, proof-of-work

@@ -121,8 +121,9 @@ Both pages check a v2 record's signature in the reader's browser.
 pyrxd installs under Pyodide with `deps=False` and coincurve ships no
 pure-Python wheel, so the one curve operation the check needs —
 recovering the signing key — comes from vendored JavaScript
-(`secp256k1-bridge.js`, which the page SHA-256 checks against the
-manifest before importing it) and is registered with
+(`secp256k1-bridge.js` and the library it imports, which the page
+SHA-256 checks against the manifest and then imports from the checked
+bytes — see "Browser variant: install-time integrity") and is registered with
 `install_signature_backend` in `glue.py`. The rest of the check is the
 Python the CLI runs. If that script cannot be loaded, every v2 record
 reads `NOT CHECKED` instead. That is a missing capability of the
@@ -605,10 +606,13 @@ that is the whole of what this page describes; pyrxd can also WRITE a v2
 record (`script/hashmark.py`, `encode_hashmark`), but nothing on this
 page does.
 
-The signature check is also why HashMark decoding is a **CLI-only**
-capability today: it reaches for `coincurve`, which is not installed in
-the browser's Pyodide runtime, so a HashMark OP_RETURN fails to classify
-there. See "Why share one classifier across CLI and browser" below.
+HashMark decoding and the signature check run on **both** surfaces:
+the CLI checks with `coincurve`, and the two browser pages check with
+the vendored curve described above, through the same Python. Where the
+browser's curve does not load, the record still decodes and only the
+verdict is withheld (`unverifiable`, rendered NOT CHECKED). See "Why
+share one classifier across CLI and browser" below for how the missing
+`coincurve` import is kept from breaking classification.
 
 ---
 
@@ -625,13 +629,32 @@ narrower than they look.
 | `pyrxd` wheel | same-origin (`/inspect/wheels/`) | SHA-256 compared against `manifest.json` before `micropip.install`. |
 | Vendored `cbor2==5.4.6` wheel | same-origin (`/inspect/wheels/`) | SHA-256 compared against `manifest.json` before `micropip.install`. Separately, the docs workflow verifies the upstream PyPI bytes at build time against a hash pinned **in the workflow file**, which is in git — that one anchor does sit outside the deploy. |
 | `glue.py` (Python bootstrap) | same-origin | SHA-256 compared against `manifest.json` before evaluation. |
+| `secp256k1-bridge.js` (the one curve operation, in JavaScript) | same-origin (`/inspect/`) | SHA-256 compared against `manifest.json`, then the **checked bytes** are imported from a `blob:` URL — with one edit: the bridge's single import specifier is pointed at the `blob:` URL of the checked library below. The file's own URL is never imported. |
+| `vendor/noble-secp256k1.js` (vendored `@noble/secp256k1`) | same-origin (`/inspect/vendor/`) | SHA-256 compared against `manifest.json`, then the checked bytes are imported from a `blob:` URL, unedited. Which upstream release these bytes are is pinned separately, in git (`tests/fixtures/noble_secp256k1_upstream_pin.json`). |
 | `manifest.json` itself | same-origin | **Not hashed.** It is fetched with no integrity check, and every expected SHA-256 above is read out of it. |
 
-If any SHA-256 mismatches the manifest, the install aborts loudly with
-an error citing the mismatch — the tool does not fall through to "try
-without the integrity check." The verification code is in
-[`docs/inspect_static/inspect/inspect.js`](../../docs/inspect_static/inspect/inspect.js)
-(`fetchAndVerify`).
+If a wheel's or `glue.py`'s SHA-256 mismatches the manifest, the install
+aborts loudly with an error citing the mismatch — the tool does not fall
+through to "try without the integrity check." A mismatch on either curve
+file is quieter by design: no curve is installed, the page still loads,
+and every signature reads NOT CHECKED, because a missing curve must never
+become a failing verdict. The verification code is `fetchAndVerify` and
+`installCurveBackend` in
+[`docs/inspect_static/inspect/shared.js`](../../docs/inspect_static/inspect/shared.js),
+which both pages load.
+
+**The bytes checked are the bytes used.** Each same-origin artifact
+above that has a SHA-256 in the manifest is downloaded once, and the
+buffer whose digest matched is the one that is installed, evaluated or
+imported. That was not true of the curve until a pre-release review
+found it: the page checked one download and then called
+`import()` on the file's URL, which downloaded it again — and the second
+download, never checked, was what ran. Against a server answering the
+second request with a tampered bridge and `Cache-Control: no-store`, a
+forged mark rendered VERIFIED in headless Chromium. The live site was
+spared only because GitHub Pages sends `max-age=600` and the browser
+answered the `import()` from cache.
+`tests/web/test_curve_executes_what_it_verified.py` replays that attack.
 
 ### What the manifest check does and does not defend against
 
@@ -652,13 +675,17 @@ It catches:
   install off-origin or up a directory;
 - a manifest that tries to *disable* a check by supplying a malformed
   digest: every SHA-256 field must be exactly 64 lowercase hex characters
-  or boot fails, rather than the field being treated as "no hash".
+  or boot fails, rather than the field being treated as "no hash";
+- bytes that change between the check and their use — a cache entry
+  that expired, a server answering a repeat request differently —
+  because there is no repeat request: the checked buffer is the one used.
 
 It does **not** defend the deployed origin against itself. An attacker who
 can rewrite the GitHub Pages deploy rewrites `manifest.json` in the same
-act, and could equally rewrite `inspect.js` — which is also same-origin
-and carries no hash — removing the check altogether. Closing that would
-need a digest anchored somewhere the deploy cannot reach.
+act, and could equally rewrite `shared.js` or either page's own script —
+which are also same-origin and carry no hash — removing the check
+altogether. Closing that would need a digest anchored somewhere the
+deploy cannot reach.
 
 The page's Content-Security-Policy denies PyPI as a script source, and
 `micropip.install(..., deps=False)` is used for the pyrxd wheel so no
@@ -666,6 +693,58 @@ transitive PyPI metadata fetch happens during bootstrap. The cbor2 wheel
 is pinned to `5.4.6` because cbor2 6.x ships C-only and a Pyodide install
 that depends on a PyPI fetch creates an off-origin trust path the
 same-origin SHA-256 approach is designed to avoid.
+
+### What this page's Content-Security-Policy allows
+
+Both pages ship the same policy as a `<meta>` tag, and the reasons for
+each source are in the comment beside it in each `index.html`. Three
+entries in `script-src` go beyond "our own origin and the pinned CDN",
+and each has a cost:
+
+- **`'unsafe-eval'`** is there for Pyodide, whose runtime
+  (`pyodide.asm.js`, 0.26.4) contains `eval()` call sites — Emscripten's
+  run-a-script path among them. How much this page needs it is **not
+  established**: in headless Chromium on 2026-09-25, `/verify/` with
+  `'unsafe-eval'` removed still loaded Pyodide and verified a real mark,
+  so the path measured does not reach those call sites. It has not been
+  measured in Firefox or Safari, or on every path either page can take,
+  so it stays until someone does. The cost is that the policy no longer
+  stops a string from being turned into code: if any script on the page
+  ever passed attacker-controlled text to `eval`, `new Function` or a
+  string `setTimeout`, CSP would not catch it. Neither page's own code
+  does — every string reaches the DOM through `textContent`, and the
+  only text interpolated into Python source is the two wheel file names,
+  which `loadManifest` restricts to a bare-basename alphabet and the
+  install step re-checks. Python running under Pyodide can also reach
+  JavaScript (`import js`), so a flaw that let a record's bytes become
+  Python code would be a flaw in the page whatever this policy said.
+- **`'wasm-unsafe-eval'`** lets the page compile WebAssembly, which is
+  what Pyodide's interpreter is. It does not allow `eval()` of
+  JavaScript.
+- **`blob:`** lets the page run a script from a `blob:` URL. It exists
+  for one import: the secp256k1 curve, whose SHA-256-checked bytes are
+  handed to the module loader as `blob:` URLs so that the checked bytes
+  are the ones that run (see the integrity table above). A `blob:` URL
+  can only be minted by script already running in this origin, so an
+  HTML injection on its own has nothing to point at; script that is
+  already running could run new code through `'unsafe-eval'` anyway; and
+  a same-origin page that minted one for an injection to load could as
+  easily have served a file that `'self'` already allows (see below). So
+  `blob:` is not believed to widen what can run here — an argument, not
+  a measurement. Without it, Chromium blocks
+  the import and every signature silently reads NOT CHECKED — which is
+  why `tests/web/test_curve_executes_what_it_verified.py` requires it on
+  every page that installs a curve, and requires it to go if the page
+  ever stops importing from object URLs.
+
+`'self'` is the page's origin, which for a GitHub Pages project site is
+`https://mudwoodlabs.github.io` — shared by every Pages site published
+from the same account, not only this one. Documents on one origin can
+script each other, so a compromised deploy of any other Pages site on
+this origin could open `/verify/` in a window it controls and rewrite the
+verdict a reader sees there, and no SHA-256 check or Content-Security-Policy
+on these pages can prevent that (a pre-release review demonstrated the
+cross-page read; rewriting needs no further access).
 
 ---
 
@@ -729,7 +808,7 @@ code rather than assumed:
    | `unknown` | "does not match any known Glyph or P2PKH layout" | token-bearing lines only | pasted script: a "doesn't match any known template" note; tx row: — |
    | `op_return` | — (the human renderer prints the head line and stops; not even `data_hex`) | — | qualifier |
    | `op_return-msg` | the decoded message, no qualifier | — | — |
-   | `op_return-hashmark-v1` / `-v2` | the HashMark caveat, no qualifier | — | — (and see the `coincurve` gap above) |
+   | `op_return-hashmark-v1` / `-v2` | the HashMark caveat, no qualifier | — | — (the signature verdict panel is drawn instead) |
    | `p2pkh` | — | — | — |
    | `error` | n/a | `(classifier error: …)` | the `error` field, no qualifier |
 

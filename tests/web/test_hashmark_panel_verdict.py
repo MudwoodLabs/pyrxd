@@ -409,6 +409,43 @@ class TestTheRecoveredKeyIsNotCalledTheSigner:
         assert "1CommittedAddressFromTheRecord" in text
 
 
+# ─────────────────────────────── which chain the verdict was reached on ──
+
+
+class TestEveryVerdictSaysWhichChainItAssumed:
+    """The inspector said "Checked against radiant-mainnet" under VERIFIED only. A GENUINE
+    record signed for testnet reads here as DOES NOT VERIFY — the chain is inside the signed
+    statement — and that is exactly the verdict the assumption explains. The record below is
+    really signed for testnet and really classified; the premise is asserted, not described."""
+
+    @pytest.fixture
+    def testnet_payload(self) -> dict:
+        from pyrxd.glyph._inspect_core import _inspect_script
+        from tests.web.test_verify_page import _record_signed_for
+
+        script = _record_signed_for("testnet").hex()
+        assert _inspect_script(script, network="testnet")["hashmark"]["attestation"]["outcome"] == "valid"
+        payload = _inspect_script(script)
+        assert payload["hashmark"]["attestation"]["outcome"] == "invalid_signature"
+        return payload
+
+    @pytest.mark.parametrize("surface", ["script_card", "output_row"])
+    def test_a_failure_names_the_chain_and_why_it_matters(self, testnet_payload, surface) -> None:
+        flat = " ".join(_both_surfaces(testnet_payload)[surface].split())
+        assert "Checked against radiant-mainnet" in flat
+        assert "a genuine record made for another network does not verify here" in flat
+
+    @pytest.mark.parametrize("surface", ["script_card", "output_row"])
+    def test_an_unchecked_signature_says_what_a_check_would_assume_not_that_one_ran(self, surface) -> None:
+        payload = TestTheRecoveredKeyIsNotCalledTheSigner._forged_payload()
+        payload["hashmark"]["attestation"].update(
+            {"outcome": "unverifiable", "status": "NOT CHECKED", "assumed_network": "radiant-mainnet"}
+        )
+        flat = " ".join(_both_surfaces(payload)[surface].split())
+        assert "A check here assumes radiant-mainnet" in flat
+        assert "Checked against" not in flat
+
+
 # ────────────────────────────────────────── the block, and its absence ──
 
 
