@@ -369,8 +369,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   raises `AnchorBindingError` if none does. The formula alone can be one block low: a
   pre-release review measured both default mainnet servers one block low together in 7 of 470
   paired samples, and in one of 12 live `verify --wave-name` runs saw ESTABLISHED printed at
-  block 460571 for a mark in block 460572. The CLI always passes `fetch_header`; the
-  `/inspect/` and `/verify/` pages do not, and show the unbound caveat.
+  block 460571 for a mark in block 460572. The CLI and the `/inspect/` and `/verify/` pages
+  always pass `fetch_header`. `AnchorBindingError` says which case happened through its
+  `served`, `unserved` and `disagrees` attributes: the endpoint's index and node are said to
+  disagree only when every header in the window arrived and none matched; otherwise the error
+  names the heights the endpoint did not serve.
 
 - **`pyrxd glyph inspect` prints a line for a v1 HashMark record's missing signature, and
   `--json` carries the verdict words and the record's algorithm id.** A v1 record now prints
@@ -418,8 +421,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hashed in the browser. It checks signatures in the browser with the same vendored curve as
   `/inspect/`, draws at most 50 marks per transaction, and prints the
   `pyrxd verify <txid> --min-confirmations N` command that checks every one. It states burial
-  as confirmations, the block itself and N−1 built on top of it, and does not check the block
-  height against a header as the CLI does. A signature that fails is reported as not verifying
+  as confirmations, the block itself and N−1 built on top of it, and shows the mark's block only
+  when the endpoint's own header at that height hashes to the block its node names: the CLI's
+  check, run through the same Python. Nothing checks proof-of-work or merkle inclusion. To
+  compute Radiant's block hash in the browser the page loads Pyodide's `hashlib` package
+  (OpenSSL 1.1.1n), which then computes every hash on the page, including the signature
+  check's; like the interpreter, it is checked only against the CDN's own lockfile. A signature that fails is reported as not verifying
   against that key on Radiant mainnet, with a note that a genuine record made for another
   Radiant network lands there too. Served from the documentation site; shipped in the sdist,
   not the wheel.
