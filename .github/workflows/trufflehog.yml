@@ -32,8 +32,10 @@ on:
   # pull_request.base.sha..head.sha, so it follows whatever the PR
   # targets. See tests/test_ci_workflows_check_every_pr_base.py.
   pull_request:
-  # Push-scan: catches anything that lands on main directly (admin
-  # override of branch protection, etc.).
+  # Push-scan: catches anything that lands on main. A direct push is
+  # refused by branch protection (enforced for admins too, read
+  # 2026-09-25), but the squash commit every merge creates is a new
+  # commit that no PR run scanned.
   push:
     branches: [main]
   # Weekly full-history audit. The PR/push scans only cover the
@@ -71,8 +73,25 @@ jobs:
           persist-credentials: false
 
       - name: Trufflehog scan
-        uses: trufflesecurity/trufflehog@f714bf454f350590f4a24c3ddb1aef02c35bf5b6  # v3.97.5
+        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85  # v3.97.9
         with:
+          # THE SHA ABOVE DOES NOT PIN THE SCANNER. This action is a wrapper:
+          # its action.yml runs `docker run "${IMAGE}:${VERSION}"`, and
+          # `version` defaults to `latest`. Before this input existed the pin
+          # read `# v3.97.5` while the log reported trufflehog 3.97.9, so the
+          # binary deciding this required check was whatever Truffle Security
+          # last pushed to ghcr.io, not what the pin said.
+          #
+          # `tag@digest`: docker resolves the DIGEST and ignores the tag
+          # (checked 2026-09-25: `3.97.9@<the 3.97.5 digest>` runs 3.97.5), so
+          # the digest is the pin and the tag is a label. The label must match
+          # the `# vX.Y.Z` comment above, so a Dependabot bump of the action
+          # fails tests/test_workflow_actions_are_sha_pinned.py until this line
+          # moves with it. To get the digest for a new version:
+          #   docker buildx imagetools inspect ghcr.io/trufflesecurity/trufflehog:X.Y.Z
+          # (the `Digest:` line), or the ghcr.io web page for that tag.
+          version: 3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
+          #
           # --results=verified,unknown — flag verified leaks (real
           # credentials confirmed by the issuer's API) and unknown
           # matches (pattern matches that couldn't be auto-verified).

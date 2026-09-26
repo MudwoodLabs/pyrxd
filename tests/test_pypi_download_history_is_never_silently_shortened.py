@@ -219,6 +219,43 @@ def test_a_corrupt_existing_file_is_not_overwritten(tmp_path: pathlib.Path, monk
     assert out.read_text() == "{ this is not json"
 
 
+def test_an_interrupted_write_leaves_the_previous_history_intact(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same failure as the traffic collector's: a cancel mid-write, then a commit step that ran on
+    `always()`, committed a truncated file. The write is cut off after half its bytes here; the
+    old file must survive byte for byte, with no temporary file left beside it."""
+    mod = _load(tmp_path, monkeypatch)
+    _serve(mod, monkeypatch, _REAL)
+    out = tmp_path / "pypi.json"
+    out.write_text(json.dumps({"without_mirrors": {"2026-01-01": 9}}, indent=2) + "\n")
+    before = out.read_bytes()
+
+    real_write_text = pathlib.Path.write_text
+
+    def _half_then_interrupted(self, data, *args, **kwargs):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pathlib.Path, "write_text", _half_then_interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        mod.main()
+    monkeypatch.undo()
+
+    assert out.read_bytes() == before, "an interrupted write truncated the history file"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["pypi.json"], "a temporary file was left behind"
+
+
+def test_a_completed_write_leaves_only_the_history_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = _load(tmp_path, monkeypatch)
+    _serve(mod, monkeypatch, _REAL)
+    assert mod.main() == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["pypi.json"]
+    assert json.loads((tmp_path / "pypi.json").read_text())["without_mirrors"]
+
+
 # ---------------------------------------------------------------------------
 # The workflow actually runs it, commits it, and goes red when it fails
 # ---------------------------------------------------------------------------
