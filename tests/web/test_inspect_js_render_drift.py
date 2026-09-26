@@ -1392,6 +1392,10 @@ def tx_rendered(tx_payloads) -> dict[str, str]:
 # two tables above: anything not listed must appear in the rendered text.
 _OMITTED_FROM_TX_CARD = {
     "form": "always 'txid' on this path — the card's title carries it",
+    "binding_candidates": "not a fact about the transaction but the page's fetch list: the "
+    "outpoints its second step asks the server for. What those fetches establish IS drawn — the "
+    "payload binding row, and each other payload's verdict — and "
+    "tests/web/test_the_headline_prefers_a_bound_payload.py checks the page fetches exactly these",
     "outputs": "rendered as one row per output, and every field of every row is "
     "guarded field-by-field by test_output_row_renders_every_field. Demanding them "
     "again here would re-demand `hex` and `length`, which the rows omit on purpose",

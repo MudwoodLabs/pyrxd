@@ -77,7 +77,7 @@ const CURVE_URL = new URL("./secp256k1-bridge.js", document.baseURI).toString();
 // global namespace and keeps the surface explicit.
 let pyGlue = null;          // glue.run(text) -> dict
 let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex, attest_limit, max_rows) -> dict
-let pySpentBinding = null;  // glue.spent_output_binding(txid, raw_hex, prev_raw_hex, prev_error) -> dict
+let pySpentBinding = null;  // glue.spent_output_bindings(txid, raw_hex, prevs_json, errors_json, attest_limit, max_rows) -> dict
 // The verdict view's three extra bridges. Each is a thin forward to pyrxd: the
 // block comes from `resolve_mark_anchor`, the hash choice from `algorithm_for`,
 // and the digest comparison and its wording from `_inspect_core`. None of the
@@ -180,7 +180,7 @@ async function boot() {
 
   pyGlue = runtime.bridges.run;
   pyGlueFetch = runtime.bridges.inspectTxidWithRaw;
-  pySpentBinding = runtime.bridges.spentOutputBinding;
+  pySpentBinding = runtime.bridges.spentOutputBindings;
   pyMarkAnchor = runtime.bridges.markAnchor;
   pyFileCheckPlan = runtime.bridges.fileCheckPlan;
   pyJudgeFileDigest = runtime.bridges.judgeFileDigest;
@@ -773,8 +773,19 @@ function renderFetchedTxCard(payload) {
       // and shown one of them is the same "you were told about a different
       // token" failure one level down.
       const label = [row.name, row.ticker].filter(Boolean).join(" / ") || "(unnamed)";
-      const tail = row.mints === false ? " — mints no token" : "";
-      odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}${tail}`));
+      let tail = row.mints === false ? " — mints no token" : "";
+      // Its commit's verdict, where the second step supplied its spent script — and flagged when
+      // a node rejects it, or when it spent no commit pyrxd recognises beside one that binds.
+      // Worded as the CLI words it.
+      if (row.binding_state) {
+        tail += ` — payload binding: ${row.binding_state}`;
+        if (row.binding_warning) tail += " *** treat as unattributed";
+      }
+      odl.appendChild(kv(
+        `input ${row.input_index}`,
+        `${row.classification || "?"} — ${label}${tail}`,
+        row.binding_warning ? "kv-warning" : undefined,
+      ));
     }
     wrapper.appendChild(odl);
     if (hiddenGlyphs > 0) {
@@ -1647,6 +1658,16 @@ function _outputShape(payload) {
 // `_outputShape`, never from `payload.outputs`, which holds at most MAX_ROWS_SHOWN rows. The one
 // thing still read off the rows is a POSITION (which vout the minted FT sits at, whether the
 // outputs are in the canonical mint order), and only when the rows are every output.
+// What a marker banner may say about the outputs: exactly what `metadata.mints` says — the field
+// the headline's "token" row reads — so the banner and that row cannot disagree. Empty when the
+// classifier did not say.
+function _mintSentence(metadata) {
+  if (!metadata || typeof metadata.mints !== "boolean") return "";
+  return metadata.mints
+    ? " An output of this transaction creates a token ref from the payload's input; the output rows say what its script is."
+    : " No output of this transaction creates a token ref from the payload's input: it mints no token here.";
+}
+
 function _detectTxShape(payload) {
   const outputs = payload.outputs || [];
   const shape = _outputShape(payload);
@@ -1685,30 +1706,35 @@ function _detectTxShape(payload) {
     );
   }
 
-  // Rarer Glyph protocol markers — detected from reveal-metadata protocol
-  // list, not from output shapes (the locking scripts are ordinary NFT/MUT
-  // shapes; the marker is purely a CBOR metadata flag). These are structural
-  // pattern matches only; semantic correctness is not verified.
+  // Rarer Glyph protocol markers — detected from the reveal-metadata protocol list, not from
+  // output shapes. The marker is purely a CBOR metadata flag. These are structural pattern
+  // matches only; semantic correctness is not verified.
+  //
+  // WHAT A BANNER MAY SAY ABOUT THE OUTPUTS: only what `metadata.mints` says (`_mintSentence`),
+  // the field the "token" row reads. Five of these banners used to say the locking script "is
+  // an ordinary Glyph NFT" (DAT's: "singleton") — read off the marker, never off the bytes — so
+  // on the mainnet DAT reveal e5c67100…be5d, whose outputs are P2PKH, the card said the payload
+  // mints no token AND that the locking script was an NFT singleton (#743 round 3).
+  const mintSentence = _mintSentence(payload.metadata);
 
-  // CONTAINER (7) — an NFT that groups other tokens/NFTs into a collection.
+  // CONTAINER (7) — a collection envelope other tokens reference.
   if (protocol.includes("7") || protocol.some((p) => p.endsWith("CONTAINER"))) {
     return (
       "This transaction carries the Glyph CONTAINER marker (protocol = 7). " +
-      "A CONTAINER is an NFT that acts as a collection envelope — other tokens " +
-      "or NFTs reference it to signal membership in the collection. The locking " +
-      "script is an ordinary Glyph NFT singleton; the CONTAINER role is " +
-      "declared only in the reveal metadata."
+      "A CONTAINER is a collection envelope — other tokens or NFTs reference " +
+      "it to signal membership in the collection. The CONTAINER role is " +
+      "declared only in the reveal metadata." + mintSentence
     );
   }
 
-  // ENCRYPTED (8) — an NFT whose payload is encrypted; requires companion key NFT.
+  // ENCRYPTED (8) — a payload that is encrypted; requires companion key NFT.
   if (protocol.includes("8") || protocol.some((p) => p.endsWith("ENCRYPTED"))) {
     return (
       "This transaction carries the Glyph ENCRYPTED marker (protocol = 8). " +
-      "The payload embedded in this NFT's reveal metadata is encrypted. " +
+      "The payload embedded in the reveal metadata is encrypted. " +
       "Decrypting it typically requires a companion key NFT held by the " +
-      "intended recipient. The on-chain shape is an ordinary Glyph NFT; " +
-      "the encryption is a metadata-layer convention, not enforced by script."
+      "intended recipient. The encryption is a metadata-layer convention, " +
+      "not enforced by script." + mintSentence
     );
   }
 
@@ -1719,41 +1745,38 @@ function _detectTxShape(payload) {
       "A TIMELOCK signals that the reveal or transfer is subject to a " +
       "time-based condition encoded in the metadata. Per the Glyph protocol " +
       "spec, TIMELOCK requires ENCRYPTED to also be present. " +
-      "The on-chain locking script is an ordinary Glyph NFT; " +
-      "the time condition is a metadata-layer convention."
+      "The time condition is a metadata-layer convention." + mintSentence
     );
   }
 
-  // AUTHORITY (10) — an issuer authority NFT; grants permission to modify/issue tokens.
+  // AUTHORITY (10) — an issuer authority; grants permission to modify/issue tokens.
   if (protocol.includes("10") || protocol.some((p) => p.endsWith("AUTHORITY"))) {
     return (
       "This transaction carries the Glyph AUTHORITY marker (protocol = 10). " +
-      "An AUTHORITY is a special NFT that confers issuer rights — the holder " +
-      "can authorize operations (such as additional mints or metadata updates) " +
-      "on a related token family. The on-chain script is an ordinary Glyph NFT; " +
-      "the authority role is declared in the reveal metadata."
+      "An AUTHORITY confers issuer rights — its holder can authorize " +
+      "operations (such as additional mints or metadata updates) on a " +
+      "related token family. The authority role is declared in the reveal " +
+      "metadata." + mintSentence
     );
   }
 
-  // WAVE (11) — an on-chain name-claim NFT (requires NFT + MUT per spec).
+  // WAVE (11) — an on-chain name claim (requires NFT + MUT per spec).
   if (protocol.includes("11") || protocol.some((p) => p.endsWith("WAVE"))) {
     return (
       "This transaction carries the Glyph WAVE marker (protocol = 11). " +
-      "WAVE is the Glyph on-chain naming protocol — this NFT claims a " +
-      "human-readable name on Radiant. The name can be updated by spending " +
-      "this output (it requires NFT + MUT per the protocol spec). " +
+      "WAVE is the Glyph on-chain naming protocol — this payload claims a " +
+      "human-readable name on Radiant (the protocol spec requires NFT + MUT). " +
       "Note: WAVE support in pyrxd is currently deferred; this banner is " +
-      "informational only."
+      "informational only." + mintSentence
     );
   }
 
-  // DAT (3) — a data-storage NFT (raw data anchored on-chain).
+  // DAT (3) — data anchored on-chain in a reveal payload.
   if (protocol.includes("3") || protocol.some((p) => p.endsWith("DAT"))) {
     return (
       "This transaction carries the Glyph DAT marker (protocol = 3). " +
-      "DAT anchors arbitrary data on-chain inside a Glyph NFT's reveal " +
-      "payload. The data blob is embedded in the CBOR metadata; the " +
-      "locking script is an ordinary Glyph NFT singleton."
+      "DAT anchors data on-chain in a Glyph reveal payload: the data is " +
+      "embedded in the CBOR metadata." + mintSentence
     );
   }
 
@@ -2612,40 +2635,49 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // output's script hex, the headline payload's protocol list — which only the transaction's
   // bytes bound.
   //
-  // PAYLOAD BINDING — a SECOND fetch, and NOT a second classification. The first pass names
-  // the outpoint the reveal's attributed input spent. That output is the commit whose
-  // `payload_hash` is the only thing binding the displayed name/attrs to anything, and the
+  // PAYLOAD BINDING — more fetches, and usually NOT a second classification. The first pass
+  // names, in `binding_candidates`, the outpoints the minting payloads' inputs spent (at most
+  // a handful; one for a reveal minting one glyph). Those outputs are the commits whose
+  // `payload_hash` is the only thing binding a displayed name/attrs to anything, and the
   // classifier is network-free, so without this the verdict can only ever read "unchecked".
-  // `spent_output_binding` answers for that one field — it reads the attributed input's
-  // envelope, the one output it spent, and this transaction's output scripts for the ref that
-  // output's commit demands — and the CLI's `--fetch` asks the same function.
+  // `spent_output_bindings` answers — the headline's verdict, and the headline itself, which
+  // goes to a payload that is bound over one that merely mints (#743 round 3) — and the CLI's
+  // `--fetch` asks the same function. It classifies again only when it has to (the headline
+  // moved, or another payload's row has a verdict to show), and then hands back the payload.
   //
-  // BOUNDED BY CONSTRUCTION: one attributed input, one prevout, one extra round trip.
+  // BOUNDED by the classifier: `binding_candidates` is capped there.
   // A failure here leaves the rest of the report standing — and is SAID: the refusal or the
-  // unusable answer goes to Python as `prevError`, and the verdict reads "unchecked" with
-  // that as its detail. It used to be swallowed, and the report then said the spent
-  // transaction "was not supplied" when the page had asked for it and been lied to.
+  // unusable answer goes to Python in `errors`, and that verdict reads "unchecked" with it as
+  // its detail. It used to be swallowed, and the report then said the spent transaction "was
+  // not supplied" when the page had asked for it and been lied to.
   let result;
   try {
     result = fromPy(pyGlueFetch(txid, rawHex, MAX_ROWS_SHOWN, MAX_ROWS_SHOWN));
 
     const metadata = result && result.ok && result.payload ? result.payload.metadata : null;
-    const outpoint = metadata ? metadata.input_outpoint : null;
-    if (outpoint) {
+    const candidates = metadata && Array.isArray(result.payload.binding_candidates)
+      ? result.payload.binding_candidates
+      : [];
+    if (candidates.length > 0) {
       statusEl.textContent = "checking payload binding…";
-      const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
-      let prevRawHex = "";
-      let prevError = "";
-      try {
-        // Hash-checked against `prevTxid` inside the fetch: a server that answers with any
-        // other transaction is refused there, before a byte of it reaches the classifier.
-        prevRawHex = await fetchRawTxFromElectrumx(prevTxid);
-      } catch (err) {
-        prevError = stripControlChars(String((err && err.message) || err));
+      const prevs = {};
+      const errors = {};
+      for (const outpoint of candidates) {
+        const prevTxid = String(outpoint).slice(0, String(outpoint).lastIndexOf(":"));
+        try {
+          // Hash-checked against `prevTxid` inside the fetch: a server that answers with any
+          // other transaction is refused there, before a byte of it reaches the classifier.
+          prevs[outpoint] = await fetchRawTxFromElectrumx(prevTxid);
+        } catch (err) {
+          errors[outpoint] = stripControlChars(String((err && err.message) || err));
+        }
       }
-      const bound = fromPy(pySpentBinding(txid, rawHex, prevRawHex, prevError));
+      const bound = fromPy(pySpentBinding(
+        txid, rawHex, JSON.stringify(prevs), JSON.stringify(errors), MAX_ROWS_SHOWN, MAX_ROWS_SHOWN,
+      ));
       if (bound && bound.ok) {
-        if (bound.binding) metadata.payload_binding = bound.binding;
+        if (bound.payload) result.payload = bound.payload;
+        else if (bound.binding) metadata.payload_binding = bound.binding;
       } else {
         // Not reachable for a transaction the first call accepted — the bridge re-reads the
         // same bytes — but if it ever is, the first pass's "was not supplied" must not stand.

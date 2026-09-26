@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_binding, _truncate_for_human
+from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_bindings, _truncate_for_human
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -274,38 +274,43 @@ async def _inspect_txid_inner(
     # is the thing the report exists to eliminate, so resolve it here, where a network
     # connection is already in hand.
     #
-    # EXACTLY ONE round trip, bounded by construction rather than by a cap: there is
-    # one attributed input and it has one prevout. No loop, so nothing to bound.
+    # WHICH round trips: the ones the classification names in `binding_candidates` — the spent
+    # transactions of the minting payloads' inputs, at most `_MAX_BINDING_FETCHES`, so a reveal
+    # minting one glyph costs the one it always did. More than one because the headline is
+    # chosen by what they say (#743 round 3): a payload that mints and was never committed to,
+    # placed first, used to headline over the bound one beside it.
     #
-    # THE VERDICT COMES FROM `_spent_output_binding`, the function the browser page calls too,
+    # THE VERDICT COMES FROM `_spent_output_bindings`, the function the browser page calls too,
     # so the two surfaces cannot word one fetch differently. A failure here used to fall back
     # to the classifier's "was not supplied" — including when the server answered with a
     # DIFFERENT transaction, which `get_transaction` refuses. It now says it asked, and why
     # nothing usable came back.
-    binding: dict | None = None
-    meta = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}) or {}
-    outpoint = meta.get("input_outpoint")
-    if outpoint:
-        prev_txid = str(outpoint).rpartition(":")[0]
-        spent_raw: bytes | None = None
-        spent_error = ""
-        try:
-            spent_raw = bytes(await client.get_transaction(Txid(prev_txid.lower())))
-        except Exception as exc:
-            # Same contract as the delegate block above: a failed fetch leaves the verdict
-            # "unchecked" rather than failing the whole inspect — and the reason is carried
-            # into the verdict's `detail` rather than only logged.
-            spent_error = str(exc) or type(exc).__name__
-            _log.debug("could not fetch the attributed input's prevout %s: %s", outpoint, exc)
-        binding = _spent_output_binding(str(txid), bytes(raw), spent_raw, spent_error=spent_error)
+    bindings: dict | None = None
+    candidates = (payload.get("binding_candidates") or []) if isinstance(payload, dict) else []
+    if candidates:
+        spent: dict[str, bytes | None] = {}
+        errors: dict[str, str] = {}
+        for outpoint in candidates:
+            try:
+                spent[outpoint] = bytes(await client.get_transaction(Txid(str(outpoint).rpartition(":")[0].lower())))
+            except Exception as exc:
+                # Same contract as the delegate block above: a failed fetch leaves that verdict
+                # "unchecked" rather than failing the whole inspect — and the reason is carried
+                # into the verdict's `detail` rather than only logged.
+                spent[outpoint] = None
+                errors[outpoint] = str(exc) or type(exc).__name__
+                _log.debug("could not fetch the prevout %s: %s", outpoint, exc)
+        bindings = _spent_output_bindings(str(txid), bytes(raw), spent, errors)
+    binding = None if bindings is None else bindings["binding"]
 
-    if resolved:
+    if resolved or (bindings is not None and bindings["reclassify"]):
         payload = _classify_raw_tx(
             str(txid),
             bytes(raw),
             only_vout=only_vout,
             network=network,
-            delegated_refs=resolved,
+            delegated_refs=resolved or None,
+            spent_scripts=None if bindings is None else bindings["spent_scripts"],
         )
     if binding is not None and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["payload_binding"] = binding
@@ -465,7 +470,7 @@ def _render_txid_human(payload: dict) -> str:
             _mark = "  *** " if _pb.get("state") in PAYLOAD_BINDING_WARNING_STATES else "  "
             lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
             # WHY, when the spent transaction was asked for and nothing usable came back. Already
-            # sanitised and capped by `_spent_output_binding`: it can quote a server.
+            # sanitised and capped by `_spent_output_bindings`: it can quote a server.
             if _pb.get("detail"):
                 lines.append(f"    why: {_pb['detail']}")
             # Named whatever the verdict. On `unchecked` it is what someone would
@@ -593,6 +598,12 @@ def _render_txid_human(payload: dict) -> str:
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
             tail = "" if row.get("mints", True) else " — mints no token"
+            # Its commit's verdict, where a fetch supplied its spent script — and flagged when a
+            # node rejects it, or when it spent no commit pyrxd recognises beside one that binds.
+            if row.get("binding_state"):
+                tail += f" — payload binding: {row['binding_state']}"
+                if row.get("binding_warning"):
+                    tail += " *** treat as unattributed"
             lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}{tail}")
 
     # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders

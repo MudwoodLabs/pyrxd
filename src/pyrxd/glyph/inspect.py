@@ -25,8 +25,11 @@ Public surface:
   the CLI uses
 * :func:`spent_output_binding` — ``payload_binding`` for a reveal, from what
   fetching the transaction its attributed input spent gave: the bytes, or why
-  there are none. The CLI's ``--fetch`` and the browser page both call it, so
-  the two cannot word the same fetch differently
+  there are none
+* :func:`spent_output_bindings` — the same for every outpoint a classification's
+  ``binding_candidates`` names, with the headline those spent scripts rank first
+  (a bound payload over one that merely mints). The CLI's ``--fetch`` and the
+  browser page both call it, so the two cannot word the same fetch differently
 * :func:`inspect_contract` — decode a 72-char Glyph contract id
 * :func:`inspect_outpoint` — decode a ``txid:vout`` outpoint
 * :func:`inspect_script` — classify a hex-encoded locking script and
@@ -87,6 +90,9 @@ from ._inspect_core import (
     _spent_output_binding as spent_output_binding,
 )
 from ._inspect_core import (
+    _spent_output_bindings as spent_output_bindings,
+)
+from ._inspect_core import (
     _truncate_for_human as truncate_for_human,
 )
 from .confusables import looks_confusable_with_latin, skeleton
@@ -112,5 +118,6 @@ __all__ = [
     "sanitize_display_string",
     "skeleton",
     "spent_output_binding",
+    "spent_output_bindings",
     "truncate_for_human",
 ]

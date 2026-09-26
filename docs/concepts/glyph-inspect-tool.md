@@ -201,15 +201,22 @@ for every output.
 Every raw transaction either page fetches is hashed and compared with
 the txid it asked for before anything reads it, so a server that
 answers with some other transaction is refused. That includes
-`/inspect/`'s second fetch, of the commit a reveal spent, which is what
-decides `payload_binding`. That step does not classify the transaction
-again: `spent_output_binding` reads the attributed input's envelope,
-the one output it spent, and the reveal's own output scripts (to see
-whether they carry the ref that output's commit demands), and
-`pyrxd glyph inspect <txid> --fetch` asks the same function, so the
-page and the CLI word the same fetch the same way. When the fetch fails
-or is refused, the verdict reads `unchecked` and says why — not that the
-spent output "was not supplied".
+`/inspect/`'s second step, which fetches the commits the reveal's
+minting payloads spent — the outpoints the first classification names
+in `binding_candidates`, at most 8, and one for a reveal minting one
+glyph — and decides `payload_binding` and which payload heads the
+card. A payload whose commit binds it heads it over one that merely
+mints: `spent_output_bindings` ranks a bound payload first, then one
+that spent a commit pyrxd recognises, then the first that mints. Only
+when that moves the headline, or another payload's verdict is known,
+is the transaction classified again, with those commits; otherwise the
+binding is the one field that changes. `pyrxd glyph inspect <txid>
+--fetch` fetches the same outpoints and asks the same function, so the
+page and the CLI word the same fetch the same way. A payload that
+spent no commit pyrxd recognises, beside one that IS bound, is flagged
+("treat as unattributed"). When a fetch fails or is refused, that
+verdict reads `unchecked` and says why — not that the spent output
+"was not supplied".
 
 What each `payload_binding` state establishes:
 

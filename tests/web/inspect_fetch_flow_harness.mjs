@@ -13,7 +13,7 @@
 //
 // So this runs the page's own `onFetchTxid`, verbatim, and records exactly what it asks the
 // server for and exactly what it hands each Python bridge — the classifier
-// (`inspect_txid_with_raw`) and the binding step (`spent_output_binding`). Each bridge answers
+// (`inspect_txid_with_raw`) and the binding step (`spent_output_bindings`). Each bridge answers
 // from a canned list, call by call. The Python side (`test_inspect_fetch_flow.py`) computes
 // those answers with the REAL `glue.py` on the arguments the page really passed — replaying a
 // first run's recorded arguments, then running again with the real answers and checking the

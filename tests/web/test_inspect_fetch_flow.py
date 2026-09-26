@@ -3,7 +3,7 @@ Python bridge, and what it then DRAWS.
 
 ``inspect_fetch_flow_harness.mjs`` runs the page's own ``onFetchTxid`` against a stub ElectrumX
 server and records every argument it passes to the two bridges — the classifier
-(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_binding``). Each bridge
+(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_bindings``). Each bridge
 answers from a canned list, and every canned answer here is computed by the REAL ``glue.py`` on
 the arguments the page really passed: a first run records the binding step's arguments, the real
 glue answers them, and a second run renders that answer after checking the page passed the same
@@ -21,7 +21,7 @@ Properties, each a defect this change fixes:
 * **A spent transaction the page could not get is SAID, not swallowed** — in the drawn
   ``payload binding`` row and its ``detail``, not "was not supplied".
 * **The binding step does not classify the transaction again.** It used to be a second full
-  ``inspect_txid_with_raw``; it is one ``spent_output_binding`` call.
+  ``inspect_txid_with_raw``; it is one ``spent_output_bindings`` call.
 * **A failed first fetch is advised by what failed.** A server that answered with a different
   transaction was reachable, and is not told to be checked for reachability.
 * **The page passes its row limit as the classifier's checking limit AND its listing limit.**
@@ -152,7 +152,7 @@ def _run(reveal, server: dict, limit: int) -> dict:
     what pass 2 draws is the page's drawing of the real binding for the real arguments."""
     first = [_first_pass(reveal, limit)]
     recorded = _flow(reveal.txid(), server, first)
-    answers = [_glue().spent_output_binding(*call) for call in recorded["binding_calls"]]
+    answers = [_glue().spent_output_bindings(*call) for call in recorded["binding_calls"]]
     flow = _flow(reveal.txid(), server, first, answers)
     assert flow["glue_calls"] == recorded["glue_calls"]
     assert flow["binding_calls"] == recorded["binding_calls"]
@@ -183,7 +183,11 @@ class TestTheSpentTransactionTheServerSends:
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         raw = reveal.serialize().hex()
         assert flow["glue_calls"] == [[reveal.txid(), raw, limit, limit]], "the transaction was classified twice"
-        assert flow["binding_calls"] == [[reveal.txid(), raw, commit.serialize().hex(), ""]]
+        (call,) = flow["binding_calls"]
+        # The page hands the prevouts as JSON objects keyed by outpoint, and its row limit twice.
+        assert call[:2] == [reveal.txid(), raw] and call[4:] == [limit, limit]
+        assert json.loads(call[2]) == {f"{commit.txid()}:0": commit.serialize().hex()}
+        assert json.loads(call[3]) == {}
         binding = flow["binding_answers"][0]["binding"]
         assert binding["state"] == "bound" and binding["first_ref_output"] == 0
         assert _drawn_binding(flow) == (
@@ -213,9 +217,9 @@ class TestTheSpentTransactionTheServerSends:
         flow = _run(reveal, server, limit)
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         (call,) = flow["binding_calls"]
-        assert call[2] == "", "the forged transaction reached the binding step"
+        assert json.loads(call[2]) == {}, "the forged transaction reached the binding step"
         said = f"the server's answer is not the transaction asked for: it hashes to {forged.txid()}"
-        assert call[3] == said
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": said}
         value, detail = _drawn_binding(flow)
         assert value == f"unchecked — {SPENT_TX_NOT_OBTAINED}"
         assert detail == said
@@ -228,7 +232,8 @@ class TestTheSpentTransactionTheServerSends:
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"error": "daemon busy"}}
         flow = _run(reveal, server, limit)
         (call,) = flow["binding_calls"]
-        assert call[2:] == ["", "server error: daemon busy"]
+        assert json.loads(call[2]) == {}
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": "server error: daemon busy"}
         assert _drawn_binding(flow) == (f"unchecked — {SPENT_TX_NOT_OBTAINED}", "server error: daemon busy")
         assert "was not supplied" not in flow["rendered"]
 
