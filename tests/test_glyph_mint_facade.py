@@ -93,6 +93,7 @@ class RecordingStore(PendingStore):
 
     def __init__(self, log: list[str] | None = None) -> None:
         self.records: dict[str, PendingMint] = {}
+        self.archived: dict[str, PendingMint] = {}
         self.log = log if log is not None else []
 
     def save(self, pending: PendingMint) -> None:
@@ -108,6 +109,11 @@ class RecordingStore(PendingStore):
     def delete(self, commit_txid: str) -> None:
         self.records.pop(commit_txid, None)
         self.log.append("delete")
+
+    def archive(self, commit_txid: str) -> None:
+        if commit_txid in self.records:
+            self.archived[commit_txid] = self.records.pop(commit_txid)
+        self.log.append("archive")
 
     def list_pending(self) -> list[str]:
         return sorted(self.records)
@@ -654,7 +660,7 @@ class TestRevealPhase:
         reveal = Transaction.from_hex(client.broadcasts[1].hex())
         assert reveal.outputs[0].satoshis == 1_500_000
 
-    async def test_record_is_deleted_only_after_the_reveal_broadcasts(self):
+    async def test_record_is_archived_only_after_the_reveal_broadcasts(self):
         log: list[str] = []
         store = RecordingStore(log)
         client = FakeClient()
@@ -664,9 +670,9 @@ class TestRevealPhase:
         pending = await minter.commit_nft(_nft_metadata())
         await minter.reveal_nft(pending)
 
-        # broadcast (commit), broadcast (reveal), THEN delete.
-        assert log[-1] == "delete"
-        assert store.list_pending() == []
+        # broadcast (commit), broadcast (reveal), THEN archive — never delete (#736, round 3).
+        assert log[-1] == "archive" and "delete" not in log
+        assert store.list_pending() == [] and store.archived == {pending.commit_txid: pending}
 
     async def test_record_survives_a_failed_reveal_broadcast(self):
         """If the reveal does not relay, the payload must still be recoverable."""

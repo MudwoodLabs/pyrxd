@@ -421,12 +421,14 @@ re-run the mint while the commit may still confirm.
   `--electrumx` if the mint named a server, and `--passphrase` if the wallet was
   opened with one — the passphrase itself is never printed), and with the
   mint's WAVE fee choice STATED: `--wave-registration-fee` if it paid the
-  published treasury, `--no-wave-registration-fee` if it declined,
-  `--wave-treasury <ADDRESS>` if it named another treasury — with `<ADDRESS>`
-  left for you to type: pyrxd never prints a paying command for a treasury
-  other than the published one, because the address would come from the
-  record, and a record can be changed after the mint. `--allow-unverified-wave-name`
-  is repeated if the mint went ahead without an indexer's answer.
+  published treasury, `--no-wave-registration-fee` if it declined, and
+  `--wave-treasury <address>` with the address the mint was given on its own
+  command line if it named another treasury. That is the only place pyrxd
+  prints a treasury other than the published one: every command printed from a
+  record read off disk — anything `resume-mint` prints, and the refusals below
+  — shows `--wave-treasury '<ADDRESS>'` for you to fill in, because a record
+  can be changed after the mint. `--allow-unverified-wave-name` is repeated if
+  the mint went ahead without an indexer's answer.
   `resume-mint` takes the fee choice from its command line, never from the
   record: a bare `resume-mint <txid>` of a WAVE claim is refused and prints the
   commands that state it, and a choice that disagrees with the record (paying
@@ -442,7 +444,10 @@ re-run the mint while the commit may still confirm.
   record on the same network is refused unless it is given
   `--ignore-pending-mint`. Records carry their network (one directory serves
   every network a wallet is used on); `resume-mint` refuses a record for
-  another network and names the `--network` to use.
+  another network and names the `--network` to use. Those two refusals print
+  commands for a record read off disk, so they never print one command
+  carrying the record's fee choice: unless the record says the mint declined,
+  they print both — one that pays and one that declines — and you choose.
 - **The window no check closes.** RXinDexer answers `wave.check_available`
   from the blocks it has indexed, not from the mempool
   (`electrumx/server/glyph_api.py:1498-1515` calls `WaveIndex.check_available`,
@@ -470,7 +475,22 @@ re-run the mint while the commit may still confirm.
   `resume-mint <commit txid>` against another server (`--electrumx`): it finds
   an archived record as well as a live one, moves it back, and reveals the
   commit. If the server lists the commit output as neither unspent nor spent, it
-  says so and keeps the record where it is.
+  says so and keeps the record where it is. That is why a finished `mint-nft`,
+  `resume-mint` or `timelock-mint` says the server reports the reveal
+  confirmed, names where the record is kept, and prints that command with
+  `--electrumx '<another-server-url>'` (in `--json`: `reveal_confirmed`,
+  `record`, `recover_if_not_mined`). The SDK's `GlyphMinter` does the same: it
+  calls `PendingStore.archive()` once a reveal is reported confirmed, never
+  `delete()`, and `JsonFilePendingStore` moves the record to `done/`.
+- **`pending-mints/done` must be absent or a real directory.** It is checked
+  (with `lstat`, so a symbolic link is seen as one) before the commit is
+  broadcast and again before the reveal is, and a regular file or a link there
+  is refused before that broadcast: move it aside and run the command again
+  (after a commit, the refusal also names the commit's recovery). On POSIX the
+  archive's `chmod` and rename act on a descriptor of `done` opened with
+  `O_NOFOLLOW`, so a link there is never followed. If archiving still fails
+  after a reveal is reported confirmed, the command succeeds and says the
+  record was kept where it was (`record_archive_error` in `--json`).
 - **Every exit after the commit is broadcast** — a declined reveal prompt, a
   network error, a node rejecting the reveal, this timeout, Ctrl-C — prints the
   recovery, and in `--json` mode also writes it to stdout as a JSON document.

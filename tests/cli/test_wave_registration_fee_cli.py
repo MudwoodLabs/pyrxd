@@ -581,7 +581,7 @@ def _assert_recovery(
         assert "--no-wave-registration-fee" not in said
     elif declined:
         # M2: the mint's opt-out is repeated, never replaced by the paying default.
-        assert f"This mint declined the WAVE registration fee for {wave}.rxd, and that command says so" in said
+        assert f"That command declines the WAVE registration fee for {wave}.rxd, as this run did" in said
         assert "pays the registration fee from a wallet input only if" not in said
     else:
         # Pay only if an indexer reports no confirmed registration; otherwise reveal without the
@@ -1095,17 +1095,17 @@ class TestAnOptOutSurvivesRecovery:
         assert result.exit_code == 2
         txid = str(_tx(chain.broadcasts[0]).txid())
         doc = json.loads(result.stdout)
-        # Round 2: no printed command pays a treasury other than the published one; the operator
-        # types the address back in place of the placeholder.
-        assert doc["recover"] == _command(tmp_path, txid, "--wave-treasury", "<ADDRESS>", network="regtest")
-        # The mint's own summary shows the treasury it was given; the recovery never repeats it.
-        assert treasury not in " ".join(result.stderr.split()).split("fix:", 1)[1]
+        # Round 3: the mint's OWN recovery command may name the treasury this process was given on
+        # its command line (the record was built from that argv here), so it runs in one step.
+        # Commands printed from a record read off disk never do: see test_wave_mint_cli_round3.py.
+        assert doc["recover"] == _command(tmp_path, txid, "--wave-treasury", treasury, network="regtest")
+        assert "<ADDRESS>" not in result.output
         other = PrivateKey().public_key().address(network=Network.TESTNET)
         chain.confirmations = 1
         refused = _resume(tmp_path, txid, "--wave-treasury", other, network="regtest")
         assert refused.exit_code == 1
         assert "the treasury this run names is not the one the record says the mint chose" in refused.stderr
-        recovered = _run_printed(tmp_path, doc["recover"].replace("'<ADDRESS>'", treasury))
+        recovered = _run_printed(tmp_path, doc["recover"])
         assert recovered.exit_code == 0, recovered.output
         assert _tx(chain.broadcasts[1]).outputs[1].locking_script.serialize() == P2PKH().lock(treasury).serialize()
 

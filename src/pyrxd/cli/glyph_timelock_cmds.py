@@ -410,7 +410,7 @@ def timelock_mint_cmd(
             "check and while you were being prompted — nothing was overwritten",
         ) from exc
 
-    from .glyph_cmds import _mint_nft_inner
+    from .glyph_cmds import _echo_where_the_record_is, _mint_nft_inner
 
     async def _do_mint() -> dict[str, object]:
         client = ctx.make_client()
@@ -447,7 +447,8 @@ def timelock_mint_cmd(
     elif ctx.output_mode == "quiet":
         click.echo(emit(payload, mode="quiet", quiet_field="ref"))
     else:
-        click.echo("\nTimelocked NFT minted.")
+        # "Confirmed" is the server's word (#736, round 3): say so, and how to recover if it is wrong.
+        click.echo("\nThe server reports the timelocked NFT's reveal confirmed.")
         click.echo(f"  glyph ref:   {payload['ref']}")
         click.echo(f"  commit txid: {payload['commit_txid']}")
         click.echo(f"  reveal txid: {payload['reveal_txid']}")
@@ -458,6 +459,7 @@ def timelock_mint_cmd(
         click.echo(f"  envelope:    {envelope_out}")
         click.echo("\n  Back up all three files now. The chain carries none of them, and a mint cannot be redone.")
         click.echo(f"  To open it later:  pyrxd glyph timelock-reveal {payload['ref']} --cek-file {cek_out}")
+        _echo_where_the_record_is(result)
 
 
 # ---------------------------------------------------------------------------

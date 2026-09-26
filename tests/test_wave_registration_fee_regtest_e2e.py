@@ -469,11 +469,12 @@ def _run_argv(tmp_path: pathlib.Path, argv: list[str]) -> Any:
 def test_an_edited_record_treasury_is_not_paid_on_chain(
     node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Panel D-L1 (and round 2) against a node. A mint that named a treasury times out; its record
-    is then edited to pay another address. Neither a bare resume-mint nor the command the mint
-    printed — with the treasury the operator typed in place of its placeholder — pays the edited
-    one, and the commit stays unspent on the node. Once the record is put back, that command
-    reveals and pays the treasury the mint named."""
+    """Panel D-L1 (and rounds 2-3) against a node. A mint that named a treasury times out; its
+    record is then edited to pay another address. Neither a bare resume-mint nor the command the
+    mint printed — which names the treasury the mint was given on its own command line (round 3)
+    — pays the edited one, nothing resume-mint prints names it, and the commit stays unspent on
+    the node. Once the record is put back, that command reveals and pays the treasury the mint
+    named."""
     label = "regtest-cli-redirect"
     net, _wallet = _wire(node, monkeypatch, available=[True])
     net.mine_on_broadcast = False
@@ -482,9 +483,9 @@ def test_an_edited_record_treasury_is_not_paid_on_chain(
     assert stopped.exit_code == 2, stopped.output
     doc = json.loads(stopped.stdout)
     commit_txid = doc["commit_txid"]
-    # Round 2: no printed command pays a treasury other than the published one.
-    assert shlex.split(doc["recover"])[-2:] == ["--wave-treasury", "<ADDRESS>"]
-    typed = [a if a != "<ADDRESS>" else _TREASURY_ON_REGTEST for a in shlex.split(doc["recover"])[1:]]
+    # Round 3: the mint's own command may name the treasury this process was given.
+    assert shlex.split(doc["recover"])[-2:] == ["--wave-treasury", _TREASURY_ON_REGTEST]
+    typed = shlex.split(doc["recover"])[1:]
     node.mine(1)
     net.mine_on_broadcast = True
 
@@ -500,6 +501,8 @@ def test_an_edited_record_treasury_is_not_paid_on_chain(
     bare = _cli(tmp_path, "resume-mint", commit_txid)
     assert bare.exit_code == 1 and "needs the WAVE registration fee choice" in bare.stderr
     assert edited["wave_treasury"] not in bare.output + printed.output
+    # A refusal prints commands from the RECORD: the placeholder, never an address.
+    assert "'<ADDRESS>'" in printed.output
     assert node.cli("gettxout", commit_txid, "0"), "nothing may have spent the commit"
 
     record.write_text(honest)
@@ -543,10 +546,11 @@ class _WithholdsTheReveal:
 def test_a_reveal_a_server_withheld_is_recovered_from_the_archived_record(
     node, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#736 round 2 against a node. The server echoes mint-nft's reveal without relaying it and
+    """#736 rounds 2-3 against a node. The server echoes mint-nft's reveal without relaying it and
     reports it confirmed: mint-nft "succeeds" while the node still holds the commit unspent. The
-    record was deleted at that point before round 2; it is archived now, and resume-mint against
-    an honest server finds it and reveals the commit on chain."""
+    record was deleted at that point before round 2; it is archived now, the success output says
+    the server REPORTS the reveal confirmed and prints the command that reveals the commit through
+    another server (round 3), and that command, run against an honest server, reveals it on chain."""
     label = "regtest-cli-withheld"
     net, _wallet = _wire(node, monkeypatch, available=[True])
     liar = _WithholdsTheReveal(net)
@@ -557,9 +561,14 @@ def test_a_reveal_a_server_withheld_is_recovered_from_the_archived_record(
     assert liar.withheld and node.cli("gettxout", commit_txid, "0"), "the commit should still be unspent"
     assert JsonFilePendingStore(tmp_path / "pending-mints").list_pending() == []
     assert (tmp_path / "pending-mints" / "done" / f"{commit_txid}.json").exists()
+    said = json.loads(fooled.stdout)
+    assert said["reveal_confirmed"] == "reported by the server; not independently verified"
+    recover = shlex.split(said["recover_if_not_mined"])
+    assert recover[1:3] == ["--electrumx", "<another-server-url>"]
+    assert recover[-2:] == ["--wave-treasury", _TREASURY_ON_REGTEST]
 
     monkeypatch.setattr(glyph_cmds.CliContext, "make_client", lambda self: net)
-    recovered = _cli(tmp_path, "resume-mint", commit_txid, "--wave-treasury", _TREASURY_ON_REGTEST)
+    recovered = _run_argv(tmp_path, [a.replace("<another-server-url>", "tcp://127.0.0.1:1") for a in recover[1:]])
     assert recovered.exit_code == 0, (recovered.output, recovered.exception)
     reveal = _assert_the_fee_output(node, json.loads(recovered.stdout)["reveal_txid"], 1, label, 5)
     assert (reveal["vin"][0]["txid"], reveal["vin"][0]["vout"]) == (commit_txid, 0)

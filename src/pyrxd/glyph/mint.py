@@ -78,6 +78,7 @@ from __future__ import annotations
 import abc
 import json
 import os
+import stat
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -571,7 +572,37 @@ class PendingStore(abc.ABC):
 
     @abc.abstractmethod
     def delete(self, commit_txid: str) -> None:
-        """Drop the record. Must not raise if it is already gone."""
+        """Drop the record. Must not raise if it is already gone.
+
+        :class:`GlyphMinter` never calls this: see :meth:`archive`. It is here for a caller who
+        has seen the reveal on chain for themselves and wants the record gone.
+        """
+
+    def archive(self, commit_txid: str) -> None:
+        """Retire the record of a mint whose reveal was REPORTED confirmed — without destroying it.
+
+        :class:`GlyphMinter` calls this, never :meth:`delete`, once its reveal is reported
+        confirmed. "Confirmed" is the server's word: a server that echoes a reveal it never
+        relayed and reports it confirmed would otherwise have the only copy of the payload the
+        commit can be spent with deleted while the commit is still unspent (#736, round 3). An
+        archived record can be revealed again, through another server.
+
+        This default KEEPS the record where it is, so :meth:`list_pending` goes on reporting it:
+        a store that cannot archive errs toward keeping. Override it to move the record where
+        :meth:`list_pending` does not look (:class:`JsonFilePendingStore` moves it to ``done/``).
+        Must not raise if the record is already gone.
+        """
+        return None
+
+    def archive_problem(self) -> str | None:
+        """Why :meth:`archive` could not work in this store, or ``None``.
+
+        :class:`GlyphMinter` asks before it broadcasts the commit and again before the reveal,
+        and refuses on an answer: an archive that fails after a reveal is reported confirmed
+        would otherwise be found only when the mint is finished. The default has nothing that
+        can fail.
+        """
+        return None
 
     @abc.abstractmethod
     def list_pending(self) -> list[str]:
@@ -665,6 +696,104 @@ class JsonFilePendingStore(PendingStore):
 
     def delete(self, commit_txid: str) -> None:
         self._path(commit_txid).unlink(missing_ok=True)
+
+    #: Where :meth:`archive` moves a record: a subdirectory :meth:`list_pending` does not read.
+    ARCHIVE_DIRNAME: ClassVar[str] = "done"
+
+    @property
+    def archive_directory(self) -> Path:
+        """Where archived records are kept (``<directory>/done``)."""
+        return self._dir / self.ARCHIVE_DIRNAME
+
+    def _archived_path(self, commit_txid: str) -> Path:
+        return self.archive_directory / f"{Txid(commit_txid)}.json"
+
+    @classmethod
+    def archive_directory_problem(cls, directory: str | os.PathLike[str]) -> str | None:
+        """Why the archive of a store at ``directory`` is unusable, or ``None``. Creates nothing.
+
+        Read with ``lstat``, so a symbolic link is seen as a link: ``done/`` must be absent or a
+        real directory. A regular file there makes the ``mkdir`` fail; a link can lead to another
+        filesystem (a rename then fails with ``EXDEV``) or to a directory that is not the
+        store's (on ``3cb57e27`` a ``chmod`` of the path followed one and made it 0700; lane D F2).
+        """
+        path = Path(directory) / cls.ARCHIVE_DIRNAME
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return f"{path} is a symbolic link; the archive must be a real directory"
+        if not stat.S_ISDIR(info.st_mode):
+            return f"{path} exists and is not a directory"
+        return None
+
+    def archive_problem(self) -> str | None:
+        return self.archive_directory_problem(self._dir)
+
+    def archive(self, commit_txid: str) -> None:
+        """Move the live record to ``done/``: a rename, so it keeps its 0600 mode, into a 0700
+        directory. Does nothing if there is no live record. See :meth:`PendingStore.archive`.
+
+        Raises :class:`~pyrxd.security.errors.ValidationError`, leaving the record where it is,
+        when ``done/`` is not a real directory (:meth:`archive_directory_problem`, which reads
+        it with ``lstat``). On POSIX the ``chmod`` and the rename then act on a descriptor of
+        ``done/`` opened with ``O_NOFOLLOW``, never on its path, so neither can follow a link —
+        not even one swapped in after the ``lstat`` (lane D F2: a ``chmod`` of the path followed
+        a link and made a foreign directory 0700).
+        """
+        live = self._path(commit_txid)
+        if not live.exists():
+            return
+        try:
+            self.archive_directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        problem = self.archive_problem()
+        if problem is not None:
+            raise ValidationError(f"cannot archive the pending mint {commit_txid}: {problem}; the record is kept")
+        if os.name != "posix":
+            os.replace(live, self._archived_path(commit_txid))
+            self._fsync_dir()
+            return
+        try:
+            done_fd = os.open(
+                self.archive_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            )
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot archive the pending mint {commit_txid}: {self.archive_directory} could not be opened as a "
+                f"real directory ({exc}); the record is kept"
+            ) from exc
+        try:
+            os.fchmod(done_fd, 0o700)
+            os.replace(live, self._archived_path(commit_txid).name, dst_dir_fd=done_fd)
+            try:
+                os.fsync(done_fd)
+            except OSError:  # pragma: no cover - e.g. some network filesystems; the rename is done
+                pass
+        finally:
+            os.close(done_fd)
+        self._fsync_dir()
+
+    def load_archived(self, commit_txid: str) -> PendingMint:
+        """The archived record for ``commit_txid``; :class:`PendingMintNotFound` if there is none."""
+        if not self._archived_path(commit_txid).exists():
+            raise PendingMintNotFound(
+                f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
+            )
+        return JsonFilePendingStore(self.archive_directory).load(commit_txid)
+
+    def restore(self, commit_txid: str) -> None:
+        """Move an archived record back to the live directory, to reveal it again."""
+        os.replace(self._archived_path(commit_txid), self._path(commit_txid))
+        self._fsync_dir()
+
+    def list_archived(self) -> list[str]:
+        """Commit txids with an archived record."""
+        if not self.archive_directory.is_dir():
+            return []
+        return sorted(p.stem for p in self.archive_directory.glob("*.json"))
 
     def list_pending(self) -> list[str]:
         return sorted(p.stem for p in self._dir.glob("*.json"))
@@ -944,8 +1073,11 @@ class GlyphMinter:
         """Wait for the commit, then broadcast the NFT reveal.
 
         The stored record is re-validated against the commit script before anything is
-        built — see :meth:`_assert_payload_still_matches`. On success the record is
-        deleted from the store; on failure it is kept so the reveal can be retried.
+        built — see :meth:`_assert_payload_still_matches`. Once the reveal is reported
+        confirmed the record is archived (:meth:`PendingStore.archive`), never deleted; on
+        failure it is kept where it is so the reveal can be retried. An archived record
+        (``JsonFilePendingStore.load_archived``) can be passed here again — through another
+        server, if the one that reported the reveal confirmed was wrong.
         """
         if not isinstance(pending, PendingMint):
             raise ValidationError("reveal_nft expects a PendingMint")
@@ -1159,7 +1291,9 @@ class GlyphMinter:
             estimate=measured,
         )
 
-        # 5. Persist, verify, and only then spend.
+        # 5. Persist, verify, and only then spend — and only into a store whose archive can
+        #    take the record when the mint is done (round 3).
+        self._refuse_an_unusable_archive(before="the commit was not broadcast")
         self._persist_or_abort(pending)
         broadcast_txid = str(await self._client.broadcast(commit_tx.serialize()))
         if broadcast_txid != pending.commit_txid:
@@ -1322,6 +1456,7 @@ class GlyphMinter:
             error_type=ValidationError,
         )
 
+        self._refuse_an_unusable_archive(before="the reveal was not broadcast and the record is kept")
         echoed = await self._client.broadcast(raw)
 
         # Wait on the txid of what WE signed, not on what the server said. Otherwise the
@@ -1346,8 +1481,8 @@ class GlyphMinter:
         # needed to rebuild it is gone too. The commit output is a hashlock with no
         # owner-only spend path, so that is permanent, unrecoverable loss of its value.
         #
-        # So the record outlives the broadcast and is dropped only once the reveal is
-        # actually confirmed. If the wait times out the record is KEPT and the timeout
+        # So the record outlives the broadcast and is retired only once the reveal is
+        # reported confirmed. If the wait times out the record is KEPT and the timeout
         # propagates: the caller can retry the reveal, which is exactly what the record
         # exists for.
         await wait_for_confirmation(
@@ -1357,7 +1492,7 @@ class GlyphMinter:
             timeout_s=self._confirmation_timeout_s,
             interval_s=self._poll_interval_s,
         )
-        self._delete_record_and_any_duplicate(pending)
+        self._archive_record(pending)
         return MintResult(
             commit_txid=pending.commit_txid,
             reveal_txid=str(reveal_txid),
@@ -1367,8 +1502,16 @@ class GlyphMinter:
             owner_pkh=pending.owner_pkh,
         )
 
-    def _delete_record_and_any_duplicate(self, pending: PendingMint) -> None:
-        """Drop the record for the mint that was just revealed — and ONLY that record.
+    def _archive_record(self, pending: PendingMint) -> None:
+        """Retire the record for the mint that was just revealed — ARCHIVED, never deleted — and
+        ONLY that record.
+
+        Archived rather than deleted (#736, round 3): the reveal is "confirmed" on the server's
+        word, and a server can echo a reveal it never relayed and report it confirmed. Deleting
+        the record then destroyed the one copy of the payload the still-unspent commit can be
+        spent with. :meth:`PendingStore.archive` keeps it recoverable —
+        ``store.load_archived(txid)`` and :meth:`reveal_nft` through another server, for
+        :class:`JsonFilePendingStore`. This method must never call :meth:`PendingStore.delete`.
 
         An earlier version of this also hunted a sibling record filed under a server's
         echoed txid, identifying it by matching ``cbor_bytes``. That was WRONG and
@@ -1390,8 +1533,30 @@ class GlyphMinter:
         ``list_pending()`` is a prompt to re-check; a deleted record is unrecoverable
         value. Removing it safely needs the echoed txid persisted ON the record, which is
         a store-schema change and its own piece of work.
+
+        An archive that fails HERE — after the reveal is reported confirmed — is reported as a
+        warning, not raised: the record stays where it was, which loses nothing, and raising
+        would turn a finished mint into an error. :meth:`_refuse_an_unusable_archive` makes it
+        unlikely by refusing before each broadcast.
         """
-        self._store.delete(pending.commit_txid)
+        try:
+            self._store.archive(pending.commit_txid)
+        except (OSError, ValidationError) as exc:
+            warnings.warn(
+                f"the reveal of {pending.commit_txid} is reported confirmed, but its pending record could not be "
+                f"archived ({exc}); the record is kept where it was",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    def _refuse_an_unusable_archive(self, *, before: str) -> None:
+        """Refuse, before a broadcast, when the store says its archive could not take the record.
+
+        ``before`` says what was not broadcast: the commit (nothing spent), or the reveal (the
+        commit was broadcast, and its record is kept for :meth:`reveal_nft`)."""
+        problem = self._store.archive_problem()
+        if problem is not None:
+            raise ValidationError(f"the pending store's archive is unusable: {problem}. {before}; fix it and retry")
 
     @staticmethod
     def _assert_payload_still_matches(pending: PendingMint, funding_key: Any) -> None:
