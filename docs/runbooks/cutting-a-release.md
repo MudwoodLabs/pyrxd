@@ -15,11 +15,40 @@ steps looked like beforehand.
 
 ## 1. Merge the release PR
 
-`main` is protected (strict, one approval), so a solo release uses the admin
-override:
+`main` is protected, and the protection now applies to administrators as well
+(`enforce_admins`, read from the live setting 2026-09-25). A merge needs every
+required check green on the PR's head commit, and the branch up to date with
+`main` (strict). No approving review is required, so a solo maintainer merges
+their own release PR once the checks are green:
 
 ```bash
-gh pr merge <N> --repo MudwoodLabs/pyrxd --squash --delete-branch --admin
+gh pr checks <N> --repo MudwoodLabs/pyrxd --required --watch
+gh pr merge <N> --repo MudwoodLabs/pyrxd --squash --delete-branch
+```
+
+**There is no admin-override step.** This runbook used to merge with the
+administrator override, because protection then required one approving review,
+which a solo maintainer cannot give their own PR. But the override does not skip
+only the review: it merges a PR that fails ANY requirement, so a red or
+never-reported required check went through the same way. With `enforce_admins`
+on, the override skips nothing: a merge with a red or missing required check is
+refused for everyone. If a required check is red, fix it; if one never reports,
+find out why. Do not look for another way around it.
+
+If `main` moved after the checks ran, strict protection refuses the merge until
+the branch is updated. Use the PR's "Update branch" button, or
+`gh api -X PUT repos/MudwoodLabs/pyrxd/pulls/<N>/update-branch`, then wait for the
+checks again. (`gh pr update-branch` does not exist in older `gh` releases, such
+as 2.45.)
+
+To read the live rules rather than trust this page:
+
+```bash
+gh api repos/MudwoodLabs/pyrxd/branches/main/protection \
+  --jq '{enforce_admins: .enforce_admins.enabled,
+         approvals: .required_pull_request_reviews.required_approving_review_count,
+         strict: .required_status_checks.strict,
+         checks: [.required_status_checks.checks[].context]}'
 ```
 
 `--repo` is not optional in this clone — see [Gotchas](#gotchas).
