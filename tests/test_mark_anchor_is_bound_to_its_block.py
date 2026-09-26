@@ -12,8 +12,9 @@ It flips a form-2 verdict when a name update shares the mark's block (rename, th
 
 THE FIX, at the funnel. ``resolve_anchor_from`` — the one door every CLI anchor comes through —
 passes ``fetch_header``, and ``resolve_mark_anchor`` then returns the height whose header hashes to
-the verbose ``blockhash``, searching up to ``MAX_INDEX_LAG_BLOCKS`` above the formula (it can only
-be low for an honest endpoint), or raises. A block number no header confirmed is never printed.
+the verbose ``blockhash``, searching ``MAX_INDEX_LAG_BLOCKS`` either side of the formula (usually it
+is low; round 3 added below, for a node behind its index), or raises ``AnchorBindingError``. A block
+number no header confirmed is never printed.
 
 The fakes here are the derived ``FakeChainServer``: every transaction real mainnet bytes, each
 height's header a synthetic 80 bytes whose hash the fake reports as the verbose ``blockhash``. The
@@ -22,13 +23,22 @@ lag is modelled as an OPERATION on that truth — the index tip reported one blo
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
+import re
 import sys
 
 import pytest
 
 from pyrxd.cli import glyph_inspect
-from pyrxd.glyph.mark_anchor import BOUND_CAVEAT, MAX_INDEX_LAG_BLOCKS, UNVERIFIED_CAVEAT, resolve_mark_anchor
+from pyrxd.glyph.mark_anchor import (
+    BOUND_CAVEAT,
+    MAX_INDEX_LAG_BLOCKS,
+    UNVERIFIED_CAVEAT,
+    AnchorBindingError,
+    resolve_mark_anchor,
+)
+from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import NetworkError
 from tests.test_mutable_chain_is_discovered_from_the_chain import (
     HEIGHTS,
@@ -107,8 +117,8 @@ def test_the_anchor_that_reaches_verify_asked_for_the_header(monkeypatch) -> Non
 
 
 def test_the_printed_caveat_says_what_the_binding_is(monkeypatch) -> None:
-    """The unbound caveat says pyrxd has no header check; for a bound anchor that sentence is now
-    false, so the bound one is printed — and it still says NOT verified."""
+    """The unbound caveat says the height was not checked against any header; for a bound anchor
+    that sentence is false, so the bound one is printed — and it still says NOT verified."""
     nam = _run(monkeypatch, _payload(MOVED_H160), _pair())
     assert nam["anchor"]["caveat"] == BOUND_CAVEAT
     assert "NOT verified" in BOUND_CAVEAT and "checked only against the endpoint itself" in BOUND_CAVEAT
@@ -152,14 +162,44 @@ async def test_the_true_block_is_found_within_the_lag_window(lag) -> None:
     assert anchor.confirmations == 10, "depth is the node's count, untouched by the binding"
 
 
-async def test_beyond_the_window_it_refuses_rather_than_guessing() -> None:
-    node_tip, true_height = 1009, 1000
-    with pytest.raises(NetworkError, match="not its header at any height from"):
+@pytest.mark.parametrize("ahead", range(1, MAX_INDEX_LAG_BLOCKS + 1))
+async def test_a_formula_that_comes_out_high_is_found_below_it(ahead) -> None:
+    """Round 3 (lane E): the window is SYMMETRIC. When the node answering the verbose call is BEHIND
+    the index (an ElectrumX failing over between nodes, or a reorg), its confirmation count is short
+    and `tip - confirmations + 1` comes out HIGH. Searching only upward refused that honest endpoint;
+    a match still has to hash to the block the node named, so looking lower costs nothing."""
+    tip, true_height = 1009, 1000
+    anchor = await _resolve(
+        confirmations=tip - true_height + 1 - ahead,
+        tip=tip,
+        verbose_extra={"blockhash": block_hash_at(true_height)},
+    )
+    assert anchor.height == true_height and anchor.header_bound
+
+
+@pytest.mark.parametrize("off", [MAX_INDEX_LAG_BLOCKS + 1, -(MAX_INDEX_LAG_BLOCKS + 1)])
+async def test_beyond_the_window_either_way_it_refuses_rather_than_guessing(off) -> None:
+    tip, true_height = 1009, 1000
+    with pytest.raises(AnchorBindingError, match="is not its header at any height from"):
         await _resolve(
-            confirmations=node_tip - true_height + 1,
-            tip=node_tip - (MAX_INDEX_LAG_BLOCKS + 1),
+            confirmations=tip - true_height + 1 + off,
+            tip=tip,
             verbose_extra={"blockhash": block_hash_at(true_height)},
         )
+
+
+async def test_the_window_does_not_reach_below_the_genesis_block() -> None:
+    """A mark in block 0 or 1 cannot have candidates at negative heights; they are skipped, not
+    asked for."""
+    asked: list[int] = []
+
+    def header(height: int) -> bytes:
+        asked.append(height)
+        return synthetic_header(height)
+
+    anchor = await _resolve(confirmations=10, tip=10, verbose_extra={"blockhash": block_hash_at(0)}, headers=header)
+    assert anchor.height == 0, "derived height 1; the block is at 0, one below"
+    assert min(asked) >= 0 and -1 not in asked, asked
 
 
 async def test_a_confirmed_reply_with_no_block_hash_is_refused() -> None:
@@ -169,16 +209,35 @@ async def test_a_confirmed_reply_with_no_block_hash_is_refused() -> None:
         await _resolve(confirmations=10, tip=1009, verbose_extra={"blockhash": "zz" * 32})
 
 
-async def test_a_header_the_endpoint_cannot_serve_is_refused() -> None:
+async def test_a_header_the_endpoint_cannot_serve_is_refused_naming_it() -> None:
+    """Every header unreadable: the search tries each candidate, then refuses, naming what failed.
+    An `AnchorBindingError` — the endpoint answered — not a bare network failure."""
+
     def refuse(height: int) -> bytes:
         raise NetworkError("height out of range")
 
-    with pytest.raises(NetworkError, match="could not read the endpoint's header"):
+    with pytest.raises(AnchorBindingError, match="headers it could not serve") as caught:
         await _resolve(confirmations=10, tip=1009, verbose_extra={"blockhash": block_hash_at(1000)}, headers=refuse)
+    assert "height out of range" in str(caught.value)
+
+
+async def test_one_unreadable_header_does_not_stop_the_search() -> None:
+    """Above the index's tip a header cannot be served; the match below it must still be found."""
+    true_height = 1000
+
+    def header(height: int) -> bytes:
+        if height > true_height:
+            raise NetworkError("height out of range")
+        return synthetic_header(height)
+
+    anchor = await _resolve(
+        confirmations=9, tip=1009, verbose_extra={"blockhash": block_hash_at(true_height)}, headers=header
+    )
+    assert anchor.height == true_height
 
 
 async def test_a_header_that_is_not_80_bytes_is_refused_not_hashed() -> None:
-    with pytest.raises(NetworkError, match="could not read the endpoint's header"):
+    with pytest.raises(AnchorBindingError, match="headers it could not serve"):
         await _resolve(
             confirmations=10, tip=1009, verbose_extra={"blockhash": block_hash_at(1000)}, headers=lambda h: b"\x00" * 79
         )
@@ -240,3 +299,144 @@ def test_one_block_earlier_the_name_pointed_at_the_old_key() -> None:
     is not, so a height one low really changes the answer rather than landing on the same one."""
     assert HEIGHTS[MINT] <= SAME_BLOCK - 1 < HEIGHTS[UPDATE_A]
     assert MINT_TARGET != MOVED
+
+
+# ---------------------------------------------------------------------------
+# Round 3: no sentence on a bound verdict's screen may say the header was NOT checked
+# ---------------------------------------------------------------------------
+
+#: The CLASS, matched loosely rather than by one exact string (round 2's test pinned only
+#: `UNVERIFIED_CAVEAT` verbatim, and `_corroborated_caveat` said the same false thing in other words
+#: on the same screen — 0.25.0 panel, round 3). Each pattern stays inside one clause.
+_NO_HEADER_CHECK = [
+    re.compile(r"\bno\b[^.;:]{0,80}\bheader\b[^.;:]{0,80}\b(check|verif)", re.I),
+    re.compile(r"\bnot\b[^.;:]{0,40}\bcheck\w*\b[^.;:]{0,40}\bheader", re.I),
+    re.compile(r"\bno\b[^.;:]{0,40}\bheight\b[^.;:]{0,40}\bcheck\w*\b[^.;:]{0,40}\bheader", re.I),
+]
+
+
+def _claims_no_header_check(text: str) -> list[str]:
+    flat = " ".join(text.split())
+    return [m.group(0) for pat in _NO_HEADER_CHECK for m in pat.finditer(flat)]
+
+
+def test_the_matcher_catches_every_spelling_this_class_has_shipped_in() -> None:
+    """Non-vacuity: the three sentences this project has used for "no header was checked" all match.
+    If the matcher stops seeing them, the tests below have stopped measuring."""
+    shipped = [
+        "and are NOT verified: pyrxd has no Radiant header, proof-of-work or merkle-inclusion check, so",
+        UNVERIFIED_CAVEAT,
+        "No height here was checked against a block header.",
+    ]
+    for sentence in shipped:
+        assert _claims_no_header_check(sentence), sentence
+    assert not _claims_no_header_check(BOUND_CAVEAT), "the bound caveat must not trip the matcher"
+
+
+def _verify_output(monkeypatch, tmp_path, *extra: str) -> str:
+    """The real `pyrxd verify --wave-name` over two agreeing servers that serve headers — a BOUND
+    anchor and a form-2 ESTABLISHED verdict (the one-record suite's harness, unchanged)."""
+    from tests.test_hashmark_verify_one_record import NAME, _address, _run, _signed, _tx
+
+    key = PrivateKey()
+    content = b"a press kit\n"
+    txid, raw = _tx(_signed(content, key))
+    digest = hashlib.sha256(content).hexdigest()
+    args = [*extra, "verify", txid, "--digest", digest, "--wave-name", NAME, "--min-confirmations", "6"]
+    r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=_address(key))
+    assert r.exit_code == 0, r.output
+    return r.output
+
+
+@pytest.mark.parametrize("mode", [[], ["--json"]], ids=["human", "json"])
+def test_no_output_of_a_bound_verdict_says_the_header_was_not_checked(monkeypatch, tmp_path, mode) -> None:
+    out = _verify_output(monkeypatch, tmp_path, *mode)
+    assert "ESTABLISHED" in out, "the premise: a form-2 verdict on a bound anchor"
+    assert not _claims_no_header_check(out), _claims_no_header_check(out)
+    flat = " ".join(out.split())
+    assert "checked against each endpoint's own block header" in flat
+    assert "the step heights were not" in flat, "what the header check does NOT cover is said too"
+    assert "Nothing checks proof-of-work or merkle inclusion" in flat
+
+
+async def test_an_unbound_report_gets_the_weaker_sentence() -> None:
+    """The caveat is true by construction: a caller whose reports do not say the mark was bound gets
+    "No height here was checked against a block header" — never a claim nobody made."""
+    from pyrxd.glyph.mark_anchor import MarkAnchor
+    from pyrxd.glyph.wave_identity import HeightReport, judge_name_at_mark
+    from tests.test_form2_step_heights_need_two_sources import TRUE, _walk
+
+    walk = await _walk()
+    anchor = MarkAnchor(txid=MARK, height=458595, confirmations=50, min_confirmations=6, source="node-A")
+    reports = [HeightReport("node-A", 458595, TRUE), HeightReport("index-B", 458595, TRUE)]
+    v = judge_name_at_mark(
+        ref=walk.ref,
+        name="custodian-gate-x7f3.rxd",
+        binding_source="index-B",
+        anchor=anchor,
+        walk=walk,
+        height_reports=reports,
+    )
+    assert v.form == 2 and "No height here was checked against a block header" in v.caveat
+    bound = [HeightReport(r.source, r.mark_height, r.step_heights, mark_header_bound=True) for r in reports]
+    v = judge_name_at_mark(
+        ref=walk.ref,
+        name="custodian-gate-x7f3.rxd",
+        binding_source="index-B",
+        anchor=anchor,
+        walk=walk,
+        height_reports=bound,
+    )
+    assert "checked against each endpoint's own block header" in v.caveat
+    half = [bound[0], reports[1]]
+    v = judge_name_at_mark(
+        ref=walk.ref,
+        name="custodian-gate-x7f3.rxd",
+        binding_source="index-B",
+        anchor=anchor,
+        walk=walk,
+        height_reports=half,
+    )
+    assert "No height here was checked against a block header" in v.caveat, "one unbound report is enough to say so"
+
+
+# ---------------------------------------------------------------------------
+# Round 3: a binding failure is not "unreachable"
+# ---------------------------------------------------------------------------
+
+
+def test_plain_verify_says_the_endpoint_answered_when_its_headers_disagree(monkeypatch, tmp_path) -> None:
+    """The endpoint WAS reachable; its node named a block no nearby header hashes to. `verify` said
+    "check that <url> is reachable", sending people to debug a connection that worked."""
+    from tests.test_hashmark_verify_cli import TIP, _FakeServer, _mark_script, _tx_with
+    from tests.test_hashmark_verify_cli import _run as _run_verify
+
+    class _HeadersDisagree(_FakeServer):
+        async def get_block_header(self, height) -> bytes:
+            return synthetic_header(int(height) + 1000)  # never the block its node named
+
+    txid, raw = _tx_with(_mark_script(b"a report\n", PrivateKey()))
+    server = _HeadersDisagree({txid: raw})
+    assert server.tip == TIP, "the premise: the fake's node and index agree on the tip"
+    r = _run_verify(monkeypatch, server, ["verify", txid, "--min-confirmations", "6"], tmp_path=tmp_path)
+    assert r.exit_code == 2, r.output
+    flat = " ".join(r.output.split())
+    assert "wss://only answered, but its index and its node disagree" in flat
+    assert "--electrumx URL" in flat and "re-run" in flat
+    assert "is reachable" not in flat
+
+
+def test_an_unreachable_endpoint_is_still_reported_as_unreachable(monkeypatch, tmp_path) -> None:
+    """The honest pair: a real network failure keeps the reachability advice."""
+    from pyrxd.security.errors import NetworkError as _NetworkError
+    from tests.test_hashmark_verify_cli import _FakeServer, _mark_script, _tx_with
+    from tests.test_hashmark_verify_cli import _run as _run_verify
+
+    class _Down(_FakeServer):
+        async def get_tip_height(self) -> int:
+            raise _NetworkError("connection refused")
+
+    txid, raw = _tx_with(_mark_script(b"a report\n", PrivateKey()))
+    r = _run_verify(monkeypatch, _Down({txid: raw}), ["verify", txid, "--min-confirmations", "6"], tmp_path=tmp_path)
+    assert r.exit_code == 2, r.output
+    assert "is reachable" in " ".join(r.output.split())

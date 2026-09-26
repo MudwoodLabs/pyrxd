@@ -238,18 +238,29 @@ class TestOneHostUnderTwoSpellingsIsOneSource:
             ("wss://evil.example/", "wss://evil.example:443/"),
             ("wss://evil.example/", "wss://evil.example./"),
             ("wss://EVIL.example:443", "wss://evil.example."),
+            # Round 3 (lane E): what the URL CAN reveal. One host, another path or query or port:
+            ("wss://evil.example/", "wss://evil.example/?b"),
+            ("wss://evil.example/", "wss://evil.example/x"),
+            ("wss://evil.example/", "wss://evil.example:50022/"),
+            # ...and one IP address in another spelling (canonicalised with `ipaddress`/inet_aton):
+            ("wss://[2001:db8::7]/", "wss://[2001:db8:0:0:0:0:0:7]/"),
+            ("wss://203.0.113.7/", "wss://0xcb.0.113.7/"),
+            ("wss://203.0.113.7/", "wss://0313.0.0161.07/"),
+            ("wss://203.0.113.7/", "wss://3405803783/"),
+            ("wss://203.0.113.7/", "wss://203.28935/"),
+            ("wss://203.0.113.7/", "wss://[::ffff:203.0.113.7]/"),
         ],
     )
     def test_two_spellings_of_one_server_are_one_source(self, monkeypatch, tmp_path, urls) -> None:
         server = _OneLyingServer(indexer=True, mark_heights={MARK: _TRUE_MARK})
         nam, built = self._attach(monkeypatch, tmp_path, urls, lambda url: server)
-        assert set(built) == {urls[0]}, f"the profile kept both spellings: {built}"
+        assert set(built) == {urls[0]}, f"a second client was built for the same host: {built}"
         assert nam["form"] == 1, nam
         assert "both came from" in nam["degraded_reason"]
 
     def test_the_honest_pair_two_different_hosts_are_still_two_sources(self, monkeypatch, tmp_path) -> None:
-        """A guard that refuses valid work is a bug: distinct hosts still count as two (a
-        non-default port on a host is its own socket too), and a liar among them still shows."""
+        """A guard that refuses valid work is a bug: distinct hosts still count as two, and a liar
+        among them still shows."""
         liar = _OneLyingServer(indexer=True, mark_heights={MARK: _TRUE_MARK})
         honest = _Server(indexer=False, mark_heights={MARK: _TRUE_MARK})
         urls = ("wss://evil.example/", "wss://honest.example:50022/")
@@ -259,6 +270,16 @@ class TestOneHostUnderTwoSpellingsIsOneSource:
         honest_b = _Server(indexer=True, mark_heights={MARK: _TRUE_MARK})
         nam, _ = self._attach(monkeypatch, tmp_path, urls, lambda url: honest_b if "evil" in url else honest)
         assert nam["form"] == 2, nam["degraded_reason"]
+
+    def test_one_host_is_one_source_but_both_urls_are_kept_for_connecting(self) -> None:
+        """Source identity ignores path, query and port; the CONNECT list does not. A profile with
+        `wss://h/` and `wss://h/x` still fails over between them — they simply are not two sources."""
+        from pyrxd.network.registry import Endpoint, NetworkProfile
+
+        profile = NetworkProfile.build("mainnet", ["wss://h.example/", "wss://h.example/x", "wss://h.example:50022/"])
+        assert profile.urls == ("wss://h.example/", "wss://h.example/x", "wss://h.example:50022/")
+        assert len({e.source for e in profile.endpoints}) == 1
+        assert Endpoint(url="wss://08.example/").source == "08.example", "a name is not parsed as an address"
 
     def test_an_ip_alias_of_the_same_host_is_not_detectable_and_says_so(self) -> None:
         """What a URL cannot show is stated, not solved: `Endpoint.key` does not claim to see that a

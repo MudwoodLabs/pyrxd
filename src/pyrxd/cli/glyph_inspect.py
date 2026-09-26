@@ -925,7 +925,12 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
 
     profile = ctx.config.require_profile()
     first = profile.endpoints[0]
-    second = profile.endpoints[1] if len(profile.endpoints) > 1 else profile.endpoints[0]
+    # A SECOND OPERATOR, not merely a second URL. `wss://h/` and `wss://h/x`, or one IP address
+    # spelled two ways, are one machine: taking the next URL made one lying server two "sources"
+    # that corroborated each other (0.25.0 panel, round 3). The first endpoint on a DIFFERENT host
+    # (`Endpoint.source`) is the second; if there is none, this is a single-operator configuration
+    # and both halves are the first endpoint under one label — which every source rule refuses.
+    second = next((e for e in profile.endpoints[1:] if e.source != first.source), first)
 
     def _one(endpoint: object) -> FailoverElectrumXClient:
         return FailoverElectrumXClient(
@@ -1111,19 +1116,22 @@ async def _name_at_mark(
         #    anchor is one endpoint's word; the judge wants both endpoints to place the mark in the
         #    same block. Only when the anchor could be used at all — otherwise the judge refuses on
         #    the anchor first and a second lookup buys nothing.
-        other_label, other_mark, other_error = "", None, ""
+        other_label, other_mark, other_bound, other_error = "", None, False, ""
         if label_a != label_b and anchor.usable_for_point_in_time:
             other_client, other_label = (client_b, label_b) if anchor_label == label_a else (client_a, label_a)
             try:
                 other_anchor = await resolve_anchor_from(
                     other_client, other_label, mark_txid=mark_txid, min_confirmations=min_confirmations
                 )
-                other_mark = other_anchor.height
+                other_mark, other_bound = other_anchor.height, other_anchor.header_bound
             except NetworkError as exc:
                 other_error = f"could not place the mark: {exc}"
 
     walk, discovery = found.walk, found.discovery
     mark_by_label = {anchor_label: anchor.height, **({other_label: other_mark} if other_label else {})}
+    # Whether each endpoint's mark height was checked against ITS OWN header. From the anchors
+    # themselves, so the verdict's caveat says what happened rather than what was meant to.
+    bound_by_label = {anchor_label: anchor.header_bound, **({other_label: other_bound} if other_label else {})}
     # ONE REPORT PER ENDPOINT, each labelled with the URL that answered: A's step heights are the
     # ones discovery read from A's histories, B's the ones B reported when asked separately. The
     # judge compares them — a report is a claim, and corroboration by assertion is not corroboration.
@@ -1131,6 +1139,7 @@ async def _name_at_mark(
         HeightReport(
             source=label_a,
             mark_height=mark_by_label.get(label_a),
+            mark_header_bound=bound_by_label.get(label_a, False),
             step_heights=discovery.heights,
             error=other_error if other_label == label_a else "",
         )
@@ -1140,6 +1149,7 @@ async def _name_at_mark(
             HeightReport(
                 source=label_b,
                 mark_height=mark_by_label.get(label_b),
+                mark_header_bound=bound_by_label.get(label_b, False),
                 step_heights=found.tip_heights,
                 error="; ".join(
                     e for e in (found.tip_heights_error, other_error if other_label == label_b else "") if e

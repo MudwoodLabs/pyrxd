@@ -137,6 +137,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # A bound anchor's caveat, the lag window the binding searches, and what --min-confirmations
     # N means — compared against, not retyped, for the same reason as the two above.
     "BOUND_CAVEAT": ("pyrxd.glyph.mark_anchor", "BOUND_CAVEAT"),
+    "AnchorBindingError": ("pyrxd.glyph.mark_anchor", "AnchorBindingError"),
     "MAX_INDEX_LAG_BLOCKS": ("pyrxd.glyph.mark_anchor", "MAX_INDEX_LAG_BLOCKS"),
     "MIN_CONFIRMATIONS_MEANING": ("pyrxd.glyph.mark_anchor", "MIN_CONFIRMATIONS_MEANING"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),

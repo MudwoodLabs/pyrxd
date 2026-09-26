@@ -57,6 +57,8 @@ by definition a local, per-developer chain. That is honest rather than convenien
 from __future__ import annotations
 
 import ipaddress
+import re
+import socket
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -126,6 +128,39 @@ def default_endpoints(network: str) -> tuple[str, ...]:
     return DEFAULT_ENDPOINTS.get(str(network), ())
 
 
+#: An IPv4 literal in any spelling ``inet_aton`` accepts: one to four dot-separated parts, each
+#: decimal, octal (leading ``0``) or hex (``0x``). ``203.0.113.7``, ``0xcb.0.113.7``,
+#: ``0313.0.0161.07``, ``203.113.7`` and ``3405803783`` are all one address.
+_INET_ATON_FORM = re.compile(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}")
+
+
+def _canonical_host(host: str) -> str:
+    """One spelling per host: lower-cased, no trailing dot, and an IP literal in its canonical form.
+
+    A URL can spell one address many ways, and a SOURCE count built on spellings counts one server
+    several times (0.25.0 panel, round 3): ``[2001:db8::7]`` and ``[2001:db8:0:0:0:0:0:7]`` are one
+    IPv6 address; ``203.0.113.7`` and ``0xcb.0.113.7`` are one IPv4 address; ``::ffff:203.0.113.7``
+    is that IPv4 address too. Names that are not IP literals are only case- and dot-folded — whether
+    two NAMES reach one machine is not visible in a URL, and nothing here claims to see it.
+    """
+    host = host.strip().rstrip(".").lower()
+    if ":" in host:  # IPv6 (urlsplit has already removed the brackets); a zone id is kept verbatim
+        address, _, zone = host.partition("%")
+        try:
+            v6 = ipaddress.IPv6Address(address)
+        except ValueError:
+            return host
+        if v6.ipv4_mapped is not None and not zone:
+            return str(v6.ipv4_mapped)
+        return v6.compressed + (f"%{zone}" if zone else "")
+    if _INET_ATON_FORM.fullmatch(host):
+        try:
+            return str(ipaddress.IPv4Address(socket.inet_aton(host)))
+        except OSError:  # e.g. "08": not a valid octal part, so not an address — keep the name
+            return host
+    return host
+
+
 def _normalize_pins(pins: Iterable[str]) -> tuple[str, ...]:
     """Validate + canonicalise SPKI pins, dropping duplicates but keeping order."""
     out: list[str] = []
@@ -185,12 +220,16 @@ class Endpoint:
         this key, so the two spellings now collapse into one endpoint and every source rule sees
         one source.
 
+        The host is canonical (:func:`_canonical_host`), so an IP literal in another spelling is the
+        same endpoint too. This key keeps the port, path and query: it is the CONNECT identity.
+        Whether two endpoints are independent SOURCES is :attr:`source`, which is coarser.
+
         What a URL CANNOT show is that two different names — a hostname and its IP address, or
         two DNS names — reach one machine. That is not detectable here and is not claimed.
         """
         try:
             parts = urlsplit(self.url)
-            host = (parts.hostname or "").rstrip(".")
+            host = _canonical_host(parts.hostname or "")
             port = parts.port
         except ValueError:  # an unparseable port: fall back to the plain fold rather than raise
             return self.url.rstrip("/").lower()
@@ -203,6 +242,25 @@ class Endpoint:
         path = parts.path.rstrip("/").lower()  # folded as before: collapsing more is the safe side
         query = f"?{parts.query}" if parts.query else ""
         return f"{scheme}://{netloc}{path}{query}"
+
+    @property
+    def source(self) -> str:
+        """Which OPERATOR this endpoint is, for counting independent sources: the canonical host.
+
+        Coarser than :attr:`key` on purpose. Two endpoints on one host — another path
+        (``wss://h/x``), a query (``wss://h/?b``), another port, or the same IP address spelled
+        another way — are one machine and one operator, so they are ONE source: a single lying
+        server reached through two such URLs must not corroborate itself (0.25.0 panel, round 3).
+        Nothing is refused by this — a profile may still list both for failover; they simply do not
+        count as two when HashMark §7.6 form 2 needs two.
+
+        Only what the URL shows. A hostname and its IP address, or two DNS names for one machine,
+        are different sources here, and that limit is stated rather than papered over.
+        """
+        try:
+            return _canonical_host(urlsplit(self.url).hostname or "")
+        except ValueError:
+            return self.url.lower()
 
 
 def _is_loopback_url(url: str) -> bool:

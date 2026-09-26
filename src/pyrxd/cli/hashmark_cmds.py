@@ -40,7 +40,7 @@ import click
 from ..constants import genesis_hash_for
 from ..glyph._inspect_core import _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
-from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING
+from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from ..security.types import Txid
@@ -878,6 +878,8 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
 
     txid = payload.get("txid")
 
+    asked: list[str] = []  # the endpoint `_do` asked, for an error that names it
+
     async def _do() -> dict:
         # Through the MODULE, not a from-import. `_endpoint_pair` is the one seam both this
         # command and `_name_at_mark` reach the network through, and a name bound here would
@@ -890,12 +892,24 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
         # than whoever actually answered, and `MarkAnchor.source` is the field the independence
         # rule is checked against. A source label that is a guess is worse than no label.
         client_a, label_a, _client_b, _label_b = _inspect._endpoint_pair(ctx)
+        asked.append(label_a)
         async with client_a:  # type: ignore[attr-defined]
             anchor = await resolve_anchor_from(client_a, label_a, mark_txid=txid, min_confirmations=min_confirmations)
         return mark_anchor_dict(anchor)
 
     try:
         return asyncio.run(_do())
+    except AnchorBindingError as exc:
+        # THE ENDPOINT ANSWERED. Its node named a block and no header near the derived height hashes
+        # to it — its index and its node disagree, or it served inconsistent data. "Check that it is
+        # reachable" sent people to debug a connection that worked (0.25.0 panel, round 3).
+        where = asked[0] if asked else ctx.electrumx_url
+        raise NetworkBoundaryError(
+            "could not establish which block the mark is in",
+            cause=str(exc),
+            fix=f"{where} answered, but its index and its node disagree about the mark's block — re-run in "
+            "a moment (a new block usually settles it), or ask another server with --electrumx URL",
+        ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",

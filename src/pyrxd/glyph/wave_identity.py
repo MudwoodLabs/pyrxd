@@ -40,9 +40,11 @@ Degrading is not a failure mode here, it is the design. Form 1 with a reason is 
 and always honest; a form-2 sentence built on an unproved input is neither.
 
 WHAT TWO AGREEING SOURCES STILL DO NOT BUY. Agreement turns one endpoint's lie into a visible
-disagreement; it is not proof. pyrxd has no Radiant header, proof-of-work or merkle-inclusion
-check, so two endpoints that tell the SAME lie still move the answer — the residual trust is "two
-independent servers do not collude", and the form-2 caveat says so.
+disagreement; it is not proof. The mark's height can be checked against each endpoint's OWN block
+header (the CLI does; :attr:`HeightReport.mark_header_bound` records it), the step heights are not,
+and nothing checks proof-of-work or merkle inclusion — so two endpoints that tell the SAME lie still
+move the answer. The residual trust is "two independent servers do not collude", and the form-2
+caveat says exactly which heights were header-checked.
 """
 
 from __future__ import annotations
@@ -90,6 +92,11 @@ class HeightReport:
     #: Why this endpoint's heights could not be obtained, if they could not. An error is not a
     #: report that nothing is confirmed, and must not be read as one: it degrades, naming it.
     error: str = ""
+    #: ``True`` when ``mark_height`` was bound to this endpoint's own header
+    #: (:attr:`~pyrxd.glyph.mark_anchor.MarkAnchor.header_bound`). The verdict's caveat says the
+    #: mark was header-checked only when EVERY report says so — a default of False makes the weaker
+    #: sentence the one a caller gets without asking.
+    mark_header_bound: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,13 +144,24 @@ def _degrade(*, ref: str, binding_source: str, reason: str, anchor: MarkAnchor) 
     )
 
 
-def _corroborated_caveat(sources: Sequence[str]) -> str:
-    """The form-2 caveat: what the agreement covers, and what it still does not."""
+def _corroborated_caveat(sources: Sequence[str], *, mark_header_bound: bool) -> str:
+    """The form-2 caveat: what the agreement covers, which heights a header checked, what nothing did.
+
+    TRUE BY CONSTRUCTION, not by assumption. It said "pyrxd has no Radiant header ... check" on the
+    same screen as a bound anchor's caveat saying the header WAS checked (0.25.0 panel, round 3).
+    Whether the mark was header-checked comes from the reports themselves; the step heights never
+    are; and proof-of-work and merkle inclusion are checked by nothing.
+    """
+    header = (
+        "The mark's height was also checked against each endpoint's own block header; the step heights were not."
+        if mark_header_bound
+        else "No height here was checked against a block header."
+    )
     return (
         f"block heights — the mark's and every chain step's — were reported identically by "
-        f"{' and '.join(repr(s) for s in sources)}, and are NOT verified: pyrxd has no Radiant header, "
-        "proof-of-work or merkle-inclusion check, so one endpoint's lie now shows as a disagreement, "
-        "but endpoints that agree on the same lie still move the point in time this answer is about"
+        f"{' and '.join(repr(s) for s in sources)}, and are NOT verified. {header} Nothing checks "
+        "proof-of-work or merkle inclusion, so one endpoint's lie now shows as a disagreement, but "
+        "endpoints that agree on the same lie still move the point in time this answer is about"
     )
 
 
@@ -507,7 +525,7 @@ def judge_name_at_mark(
         provisional=False,
         expiry=EXPIRY_UNKNOWN,
         degraded_reason="",
-        caveat=_corroborated_caveat(sources),
+        caveat=_corroborated_caveat(sources, mark_header_bound=all(r.mark_header_bound for r in height_reports)),
         height_sources=tuple(sources),
     )
 
