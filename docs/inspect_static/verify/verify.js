@@ -276,11 +276,13 @@ async function lookUpTransaction(txid, token) {
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole
   // claim is "no later than the block that confirms this", so the block is not
-  // decoration — but it costs two more round trips, and a transaction with no mark
-  // in it has nothing to gain from them.
+  // decoration — but it costs more round trips (the depth, the tip, and a header or two to
+  // bind the height), and a transaction with no mark in it has nothing to gain from them.
+  // The token test goes in too: the lookup checks it after each header wait and stops
+  // fetching once the reader has moved on.
   if (carriesAMark(result)) {
     setFormStatus("Finding the block…");
-    const anchor = await resolveMarkAnchor(bridges.markAnchor, txid);
+    const anchor = await resolveMarkAnchor(bridges.markAnchor, txid, () => token !== inFlight);
     if (token !== inFlight) return null;
     result.payload.mark_anchor = anchor;
   }
@@ -671,7 +673,7 @@ function hiddenMarksNote(hiddenRecords, txid) {
   //
   // N IS CONFIRMATIONS, NOT BLOCKS ON TOP. The CLI holds the mark's block to
   // `confirmations >= N` (`MarkAnchor.provisional`), and a confirmation count includes the
-  // block itself (`mark_anchor.py` places it at `tip - confirmations + 1`). This said "blocks
+  // block itself (`MIN_CONFIRMATIONS_MEANING` in `mark_anchor.py`). This said "blocks
   // built on top", which is one more than the command asks for.
   lines.push(
     `To check every mark in it: pyrxd verify ${safeText(txid || "<transaction number>")} ` +
@@ -1110,8 +1112,8 @@ function answerWhatWasFingerprinted(hm) {
 }
 
 // HOW DEEP, in words that do not add a block. `confirmations` INCLUDES the mark's own
-// block — `mark_anchor.py` derives the height as `tip - confirmations + 1`, so a mark in
-// the newest block has one confirmation and nothing on top of it. The page used to print
+// block — a node counts the block that holds the transaction as its first confirmation —
+// so a mark in the newest block has one confirmation and nothing on top of it. The page used to print
 // "N block(s) built on top of it", which overstated every mark's burial by one.
 function depthInWords(confirmations) {
   const n = Number(confirmations);
@@ -1164,8 +1166,8 @@ function answerWhen(anchor, anchorReason) {
   }
 
   // safeText ON THE NUMBERS TOO. They are ints by the time `resolve_mark_anchor` is
-  // done with them — `nonneg_int` refuses anything else and the height is arithmetic
-  // on them — so this is not closing a live hole. It closes the LAST place on this
+  // done with them — `nonneg_int` refuses anything else and the height is one of the
+  // candidate heights it computed from them — so this is not closing a live hole. It closes the LAST place on this
   // page where a payload value reaches a sentence without passing the sanitiser,
   // which is what keeps "every string is sanitised" a property of the file rather
   // than a fact about today's callers.
@@ -1183,8 +1185,11 @@ function answerWhen(anchor, anchorReason) {
   dl.appendChild(fact("confirmations", anchor.confirmations));
   sec.appendChild(dl);
   // THE CAVEAT TRAVELS WITH THE NUMBER. `mark_anchor_dict` carries it precisely so a
-  // height cannot reach a screen without it: pyrxd has no Radiant header, proof-of-work
-  // or merkle check, so the height is one server's claim and nothing here tested it.
+  // height cannot reach a screen without it. A height reaches this line only when it is
+  // BOUND — the server's own header at it hashes to the block the server's node names — and
+  // the caveat says exactly that and no more: checked against the endpoint itself, with
+  // nothing checking proof-of-work or merkle inclusion, so it is still one server's claim.
+  // An unbound height never gets here: it is the `!anchor.resolved` branch above.
   sec.appendChild(para(
     `About that block number: ${safeText(anchor.caveat)}. It was reported by ${safeText(anchor.source)}.`,
     "answer-body muted",

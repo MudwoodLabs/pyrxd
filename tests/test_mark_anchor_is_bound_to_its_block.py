@@ -254,10 +254,11 @@ async def test_an_unmined_mark_needs_no_header() -> None:
 
 
 async def test_without_a_header_fetcher_the_library_is_still_the_formula() -> None:
-    """The browser pages call the library WITHOUT `fetch_header` (they fetch the verbose reply and
-    the tip themselves, in `shared.js`, and hand both to `glue.mark_anchor`). This pins what that
-    path still does: the arithmetic, one block low under lag, with the UNBOUND caveat. When the
-    pages bind (PR #741's territory, not this one), this fails and forces the sentence out."""
+    """What the bare library does when a caller passes no `fetch_header`: the arithmetic, one block
+    low under lag, with the UNBOUND caveat. No shipped surface calls it that way any more — the
+    CLI funnel binds (`test_the_cli_funnel_always_binds`) and so do the pages' glue
+    (`test_the_pages_glue_binds`) — so this pins the library's contract for any future caller, and
+    the unbound caveat that such a caller would have to show."""
     node_tip, true_height = 1009, 1000
     anchor = await _resolve(
         confirmations=node_tip - true_height + 1,
@@ -269,9 +270,18 @@ async def test_without_a_header_fetcher_the_library_is_still_the_formula() -> No
     assert anchor.caveat == UNVERIFIED_CAVEAT
 
 
-def test_the_pages_glue_does_not_bind_yet() -> None:
-    """Executable, not prose: the page bridge calls `resolve_mark_anchor` with no header fetcher."""
+def test_the_pages_glue_binds() -> None:
+    """The flip of what this test used to pin ("the pages' glue does not bind yet"). The page
+    bridge now calls `resolve_mark_anchor` WITH a header fetcher, and — executed, not only read —
+    under the same lag the CLI tests model it lands on the true block, carrying the bound caveat.
+
+    The bridge cannot fetch, so it answers `needs_headers` until the page has handed over the
+    header the rule asks for next; the loop below plays the page's part against the fake chain's
+    headers. `tests/web/test_mark_anchor_bridge.py` does the same with real mainnet headers, and the
+    page harnesses drive the JavaScript side of the loop.
+    """
     import inspect as _inspect
+    import json
 
     glue_dir = pathlib.Path(__file__).resolve().parents[1] / "docs" / "inspect_static" / "inspect"
     sys.path.insert(0, str(glue_dir))
@@ -279,11 +289,27 @@ def test_the_pages_glue_does_not_bind_yet() -> None:
         import glue
 
         source = _inspect.getsource(glue.mark_anchor)
+        node_tip, true_height, txid = 1009, 1000, "ab" * 32
+        verbose = json.dumps(
+            {"txid": txid, "confirmations": node_tip - true_height + 1, "blockhash": block_hash_at(true_height)}
+        )
+        fetched: dict = {"headers": {}, "errors": {}}
+        answer: dict = {}
+        for _ in range(2 * MAX_INDEX_LAG_BLOCKS + 2):
+            answer = glue.mark_anchor(txid, verbose, node_tip - 1, json.dumps(fetched))
+            if not answer.get("needs_headers"):
+                break
+            height = answer["needs_headers"][0]
+            fetched["headers"][str(height)] = synthetic_header(height).hex()
     finally:
         sys.path.remove(str(glue_dir))
         sys.modules.pop("glue", None)
     assert "resolve_mark_anchor(" in source, "the premise: the page calls the library"
-    assert "fetch_header" not in source
+    assert "fetch_header=" in source, "the page bridge calls the library without a header fetcher"
+    assert answer.get("resolved") is True, answer
+    assert answer["height"] == true_height, "one block low: the formula, not the header"
+    assert answer["caveat"] == BOUND_CAVEAT
+    assert sorted(int(h) for h in fetched["headers"]) == [true_height - 1, true_height]
 
 
 def test_the_cli_funnel_always_binds() -> None:
@@ -440,3 +466,143 @@ def test_an_unreachable_endpoint_is_still_reported_as_unreachable(monkeypatch, t
     r = _run_verify(monkeypatch, _Down({txid: raw}), ["verify", txid, "--min-confirmations", "6"], tmp_path=tmp_path)
     assert r.exit_code == 2, r.output
     assert "is reachable" in " ".join(r.output.split())
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: "its index and its node disagree" only when every header arrived
+# ---------------------------------------------------------------------------
+#
+# THE FALSE SENTENCE. The binding said the block "is not its header at any height from lo to hi …
+# its index and its node disagree" even when some of those headers could not be read. On an HONEST
+# chain whose header at the mark's own height is refused (or times out), the other headers not
+# matching is exactly what honesty looks like — the missing one is the match — so the endpoint was
+# accused of contradicting itself for a header it never sent. The browser pages had the same
+# sentence and were fixed first; this is the CLI sibling. Each case below is paired with the true
+# disagreement, where every header in the window is served and none matches.
+
+_TRUE_HEIGHT, _NODE_TIP = 1000, 1009
+
+
+def _refusing(refused: int):
+    def header(height: int) -> bytes:
+        if height == refused:
+            raise NetworkError(f"height {height}: request timed out")
+        return synthetic_header(height)
+
+    return header
+
+
+async def test_a_refused_header_on_an_honest_chain_is_named_not_called_a_disagreement() -> None:
+    with pytest.raises(AnchorBindingError) as caught:
+        await _resolve(
+            confirmations=_NODE_TIP - _TRUE_HEIGHT + 1,
+            tip=_NODE_TIP,
+            verbose_extra={"blockhash": block_hash_at(_TRUE_HEIGHT)},
+            headers=_refusing(_TRUE_HEIGHT),
+        )
+    exc = caught.value
+    assert exc.unserved == (_TRUE_HEIGHT,) and not exc.disagrees
+    assert sorted(exc.served) == [_TRUE_HEIGHT - 2, _TRUE_HEIGHT - 1, _TRUE_HEIGHT + 1, _TRUE_HEIGHT + 2]
+    assert f"did not serve a usable header at heights {_TRUE_HEIGHT} " in str(exc)
+    assert "request timed out" in str(exc), "what failed is still named"
+    assert "disagree" not in str(exc)
+
+
+async def test_every_header_served_and_none_matching_is_the_disagreement() -> None:
+    """The pair: the whole window arrives and none of it is the node's block."""
+    with pytest.raises(AnchorBindingError) as caught:
+        await _resolve(
+            confirmations=_NODE_TIP - _TRUE_HEIGHT + 1, tip=_NODE_TIP, verbose_extra={"blockhash": block_hash_at(2000)}
+        )
+    exc = caught.value
+    assert exc.disagrees and exc.unserved == () and len(exc.served) == 2 * MAX_INDEX_LAG_BLOCKS + 1
+    assert "its index and its node disagree" in str(exc)
+
+
+def _verify_exit(monkeypatch, tmp_path, server_cls) -> str:
+    from tests.test_hashmark_verify_cli import _mark_script, _tx_with
+    from tests.test_hashmark_verify_cli import _run as _run_verify
+
+    txid, raw = _tx_with(_mark_script(b"a report\n", PrivateKey()))
+    r = _run_verify(
+        monkeypatch, server_cls({txid: raw}), ["verify", txid, "--min-confirmations", "6"], tmp_path=tmp_path
+    )
+    assert r.exit_code == 2, r.output
+    return " ".join(r.output.split())
+
+
+def test_plain_verify_names_the_header_it_was_refused_rather_than_blaming_the_server(monkeypatch, tmp_path) -> None:
+    """Through the real `verify` command: an honest fake whose header at the mark's own height is
+    refused. The exit-2 advice names that height; it does not say the index and node disagree."""
+    from tests.test_hashmark_verify_cli import _FakeServer
+
+    class _RefusesTheMarksHeader(_FakeServer):
+        async def get_block_header(self, height) -> bytes:
+            if int(height) == self.tip - self.confirmations + 1:
+                self.calls.append(("get_block_header", str(int(height))))
+                raise NetworkError(f"height {int(height)}: request timed out")
+            return await super().get_block_header(height)
+
+    probe = _RefusesTheMarksHeader({})
+    mark_height = probe.tip - probe.confirmations + 1
+    flat = _verify_exit(monkeypatch, tmp_path, _RefusesTheMarksHeader)
+    assert f"wss://only answered, but did not serve the block headers at heights {mark_height}," in flat
+    assert "disagree" not in flat
+    assert "is reachable" not in flat and "--electrumx URL" in flat
+
+
+def test_plain_verify_still_says_disagree_when_every_header_arrived(monkeypatch, tmp_path) -> None:
+    """The pair, stated with the attribute the advice now reads: all five served, none matching."""
+    from tests.test_hashmark_verify_cli import _FakeServer
+
+    class _HeadersDisagree(_FakeServer):
+        async def get_block_header(self, height) -> bytes:
+            return synthetic_header(int(height) + 1000)
+
+    flat = _verify_exit(monkeypatch, tmp_path, _HeadersDisagree)
+    assert "wss://only answered, but its index and its node disagree" in flat
+    assert "did not serve" not in flat
+
+
+def test_form_2_degrades_with_the_true_reason_for_each_failure(monkeypatch) -> None:
+    """The form-2 path reports the anchor's failure in its degrade reason (the exception's own
+    words). Both endpoints refuse the header at the mark's block: the reason names it and does not
+    say "disagree". Paired: both serve every header and none is the node's block."""
+
+    class _RefusesTheMarksHeader(_Server):
+        async def get_block_header(self, height) -> bytes:
+            if int(height) == SAME_BLOCK:
+                raise NetworkError(f"height {int(height)}: request timed out")
+            return await super().get_block_header(height)
+
+    class _HeadersDisagree(_Server):
+        async def get_block_header(self, height) -> bytes:
+            return synthetic_header(int(height) + 100_000)
+
+    refused = _run(monkeypatch, _payload(MOVED_H160), _pair(_RefusesTheMarksHeader, _RefusesTheMarksHeader))
+    assert refused["resolved"] is False, refused
+    assert f"did not serve a usable header at heights {SAME_BLOCK} " in refused["reason"]
+    assert "disagree" not in refused["reason"]
+
+    disagree = _run(monkeypatch, _payload(MOVED_H160), _pair(_HeadersDisagree, _HeadersDisagree))
+    assert disagree["resolved"] is False, disagree
+    assert "its index and its node disagree" in disagree["reason"]
+
+
+def test_the_page_and_the_cli_tell_each_failure_the_same_way() -> None:
+    """ONE classification. The page words its reason from the same exception attributes the CLI's
+    advice reads — for a refused header and for a true disagreement, the two agree on which it is."""
+    import inspect as _inspect
+
+    glue_dir = pathlib.Path(__file__).resolve().parents[1] / "docs" / "inspect_static" / "inspect"
+    sys.path.insert(0, str(glue_dir))
+    try:
+        import glue
+
+        source = _inspect.getsource(glue._unbound_reason)
+    finally:
+        sys.path.remove(str(glue_dir))
+        sys.modules.pop("glue", None)
+    assert "exc.disagrees" in source and "exc.unserved" in source, "the page classifies the failure itself"
+    cli = _inspect.getsource(sys.modules["pyrxd.cli.hashmark_cmds"])
+    assert "exc.disagrees" in cli and "exc.unserved" in cli, "the CLI's advice classifies the failure itself"

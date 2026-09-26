@@ -36,6 +36,11 @@
 //            "binding_returns": [result, …], — what the binding bridge returns, call by call
 //            "anchor_returns"?: [anchor, …], — what the block-lookup bridge returns, call by call
 //            "binding_throws"?: true,       — the binding bridge raises instead of answering
+//            "anchor_python"?: path,        — answer the block lookup with the REAL glue.mark_anchor,
+//                      run by that interpreter (anchor_returns is then unused)
+//            "blockhash"?: hex, "headers"?: {height: hex}, "tip"?: n, "confirmations"?: n —
+//                      the verbose reply's block hash, the headers `blockchain.block.header`
+//                      serves (any other height is refused), the tip, the depth
 //            "interleave"?: "clear" | {"classify": {"text", "result"}}, — what the reader does
 //                      while the fetch is still waiting on the server
 //            "interleave_on_request"?: n} — do it when the server receives its n-th request
@@ -54,10 +59,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
+import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
+const GLUE_DIR = resolve(HERE, "../../docs/inspect_static/inspect");
 
 class StubText {
   constructor(text) {
@@ -149,7 +156,20 @@ function makeServer(table, requested, hooks) {
         return;
       }
       if (req.method === "blockchain.transaction.get" && req.params[1] === true && table[req.params[0]]) {
-        const frame = { id: req.id, result: { txid: req.params[0], confirmations: hooks.confirmations } };
+        const verbose = { txid: req.params[0], confirmations: hooks.confirmations };
+        if (hooks.blockhash !== undefined) verbose.blockhash = hooks.blockhash;
+        const frame = { id: req.id, result: verbose };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
+      if (req.method === "blockchain.block.header") {
+        // `hooks.headers`: {height: hex} — served verbatim, whatever it is, because what the page
+        // does with a malformed answer is part of what is under test. Absent: ElectrumX's refusal
+        // for a height past its index.
+        const key = String(req.params[0]);
+        const frame = Object.prototype.hasOwnProperty.call(hooks.headers, key)
+          ? { id: req.id, result: hooks.headers[key] }
+          : { id: req.id, error: { code: 1, message: `height ${key} out of range` } };
         setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
         return;
       }
@@ -187,7 +207,15 @@ async function main() {
   const glueCalls = [];
   const bindingCalls = [];
   const anchorCalls = [];
-  const hooks = { count: 0, log: [], onRequest: null, confirmations: spec.confirmations ?? 5, tip: spec.tip ?? 460572 };
+  const hooks = {
+    count: 0,
+    log: [],
+    onRequest: null,
+    confirmations: spec.confirmations ?? 5,
+    tip: spec.tip ?? 460572,
+    blockhash: spec.blockhash,
+    headers: spec.headers || {},
+  };
   const document = {
     createElement: (tag) => new StubElement(tag),
     getElementById: () => new StubElement("div"),
@@ -242,7 +270,11 @@ async function main() {
     }
     : recorder(bindingCalls, spec.binding_returns || [], "binding result");
   // The block lookup's bridge (`glue.mark_anchor`). Its canned answers are the real glue's.
-  sandbox.__anchor_recorder__ = recorder(anchorCalls, spec.anchor_returns || [], "anchor result");
+  // `anchor_python`: answer the block lookup with the REAL `glue.mark_anchor` (see
+  // glue_subprocess_bridge.mjs) instead of a canned list.
+  sandbox.__anchor_recorder__ = spec.anchor_python
+    ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, anchorCalls)
+    : recorder(anchorCalls, spec.anchor_returns || [], "anchor result");
   vm.runInContext(
     "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__;",
     sandbox,

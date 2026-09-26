@@ -1752,21 +1752,22 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
 
 
 class TestAConfirmationCountIncludesTheBlock:
-    """``confirmations`` counts the mark's OWN block: ``resolve_mark_anchor`` places it at
-    ``tip - confirmations + 1``, so a mark in the newest block has one confirmation and nothing
-    built on top of it. The page printed "N block(s) built on top of it", overstating every
-    mark's burial by one block on the one screen a stranger reads it from.
+    """``confirmations`` counts the mark's OWN block: for an endpoint whose index and node agree,
+    the block holding it is ``tip - confirmations + 1``, so a mark in the newest block has one
+    confirmation and nothing built on top of it. The page printed "N block(s) built on top of it",
+    overstating every mark's burial by one block on the one screen a stranger reads it from.
 
-    The anchor is produced by the page's own Python entry point (``glue.mark_anchor``) from the
-    reply shape the endpoint really sends, so the height/confirmation pairing is the real one."""
+    The anchor is produced by the page's own Python entry point (``glue.mark_anchor``), bound to
+    the (synthetic) header the way the page binds it, so the height/confirmation pairing is the
+    one the page really renders."""
 
     TIP = 460_572
 
     def _answer(self, confirmations: int) -> tuple[dict, str, list[str]]:
+        from tests.web.test_mark_block_is_bound_on_the_pages import bound_anchor
+
         txid = "ab" * 32
-        verbose = json.dumps({"txid": txid, "confirmations": confirmations})
-        anchor = _glue().mark_anchor(txid, verbose, self.TIP)
-        assert anchor["resolved"], anchor
+        anchor = bound_anchor(_glue(), txid, confirmations=confirmations, tip=self.TIP)
         assert anchor["height"] == self.TIP - confirmations + 1, "the premise: the count includes the block"
         text = _page(_as_tx_result(_payload_with_status("valid"), anchor=anchor))["text"]
         return anchor, " ".join(text.split()), text.split("\n")
