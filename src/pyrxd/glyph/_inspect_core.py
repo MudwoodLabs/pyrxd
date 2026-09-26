@@ -2096,10 +2096,16 @@ def _spent_output_bindings(
         {"input_index": the headline, per :func:`_reveal_attribution` given the spent scripts,
          "moved": whether that differs from the network-free headline,
          "binding": its payload_binding — as _classify_raw_tx would give it, or ``unchecked`` with
-                    a ``detail`` when its own fetch failed,
+                    a ``detail`` when its own fetch failed; with ``unsettled`` saying so when it
+                    is not ``bound`` and another minting payload went unchecked,
          "spent_scripts": {input index: the locking script it spent},
+         "rows": {input index: {"state", "detail"?}} for every OTHER minting payload —
+                 ``unchecked`` with the reason where its fetch failed or was never made,
+         "past_cap": how many of those were past the fetch limit,
          "reclassify": whether a caller must classify again with ``spent_scripts`` — the
-                       headline moved, or another payload's row has a verdict to show.}
+                       headline moved, or another minting payload has a row verdict to show.}
+
+    :func:`_apply_bindings` writes it into a classification.
 
     Classifies no output and checks no signature. Raises ``ValidationError`` only for *raw* itself.
     """
@@ -2146,17 +2152,106 @@ def _spent_output_bindings(
         binding = _payload_binding(cbor, spent_scripts[idx], outpoint, output_scripts)
     else:
         binding = problems.get(idx) or _payload_binding(cbor, None, outpoint, output_scripts)
+
+    # EVERY OTHER MINTING PAYLOAD GETS A VERDICT, and a check that did not happen says so (#743
+    # round 4). Only rows with a spent script used to get one, so a commit the server refused, one
+    # it answered with another transaction for, and one past the fetch limit all showed nothing —
+    # and a decoy kept the headline with no sign that the check that could have moved it had not
+    # run.
+    payload_inputs = _minting_payload_inputs(inputs, scriptsigs, inspector, minting)
+    asked_for = set(payload_inputs[:_MAX_BINDING_FETCHES])
+    rows: dict[int, dict] = {}
+    for i in payload_inputs:
+        if i == idx:
+            continue
+        if i in spent_scripts:
+            state = _payload_binding(
+                inspector.extract_reveal_cbor(scriptsigs[i]), spent_scripts[i], _outpoint_of(inputs[i]), output_scripts
+            )["state"]
+            rows[i] = {"state": state}
+        elif i in problems:
+            rows[i] = {"state": "unchecked", "detail": problems[i]["detail"], "why": "failed"}
+        elif i in asked_for:
+            rows[i] = {"state": "unchecked", "detail": "its commit was not fetched", "why": "not asked"}
+        else:
+            detail = f"not checked: past the limit of {_MAX_BINDING_FETCHES} commits fetched for one transaction"
+            rows[i] = {"state": "unchecked", "detail": detail, "why": "past the limit"}
+    past_cap = sum(1 for r in rows.values() if r.get("why") == "past the limit")
+
+    # AND THE HEADLINE SAYS SO, when it is not bound and some other minting payload went unchecked:
+    # a bound one among those would head the card instead, so this headline is not the answer.
+    unchecked = [r["why"] for r in rows.values() if r["state"] == "unchecked"]
+    if binding["state"] != "bound" and unchecked:
+        parts = [
+            f"{unchecked.count(why)} {said}"
+            for why, said in (
+                ("failed", "could not be fetched"),
+                ("past the limit", f"past the limit of {_MAX_BINDING_FETCHES}"),
+                ("not asked", "not fetched"),
+            )
+            if unchecked.count(why)
+        ]
+        binding = {
+            **binding,
+            "unsettled": f"{len(unchecked)} other minting payload(s) went unchecked ({', '.join(parts)}); a bound "
+            "one among them would head this card instead, so this headline is not settled",
+        }
     moved = idx != network_free[0]
     return {
         "input_index": idx,
         "moved": moved,
         "binding": binding,
         "spent_scripts": spent_scripts,
+        "rows": {i: {k: v for k, v in r.items() if k != "why"} for i, r in rows.items()},
+        "past_cap": past_cap,
         # WHEN A CALLER MUST CLASSIFY AGAIN, with `spent_scripts`: the headline moved, or another
-        # payload's commit is known and its row has a verdict to show. Otherwise the binding is
-        # the one field that changes. One decision, read by the CLI and by the page's glue.
-        "reclassify": moved or any(i != idx for i in spent_scripts),
+        # payload has a row verdict to show. Otherwise the binding is the one field that changes.
+        # One decision, read by the CLI and by the page's glue.
+        "reclassify": moved or bool(rows),
     }
+
+
+def _minting_payload_inputs(inputs: Sequence, scriptsigs: list[bytes], inspector, minting: set[int]) -> list[int]:
+    """The minting inputs that carry a decodable payload, in input order — the ones
+    :func:`_binding_candidates` fetches the first :data:`_MAX_BINDING_FETCHES` of."""
+    return [
+        idx
+        for idx in sorted(minting)
+        if idx < len(scriptsigs)
+        and _outpoint_of(inputs[idx]) is not None
+        and inspector.extract_reveal_metadata(scriptsigs[idx]) is not None
+    ]
+
+
+def _apply_bindings(payload: dict, answer: dict) -> dict:
+    """Write what :func:`_spent_output_bindings` found into a classification of the same
+    transaction: the headline's ``payload_binding``, each other minting payload's row verdict, and
+    how many went unchecked past the fetch limit. ONE step, for the CLI's ``--fetch`` and the
+    page's glue, so the two cannot draw the same fetches differently."""
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if not metadata:
+        return payload
+    metadata["payload_binding"] = answer["binding"]
+    rows = answer.get("rows") or {}
+    any_bound = answer["binding"]["state"] == "bound" or any(r["state"] == "bound" for r in rows.values())
+    for row in payload.get("metadata_inputs") or []:
+        verdict = rows.get(row["input_index"])
+        if verdict is None:
+            continue
+        row["binding_state"] = verdict["state"]
+        row["binding_warning"] = _row_binding_warning(verdict["state"], any_bound)
+        if verdict.get("detail"):
+            row["binding_detail"] = verdict["detail"]
+    if answer.get("past_cap"):
+        metadata["bindings_past_cap"] = {"count": answer["past_cap"], "cap": _MAX_BINDING_FETCHES}
+    return payload
+
+
+def _classify_with_bindings(txid_hex: str, raw: bytes, answer: dict, **classify_kwargs) -> dict:
+    """:func:`_classify_raw_tx` again, with the spent scripts *answer* holds, and
+    :func:`_apply_bindings` — what a fetching caller shows when ``answer["reclassify"]``."""
+    payload = _classify_raw_tx(txid_hex, raw, spent_scripts=answer["spent_scripts"], **classify_kwargs)
+    return _apply_bindings(payload, answer)
 
 
 # --- Counting what a bounded caller does not list --------------------------------------------
@@ -2493,26 +2588,9 @@ def _classify_raw_tx(
                 "mints": idx in minting,
             }
         )
-    # WHAT THE OTHER PAYLOADS' COMMITS SAY, where a fetching caller supplied their spent scripts
-    # (#743 round 3). A payload that mints and whose input spent no commit pyrxd recognises is
-    # unremarkable alone, and is exactly the decoy when another payload in the same transaction
-    # IS bound: the headline goes to the bound one, and this row is flagged.
-    if known_spent and found is not None:
-        states = {
-            row["input_index"]: _payload_binding(
-                inspector.extract_reveal_cbor(scriptsigs[row["input_index"]]),
-                known_spent[row["input_index"]],
-                _outpoint_of(tx.inputs[row["input_index"]]),
-                output_scripts,
-            )["state"]
-            for row in metadata_inputs
-            if row["input_index"] in known_spent
-        }
-        any_bound = "bound" in states.values()
-        for row in metadata_inputs:
-            if row["input_index"] in states and row["input_index"] != found[0]:
-                row["binding_state"] = states[row["input_index"]]
-                row["binding_warning"] = _row_binding_warning(states[row["input_index"]], any_bound)
+    # WHAT THE OTHER PAYLOADS' COMMITS SAY is not written here: a row's verdict needs what the
+    # fetches found — including the ones that failed or never happened — and only
+    # `_spent_output_bindings` has that. `_apply_bindings` writes the rows, for both surfaces.
     # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
     # token payload here", and returns None both for "no glyph" and for "a glyph I could not
     # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on

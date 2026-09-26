@@ -577,6 +577,10 @@ function renderFetchedTxCard(payload) {
       // was not the transaction asked for. From `glue.py`, which says it rather than letting
       // "was not supplied" stand for a transaction that was.
       if (pb.detail) mdl.appendChild(kv("payload binding detail", pb.detail));
+      // NOT SETTLED: the headline is not bound and a check that could have moved it did not
+      // happen (a fetch failed, or the payload was past the fetch limit). Flagged, as the CLI
+      // flags it.
+      if (pb.unsettled) mdl.appendChild(kv("payload binding caveat", pb.unsettled, "kv-warning"));
     }
     // Named whatever the verdict. On `unchecked` it is the outpoint someone would
     // fetch to settle it; on `mismatch` it is where the committed payload lives.
@@ -774,11 +778,12 @@ function renderFetchedTxCard(payload) {
       // token" failure one level down.
       const label = [row.name, row.ticker].filter(Boolean).join(" / ") || "(unnamed)";
       let tail = row.mints === false ? " — mints no token" : "";
-      // Its commit's verdict, where the second step supplied its spent script — and flagged when
-      // a node rejects it, or when it spent no commit pyrxd recognises beside one that binds.
-      // Worded as the CLI words it.
+      // Its commit's verdict — `unchecked` with the reason where the fetch failed or was never
+      // made — and flagged when a node rejects it, or when it spent no commit pyrxd recognises
+      // beside one that binds. Worded as the CLI words it.
       if (row.binding_state) {
         tail += ` — payload binding: ${row.binding_state}`;
+        if (row.binding_detail) tail += ` (${row.binding_detail})`;
         if (row.binding_warning) tail += " *** treat as unattributed";
       }
       odl.appendChild(kv(
@@ -788,6 +793,14 @@ function renderFetchedTxCard(payload) {
       ));
     }
     wrapper.appendChild(odl);
+    const pastCap = metadata ? metadata.bindings_past_cap : null;
+    if (pastCap) {
+      wrapper.appendChild(el("p", {
+        class: "card-note",
+        text: `(${pastCap.count} minting payload(s) past the limit of ${pastCap.cap} ` +
+              "commits fetched were not checked)",
+      }));
+    }
     if (hiddenGlyphs > 0) {
       wrapper.appendChild(el("p", {
         class: "card-note hidden-rows-note",

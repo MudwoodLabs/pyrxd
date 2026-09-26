@@ -20,6 +20,7 @@ the mainnet GLYPH deploy reveal (input 0).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 from pathlib import Path
@@ -86,28 +87,46 @@ def _glyph_deploy():
     return Transaction.from_hex(bytes.fromhex(reveal["raw"])), [Transaction.from_hex(bytes.fromhex(commit["raw"]))]
 
 
+@functools.lru_cache(maxsize=1)
+def _other_tx():
+    """What a server answers instead of the transaction asked for: a real, hash-valid
+    transaction — just not that one."""
+    return _tx([(b"\x51", 7)], [])
+
+
 class _Stub:
-    def __init__(self, txs) -> None:
+    """*fail*: txids the server refuses. *swap*: txids it answers with another transaction for."""
+
+    def __init__(self, txs, *, fail=(), swap=()) -> None:
         self.by_txid = {t.txid(): t.serialize() for t in txs}
+        self.fail, self.swap = set(fail), set(swap)
         self.requested: list[str] = []
 
     async def get_transaction(self, txid):
         self.requested.append(str(txid))
+        if str(txid) in self.fail:
+            raise TimeoutError("server refused")
+        if str(txid) in self.swap:
+            return _other_tx().serialize()
         return self.by_txid[str(txid)]
 
 
-def _cli(reveal, prevs) -> tuple[dict, str, list[str]]:
+def _cli(reveal, prevs, *, fail=(), swap=()) -> tuple[dict, str, list[str]]:
     from pyrxd.cli.glyph_inspect import _inspect_txid_inner, _render_txid_human
 
-    client = _Stub([reveal, *prevs])
+    client = _Stub([reveal, *prevs], fail=fail, swap=swap)
     payload = asyncio.run(_inspect_txid_inner(client, reveal.txid()))
     return payload, _render_txid_human(payload), client.requested
 
 
-def _page(reveal, prevs) -> dict:
-    """The page's own `onFetchTxid`, with the real glue's answers for the arguments it passed."""
+def _page(reveal, prevs, *, fail=(), swap=()) -> dict:
+    """The page's own `onFetchTxid`, with the real glue's answers for the arguments it passed.
+    A txid in *fail* is answered with an error frame; one in *swap* with another transaction's
+    bytes, which the page's own fetch helper refuses by hash."""
     limit = _flow("00" * 32, {}, [])["__constants__"]["max_rows_shown"]
     server = {t.txid(): {"hex": t.serialize().hex()} for t in [reveal, *prevs]}
+    server |= {t: {"error": "daemon busy"} for t in fail}
+    server |= {t: {"hex": _other_tx().serialize().hex()} for t in swap}
     first = [_first_pass(reveal, limit)]
     recorded = _flow(reveal.txid(), server, first)
     answers = [_glue().spent_output_bindings(*call) for call in recorded["binding_calls"]]
@@ -229,3 +248,141 @@ class TestTheRanking:
         # The concept doc states the cap as a number; it is a claim, so it is checked.
         doc = (_REPO_ROOT / "docs" / "concepts" / "glyph-inspect-tool.md").read_text(encoding="utf-8")
         assert f"at most {_MAX_BINDING_FETCHES}" in " ".join(doc.split())
+
+
+# ─────────────────────────── a check that did not happen is said (#743 round 4) ──
+#
+# Lane C, round 4. The ranking can only move the headline to a payload whose commit it read. When
+# the server refused that fetch (Kfail), answered it with another hash-valid transaction (Kswap),
+# or the payload was past the fetch limit (K9), the real payload's row showed NOTHING and the decoy
+# kept the headline unflagged — round 2's headline, back, with no sign a check had been skipped.
+# Now every other minting payload's row reads `unchecked` with the reason; the number past the
+# limit is shown, naming it; and a headline that is not bound says, flagged, that it is not settled.
+
+_UNSETTLED = "a bound one among them would head this card instead, so this headline is not settled"
+
+
+def _decoys_then_real(n_decoys: int):
+    """*n_decoys* uncommitted decoys (``OP_2DROP`` + P2PKH, each minting its own outpoint), then a
+    real NFT commit's payload, minted. Returns (reveal, [what its inputs spend], the real commit)."""
+    prevs, ins, outs = [], [], []
+    for d in range(n_decoys):
+        suffix, _ = _envelope(f"Decoy{d}")
+        prev = _tx([(b"\x6d" + _P2PKH, 1000 + d)], [])
+        prevs.append(prev)
+        ins.append((prev.txid(), 0, _SIG + suffix))
+        outs.append((_singleton(prev.txid()), 1))
+    suffix, cbor = _envelope("RealToken")
+    real = _nft_commit_tx(cbor)
+    prevs.append(real)
+    ins.append((real.txid(), 0, _SIG + suffix))
+    outs.append((_singleton(real.txid()), 1))
+    return _tx(outs, ins), prevs, real
+
+
+def _cli_row(text: str, name: str) -> str:
+    (row,) = [line for line in _lines(text) if line.startswith("  input ") and line.split(" — ")[0].endswith(name)]
+    return row
+
+
+def _page_row(text: str, name: str) -> str:
+    """The other-glyph row naming *name* — not the raw-JSON drawer, which names it too."""
+    (row,) = [line for line in _lines(text) if line.startswith(f"nft — {name} — ")]
+    return row
+
+
+def _page_caveat(text: str) -> str | None:
+    lines = _lines(text)
+    return lines[lines.index("payload binding caveat") + 1] if "payload binding caveat" in lines else None
+
+
+class TestACheckThatDidNotHappenIsSaid:
+    def test_k9_a_real_payload_past_the_fetch_limit(self) -> None:
+        from pyrxd.glyph._inspect_core import _MAX_BINDING_FETCHES as cap
+
+        reveal, prevs, _real = _decoys_then_real(cap)
+        payload, cli, requested = _cli(reveal, prevs)
+        assert len(requested) == 1 + cap, "the reveal, then the first `cap` commits: the real one is past the limit"
+        metadata = payload["metadata"]
+        assert (metadata["name"], metadata["payload_binding"]["state"]) == ("Decoy0", "not-a-commit")
+        assert metadata["bindings_past_cap"] == {"count": 1, "cap": cap}
+        past = f"not checked: past the limit of {cap} commits fetched for one transaction"
+        caveat = f"1 other minting payload(s) went unchecked (1 past the limit of {cap}); {_UNSETTLED}"
+        count = f"(1 minting payload(s) past the limit of {cap} commits fetched were not checked)"
+        assert f"  *** {caveat}" in _lines(cli)
+        assert _cli_row(cli, "RealToken").endswith(f"payload binding: unchecked ({past})")
+        assert f"  {count}" in _lines(cli)
+        page = _page(reveal, prevs)["rendered"]
+        assert _page_caveat(page) == caveat
+        assert _page_row(page, "RealToken").endswith(f"payload binding: unchecked ({past})")
+        assert count in _lines(page)
+        # The concept doc names the limit in this sentence too; a claim, so it is checked.
+        doc = (_REPO_ROOT / "docs" / "concepts" / "glyph-inspect-tool.md").read_text(encoding="utf-8")
+        assert f"one past the limit of {cap} reads `unchecked` too" in " ".join(doc.split())
+
+    def test_kfail_the_server_refuses_the_real_commit(self) -> None:
+        reveal, prevs, real = _decoys_then_real(1)
+        payload, cli, _ = _cli(reveal, prevs, fail={real.txid()})
+        assert payload["metadata"]["name"] == "Decoy0"
+        assert "bindings_past_cap" not in payload["metadata"], "nothing was past the limit"
+        caveat = f"1 other minting payload(s) went unchecked (1 could not be fetched); {_UNSETTLED}"
+        assert f"  *** {caveat}" in _lines(cli)
+        assert _cli_row(cli, "RealToken").endswith("payload binding: unchecked (server refused)")
+        page = _page(reveal, prevs, fail={real.txid()})["rendered"]
+        assert _page_caveat(page) == caveat
+        assert _page_row(page, "RealToken").endswith("payload binding: unchecked (server error: daemon busy)")
+        assert "were not checked" not in page
+
+    def test_kswap_the_server_answers_with_another_transaction(self) -> None:
+        reveal, prevs, real = _decoys_then_real(1)
+        payload, cli, _ = _cli(reveal, prevs, swap={real.txid()})
+        assert payload["metadata"]["name"] == "Decoy0"
+        other = _other_tx().txid()
+        caveat = f"1 other minting payload(s) went unchecked (1 could not be fetched); {_UNSETTLED}"
+        assert f"  *** {caveat}" in _lines(cli)
+        assert _cli_row(cli, "RealToken").endswith(
+            f"payload binding: unchecked (it is not the transaction this input spent: it hashes to {other})"
+        )
+        page = _page(reveal, prevs, swap={real.txid()})["rendered"]
+        assert _page_caveat(page) == caveat
+        assert _page_row(page, "RealToken").endswith(
+            f"payload binding: unchecked (the server's answer is not the transaction asked for: it hashes to {other})"
+        )
+
+    def test_a_bound_headline_is_settled_though_another_fetch_failed(self) -> None:
+        """The other branch of the caveat. It is about a headline that may not be the answer; a
+        bound one is, whatever happened to the rest — which still get their own `unchecked` row."""
+        reveal, prevs = _honest_two_token()
+        payload, cli, _ = _cli(reveal, prevs, fail={prevs[1].txid()})
+        binding = payload["metadata"]["payload_binding"]
+        assert binding["state"] == "bound" and "unsettled" not in binding
+        assert _UNSETTLED not in cli
+        assert _cli_row(cli, "Second").endswith("payload binding: unchecked (server refused)")
+        page = _page(reveal, prevs, fail={prevs[1].txid()})["rendered"]
+        assert _page_caveat(page) is None
+        assert _page_row(page, "Second").endswith("payload binding: unchecked (server error: daemon busy)")
+
+
+class TestTheHonestNeighboursHaveNothingUnchecked:
+    @pytest.mark.parametrize("world", [_honest_two_token, _glyph_deploy], ids=["two-bound-tokens", "mainnet-deploy"])
+    def test_no_row_is_unchecked_and_the_headline_is_settled(self, world) -> None:
+        reveal, prevs = world()
+        payload, cli, _ = _cli(reveal, prevs)
+        assert "unsettled" not in payload["metadata"]["payload_binding"]
+        assert "bindings_past_cap" not in payload["metadata"]
+        assert all(row.get("binding_state") != "unchecked" for row in payload["metadata_inputs"])
+        assert "unchecked" not in cli and "were not checked" not in cli
+        page = _page(reveal, prevs)["rendered"]
+        assert _page_caveat(page) is None
+        assert "payload binding: unchecked" not in page and "were not checked" not in page
+
+    def test_a_single_glyph_has_nothing_else_to_check(self) -> None:
+        s, c = _envelope("Solo")
+        k = _nft_commit_tx(c)
+        reveal = _tx([(_singleton(k.txid()), 1)], [(k.txid(), 0, _SIG + s)])
+        payload, cli, _ = _cli(reveal, [k])
+        binding = payload["metadata"]["payload_binding"]
+        assert binding["state"] == "bound" and "unsettled" not in binding
+        assert "unchecked" not in cli and "were not checked" not in cli
+        page = _page(reveal, [k])["rendered"]
+        assert _page_caveat(page) is None and "were not checked" not in page

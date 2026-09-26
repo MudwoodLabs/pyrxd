@@ -474,15 +474,16 @@ def spent_output_bindings(
             return {"ok": True, "binding": None}
         out = {"ok": True, "binding": _sanitize_payload_strings(answer["binding"])}
         if answer["reclassify"]:
-            payload = _inspect.classify_raw_tx(
+            # The headline's verdict, every other minting payload's and the count past the fetch
+            # limit are written by `classify_with_bindings` — the step the CLI takes too.
+            payload = _inspect.classify_with_bindings(
                 txid,
                 raw,
+                answer,
                 network=_PAGE_NETWORK,
-                spent_scripts=answer["spent_scripts"],
                 attest_hashmark_limit=attest_hashmark_limit,
                 max_rows=max_rows,
             )
-            payload["metadata"]["payload_binding"] = answer["binding"]
             out["payload"] = _finish_payload(payload)
     except Exception as exc:
         return _err(_safe_error(exc), form="error")

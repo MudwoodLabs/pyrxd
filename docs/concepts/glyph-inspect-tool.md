@@ -208,14 +208,20 @@ glyph — and decides `payload_binding` and which payload heads the
 card. A payload whose commit binds it heads it over one that merely
 mints: `spent_output_bindings` ranks a bound payload first, then one
 that spent a commit pyrxd recognises, then the first that mints. Only
-when that moves the headline, or another payload's verdict is known,
-is the transaction classified again, with those commits; otherwise the
-binding is the one field that changes. `pyrxd glyph inspect <txid>
---fetch` fetches the same outpoints and asks the same function, so the
-page and the CLI word the same fetch the same way. A payload that
-spent no commit pyrxd recognises, beside one that IS bound, is flagged
-("treat as unattributed"). When a fetch fails or is refused, that
-verdict reads `unchecked` and says why — not that the spent output
+when that moves the headline, or another minting payload has a verdict
+to show, is the transaction classified again, with those commits;
+otherwise the binding is the one field that changes. `pyrxd glyph
+inspect <txid> --fetch` fetches the same outpoints and asks the same
+function, so the page and the CLI word the same fetch the same way.
+Every minting payload gets a verdict. One that spent no commit pyrxd
+recognises, beside one that IS bound, is flagged ("treat as
+unattributed"). One whose fetch failed, was refused, or was answered
+with another transaction reads `unchecked` with the reason; one past
+the limit of 8 reads `unchecked` too, and the card counts those. When
+the headline is not bound and any other minting payload went unchecked,
+the headline says so, flagged: a bound one among them would have headed
+the card. For the headline's own fetch, a failure or refusal likewise
+reads `unchecked` and says why — not that the spent output
 "was not supplied".
 
 What each `payload_binding` state establishes:

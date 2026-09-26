@@ -31,7 +31,13 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_bindings, _truncate_for_human
+from ..glyph._inspect_core import (
+    _HUMAN_ENTRY_CAP,
+    _apply_bindings,
+    _attestation_verdict,
+    _spent_output_bindings,
+    _truncate_for_human,
+)
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -301,7 +307,6 @@ async def _inspect_txid_inner(
                 errors[outpoint] = str(exc) or type(exc).__name__
                 _log.debug("could not fetch the prevout %s: %s", outpoint, exc)
         bindings = _spent_output_bindings(str(txid), bytes(raw), spent, errors)
-    binding = None if bindings is None else bindings["binding"]
 
     if resolved or (bindings is not None and bindings["reclassify"]):
         payload = _classify_raw_tx(
@@ -312,8 +317,11 @@ async def _inspect_txid_inner(
             delegated_refs=resolved or None,
             spent_scripts=None if bindings is None else bindings["spent_scripts"],
         )
-    if binding is not None and isinstance(payload, dict) and payload.get("metadata"):
-        payload["metadata"]["payload_binding"] = binding
+    # The headline's verdict, every other minting payload's — `unchecked` with the reason where its
+    # fetch failed or was never made — and the count past the fetch limit: `_apply_bindings`, the
+    # step the page's glue takes too.
+    if bindings is not None and isinstance(payload, dict):
+        _apply_bindings(payload, bindings)
     if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
@@ -473,6 +481,11 @@ def _render_txid_human(payload: dict) -> str:
             # sanitised and capped by `_spent_output_bindings`: it can quote a server.
             if _pb.get("detail"):
                 lines.append(f"    why: {_pb['detail']}")
+            # NOT SETTLED: the headline is not bound and a check that could have moved it did not
+            # happen (a fetch failed, or the payload was past the fetch limit). Flagged, as the
+            # page flags it.
+            if _pb.get("unsettled"):
+                lines.append(f"  *** {_pb['unsettled']}")
             # Named whatever the verdict. On `unchecked` it is what someone would
             # fetch to settle it; on `mismatch` it is where the real payload is.
             if metadata.get("input_outpoint"):
@@ -598,13 +611,22 @@ def _render_txid_human(payload: dict) -> str:
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
             tail = "" if row.get("mints", True) else " — mints no token"
-            # Its commit's verdict, where a fetch supplied its spent script — and flagged when a
-            # node rejects it, or when it spent no commit pyrxd recognises beside one that binds.
+            # Its commit's verdict — `unchecked` with the reason where the fetch failed or was
+            # never made — and flagged when a node rejects it, or when it spent no commit pyrxd
+            # recognises beside one that binds.
             if row.get("binding_state"):
                 tail += f" — payload binding: {row['binding_state']}"
+                if row.get("binding_detail"):
+                    tail += f" ({row['binding_detail']})"
                 if row.get("binding_warning"):
                     tail += " *** treat as unattributed"
             lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}{tail}")
+        past_cap = (metadata or {}).get("bindings_past_cap")
+        if past_cap:
+            lines.append(
+                f"  ({past_cap['count']} minting payload(s) past the limit of {past_cap['cap']} "
+                "commits fetched were not checked)"
+            )
 
     # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
     # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —

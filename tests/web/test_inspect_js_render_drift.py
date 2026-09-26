@@ -327,6 +327,10 @@ _PROSE_EVIDENCE = {
     # the ordinary case and carries no extra words; one that mints NOTHING says so, on the
     # headline ("token: none — this input mints no token here") and on an other-glyph row.
     "mints": {True: None, False: "mints no token"},
+    # An other-glyph row's payload binding, when another payload in the transaction IS bound and
+    # this one is not: it shouts. When it is not flagged, the row's `binding_state` word says all
+    # there is, and no warning is drawn — the absence is the rendering.
+    "binding_warning": {True: "treat as unattributed", False: None},
 }
 
 #: Below this length, "is the evidence in the text" stops being a question about the
@@ -1144,10 +1148,55 @@ def _tx_payload_single_vout(scriptsigs: list[bytes], outputs: list[tuple[bytes, 
     return classify_raw_tx(hash256(raw)[::-1].hex(), raw, only_vout=vout)
 
 
+def _tx_payload_after_fetches(
+    inputs: list[tuple[str, int, bytes]],
+    outputs: list[tuple[bytes, int]],
+    *,
+    prevs: dict[str, bytes] | None = None,
+    errors: dict[str, str] | None = None,
+) -> dict:
+    """The payload the page draws after its SECOND step: ``glue.spent_output_bindings`` handed
+    *prevs* (``{outpoint: the spent transaction's bytes}``) and *errors* (``{outpoint: why it
+    could not be fetched}``) for the ``(source txid, vout, scriptSig)`` *inputs*.
+
+    The cases above are all network-free, so the keys only that step writes — a row's
+    ``binding_state``, ``binding_warning`` and ``binding_detail``, ``payload_binding.unsettled``,
+    ``bindings_past_cap`` — never reached the field guard, which passed over them true and empty
+    (#743 round 4)."""
+    import json
+
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    tx = Transaction(
+        tx_inputs=[
+            TransactionInput(source_txid=txid, source_output_index=vout, unlocking_script=Script(ss))
+            for txid, vout, ss in inputs
+        ],
+        tx_outputs=[
+            TransactionOutput(locking_script=Script(spk, allow_malformed=True), satoshis=value)
+            for spk, value in outputs
+        ],
+    )
+    raw = tx.serialize()
+    result = _glue().spent_output_bindings(
+        hash256(raw)[::-1].hex(),
+        raw.hex(),
+        json.dumps({op: spent.hex() for op, spent in (prevs or {}).items()}),
+        json.dumps(errors or {}),
+    )
+    assert result["ok"] and "payload" in result, result
+    return result["payload"]
+
+
 @functools.lru_cache(maxsize=1)
 def _tx_payloads() -> dict[str, dict]:
     """One classified transaction per claim the tx card makes, each built to sit
     on a chosen side of the check that claim now depends on."""
+    from pyrxd.glyph._inspect_core import _MAX_BINDING_FETCHES
     from pyrxd.glyph.dmint.builders import build_dmint_v1_contract_script
     from pyrxd.glyph.script import (
         build_commit_locking_script,
@@ -1367,7 +1416,55 @@ def _tx_payloads() -> dict[str, dict]:
             ],
             max_rows=2,
         ),
+        # AFTER THE PAGE'S FETCHES, with every one failing: one more minting payload than the fetch
+        # limit, so each other row reads `unchecked` — why, or past the limit — and the headline,
+        # itself unchecked, says it is not settled.
+        "fetches-failed-and-past-the-limit": _tx_payload_after_fetches(
+            [("ab" * 32, i, _reveal_scriptsig(f"Glyph{i}")) for i in range(_MAX_BINDING_FETCHES + 1)],
+            [(minted_from(i), 546) for i in range(_MAX_BINDING_FETCHES + 1)],
+            errors={f"{'ab' * 32}:{i}": "daemon busy" for i in range(_MAX_BINDING_FETCHES)},
+        ),
+        # AND WITH THEM SUCCEEDING, on case K: a decoy on `OP_2DROP` + P2PKH minting its own
+        # outpoint, beside a payload whose NFT commit binds it. The bound one heads the card and
+        # the decoy's row is flagged — the one case in which `binding_warning` is true.
+        "decoy-beside-a-bound-payload": _decoy_beside_a_bound_payload(pkh, p2pkh),
     }
+
+
+def _decoy_beside_a_bound_payload(pkh, p2pkh: bytes) -> dict:
+    from pyrxd.glyph.inspector import GlyphInspector
+    from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.hash import hash256
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    def paying_to(script: bytes) -> Transaction:
+        """A transaction whose output 0 is *script* — something an input can spend, hash-valid."""
+        return Transaction(
+            tx_inputs=[
+                TransactionInput(
+                    source_txid=os.urandom(32).hex(), source_output_index=0, unlocking_script=Script(b"\x00")
+                )
+            ],
+            tx_outputs=[TransactionOutput(locking_script=Script(script, allow_malformed=True), satoshis=1000)],
+        )
+
+    decoy_sig, real_sig = _reveal_scriptsig("Tether USD", ticker="USDT"), _reveal_scriptsig("RealToken", ticker="REAL")
+    decoy_prev = paying_to(b"\x6d" + p2pkh)  # OP_2DROP, then P2PKH: drops the envelope unchecked
+    commit = paying_to(
+        build_commit_locking_script(hash256(GlyphInspector().extract_reveal_cbor(real_sig)), pkh, is_nft=True)
+    )
+    return _tx_payload_after_fetches(
+        [(decoy_prev.txid(), 0, decoy_sig), (commit.txid(), 0, real_sig)],
+        [
+            (build_nft_locking_script(pkh, GlyphRef(txid=decoy_prev.txid(), vout=0)), 546),
+            (build_nft_locking_script(pkh, GlyphRef(txid=commit.txid(), vout=0)), 546),
+        ],
+        prevs={f"{decoy_prev.txid()}:0": decoy_prev.serialize(), f"{commit.txid()}:0": commit.serialize()},
+    )
 
 
 def _hashmark_v1_script(i: int) -> bytes:
@@ -1475,6 +1572,28 @@ class TestTheTxCardRendersEveryFieldToo:
         exercised = set().union(*(keys_anywhere(payload) for payload in tx_payloads.values()))
         assert len(emitted) >= 8, f"only {sorted(emitted)} derived — the extraction is broken"
         assert emitted <= exercised, f"never exercised: {sorted(emitted - exercised)}"
+
+        # What the page's fetches write into a classification — DERIVED from `_apply_bindings`, the
+        # one step both surfaces take, so a key it starts writing without a case here fails. Every
+        # case above was network-free until #743 round 4, so these passed the field guard empty.
+        tree = ast.parse(source)
+        (apply_bindings,) = [
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_apply_bindings"
+        ]
+        written = {
+            target.slice.value
+            for node in ast.walk(apply_bindings)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and isinstance(target.slice.value, str)
+        }
+        assert {"payload_binding", "binding_detail", "bindings_past_cap"} <= written, sorted(written)
+        assert written <= exercised, f"never exercised: {sorted(written - exercised)}"
+        # And the caveat the headline carries when it is not settled, which `_spent_output_bindings`
+        # puts inside `payload_binding` rather than `_apply_bindings` writing it.
+        assert "unsettled" in exercised
 
 
 def test_the_tallies_whose_words_are_required_are_derived_and_found() -> None:
