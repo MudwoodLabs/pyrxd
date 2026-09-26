@@ -159,6 +159,14 @@ class _NodeClient:
     async def get_tip_height(self) -> int:
         return int(self.node.cli("getblockcount"))  # type: ignore[arg-type]
 
+    # The anchor BINDS its height to a header: the one at that height must hash to the verbose
+    # reply's `blockhash`. From the node itself — `getblockhash` then `getblockheader <hash> false`,
+    # whose reply is the 160-hex header (checked read-only against a mainnet node: pyrxd's
+    # `block_hash_hex` of it equals `getblockhash`).
+    async def get_block_header(self, height: object) -> bytes:
+        block = str(self.node.cli("getblockhash", str(int(height))))  # type: ignore[call-overload]
+        return bytes.fromhex(str(self.node.cli("getblockheader", block, "false")))
+
 
 class _NodeWallet:
     """The three methods ``pyrxd mark`` asks a wallet for, over one funded UTXO.

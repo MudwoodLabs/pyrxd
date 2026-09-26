@@ -58,6 +58,22 @@ def double_sha256(payload: bytes) -> bytes:
     return sha256(sha256(payload))
 
 
+def radiant_block_hash(header: bytes) -> str:
+    """The Radiant block hash of an 80-byte header, in display order: double SHA-512/256, reversed.
+
+    The ONE definition. :func:`pyrxd.network.registry.block_hash_hex` validates its argument and
+    delegates here; it lives in this module because it must be importable without
+    ``pyrxd.network`` (whose ``__init__`` loads the ElectrumX and Bitcoin clients), so the
+    browser-importable :mod:`pyrxd.glyph.mark_anchor` can bind a height to a header too.
+
+    Raises ``ValueError`` if *header* is not 80 bytes.
+    """
+    if not isinstance(header, (bytes, bytearray)) or len(header) != 80:
+        raise ValueError("a Radiant block header is exactly 80 bytes")
+    once = hashlib.new("sha512_256", bytes(header)).digest()
+    return hashlib.new("sha512_256", once).digest()[::-1].hex()
+
+
 # --------------------------------------------------------------------------
 # RIPEMD160 — hashlib fast path with pure-Python fallback.
 # --------------------------------------------------------------------------
