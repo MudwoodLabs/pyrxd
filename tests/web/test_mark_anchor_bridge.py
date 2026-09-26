@@ -2,9 +2,9 @@
 
 ``resolve_mark_anchor`` is what turns "this transaction" into "this block": it binds
 the echoed txid, refuses an unreadable confirmation depth rather than reading it as
-zero, and derives the height from the chain tip because the verbose reply carries no
-height field of its own. The browser panel needs all three, and until this work it
-could not call the function at all.
+zero, and places the height by the chain tip (the verbose reply carries no height field
+of its own) and then BINDS it to the endpoint's own header. The browser panel needs all
+of it, and until this work it could not call the function at all.
 
 **Why it could not.** ``mark_anchor.py`` imported ``nonneg_int`` from
 ``pyrxd.network._guards``, and importing anything under ``pyrxd.network`` executes
@@ -44,6 +44,52 @@ _TXID = "a1a86ab4503901af4df3d092fcf668b07c03c5cd89240fe918ae70e02e045916"
 _MEASURED_CONFIRMATIONS = 5140
 _MEASURED_TIP = 465711
 _KNOWN_HEIGHT = 460572
+
+#: The REAL mainnet headers around that block, and the block hash the node names for the
+#: transaction — measured 2026-09-26, read-only, from the same endpoint with
+#: ``blockchain.block.header`` and the verbose ``blockhash``. The header at 460,572 hashes to that
+#: block hash (``pyrxd.hash.radiant_block_hash``), and its neighbours do not, so a binding that
+#: lands one block off lands on a header that really exists and really does not match.
+_MEASURED_BLOCKHASH = "000000000000003b235d5c1ae5e1015472bbbf422247513b8a2e2351977f3dd5"
+_MEASURED_HEADERS = {
+    460571: (
+        "000000202c638907983cee25c571ef5c208bba2f85c6f6a0f5e5364d1f000000000000001796c08709e087b10fc8"
+        "f034d904a8fced63aa539f3ef52c5e60dd2f20429b61e4de966ac9a9001a480ae052"
+    ),
+    460572: (
+        "0000002072f29019f4a61fda2a63b12deb0f9282a5bf2e8de1fc08e7a800000000000000531b3ef06ad67e5d7aeb"
+        "209bc4c73d52fea59b789978b1ddc7be512d7a84025965e0966a31aa001a5d60f425"
+    ),
+    460573: (
+        "00000020d53d7f9751232e8a3b51472242bfbb725401e1e51a5c5d233b000000000000008a4082936ad0e291e3ed"
+        "d8b78c35af61dabe9e92fd97d91f81923080c6ff490df8e0966a6daa001a64076e42"
+    ),
+}
+
+
+def _page_loop(glue, verbose_json: str, tip, served: dict[int, str], *, rounds: int = 16):
+    """What the page's `resolveMarkAnchor` does, in Python: call the bridge, fetch the ONE header
+    it asks for from ``served`` (a height it lacks is the server's refusal), and call again.
+    Returns ``(final answer, heights asked for, in order)``. The JavaScript loop is exercised on
+    its own through the page harnesses; this is for testing the bridge's side of the protocol."""
+    fetched: dict = {"headers": {}, "errors": {}}
+    asked: list[int] = []
+    for _ in range(rounds):
+        answer = glue.mark_anchor(_TXID, verbose_json, tip, json.dumps(fetched))
+        wanted = answer.get("needs_headers")
+        if not wanted:
+            return answer, asked
+        height = wanted[0]
+        asked.append(height)
+        if height in served:
+            fetched["headers"][str(height)] = served[height]
+        else:
+            fetched["errors"][str(height)] = f"height {height} out of range"
+    raise AssertionError(f"the bridge was still asking for headers after {rounds} rounds: {asked}")
+
+
+def _anchor(glue, verbose_json: str | None = None, tip=_MEASURED_TIP, served=None) -> dict:
+    return _page_loop(glue, verbose_json or _verbose(), tip, _MEASURED_HEADERS if served is None else served)[0]
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +132,7 @@ def _verbose(**over) -> str:
         "txid": _TXID,
         "hash": _TXID,
         "confirmations": _MEASURED_CONFIRMATIONS,
-        "blockhash": "00" * 32,
+        "blockhash": _MEASURED_BLOCKHASH,
         "blocktime": 1_756_000_000,
     }
     reply.update(over)
@@ -192,27 +238,33 @@ class TestTheAnchorIsReachableFromTheBrowser:
 
 class TestTheBlockIsDerivedNotInvented:
     def test_the_measured_mainnet_reply_lands_on_the_right_block(self, glue) -> None:
-        """The honest path, against numbers that really occurred together. The height
-        is not in the reply at all — it is ``tip - confirmations + 1``, and this
-        asserts that arithmetic against a block the node independently reports."""
-        anchor = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        """The honest path, against numbers that really occurred together. The height is not
+        in the reply at all: ``tip - confirmations + 1`` is where the search starts, and the
+        height returned is the one whose REAL header hashes to the block the node names."""
+        anchor, asked = _page_loop(glue, _verbose(), _MEASURED_TIP, _MEASURED_HEADERS)
         assert anchor["resolved"] is True
         assert anchor["height"] == _KNOWN_HEIGHT
         assert anchor["confirmations"] == _MEASURED_CONFIRMATIONS
+        assert anchor["header_bound"] is True
+        assert asked == [_KNOWN_HEIGHT], "the honest path should need exactly the one header"
 
     def test_the_caveat_travels_with_the_height(self, glue) -> None:
-        """pyrxd has no Radiant header, proof-of-work or merkle check, so the height
-        is an endpoint's claim. A reader who does not know that over-trusts every
-        sentence built on it."""
-        anchor = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        """The height is bound to the endpoint's OWN header and nothing more: nothing checks
+        proof-of-work or merkle inclusion, so it is still an endpoint's claim. The caveat says
+        exactly that — the bound one, not the one that says no header was checked."""
+        from pyrxd.glyph.mark_anchor import BOUND_CAVEAT
+
+        anchor = _anchor(glue)
         assert anchor["height_is_verified"] is False
+        assert anchor["caveat"] == BOUND_CAVEAT
         assert "NOT verified" in anchor["caveat"]
+        assert "not checked against any block header" not in anchor["caveat"]
 
     def test_no_depth_verdict_is_shipped(self, glue) -> None:
         """Depth buys reorg-resistance priced in a chain's hashrate; a shipped number
         is folklore. The bridge reports the count and says the judgement is not its
         to make — it must not leak a pass/fail on depth."""
-        anchor = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        anchor = _anchor(glue)
         assert "provisional" not in anchor
         assert "sets no confirmation-depth requirement" in anchor["no_depth_policy"]
 
@@ -281,8 +333,9 @@ class TestTheBridgeFailsClosed:
 
 class TestTheSyncDriverIsHonestAboutItsLimits:
     """``asyncio.run`` does not work on Pyodide's main thread, so the bridge steps the
-    coroutine by hand. That is only sound because ``resolve_mark_anchor``'s single
-    ``await`` is on a value the page already has."""
+    coroutine by hand. That is only sound because every ``await`` in ``resolve_mark_anchor`` is
+    on a callable the bridge supplies — the verbose reply and the headers the page has already
+    fetched — and none of them suspends."""
 
     def test_a_coroutine_that_really_suspends_raises_rather_than_half_answering(self, glue) -> None:
         import asyncio
@@ -310,10 +363,19 @@ class TestThePanelAndTheCliShareOneAnchorShape:
 
     @staticmethod
     def _cli_shape() -> dict:
-        from pyrxd.glyph.mark_anchor import MarkAnchor, mark_anchor_dict
+        """The shape the CLI's funnel produces — which always binds, so a BOUND anchor."""
+        from pyrxd.glyph.mark_anchor import BOUND_CAVEAT, MarkAnchor, mark_anchor_dict
 
         return mark_anchor_dict(
-            MarkAnchor(txid="a" * 64, height=_KNOWN_HEIGHT, confirmations=5, min_confirmations=1, source="s")
+            MarkAnchor(
+                txid="a" * 64,
+                height=_KNOWN_HEIGHT,
+                confirmations=5,
+                min_confirmations=1,
+                source="s",
+                caveat=BOUND_CAVEAT,
+                header_bound=True,
+            )
         )
 
     def test_the_bridge_calls_the_shared_helper(self) -> None:
@@ -341,7 +403,7 @@ class TestThePanelAndTheCliShareOneAnchorShape:
     _DELIBERATELY_ABSENT = frozenset({"provisional", "deep_enough", "min_confirmations"})
 
     def test_the_panel_carries_every_field_except_the_depth_verdicts(self, glue) -> None:
-        panel = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        panel = _anchor(glue)
         cli = set(self._cli_shape())
         missing = cli - set(panel)
         assert missing == self._DELIBERATELY_ABSENT, (
@@ -352,13 +414,202 @@ class TestThePanelAndTheCliShareOneAnchorShape:
 
     def test_the_caveat_is_among_the_fields_that_cross(self, glue) -> None:
         """The specific one. Everything else here is structure; this is the sentence."""
-        panel = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        panel = _anchor(glue)
         assert panel["caveat"] == self._cli_shape()["caveat"]
 
     def test_no_depth_verdict_reaches_the_page(self, glue) -> None:
         """The floor this page passes is 1 — "it is in a block at all", not a policy.
         A ``deep_enough: true`` derived from it would read as "buried enough", which
         nobody here has judged."""
-        panel = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        panel = _anchor(glue)
         for key in self._DELIBERATELY_ABSENT:
             assert key not in panel
+
+
+# ─────────────────────────────────────── the height is BOUND to a header ──
+
+
+class TestTheBridgeBindsTheHeightThroughTheOneRule:
+    """``tip - confirmations + 1`` is one block low whenever the server's index trails its node,
+    on every server at once (#744 measured it and fixed the CLI). The pages call the same
+    ``resolve_mark_anchor`` with ``fetch_header``; the bridge runs that rule against the headers the
+    page has fetched, and asks for the next one — the rule's own next candidate — when it needs it.
+    Every case below uses the REAL mainnet headers around block 460,572."""
+
+    def test_the_first_call_asks_for_the_derived_heights_header_and_names_no_block(self, glue) -> None:
+        answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        assert answer == {
+            "resolved": False,
+            "needs_headers": [_KNOWN_HEIGHT],
+            "reason": "the block's header has not been fetched yet, so no block number is shown",
+        }
+
+    def test_a_node_one_block_ahead_of_its_index_returns_the_true_block(self, glue) -> None:
+        """THE FINDING, with real headers. The index tip one behind the node makes the formula say
+        460,571; that block's real header does not hash to the node's block hash, 460,572's does."""
+        anchor, asked = _page_loop(glue, _verbose(), _MEASURED_TIP - 1, _MEASURED_HEADERS)
+        assert asked == [_KNOWN_HEIGHT - 1, _KNOWN_HEIGHT], "the rule's order: the formula, then +1"
+        assert anchor["resolved"] is True and anchor["height"] == _KNOWN_HEIGHT
+        assert anchor["header_bound"] is True
+
+    @pytest.mark.parametrize("tip_shift", [-2, -1, 0, 1, 2])
+    def test_the_bridge_gives_the_answer_the_cli_rule_gives(self, glue, tip_shift) -> None:
+        """PARITY WITH THE CLI, by construction and by measurement. The same server answers are
+        handed to ``resolve_mark_anchor(fetch_header=...)`` directly — the call the CLI makes — and
+        to the page's loop through the bridge; the two must agree on the height, and on the order
+        the headers were looked at."""
+        import asyncio
+
+        from pyrxd.glyph.mark_anchor import resolve_mark_anchor
+        from pyrxd.security.errors import NetworkError
+
+        verbose = json.loads(_verbose())
+        order: list[int] = []
+
+        async def fetch_verbose(_t):
+            return verbose
+
+        async def fetch_header(height):
+            order.append(height)
+            if height not in _MEASURED_HEADERS:
+                raise NetworkError(f"height {height} out of range")
+            return bytes.fromhex(_MEASURED_HEADERS[height])
+
+        cli = asyncio.run(
+            resolve_mark_anchor(
+                txid=_TXID,
+                fetch_verbose=fetch_verbose,
+                source="s",
+                min_confirmations=1,
+                tip_height=_MEASURED_TIP + tip_shift,
+                fetch_header=fetch_header,
+            )
+        )
+        page, asked = _page_loop(glue, _verbose(), _MEASURED_TIP + tip_shift, _MEASURED_HEADERS)
+        assert page["height"] == cli.height == _KNOWN_HEIGHT
+        assert asked == order
+
+    def test_a_header_that_does_not_hash_to_the_block_is_refused(self, glue) -> None:
+        """No header the server serves hashes to the block its node names: no height, and the
+        reason says the server contradicted itself. The block-number neighbours must not appear."""
+        anchor, asked = _page_loop(glue, _verbose(blockhash="11" * 32), _MEASURED_TIP, _MEASURED_HEADERS)
+        assert anchor["resolved"] is False
+        assert "height" not in anchor
+        assert "the server's index and its node disagree about which block holds this transaction" in anchor["reason"]
+        assert "so no block number is shown" in anchor["reason"]
+        assert sorted(asked) == [
+            _KNOWN_HEIGHT - 2,
+            _KNOWN_HEIGHT - 1,
+            _KNOWN_HEIGHT,
+            _KNOWN_HEIGHT + 1,
+            _KNOWN_HEIGHT + 2,
+        ]
+
+    def test_a_server_that_serves_no_headers_is_not_called_inconsistent(self, glue) -> None:
+        """A different fact, told differently: nothing was read, so nothing disagreed."""
+        anchor, _asked = _page_loop(glue, _verbose(), _MEASURED_TIP, {})
+        assert anchor["resolved"] is False and "height" not in anchor
+        assert "did not serve the block headers needed" in anchor["reason"]
+        assert "disagree" not in anchor["reason"]
+
+    def test_a_confirmed_reply_that_names_no_block_is_refused_without_asking(self, glue) -> None:
+        answer = glue.mark_anchor(_TXID, _verbose(blockhash=None), _MEASURED_TIP)
+        assert answer["resolved"] is False and "needs_headers" not in answer and "height" not in answer
+        assert "does not say which one" in answer["reason"]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "zz" * 80,
+            _MEASURED_HEADERS[_KNOWN_HEIGHT][:-2],
+            _MEASURED_HEADERS[_KNOWN_HEIGHT] + "00",
+            _MEASURED_HEADERS[_KNOWN_HEIGHT][:-1],
+            12345,
+        ],
+        ids=["not-hex", "one-byte-short", "one-byte-long", "odd-length", "not-a-string"],
+    )
+    def test_a_malformed_header_is_an_error_for_its_height_never_a_header(self, glue, bad) -> None:
+        """UNTRUSTED SERVER INPUT. A bad header at the derived height is treated as a header the
+        server could not serve, so the rule moves on and asks for its next candidate — and the
+        bridge does not raise on it (an odd number of hex digits is not bytes at all)."""
+        fetched = {"headers": {str(_KNOWN_HEIGHT): bad}, "errors": {}}
+        answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP, json.dumps(fetched))
+        assert answer.get("needs_headers") == [_KNOWN_HEIGHT + 1], answer
+
+    def test_an_oversize_headers_map_is_refused_before_it_is_parsed(self, glue) -> None:
+        answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP, "x" * (glue._MAX_HEADERS_JSON_CHARS + 1))
+        assert answer["resolved"] is False and "height" not in answer
+        assert "not in a shape this page reads" in answer["reason"]
+
+    def test_the_rules_order_wins_over_whatever_the_page_hands_over(self, glue) -> None:
+        """Handed a later candidate that matches while an earlier one is missing, the bridge asks
+        for the earlier one: the CLI fetches in order and stops at the first match, so answering
+        with the later height could differ from the CLI."""
+        fetched = {"headers": {str(_KNOWN_HEIGHT): _MEASURED_HEADERS[_KNOWN_HEIGHT]}, "errors": {}}
+        # The formula says 460,571 (tip one low); the page handed over only 460,572, which matches.
+        answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP - 1, json.dumps(fetched))
+        assert answer.get("needs_headers") == [_KNOWN_HEIGHT - 1], answer
+
+    @staticmethod
+    def _without_sha512_256(monkeypatch) -> None:
+        """Reproduce Pyodide without its OpenSSL-backed ``_hashlib``: MEASURED in headless Chromium
+        on Pyodide 0.26.4, ``hashlib.new("sha512_256")`` raises exactly this."""
+        import hashlib
+
+        real_new = hashlib.new
+
+        def new(name, *args, **kwargs):
+            if name == "sha512_256":
+                raise ValueError("unsupported hash type sha512_256")
+            return real_new(name, *args, **kwargs)
+
+        monkeypatch.setattr(hashlib, "new", new)
+
+    def test_a_runtime_that_cannot_hash_a_block_says_so_and_fetches_nothing(self, glue, monkeypatch) -> None:
+        """FOUND IN THE BROWSER, not here: the first live run in Chromium showed the page blaming
+        the server ("its index and its node disagree") for a hash its own Python could not compute.
+        The rule catches the hashing error as an unreadable header, so the reason has to be decided
+        before the rule runs out of heights — and no header should be asked for at all."""
+        self._without_sha512_256(monkeypatch)
+        answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
+        assert answer["resolved"] is False
+        assert "needs_headers" not in answer and "height" not in answer
+        assert "this browser's Python cannot compute a Radiant block hash" in answer["reason"]
+        assert "disagree" not in answer["reason"]
+
+    def test_an_unmined_mark_is_not_refused_over_a_hash_it_does_not_need(self, glue, monkeypatch) -> None:
+        """The honest neighbour: no block, no header, no hash — the answer is unchanged."""
+        self._without_sha512_256(monkeypatch)
+        answer = glue.mark_anchor(_TXID, _verbose(confirmations=0), _MEASURED_TIP)
+        assert answer["resolved"] is True and answer["height"] is None
+
+    def test_the_boot_loads_the_hash_before_anything_imports_hashlib(self) -> None:
+        """The Radiant block hash is ``hashlib.new("sha512_256")``, which Pyodide only has once its
+        ``hashlib`` package (OpenSSL) is loaded, and only if that happens before ``hashlib`` is first
+        imported — micropip imports it. So the boot's FIRST ``loadPackage`` must name it, and must
+        come before micropip is used. Gated on the library really using that algorithm."""
+        import inspect as _i
+        import re
+
+        from pyrxd.hash import radiant_block_hash
+
+        assert 'hashlib.new("sha512_256"' in _i.getsource(radiant_block_hash), (
+            "the premise: the block hash is OpenSSL's SHA-512/256 — if it no longer is, re-read this test"
+        )
+        shared = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
+        first = re.search(r"loadPackage\(\[([^\]]*)\]\)", shared)
+        assert first, "no pyodide.loadPackage([...]) in shared.js — this scan is broken"
+        assert '"hashlib"' in first.group(1), f"the first loadPackage is {first.group(1)} — no hashlib"
+        assert first.start() < shared.index("import micropip"), "micropip is imported before hashlib is loaded"
+
+    def test_the_pages_safety_stop_is_above_what_the_rule_can_ask(self) -> None:
+        """`MAX_HEADER_REQUESTS` in shared.js only stops a runaway loop; it must never cut off a
+        header the rule is entitled to ask for. Derived from the rule's own bound."""
+        import re
+
+        from pyrxd.glyph.mark_anchor import MAX_INDEX_LAG_BLOCKS
+
+        shared = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
+        match = re.search(r"const MAX_HEADER_REQUESTS = (\d+);", shared)
+        assert match, "shared.js no longer declares MAX_HEADER_REQUESTS — this scan is broken"
+        assert int(match.group(1)) >= 2 * MAX_INDEX_LAG_BLOCKS + 1

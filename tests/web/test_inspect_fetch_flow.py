@@ -490,8 +490,11 @@ class TestEveryLaterWaitIsGuardedToo:
         server = {tx.txid(): {"hex": tx.serialize().hex()}}
         first = _first_pass(tx, limit)
         assert any(row.get("hashmark") for row in first["payload"]["outputs"]), "the premise: a mark"
-        anchor = _glue().mark_anchor(tx.txid(), json.dumps({"txid": tx.txid(), "confirmations": 5}), 460572)
-        assert anchor["resolved"], anchor
+        from tests.web.test_mark_block_is_bound_on_the_pages import bound_anchor
+
+        # A BOUND anchor from the real bridge, handed over whole: these cases are about when the
+        # page stops, not about the binding, which `test_mark_block_is_bound_on_the_pages.py` owns.
+        anchor = bound_anchor(_glue(), tx.txid(), confirmations=5, tip=460572)
         return tx, server, [first], [anchor]
 
     # ── the honest paths, so each refusal below is known to be interrupting a flow that renders ──
@@ -572,6 +575,9 @@ class TestEveryLaterWaitIsGuardedToo:
         assert tx.txid() not in flow["rendered"], (
             f"a fetch interrupted during the block lookup drew its result anyway:\n{flow['rendered']}"
         )
+        # And the lookup itself stopped there: the bridge was not asked to place the mark, so no
+        # header would have been fetched for a reader who had already moved on.
+        assert flow["anchor_calls"] == [], "the block lookup went on after the reader moved on"
         if action == "clear":
             assert flow["rendered"] == ""
         else:

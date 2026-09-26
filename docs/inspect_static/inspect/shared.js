@@ -400,7 +400,16 @@ async function bootPyrxdRuntime(options) {
     //     lazy ``__getattr__``s in pyrxd's package ``__init__``s might
     //     if a downstream caller touches it. Cheap to load preemptively
     //     (the glue.py shim aliases ``Cryptodome`` → ``Crypto``).
-    await pyodide.loadPackage(["micropip", "pycryptodome"]);
+    //   - ``hashlib`` — Pyodide's OpenSSL-backed ``_hashlib`` (with its
+    //     ``openssl`` dependency). Without it ``hashlib`` has no SHA-512/256,
+    //     which is the Radiant block hash (``pyrxd.hash.radiant_block_hash``)
+    //     that binds a mark's height to its header. MEASURED in headless
+    //     Chromium on Pyodide 0.26.4: ``hashlib.new("sha512_256")`` raised
+    //     "unsupported hash type" until this package was loaded — and it has
+    //     to be loaded BEFORE anything imports ``hashlib`` (micropip does),
+    //     because ``hashlib`` decides at import time what it can build. So
+    //     it is first in this, the first load.
+    await pyodide.loadPackage(["hashlib", "micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)
     // and SHA-256 pinned in manifest.json. Fetch each, verify the
@@ -774,17 +783,58 @@ async function fetchRawTxFromElectrumx(txid) {
   return result;
 }
 
-// The BLOCK a mark sits in — two calls, and only worth making when a mark is present.
+// A Radiant block header is 80 bytes, which ElectrumX sends as 160 hex characters.
+const BLOCK_HEADER_HEX_LEN = 160;
+
+// A safety stop on the header loop below, NOT the rule. Which heights are looked at, and in
+// what order, is `resolve_mark_anchor`'s to decide (at most one per candidate height,
+// `MAX_INDEX_LAG_BLOCKS` either side of the formula). This only ends a loop that would
+// otherwise keep asking; `tests/web/test_mark_anchor_bridge.py` checks it is never smaller
+// than what the rule can ask for.
+const MAX_HEADER_REQUESTS = 8;
+
+// One block header, as hex, with the checks that are about THIS method's result.
+//
+// EVERY HEADER IS UNTRUSTED SERVER INPUT. Bounded before anything else is done with it: a
+// header is exactly 160 hex characters, so anything else — a longer string, a non-string, a
+// string that is not hex — is refused here and becomes an error for that height, never a
+// header. `glue.py` checks the same again where the hex becomes bytes.
+async function fetchBlockHeaderHex(height) {
+  const result = await electrumxRpc("blockchain.block.header", [height]);
+  if (typeof result !== "string") {
+    throw wireError("malformed", "the server's header answer is not a string");
+  }
+  if (result.length !== BLOCK_HEADER_HEX_LEN) {
+    throw wireError("malformed", `the server's header is ${result.length} characters, not ${BLOCK_HEADER_HEX_LEN}`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(result)) {
+    throw wireError("malformed", "the server's header is not hex");
+  }
+  return result.toLowerCase();
+}
+
+// The BLOCK a mark sits in, BOUND to the server's own header — only worth asking for when a
+// mark is present.
 //
 // The depth and the tip are FETCHED here and JUDGED in Python: `resolve_mark_anchor`
 // binds the echoed txid (so a server cannot answer about a different transaction),
-// refuses an unreadable confirmation count instead of reading it as zero, and derives
-// the height as `tip - confirmations + 1` — measured, because the verbose reply
-// carries neither `height` nor `blockheight` on either shipped public server.
+// refuses an unreadable confirmation count instead of reading it as zero, and — the part
+// this loop exists for — BINDS the height to a header. `tip - confirmations + 1` alone is one
+// block LOW whenever the server's index trails its node, on every server at once (the 0.25.0
+// panel measured it), so the height is the one whose header hashes to the block the node
+// names. Python chooses which heights to look at, one at a time, in its own order
+// (`needs_headers`); this loop only fetches what it is asked for and hands every answer back.
+// It never decides a height itself.
+//
+// `superseded` (optional) is the caller's "has the reader moved on?" test. It is checked after
+// every wait here, so a lookup the reader has abandoned stops fetching headers; the caller
+// still checks again before drawing anything.
 //
 // Never throws. Losing the block must not lose the record, so a failure comes back
-// as a `resolved: false` shape with its reason and the page renders that.
-async function resolveMarkAnchor(markAnchorBridge, txid) {
+// as a `resolved: false` shape with its reason and the page renders that — and no failure
+// here carries a block number.
+async function resolveMarkAnchor(markAnchorBridge, txid, superseded) {
+  const stale = typeof superseded === "function" ? superseded : () => false;
   if (!markAnchorBridge) {
     return { resolved: false, reason: "the pyrxd runtime is not ready on this page yet" };
   }
@@ -793,8 +843,37 @@ async function resolveMarkAnchor(markAnchorBridge, txid) {
       electrumxRpc("blockchain.transaction.get", [txid, true]),
       electrumxRpc("blockchain.headers.subscribe", []),
     ]);
+    if (stale()) return null;
     const tip = tipFrame && typeof tipFrame === "object" ? tipFrame.height : null;
-    return fromPy(markAnchorBridge(txid, JSON.stringify(verbose), tip === undefined ? null : tip));
+    const verboseJson = JSON.stringify(verbose);
+    const fetched = { headers: {}, errors: {} };
+    for (let asked = 0; ; asked += 1) {
+      const answer = fromPy(
+        markAnchorBridge(txid, verboseJson, tip === undefined ? null : tip, JSON.stringify(fetched)),
+      );
+      const wanted = answer && Array.isArray(answer.needs_headers) ? answer.needs_headers : null;
+      if (!wanted || wanted.length === 0) return answer;
+      const height = wanted[0];
+      const key = String(height);
+      if (
+        !Number.isInteger(height) || height < 0 || asked >= MAX_HEADER_REQUESTS ||
+        Object.prototype.hasOwnProperty.call(fetched.headers, key) ||
+        Object.prototype.hasOwnProperty.call(fetched.errors, key)
+      ) {
+        // Asked for something it cannot want, or for the same header twice: stop rather than
+        // loop, and say so. No block number either way.
+        return {
+          resolved: false,
+          reason: "the block's height could not be checked against the server's headers, so no block number is shown",
+        };
+      }
+      try {
+        fetched.headers[key] = await fetchBlockHeaderHex(height);
+      } catch (err) {
+        fetched.errors[key] = stripControlChars(String((err && err.message) || err)).slice(0, 160);
+      }
+      if (stale()) return null;
+    }
   } catch (err) {
     return {
       resolved: false,

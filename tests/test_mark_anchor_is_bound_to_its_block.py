@@ -254,10 +254,11 @@ async def test_an_unmined_mark_needs_no_header() -> None:
 
 
 async def test_without_a_header_fetcher_the_library_is_still_the_formula() -> None:
-    """The browser pages call the library WITHOUT `fetch_header` (they fetch the verbose reply and
-    the tip themselves, in `shared.js`, and hand both to `glue.mark_anchor`). This pins what that
-    path still does: the arithmetic, one block low under lag, with the UNBOUND caveat. When the
-    pages bind (PR #741's territory, not this one), this fails and forces the sentence out."""
+    """What the bare library does when a caller passes no `fetch_header`: the arithmetic, one block
+    low under lag, with the UNBOUND caveat. No shipped surface calls it that way any more — the
+    CLI funnel binds (`test_the_cli_funnel_always_binds`) and so do the pages' glue
+    (`test_the_pages_glue_binds`) — so this pins the library's contract for any future caller, and
+    the unbound caveat that such a caller would have to show."""
     node_tip, true_height = 1009, 1000
     anchor = await _resolve(
         confirmations=node_tip - true_height + 1,
@@ -269,9 +270,18 @@ async def test_without_a_header_fetcher_the_library_is_still_the_formula() -> No
     assert anchor.caveat == UNVERIFIED_CAVEAT
 
 
-def test_the_pages_glue_does_not_bind_yet() -> None:
-    """Executable, not prose: the page bridge calls `resolve_mark_anchor` with no header fetcher."""
+def test_the_pages_glue_binds() -> None:
+    """The flip of what this test used to pin ("the pages' glue does not bind yet"). The page
+    bridge now calls `resolve_mark_anchor` WITH a header fetcher, and — executed, not only read —
+    under the same lag the CLI tests model it lands on the true block, carrying the bound caveat.
+
+    The bridge cannot fetch, so it answers `needs_headers` until the page has handed over the
+    header the rule asks for next; the loop below plays the page's part against the fake chain's
+    headers. `tests/web/test_mark_anchor_bridge.py` does the same with real mainnet headers, and the
+    page harnesses drive the JavaScript side of the loop.
+    """
     import inspect as _inspect
+    import json
 
     glue_dir = pathlib.Path(__file__).resolve().parents[1] / "docs" / "inspect_static" / "inspect"
     sys.path.insert(0, str(glue_dir))
@@ -279,11 +289,27 @@ def test_the_pages_glue_does_not_bind_yet() -> None:
         import glue
 
         source = _inspect.getsource(glue.mark_anchor)
+        node_tip, true_height, txid = 1009, 1000, "ab" * 32
+        verbose = json.dumps(
+            {"txid": txid, "confirmations": node_tip - true_height + 1, "blockhash": block_hash_at(true_height)}
+        )
+        fetched: dict = {"headers": {}, "errors": {}}
+        answer: dict = {}
+        for _ in range(2 * MAX_INDEX_LAG_BLOCKS + 2):
+            answer = glue.mark_anchor(txid, verbose, node_tip - 1, json.dumps(fetched))
+            if not answer.get("needs_headers"):
+                break
+            height = answer["needs_headers"][0]
+            fetched["headers"][str(height)] = synthetic_header(height).hex()
     finally:
         sys.path.remove(str(glue_dir))
         sys.modules.pop("glue", None)
     assert "resolve_mark_anchor(" in source, "the premise: the page calls the library"
-    assert "fetch_header" not in source
+    assert "fetch_header=" in source, "the page bridge calls the library without a header fetcher"
+    assert answer.get("resolved") is True, answer
+    assert answer["height"] == true_height, "one block low: the formula, not the header"
+    assert answer["caveat"] == BOUND_CAVEAT
+    assert sorted(int(h) for h in fetched["headers"]) == [true_height - 1, true_height]
 
 
 def test_the_cli_funnel_always_binds() -> None:

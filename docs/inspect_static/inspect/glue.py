@@ -697,8 +697,8 @@ def _sanitize_payload_strings(value, *, key=None):
 # ---------------------------------------------------------------------------
 # W8 — the verdict view's two extra inputs: the BLOCK, and the FILE.
 #
-# Both are deliberately thin. Everything a reader could be misled by — how a
-# height is derived from a confirmation count, what a digest match is allowed to
+# Both are deliberately thin. Everything a reader could be misled by — which
+# block a mark's transaction is in, what a digest match is allowed to
 # mean, which hash a record actually names — is computed by the same pyrxd code
 # the CLI runs, and this module only carries values across the bridge.
 # ---------------------------------------------------------------------------
@@ -725,10 +725,11 @@ def _run_sync(coro):
     """Run a coroutine that never actually suspends, without an event loop.
 
     Pyodide's main thread already has a running loop, so ``asyncio.run`` is not
-    available here. ``resolve_mark_anchor`` has exactly one ``await``, on the
-    ``fetch_verbose`` callable we supply — and ours returns a value the page has
-    already fetched, so the coroutine runs to completion on the first ``send`` and
-    raises ``StopIteration`` carrying the result.
+    available here. ``resolve_mark_anchor`` awaits only the callables we supply —
+    ``fetch_verbose``, and ``fetch_header`` once per candidate height — and ours return
+    values the page has already fetched (or raise at once for one it has not), so the
+    coroutine runs to completion on the first ``send`` and raises ``StopIteration``
+    carrying the result.
 
     If it ever DOES suspend, that is a real change in the function's contract and
     this raises rather than returning a half-built anchor.
@@ -750,7 +751,127 @@ def _run_sync(coro):
 _MAX_VERBOSE_JSON_CHARS = 8_000_000
 
 
-def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
+#: A Radiant block header is 80 bytes; the page hands each one across as hex.
+_HEADER_HEX_CHARS = 160
+
+#: Cap on the fetched-headers JSON. The rule asks for at most one header per candidate height
+#: (``MAX_INDEX_LAG_BLOCKS`` either side of the formula), each 160 hex characters plus a short
+#: error string; anything near this is not what the page sends.
+_MAX_HEADERS_JSON_CHARS = 16_000
+
+#: How much of a page-reported header error crosses into a reason.
+_HEADER_ERROR_CAP = 160
+
+_UNREADABLE_HEADERS = "the fetched block headers were not in a shape this page reads"
+
+
+def _fetched_headers(headers_json: object) -> tuple[dict[int, bytes], dict[int, str]] | str:
+    """``(headers, errors)`` from what the page fetched, or a reason they cannot be read.
+
+    EVERY HEADER IS UNTRUSTED SERVER INPUT. The page already refuses a header answer that is not
+    a string of exactly 160 hex characters (``fetchBlockHeaderHex`` in ``shared.js``), and it is
+    checked again here, where it becomes bytes: anything else is recorded as an ERROR for that
+    height — which the binding treats as a header the server could not serve — never as a header.
+    """
+    import json
+    import re
+
+    if headers_json is None:
+        return {}, {}
+    if not isinstance(headers_json, str) or len(headers_json) > _MAX_HEADERS_JSON_CHARS:
+        return _UNREADABLE_HEADERS
+    try:
+        fetched = json.loads(headers_json)
+    except ValueError:
+        return _UNREADABLE_HEADERS
+    if not isinstance(fetched, dict):
+        return _UNREADABLE_HEADERS
+    raw_headers, raw_errors = fetched.get("headers", {}), fetched.get("errors", {})
+    if not isinstance(raw_headers, dict) or not isinstance(raw_errors, dict):
+        return _UNREADABLE_HEADERS
+    height_key = re.compile(r"^[0-9]{1,10}$")
+    headers: dict[int, bytes] = {}
+    errors: dict[int, str] = {}
+    for key, value in raw_errors.items():
+        if isinstance(key, str) and height_key.match(key):
+            errors[int(key)] = _truncate(_inspect.sanitize_display_string(str(value)), cap=_HEADER_ERROR_CAP)
+    for key, value in raw_headers.items():
+        if not (isinstance(key, str) and height_key.match(key)):
+            continue
+        if (
+            isinstance(value, str)
+            and len(value) == _HEADER_HEX_CHARS
+            and all(c in "0123456789abcdefABCDEF" for c in value)
+        ):
+            headers[int(key)] = bytes.fromhex(value)
+        else:
+            errors[int(key)] = "the server's answer is not an 80-byte header"
+    return headers, errors
+
+
+def _unbound_reason(asked: list[int], headers: dict[int, bytes]) -> str:
+    """Why no block number is shown, told by what the binding actually did.
+
+    Three different facts, and one sentence for all of them would say something false about
+    two. What decides it is what this bridge OBSERVED the rule do — which heights it asked for,
+    and which of those the server served — not a second copy of the rule.
+    """
+    if not asked:
+        # The rule refused before asking for any header: the verbose reply names no block.
+        return (
+            "the server says this transaction is in a block but does not say which one, so its "
+            "height could not be checked against a header, and no block number is shown"
+        )
+    span = f"{min(asked)} to {max(asked)}"
+    if not any(height in headers for height in asked):
+        return (
+            "the server did not serve the block headers needed to check which block holds this "
+            f"transaction (heights {span}), so no block number is shown. Trying again in a moment, "
+            "or another server, may work"
+        )
+    return (
+        "the server's index and its node disagree about which block holds this transaction (or it "
+        f"is serving inconsistent data): none of its headers at heights {span} hashes to the block "
+        "its node names, so no block number is shown. Trying again in a moment, or another server, "
+        "may work"
+    )
+
+
+def _block_hash_unavailable() -> str | None:
+    """Why this runtime cannot compute a Radiant block hash, or None if it can.
+
+    The binding compares a header's hash with the block the node names, and the Radiant block
+    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have unless its OpenSSL-backed
+    ``_hashlib`` package was loaded before ``hashlib`` was first imported (measured: "unsupported
+    hash type sha512_256" otherwise; the boot in ``shared.js`` loads it first). If that ever
+    fails, the rule would catch the hashing error as a header it "could not read" and try the
+    next height, and this page would then blame the SERVER for disagreeing with itself. Checked
+    here, first, so the reason is the true one and no header is fetched for nothing.
+    """
+    from pyrxd.hash import radiant_block_hash
+
+    try:
+        radiant_block_hash(bytes(80))
+    except ValueError as exc:
+        return (
+            "this browser's Python cannot compute a Radiant block hash "
+            f"({_truncate(_inspect.sanitize_display_string(_safe_error(exc)), cap=80)}), so the block's "
+            "height could not be checked against a header, and no block number is shown"
+        )
+    return None
+
+
+def _needs_header(height: int) -> dict:
+    """Ask the page for one more header. Not an answer: it carries no height, and a page that
+    rendered it anyway would show why there is no block number rather than a wrong one."""
+    return {
+        "resolved": False,
+        "needs_headers": [height],
+        "reason": "the block's header has not been fetched yet, so no block number is shown",
+    }
+
+
+def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: object = None) -> dict:
     """Where the mark's transaction sits in the chain, per the endpoint that was asked.
 
     *verbose_json* is the ``blockchain.transaction.get(txid, verbose=True)`` reply as a
@@ -760,17 +881,31 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
     shape depends on how Pyodide happens to proxy a plain object today.
     Handing them to :func:`pyrxd.glyph.mark_anchor.resolve_mark_anchor` rather than
     reading ``confirmations`` in JS is the whole point: that function binds the echoed
-    txid, refuses an unreadable depth instead of reading it as zero, derives the height
-    as ``tip - confirmations + 1`` (measured: the verbose reply carries NEITHER
-    ``height`` NOR ``blockheight``), and carries the caveat saying the height is the
-    endpoint's claim and nothing here verified it.
+    txid, refuses an unreadable depth instead of reading it as zero, and BINDS the height
+    to the endpoint's own header — the same call the CLI makes.
+
+    THE HEIGHT IS BOUND, THROUGH THE ONE RULE. ``tip - confirmations + 1`` is one block low
+    whenever an endpoint's index trails its node, on every server at once (measured by the
+    0.25.0 panel), so the page no longer shows it. ``resolve_mark_anchor(fetch_header=...)``
+    decides the height, as it does for the CLI. This bridge cannot fetch, so it runs that rule
+    against the headers the page has already fetched (*headers_json*: ``{"headers": {height:
+    hex}, "errors": {height: message}}``), and when the rule asks for one the page does not have
+    yet it returns ``{"resolved": False, "needs_headers": [height]}`` — the FIRST such height, in
+    the rule's own order. The page fetches it with ``blockchain.block.header`` and calls again.
+    So the rule, not JavaScript, chooses which heights are looked at and in what order, and the
+    answer is the one the CLI gives for the same server answers.
+
+    A height is returned only when a header the server served at it hashes to the block the
+    server's node names. Otherwise the answer is ``resolved: False``, with a reason saying which
+    of three failures it was; an unbound block number never crosses to the page.
 
     Never raises. A failure is a dict with ``resolved: False`` and the reason, because
     losing the block must not lose the record.
     """
     import json
 
-    from pyrxd.glyph.mark_anchor import mark_anchor_dict, resolve_mark_anchor
+    from pyrxd.glyph.mark_anchor import AnchorBindingError, mark_anchor_dict, resolve_mark_anchor
+    from pyrxd.security.errors import NetworkError
 
     if not isinstance(verbose_json, str):
         verbose_json = str(verbose_json)
@@ -785,9 +920,36 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
         return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(f"unreadable reply: {exc}"))}
     if not isinstance(verbose, dict):
         return {"resolved": False, "reason": "the endpoint's reply was not an object"}
+    fetched = _fetched_headers(headers_json)
+    if isinstance(fetched, str):
+        return {"resolved": False, "reason": fetched}
+    headers, errors = fetched
 
     async def _fetch(_requested: str) -> dict:
         return verbose
+
+    #: Every height the rule asked for, in its order, and those the page has not fetched yet.
+    asked: list[int] = []
+    missing: list[int] = []
+    #: Checked when the rule first asks for a header — not before, because an unmined
+    #: transaction needs no header and must not be refused over a hash it never needed.
+    cannot_hash: list[str] = []
+
+    async def _header(height: int) -> bytes:
+        height = int(height)
+        if not asked:
+            problem = _block_hash_unavailable()
+            if problem:
+                cannot_hash.append(problem)
+        asked.append(height)
+        if cannot_hash:
+            raise NetworkError(cannot_hash[0])
+        if height in headers:
+            return headers[height]
+        if height in errors:
+            raise NetworkError(errors[height])
+        missing.append(height)
+        raise NetworkError("this page has not fetched that header yet")
 
     try:
         anchor = _run_sync(
@@ -797,10 +959,28 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
                 source=_ANCHOR_SOURCE,
                 min_confirmations=_ANCHOR_FLOOR,
                 tip_height=int(tip_height) if tip_height is not None else None,
+                fetch_header=_header,
             )
         )
+    except AnchorBindingError as exc:
+        if cannot_hash:
+            return {"resolved": False, "reason": cannot_hash[0]}
+        if missing:
+            return _needs_header(missing[0])
+        return {
+            "resolved": False,
+            "reason": _unbound_reason(asked, headers),
+            "detail": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
+        }
     except Exception as exc:
         return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(_safe_error(exc)))}
+
+    # IN THE RULE'S ORDER, EXACTLY. If the rule passed over a height the page had not fetched and
+    # then matched a later one the page had, the CLI — which fetches in that order and stops at
+    # the first match — could have answered with the earlier height. So a missing earlier
+    # candidate is fetched first, whatever else the page happened to hand over.
+    if missing:
+        return _needs_header(missing[0])
 
     # THE SHAPE IS `mark_anchor_dict`'s, not this module's. It was factored out so a
     # height never reaches a screen without the caveat that it is one endpoint's
@@ -828,6 +1008,9 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
         "resolved": True,
         "txid": anchor.txid,
         **shape,
+        # Beside the caveat so a test, and a reader of the JSON drawer, can see the height was
+        # bound without parsing a sentence. Always True here: an unbound height is never returned.
+        "header_bound": anchor.header_bound,
         "no_depth_policy": (
             "This page sets no confirmation-depth requirement: the count above is the fact, "
             "and how much burial is enough depends on what this mark is worth to you"
