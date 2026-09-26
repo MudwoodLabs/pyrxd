@@ -330,11 +330,16 @@ class TestARecordReadFromDiskGetsBothFeeChoices:
 # ─── (4) lane D F2: done/ is checked before anything is broadcast, never chmodded through a link ──
 
 
+#: The foreign directory's mode: anything but the archive's 0700, so a chmod through a link shows,
+#: with no group or world bits (CodeQL's overly-permissive-file rule flags any, even in a test).
+_FOREIGN_MODE = 0o500
+
+
 def _foreign(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A directory that is not pyrxd's, 0755."""
+    """A directory that is not pyrxd's, at :data:`_FOREIGN_MODE`."""
     foreign = tmp_path / "somebody-elses"
     foreign.mkdir()
-    os.chmod(foreign, 0o755)
+    os.chmod(foreign, _FOREIGN_MODE)
     return foreign
 
 
@@ -352,7 +357,7 @@ def _spoil(tmp_path: pathlib.Path, shape: str) -> pathlib.Path | None:
 
 def _assert_untouched(foreign: pathlib.Path | None) -> None:
     if foreign is not None:
-        assert stat.S_IMODE(foreign.stat().st_mode) == 0o755
+        assert stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE
         assert list(foreign.iterdir()) == []
 
 

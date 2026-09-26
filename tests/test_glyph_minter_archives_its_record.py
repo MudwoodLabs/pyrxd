@@ -158,11 +158,16 @@ def test_archive_and_restore_round_trip(tmp_path: pathlib.Path) -> None:
 _POSIX = pytest.mark.skipif(os.name != "posix", reason="file modes and symbolic links as POSIX has them")
 
 
+#: The foreign directory's mode: anything but the archive's 0700, so a chmod through a link shows,
+#: with no group or world bits (CodeQL's overly-permissive-file rule flags any, even in a test).
+_FOREIGN_MODE = 0o500
+
+
 def _foreign(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A directory that is not the store's, 0755."""
+    """A directory that is not the store's, at :data:`_FOREIGN_MODE`."""
     foreign = tmp_path / "somebody-elses"
     foreign.mkdir()
-    os.chmod(foreign, 0o755)
+    os.chmod(foreign, _FOREIGN_MODE)
     return foreign
 
 
@@ -197,7 +202,7 @@ def test_archive_refuses_and_keeps_the_record_without_touching_a_link_target(
     assert store.list_pending() == [record.commit_txid]
     if foreign is not None:
         # chmod follows links: before round 3 this was 0700, and the record had moved into it.
-        assert stat.S_IMODE(foreign.stat().st_mode) == 0o755 and list(foreign.iterdir()) == []
+        assert stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE and list(foreign.iterdir()) == []
 
 
 @_POSIX
@@ -217,7 +222,7 @@ def test_a_link_swapped_in_after_the_lstat_is_not_followed(
     with pytest.raises(ValidationError, match="could not be opened as a real directory"):
         store.archive(record.commit_txid)
     assert store.list_pending() == [record.commit_txid]
-    assert foreign is not None and stat.S_IMODE(foreign.stat().st_mode) == 0o755
+    assert foreign is not None and stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE
     assert list(foreign.iterdir()) == []
 
 
@@ -233,7 +238,7 @@ async def test_the_minter_refuses_before_the_commit_when_the_archive_is_unusable
         await GlyphMinter(client, FakeWallet(_key()), store).mint_nft(_nft_metadata())
     assert client.broadcasts == [] and store.list_pending() == []
     if foreign is not None:
-        assert stat.S_IMODE(foreign.stat().st_mode) == 0o755
+        assert stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE
 
 
 @_POSIX
