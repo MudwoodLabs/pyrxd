@@ -2034,6 +2034,9 @@ async def _resume_mint_inner(
     from ..network.electrumx import script_hash_for_script
 
     store = _pending_store(ctx)
+    # Before ANY record is read, live or archived (lane D N1): done/ is looked at with lstat, and
+    # the library reads it only through a descriptor that does not follow a link.
+    _refuse_an_unusable_archive(store, before="the reveal", error=UserError)
     archived = False
     try:
         pending = store.load(commit_txid)
@@ -2100,7 +2103,6 @@ async def _resume_mint_inner(
             fix=f"pass --wave-treasury <a {ctx.network} address>, or --no-wave-registration-fee",
         )
     source = _CommandSource.resume(allow_unverified=allow_unverified_wave_name, pay=pay)
-    _refuse_an_unusable_archive(store, before="the reveal", error=UserError)
     if archived:
         # Used again: back where a live record lives, so every exit below names it as usual and
         # a confirmed reveal archives it again.

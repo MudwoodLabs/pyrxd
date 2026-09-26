@@ -486,11 +486,15 @@ re-run the mint while the commit may still confirm.
   (with `lstat`, so a symbolic link is seen as one) before the commit is
   broadcast and again before the reveal is, and a regular file or a link there
   is refused before that broadcast: move it aside and run the command again
-  (after a commit, the refusal also names the commit's recovery). On POSIX the
-  archive's `chmod` and rename act on a descriptor of `done` opened with
-  `O_NOFOLLOW`, so a link there is never followed. If archiving still fails
-  after a reveal is reported confirmed, the command succeeds and says the
-  record was kept where it was (`record_archive_error` in `--json`).
+  (after a commit, the refusal also names the commit's recovery). `resume-mint`
+  refuses it before it reads any record, live or archived. On POSIX every
+  archive operation — archiving, reading, listing and restoring a record — acts
+  on a descriptor of `done` opened with `O_NOFOLLOW`, so a link there is never
+  followed and nothing it points to changes mode. (A `pending-mints` directory
+  that is itself a link is used as it is; pyrxd tightens a real one to 0700 and
+  leaves a link's target alone.) If archiving still fails after a reveal is
+  reported confirmed, the command succeeds and says the record was kept where
+  it was (`record_archive_error` in `--json`).
 - **Every exit after the commit is broadcast** — a declined reveal prompt, a
   network error, a node rejecting the reveal, this timeout, Ctrl-C — prints the
   recovery, and in `--json` mode also writes it to stdout as a JSON document.

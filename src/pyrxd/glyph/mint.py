@@ -76,6 +76,7 @@ What is deliberately not here
 from __future__ import annotations
 
 import abc
+import errno
 import json
 import os
 import stat
@@ -609,6 +610,33 @@ class PendingStore(abc.ABC):
         """Commit txids with a stored record — the resume list after a crash."""
 
 
+def _parse_record(raw: bytes, path: Path) -> PendingMint:
+    """A pending-mint record's bytes, as read from ``path`` (named in the error only)."""
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValidationError(f"pending mint record {path} is not valid JSON: {exc}") from exc
+    return PendingMint.from_dict(parsed)
+
+
+def _owner_only_unless_a_link(directory: Path) -> None:
+    """Make ``directory`` 0700 through a descriptor opened with ``O_NOFOLLOW``.
+
+    A ``directory`` that is a symbolic link is left alone — its target is not this store's to
+    change (lane D N1); ``os.chmod`` of the path would follow it.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):  # the final component is a link
+            return
+        raise
+    try:
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 class JsonFilePendingStore(PendingStore):
     """One 0600 JSON file per pending mint, in a 0700 directory.
 
@@ -632,8 +660,11 @@ class JsonFilePendingStore(PendingStore):
         if os.name == "posix":
             # The records are not secret (no key material) but they are integrity-
             # critical: anyone who can rewrite the CBOR bytes can make the reveal
-            # unspendable. Keep the directory owner-only.
-            os.chmod(self._dir, 0o700)
+            # unspendable. Keep the directory owner-only — through a descriptor that does
+            # not follow a link: a store directory that IS a link is the caller's
+            # arrangement, and its target's mode is not this store's to change (lane D N1:
+            # a store built on a symlinked ``done/`` chmodded the foreign target to 0700).
+            _owner_only_unless_a_link(self._dir)
 
     @property
     def directory(self) -> Path:
@@ -688,11 +719,7 @@ class JsonFilePendingStore(PendingStore):
             raw = path.read_bytes()
         except FileNotFoundError as exc:
             raise PendingMintNotFound(f"no pending mint stored for {commit_txid} (looked in {self._dir})") from exc
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ValidationError(f"pending mint record {path} is not valid JSON: {exc}") from exc
-        return PendingMint.from_dict(parsed)
+        return _parse_record(raw, path)
 
     def delete(self, commit_txid: str) -> None:
         self._path(commit_txid).unlink(missing_ok=True)
@@ -731,16 +758,41 @@ class JsonFilePendingStore(PendingStore):
     def archive_problem(self) -> str | None:
         return self.archive_directory_problem(self._dir)
 
+    def _open_archive(self, doing: str) -> int | None:
+        """``done/`` as a descriptor opened with ``O_NOFOLLOW`` (POSIX), or ``None`` if it is absent.
+
+        EVERY archive operation — :meth:`archive`, :meth:`load_archived`, :meth:`restore`,
+        :meth:`list_archived` — goes through here and then acts on the descriptor, never on
+        the path, so none of them can follow ``done/`` as a link. The ``lstat`` check
+        (:meth:`archive_problem`) runs first for its message; the ``O_NOFOLLOW`` open is what
+        holds if a link is swapped in after it. Raises
+        :class:`~pyrxd.security.errors.ValidationError` (``cannot <doing>: ...``) for a
+        ``done/`` that is not a real directory.
+        """
+        problem = self.archive_problem()
+        if problem is not None:
+            raise ValidationError(f"cannot {doing}: {problem}")
+        try:
+            return os.open(
+                self.archive_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot {doing}: {self.archive_directory} could not be opened as a real directory ({exc})"
+            ) from exc
+
     def archive(self, commit_txid: str) -> None:
         """Move the live record to ``done/``: a rename, so it keeps its 0600 mode, into a 0700
         directory. Does nothing if there is no live record. See :meth:`PendingStore.archive`.
 
         Raises :class:`~pyrxd.security.errors.ValidationError`, leaving the record where it is,
         when ``done/`` is not a real directory (:meth:`archive_directory_problem`, which reads
-        it with ``lstat``). On POSIX the ``chmod`` and the rename then act on a descriptor of
-        ``done/`` opened with ``O_NOFOLLOW``, never on its path, so neither can follow a link —
-        not even one swapped in after the ``lstat`` (lane D F2: a ``chmod`` of the path followed
-        a link and made a foreign directory 0700).
+        it with ``lstat``). On POSIX the ``chmod`` and the rename act on a descriptor of
+        ``done/`` opened with ``O_NOFOLLOW`` (:meth:`_open_archive`), never on its path, so
+        neither can follow a link — not even one swapped in after the ``lstat`` (lane D F2: a
+        ``chmod`` of the path followed a link and made a foreign directory 0700).
         """
         live = self._path(commit_txid)
         if not live.exists():
@@ -749,22 +801,17 @@ class JsonFilePendingStore(PendingStore):
             self.archive_directory.mkdir(mode=0o700)
         except FileExistsError:
             pass
-        problem = self.archive_problem()
-        if problem is not None:
-            raise ValidationError(f"cannot archive the pending mint {commit_txid}: {problem}; the record is kept")
+        doing = f"archive the pending mint {commit_txid}; the record is kept"
         if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
             os.replace(live, self._archived_path(commit_txid))
             self._fsync_dir()
             return
-        try:
-            done_fd = os.open(
-                self.archive_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-            )
-        except OSError as exc:
-            raise ValidationError(
-                f"cannot archive the pending mint {commit_txid}: {self.archive_directory} could not be opened as a "
-                f"real directory ({exc}); the record is kept"
-            ) from exc
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            raise ValidationError(f"cannot {doing}: {self.archive_directory} disappeared after it was created")
         try:
             os.fchmod(done_fd, 0o700)
             os.replace(live, self._archived_path(commit_txid).name, dst_dir_fd=done_fd)
@@ -777,23 +824,77 @@ class JsonFilePendingStore(PendingStore):
         self._fsync_dir()
 
     def load_archived(self, commit_txid: str) -> PendingMint:
-        """The archived record for ``commit_txid``; :class:`PendingMintNotFound` if there is none."""
-        if not self._archived_path(commit_txid).exists():
+        """The archived record for ``commit_txid``; :class:`PendingMintNotFound` if there is none.
+
+        A read: it changes no mode and builds no second store (lane D N1 — a store built on
+        ``done/`` chmodded it by path, through a link). Refuses a ``done/`` that is not a real
+        directory, as :meth:`archive` does.
+        """
+        path = self._archived_path(commit_txid)
+        missing = f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
+        doing = f"read the archived pending mint {commit_txid}"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            try:
+                return _parse_record(path.read_bytes(), path)
+            except FileNotFoundError as exc:
+                raise PendingMintNotFound(missing) from exc
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            raise PendingMintNotFound(missing)
+        try:
+            try:
+                fd = os.open(path.name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=done_fd)
+            except FileNotFoundError as exc:
+                raise PendingMintNotFound(missing) from exc
+            with os.fdopen(fd, "rb") as fh:
+                raw = fh.read()
+        finally:
+            os.close(done_fd)
+        return _parse_record(raw, path)
+
+    def restore(self, commit_txid: str) -> None:
+        """Move an archived record back to the live directory, to reveal it again — renamed out of
+        a ``done/`` descriptor opened with ``O_NOFOLLOW``, as :meth:`archive` renames into one."""
+        doing = f"restore the archived pending mint {commit_txid}"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            os.replace(self._archived_path(commit_txid), self._path(commit_txid))
+            self._fsync_dir()
+            return
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
             raise PendingMintNotFound(
                 f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
             )
-        return JsonFilePendingStore(self.archive_directory).load(commit_txid)
-
-    def restore(self, commit_txid: str) -> None:
-        """Move an archived record back to the live directory, to reveal it again."""
-        os.replace(self._archived_path(commit_txid), self._path(commit_txid))
+        try:
+            os.replace(self._archived_path(commit_txid).name, self._path(commit_txid), src_dir_fd=done_fd)
+        finally:
+            os.close(done_fd)
         self._fsync_dir()
 
     def list_archived(self) -> list[str]:
-        """Commit txids with an archived record."""
-        if not self.archive_directory.is_dir():
+        """Commit txids with an archived record. Refuses a ``done/`` that is not a real directory."""
+        doing = "list the archived pending mints"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            if not self.archive_directory.is_dir():
+                return []
+            return sorted(p.stem for p in self.archive_directory.glob("*.json"))
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
             return []
-        return sorted(p.stem for p in self.archive_directory.glob("*.json"))
+        try:
+            names = os.listdir(done_fd)
+        finally:
+            os.close(done_fd)
+        return sorted(n[: -len(".json")] for n in names if n.endswith(".json") and not n.startswith("."))
 
     def list_pending(self) -> list[str]:
         return sorted(p.stem for p in self._dir.glob("*.json"))

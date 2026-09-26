@@ -13,6 +13,11 @@ a regular file or a symbolic link is refused before the commit and again before 
 library ``archive()`` never ``chmod``s through a link, and an archive that still fails after a
 reported confirmation is a warning, not an error.
 
+Round 4 (lane D N1): the READ side as well. ``load_archived`` built a second store on
+``done/``, and a store's constructor chmodded its directory by path — through a link. Every
+archive operation (write, read, list, restore) now goes through one descriptor opened with
+``O_NOFOLLOW``, and a store's own directory is tightened the same way, never through a link.
+
 The client and wallet doubles are ``test_glyph_mint_facade.py``'s.
 """
 
@@ -272,3 +277,91 @@ async def test_an_archive_failure_after_a_reported_confirmation_warns_and_keeps_
     with pytest.warns(UserWarning, match="could not be archived .*Invalid cross-device link.*kept where it was"):
         result = await GlyphMinter(FakeClient(), FakeWallet(_key()), store).mint_nft(_nft_metadata())
     assert result.reveal_txid and store.list_pending() == [result.commit_txid]
+
+
+# ─── lane D N1 (round 4): reading the archive never changes a mode or follows a link ──
+
+
+def _archived_then_linked(tmp_path: pathlib.Path) -> tuple[JsonFilePendingStore, PendingMint, pathlib.Path]:
+    """A record archived honestly, then ``done/`` moved aside and replaced by a link to it: the
+    foreign directory HOLDS the archived record, as in lane D's proof."""
+    from test_glyph_mint_facade import _pending
+
+    store = JsonFilePendingStore(tmp_path / "pm")
+    record = _pending()
+    store.save(record)
+    store.archive(record.commit_txid)
+    foreign = tmp_path / "somebody-elses"
+    os.replace(store.archive_directory, foreign)
+    os.chmod(foreign, _FOREIGN_MODE)
+    store.archive_directory.symlink_to(foreign, target_is_directory=True)
+    return store, record, foreign
+
+
+@_POSIX
+@pytest.mark.parametrize("read", ["load_archived", "list_archived", "restore"])
+def test_reading_a_linked_archive_changes_no_mode_and_is_refused(tmp_path: pathlib.Path, read: str) -> None:
+    store, record, foreign = _archived_then_linked(tmp_path)
+    call = getattr(store, read)
+    try:
+        call() if read == "list_archived" else call(record.commit_txid)
+    except ValidationError as exc:
+        refused: str | None = str(exc)
+    else:
+        refused = None
+    # The property lane D broke first: on 954b8d92 load_archived made this 0700.
+    assert stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE
+    assert [p.name for p in foreign.iterdir()] == [f"{record.commit_txid}.json"]  # nothing moved out
+    assert refused is not None and "is a symbolic link" in refused, refused
+    assert store.list_pending() == []
+
+
+@_POSIX
+@pytest.mark.parametrize("read", ["load_archived", "list_archived", "restore"])
+def test_a_link_swapped_in_after_the_lstat_is_not_followed_by_a_read(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    """With the lstat check blinded, the O_NOFOLLOW descriptor still refuses the link."""
+    store, record, foreign = _archived_then_linked(tmp_path)
+    monkeypatch.setattr(JsonFilePendingStore, "archive_problem", lambda self: None)
+    call = getattr(store, read)
+    with pytest.raises(ValidationError, match="could not be opened as a real directory"):
+        call() if read == "list_archived" else call(record.commit_txid)
+    assert stat.S_IMODE(foreign.stat().st_mode) == _FOREIGN_MODE
+    assert [p.name for p in foreign.iterdir()] == [f"{record.commit_txid}.json"]
+
+
+@_POSIX
+def test_a_store_on_a_linked_directory_leaves_the_target_mode_and_still_reads(tmp_path: pathlib.Path) -> None:
+    """The store's own directory is tightened through an O_NOFOLLOW descriptor: a store built
+    on a link reads through it, and does not chmod the target (on 954b8d92 it did)."""
+    from test_glyph_mint_facade import _pending
+
+    real = JsonFilePendingStore(tmp_path / "real")
+    record = _pending()
+    real.save(record)
+    os.chmod(real.directory, _FOREIGN_MODE)
+    link = tmp_path / "linked"
+    link.symlink_to(real.directory, target_is_directory=True)
+    through = JsonFilePendingStore(link)
+    assert stat.S_IMODE(real.directory.stat().st_mode) == _FOREIGN_MODE
+    assert through.load(record.commit_txid) == record
+
+
+def test_the_honest_archive_still_reads_lists_and_restores(tmp_path: pathlib.Path) -> None:
+    from test_glyph_mint_facade import _pending
+
+    store = JsonFilePendingStore(tmp_path / "pm")
+    records = [_pending(), _pending(commit_txid="ab" * 32)]
+    for record in records:
+        store.save(record)
+        store.archive(record.commit_txid)
+    (store.archive_directory / "notes.txt").write_text("not a record")
+    assert store.list_archived() == sorted(r.commit_txid for r in records)
+    assert store.load_archived(records[1].commit_txid) == records[1]
+    with pytest.raises(PendingMintNotFound):
+        store.load_archived("ef" * 32)
+    store.restore(records[0].commit_txid)
+    assert store.list_pending() == [records[0].commit_txid] and store.list_archived() == [records[1].commit_txid]
+    if os.name == "posix":
+        assert stat.S_IMODE(store.archive_directory.stat().st_mode) == 0o700
