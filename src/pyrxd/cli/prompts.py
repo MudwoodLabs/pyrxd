@@ -186,7 +186,7 @@ def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWalle
     if prompt_passphrase:
         passphrase = prompt_passphrase_input(optional=False)
     try:
-        return HdWallet.load(ctx.wallet_path, mnemonic, passphrase)
+        wallet = HdWallet.load(ctx.wallet_path, mnemonic, passphrase)
     except (ValidationError, ValueError) as exc:
         # ValidationError: library's "Could not decrypt" surface.
         # ValueError:      bip39.validate_mnemonic on a non-wordlist word.
@@ -194,3 +194,7 @@ def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWalle
         # echo the user's input back, so distinguishing them would only
         # leak information about which guess was closer.
         raise WalletDecryptError() from exc
+    # Whether, not what: a command that prints a follow-up for this wallet (glyph resume-mint's
+    # recovery command) must say it needs --passphrase, and must never print the passphrase.
+    ctx.opened_with_passphrase = bool(passphrase)
+    return wallet

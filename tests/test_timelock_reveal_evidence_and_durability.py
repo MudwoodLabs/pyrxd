@@ -42,6 +42,7 @@ from pyrxd.glyph.payload import decode_payload, encode_payload
 from pyrxd.glyph.timelock_reveal_tx import build_timelock_reveal, plan_timelock_reveal
 from pyrxd.security.errors import NetworkError
 from tests.test_timelock_irreversible_paths_are_gated_and_visible import (
+    _REPORTED,
     TOKEN_REF,
     UNLOCK_AT,
     _off_chain,
@@ -507,7 +508,13 @@ class TestTheMintsOnlyKeyIsDurableBeforeTheCommitRelays:
 
         async def _inner(ctx, wallet, metadata, client):
             at_broadcast["synced"] = list(spy.synced)
-            return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+            return {
+                "commit_txid": "aa" * 32,
+                "reveal_txid": "bb" * 32,
+                "ref": TOKEN_REF,
+                "owner_address": "x",
+                **_REPORTED,
+            }
 
         result = self._mint(runner, tmp_path, monkeypatch, inner=_inner)
         assert result.exit_code == 0, result.output
@@ -571,7 +578,13 @@ class TestTheMintsOnlyKeyIsDurableBeforeTheCommitRelays:
 
         async def _inner(ctx, wallet, metadata, client):
             captured["cbor"] = encode_payload(metadata)[0]
-            return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+            return {
+                "commit_txid": "aa" * 32,
+                "reveal_txid": "bb" * 32,
+                "ref": TOKEN_REF,
+                "owner_address": "x",
+                **_REPORTED,
+            }
 
         result = self._mint(runner, tmp_path, monkeypatch, inner=_inner)
         assert result.exit_code == 0, result.output
@@ -597,7 +610,7 @@ class TestDurabilityDoesNotBecomeARefusal:
 
     @staticmethod
     async def _ok_mint(ctx, wallet, metadata, client):
-        return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x"}
+        return {"commit_txid": "aa" * 32, "reveal_txid": "bb" * 32, "ref": TOKEN_REF, "owner_address": "x", **_REPORTED}
 
     def test_a_host_that_cannot_fsync_a_DIRECTORY_still_mints(self, runner, tmp_path, monkeypatch) -> None:
         """Run through the real command, not through ``_write_new_file`` — the claim in the name

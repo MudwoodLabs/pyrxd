@@ -76,8 +76,10 @@ What is deliberately not here
 from __future__ import annotations
 
 import abc
+import errno
 import json
 import os
+import stat
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -94,6 +96,7 @@ from ..network.confirm import (
     _assert_positive_finite,
     wait_for_confirmation,
 )
+from ..network.registry import KNOWN_NETWORKS
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
 from ..security.errors import InsufficientFundsError, RxdSdkError, ValidationError
@@ -117,6 +120,7 @@ __all__ = [
     "DEFAULT_MINT_CONFIRMATIONS",
     "NFT_CARRIER_VALUE",
     "PENDING_MINT_SCHEMA_VERSION",
+    "PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK",
     "PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE",
     "GlyphMinter",
     "JsonFilePendingStore",
@@ -188,6 +192,14 @@ PENDING_MINT_SCHEMA_VERSION = 1
 # the decision they carry is whether the reveal spends 5-100 RXD of the user's money. An older
 # pyrxd refuses a version-2 record instead of revealing it on a guess.
 PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE = 2
+
+# The version of a record that also says which network its commit was broadcast on
+# (:attr:`PendingMint.network`), with or without a WAVE fee decision. ``pyrxd glyph mint-nft``
+# writes it: its records live beside the wallet file, one directory for every network the
+# wallet is used on, and a record that does not say its network was taken for another
+# network's (a regtest record refused a mainnet mint of the same name). A separate number for
+# the same reason as version 2: an older reader ignoring the key would resume on any network.
+PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK = 3
 
 # Protocol tags whose reveal is NOT the single-output shape this module builds. MUT and
 # WAVE need a second contract output AND a second commit outpoint to seed its singleton
@@ -330,6 +342,14 @@ class PendingMint:
         wave_treasury: the address the fee is paid to when the minter named one
             (``--wave-treasury``); ``None`` for the published treasury. Only with
             ``wave_fee="pay"``.
+        network: the network the commit was broadcast on (``mainnet``, ``testnet`` or
+            ``regtest``), or ``None`` when the writer did not say. ``pyrxd glyph mint-nft``
+            always says: one pending-mints directory serves every network a wallet is used on.
+
+    ``wave_fee``, ``wave_treasury`` and ``network`` are the writer's word, kept for comparison.
+    ``pyrxd glyph resume-mint`` never lets them decide what is paid: a record is a file that can
+    be changed after the mint, so the fee choice is stated on the resume command line and the
+    record only cross-checks it.
     """
 
     commit_txid: str
@@ -344,6 +364,7 @@ class PendingMint:
     funding_address: str
     wave_fee: str | None = None
     wave_treasury: str | None = None
+    network: str | None = None
 
     def __post_init__(self) -> None:
         # Txid() rejects anything that is not 64 lowercase hex. This also makes the
@@ -381,6 +402,10 @@ class PendingMint:
             raise ValidationError("PendingMint.wave_treasury is only meaningful with wave_fee='pay'")
         if self.wave_fee is not None and wave_registered_label(self.cbor_bytes) is None:
             raise ValidationError("PendingMint.wave_fee is set, but the payload registers no WAVE name")
+        if self.network is not None and self.network not in KNOWN_NETWORKS:
+            raise ValidationError(
+                f"PendingMint.network must be one of {', '.join(KNOWN_NETWORKS)} or None, got {self.network!r}"
+            )
 
     @property
     def ref(self) -> GlyphRef:
@@ -416,6 +441,9 @@ class PendingMint:
             d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
             d["wave_fee"] = self.wave_fee
             d["wave_treasury"] = self.wave_treasury
+        if self.network is not None:
+            d["schema_version"] = PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK
+            d["network"] = self.network
         return d
 
     @classmethod
@@ -430,21 +458,42 @@ class PendingMint:
         if not isinstance(d, dict):
             raise ValidationError("PendingMint.from_dict expects a dict")
         version = d.get("schema_version")
-        known = (PENDING_MINT_SCHEMA_VERSION, PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE)
+        known = (
+            PENDING_MINT_SCHEMA_VERSION,
+            PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE,
+            PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK,
+        )
         if version not in known or isinstance(version, bool):
             raise ValidationError(
                 f"unsupported PendingMint schema_version {version!r} "
-                f"(this build understands {' and '.join(map(str, known))}) — refusing to guess at a "
+                f"(this build understands {', '.join(map(str, known))}) — refusing to guess at a "
                 "record that decides whether a commit output can be spent"
             )
-        # Version 1 carries no fee decision and version 2 must: a version-1 record with the keys,
-        # or a version-2 record without them, was not written by this code.
+        # Version 1 carries no fee decision and version 2 must; version 3 carries the network and
+        # a fee decision exactly when its payload registers a WAVE name (checked on construction).
+        # A record with keys its version cannot hold, or without the ones it must, was not written
+        # by this code.
         has_fee = "wave_fee" in d or "wave_treasury" in d
-        if has_fee != (version == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE):
+        has_network = "network" in d
+        if has_network != (version == PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK):
+            raise ValidationError(
+                f"PendingMint schema_version {version} record "
+                + ("carries a network it cannot hold" if has_network else "is missing its network")
+            )
+        if version != PENDING_MINT_SCHEMA_VERSION_WITH_NETWORK and has_fee != (
+            version == PENDING_MINT_SCHEMA_VERSION_WITH_WAVE_FEE
+        ):
             raise ValidationError(
                 f"PendingMint schema_version {version} record "
                 + ("carries a WAVE fee decision it cannot hold" if has_fee else "is missing its WAVE fee decision")
             )
+        if has_network and not isinstance(d["network"], str):
+            raise ValidationError(
+                f"PendingMint schema_version {version} record's network must be one of {', '.join(KNOWN_NETWORKS)}, "
+                f"got {d['network']!r}"
+            )
+        if has_fee and ("wave_fee" not in d or "wave_treasury" not in d):
+            raise ValidationError(f"PendingMint schema_version {version} record has half a WAVE fee decision")
         if has_fee and d.get("wave_fee") not in ("pay", "decline"):
             raise ValidationError(f"PendingMint schema_version {version} record has wave_fee {d.get('wave_fee')!r}")
         try:
@@ -461,6 +510,7 @@ class PendingMint:
                 funding_address=d["funding_address"],
                 wave_fee=d["wave_fee"] if has_fee else None,
                 wave_treasury=d["wave_treasury"] if has_fee else None,
+                network=d["network"] if has_network else None,
             )
         except KeyError as exc:
             raise ValidationError(f"PendingMint record is missing field {exc.args[0]!r}") from exc
@@ -523,11 +573,68 @@ class PendingStore(abc.ABC):
 
     @abc.abstractmethod
     def delete(self, commit_txid: str) -> None:
-        """Drop the record. Must not raise if it is already gone."""
+        """Drop the record. Must not raise if it is already gone.
+
+        :class:`GlyphMinter` never calls this: see :meth:`archive`. It is here for a caller who
+        has seen the reveal on chain for themselves and wants the record gone.
+        """
+
+    def archive(self, commit_txid: str) -> None:
+        """Retire the record of a mint whose reveal was REPORTED confirmed — without destroying it.
+
+        :class:`GlyphMinter` calls this, never :meth:`delete`, once its reveal is reported
+        confirmed. "Confirmed" is the server's word: a server that echoes a reveal it never
+        relayed and reports it confirmed would otherwise have the only copy of the payload the
+        commit can be spent with deleted while the commit is still unspent (#736, round 3). An
+        archived record can be revealed again, through another server.
+
+        This default KEEPS the record where it is, so :meth:`list_pending` goes on reporting it:
+        a store that cannot archive errs toward keeping. Override it to move the record where
+        :meth:`list_pending` does not look (:class:`JsonFilePendingStore` moves it to ``done/``).
+        Must not raise if the record is already gone.
+        """
+        return None
+
+    def archive_problem(self) -> str | None:
+        """Why :meth:`archive` could not work in this store, or ``None``.
+
+        :class:`GlyphMinter` asks before it broadcasts the commit and again before the reveal,
+        and refuses on an answer: an archive that fails after a reveal is reported confirmed
+        would otherwise be found only when the mint is finished. The default has nothing that
+        can fail.
+        """
+        return None
 
     @abc.abstractmethod
     def list_pending(self) -> list[str]:
         """Commit txids with a stored record — the resume list after a crash."""
+
+
+def _parse_record(raw: bytes, path: Path) -> PendingMint:
+    """A pending-mint record's bytes, as read from ``path`` (named in the error only)."""
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValidationError(f"pending mint record {path} is not valid JSON: {exc}") from exc
+    return PendingMint.from_dict(parsed)
+
+
+def _owner_only_unless_a_link(directory: Path) -> None:
+    """Make ``directory`` 0700 through a descriptor opened with ``O_NOFOLLOW``.
+
+    A ``directory`` that is a symbolic link is left alone — its target is not this store's to
+    change (lane D N1); ``os.chmod`` of the path would follow it.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):  # the final component is a link
+            return
+        raise
+    try:
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
 
 
 class JsonFilePendingStore(PendingStore):
@@ -553,8 +660,11 @@ class JsonFilePendingStore(PendingStore):
         if os.name == "posix":
             # The records are not secret (no key material) but they are integrity-
             # critical: anyone who can rewrite the CBOR bytes can make the reveal
-            # unspendable. Keep the directory owner-only.
-            os.chmod(self._dir, 0o700)
+            # unspendable. Keep the directory owner-only — through a descriptor that does
+            # not follow a link: a store directory that IS a link is the caller's
+            # arrangement, and its target's mode is not this store's to change (lane D N1:
+            # a store built on a symlinked ``done/`` chmodded the foreign target to 0700).
+            _owner_only_unless_a_link(self._dir)
 
     @property
     def directory(self) -> Path:
@@ -609,14 +719,182 @@ class JsonFilePendingStore(PendingStore):
             raw = path.read_bytes()
         except FileNotFoundError as exc:
             raise PendingMintNotFound(f"no pending mint stored for {commit_txid} (looked in {self._dir})") from exc
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ValidationError(f"pending mint record {path} is not valid JSON: {exc}") from exc
-        return PendingMint.from_dict(parsed)
+        return _parse_record(raw, path)
 
     def delete(self, commit_txid: str) -> None:
         self._path(commit_txid).unlink(missing_ok=True)
+
+    #: Where :meth:`archive` moves a record: a subdirectory :meth:`list_pending` does not read.
+    ARCHIVE_DIRNAME: ClassVar[str] = "done"
+
+    @property
+    def archive_directory(self) -> Path:
+        """Where archived records are kept (``<directory>/done``)."""
+        return self._dir / self.ARCHIVE_DIRNAME
+
+    def _archived_path(self, commit_txid: str) -> Path:
+        return self.archive_directory / f"{Txid(commit_txid)}.json"
+
+    @classmethod
+    def archive_directory_problem(cls, directory: str | os.PathLike[str]) -> str | None:
+        """Why the archive of a store at ``directory`` is unusable, or ``None``. Creates nothing.
+
+        Read with ``lstat``, so a symbolic link is seen as a link: ``done/`` must be absent or a
+        real directory. A regular file there makes the ``mkdir`` fail; a link can lead to another
+        filesystem (a rename then fails with ``EXDEV``) or to a directory that is not the
+        store's (on ``3cb57e27`` a ``chmod`` of the path followed one and made it 0700; lane D F2).
+        """
+        path = Path(directory) / cls.ARCHIVE_DIRNAME
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return f"{path} is a symbolic link; the archive must be a real directory"
+        if not stat.S_ISDIR(info.st_mode):
+            return f"{path} exists and is not a directory"
+        return None
+
+    def archive_problem(self) -> str | None:
+        return self.archive_directory_problem(self._dir)
+
+    def _open_archive(self, doing: str) -> int | None:
+        """``done/`` as a descriptor opened with ``O_NOFOLLOW`` (POSIX), or ``None`` if it is absent.
+
+        EVERY archive operation — :meth:`archive`, :meth:`load_archived`, :meth:`restore`,
+        :meth:`list_archived` — goes through here and then acts on the descriptor, never on
+        the path, so none of them can follow ``done/`` as a link. The ``lstat`` check
+        (:meth:`archive_problem`) runs first for its message; the ``O_NOFOLLOW`` open is what
+        holds if a link is swapped in after it. Raises
+        :class:`~pyrxd.security.errors.ValidationError` (``cannot <doing>: ...``) for a
+        ``done/`` that is not a real directory.
+        """
+        problem = self.archive_problem()
+        if problem is not None:
+            raise ValidationError(f"cannot {doing}: {problem}")
+        try:
+            return os.open(
+                self.archive_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot {doing}: {self.archive_directory} could not be opened as a real directory ({exc})"
+            ) from exc
+
+    def archive(self, commit_txid: str) -> None:
+        """Move the live record to ``done/``: a rename, so it keeps its 0600 mode, into a 0700
+        directory. Does nothing if there is no live record. See :meth:`PendingStore.archive`.
+
+        Raises :class:`~pyrxd.security.errors.ValidationError`, leaving the record where it is,
+        when ``done/`` is not a real directory (:meth:`archive_directory_problem`, which reads
+        it with ``lstat``). On POSIX the ``chmod`` and the rename act on a descriptor of
+        ``done/`` opened with ``O_NOFOLLOW`` (:meth:`_open_archive`), never on its path, so
+        neither can follow a link — not even one swapped in after the ``lstat`` (lane D F2: a
+        ``chmod`` of the path followed a link and made a foreign directory 0700).
+        """
+        live = self._path(commit_txid)
+        if not live.exists():
+            return
+        try:
+            self.archive_directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        doing = f"archive the pending mint {commit_txid}; the record is kept"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            os.replace(live, self._archived_path(commit_txid))
+            self._fsync_dir()
+            return
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            raise ValidationError(f"cannot {doing}: {self.archive_directory} disappeared after it was created")
+        try:
+            os.fchmod(done_fd, 0o700)
+            os.replace(live, self._archived_path(commit_txid).name, dst_dir_fd=done_fd)
+            try:
+                os.fsync(done_fd)
+            except OSError:  # pragma: no cover - e.g. some network filesystems; the rename is done
+                pass
+        finally:
+            os.close(done_fd)
+        self._fsync_dir()
+
+    def load_archived(self, commit_txid: str) -> PendingMint:
+        """The archived record for ``commit_txid``; :class:`PendingMintNotFound` if there is none.
+
+        A read: it changes no mode and builds no second store (lane D N1 — a store built on
+        ``done/`` chmodded it by path, through a link). Refuses a ``done/`` that is not a real
+        directory, as :meth:`archive` does.
+        """
+        path = self._archived_path(commit_txid)
+        missing = f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
+        doing = f"read the archived pending mint {commit_txid}"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            try:
+                return _parse_record(path.read_bytes(), path)
+            except FileNotFoundError as exc:
+                raise PendingMintNotFound(missing) from exc
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            raise PendingMintNotFound(missing)
+        try:
+            try:
+                fd = os.open(path.name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=done_fd)
+            except FileNotFoundError as exc:
+                raise PendingMintNotFound(missing) from exc
+            with os.fdopen(fd, "rb") as fh:
+                raw = fh.read()
+        finally:
+            os.close(done_fd)
+        return _parse_record(raw, path)
+
+    def restore(self, commit_txid: str) -> None:
+        """Move an archived record back to the live directory, to reveal it again — renamed out of
+        a ``done/`` descriptor opened with ``O_NOFOLLOW``, as :meth:`archive` renames into one."""
+        doing = f"restore the archived pending mint {commit_txid}"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            os.replace(self._archived_path(commit_txid), self._path(commit_txid))
+            self._fsync_dir()
+            return
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            raise PendingMintNotFound(
+                f"no archived pending mint for {commit_txid} (looked in {self.archive_directory})"
+            )
+        try:
+            os.replace(self._archived_path(commit_txid).name, self._path(commit_txid), src_dir_fd=done_fd)
+        finally:
+            os.close(done_fd)
+        self._fsync_dir()
+
+    def list_archived(self) -> list[str]:
+        """Commit txids with an archived record. Refuses a ``done/`` that is not a real directory."""
+        doing = "list the archived pending mints"
+        if os.name != "posix":
+            problem = self.archive_problem()
+            if problem is not None:
+                raise ValidationError(f"cannot {doing}: {problem}")
+            if not self.archive_directory.is_dir():
+                return []
+            return sorted(p.stem for p in self.archive_directory.glob("*.json"))
+        done_fd = self._open_archive(doing)
+        if done_fd is None:
+            return []
+        try:
+            names = os.listdir(done_fd)
+        finally:
+            os.close(done_fd)
+        return sorted(n[: -len(".json")] for n in names if n.endswith(".json") and not n.startswith("."))
 
     def list_pending(self) -> list[str]:
         return sorted(p.stem for p in self._dir.glob("*.json"))
@@ -896,8 +1174,11 @@ class GlyphMinter:
         """Wait for the commit, then broadcast the NFT reveal.
 
         The stored record is re-validated against the commit script before anything is
-        built — see :meth:`_assert_payload_still_matches`. On success the record is
-        deleted from the store; on failure it is kept so the reveal can be retried.
+        built — see :meth:`_assert_payload_still_matches`. Once the reveal is reported
+        confirmed the record is archived (:meth:`PendingStore.archive`), never deleted; on
+        failure it is kept where it is so the reveal can be retried. An archived record
+        (``JsonFilePendingStore.load_archived``) can be passed here again — through another
+        server, if the one that reported the reveal confirmed was wrong.
         """
         if not isinstance(pending, PendingMint):
             raise ValidationError("reveal_nft expects a PendingMint")
@@ -1111,7 +1392,9 @@ class GlyphMinter:
             estimate=measured,
         )
 
-        # 5. Persist, verify, and only then spend.
+        # 5. Persist, verify, and only then spend — and only into a store whose archive can
+        #    take the record when the mint is done (round 3).
+        self._refuse_an_unusable_archive(before="the commit was not broadcast")
         self._persist_or_abort(pending)
         broadcast_txid = str(await self._client.broadcast(commit_tx.serialize()))
         if broadcast_txid != pending.commit_txid:
@@ -1274,6 +1557,7 @@ class GlyphMinter:
             error_type=ValidationError,
         )
 
+        self._refuse_an_unusable_archive(before="the reveal was not broadcast and the record is kept")
         echoed = await self._client.broadcast(raw)
 
         # Wait on the txid of what WE signed, not on what the server said. Otherwise the
@@ -1298,8 +1582,8 @@ class GlyphMinter:
         # needed to rebuild it is gone too. The commit output is a hashlock with no
         # owner-only spend path, so that is permanent, unrecoverable loss of its value.
         #
-        # So the record outlives the broadcast and is dropped only once the reveal is
-        # actually confirmed. If the wait times out the record is KEPT and the timeout
+        # So the record outlives the broadcast and is retired only once the reveal is
+        # reported confirmed. If the wait times out the record is KEPT and the timeout
         # propagates: the caller can retry the reveal, which is exactly what the record
         # exists for.
         await wait_for_confirmation(
@@ -1309,7 +1593,7 @@ class GlyphMinter:
             timeout_s=self._confirmation_timeout_s,
             interval_s=self._poll_interval_s,
         )
-        self._delete_record_and_any_duplicate(pending)
+        self._archive_record(pending)
         return MintResult(
             commit_txid=pending.commit_txid,
             reveal_txid=str(reveal_txid),
@@ -1319,8 +1603,16 @@ class GlyphMinter:
             owner_pkh=pending.owner_pkh,
         )
 
-    def _delete_record_and_any_duplicate(self, pending: PendingMint) -> None:
-        """Drop the record for the mint that was just revealed — and ONLY that record.
+    def _archive_record(self, pending: PendingMint) -> None:
+        """Retire the record for the mint that was just revealed — ARCHIVED, never deleted — and
+        ONLY that record.
+
+        Archived rather than deleted (#736, round 3): the reveal is "confirmed" on the server's
+        word, and a server can echo a reveal it never relayed and report it confirmed. Deleting
+        the record then destroyed the one copy of the payload the still-unspent commit can be
+        spent with. :meth:`PendingStore.archive` keeps it recoverable —
+        ``store.load_archived(txid)`` and :meth:`reveal_nft` through another server, for
+        :class:`JsonFilePendingStore`. This method must never call :meth:`PendingStore.delete`.
 
         An earlier version of this also hunted a sibling record filed under a server's
         echoed txid, identifying it by matching ``cbor_bytes``. That was WRONG and
@@ -1342,8 +1634,30 @@ class GlyphMinter:
         ``list_pending()`` is a prompt to re-check; a deleted record is unrecoverable
         value. Removing it safely needs the echoed txid persisted ON the record, which is
         a store-schema change and its own piece of work.
+
+        An archive that fails HERE — after the reveal is reported confirmed — is reported as a
+        warning, not raised: the record stays where it was, which loses nothing, and raising
+        would turn a finished mint into an error. :meth:`_refuse_an_unusable_archive` makes it
+        unlikely by refusing before each broadcast.
         """
-        self._store.delete(pending.commit_txid)
+        try:
+            self._store.archive(pending.commit_txid)
+        except (OSError, ValidationError) as exc:
+            warnings.warn(
+                f"the reveal of {pending.commit_txid} is reported confirmed, but its pending record could not be "
+                f"archived ({exc}); the record is kept where it was",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    def _refuse_an_unusable_archive(self, *, before: str) -> None:
+        """Refuse, before a broadcast, when the store says its archive could not take the record.
+
+        ``before`` says what was not broadcast: the commit (nothing spent), or the reveal (the
+        commit was broadcast, and its record is kept for :meth:`reveal_nft`)."""
+        problem = self._store.archive_problem()
+        if problem is not None:
+            raise ValidationError(f"the pending store's archive is unusable: {problem}. {before}; fix it and retry")
 
     @staticmethod
     def _assert_payload_still_matches(pending: PendingMint, funding_key: Any) -> None:

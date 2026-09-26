@@ -1,0 +1,1095 @@
+"""
+Glyph v2 Token Standard Support for ElectrumX
+
+This module provides parsing and indexing support for Glyph v2 tokens
+on the Radiant blockchain.
+
+Reference: https://github.com/Radiant-Core/Glyph-Token-Standards
+"""
+
+import struct
+from typing import Optional, Dict, Any, List, Tuple
+
+try:
+    import cbor2
+    HAS_CBOR = True
+except ImportError:
+    HAS_CBOR = False
+
+try:
+    from electrumx.server.metrics import glyph_parse_errors_total as _glyph_parse_errors
+except Exception:
+    class _glyph_parse_errors:  # type: ignore
+        @staticmethod
+        def inc(*a, **kw): pass
+
+# Glyph magic bytes
+GLYPH_MAGIC = b'gly'
+GLYPH_MAGIC_HEX = '676c79'
+
+# Protocol versions
+class GlyphVersion:
+    V1 = 0x01
+    V2 = 0x02
+
+# Protocol IDs
+class GlyphProtocol:
+    GLYPH_FT = 1         # Fungible Token
+    GLYPH_NFT = 2        # Non-Fungible Token
+    GLYPH_DAT = 3        # Data Storage
+    GLYPH_DMINT = 4      # Decentralized Minting
+    GLYPH_MUT = 5        # Mutable State
+    GLYPH_BURN = 6       # Explicit Burn
+    GLYPH_CONTAINER = 7  # Container/Collection
+    GLYPH_ENCRYPTED = 8  # Encrypted Content
+    GLYPH_TIMELOCK = 9   # Timelocked Reveal
+    GLYPH_AUTHORITY = 10 # Issuer Authority
+    GLYPH_WAVE = 11      # WAVE Naming
+
+
+# Token types for indexing / API
+class GlyphTokenType:
+    UNKNOWN = 0
+    FT = 1
+    NFT = 2
+    DAT = 3
+    DMINT = 4
+    WAVE = 5
+    CONTAINER = 6
+    AUTHORITY = 7
+
+# Protocol names for logging/display
+PROTOCOL_NAMES = {
+    1: 'Fungible Token',
+    2: 'Non-Fungible Token',
+    3: 'Data Storage',
+    4: 'Decentralized Minting',
+    5: 'Mutable State',
+    6: 'Burn',
+    7: 'Container',
+    8: 'Encrypted',
+    9: 'Timelock',
+    10: 'Authority',
+    11: 'WAVE Name',
+}
+
+# ---------------------------------------------------------------------------
+# dMint contract-state bounds (H5)
+#
+# dMint contract state is parsed from attacker-authored on-chain scriptnums,
+# which can be negative (CScriptNum is signed, up to +/-2^63) or absurdly
+# large.  These values feed total_supply = num_contracts * reward * max_height
+# and the difficulty math, so an unbounded/negative value can poison the
+# supply accounting, the /dmint/contracts listing, and percent_mined.
+#
+# Bounds chosen:
+#   * reward / max_height are unsigned-by-nature mining parameters; a negative
+#     value is never valid, so we reject the contract outright.
+#   * max_height must be > 0 (a contract that mines for 0 blocks mints nothing
+#     and would only create divide/clamp hazards downstream).
+#   * DMINT_MAX_SCRIPTNUM is the int64 ceiling (2^63 - 1).  CScriptNum, the
+#     CBOR encoder and the on-disk int packing are all 64-bit signed, so any
+#     individual field above this is malformed/out-of-consensus-range.
+#   * DMINT_MAX_TOTAL_SUPPLY caps the *derived* supply (and each multiplicand)
+#     at the int64 ceiling so num_contracts * reward * max_height can never
+#     overflow or go absurd.  RXD's whole genesis supply is ~2.1e18 photons
+#     (well under 2^63 ~= 9.2e18), so this never rejects a legitimate token.
+# ---------------------------------------------------------------------------
+DMINT_MAX_SCRIPTNUM = (1 << 63) - 1
+DMINT_MAX_TOTAL_SUPPLY = (1 << 63) - 1
+
+# ---------------------------------------------------------------------------
+# CBOR payload size cap (DoS guard)
+# ---------------------------------------------------------------------------
+# A reveal scriptSig can push up to 2**32-1 bytes via OP_PUSHDATA4.  Without a
+# pre-decode cap, a single crafted reveal can force cbor2 to allocate large
+# buffers (or spin) before it ever learns the shape of the input, turning every
+# service that fetches reveal scriptSigs into a DoS target.  Always enforce the
+# cap *before* handing bytes to cbor2 — most CBOR libraries allocate before they
+# know the structure of the input.  Use cbor_loads_capped() at every decode
+# site.
+#
+# Sizing: this is the *whole CBOR payload* cap, which must sit ABOVE the
+# on-chain *content* limit so a max-size embed still decodes.  Photonic enforces
+# a 512 KB on-chain content limit (`mintEmbedMaxBytes = 512000`,
+# `GLYPH_INSCRIPTION_MAX_SIZE = 512*1024`), and the payload additionally carries
+# name/desc/ticker/refs + CBOR framing on top of `main.b`.  640 KiB gives ~125
+# KiB of headroom over a 512 KiB embed while keeping decode cost trivial.  Keep
+# this in sync with the Photonic content limit and Glyph v2 Token Standard
+# Appendix C; raise both together if the ecosystem content limit changes.
+MAX_CBOR_PAYLOAD_BYTES = 655_360  # 640 KiB (512 KiB content + headroom)
+
+
+def cbor_loads_capped(data: bytes):
+    """``cbor2.loads(data)`` with a hard input-size cap applied first.
+
+    Raises ``ValueError`` if the payload exceeds ``MAX_CBOR_PAYLOAD_BYTES`` so a
+    caller's existing ``try/except`` treats an oversized body as a decode
+    failure (fail closed — the token is simply not indexed), and re-raises
+    whatever ``cbor2`` raises for genuinely malformed CBOR.  Only reached when
+    ``HAS_CBOR`` is True (every call site gates on it first).
+    """
+    n = len(data) if data is not None else 0
+    if n > MAX_CBOR_PAYLOAD_BYTES:
+        raise ValueError(
+            f"CBOR payload too large: {n} > {MAX_CBOR_PAYLOAD_BYTES} bytes"
+        )
+    return cbor2.loads(data)
+
+
+# Envelope flags
+class EnvelopeFlags:
+    HAS_CONTENT_ROOT = 1 << 0
+    HAS_CONTROLLER = 1 << 1
+    HAS_PROFILE_HINT = 1 << 2
+    IS_REVEAL = 1 << 7
+
+# dMint Algorithm IDs
+class DmintAlgorithm:
+    SHA256D = 0x00
+    BLAKE3 = 0x01
+    K12 = 0x02
+    ARGON2ID_LIGHT = 0x03
+    RANDOMX_LIGHT = 0x04
+
+# DAA Mode IDs
+class DaaMode:
+    FIXED = 0x00
+    EPOCH = 0x01
+    ASERT = 0x02
+    LWMA = 0x03
+    SCHEDULE = 0x04
+
+
+def contains_glyph_magic(data: bytes) -> bool:
+    """Check if data contains Glyph magic bytes."""
+    return GLYPH_MAGIC in data
+
+
+def find_glyph_magic(data: bytes) -> int:
+    """Find the position of Glyph magic bytes in data. Returns -1 if not found."""
+    return data.find(GLYPH_MAGIC)
+
+
+def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse a Glyph envelope from raw script bytes.
+
+    Handles all known on-chain formats for both v1 and v2 tokens:
+
+    FORMAT 1 — v1 / v2 Style B  (scriptSig, 'gly' in its own push)
+    ---------------------------------------------------------------
+    v1:  ... OP_PUSHBYTES_3(03) 'gly'  <push>(CBOR_metadata) ...
+    v2B: ... OP_3(53) OP_PUSHBYTES_3(03) 'gly' <push>(data) ...
+
+    The 'gly' magic is a standalone 3-byte data push.
+    The NEXT push is either:
+      • Raw CBOR metadata dict  → reveal  (v1 or v2 Style B reveal)
+      • Version+flags+...       → v2 Style B commit
+
+    FORMAT 2 — v2 Style A  (OP_RETURN output, 'gly' concatenated)
+    ---------------------------------------------------------------
+    Commit:  OP_RETURN <push>('gly' || V2 || flags || commit_hash [...])
+    Reveal:  OP_RETURN <push>('gly' || V2 || flags) <push>(CBOR) [<push>(file)]...
+
+    The 'gly' magic is the first 3 bytes of a larger data push,
+    followed immediately by version (0x02) and flags bytes.
+    For reveals (flags bit 7 set), metadata is in the next push.
+    For commits (flags bit 7 clear), commit_hash follows inline.
+
+    Returns a dict with envelope details, or None if not a valid
+    Glyph envelope.
+    """
+    if GLYPH_MAGIC not in data:
+        return None
+
+    try:
+        pushes = _parse_script_pushes(data)
+
+        for i, push in enumerate(pushes):
+            # -----------------------------------------------------------
+            # Case A: 'gly' is a standalone 3-byte push
+            # Matches v1 format and v2 Style B.
+            # -----------------------------------------------------------
+            if push == GLYPH_MAGIC:
+                if i + 1 >= len(pushes):
+                    continue
+                payload = pushes[i + 1]
+                if not payload or len(payload) < 2:
+                    continue
+
+                # Try decoding as CBOR reveal (most common case).
+                if HAS_CBOR:
+                    try:
+                        decoded = cbor_loads_capped(payload)
+                        if isinstance(decoded, dict):
+                            v = decoded.get('v', GlyphVersion.V1)
+                            return {
+                                'version': v,
+                                'flags': EnvelopeFlags.IS_REVEAL,
+                                'is_reveal': True,
+                                'metadata_bytes': payload,
+                            }
+                    except Exception:
+                        pass
+
+                # Try as v2 structured payload (commit: version+flags+data).
+                if payload[0] in (GlyphVersion.V1, GlyphVersion.V2):
+                    result = _parse_v2_structured(payload)
+                    if result is not None:
+                        return result
+                continue
+
+            # -----------------------------------------------------------
+            # Case B: 'gly' is the prefix of a larger push
+            # Matches v2 Style A (OP_RETURN concatenated format).
+            # -----------------------------------------------------------
+            if len(push) > 3 and push[:3] == GLYPH_MAGIC:
+                inner = push[3:]  # bytes after 'gly'
+                if len(inner) < 2:
+                    continue
+                version = inner[0]
+                if version not in (GlyphVersion.V1, GlyphVersion.V2):
+                    continue
+                flags = inner[1]
+                is_reveal = (flags & EnvelopeFlags.IS_REVEAL) != 0
+
+                if is_reveal:
+                    # Style A reveal — metadata is in the NEXT push
+                    result: Dict[str, Any] = {
+                        'version': version,
+                        'flags': flags,
+                        'is_reveal': True,
+                    }
+                    if i + 1 < len(pushes):
+                        result['metadata_bytes'] = pushes[i + 1]
+                        # Collect file-chunk pushes (if any)
+                        if i + 2 < len(pushes):
+                            result['file_chunks'] = pushes[i + 2:]
+                    return result
+                else:
+                    # Style A commit — commit data follows inline
+                    return _parse_v2_commit_inline(version, flags, inner[2:])
+
+    except Exception:
+        _glyph_parse_errors.inc()  # R20
+        return None
+
+    return None
+
+
+# ------------------------------------------------------------------
+# Internal helpers
+# ------------------------------------------------------------------
+
+def _parse_script_pushes(data: bytes) -> list:
+    """Extract an ordered list of data-push payloads from raw script bytes.
+
+    Skips non-push opcodes (OP_RETURN, OP_3, OP_DROP, etc.).
+    Handles:
+      • OP_0 / OP_FALSE (0x00)
+      • OP_1NEGATE      (0x4f)
+      • OP_1 .. OP_16   (0x51-0x60)
+      • OP_PUSHBYTES_N  (0x01-0x4b)
+      • OP_PUSHDATA1    (0x4c)
+      • OP_PUSHDATA2    (0x4d)
+      • OP_PUSHDATA4    (0x4e)
+      • Radiant ref opcodes 0xd0-0xd3, 0xd8  (skip 36-byte inline ref)
+    """
+    pushes: list = []
+    pos = 0
+    length = len(data)
+    while pos < length:
+        op = data[pos]
+        pos += 1
+
+        if op == 0x00:                                # OP_0 / OP_FALSE
+            pushes.append(b'')
+        elif op == 0x4f:                             # OP_1NEGATE
+            pushes.append(b'\x81')
+        elif 0x51 <= op <= 0x60:                     # OP_1 .. OP_16
+            pushes.append(bytes([op - 0x50]))
+        elif 1 <= op <= 75:                          # OP_PUSHBYTES_N
+            end = pos + op
+            if end <= length:
+                pushes.append(data[pos:end])
+                pos = end
+            else:
+                break
+        elif op == 0x4c:                             # OP_PUSHDATA1
+            if pos < length:
+                dlen = data[pos]; pos += 1
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op == 0x4d:                             # OP_PUSHDATA2
+            if pos + 2 <= length:
+                dlen = data[pos] | (data[pos + 1] << 8); pos += 2
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op == 0x4e:                             # OP_PUSHDATA4
+            if pos + 4 <= length:
+                dlen = (data[pos] | (data[pos + 1] << 8)
+                        | (data[pos + 2] << 16) | (data[pos + 3] << 24))
+                pos += 4
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op in (0xd0, 0xd1, 0xd2, 0xd3, 0xd8):  # Radiant ref ops
+            pos += 36
+        # else: non-push opcode — skip (OP_RETURN, OP_3, OP_DROP, …)
+
+    return pushes
+
+
+def _parse_v2_structured(payload: bytes) -> Optional[Dict[str, Any]]:
+    """Parse a v2 structured payload that starts with version + flags.
+
+    Used for v2 Style B commits where the push after 'gly' contains
+    ``version || flags || commit_hash [|| optional fields]``.
+
+    Also handles a v2 Style B reveal with the is_reveal flag set,
+    where the remaining bytes after flags are the CBOR metadata.
+    """
+    if len(payload) < 2:
+        return None
+    version = payload[0]
+    flags = payload[1]
+    if version not in (GlyphVersion.V1, GlyphVersion.V2):
+        return None
+    is_reveal = (flags & EnvelopeFlags.IS_REVEAL) != 0
+    result: Dict[str, Any] = {
+        'version': version,
+        'flags': flags,
+        'is_reveal': is_reveal,
+    }
+    pos = 2
+    if is_reveal:
+        if pos < len(payload):
+            result['metadata_bytes'] = payload[pos:]
+    else:
+        return _parse_v2_commit_inline(version, flags, payload[pos:])
+    return result
+
+
+def _parse_v2_commit_inline(version: int, flags: int,
+                            remainder: bytes) -> Dict[str, Any]:
+    """Build a commit envelope dict from the bytes after version+flags."""
+    result: Dict[str, Any] = {
+        'version': version,
+        'flags': flags,
+        'is_reveal': False,
+    }
+    pos = 0
+    if pos + 32 <= len(remainder):
+        result['commit_hash'] = remainder[pos:pos + 32].hex()
+        pos += 32
+        if flags & EnvelopeFlags.HAS_CONTENT_ROOT:
+            if pos + 32 <= len(remainder):
+                result['content_root'] = remainder[pos:pos + 32].hex()
+                pos += 32
+        if flags & EnvelopeFlags.HAS_CONTROLLER:
+            if pos + 36 <= len(remainder):
+                result['controller'] = remainder[pos:pos + 36].hex()
+    return result
+
+
+def _read_script_push(data: bytes, pos: int) -> Optional[bytes]:
+    """Read a single script data push starting at *pos*.
+
+    Handles OP_PUSHBYTES_N (1-75), OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4.
+    Returns the pushed data bytes, or None on failure.
+
+    .. note:: Prefer ``_parse_script_pushes`` for full script parsing.
+              This helper remains for callers that need positional reads.
+    """
+    if pos >= len(data):
+        return None
+    op = data[pos]
+    pos += 1
+    if 1 <= op <= 75:
+        end = pos + op
+        if end <= len(data):
+            return data[pos:end]
+    elif op == 0x4c:
+        if pos < len(data):
+            dlen = data[pos]; pos += 1
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    elif op == 0x4d:
+        if pos + 2 <= len(data):
+            dlen = data[pos] | (data[pos + 1] << 8); pos += 2
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    elif op == 0x4e:
+        if pos + 4 <= len(data):
+            dlen = (data[pos] | (data[pos + 1] << 8)
+                    | (data[pos + 2] << 16) | (data[pos + 3] << 24))
+            pos += 4
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    return None
+
+
+def parse_glyph_metadata(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parse Glyph metadata from a reveal envelope."""
+    if not envelope:
+        return None
+    if not envelope.get('is_reveal'):
+        return None
+    metadata_bytes = envelope.get('metadata_bytes')
+    if not metadata_bytes:
+        return None
+    if not HAS_CBOR:
+        return None
+    try:
+        return cbor_loads_capped(metadata_bytes)
+    except Exception:
+        _glyph_parse_errors.inc()  # R20: CBOR decode failure (incl. oversize)
+        return None
+
+
+def meta_indicates_container(metadata: Optional[Dict[str, Any]]) -> bool:
+    """Heuristic container detection for tokens that omit protocol code 7.
+
+    The canonical encoding for a collection parent is ``p`` containing
+    GLYPH_CONTAINER (7).  However some wallet builds (notably the Photonic Mint
+    flow as of mid-2026) mint the parent as a plain or mutable NFT (``p=[2]`` or
+    ``p=[2,5]``) and record the "container" intent only in the metadata ``type``
+    string or a ``container`` object — they never add code 7.  Recognising those
+    here keeps such tokens classified as containers so explorers and
+    ``glyph.get_tokens_by_type(CONTAINER)`` still surface them.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('type') == 'container':
+        return True
+    if isinstance(metadata.get('container'), dict):
+        return True
+    return False
+
+
+def get_token_type_id(protocols: List[int],
+                      metadata: Optional[Dict[str, Any]] = None) -> int:
+    """Map protocol list to a stable token type ID.
+
+    ``metadata`` is optional; when supplied it lets us recover containers that
+    were minted without protocol code 7 (see ``meta_indicates_container``).
+    """
+    if not protocols:
+        return GlyphTokenType.UNKNOWN
+
+    if GlyphProtocol.GLYPH_FT in protocols:
+        if GlyphProtocol.GLYPH_DMINT in protocols:
+            return GlyphTokenType.DMINT
+        return GlyphTokenType.FT
+
+    if GlyphProtocol.GLYPH_NFT in protocols:
+        if GlyphProtocol.GLYPH_WAVE in protocols:
+            return GlyphTokenType.WAVE
+        if GlyphProtocol.GLYPH_CONTAINER in protocols:
+            return GlyphTokenType.CONTAINER
+        if GlyphProtocol.GLYPH_AUTHORITY in protocols:
+            return GlyphTokenType.AUTHORITY
+        # Fallback for containers minted without code 7 (see helper docstring).
+        if meta_indicates_container(metadata):
+            return GlyphTokenType.CONTAINER
+        return GlyphTokenType.NFT
+
+    if GlyphProtocol.GLYPH_DAT in protocols:
+        return GlyphTokenType.DAT
+
+    return GlyphTokenType.UNKNOWN
+
+
+def format_ref(txid_hex: str, vout: int) -> str:
+    """Format a ref string as txid_vout."""
+    return f'{txid_hex}_{vout}'
+
+
+def parse_ref(ref_str: str) -> Tuple[str, int]:
+    """Parse a ref string formatted as txid_vout."""
+    txid_hex, vout_str = ref_str.split('_')
+    return txid_hex, int(vout_str)
+
+
+def wave_full_name_from_token(token: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract a WAVE name's full ``label.domain`` from a Glyph token dict.
+
+    A WAVE token carries the name twice: already-qualified in the top-level
+    ``name`` (``"gatorcoin.rxd"``) and split across ``attrs.name`` /
+    ``attrs.domain``. Prefer the top-level field and fall back to ``attrs``,
+    since ``attrs`` is arbitrary user-supplied metadata and need not be present.
+    Returns ``None`` when neither yields a name.
+    """
+    if not token:
+        return None
+    name = token.get('name')
+    if isinstance(name, str) and name:
+        return name
+    attrs = token.get('attrs') or {}
+    if not isinstance(attrs, dict):
+        return None
+    label = attrs.get('name')
+    if not isinstance(label, str) or not label:
+        return None
+    domain = attrs.get('domain')
+    if not isinstance(domain, str) or not domain:
+        domain = 'rxd'
+    return f'{label}.{domain}'
+
+
+class MetadataTooComplex(ValueError):
+    """A decoded Glyph structure is too large/shared/cyclic to serialise.
+
+    Raised by ``to_jsonsafe`` (and the REST ``_sanitize_cbor``) instead of
+    letting a pathological CBOR body wedge the single-threaded server. Subclasses
+    ``ValueError`` so the existing ``except Exception``/``except ValueError``
+    handlers turn it into a fast, clean error response.
+    """
+
+
+# Upper bound on the number of nodes ``to_jsonsafe`` will expand before it
+# refuses to continue.  A decoded CBOR value can be a *shared-reference DAG*
+# (CBOR value-sharing, tags 28/29 — which ``cbor2.loads`` materialises into
+# genuinely shared Python objects) or contain reference cycles.  ``to_jsonsafe``
+# emits a plain JSON tree, so a shared subtree is re-expanded once per reference
+# path: a ~200-byte payload that nests one shared node 26 levels deep expands to
+# 2**26 ≈ 67M nodes and pins the event loop for minutes (and the downstream
+# ``json.dumps`` would blow up identically).  This is exactly why
+# ``glyph.get_metadata`` timed out for certain WAVE/commit tokens whose stored
+# metadata is tiny but value-shared, while plain tokens returned instantly.
+#
+# A legitimate metadata body is size-capped to ``MAX_CBOR_PAYLOAD_BYTES``
+# (640 KiB) at index time, and a non-shared CBOR encodes at most ~1 node per
+# byte, so a real token never decodes to more than ~655K nodes.  2M gives ~3x
+# headroom while bounding the worst-case expansion of a hostile body to well
+# under a second before it fails fast.
+MAX_JSONSAFE_NODES = 2_000_000
+
+
+def to_jsonsafe(obj: Any) -> Any:
+    """Recursively convert a decoded Glyph structure into JSON-serialisable form.
+
+    CBOR-decoded metadata can contain raw ``bytes`` — NFT ``attrs`` values,
+    embedded binary, and ``cbor2.CBORTag`` payloads (e.g. typed arrays). Most
+    token-record fields are already hex-encoded by ``_token_to_dict`` / the
+    envelope parser, but this metadata is passed through verbatim. aiorpcX/JSON
+    cannot encode ``bytes``, so returning such a structure from an RPC handler
+    raises and the client sees ``-32603 internal server error``. This converts
+    every bytes value to a hex string and recurses through dicts/lists, leaving
+    scalars untouched; ``CBORTag`` values are unwrapped to their ``.value``.
+
+    Raises :class:`MetadataTooComplex` if the structure expands past
+    ``MAX_JSONSAFE_NODES`` nodes or contains a reference cycle, so a value-shared
+    or cyclic CBOR body returns a fast error instead of hanging the event loop.
+    """
+    counter = [0]
+
+    def _convert(o, path):
+        counter[0] += 1
+        if counter[0] > MAX_JSONSAFE_NODES:
+            raise MetadataTooComplex(
+                f"Glyph structure expands past {MAX_JSONSAFE_NODES} nodes "
+                f"(value-shared or oversized CBOR); refusing to serialise"
+            )
+        if isinstance(o, (bytes, bytearray)):
+            return o.hex()
+        if isinstance(o, (dict, list, tuple)):
+            oid = id(o)
+            if oid in path:
+                raise MetadataTooComplex(
+                    "cyclic Glyph structure; refusing to serialise"
+                )
+            path = path | {oid}
+            if isinstance(o, dict):
+                return {_convert(k, path): _convert(v, path)
+                        for k, v in o.items()}
+            return [_convert(v, path) for v in o]
+        if o.__class__.__name__ == 'CBORTag' and hasattr(o, 'value'):
+            return _convert(o.value, path)
+        if o is None or isinstance(o, (bool, int, float, str)):
+            return o
+        # Everything else a CBOR decode can yield is NOT JSON-native: most
+        # importantly ``cbor2.undefined`` (CBOR simple value 23 — e.g. a WAVE
+        # token's empty ``desc`` field), plus Decimal/datetime/Fraction from
+        # semantic tags, sets, and unknown simple values. Returning any of these
+        # makes the RPC response un-serialisable, and aiorpcX SILENTLY DROPS a
+        # reply it cannot JSON-encode — so the client hangs until it times out.
+        # (This is the real cause of the WAVE ``glyph.get_metadata`` timeout.)
+        # Coerce to a JSON-safe value so a reply is always produced.
+        # ``cbor2.undefined`` is a singleton; match it by identity (its class
+        # name varies across cbor2 versions: ``undefined_type`` / ``UndefinedType``).
+        if (HAS_CBOR and o is cbor2.undefined) or \
+                o.__class__.__name__ in ('undefined_type', 'UndefinedType'):
+            return None
+        if isinstance(o, (set, frozenset)):
+            return [_convert(v, path) for v in o]
+        return str(o)
+
+    return _convert(obj, frozenset())
+
+
+def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Extract a normalized token-info dict from decoded metadata.
+
+    Handles both v1 (``type`` field) and v2 (``p`` list) formats.
+    """
+    version = metadata.get('v', (envelope or {}).get('version', GlyphVersion.V1))
+    protocols = metadata.get('p', []) or []
+
+    # v1 legacy: infer protocols from 'type' string
+    if not protocols and 'type' in metadata:
+        _type_map = {
+            'ft': [GlyphProtocol.GLYPH_FT],
+            'nft': [GlyphProtocol.GLYPH_NFT],
+            'dat': [GlyphProtocol.GLYPH_DAT],
+        }
+        protocols = _type_map.get(str(metadata['type']).lower(), [])
+
+    token_info: Dict[str, Any] = {
+        'protocols': protocols,
+        'version': version,
+        'name': metadata.get('name') or metadata.get('n'),
+        'ticker': metadata.get('ticker') or metadata.get('tk'),
+        'decimals': metadata.get('decimals') or metadata.get('dc', 0),
+    }
+
+    # Pass through attrs if present
+    if 'attrs' in metadata:
+        token_info['attrs'] = metadata['attrs']
+
+    # dMint fields — check both top-level and nested 'dmint' object
+    if GlyphProtocol.GLYPH_DMINT in protocols:
+        dm_nested = metadata.get('dmint', {}) if isinstance(metadata.get('dmint'), dict) else {}
+        token_info['dmint'] = {
+            'algorithm': metadata.get('algorithm') or dm_nested.get('algorithm'),
+            'start_difficulty': metadata.get('startDiff') or dm_nested.get('startDiff'),
+            'max_supply': metadata.get('maxSupply') or dm_nested.get('maxSupply'),
+            'reward': metadata.get('reward') or dm_nested.get('reward'),
+            'premine': metadata.get('premine') or dm_nested.get('premine', 0),
+        }
+        daa = metadata.get('daa') or dm_nested.get('daa')
+        if daa and isinstance(daa, dict):
+            token_info['dmint']['daa_mode'] = daa.get('mode')
+            token_info['dmint']['halflife'] = daa.get('halflife')
+
+    return token_info
+
+
+def parse_glyph_from_output(script: bytes) -> Optional[Dict[str, Any]]:
+    """Best-effort parse for glyph commit/reveal info from an output script."""
+    env = parse_glyph_envelope(script)
+    if not env:
+        return None
+    if env.get('is_reveal'):
+        return {'is_reveal': True, 'metadata_bytes': env.get('metadata_bytes', b'')}
+    # Commit envelope
+    return {
+        'is_commit': True,
+        'commit_hash': env.get('commit_hash'),
+        'content_root': env.get('content_root'),
+        'controller': env.get('controller'),
+    }
+
+
+def get_protocol_name(protocol_id: int) -> str:
+    """Get human-readable name for a protocol ID."""
+    return PROTOCOL_NAMES.get(protocol_id, f'Unknown({protocol_id})')
+
+
+def get_token_type(protocols: List[int],
+                   metadata: Optional[Dict[str, Any]] = None) -> str:
+    """Get token type string from protocol list.
+
+    ``metadata`` is optional; when supplied it lets us recover containers that
+    were minted without protocol code 7 (see ``meta_indicates_container``).
+    """
+    if GlyphProtocol.GLYPH_FT in protocols:
+        if GlyphProtocol.GLYPH_DMINT in protocols:
+            return 'dMint FT'
+        return 'Fungible Token'
+
+    if GlyphProtocol.GLYPH_NFT in protocols:
+        if GlyphProtocol.GLYPH_WAVE in protocols:
+            return 'WAVE Name'
+        # CONTAINER is checked before AUTHORITY to match get_token_type_id's
+        # precedence, so a container+authority token ([2,7,10]) classifies
+        # consistently across both functions.
+        if GlyphProtocol.GLYPH_CONTAINER in protocols:
+            return 'Container'
+        if GlyphProtocol.GLYPH_AUTHORITY in protocols:
+            return 'Authority'
+        # Fallback for containers minted without code 7 (see helper docstring).
+        # Checked before the MUT/ENCRYPTED labels so a [2,5] container parent is
+        # reported as a Container rather than a "Mutable NFT".
+        if meta_indicates_container(metadata):
+            return 'Container'
+        if GlyphProtocol.GLYPH_ENCRYPTED in protocols:
+            return 'Encrypted NFT'
+        if GlyphProtocol.GLYPH_MUT in protocols:
+            return 'Mutable NFT'
+        return 'NFT'
+
+    if GlyphProtocol.GLYPH_DAT in protocols:
+        return 'Data'
+
+    return 'Unknown'
+
+
+def is_fungible(protocols: List[int]) -> bool:
+    """Check if protocols indicate a fungible token."""
+    return GlyphProtocol.GLYPH_FT in protocols
+
+
+def is_nft(protocols: List[int]) -> bool:
+    """Check if protocols indicate an NFT."""
+    return GlyphProtocol.GLYPH_NFT in protocols
+
+
+def is_dmint(protocols: List[int]) -> bool:
+    """Check if protocols indicate a dMint token."""
+    return GlyphProtocol.GLYPH_DMINT in protocols
+
+
+def is_mutable(protocols: List[int]) -> bool:
+    """Check if protocols indicate a mutable token."""
+    return GlyphProtocol.GLYPH_MUT in protocols
+
+
+def is_container(protocols: List[int],
+                 metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """Check if protocols indicate a container.
+
+    Recognises both the canonical encoding (protocol code 7) and containers
+    minted without it when ``metadata`` is supplied (see
+    ``meta_indicates_container``).
+    """
+    if GlyphProtocol.GLYPH_CONTAINER in protocols:
+        return True
+    return meta_indicates_container(metadata)
+
+
+def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse dMint contract state from a UTXO output script.
+
+    The dMint contract output script encodes live state as data pushes
+    before the contract bytecode (which starts at ``OP_CHECKTEMPLATEVERIFY``
+    0xbd).  Two layouts exist:
+
+    V1 (4 numeric pushes after refs):
+        <height:4B> d8<contractRef:36B> d0<tokenRef:36B>
+        <maxHeight> <reward> <target>
+        bd <contract_bytecode>
+
+    V2 (8 numeric pushes after refs — algoId/daaMode in range 0-4):
+        <height:4B> d8<contractRef:36B> d0<tokenRef:36B>
+        <maxHeight> <reward> <algoId> <daaMode> <targetTime>
+        <lastTime:4B> <target>
+        bd <contract_bytecode>
+
+    All numeric values are minimal CScriptNum encoded pushes.
+
+    Returns a dict with parsed fields, or None if the script does not look
+    like a dMint contract output.
+    """
+    if not script or len(script) < 80:
+        return None
+
+    # Must contain OP_PUSHINPUTREFSINGLETON (0xd8)
+    if b'\xd8' not in script:
+        return None
+
+    try:
+        # Heuristic: find the contract ref (36 bytes after a d8 opcode) and
+        # token ref (36 bytes after a d0 opcode) by scanning the raw script.
+        # Also locate the boundary (0xbd = OP_CHECKTEMPLATEVERIFY) where
+        # the state prefix ends and the contract bytecode begins.
+        contract_ref = None
+        token_ref = None
+        state_end = len(script)
+        pos = 0
+        slen = len(script)
+        while pos < slen:
+            op = script[pos]
+            if op == 0xbd:
+                state_end = pos
+                break
+            elif op == 0xd8 and pos + 37 <= slen:
+                contract_ref = script[pos + 1:pos + 37]
+                pos += 37
+            elif op == 0xd0 and pos + 37 <= slen:
+                token_ref = script[pos + 1:pos + 37]
+                pos += 37
+            elif 1 <= op <= 75:
+                # A fixed-length push whose payload runs off the end of the
+                # script is malformed — bail rather than letting the cursor
+                # jump past the real OP_CHECKTEMPLATEVERIFY boundary (H5).
+                if pos + 1 + op > slen:
+                    return None
+                pos += 1 + op
+            elif op == 0x4c and pos + 1 < slen:
+                if pos + 2 + script[pos + 1] > slen:
+                    return None
+                pos += 2 + script[pos + 1]
+            elif op == 0x4d and pos + 2 < slen:
+                dlen = script[pos + 1] | (script[pos + 2] << 8)
+                if pos + 3 + dlen > slen:
+                    return None
+                pos += 3 + dlen
+            elif op == 0x4e and pos + 4 < slen:
+                dlen = (script[pos + 1] | (script[pos + 2] << 8)
+                        | (script[pos + 3] << 16) | (script[pos + 4] << 24))
+                if pos + 5 + dlen > slen:
+                    return None
+                pos += 5 + dlen
+            else:
+                pos += 1
+
+        if not contract_ref:
+            return None
+
+        # Parse only the state prefix (before OP_CHECKTEMPLATEVERIFY)
+        # to avoid picking up pushes from the contract bytecode.
+        pushes = _parse_script_pushes(script[:state_end])
+        if len(pushes) < 4:
+            return None
+
+        # Extract numeric data pushes, filtering out 36-byte ref pushes.
+        numeric_pushes = [p for p in pushes if len(p) <= 8 and len(p) != 36]
+
+        result: Dict[str, Any] = {
+            'contract_ref': contract_ref.hex() if contract_ref else None,
+            'token_ref': token_ref.hex() if token_ref else None,
+        }
+
+        # First three numeric pushes are common to V1 and V2
+        if len(numeric_pushes) >= 1:
+            result['height'] = _scriptnum_to_int(numeric_pushes[0])
+        if len(numeric_pushes) >= 2:
+            result['max_height'] = _scriptnum_to_int(numeric_pushes[1])
+        if len(numeric_pushes) >= 3:
+            result['reward'] = _scriptnum_to_int(numeric_pushes[2])
+
+        # Detect V2: 8+ numeric pushes where [3]=algoId(0-4), [4]=daaMode(0-4)
+        is_v2 = False
+        if len(numeric_pushes) >= 8:
+            algo_candidate = _scriptnum_to_int(numeric_pushes[3])
+            daa_candidate = _scriptnum_to_int(numeric_pushes[4])
+            if 0 <= algo_candidate <= 4 and 0 <= daa_candidate <= 4:
+                is_v2 = True
+
+        if is_v2:
+            # V2 layout: height, maxHeight, reward, algoId, daaMode,
+            #            targetTime, lastTime, target
+            result['algo_id'] = _scriptnum_to_int(numeric_pushes[3])
+            result['daa_mode'] = _scriptnum_to_int(numeric_pushes[4])
+            result['target_time'] = _scriptnum_to_int(numeric_pushes[5])
+            result['last_time'] = _scriptnum_to_int(numeric_pushes[6])
+            result['target'] = _scriptnum_to_int(numeric_pushes[7])
+        else:
+            # V1 layout: height, maxHeight, reward, target
+            if len(numeric_pushes) >= 4:
+                result['target'] = _scriptnum_to_int(numeric_pushes[3])
+
+        # H5: validate the supply-relevant numeric fields.  These come from
+        # attacker-authored scriptnums (signed, up to +/-2^63), so reject the
+        # whole contract when a value is negative or out of the int64 range.
+        # We deliberately only validate reward / max_height (the fields that
+        # feed total_supply); target / last_time / target_time are difficulty
+        # and timestamp values that may legitimately be 0 or near-2^63 and are
+        # NOT used in the supply arithmetic, so leaving them untouched keeps
+        # every currently-valid contract parsing identically.
+        max_height = result.get('max_height')
+        if max_height is not None and (
+            max_height <= 0 or max_height > DMINT_MAX_SCRIPTNUM
+        ):
+            # max_height <= 0 means "mines for no blocks" — never a real,
+            # mintable contract; treat as malformed/inert.
+            return None
+        reward = result.get('reward')
+        if reward is not None and (
+            reward < 0 or reward > DMINT_MAX_SCRIPTNUM
+        ):
+            return None
+
+        return result
+    except Exception:
+        return None
+
+
+def _scriptnum_to_int(data: bytes) -> int:
+    """Convert a CScriptNum-encoded byte string to a Python int.
+
+    CScriptNum uses minimal little-endian encoding with the MSB of the
+    last byte as a sign bit.  An empty byte string encodes 0.
+    """
+    if not data:
+        return 0
+    # Little-endian magnitude with sign bit in top bit of last byte
+    negative = (data[-1] & 0x80) != 0
+    # Strip sign bit for magnitude
+    raw = bytearray(data)
+    raw[-1] &= 0x7f
+    value = int.from_bytes(raw, 'little')
+    return -value if negative else value
+
+
+def is_dmint_reveal(script_or_envelope) -> bool:
+    """Check if a script/envelope contains a dMint reveal (DMINT protocol).
+
+    Accepts either raw script bytes or a pre-parsed envelope dict.
+    """
+    if isinstance(script_or_envelope, dict):
+        env = script_or_envelope
+    else:
+        env = parse_glyph_envelope(script_or_envelope)
+    if not env:
+        return False
+    # Already-parsed metadata takes priority
+    metadata = env.get('metadata')
+    if metadata is None:
+        if not env.get('is_reveal'):
+            return False
+        metadata = parse_glyph_metadata(env)
+    if not metadata or not isinstance(metadata, dict):
+        return False
+    protocols = metadata.get('p', [])
+    return GlyphProtocol.GLYPH_DMINT in protocols
+
+
+def is_wave_claim(script_or_envelope) -> bool:
+    """Check if a script/envelope contains a WAVE name claim (WAVE protocol).
+
+    Accepts either raw script bytes or a pre-parsed envelope dict.
+    """
+    if isinstance(script_or_envelope, dict):
+        env = script_or_envelope
+    else:
+        env = parse_glyph_envelope(script_or_envelope)
+    if not env:
+        return False
+    metadata = env.get('metadata')
+    if metadata is None:
+        if not env.get('is_reveal'):
+            return False
+        metadata = parse_glyph_metadata(env)
+    if not metadata or not isinstance(metadata, dict):
+        return False
+    protocols = metadata.get('p', [])
+    return GlyphProtocol.GLYPH_WAVE in protocols
+
+
+def validate_protocols(protocols: List[int]) -> Tuple[bool, Optional[str]]:
+    """
+    Validate a protocol combination per Glyph v2 spec Section 3.5.
+    
+    Returns (valid, error_message).
+    """
+    # FT and NFT are mutually exclusive
+    if GlyphProtocol.GLYPH_FT in protocols and GlyphProtocol.GLYPH_NFT in protocols:
+        return False, 'FT and NFT are mutually exclusive'
+    
+    # BURN alone is invalid (it's an action marker, not a token type)
+    if protocols == [GlyphProtocol.GLYPH_BURN]:
+        return False, 'BURN alone is invalid - it is an action marker, not a token type'
+    
+    # BURN must accompany a token type (FT or NFT)
+    if GlyphProtocol.GLYPH_BURN in protocols:
+        if GlyphProtocol.GLYPH_FT not in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+            return False, 'BURN must accompany FT or NFT'
+    
+    # DMINT requires FT
+    if GlyphProtocol.GLYPH_DMINT in protocols and GlyphProtocol.GLYPH_FT not in protocols:
+        return False, 'DMINT requires FT'
+    
+    # MUT requires NFT
+    if GlyphProtocol.GLYPH_MUT in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+        return False, 'MUT requires NFT'
+    
+    # CONTAINER requires NFT
+    if GlyphProtocol.GLYPH_CONTAINER in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+        return False, 'CONTAINER requires NFT'
+    
+    # ENCRYPTED requires NFT
+    if GlyphProtocol.GLYPH_ENCRYPTED in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+        return False, 'ENCRYPTED requires NFT'
+    
+    # TIMELOCK requires ENCRYPTED
+    if GlyphProtocol.GLYPH_TIMELOCK in protocols and GlyphProtocol.GLYPH_ENCRYPTED not in protocols:
+        return False, 'TIMELOCK requires ENCRYPTED'
+    
+    # AUTHORITY requires NFT
+    if GlyphProtocol.GLYPH_AUTHORITY in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+        return False, 'AUTHORITY requires NFT'
+    
+    # WAVE requires NFT and MUT
+    if GlyphProtocol.GLYPH_WAVE in protocols:
+        if GlyphProtocol.GLYPH_NFT not in protocols:
+            return False, 'WAVE requires NFT'
+        if GlyphProtocol.GLYPH_MUT not in protocols:
+            return False, 'WAVE requires MUT'
+    
+    return True, None
+
+
+def decode_cbor_metadata(data: bytes) -> Optional[Dict[str, Any]]:
+    """Decode raw CBOR bytes into a metadata dict.
+
+    Returns None if data is invalid CBOR or not a dict.
+    """
+    if not HAS_CBOR:
+        return None
+    try:
+        result = cbor_loads_capped(data)
+        if not isinstance(result, dict):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def is_glyph_op_return(script: bytes) -> bool:
+    """Check if an output script is an OP_RETURN containing Glyph magic.
+
+    Handles both OP_RETURN and OP_FALSE OP_RETURN patterns.
+    """
+    if not script:
+        return False
+    # Must start with OP_RETURN (0x6a) or OP_FALSE OP_RETURN (0x00 0x6a)
+    if script[0] == 0x6a:
+        return GLYPH_MAGIC in script
+    if len(script) >= 2 and script[0] == 0x00 and script[1] == 0x6a:
+        return GLYPH_MAGIC in script
+    return False
+
+
+def format_glyph_id(txid: str, vout: int) -> str:
+    """Format a Glyph ID from txid and vout."""
+    return f'{txid}:{vout}'
+
+
+def parse_glyph_id(glyph_id: str) -> Tuple[str, int]:
+    """Parse a Glyph ID into txid and vout."""
+    parts = glyph_id.split(':')
+    return parts[0], int(parts[1])
