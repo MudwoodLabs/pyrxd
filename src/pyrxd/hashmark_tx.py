@@ -53,6 +53,7 @@ from .script.hashmark import (
     RADIANT_MAINNET_GENESIS,
     AttestationResult,
     HashMarkRecord,
+    _require_signable_genesis,
     algorithm_for,
     decode_hashmark,
     encode_hashmark,
@@ -127,20 +128,28 @@ class MarkPlan:
         statement, so the same bytes on another chain are a different statement and do
         not verify there (§5.6, §2.10). Getting this wrong does not produce a broken
         transaction — it produces a perfectly relayable record whose claim is false on
-        the chain it lands on.
+        the chain it lands on. So it must be 64 lowercase hex and the genesis of a chain
+        pyrxd knows: the attestation check below verifies against THIS string, so on its
+        own it is circular for exactly this field — bytes signed for ``"mainnet"`` verify
+        against ``"mainnet"``.
     :param source: what was digested, for a confirmation prompt to show. Local only;
         no part of it reaches the chain.
+    :param allow_unknown_genesis: accept a well-formed genesis pyrxd has no constant for.
+        See :func:`~pyrxd.script.hashmark.encode_hashmark`.
     """
 
     op_return_script: bytes
     network_genesis: str = RADIANT_MAINNET_GENESIS
     source: str | None = None
+    allow_unknown_genesis: bool = False
     #: The record as read back OFF ``op_return_script``.
     record: HashMarkRecord = field(init=False)
     #: The §6.3 verdict a stranger computes, run here before anything is funded.
     attestation: AttestationResult = field(init=False)
 
     def __post_init__(self) -> None:
+        # Before the attestation, which cannot catch it: see `network_genesis` above.
+        _require_signable_genesis(self.network_genesis, allow_unknown_genesis=self.allow_unknown_genesis)
         record = decode_hashmark(self.op_return_script)
         if not record.ok:
             raise ValidationError(
@@ -203,6 +212,7 @@ def plan_hashmark(
     algorithm_id: int = 0x01,
     network_genesis: str = RADIANT_MAINNET_GENESIS,
     source: str | None = None,
+    allow_unknown_genesis: bool = False,
 ) -> MarkPlan:
     """Sign *digest* into a v2 HashMark record and check it the way a stranger will.
 
@@ -221,8 +231,14 @@ def plan_hashmark(
         label=label,
         algorithm_id=algorithm_id,
         network_genesis=network_genesis,
+        allow_unknown_genesis=allow_unknown_genesis,
     )
-    return MarkPlan(op_return_script=script, network_genesis=network_genesis, source=source)
+    return MarkPlan(
+        op_return_script=script,
+        network_genesis=network_genesis,
+        source=source,
+        allow_unknown_genesis=allow_unknown_genesis,
+    )
 
 
 def plan_hashmark_for_file(
@@ -232,6 +248,7 @@ def plan_hashmark_for_file(
     label: str | None = None,
     algorithm_id: int = 0x01,
     network_genesis: str = RADIANT_MAINNET_GENESIS,
+    allow_unknown_genesis: bool = False,
 ) -> MarkPlan:
     """:func:`plan_hashmark` over the digest of a file, with ``source`` set to its path.
 
@@ -246,6 +263,7 @@ def plan_hashmark_for_file(
         algorithm_id=algorithm_id,
         network_genesis=network_genesis,
         source=str(path),
+        allow_unknown_genesis=allow_unknown_genesis,
     )
 
 
@@ -314,6 +332,56 @@ class MarkBuild:
         return bytes(self.tx.serialize())
 
 
+def _client_chain_genesis(client: Any) -> str | None:
+    """The genesis hash *client* says it is on, or ``None`` when it does not say.
+
+    Read from a real :class:`~pyrxd.network.registry.NetworkProfile` only — an ``isinstance``
+    check, not attribute sniffing, so a stand-in object with a ``profile`` attribute of some other
+    shape is "does not say" rather than a value to compare against.
+    """
+    from .network.registry import NetworkProfile
+
+    profile = getattr(client, "profile", None)
+    if not isinstance(profile, NetworkProfile):
+        return None
+    genesis = profile.genesis_hash
+    return genesis if isinstance(genesis, str) else None
+
+
+async def _require_client_on_chain(client: Any, genesis: str) -> None:
+    """Refuse unless the SERVER behind *client* is on the chain *genesis* names.
+
+    The server is asked (``assert_chain``), not only the client's own declaration read. Both
+    shipped clients implement it: :class:`~pyrxd.network.electrumx.ElectrumXClient` — the plain
+    client the docs and README construct, which carries no profile at all — and
+    :class:`~pyrxd.network.failover.FailoverElectrumXClient`, whose profile genesis may be ``None``
+    (an unknown network) or declared but never checked (``verify_chain=False``). Comparing the
+    profile alone skipped the first two outright and trusted the third.
+
+    A client that cannot be asked is REFUSED, not waved through. The statement being funded is
+    bound to one chain and cannot be edited once published; a client that cannot say which chain
+    it is on is not one to publish it through.
+
+    :raises ValidationError: the server is on another chain, or the client cannot be asked.
+    :raises NetworkError: the server could not be reached to ask.
+    """
+    import inspect
+
+    assert_chain = getattr(client, "assert_chain", None)
+    if not callable(assert_chain):
+        raise ValidationError(
+            f"{type(client).__name__} cannot say which chain it is on (it has no assert_chain), so "
+            f"a mark signed for genesis {genesis} cannot be published through it safely — use an "
+            f"ElectrumXClient or a FailoverElectrumXClient"
+        )
+    pending = assert_chain(genesis)
+    if not inspect.isawaitable(pending):
+        raise ValidationError(
+            f"{type(client).__name__}.assert_chain did not return an awaitable, so the chain was not checked"
+        )
+    await pending
+
+
 async def build_hashmark_mark(
     wallet: Any,
     plan: MarkPlan,
@@ -338,12 +406,18 @@ async def build_hashmark_mark(
     burning an NFT to publish a hash about a file would be a memorable way to close this
     issue.
 
+    *client* must be able to prove which chain it is on: its server is asked
+    (``assert_chain``) before anything is funded — see :func:`_require_client_on_chain`.
+
     Raises:
-        ~pyrxd.security.errors.ValidationError: *plan* is not a :class:`MarkPlan`, or the
-            fee rate is out of bounds, or the signed transaction does not pay for its
-            own size.
+        ~pyrxd.security.errors.ValidationError: *plan* is not a :class:`MarkPlan`, or
+            *client*'s server is not on the chain the plan was signed for, or *client*
+            cannot be asked, or the fee rate is out of bounds, or the signed transaction
+            does not pay for its own size.
         ~pyrxd.security.errors.InsufficientFundsError: no plain-RXD UTXO large enough.
             Raised before anything is signed.
+        ~pyrxd.security.errors.NetworkError: the server could not be reached to ask which
+            chain it is on.
     """
     from .fee_models import SatoshisPerKilobyte
     from .fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
@@ -361,6 +435,21 @@ async def build_hashmark_mark(
             f"signature is required to verify"
         )
 
+    # THE PLAN SAYS WHICH CHAIN THE STATEMENT IS ABOUT; THE CLIENT SAYS WHICH CHAIN IT IS ON.
+    # Nothing compared them, so a plan signed for mainnet was funded and signed through a testnet
+    # client without complaint — and the record, once broadcast, does not verify on the chain that
+    # carries it. Two steps. First the client's own declaration, when it makes one — free, and the
+    # clearest message. Then, below and before any funding, the SERVER is asked; that is the step
+    # that covers a client which declares nothing.
+    client_genesis = _client_chain_genesis(client)
+    if client_genesis is not None and client_genesis != plan.network_genesis:
+        raise ValidationError(
+            f"this mark is signed for the chain with genesis {plan.network_genesis}, but the client "
+            f"is on the chain with genesis {client_genesis} — published there, the record would not "
+            f"verify on the chain that carries it. Plan it with network_genesis={client_genesis!r}, or "
+            f"build it through a client for the chain it was signed for."
+        )
+
     assert_fee_rate_clears_relay_floor(
         fee_rate,
         what="build_hashmark_mark",
@@ -368,6 +457,9 @@ async def build_hashmark_mark(
         allow_below_relay_floor=allow_below_relay_floor,
         error_type=ValidationError,
     )
+
+    # After the checks that cost nothing, before the first funding read.
+    await _require_client_on_chain(client, plan.network_genesis)
 
     script = plan.op_return_script
     needed = hashmark_mark_funding_bar(script, fee_rate)
