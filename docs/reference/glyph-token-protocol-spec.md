@@ -910,7 +910,7 @@ envelope carries more type information than the chain does.
 
 `src/pyrxd/glyph/_inspect_core.py:1073-1228` is the dispatch order pyrxd uses — NFT, FT,
 container-legacy, MUT, commit-NFT, commit-FT, in that order — and
-`src/pyrxd/glyph/_inspect_core.py:1404-1468` is the envelope-side classification, which returns
+`src/pyrxd/glyph/_inspect_core.py:1405-1469` is the envelope-side classification, which returns
 the highest-specificity marker present.
 
 (Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,

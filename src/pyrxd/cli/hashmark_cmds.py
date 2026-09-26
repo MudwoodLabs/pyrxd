@@ -1223,8 +1223,10 @@ def verify_cmd(
     question and it could not be answered, and a gate that passes on "not answered" is worse
     than no gate.
 
-    Read-only: no wallet, no broadcast, no mnemonic prompt. Nothing is sent anywhere but the
-    transaction id you typed.
+    Read-only: no wallet, no broadcast, no mnemonic prompt. The configured ElectrumX servers see
+    the transaction id you typed; with --wave-name they also see that name, and with
+    --verify-wave a lookup keyed on the signer's address. A --file is hashed on this machine and
+    never sent.
     """
     if file_path is not None and digest_hex is not None:
         raise UserError(
