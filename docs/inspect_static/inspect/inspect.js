@@ -2717,7 +2717,16 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
         } catch (err) {
           errors[outpoint] = stripControlChars(String((err && err.message) || err));
         }
+        // AFTER EACH CANDIDATE, answered or refused (#743 round 5): a reader who moved on during
+        // it gets no further fetches for the old transaction, and no binding step. There are up
+        // to _MAX_BINDING_FETCHES of these waits; one check after the loop stopped the drawing
+        // but still paid for the rest of them and for the Python below.
+        if (superseded()) return;
       }
+      // No check after this call or inside it: `pySpentBinding` is a synchronous call into
+      // Pyodide on this thread (so is the re-classification it may do), and a click cannot be
+      // handled until it returns. The wait before it is the last candidate fetch, checked above.
+      // `test_the_page_awaits_only_the_network` pins that it is not awaited.
       const bound = fromPy(pySpentBinding(
         txid, rawHex, JSON.stringify(prevs), JSON.stringify(errors), MAX_ROWS_SHOWN, MAX_ROWS_SHOWN,
       ));
@@ -2746,7 +2755,9 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
     });
     return;
   }
-  // The spent-transaction fetch above is awaited too, so the reader may have moved on during it.
+  // Every wait inside the try above is a spent-transaction fetch, and each is checked where it
+  // ends, so this (and the one in the catch) cannot fire today. Kept so that a wait added
+  // there later still cannot draw a stale result.
   if (superseded()) return;
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole

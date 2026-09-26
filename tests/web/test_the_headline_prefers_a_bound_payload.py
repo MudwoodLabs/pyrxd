@@ -386,3 +386,100 @@ class TestTheHonestNeighboursHaveNothingUnchecked:
         assert "unchecked" not in cli and "were not checked" not in cli
         page = _page(reveal, [k])["rendered"]
         assert _page_caveat(page) is None and "were not checked" not in page
+
+
+# ─────────────────────────── a reader who moved on stops the candidate fetches (#743 round 5) ──
+#
+# #741 made `onFetchTxid` check, after every wait, that the reader has not moved on (Clear, or
+# another input classified). Rounds 3 and 4 made one of those waits up to eight: the page fetches
+# every minting payload's commit, one after another. #741's one check after that loop kept the old
+# result off the screen but still fetched the rest and ran the binding step. Now each candidate
+# fetch is checked where it ends. Driven through #741's harness, interrupting when the server
+# receives the n-th request: request 1 is the reveal, request 1 + k the k-th candidate.
+
+
+@functools.lru_cache(maxsize=1)
+def _max_rows() -> int:
+    return _flow("00" * 32, {}, [])["__constants__"]["max_rows_shown"]
+
+
+def _three_candidates():
+    """Two decoys and the real payload, all minting: three commits fetched, in input order."""
+    reveal, prevs, _real = _decoys_then_real(2)
+    first = [_first_pass(reveal, _max_rows())]
+    assert first[0]["payload"]["binding_candidates"] == [f"{p.txid()}:0" for p in prevs], "the premise"
+    server = {t.txid(): {"hex": t.serialize().hex()} for t in [reveal, *prevs]}
+    return reveal, prevs, server, first
+
+
+_OTHER_INPUT = "76a914" + "5a" * 20 + "88ac"
+
+
+def _interleave(action: str):
+    return "clear" if action == "clear" else {"classify": {"text": _OTHER_INPUT, "result": _glue().run(_OTHER_INPUT)}}
+
+
+class TestAReaderWhoMovedOnStopsTheCandidateFetches:
+    def test_uninterrupted_every_candidate_is_fetched_and_the_binding_drawn(self) -> None:
+        """The honest path every refusal below interrupts: all three fetched, one binding step,
+        the bound payload drawn as the headline."""
+        reveal, prevs, _server, _first = _three_candidates()
+        flow = _page(reveal, prevs)
+        assert flow["requested"] == [reveal.txid(), *(p.txid() for p in prevs)]
+        assert [method for method, _params in flow["server_log"]] == ["blockchain.transaction.get"] * 4, (
+            "the premise: request 1 + k is the k-th candidate"
+        )
+        assert len(flow["binding_calls"]) == 1
+        assert "Reveal metadata (from input 2 — 1 of 3 glyphs minted here)" in flow["rendered"]
+
+    def test_uninterrupted_a_refused_candidate_is_drawn_unchecked(self) -> None:
+        """The honest half of the refusal case below."""
+        reveal, prevs, _server, _first = _three_candidates()
+        flow = _page(reveal, prevs, fail={prevs[1].txid()})
+        assert flow["requested"] == [reveal.txid(), *(p.txid() for p in prevs)]
+        assert len(flow["binding_calls"]) == 1
+        assert _page_row(flow["rendered"], "Decoy1").endswith("payload binding: unchecked (server error: daemon busy)")
+
+    @pytest.mark.parametrize("action", ["clear", "classify"])
+    @pytest.mark.parametrize("k", [1, 2, 3], ids=["first-candidate", "second-candidate", "last-before-the-bridge"])
+    def test_interrupted_during_a_candidate_fetch(self, k, action) -> None:
+        reveal, prevs, server, first = _three_candidates()
+        flow = _flow(reveal.txid(), server, first, interleave=_interleave(action), on_request=1 + k)
+        assert flow["requested"] == [reveal.txid(), *(p.txid() for p in prevs[:k])], (
+            f"after the reader moved on during candidate {k}, the page went on fetching"
+        )
+        assert flow["binding_calls"] == [], "after the reader moved on, the page still ran the binding step"
+        assert reveal.txid() not in flow["rendered"]
+        if action == "clear":
+            assert flow["rendered"] == ""
+        else:
+            assert "5a" * 20 in flow["rendered"], f"the newer classification is not on screen:\n{flow['rendered']}"
+
+    def test_interrupted_during_a_candidate_fetch_the_server_refuses(self) -> None:
+        """The other branch of the loop body: the fetch the reader moved on during FAILED, and the
+        page is in its catch. It must stop there too."""
+        reveal, prevs, server, first = _three_candidates()
+        server[prevs[1].txid()] = {"error": "daemon busy"}
+        flow = _flow(reveal.txid(), server, first, interleave="clear", on_request=3)
+        assert flow["requested"] == [reveal.txid(), prevs[0].txid(), prevs[1].txid()]
+        assert flow["binding_calls"] == [] and flow["rendered"] == ""
+
+    def test_the_page_awaits_only_the_network(self) -> None:
+        """WHY there is no check after the binding step: it is not a wait. `pySpentBinding` and
+        `pyGlueFetch` are synchronous calls into Pyodide on the page's own thread, so a click
+        cannot be handled during them, and a check after one could never fire.
+
+        That reason holds only while nothing in `onFetchTxid` awaits them, so it is pinned: the
+        awaits are exactly the three network waits, each checked by a test above or in
+        `test_inspect_fetch_flow.py::TestEveryLaterWaitIsGuardedToo`. A new await fails here, and
+        needs a `superseded()` check after it and a test that interrupts there."""
+        import re
+
+        source = (_REPO_ROOT / "docs" / "inspect_static" / "inspect" / "inspect.js").read_text(encoding="utf-8")
+        start = source.index("async function onFetchTxid(")
+        body = source[start : source.index("\n}\n", start)]
+        awaited = re.findall(r"await\s+([A-Za-z_$][\w$]*)\s*\(", body)
+        assert sorted(awaited) == ["fetchRawTxFromElectrumx", "fetchRawTxFromElectrumx", "resolveMarkAnchor"], awaited
+        for bridge in ("pyGlueFetch", "pySpentBinding"):
+            assert f"{bridge}(" in body, f"the premise: onFetchTxid calls {bridge}"
+            assert not re.search(rf"await\s+(fromPy\s*\(\s*)?{bridge}\b", body), f"{bridge} is awaited now"

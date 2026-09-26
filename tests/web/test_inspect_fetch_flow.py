@@ -548,13 +548,18 @@ class TestEveryLaterWaitIsGuardedToo:
         assert len(flow["binding_calls"]) == 1
         assert "bridge error: harness: the binding bridge raised" in flow["rendered"]
 
-    def test_a_bridge_that_raises_after_the_reader_moved_on_draws_nothing(self, limit) -> None:
-        """The fifth stale-check, in the bridge-error branch — the one path that renders from
-        inside the catch. Interrupted during the spent-transaction fetch, then the binding step
-        raises: a page that checked only on the success path would draw the error card."""
+    def test_a_bridge_that_would_raise_is_not_reached_after_the_reader_moved_on(self, limit) -> None:
+        """The bridge-error branch — the one path that renders from inside the catch. Interrupted
+        during the spent-transaction fetch, with a binding step that raises.
+
+        Until #743 round 5 the superseded fetch still CALLED the binding step, which raised, and
+        only the check in the catch kept the error card off the screen. Now the check after each
+        candidate fetch returns before the bridge is called at all — the stronger property, and
+        the one asserted: no call, nothing drawn. A page that reaches the bridge again after the
+        reader moved on fails the first assertion whether or not the catch still checks."""
         reveal, _commit, server, first = self._reveal(limit)
         flow = _flow(reveal.txid(), server, first, interleave="clear", on_request=2, binding_throws=True)
-        assert len(flow["binding_calls"]) == 1, "the premise: the binding step ran and raised"
+        assert flow["binding_calls"] == [], "a superseded fetch went on to the binding step"
         assert flow["rendered"] == "", f"a superseded fetch drew its bridge error:\n{flow['rendered']}"
 
     @pytest.mark.parametrize("action", ["clear", "classify"])
