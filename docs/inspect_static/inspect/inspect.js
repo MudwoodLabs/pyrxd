@@ -1761,13 +1761,19 @@ function _detectTxShape(payload) {
   }
 
   // WAVE (11) — an on-chain name claim (requires NFT + MUT per spec).
+  //
+  // WHAT THIS PAGE DOES WITH ONE: shows the claim as the payload states it, and nothing more. It
+  // talks to ElectrumX only (`blockchain.transaction.get`, `blockchain.headers.subscribe` in
+  // shared.js), never to a WAVE indexer, so it cannot say whether the name is registered or
+  // what it resolves to. The banner used to add that pyrxd's WAVE support was deferred, which
+  // was false by 0.25.0 — pyrxd builds WAVE claims and pays their registration fee.
   if (protocol.includes("11") || protocol.some((p) => p.endsWith("WAVE"))) {
     return (
       "This transaction carries the Glyph WAVE marker (protocol = 11). " +
       "WAVE is the Glyph on-chain naming protocol — this payload claims a " +
       "human-readable name on Radiant (the protocol spec requires NFT + MUT). " +
-      "Note: WAVE support in pyrxd is currently deferred; this banner is " +
-      "informational only." + mintSentence
+      "This page shows the claim as the payload states it; it does not ask a " +
+      "WAVE indexer whether the name is registered or what it resolves to." + mintSentence
     );
   }
 

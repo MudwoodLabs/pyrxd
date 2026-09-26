@@ -9,6 +9,10 @@ claim ("the on-chain script is an ordinary Glyph NFT").
 Each marker banner now takes its only sentence about the outputs from ``metadata.mints`` — the
 field the token row reads. The CLI prints no marker banner, so there is nothing there to fix;
 ``test_the_cli_carries_no_banner_that_could_disagree`` checks that stays true.
+
+The WAVE banner also said pyrxd's WAVE support was "currently deferred", false by 0.25.0. It now
+says what the page does with a claim — shows it, and asks no indexer — and the tests at the end
+check both that wording and the claim about the page's code.
 """
 
 from __future__ import annotations
@@ -198,3 +202,52 @@ def test_the_cli_carries_no_banner_that_could_disagree() -> None:
     source = (_REPO_ROOT / "src" / "pyrxd" / "cli" / "glyph_inspect.py").read_text(encoding="utf-8")
     assert "marker (protocol =" not in source
     assert "ordinary Glyph NFT" not in source
+
+
+WAVE_BANNER_SAYS = (
+    "This page shows the claim as the payload states it; it does not ask a "
+    "WAVE indexer whether the name is registered or what it resolves to."
+)
+
+
+def test_the_wave_banner_says_what_the_page_does_with_a_claim() -> None:
+    """It said "WAVE support in pyrxd is currently deferred", false by 0.25.0: pyrxd builds WAVE
+    claims and pays their registration fee. It now says what THIS page does with one."""
+    text = _render(_payload(_REACH["11"], mints=True))
+    assert "(protocol = 11)" in text, "the premise: the WAVE banner is the one drawn"
+    assert WAVE_BANNER_SAYS in " ".join(text.split())
+    assert "deferred" not in text
+
+
+def test_the_wave_banners_claim_about_the_page_is_true() -> None:
+    """The banner says the page asks no WAVE indexer. That is a claim about the page's code, so it
+    is checked against it: the page's one socket is opened inside `electrumxRpc`, and every call of
+    that sends one of the two ElectrumX reads. A page that learned to resolve a name would fail
+    here, and its banner with it."""
+    scripts = "".join(
+        (_REPO_ROOT / "docs" / "inspect_static" / "inspect" / name).read_text(encoding="utf-8")
+        for name in ("inspect.js", "shared.js")
+    )
+    assert scripts.count("new WebSocket(") == 1, "a second socket is a second way to ask a server"
+    methods = re.findall(r'electrumxRpc\("([^"]+)"', scripts)
+    calls = re.findall(r"(?<!function )electrumxRpc\(", scripts)
+    assert len(calls) == len(methods) > 0, "a call whose method is not a literal escapes the check"
+    assert set(methods) == {"blockchain.transaction.get", "blockchain.headers.subscribe"}, methods
+
+
+def test_no_surface_still_says_wave_support_is_deferred() -> None:
+    """The sentence, anywhere a reader of the inspector or the CLI would meet it."""
+    roots = [
+        _REPO_ROOT / "docs" / "inspect_static",
+        _REPO_ROOT / "src" / "pyrxd" / "cli",
+        _REPO_ROOT / "docs" / "concepts",
+    ]
+    hits = [
+        str(path.relative_to(_REPO_ROOT))
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in {".js", ".py", ".md", ".html"}
+        and "wave support in pyrxd is currently deferred" in " ".join(path.read_text(encoding="utf-8").lower().split())
+    ]
+    assert hits == []
