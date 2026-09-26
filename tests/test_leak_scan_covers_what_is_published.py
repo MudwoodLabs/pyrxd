@@ -615,6 +615,30 @@ _HOME_LEAK_FORMS = {
     "claude-tmp-scratch": "and /tmp/claude-1000/" + _ENCODED_HOME + "/scratch",
     "macos-encoded": "under ~/.claude/projects/" + "-".join(("", "Users", _USERNAME, "src")),
     "encoded-in-backticks": "the project dir `" + _ENCODED_HOME + "`",
+    # The encoded home directory itself, as a path segment with nothing after the user.
+    "encoded-bare-home-segment": "~/.claude/projects/" + "-".join(("", "home", _USERNAME)) + "/",
+    # Windows, which the first widening did not cover: the drive letter's colon and backslash
+    # become two dashes when encoded, and the plain path uses backslashes (doubled in source).
+    "windows-encoded": "~/.claude/projects/" + "-".join(("C", "", "Users", _USERNAME, "src")) + "/memory",
+    "windows-encoded-bare": "the dir " + "-".join(("C", "", "Users", _USERNAME)),
+    "windows-backslash": "C:" + "\\".join(("", "Users", _USERNAME, "src")),
+    "windows-doubled-backslash": 'p = "C:' + "\\\\".join(("", "Users", _USERNAME, "src")) + '"',
+    # Windows paths are case-insensitive, and a lowercase `users` was missed by round 2.
+    "windows-backslash-lowercase": "c:" + "\\".join(("", "users", _USERNAME, "src")),
+    "windows-encoded-lowercase": "the dir " + "-".join(("c", "", "users", _USERNAME, "src")),
+    "in-a-url-query-string": "https://example.com/?next=/" + "/".join(("home", _USERNAME, "x")),
+    # Round 2 skipped a web URL's PATH, and every one of these then went unreported (lane G,
+    # round 3). They are REFUSAL cases: a skip for URLs must not come back.
+    "localhost-dev-server": "http://localhost:8000/" + "/".join(("home", _USERNAME, "notes.ipynb")),
+    "loopback-address": "http://127.0.0.1:8080/" + "/".join(("home", _USERNAME, "x")),
+    "notebook-tree-url": "http://localhost:8888/tree/" + "/".join(("home", _USERNAME, "work")),
+    "glued-with-a-pipe": "https://example.com|/" + "/".join(("home", _USERNAME, "x")),
+    "glued-with-a-comma": "https://example.com,/" + "/".join(("home", _USERNAME, "x")),
+    "editor-link": "vscode://file/" + "/".join(("home", _USERNAME, "src", "app.py")),
+    # Round 2 also required an encoded match to "look like a path", which lost these three.
+    "encoded-user-in-quotes": 'dir = "' + "-".join(("", "home", _USERNAME)) + '"',
+    "encoded-user-in-backticks": "the dir `" + "-".join(("", "home", _USERNAME)) + "`",
+    "encoded-user-ending-a-sentence": "it was " + "-".join(("", "home", _USERNAME)) + ".",
 }
 
 
@@ -644,10 +668,10 @@ def test_a_dash_encoded_home_path_in_a_commit_message_is_caught(repo) -> None:
 
 def test_home_path_look_alikes_are_not_flagged(repo) -> None:
     """The honest-path twin of the test above. Widening a pattern is where a scanner starts
-    refusing honest docs, so each near miss is here: placeholders in both spellings, a flag and a
-    hyphenated word that contain `-home-`, `/home` with no user, the exempt Pyodide home in both
-    spellings and at the end of a sentence, a lowercase `/users/` URL path, and a `/tmp/claude-*/`
-    scratch path that carries no username."""
+    refusing honest docs, so each near miss is here: placeholders in every spelling (Windows
+    included, in both cases), a flag and a hyphenated word that contain `-home-`, `/home` with no
+    user, the exempt Pyodide home in both spellings and at the end of a sentence, a lowercase
+    `/users/` web path, and a `/tmp/claude-*/` scratch path that carries no username."""
     base = _git(repo, "rev-parse", "HEAD")
     _commit(
         repo,
@@ -659,6 +683,7 @@ def test_home_path_look_alikes_are_not_flagged(repo) -> None:
                 "the /home directory, and /home/ itself\n"
                 "Pyodide is rooted at /home/pyodide. Its glue is -home-pyodide-glue.\n"
                 "see https://api.github.com/users/octocat and /tmp/claude-1000/scratch\n"
+                "C--Users-<user>-src, C:\\Users\\<user>\\src and c:\\users\\<user> are placeholders\n"
             ),
             "shared.js": 'sys.path.insert(0, "/home/pyodide")\n',
         },
@@ -668,7 +693,27 @@ def test_home_path_look_alikes_are_not_flagged(repo) -> None:
     assert tree.returncode == 0, tree.stdout + tree.stderr
     history = _scan(repo, "--no-tree", "--range", f"{base}..HEAD")
     assert history.returncode == 0, history.stdout + history.stderr
-    assert "1 commit(s), 7 added line(s), 0 finding(s)" in history.stdout
+    assert "1 commit(s), 8 added line(s), 0 finding(s)" in history.stdout
+
+
+#: Text that names no person and IS reported, on purpose. Round 2 exempted a web URL's path and a
+#: bare dash-encoded word; both exemptions failed open (see the refusal cases above), so they were
+#: removed and these became accepted false positives. Built at runtime: this file is scanned too.
+_ACCEPTED_FALSE_POSITIVES = {
+    "a-web-url-path": "see https://example.com/" + "home/about",
+    "a-bare-encoded-word": "the " + "-".join(("", "home", "page")) + " link",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ACCEPTED_FALSE_POSITIVES))
+def test_the_accepted_false_positives_are_still_reported(repo, case) -> None:
+    """Strict on purpose. If someone brings back a skip for web paths or bare encoded words,
+    this fails and sends them to the refusal cases the last skip let through, instead of letting
+    the trade-off be undone quietly. The tree and full history held none of these when this was
+    written (2026-09-25), so the cost of reporting them is a rename, not a blocked release."""
+    _commit(repo, {"notes.md": f"{_ACCEPTED_FALSE_POSITIVES[case]}\n"}, "notes")
+    proc = _scan(repo, "--redact")
+    assert proc.returncode == 1 and "notes.md:1: home-path" in proc.stderr, proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize(

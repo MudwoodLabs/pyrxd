@@ -50,19 +50,25 @@ gh api -X PUT "repos/${REPO}/private-vulnerability-reporting" --silent || warn "
 ok "private vulnerability reporting enabled"
 
 say "Applying branch protection to ${BRANCH}"
-# MIRRORS THE LIVE SETTING, read 2026-09-25 with
+# REPRODUCES THE LIVE SETTING EXACTLY, read 2026-09-25 (after required signatures were
+# switched off) with
 #   gh api repos/MudwoodLabs/pyrxd/branches/main/protection
-# A re-run must not DOWNGRADE it. This block used to require one approval and
-# enforce_admins=false ("so the maintainer can push hotfixes if CI is wedged"), with a
-# `typecheck` check no workflow produces. Re-running that would have switched the admin
-# bypass back on and made every PR wait for a check that never reports.
+# A re-run must neither downgrade it nor add to it. This block used to require one
+# approval and enforce_admins=false ("so the maintainer can push hotfixes if CI is
+# wedged"), with a `typecheck` check no workflow produces. Re-running that would have
+# switched the admin bypass back on and made every PR wait for a check that never reports.
 #
 # Every rule applies to admins too, so nobody can merge past a red or missing required
 # check (docs/runbooks/cutting-a-release.md). A PR is required, but no approving review,
 # so a solo maintainer can merge their own PR once it is green. Each check is bound to the
 # GitHub Actions app (app_id 15368), so a status posted by anything else cannot satisfy it.
-# The check list must equal `_REQUIRED_CHECKS` in
-# tests/test_ci_workflows_check_every_pr_base.py, which fails if the two differ.
+#
+# NO REQUIRED SIGNATURES, and deliberately no call to that endpoint: with admins enforced,
+# signing blocked every PR, because PR head commits are unsigned. It is not part of this
+# PUT's document either (it has its own endpoint), so this script leaves it as it is.
+#
+# tests/test_ci_workflows_check_every_pr_base.py pins this whole document to a reviewed copy
+# of the live rules, and fails if this script makes any other protection call.
 gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
   --input - <<'EOF' >/dev/null
 {
@@ -94,8 +100,6 @@ gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
   "allow_fork_syncing": false
 }
 EOF
-# Signed commits are a separate endpoint; the live setting has them on.
-gh api -X POST "repos/${REPO}/branches/${BRANCH}/protection/required_signatures" --silent
 ok "branch protection applied to ${BRANCH}"
 
 say "Confirming current state"
@@ -116,18 +120,21 @@ cat <<'EOF'
 2. (Optional) Add a CI status badge to README.md once the public CI runs
    produce a stable badge URL.
 
-3. (Optional) Submit pyrxd 0.2.0 to PyPI:
-     poetry build && poetry publish
-   Confirm credentials in ~/.config/pypoetry/auth.toml first. Tag the
-   release in git and on GitHub once published.
+3. Publishing to PyPI is NOT a laptop step. A release is published by creating
+   a GitHub Release, which runs .github/workflows/publish.yml: its verify job,
+   the `pypi` environment and the attestations. `poetry publish` from a laptop
+   would skip all three. See docs/runbooks/cutting-a-release.md.
 
 4. Verify the public repo's Security tab shows:
    - Secret scanning: enabled
    - Dependabot alerts: enabled
    - Private vulnerability reporting: enabled
-   - Code scanning (CodeQL): consider enabling (free for public repos)
+   - Code scanning: results from the CodeQL workflow
 
-5. (Optional) Enable CodeQL via GitHub Actions:
-     Settings -> Code security and analysis -> Code scanning -> Set up
+5. CodeQL already runs from .github/workflows/codeql.yml (the required
+   "Analyze (Python)" check). Do NOT also switch on CodeQL "default setup" in
+   Settings: GitHub then rejects the workflow's SARIF upload, so that required
+   check stops passing (it no longer reports a success) and every merge to main
+   is blocked until default setup is switched off again.
 
 EOF

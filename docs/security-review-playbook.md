@@ -425,7 +425,13 @@ Four checks:
    with nothing after it, and the dash-encoded `-home-<user>-…` that
    tools derive from an absolute path (`~/.claude/projects/-home-<user>-…`,
    `/tmp/claude-<uid>/-home-<user>-…`). The last two were added after a
-   2026-09-25 probe: a repo holding only those forms scanned clean.
+   2026-09-25 probe: a repo holding only those forms scanned clean. A
+   re-review the same day found the Windows spellings (`C:\Users\<user>\…`
+   and its encoding `C--Users-<user>-…`, `Users` in any case) still missed;
+   they are covered now. A later attempt to stop flagging web URLs whose
+   path contains `/home/<word>` FAILED OPEN (a localhost dev server, an
+   editor link and a notebook URL all went unreported) and was removed:
+   such URLs are reported, on purpose.
 3. Private-project-name check — names listed in a local, gitignored
    `.private-names` file. It runs only where that file exists, so
    never in CI.

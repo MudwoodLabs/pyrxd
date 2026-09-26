@@ -26,14 +26,14 @@ gh pr checks <N> --repo MudwoodLabs/pyrxd --required --watch
 gh pr merge <N> --repo MudwoodLabs/pyrxd --squash --delete-branch
 ```
 
-**There is no `--admin` step.** This runbook used to merge with `--admin`,
-because protection then required one approving review, which a solo maintainer
-cannot give their own PR. But the flag does not bypass only the review: it merges
-a PR that fails ANY requirement, so a red or never-reported required check went
-through the same way. With `enforce_admins` on, `--admin` bypasses nothing: a merge with
-a red or missing required check is refused for everyone. If a required check is
-red, fix it; if one never reports, find out why. Do not look for another way
-around it.
+**There is no admin-override step.** This runbook used to merge with the
+administrator override, because protection then required one approving review,
+which a solo maintainer cannot give their own PR. But the override does not skip
+only the review: it merges a PR that fails ANY requirement, so a red or
+never-reported required check went through the same way. With `enforce_admins`
+on, the override skips nothing: a merge with a red or missing required check is
+refused for everyone. If a required check is red, fix it; if one never reports,
+find out why. Do not look for another way around it.
 
 If `main` moved after the checks ran, strict protection refuses the merge until
 the branch is updated. Use the PR's "Update branch" button, or

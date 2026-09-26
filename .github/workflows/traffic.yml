@@ -22,14 +22,22 @@
 # A repository secret is readable by any workflow on any branch that asks for it;
 # an environment secret only by a job that names the environment, and only from
 # the branches the environment admits (here: main). The `collect` job checks that
-# restriction before anything else and fails, naming the fix, if it is missing —
-# including the case GitHub creates silently: the first run that names an
+# restriction before anything else and fails, naming the fix, unless it is
+# exactly "Selected branches and tags" with the one branch rule `main`. That
+# includes the case GitHub creates silently: the first run that names an
 # environment that does not exist CREATES it, with no branch restriction at all.
-# Setup (maintainer, once): Settings -> Environments -> New environment `traffic`
-# -> Deployment branches and tags -> "Selected branches and tags" -> add branch
-# `main`; add TRAFFIC_TOKEN as an environment secret; delete the repository-level
-# TRAFFIC_TOKEN. The collector exits 2 with the remediation if the token is
-# missing or wrong.
+# Setup (maintainer, once, BEFORE this job's first run on main):
+#   1. Settings -> Environments -> New environment `traffic` -> Deployment
+#      branches and tags -> "Selected branches and tags" -> add the branch rule
+#      `main`. Not "Protected branches only": the check refuses it.
+#   2. Create a NEW fine-grained PAT (resource owner MudwoodLabs, only this
+#      repository, Administration: Read-only) and store it with
+#      `gh secret set TRAFFIC_TOKEN --env traffic --repo MudwoodLabs/pyrxd`,
+#      typing the value at the prompt.
+#   3. Delete the repository-level copy with
+#      `gh secret delete TRAFFIC_TOKEN --repo MudwoodLabs/pyrxd` (no --env), and
+#      REVOKE the old token: deleting a secret does not revoke the token in it.
+# The collector exits 2 with the remediation if the token is missing or wrong.
 #
 # PULL REQUESTS run a separate job with a read-only token, no persisted
 # credentials, no environment and no secrets. That job IMPORTS the PR's copies of
@@ -183,19 +191,21 @@ jobs:
                   "branch can run a job in it and read its secrets. GitHub creates an environment "
                   "exactly like that, silently, the first time a workflow names one that does not exist."
               )
-          if policy.get("custom_branch_policies"):
-              rules = sorted(
-                  (p.get("type") or "branch", p.get("name"))
-                  for p in api(f"{env}/deployment-branch-policies").get("branch_policies") or []
+          # 'Protected branches only' is refused: it admits every branch that is
+          # protected, including any protected LATER, so what it allows can widen
+          # without anyone touching this environment.
+          if policy.get("protected_branches") or not policy.get("custom_branch_policies"):
+              fail(
+                  f"environment {env!r} uses {policy}, which is not a list of named branches. "
+                  "'Protected branches only' admits every branch protected now or later."
               )
-              if rules != [("branch", "main")]:
-                  fail(f"environment {env!r} admits {rules}; it must admit exactly the branch main.")
-              admits = "the branch main"
-          elif policy.get("protected_branches"):
-              admits = "protected branches only"
-          else:
-              fail(f"environment {env!r} has a branch policy that restricts nothing: {policy}.")
-          print(f"environment {env!r}: deployments restricted to {admits}")
+          rules = sorted(
+              (p.get("type") or "branch", p.get("name"))
+              for p in api(f"{env}/deployment-branch-policies").get("branch_policies") or []
+          )
+          if rules != [("branch", "main")]:
+              fail(f"environment {env!r} admits {rules}; it must admit exactly the branch main.")
+          print(f"environment {env!r}: deployments restricted to the branch main")
           PY
 
       - name: Check out the data branch

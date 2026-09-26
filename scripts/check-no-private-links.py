@@ -12,11 +12,14 @@ Four checks:
    code or config; a bare ``/home/<user>`` with nothing after it; and the
    DASH-ENCODED form tools derive from one, ``-home-<user>-…``, as in
    ``~/.claude/projects/-home-<user>-apps-<repo>/`` or
-   ``/tmp/claude-1000/-home-<user>-…``. These leak the author's username and
-   local layout, break in every other clone, and — when they point into a
-   sibling project — leak that project's existence. Username-agnostic forms
-   like ``~/.pyrxd/config.toml`` are NOT flagged: that's the correct
-   way to document a home-relative path.
+   ``/tmp/claude-1000/-home-<user>-…``; and the Windows spellings,
+   ``C:\\Users\\<user>\\…`` and its encoding ``C--Users-<user>-…``. These leak
+   the author's username and local layout, break in every other clone, and —
+   when they point into a sibling project — leak that project's existence.
+   Username-agnostic forms like ``~/.pyrxd/config.toml`` are NOT flagged:
+   that's the correct way to document a home-relative path. A web URL whose
+   path has a ``/home/<word>`` segment IS flagged: a skip for URLs failed
+   open, so recall wins over the rare false positive.
 3. **Private project names** — read from a local, gitignored
    ``.private-names`` file. Without that file the check does not run, and
    the output says so. It therefore never runs in CI.
@@ -147,7 +150,20 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 #   - /root/... — no username embedded; rare and not a personal leak
 #   - /tmp/... — scratch paths carry no username and are a normal way
 #     to describe a throwaway clone or fixture dump
-_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)(?:/[^\s`)\"'<>]*)?")
+#
+# NOT skipped, on purpose: a web URL whose PATH has a ``/home/<word>`` segment. A skip for http(s)
+# URL paths was tried and FAILED OPEN: a localhost dev server, a loopback address, a notebook
+# server's ``/tree/home/<user>`` URL, an editor's ``vscode://file/home/<user>/`` link and a path
+# glued to a URL with ``|`` or ``,`` all stopped being reported. Recall wins: the tree and the
+# full history held no false positive of that kind when it was removed (2026-09-25), and a false
+# positive fails loudly and names the line, where a false negative publishes the leak.
+#
+# Also matches the Windows spelling, ``C:\Users\<user>\...``, with ``Users`` in any case and a
+# doubled ``\\`` as in source code. Group ``user`` is the username in every form.
+_HOME_PATH_RE = re.compile(
+    r"(?:file://)?(?:/(?:home|Users)/|\b[A-Za-z]:\\{1,2}(?i:users)\\{1,2})"
+    r"(?P<user>[a-zA-Z0-9._-]+)(?:[/\\][^\s`)\"'<>]*)?"
+)
 
 #: The SAME leak with its slashes turned into dashes. Tools that key a directory on an absolute
 #: path encode it this way — Claude Code keeps per-project state under
@@ -158,11 +174,19 @@ _HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/([a-zA-Z0-9._-]+)(?:/[^
 #: follows, which does not matter for flagging it.
 #:
 #: The segment must START the token: nothing word-like, no ``.`` and no ``-`` immediately before
-#: it. So ``--home-dir`` (a flag) and ``non-home-directory`` (prose) do not match, while
-#: a segment after ``/`` and a backticked one do. A placeholder (``-home-<user>-``) does not match,
-#: for the same reason as ``/home/<user>/``. A SINGLE-dash flag spelled ``-home-<word>`` would
-#: match and be reported; none is in the tree (checked 2026-09-25), and the report names the line.
-_ENCODED_HOME_PATH_RE = re.compile(r"(?<![\w.-])-(?:home|Users)-([a-zA-Z0-9._]+)[^\s`)\"'<>]*")
+#: it. So ``--home-dir`` (a flag) and ``non-home-directory`` (prose) do not match. A placeholder
+#: (``-home-<user>-``) does not match, for the same reason as ``/home/<user>/``.
+#:
+#: On Windows the drive letter comes first and its colon and backslash become two dashes:
+#: ``C:\Users\<user>\src`` is encoded ``C--Users-<user>-src``. That form is matched too, with
+#: ``Users`` in any case.
+#:
+#: NO "must look like a path" requirement. One was tried, to spare a bare ``-home-<word>`` in
+#: prose, and it cost real leaks: the encoded user alone in quotes or backticks, and at the end of
+#: a sentence. A bare ``-home-<word>`` is reported, and the report names the line.
+_ENCODED_HOME_PATH_RE = re.compile(
+    r"(?<![\w.-])(?:[A-Za-z]--(?i:users)|-(?:home|Users))-(?P<user>[a-zA-Z0-9._]+)[^\s`)\"'<>]*"
+)
 
 #: Home directories that name no person. Each is an exemption, so the membership is pinned by
 #: ``tests/test_leak_scan_covers_what_is_published.py`` rather than trusted as prose.
@@ -180,17 +204,17 @@ def _is_personal_home(user: str) -> bool:
 
 
 def _home_path_matches(content: str) -> list[re.Match[str]]:
-    """Every home-path leak in *content*, both spellings, in order.
+    """Every home-path leak in *content*, every spelling, in order.
 
     THE ONE DEFINITION, used by every scan through :func:`scan_text`. An encoded match that sits
-    inside a slash-form match (``/home/<user>/.claude/projects/-home-<user>-…``) is the same leak and is
-    reported once, as the slash form.
+    inside a slash-form match (``/home/<user>/.claude/projects/-home-<user>-…``) is the same leak
+    and is reported once, as the slash form.
     """
-    plain = [m for m in _HOME_PATH_RE.finditer(content) if _is_personal_home(m.group(1))]
+    plain = [m for m in _HOME_PATH_RE.finditer(content) if _is_personal_home(m.group("user"))]
     encoded = [
         m
         for m in _ENCODED_HOME_PATH_RE.finditer(content)
-        if _is_personal_home(m.group(1)) and not any(p.start() <= m.start() < p.end() for p in plain)
+        if _is_personal_home(m.group("user")) and not any(p.start() <= m.start() < p.end() for p in plain)
     ]
     return sorted(plain + encoded, key=lambda m: m.start())
 
