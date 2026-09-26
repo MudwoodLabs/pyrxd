@@ -439,14 +439,23 @@ def _render_txid_human(payload: dict) -> str:
         # payload per minted glyph; printing one under a bare "Reveal metadata"
         # heading told the reader it described the transaction. One observed
         # mainnet reveal mints 35 refs from 36 inputs.
+        # And MINTED is counted from the outputs (`of_n_minted`), not from the envelopes: an input
+        # can carry a payload and mint nothing. The page words it identically (`inspect.js`).
         n_payloads = metadata.get("of_n_payloads")
         if n_payloads:
+            n_minted = metadata.get("of_n_minted", n_payloads)
+            said = (
+                f"1 of {n_payloads} glyphs minted here"
+                if n_minted == n_payloads
+                else f"1 of {n_payloads} payloads here, {n_minted} minting a token"
+            )
             lines.append(
-                f"Reveal metadata (from input {metadata['input_index']} — "
-                f"1 of {n_payloads} glyphs minted here; see metadata_inputs for the rest):"
+                f"Reveal metadata (from input {metadata['input_index']} — {said}; see metadata_inputs for the rest):"
             )
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        if metadata.get("mints") is False:
+            lines.append("  token:    none — this input mints no token here")
         _pb = metadata.get("payload_binding")
         if _pb:
             # Same reasoning as the browser: every state, including "unchecked". Flagged: the
@@ -570,12 +579,21 @@ def _render_txid_human(payload: dict) -> str:
         for row in (payload.get("metadata_inputs") or [])
         if row["input_index"] != (metadata or {}).get("input_index")
     ]
-    if others:
+    # Minted is what the outputs create (`mints`), so a payload on an input that mints nothing is
+    # listed as that, and the heading counts only the others that do. Worded as the page words it.
+    hidden = payload.get("metadata_inputs_not_listed") or {}
+    if others or hidden.get("count"):
+        total = len(others) + int(hidden.get("count") or 0)
+        minting = sum(1 for row in others if row.get("mints", True)) + int(hidden.get("minting") or 0)
         lines.append("")
-        lines.append(f"Other glyphs minted in this transaction ({len(others)}):")
+        if minting == total:
+            lines.append(f"Other glyphs minted in this transaction ({total}):")
+        else:
+            lines.append(f"Other payloads in this transaction ({total}), {minting} minting a token:")
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
-            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
+            tail = "" if row.get("mints", True) else " — mints no token"
+            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}{tail}")
 
     # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
     # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —

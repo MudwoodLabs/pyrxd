@@ -323,6 +323,10 @@ _PROSE_EVIDENCE = {
     # `algorithm_id` above, and declared for the same reason: the generic short-value
     # rule would demand a standalone token the renderer correctly does not print.
     "version": {1: "v1", 2: "v2"},
+    # Whether the transaction creates a ref from that input's outpoint. A payload that mints is
+    # the ordinary case and carries no extra words; one that mints NOTHING says so, on the
+    # headline ("token: none — this input mints no token here") and on an other-glyph row.
+    "mints": {True: None, False: "mints no token"},
 }
 
 #: Below this length, "is the evidence in the text" stops being a question about the
@@ -1166,6 +1170,10 @@ def _tx_payloads() -> dict[str, dict]:
     commit_nft = build_commit_locking_script(os.urandom(32), pkh, is_nft=True)
     empty = b""
 
+    def minted_from(input_index: int) -> bytes:
+        """The singleton for the outpoint `_tx_payload`'s input *input_index* spends."""
+        return build_nft_locking_script(pkh, GlyphRef(txid="ab" * 32, vout=input_index))
+
     def dmint(height: int, *, tref: GlyphRef, reward: int = 100_000, max_height: int = 1000) -> bytes:
         return build_dmint_v1_contract_script(
             height=height,
@@ -1184,14 +1192,23 @@ def _tx_payloads() -> dict[str, dict]:
             [_reveal_scriptsig("Torch", ticker="TRCH", protocol=(1, 6))],
             [(ft, 1000), (p2pkh, 546)],
         ),
-        "single-glyph": _tx_payload([_reveal_scriptsig("Solo", ticker="SOLO")], [(nft, 546)]),
+        # These MINT: each output is the singleton for an input's outpoint (`_tx_payload` spends
+        # "ab"*32:<input index>), which is what makes a payload a glyph minted here. Before #743
+        # round 2 they carried a token ref from nowhere and still read "3 glyphs minted".
+        "single-glyph": _tx_payload([_reveal_scriptsig("Solo", ticker="SOLO")], [(minted_from(0), 546)]),
         "multi-glyph": _tx_payload(
             [
                 _reveal_scriptsig("First", ticker="ONE"),
                 _reveal_scriptsig("Second", ticker="TWO"),
                 _reveal_scriptsig("Third", ticker="THREE"),
             ],
-            [(nft, 546)],
+            [(minted_from(0), 546), (minted_from(1), 546), (minted_from(2), 546)],
+        ),
+        # The decoy a node accepts: a payload on input 0 that mints nothing, the real glyph on
+        # input 1. The headline is the one minted; the decoy is listed as minting no token.
+        "decoy-first": _tx_payload(
+            [_reveal_scriptsig("Tether USD", ticker="USDT"), _reveal_scriptsig("RealToken", ticker="REAL")],
+            [(minted_from(1), 546)],
         ),
         # A TIMELOCK envelope: the page had a banner saying a time condition
         # exists and rendered nothing about what it is.
@@ -1519,6 +1536,19 @@ class TestAMultiGlyphRevealSaysWhichGlyph:
         assert "Reveal metadata (from input 0)" in text
         assert "glyphs minted here" not in text
         assert "Other glyphs" not in text
+        assert "mints no token" not in text, "a payload that mints must not be told it does not"
+
+    def test_a_payload_that_mints_nothing_is_not_counted_as_minted(self, tx_payloads, tx_rendered):
+        """#743 round 2: two payloads, one glyph minted. The page said "1 of 2 glyphs minted here"
+        and listed the decoy under "Other glyphs minted", with the decoy as the headline."""
+        payload = tx_payloads["decoy-first"]
+        assert (payload["metadata"]["of_n_payloads"], payload["metadata"]["of_n_minted"]) == (2, 1)
+        assert payload["metadata"]["input_index"] == 1 and payload["metadata"]["name"] == "RealToken"
+        text = tx_rendered["decoy-first"]
+        assert "Reveal metadata (from input 1 — 1 of 2 payloads here, 1 minting a token)" in text
+        assert "glyphs minted here" not in text and "Other glyphs minted" not in text
+        assert "Other payloads in this transaction (1), 0 minting a token" in text
+        assert "nft — Tether USD / USDT — mints no token" in text
 
 
 class TestTheCommitNftNoteStopsClaimingAnFtDeploy:

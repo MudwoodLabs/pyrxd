@@ -127,12 +127,12 @@ rejects a valid script or — when the byte it resumes on happens to be a valid
 single-byte opcode — silently resynchronizes, reporting a **phantom** ref and
 dropping the real one. Implementations MUST use the five-opcode set.
 
-pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:562-584`) over
-the constant `REF_OPCODES` (`:511`); the differential test against a port of the
+pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:1120-1142`) over
+the constant `REF_OPCODES` (`:1075`); the differential test against a port of the
 consensus rule is `TestRefWalkerConsensusDifferential` in `tests/test_glyph.py`.
 A script that ends mid-push or mid-ref-operand has ambiguous length;
 implementations MUST refuse it rather than guess (`TruncatedScriptError`,
-`src/pyrxd/glyph/script.py:451-457`).
+`src/pyrxd/glyph/script.py:1078-1084`).
 
 ## 3. Identifiers
 

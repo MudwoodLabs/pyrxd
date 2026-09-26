@@ -1489,6 +1489,16 @@ def _commit_obligation(spent_script: bytes) -> tuple[str, bytes, int | None] | N
     (:data:`~pyrxd.glyph.script.COMMIT_SCRIPT_RE`). A commit with ``OP_0`` there demands that its
     ref appear in NO output — it mints nothing — and reading one as a commit is how a decoy
     placed first read ``bound``.
+
+    WHICH DAT FORMS. The ones the two builders emit, read from their source rather than from
+    samples: Photonic's ``datCommitScript`` at ``becf41a7`` (unchanged since it was added in
+    ``36d8d34``, 2024-04-05) and pyrxd's :func:`~pyrxd.glyph.script.build_dat_commit_locking_script`
+    both build ``OP_HASH256 <h> OP_EQUALVERIFY "dat" OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH,
+    70 bytes, or 126 behind a delegate prefix. Mainnet also carries a 65-byte form with no ``"dat"``
+    push (``77df45a9…1b22:0``), which neither builder emits and whose builder is not known here.
+    It is NOT recognised: the templates here are the ones the builders are known to emit, not
+    ones inferred from samples. :func:`_payload_binding` says only that it is unrecognised, never
+    that nobody committed.
     """
     from .script import (
         extract_payload_hash_from_commit_script,
@@ -1552,9 +1562,9 @@ def _payload_binding(
     """Is the payload shown the one a commit bound — and to WHAT did it bind it?
 
     A commit output's locking script carries ``sha256d(envelope CBOR)`` as its ``payload_hash``.
-    Both readers take the FIRST ``gly`` push in the FIRST input that decodes, so the name, attrs
-    and creator shown to a human need not be the ones any commit committed to: inputs
-    ``[decoy, real]`` attribute the decoy, ``[real, decoy]`` the real one.
+    The headline payload is chosen from the inputs' envelopes (:func:`_reveal_attribution`: the
+    first whose outpoint the outputs mint, else the first at all), so the name, attrs and creator
+    shown to a human need not be the ones any commit committed to. This says whether one did.
 
     WHAT EACH STATE ESTABLISHES, AND NO MORE:
 
@@ -1566,8 +1576,11 @@ def _payload_binding(
         payload is the one committed to for the token those outputs carry. It is NOT a statement
         about the transaction's other outputs: a reveal that mints two tokens from two commits is
         ``bound`` for whichever input is attributed, and only for its own token — which is why
-        the reason names the outputs. Nor does it check signatures, or the delegate burn a
-        delegate-prefixed commit also demands.
+        the reason names the outputs. Nor does it say a node would accept the transaction: it
+        checks no signature, not the delegate burn a delegate-prefixed commit also demands, and
+        not the rest of the reference rules — a singleton beside a normal push of the same ref
+        reads ``bound`` here, and a node refuses it (``bad-txns-…-reference-operations``, measured
+        by the round-2 review of #743).
     ``bound-no-token``
         The same hash equality against a DAT commit. A DAT commit demands no ref, so the payload
         is bound as DATA and describes no output here — whatever protocol it declares. It is kept
@@ -1586,8 +1599,11 @@ def _payload_binding(
         The hash matches, and the transaction does not create the commit's ref as the commit
         demands. A node rejects that spend too, for the ``OP_REFTYPE_OUTPUT`` check.
     ``not-a-commit``
-        The attributed input spent something that is none of the three commit templates. Nothing
-        here shows anyone committed to the envelope.
+        The attributed input spent a script that is none of the commit templates pyrxd recognises
+        (:func:`_commit_obligation`). That is ALL it says. It is not evidence that nobody committed
+        to the envelope: the mainnet DAT reveal ``e5c67100…be5d`` spends a 65-byte hash-lock
+        neither builder emits (``77df45a9…1b22:0``) whose ``payload_hash`` is its envelope's, and
+        it reads this (``tests/fixtures/dat_65_byte_commit_mainnet.json``).
     ``unchecked``
         The spent script (or the envelope's bytes) was not available.
 
@@ -1609,8 +1625,7 @@ def _payload_binding(
     if commit is None:
         return {
             "state": "not-a-commit",
-            "reason": "the attributed input did not spend an NFT, FT or DAT commit output, so nothing "
-            "here shows that anyone committed to this envelope",
+            "reason": "the output the attributed input spent is not a commit template pyrxd recognises",
         }
     kind, expected, required = commit
     if metadata_cbor is None:
@@ -1828,10 +1843,84 @@ def _walk_outputs_to_the_end(reader, total: int) -> list[tuple[int, int]]:
     return spans
 
 
-def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector) -> tuple | None:
+def _minting_inputs(inputs: Sequence, output_scripts: Sequence[bytes]) -> set[int]:
+    """The indices of the inputs whose OUTPOINT this transaction's outputs push as a ref.
+
+    A ref is created from the outpoint an input spends, and only by the transaction spending it,
+    so these are the tokens this transaction MINTS — counted from what the outputs carry, not from
+    how many envelopes the inputs push. An envelope on an input that is in no output mints nothing:
+    a DAT reveal, or a decoy spending a commit whose ``OP_REFTYPE_OUTPUT OP_0`` demands its ref be
+    in NO output (a node accepts that transaction).
+
+    Pushed means ``OP_PUSHINPUTREF``/``OP_PUSHINPUTREFSINGLETON`` found by the consensus opcode walk,
+    as in :func:`_output_ref_type`. A script is walked only if some ``0xd0``/``0xd8`` byte in it is
+    followed by the 36 bytes of one of these outpoints, so the cost is a byte search over the
+    outputs plus a walk of the few that could match. A script that does not decode contributes
+    nothing, and the refs a partial walk saw before failing are discarded with it.
+    """
+    from ..constants import PUSH_REF_OPCODES
+    from .script import TruncatedScriptError, iter_input_refs
+
+    by_ref: dict[bytes, int] = {}
+    for idx, inp in enumerate(inputs):
+        if inp.source_txid:
+            wire = bytes.fromhex(inp.source_txid)[::-1] + int(inp.source_output_index).to_bytes(4, "little")
+            by_ref.setdefault(wire, idx)
+    minted: set[int] = set()
+    if not by_ref:
+        return minted
+    for script in output_scripts:
+        if not _may_push_one_of(script, by_ref):
+            continue
+        found: set[int] = set()
+        try:
+            for op, operand in iter_input_refs(script):
+                if op in PUSH_REF_OPCODES and bytes(operand) in by_ref:
+                    found.add(by_ref[bytes(operand)])
+        except TruncatedScriptError:
+            continue
+        minted |= found
+    return minted
+
+
+def _may_push_one_of(script: bytes, refs: Mapping[bytes, int]) -> bool:
+    """Is some ``0xd0``/``0xd8`` byte in *script* followed by one of *refs*? A cheap superset of
+    "pushes one of them": a byte inside pushed data can match too, and the walk decides."""
+    for marker in (b"\xd0", b"\xd8"):
+        at = script.find(marker)
+        while at != -1:
+            if script[at + 1 : at + 37] in refs:
+                return True
+            at = script.find(marker, at + 1)
+    return False
+
+
+def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector, minting: set[int]) -> tuple | None:
     """``(input_index, metadata, envelope_cbor, spent_outpoint)`` for the reveal the readers
-    attribute, or ``None``. The one rule both the classifier and the spent-binding check use."""
-    found = inspector.find_reveal_metadata(scriptsigs)
+    attribute, or ``None``. The one rule both the classifier and the spent-binding check use.
+
+    WHICH PAYLOAD IS THE HEADLINE. The first input carrying a decodable payload whose outpoint the
+    outputs push as a ref (*minting*, from :func:`_minting_inputs`), and only if no input's does,
+    the first decodable payload at all. It used to be the first decodable payload, full stop, so an
+    envelope placed first on an input that mints nothing — a commit whose ``OP_REFTYPE_OUTPUT OP_0``
+    demands exactly that, in a transaction a node accepts — was the headline over the token the
+    transaction really minted. A reveal that mints nothing (DAT, or no token output at all) is read
+    exactly as before. :meth:`GlyphInspector.find_reveal_metadata` keeps its own first-wins rule.
+    """
+    found = None
+    first = None
+    for idx, scriptsig in enumerate(scriptsigs):
+        if first is not None and idx not in minting:
+            continue  # only a minting payload can displace the first one
+        metadata = inspector.extract_reveal_metadata(scriptsig)
+        if metadata is None:
+            continue
+        if idx in minting:
+            found = (idx, metadata)
+            break
+        if first is None:
+            first = (idx, metadata)
+    found = found or first
     if found is None:
         return None
     input_idx, metadata = found
@@ -1886,7 +1975,9 @@ def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *,
 
     inputs, spans = _checked_inputs_and_output_spans(txid_hex, raw)
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in inputs]
-    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector())
+    data = bytes(raw)
+    output_scripts = [data[start:end] for start, end in spans]
+    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector(), _minting_inputs(inputs, output_scripts))
     if attributed is None or attributed[3] is None:
         return None
     _idx, _metadata, cbor, outpoint = attributed
@@ -1903,8 +1994,7 @@ def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *,
         return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc))}
     except Exception as exc:  # anything else about the bytes: the same honest state, with what went wrong
         return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc) or type(exc).__name__)}
-    data = bytes(raw)
-    return _payload_binding(cbor, script, outpoint, [data[start:end] for start, end in spans])
+    return _payload_binding(cbor, script, outpoint, output_scripts)
 
 
 # --- Counting what a bounded caller does not list --------------------------------------------
@@ -2027,7 +2117,7 @@ def _classify_raw_tx(
       ``_MAX_INPUT_COUNT`` entries — bounds total classification work.
     * Wrap per-output classification in try/except so one malformed script
       cannot abort the listing.
-    * Use ``GlyphInspector.find_reveal_metadata`` (already swallows
+    * Use ``GlyphInspector.extract_reveal_metadata`` (already swallows
       exceptions around ``decode_payload``) for input metadata extraction.
     * Sanitize every CBOR-derived display string before it leaves this
       function.
@@ -2173,7 +2263,12 @@ def _classify_raw_tx(
     # does NOT escape U+202E and friends.
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
-    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector)
+    # EVERY output, whatever `only_vout` and `max_rows` list: which inputs this transaction mints
+    # from, `payload_binding` (what `OP_REFTYPE_OUTPUT` would answer) and the relationship
+    # verdicts (what consensus backs) are all questions about the whole transaction.
+    output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
+    minting = _minting_inputs(tx.inputs, output_scripts)
+    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector, minting)
     found = None if attributed is None else (attributed[0], attributed[1])
 
     # dMint mint-claim scriptSig: if vin[0] is a dMint mint claim (4 canonical
@@ -2196,22 +2291,32 @@ def _classify_raw_tx(
     # to see WHICH input a name belongs to, and `metadata.input_index` already says
     # which one the headline payload came from. What was missing was any signal
     # that other payloads existed at all.
+    #
+    # WHAT IS MINTED IS COUNTED FROM THE OUTPUTS, not from the envelopes (#743 round 2). Each entry
+    # says whether the transaction creates a ref from that input's outpoint (`mints`), and
+    # `of_n_minted` counts those. They used to be one number: an envelope on an input that mints
+    # nothing — a decoy whose commit demands that its ref be in NO output, in a transaction a node
+    # accepts — made both surfaces say "1 of 2 glyphs minted here" where one was.
     metadata_inputs: list[dict] = []
     read_by_reveal_reader: set[int] = set()  # every input `extract_reveal_metadata` decoded
     payload_count = 0
+    minted_count = 0
     others_listed = 0
     others_not_listed = 0
+    others_not_listed_minting = 0
     for idx, ss in enumerate(scriptsigs):
         m = inspector.extract_reveal_metadata(ss)
         if m is None:
             continue
         read_by_reveal_reader.add(idx)
         payload_count += 1
+        minted_count += idx in minting
         # The headline payload's own entry is always listed; the OTHERS are what a reader has
         # no other way to learn about, and they are what `max_rows` bounds.
         if found is None or idx != found[0]:
             if max_rows is not None and others_listed >= max_rows:
                 others_not_listed += 1
+                others_not_listed_minting += idx in minting
                 continue
             others_listed += 1
         metadata_inputs.append(
@@ -2220,6 +2325,7 @@ def _classify_raw_tx(
                 "classification": _classify_metadata_protocol(m),
                 "name": _sanitize_display_string(m.name) if m.name else "",
                 "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
+                "mints": idx in minting,
             }
         )
     # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
@@ -2291,9 +2397,6 @@ def _classify_raw_tx(
     metadata_payload: dict | None = None
     if attributed is not None:
         input_idx, metadata, _cbor, _outpoint = attributed
-        # EVERY output, whatever `only_vout` and `max_rows` listed: `payload_binding` asks what
-        # `OP_REFTYPE_OUTPUT` would, and the relationship verdicts what consensus backs.
-        output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
         # WHAT THIS ATTRIBUTION IS WORTH. Reported for every inspect, because
         # "I did not check" and "I checked and it held" are opposite facts and the
         # silent one reads as the reassuring one.
@@ -2306,6 +2409,9 @@ def _classify_raw_tx(
             # it from here — and it is also the outpoint a human would go and look
             # at by hand.
             "input_outpoint": _outpoint,
+            # Does this transaction create a ref from that outpoint — mint the token this payload
+            # would describe? Read off the outputs; `payload_binding` says what the commit adds.
+            "mints": input_idx in minting,
             "payload_binding": _payload_binding(_cbor, (spent_scripts or {}).get(input_idx), _outpoint, output_scripts),
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             # Human-friendly highest-specificity protocol label (e.g. "wave",
@@ -2459,6 +2565,8 @@ def _classify_raw_tx(
         # Say it on the headline payload too. A caller reading only `metadata` must
         # not be able to mistake one glyph's fields for the transaction's.
         metadata_payload["of_n_payloads"] = payload_count
+        # ...and how many of those this transaction MINTS, which is not the same number.
+        metadata_payload["of_n_minted"] = minted_count
 
     payload = {
         "form": "txid",
@@ -2502,7 +2610,7 @@ def _classify_raw_tx(
             "by_kind": envelopes_by_kind,
         }
     if others_not_listed:
-        payload["metadata_inputs_not_listed"] = {"count": others_not_listed}
+        payload["metadata_inputs_not_listed"] = {"count": others_not_listed, "minting": others_not_listed_minting}
     # Bounded as a whole, like `_inspect_script`'s payload: the output rows already are, but
     # `metadata` carries reveal-envelope integers of its own — a TIMELOCK's `unlock_at` is
     # `int(...)` of raw CBOR with no width limit — and so will whatever field is added next.

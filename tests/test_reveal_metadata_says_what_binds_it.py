@@ -1,14 +1,16 @@
 """The metadata shown for a transaction need not be the metadata its commit committed to.
 
 A commit output's locking script carries ``sha256d(envelope CBOR)`` as ``payload_hash``.
-Both readers take the FIRST ``gly`` push in the FIRST input that decodes, so given inputs
-``[decoy, real]`` the decoy wins:
+``GlyphInspector.find_reveal_metadata`` takes the FIRST ``gly`` push in the FIRST input that
+decodes, so given inputs ``[decoy, real]`` the decoy wins:
 
     inputs = [decoy, real]  -> attributed input 0, name='EVIL'
     inputs = [real, decoy]  -> attributed input 0, name='real-token'
 
-Whichever is first. ``metadata.payload_binding`` says what, if anything, binds the payload
-shown — and, since the 0.25.0 panel, to WHAT:
+Whichever is first. The inspect classifier's headline now prefers the first payload whose
+input's outpoint the outputs mint (#743 round 2), so a decoy that mints nothing no longer heads
+a transaction that mints something. ``metadata.payload_binding`` says what, if anything, binds
+the payload shown — and, since the 0.25.0 panel, to WHAT:
 
 * ``bound`` needs an NFT or FT commit (ref-type operand exactly ``OP_2``/``OP_1``) whose hash
   matches, AND the commit's outpoint among the transaction's OUTPUTS as the ref type that
@@ -16,7 +18,9 @@ shown — and, since the 0.25.0 panel, to WHAT:
 * ``bound-no-token`` is a DAT commit: bound as data, describing no output.
 * ``mismatch`` and ``commit-unsatisfied`` are transactions a node REJECTS — the commit's hash
   check or its ``OP_REFTYPE_OUTPUT`` check fails — so they are bytes that were never mined.
-* ``not-a-commit`` / ``unchecked`` establish nothing.
+* ``not-a-commit`` says only that pyrxd does not recognise the spent script as a commit —
+  NOT that nobody committed (a 65-byte mainnet DAT commit is unrecognised and does bind).
+  ``unchecked`` establishes nothing.
 
 TWO THINGS THE PANEL FOUND, AND WHY THE FIXTURES CHANGED.
 
@@ -334,6 +338,68 @@ class TestADatCommitBindsData:
         spent = build_dat_commit_locking_script(hash256(cbor), Hex20(os.urandom(20)))
         assert _bind(cbor, spent, [_nft_out(_OUTPOINT_TXID)])["state"] == "bound-no-token"
 
+    @pytest.mark.parametrize("delegated", [False, True], ids=["bare", "delegate-prefixed"])
+    def test_photonics_dat_commit_spelled_from_its_builder_is_recognised(self, delegated: bool) -> None:
+        """Photonic ``datCommitScript`` at ``becf41a7`` (``packages/lib/src/script.ts:351-378``),
+        transcribed op by op here rather than taken from pyrxd's builder: ``OP_HASH256``
+        ``<payloadHash>`` ``OP_EQUALVERIFY``, ``Buffer.from("dat")`` ``OP_EQUALVERIFY``,
+        ``glyphMagicBytesBuffer`` ``OP_EQUALVERIFY``, ``buildPublicKeyHashOut``; with a delegate,
+        ``addDelegateRefScript`` first (``:267-279``). The only DAT form either builder emits."""
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        pkh = os.urandom(20)
+        body = (
+            b"\xaa" + b"\x20" + hash256(cbor) + b"\x88"  # OP_HASH256 <payloadHash> OP_EQUALVERIFY
+            + b"\x03dat" + b"\x88"  # "dat" OP_EQUALVERIFY
+            + b"\x03gly" + b"\x88"  # glyphMagicBytesBuffer OP_EQUALVERIFY
+            + b"\x76\xa9\x14" + pkh + b"\x88\xac"  # P2PKH
+        )  # fmt: skip
+        if delegated:
+            ref = GlyphRef(txid="ef" * 32, vout=3).to_bytes()
+            # OP_PUSHINPUTREF <ref> OP_DUP OP_REFOUTPUTCOUNT_OUTPUTS OP_0 OP_NUMEQUALVERIFY
+            # d1 OP_SWAP 6a0364656c OP_CAT OP_CAT OP_HASH256 OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS OP_1 OP_NUMEQUALVERIFY
+            body = b"\xd0" + ref + b"\x76\xde\x00\x9d" + b"\x01\xd1\x7c\x05\x6a\x03del\x7e\x7e\xaa\xe6\x51\x9d" + body
+        assert len(body) == (126 if delegated else 70)
+        verdict = _bind(cbor, body, [_P2PKH])
+        assert (verdict["state"], verdict["commit"]) == ("bound-no-token", "dat")
+
+    def test_the_65_byte_mainnet_dat_commit_is_unrecognised_and_says_only_that(self) -> None:
+        """#743 round 2, L1. A real DAT reveal (``e5c67100…be5d``, block 449835) spends a 65-byte
+        commit — ``OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH, no ``"dat"`` push —
+        that neither Photonic's builder nor pyrxd's emits, and whose ``h`` IS the envelope's
+        ``sha256d``. It stays unrecognised (the templates are the builders', not inferred from a
+        sample), and the verdict says exactly that. It used to add "so nothing here shows that
+        anyone committed to this envelope", which this transaction makes false.
+
+        Through the real ``--fetch`` path, with the mainnet bytes."""
+        import json
+        from pathlib import Path
+
+        from pyrxd.cli.glyph_inspect import _inspect_txid_inner
+
+        pair = json.loads(
+            (Path(__file__).resolve().parent / "fixtures" / "dat_65_byte_commit_mainnet.json").read_text()
+        )
+        commit, reveal = pair["commit"], pair["reveal"]
+        craw, rraw = bytes.fromhex(commit["raw"]), bytes.fromhex(reveal["raw"])
+        assert hash256(craw)[::-1].hex() == commit["txid"] and hash256(rraw)[::-1].hex() == reveal["txid"]
+        # The premises, from the bytes: a 65-byte hash-lock whose hash is the envelope's.
+        spent = bytes(Transaction.from_hex(craw).outputs[0].locking_script.serialize())
+        assert len(spent) == 65 and spent[:2] == b"\xaa\x20" and spent[34:40] == b"\x88\x03gly\x88"
+        envelope = GlyphInspector().extract_reveal_cbor(
+            bytes(Transaction.from_hex(rraw).inputs[0].unlocking_script.serialize())
+        )
+        assert spent[2:34] == hash256(envelope), "the commit DID commit to this envelope"
+
+        client = _StubElectrumX({commit["txid"]: craw, reveal["txid"]: rraw})
+        payload = asyncio.run(_inspect_txid_inner(client, reveal["txid"]))
+        metadata = payload["metadata"]
+        assert commit["txid"] in client.requested
+        assert (metadata["classification"], metadata["mints"]) == ("dat", False)
+        assert metadata["payload_binding"] == {
+            "state": "not-a-commit",
+            "reason": "the output the attributed input spent is not a commit template pyrxd recognises",
+        }
+
 
 def test_a_commit_that_committed_to_a_DIFFERENT_payload_reads_mismatch() -> None:
     """Not "unverified" — demonstrably not this payload, so never a transaction a node accepted."""
@@ -345,11 +411,15 @@ def test_a_commit_that_committed_to_a_DIFFERENT_payload_reads_mismatch() -> None
 
 
 def test_an_input_that_spent_something_other_than_a_commit_says_so() -> None:
-    """Distinct from `unchecked`: here the evidence exists and shows no binding at all."""
+    """Distinct from `unchecked`: the spent script is here and pyrxd does not recognise it — and
+    that is ALL the reason says. It used to add "so nothing here shows that anyone committed to
+    this envelope", which is false for the 65-byte mainnet DAT commit below."""
     _, cbor = _envelope("x")
     verdict = _bind(cbor, _P2PKH, [_nft_out(_OUTPOINT_TXID)])
-    assert verdict["state"] == "not-a-commit"
-    assert "did not spend an NFT, FT or DAT commit output" in verdict["reason"]
+    assert verdict == {
+        "state": "not-a-commit",
+        "reason": "the output the attributed input spent is not a commit template pyrxd recognises",
+    }
 
 
 def test_no_spent_script_reads_unchecked_and_never_bound() -> None:
@@ -511,9 +581,11 @@ class TestTheDecoyThatANodeAccepts:
     """C-L2 / H-M2 through the real ``--fetch`` path. Each reveal below is one a node ACCEPTS
     (given signatures): every commit it spends is satisfied by its outputs."""
 
-    def test_an_op0_decoy_placed_first_no_longer_reads_bound(self) -> None:
-        """The panel's probe. The decoy commit demands its ref in NO output, and gets that; the
-        real commit gets its singleton. Before: headline "Tether USD", ``bound``."""
+    def test_an_op0_decoy_placed_first_is_no_longer_the_headline(self) -> None:
+        """The panel's probe, and #743 round 2's case G. The decoy commit demands its ref in NO
+        output, and gets that; the real commit gets its singleton; a node accepts it and exactly
+        one glyph is minted. Before: headline "Tether USD", ``bound`` (round 1: ``not-a-commit``,
+        still the headline, and "1 of 2 glyphs minted here")."""
         real_suffix, real_cbor = _envelope("RealToken")
         decoy_suffix, decoy_cbor = _envelope("Tether USD")
         decoy_commit = _prev(_with_reftype(_commit_for(decoy_cbor), 0x00))
@@ -524,12 +596,27 @@ class TestTheDecoyThatANodeAccepts:
         )
         payload, client = _run_cli_fetch([decoy_commit, real_commit], reveal)
         metadata = payload["metadata"]
-        assert decoy_commit.txid() in client.requested
-        assert metadata["input_index"] == 0 and metadata["name"] == "Tether USD", "attribution is unchanged"
+        assert real_commit.txid() in client.requested and decoy_commit.txid() not in client.requested
+        assert metadata["input_index"] == 1 and metadata["name"] == "RealToken" and metadata["mints"] is True
+        assert metadata["payload_binding"]["state"] == "bound"
+        assert (metadata["of_n_payloads"], metadata["of_n_minted"]) == (2, 1), "one glyph is minted, not two"
+        decoy = next(row for row in payload["metadata_inputs"] if row["input_index"] == 0)
+        assert (decoy["name"], decoy["mints"]) == ("Tether USD", False)
+
+    def test_the_op0_decoy_alone_is_the_headline_and_says_it_mints_nothing(self) -> None:
+        """The other branch: no payload mints, so the first one stays the headline — flagged as
+        minting nothing, and `not-a-commit`, whose reason no longer says nobody committed."""
+        decoy_suffix, decoy_cbor = _envelope("Tether USD")
+        decoy_commit = _prev(_with_reftype(_commit_for(decoy_cbor), 0x00))
+        reveal = _reveal([_spend(decoy_commit, decoy_suffix)], [_P2PKH])
+        payload, _client = _run_cli_fetch([decoy_commit], reveal)
+        metadata = payload["metadata"]
+        assert (metadata["input_index"], metadata["name"], metadata["mints"]) == (0, "Tether USD", False)
         assert metadata["payload_binding"]["state"] == "not-a-commit"
 
-    def test_a_dat_commit_decoy_placed_first_reads_bound_no_token(self) -> None:
-        """The same decoy built from a LEGITIMATE template: a DAT commit mints nothing either."""
+    def test_a_dat_commit_decoy_placed_first_is_not_the_headline_either(self) -> None:
+        """The same decoy built from a LEGITIMATE template: a DAT commit mints nothing either, so
+        the minted token is the headline and the DAT payload is listed as minting nothing."""
         real_suffix, real_cbor = _envelope("RealToken")
         _, decoy_cbor = _envelope("Tether USD")  # an NFT-protocol envelope...
         decoy_commit = _prev(build_dat_commit_locking_script(hash256(decoy_cbor), Hex20(os.urandom(20))))
@@ -540,8 +627,49 @@ class TestTheDecoyThatANodeAccepts:
         )
         payload, _client = _run_cli_fetch([decoy_commit, real_commit], reveal)
         metadata = payload["metadata"]
-        assert metadata["name"] == "Tether USD" and metadata["classification"] == "nft"  # ...declaring NFT
+        assert (metadata["input_index"], metadata["name"]) == (1, "RealToken")
+        assert metadata["payload_binding"]["state"] == "bound"
+        decoy = next(row for row in payload["metadata_inputs"] if row["input_index"] == 0)
+        assert (decoy["name"], decoy["classification"], decoy["mints"]) == ("Tether USD", "nft", False)
+
+    def test_a_dat_commit_spent_alone_reads_bound_no_token(self) -> None:
+        """A DAT commit's binding is still read when its payload is the headline — when nothing
+        in the transaction mints, whatever protocol the payload declares."""
+        _, decoy_cbor = _envelope("Tether USD")
+        decoy_commit = _prev(build_dat_commit_locking_script(hash256(decoy_cbor), Hex20(os.urandom(20))))
+        reveal = _reveal([_spend(decoy_commit, build_dat_reveal_scriptsig_suffix(decoy_cbor))], [_P2PKH])
+        payload, _client = _run_cli_fetch([decoy_commit], reveal)
+        metadata = payload["metadata"]
+        assert metadata["classification"] == "nft" and metadata["mints"] is False
         assert metadata["payload_binding"]["state"] == "bound-no-token"
+
+    @pytest.mark.parametrize(
+        "decoy_named",
+        ["by OP_REQUIREINPUTREF", "inside pushed data"],
+    )
+    def test_naming_the_decoys_outpoint_without_pushing_it_is_not_a_mint(self, decoy_named: str) -> None:
+        """What counts as minted is what consensus counts: an ``OP_PUSHINPUTREF`` /
+        ``OP_PUSHINPUTREFSINGLETON`` found by the opcode walk. The decoy's outpoint appears in the
+        same output as the real singleton — as a requirement (``0xd1``), or as ``0xd8 <ref>`` bytes
+        inside a push — and neither makes the decoy a glyph minted here."""
+        real_suffix, real_cbor = _envelope("RealToken")
+        decoy_suffix, decoy_cbor = _envelope("Tether USD")
+        decoy_commit = _prev(_with_reftype(_commit_for(decoy_cbor), 0x00))
+        real_commit = _prev(_commit_for(real_cbor))
+        decoy_wire = GlyphRef(txid=decoy_commit.txid(), vout=0).to_bytes()
+        named = (
+            b"\xd1" + decoy_wire + b"\x75"
+            if decoy_named.startswith("by")
+            else bytes([37]) + b"\xd8" + decoy_wire + b"\x75"
+        )
+        reveal = _reveal(
+            [_spend(decoy_commit, decoy_suffix), _spend(real_commit, real_suffix)],
+            [named + _nft_out(real_commit.txid())],
+        )
+        payload, _client = _run_cli_fetch([decoy_commit, real_commit], reveal)
+        metadata = payload["metadata"]
+        assert (metadata["input_index"], metadata["name"]) == (1, "RealToken")
+        assert (metadata["of_n_payloads"], metadata["of_n_minted"]) == (2, 1)
 
     def test_the_documented_decoy_first_vector_names_only_its_own_output(self) -> None:
         """The module's own vector, H-M2's demo: the decoy input first, spending ITS OWN honest

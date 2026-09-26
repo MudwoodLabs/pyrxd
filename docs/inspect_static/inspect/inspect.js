@@ -532,7 +532,8 @@ function renderFetchedTxCard(payload) {
   // Reveal metadata (if present).
   //
   // WHICH GLYPH THIS IS (#577). A multi-glyph reveal carries one payload per
-  // minted glyph. The Python reports the FIRST decodable one as `metadata`,
+  // minted glyph. The Python reports one as `metadata` (the first whose outpoint the
+  // outputs mint, else the first decodable one),
   // stamps `of_n_payloads` on it when there is more than one, and lists every
   // payload-carrying input in `metadata_inputs` — and this card read neither.
   // Under a bare "Reveal metadata" heading, one name, ticker, description and
@@ -543,18 +544,25 @@ function renderFetchedTxCard(payload) {
   const metadata = payload.metadata;
   const metadataInputs = Array.isArray(payload.metadata_inputs) ? payload.metadata_inputs : [];
   if (metadata) {
+    // MINTED is counted from the outputs (`of_n_minted`), not from the envelopes: an input can
+    // carry a payload and mint nothing. Worded exactly as the CLI words it.
     const ofN = metadata.of_n_payloads;
+    const minted = metadata.of_n_minted === undefined ? ofN : metadata.of_n_minted;
+    const said = minted === ofN
+      ? `1 of ${ofN} glyphs minted here`
+      : `1 of ${ofN} payloads here, ${minted} minting a token`;
     wrapper.appendChild(el("h3", {
       class: "result-subhead",
       text: ofN
-        ? `Reveal metadata (from input ${metadata.input_index} — 1 of ${ofN} glyphs minted here)`
+        ? `Reveal metadata (from input ${metadata.input_index} — ${said})`
         : `Reveal metadata (from input ${metadata.input_index})`,
     }));
     const mdl = el("dl", { class: "kv-list" });
     const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
-    // WHAT THE ATTRIBUTION IS WORTH. Both readers take the first `gly` push in the
-    // first input that decodes, so the name shown need not be the one the commit
+    if (metadata.mints === false) mdl.appendChild(kv("token", "none — this input mints no token here"));
+    // WHAT THE ATTRIBUTION IS WORTH. The headline is chosen from the inputs'
+    // envelopes, so the name shown need not be the one the commit
     // committed to. `mismatch` means it demonstrably is not. Rendered for every
     // state, because "not checked" and "checked and held" are opposite facts and
     // omitting the weak one leaves the confident reading in place. Flagged: the
@@ -747,10 +755,17 @@ function renderFetchedTxCard(payload) {
   // At most MAX_ROWS_SHOWN are listed, like the outputs: one row per payload-carrying input,
   // and nothing else bounds how many inputs carry one. The rest are counted by the classifier.
   const hiddenGlyphs = payload.metadata_inputs_not_listed ? payload.metadata_inputs_not_listed.count : 0;
+  const hiddenMinting = payload.metadata_inputs_not_listed ? (payload.metadata_inputs_not_listed.minting || 0) : 0;
   if (otherGlyphs.length > 0 || hiddenGlyphs > 0) {
+    // Minted is what the outputs create (`mints`), so a payload on an input that mints nothing
+    // is listed as that, and the heading counts only the others that do. As the CLI words it.
+    const total = otherGlyphs.length + hiddenGlyphs;
+    const minting = otherGlyphs.filter((row) => row.mints !== false).length + hiddenMinting;
     wrapper.appendChild(el("h3", {
       class: "result-subhead",
-      text: `Other glyphs minted in this transaction (${otherGlyphs.length + hiddenGlyphs})`,
+      text: minting === total
+        ? `Other glyphs minted in this transaction (${total})`
+        : `Other payloads in this transaction (${total}), ${minting} minting a token`,
     }));
     const odl = el("dl", { class: "kv-list" });
     for (const row of otherGlyphs) {
@@ -758,14 +773,16 @@ function renderFetchedTxCard(payload) {
       // and shown one of them is the same "you were told about a different
       // token" failure one level down.
       const label = [row.name, row.ticker].filter(Boolean).join(" / ") || "(unnamed)";
-      odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}`));
+      const tail = row.mints === false ? " — mints no token" : "";
+      odl.appendChild(kv(`input ${row.input_index}`, `${row.classification || "?"} — ${label}${tail}`));
     }
     wrapper.appendChild(odl);
     if (hiddenGlyphs > 0) {
       wrapper.appendChild(el("p", {
         class: "card-note hidden-rows-note",
         text: `The first ${otherGlyphs.length} are listed; ${hiddenGlyphs} more ` +
-              `${hiddenGlyphs === 1 ? "is" : "are"} not shown here. ${seeEverything(payload.txid)}`,
+              `${hiddenGlyphs === 1 ? "is" : "are"} not shown here, ${hiddenMinting} of them minting a token. ` +
+              `${seeEverything(payload.txid)}`,
       }));
     }
   }
