@@ -17,9 +17,9 @@ Four checks:
    the author's username and local layout, break in every other clone, and —
    when they point into a sibling project — leak that project's existence.
    Username-agnostic forms like ``~/.pyrxd/config.toml`` are NOT flagged:
-   that's the correct way to document a home-relative path. Nor is the PATH
-   of a web URL (``https://example.com/home/about``), though its query
-   string is scanned.
+   that's the correct way to document a home-relative path. A web URL whose
+   path has a ``/home/<word>`` segment IS flagged: a skip for URLs failed
+   open, so recall wins over the rare false positive.
 3. **Private project names** — read from a local, gitignored
    ``.private-names`` file. Without that file the check does not run, and
    the output says so. It therefore never runs in CI.
@@ -150,14 +150,18 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 #   - /root/... — no username embedded; rare and not a personal leak
 #   - /tmp/... — scratch paths carry no username and are a normal way
 #     to describe a throwaway clone or fixture dump
-#   - an http(s) URL's PATH (``https://example.com/home/about``): a web path, not a home
-#     directory. Only the path: ``https://x/?next=/home/<user>/...`` still matches, because a
-#     query string can carry a real filesystem path. See :func:`_in_a_web_url_path`.
 #
-# Also matches the Windows spelling, ``C:\Users\<user>\...`` (a doubled ``\\``, as in source
-# code, too). Group ``user`` is the username in every form.
+# NOT skipped, on purpose: a web URL whose PATH has a ``/home/<word>`` segment. A skip for http(s)
+# URL paths was tried and FAILED OPEN: a localhost dev server, a loopback address, a notebook
+# server's ``/tree/home/<user>`` URL, an editor's ``vscode://file/home/<user>/`` link and a path
+# glued to a URL with ``|`` or ``,`` all stopped being reported. Recall wins: the tree and the
+# full history held no false positive of that kind when it was removed (2026-09-25), and a false
+# positive fails loudly and names the line, where a false negative publishes the leak.
+#
+# Also matches the Windows spelling, ``C:\Users\<user>\...``, with ``Users`` in any case and a
+# doubled ``\\`` as in source code. Group ``user`` is the username in every form.
 _HOME_PATH_RE = re.compile(
-    r"(?:file://)?(?:/(?:home|Users)/|\b[A-Za-z]:\\{1,2}Users\\{1,2})"
+    r"(?:file://)?(?:/(?:home|Users)/|\b[A-Za-z]:\\{1,2}(?i:users)\\{1,2})"
     r"(?P<user>[a-zA-Z0-9._-]+)(?:[/\\][^\s`)\"'<>]*)?"
 )
 
@@ -174,18 +178,15 @@ _HOME_PATH_RE = re.compile(
 #: (``-home-<user>-``) does not match, for the same reason as ``/home/<user>/``.
 #:
 #: On Windows the drive letter comes first and its colon and backslash become two dashes:
-#: ``C:\Users\<user>\src`` is encoded ``C--Users-<user>-src``. That form is matched too.
+#: ``C:\Users\<user>\src`` is encoded ``C--Users-<user>-src``. That form is matched too, with
+#: ``Users`` in any case.
 #:
-#: And the match must LOOK LIKE A PATH, which :func:`_home_path_matches` checks: the Windows form,
-#: or more path after the user (``-home-<user>-apps``), or a ``/`` right before it
-#: (``projects/-home-<user>``). A bare ``-home-page`` in prose or an anchor is none of these.
+#: NO "must look like a path" requirement. One was tried, to spare a bare ``-home-<word>`` in
+#: prose, and it cost real leaks: the encoded user alone in quotes or backticks, and at the end of
+#: a sentence. A bare ``-home-<word>`` is reported, and the report names the line.
 _ENCODED_HOME_PATH_RE = re.compile(
-    r"(?<![\w.-])(?P<prefix>[A-Za-z]--Users|-(?:home|Users))-(?P<user>[a-zA-Z0-9._]+)(?P<rest>[^\s`)\"'<>]*)"
+    r"(?<![\w.-])(?:[A-Za-z]--(?i:users)|-(?:home|Users))-(?P<user>[a-zA-Z0-9._]+)[^\s`)\"'<>]*"
 )
-
-#: The start of an http(s) URL whose PATH runs up to the end of the text: no whitespace, and no
-#: ``?``, ``#``, ``=`` or ``&`` after the host, so a query string or fragment is not a path.
-_WEB_URL_PATH_BEFORE = re.compile(r"https?://[^\s/?#]+(?:/[^\s?#=&`)\"'<>]*)?$", re.IGNORECASE)
 
 #: Home directories that name no person. Each is an exemption, so the membership is pinned by
 #: ``tests/test_leak_scan_covers_what_is_published.py`` rather than trusted as prose.
@@ -202,24 +203,6 @@ def _is_personal_home(user: str) -> bool:
     return user.rstrip(".") not in _NON_PERSONAL_HOMES
 
 
-def _in_a_web_url_path(content: str, start: int) -> bool:
-    """True when the text just before *start* is an http(s) URL whose path reaches *start*.
-
-    A softening clause, so it is scoped to the one token: at most 2048 characters back, no
-    whitespace, and never across a ``?``, ``#``, ``=`` or ``&``. A longer URL is not recognised, so
-    its match is reported rather than skipped.
-    """
-    return bool(_WEB_URL_PATH_BEFORE.search(content, max(0, start - 2048), start))
-
-
-def _looks_like_an_encoded_path(content: str, m: re.Match[str]) -> bool:
-    return (
-        m.group("prefix")[0] != "-"  # the Windows drive-letter form
-        or m.group("rest")[:1] in ("-", "/")  # more path follows the user
-        or content[m.start() - 1 : m.start()] == "/"  # a path segment of its own
-    )
-
-
 def _home_path_matches(content: str) -> list[re.Match[str]]:
     """Every home-path leak in *content*, every spelling, in order.
 
@@ -227,18 +210,11 @@ def _home_path_matches(content: str) -> list[re.Match[str]]:
     inside a slash-form match (``/home/<user>/.claude/projects/-home-<user>-…``) is the same leak
     and is reported once, as the slash form.
     """
-    plain = [
-        m
-        for m in _HOME_PATH_RE.finditer(content)
-        if _is_personal_home(m.group("user")) and not _in_a_web_url_path(content, m.start())
-    ]
+    plain = [m for m in _HOME_PATH_RE.finditer(content) if _is_personal_home(m.group("user"))]
     encoded = [
         m
         for m in _ENCODED_HOME_PATH_RE.finditer(content)
-        if _is_personal_home(m.group("user"))
-        and _looks_like_an_encoded_path(content, m)
-        and not _in_a_web_url_path(content, m.start())
-        and not any(p.start() <= m.start() < p.end() for p in plain)
+        if _is_personal_home(m.group("user")) and not any(p.start() <= m.start() < p.end() for p in plain)
     ]
     return sorted(plain + encoded, key=lambda m: m.start())
 

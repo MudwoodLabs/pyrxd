@@ -294,13 +294,123 @@ _LIVE_PROTECTION: dict[str, Any] = {
 }
 
 
-def _script_without_comments_or_heredocs() -> str:
-    """The script's COMMANDS: comment lines and heredoc bodies removed, continuations joined."""
-    text = re.sub(
-        r"<<'?(\w+)'?([^\n]*)\n.*?\n\1\n", r"<<\1\2\n", _PROTECTION_SCRIPT.read_text(encoding="utf-8"), flags=re.S
-    )
+#: Shell operators that end a command's argument list, as `shlex` (punctuation mode) splits them.
+_SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "<", ">", "<<", ">>", ">&", "<&", ";;"})
+
+#: `gh api` options that take a value, so the word after them is not the endpoint.
+_GH_API_VALUED_OPTIONS = frozenset(
+    {"-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field", "--input", "-q", "--jq"}
+    | {"-t", "--template", "--hostname", "-p", "--preview", "--cache"}
+)
+
+#: EVERY `gh api` invocation the script makes, word for word after `gh api`, in order. REVIEWED:
+#: read from the script on 2026-09-25. Any new call, or any change to one, fails
+#: `test_the_protection_script_makes_only_the_reviewed_api_calls` until it is added here, which is
+#: the point: a call that changes repository settings should not arrive without someone reading it.
+_REVIEWED_GH_API_CALLS: list[list[str]] = [
+    ["repos/${REPO}", "--jq", ".visibility"],
+    [
+        "-X",
+        "PATCH",
+        "repos/${REPO}",
+        "-F",
+        "security_and_analysis[secret_scanning][status]=enabled",
+        "-F",
+        "security_and_analysis[secret_scanning_push_protection][status]=enabled",
+        "--silent",
+    ],
+    ["-X", "PUT", "repos/${REPO}/automated-security-fixes", "--silent"],
+    ["-X", "PUT", "repos/${REPO}/vulnerability-alerts", "--silent"],
+    ["-X", "PUT", "repos/${REPO}/private-vulnerability-reporting", "--silent"],
+    ["-X", "PUT", "repos/${REPO}/branches/${BRANCH}/protection", "--input", "-"],
+    [
+        "repos/${REPO}",
+        "--jq",
+        "{\n  visibility,\n  default_branch,\n  security_and_analysis: .security_and_analysis\n}",
+    ],
+]
+
+
+def _script_commands() -> str:
+    """The script as the shell would run it, minus what the shell does not run.
+
+    Heredoc BODIES are removed (they are data: the protection JSON, the printed follow-ups),
+    backslash continuations are joined, comments are dropped (a `#` that starts a word, outside
+    quotes, runs to the end of the line), and every newline outside quotes becomes `;`, so each
+    command's words end where the shell's do while a quoted multi-line argument stays whole.
+    """
+    text = _PROTECTION_SCRIPT.read_text(encoding="utf-8")
+    text = re.sub(r"<<-?'?(\w+)'?([^\n]*)\n.*?\n\1\n", r"<<\1\2\n", text, flags=re.S)
     text = re.sub(r"\\\n", " ", text)
-    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == quote:
+                quote = ""
+            elif c == "\\" and quote == '"' and i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 1
+        elif c in "'\"":
+            quote = c
+            out.append(c)
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(" ; " if c == "\n" else c)
+        i += 1
+    assert not quote, f"unbalanced {quote} quote in {_PROTECTION_SCRIPT.name}; this parser cannot read it"
+    return "".join(out)
+
+
+def _script_words() -> list[str]:
+    """`_script_commands()` split into shell words (quotes removed, variables NOT expanded)."""
+    import shlex
+
+    lex = shlex.shlex(_script_commands(), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    return list(lex)
+
+
+def _gh_api_calls(words: list[str]) -> list[list[str]]:
+    """The words after each `gh api`, up to the operator that ends the command."""
+    calls = []
+    for i, word in enumerate(words):
+        if word == "gh" and words[i + 1 : i + 2] == ["api"]:
+            argv = []
+            for w in words[i + 2 :]:
+                if w in _SHELL_OPERATORS:
+                    break
+                argv.append(w)
+            calls.append(argv)
+    return calls
+
+
+def _method_and_endpoint(argv: list[str]) -> tuple[str, str]:
+    """The HTTP method `gh api` will use, and its endpoint argument. With no `-X`, `gh api` sends
+    GET, or POST when any field or input is given."""
+    method, positional, i = "", [], 0
+    while i < len(argv):
+        word = argv[i]
+        if word in _GH_API_VALUED_OPTIONS:
+            if word in ("-X", "--method"):
+                method = argv[i + 1].upper()
+            i += 2
+            continue
+        if not word.startswith("-"):
+            positional.append(word)
+        i += 1
+    assert len(positional) == 1, f"`gh api {' '.join(argv)}` has {len(positional)} endpoint arguments, not 1"
+    if not method:
+        has_body = any(w in ("-f", "--raw-field", "-F", "--field", "--input") for w in argv)
+        method = "POST" if has_body else "GET"
+    return method, positional[0]
 
 
 def test_the_protection_script_reproduces_the_live_rules_exactly() -> None:
@@ -334,20 +444,58 @@ def test_the_protection_script_reproduces_the_live_rules_exactly() -> None:
     )
 
 
-def test_the_protection_script_makes_no_other_protection_call() -> None:
-    """Required signatures has its own endpoint, outside the PUT document, and the script used to
-    POST it. With admins enforced that blocked every PR, whose head commits are unsigned, so the
-    maintainer switched it off; a re-run would have switched it back on. Every command that
-    touches `branches/` is found here (comments and heredoc text removed first), and it must be
-    exactly the one PUT the test above checks."""
-    commands = _script_without_comments_or_heredocs()
-    api_calls = [line.strip() for line in commands.splitlines() if re.search(r"\bgh\s+api\b", line)]
-    assert api_calls, f"found no `gh api` call in {_PROTECTION_SCRIPT.name}; this test checked nothing"
-    branch_calls = [c for c in api_calls if "branches/" in c]
-    assert len(branch_calls) == 1 and re.search(
-        r'-X PUT "repos/\$\{REPO\}/branches/\$\{BRANCH\}/protection"', branch_calls[0]
-    ), f"{_PROTECTION_SCRIPT.name} must make exactly one branch-protection call, the PUT; found {branch_calls}"
-    assert "required_signatures" not in commands, "the script touches required signatures again"
+def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
+    """The script used to POST required signatures after its PUT. With admins enforced that
+    blocked every PR, so the maintainer switched it off, and a re-run would have switched it back
+    on. A first version of this test looked only at `gh api` lines containing `branches/`, and two
+    plants got past it: a DELETE of `enforce_admins` through a variable path, and a GraphQL
+    `updateBranchProtectionRule(isAdminEnforced: false)`.
+
+    What it checks, on the script's text split into shell words (heredoc bodies and comments
+    removed; variables are NOT expanded):
+
+    * every `gh` is `gh api`, every `api` follows `gh`, and no word is `eval`, `curl`, `wget` or
+      `source`, and nothing mentions `graphql` or `required_signatures`;
+    * `REPO` and `BRANCH` are each assigned exactly once, to `MudwoodLabs/pyrxd` and `main`;
+    * every endpoint is a literal path whose only variables are `${REPO}` and `${BRANCH}`;
+    * the method is never DELETE or POST, the only call whose endpoint mentions `protection` is
+      the PUT the test above checks, and the calls equal `_REVIEWED_GH_API_CALLS` word for word.
+
+    WHAT IT CANNOT SEE: it reads text, it is not a shell. A call assembled in a way none of the
+    above names (a command run from another file, an interpreter's own HTTP client) is invisible
+    to it. Review of this file remains the control for that."""
+    words = _script_words()
+    joined = " ".join(words).lower()
+    for banned in ("eval", "curl", "wget", "source"):
+        assert banned not in words, f"{_PROTECTION_SCRIPT.name} runs `{banned}`, which this test cannot see through"
+    for text in ("graphql", "required_signatures"):
+        assert text not in joined, f"{_PROTECTION_SCRIPT.name} mentions {text!r} outside its comments and heredocs"
+    for i, word in enumerate(words):
+        if word == "gh":
+            assert words[i + 1 : i + 2] == ["api"], f"`gh {words[i + 1]}`: the script may use only `gh api`"
+        if word == "api":
+            assert i > 0 and words[i - 1] == "gh", f"`{words[i - 1]} api`: an API call not spelled `gh api`"
+    assignments = {name: [w for w in words if w.startswith(f"{name}=")] for name in ("REPO", "BRANCH")}
+    assert assignments == {"REPO": ["REPO=MudwoodLabs/pyrxd"], "BRANCH": ["BRANCH=main"]}, assignments
+
+    calls = _gh_api_calls(words)
+    assert calls, f"found no `gh api` call in {_PROTECTION_SCRIPT.name}; this test checked nothing"
+    protection = []
+    for argv in calls:
+        method, endpoint = _method_and_endpoint(argv)
+        literal = endpoint.replace("${REPO}", "").replace("${BRANCH}", "")
+        assert re.fullmatch(r"[A-Za-z0-9_./-]+", literal), (
+            f"`gh api {' '.join(argv)}`: the endpoint {endpoint!r} is not a literal path "
+            f"(only ${{REPO}} and ${{BRANCH}} may appear in it)"
+        )
+        assert method not in ("DELETE", "POST"), f"`gh api {' '.join(argv)}` is a {method}"
+        if "protection" in endpoint:
+            protection.append((method, endpoint))
+    assert protection == [("PUT", "repos/${REPO}/branches/${BRANCH}/protection")], protection
+    assert calls == _REVIEWED_GH_API_CALLS, (
+        f"{_PROTECTION_SCRIPT.name} makes API calls that differ from _REVIEWED_GH_API_CALLS:\n"
+        + "\n".join(f"  gh api {' '.join(c)}" for c in calls)
+    )
 
 
 def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:

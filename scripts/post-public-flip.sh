@@ -133,7 +133,8 @@ cat <<'EOF'
 
 5. CodeQL already runs from .github/workflows/codeql.yml (the required
    "Analyze (Python)" check). Do NOT also switch on CodeQL "default setup" in
-   Settings: GitHub then rejects the workflow's SARIF upload, and the required
-   check fails.
+   Settings: GitHub then rejects the workflow's SARIF upload, so that required
+   check stops passing (it no longer reports a success) and every merge to main
+   is blocked until default setup is switched off again.
 
 EOF
