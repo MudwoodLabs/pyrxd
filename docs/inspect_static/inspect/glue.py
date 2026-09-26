@@ -4,8 +4,8 @@ This module is loaded into the Pyodide WASM runtime by ``inspect.js`` and
 exposes, among others, :func:`run` for offline classification of a
 user-pasted string, :func:`inspect_txid_with_raw` for classifying a
 transaction whose raw bytes JS already fetched, and
-:func:`spent_output_binding` for checking a reveal's payload against the
-commit it spent. Each returns a JSON-serialisable dict that the JS side
+:func:`spent_output_bindings` for checking a reveal's payloads against the
+commits they spent (:func:`spent_output_binding` is its one-prevout form). Each returns a JSON-serialisable dict that the JS side
 renders without further parsing.
 
 Design rules:
@@ -219,8 +219,8 @@ def inspect_txid_with_raw(
     drawer — is bounded by it. The size of one entry is not (``classify_raw_tx`` says which
     entries can be large). ``None`` lists everything.
 
-    The payload binding is NOT decided here: :func:`spent_output_binding` does that, once the
-    page has fetched the transaction the reveal spent.
+    The payload binding is NOT decided here: :func:`spent_output_bindings` does that, once the
+    page has fetched the transactions the payload ``binding_candidates`` names.
 
     The JS side opens a WebSocket to the configured ElectrumX server,
     sends ``blockchain.transaction.get`` for ``txid``, and hands the
@@ -287,6 +287,18 @@ def inspect_txid_with_raw(
             ),
         )
 
+    return {
+        "ok": True,
+        "form": "txid",
+        "input": txid,
+        "payload": _finish_payload(payload),
+    }
+
+
+def _finish_payload(payload: dict) -> dict:
+    """What the page draws from a ``classify_raw_tx`` payload: its display warnings added, every
+    string sanitised and capped. ONE step, for the first classification and for the one
+    :func:`spent_output_bindings` redoes when the headline moves."""
     # Annotate metadata strings with homoglyph / script-mixing warnings.
     # The control-byte sanitizer runs in the next step, but it doesn't
     # catch a token deployer who names their token "USDC" using a
@@ -339,13 +351,7 @@ def inspect_txid_with_raw(
         if warnings:
             metadata["display_warnings"] = warnings
 
-    sanitized = _sanitize_payload_strings(payload)
-    return {
-        "ok": True,
-        "form": "txid",
-        "input": txid,
-        "payload": sanitized,
-    }
+    return _sanitize_payload_strings(payload)
 
 
 def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", prev_fetch_error: object = "") -> dict:
@@ -358,8 +364,9 @@ def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", pre
 
     It does NOT classify the transaction again. Re-running the whole classifier to change one
     field of its metadata was what this step used to cost; the answer comes from
-    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope and
-    the one output it spent, and which the CLI's ``--fetch`` calls too. The spent transaction is
+    ``pyrxd.glyph.inspect.spent_output_binding``, which reads the attributed input's envelope, the
+    one output it spent, and the reveal's own output scripts (for the ref that output's commit
+    demands), and which the CLI's ``--fetch`` calls too. The spent transaction is
     hash-checked there against the txid in the outpoint before anything is read out of it.
 
     Returns ``{"ok": True, "binding": {...}}`` — ``binding`` is ``None`` when no input is
@@ -380,24 +387,107 @@ def spent_output_binding(txid: str, raw_hex: str, prev_raw_hex: object = "", pre
     except ValueError as exc:
         return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
 
-    spent_raw: bytes | None = None
-    text = prev_raw_hex.strip()
-    if text:
-        if len(text) > _MAX_RAW_HEX_CHARS:
-            prev_fetch_error = f"the answer is {len(text):,} hex characters, larger than any transaction"
-        else:
-            try:
-                spent_raw = bytes.fromhex(text)
-            except ValueError as exc:
-                prev_fetch_error = f"the answer is not valid hex ({_safe_error(exc)})"
-    elif not prev_fetch_error:
-        prev_fetch_error = "the page handed over no spent transaction and no reason"
-
+    spent_raw, prev_fetch_error = _spent_answer(prev_raw_hex, prev_fetch_error)
     try:
         binding = _inspect.spent_output_binding(txid.strip().lower(), raw, spent_raw, spent_error=prev_fetch_error)
     except Exception as exc:
         return _err(_safe_error(exc), form="error")
     return {"ok": True, "binding": _sanitize_payload_strings(binding)}
+
+
+def _spent_answer(prev_raw_hex: str, prev_fetch_error: str) -> tuple[bytes | None, str]:
+    """``(the spent transaction's bytes, or None; why there are none)`` from what the page's fetch
+    handed over: hex, or nothing and a reason."""
+    text = prev_raw_hex.strip()
+    if text:
+        if len(text) > _MAX_RAW_HEX_CHARS:
+            return None, f"the answer is {len(text):,} hex characters, larger than any transaction"
+        try:
+            return bytes.fromhex(text), prev_fetch_error
+        except ValueError as exc:
+            return None, f"the answer is not valid hex ({_safe_error(exc)})"
+    return None, prev_fetch_error or "the page handed over no spent transaction and no reason"
+
+
+def spent_output_bindings(
+    txid: str,
+    raw_hex: str,
+    prevs_json: object = "{}",
+    errors_json: object = "{}",
+    attest_hashmark_limit: object = None,
+    max_rows: object = None,
+) -> dict:
+    """``payload_binding`` for the reveal *raw_hex* carries, against every transaction the page
+    fetched for its ``binding_candidates`` — and the headline those rank first.
+
+    The page's SECOND step. :func:`inspect_txid_with_raw` names, in ``binding_candidates``, the
+    outpoints of the minting payloads' inputs; the page fetches each and hands them here as
+    ``prevs_json``, a JSON object of ``{outpoint: hex}``, with ``errors_json`` saying why for each
+    it could not get. JSON strings, not JavaScript objects, so what crosses the bridge is text the
+    way every other argument here is. ``pyrxd.glyph.inspect.spent_output_bindings`` hash-checks
+    each and decides; the CLI's ``--fetch`` calls the same function.
+
+    Returns ``{"ok": True, "binding": {...} | None}``, and — when that function says the
+    classification must be redone (the headline moved to a bound payload, or another payload's
+    row has a verdict to show) — ``"payload"``: the transaction classified again with the spent
+    scripts, finished exactly as :func:`inspect_txid_with_raw` finishes its own, with *max_rows*
+    and *attest_hashmark_limit* as the page passed there. Otherwise nothing is classified again.
+    Or the usual ``{"ok": False, ...}``. Never raises.
+    """
+    import json
+
+    if not isinstance(txid, str) or not isinstance(raw_hex, str):
+        return _err("txid and raw_hex must both be strings", form="error")
+    attest_hashmark_limit = _whole_number("attest_hashmark_limit", attest_hashmark_limit)
+    if isinstance(attest_hashmark_limit, dict):
+        return attest_hashmark_limit
+    max_rows = _whole_number("max_rows", max_rows)
+    if isinstance(max_rows, dict):
+        return max_rows
+    raw_hex = raw_hex.strip()
+    if len(raw_hex) > _MAX_RAW_HEX_CHARS:
+        return _err(f"raw_hex too long ({len(raw_hex):,} chars); cap is {_MAX_RAW_HEX_CHARS:,}", form="error")
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError as exc:
+        return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
+    try:
+        prevs = json.loads(prevs_json) if isinstance(prevs_json, str) else None
+        errors = json.loads(errors_json) if isinstance(errors_json, str) else None
+    except ValueError as exc:
+        return _err(f"prevs_json / errors_json is not JSON: {_safe_error(exc)}", form="error")
+    if not isinstance(prevs, dict) or not isinstance(errors, dict):
+        return _err("prevs_json and errors_json must each be a JSON object", form="error")
+
+    spent: dict[str, bytes | None] = {}
+    said: dict[str, str] = {}
+    for outpoint in list(prevs) + [op for op in errors if op not in prevs]:
+        hex_text = prevs.get(outpoint)
+        spent[str(outpoint)], said[str(outpoint)] = _spent_answer(
+            hex_text if isinstance(hex_text, str) else "", str(errors.get(outpoint) or "")
+        )
+
+    txid = txid.strip().lower()
+    try:
+        answer = _inspect.spent_output_bindings(txid, raw, spent, said)
+        if answer is None:
+            return {"ok": True, "binding": None}
+        out = {"ok": True, "binding": _sanitize_payload_strings(answer["binding"])}
+        if answer["reclassify"]:
+            # The headline's verdict, every other minting payload's and the count past the fetch
+            # limit are written by `classify_with_bindings` — the step the CLI takes too.
+            payload = _inspect.classify_with_bindings(
+                txid,
+                raw,
+                answer,
+                network=_PAGE_NETWORK,
+                attest_hashmark_limit=attest_hashmark_limit,
+                max_rows=max_rows,
+            )
+            out["payload"] = _finish_payload(payload)
+    except Exception as exc:
+        return _err(_safe_error(exc), form="error")
+    return out
 
 
 # Whether a Letter codepoint is Latin-script (A-Z, a-z, plus Latin
@@ -607,8 +697,8 @@ def _sanitize_payload_strings(value, *, key=None):
 # ---------------------------------------------------------------------------
 # W8 — the verdict view's two extra inputs: the BLOCK, and the FILE.
 #
-# Both are deliberately thin. Everything a reader could be misled by — how a
-# height is derived from a confirmation count, what a digest match is allowed to
+# Both are deliberately thin. Everything a reader could be misled by — which
+# block a mark's transaction is in, what a digest match is allowed to
 # mean, which hash a record actually names — is computed by the same pyrxd code
 # the CLI runs, and this module only carries values across the bridge.
 # ---------------------------------------------------------------------------
@@ -635,10 +725,11 @@ def _run_sync(coro):
     """Run a coroutine that never actually suspends, without an event loop.
 
     Pyodide's main thread already has a running loop, so ``asyncio.run`` is not
-    available here. ``resolve_mark_anchor`` has exactly one ``await``, on the
-    ``fetch_verbose`` callable we supply — and ours returns a value the page has
-    already fetched, so the coroutine runs to completion on the first ``send`` and
-    raises ``StopIteration`` carrying the result.
+    available here. ``resolve_mark_anchor`` awaits only the callables we supply —
+    ``fetch_verbose``, and ``fetch_header`` once per candidate height — and ours return
+    values the page has already fetched (or raise at once for one it has not), so the
+    coroutine runs to completion on the first ``send`` and raises ``StopIteration``
+    carrying the result.
 
     If it ever DOES suspend, that is a real change in the function's contract and
     this raises rather than returning a half-built anchor.
@@ -660,7 +751,148 @@ def _run_sync(coro):
 _MAX_VERBOSE_JSON_CHARS = 8_000_000
 
 
-def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
+#: A Radiant block header is 80 bytes; the page hands each one across as hex.
+_HEADER_HEX_CHARS = 160
+
+#: Cap on the fetched-headers JSON. The rule asks for at most one header per candidate height
+#: (``MAX_INDEX_LAG_BLOCKS`` either side of the formula), each 160 hex characters plus a short
+#: error string; anything near this is not what the page sends.
+_MAX_HEADERS_JSON_CHARS = 16_000
+
+#: How much of a page-reported header error crosses into a reason.
+_HEADER_ERROR_CAP = 160
+
+_UNREADABLE_HEADERS = "the fetched block headers were not in a shape this page reads"
+
+
+def _fetched_headers(headers_json: object) -> tuple[dict[int, bytes], dict[int, str]] | str:
+    """``(headers, errors)`` from what the page fetched, or a reason they cannot be read.
+
+    EVERY HEADER IS UNTRUSTED SERVER INPUT. The page already refuses a header answer that is not
+    a string of exactly 160 hex characters (``fetchBlockHeaderHex`` in ``shared.js``), and it is
+    checked again here, where it becomes bytes: anything else is recorded as an ERROR for that
+    height — which the binding treats as a header the server could not serve — never as a header.
+    """
+    import json
+    import re
+
+    if headers_json is None:
+        return {}, {}
+    if not isinstance(headers_json, str) or len(headers_json) > _MAX_HEADERS_JSON_CHARS:
+        return _UNREADABLE_HEADERS
+    try:
+        fetched = json.loads(headers_json)
+    except ValueError:
+        return _UNREADABLE_HEADERS
+    if not isinstance(fetched, dict):
+        return _UNREADABLE_HEADERS
+    raw_headers, raw_errors = fetched.get("headers", {}), fetched.get("errors", {})
+    if not isinstance(raw_headers, dict) or not isinstance(raw_errors, dict):
+        return _UNREADABLE_HEADERS
+    height_key = re.compile(r"^[0-9]{1,10}$")
+    headers: dict[int, bytes] = {}
+    errors: dict[int, str] = {}
+    for key, value in raw_errors.items():
+        if isinstance(key, str) and height_key.match(key):
+            errors[int(key)] = _truncate(_inspect.sanitize_display_string(str(value)), cap=_HEADER_ERROR_CAP)
+    for key, value in raw_headers.items():
+        if not (isinstance(key, str) and height_key.match(key)):
+            continue
+        if (
+            isinstance(value, str)
+            and len(value) == _HEADER_HEX_CHARS
+            and all(c in "0123456789abcdefABCDEF" for c in value)
+        ):
+            headers[int(key)] = bytes.fromhex(value)
+        else:
+            errors[int(key)] = "the server's answer is not an 80-byte header"
+    return headers, errors
+
+
+def _heights(heights: list[int]) -> str:
+    return ", ".join(str(h) for h in sorted(heights))
+
+
+def _unbound_reason(exc) -> str:
+    """Why no block number is shown, told by what the binding actually found.
+
+    Four different facts, and one sentence for all of them would say something false about the
+    others. Which one it was comes from the ``AnchorBindingError`` itself — its ``served`` and
+    ``unserved`` heights and ``disagrees`` — which is the same classification the CLI's message and
+    its exit-2 advice are built from, so the page and ``pyrxd verify`` cannot tell one failure two
+    ways. This function only words it for a stranger.
+
+    "THE SERVER DISAGREES WITH ITSELF" NEEDS EVERY HEADER. It is a claim that none of the headers
+    in the window hashes to the block the node names, and that is only established when every
+    one of them arrived. If the matching header is simply the one that never came — a request
+    that timed out, a refusal — the other headers not matching is exactly what an HONEST chain
+    looks like, so the sentence then names the heights that were not served instead. (Found by
+    review: an honest chain whose request for the mark's own height went unanswered drew the
+    "disagree" sentence after the 10 s timeout.)
+    """
+    served, unserved = list(exc.served), list(exc.unserved)
+    if not served and not unserved:
+        # The rule refused before asking for any header: the verbose reply names no block.
+        return (
+            "the server says this transaction is in a block but does not say which one, so its "
+            "height could not be checked against a header, and no block number is shown"
+        )
+    if not served:
+        return (
+            "the server did not serve the block headers needed to check which block holds this "
+            f"transaction (heights {_heights(unserved)}), so no block number is shown. Trying again "
+            "in a moment, or another server, may work"
+        )
+    if not exc.disagrees:
+        return (
+            f"the server did not serve the block headers at heights {_heights(unserved)}, and none "
+            f"of those it did serve (heights {_heights(served)}) is the block that holds this "
+            "transaction, so which block holds it could not be checked and no block number is "
+            "shown. Trying again in a moment, or another server, may work"
+        )
+    return (
+        "the server's index and its node disagree about which block holds this transaction (or it "
+        f"is serving inconsistent data): none of its headers at heights {_heights(served)} hashes "
+        "to the block its node names, so no block number is shown. Trying again in a moment, or "
+        "another server, may work"
+    )
+
+
+def _block_hash_unavailable() -> str | None:
+    """Why this runtime cannot compute a Radiant block hash, or None if it can.
+
+    The binding compares a header's hash with the block the node names, and the Radiant block
+    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have unless its OpenSSL-backed
+    ``_hashlib`` package was loaded before ``hashlib`` was first imported (measured: "unsupported
+    hash type sha512_256" otherwise; the boot in ``shared.js`` loads it first). If that ever
+    fails, the rule would catch the hashing error as a header it "could not read" and try the
+    next height, and this page would then blame the SERVER for disagreeing with itself. Checked
+    here, first, so the reason is the true one and no header is fetched for nothing.
+    """
+    from pyrxd.hash import radiant_block_hash
+
+    try:
+        radiant_block_hash(bytes(80))
+    except ValueError as exc:
+        return (
+            "this browser's Python cannot compute a Radiant block hash "
+            f"({_truncate(_inspect.sanitize_display_string(_safe_error(exc)), cap=80)}), so the block's "
+            "height could not be checked against a header, and no block number is shown"
+        )
+    return None
+
+
+def _needs_header(height: int) -> dict:
+    """Ask the page for one more header. Not an answer: it carries no height, and a page that
+    rendered it anyway would show why there is no block number rather than a wrong one."""
+    return {
+        "resolved": False,
+        "needs_headers": [height],
+        "reason": "the block's header has not been fetched yet, so no block number is shown",
+    }
+
+
+def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: object = None) -> dict:
     """Where the mark's transaction sits in the chain, per the endpoint that was asked.
 
     *verbose_json* is the ``blockchain.transaction.get(txid, verbose=True)`` reply as a
@@ -670,17 +902,31 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
     shape depends on how Pyodide happens to proxy a plain object today.
     Handing them to :func:`pyrxd.glyph.mark_anchor.resolve_mark_anchor` rather than
     reading ``confirmations`` in JS is the whole point: that function binds the echoed
-    txid, refuses an unreadable depth instead of reading it as zero, derives the height
-    as ``tip - confirmations + 1`` (measured: the verbose reply carries NEITHER
-    ``height`` NOR ``blockheight``), and carries the caveat saying the height is the
-    endpoint's claim and nothing here verified it.
+    txid, refuses an unreadable depth instead of reading it as zero, and BINDS the height
+    to the endpoint's own header — the same call the CLI makes.
+
+    THE HEIGHT IS BOUND, THROUGH THE ONE RULE. ``tip - confirmations + 1`` is one block low
+    whenever an endpoint's index trails its node, on every server at once (measured by the
+    0.25.0 panel), so the page no longer shows it. ``resolve_mark_anchor(fetch_header=...)``
+    decides the height, as it does for the CLI. This bridge cannot fetch, so it runs that rule
+    against the headers the page has already fetched (*headers_json*: ``{"headers": {height:
+    hex}, "errors": {height: message}}``), and when the rule asks for one the page does not have
+    yet it returns ``{"resolved": False, "needs_headers": [height]}`` — the FIRST such height, in
+    the rule's own order. The page fetches it with ``blockchain.block.header`` and calls again.
+    So the rule, not JavaScript, chooses which heights are looked at and in what order, and the
+    answer is the one the CLI gives for the same server answers.
+
+    A height is returned only when a header the server served at it hashes to the block the
+    server's node names. Otherwise the answer is ``resolved: False``, with a reason saying which
+    of three failures it was; an unbound block number never crosses to the page.
 
     Never raises. A failure is a dict with ``resolved: False`` and the reason, because
     losing the block must not lose the record.
     """
     import json
 
-    from pyrxd.glyph.mark_anchor import mark_anchor_dict, resolve_mark_anchor
+    from pyrxd.glyph.mark_anchor import AnchorBindingError, mark_anchor_dict, resolve_mark_anchor
+    from pyrxd.security.errors import NetworkError
 
     if not isinstance(verbose_json, str):
         verbose_json = str(verbose_json)
@@ -695,9 +941,36 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
         return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(f"unreadable reply: {exc}"))}
     if not isinstance(verbose, dict):
         return {"resolved": False, "reason": "the endpoint's reply was not an object"}
+    fetched = _fetched_headers(headers_json)
+    if isinstance(fetched, str):
+        return {"resolved": False, "reason": fetched}
+    headers, errors = fetched
 
     async def _fetch(_requested: str) -> dict:
         return verbose
+
+    #: Every height the rule asked for, in its order, and those the page has not fetched yet.
+    asked: list[int] = []
+    missing: list[int] = []
+    #: Checked when the rule first asks for a header — not before, because an unmined
+    #: transaction needs no header and must not be refused over a hash it never needed.
+    cannot_hash: list[str] = []
+
+    async def _header(height: int) -> bytes:
+        height = int(height)
+        if not asked:
+            problem = _block_hash_unavailable()
+            if problem:
+                cannot_hash.append(problem)
+        asked.append(height)
+        if cannot_hash:
+            raise NetworkError(cannot_hash[0])
+        if height in headers:
+            return headers[height]
+        if height in errors:
+            raise NetworkError(errors[height])
+        missing.append(height)
+        raise NetworkError("this page has not fetched that header yet")
 
     try:
         anchor = _run_sync(
@@ -707,10 +980,28 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
                 source=_ANCHOR_SOURCE,
                 min_confirmations=_ANCHOR_FLOOR,
                 tip_height=int(tip_height) if tip_height is not None else None,
+                fetch_header=_header,
             )
         )
+    except AnchorBindingError as exc:
+        if cannot_hash:
+            return {"resolved": False, "reason": cannot_hash[0]}
+        if missing:
+            return _needs_header(missing[0])
+        return {
+            "resolved": False,
+            "reason": _unbound_reason(exc),
+            "detail": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
+        }
     except Exception as exc:
         return {"resolved": False, "reason": _truncate(_inspect.sanitize_display_string(_safe_error(exc)))}
+
+    # IN THE RULE'S ORDER, EXACTLY. If the rule passed over a height the page had not fetched and
+    # then matched a later one the page had, the CLI — which fetches in that order and stops at
+    # the first match — could have answered with the earlier height. So a missing earlier
+    # candidate is fetched first, whatever else the page happened to hand over.
+    if missing:
+        return _needs_header(missing[0])
 
     # THE SHAPE IS `mark_anchor_dict`'s, not this module's. It was factored out so a
     # height never reaches a screen without the caveat that it is one endpoint's
@@ -738,6 +1029,9 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object) -> dict:
         "resolved": True,
         "txid": anchor.txid,
         **shape,
+        # Beside the caveat so a test, and a reader of the JSON drawer, can see the height was
+        # bound without parsing a sentence. Always True here: an unbound height is never returned.
+        "header_bound": anchor.header_bound,
         "no_depth_policy": (
             "This page sets no confirmation-depth requirement: the count above is the fact, "
             "and how much burial is enough depends on what this mark is worth to you"

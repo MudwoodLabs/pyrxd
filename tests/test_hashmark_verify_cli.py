@@ -49,9 +49,11 @@ from pyrxd.hashmark_tx import digest_file, plan_hashmark
 from pyrxd.keys import PrivateKey
 from pyrxd.script.hashmark import _ALGORITHMS, decode_hashmark
 from pyrxd.script.script import Script
+from pyrxd.security.errors import NetworkError
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests.test_mutable_chain_is_discovered_from_the_chain import block_hash_at, synthetic_header
 
 MAINNET_GENESIS = genesis_hash_for("mainnet")
 TIP = 800_000
@@ -103,7 +105,16 @@ class _FakeServer:
 
     async def get_transaction_verbose(self, txid) -> dict:
         self.calls.append(("get_transaction_verbose", str(txid)))
-        return {"txid": str(txid).lower(), "confirmations": self.confirmations}
+        out = {"txid": str(txid).lower(), "confirmations": self.confirmations}
+        if self.confirmations > 0:  # the node names the block, as measured; the anchor binds to it
+            out["blockhash"] = block_hash_at(self.tip - self.confirmations + 1)
+        return out
+
+    async def get_block_header(self, height) -> bytes:
+        self.calls.append(("get_block_header", str(int(height))))
+        if int(height) > self.tip:
+            raise NetworkError(f"height {int(height)} out of range")
+        return synthetic_header(int(height))
 
     async def get_tip_height(self) -> int:
         self.calls.append(("get_tip_height", ""))
@@ -200,9 +211,16 @@ class TestTheHonestPath:
         # THE WHOLE CAVEAT, not its first 200 characters. It ran past `_truncate_for_human`'s
         # cap and was cut mid-word, dropping the half that says why the number is unverified —
         # a safety qualifier that stops halfway still reads as complete.
-        from pyrxd.glyph.mark_anchor import UNVERIFIED_CAVEAT
+        #
+        # The BOUND caveat: the CLI binds the height to the header that hashes to the block the
+        # node names, so the unbound caveat's "pyrxd has no Radiant header ... check" would now be
+        # a false sentence on this screen. The bound one says the check is against the endpoint
+        # itself and is NOT verification.
+        from pyrxd.glyph.mark_anchor import BOUND_CAVEAT, UNVERIFIED_CAVEAT
 
-        assert " ".join(r.output.split()).count(" ".join(UNVERIFIED_CAVEAT.split())) == 1
+        flat = " ".join(r.output.split())
+        assert flat.count(" ".join(BOUND_CAVEAT.split())) == 1
+        assert " ".join(UNVERIFIED_CAVEAT.split()) not in flat
         assert "…" not in r.output
 
     def test_quiet_mode_prints_the_answer_not_the_question(self, monkeypatch, tmp_path, marked) -> None:
@@ -233,6 +251,23 @@ class TestTheFileMatchingHalf:
         assert "DOES NOT MATCH" in r.output
         assert "VERDICT — DOES NOT HOLD" in r.output
         assert marked["digest"] in r.output, "the record's own digest is shown beside the one supplied"
+
+    def test_a_digest_differing_only_in_its_LAST_byte_does_not_match(self, monkeypatch, tmp_path, marked) -> None:
+        """The comparison is over every byte. A different file differs everywhere, so the case
+        above cannot tell a whole-digest compare from a prefix compare — a planted
+        ``expected_hex[:16] == have[:16]`` survived the full suite. This digest agrees with the
+        record in its first 31 bytes."""
+        last = int(marked["digest"][-2:], 16)
+        near = marked["digest"][:-2] + f"{last ^ 0x01:02x}"
+        assert near[:-2] == marked["digest"][:-2] and near != marked["digest"]
+        r = _run(
+            monkeypatch,
+            marked["server"],
+            ["verify", marked["txid"], "--digest", near, "--min-confirmations", "6"],
+            tmp_path=tmp_path,
+        )
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        assert "file:       DOES NOT MATCH" in r.output.split("HashMark record at vout", 1)[0]
 
     def test_the_file_is_hashed_with_the_algorithm_the_RECORD_names(self, monkeypatch, tmp_path, marked) -> None:
         """Not with a spelling chosen by the CLI. `algorithm_for`'s docstring is explicit that a
@@ -359,6 +394,26 @@ class TestEveryRefusal:
         assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
         assert "PROVISIONAL" in r.output
 
+    @pytest.mark.parametrize(
+        ("confirmations", "state", "exit_code"),
+        [(5, "PROVISIONAL", EXIT_VERDICT_DOES_NOT_HOLD), (6, "CONFIRMED", 0)],
+    )
+    def test_the_floor_is_exact_at_its_boundary(
+        self, monkeypatch, tmp_path, marked, confirmations, state, exit_code
+    ) -> None:
+        """One below the floor you set does not hold; AT the floor does. Two confirmations
+        against six (above) is far enough from the edge that ``confirmations + 1 < floor`` passed
+        it too, and survived the full suite as a plant."""
+        marked["server"].confirmations = confirmations
+        r = _run(
+            monkeypatch,
+            marked["server"],
+            ["verify", marked["txid"], "--min-confirmations", "6"],
+            tmp_path=tmp_path,
+        )
+        assert r.exit_code == exit_code, r.output
+        assert f"block:      {state}" in r.output.split("HashMark record at vout", 1)[0]
+
     def test_min_confirmations_is_required_and_names_the_flag(self, monkeypatch, tmp_path, marked) -> None:
         r = _run(monkeypatch, marked["server"], ["verify", marked["txid"]], tmp_path=tmp_path)
         assert r.exit_code == 1
@@ -394,6 +449,30 @@ class TestEveryRefusal:
         assert r.exit_code == 1
         assert "not an even-length hex" in r.output
         assert marked["server"].calls == []
+
+    def test_a_file_that_cannot_be_read_is_named_without_its_escape_bytes(self, monkeypatch, tmp_path, marked) -> None:
+        """The summary line always sanitised the path; the "could not read" error printed it raw,
+        so a file named with an escape sequence drove the terminal on the error path."""
+        import pyrxd.hashmark_tx as hx
+
+        named = tmp_path / "report.pdf\x1b[8m"
+        named.write_bytes(marked["content"])
+
+        def _unreadable(path, *_a, **_k):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(hx, "digest_file", _unreadable)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: marked["server"])
+        monkeypatch.setattr(
+            glyph_inspect,
+            "_endpoint_pair",
+            lambda ctx: (marked["server"], "wss://only", marked["server"], "wss://only"),
+        )
+        args = ["--config", str(tmp_path / "c.toml"), "verify", marked["txid"], "--file", str(named)]
+        r = CliRunner().invoke(cli, [*args, "--min-confirmations", "6"], color=True)  # color=True keeps ESC visible
+        assert r.exit_code == 1, r.output
+        assert "could not read" in r.output and "report.pdf?[8m" in r.output
+        assert "\x1b" not in r.output
 
     def test_a_file_path_where_a_txid_belongs_explains_the_shape(self, monkeypatch, tmp_path, marked) -> None:
         r = _run(

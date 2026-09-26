@@ -68,6 +68,16 @@ class ChainStep:
     attrs: dict = field(default_factory=dict)
     #: Set only for ``unreadable``.
     reason: str = ""
+    #: The committed envelope CBOR, VERBATIM — the bytes whose ``sha256d`` this step's mutable
+    #: output commits to. Empty for a step whose record could not be bound or read.
+    #:
+    #: Carried because ``attrs`` is not the whole record. A WAVE mint names itself in
+    #: ``attrs.name`` OR ``app.data.name`` (RXinDexer reads both), and the second is outside
+    #: ``attrs``; a consumer that needs to know what the glyph's OWN payload claims — HashMark
+    #: §7.6 form 2 checking the name an index bound to it — has to read these bytes, which are
+    #: already txid-bound (fetched through a hashing fetch) and hash-bound (the covenant commits
+    #: to them). ``compare=False``: two steps are the same step whatever bytes rode along.
+    envelope_cbor: bytes = field(default=b"", compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -139,8 +149,13 @@ def _mut_output_for(
 RECORD_UNKNOWN_KINDS = frozenset({"unreadable", "unbound", "none"})
 
 
-def _envelope_of(inspector: GlyphInspector, scriptsigs: Sequence[bytes], payload_hash: bytes) -> tuple[str, dict, str]:
-    """(kind, attrs, reason) for the envelope THE COVENANT COMMITS TO.
+def _envelope_of(
+    inspector: GlyphInspector, scriptsigs: Sequence[bytes], payload_hash: bytes
+) -> tuple[str, dict, str, bytes]:
+    """(kind, attrs, reason, committed bytes) for the envelope THE COVENANT COMMITS TO.
+
+    The bytes are returned only for a record that was read (``mint`` / ``update``), and are
+    exactly the blob whose ``sha256d`` is ``payload_hash``; every other kind returns ``b""``.
 
     THE BINDING THIS EXISTS FOR. A mutable output's script carries ``payload_hash``, and measured
     on every real mainnet step of two WAVE chains it is exactly ``sha256d`` of that step's envelope
@@ -179,12 +194,12 @@ def _envelope_of(inspector: GlyphInspector, scriptsigs: Sequence[bytes], payload
             if envelope is None:  # pragma: no cover - the marker and blob were just rebuilt
                 continue
             if envelope.kind == "payload":
-                return "mint", dict(_as_attrs(envelope.metadata.attrs)), ""
+                return "mint", dict(_as_attrs(envelope.metadata.attrs)), "", bytes(blob)
             if envelope.kind == "update":
-                return "update", dict(_as_attrs((envelope.fields or {}).get("attrs"))), ""
+                return "update", dict(_as_attrs((envelope.fields or {}).get("attrs"))), "", bytes(blob)
             unreadable_reason = envelope.reason
     if unreadable_reason:
-        return "unreadable", {}, unreadable_reason
+        return "unreadable", {}, unreadable_reason, b""
     if saw_marker:
         return (
             "unbound",
@@ -193,6 +208,7 @@ def _envelope_of(inspector: GlyphInspector, scriptsigs: Sequence[bytes], payload
                 "this transaction carries glyph envelopes, but none of them hashes to the payload_hash "
                 "its own mutable output commits to - so none of them is this token's record"
             ),
+            b"",
         )
     return (
         "none",
@@ -201,6 +217,7 @@ def _envelope_of(inspector: GlyphInspector, scriptsigs: Sequence[bytes], payload
             "this transaction's mutable output commits to a payload_hash, but the transaction "
             "reveals no glyph envelope at all - so this step's record was never published"
         ),
+        b"",
     )
 
 
@@ -354,10 +371,10 @@ async def walk_mutable_chain(
             excluded=tuple(sorted(pool)),
         )
     vout, ref, payload_hash = found
-    kind, attrs, why = _envelope_of(
+    kind, attrs, why, blob = _envelope_of(
         inspector, [bytes(i.unlocking_script.serialize()) for i in mint_tx.inputs], payload_hash
     )
-    steps = [ChainStep(txid=mint_txid, mut_vout=vout, kind=kind, attrs=attrs, reason=why)]
+    steps = [ChainStep(txid=mint_txid, mut_vout=vout, kind=kind, attrs=attrs, reason=why, envelope_cbor=blob)]
     # THE FRONT OF THE HISTORY, guarded like the back. The tip proof stops suffix truncation; the
     # prefix had no check at all, and `mint_txid` arrives from the same untrusted place as the
     # candidates. Starting the walk at a mid-chain UPDATE produced `complete=True` over a record
@@ -422,10 +439,10 @@ async def walk_mutable_chain(
             cur_txid, cur_vout = cand, -1
             break
         nxt_vout, _nxt_ref, nxt_payload_hash = nxt
-        kind, attrs, why = _envelope_of(
+        kind, attrs, why, blob = _envelope_of(
             inspector, [bytes(i.unlocking_script.serialize()) for i in tx.inputs], nxt_payload_hash
         )
-        steps.append(ChainStep(txid=cand, mut_vout=nxt_vout, kind=kind, attrs=attrs, reason=why))
+        steps.append(ChainStep(txid=cand, mut_vout=nxt_vout, kind=kind, attrs=attrs, reason=why, envelope_cbor=blob))
         cur_txid, cur_vout = cand, nxt_vout
     else:
         truncated_reason = f"walk stopped at the {max_steps}-step cap — the chain may continue"

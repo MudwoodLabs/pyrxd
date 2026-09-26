@@ -155,8 +155,13 @@ FT_SCRIPT_RE = re.compile(r"^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e37
 # NFT commit uses OP_2 (52) for SINGLETON ref type; FT commit uses OP_1 (51) for NORMAL ref type.
 COMMIT_SCRIPT_NFT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda529d76a914[0-9a-f]{40}88ac$")
 COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda519d76a914[0-9a-f]{40}88ac$")
-# Kept for backwards compatibility — matches either variant.
-COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda[0-9a-f]{2}9d76a914[0-9a-f]{40}88ac$")
+# Either variant — and ONLY those two. The ref-type operand is ``OP_2`` or ``OP_1``, the two
+# values pyrxd's builder and Photonic's ``nftCommitScript`` / ``ftCommitScript``
+# (``packages/lib/src/script.ts``) emit. It used to accept ANY byte there, including ``00``:
+# ``OP_REFTYPE_OUTPUT OP_0 OP_NUMEQUALVERIFY`` demands that the reveal create NO ref for the
+# commit's outpoint, so a commit carrying it mints nothing — and a reveal spending one placed
+# first had its decoy envelope read as the payload a commit bound (``payload_binding``).
+COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda5[12]9d76a914[0-9a-f]{40}88ac$")
 
 # A DAT commit carries NO OP_REFTYPE_OUTPUT block — a DAT reveal mints nothing —
 # and adds a "dat" marker push ahead of "gly". 70 bytes.
@@ -246,8 +251,9 @@ def build_commit_locking_script(
 
     The commit script asserts that the spending reveal tx produces an output
     of the expected refType: ``SINGLETON`` (2) for NFT, ``NORMAL`` (1) for FT.
-    That single byte — ``OP_2`` vs ``OP_1`` at offset 54 — is the difference
-    between an NFT-compatible and FT-compatible commit output.
+    That single byte — ``OP_2`` vs ``OP_1`` at offset 48 of the 75-byte script
+    (56 bytes further on behind a delegate prefix) — is the difference between an
+    NFT-compatible and FT-compatible commit output.
 
     Prior versions of this function hardcoded ``OP_2`` (NFT only). Downstream
     FT mint consumers had to patch the output byte themselves, producing

@@ -31,7 +31,13 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..glyph._inspect_core import _HUMAN_ENTRY_CAP, _attestation_verdict, _spent_output_binding, _truncate_for_human
+from ..glyph._inspect_core import (
+    _HUMAN_ENTRY_CAP,
+    _apply_bindings,
+    _attestation_verdict,
+    _spent_output_bindings,
+    _truncate_for_human,
+)
 from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from ..glyph._inspect_core import _classify_input as _classify_input_core
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core
@@ -39,7 +45,7 @@ from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
-from ..glyph.mark_anchor import mark_anchor_dict
+from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, mark_anchor_dict
 from ..glyph.payload import _MAX_ATTRS_LIST_LEN
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
@@ -274,41 +280,48 @@ async def _inspect_txid_inner(
     # is the thing the report exists to eliminate, so resolve it here, where a network
     # connection is already in hand.
     #
-    # EXACTLY ONE round trip, bounded by construction rather than by a cap: there is
-    # one attributed input and it has one prevout. No loop, so nothing to bound.
+    # WHICH round trips: the ones the classification names in `binding_candidates` — the spent
+    # transactions of the minting payloads' inputs, at most `_MAX_BINDING_FETCHES`, so a reveal
+    # minting one glyph costs the one it always did. More than one because the headline is
+    # chosen by what they say (#743 round 3): a payload that mints and was never committed to,
+    # placed first, used to headline over the bound one beside it.
     #
-    # THE VERDICT COMES FROM `_spent_output_binding`, the function the browser page calls too,
+    # THE VERDICT COMES FROM `_spent_output_bindings`, the function the browser page calls too,
     # so the two surfaces cannot word one fetch differently. A failure here used to fall back
     # to the classifier's "was not supplied" — including when the server answered with a
     # DIFFERENT transaction, which `get_transaction` refuses. It now says it asked, and why
     # nothing usable came back.
-    binding: dict | None = None
-    meta = ((payload.get("metadata") or {}) if isinstance(payload, dict) else {}) or {}
-    outpoint = meta.get("input_outpoint")
-    if outpoint:
-        prev_txid = str(outpoint).rpartition(":")[0]
-        spent_raw: bytes | None = None
-        spent_error = ""
-        try:
-            spent_raw = bytes(await client.get_transaction(Txid(prev_txid.lower())))
-        except Exception as exc:
-            # Same contract as the delegate block above: a failed fetch leaves the verdict
-            # "unchecked" rather than failing the whole inspect — and the reason is carried
-            # into the verdict's `detail` rather than only logged.
-            spent_error = str(exc) or type(exc).__name__
-            _log.debug("could not fetch the attributed input's prevout %s: %s", outpoint, exc)
-        binding = _spent_output_binding(str(txid), bytes(raw), spent_raw, spent_error=spent_error)
+    bindings: dict | None = None
+    candidates = (payload.get("binding_candidates") or []) if isinstance(payload, dict) else []
+    if candidates:
+        spent: dict[str, bytes | None] = {}
+        errors: dict[str, str] = {}
+        for outpoint in candidates:
+            try:
+                spent[outpoint] = bytes(await client.get_transaction(Txid(str(outpoint).rpartition(":")[0].lower())))
+            except Exception as exc:
+                # Same contract as the delegate block above: a failed fetch leaves that verdict
+                # "unchecked" rather than failing the whole inspect — and the reason is carried
+                # into the verdict's `detail` rather than only logged.
+                spent[outpoint] = None
+                errors[outpoint] = str(exc) or type(exc).__name__
+                _log.debug("could not fetch the prevout %s: %s", outpoint, exc)
+        bindings = _spent_output_bindings(str(txid), bytes(raw), spent, errors)
 
-    if resolved:
+    if resolved or (bindings is not None and bindings["reclassify"]):
         payload = _classify_raw_tx(
             str(txid),
             bytes(raw),
             only_vout=only_vout,
             network=network,
-            delegated_refs=resolved,
+            delegated_refs=resolved or None,
+            spent_scripts=None if bindings is None else bindings["spent_scripts"],
         )
-    if binding is not None and isinstance(payload, dict) and payload.get("metadata"):
-        payload["metadata"]["payload_binding"] = binding
+    # The headline's verdict, every other minting payload's — `unchecked` with the reason where its
+    # fetch failed or was never made — and the count past the fetch limit: `_apply_bindings`, the
+    # step the page's glue takes too.
+    if bindings is not None and isinstance(payload, dict):
+        _apply_bindings(payload, bindings)
     if unresolved_over_cap and isinstance(payload, dict) and payload.get("metadata"):
         payload["metadata"]["delegate_bases_unresolved"] = unresolved_over_cap
     return payload
@@ -439,23 +452,40 @@ def _render_txid_human(payload: dict) -> str:
         # payload per minted glyph; printing one under a bare "Reveal metadata"
         # heading told the reader it described the transaction. One observed
         # mainnet reveal mints 35 refs from 36 inputs.
+        # And MINTED is counted from the outputs (`of_n_minted`), not from the envelopes: an input
+        # can carry a payload and mint nothing. The page words it identically (`inspect.js`).
         n_payloads = metadata.get("of_n_payloads")
         if n_payloads:
+            n_minted = metadata.get("of_n_minted", n_payloads)
+            said = (
+                f"1 of {n_payloads} glyphs minted here"
+                if n_minted == n_payloads
+                else f"1 of {n_payloads} payloads here, {n_minted} minting a token"
+            )
             lines.append(
-                f"Reveal metadata (from input {metadata['input_index']} — "
-                f"1 of {n_payloads} glyphs minted here; see metadata_inputs for the rest):"
+                f"Reveal metadata (from input {metadata['input_index']} — {said}; see metadata_inputs for the rest):"
             )
         else:
             lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        if metadata.get("mints") is False:
+            lines.append("  token:    none — this input mints no token here")
         _pb = metadata.get("payload_binding")
         if _pb:
-            # Same reasoning as the browser: every state, including "unchecked".
-            _mark = "  *** " if _pb.get("state") == "mismatch" else "  "
+            # Same reasoning as the browser: every state, including "unchecked". Flagged: the
+            # states that say a node would reject this transaction as shown.
+            from ..glyph._inspect_core import PAYLOAD_BINDING_WARNING_STATES
+
+            _mark = "  *** " if _pb.get("state") in PAYLOAD_BINDING_WARNING_STATES else "  "
             lines.append(f"{_mark}payload_binding={_pb.get('state')} — {_pb.get('reason')}")
             # WHY, when the spent transaction was asked for and nothing usable came back. Already
-            # sanitised and capped by `_spent_output_binding`: it can quote a server.
+            # sanitised and capped by `_spent_output_bindings`: it can quote a server.
             if _pb.get("detail"):
                 lines.append(f"    why: {_pb['detail']}")
+            # NOT SETTLED: the headline is not bound and a check that could have moved it did not
+            # happen (a fetch failed, or the payload was past the fetch limit). Flagged, as the
+            # page flags it.
+            if _pb.get("unsettled"):
+                lines.append(f"  *** {_pb['unsettled']}")
             # Named whatever the verdict. On `unchecked` it is what someone would
             # fetch to settle it; on `mismatch` it is where the real payload is.
             if metadata.get("input_outpoint"):
@@ -567,12 +597,36 @@ def _render_txid_human(payload: dict) -> str:
         for row in (payload.get("metadata_inputs") or [])
         if row["input_index"] != (metadata or {}).get("input_index")
     ]
-    if others:
+    # Minted is what the outputs create (`mints`), so a payload on an input that mints nothing is
+    # listed as that, and the heading counts only the others that do. Worded as the page words it.
+    hidden = payload.get("metadata_inputs_not_listed") or {}
+    if others or hidden.get("count"):
+        total = len(others) + int(hidden.get("count") or 0)
+        minting = sum(1 for row in others if row.get("mints", True)) + int(hidden.get("minting") or 0)
         lines.append("")
-        lines.append(f"Other glyphs minted in this transaction ({len(others)}):")
+        if minting == total:
+            lines.append(f"Other glyphs minted in this transaction ({total}):")
+        else:
+            lines.append(f"Other payloads in this transaction ({total}), {minting} minting a token:")
         for row in others:
             label = _truncate_for_human(row["name"] or row["ticker"] or "(unnamed)")
-            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}")
+            tail = "" if row.get("mints", True) else " — mints no token"
+            # Its commit's verdict — `unchecked` with the reason where the fetch failed or was
+            # never made — and flagged when a node rejects it, or when it spent no commit pyrxd
+            # recognises beside one that binds.
+            if row.get("binding_state"):
+                tail += f" — payload binding: {row['binding_state']}"
+                if row.get("binding_detail"):
+                    tail += f" ({row['binding_detail']})"
+                if row.get("binding_warning"):
+                    tail += " *** treat as unattributed"
+            lines.append(f"  input {row['input_index']:>3}: {row['classification']:<12} {label}{tail}")
+        past_cap = (metadata or {}).get("bindings_past_cap")
+        if past_cap:
+            lines.append(
+                f"  ({past_cap['count']} minting payload(s) past the limit of {past_cap['cap']} "
+                "commits fetched were not checked)"
+            )
 
     # GLYPH ENVELOPES THAT ARE NOT FULL PAYLOADS (#661 follow-up). `metadata` above renders
     # only a full token payload, so a mutable-glyph UPDATE transaction rendered NOTHING here —
@@ -714,6 +768,14 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     ``label`` is the endpoint's URL, carried into :attr:`MarkAnchor.source` so the caller's
     independence rules — the height must not come from whoever supplied the name binding —
     are checkable rather than assumed.
+
+    THE HEIGHT IS BOUND TO A HEADER, always, here. ``tip - confirmations + 1`` is one block low
+    whenever an endpoint's index trails its node, and that happens to every endpoint at once, so
+    two agreeing servers did not catch it: ``verify`` printed a block the mark is not in, and
+    form 2 folded against it. ``fetch_header`` makes the height the one whose header hashes to
+    the block the node says holds the mark, or raises. It is passed unconditionally because this
+    is the one door every CLI anchor comes through; the browser pages make the same call, through
+    ``glue.mark_anchor``, with the headers they fetch.
     """
     from ..glyph.mark_anchor import MarkAnchor, resolve_mark_anchor
 
@@ -726,6 +788,7 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
         source=label,
         min_confirmations=min_confirmations,
         tip_height=int(tip_height),
+        fetch_header=client.get_block_header,  # type: ignore[attr-defined]
     )
 
 
@@ -851,8 +914,16 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
     ]
     if nam.get("provisional"):
         lines.append(f"{indent}  PROVISIONAL: the mark is below the confirmation floor you set")
+    # EXPIRY IS A STATE, AND IT IS PRINTED. `expiry` has only ever been "unknown" — renewals are
+    # decided by treasury payments the walk does not observe — and it reached --json but no
+    # terminal, so a reader of "pointed at X at block N" had no way to learn the name might have
+    # lapsed by then. A qualifier that only JSON carries is one a human never sees.
+    lines.append(f"{indent}  expiry at that block: {nam.get('expiry')}")
     lines.append(f"{indent}  ({nam.get('caveat')})")
-    lines.append(f"{indent}  (name→glyph binding is {nam.get('binding_source')}'s claim, not verified on chain)")
+    lines.append(
+        f"{indent}  (name→glyph binding is {nam.get('binding_source')}'s claim: the glyph's own mint does name "
+        f"{name}, but which registration of it is in force is not verified on chain)"
+    )
     return lines
 
 
@@ -876,18 +947,62 @@ def _require_min_confirmations(
         raise UserError(
             f"{needed_by} needs --min-confirmations",
             cause="confirmation depth is value-scaled per chain and deliberately has no default",
-            fix=f"add --min-confirmations N {where}: N is how many blocks must sit on top of the mark's "
-            "block before you rely on it; below that the block is treated as provisional",
+            fix=f"add --min-confirmations N {where} — {MIN_CONFIRMATIONS_MEANING} (the mark's block); "
+            "with fewer, the block is treated as provisional",
         )
+
+
+def _require_wave_name(name: str | None) -> str | None:
+    """``None`` when ``--wave-name`` was not given, the name when it was — and a ``UserError`` when
+    it was given EMPTY.
+
+    ABSENT IS ``None``, NEVER "FALSY". Both commands tested ``if wave_name:``, so an empty value
+    was indistinguishable from the flag not being passed: ``pyrxd verify`` then reported ``name:
+    NOT CHECKED — --wave-name was not given`` (a state that HOLDS) and exited 0. The way an empty
+    value arrives is an unset shell variable — ``pyrxd verify T --wave-name "$PUBLISHER" && deploy``
+    with ``PUBLISHER`` unset — so the gate passed an attacker's mark while the caller believed it
+    had checked the name. Whitespace-only is refused too: it is no name either, and it used to go
+    on to a name lookup as though it were one.
+
+    ONE RULE, BOTH COMMANDS, AND THE FUNNEL. Called by ``glyph inspect`` and ``pyrxd verify``
+    before anything touches the network, and again by :func:`_attach_name_at_mark`, which is where
+    every name lookup goes, so a third caller cannot route around it.
+    """
+    if name is None:
+        return None
+    if not name.strip():
+        raise UserError(
+            "--wave-name was given an empty name",
+            cause=f'got {name!r} — usually an unset shell variable, e.g. --wave-name "$PUBLISHER"',
+            fix="pass the WAVE name to check (e.g. company.rxd), or leave --wave-name out entirely",
+        )
+    # AND IT MUST BE A NAME THIS CAN ASK ABOUT: a top-level `.rxd` name (domain exactly `rxd`)
+    # whose label the indexer could have registered. `alice.evil` used to be judged and printed as
+    # `alice.rxd`. Same door as the empty check, so both commands refuse it before the network.
+    from ..glyph.wave_identity import _requested_label
+    from ..security.errors import ValidationError
+
+    try:
+        _requested_label(name)
+    except ValidationError as exc:
+        raise UserError(
+            "that --wave-name is not a name this can ask about",
+            cause=str(exc),
+            fix="pass a top-level WAVE name: a label with the domain exactly 'rxd' (alice.rxd), or the bare label (alice)",
+        ) from exc
+    return name
 
 
 def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     """Two clients pinned to two DIFFERENT configured endpoints, each labelled by its URL.
 
-    Form 2 needs two independent sources twice over: the walker refuses a tip proof from the
-    server that supplied the candidates, and the judge refuses a block height from the server
-    that supplied the name→glyph binding. With ONE configured endpoint both clients are that
-    endpoint and both labels are equal, so each of those rules degrades with its reason — which
+    Form 2 needs two independent sources three times over: the walker refuses a tip proof from
+    the server that supplied the candidates, the judge refuses a mark height from the server that
+    supplied the name→glyph binding, and the judge refuses any block height — the mark's or a chain
+    step's — that both endpoints do not report identically. The LABEL is what those rules compare,
+    so a label must name the endpoint that really answers: one endpoint must never carry two
+    labels. With ONE configured endpoint both clients are that endpoint and both labels are
+    equal, so each of those rules degrades with its reason — which
     is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
     config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
     ships two independent operators, so with no configuration at all these are two different
@@ -905,7 +1020,12 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
 
     profile = ctx.config.require_profile()
     first = profile.endpoints[0]
-    second = profile.endpoints[1] if len(profile.endpoints) > 1 else profile.endpoints[0]
+    # A SECOND OPERATOR, not merely a second URL. `wss://h/` and `wss://h/x`, or one IP address
+    # spelled two ways, are one machine: taking the next URL made one lying server two "sources"
+    # that corroborated each other (0.25.0 panel, round 3). The first endpoint on a DIFFERENT host
+    # (`Endpoint.source`) is the second; if there is none, this is a single-operator configuration
+    # and both halves are the first endpoint under one label — which every source rule refuses.
+    second = next((e for e in profile.endpoints[1:] if e.source != first.source), first)
 
     def _one(endpoint: object) -> FailoverElectrumXClient:
         return FailoverElectrumXClient(
@@ -923,7 +1043,13 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
     with a reason, never raised, because a failed name resolution is not a reason to lose the
     classification the user asked for. The mark's txid comes from the fetched transaction; a
     pasted script has none, and form 2 is then unavailable by construction.
+
+    THE ONE EXCEPTION IS THE QUESTION ITSELF. A ``--wave-name`` that is empty, or not a top-level
+    ``.rxd`` name, is bad input: :func:`_require_wave_name` refuses it with :class:`UserError`. Both
+    commands call it before the network, and it is called here too, before any lookup, so a caller
+    that forgot cannot route around it. ``alice.evil`` used to be judged and printed as ``alice.rxd``.
     """
+    _require_wave_name(name)
     mark_txid = payload.get("txid") if isinstance(payload.get("txid"), str) else None
     # ONE LOOKUP PER SIGNER, NOT PER RECORD. A lookup is a name resolution, an anchor and a chain
     # walk across two servers, and it was run once for EVERY verified record — so a transaction
@@ -994,16 +1120,18 @@ def _judge_one_name_at_mark(
 async def _name_at_mark(
     ctx: CliContext, *, name: str, mark_txid: str | None, min_confirmations: int, signer_hash160: bytes
 ) -> dict:
-    """Binding from one endpoint, height from the other; candidates from one, tip proof from
-    the other. Then the pure judge. Every source is labelled by URL so the two rules that refuse
-    a shared source can see when it IS shared."""
+    """Binding from one endpoint, the mark's block from the other; candidates from one, tip proof
+    from the other; and EVERY block height — the mark's and each chain step's — from both. Then
+    the pure judge. Every source is labelled by URL so the rules that refuse a shared or a
+    disagreeing source can see when it IS shared, or does disagree."""
     from contextlib import AsyncExitStack
 
     from ..base58 import base58check_encode
     from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
     from ..glyph.mutable_chain_discovery import walk_discovered_chain
     from ..glyph.wave import WaveNameNotFound, WaveResolver
-    from ..glyph.wave_identity import judge_name_at_mark
+    from ..glyph.wave_identity import HeightReport, _requested_label, judge_name_at_mark
+    from ..security.errors import NetworkError
 
     san = _sanitize_display_string
     shown = san(name)
@@ -1059,7 +1187,8 @@ async def _name_at_mark(
             anchor_client, anchor_label, mark_txid=mark_txid, min_confirmations=min_confirmations
         )
 
-        # 3. THE CHAIN: discovered on A, tip proved on B.
+        # 3. THE CHAIN: discovered on A, tip proved on B — and B asked, independently, where each
+        #    walked step is (`found.tip_heights`). A's step heights alone decided the answer before.
         found = await walk_discovered_chain(
             mint_txid=mint,
             discovery_client=client_a,
@@ -1068,23 +1197,74 @@ async def _name_at_mark(
             tip_source=label_b,
         )
 
+        # 4. THE MARK'S BLOCK, A SECOND TIME, from the endpoint that did NOT supply the anchor. The
+        #    anchor is one endpoint's word; the judge wants both endpoints to place the mark in the
+        #    same block. Only when the anchor could be used at all — otherwise the judge refuses on
+        #    the anchor first and a second lookup buys nothing.
+        other_label, other_mark, other_bound, other_error = "", None, False, ""
+        if label_a != label_b and anchor.usable_for_point_in_time:
+            other_client, other_label = (client_b, label_b) if anchor_label == label_a else (client_a, label_a)
+            try:
+                other_anchor = await resolve_anchor_from(
+                    other_client, other_label, mark_txid=mark_txid, min_confirmations=min_confirmations
+                )
+                other_mark, other_bound = other_anchor.height, other_anchor.header_bound
+            except NetworkError as exc:
+                other_error = f"could not place the mark: {exc}"
+
     walk, discovery = found.walk, found.discovery
-    # 4. THE VERDICT — pure. `ref` is the walk's own, so the "walk is of another ref" rule can
-    #    never fire here; what the binding asserts is that THIS chain is the name, and that stays
-    #    `binding_verified=False` because nothing checked it on chain.
+    mark_by_label = {anchor_label: anchor.height, **({other_label: other_mark} if other_label else {})}
+    # Whether each endpoint's mark height was checked against ITS OWN header. From the anchors
+    # themselves, so the verdict's caveat says what happened rather than what was meant to.
+    bound_by_label = {anchor_label: anchor.header_bound, **({other_label: other_bound} if other_label else {})}
+    # ONE REPORT PER ENDPOINT, each labelled with the URL that answered: A's step heights are the
+    # ones discovery read from A's histories, B's the ones B reported when asked separately. The
+    # judge compares them — a report is a claim, and corroboration by assertion is not corroboration.
+    reports = [
+        HeightReport(
+            source=label_a,
+            mark_height=mark_by_label.get(label_a),
+            mark_header_bound=bound_by_label.get(label_a, False),
+            step_heights=discovery.heights,
+            error=other_error if other_label == label_a else "",
+        )
+    ]
+    if label_b != label_a:
+        reports.append(
+            HeightReport(
+                source=label_b,
+                mark_height=mark_by_label.get(label_b),
+                mark_header_bound=bound_by_label.get(label_b, False),
+                step_heights=found.tip_heights,
+                error="; ".join(
+                    e for e in (found.tip_heights_error, other_error if other_label == label_b else "") if e
+                ),
+            )
+        )
+    # 5. THE VERDICT — pure. `ref` is the walk's own, so the "walk is of another ref" rule can
+    #    never fire here; `name` is what was ASKED, and the judge compares it with the name the
+    #    glyph's own mint payload claims. `binding_verified` stays False: which registration of a
+    #    name is in force is still the indexer's word.
     verdict = judge_name_at_mark(
         ref=walk.ref or mint,
+        name=name,
         binding_source=binding_label,
         anchor=anchor,
         walk=walk,
-        step_heights=discovery.heights,
+        height_reports=reports,
     )
     network = Network(ctx.network) if ctx.network in {n.value for n in Network} else Network.TESTNET
     signer_address = base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[network] + signer_hash160)
     same: bool | None = (verdict.target_at_height == signer_address) if verdict.form == 2 else None
+    # THE NAME SHOWN IS THE NAME CHECKED. This was the indexer's echo (`record.name`), which the
+    # indexer chooses: asked about one name, it could answer with another's glyph under a third
+    # name, and every sentence below — "NAME pointed at …", ESTABLISHED, "the glyph's own mint does
+    # name NAME" — would print its choice. The judge compared the label that was ASKED with the
+    # glyph's own mint, so that label, qualified, is the one a human reads.
+    asked_label = _requested_label(name)  # validated at the door (`_attach_name_at_mark`); the same rule
     return {
         "resolved": True,
-        "name": san(record.name),
+        "name": san(f"{asked_label}.rxd"),
         "ref": san(verdict.ref),
         "reveal_txid": mint,
         "form": verdict.form,
@@ -1119,6 +1299,21 @@ async def _name_at_mark(
             "hops": discovery.hops,
             "fetches": discovery.fetches,
             "capped": discovery.capped,
+        },
+        # WHO SAID WHICH HEIGHT. The verdict's heights are the mark's and each walked step's, and
+        # form 2 needs every one of them from both endpoints; this is each endpoint's own word, so
+        # a reader can see which server disagreed rather than only that one did.
+        "heights": {
+            "agreed_by": [san(s) for s in verdict.height_sources],
+            "by_source": [
+                {
+                    "source": san(r.source),
+                    "mark": r.mark_height,
+                    "steps": {step.txid: r.step_heights.get(step.txid) for step in walk.steps},
+                    "error": san(r.error),
+                }
+                for r in reports
+            ],
         },
     }
 
@@ -1189,6 +1384,17 @@ def _op_return_payload_lines(payload: dict, indent: str = "  ") -> list[str]:
                     # "we do not know" rather than toward either verdict.
                     out.append(f"{indent}  signature {status} — {att.get('detail') or meaning}")
                     out.append(f"{indent}    ({meaning})")
+                    # THE CHAIN, FOR EVERY OUTCOME, not only beside VERIFIED. The genesis hash is
+                    # inside the signed statement, so a record honestly signed for testnet DOES
+                    # NOT VERIFY against mainnet — and printed without the chain it was held to,
+                    # that honest record read as a plain forgery on the default run. Name the
+                    # chain it was checked against (or would be), and how to ask about another.
+                    net = att.get("assumed_network")
+                    if net:
+                        held = "checked against" if outcome == "invalid_signature" else "would be checked against"
+                        out.append(f"{indent}    ({held} {net}: the chain is part of the signed statement, so a")
+                        out.append(f"{indent}     record signed for another chain does not verify here — if it was")
+                        out.append(f"{indent}     made on another network, re-run with that --network)")
             elif outcome == "not_attested":
                 # v1. There IS no signature, and the absence is the finding: a v1 mark
                 # fixes a time and names nobody. Printing nothing here left the reader
@@ -1485,8 +1691,9 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     help=(
         "HashMark §7.6 form 2: what did NAME (e.g. company.rxd) point at AT THE BLOCK THAT "
         "CARRIED THIS MARK, and was it the signing key? Needs --min-confirmations and two "
-        "configured ElectrumX servers; with one it degrades to the present-tense answer and "
-        "says why. Never runs on an unverified signature."
+        "configured ElectrumX servers that report the same block heights; with one, or if they "
+        "disagree, it degrades to the present-tense answer and says why. Never runs on an "
+        "unverified signature."
     ),
 )
 @click.option(
@@ -1496,8 +1703,9 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     default=None,
     metavar="N",
     help=(
-        "Depth below which the mark's block is too shallow to build a form-2 claim on. "
-        "Required with --wave-name; deliberately has no default (depth is value-scaled)."
+        f"The confirmation floor for the mark's block — {MIN_CONFIRMATIONS_MEANING}. Below it the "
+        "block is too shallow to build a form-2 claim on. Required with --wave-name; deliberately "
+        "has no default (depth is value-scaled)."
     ),
 )
 @click.pass_obj
@@ -1605,6 +1813,8 @@ def inspect_cmd(
     returned tx is verified against the requested txid by sha256d roundtrip.
     """
     form, value = _classify_input(inspect_input)
+    # Before any fetch: an empty --wave-name is refused, not read as "not given".
+    wave_name = _require_wave_name(wave_name)
 
     # Forms that need a network fetch.
     needs_fetch = (form == "txid") or (form == "outpoint" and resolve)
@@ -1638,7 +1848,7 @@ def inspect_cmd(
 
     if verify_wave:
         _attach_wave_identity(ctx, payload)
-    if wave_name:
+    if wave_name is not None:
         _require_min_confirmations(min_confirmations)
         _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 

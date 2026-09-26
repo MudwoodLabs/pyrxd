@@ -233,10 +233,13 @@ def build_wave_metadata(
     ``pay_registration_fee=False``. See :mod:`pyrxd.glyph.wave_rules`.
 
     THE LABEL GOES IN ``attrs.name``, NOT THE QUALIFIED NAME. Through 0.24.0 this function
-    wrote ``attrs.name = "alice.rxd"`` and left the top level empty. RXinDexer registers a
-    claim from ``attrs.name`` and its ``validate_wave_name`` refuses the ``.``, so by the
-    indexer's source no claim this function built was registered (#728; read from source,
-    not observed against a live indexer).
+    wrote the string it was given into ``attrs.name`` and left the top level empty. RXinDexer
+    registers a claim from ``attrs.name`` and its ``validate_wave_name`` refuses the ``.``, so a
+    claim built from a qualified name (``"alice.rxd"``, the form its 0.24.0 docstring showed)
+    registered nothing (#728). One built from a bare label (``"alice"``) wrote
+    ``attrs.name = "alice"``, which registers ``alice.rxd``. Both were checked by running the
+    indexer's own code at the pinned commit (``tests/test_wave_fee_matches_the_pinned_indexer.py``),
+    not against a live indexer.
 
     There is no homograph option. The label rule is ASCII-only, so a NON-ASCII look-alike
     label is refused by construction; a non-ASCII name is written as its ``xn--`` punycode.
@@ -382,7 +385,13 @@ class WaveResolver:
         return WaveRecord.from_indexer_response(result)
 
     async def check_available(self, name: str) -> bool:
-        """Return True if `name` is not yet registered.
+        """Return True if the indexer has no confirmed registration of `name`.
+
+        RXinDexer answers from the blocks it has indexed, not from the mempool
+        (``electrumx/server/glyph_api.py:1498-1515`` calls ``WaveIndex.check_available``,
+        ``electrumx/server/wave_index.py:1773-1800`` at ``ca8a6a4e``), so a rival claim that
+        is broadcast but not yet mined is not seen: True is "no confirmed registration", not
+        "nobody else is registering it".
 
         SENDS THE LABEL, NOT THE QUALIFIED NAME — the same rule :meth:`resolve` documents.
         ``resolve`` was corrected in #695 and this twin was left sending ``"alice.rxd"``, which

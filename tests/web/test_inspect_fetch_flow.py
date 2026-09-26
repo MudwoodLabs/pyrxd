@@ -3,7 +3,7 @@ Python bridge, and what it then DRAWS.
 
 ``inspect_fetch_flow_harness.mjs`` runs the page's own ``onFetchTxid`` against a stub ElectrumX
 server and records every argument it passes to the two bridges — the classifier
-(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_binding``). Each bridge
+(``glue.inspect_txid_with_raw``) and the binding step (``glue.spent_output_bindings``). Each bridge
 answers from a canned list, and every canned answer here is computed by the REAL ``glue.py`` on
 the arguments the page really passed: a first run records the binding step's arguments, the real
 glue answers them, and a second run renders that answer after checking the page passed the same
@@ -21,7 +21,7 @@ Properties, each a defect this change fixes:
 * **A spent transaction the page could not get is SAID, not swallowed** — in the drawn
   ``payload binding`` row and its ``detail``, not "was not supplied".
 * **The binding step does not classify the transaction again.** It used to be a second full
-  ``inspect_txid_with_raw``; it is one ``spent_output_binding`` call.
+  ``inspect_txid_with_raw``; it is one ``spent_output_bindings`` call.
 * **A failed first fetch is advised by what failed.** A server that answered with a different
   transaction was reachable, and is not told to be checked for reachability.
 * **The page passes its row limit as the classifier's checking limit AND its listing limit.**
@@ -97,12 +97,19 @@ def _commit_for(cbor: bytes, amount: int = 1000):
 
 
 def _world(shown: str = "honest", committed: str | None = None):
-    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen)."""
+    """(reveal, the real commit it spent, a FORGED commit to the envelope on screen). The reveal
+    mints the singleton its commit demands; ``committed`` differing from ``shown`` is a spend no
+    node accepts, which is what ``mismatch`` reports."""
+    from pyrxd.glyph.script import build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.security.types import Hex20
+
     suffix, shown_cbor = _envelope(shown)
     _, committed_cbor = _envelope(committed if committed is not None else shown)
     commit = _commit_for(committed_cbor)
     unlocking = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + suffix
-    reveal = _tx([(b"\x6a" + b"\x00" * 8, 0)], [(commit.txid(), 0, unlocking)])
+    minted = build_nft_locking_script(Hex20(b"\x33" * 20), GlyphRef(txid=commit.txid(), vout=0))
+    reveal = _tx([(minted, 1)], [(commit.txid(), 0, unlocking)])
     forged = _commit_for(shown_cbor, amount=999)
     assert forged.txid() != commit.txid()
     return reveal, commit, forged
@@ -121,12 +128,29 @@ def _first_pass(tx, limit: int) -> dict:
     return _glue().inspect_txid_with_raw(tx.txid(), tx.serialize().hex(), limit, limit)
 
 
-def _flow(txid: str, server: dict, glue_returns: list, binding_returns: list | None = None) -> dict:
+def _flow(
+    txid: str,
+    server: dict,
+    glue_returns: list,
+    binding_returns: list | None = None,
+    *,
+    interleave=None,
+    on_request: int | None = None,
+    anchor_returns: list | None = None,
+    binding_throws: bool = False,
+) -> dict:
+    spec = {"txid": txid, "server": server, "glue_returns": glue_returns, "binding_returns": binding_returns or []}
+    if binding_throws:
+        spec["binding_throws"] = True
+    if interleave is not None:
+        spec["interleave"] = interleave
+    if on_request is not None:
+        spec["interleave_on_request"] = on_request
+    if anchor_returns is not None:
+        spec["anchor_returns"] = anchor_returns
     proc = subprocess.run(  # nosec B603 — fixed argv, no shell, repo-local script
         [_require_node(), str(_HARNESS)],
-        input=json.dumps(
-            {"txid": txid, "server": server, "glue_returns": glue_returns, "binding_returns": binding_returns or []}
-        ),
+        input=json.dumps(spec),
         capture_output=True,
         text=True,
         check=False,
@@ -145,7 +169,7 @@ def _run(reveal, server: dict, limit: int) -> dict:
     what pass 2 draws is the page's drawing of the real binding for the real arguments."""
     first = [_first_pass(reveal, limit)]
     recorded = _flow(reveal.txid(), server, first)
-    answers = [_glue().spent_output_binding(*call) for call in recorded["binding_calls"]]
+    answers = [_glue().spent_output_bindings(*call) for call in recorded["binding_calls"]]
     flow = _flow(reveal.txid(), server, first, answers)
     assert flow["glue_calls"] == recorded["glue_calls"]
     assert flow["binding_calls"] == recorded["binding_calls"]
@@ -176,9 +200,18 @@ class TestTheSpentTransactionTheServerSends:
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         raw = reveal.serialize().hex()
         assert flow["glue_calls"] == [[reveal.txid(), raw, limit, limit]], "the transaction was classified twice"
-        assert flow["binding_calls"] == [[reveal.txid(), raw, commit.serialize().hex(), ""]]
-        assert flow["binding_answers"][0]["binding"]["state"] == "bound"
-        assert _drawn_binding(flow) == ("bound — the spent commit committed to exactly this payload", None)
+        (call,) = flow["binding_calls"]
+        # The page hands the prevouts as JSON objects keyed by outpoint, and its row limit twice.
+        assert call[:2] == [reveal.txid(), raw] and call[4:] == [limit, limit]
+        assert json.loads(call[2]) == {f"{commit.txid()}:0": commit.serialize().hex()}
+        assert json.loads(call[3]) == {}
+        binding = flow["binding_answers"][0]["binding"]
+        assert binding["state"] == "bound" and binding["first_ref_output"] == 0
+        assert _drawn_binding(flow) == (
+            "bound — the spent NFT commit committed to exactly this payload, and this transaction creates its ref "
+            "as a singleton at output 0: that token's payload, not every output's",
+            None,
+        )
 
     def test_a_commit_to_a_different_payload_is_drawn_as_a_mismatch(self, limit) -> None:
         """The honest server, the dishonest reveal: the real commit committed to another payload."""
@@ -201,9 +234,9 @@ class TestTheSpentTransactionTheServerSends:
         flow = _run(reveal, server, limit)
         assert flow["requested"] == [reveal.txid(), commit.txid()]
         (call,) = flow["binding_calls"]
-        assert call[2] == "", "the forged transaction reached the binding step"
+        assert json.loads(call[2]) == {}, "the forged transaction reached the binding step"
         said = f"the server's answer is not the transaction asked for: it hashes to {forged.txid()}"
-        assert call[3] == said
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": said}
         value, detail = _drawn_binding(flow)
         assert value == f"unchecked — {SPENT_TX_NOT_OBTAINED}"
         assert detail == said
@@ -216,7 +249,8 @@ class TestTheSpentTransactionTheServerSends:
         server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"error": "daemon busy"}}
         flow = _run(reveal, server, limit)
         (call,) = flow["binding_calls"]
-        assert call[2:] == ["", "server error: daemon busy"]
+        assert json.loads(call[2]) == {}
+        assert json.loads(call[3]) == {f"{commit.txid()}:0": "server error: daemon busy"}
         assert _drawn_binding(flow) == (f"unchecked — {SPENT_TX_NOT_OBTAINED}", "server error: daemon busy")
         assert "was not supplied" not in flow["rendered"]
 
@@ -380,3 +414,171 @@ class TestEveryClassificationIsBounded:
         flow = _run(reveal, server, limit)
         assert len(flow["glue_calls"]) == 1 and flow["glue_calls"][0][2:] == [limit, limit], flow["glue_calls"]
         assert len(flow["binding_calls"]) == 1
+
+
+# ─────────────────────────────── a fetch the reader moved on from draws nothing ──
+
+
+class TestAFetchTheReaderMovedOnFromDrawsNothing:
+    """The "Fetch from network" button awaits the server and then renders. /inspect/ had no in-flight guard,
+    so classifying another input — or pressing Clear — while it waited did not stop it: the slow
+    answer about the OLD transaction replaced whatever the reader was now looking at. /verify/
+    already had the token pattern; this is the same pattern, and Clear cancels too.
+
+    Each case runs the page's own ``onFetchTxid`` and, while it is still waiting on the server,
+    the page's own ``onClear`` or ``onClassify``."""
+
+    @staticmethod
+    def _plain(limit: int):
+        """A transaction with no reveal: one fetch, one classification, nothing else awaited."""
+        tx = _tx([(b"\x6a" + b"\x00" * 30, 0)], [("ab" * 32, 0, b"\x00")])
+        return tx, {tx.txid(): {"hex": tx.serialize().hex()}}, [_first_pass(tx, limit)]
+
+    def test_the_honest_path_still_draws_the_fetched_transaction(self, limit) -> None:
+        """The neighbour of both refusals below: with nobody interrupting, the answer is drawn."""
+        tx, server, first = self._plain(limit)
+        flow = _flow(tx.txid(), server, first)
+        assert "Fetched transaction" in flow["rendered"] and tx.txid() in flow["rendered"]
+
+    def test_clear_during_the_fetch_leaves_the_screen_clear(self, limit) -> None:
+        tx, server, first = self._plain(limit)
+        flow = _flow(tx.txid(), server, first, interleave="clear")
+        assert flow["requested"] == [tx.txid()], "the premise: the fetch really was in flight"
+        assert flow["rendered"] == "", f"a fetch the reader cleared drew its result anyway:\n{flow['rendered']}"
+
+    def test_a_failed_fetch_after_clear_does_not_draw_its_error_either(self) -> None:
+        """The failure branch renders too, so it is guarded too."""
+        flow = _flow("cd" * 32, {}, [], interleave="clear")
+        assert flow["requested"] == ["cd" * 32]
+        assert flow["rendered"] == ""
+
+    def test_classifying_something_else_is_not_overwritten_by_the_old_fetch(self, limit) -> None:
+        tx, server, first = self._plain(limit)
+        other = "76a914" + "5a" * 20 + "88ac"
+        classified = _glue().run(other)
+        assert classified["ok"] and classified["form"] == "script", classified
+        flow = _flow(tx.txid(), server, first, interleave={"classify": {"text": other, "result": classified}})
+        assert flow["requested"] == [tx.txid()], "the premise: the fetch really was in flight"
+        assert tx.txid() not in flow["rendered"], "the old fetch replaced the input the reader classified since"
+        assert "5a" * 20 in flow["rendered"], f"the newer classification is not on screen:\n{flow['rendered']}"
+
+
+class TestEveryLaterWaitIsGuardedToo:
+    """The class above interrupts only during the FIRST fetch. A re-review planted the removal of
+    each of the three later stale-checks in ``onFetchTxid`` — after the first fetch, after the
+    spent-transaction fetch, after the block lookup — and every one survived, because nothing
+    interrupted the page at those waits. Each case here interrupts at one of them, through the
+    harness's ``interleave_on_request``, and the transactions are real ones classified by the
+    real glue: a reveal with no mark (so the spent-transaction fetch is the last wait), and a
+    transaction carrying a signed HashMark (so the block lookup is)."""
+
+    @staticmethod
+    def _reveal(limit: int):
+        reveal, commit, _forged = _world()
+        server = {reveal.txid(): {"hex": reveal.serialize().hex()}, commit.txid(): {"hex": commit.serialize().hex()}}
+        first = _first_pass(reveal, limit)
+        assert not first["payload"].get("hashmark") and not any(
+            row.get("hashmark") for row in first["payload"].get("outputs", [])
+        ), "the premise: this reveal carries no mark, so the spent-transaction fetch is the last wait"
+        return reveal, commit, server, [first]
+
+    @staticmethod
+    def _marked(limit: int):
+        from tests.web.test_verify_page import _signed_script
+
+        tx = _tx([(_signed_script(b"the advisory, as published\n"), 0)], [("ab" * 32, 0, b"\x00")])
+        server = {tx.txid(): {"hex": tx.serialize().hex()}}
+        first = _first_pass(tx, limit)
+        assert any(row.get("hashmark") for row in first["payload"]["outputs"]), "the premise: a mark"
+        from tests.web.test_mark_block_is_bound_on_the_pages import bound_anchor
+
+        # A BOUND anchor from the real bridge, handed over whole: these cases are about when the
+        # page stops, not about the binding, which `test_mark_block_is_bound_on_the_pages.py` owns.
+        anchor = bound_anchor(_glue(), tx.txid(), confirmations=5, tip=460572)
+        return tx, server, [first], [anchor]
+
+    # ── the honest paths, so each refusal below is known to be interrupting a flow that renders ──
+
+    def test_an_uninterrupted_reveal_fetches_the_commit_and_draws(self, limit) -> None:
+        reveal, commit, server, first = self._reveal(limit)
+        flow = _flow(reveal.txid(), server, first)
+        assert flow["requested"] == [reveal.txid(), commit.txid()]
+        assert "Fetched transaction" in flow["rendered"]
+
+    def test_an_uninterrupted_mark_is_placed_in_its_block_and_drawn(self, limit) -> None:
+        tx, server, first, anchors = self._marked(limit)
+        flow = _flow(tx.txid(), server, first, anchor_returns=anchors)
+        assert [m for m, _p in flow["server_log"]] == [
+            "blockchain.transaction.get",
+            "blockchain.transaction.get",
+            "blockchain.headers.subscribe",
+        ], "the premise: request 2 is the block lookup"
+        assert len(flow["anchor_calls"]) == 1
+        assert "Fetched transaction" in flow["rendered"] and str(anchors[0]["height"]) in flow["rendered"]
+
+    # ── interrupted at each wait ──
+
+    def test_clear_during_the_first_fetch_stops_the_work_there(self, limit) -> None:
+        """The check right after the first fetch. Rendering is also stopped by the later checks, so
+        what this one is FOR is visible only in the work: a superseded fetch must not go on to
+        classify the transaction or fetch the commit it spent."""
+        reveal, _commit, server, first = self._reveal(limit)
+        flow = _flow(reveal.txid(), server, first, interleave="clear")
+        assert flow["rendered"] == ""
+        assert flow["glue_calls"] == [], "a fetch the reader had cleared went on to classify the transaction"
+        assert flow["requested"] == [reveal.txid()], "a fetch the reader had cleared went on to fetch the commit"
+
+    @pytest.mark.parametrize("action", ["clear", "classify"])
+    def test_interrupted_during_the_spent_transaction_fetch_draws_nothing(self, limit, action) -> None:
+        reveal, commit, server, first = self._reveal(limit)
+        other = "76a914" + "5a" * 20 + "88ac"
+        interleave = "clear" if action == "clear" else {"classify": {"text": other, "result": _glue().run(other)}}
+        flow = _flow(reveal.txid(), server, first, interleave=interleave, on_request=2)
+        assert flow["requested"] == [reveal.txid(), commit.txid()], "the premise: request 2 is the commit"
+        assert reveal.txid() not in flow["rendered"], (
+            f"a fetch interrupted during the spent-transaction fetch drew its result anyway:\n{flow['rendered']}"
+        )
+        if action == "clear":
+            assert flow["rendered"] == ""
+        else:
+            assert "5a" * 20 in flow["rendered"]
+
+    def test_a_bridge_that_raises_draws_its_error_when_nobody_moved_on(self, limit) -> None:
+        """The honest half of the case below: the raise really does reach the page's "bridge error"
+        branch, so an empty screen there means the guard held, not that nothing happened."""
+        reveal, _commit, server, first = self._reveal(limit)
+        flow = _flow(reveal.txid(), server, first, binding_throws=True)
+        assert len(flow["binding_calls"]) == 1
+        assert "bridge error: harness: the binding bridge raised" in flow["rendered"]
+
+    def test_a_bridge_that_would_raise_is_not_reached_after_the_reader_moved_on(self, limit) -> None:
+        """The bridge-error branch — the one path that renders from inside the catch. Interrupted
+        during the spent-transaction fetch, with a binding step that raises.
+
+        Until #743 round 5 the superseded fetch still CALLED the binding step, which raised, and
+        only the check in the catch kept the error card off the screen. Now the check after each
+        candidate fetch returns before the bridge is called at all — the stronger property, and
+        the one asserted: no call, nothing drawn. A page that reaches the bridge again after the
+        reader moved on fails the first assertion whether or not the catch still checks."""
+        reveal, _commit, server, first = self._reveal(limit)
+        flow = _flow(reveal.txid(), server, first, interleave="clear", on_request=2, binding_throws=True)
+        assert flow["binding_calls"] == [], "a superseded fetch went on to the binding step"
+        assert flow["rendered"] == "", f"a superseded fetch drew its bridge error:\n{flow['rendered']}"
+
+    @pytest.mark.parametrize("action", ["clear", "classify"])
+    def test_interrupted_during_the_block_lookup_draws_nothing(self, limit, action) -> None:
+        tx, server, first, anchors = self._marked(limit)
+        other = "76a914" + "5a" * 20 + "88ac"
+        interleave = "clear" if action == "clear" else {"classify": {"text": other, "result": _glue().run(other)}}
+        flow = _flow(tx.txid(), server, first, interleave=interleave, on_request=2, anchor_returns=anchors)
+        assert flow["server_log"][1] == ["blockchain.transaction.get", [tx.txid(), True]], "the premise"
+        assert tx.txid() not in flow["rendered"], (
+            f"a fetch interrupted during the block lookup drew its result anyway:\n{flow['rendered']}"
+        )
+        # And the lookup itself stopped there: the bridge was not asked to place the mark, so no
+        # header would have been fetched for a reader who had already moved on.
+        assert flow["anchor_calls"] == [], "the block lookup went on after the reader moved on"
+        if action == "clear":
+            assert flow["rendered"] == ""
+        else:
+            assert "5a" * 20 in flow["rendered"]

@@ -13,7 +13,7 @@
 //
 // So this runs the page's own `onFetchTxid`, verbatim, and records exactly what it asks the
 // server for and exactly what it hands each Python bridge — the classifier
-// (`inspect_txid_with_raw`) and the binding step (`spent_output_binding`). Each bridge answers
+// (`inspect_txid_with_raw`) and the binding step (`spent_output_bindings`). Each bridge answers
 // from a canned list, call by call. The Python side (`test_inspect_fetch_flow.py`) computes
 // those answers with the REAL `glue.py` on the arguments the page really passed — replaying a
 // first run's recorded arguments, then running again with the real answers and checking the
@@ -33,10 +33,23 @@
 //                      have (NOT_FOUND_FRAME below). `close` closes the socket without
 //                      answering; `frame` is sent verbatim instead of a JSON reply.
 //            "glue_returns": [result, …],   — what the classifier bridge returns, call by call
-//            "binding_returns": [result, …]} — what the binding bridge returns, call by call
+//            "binding_returns": [result, …], — what the binding bridge returns, call by call
+//            "anchor_returns"?: [anchor, …], — what the block-lookup bridge returns, call by call
+//            "binding_throws"?: true,       — the binding bridge raises instead of answering
+//            "anchor_python"?: path,        — answer the block lookup with the REAL glue.mark_anchor,
+//                      run by that interpreter (anchor_returns is then unused)
+//            "blockhash"?: hex, "headers"?: {height: hex}, "tip"?: n, "confirmations"?: n —
+//                      the verbose reply's block hash, the headers `blockchain.block.header`
+//                      serves (any other height is refused), the tip, the depth
+//            "interleave"?: "clear" | {"classify": {"text", "result"}}, — what the reader does
+//                      while the fetch is still waiting on the server
+//            "interleave_on_request"?: n} — do it when the server receives its n-th request
+//                      (every method counted), instead of during the first fetch
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
 //            "glue_calls": [[arg, …], …],   — every call to the classifier bridge, verbatim
 //            "binding_calls": [[arg, …], …], — every call to the binding bridge, verbatim
+//            "anchor_calls": [[arg, …], …],  — every call to the block-lookup bridge, verbatim
+//            "server_log": [[method, params], …], — every request the server received, in order
 //            "rendered": "…",               — the result block's text, one node per line
 //            "status": "…",                 — the fetch-row status text when it finished
 //            "__constants__": {"max_rows_shown": n}}
@@ -46,10 +59,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
+import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const INSPECT_JS = resolve(HERE, "../../docs/inspect_static/inspect/inspect.js");
+const GLUE_DIR = resolve(HERE, "../../docs/inspect_static/inspect");
 
 class StubText {
   constructor(text) {
@@ -114,7 +129,11 @@ const NOT_FOUND_ERROR = {
 
 // One ElectrumX server, answering `blockchain.transaction.get` from a table. Each socket
 // serves one request, as `electrumxRpc` uses it: open, one frame out, one frame back.
-function makeServer(table, requested) {
+// `hooks.onRequest(n, req)` runs SYNCHRONOUSLY when the n-th request of the run arrives
+// (1-based, every method counted), before it is answered — which is how a case interrupts the
+// page at a particular wait. The block lookup's two calls are answered too: the verbose form
+// of a transaction in the table (`[txid, true]`, with `hooks.confirmations`) and the tip.
+function makeServer(table, requested, hooks) {
   return class StubWebSocket {
     constructor() {
       this.listeners = {};
@@ -128,8 +147,34 @@ function makeServer(table, requested) {
     }
     send(text) {
       const req = JSON.parse(text);
+      hooks.count += 1;
+      hooks.log.push([req.method, req.params]);
+      if (hooks.onRequest) hooks.onRequest(hooks.count, req);
+      if (req.method === "blockchain.headers.subscribe") {
+        const frame = { id: req.id, result: { height: hooks.tip, hex: "" } };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
+      if (req.method === "blockchain.transaction.get" && req.params[1] === true && table[req.params[0]]) {
+        const verbose = { txid: req.params[0], confirmations: hooks.confirmations };
+        if (hooks.blockhash !== undefined) verbose.blockhash = hooks.blockhash;
+        const frame = { id: req.id, result: verbose };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
+      if (req.method === "blockchain.block.header") {
+        // `hooks.headers`: {height: hex} — served verbatim, whatever it is, because what the page
+        // does with a malformed answer is part of what is under test. Absent: ElectrumX's refusal
+        // for a height past its index.
+        const key = String(req.params[0]);
+        const frame = Object.prototype.hasOwnProperty.call(hooks.headers, key)
+          ? { id: req.id, result: hooks.headers[key] }
+          : { id: req.id, error: { code: 1, message: `height ${key} out of range` } };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
       if (req.method !== "blockchain.transaction.get" || req.params[1] !== false) {
-        throw new Error(`the stub server only answers raw transaction fetches, got ${text}`);
+        throw new Error(`the stub server only answers raw transaction fetches and the block lookup, got ${text}`);
       }
       const txid = req.params[0];
       requested.push(txid);
@@ -161,6 +206,16 @@ async function main() {
   const requested = [];
   const glueCalls = [];
   const bindingCalls = [];
+  const anchorCalls = [];
+  const hooks = {
+    count: 0,
+    log: [],
+    onRequest: null,
+    confirmations: spec.confirmations ?? 5,
+    tip: spec.tip ?? 460572,
+    blockhash: spec.blockhash,
+    headers: spec.headers || {},
+  };
   const document = {
     createElement: (tag) => new StubElement(tag),
     getElementById: () => new StubElement("div"),
@@ -176,8 +231,11 @@ async function main() {
     clearTimeout,
     fetch: () => Promise.reject(new Error("no network in the fetch-flow harness")),
     crypto: { subtle: { digest: (algorithm, data) => webcrypto.subtle.digest(algorithm, data) } },
-    WebSocket: makeServer(spec.server || {}, requested),
+    WebSocket: makeServer(spec.server || {}, requested, hooks),
     navigator: {},
+    // Read by Clear and by a classification, which rewrite `?input=` in the address bar.
+    location: { href: "https://pyrxd.invalid/inspect/", search: "" },
+    history: { replaceState() {} },
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -203,12 +261,67 @@ async function main() {
       : { ok: false, form: "error", error: `harness: no canned ${what} for this call`, hint: "" };
   };
   sandbox.__recorder__ = recorder(glueCalls, spec.glue_returns || [], "classifier result");
-  sandbox.__binding_recorder__ = recorder(bindingCalls, spec.binding_returns || [], "binding result");
-  vm.runInContext("pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__;", sandbox);
+  sandbox.__binding_recorder__ = spec.binding_throws
+    ? (...args) => {
+      // A bridge that RAISES rather than answering — the path that lands in onFetchTxid's
+      // "bridge error" branch, which renders too and so is guarded too.
+      bindingCalls.push(args);
+      throw new Error("harness: the binding bridge raised");
+    }
+    : recorder(bindingCalls, spec.binding_returns || [], "binding result");
+  // The block lookup's bridge (`glue.mark_anchor`). Its canned answers are the real glue's.
+  // `anchor_python`: answer the block lookup with the REAL `glue.mark_anchor` (see
+  // glue_subprocess_bridge.mjs) instead of a canned list.
+  sandbox.__anchor_recorder__ = spec.anchor_python
+    ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, anchorCalls)
+    : recorder(anchorCalls, spec.anchor_returns || [], "anchor result");
+  vm.runInContext(
+    "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__;",
+    sandbox,
+  );
 
   const fetchBtn = new StubElement("button");
   const status = new StubElement("span");
-  await sandbox.onFetchTxid(spec.txid, fetchBtn, status);
+  // `interleave`: what the reader does WHILE the fetch is waiting on the server. "clear" presses
+  // Clear; {"classify": {"text", "result"}} classifies another input, the offline bridge
+  // answering with `result`.
+  //
+  // WHEN, by `interleave_on_request`: absent, it runs synchronously right after `onFetchTxid`
+  // starts — during the FIRST fetch, before any answer can arrive (the stub server answers on a
+  // later timer tick). A number n runs it the moment the server receives its n-th request, before
+  // answering it — so a case can interrupt the page during the spent-transaction fetch, or during
+  // the block lookup, instead of only ever during the first wait.
+  const act = () => {
+    if (spec.interleave === "clear") {
+      sandbox.onClear();
+    } else if (spec.interleave && spec.interleave.classify) {
+      const { text, result } = spec.interleave.classify;
+      sandbox.__classify__ = () => ({ toJs: () => JSON.parse(JSON.stringify(result)), destroy() {} });
+      vm.runInContext(`pyGlue = __classify__; INPUT_BOX.value = ${JSON.stringify(text)};`, sandbox);
+      sandbox.onClassify();
+    } else {
+      throw new Error(`unknown interleave ${JSON.stringify(spec.interleave)}`);
+    }
+  };
+  let acted = false;
+  if (spec.interleave && spec.interleave_on_request !== undefined) {
+    hooks.onRequest = (n) => {
+      if (n === spec.interleave_on_request) {
+        acted = true;
+        act();
+      }
+    };
+  }
+  const pending = sandbox.onFetchTxid(spec.txid, fetchBtn, status);
+  if (spec.interleave && spec.interleave_on_request === undefined) {
+    acted = true;
+    act();
+  }
+  await pending;
+  if (spec.interleave && !acted) {
+    // A case that asked to interrupt at a request the page never made proves nothing.
+    throw new Error(`the interleave never ran: the server saw ${hooks.count} request(s), not ${spec.interleave_on_request}`);
+  }
 
   const resultBlock = vm.runInContext("RESULT_BLOCK", sandbox);
   const constants = {
@@ -218,6 +331,8 @@ async function main() {
     requested,
     glue_calls: glueCalls,
     binding_calls: bindingCalls,
+    anchor_calls: anchorCalls,
+    server_log: hooks.log,
     rendered: renderedLines(resultBlock),
     status: status.textContent,
     __constants__: constants,

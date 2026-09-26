@@ -58,6 +58,33 @@ class IndexerStats:
         )
 
 
+def _token_page(method: str, result: Any) -> dict[str, Any]:
+    """``result`` if it is the ``{"tokens": [...], "next_cursor": str | None}`` page the docstrings
+    promise, else :class:`RxinDexerError`.
+
+    THE PROMISE WAS UNCHECKED. Both discovery wrappers returned whatever dict the server sent, so
+    upstream's own ``{"error": "Glyph indexing not enabled"}`` (``glyph_api.py``, when the index
+    is off) came back as a "page" with no ``tokens`` key, and a hostile server's
+    ``{"tokens": "x", "next_cursor": 7}`` reached a caller that iterates characters and feeds an
+    int back as the next cursor. Checked here, once, for both.
+    """
+    if not isinstance(result, dict):
+        raise RxinDexerError(f"{method} returned {type(result).__name__}, expected dict")
+    if "error" in result and "tokens" not in result:
+        raise RxinDexerError(f"{method} was refused by the indexer: {result['error']!r}")
+    tokens = result.get("tokens")
+    if not isinstance(tokens, list) or not all(isinstance(t, dict) for t in tokens):
+        raise RxinDexerError(f"{method} page has no list of token records under 'tokens' — refusing to guess")
+    if "next_cursor" not in result:
+        raise RxinDexerError(f"{method} page has no 'next_cursor' — cannot tell the last page from a truncated one")
+    cursor = result["next_cursor"]
+    if cursor is not None and not isinstance(cursor, str):
+        raise RxinDexerError(
+            f"{method} page's next_cursor is {type(cursor).__name__}, expected an opaque string or null"
+        )
+    return result
+
+
 class RxinDexerClient:
     """Thin wrapper over ``ElectrumXClient`` for RXinDexer extension RPCs.
 
@@ -214,12 +241,10 @@ class RxinDexerClient:
 
         Across every type by default; pass ``token_type`` (1=FT, 2=NFT,
         3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority) to filter.
-        Returns ``{"tokens": [...], "next_cursor": str | None}``.
+        Returns ``{"tokens": [...], "next_cursor": str | None}`` — checked, not assumed: any other
+        shape, or the indexer's ``{"error": ...}``, raises :class:`RxinDexerError`.
         """
-        result = await self._call("glyph.get_recent", [limit, cursor, token_type])
-        if not isinstance(result, dict):
-            raise RxinDexerError(f"glyph.get_recent returned {type(result).__name__}, expected dict")
-        return result
+        return _token_page("glyph.get_recent", await self._call("glyph.get_recent", [limit, cursor, token_type]))
 
     async def glyph_get_tokens_by_type(
         self,
@@ -233,14 +258,15 @@ class RxinDexerClient:
         ``order="recent"`` = newest-deployed first (v4 index);
         ``order="ref"`` (default) = legacy stable ref-hash order. Cursors must
         not be reused across a change of ``order``.
-        Returns ``{"tokens": [...], "next_cursor": str | None}``.
+        Returns ``{"tokens": [...], "next_cursor": str | None}`` — checked, not assumed: any other
+        shape, or the indexer's ``{"error": ...}``, raises :class:`RxinDexerError`.
         """
         if order not in ("ref", "recent"):
             raise ValueError(f"order must be 'ref' or 'recent', got {order!r}")
-        result = await self._call("glyph.get_tokens_by_type", [token_type, limit, cursor, order])
-        if not isinstance(result, dict):
-            raise RxinDexerError(f"glyph.get_tokens_by_type returned {type(result).__name__}, expected dict")
-        return result
+        return _token_page(
+            "glyph.get_tokens_by_type",
+            await self._call("glyph.get_tokens_by_type", [token_type, limit, cursor, order]),
+        )
 
     # ─────────────────────────────────────────── Swap (RSWP) ──
     #

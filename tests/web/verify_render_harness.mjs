@@ -31,6 +31,14 @@
 //               answers `blockchain.transaction.get` with exactly that frame, fetched through
 //               shared.js's own `fetchRawTxFromElectrumx`, whose rejection is then handed to
 //               `lookupFailure`. The second is the whole path a real error frame takes.
+//               A case may instead carry `check: {"text", "raw": {txid: hex}, "run_returns",
+//               "fetch_returns", "anchor_returns", "confirmations"?, "tip"?}` — the page's own
+//               `onCheck` is run with `text` typed into the box, against a server answering
+//               from `raw` and bridges answering from the canned lists; the output then also
+//               carries `requested` (every server call) and `calls` (every bridge call).
+//               `check` may also carry `blockhash` and `headers` ({height: hex}) for the block
+//               lookup, `anchor_python` (an interpreter: the REAL glue.mark_anchor answers the
+//               block lookup instead of `anchor_returns`) and `interleave_clear_on_request` (n).
 //   stdout:     JSON — {"name": {"text": "…", "classes": [...], "statuses": [...],
 //                                "panels": [...], "file_inputs": n, "judged": [...]}}
 //               `text` is one text node per line, so the Python side can assert on
@@ -47,10 +55,12 @@ import { webcrypto } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
 const VERIFY_JS = resolve(HERE, "../../docs/inspect_static/verify/verify.js");
+const GLUE_DIR = resolve(HERE, "../../docs/inspect_static/inspect");
 
 // --- stub DOM ---------------------------------------------------------
 //
@@ -285,6 +295,110 @@ function frameServer(frame) {
   };
 }
 
+// A server that answers the three calls `lookUp` makes, from a table: the raw transaction
+// (`blockchain.transaction.get [txid, false]`), its verbose form (`[txid, true]`, carrying a
+// confirmation count), and the tip (`blockchain.headers.subscribe`). Every request is
+// recorded, so a case can say which transaction the page actually asked for.
+function tableServer(table, requested, onRequest) {
+  return class TableWebSocket {
+    constructor() {
+      this.listeners = {};
+      setTimeout(() => this.dispatch("open", {}), 0);
+    }
+    addEventListener(type, cb) {
+      (this.listeners[type] ||= []).push(cb);
+    }
+    dispatch(type, ev) {
+      for (const cb of this.listeners[type] || []) cb(ev);
+    }
+    send(text) {
+      const req = JSON.parse(text);
+      requested.push([req.method, req.params]);
+      if (onRequest) onRequest(requested.length, req);
+      let frame;
+      if (req.method === "blockchain.headers.subscribe") {
+        frame = { id: req.id, result: { height: table.tip, hex: "" } };
+      } else if (req.method === "blockchain.block.header") {
+        // Served verbatim from the table, whatever it holds; any other height is refused the way
+        // ElectrumX refuses a height past its index.
+        const key = String(req.params[0]);
+        const served = table.headers[key];
+        // `{"hang": true}`: the request is never answered — the page's own timeout is what ends it.
+        if (served && typeof served === "object" && served.hang) return;
+        frame = Object.prototype.hasOwnProperty.call(table.headers, key)
+          ? { id: req.id, result: served }
+          : { id: req.id, error: { code: 1, message: `height ${key} out of range` } };
+      } else if (req.method === "blockchain.transaction.get" && typeof table.raw[req.params[0]] === "string") {
+        const verbose = { txid: req.params[0], confirmations: table.confirmations };
+        if (table.blockhash !== undefined) verbose.blockhash = table.blockhash;
+        frame = req.params[1] ? { id: req.id, result: verbose } : { id: req.id, result: table.raw[req.params[0]] };
+      } else {
+        frame = { id: req.id, error: { code: 2, message: "daemon error: No such mempool or blockchain transaction." } };
+      }
+      setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+    }
+    close() {}
+  };
+}
+
+// Drive the page's OWN `onCheck` — what the Check button runs — with `text` typed into the
+// box. The three Python bridges are recorders answering from canned lists the Python side
+// computed with the REAL `glue.py`; what is asserted is what the page asked the server for,
+// what it handed each bridge, and what it drew.
+async function driveCheck(renderer, spec) {
+  const requested = [];
+  const calls = { run: [], fetch: [], anchor: [] };
+  const recorder = (bucket, returns) => (...args) => {
+    calls[bucket].push(args);
+    const canned = (returns || [])[calls[bucket].length - 1];
+    if (canned === undefined) throw new Error(`harness: no canned ${bucket} answer for call ${calls[bucket].length}`);
+    return JSON.parse(JSON.stringify(canned));
+  };
+  // `interleave_clear_on_request: n` — press Start over the moment the server receives its n-th
+  // request, before it is answered: the reader moving on while the page is still waiting.
+  let cleared = false;
+  const onRequest = spec.interleave_clear_on_request === undefined
+    ? null
+    : (n) => {
+      if (n === spec.interleave_clear_on_request) {
+        cleared = true;
+        renderer.onClear();
+      }
+    };
+  renderer.WebSocket = tableServer(
+    {
+      raw: spec.raw || {},
+      confirmations: spec.confirmations ?? 5,
+      tip: spec.tip ?? 460572,
+      blockhash: spec.blockhash,
+      headers: spec.headers || {},
+    },
+    requested,
+    onRequest,
+  );
+  renderer.__run__ = recorder("run", spec.run_returns);
+  renderer.__fetch__ = recorder("fetch", spec.fetch_returns);
+  // `anchor_python`: the REAL glue.mark_anchor answers the block lookup (glue_subprocess_bridge.mjs).
+  renderer.__anchor__ = spec.anchor_python
+    ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, calls.anchor)
+    : recorder("anchor", spec.anchor_returns);
+  vm.runInContext(
+    "pyRun = __run__; pyFetch = __fetch__; bridges = { markAnchor: __anchor__ }; " +
+    `INPUT_BOX.value = ${JSON.stringify(spec.text)};`,
+    renderer,
+  );
+  try {
+    await renderer.onCheck();
+  } finally {
+    vm.runInContext("pyRun = null; pyFetch = null; bridges = null;", renderer);
+  }
+  if (onRequest && !cleared) {
+    throw new Error(`the interleave never ran: the server saw ${requested.length} request(s)`);
+  }
+  const block = vm.runInContext("RESULT_BLOCK", renderer);
+  return { node: block, requested, calls };
+}
+
 async function main() {
   const payloadPath = process.argv[2];
   const raw = !payloadPath || payloadPath === "-"
@@ -304,7 +418,11 @@ async function main() {
     // page with a hand-built error dict would prove the renderer and leave the
     // translation, which is the half that was wrong, untested.
     let node;
-    if (spec && typeof spec.wire_frame === "string") {
+    let checked = null;
+    if (spec && spec.check) {
+      checked = await driveCheck(renderer, spec.check);
+      node = checked.node;
+    } else if (spec && typeof spec.wire_frame === "string") {
       renderer.WebSocket = frameServer(spec.wire_frame);
       let rejection = null;
       try {
@@ -331,6 +449,7 @@ async function main() {
       panels: collect(node, hasClass("mark")).map(renderedLines),
       file_inputs: collect(node, (n) => n.tag === "input" && n.type === "file").length,
       judged,
+      ...(checked ? { requested: checked.requested, calls: checked.calls } : {}),
     };
   }
   process.stdout.write(JSON.stringify(results));

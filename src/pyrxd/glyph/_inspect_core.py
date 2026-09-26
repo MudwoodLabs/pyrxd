@@ -1468,55 +1468,221 @@ def _classify_metadata_protocol(metadata) -> str:
     return "unknown"
 
 
-def _payload_binding(metadata_cbor: bytes | None, spent_script: bytes | None) -> dict:
-    """Did the commit this input spent actually commit to THIS payload?
+#: The ``payload_binding`` states that say a node would REJECT the transaction as shown: its
+#: attributed input fails the commit it spends. Such a transaction is not one the chain accepted,
+#: so whatever its envelope names is unattributed. Both renderers flag exactly these.
+PAYLOAD_BINDING_WARNING_STATES: frozenset[str] = frozenset({"mismatch", "commit-unsatisfied"})
 
-    A commit output's locking script carries ``sha256d(envelope CBOR)`` as its
-    ``payload_hash``. Nothing checked the reveal's envelope against it, and both
-    readers take the FIRST ``gly`` push in the FIRST input that decodes — so the
-    name, attrs and creator shown to a human need not be the ones the commit
-    committed to. Demonstrated at library level: inputs ``[decoy, real]`` attribute
-    the decoy; ``[real, decoy]`` attribute the real one. Whichever is first wins.
 
-    On the commit input itself a second envelope is unreachable — ``CLEANSTACK``
-    and ``SIGPUSHONLY`` are set unconditionally for block connection
-    (``tests/vendor/radiant_core/validation.cpp``), and the commit script's stack
-    arithmetic is fixed. The vector is a SECOND input whose locking script consumes
-    the extra items, placed first.
+def _commit_obligation(spent_script: bytes) -> tuple[str, bytes, int | None] | None:
+    """``(kind, payload_hash, required_ref_type)`` if *spent_script* is a Glyph commit, else ``None``.
 
-    This is deliberately a REPORT, not a refusal. The classifier is network-free,
-    so the spent script is only present when a fetching caller supplied it; a
-    verdict that silently means "I could not check" is the thing being fixed, so
-    every state is named. ``mismatch`` is the one that matters.
+    The three commit templates pyrxd and Photonic build (``packages/lib/src/script.ts``:
+    ``nftCommitScript``, ``ftCommitScript``, ``datCommitScript``), bare or behind a delegate prefix:
+
+    * ``"nft"`` — ``OP_REFTYPE_OUTPUT OP_2 OP_NUMEQUALVERIFY``: the spending transaction must
+      create the commit's own outpoint as a SINGLETON ref. ``required_ref_type`` is 2.
+    * ``"ft"`` — the same with ``OP_1``: as a NORMAL ref, and not as a singleton. 1.
+    * ``"dat"`` — no ref check at all: a DAT reveal creates nothing. ``None``.
+
+    The ref-type operand is matched as exactly ``OP_2`` or ``OP_1``
+    (:data:`~pyrxd.glyph.script.COMMIT_SCRIPT_RE`). A commit with ``OP_0`` there demands that its
+    ref appear in NO output — it mints nothing — and reading one as a commit is how a decoy
+    placed first read ``bound``.
+
+    WHICH DAT FORMS. The ones the two builders emit, read from their source rather than from
+    samples: Photonic's ``datCommitScript`` at ``becf41a7`` (unchanged since it was added in
+    ``36d8d34``, 2024-04-05) and pyrxd's :func:`~pyrxd.glyph.script.build_dat_commit_locking_script`
+    both build ``OP_HASH256 <h> OP_EQUALVERIFY "dat" OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH,
+    70 bytes, or 126 behind a delegate prefix. Mainnet also carries a 65-byte form with no ``"dat"``
+    push (``77df45a9…1b22:0``), which neither builder emits and whose builder is not known here.
+    It is NOT recognised: the templates here are the ones the builders are known to emit, not
+    ones inferred from samples. :func:`_payload_binding` says only that it is unrecognised, never
+    that nobody committed.
     """
-    from .script import extract_payload_hash_from_commit_script
+    from .script import (
+        extract_payload_hash_from_commit_script,
+        is_commit_ft_script,
+        is_commit_nft_script,
+        parse_dat_commit_script,
+    )
 
+    dat = parse_dat_commit_script(spent_script)
+    if dat is not None:
+        return "dat", dat[0], None
+    script_hex = spent_script.hex()
+    if is_commit_nft_script(script_hex):
+        return "nft", extract_payload_hash_from_commit_script(spent_script), 2
+    if is_commit_ft_script(script_hex):
+        return "ft", extract_payload_hash_from_commit_script(spent_script), 1
+    return None
+
+
+def _output_ref_type(output_scripts: Sequence[bytes], wire_ref: bytes) -> tuple[int, list[int], list[int]]:
+    """What ``OP_REFTYPE_OUTPUT`` answers for *wire_ref* in a transaction with these outputs.
+
+    Returns ``(ref_type, singleton_outputs, normal_outputs)``. Mirrors Radiant Core
+    ``ScriptExecutionContext::getRefTypeOutput`` (``src/script/script_execution_context.h``): 2 if
+    any output pushes the ref with ``OP_PUSHINPUTREFSINGLETON``, else 1 if any pushes it with
+    ``OP_PUSHINPUTREF``, else 0. The sets it reads are filled by ``CScript::GetPushRefs`` over
+    EVERY output, walking the opcode stream — so this walks it too
+    (:func:`~pyrxd.glyph.script.iter_input_refs`), and a ``0xd8`` byte inside pushed data is not a
+    ref. An output whose script does not decode is one ``GetPushRefs`` refuses, which makes the
+    whole transaction invalid; it is counted as carrying nothing, which can only move a verdict
+    away from ``bound``.
+
+    Only scripts that contain the 36 bytes are walked: an operand is those bytes, contiguous, so a
+    script without them cannot carry the ref, and a large transaction costs a byte search.
+    """
+    from ..constants import OP_PUSHINPUTREF_BYTE, OP_PUSHINPUTREFSINGLETON_BYTE
+    from .script import TruncatedScriptError, iter_input_refs
+
+    singleton: list[int] = []
+    normal: list[int] = []
+    for idx, script in enumerate(output_scripts):
+        if wire_ref not in script:
+            continue
+        try:
+            ops = {op for op, operand in iter_input_refs(script) if operand == wire_ref}
+        except TruncatedScriptError:
+            continue
+        if OP_PUSHINPUTREFSINGLETON_BYTE in ops:
+            singleton.append(idx)
+        if OP_PUSHINPUTREF_BYTE in ops:
+            normal.append(idx)
+    return (2 if singleton else 1 if normal else 0), singleton, normal
+
+
+def _payload_binding(
+    metadata_cbor: bytes | None,
+    spent_script: bytes | None,
+    spent_outpoint: str | None,
+    output_scripts: Sequence[bytes],
+) -> dict:
+    """Is the payload shown the one a commit bound — and to WHAT did it bind it?
+
+    A commit output's locking script carries ``sha256d(envelope CBOR)`` as its ``payload_hash``.
+    The headline payload is chosen from the inputs' envelopes (:func:`_reveal_attribution`: the
+    first whose outpoint the outputs mint, else the first at all), so the name, attrs and creator
+    shown to a human need not be the ones any commit committed to. This says whether one did.
+
+    WHAT EACH STATE ESTABLISHES, AND NO MORE:
+
+    ``bound``
+        The attributed input spent an NFT or FT commit whose ``payload_hash`` is
+        ``sha256d`` of exactly the envelope shown, AND this transaction's outputs carry that
+        commit's outpoint with the ref type the commit demands (``first_ref_output`` and
+        ``ref_output_count`` say where, and the reason names up to three). So the
+        payload is the one committed to for the token those outputs carry. It is NOT a statement
+        about the transaction's other outputs: a reveal that mints two tokens from two commits is
+        ``bound`` for whichever input is attributed, and only for its own token — which is why
+        the reason names the outputs. Nor does it say a node would accept the transaction: it
+        checks no signature, not the delegate burn a delegate-prefixed commit also demands, and
+        not the rest of the reference rules — a singleton beside a normal push of the same ref
+        reads ``bound`` here, and a node refuses it (``bad-txns-…-reference-operations``, measured
+        by the round-2 review of #743).
+    ``bound-no-token``
+        The same hash equality against a DAT commit. A DAT commit demands no ref, so the payload
+        is bound as DATA and describes no output here — whatever protocol it declares. It is kept
+        apart from ``bound`` because a DAT commit is a commit that mints nothing, placed first
+        exactly as a decoy would be.
+    ``mismatch``
+        The spent commit committed to a different payload. A node rejects that spend: the commit's
+        ``OP_HASH256 <payload_hash> OP_EQUALVERIFY`` hashes the top stack item, and with
+        ``SIGPUSHONLY`` and ``CLEANSTACK`` set for block connection
+        (``tests/vendor/radiant_core/validation.cpp``) the commit input's scriptSig is exactly
+        ``<sig> <pubkey> "gly" [dat] <payload>`` — a valid signature and pubkey are never the
+        3-byte marker — so the payload these readers select is the item the commit hashes. A
+        mismatch is therefore never a transaction the chain accepted: it is bytes that were never
+        mined (pasted raw, or served for a txid no block contains).
+    ``commit-unsatisfied``
+        The hash matches, and the transaction does not create the commit's ref as the commit
+        demands. A node rejects that spend too, for the ``OP_REFTYPE_OUTPUT`` check.
+    ``not-a-commit``
+        The attributed input spent a script that is none of the commit templates pyrxd recognises
+        (:func:`_commit_obligation`). That is ALL it says. It is not evidence that nobody committed
+        to the envelope: the mainnet DAT reveal ``e5c67100…be5d`` spends a 65-byte hash-lock
+        neither builder emits (``77df45a9…1b22:0``) whose ``payload_hash`` is its envelope's, and
+        it reads this (``tests/fixtures/dat_65_byte_commit_mainnet.json``).
+    ``unchecked``
+        The spent script (or the envelope's bytes) was not available.
+
+    This is deliberately a REPORT, not a refusal. The classifier is network-free, so the spent
+    script is only present when a fetching caller supplied it; a verdict that silently means "I
+    could not check" is the thing being fixed, so every state is named.
+
+    *output_scripts* is EVERY output of the transaction — what ``OP_REFTYPE_OUTPUT`` reads —
+    not a listing that ``only_vout`` or ``max_rows`` has cut. It is required, so no caller can
+    reach ``bound`` without the outputs having been looked at.
+    """
     if spent_script is None:
         return {
             "state": "unchecked",
             "reason": "the spent output of the attributed input was not supplied, so the "
             "payload was not checked against the commit that committed to it",
         }
-    try:
-        expected = extract_payload_hash_from_commit_script(spent_script)
-    except (ValidationError, ValueError, IndexError):
+    commit = _commit_obligation(spent_script)
+    if commit is None:
         return {
             "state": "not-a-commit",
-            "reason": "the attributed input did not spend a commit output, so no payload hash "
-            "binds this envelope to anything",
+            "reason": "the output the attributed input spent is not a commit template pyrxd recognises",
         }
+    kind, expected, required = commit
     if metadata_cbor is None:
         return {
             "state": "unchecked",
+            "commit": kind,
             "reason": "the envelope CBOR was not recoverable for hashing",
         }
-    actual = hash256(metadata_cbor)
-    if actual == expected:
-        return {"state": "bound", "reason": "the spent commit committed to exactly this payload"}
+    if hash256(metadata_cbor) != expected:
+        return {
+            "state": "mismatch",
+            "commit": kind,
+            "reason": "THE SPENT COMMIT COMMITTED TO A DIFFERENT PAYLOAD than the envelope shown here. "
+            "A node rejects that spend, so the chain never accepted this transaction — treat this "
+            "metadata as unattributed",
+        }
+    if required is None:
+        return {
+            "state": "bound-no-token",
+            "commit": kind,
+            "reason": "the spent DAT commit committed to exactly this payload. A DAT commit creates no "
+            "token, so this payload describes no output of this transaction, whatever protocol it declares",
+        }
+    if spent_outpoint is None:
+        return {
+            "state": "unchecked",
+            "commit": kind,
+            "reason": "the attributed input names no outpoint, so the ref its commit demands was not "
+            "looked for in the outputs",
+        }
+    prev_txid, _, vout = spent_outpoint.rpartition(":")
+    wire_ref = bytes.fromhex(prev_txid)[::-1] + int(vout).to_bytes(4, "little")
+    found, singleton, normal = _output_ref_type(output_scripts, wire_ref)
+    wanted = "a singleton" if required == 2 else "a normal ref"
+    if found != required:
+        carried = {0: "no output carries it", 1: "it is only a normal ref", 2: "it is a singleton"}
+        return {
+            "state": "commit-unsatisfied",
+            "commit": kind,
+            "reason": f"the spent {kind.upper()} commit committed to this payload but demands its outpoint "
+            f"as {wanted} in an output: {carried[found]}. A node rejects that spend — treat this "
+            "metadata as unattributed",
+        }
+    at = singleton if required == 2 else normal
+    where = f"output {at[0]}" if len(at) == 1 else f"outputs {', '.join(map(str, at[:3]))}"
+    if len(at) > 3:
+        where += f" and {len(at) - 3:,} more"
+    # Two scalars rather than a list of indices: an FT reveal can carry its ref in every one of
+    # 100,000 outputs, and a list that long is what every other list here is cut for. The first
+    # three are in the reason, which is what both renderers draw.
     return {
-        "state": "mismatch",
-        "reason": "THE SPENT COMMIT COMMITTED TO A DIFFERENT PAYLOAD than the envelope shown "
-        "here — treat this metadata as unattributed",
+        "state": "bound",
+        "commit": kind,
+        "reason": f"the spent {kind.upper()} commit committed to exactly this payload, and this transaction "
+        f"creates its ref as {wanted} at {where}: that token's payload, not every output's",
+        "first_ref_output": at[0],
+        "ref_output_count": len(at),
     }
 
 
@@ -1591,8 +1757,9 @@ def _checked_transaction(txid_hex: str, raw: bytes) -> tuple[Txid, Transaction]:
 def _checked_inputs(txid_hex: str, raw: bytes) -> list:
     """The INPUTS of *raw*, after :func:`_bound_to_txid` — without building a single output.
 
-    For a caller that needs only the inputs: the spent-output binding reads one input's envelope,
-    and a transaction's outputs can be 4 MB of it. The inputs come first on the wire (version,
+    For a caller that needs only the inputs — the spent-output binding reads one input's envelope
+    (and the output SCRIPTS, via :func:`_checked_inputs_and_output_spans`, not output objects), and
+    a transaction's outputs can be 4 MB of it. The inputs come first on the wire (version,
     input count, inputs), and each is read by ``TransactionInput.from_hex``, the reader
     ``Transaction.from_reader`` uses for them; ``tests/web/test_inspect_spent_tx_is_checked.py``
     pins the result equal to ``Transaction.from_hex(raw).inputs``.
@@ -1608,6 +1775,17 @@ def _checked_inputs(txid_hex: str, raw: bytes) -> list:
     and no output object is built. It refuses what a whole parse refuses, and the output-count
     cap :func:`_checked_transaction` applies; the same test file pins that against
     ``Transaction.from_hex`` on malformed and well-formed bytes alike. Raises ``ValidationError``.
+    """
+    return _checked_inputs_and_output_spans(txid_hex, raw)[0]
+
+
+def _checked_inputs_and_output_spans(txid_hex: str, raw: bytes) -> tuple[list, list[tuple[int, int]]]:
+    """:func:`_checked_inputs`, and the ``(start, end)`` of every output SCRIPT within *raw*.
+
+    The spans are where the walk already steps over each script, so recording them builds no
+    output and copies no byte. :func:`_spent_output_binding` needs the scripts themselves — a
+    commit binds a payload to a token only if the reveal's outputs carry the commit's ref, and
+    ``OP_REFTYPE_OUTPUT`` reads every output — and slices them out of *raw* by these spans.
     """
     from ..transaction.transaction_input import TransactionInput
     from ..utils import Reader
@@ -1628,23 +1806,25 @@ def _checked_inputs(txid_hex: str, raw: bytes) -> list:
             if inp is None:
                 raise ValidationError("could not parse the raw transaction bytes")
             inputs.append(inp)
-        _walk_outputs_to_the_end(reader, len(data))
+        spans = _walk_outputs_to_the_end(reader, len(data))
     except ValidationError:
         raise
     except Exception as exc:  # a non-canonical or truncated varint, and anything else about the bytes
         raise ValidationError("could not parse the raw transaction bytes") from exc
-    return inputs
+    return inputs, spans
 
 
-def _walk_outputs_to_the_end(reader, total: int) -> None:
+def _walk_outputs_to_the_end(reader, total: int) -> list[tuple[int, int]]:
     """Walk the outputs and locktime of a transaction whose inputs *reader* has just read, to its
-    last byte. ``Transaction.from_reader``'s layout; raises ``ValidationError`` where it fails."""
+    last byte. ``Transaction.from_reader``'s layout; raises ``ValidationError`` where it fails.
+    Returns each output script's ``(start, end)`` offsets, in output order."""
     unparsable = "could not parse the raw transaction bytes"
     count = reader.read_var_int_num()
     if count is None:
         raise ValidationError(unparsable)
     if count > _MAX_OUTPUT_COUNT:
         raise ValidationError(f"transaction structure exceeds inspect's safety caps (outputs={count})")
+    spans: list[tuple[int, int]] = []
     for _ in range(count):
         if reader.read_exact(8) is None:  # the value
             raise ValidationError(unparsable)
@@ -1655,23 +1835,185 @@ def _walk_outputs_to_the_end(reader, total: int) -> None:
         if length > total - at:  # an over-claiming script length: a whole parse refuses it too
             raise ValidationError(unparsable)
         reader.seek(at + length)
+        spans.append((at, at + length))
     if reader.read_uint32_le() is None:  # the locktime
         raise ValidationError(unparsable)
     if not reader.eof():
         raise ValidationError(f"{unparsable}: {total - reader.tell()} byte(s) after the locktime")
+    return spans
 
 
-def _reveal_attribution(inputs: Sequence, scriptsigs: list[bytes], inspector) -> tuple | None:
+def _minting_inputs(inputs: Sequence, output_scripts: Sequence[bytes]) -> set[int]:
+    """The indices of the inputs whose OUTPOINT this transaction's outputs push as a ref.
+
+    A ref is created from the outpoint an input spends, and only by the transaction spending it,
+    so these are the tokens this transaction MINTS — counted from what the outputs carry, not from
+    how many envelopes the inputs push. An envelope on an input that is in no output mints nothing:
+    a DAT reveal, or a decoy spending a commit whose ``OP_REFTYPE_OUTPUT OP_0`` demands its ref be
+    in NO output (a node accepts that transaction).
+
+    Pushed means ``OP_PUSHINPUTREF``/``OP_PUSHINPUTREFSINGLETON`` found by the consensus opcode walk,
+    as in :func:`_output_ref_type`. A script is walked only if some ``0xd0``/``0xd8`` byte in it is
+    followed by the 36 bytes of one of these outpoints, so the cost is a byte search over the
+    outputs plus a walk of the few that could match. A script that does not decode contributes
+    nothing, and the refs a partial walk saw before failing are discarded with it.
+    """
+    from ..constants import PUSH_REF_OPCODES
+    from .script import TruncatedScriptError, iter_input_refs
+
+    by_ref: dict[bytes, int] = {}
+    for idx, inp in enumerate(inputs):
+        if inp.source_txid:
+            wire = bytes.fromhex(inp.source_txid)[::-1] + int(inp.source_output_index).to_bytes(4, "little")
+            by_ref.setdefault(wire, idx)
+    minted: set[int] = set()
+    if not by_ref:
+        return minted
+    for script in output_scripts:
+        if not _may_push_one_of(script, by_ref):
+            continue
+        found: set[int] = set()
+        try:
+            for op, operand in iter_input_refs(script):
+                if op in PUSH_REF_OPCODES and bytes(operand) in by_ref:
+                    found.add(by_ref[bytes(operand)])
+        except TruncatedScriptError:
+            continue
+        minted |= found
+    return minted
+
+
+def _may_push_one_of(script: bytes, refs: Mapping[bytes, int]) -> bool:
+    """Is some ``0xd0``/``0xd8`` byte in *script* followed by one of *refs*? A cheap superset of
+    "pushes one of them": a byte inside pushed data can match too, and the walk decides."""
+    for marker in (b"\xd0", b"\xd8"):
+        at = script.find(marker)
+        while at != -1:
+            if script[at + 1 : at + 37] in refs:
+                return True
+            at = script.find(marker, at + 1)
+    return False
+
+
+#: At most this many payload inputs have their spent transaction fetched to decide the headline
+#: (:func:`_binding_candidates`). Each is one round trip, and nothing else bounds how many inputs
+#: of one transaction mint.
+_MAX_BINDING_FETCHES = 8
+
+
+def _outpoint_of(inp) -> str | None:
+    return f"{inp.source_txid}:{inp.source_output_index}" if inp.source_txid else None
+
+
+def _row_binding_warning(state: str, any_bound: bool) -> bool:
+    """Is another payload's binding *state* one to flag? The warning states always; and
+    ``not-a-commit`` when some payload in the same transaction IS bound — the decoy's signature.
+
+    Only other payloads' rows: the headline cannot be ``not-a-commit`` beside a bound payload,
+    because a bound payload always mints and so always outranks it (:func:`_reveal_attribution`).
+    """
+    return state in PAYLOAD_BINDING_WARNING_STATES or (state == "not-a-commit" and any_bound)
+
+
+def _headline_rank(
+    idx: int, scriptsig: bytes, inputs: Sequence, inspector, output_scripts: Sequence[bytes], spent_scripts
+) -> int:
+    """0 if the payload on input *idx* reads ``bound``, 1 if it spent a commit pyrxd recognises, 2
+    otherwise — including when its spent script is not known, which is every input in a
+    network-free classification."""
+    spent = spent_scripts.get(idx)
+    if spent is None:
+        return 2
+    cbor = inspector.extract_reveal_cbor(scriptsig)
+    if _payload_binding(cbor, spent, _outpoint_of(inputs[idx]), output_scripts)["state"] == "bound":
+        return 0
+    return 1 if _commit_obligation(spent) is not None else 2
+
+
+def _reveal_attribution(
+    inputs: Sequence,
+    scriptsigs: list[bytes],
+    inspector,
+    minting: set[int],
+    output_scripts: Sequence[bytes] = (),
+    spent_scripts: Mapping[int, bytes] | None = None,
+) -> tuple | None:
     """``(input_index, metadata, envelope_cbor, spent_outpoint)`` for the reveal the readers
-    attribute, or ``None``. The one rule both the classifier and the spent-binding check use."""
-    found = inspector.find_reveal_metadata(scriptsigs)
+    attribute, or ``None``. The one rule both the classifier and the spent-binding check use.
+
+    WHICH PAYLOAD IS THE HEADLINE, in order of preference:
+
+    1. among the payloads whose input's outpoint the outputs push as a ref (*minting*, from
+       :func:`_minting_inputs`), the first that reads ``bound``;
+    2. then the first of those that spent a commit pyrxd recognises;
+    3. then the first of those at all;
+    4. and only if no payload mints, the first decodable payload.
+
+    1 and 2 need the spent scripts (*spent_scripts*, by input index), which only a fetching
+    caller has; without them neither applies and the rule is round 2's. It was the
+    first decodable payload, full stop, so an envelope placed first on an input that mints nothing
+    headlined over the token the transaction really minted (#743 round 2). Then the first MINTING
+    payload, so a payload placed first on an input that mints and was never committed to —
+    ``OP_2DROP`` + P2PKH, with an output pushing that input's own outpoint, which a node accepts
+    (round 3, case K) — headlined over the bound one beside it. A reveal that mints nothing (DAT)
+    is read as it always was. :meth:`GlyphInspector.find_reveal_metadata` keeps its first-wins rule.
+    """
+    spent_scripts = spent_scripts or {}
+    # No input past this one can outrank a minting payload already found: only a spent script
+    # lifts a payload above rank 2.
+    last_ranked = max(spent_scripts, default=-1)
+    first = None
+    best = None  # (rank, input index, metadata)
+    for idx, scriptsig in enumerate(scriptsigs):
+        if first is not None and idx not in minting:
+            continue  # only a minting payload can displace the first one
+        if best is not None and idx > last_ranked:
+            break
+        metadata = inspector.extract_reveal_metadata(scriptsig)
+        if metadata is None:
+            continue
+        if first is None:
+            first = (idx, metadata)
+        if idx not in minting:
+            continue
+        rank = _headline_rank(idx, scriptsig, inputs, inspector, output_scripts, spent_scripts)
+        if best is None or rank < best[0]:
+            best = (rank, idx, metadata)
+        if rank == 0:
+            break  # bound, and the first bound one: nothing can outrank it
+    found = (best[1], best[2]) if best is not None else first
     if found is None:
         return None
     input_idx, metadata = found
     cbor = inspector.extract_reveal_cbor(scriptsigs[input_idx]) if scriptsigs else None
-    src = inputs[input_idx]
-    outpoint = f"{src.source_txid}:{src.source_output_index}" if src.source_txid else None
-    return input_idx, metadata, cbor, outpoint
+    return input_idx, metadata, cbor, _outpoint_of(inputs[input_idx])
+
+
+def _binding_candidates(inputs: Sequence, scriptsigs: list[bytes], inspector, minting: set[int]) -> list[str]:
+    """The outpoints a fetching caller should fetch to settle the headline and its binding.
+
+    The minting payloads' inputs, in order, at most :data:`_MAX_BINDING_FETCHES` of them — the
+    only payloads :func:`_reveal_attribution` can rank on a spent script — or, when no payload
+    mints, the first payload's. The first entry is always the network-free headline's, so a
+    reveal minting one glyph costs the one round trip it always did.
+    """
+    out: list[str] = []
+    first: str | None = None
+    for idx, scriptsig in enumerate(scriptsigs):
+        if len(out) >= _MAX_BINDING_FETCHES:
+            break
+        if first is not None and idx not in minting:
+            continue
+        if inspector.extract_reveal_metadata(scriptsig) is None:
+            continue
+        outpoint = _outpoint_of(inputs[idx])
+        if outpoint is None:
+            continue
+        if first is None:
+            first = outpoint
+        if idx in minting:
+            out.append(outpoint)
+    return out or ([first] if first is not None else [])
 
 
 def _spent_script(outpoint: str, spent_raw: bytes) -> bytes:
@@ -1700,40 +2042,216 @@ def _spent_output_binding(txid_hex: str, raw: bytes, spent_raw: bytes | None, *,
     *spent_raw* is the transaction the attributed input spent, or ``None`` when the fetch failed,
     in which case *spent_error* says why. Returns ``None`` when no input is attributed a payload
     (there is nothing to bind); otherwise the same dict :func:`_classify_raw_tx` would put under
-    ``metadata.payload_binding`` if handed that input's spent script — ``bound``, ``mismatch`` or
-    ``not-a-commit`` from :func:`_payload_binding` itself — or ``unchecked`` with a ``detail`` that
-    says what went wrong. Never "was not supplied": this is only called by a caller that asked.
+    ``metadata.payload_binding`` if handed that input's spent script — any state
+    :func:`_payload_binding` itself returns — or ``unchecked`` with a ``detail`` that says what
+    went wrong. Never "was not supplied": this is only called by a caller that asked.
 
     Costs a hash of *raw*, a parse of its inputs and a walk of its outputs that builds none of
-    them (see :func:`_checked_inputs`), and a parse of *spent_raw*, and no classification of
-    anything: the binding reads the attributed input's envelope and the one output it spent.
-    ``tests/web/test_inspect_spent_tx_is_checked.py`` pins it equal to a full re-classification.
+    them (see :func:`_checked_inputs_and_output_spans`), and a parse of *spent_raw*, and no
+    classification of anything: the binding reads the attributed input's envelope, the one output
+    it spent, and — to see whether this transaction creates the ref that output's commit demands —
+    the reveal's own output scripts, sliced out of *raw* and walked only where they contain that
+    ref's bytes. ``tests/web/test_inspect_spent_tx_is_checked.py`` pins it equal to a full
+    re-classification.
 
     Raises ``ValidationError`` only for *raw* itself (bound to *txid_hex* by the same check
     :func:`_classify_raw_tx` makes); everything about the spent transaction is reported.
+
+    The one-prevout form of :func:`_spent_output_bindings`, for the network-free headline: handed
+    only that input's spent transaction, the ranking in :func:`_reveal_attribution` cannot move
+    the headline, so this answers for exactly the input it always did.
     """
     from .inspector import GlyphInspector
 
-    inputs = _checked_inputs(txid_hex, raw)
+    inputs, spans = _checked_inputs_and_output_spans(txid_hex, raw)
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in inputs]
-    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector())
+    data = bytes(raw)
+    output_scripts = [data[start:end] for start, end in spans]
+    attributed = _reveal_attribution(inputs, scriptsigs, GlyphInspector(), _minting_inputs(inputs, output_scripts))
     if attributed is None or attributed[3] is None:
         return None
-    _idx, _metadata, cbor, outpoint = attributed
+    outpoint = attributed[3]
+    answer = _spent_output_bindings(txid_hex, raw, {outpoint: spent_raw}, {outpoint: spent_error})
+    return None if answer is None else answer["binding"]
 
-    def said(text: str) -> str:
-        # Whatever went wrong may quote a server, and it lands in terminal output and on a page.
-        return _truncate_for_human(_sanitize_display_string(text))
 
-    if spent_raw is None:
-        return {"state": "unchecked", "reason": SPENT_TX_NOT_OBTAINED, "detail": said(spent_error or "no reason given")}
-    try:
-        script = _spent_script(outpoint, spent_raw)
-    except _SpentTxUnusable as exc:
-        return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc))}
-    except Exception as exc:  # anything else about the bytes: the same honest state, with what went wrong
-        return {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": said(str(exc) or type(exc).__name__)}
-    return _payload_binding(cbor, script)
+def _said(text: str) -> str:
+    """What went wrong with a fetch may quote a server, and it lands in terminal output and on a
+    page: sanitised and capped."""
+    return _truncate_for_human(_sanitize_display_string(text))
+
+
+def _spent_output_bindings(
+    txid_hex: str, raw: bytes, spent: Mapping[str, bytes | None], errors: Mapping[str, str] | None = None
+) -> dict | None:
+    """The headline and its ``payload_binding``, from the spent transactions of the inputs
+    :func:`_binding_candidates` named.
+
+    *spent* maps each fetched outpoint to its transaction's bytes, or to ``None`` when the fetch
+    failed — *errors* then says why. Each is hash-checked against the txid in its outpoint before
+    anything is read from it; an outpoint that no input of *raw* spends is ignored.
+
+    Returns ``None`` when no input carries a payload, else::
+
+        {"input_index": the headline, per :func:`_reveal_attribution` given the spent scripts,
+         "moved": whether that differs from the network-free headline,
+         "binding": its payload_binding — as _classify_raw_tx would give it, or ``unchecked`` with
+                    a ``detail`` when its own fetch failed; with ``unsettled`` saying so when it
+                    is not ``bound`` and another minting payload went unchecked,
+         "spent_scripts": {input index: the locking script it spent},
+         "rows": {input index: {"state", "detail"?}} for every OTHER minting payload —
+                 ``unchecked`` with the reason where its fetch failed or was never made,
+         "past_cap": how many of those were past the fetch limit,
+         "reclassify": whether a caller must classify again with ``spent_scripts`` — the
+                       headline moved, or another minting payload has a row verdict to show.}
+
+    :func:`_apply_bindings` writes it into a classification.
+
+    Classifies no output and checks no signature. Raises ``ValidationError`` only for *raw* itself.
+    """
+    from .inspector import GlyphInspector
+
+    inputs, spans = _checked_inputs_and_output_spans(txid_hex, raw)
+    scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in inputs]
+    data = bytes(raw)
+    output_scripts = [data[start:end] for start, end in spans]
+    inspector = GlyphInspector()
+    minting = _minting_inputs(inputs, output_scripts)
+    network_free = _reveal_attribution(inputs, scriptsigs, inspector, minting)
+    if network_free is None or network_free[3] is None:
+        return None
+
+    by_outpoint = {op: idx for idx, inp in enumerate(inputs) if (op := _outpoint_of(inp)) is not None}
+    spent_scripts: dict[int, bytes] = {}
+    problems: dict[int, dict] = {}
+    taken = 0
+    for outpoint, spent_raw in spent.items():
+        idx = by_outpoint.get(outpoint)
+        if idx is None:
+            continue
+        taken += 1
+        if taken > _MAX_BINDING_FETCHES:  # the number `_binding_candidates` ever names: no more is read
+            break
+        if spent_raw is None:
+            why = (errors or {}).get(outpoint) or "no reason given"
+            problems[idx] = {"state": "unchecked", "reason": SPENT_TX_NOT_OBTAINED, "detail": _said(why)}
+            continue
+        try:
+            spent_scripts[idx] = _spent_script(outpoint, spent_raw)
+        except _SpentTxUnusable as exc:
+            problems[idx] = {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": _said(str(exc))}
+        except Exception as exc:  # anything else about the bytes: the same honest state, with what went wrong
+            detail = _said(str(exc) or type(exc).__name__)
+            problems[idx] = {"state": "unchecked", "reason": SPENT_TX_UNUSABLE, "detail": detail}
+
+    attributed = _reveal_attribution(inputs, scriptsigs, inspector, minting, output_scripts, spent_scripts)
+    if attributed is None:  # not reachable: the same payloads decode, only their order changed
+        return None
+    idx, _metadata, cbor, outpoint = attributed
+    if idx in spent_scripts:
+        binding = _payload_binding(cbor, spent_scripts[idx], outpoint, output_scripts)
+    else:
+        binding = problems.get(idx) or _payload_binding(cbor, None, outpoint, output_scripts)
+
+    # EVERY OTHER MINTING PAYLOAD GETS A VERDICT, and a check that did not happen says so (#743
+    # round 4). Only rows with a spent script used to get one, so a commit the server refused, one
+    # it answered with another transaction for, and one past the fetch limit all showed nothing —
+    # and a decoy kept the headline with no sign that the check that could have moved it had not
+    # run.
+    payload_inputs = _minting_payload_inputs(inputs, scriptsigs, inspector, minting)
+    asked_for = set(payload_inputs[:_MAX_BINDING_FETCHES])
+    rows: dict[int, dict] = {}
+    for i in payload_inputs:
+        if i == idx:
+            continue
+        if i in spent_scripts:
+            state = _payload_binding(
+                inspector.extract_reveal_cbor(scriptsigs[i]), spent_scripts[i], _outpoint_of(inputs[i]), output_scripts
+            )["state"]
+            rows[i] = {"state": state}
+        elif i in problems:
+            rows[i] = {"state": "unchecked", "detail": problems[i]["detail"], "why": "failed"}
+        elif i in asked_for:
+            rows[i] = {"state": "unchecked", "detail": "its commit was not fetched", "why": "not asked"}
+        else:
+            detail = f"not checked: past the limit of {_MAX_BINDING_FETCHES} commits fetched for one transaction"
+            rows[i] = {"state": "unchecked", "detail": detail, "why": "past the limit"}
+    past_cap = sum(1 for r in rows.values() if r.get("why") == "past the limit")
+
+    # AND THE HEADLINE SAYS SO, when it is not bound and some other minting payload went unchecked:
+    # a bound one among those would head the card instead, so this headline is not the answer.
+    unchecked = [r["why"] for r in rows.values() if r["state"] == "unchecked"]
+    if binding["state"] != "bound" and unchecked:
+        parts = [
+            f"{unchecked.count(why)} {said}"
+            for why, said in (
+                ("failed", "could not be fetched"),
+                ("past the limit", f"past the limit of {_MAX_BINDING_FETCHES}"),
+                ("not asked", "not fetched"),
+            )
+            if unchecked.count(why)
+        ]
+        binding = {
+            **binding,
+            "unsettled": f"{len(unchecked)} other minting payload(s) went unchecked ({', '.join(parts)}); a bound "
+            "one among them would head this card instead, so this headline is not settled",
+        }
+    moved = idx != network_free[0]
+    return {
+        "input_index": idx,
+        "moved": moved,
+        "binding": binding,
+        "spent_scripts": spent_scripts,
+        "rows": {i: {k: v for k, v in r.items() if k != "why"} for i, r in rows.items()},
+        "past_cap": past_cap,
+        # WHEN A CALLER MUST CLASSIFY AGAIN, with `spent_scripts`: the headline moved, or another
+        # payload has a row verdict to show. Otherwise the binding is the one field that changes.
+        # One decision, read by the CLI and by the page's glue.
+        "reclassify": moved or bool(rows),
+    }
+
+
+def _minting_payload_inputs(inputs: Sequence, scriptsigs: list[bytes], inspector, minting: set[int]) -> list[int]:
+    """The minting inputs that carry a decodable payload, in input order — the ones
+    :func:`_binding_candidates` fetches the first :data:`_MAX_BINDING_FETCHES` of."""
+    return [
+        idx
+        for idx in sorted(minting)
+        if idx < len(scriptsigs)
+        and _outpoint_of(inputs[idx]) is not None
+        and inspector.extract_reveal_metadata(scriptsigs[idx]) is not None
+    ]
+
+
+def _apply_bindings(payload: dict, answer: dict) -> dict:
+    """Write what :func:`_spent_output_bindings` found into a classification of the same
+    transaction: the headline's ``payload_binding``, each other minting payload's row verdict, and
+    how many went unchecked past the fetch limit. ONE step, for the CLI's ``--fetch`` and the
+    page's glue, so the two cannot draw the same fetches differently."""
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if not metadata:
+        return payload
+    metadata["payload_binding"] = answer["binding"]
+    rows = answer.get("rows") or {}
+    any_bound = answer["binding"]["state"] == "bound" or any(r["state"] == "bound" for r in rows.values())
+    for row in payload.get("metadata_inputs") or []:
+        verdict = rows.get(row["input_index"])
+        if verdict is None:
+            continue
+        row["binding_state"] = verdict["state"]
+        row["binding_warning"] = _row_binding_warning(verdict["state"], any_bound)
+        if verdict.get("detail"):
+            row["binding_detail"] = verdict["detail"]
+    if answer.get("past_cap"):
+        metadata["bindings_past_cap"] = {"count": answer["past_cap"], "cap": _MAX_BINDING_FETCHES}
+    return payload
+
+
+def _classify_with_bindings(txid_hex: str, raw: bytes, answer: dict, **classify_kwargs) -> dict:
+    """:func:`_classify_raw_tx` again, with the spent scripts *answer* holds, and
+    :func:`_apply_bindings` — what a fetching caller shows when ``answer["reclassify"]``."""
+    payload = _classify_raw_tx(txid_hex, raw, spent_scripts=answer["spent_scripts"], **classify_kwargs)
+    return _apply_bindings(payload, answer)
 
 
 # --- Counting what a bounded caller does not list --------------------------------------------
@@ -1856,7 +2374,7 @@ def _classify_raw_tx(
       ``_MAX_INPUT_COUNT`` entries — bounds total classification work.
     * Wrap per-output classification in try/except so one malformed script
       cannot abort the listing.
-    * Use ``GlyphInspector.find_reveal_metadata`` (already swallows
+    * Use ``GlyphInspector.extract_reveal_metadata`` (already swallows
       exceptions around ``decode_payload``) for input metadata extraction.
     * Sanitize every CBOR-derived display string before it leaves this
       function.
@@ -2002,7 +2520,15 @@ def _classify_raw_tx(
     # does NOT escape U+202E and friends.
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
-    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector)
+    # EVERY output, whatever `only_vout` and `max_rows` list: which inputs this transaction mints
+    # from, `payload_binding` (what `OP_REFTYPE_OUTPUT` would answer) and the relationship
+    # verdicts (what consensus backs) are all questions about the whole transaction.
+    output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
+    minting = _minting_inputs(tx.inputs, output_scripts)
+    # The spent scripts a fetching caller supplied rank the minting payloads (bound first); with
+    # none, the headline is the network-free one. Keys that are not a valid input are ignored.
+    known_spent = {i: s for i, s in (spent_scripts or {}).items() if isinstance(i, int) and 0 <= i < len(tx.inputs)}
+    attributed = _reveal_attribution(tx.inputs, scriptsigs, inspector, minting, output_scripts, known_spent)
     found = None if attributed is None else (attributed[0], attributed[1])
 
     # dMint mint-claim scriptSig: if vin[0] is a dMint mint claim (4 canonical
@@ -2025,22 +2551,32 @@ def _classify_raw_tx(
     # to see WHICH input a name belongs to, and `metadata.input_index` already says
     # which one the headline payload came from. What was missing was any signal
     # that other payloads existed at all.
+    #
+    # WHAT IS MINTED IS COUNTED FROM THE OUTPUTS, not from the envelopes (#743 round 2). Each entry
+    # says whether the transaction creates a ref from that input's outpoint (`mints`), and
+    # `of_n_minted` counts those. They used to be one number: an envelope on an input that mints
+    # nothing — a decoy whose commit demands that its ref be in NO output, in a transaction a node
+    # accepts — made both surfaces say "1 of 2 glyphs minted here" where one was.
     metadata_inputs: list[dict] = []
     read_by_reveal_reader: set[int] = set()  # every input `extract_reveal_metadata` decoded
     payload_count = 0
+    minted_count = 0
     others_listed = 0
     others_not_listed = 0
+    others_not_listed_minting = 0
     for idx, ss in enumerate(scriptsigs):
         m = inspector.extract_reveal_metadata(ss)
         if m is None:
             continue
         read_by_reveal_reader.add(idx)
         payload_count += 1
+        minted_count += idx in minting
         # The headline payload's own entry is always listed; the OTHERS are what a reader has
         # no other way to learn about, and they are what `max_rows` bounds.
         if found is None or idx != found[0]:
             if max_rows is not None and others_listed >= max_rows:
                 others_not_listed += 1
+                others_not_listed_minting += idx in minting
                 continue
             others_listed += 1
         metadata_inputs.append(
@@ -2049,8 +2585,12 @@ def _classify_raw_tx(
                 "classification": _classify_metadata_protocol(m),
                 "name": _sanitize_display_string(m.name) if m.name else "",
                 "ticker": _sanitize_display_string(m.ticker) if m.ticker else "",
+                "mints": idx in minting,
             }
         )
+    # WHAT THE OTHER PAYLOADS' COMMITS SAY is not written here: a row's verdict needs what the
+    # fetches found — including the ones that failed or never happened — and only
+    # `_spent_output_bindings` has that. `_apply_bindings` writes the rows, for both surfaces.
     # A GLYPH ENVELOPE THAT IS NOT A REVEAL. `find_reveal_metadata` answers only "is there a full
     # token payload here", and returns None both for "no glyph" and for "a glyph I could not
     # read" — so a mutable-glyph UPDATE transaction inspected as nothing at all. Measured on
@@ -2132,7 +2672,10 @@ def _classify_raw_tx(
             # it from here — and it is also the outpoint a human would go and look
             # at by hand.
             "input_outpoint": _outpoint,
-            "payload_binding": _payload_binding(_cbor, (spent_scripts or {}).get(input_idx)),
+            # Does this transaction create a ref from that outpoint — mint the token this payload
+            # would describe? Read off the outputs; `payload_binding` says what the commit adds.
+            "mints": input_idx in minting,
+            "payload_binding": _payload_binding(_cbor, known_spent.get(input_idx), _outpoint, output_scripts),
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             # Human-friendly highest-specificity protocol label (e.g. "wave",
             # "container", "timelock", "authority", "dat"). Computed from the
@@ -2166,7 +2709,6 @@ def _classify_raw_tx(
         # parent appearing under one of those means the transaction spent it. The
         # other two operand-carrying opcodes prove nothing and are discarded — see
         # `output_ref_operands`.
-        output_scripts = [bytes(o.locking_script.serialize()) for o in tx.outputs]
         rel = verify_relationship_claims(metadata, output_scripts, delegated_refs=delegated_refs)
         if rel:
             listed_rel = rel if max_rows is None else rel[:max_rows]
@@ -2286,6 +2828,8 @@ def _classify_raw_tx(
         # Say it on the headline payload too. A caller reading only `metadata` must
         # not be able to mistake one glyph's fields for the transaction's.
         metadata_payload["of_n_payloads"] = payload_count
+        # ...and how many of those this transaction MINTS, which is not the same number.
+        metadata_payload["of_n_minted"] = minted_count
 
     payload = {
         "form": "txid",
@@ -2301,6 +2845,11 @@ def _classify_raw_tx(
         "metadata_inputs": metadata_inputs,
         "mint_scriptsig": mint_scriptsig,
     }
+    # WHAT A FETCHING CALLER SHOULD FETCH to settle the headline: the spent transactions of the
+    # minting payloads' inputs, at most `_MAX_BINDING_FETCHES` (`_binding_candidates`). Both the
+    # CLI's `--fetch` and the page read this list, so they ask for the same outpoints.
+    if metadata_payload is not None:
+        payload["binding_candidates"] = _binding_candidates(tx.inputs, scriptsigs, inspector, minting)
     # WHAT WAS COUNTED AND NOT LISTED, beside each list, only when something was. Every count is
     # of what the classifier decided about each entry left out — never inferred from position.
     if unlisted_vouts:
@@ -2329,7 +2878,7 @@ def _classify_raw_tx(
             "by_kind": envelopes_by_kind,
         }
     if others_not_listed:
-        payload["metadata_inputs_not_listed"] = {"count": others_not_listed}
+        payload["metadata_inputs_not_listed"] = {"count": others_not_listed, "minting": others_not_listed_minting}
     # Bounded as a whole, like `_inspect_script`'s payload: the output rows already are, but
     # `metadata` carries reveal-envelope integers of its own — a TIMELOCK's `unlock_at` is
     # `int(...)` of raw CBOR with no width limit — and so will whatever field is added next.

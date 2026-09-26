@@ -76,18 +76,32 @@ def _tx(outputs: list[tuple[bytes, int]], inputs: list[tuple[str, int, bytes]] |
     return tx
 
 
-def _reveal_spending(source_txid: str, vout: int, shown: str, extra_outputs: tuple[bytes, ...] = ()):
+def _minted(source_txid: str, vout: int) -> bytes:
+    """The singleton an NFT commit at *source_txid*:*vout* demands its reveal create."""
+    from pyrxd.glyph.script import build_nft_locking_script
+    from pyrxd.glyph.types import GlyphRef
+    from pyrxd.security.types import Hex20
+
+    return build_nft_locking_script(Hex20(b"\x33" * 20), GlyphRef(txid=source_txid, vout=vout))
+
+
+def _reveal_spending(source_txid: str, vout: int, shown: str, extra_outputs: tuple[bytes, ...] = (), *, mint=True):
+    """A reveal of *shown* spending *source_txid*:*vout*. With ``mint`` (the default) its first output
+    is the singleton an NFT commit there demands — without it, no node accepts the spend, and
+    ``payload_binding`` says so (``commit-unsatisfied``) rather than ``bound``."""
     suffix, _ = _envelope(shown)
     unlocking = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33 + suffix
-    return _tx([(b"\x6a", 0), *((s, 0) for s in extra_outputs)], [(source_txid, vout, unlocking)])
+    first = (_minted(source_txid, vout), 1) if mint else (b"\x6a", 0)
+    return _tx([first, *((s, 0) for s in extra_outputs)], [(source_txid, vout, unlocking)])
 
 
-def _commit_and_reveal(shown: str, committed: str | None = None, extra_outputs: tuple[bytes, ...] = ()):
-    """A reveal spending a real commit output. ``committed`` differing = the attack the binding
-    exists to catch: the envelope on screen is not the one the commit committed to."""
+def _commit_and_reveal(shown: str, committed: str | None = None, extra_outputs: tuple[bytes, ...] = (), *, mint=True):
+    """A reveal spending a real commit output. ``committed`` differing from ``shown`` is a spend no
+    node accepts — the commit hashes the payload it is handed — so it models bytes that were never
+    mined, which is what ``mismatch`` reports."""
     _, committed_cbor = _envelope(committed if committed is not None else shown)
     commit = _tx([(_commit_script(committed_cbor), 1000)])
-    return commit, _reveal_spending(commit.txid(), 0, shown, extra_outputs)
+    return commit, _reveal_spending(commit.txid(), 0, shown, extra_outputs, mint=mint)
 
 
 def _binding(reveal, prev_hex: object = "", prev_fetch_error: object = "") -> dict | None:
@@ -113,9 +127,18 @@ class TestTheSpentTransactionMustBeTheOneAskedFor:
         assert _binding(reveal, commit.serialize().hex())["state"] == "bound"
 
     def test_the_real_commit_still_exposes_a_forged_envelope(self) -> None:
-        """What the binding is FOR, through the page's entry point: the attack reads mismatch."""
+        """Through the page's entry point: an envelope its commit did not commit to reads mismatch.
+        No node accepts that spend, so this models bytes that were never mined — pasted, or served
+        for a txid no block holds. The decoy a node DOES accept is in
+        ``tests/test_reveal_metadata_says_what_binds_it.py``."""
         commit, reveal = _commit_and_reveal("EVIL", committed="real-token")
         assert _binding(reveal, commit.serialize().hex())["state"] == "mismatch"
+
+    def test_a_reveal_that_creates_nothing_is_unsatisfied_not_bound(self) -> None:
+        """The hash matches, and the commit's ``OP_REFTYPE_OUTPUT`` demand is not met. This is what
+        every fixture in this file used to be, reading ``bound``."""
+        commit, reveal = _commit_and_reveal("honest", mint=False)
+        assert _binding(reveal, commit.serialize().hex())["state"] == "commit-unsatisfied"
 
     @pytest.mark.parametrize("shown, committed", [("honest", None), ("EVIL", "real-token")])
     def test_a_different_transaction_is_refused_not_read(self, shown, committed) -> None:
@@ -247,28 +270,47 @@ _SIG = b"\x47" + b"\x00" * 71 + b"\x21" + b"\x02" * 33
 
 def _graft_shapes():
     """The five shapes the review checked the graft on, rebuilt: which input carries the
-    headline, which vout of the commit it spends, what else the transactions carry."""
+    headline, which vout of the commit it spends, what else the transactions carry — and one
+    for each state the 0.25.0 panel's fix added. A reveal expected to read ``bound`` mints the
+    singleton its NFT commit demands; before that panel none of them did, and every one of those
+    was a spend no node accepts, reading ``bound``."""
+    from pyrxd.glyph.payload import build_dat_reveal_scriptsig_suffix, encode_payload
+    from pyrxd.glyph.script import build_dat_commit_locking_script
+    from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+    from pyrxd.hash import hash256
+    from pyrxd.security.types import Hex20
+
     s1, c1 = _envelope("head")
     s2, _c2 = _envelope("other")
     commit1 = _tx([(_P2PKH, 5), (_v1(1), 0), (_commit_script(c1), 1000)], [("cd" * 32, 0, b"\x00")])
     reveal1 = _tx(
-        [(b"\x6a", 0)], [("ef" * 32, 0, b"\x00" * 80), (commit1.txid(), 2, _SIG + s1), ("aa" * 32, 0, _SIG + s2)]
+        [(b"\x6a", 0), (_minted(commit1.txid(), 2), 1)],
+        [("ef" * 32, 0, b"\x00" * 80), (commit1.txid(), 2, _SIG + s1), ("aa" * 32, 0, _SIG + s2)],
     )
     commit2 = _tx([(_signed(b"x"), 0), (_v1(2), 0), (_commit_script(c1), 1000)], [("cd" * 32, 1, b"\x00")])
-    reveal2 = _tx([(_signed(bytes([i % 256, i // 256])), 0) for i in range(150)], [(commit2.txid(), 2, _SIG + s1)])
+    reveal2 = _tx(
+        [(_signed(bytes([i % 256, i // 256])), 0) for i in range(150)] + [(_minted(commit2.txid(), 2), 1)],
+        [(commit2.txid(), 2, _SIG + s1)],
+    )
     _, c_evil = _envelope("real-token")
     commit3 = _tx([(_commit_script(c_evil), 1000)], [("cd" * 32, 2, b"\x00")])
-    reveal3 = _tx([(b"\x6a", 0)], [(commit3.txid(), 0, _SIG + s1)])
+    reveal3 = _tx([(_minted(commit3.txid(), 0), 1)], [(commit3.txid(), 0, _SIG + s1)])
     commit4 = _tx([(_P2PKH, 1000)], [("cd" * 32, 3, b"\x00")])
     reveal4 = _tx([(b"\x6a", 0)], [(commit4.txid(), 0, _SIG + s1)])
     commit5 = _tx([(_commit_script(c1), 1000)], [("cd" * 32, 4, b"\x00")])
     reveal5 = _tx([], [(commit5.txid(), 0, _SIG + s1)])
+    dat, _ = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.DAT], name="data"))
+    commit6 = _tx(
+        [(build_dat_commit_locking_script(hash256(dat), Hex20(b"\x44" * 20)), 1000)], [("cd" * 32, 5, b"\x00")]
+    )
+    reveal6 = _tx([(_P2PKH, 900)], [(commit6.txid(), 0, _SIG + build_dat_reveal_scriptsig_suffix(dat))])
     return {
         "headline-at-input-1-spends-vout-2": (reveal1, commit1, "bound"),
         "150-signed-marks-and-a-marked-commit": (reveal2, commit2, "bound"),
         "mismatch": (reveal3, commit3, "mismatch"),
         "not-a-commit": (reveal4, commit4, "not-a-commit"),
-        "zero-output-reveal": (reveal5, commit5, "bound"),
+        "zero-output-reveal": (reveal5, commit5, "commit-unsatisfied"),
+        "dat-commit": (reveal6, commit6, "bound-no-token"),
     }
 
 
@@ -299,7 +341,8 @@ class TestTheBindingStepIsOneFieldNotASecondInspect:
 
     def test_it_classifies_no_output_and_checks_no_signature(self, monkeypatch) -> None:
         """The cost the review measured: the second call re-ran every output's classification.
-        The binding reads one input and one spent output; nothing else is classified."""
+        The binding reads one input, one spent output, and the reveal's output SCRIPTS for one ref;
+        nothing is classified."""
         core = _core()
         calls = {"script": 0, "attest": 0}
         real_script, real_attest = core._classify_script, core.verify_attestation
@@ -319,12 +362,14 @@ class TestTheBindingStepIsOneFieldNotASecondInspect:
         assert calls == {"script": 0, "attest": 0}, calls
         # The counters count: the same patch sees the first pass classify.
         _glue().inspect_txid_with_raw(reveal.txid(), reveal.serialize().hex(), 2, 2)
-        assert calls["script"] == 150 and calls["attest"] == 2, calls
+        assert calls["script"] == len(reveal.outputs) == 151 and calls["attest"] == 2, calls
 
 
 class TestTheBindingStepReadsOnlyTheInputs:
     """It never parses an output of the reveal — a 4 MB transaction is mostly outputs — so it reads
-    the inputs itself. That read must be the whole transaction's, input for input."""
+    the inputs itself. That read must be the whole transaction's, input for input. The output
+    SCRIPTS it does need (is the commit's ref created?) are sliced out of the bytes the walk
+    already steps over; ``test_the_output_scripts_are_the_whole_parses_scripts`` pins them."""
 
     @pytest.mark.parametrize("shape", sorted(_graft_shapes()))
     def test_the_inputs_are_the_whole_parses_inputs(self, shape) -> None:
@@ -370,6 +415,18 @@ class TestTheBindingStepReadsOnlyTheInputs:
         assert _binding(reveal, commit.serialize().hex())["state"] == "bound"
         assert len(calls) == 3, f"{len(calls)} outputs parsed: the spent transaction has 3, the reveal none"
 
+    @pytest.mark.parametrize("shape", sorted(_graft_shapes()))
+    def test_the_output_scripts_are_the_whole_parses_scripts(self, shape) -> None:
+        """What the binding scans for the commit's ref is every output script, byte for byte, in
+        order — the set ``OP_REFTYPE_OUTPUT`` reads — though no output object is built for it."""
+        from pyrxd.transaction.transaction import Transaction
+
+        for tx in _graft_shapes()[shape][:2]:
+            raw = tx.serialize()
+            _inputs, spans = _core()._checked_inputs_and_output_spans(tx.txid(), raw)
+            whole = [bytes(o.locking_script.serialize()) for o in Transaction.from_hex(raw).outputs]
+            assert [raw[start:end] for start, end in spans] == whole
+
 
 # ─────────────── the bytes after the inputs are walked, not trusted ──
 #
@@ -384,7 +441,9 @@ def _malformed_after_the_inputs() -> dict[str, bytes]:
     inputs, plus a non-canonical input count."""
     from pyrxd.transaction.transaction import Transaction
 
-    _commit, reveal = _commit_and_reveal("honest")
+    # A one-byte OP_RETURN output, which the offsets below are computed for. Its binding is beside
+    # the point: these bytes are refused before anything reads it.
+    _commit, reveal = _commit_and_reveal("honest", mint=False)
     good = reveal.serialize()
     tx = Transaction.from_hex(good)
     assert len(tx.inputs) == 1 and len(tx.outputs) == 1, "the fixture's layout changed; recompute the offsets"
@@ -475,17 +534,19 @@ class TestTheBytesAfterTheInputsAreWalked:
         ]
         caps = (_core()._MAX_INPUT_COUNT, _core()._MAX_OUTPUT_COUNT)
 
+        # Inputs AND output scripts: the binding reads both out of the walk.
         def whole(raw: bytes):
             tx = Transaction.from_hex(raw)
             if tx is None or len(tx.inputs) > caps[0] or len(tx.outputs) > caps[1]:
                 return None
-            return [i.serialize() for i in tx.inputs]
+            return [i.serialize() for i in tx.inputs], [bytes(o.locking_script.serialize()) for o in tx.outputs]
 
         def walked(raw: bytes):
             try:
-                return [i.serialize() for i in _core()._checked_inputs(hash256(raw)[::-1].hex(), raw)]
+                inputs, spans = _core()._checked_inputs_and_output_spans(hash256(raw)[::-1].hex(), raw)
             except ValidationError:
                 return None
+            return [i.serialize() for i in inputs], [raw[start:end] for start, end in spans]
 
         def mutate(b: bytes) -> bytes:
             out = bytearray(b)

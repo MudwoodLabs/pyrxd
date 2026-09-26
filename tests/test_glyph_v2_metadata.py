@@ -535,6 +535,33 @@ class TestAnIntegerLocIsKeptNotDropped:
         assert self._decode(-1).loc_vout is None
         assert self._decode(2**33).loc_vout is None
 
+    def test_a_loc_too_wide_to_print_is_dropped_once_without_a_logging_error(self, caplog):
+        """#715's class, found again by the 0.25.0 panel (F-L1). The drop was logged with ``%d``,
+        and past 4,300 digits turning an int into text raises — inside the logging call, which the
+        ``logging`` module answers by printing a ``--- Logging error ---`` traceback. Twice per
+        decode, because the value was asked for twice.
+
+        Under pytest the capture handler RE-RAISES a formatting failure instead of printing it, so
+        before the fix this decode raised; outside pytest it printed two tracebacks and carried on."""
+        import logging
+
+        wide = 2**20000  # 6,021 decimal digits
+        with pytest.raises(ValueError, match="Exceeds the limit"):
+            str(wide)  # the premise: this interpreter refuses to print it
+        with caplog.at_level(logging.WARNING, logger="pyrxd.glyph.payload"):
+            md = decode_payload(cbor2.dumps({"p": [2], "name": "x", "loc": wide}))
+        assert md.loc_vout is None and md.loc == "" and md.name == "x"
+        drops = [r.getMessage() for r in caplog.records if "integer 'loc'" in r.getMessage()]
+        assert drops == ["decode_payload: integer 'loc' is not a plausible vout (above 2**32 - 1, 20001 bits); dropped"]
+
+    def test_a_negative_loc_says_so_by_its_width_too(self, caplog):
+        """The honest neighbour on the other side of the range, still logged and still dropped."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="pyrxd.glyph.payload"):
+            assert self._decode(-(2**20000)).loc_vout is None
+        assert any("(negative, 20001 bits)" in r.getMessage() for r in caplog.records)
+
     def test_an_integer_loc_is_never_written_back(self):
         """Read-path only. pyrxd must not start emitting a field it cannot resolve."""
         md = self._decode(2)

@@ -123,12 +123,21 @@ def _cbor_loc_vout(d: dict) -> int | None:
 
     Bounds are deliberate: a vout is a non-negative output index, and ``bool`` is rejected
     explicitly because it is an ``int`` subclass and ``loc: True`` is not vout 1.
+
+    The value being dropped is NOT printed. It is an integer off the chain of any width CBOR can
+    carry, and past 4,300 digits turning it into text raises — inside the logging call, where the
+    ``logging`` module catches it and prints a ``--- Logging error ---`` traceback instead (#715's
+    class). Its width is always printable, and says why it was dropped.
     """
     v = d.get("loc")
     if isinstance(v, bool) or not isinstance(v, int):
         return None
     if v < 0 or v > 0xFFFFFFFF:
-        _log.warning("decode_payload: integer 'loc' %d is not a plausible vout; dropped", v)
+        _log.warning(
+            "decode_payload: integer 'loc' is not a plausible vout (%s, %d bits); dropped",
+            "negative" if v < 0 else "above 2**32 - 1",
+            v.bit_length(),
+        )
         return None
     return v
 
@@ -512,6 +521,8 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         except _DECODE_REFUSALS as e:
             _log.warning("decode_payload: malformed 'crypto' field ignored: %s", e)
 
+    # ONCE: it logs when it drops a value, and asking twice logged the same drop twice.
+    loc_vout = _cbor_loc_vout(d)
     return GlyphMetadata(
         source_cbor=cbor_bytes,
         protocol=d["p"],
@@ -533,8 +544,8 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
         # `loc` is text to pyrxd and a ref-vout to Photonic. Resolve which one this is ONCE:
         # asking _cbor_str for a value we are about to keep would log "dropped" about a field
         # that was not dropped, and a log line that contradicts the code is worse than silence.
-        loc="" if _cbor_loc_vout(d) is not None else _cbor_str(d, "loc", 512),
-        loc_vout=_cbor_loc_vout(d),
+        loc="" if loc_vout is not None else _cbor_str(d, "loc", 512),
+        loc_vout=loc_vout,
         loc_hash=_cbor_str(d, "loc_hash", 128),
         decimals=_decode_decimals(d.get("decimals", 0)),
         image_url=_cbor_str(d, "image", 512),
@@ -586,7 +597,7 @@ def build_reveal_scriptsig_suffix(
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
 
-    Refuses a WAVE claim the indexer would not register, unless ``allow_unregistrable_wave``
+    Refuses a WAVE claim outside the rule pyrxd writes claims by, unless ``allow_unregistrable_wave``
     — see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`, which says what
     that escape is for.
 

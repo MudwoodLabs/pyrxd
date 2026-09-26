@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Verbatim copies of Radiant-Core/RXinDexer files at the commit below, fetched with",
+    "gh api repos/Radiant-Core/RXinDexer/contents/<path>?ref=<commit> -H 'Accept: application/vnd.github.raw'.",
+    "Each digest is the sha256 of the file's bytes. The two files also in",
+    "tests/fixtures/rxindexer_upstream_pin.json must carry the pin's digest; the test enforces it.",
+    "Do NOT hand-edit a vendored file: a byte changed is a digest that no longer matches."
+  ],
+  "repo": "Radiant-Core/RXinDexer",
+  "commit": "ca8a6a4e77ef0ad3f24ec6f41cb0a73eb5f3651e",
+  "fetched": "2026-09-25",
+  "files": {
+    "LICENCE": "64f788706cfa162eee486d9a2b70925b1961d7a9cd6f8d7cc366a3a68991a4d2",
+    "electrumx/__init__.py": "fe3316a40faa2b74d450ad9ced07097c8744a597962fc7218870215bffd9bb58",
+    "electrumx/lib/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "electrumx/lib/enum.py": "91a60b3b9d23691662c32adc5d79a92f871ee313b6c7d00a2eaf9c600f5ebbb8",
+    "electrumx/lib/glyph.py": "bdad3e8cd043bb423713ff07acc82883ea3228ac848b2d32439ef2ba999615db",
+    "electrumx/lib/hash.py": "7ccad6c76e2665ac230690c81bc73269213be3f71507f72381a0a768cf1a2a58",
+    "electrumx/lib/script.py": "680f9013fad6c02f0f1fcfc46de6e987aff5240857e6e2d431b1fcfca776f827",
+    "electrumx/lib/util.py": "66bf4f4b9cc3cdbe5638fe8b43eeb6a08a0f21c2a80a86de82ff214f7462ac45",
+    "electrumx/server/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "electrumx/server/wave_index.py": "2724f291a55e83751fdf553e52dd68413e66cde0a7e879ec91391241c99afe53"
+  }
+}

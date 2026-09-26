@@ -47,6 +47,14 @@ class CliContext:
     no_color: bool = False
     yes: bool = False  # skip confirmation prompts
     debug: bool = False  # show full tracebacks on error
+    #: The ``--electrumx`` URL given on THIS command line, or ``None``. ``electrumx_url`` is the
+    #: resolved endpoint whatever its source (config, env, default); a command that prints a
+    #: follow-up command for the operator to run repeats only what the operator typed.
+    electrumx_override: str | None = None
+    #: Set by :func:`~pyrxd.cli.prompts._load_wallet` once it has opened the wallet with a
+    #: BIP39 passphrase, so a printed follow-up command can say it needs ``--passphrase``.
+    #: The passphrase itself is never kept here.
+    opened_with_passphrase: bool = False
     # Optional injection point for tests: a callable returning
     # ElectrumXClient. Production code uses the default factory.
     client_factory: Callable[[], ElectrumXClient] | None = None

@@ -125,6 +125,21 @@ class _NodeClient:
     async def get_transaction(self, txid: object) -> bytes:
         return bytes.fromhex(str(self.node.cli("getrawtransaction", str(txid))))
 
+    async def assert_chain(self, expected_genesis_hash: str) -> str:
+        """``ElectrumXClient.assert_chain``'s contract, answered by the NODE's own block 0.
+
+        ``build_hashmark_mark`` refuses a client it cannot ask which chain it is on, so this stub
+        has to answer — and it answers from the chain rather than agreeing with whatever it is
+        asked, so a plan signed for another chain is refused here exactly as it would be in
+        production.
+        """
+        from pyrxd.security.errors import ValidationError
+
+        observed = str(self.node.cli("getblockhash", "0")).strip().lower()
+        if observed != str(expected_genesis_hash).strip().lower():
+            raise ValidationError(f"regtest node is on the wrong chain: genesis {observed} != {expected_genesis_hash}")
+        return observed
+
     async def broadcast(self, raw: bytes) -> str:
         self.verdict = self.node.accepts(raw.hex())
         if self.verdict.get("allowed") is not True:
@@ -143,6 +158,14 @@ class _NodeClient:
 
     async def get_tip_height(self) -> int:
         return int(self.node.cli("getblockcount"))  # type: ignore[arg-type]
+
+    # The anchor BINDS its height to a header: the one at that height must hash to the verbose
+    # reply's `blockhash`. From the node itself — `getblockhash` then `getblockheader <hash> false`,
+    # whose reply is the 160-hex header (checked read-only against a mainnet node: pyrxd's
+    # `block_hash_hex` of it equals `getblockhash`).
+    async def get_block_header(self, height: object) -> bytes:
+        block = str(self.node.cli("getblockhash", str(int(height))))  # type: ignore[call-overload]
+        return bytes.fromhex(str(self.node.cli("getblockheader", block, "false")))
 
 
 class _NodeWallet:

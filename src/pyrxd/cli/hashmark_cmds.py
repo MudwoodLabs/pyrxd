@@ -32,6 +32,7 @@ publish a permanent claim about a chain nobody chose.
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +41,7 @@ import click
 from ..constants import genesis_hash_for
 from ..glyph._inspect_core import _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
+from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from ..security.types import Txid
@@ -57,6 +59,7 @@ from .glyph_inspect import (
     _attach_wave_identity,
     _op_return_payload_lines,
     _require_min_confirmations,
+    _require_wave_name,
     _run_fetch_inspect,
     _sanitize_display_string,
     hashmark_records,
@@ -104,6 +107,180 @@ def _canonical_label(label: str | None) -> tuple[str | None, bool]:
     return canonical, canonical != label
 
 
+#: How many distinct codepoints the label banner names one by one before summarising.
+_MAX_NAMED_LABEL_CODEPOINTS = 8
+
+#: Unicode's Default_Ignorable_Code_Point property, as merged codepoint ranges: what a renderer
+#: draws as NOTHING when it has no special handling for it. The variation selectors
+#: (U+FE00-FE0F, U+E0100-E01EF), U+034F COMBINING GRAPHEME JOINER, the TAG block and the Hangul
+#: fillers are all here — including ones whose general category is Mn or Lo, which is why a
+#: category test cannot find them: VS-17..256 are "combining marks", and a run of them after any
+#: letter is a published way to carry arbitrary bytes inside text that looks unchanged.
+#:
+#: GENERATED, NOT HAND-TYPED, AND NOT DERIVED AT RUN TIME. Python's ``unicodedata`` has no accessor
+#: for this property, so the ranges were extracted once from DerivedCoreProperties.txt of Unicode
+#: 17.0.0 (https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt, file sha256
+#: 24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08), merged, and checked in; the
+#: 16.0.0 file yields the identical set. A test pins the membership
+#: (`test_the_default_ignorable_table_is_the_reviewed_unicode_17_set`), so a change to it has to be
+#: made — and reviewed — on purpose.
+_DEFAULT_IGNORABLE: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+#: The two joiners §5.4 calls "load-bearing in Devanagari and emoji sequences".
+_JOINERS = frozenset({"\u200c", "\u200d"})
+
+#: Text / emoji presentation selectors. The only default-ignorables an honest label routinely
+#: carries on their own, and only straight after a symbol (a heart followed by U+FE0F).
+_PRESENTATION_SELECTORS = frozenset({"\ufe0e", "\ufe0f"})
+
+
+def _is_default_ignorable(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE)
+
+
+def _follows_a_symbol(label: str, i: int) -> bool:
+    """Whether position *i* comes straight after a non-ASCII symbol (So, Sm) — an emoji base."""
+    return i > 0 and not label[i - 1].isascii() and unicodedata.category(label[i - 1]) in ("So", "Sm")
+
+
+def _escaped_positions(label: str) -> list[bool]:
+    """For each character of *label*, whether `mark` must print it as ``<U+XXXX>``.
+
+    The rule is "escape whatever can be signed without being SEEN", with exactly three ways honest
+    text is written left to print as itself — each narrowed to where honest text puts it:
+
+    * a combining mark (Mn, Me) that is NOT default-ignorable. It renders ON its base character:
+      the virama and vowel signs of Devanagari, an accent written as a separate mark. The
+      default-ignorable combining marks (U+034F, the variation selectors, U+17B4-17B5,
+      U+180B-180F) render as nothing and are escaped wherever they are.
+    * U+FE0E / U+FE0F straight after a non-ASCII symbol (So, Sm), and nowhere else.
+    * ZWJ / ZWNJ between two non-ASCII characters that are themselves printed as written — a
+      joined emoji, a Devanagari conjunct. Between ASCII letters (``pay`` + ZWJ + ``pal``) a
+      joiner joins nothing visible, so it is escaped.
+
+    Everything else the reader's sanitiser replaces, and every other default-ignorable, is
+    escaped. Round 2 exempted every Mn/Me and both joiners by CATEGORY, which let a run of
+    variation selectors after ``invoice 42`` — a whole hidden sentence — print as ``invoice 42``
+    with no banner. The exemption is now by what renders, and where.
+    """
+    n = len(label)
+    escaped = [False] * n
+    for i, ch in enumerate(label):  # everything but the joiners, which depend on their neighbours
+        if ch in _JOINERS:
+            continue
+        if _is_default_ignorable(ch):
+            escaped[i] = not (ch in _PRESENTATION_SELECTORS and _follows_a_symbol(label, i))
+        elif _sanitize_display_string(ch) != ch:
+            escaped[i] = unicodedata.category(ch) not in ("Mn", "Me")
+
+    def _printed_non_ascii(j: int) -> bool:
+        return 0 <= j < n and label[j] not in _JOINERS and not label[j].isascii() and not escaped[j]
+
+    for i, ch in enumerate(label):
+        if ch in _JOINERS:
+            escaped[i] = not (_printed_non_ascii(i - 1) and _printed_non_ascii(i + 1))
+    return escaped
+
+
+def _label_for_display(label: str | None) -> str:
+    """The label as `mark` prints it: every character that could be signed unseen becomes ``<U+XXXX>``.
+
+    The raw label is what gets SIGNED, and printing it raw hid part of it: ``invoice 42`` followed
+    by Unicode TAG characters spelling ``pay 9999`` showed as ``invoice 42`` on a terminal that
+    does not render format characters, while the whole string went into the signature. §5.4's
+    reject table does not list those characters, so the encoder accepts them; the defence is to
+    make them visible before the operator agrees. See :func:`_escaped_positions` for which ones.
+    """
+    if label is None:
+        return "(none)"
+    return "".join(f"<U+{ord(ch):04X}>" if esc else ch for ch, esc in zip(label, _escaped_positions(label)))
+
+
+def _label_lines(label: str | None, *, head: str, indent: str) -> list[str]:
+    """The ``label:`` line, and — for any label with a non-ASCII character — its ``ascii()`` form.
+
+    THE ESCAPES ARE NOT THE WHOLE OF WHAT MISLEADS. Some characters print as something while
+    meaning something else: a Cyrillic ``о`` beside Latin letters, a blank Braille pattern
+    (U+2800) that renders as white space. Neither renders as nothing, so neither is escaped. The
+    ``ascii()`` form names every codepoint, so the operator can see what is about to be signed
+    whatever it looks like. An ASCII label gets no second line: its ``ascii()`` would say nothing new.
+    """
+    lines = [f"{head}{_label_for_display(label)}"]
+    if label is not None and not label.isascii():
+        lines.append(f"{indent}ascii: {label!a}  (the exact codepoints signed)")
+    return lines
+
+
+def _hidden_label_lines(label: str | None) -> list[str]:
+    """The banner for a label that renders as less than it is, or that readers print differently.
+
+    IT FIRES WHENEVER ``pyrxd verify`` AND ``glyph inspect`` WILL PRINT THE LABEL DIFFERENTLY —
+    derived from the very function they print it through
+    (:func:`~pyrxd.glyph._inspect_core._sanitize_display_string`), not from a list kept here — and
+    whenever this screen escaped anything. So the signer is warned exactly when the reader will
+    show something other than what they saw. That includes honest text: a Devanagari label prints
+    naturally above and reads ``?`` for its combining marks in the reader, and the banner says so.
+
+    SHOWN, NOT REFUSED — and that is a reading of HashMark §5.4, not a convenience. §5.4 names the
+    characters an encoder must reject and says outright that ZWJ and ZWNJ are "load-bearing in
+    Devanagari and emoji sequences". Refusing everything outside that table that a terminal cannot
+    print would refuse text §5.4 permits: combining marks are ordinary in Indic scripts, TAG
+    characters spell the England, Scotland and Wales flag emoji, and an emoji newer than this
+    Python's Unicode tables is "unassigned" here. pyrxd must not refuse an honest label, so it
+    discloses: the codepoints, their names, where each appears above, and how the reader prints it.
+    """
+    if label is None:
+        return []
+    escaped = _escaped_positions(label)
+    as_read = _sanitize_display_string(label)
+    flagged = [i for i, ch in enumerate(label) if escaped[i] or _sanitize_display_string(ch) != ch]
+    if not flagged:
+        return []
+    lines = [
+        "",
+        f"*** THE LABEL HOLDS {len(flagged)} CHARACTER(S) THAT RENDER AS NOTHING HERE OR THAT `pyrxd verify`",
+        "*** PRINTS DIFFERENTLY — EVERY ONE OF THEM IS SIGNED AND PUBLISHED:",
+    ]
+    distinct = list(dict.fromkeys(label[i] for i in flagged))
+    for ch in distinct[:_MAX_NAMED_LABEL_CODEPOINTS]:
+        at = [escaped[i] for i in flagged if label[i] == ch]
+        if all(at):
+            here = f"shown above as <U+{ord(ch):04X}>"
+        elif not any(at):
+            here = "printed above as written"
+        else:
+            here = f"printed as written in one place, as <U+{ord(ch):04X}> in another"
+        read = "verify prints it as ?" if _sanitize_display_string(ch) != ch else "verify prints it as written"
+        name = unicodedata.name(ch, "(no Unicode name: unassigned or private use)")
+        lines.append(f"***   U+{ord(ch):04X}  {name} — {here}; {read}")
+    if len(distinct) > _MAX_NAMED_LABEL_CODEPOINTS:
+        lines.append(f"***   ... and {len(distinct) - _MAX_NAMED_LABEL_CODEPOINTS} more distinct codepoint(s)")
+    if as_read != label:
+        lines.append(f"*** `pyrxd verify` and `glyph inspect` will print this label as: {as_read}")
+    lines.append("*** HashMark 5.4 does not forbid these, and honest text uses some of them, so they are shown,")
+    lines.append("*** not refused. If you did not put them there, do not publish this: retype the label.")
+    return lines
+
+
 def _mark_lines(
     build: MarkBuild,
     *,
@@ -118,13 +295,18 @@ def _mark_lines(
     statement that is NOT recoverable from the record, so an operator reading the record
     back later cannot tell from it which chain it was signed for — this prompt is the
     only place the two are ever seen together.
+
+    NOTHING HERE IS PRINTED RAW THAT SOMEONE ELSE COULD HAVE CHOSEN. The file path is sanitised
+    the way `verify` already sanitised it — a file named ``report.pdf\\x1b[8m`` switched the
+    terminal to concealed text for every line after it, the fee and the warnings included — and
+    the label is escaped, see :func:`_label_for_display`.
     """
     plan = build.plan
     raw = build.serialize()
     lines = [
-        f"file:        {plan.source}",
+        f"file:        {_sanitize_display_string(plan.source) if plan.source is not None else '(not recorded)'}",
         f"{plan.algorithm}:      {plan.digest_hex}",
-        f"label:       {plan.label if plan.label is not None else '(none)'}",
+        *_label_lines(plan.label, head="label:       ", indent="             "),
         f"signer:      {signer_address}",
         f"             hash160 {plan.signer_hash160_hex} — committed in the record and in the statement",
         f"network:     {network} (genesis {plan.network_genesis})",
@@ -133,11 +315,12 @@ def _mark_lines(
         f"fee:         {build.fee:,} photons ({len(raw)} B @ {fee_rate:,}/B)"
         + ("" if build.has_change else " — no change: the whole funding UTXO is the fee"),
     ]
+    lines.extend(_hidden_label_lines(plan.label))
     if typed_label is not None and plan.label != typed_label:
         lines.append("")
         lines.append("*** LABEL CANONICALISED — what gets signed is NOT what you typed:")
-        lines.append(f"***   you typed:  {typed_label!r}")
-        lines.append(f"***   published:  {plan.label!r}")
+        lines.append(f"***   you typed:  {typed_label!a}")
+        lines.append(f"***   published:  {plan.label!a}")
         lines.append("*** HashMark 5.4 requires the label be trimmed and NFC-normalised before")
         lines.append("*** signing. The published spelling above is the one inside the signature.")
     lines.append("")
@@ -248,7 +431,9 @@ def mark_cmd(
             "everything else in the record is fixed-width",
         ) from exc
     except OSError as exc:
-        raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
+        raise UserError(
+            f"could not read {_sanitize_display_string(str(file_path))}", cause=_sanitize_display_string(str(exc))
+        ) from exc
 
     async def _do_build() -> Any:
         client = ctx.make_client()
@@ -360,15 +545,16 @@ def mark_cmd(
             click.echo(f"  {line}")
         click.echo(f"\n  record:      {build.plan.op_return_script.hex()}")
         click.echo(f"  decoded:     v{record.version} {record.algorithm} digest={record.digest_hex}")
-        click.echo(f"               label={record.label!r} signer={record.signer_hash160_hex}")
+        click.echo(f"               label={record.label!a} signer={record.signer_hash160_hex}")
         click.echo(f"               signature (unverified by a third party)={record.signature_hex}")
         click.echo(f"  raw tx:      {payload['raw_tx_hex']}")
         click.echo("\n  Re-run without --dry-run to publish it.")
     else:
         click.echo(f"\nMarked: {txid}")
-        click.echo(f"  file:       {file_path}")
+        click.echo(f"  file:       {_sanitize_display_string(str(file_path))}")
         click.echo(f"  {build.plan.algorithm}:     {build.plan.digest_hex}")
-        click.echo(f"  label:      {build.plan.label if build.plan.label is not None else '(none)'}")
+        for line in _label_lines(build.plan.label, head="  label:      ", indent="              "):
+            click.echo(line)
         click.echo(f"  signer:     {signer_address}")
         click.echo(f"  network:    {ctx.network} (genesis {build.plan.network_genesis})")
         click.echo(f"  record:     {build.plan.size_bytes} B")
@@ -411,12 +597,17 @@ EXIT_VERDICT_DOES_NOT_HOLD = 5
 #: Check states that leave the overall verdict standing. Everything else fails it.
 #:
 #: THE ASYMMETRY IS DELIBERATE AND IS THE ONE THING TO GET RIGHT HERE. "NOT CHECKED" holds;
-#: "NOT ESTABLISHED" does not. On the WRITE side `MarkPlan` treats an UNVERIFIABLE attestation
-#: as a refusal, because funding a broadcast needs the same curve library that signs and a mark
-#: nobody could self-check must not be published. On the READ side the same word means a missing
-#: capability in the READER — the curve library is absent — and failing the verdict on it would
-#: accuse an honest signer of forgery because of something missing on the verifier's machine.
-#: So it is reported loudly and does not fail.
+#: "NOT ESTABLISHED" does not. In THIS command "NOT CHECKED" means the tool did not examine
+#: something: a question the caller did not ask (no --file/--digest, no --wave-name), or a
+#: record this build cannot read (an unknown version or hash), which has no signature it could
+#: check. Neither is a finding against the record, and failing the verdict on it would accuse an
+#: honest signer. So it is reported loudly and does not fail.
+#:
+#: NOT "the curve library is absent", which this used to say. That is the shared inspect core's
+#: case in the BROWSER; the CLI cannot even import without coincurve, which
+#: `test_the_cli_cannot_load_without_a_curve_so_not_checked_never_means_that` pins. On the WRITE
+#: side `MarkPlan` refuses an UNVERIFIABLE attestation outright: a mark nobody could self-check
+#: must not be published.
 #:
 #: "NOT ESTABLISHED" is the opposite case: the caller ASKED a question (`--wave-name`) and it
 #: could not be answered. A gate that waves that through is the quiet, dangerous direction.
@@ -424,7 +615,7 @@ _CHECK_HOLDS = frozenset(
     {
         "VERIFIED",
         "NO SIGNATURE",  # a v1 record makes no signature claim; there is nothing to fail
-        "NOT CHECKED",  # a capability the reader lacks, or a question the caller did not ask
+        "NOT CHECKED",  # a question the caller did not ask, or a record this build cannot read
         "MATCHES",
         "ESTABLISHED",
         "CONFIRMED",
@@ -462,7 +653,9 @@ def _digest_expectation(
     try:
         return digest_file(file_path, algorithm_id=next(iter(ids))).hex(), ""
     except OSError as exc:
-        raise UserError(f"could not read {file_path}", cause=str(exc)) from exc
+        raise UserError(
+            f"could not read {_sanitize_display_string(str(file_path))}", cause=_sanitize_display_string(str(exc))
+        ) from exc
 
 
 def _why_no_digest_to_compare(record: dict) -> str:
@@ -581,16 +774,31 @@ def _signature_check(record: dict) -> tuple[str, str]:
         return "RECORD DOES NOT DECODE", _sanitize_display_string(
             str(record.get("detail") or "the bytes claim HashMark and are broken")
         )
+    # THE CHAIN IS PART OF THE ANSWER. The genesis hash is inside the signed statement, so the
+    # same record verifies on the chain it was signed for and DOES NOT VERIFY on any other. A
+    # summary of "DOES NOT VERIFY" with no chain named read an honest testnet record, checked
+    # on the default mainnet, as a plain forgery. Named on every outcome that involves a key.
+    net = att.get("assumed_network")
+    against = f" (checked against {net})" if net else ""
     if outcome == "invalid_signature":
         return "DOES NOT VERIFY", _sanitize_display_string(
             str(att.get("detail") or "the recovered key is not the committed signer")
+            + (
+                f" — checked against {net}; a record signed for another chain does not verify here, "
+                "so if it was made on another network, re-run with that --network"
+                if net
+                else ""
+            )
         )
     if outcome == "unverifiable":
         # A MISSING CAPABILITY ON THIS MACHINE, not a verdict on the record. Getting this
         # backwards accuses an honest signer, so it holds and says exactly what is absent.
-        return "NOT CHECKED", _sanitize_display_string(str(att.get("detail") or "no curve library available here"))
+        return "NOT CHECKED", _sanitize_display_string(
+            str(att.get("detail") or "no curve library available here")
+            + (f" (it would be checked against {net})" if net else "")
+        )
     if outcome == "valid":
-        return "VERIFIED", "the signature recovers to the hash160 committed in the record"
+        return "VERIFIED", f"the signature recovers to the hash160 committed in the record{against}"
     if record.get("outcome") == "ok" and not record.get("signer_hash160"):
         return "NO SIGNATURE", "a v1 record carries no signer and makes no signature claim"
     return "NOT CHECKED", "this record carries no signature this tool reads"
@@ -862,6 +1070,8 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
 
     txid = payload.get("txid")
 
+    asked: list[str] = []  # the endpoint `_do` asked, for an error that names it
+
     async def _do() -> dict:
         # Through the MODULE, not a from-import. `_endpoint_pair` is the one seam both this
         # command and `_name_at_mark` reach the network through, and a name bound here would
@@ -874,12 +1084,39 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
         # than whoever actually answered, and `MarkAnchor.source` is the field the independence
         # rule is checked against. A source label that is a guess is worse than no label.
         client_a, label_a, _client_b, _label_b = _inspect._endpoint_pair(ctx)
+        asked.append(label_a)
         async with client_a:  # type: ignore[attr-defined]
             anchor = await resolve_anchor_from(client_a, label_a, mark_txid=txid, min_confirmations=min_confirmations)
         return mark_anchor_dict(anchor)
 
     try:
         return asyncio.run(_do())
+    except AnchorBindingError as exc:
+        # THE ENDPOINT ANSWERED. "Check that it is reachable" sent people to debug a connection that
+        # worked (0.25.0 panel, round 3). WHICH failure it was comes from the exception's attributes,
+        # not its words: "its index and its node disagree" only when every header in the window was
+        # served and none matched — with one missing, the missing one may be the match, and the
+        # sentence would accuse an honest server (0.25.0 review, round 2).
+        where = asked[0] if asked else ctx.electrumx_url
+        retry = "re-run in a moment, or ask another server with --electrumx URL"
+        if exc.disagrees:
+            fix = (
+                f"{where} answered, but its index and its node disagree about the mark's block — re-run in "
+                "a moment (a new block usually settles it), or ask another server with --electrumx URL"
+            )
+        elif exc.unserved:
+            heights = ", ".join(map(str, sorted(exc.unserved)))
+            fix = (
+                f"{where} answered, but did not serve the block headers at heights {heights}, so the "
+                f"mark's block could not be checked — {retry}"
+            )
+        else:
+            fix = f"{where} answered, but named no block for the mark's transaction — {retry}"
+        raise NetworkBoundaryError(
+            "could not establish which block the mark is in",
+            cause=str(exc),
+            fix=fix,
+        ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
@@ -911,9 +1148,9 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
     type=click.IntRange(min=1),
     default=None,
     metavar="N",
-    help="Depth below which the mark's block is too shallow to rely on. REQUIRED: a mark's whole "
-    "claim is 'no later than the block that confirms it', and depth is value-scaled per chain, "
-    "so there is deliberately no default.",
+    help=f"The confirmation floor for the mark's block — {MIN_CONFIRMATIONS_MEANING}. Below it the "
+    "block is too shallow to rely on. REQUIRED: a mark's whole claim is 'no later than the block "
+    "that confirms it', and depth is value-scaled per chain, so there is deliberately no default.",
 )
 @click.option(
     "--wave-name",
@@ -921,8 +1158,9 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
     default=None,
     metavar="NAME",
     help="HashMark 7.6 form 2: did NAME (e.g. company.rxd) point at the signing key AT THE BLOCK "
-    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers; with one it degrades to "
-    "form 1, says why, and the verdict does NOT hold.",
+    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers that report the same block "
+    "heights; with one, or if they disagree, it degrades to form 1, says why, and the verdict "
+    "does NOT hold.",
 )
 @click.option(
     "--verify-wave",
@@ -978,9 +1216,10 @@ def verify_cmd(
 
     \b
     Exit codes: 0 the verdict holds, 5 it does not, 1 bad input, 2 network.
-    NOT CHECKED never fails the verdict — it means this tool did not check, most often because
-    the curve library is absent, and failing on it would accuse an honest signer of forgery for
-    something missing on YOUR machine. NOT ESTABLISHED and CANNOT COMPARE do fail it: you asked a
+    NOT CHECKED never fails the verdict. Here it means you did not ask that question (no --file
+    or --digest, no --wave-name), or the record is a version or hash this build cannot read, so
+    no signature in it could be checked. Neither is a finding against the record, and failing
+    on it would accuse an honest signer. NOT ESTABLISHED and CANNOT COMPARE do fail it: you asked a
     question and it could not be answered, and a gate that passes on "not answered" is worse
     than no gate.
 
@@ -1000,6 +1239,9 @@ def verify_cmd(
                 cause=f"got {digest_hex!r}",
                 fix="pass the digest as hex, e.g. the output of `sha256sum <file>`",
             )
+    # The same shape of refusal as --digest "" above, and for the same reason: an empty value is
+    # a question typed wrong, not a question not asked. See `_require_wave_name`.
+    wave_name = _require_wave_name(wave_name)
     wanted = txid.strip().lower()
     try:
         Txid(wanted)
@@ -1031,13 +1273,16 @@ def verify_cmd(
             "what you have, give the mark's txid and pass the digest with --digest.",
         )
 
+    # `is not None`, NEVER truthiness, for every "was this asked?" below. A falsy-but-present value
+    # read as "not asked" is how `--wave-name ""` passed the gate; see `_require_wave_name`.
+    name_asked = wave_name is not None
     if verify_wave:
         _attach_wave_identity(ctx, payload)
-    if wave_name:
+    if name_asked:
         _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
 
     expected, absent_reason = _digest_expectation(records, file_path=file_path, digest_hex=digest_hex)
-    source = "--digest" if digest_hex is not None else (str(file_path) if file_path else "")
+    source = "--digest" if digest_hex is not None else (str(file_path) if file_path is not None else "")
     for hm in records:
         hm["digest_match"] = judge_digest_match(
             hm,
@@ -1050,7 +1295,7 @@ def verify_cmd(
     # ONE RECORD, EVERY CHECK. Each record is judged alone; the summary is ONE record's checks
     # (the witness), plus the transaction-wide refusal and the block. See `_signature_check`.
     per_record = [
-        (row.get("vout"), row["hashmark"], _record_checks(row["hashmark"], name_asked=bool(wave_name))) for row in rows
+        (row.get("vout"), row["hashmark"], _record_checks(row["hashmark"], name_asked=name_asked)) for row in rows
     ]
     w_vout, w_hm, w_checks = _choose_witness(per_record)
     refusal = _tx_refusal(per_record)
