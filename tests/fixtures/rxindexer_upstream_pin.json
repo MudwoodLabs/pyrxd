@@ -12,6 +12,7 @@
   "not_found_at_this_commit": [],
   "files": {
     "electrumx/lib/glyph.py": "bdad3e8cd043bb423713ff07acc82883ea3228ac848b2d32439ef2ba999615db",
+    "electrumx/server/block_processor.py": "43f5b8fa3da276b77eab0a4e1d148fede06e45392be210c64d02ed348af5ea74",
     "electrumx/server/glyph_api.py": "27f8816e43c40d2f50e2daafce423dfd62d2bda269af871254097350e4dff061",
     "electrumx/server/glyph_index.py": "8fdbf57ebd23a6ba58f95430bd582f7375d5903a839c07a032e7946ddea03fe2",
     "electrumx/server/rest_api.py": "91fb253c2b4c325c56cdc5b957f63d3273dd3a6f6f43bcaa7e8a716fc995158a",

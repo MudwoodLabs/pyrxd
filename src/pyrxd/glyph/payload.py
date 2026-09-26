@@ -597,7 +597,7 @@ def build_reveal_scriptsig_suffix(
     same shape the live Radiant indexers parse without complaint.
     Added 2026-05-11 per red-team finding R3.
 
-    Refuses a WAVE claim the indexer would not register, unless ``allow_unregistrable_wave``
+    Refuses a WAVE claim outside the rule pyrxd writes claims by, unless ``allow_unregistrable_wave``
     — see :func:`~pyrxd.glyph.wave_rules.refuse_unregistrable_wave_claim`, which says what
     that escape is for.
 
