@@ -7,15 +7,22 @@
 
   <!-- Content-Security-Policy
        default-src 'none'        — deny everything not whitelisted below
-       script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net
+       script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' blob: https://cdn.jsdelivr.net
                                 — Pyodide loads from jsdelivr CDN with SRI; runs WASM.
-                                  'unsafe-eval' is required by Pyodide internals (it
-                                  uses eval() in the Python-to-JS bridge); cost is
-                                  documented in docs/threat-model.md.
-                                  'self' also covers the vendored secp256k1 the page
-                                  imports to check signatures: it is same-origin, so
-                                  giving this page a curve ADDED NOTHING to this
-                                  policy. No new host, no new directive.
+                                  'unsafe-eval' is kept for Pyodide, whose runtime has
+                                  eval() call sites; whether this page's path reaches
+                                  them is NOT established (headless Chromium ran
+                                  /verify/ without it). What it and blob: cost, and what was
+                                  measured, is written down in
+                                  docs/concepts/glyph-inspect-tool.md, "What this
+                                  page's Content-Security-Policy allows".
+                                  blob: is for the vendored secp256k1 the page uses
+                                  to check signatures, and ONLY for it: shared.js
+                                  downloads the bridge and the library once each,
+                                  SHA-256 checks them against manifest.json, and
+                                  imports THOSE BYTES from blob: URLs. Importing
+                                  the files by their own URLs meant a second,
+                                  unchecked download was what actually ran.
        style-src 'self'          — only our own CSS
        connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
                                 — page-relative (for vendored wheels in
@@ -36,7 +43,7 @@
   -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
-    script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net;
+    script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' blob: https://cdn.jsdelivr.net;
     style-src 'self';
     connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022;
     img-src 'self' data:;

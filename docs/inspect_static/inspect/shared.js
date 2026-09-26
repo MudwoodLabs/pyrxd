@@ -177,9 +177,20 @@ async function loadManifest(manifestUrl) {
 }
 
 // Fetch a same-origin URL, verify its SHA-256 against the expected
-// hex digest, return the bytes. The hash is the trust boundary —
-// even if the GitHub Pages deploy is compromised, a mismatch fails
-// closed before any wheel byte reaches the Pyodide interpreter.
+// hex digest, return the bytes. The caller must USE THE RETURNED BYTES:
+// the check says something only about this one buffer, and fetching the
+// same URL again — by another `fetch`, a `<script src>` or an `import()` —
+// is a second download the check never saw.
+//
+// WHAT A MATCH GUARANTEES, and no more. The expected digest comes from
+// `manifest.json`, which is served from the same deploy as the bytes and
+// is not itself hashed. So a match means "these bytes are the ones the CI
+// run that wrote this manifest built" — it catches a partial, stale or
+// corrupted deploy and a cached file out of step with its manifest. It
+// does NOT hold against a compromised GitHub Pages deploy: whoever can
+// rewrite the deploy can rewrite the manifest, and this file, in the same
+// act. See "What the manifest check does and does not defend against" in
+// docs/concepts/glyph-inspect-tool.md.
 async function fetchAndVerify(url, expectedSha256, label) {
   const resp = await fetch(url, { cache: "no-cache" });
   if (!resp.ok) {
@@ -225,36 +236,93 @@ async function fetchAndVerify(url, expectedSha256, label) {
 // point rather than a shortcut.
 //
 // FAILURE IS SILENT AND SAFE, BY CONSTRUCTION. Anything that goes wrong here —
-// a SHA mismatch, a missing file, an old browser without dynamic `import()` — means
-// no backend is registered, and `verify_attestation` returns the UNVERIFIABLE it
+// a SHA mismatch, a missing file, an old browser without dynamic `import()`, a
+// Content-Security-Policy that will not run a `blob:` module — means no backend is
+// registered, and `verify_attestation` returns the UNVERIFIABLE it
 // returned before by exactly the path it already had. There is no branch in which a
 // curve that failed to load can produce a FAILING verdict, because the code that
 // would have to decide that never runs. Painting an honest signer's mark red because
 // of a script missing from the READER's machine is the worst thing either page could
 // do, and this is what makes it unrepresentable rather than merely avoided.
 //
-// WHAT THE SHA-256 CHECK IS AND IS NOT. The bytes are fetched and verified BEFORE
-// the module is imported, so a deploy whose curve does not match what CI built is
-// never executed. That is a deploy-integrity check — it catches drift and a
-// tampered Pages deploy. It is NOT a sandbox: `script-src 'self'` is what bounds
-// what can run here at all, and an origin serving hostile JavaScript is already
-// serving this file. The provenance of the vendored bytes — which upstream release
-// they are and how that was established — lives in
+// WHAT THE SHA-256 CHECK GUARANTEES, stated exactly, because it used to be stated
+// more broadly than it held. Each of the two files is downloaded ONCE, its SHA-256
+// is compared against the manifest, and the module loader is then handed THOSE
+// BYTES through a `blob:` URL — never the file's own URL. So:
+//
+//   * the vendored library that executes is byte-for-byte the buffer whose digest
+//     matched `manifest.curve_sha256`;
+//   * the bridge that executes is byte-for-byte the buffer whose digest matched
+//     `manifest.curve_bridge_sha256`, with ONE substitution: its single import
+//     specifier, `"./vendor/noble-secp256k1.js"`, is replaced by the `blob:` URL of
+//     the verified library bytes. That is the only edit, it is made to a string that
+//     must occur exactly once, and it points at bytes that were themselves checked;
+//   * nothing else is loaded. A `blob:` module cannot resolve a relative import, so
+//     if the bridge ever grew a second one, loading it would FAIL — and a failed load
+//     is the NOT CHECKED path below, never a verdict.
+//
+// WHY THE BLOB AND NOT `import(bridgeUrl)`, which is what this did until a reviewer
+// broke it. That verified one download and executed another: `import()` fetched the
+// bridge again, and the bridge fetched the library again, and neither second
+// download was checked. Headless Chromium against a server answering the SECOND
+// request for the bridge with a tampered file — `Cache-Control: no-store` — ran the
+// tampered code, and a forged mark rendered a green VERIFIED. It held on the live
+// site only because GitHub Pages sends `max-age=600` and the browser happened to
+// answer the `import()` from its cache. `tests/web/test_curve_executes_what_it_verified.py`
+// replays that attack.
+//
+// WHAT IT IS NOT. The manifest the digests come from is served by the same deploy
+// as the files (see `fetchAndVerify`), so this is a deploy-integrity check: it
+// catches a curve out of step with its manifest, and a second download that differs
+// from the first. It does NOT hold against a compromised Pages deploy, which can
+// rewrite the manifest and this file together. Nor is it a sandbox: `script-src`
+// bounds what can run here at all, and it lists `blob:` for exactly this import —
+// see the CSP comment in both `index.html` files. The provenance of the vendored
+// bytes — which upstream release they are and how that was established — lives in
 // `tests/fixtures/noble_secp256k1_upstream_pin.json` and is asserted in CI by
 // `tests/test_noble_secp256k1_pin.py`, not at runtime.
 //
 // Returns { installed: bool, reason: string|null }. Never throws.
+
+// The bridge's one import specifier — the string rewritten to point at the verified
+// library bytes, and the path, relative to the bridge, the library is fetched from.
+const CURVE_LIBRARY_SPECIFIER = "./vendor/noble-secp256k1.js";
+
+// A module URL for bytes already in hand. The type is what lets the loader accept it
+// as JavaScript at all; a blob with no type fails the module MIME check.
+function moduleUrlForVerifiedBytes(bytes) {
+  return URL.createObjectURL(new Blob([bytes], { type: "text/javascript" }));
+}
+
 async function installCurveBackend(bridges, manifest, curveUrl) {
   if (!curveUrl) {
     return { installed: false, reason: "this page did not point at a curve bridge" };
   }
+  const moduleUrls = [];
   try {
     const bridgeUrl = new URL(curveUrl, document.baseURI);
-    const vendorUrl = new URL("./vendor/noble-secp256k1.js", bridgeUrl);
-    // Verify BOTH, then import. Order matters: `import()` is what executes them.
-    await fetchAndVerify(bridgeUrl.toString(), manifest.curve_bridge_sha256, "secp256k1 bridge");
-    await fetchAndVerify(vendorUrl.toString(), manifest.curve_sha256, "vendored secp256k1");
-    const module = await import(bridgeUrl.toString());
+    const libraryUrl = new URL(CURVE_LIBRARY_SPECIFIER, bridgeUrl);
+    // ONE download of each, verified, and these buffers are what executes.
+    const bridgeBytes = await fetchAndVerify(bridgeUrl.toString(), manifest.curve_bridge_sha256, "secp256k1 bridge");
+    const libraryBytes = await fetchAndVerify(libraryUrl.toString(), manifest.curve_sha256, "vendored secp256k1");
+
+    const libraryModuleUrl = moduleUrlForVerifiedBytes(libraryBytes);
+    moduleUrls.push(libraryModuleUrl);
+    // `fatal`: bytes that are not UTF-8 are refused rather than decoded lossily, so the
+    // text that is re-encoded below is exactly the text that was hashed.
+    const bridgeSource = new TextDecoder("utf-8", { fatal: true }).decode(bridgeBytes);
+    const quoted = JSON.stringify(CURVE_LIBRARY_SPECIFIER);
+    const pieces = bridgeSource.split(quoted);
+    if (pieces.length !== 2) {
+      return {
+        installed: false,
+        reason: `the curve bridge names ${quoted} ${pieces.length - 1} times; exactly once is required`,
+      };
+    }
+    const bridgeModuleUrl = moduleUrlForVerifiedBytes(pieces.join(JSON.stringify(libraryModuleUrl)));
+    moduleUrls.push(bridgeModuleUrl);
+
+    const module = await import(bridgeModuleUrl);
     if (typeof module.recoverPublicKeySec1 !== "function") {
       return { installed: false, reason: "the curve bridge exported no recoverPublicKeySec1" };
     }
@@ -266,6 +334,17 @@ async function installCurveBackend(bridges, manifest, curveUrl) {
       : { installed: false, reason: "pyrxd would not register the curve backend" };
   } catch (err) {
     return { installed: false, reason: String((err && err.message) || err) };
+  } finally {
+    // The module graph is fully loaded once `import()` settles, so the URLs are no
+    // longer needed; revoking them means nothing else on the page can import them.
+    // Guarded: this function never throws, and a `finally` that threw would.
+    for (const url of moduleUrls) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (_) {
+        // Nothing to do: an unrevoked blob URL only keeps some memory alive.
+      }
+    }
   }
 }
 
@@ -334,8 +413,11 @@ async function bootPyrxdRuntime(options) {
     //   - Defends against a poisoned manifest redirecting wheel
     //     installs to attacker-staged URLs: ``loadManifest`` already
     //     validates ``wheel`` / ``cbor2_wheel`` are bare basenames.
-    //   - Defends against a compromised GitHub Pages deploy: even
-    //     same-origin bytes are SHA-checked before micropip sees them.
+    //   - Catches a partial, stale or corrupted deploy: even same-origin
+    //     bytes are SHA-checked before micropip sees them, and micropip
+    //     installs the checked buffer, not a second download. It does
+    //     NOT defend against a compromised GitHub Pages deploy, which
+    //     rewrites manifest.json in the same act (see `fetchAndVerify`).
     //
     // We use ``deps=False`` for the pyrxd wheel because its METADATA
     // declares five runtime deps (aiohttp, coincurve, base58,

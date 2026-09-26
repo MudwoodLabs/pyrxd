@@ -370,8 +370,6 @@ _OMITTED_NESTED_KEYS = {
     "outcome text otherwise. The literal 'ok' would tell a reader nothing",
     "signature_unverified": "the raw 65-byte signature. The VERDICT is what a reader "
     "needs and the bytes are in the JSON drawer; the CLI omits it for the same reason",
-    "assumed_network": "shown beside a VERIFIED signature, where the assumption is "
-    "load-bearing. On a failure the reason is the detail, not the chain",
     "is_utf8": "rendered as prose — either the decoded text, or 'not valid UTF-8'",
     "recovered_hash160": "identical to the committed signer whenever it is set, and "
     "the signer is already rendered; printing both invites reading them as two facts",
@@ -414,6 +412,26 @@ def _tally_keys() -> frozenset[str]:
     )
 
 
+def _without_the_chain_of_an_unsigned_record(key: str, value: dict) -> dict:
+    """``assumed_network`` IS REQUIRED — except on a record with no signature.
+
+    It used to sit in ``_OMITTED_NESTED_KEYS`` with the reason "shown beside a VERIFIED
+    signature". That stopped being true when the page began naming the chain beside EVERY
+    signature verdict (a genuine testnet record reads DOES NOT VERIFY here, and the chain is
+    why), and a blanket exemption would have gone on excusing the field on exactly the
+    outcomes it now has to appear on. So it is not exempt: it is evidence like any other
+    leaf, and the one case that still omits it is DERIVED here rather than written as prose.
+    A v1 record carries the key too (``verify_attestation`` fills it for every outcome), but
+    has no signature for the chain to bear on, and the page draws no chain line for it.
+    """
+    if key != "hashmark" or value.get("signer_hash160"):
+        return value
+    attestation = value.get("attestation")
+    if not isinstance(attestation, dict) or "assumed_network" not in attestation:
+        return value
+    return {**value, "attestation": {k: v for k, v in attestation.items() if k != "assumed_network"}}
+
+
 def _required_evidence(key: str, value) -> list[str]:
     """Substrings the rendered text must contain for *key* to count as shown."""
     if key in _PROSE_EVIDENCE and _hashable(value) and value in _PROSE_EVIDENCE[key]:
@@ -427,6 +445,7 @@ def _required_evidence(key: str, value) -> list[str]:
         # A TALLY's keys are required too: in `{"op_return": 1}` the count alone says nothing,
         # and a note that printed "1" and no type name would have passed on the count.
         words = [str(sub_key) for sub_key in value] if key in _tally_keys() else []
+        value = _without_the_chain_of_an_unsigned_record(key, value)
         return words + [
             evidence
             for sub_key, sub_value in value.items()
@@ -969,6 +988,18 @@ class TestTheNestedRequirementIsNotVACUOUS:
         badge again."""
         block = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
         assert block["attestation"]["detail"] in _required_evidence("hashmark", block)
+
+    def test_the_chain_is_required_beside_a_signature_and_only_there(self, payloads) -> None:
+        """Both directions of the one derived omission. The v2 corpus record's signature is random,
+        so its verdict is a FAILURE — the outcome on which the chain line used to be missing — and
+        its ``assumed_network`` must be demanded. The v1 record carries the same key and has no
+        signature, and must not be."""
+        signed = payloads["op_return-hashmark-v2"]["row"]["hashmark"]
+        assert signed["attestation"]["status"] != "VERIFIED", "the premise: a non-VERIFIED signature"
+        assert signed["attestation"]["assumed_network"] in _required_evidence("hashmark", signed)
+        unsigned = payloads["op_return-hashmark-v1"]["row"]["hashmark"]
+        assert unsigned["attestation"].get("assumed_network"), "the premise: v1 carries the key too"
+        assert unsigned["attestation"]["assumed_network"] not in _required_evidence("hashmark", unsigned)
 
 
 # ───────────────────────────────────────── the transaction-level card ──
