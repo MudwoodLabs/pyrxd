@@ -148,6 +148,34 @@ class TestNetworkProfile:
         profile = NetworkProfile.build("mainnet", ["wss://a.example/", "wss://A.example", "wss://b.example/"])
         assert profile.urls == ("wss://a.example/", "wss://b.example/")
 
+    @pytest.mark.parametrize(
+        "same",
+        [
+            "wss://a.example:443/",  # the scheme's default port, written out
+            "wss://a.example./",  # a fully-qualified trailing dot
+        ],
+    )
+    def test_the_connect_key_folds_what_names_the_same_socket(self, same) -> None:
+        """`Endpoint.key` is the CONNECT identity: the failover list must not hold one socket twice.
+        (Independence of SOURCES is `Endpoint.source`, coarser still — tested with form 2.)"""
+        profile = NetworkProfile.build("mainnet", ["wss://a.example/", same])
+        assert profile.urls == ("wss://a.example/",)
+
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [
+            ("wss://[2001:db8::7]/", "wss://[2001:db8:0:0:0:0:0:7]/"),
+            ("wss://203.0.113.7/", "wss://0xcb.0.113.7/"),
+        ],
+    )
+    def test_the_connect_key_folds_one_ip_address_spelled_two_ways(self, one, other) -> None:
+        assert NetworkProfile.build("mainnet", [one, other]).urls == (one,)
+
+    def test_a_different_path_is_a_different_connect_url_but_the_same_source(self) -> None:
+        profile = NetworkProfile.build("mainnet", ["wss://a.example/", "wss://a.example/other"])
+        assert len(profile.urls) == 2
+        assert profile.endpoints[0].source == profile.endpoints[1].source == "a.example"
+
     def test_build_defaults_genesis_from_the_registry(self) -> None:
         profile = NetworkProfile.build("regtest", ["ws://127.0.0.1:50022/"], allow_insecure=True)
         assert profile.genesis_hash == GENESIS_BLOCK_HASHES["regtest"]

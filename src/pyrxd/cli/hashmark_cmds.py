@@ -41,6 +41,7 @@ import click
 from ..constants import genesis_hash_for
 from ..glyph._inspect_core import _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
+from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from ..security.types import Txid
@@ -773,16 +774,31 @@ def _signature_check(record: dict) -> tuple[str, str]:
         return "RECORD DOES NOT DECODE", _sanitize_display_string(
             str(record.get("detail") or "the bytes claim HashMark and are broken")
         )
+    # THE CHAIN IS PART OF THE ANSWER. The genesis hash is inside the signed statement, so the
+    # same record verifies on the chain it was signed for and DOES NOT VERIFY on any other. A
+    # summary of "DOES NOT VERIFY" with no chain named read an honest testnet record, checked
+    # on the default mainnet, as a plain forgery. Named on every outcome that involves a key.
+    net = att.get("assumed_network")
+    against = f" (checked against {net})" if net else ""
     if outcome == "invalid_signature":
         return "DOES NOT VERIFY", _sanitize_display_string(
             str(att.get("detail") or "the recovered key is not the committed signer")
+            + (
+                f" — checked against {net}; a record signed for another chain does not verify here, "
+                "so if it was made on another network, re-run with that --network"
+                if net
+                else ""
+            )
         )
     if outcome == "unverifiable":
         # A MISSING CAPABILITY ON THIS MACHINE, not a verdict on the record. Getting this
         # backwards accuses an honest signer, so it holds and says exactly what is absent.
-        return "NOT CHECKED", _sanitize_display_string(str(att.get("detail") or "no curve library available here"))
+        return "NOT CHECKED", _sanitize_display_string(
+            str(att.get("detail") or "no curve library available here")
+            + (f" (it would be checked against {net})" if net else "")
+        )
     if outcome == "valid":
-        return "VERIFIED", "the signature recovers to the hash160 committed in the record"
+        return "VERIFIED", f"the signature recovers to the hash160 committed in the record{against}"
     if record.get("outcome") == "ok" and not record.get("signer_hash160"):
         return "NO SIGNATURE", "a v1 record carries no signer and makes no signature claim"
     return "NOT CHECKED", "this record carries no signature this tool reads"
@@ -1054,6 +1070,8 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
 
     txid = payload.get("txid")
 
+    asked: list[str] = []  # the endpoint `_do` asked, for an error that names it
+
     async def _do() -> dict:
         # Through the MODULE, not a from-import. `_endpoint_pair` is the one seam both this
         # command and `_name_at_mark` reach the network through, and a name bound here would
@@ -1066,12 +1084,24 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
         # than whoever actually answered, and `MarkAnchor.source` is the field the independence
         # rule is checked against. A source label that is a guess is worse than no label.
         client_a, label_a, _client_b, _label_b = _inspect._endpoint_pair(ctx)
+        asked.append(label_a)
         async with client_a:  # type: ignore[attr-defined]
             anchor = await resolve_anchor_from(client_a, label_a, mark_txid=txid, min_confirmations=min_confirmations)
         return mark_anchor_dict(anchor)
 
     try:
         return asyncio.run(_do())
+    except AnchorBindingError as exc:
+        # THE ENDPOINT ANSWERED. Its node named a block and no header near the derived height hashes
+        # to it — its index and its node disagree, or it served inconsistent data. "Check that it is
+        # reachable" sent people to debug a connection that worked (0.25.0 panel, round 3).
+        where = asked[0] if asked else ctx.electrumx_url
+        raise NetworkBoundaryError(
+            "could not establish which block the mark is in",
+            cause=str(exc),
+            fix=f"{where} answered, but its index and its node disagree about the mark's block — re-run in "
+            "a moment (a new block usually settles it), or ask another server with --electrumx URL",
+        ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
@@ -1103,9 +1133,9 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
     type=click.IntRange(min=1),
     default=None,
     metavar="N",
-    help="Depth below which the mark's block is too shallow to rely on. REQUIRED: a mark's whole "
-    "claim is 'no later than the block that confirms it', and depth is value-scaled per chain, "
-    "so there is deliberately no default.",
+    help=f"The confirmation floor for the mark's block — {MIN_CONFIRMATIONS_MEANING}. Below it the "
+    "block is too shallow to rely on. REQUIRED: a mark's whole claim is 'no later than the block "
+    "that confirms it', and depth is value-scaled per chain, so there is deliberately no default.",
 )
 @click.option(
     "--wave-name",
@@ -1113,8 +1143,9 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
     default=None,
     metavar="NAME",
     help="HashMark 7.6 form 2: did NAME (e.g. company.rxd) point at the signing key AT THE BLOCK "
-    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers; with one it degrades to "
-    "form 1, says why, and the verdict does NOT hold.",
+    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers that report the same block "
+    "heights; with one, or if they disagree, it degrades to form 1, says why, and the verdict "
+    "does NOT hold.",
 )
 @click.option(
     "--verify-wave",
