@@ -125,6 +125,21 @@ class _NodeClient:
     async def get_transaction(self, txid: object) -> bytes:
         return bytes.fromhex(str(self.node.cli("getrawtransaction", str(txid))))
 
+    async def assert_chain(self, expected_genesis_hash: str) -> str:
+        """``ElectrumXClient.assert_chain``'s contract, answered by the NODE's own block 0.
+
+        ``build_hashmark_mark`` refuses a client it cannot ask which chain it is on, so this stub
+        has to answer — and it answers from the chain rather than agreeing with whatever it is
+        asked, so a plan signed for another chain is refused here exactly as it would be in
+        production.
+        """
+        from pyrxd.security.errors import ValidationError
+
+        observed = str(self.node.cli("getblockhash", "0")).strip().lower()
+        if observed != str(expected_genesis_hash).strip().lower():
+            raise ValidationError(f"regtest node is on the wrong chain: genesis {observed} != {expected_genesis_hash}")
+        return observed
+
     async def broadcast(self, raw: bytes) -> str:
         self.verdict = self.node.accepts(raw.hex())
         if self.verdict.get("allowed") is not True:

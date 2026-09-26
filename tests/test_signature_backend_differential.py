@@ -395,6 +395,61 @@ class TestTheRegistryStaysOutOfTheShippedLibrary:
             f"for every caller in the process: {offenders}"
         )
 
+    def test_importing_every_shipped_module_registers_no_backend(self) -> None:
+        """The grep above finds the SETTER by name. A module that assigns the registry directly at
+        import — ``hashmark._recovery_backend = ...`` — never names it, and exactly that survived
+        the grep as a plant. So this imports every module under ``src/pyrxd`` and asks the
+        registry itself.
+
+        In a FRESH interpreter, so nothing an earlier test registered or cleared can decide the
+        answer. What it cannot see, said plainly: an assignment inside a function that has not run.
+        """
+        import textwrap
+
+        import pyrxd
+
+        script = textwrap.dedent(
+            """
+            import importlib, json, pkgutil, pyrxd
+            imported, failed = [], []
+            for info in pkgutil.walk_packages(pyrxd.__path__, "pyrxd."):
+                try:
+                    importlib.import_module(info.name)
+                    imported.append(info.name)
+                except ModuleNotFoundError as exc:
+                    failed.append([info.name, "ModuleNotFoundError", exc.name or ""])
+                except Exception as exc:
+                    failed.append([info.name, type(exc).__name__, str(exc)[:200]])
+            from pyrxd.script.hashmark import recovery_backend
+            print(json.dumps({"imported": imported, "failed": failed, "backend": repr(recovery_backend())}))
+            """
+        )
+        src_root = str(Path(pyrxd.__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (src_root, os.environ.get("PYTHONPATH")) if p)}
+        proc = subprocess.run(  # nosec B603 — fixed argv, no shell, this interpreter
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=300, check=False
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        # NON-VACUITY. The walk found the tree, and the modules this registry matters to were in it.
+        assert len(report["imported"]) >= 150, f"only {len(report['imported'])} modules imported"
+        assert {"pyrxd.script.hashmark", "pyrxd.hashmark_tx", "pyrxd.cli.hashmark_cmds", "pyrxd.cli.main"} <= set(
+            report["imported"]
+        )
+        # An absent OPTIONAL dependency is the one acceptable reason a module did not import — and
+        # then it registered nothing either. Anything else is a module this test could not check.
+        unchecked = [
+            f
+            for f in report["failed"]
+            if not (f[0] and f[1] == "ModuleNotFoundError" and f[2] and not f[2].startswith("pyrxd"))
+        ]
+        assert unchecked == [], f"these modules could not be imported, so were not checked: {unchecked}"
+        assert report["backend"] == "None", (
+            f"importing the shipped library left a secp256k1 backend registered ({report['backend']}), "
+            "which overrides coincurve for every caller in the process"
+        )
+
     def test_the_setter_refuses_a_non_callable(self) -> None:
         from pyrxd.security.errors import ValidationError
 

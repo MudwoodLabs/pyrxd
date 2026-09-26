@@ -384,6 +384,51 @@ class TestAQuestionAskedAndNotAnsweredFails:
         s = _summary(r.output)
         assert "file:       NOT CHECKED" in s and "signature:  NOT CHECKED" in s
 
+    def test_the_help_says_where_NOT_CHECKED_comes_from_in_THIS_command(self, tmp_path) -> None:
+        """It said NOT CHECKED holds "most often because the curve library is absent". This command
+        cannot run without one (the test below), so there it never means that. What it does mean
+        here: a question not asked, or a record this build cannot read — which the honest pair
+        above reaches through the command."""
+        flat = " ".join(_invoke(tmp_path, ["verify", "--help"]).output.split())
+        assert "curve library" not in flat
+        assert "you did not ask that question (no --file or --digest, no --wave-name)" in flat
+        assert "the record is a version or hash this build cannot read" in flat
+
+    def test_the_cli_cannot_load_without_a_curve_so_not_checked_never_means_that(self) -> None:
+        """The premise of the sentence above, made executable rather than left as prose. If the CLI
+        ever imports without coincurve, this fails, and the help must say NOT CHECKED can mean a
+        missing curve again. A fresh interpreter, so nothing already imported can hide it."""
+        import subprocess  # nosec B404 — fixed argv, no shell, this interpreter
+        import sys
+
+        import pyrxd
+
+        script = (
+            "import sys\n"
+            "class _NoCurve:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'coincurve' or name.startswith('coincurve.'):\n"
+            "            raise ImportError('coincurve blocked')\n"
+            "sys.meta_path.insert(0, _NoCurve())\n"
+            "import pyrxd.script.hashmark\n"  # control: the dependency-free half still loads
+            "try:\n"
+            "    import pyrxd.cli.main\n"
+            "except ImportError:\n"
+            "    print('CLI-REFUSED')\n"
+            "else:\n"
+            "    print('CLI-LOADED')\n"
+        )
+        src_root = str(Path(pyrxd.__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (src_root, os.environ.get("PYTHONPATH")) if p)}
+        proc = subprocess.run(  # nosec B603 — fixed argv, no shell, this interpreter
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=120, check=False
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip() == "CLI-REFUSED", (
+            "`pyrxd.cli.main` now imports without coincurve — `verify --help` says NOT CHECKED never "
+            "means a missing curve, which is no longer true"
+        )
+
     def test_the_help_says_what_HOLDS_means(self, tmp_path) -> None:
         r = _invoke(tmp_path, ["verify", "--help"])
         flat = " ".join(r.output.split())
@@ -447,6 +492,86 @@ class TestAQuestionAskedAndNotAnsweredFails:
         r = _run(monkeypatch, {txid: raw}, args, tmp_path)
         assert r.exit_code == 0, r.output
         assert "record:     vout 0" in _summary(r.output)
+
+
+class TestAnEmptyWaveNameIsRefusedNotReadAsAbsent:
+    """``--wave-name ""`` is a question typed wrong, not a question not asked.
+
+    Both commands tested ``if wave_name:``, so an empty value — what an unset shell variable
+    expands to — read as the flag being absent. ``verify`` then printed ``name: NOT CHECKED —
+    --wave-name was not given``, a state that HOLDS, and exited 0 over the ATTACKER's mark while
+    the name pointed at the victim: ``pyrxd verify T --wave-name "$PUBLISHER" && deploy`` with
+    ``PUBLISHER`` unset deployed it. Whitespace-only was sent to the indexer as a name.
+    """
+
+    @pytest.mark.parametrize("name", ["", " ", "\t"])
+    def test_verify_refuses_it_before_the_network_in_every_output_mode(self, monkeypatch, tmp_path, world, name):
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        fetched: list = []
+        real_fetch = hashmark_cmds._run_fetch_inspect
+        monkeypatch.setattr(
+            hashmark_cmds, "_run_fetch_inspect", lambda ctx, **kw: fetched.append(kw) or real_fetch(ctx, **kw)
+        )
+        args = ["verify", txid, "--wave-name", name, "--min-confirmations", "6"]
+        for mode in ([], ["--quiet"], ["--json"]):
+            r = _run(monkeypatch, {txid: raw}, [*mode, *args], tmp_path, name_target=world["victim_addr"])
+            assert r.exit_code == 1, (mode, r.output)
+            assert "--wave-name was given an empty name" in r.output, (mode, r.output)
+            assert r.stdout.strip() == "", f"nothing on stdout for a script to read as a verdict: {r.stdout!r}"
+        assert fetched == [], "refused before the transaction was fetched"
+
+    def test_the_honest_pair_a_real_name_is_asked_and_refuses_the_attackers_mark(
+        self, monkeypatch, tmp_path, world
+    ) -> None:
+        """The same command with the variable SET: the name is asked, and the attacker's mark fails
+        it. This is what the empty value was silently skipping."""
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        args = ["verify", txid, "--wave-name", NAME, "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=world["victim_addr"])
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        assert "name:       NOT THE SIGNER" in _summary(r.output)
+
+    def test_past_the_refusal_an_empty_name_is_still_asked_never_NOT_CHECKED(self, monkeypatch, tmp_path, world):
+        """Defence in depth, pinned on its own. With the up-front refusal routed around, the
+        verdict must still treat a present-but-empty name as ASKED — so it fails — rather than as
+        absent, which holds. Without this, ``name_asked = bool(wave_name)`` is unreachable behind
+        the refusal and any regression in it would go unseen."""
+
+        def _no_refusal(name):
+            return name
+
+        monkeypatch.setattr(hashmark_cmds, "_require_wave_name", _no_refusal)
+        monkeypatch.setattr(glyph_inspect, "_require_wave_name", _no_refusal)
+        txid, raw = _tx(_signed(_content(world, "attacker"), world["attacker"]))
+        args = ["--json", "verify", txid, "--wave-name", "", "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path, name_target=world["victim_addr"])
+        assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
+        name_check = json.loads(r.stdout)["checks"]["name"]
+        assert name_check["state"] == "NOT ESTABLISHED", name_check
+
+    @pytest.mark.parametrize("name", ["", "  "])
+    def test_glyph_inspect_refuses_it_too_before_the_network(self, monkeypatch, tmp_path, name) -> None:
+        """``glyph inspect`` had the same ``if wave_name:``. It has no verdict to pass, but it
+        printed a classification with no name answer and exit 0, as though none had been asked."""
+        txid, raw = _tx(_raw_record(1, 1, b"\x11" * 32))
+        fetched: list = []
+        real_fetch = glyph_inspect._run_fetch_inspect
+        monkeypatch.setattr(
+            glyph_inspect, "_run_fetch_inspect", lambda ctx, **kw: fetched.append(kw) or real_fetch(ctx, **kw)
+        )
+        args = ["glyph", "inspect", txid, "--fetch", "--wave-name", name, "--min-confirmations", "6"]
+        r = _run(monkeypatch, {txid: raw}, args, tmp_path)
+        assert r.exit_code == 1, r.output
+        assert "--wave-name was given an empty name" in r.output
+        assert fetched == [], "refused before the transaction was fetched"
+
+    def test_the_lookup_funnel_refuses_it_for_any_future_caller(self) -> None:
+        """Every name lookup goes through ``_attach_name_at_mark``; a third command that forgot the
+        early check still cannot run one on an empty name."""
+        from pyrxd.cli.errors import UserError
+
+        with pytest.raises(UserError, match="empty name"):
+            glyph_inspect._attach_name_at_mark(object(), {"txid": "cd" * 32}, name=" ", min_confirmations=6)
 
 
 # --------------------------------------------------------------------------- the honest paths

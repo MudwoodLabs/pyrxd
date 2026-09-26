@@ -172,6 +172,144 @@ class TestMalformedSignatures:
         assert verify_attestation(bad).outcome is AttestationOutcome.INVALID_SIGNATURE
 
 
+class TestAHandBuiltRecordGetsAVerdictNotATraceback:
+    """``verify_attestation`` is public, and an offline verifier builds the record from stored
+    fields rather than from ``decode_hashmark``. Its contract is one of four outcomes; a field of
+    the wrong type raised instead — ``algorithm_id=None`` reached ``f"{None:02x}"``."""
+
+    @staticmethod
+    def _honest() -> HashMarkRecord:
+        return decode_hashmark(_signed_record(PrivateKey()))
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"algorithm_id": None},
+            {"algorithm_id": "01"},
+            {"algorithm_id": 256},
+            {"algorithm_id": -1},
+            # `bool` is an int and f"{True:02x}" is "01": without its own refusal this record would
+            # be verified as algorithm 1 while claiming an algorithm of True.
+            {"algorithm_id": True},
+            {"digest_hex": None},
+            {"digest_hex": b"\x00" * 32},
+            {"label": 7},
+            {"signer_hash160_hex": b"\x00" * 20},
+            {"signature_hex": b"\x00" * 65},
+        ],
+        ids=repr,
+    )
+    def test_a_field_of_the_wrong_type_is_refused_with_a_reason(self, overrides: dict) -> None:
+        from dataclasses import replace
+
+        result = verify_attestation(replace(self._honest(), **overrides))
+        assert result.outcome is AttestationOutcome.INVALID_SIGNATURE
+        assert result.detail
+
+    @pytest.mark.parametrize(
+        "genesis",
+        [None, b"\x00" * 32, 0, 123, "mainnet", "", RADIANT_MAINNET_GENESIS.upper(), RADIANT_MAINNET_GENESIS + " "],
+        ids=["none", "bytes", "zero", "int", "a-network-name", "empty", "uppercase", "padded"],
+    )
+    def test_the_callers_bad_genesis_raises_and_is_never_a_verdict_on_an_honest_record(self, genesis) -> None:
+        """The genesis is the CALLER's context, not the record's. The first version of this check
+        returned INVALID_SIGNATURE for it — "DOES NOT VERIFY", an accusation against an honest
+        signer for the caller's mistake, the direction a broken backend is kept out of. It raises."""
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="network_genesis must be"):
+            verify_attestation(self._honest(), network_genesis=genesis)
+
+    def test_the_honest_pair_a_well_formed_genesis_is_accepted_known_or_not(self) -> None:
+        """Only the SPELLING is the reader's rule. A reader verifies against the chain it found the
+        record on and cannot choose it, so a well-formed genesis pyrxd has no constant for is a
+        real answer — "does not verify on that chain" — not a refusal."""
+        record = self._honest()
+        assert verify_attestation(record).valid
+        assert verify_attestation(record, network_genesis="00" * 32).outcome is AttestationOutcome.INVALID_SIGNATURE
+
+    def test_a_defect_in_the_RECORD_is_still_a_verdict_with_any_good_genesis(self) -> None:
+        """The other direction: moving the caller's error to a raise must not move the RECORD's."""
+        from dataclasses import replace
+
+        result = verify_attestation(replace(self._honest(), algorithm_id=None), network_genesis=RADIANT_MAINNET_GENESIS)
+        assert result.outcome is AttestationOutcome.INVALID_SIGNATURE and "algorithm id" in (result.detail or "")
+
+    def test_the_honest_pair_the_same_record_unmodified_verifies(self) -> None:
+        assert verify_attestation(self._honest()).valid
+
+
+class TestARecoveryBackendsAnswerIsCheckedNotTrusted:
+    """A registered backend is process-global and wins over coincurve, and its return was only
+    ever HASHED. Any 33 bytes whose hash160 matched the committed signer made the record VALID —
+    whether or not they were a public key, and whatever form ``compressed`` asked for."""
+
+    @pytest.fixture(autouse=True)
+    def _no_backend_leaks(self):
+        from pyrxd.script.hashmark import set_recovery_backend
+
+        yield
+        set_recovery_backend(None)
+
+    @staticmethod
+    def _committed_to(fake_key: bytes) -> HashMarkRecord:
+        """A record whose committed signer is ``hash160(fake_key)``, with a compressed-header
+        signature that passes every range check — so only the backend's answer decides it."""
+        from pyrxd.hash import hash160
+
+        sig = bytes([31]) + (1).to_bytes(32, "big") + (1).to_bytes(32, "big")
+        return HashMarkRecord(
+            HashMarkOutcome.OK,
+            version=2,
+            algorithm_id=1,
+            algorithm="sha256",
+            digest_hex=_DIGEST.hex(),
+            signer_hash160_hex=hash160(fake_key).hex(),
+            signature_hex=sig.hex(),
+        )
+
+    @pytest.mark.parametrize(
+        "fake",
+        [b"\x05" + bytes(32), bytes(33), b"\x04" + bytes(32)],
+        ids=["prefix-05", "prefix-00", "uncompressed-prefix-at-compressed-length"],
+    )
+    def test_bytes_that_are_not_a_compressed_key_cannot_make_a_record_VALID(self, fake: bytes) -> None:
+        from pyrxd.script.hashmark import set_recovery_backend
+
+        set_recovery_backend(lambda *_a: fake)
+        result = verify_attestation(self._committed_to(fake))
+        assert result.outcome is AttestationOutcome.UNVERIFIABLE, result
+        assert "recovery backend returned" in (result.detail or "")
+
+    def test_the_right_key_in_the_wrong_form_is_not_an_accusation(self) -> None:
+        """A backend that ignores ``compressed`` hashes the uncompressed key, which never matches a
+        compressed commitment — and that read as DOES NOT VERIFY on an honest mark. It is the
+        verifier that is broken, so it is NOT CHECKED."""
+        from pyrxd.script.hashmark import _coincurve_backend, set_recovery_backend
+
+        real = _coincurve_backend()
+        assert callable(real)
+        set_recovery_backend(lambda h, r, s, rid, compressed: real(h, r, s, rid, not compressed))
+        result = verify_attestation(decode_hashmark(_signed_record(PrivateKey())))
+        assert result.outcome is AttestationOutcome.UNVERIFIABLE, result
+
+    def test_a_return_that_is_not_bytes_is_not_a_verdict_either(self) -> None:
+        from pyrxd.script.hashmark import set_recovery_backend
+
+        set_recovery_backend(lambda *_a: "02" + "00" * 32)
+        assert verify_attestation(decode_hashmark(_signed_record(PrivateKey()))).outcome is (
+            AttestationOutcome.UNVERIFIABLE
+        )
+
+    def test_the_honest_pair_a_backend_answering_correctly_still_verifies(self) -> None:
+        from pyrxd.script.hashmark import _coincurve_backend, set_recovery_backend
+
+        real = _coincurve_backend()
+        assert callable(real)
+        set_recovery_backend(real)
+        assert verify_attestation(decode_hashmark(_signed_record(PrivateKey()))).valid
+
+
 class TestV1IsNotAFailure:
     def test_a_v1_record_is_NOT_ATTESTED_rather_than_invalid(self) -> None:
         """v1 never claimed to say WHO — only WHEN. Reporting it as an invalid

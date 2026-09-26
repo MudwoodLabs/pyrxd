@@ -31,6 +31,11 @@
 //               answers `blockchain.transaction.get` with exactly that frame, fetched through
 //               shared.js's own `fetchRawTxFromElectrumx`, whose rejection is then handed to
 //               `lookupFailure`. The second is the whole path a real error frame takes.
+//               A case may instead carry `check: {"text", "raw": {txid: hex}, "run_returns",
+//               "fetch_returns", "anchor_returns", "confirmations"?, "tip"?}` — the page's own
+//               `onCheck` is run with `text` typed into the box, against a server answering
+//               from `raw` and bridges answering from the canned lists; the output then also
+//               carries `requested` (every server call) and `calls` (every bridge call).
 //   stdout:     JSON — {"name": {"text": "…", "classes": [...], "statuses": [...],
 //                                "panels": [...], "file_inputs": n, "judged": [...]}}
 //               `text` is one text node per line, so the Python side can assert on
@@ -285,6 +290,75 @@ function frameServer(frame) {
   };
 }
 
+// A server that answers the three calls `lookUp` makes, from a table: the raw transaction
+// (`blockchain.transaction.get [txid, false]`), its verbose form (`[txid, true]`, carrying a
+// confirmation count), and the tip (`blockchain.headers.subscribe`). Every request is
+// recorded, so a case can say which transaction the page actually asked for.
+function tableServer(table, requested) {
+  return class TableWebSocket {
+    constructor() {
+      this.listeners = {};
+      setTimeout(() => this.dispatch("open", {}), 0);
+    }
+    addEventListener(type, cb) {
+      (this.listeners[type] ||= []).push(cb);
+    }
+    dispatch(type, ev) {
+      for (const cb of this.listeners[type] || []) cb(ev);
+    }
+    send(text) {
+      const req = JSON.parse(text);
+      requested.push([req.method, req.params]);
+      let frame;
+      if (req.method === "blockchain.headers.subscribe") {
+        frame = { id: req.id, result: { height: table.tip, hex: "" } };
+      } else if (req.method === "blockchain.transaction.get" && typeof table.raw[req.params[0]] === "string") {
+        frame = req.params[1]
+          ? { id: req.id, result: { txid: req.params[0], confirmations: table.confirmations } }
+          : { id: req.id, result: table.raw[req.params[0]] };
+      } else {
+        frame = { id: req.id, error: { code: 2, message: "daemon error: No such mempool or blockchain transaction." } };
+      }
+      setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+    }
+    close() {}
+  };
+}
+
+// Drive the page's OWN `onCheck` — what the Check button runs — with `text` typed into the
+// box. The three Python bridges are recorders answering from canned lists the Python side
+// computed with the REAL `glue.py`; what is asserted is what the page asked the server for,
+// what it handed each bridge, and what it drew.
+async function driveCheck(renderer, spec) {
+  const requested = [];
+  const calls = { run: [], fetch: [], anchor: [] };
+  const recorder = (bucket, returns) => (...args) => {
+    calls[bucket].push(args);
+    const canned = (returns || [])[calls[bucket].length - 1];
+    if (canned === undefined) throw new Error(`harness: no canned ${bucket} answer for call ${calls[bucket].length}`);
+    return JSON.parse(JSON.stringify(canned));
+  };
+  renderer.WebSocket = tableServer(
+    { raw: spec.raw || {}, confirmations: spec.confirmations ?? 5, tip: spec.tip ?? 460572 },
+    requested,
+  );
+  renderer.__run__ = recorder("run", spec.run_returns);
+  renderer.__fetch__ = recorder("fetch", spec.fetch_returns);
+  renderer.__anchor__ = recorder("anchor", spec.anchor_returns);
+  vm.runInContext(
+    "pyRun = __run__; pyFetch = __fetch__; bridges = { markAnchor: __anchor__ }; " +
+    `INPUT_BOX.value = ${JSON.stringify(spec.text)};`,
+    renderer,
+  );
+  try {
+    await renderer.onCheck();
+  } finally {
+    vm.runInContext("pyRun = null; pyFetch = null; bridges = null;", renderer);
+  }
+  const block = vm.runInContext("RESULT_BLOCK", renderer);
+  return { node: block, requested, calls };
+}
+
 async function main() {
   const payloadPath = process.argv[2];
   const raw = !payloadPath || payloadPath === "-"
@@ -304,7 +378,11 @@ async function main() {
     // page with a hand-built error dict would prove the renderer and leave the
     // translation, which is the half that was wrong, untested.
     let node;
-    if (spec && typeof spec.wire_frame === "string") {
+    let checked = null;
+    if (spec && spec.check) {
+      checked = await driveCheck(renderer, spec.check);
+      node = checked.node;
+    } else if (spec && typeof spec.wire_frame === "string") {
       renderer.WebSocket = frameServer(spec.wire_frame);
       let rejection = null;
       try {
@@ -331,6 +409,7 @@ async function main() {
       panels: collect(node, hasClass("mark")).map(renderedLines),
       file_inputs: collect(node, (n) => n.tag === "input" && n.type === "file").length,
       judged,
+      ...(checked ? { requested: checked.requested, calls: checked.calls } : {}),
     };
   }
   process.stdout.write(JSON.stringify(results));

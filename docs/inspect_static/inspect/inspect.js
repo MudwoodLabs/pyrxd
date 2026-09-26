@@ -223,8 +223,19 @@ function enableForm() {
 // Classify / clear / share
 // ---------------------------------------------------------------------
 
+// A FETCH MUST NOT LAND ON A SCREEN THE READER HAS MOVED ON FROM. "Fetch from network" awaits
+// the server (twice, for a reveal) and then renders — and classifying something else, or
+// pressing Clear, in the meantime does not stop it. Without this the slow answer about the OLD
+// transaction replaced whatever the reader was now looking at, seconds later and with no sign
+// that it was stale. Same pattern as /verify/'s `onCheck`: every new intention bumps the
+// token, and a fetch renders only if the token is still the one it started with.
+let inFlight = 0;
+
 function onClassify() {
   if (!pyGlue) return;
+  // Bumped even for an empty submit: it is still a new intention, and a fetch already in
+  // flight must not land on a screen the reader has just emptied.
+  inFlight += 1;
   const text = (INPUT_BOX.value || "").trim();
   if (!text) {
     renderEmpty();
@@ -257,6 +268,8 @@ function onClassify() {
 }
 
 function onClear() {
+  // CLEAR CANCELS. A fetch still in flight would otherwise put its result back a moment later.
+  inFlight += 1;
   INPUT_BOX.value = "";
   RESULT_BLOCK.hidden = true;
   RESULT_BLOCK.replaceChildren();
@@ -1265,13 +1278,21 @@ function appendMarkVerdict(wrapper, row, opts) {
   const meaning = att.meaning || "this build could not read the outcome of the signature check";
   if (hm.signer_hash160) {
     panel.appendChild(verdictBlock("signature", status, meaning, att.detail || ""));
-    if (status === "VERIFIED" && att.assumed_network) {
-      // The assumption is load-bearing exactly where the verdict is affirmative: the
-      // chain's genesis hash is inside the signed statement, so the same bytes on
-      // another chain are a different statement and recover a different key.
+    if (att.assumed_network) {
+      // FOR EVERY VERDICT, not only VERIFIED. The chain's genesis hash is inside the signed
+      // statement, so the same bytes on another chain are a different statement and recover a
+      // different key — which is as load-bearing for a failure as for a success: a genuine
+      // testnet record read here is a DOES NOT VERIFY, and only this line says why it might be.
+      // Where no check ran, it says what a check would assume rather than "checked".
+      const checked = status === "VERIFIED" || status === "DOES NOT VERIFY";
       caveats.push(
-        `Checked against ${att.assumed_network}. The chain is part of the signed ` +
-        `statement, so the same bytes read against another chain recover a different key.`
+        `${checked ? "Checked against" : "A check here assumes"} ${att.assumed_network}. The chain ` +
+        `is part of the signed statement, so the same bytes read against another chain recover a ` +
+        `different key` +
+        (status === "DOES NOT VERIFY"
+          ? ` — a genuine record made for another network does not verify here; the CLI's ` +
+            `--network checks it against that one.`
+          : `.`)
       );
     }
   } else {
@@ -2563,6 +2584,10 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
     statusEl.textContent = "(glue not ready)";
     return;
   }
+  // Checked before every render and before each further network wait: a fetch the reader has
+  // moved on from (another input classified, or Clear) finishes quietly and draws nothing.
+  const token = ++inFlight;
+  const superseded = () => token !== inFlight;
   fetchBtn.disabled = true;
   statusEl.textContent = "fetching…";
 
@@ -2570,11 +2595,13 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   try {
     rawHex = await fetchRawTxFromElectrumx(txid);
   } catch (err) {
+    if (superseded()) return;
     fetchBtn.disabled = false;
     statusEl.textContent = "";
     renderResult(fetchFailure(err, txid));
     return;
   }
+  if (superseded()) return;
 
   statusEl.textContent = "classifying…";
 
@@ -2632,6 +2659,7 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
       }
     }
   } catch (err) {
+    if (superseded()) return;
     fetchBtn.disabled = false;
     statusEl.textContent = "";
     renderResult({
@@ -2642,6 +2670,8 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
     });
     return;
   }
+  // The spent-transaction fetch above is awaited too, so the reader may have moved on during it.
+  if (superseded()) return;
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole
   // claim is "no later than the block that confirms this", so the block is not
@@ -2650,6 +2680,7 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   if (carriesAMark(result)) {
     statusEl.textContent = "placing the mark in a block…";
     result.payload.mark_anchor = await resolveMarkAnchor(pyMarkAnchor, txid);
+    if (superseded()) return;
   }
 
   renderResult(result);
