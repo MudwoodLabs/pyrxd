@@ -263,6 +263,11 @@ ignore = [
     # page (see docs/index.rst's toctree) and not needed to build or audit the
     # package.
     "docs/_static/announce/**",
+
+    # The maintainer-only adoption dashboard, a static page deployed to Cloudflare Pages
+    # from this directory. It reads public data at load time and is not part of the
+    # package, its docs, or anything needed to build or audit it.
+    "tools/adoption-dashboard/**",
 ]
 
 [tool.taskipy.tasks]
