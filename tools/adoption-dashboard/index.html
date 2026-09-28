@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>pyrxd Adoption Signals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --avg: #52514e;
+  --wash: rgba(42, 120, 214, 0.08);
+  --focus: #2a78d6;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --avg: #c3c2b7;
+    --wash: rgba(57, 135, 229, 0.12);
+    --focus: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --avg: #c3c2b7;
+  --wash: rgba(57, 135, 229, 0.12);
+  --focus: #3987e5;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 20px 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+header { display: flex; flex-direction: column; gap: 6px; }
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+h1 { margin: 0; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { margin: 0; font-size: 17px; font-weight: 600; text-wrap: balance; }
+.lede { margin: 0; color: var(--ink-2); max-width: 70ch; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--ring);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tile .label { font-size: 13px; color: var(--ink-2); }
+.tile .value { font-size: 28px; font-weight: 600; line-height: 1.2; }
+.tile .sub { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--ring);
+  border-radius: 10px;
+  padding: 18px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.panel-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 10px; }
+.panel-head .titles { display: flex; flex-direction: column; gap: 2px; }
+.caption { margin: 0; font-size: 13px; color: var(--ink-2); max-width: 72ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key-bar { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.key-line { width: 16px; height: 0; border-top: 2px solid; display: inline-block; }
+.key-tick { width: 2px; height: 10px; background: var(--ink-2); display: inline-block; }
+
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; }
+.seg button {
+  font: inherit; font-size: 13px; color: var(--ink-2);
+  background: transparent; border: 0; padding: 6px 12px; cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--ring); }
+.seg button[aria-pressed="true"] { background: var(--wash); color: var(--ink); font-weight: 500; }
+.seg button:focus-visible, .chart:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--focus); outline-offset: 2px;
+}
+
+.chart { position: relative; width: 100%; outline: none; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart .grid { stroke: var(--grid); stroke-width: 1; }
+.chart .base { stroke: var(--axis); stroke-width: 1; }
+.chart .tick { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
+.chart .bar { fill: var(--series-1); }
+.chart .bar.dim { opacity: 0.35; }
+.chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .line.avg { stroke: var(--avg); }
+.chart .line.s2 { stroke: var(--series-2); }
+.chart .dot.s2 { fill: var(--series-2); stroke: var(--surface); stroke-width: 2; }
+.chart .rel { fill: var(--ink-2); }
+.chart .rel.hot { fill: var(--ink); }
+.chart .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.tip {
+  position: absolute; pointer-events: none; z-index: 2;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  padding: 8px 10px; font-size: 13px; min-width: 150px;
+}
+.tip .d { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.tip .r { display: flex; justify-content: space-between; gap: 14px; }
+.tip .r b { font-family: var(--mono); font-weight: 500; }
+.tip .rel-line { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--grid); color: var(--ink-2); }
+
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.note {
+  font-size: 13px; color: var(--ink-2); margin: 0;
+  border-left: 2px solid var(--axis); padding-left: 10px;
+}
+
+.notes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 28px; }
+.notes h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.notes p { margin: 0; font-size: 14px; color: var(--ink-2); max-width: 62ch; }
+
+details { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 16px; }
+summary { cursor: pointer; font-weight: 500; }
+.tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
+.tbl { max-height: 360px; overflow: auto; border: 1px solid var(--grid); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 10px; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { position: sticky; top: 0; background: var(--surface); color: var(--ink-2); font-family: var(--sans); font-weight: 500; }
+footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+@media (max-width: 760px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pair, .notes, .tables { grid-template-columns: 1fr; }
+  h1 { font-size: 25px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+<style>
+.status { margin: 0; font-size: 13px; color: var(--ink-2); font-family: var(--mono); }
+.status.err { color: #b3261e; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">MudwoodLabs / pyrxd</div>
+    <h1>pyrxd Adoption Signals</h1>
+    <p class="lede" id="lede">Downloads from PyPI and traffic on GitHub, side by side. Loaded live from the pyrxd traffic-data branch, which a daily job updates. The notes below say what each number can and cannot tell you.</p>
+    <p class="status" id="status" role="status">Loading the latest data…</p>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="panel" aria-labelledby="pypi-h">
+    <div class="panel-head">
+      <div class="titles">
+        <h2 id="pypi-h">PyPI downloads per day</h2>
+        <p class="caption">Mirrors excluded. Read the 7-day line, not single days. The ticks under the axis are releases; hover any day to see which.</p>
+      </div>
+      <div class="seg" role="group" aria-label="Time range">
+        <button type="button" id="range-all" data-range="all" aria-pressed="true">All</button>
+        <button type="button" id="range-90" data-range="90" aria-pressed="false">90 days</button>
+        <button type="button" id="range-30" data-range="30" aria-pressed="false">30 days</button>
+      </div>
+    </div>
+    <div class="legend">
+      <span><i class="key-bar" style="background:var(--series-1)"></i>Downloads</span>
+      <span><i class="key-line" style="border-color:var(--avg)"></i>7-day average</span>
+      <span><i class="key-tick"></i>Release</span>
+    </div>
+    <div class="chart" id="chart-pypi" tabindex="0" aria-label="PyPI downloads per day chart. Use left and right arrow keys to move between days."></div>
+  </section>
+
+  <section class="pair">
+    <div class="panel" aria-labelledby="views-h">
+      <div class="titles">
+        <h2 id="views-h">GitHub page views per day</h2>
+        <p class="caption">The closer proxy for people reading the repository.</p>
+      </div>
+      <div class="legend">
+        <span><i class="key-bar" style="background:var(--series-1)"></i>Views</span>
+        <span><i class="key-line" style="border-color:var(--series-2)"></i>Unique visitors</span>
+      </div>
+      <div class="chart" id="chart-views" tabindex="0" aria-label="GitHub page views per day chart"></div>
+    </div>
+    <div class="panel" aria-labelledby="clones-h">
+      <div class="titles">
+        <h2 id="clones-h">GitHub clones per day</h2>
+        <p class="caption">Mostly automation. Useful for trend only.</p>
+      </div>
+      <div class="legend">
+        <span><i class="key-bar" style="background:var(--series-1)"></i>Clones</span>
+        <span><i class="key-line" style="border-color:var(--series-2)"></i>Unique cloners</span>
+      </div>
+      <div class="chart" id="chart-clones" tabindex="0" aria-label="GitHub clones per day chart"></div>
+      <p class="note" id="clone-note"></p>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="Reading these numbers">
+    <div>
+      <h3>Downloads are not users</h3>
+      <p>pypistats' "without mirrors" count still includes CI jobs and other automated installs, among them the clean-environment install the release runbook runs after every publish. A release day therefore always adds at least one download of its own.</p>
+    </div>
+    <div>
+      <h3>Days with no row</h3>
+      <p id="gap-note">pypistats returns no row for some days. Those days are drawn as 0.</p>
+    </div>
+    <div>
+      <h3>Clones mostly measure CI</h3>
+      <p>Clones count every checkout, including CI runs, mirrors and package bots, and this repository's own workflows. Views and unique visitors are the better signal for people, and even they include some automation.</p>
+    </div>
+    <div>
+      <h3>GitHub keeps 14 days</h3>
+      <p>GitHub's traffic API returns only the last 14 days. A daily workflow copies them to the <span class="mono">traffic-data</span> branch, so this history starts on 2026-09-01 (seeded on 09-15) and grows from here. PyPI history comes from pypistats, which keeps about 180 days.</p>
+    </div>
+  </section>
+
+  <details>
+    <summary>Daily numbers (table view)</summary>
+    <div class="tables">
+      <div class="tbl"><table id="t-pypi" aria-label="PyPI downloads per day"></table></div>
+      <div class="tbl"><table id="t-gh" aria-label="GitHub traffic per day"></table></div>
+    </div>
+  </details>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  function render(DATA) {
+    var NS = "http://www.w3.org/2000/svg";
+  var fmt = new Intl.NumberFormat("en-US");
+  var fmtTick = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+  var MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  function parseDay(s) { var p = s.split("-"); return { y: +p[0], m: +p[1] - 1, d: +p[2] }; }
+  function shortDay(s) { var p = parseDay(s); return MONTHS[p.m] + " " + p.d; }
+  function sum(a) { var t = 0; for (var i = 0; i < a.length; i++) t += a[i] || 0; return t; }
+
+  // ---------------------------------------------------------------- data
+  var pDays = Object.keys(DATA.pypi_daily).sort();
+  var pVals = pDays.map(function (d) { return DATA.pypi_daily[d]; });
+  var pAvg = pVals.map(function (_, i) {
+    if (i < 6) return null;
+    return sum(pVals.slice(i - 6, i + 1)) / 7;
+  });
+  var relByDay = {};
+  DATA.releases.forEach(function (r) { (relByDay[r.date] = relByDay[r.date] || []).push(r.tag); });
+
+  var gh = DATA.github;
+  var gDays = Object.keys(gh.views).concat(Object.keys(gh.clones))
+    .filter(function (d, i, a) { return a.indexOf(d) === i; }).sort();
+  function ghSeries(kind, key) { return gDays.map(function (d) { return (gh[kind][d] || {})[key] || 0; }); }
+  var views = ghSeries("views", "count"), viewU = ghSeries("views", "uniques");
+  var clones = ghSeries("clones", "count"), cloneU = ghSeries("clones", "uniques");
+
+  // ---------------------------------------------------------------- tiles
+  var last7 = sum(pVals.slice(-7)), prev7 = sum(pVals.slice(-14, -7));
+  var last30 = sum(pVals.slice(-30)), total = sum(pVals);
+  var tiles = [
+    { label: "Downloads, last 7 days", value: fmt.format(last7), sub: "previous 7 days: " + fmt.format(prev7) },
+    { label: "Downloads, last 30 days", value: fmt.format(last30), sub: shortDay(pDays[pDays.length - 30]) + " – " + shortDay(pDays[pDays.length - 1]) },
+    { label: "Downloads since " + shortDay(pDays[0]), value: fmt.format(total), sub: pDays.length + " days · " + DATA.releases.length + " releases" },
+    { label: "GitHub page views", value: fmt.format(sum(views)), sub: shortDay(gDays[0]) + " – " + shortDay(gDays[gDays.length - 1]) + " · " + gDays.length + " days" }
+  ];
+  var tilesEl = document.getElementById("tiles");
+  tiles.forEach(function (t) {
+    var el = document.createElement("div"); el.className = "tile";
+    var a = document.createElement("div"); a.className = "label"; a.textContent = t.label;
+    var b = document.createElement("div"); b.className = "value"; b.textContent = t.value;
+    var c = document.createElement("div"); c.className = "sub"; c.textContent = t.sub;
+    el.appendChild(a); el.appendChild(b); el.appendChild(c); tilesEl.appendChild(el);
+  });
+
+  var gaps = pDays.filter(function (d) { return DATA.pypi_daily[d] === 0; }).length;
+  document.getElementById("gap-note").textContent =
+    "pypistats returned no row for " + gaps + " of the " + pDays.length + " days since the first release. Those days are drawn as 0, most likely because nothing was downloaded on them.";
+
+  var spike = gDays.reduce(function (best, d, i) { return clones[i] > clones[best] ? i : best; }, 0);
+  document.getElementById("clone-note").textContent = DATA.clone_spike_note && DATA.clone_spike_note.date === gDays[spike]
+    ? DATA.clone_spike_note.text
+    : "Largest day: " + shortDay(gDays[spike]) + ", " + fmt.format(clones[spike]) + " clones.";
+
+  document.getElementById("foot").textContent =
+    "Fetched " + DATA.fetched + " · PyPI: pypistats.org, without mirrors, as saved daily to the traffic-data branch · GitHub: traffic-data branch · Releases: GitHub releases.";
+
+  // ---------------------------------------------------------------- chart
+  // A round tick step (1, 2, 2.5 or 5 x 10^k) giving about four intervals, and the smallest
+  // multiple of it that clears the data — so every tick label is a round number.
+  function niceScale(v) {
+    if (v <= 0) return { max: 4, step: 1 };
+    var raw = v / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / p;
+    var step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+    if (step < 1) step = 1;
+    return { max: Math.ceil(v / step) * step, step: step };
+  }
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  function TimeChart(host, cfg) {
+    this.host = host; this.cfg = cfg; this.idx = null;
+    this.tip = document.createElement("div"); this.tip.className = "tip"; this.tip.hidden = true;
+    host.appendChild(this.tip);
+    var self = this;
+    host.addEventListener("pointermove", function (e) { self.hover(e); });
+    host.addEventListener("pointerleave", function () { self.setIdx(null); });
+    host.addEventListener("keydown", function (e) {
+      var n = self.cfg.days.length;
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        var i = self.idx == null ? n - 1 : self.idx + (e.key === "ArrowRight" ? 1 : -1);
+        self.setIdx(Math.max(0, Math.min(n - 1, i)));
+      } else if (e.key === "Escape") { self.setIdx(null); }
+    });
+    host.addEventListener("blur", function () { self.setIdx(null); });
+    if (window.ResizeObserver) new ResizeObserver(function () { self.render(); }).observe(host);
+    this.render();
+  }
+  TimeChart.prototype.update = function (cfg) { this.cfg = cfg; this.idx = null; this.render(); };
+  TimeChart.prototype.render = function () {
+    var c = this.cfg, host = this.host;
+    var W = Math.max(280, host.clientWidth), H = c.height;
+    var m = { l: 40, r: 10, t: 10, b: c.markers ? 40 : 26 };
+    var iw = W - m.l - m.r, ih = H - m.t - m.b, n = c.days.length;
+    var sc = niceScale(Math.max.apply(null, c.bars.concat((c.line || []).filter(function (v) { return v != null; }))));
+    var ymax = sc.max;
+    var band = iw / n, gap = band >= 4 ? Math.min(2, band * 0.3) : 0;
+    var bw = Math.max(1, band - gap);
+    var y = function (v) { return m.t + ih - (v / ymax) * ih; };
+    var xc = function (i) { return m.l + band * i + band / 2; };
+    this.geom = { m: m, band: band, xc: xc, y: y, W: W, H: H, ih: ih };
+
+    if (this.svg) this.svg.remove();
+    var svg = el("svg", { viewBox: "0 0 " + W + " " + H, height: H, role: "img", "aria-label": c.label });
+    this.svg = svg;
+    host.insertBefore(svg, this.tip);
+
+    for (var v = 0; v <= ymax + 1e-9; v += sc.step) {
+      var yy = Math.round(y(v)) + 0.5, t = v;
+      if (t > 0) el("line", { x1: m.l, x2: W - m.r, y1: yy, y2: yy, "class": "grid" }, svg);
+      var lab = el("text", { x: m.l - 8, y: yy + 4, "text-anchor": "end", "class": "tick" }, svg);
+      lab.textContent = fmtTick.format(v);
+    }
+    var base = Math.round(y(0)) + 0.5;
+    el("line", { x1: m.l, x2: W - m.r, y1: base, y2: base, "class": "base" }, svg);
+
+    var r = Math.min(4, bw / 2);
+    this.bars = [];
+    for (var i = 0; i < n; i++) {
+      var v2 = c.bars[i], x0 = m.l + band * i + gap / 2, top = y(v2), h = y(0) - top;
+      var p;
+      if (v2 <= 0) { p = el("rect", { x: x0, y: y(0) - 0.001, width: bw, height: 0, "class": "bar" }, svg); }
+      else if (h < r * 1.2 || r < 1.5) { p = el("rect", { x: x0, y: top, width: bw, height: h, "class": "bar" }, svg); }
+      else {
+        p = el("path", { "class": "bar", d:
+          "M" + x0 + "," + y(0) + "V" + (top + r) + "Q" + x0 + "," + top + " " + (x0 + r) + "," + top +
+          "H" + (x0 + bw - r) + "Q" + (x0 + bw) + "," + top + " " + (x0 + bw) + "," + (top + r) + "V" + y(0) + "Z" }, svg);
+      }
+      this.bars.push(p);
+    }
+
+    if (c.line) {
+      var d = "", pen = false;
+      for (var j = 0; j < n; j++) {
+        if (c.line[j] == null) { pen = false; continue; }
+        d += (pen ? "L" : "M") + xc(j).toFixed(1) + "," + y(c.line[j]).toFixed(1); pen = true;
+      }
+      el("path", { d: d, "class": "line " + c.lineClass }, svg);
+    }
+
+    // x labels: first of each month for long spans, every k days for short ones
+    var lastX = -1e9;
+    for (var k = 0; k < n; k++) {
+      var pd = parseDay(c.days[k]);
+      var want = n > 45 ? pd.d === 1 : (k % Math.max(1, Math.ceil(n / 6)) === 0);
+      if (!want) continue;
+      var xx = xc(k);
+      if (xx - lastX < 44) continue;
+      var tx = el("text", { x: xx, y: base + 16, "text-anchor": "middle", "class": "tick" }, svg);
+      tx.textContent = n > 45 ? MONTHS[pd.m] : shortDay(c.days[k]);
+      lastX = xx;
+    }
+
+    this.rels = {};
+    if (c.markers) {
+      for (var q = 0; q < n; q++) {
+        if (!c.markers[c.days[q]]) continue;
+        this.rels[q] = el("rect", { x: xc(q) - 1, y: base + 24, width: 2, height: 9, rx: 1, "class": "rel" }, svg);
+      }
+    }
+    this.cross = el("line", { x1: 0, x2: 0, y1: m.t, y2: base, "class": "cross", visibility: "hidden" }, svg);
+    if (c.line && c.lineClass === "s2") this.dot = el("circle", { r: 4, "class": "dot s2", visibility: "hidden" }, svg);
+    else this.dot = null;
+    if (this.idx != null) this.setIdx(this.idx);
+  };
+  TimeChart.prototype.hover = function (e) {
+    var g = this.geom; if (!g) return;
+    var rect = this.svg.getBoundingClientRect();
+    var sx = (e.clientX - rect.left) * (g.W / rect.width);
+    var i = Math.floor((sx - g.m.l) / g.band);
+    if (i < 0 || i >= this.cfg.days.length) { this.setIdx(null); return; }
+    this.setIdx(i);
+  };
+  TimeChart.prototype.setIdx = function (i) {
+    var c = this.cfg, g = this.geom;
+    if (this.idx != null && this.rels[this.idx]) this.rels[this.idx].setAttribute("class", "rel");
+    this.idx = i;
+    for (var b = 0; b < this.bars.length; b++) this.bars[b].setAttribute("class", "bar" + (i != null && b !== i ? " dim" : ""));
+    if (i == null) { this.tip.hidden = true; this.cross.setAttribute("visibility", "hidden"); if (this.dot) this.dot.setAttribute("visibility", "hidden"); return; }
+    var x = g.xc(i);
+    this.cross.setAttribute("x1", x); this.cross.setAttribute("x2", x); this.cross.setAttribute("visibility", "visible");
+    if (this.dot && c.line[i] != null) { this.dot.setAttribute("cx", x); this.dot.setAttribute("cy", g.y(c.line[i])); this.dot.setAttribute("visibility", "visible"); }
+    if (this.rels[i]) this.rels[i].setAttribute("class", "rel hot");
+
+    var tip = this.tip; tip.textContent = "";
+    var dd = document.createElement("div"); dd.className = "d"; dd.textContent = c.days[i]; tip.appendChild(dd);
+    function row(label, value) {
+      var r = document.createElement("div"); r.className = "r";
+      var s = document.createElement("span"); s.textContent = label;
+      var v = document.createElement("b"); v.textContent = value;
+      r.appendChild(s); r.appendChild(v); tip.appendChild(r);
+    }
+    row(c.barLabel, fmt.format(c.bars[i]));
+    if (c.line) row(c.lineLabel, c.line[i] == null ? "—" : (c.lineDecimals ? c.line[i].toFixed(1) : fmt.format(c.line[i])));
+    if (c.markers && c.markers[c.days[i]]) {
+      var rl = document.createElement("div"); rl.className = "rel-line";
+      rl.textContent = "Released " + c.markers[c.days[i]].join(", ");
+      tip.appendChild(rl);
+    }
+    tip.hidden = false;
+    var hostW = this.host.clientWidth, tw = tip.offsetWidth;
+    var px = x * (this.svg.getBoundingClientRect().width / g.W);
+    var left = px + 14 + tw > hostW ? px - 14 - tw : px + 14;
+    tip.style.left = Math.max(0, left) + "px";
+    tip.style.top = "6px";
+  };
+
+  // ---------------------------------------------------------------- mount
+  function pypiCfg(range) {
+    var start = range === "all" ? 0 : Math.max(0, pDays.length - (+range));
+    return {
+      label: "PyPI downloads per day", height: 300,
+      days: pDays.slice(start), bars: pVals.slice(start),
+      line: pAvg.slice(start), lineClass: "avg", lineDecimals: true,
+      barLabel: "Downloads", lineLabel: "7-day average", markers: relByDay
+    };
+  }
+  var pypiChart = new TimeChart(document.getElementById("chart-pypi"), pypiCfg("all"));
+  var rangeKey = "all";
+  try { var saved = localStorage.getItem("pyrxd-signals-range"); if (saved === "90" || saved === "30") rangeKey = saved; } catch (e) {}
+  function setRange(key) {
+    rangeKey = key;
+    document.querySelectorAll(".seg button").forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.range === key ? "true" : "false"); });
+    pypiChart.update(pypiCfg(key));
+    try { localStorage.setItem("pyrxd-signals-range", key); } catch (e) {}
+  }
+  document.querySelectorAll(".seg button").forEach(function (b) { b.addEventListener("click", function () { setRange(b.dataset.range); }); });
+  if (rangeKey !== "all") setRange(rangeKey);
+
+  new TimeChart(document.getElementById("chart-views"), {
+    label: "GitHub page views per day", height: 220, days: gDays, bars: views, line: viewU,
+    lineClass: "s2", barLabel: "Views", lineLabel: "Unique visitors"
+  });
+  new TimeChart(document.getElementById("chart-clones"), {
+    label: "GitHub clones per day", height: 220, days: gDays, bars: clones, line: cloneU,
+    lineClass: "s2", barLabel: "Clones", lineLabel: "Unique cloners"
+  });
+
+  // ---------------------------------------------------------------- tables
+  function table(id, head, rows) {
+    var t = document.getElementById(id);
+    var thead = document.createElement("thead"), tr = document.createElement("tr");
+    head.forEach(function (h) { var th = document.createElement("th"); th.textContent = h; tr.appendChild(th); });
+    thead.appendChild(tr); t.appendChild(thead);
+    var tb = document.createElement("tbody");
+    rows.forEach(function (r) {
+      var row = document.createElement("tr");
+      r.forEach(function (c) { var td = document.createElement("td"); td.textContent = c; row.appendChild(td); });
+      tb.appendChild(row);
+    });
+    t.appendChild(tb);
+  }
+  table("t-pypi", ["Date", "Downloads", "7-day avg", "Release"], pDays.map(function (d, i) {
+    return [d, fmt.format(pVals[i]), pAvg[i] == null ? "" : pAvg[i].toFixed(1), (relByDay[d] || []).join(", ")];
+  }).reverse());
+  table("t-gh", ["Date", "Views", "Uniq", "Clones", "Uniq"], gDays.map(function (d, i) {
+    return [d, fmt.format(views[i]), fmt.format(viewU[i]), fmt.format(clones[i]), fmt.format(cloneU[i])];
+  }).reverse());
+  }
+
+var RAW = "https://raw.githubusercontent.com/MudwoodLabs/pyrxd/traffic-data/";
+var RELEASES = "https://api.github.com/repos/MudwoodLabs/pyrxd/releases?per_page=100";
+function getJSON(url) {
+  return fetch(url, { cache: "no-store" }).then(function (r) {
+    if (!r.ok) throw new Error(url.replace(/^https:\/\//, "") + " answered HTTP " + r.status);
+    return r.json();
+  });
+}
+function iso(d) { return d.toISOString().slice(0, 10); }
+function zeroFill(obj) {
+  var days = Object.keys(obj).sort(), out = {};
+  if (!days.length) return out;
+  var d = new Date(days[0] + "T00:00:00Z"), end = new Date(days[days.length - 1] + "T00:00:00Z");
+  for (; d <= end; d.setUTCDate(d.getUTCDate() + 1)) { var k = iso(d); out[k] = +(obj[k] || 0); }
+  return out;
+}
+var statusEl = document.getElementById("status");
+Promise.all([
+  getJSON(RAW + "pypi.json"),
+  getJSON(RAW + "traffic.json"),
+  getJSON(RELEASES).catch(function () { return null; })  // release ticks are optional
+]).then(function (res) {
+  var pypi = res[0], traffic = res[1], rel = res[2];
+  var DATA = {
+    fetched: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",
+    pypi_daily: zeroFill(pypi.without_mirrors || {}),
+    github: { views: traffic.views || {}, clones: traffic.clones || {} },
+    releases: (rel || []).filter(function (r) { return !r.draft; })
+      .map(function (r) { return { tag: r.tag_name, date: (r.published_at || "").slice(0, 10) }; })
+      .sort(function (a, b) { return a.date < b.date ? -1 : 1; }),
+    clone_spike_note: { date: "2026-09-23", text: "Largest day: Sep 23, 1,042 clones. That day 12 pull requests merged and 262 workflow runs started (UTC)." }
+  };
+  var pLast = Object.keys(DATA.pypi_daily).sort().pop();
+  var gLast = Object.keys(DATA.github.views).sort().pop();
+  statusEl.textContent = "PyPI data through " + pLast + " · GitHub traffic through " + gLast +
+    (rel ? "" : " · release markers unavailable (GitHub API did not answer)");
+  render(DATA);
+}).catch(function (e) {
+  statusEl.className = "status err";
+  statusEl.textContent = "Could not load the data: " + e.message + ". Reload to try again.";
+});
+
+})();
+</script>
+</body>
+</html>
