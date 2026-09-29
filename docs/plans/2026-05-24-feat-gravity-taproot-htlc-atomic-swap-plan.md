@@ -438,7 +438,7 @@ separate BTC-peg work). Remove the `trade.py:40` SPV import from the swap path.
 - Carried-forward off-chain gaps: `docs/brainstorms/gravity-ref-spike/AUDIT_REDTEAM_2026-05-24.md` (`C-NFT-1`, `C-ECON-1`, `H-ECON-2`, finalize/forfeit race)
 - Asset custody (REUSE): `src/pyrxd/glyph/script.py:127,135,404,459`; `src/pyrxd/gravity/transactions.py:96,125,257-290`
 - BTC wallet (REUSE/EXTEND): `src/pyrxd/btc_wallet/keys.py:123,205,319`; `payment.py:60-248`
-- Covenant pipeline (`fuse_*.py` regex transforms — NO `gen_*.js` exists in-tree): `gravity-ref-spike/fuse_ft_covenant.py`, `fuse_nft_covenant.py`, `fuse_anywallet.py`; `src/pyrxd/gravity/covenant.py:125,203`; walker `src/pyrxd/glyph/script.py:459`
+- Covenant pipeline (`fuse_*.py` regex transforms — NO `gen_*.js` exists in-tree): `gravity-ref-spike/fuse_ft_covenant.py`, `fuse_nft_covenant.py`, `fuse_anywallet.py`; `src/pyrxd/gravity/covenant.py:125,203`; walker `src/pyrxd/glyph/script.py:481`
 - Conventions: `BTC_RECOVERY.md`, `swap-order-wire-format.md`, memory `project_radiant_node_on_tr`, `feedback_never_handwrite_test_keys`
 
 ### External (best-practices research, 2026)
