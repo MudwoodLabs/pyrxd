@@ -2,8 +2,8 @@
 
 **Who this page is for:** you have a wallet (`pyrxd wallet new` or
 `pyrxd wallet recover`) and you want a receive address, then to confirm money
-arrived. Everything on this page is **read-only** — no signing, no broadcast, no
-mnemonic required for the balance and UTXO views.
+arrived. Everything on this page is **read-only** — no signing, no broadcast.
+`balance` and `utxos` still ask for the mnemonic, to open the wallet file.
 
 ```
 pyrxd address   →  give it to the sender
@@ -37,22 +37,26 @@ Hand the printed address to whoever is paying you. It's a public receive address
 
 ```console
 $ pyrxd balance
-Confirmed:    1.23456789 RXD
-Unconfirmed:  0.00000000 RXD
+Network    mainnet
+Confirmed  123,456,789 photons (1.23456789 RXD)
+Pending    0 photons (0.00000000 RXD)
 ```
 
-`balance` sums confirmed and unconfirmed photons across the addresses the wallet
-already knows about. If you just received to a **fresh** address the wallet
-hasn't seen used yet, run a gap-limit scan first so it gets discovered:
+`balance` scans the chain first: it walks the receive and change chains until 20
+addresses in a row have no history, then sums confirmed and pending photons
+across every address that has some. So a payment to any address inside that
+window shows up, including on a wallet `pyrxd wallet new` just made. The
+scan runs every time and is not saved to the wallet file. `--refresh`, which
+used to turn the scan on, is still accepted and changes nothing.
 
-```console
-$ pyrxd balance --refresh
-```
+If an address cannot be read, the balance is not reported as complete: the
+command exits 2, and the human output shows what the other addresses hold with
+an `INCOMPLETE` line naming the ones that failed (JSON and `--quiet` output
+print nothing). Retry, or point `--electrumx` at another server.
 
-Use `--refresh` after receiving to a new address, or any time the balance looks
-lower than the explorer shows. (If `--refresh` *still* shows zero while an
-explorer shows funds, your coins are likely on a different derivation path —
-see [Recover funds across wallet paths](recover-funds-across-wallet-paths.md).)
+If the balance shows zero while an explorer shows funds, your coins are likely
+on a different derivation path — see
+[Recover funds across wallet paths](recover-funds-across-wallet-paths.md).
 
 ---
 
@@ -63,7 +67,8 @@ $ pyrxd utxos
 ```
 
 `utxos` is a read-only diagnostic listing every spendable output across your
-used addresses. Two filters:
+used addresses, after the same scan. An address it cannot read makes it exit 2
+the same way `balance` does. Two filters:
 
 ```console
 $ pyrxd utxos --min-photons 10000   # hide dust below 10,000 photons

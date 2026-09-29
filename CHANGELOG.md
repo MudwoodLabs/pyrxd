@@ -46,8 +46,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
     it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
     any failed read fails it.
-  - `pyrxd utxos` lists the partial view. `pyrxd balance` and `pyrxd glyph list` are
-    unchanged: they read only the addresses the wallet file records as used, and do not scan.
+  - `pyrxd utxos` collects the partial view so it can name the addresses it could not read;
+    it then refuses to show that view as complete (next entry).
+- **`pyrxd balance` and `pyrxd glyph list` scan the chain by default.** Both read only the
+  addresses marked used, and only the gap-limit scan marks them. `balance` ran the scan only
+  under `--refresh`, `glyph list` never ran it, and nothing saves a scan, so a wallet made by
+  `pyrxd wallet new` and funded at its first receive address showed a balance of 0 and no
+  tokens. Both now run `HdWallet.refresh`, the scan `collect_spendable` runs, on every call.
+  The scan reads at least 20 addresses' history on each chain before the balance or token
+  reads. Its result is still not saved: the wallet file is unchanged, as it was under
+  `--refresh`. `balance --refresh` is still accepted and changes nothing. There is no opt-out,
+  because the old view read the network anyway, and it read only what something had marked
+  used, which on a `wallet new` file is nothing.
+- **`balance`, `glyph list` and `utxos` never show a partial view as the whole wallet.** A
+  scan that cannot read an address, or a read that fails for every used address, exits 2
+  and prints nothing. When some addresses answer and others fail, the command still exits 2.
+  The human output shows what the others hold, with an `INCOMPLETE` line on stdout naming the
+  unread addresses. JSON and `--quiet` output print nothing, since neither shape can say
+  "incomplete". Before, `utxos` listed the partial view and exited 0, and `balance` and
+  `glyph list` stopped at the first failed address. `utxos --addr A` is refused only when A's
+  own read fails.
+- **`GlyphScanner.scan_address` and `scan_script_hash` take `strict=`.** With `strict=True`, a
+  UTXO whose transaction cannot be fetched raises `NetworkError` rather than being logged and
+  left out of the result. The default is unchanged. `pyrxd glyph list` passes `strict=True`, so
+  a token it could not fetch fails the listing instead of dropping out of it.
 
 ## [0.25.0] — 2026-09-26
 
