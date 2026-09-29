@@ -574,7 +574,10 @@ def _inspect_outpoint(s: str) -> dict:
         # combining codepoints — exactly the surface that terminal
         # injection exploits.
         raise ValidationError(f"vout is not an integer: {_sanitize_display_string(vout_str)!r}")
-    vout = int(vout_str, 10)
+    try:
+        vout = int(vout_str, 10)
+    except ValueError as exc:  # more digits than int() will convert (4300 by default)
+        raise ValidationError("vout must be 0..2^32-1") from exc
     ref = GlyphRef(txid=Txid(txid_str.lower()), vout=vout)
     return {
         "form": "outpoint",

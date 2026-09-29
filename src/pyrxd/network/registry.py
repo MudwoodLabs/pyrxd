@@ -169,7 +169,9 @@ def _canonical_host(host: str) -> str:
         # ``bücher.example`` to ``xn--bcher-kva.example`` (#754). Fold to the A-label, the form
         # that goes on the wire. A name the codec cannot encode is kept as typed.
         try:
-            return host.encode("idna").decode("ascii")
+            # Re-canonicalised: the codec maps ``。`` to ``.`` and full-width digits to ASCII,
+            # so the A-label can still carry a trailing dot or spell an IP literal.
+            return _canonical_host(host.encode("idna").decode("ascii"))
         except UnicodeError:
             return host
     return host

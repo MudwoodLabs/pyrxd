@@ -228,6 +228,18 @@ class TestSourceIdentityFollowUps:
         assert len(profile.endpoints) == 2  # two URLs, kept for failover
         assert len({e.source for e in profile.endpoints}) == 1  # but one source
 
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            # The codec maps U+3002 to ".", so the A-label can end in the dot the ASCII path strips.
+            ("wss://bücher.example\u3002/a", "xn--bcher-kva.example"),
+            # ...and maps full-width digits to ASCII, so a non-ASCII host can spell an IP literal.
+            ("wss://\uff10x7f.0.0.1/", "127.0.0.1"),
+        ],
+    )
+    def test_the_a_label_is_canonicalised_like_any_ascii_host(self, url, source) -> None:
+        assert NetworkProfile.build("mainnet", [url]).endpoints[0].source == source
+
     def test_two_different_ascii_hosts_stay_two_sources(self) -> None:
         """The honest path: folding must not merge servers that are different."""
         profile = NetworkProfile.build("mainnet", ["wss://a.example/", "wss://b.example/"])

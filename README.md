@@ -205,6 +205,8 @@ then a **reveal** that publishes the metadata and creates the token.
 guard, signing and confirmation polling included.
 
 ```python
+from pathlib import Path
+
 from pyrxd.glyph import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.mint import GlyphMinter, JsonFilePendingStore
 
@@ -213,7 +215,7 @@ metadata = GlyphMetadata(
     name="My NFT",
     description="A demo non-fungible token.",
 )
-minter = GlyphMinter(client, wallet, JsonFilePendingStore("~/.pyrxd/pending-mints"))
+minter = GlyphMinter(client, wallet, JsonFilePendingStore(Path("~/.pyrxd/pending-mints").expanduser()))
 result = await minter.mint_nft(metadata)
 print(result.ref)  # the token's permanent identity: the commit outpoint
 ```

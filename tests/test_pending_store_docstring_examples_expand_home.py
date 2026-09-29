@@ -53,3 +53,33 @@ def test_a_bare_tilde_string_is_still_used_as_given(tmp_path, monkeypatch) -> No
     assert Path(store.directory) == Path("~/pending")
     assert (tmp_path / "~" / "pending").is_dir()
     assert "expanduser" in (JsonFilePendingStore.__doc__ or "")
+
+
+_REPO = Path(__file__).resolve().parents[1]
+_ANY_STORE_CALL = re.compile(r"PendingStore\(")
+_BARE_TILDE_ARG = re.compile(r"PendingStore\(\s*[rbfu]?[\"']~")
+
+
+def _shipped_text_files() -> list[Path]:
+    """Everything a reader copies from: the README (also the PyPI page), docs, examples, source."""
+    files = [_REPO / "README.md"]
+    for sub, pattern in (("docs", "*.md"), ("docs", "*.rst"), ("examples", "*.py"), ("src", "*.py")):
+        files += sorted((_REPO / sub).rglob(pattern))
+    return [f for f in files if f.is_file()]
+
+
+def test_no_shipped_example_hands_a_store_a_bare_tilde_string() -> None:
+    """The docstring test above runs two examples it names; this one finds every example (#755).
+
+    The README carried the same bare ``"~/..."`` string after both docstrings were fixed, because the
+    list above is typed by hand. This scan derives its scope from the tree instead.
+    """
+    calls, offenders = 0, []
+    for path in _shipped_text_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        calls += len(_ANY_STORE_CALL.findall(text))
+        offenders += [
+            f"{path.relative_to(_REPO)}:{text.count(chr(10), 0, m.start()) + 1}" for m in _BARE_TILDE_ARG.finditer(text)
+        ]
+    assert calls >= 3, f"found only {calls} store constructions; the scan has stopped seeing the examples"
+    assert not offenders, f"a store is built from a bare '~' string (it is used as given): {offenders}"

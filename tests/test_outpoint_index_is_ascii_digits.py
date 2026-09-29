@@ -49,6 +49,15 @@ def test_ascii_digits_still_parse(index: str, vout: int) -> None:
     assert out["outpoint"] == f"{TXID}:{vout}"
 
 
+def test_an_index_too_long_for_int_is_refused_not_crashed() -> None:
+    """``int()`` refuses more than 4300 digits with a raw ``ValueError``; that is a refusal, not a crash."""
+    with pytest.raises(ValidationError, match="0..2"):
+        _inspect_outpoint(f"{TXID}:{'9' * 4301}")
+    result = CliRunner().invoke(cli, ["glyph", "inspect", f"{TXID}:{'9' * 4301}"])
+    assert result.exit_code == 1, result.output
+    assert "unexpected failure" not in result.output
+
+
 def test_the_cli_refuses_an_underscored_index_and_accepts_the_plain_one() -> None:
     refused = CliRunner().invoke(cli, ["--json", "glyph", "inspect", f"{TXID}:1_0"])
     assert refused.exit_code != 0
