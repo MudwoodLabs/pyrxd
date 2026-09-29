@@ -99,3 +99,57 @@ def test_floor_matches_margin_policy_floor():
     from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
 
     assert _FLOOR_S == _MIN_ETH_FINALIZATION_WINDOW_S
+
+
+# ── added from the 2026-09-29 `ethleg` mutation run ──────────────────────────────────────────────
+#
+# `is_testnet` decides whether real value is at stake (it is what lets a rehearsal skip measured
+# margins and a multi-endpoint quorum), and every flag in the registry could be flipped with no
+# test failing. It is STATED per entry, never derived from the name — so this table states it too.
+
+_EXPECTED_REGISTRY = {
+    # name: (chain_id, finalization_window_s, is_testnet)
+    "ethereum": (1, 768, False),
+    "sepolia": (11155111, 768, True),
+    "base": (8453, 900, False),
+    "base-sepolia": (84532, 900, True),
+    "optimism": (10, 900, False),
+    "optimism-sepolia": (11155420, 900, True),
+    "arbitrum-one": (42161, 1200, False),
+    "arbitrum-sepolia": (421614, 1200, True),
+    "linea": (59144, 6000, False),
+    "linea-sepolia": (59141, 6000, True),
+}
+
+
+def test_every_registry_entry_pins_its_id_window_and_testnet_flag():
+    got = {n: (c.chain_id, c.finalization_window_s, c.is_testnet) for n, c in KNOWN_EVM_CHAINS.items()}
+    assert got == _EXPECTED_REGISTRY
+
+
+def test_an_unlisted_chain_defaults_to_REAL_value():
+    # The fail-safe default: forgetting the flag must never promote a mainnet to faucet money.
+    assert EvmChain(name="x", chain_id=42, network="x", finalization_window_s=900).is_testnet is False
+
+
+def test_a_registry_entry_cannot_be_mutated_in_place():
+    import dataclasses
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        KNOWN_EVM_CHAINS["ethereum"].is_testnet = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("chain_id", [-1, True, "1"])
+def test_evm_chain_refuses_a_chain_id_that_is_not_a_positive_int(chain_id):
+    with pytest.raises(ValidationError, match="chain_id"):
+        EvmChain(name="x", chain_id=chain_id, network="x", finalization_window_s=900)
+
+
+@pytest.mark.parametrize("window", ["900", 900.0, True])
+def test_evm_chain_refuses_a_window_that_is_not_an_int(window):
+    with pytest.raises(ValidationError, match="finalization_window_s"):
+        EvmChain(name="x", chain_id=42, network="x", finalization_window_s=window)
+
+
+def test_evm_chain_accepts_the_floor_itself():
+    assert EvmChain(name="x", chain_id=42, network="x", finalization_window_s=768).finalization_window_s == 768

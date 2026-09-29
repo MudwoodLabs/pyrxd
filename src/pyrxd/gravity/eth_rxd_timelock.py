@@ -76,6 +76,7 @@ from pyrxd.constants import SEQUENCE_LOCKTIME_MASK
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
+    "CLAIM_INCLUSION_BUDGET_S",
     "CrossClockMargin",
     "assert_covenant_confirms_before_eth_deadline",
     "assert_eth_deadline_is_claimable",
@@ -88,6 +89,18 @@ __all__ = [
 # the shared consensus constant rather than re-typed as 0xFFFF — a fourth spelling of
 # SEQUENCE_LOCKTIME_MASK is a fourth place for it to be wrong.
 _MAX_RXD_CSV_BLOCKS = SEQUENCE_LOCKTIME_MASK
+
+#: Seconds of head-room an ETH claim must have before ``timeout`` to be worth broadcasting.
+#: ~8 Ethereum blocks at 12s. Sized to cover ordinary inclusion latency and a fee spike, not to be
+#: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
+#: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
+#: that does not is the preimage published for nothing.
+#:
+#: Defined HERE, not in ``eth_wallet.htlc_leg`` (which re-exports it for its claim guard), because
+#: :func:`assert_eth_deadline_is_claimable` must reserve it too, and this module is pure: it cannot
+#: import the ETH leg. The claim guard refuses when ``now + budget >= timeout``; the pre-funding
+#: check ignored the budget, so it accepted deadlines the maker's own leg then refused to claim.
+CLAIM_INCLUSION_BUDGET_S: int = 96
 
 
 @dataclass(frozen=True)
@@ -458,22 +471,42 @@ def assert_eth_deadline_is_claimable(
     a free option: it can watch the price and simply decline to reveal.
 
     Fail-closed on a deadline in the past — that case is not a tight window, it is a dead swap.
+
+    THE BOUNDARY IS THE CONTRACT'S. ``EthHtlc.claim`` reverts once ``block.timestamp >= timeout``,
+    so a claim must be MINED strictly before ``timeout``; ``remaining_s == 0`` is already expired.
+    Once funding is final the maker still has to get its claim included, and its own leg refuses to
+    broadcast unless ``now + CLAIM_INCLUSION_BUDGET_S < timeout``. So a deadline is claimable only
+    if ``remaining_s > finality + stall + rounding + CLAIM_INCLUSION_BUDGET_S``, strictly.
+
+    TWO DEFECTS WERE HERE. The comparison was a strict ``<``, which accepted ``remaining_s`` EQUAL to
+    the floor — and with an all-zero margin, a deadline equal to ``now``, which the contract has
+    already expired, was accepted and not even labelled expired. And the floor left out the
+    inclusion budget, so every deadline within 96 s above finality + stall + rounding was accepted
+    for funding and then refused by the maker's claim guard. With a real-value margin (a stall
+    tolerance of at least 3,600 s) the first defect cannot reach an expired deadline; the second can.
     """
     _require_int(now_unix_s, "now_unix_s")
     _require_int(eth_timeout_unix_s, "eth_timeout_unix_s")
 
     # The maker acts only on FINAL funding, so that is the floor: finality, plus the stall budget
-    # the policy already carries for it, plus the rounding/skew allowance.
+    # the policy already carries for it, plus the rounding/skew allowance — and then its claim must
+    # still be MINED before `timeout`, which is the inclusion budget its own claim guard demands.
     claim_reachable_s = margin.eth_reorg_finality_s + margin.eth_finality_stall_tolerance_s + margin.rounding_slack_s
+    claim_floor_s = claim_reachable_s + CLAIM_INCLUSION_BUDGET_S
     remaining_s = eth_timeout_unix_s - now_unix_s
-    if remaining_s < claim_reachable_s:
-        expired = " (ALREADY EXPIRED)" if remaining_s < 0 else ""
+    # `<=`, both of them: `EthHtlc.claim` reverts at `block.timestamp >= timeout`, so zero seconds
+    # left is expired, and a claim with exactly the floor left lands AT `timeout` — the claim guard
+    # refuses `now + budget >= timeout` for the same reason.
+    if remaining_s <= claim_floor_s:
+        expired = " (ALREADY EXPIRED)" if remaining_s <= 0 else ""
         raise ValidationError(
             f"the ETH deadline leaves too little time to claim{expired}: eth_timeout is {remaining_s}s away "
-            f"but the maker cannot act until the counter leg is final, which needs {claim_reachable_s}s "
+            f"but the maker cannot act until the counter leg is final and must then get its claim mined "
+            f"before the timeout, which needs more than {claim_floor_s}s "
             f"(finality {margin.eth_reorg_finality_s}s + stall {margin.eth_finality_stall_tolerance_s}s + "
-            f"rounding {margin.rounding_slack_s}s). Funding this would confirm too late to be claimed — "
-            "both legs would refund, and until then the maker holds a free option (#482)."
+            f"rounding {margin.rounding_slack_s}s + claim inclusion {CLAIM_INCLUSION_BUDGET_S}s). "
+            "Funding this would confirm too late to be claimed — both legs would refund, and until then "
+            "the maker holds a free option (#482)."
         )
 
 

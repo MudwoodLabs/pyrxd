@@ -755,3 +755,44 @@ class TestTheLandedBalanceUsesTheQUORUM_th:
         from pyrxd.eth_wallet.multi_rpc import quorum_combiner
 
         assert quorum_combiner(object()) is min
+
+
+class TestQuorumSizeAndTheQuorumHeadFromTheMutationRun:
+    """2026-09-29 `ethleg` run: the default quorum and the quorum-th head were only ever exercised
+    at sizes where a wrong formula happens to give the right answer (2 or 3 sources, 2-of-3)."""
+
+    @pytest.mark.parametrize(("n", "majority"), [(2, 2), (3, 2), (4, 3), (5, 3), (6, 4), (7, 4), (8, 5)])
+    def test_the_default_quorum_is_a_true_majority(self, n: int, majority: int) -> None:
+        # 6 sources need 4: three is only half, and two halves can each "agree" on opposite answers.
+        assert MultiSourceEthRpc([_Source() for _ in range(n)]).min_agreeing == majority
+
+    @pytest.mark.parametrize(("quorum", "want"), [(2, 1_700_000_300), (3, 1_700_000_200), (4, 1_700_000_100)])
+    def test_the_quorum_head_is_the_quorum_th_LARGEST_at_every_size(self, quorum: int, want: int) -> None:
+        heads = [1_700_000_100, 1_700_000_400, 1_700_000_200, 1_700_000_300]
+        rpc = MultiSourceEthRpc([_Source(head_ts=h) for h in heads], min_agreeing=quorum)
+        assert _run(rpc.latest_block_timestamp_quorum()) == want
+
+    def test_close_closes_every_source_even_when_one_fails_to(self) -> None:
+        closed: list[int] = []
+
+        class _Closing(_Source):
+            def __init__(self, i: int, fail: bool) -> None:
+                super().__init__()
+                self.i, self.fail = i, fail
+
+            async def close(self):
+                closed.append(self.i)
+                if self.fail:
+                    raise ConnectionError("already gone")
+
+        rpc = MultiSourceEthRpc([_Closing(0, True), _Closing(1, False), _Closing(2, False)])
+        _run(rpc.close())  # a dead endpoint must not stop shutdown, nor raise out of it
+        assert sorted(closed) == [0, 1, 2]
+
+    def test_sources_is_a_read_only_copy(self) -> None:
+        a, b = _Source(), _Source()
+        rpc = MultiSourceEthRpc([a, b])
+        got = rpc.sources
+        assert got == [a, b]
+        got.clear()
+        assert rpc.sources == [a, b] and rpc.primary is a
