@@ -126,6 +126,20 @@ async def test_over_funding_is_accepted_and_under_funding_is_refused():
         await _verifying(_Rpc(loc, balanceOf=_AMOUNT - 1)).verify_funded(loc, expected_amount_wei=_AMOUNT)
 
 
+async def test_a_NEGATIVE_eth_balance_from_the_node_is_refused():
+    # A token HTLC holds no ETH, so the inherited balance floor is 0 — and a node reporting less
+    # than that is not describing a real contract. The balance is an untrusted RPC answer.
+    loc = _locator()
+    rpc = _Rpc(loc)
+
+    async def _negative(address, block_identifier=None):
+        return -1
+
+    rpc.get_balance = _negative
+    with pytest.raises(ValidationError, match=r"funded balance -1 wei < negotiated 0 wei"):
+        await _verifying(rpc).verify_funded(loc, expected_amount_wei=_AMOUNT)
+
+
 @pytest.mark.parametrize("other", ["0x" + "00" * 20, "0x" + "ff" * 20])
 async def test_a_locator_in_ANY_other_token_is_refused(other):
     # Both orderings: a mismatch must not depend on which address sorts first.
@@ -277,22 +291,64 @@ def test_create_address_refuses_a_sender_that_is_not_20_bytes(n):
         _create_address("0x" + "ab" * n, 1)
 
 
-# ── _push_and_bind: what is sent, and when a resume must refuse to send ─────────────────────────
+# ── fund: what is sent, and when a resume must refuse to send ──────────────────────────────────
 #
-# Driven directly: the fund() wrappers around it have their own tests, and these are about the
-# arithmetic of `shortfall = amount - held` against the nonce window, which decides whether a
-# resume can fund the HTLC twice.
+# Driven through `fund()`, fresh or resumed (`resume_from`), so each case takes the path a real
+# caller takes: the decimals cross-check, the freeze gates, the deploy, the resume's immutable
+# re-verification, and then the arithmetic of `shortfall = amount - held` against the nonce
+# window, which decides whether a resume can fund the HTLC twice. Signing is stubbed (it has its
+# own tests), and so is the runtime-code compare, as in `_verifying`.
+
+_HASHLOCK = b"\x33" * 32
+_DEPLOY_HASH = "0x" + "de" * 32
+_PUSH_HASH = "0x" + "fe" * 32
 
 
 class _PushRpc:
-    """Token balance, nonce window and push receipt, all dictated. Records every transfer."""
+    """Everything `fund()` reads, all dictated. Records every transfer and every deploy.
 
-    def __init__(self, *, held, pending=0, latest=0, landed=None, push_status=1, statusless=False):
+    `held` is the HTLC's token balance before the push; `pending`/`latest` the sender's nonces
+    (the deploy and the push are both built at `pending`). `window`, when given, is installed as
+    the multi-source `inflight_nonce_window` read.
+    """
+
+    def __init__(
+        self,
+        *,
+        held,
+        pending=0,
+        latest=0,
+        landed=None,
+        push_status=1,
+        statusless=False,
+        deploy_status=1,
+        deploy_statusless=False,
+        lie=None,
+        window=None,
+    ):
+        from web3 import Web3
+
         self.held, self.pending, self.latest = held, pending, latest
         self.landed = landed
         self.push_status, self.statusless = push_status, statusless
+        self.deploy_status, self.deploy_statusless, self.lie = deploy_status, deploy_statusless, lie
+        if window is not None:
+            self.inflight_nonce_window = window
         self.transfers: list[int] = []
+        self.deploys: list[dict] = []
+        self.deployer: str | None = None  # the leg's own address; `_push` sets it
+        self.amount: int | None = None  # the negotiated amount; `_push` sets it
         rpc = self
+
+        def _immutable(name):
+            return {
+                "hashlock": _HASHLOCK,
+                "claimant": Web3.to_checksum_address(_FUND["claimant"]),
+                "refundee": Web3.to_checksum_address(_FUND["refundee"]),
+                "timeout": _FUND["timeout"],
+                "token": Web3.to_checksum_address(_USDC.address),
+                "amount": rpc.amount,
+            }[name]
 
         class _Call:
             def __init__(self, v):
@@ -309,6 +365,10 @@ class _PushRpc:
                 rpc.transfers.append(self.amount)
                 return {**tx, "amount": self.amount}
 
+        class _Ctor:
+            async def build_transaction(self, tx):
+                return dict(tx)
+
         class _Fns:
             def balanceOf(self, _who):
                 # The balance TRACKS the push; `landed` overrides it to model a token that
@@ -323,8 +383,26 @@ class _PushRpc:
             def transfer(self, _to, amount):
                 return _Built(amount)
 
-        eth = types.SimpleNamespace(contract=lambda **_k: types.SimpleNamespace(functions=_Fns()))
+            def decimals(self):
+                return _Call(_USDC.decimals)
+
+            def __getattr__(self, name):  # the HTLC's immutable getters, read on a resume
+                return lambda: _Call(_immutable(name))
+
+        def _contract(**_k):
+            return types.SimpleNamespace(functions=_Fns(), constructor=lambda *_a: _Ctor())
+
+        eth = types.SimpleNamespace(contract=_contract)
         self.w3 = self.write_w3 = types.SimpleNamespace(eth=eth)
+
+    async def assert_chain(self):
+        return None
+
+    async def get_code(self, address, block_identifier=None):
+        return b"\x60\x00" if address.lower() == _CONTRACT else b""
+
+    async def get_balance(self, address, block_identifier=None):
+        return 0
 
     async def get_transaction_count(self, _addr, block="pending"):
         return self.pending if block == "pending" else self.latest
@@ -336,38 +414,46 @@ class _PushRpc:
         # The push already pending at the pinned nonce, priced well above today's estimate.
         return {"nonce": 7, "maxFeePerGas": 100, "maxPriorityFeePerGas": 10}
 
-    async def wait_receipt(self, _h, **_k):
+    async def wait_receipt(self, h, **_k):
+        if h == _DEPLOY_HASH:
+            r = {"contractAddress": self.lie or _create_address(self.deployer, self.pending)}
+            if not self.deploy_statusless:
+                r["status"] = self.deploy_status
+            return r
         return {"logs": []} if self.statusless else {"status": self.push_status, "logs": []}
 
 
 def _push(rpc, *, resuming, amount=100, push_nonce=None, push_tx_hash=None, on_push_hash=None):
-    from web3 import Web3
+    """`fund()`: a resume of the HTLC at `_CONTRACT`, or a fresh deploy. Returns the coroutine and
+    the list of TOKEN PUSHES signed; the deploy, if any, lands on `rpc.deploys`."""
+    from pyrxd.eth_wallet.keys import derive_address
+    from pyrxd.eth_wallet.locator import PendingDeploy
 
-    leg = _leg(rpc)
+    key = PrivateKeyMaterial(os.urandom(32))
+    leg = Erc20HtlcLeg(token=_USDC, rpc=rpc, signing_key=key, chain_id=1, artifact=_ART)
+    leg._runtime_code_matches = lambda code: True  # the artifact compare has its own tests
+    rpc.deployer, rpc.amount = derive_address(key), amount
     sent: list = []
 
-    async def _send(built, *, on_signed=None, **_k):
-        h = "0x" + "fe" * 32
+    async def _send(built, *, preflight=True, on_signed=None, **_k):
+        if preflight is False:  # only the deploy skips the eth_call preflight: it has no `to`
+            rpc.deploys.append(built)
+            return _DEPLOY_HASH
         if on_signed is not None:
-            await on_signed(h)
+            await on_signed(_PUSH_HASH)
         sent.append(built)
-        return h
+        return _PUSH_HASH
 
     leg._sign_and_send = _send
-    coro = leg._push_and_bind(
-        resuming=resuming,
+    resume = PendingDeploy(address=_CONTRACT, deploy_tx_hash="0x" + "ab" * 32) if resuming else None
+    coro = leg.fund(
+        hashlock=_HASHLOCK,
+        amount_wei=amount,
+        resume_from=resume,
         push_nonce=push_nonce,
         push_tx_hash=push_tx_hash,
-        on_push_nonce=None,
         on_push_hash=on_push_hash,
-        web3=__import__("web3"),
-        address=Web3.to_checksum_address(_CONTRACT),
-        deploy_hash="0x" + "ab" * 32,
-        hashlock=b"\x33" * 32,
-        claimant="0x" + "44" * 20,
-        refundee="0x" + "55" * 20,
-        timeout=2_000_000_000,
-        amount_wei=amount,
+        **_FUND,
     )
     return coro, sent
 
@@ -421,6 +507,53 @@ async def test_a_pin_still_at_the_settled_nonce_is_used_not_refused():
     assert rpc.transfers == [60] and sent[0]["nonce"] == 7
 
 
+async def _window_unreadable(sender):
+    """A multi-source `inflight_nonce_window` whose endpoints cannot be read or do not agree."""
+    raise NetworkError("inflight nonce window: no quorum of endpoints answered")
+
+
+async def test_a_fresh_fund_completes_when_the_nonce_window_cannot_be_read():
+    # A fresh HTLC was created by the deploy that just confirmed, so nothing can be in flight TO
+    # it and the window is never consulted. Reading it anyway would let one failed quorum read
+    # abort a fund AFTER the deploy had spent gas.
+    rpc = _PushRpc(held=0, window=_window_unreadable)
+    coro, sent = _push(rpc, resuming=False)
+    loc = await coro
+    assert rpc.transfers == [100] and len(sent) == 1
+    assert loc.amount_wei == 100
+
+
+@pytest.mark.parametrize("held", [100, 150])
+async def test_a_resume_with_nothing_left_to_send_completes_when_the_window_cannot_be_read(held):
+    # Fully or over-funded: nothing will be sent, so the window cannot change the outcome and a
+    # failed read of it must not strand a taker whose fund already completed.
+    rpc = _PushRpc(held=held, window=_window_unreadable)
+    coro, sent = _push(rpc, resuming=True)
+    loc = await coro
+    assert sent == [] and rpc.transfers == []
+    assert loc.amount_wei == 100
+
+
+async def test_a_resume_that_must_send_refuses_when_the_window_cannot_be_read():
+    # The refusal pair: here the window IS the guard, so an unreadable one fails closed.
+    rpc = _PushRpc(held=99, window=_window_unreadable)
+    coro, sent = _push(rpc, resuming=True)
+    with pytest.raises(NetworkError, match="no quorum of endpoints answered"):
+        await coro
+    assert sent == [] and rpc.transfers == []
+
+
+async def test_the_deploy_and_the_push_are_signed_with_their_gas_limits():
+    # The limits are fields of the signed transactions, so changing either changes what is
+    # broadcast. (The source records the deploy at 412,786 gas on a mainnet fork.)
+    rpc = _PushRpc(held=0)
+    coro, sent = _push(rpc, resuming=False)
+    await coro
+    ((deploy,), (push,)) = rpc.deploys, sent
+    assert deploy["gas"] == 800_000
+    assert push["gas"] == 100_000
+
+
 async def test_a_fresh_fund_sends_exactly_the_shortfall_even_when_it_is_one_unit():
     rpc = _PushRpc(held=0)
     coro, _ = _push(rpc, resuming=False, amount=1)
@@ -447,7 +580,7 @@ async def test_the_push_hash_is_recorded_with_its_nonce_before_the_broadcast():
     assert recorded == [(5, "0x" + "fe" * 32)]
 
 
-@pytest.mark.parametrize("kw", [{"push_status": 0}, {"statusless": True}])
+@pytest.mark.parametrize("kw", [{"push_status": 0}, {"push_status": 2}, {"statusless": True}])
 async def test_a_reverted_or_statusless_push_is_a_failure(kw):
     coro, _ = _push(_PushRpc(held=0, **kw), resuming=False)
     with pytest.raises(NetworkError, match="token transfer into .* reverted"):
@@ -462,75 +595,33 @@ async def test_an_over_delivering_token_is_accepted_and_an_under_delivering_one_
         await coro
 
 
-# ── _deploy: the receipt ────────────────────────────────────────────────────────────────────────
-
-
-def _deploying_leg(*, status=1, statusless=False, lie=None):
-    from pyrxd.eth_wallet.keys import derive_address
-
-    key = PrivateKeyMaterial(os.urandom(32))
-    sender = derive_address(key)
-
-    class _Ctor:
-        async def build_transaction(self, tx):
-            return dict(tx)
-
-    class _Rpc:
-        write_w3 = types.SimpleNamespace(
-            eth=types.SimpleNamespace(contract=lambda **_k: types.SimpleNamespace(constructor=lambda *a: _Ctor()))
-        )
-
-        async def fee_fields(self):
-            return {"maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
-
-        async def get_transaction_count(self, _a, block="pending"):
-            return 4
-
-        async def wait_receipt(self, _h, **_k):
-            r = {"contractAddress": lie or _create_address(sender, 4)}
-            if not statusless:
-                r["status"] = status
-            return r
-
-    leg = Erc20HtlcLeg(token=_USDC, rpc=_Rpc(), signing_key=key, chain_id=1, artifact=_ART)
-
-    async def _send(built, *, preflight=True, **_k):
-        assert preflight is False
-        return "0x" + "de" * 32
-
-    leg._sign_and_send = _send
-    return leg, sender
-
-
-def _deploy(leg):
-    return leg._deploy(
-        web3=__import__("web3"),
-        hashlock=b"\x33" * 32,
-        claimant="0x" + "44" * 20,
-        refundee="0x" + "55" * 20,
-        timeout=2_000_000_000,
-        amount_wei=_AMOUNT,
-        on_deploy=None,
-    )
+# ── fund: the deploy receipt ────────────────────────────────────────────────────────────────────
 
 
 async def test_deploy_returns_the_derived_address():
-    leg, sender = _deploying_leg()
-    assert await _deploy(leg) == (_create_address(sender, 4), "0x" + "de" * 32)
+    rpc = _PushRpc(held=0, pending=4)
+    coro, _ = _push(rpc, resuming=False)
+    loc = await coro
+    assert loc.contract_address.lower() == _create_address(rpc.deployer, 4).lower()
+    assert loc.deploy_tx_hash == _DEPLOY_HASH
 
 
-@pytest.mark.parametrize("kw", [{"status": 0}, {"status": 2}, {"statusless": True}])
+@pytest.mark.parametrize("kw", [{"deploy_status": 0}, {"deploy_status": 2}, {"deploy_statusless": True}])
 async def test_deploy_refuses_any_receipt_status_but_one(kw):
-    leg, _ = _deploying_leg(**kw)
+    rpc = _PushRpc(held=0, **kw)
+    coro, sent = _push(rpc, resuming=False)
     with pytest.raises(NetworkError, match="deploy reverted"):
-        await _deploy(leg)
+        await coro
+    assert sent == [] and rpc.transfers == []
 
 
 @pytest.mark.parametrize("lie", ["0x" + "00" * 20, "0x" + "ff" * 20])
 async def test_deploy_refuses_a_receipt_naming_ANY_other_address(lie):
-    leg, _ = _deploying_leg(lie=lie)
+    rpc = _PushRpc(held=0, lie=lie)
+    coro, sent = _push(rpc, resuming=False)
     with pytest.raises(ValidationError, match="deploy receipt names contract"):
-        await _deploy(leg)
+        await coro
+    assert sent == [] and rpc.transfers == []
 
 
 async def test_a_resume_REPLACES_its_own_pending_push_above_that_pushs_price():

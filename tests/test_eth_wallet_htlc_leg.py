@@ -202,6 +202,25 @@ async def test_a_refund_is_priced_at_the_nodes_own_fee(frozen_clock):
     await _leg(rpc).refund(_locator(timeout=_NOW))
     (base,) = rpc.built
     assert (base["maxFeePerGas"], base["maxPriorityFeePerGas"]) == (2_000_000_002, 2)
+    assert base["gas"] == 100_000  # a field of the signed refund
+
+
+async def test_a_claim_quoted_a_fee_BELOW_its_tip_is_priced_at_the_tip(frozen_clock):
+    # A node reporting maxFeePerGas < tip leaves no basefee share to scale: the share floors at
+    # 0, so the claim goes out at exactly the tip, never below it and never scaled above it.
+    rpc = _Rpc(max_fee=1, tip=5)
+    await _leg(rpc).claim(_locator(), b"\x01" * 32)
+    (base,) = rpc.built
+    assert (base["maxFeePerGas"], base["maxPriorityFeePerGas"]) == (5, 5)
+
+
+async def test_a_refund_quoted_a_fee_BELOW_its_tip_is_not_repriced(frozen_clock):
+    # Only the claim is re-priced. A refund's fee fields are the node's, unchanged, even when the
+    # pair is inconsistent. This pins what the code does; it is not a claim the pair is valid.
+    rpc = _Rpc(max_fee=1, tip=5)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    (base,) = rpc.built
+    assert (base["maxFeePerGas"], base["maxPriorityFeePerGas"]) == (1, 5)
 
 
 async def test_a_32_character_string_is_not_a_preimage():
@@ -260,9 +279,11 @@ async def test_is_final_is_at_or_under_the_finalized_checkpoint(block, final):
     assert await _leg(_FinalityRpc(block=block, finalized=10)).is_final("0xtx") is final
 
 
-@pytest.mark.parametrize("status", [0, None])
+@pytest.mark.parametrize("status", [0, 2, 0xFF, None])
 async def test_is_final_never_reports_a_failed_or_statusless_tx_final(status):
-    rpc = _FinalityRpc(status=0, block=1, finalized=10)
+    # EIP-658 defines 0 and 1 only, and the receipt comes from an untrusted RPC: anything but 1
+    # is not a success, including a value above it.
+    rpc = _FinalityRpc(status=status, block=1, finalized=10)
     if status is None:
 
         async def _no_status(tx_hash, **_k):
@@ -270,6 +291,15 @@ async def test_is_final_never_reports_a_failed_or_statusless_tx_final(status):
 
         rpc.wait_receipt = _no_status
     assert await _leg(rpc).is_final("0xtx") is False
+
+
+@pytest.mark.parametrize("status", [0, 2, 0xFF])
+async def test_a_claim_whose_status_is_not_one_is_never_FINAL(status):
+    # Buried well under the checkpoint, so only the status can decide.
+    v = await _leg(_FinalityRpc(status=status, block=5, finalized=10)).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.NOT_YET_FINAL_LIVE
+    v = await _leg(_FinalityRpc(status=1, block=5, finalized=10)).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.FINAL
 
 
 async def test_a_claim_in_the_finalized_block_itself_is_FINAL():
@@ -414,11 +444,22 @@ async def test_the_artifact_total_is_capped_at_exactly_256_kib():
 
 
 class _ProvenanceRpc:
-    def __init__(self, logs):
-        self.logs = logs
+    def __init__(self, logs, status=1):
+        self.logs, self.status = logs, status
 
     async def wait_receipt(self, tx_hash, **_k):
-        return {"status": 1, "logs": self.logs}
+        return {"status": self.status, "logs": self.logs}
+
+
+@pytest.mark.parametrize("status", [0, 2, 0xFF])
+async def test_provenance_refuses_any_claim_status_but_one(status):
+    # The log from our own contract carries p, so only the status stands between this receipt and
+    # "the maker collected".
+    p = os.urandom(32)
+    logs = [{"address": _CONTRACT, "topics": [], "data": "0x" + p.hex()}]
+    with pytest.raises(ValidationError, match="did not succeed"):
+        await _leg(_ProvenanceRpc(logs, status)).assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
+    await _leg(_ProvenanceRpc(logs, 1)).assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
 
 
 async def test_provenance_keeps_scanning_past_a_foreign_log_and_a_malformed_one():
@@ -662,9 +703,38 @@ async def test_an_uncorroborated_claim_receipt_gives_up_after_the_quorum_wait(mo
             raise NetworkError("endpoints disagree")
 
     with pytest.raises(NetworkError, match="no quorum of endpoints corroborated"):
-        await _leg(_Split())._confirmed_receipt("0xtx")
+        await _leg(_Split()).assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=os.urandom(32))
     # 60 s at a 2 s poll: thirty re-asks, not an unbounded spin.
     assert len(polls) == 30 and set(polls) == {2.0}
+
+
+async def test_a_quorum_that_forms_just_inside_the_60s_wait_is_accepted(monkeypatch):
+    """The honest-path pair: endpoints that only agree after 59.5 s are still in time."""
+    clock = {"t": 1000.0}
+    p = os.urandom(32)
+    agreed = {"status": 1, "logs": [{"address": _CONTRACT, "topics": [], "data": "0x" + p.hex()}]}
+    reads = []
+
+    async def _sleep(s):
+        clock["t"] += s
+
+    monkeypatch.setattr(hl, "time", types.SimpleNamespace(time=lambda: float(_NOW), monotonic=lambda: clock["t"]))
+    monkeypatch.setattr(hl.asyncio, "sleep", _sleep)
+
+    class _SlowThenAgreed:
+        async def wait_receipt(self, tx_hash, **_k):
+            return agreed
+
+        async def eth_call_quorum(self, make_call, *, label, combine):
+            reads.append(clock["t"])
+            if len(reads) == 1:
+                clock["t"] += 57.5  # one slow read: the endpoints answer, but do not yet agree
+            if len(reads) < 3:
+                raise NetworkError("endpoints disagree")
+            return agreed
+
+    await _leg(_SlowThenAgreed()).assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
+    assert reads == [1000.0, 1059.5, 1061.5]
 
 
 # ── fund: the deploy receipt ────────────────────────────────────────────────────────────────────
@@ -702,35 +772,39 @@ def _funding_leg(receipt_status=1, *, lie=None, statusless=False):
             return r
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=key, chain_id=11155111, artifact=_ART)
+    signed: list[dict] = []
 
     async def _send(built, *, preflight=True, private=False, on_signed=None):
         assert preflight is False  # a deploy has no `to`, so there is nothing to eth_call
+        signed.append(built)
         return deploy_hash
 
     leg._sign_and_send = _send
-    return leg, sender, deploy_hash
+    return leg, sender, deploy_hash, signed
 
 
 _FUND_ARGS = dict(hashlock=b"\x22" * 32, claimant="0x" + "33" * 20, refundee="0x" + "44" * 20, timeout=_NOW)
 
 
 async def test_fund_returns_a_locator_carrying_the_deploy_hash_verbatim():
-    leg, sender, deploy_hash = _funding_leg()
+    leg, sender, deploy_hash, signed = _funding_leg()
     loc = await leg.fund(amount_wei=1, **_FUND_ARGS)  # one wei is a valid amount
     assert loc.deploy_tx_hash == deploy_hash
     assert loc.contract_address == create_address(sender, 5)
     assert loc.amount_wei == 1
+    (deploy,) = signed
+    assert (deploy["gas"], deploy["value"]) == (800_000, 1)  # fields of the signed deploy
 
 
-@pytest.mark.parametrize("kw", [{"receipt_status": 0}, {"statusless": True}])
+@pytest.mark.parametrize("kw", [{"receipt_status": 0}, {"receipt_status": 2}, {"statusless": True}])
 async def test_fund_never_returns_a_locator_for_a_reverted_or_statusless_deploy(kw):
-    leg, _, _ = _funding_leg(**kw)
+    leg, _, _, _ = _funding_leg(**kw)
     with pytest.raises(NetworkError, match="deploy tx reverted"):
         await leg.fund(amount_wei=10**15, **_FUND_ARGS)
 
 
 @pytest.mark.parametrize("lie", ["0x" + "00" * 20, "0x" + "ff" * 20])
 async def test_fund_refuses_a_receipt_naming_ANY_other_address(lie):
-    leg, _, _ = _funding_leg(lie=lie)
+    leg, _, _, _ = _funding_leg(lie=lie)
     with pytest.raises(ValidationError, match="deploy receipt names contract"):
         await leg.fund(amount_wei=10**15, **_FUND_ARGS)
