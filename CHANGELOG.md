@@ -27,6 +27,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   output, or which outputs do. The CLI and the /inspect/ page print this reason. The `commit-dat`
   note now says "demands no token of its reveal, nor prevents one" instead of "creates no token".
 
+- **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
+  `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
+  an older pending run in a group when another queues, so a PR build could leave the published
+  docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
+  build has a group per ref.
+
 ### Documentation
 
 - Doc citations into `glyph/script.py` and `glyph/_inspect_core.py` re-pointed at the code they
