@@ -152,12 +152,19 @@ _JOINERS = frozenset({"\u200c", "\u200d"})
 _PRESENTATION_SELECTORS = frozenset({"\ufe0e", "\ufe0f"})
 
 
-#: Blank characters that are not category Zs but still render as empty space: U+2800 BRAILLE
-#: PATTERN BLANK (So) and U+1D159 MUSICAL SYMBOL NULL NOTEHEAD (So). With the non-ASCII Zs
-#: characters (NBSP, U+2000-200A, U+202F, U+205F, U+3000, ...) they are what :func:`_is_non_ascii_blank`
-#: escapes: a word spelled in them after ``invoice 42`` showed as ``invoice 42`` plus trailing
-#: space, with no banner (#747).
-_BLANKS_OUTSIDE_ZS = frozenset({"\u2800", "\U0001d159"})
+#: Characters outside category Zs that render as empty space: U+2800 BRAILLE PATTERN BLANK (So),
+#: U+1D159 MUSICAL SYMBOL NULL NOTEHEAD (So), U+FFFC OBJECT REPLACEMENT CHARACTER (So; DejaVu Sans
+#: Mono, a common default terminal font, draws it with no ink) and U+13441 / U+13442 EGYPTIAN
+#: HIEROGLYPH FULL / HALF BLANK (Lo from Unicode 15). With the non-ASCII Zs characters (NBSP,
+#: U+2000-200A, U+202F, U+205F, U+3000, ...) they are what :func:`_is_non_ascii_blank` escapes: a
+#: word spelled in them after ``invoice 42`` showed as ``invoice 42`` plus trailing space, with no
+#: banner (#747).
+#:
+#: REVIEWED, NOT DERIVED, AND NOT COMPLETE BY CONSTRUCTION. No Unicode property says "renders as
+#: blank" — that is a fact about fonts — so this is a list of the ones found, and a test pins its
+#: membership so a change is made on purpose. The ``ascii:`` line under the label is the backstop:
+#: it names every codepoint of a non-ASCII label, whatever this list misses.
+_BLANKS_OUTSIDE_ZS = frozenset({"\u2800", "\U0001d159", "\ufffc", "\U00013441", "\U00013442"})
 
 
 def _is_non_ascii_blank(ch: str) -> bool:
@@ -178,9 +185,10 @@ def _follows_a_symbol(label: str, i: int) -> bool:
 def _escaped_positions(label: str) -> list[bool]:
     """For each character of *label*, whether `mark` must print it as ``<U+XXXX>``.
 
-    The rule is "escape whatever can be signed without being SEEN", which includes every blank
-    character but the ASCII space (:func:`_is_non_ascii_blank`): it renders as white space, so a
-    word spelled in blanks shows as nothing. Exactly three ways honest
+    The rule is "escape whatever can be signed without being SEEN", which includes the blank
+    characters other than the ASCII space that :func:`_is_non_ascii_blank` recognises (every Zs, and
+    the reviewed list :data:`_BLANKS_OUTSIDE_ZS`): they render as white space, so a word spelled in
+    them shows as nothing. Exactly three ways honest
     text is written left to print as itself — each narrowed to where honest text puts it:
 
     * a combining mark (Mn, Me) that is NOT default-ignorable. It renders ON its base character:
@@ -205,7 +213,9 @@ def _escaped_positions(label: str) -> list[bool]:
         if _is_non_ascii_blank(ch):
             escaped[i] = True
         elif _is_default_ignorable(ch):
-            escaped[i] = not (ch in _PRESENTATION_SELECTORS and _follows_a_symbol(label, i))
+            # The base must itself be PRINTED: after an escaped U+2800 (So) a selector has nothing
+            # visible to select, and printing it raw would hide it behind ``<U+2800>``.
+            escaped[i] = not (ch in _PRESENTATION_SELECTORS and _follows_a_symbol(label, i) and not escaped[i - 1])
         elif _sanitize_display_string(ch) != ch:
             escaped[i] = unicodedata.category(ch) not in ("Mn", "Me")
 
@@ -237,8 +247,8 @@ def _label_lines(label: str | None, *, head: str, indent: str) -> list[str]:
 
     THE ESCAPES ARE NOT THE WHOLE OF WHAT MISLEADS. Some characters print as something while
     meaning something else: a Cyrillic ``о`` beside Latin letters renders as a Latin ``o`` and is
-    not escaped. (Blank characters other than the ASCII space, such as U+2800 BRAILLE PATTERN
-    BLANK, are escaped: see :func:`_escaped_positions`.) The ``ascii()`` form names every
+    not escaped. (The blank characters :func:`_is_non_ascii_blank` recognises, such as U+2800
+    BRAILLE PATTERN BLANK, are escaped: see :func:`_escaped_positions`.) The ``ascii()`` form names every
     codepoint, so the operator can see what is about to be signed whatever it looks like. An ASCII label gets no second line: its ``ascii()`` would say nothing new.
     """
     lines = [f"{head}{_label_for_display(label)}"]

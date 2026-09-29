@@ -9,10 +9,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
-  in non-ASCII blanks (NBSP, U+2002-200A, U+202F, U+205F, U+3000, U+2800 BRAILLE PATTERN BLANK,
-  U+1D159 and every other Unicode Zs character) after `invoice 42` showed as `invoice 42` plus
-  white space, with no banner. Each is now printed as `<U+XXXX>` and named in the banner. The
-  ASCII space is printed as typed, and the label is signed as typed either way.
+  in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
+  banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,
+  U+3000, ...) and a reviewed list of other characters that render as blank (U+2800 BRAILLE
+  PATTERN BLANK, U+1D159, U+FFFC, U+13441 and U+13442) is now printed as `<U+XXXX>` and named in
+  the banner. No Unicode property marks every character a font draws as blank, so that list
+  cannot be complete; the `ascii:` line under the label still names every codepoint. The ASCII
+  space is printed as typed, and the label is signed as typed either way.
 
 ## [0.25.0] — 2026-09-26
 

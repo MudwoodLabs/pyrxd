@@ -37,7 +37,9 @@ import pytest
 from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
+from pyrxd.cli.hashmark_cmds import _BLANKS_OUTSIDE_ZS
 from pyrxd.constants import GENESIS_BLOCK_HASHES
+from pyrxd.glyph._inspect_core import _sanitize_display_string
 from pyrxd.hashmark_tx import (
     MARK_MODELLED_BYTES,
     MarkPlan,
@@ -860,8 +862,9 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         assert "label:       advisory" in result.output and "ascii: " not in result.output
 
 
-#: Every non-ASCII blank #747 names: the Zs characters it lists, plus the two outside Zs.
-_BLANKS = ["\u00a0", "\u2002", "\u2007", "\u200a", "\u202f", "\u205f", "\u3000", "\u2800", "\U0001d159"]
+#: The Zs blanks #747 names, plus every non-Zs blank the code recognises (read from the code, so a
+#: character added there is exercised here without anyone remembering to add it).
+_BLANKS = ["\u00a0", "\u2002", "\u2007", "\u200a", "\u202f", "\u205f", "\u3000", *sorted(_BLANKS_OUTSIDE_ZS)]
 
 
 class TestBlankCharactersAreEscapedOnTheConfirmationLine:
@@ -879,7 +882,9 @@ class TestBlankCharactersAreEscapedOnTheConfirmationLine:
         assert blank not in result.output, "reached the terminal raw"
         assert f"label:       invoice 42{f'<U+{ord(blank):04X}>' * 3}x" in result.output
         assert _BANNER in result.output and "AS BLANK SPACE" in result.output
-        assert f"U+{ord(blank):04X}  {unicodedata.name(blank)} — shown above as <U+{ord(blank):04X}>" in result.output
+        name = unicodedata.name(blank, "(no Unicode name: unassigned or private use)")  # U+13441 is new in Unicode 15
+        read = "verify prints it as ?" if _sanitize_display_string(blank) != blank else "verify prints it as written"
+        assert f"U+{ord(blank):04X}  {name} — shown above as <U+{ord(blank):04X}>; {read}\n" in result.output
         assert decode_hashmark(_published_script(h)).label == label, "shown, and signed as typed"
 
     def test_every_zs_character_but_the_ascii_space_is_escaped(self) -> None:
@@ -893,6 +898,22 @@ class TestBlankCharactersAreEscapedOnTheConfirmationLine:
         assert " " in zs and len(zs) > 10
         for ch in zs:
             assert _escaped_positions("a" + ch + "b") == [False, ch != " ", False], f"U+{ord(ch):04X}"
+
+    def test_the_non_zs_blank_list_is_the_reviewed_set(self) -> None:
+        """REVIEWED, NOT DERIVED: no Unicode property says "renders as blank", so the list is a judgement.
+
+        Pinned so a change to it is made on purpose. U+FFFC and the two Egyptian blanks were added
+        after a review drew a word in them that DejaVu Sans Mono showed as empty space.
+        """
+        assert frozenset({"\u2800", "\U0001d159", "\ufffc", "\U00013441", "\U00013442"}) == _BLANKS_OUTSIDE_ZS
+
+    def test_a_selector_after_an_escaped_blank_is_escaped_too(self) -> None:
+        """U+2800 is So, the category an emoji base has; once it is escaped, a U+FE0F after it selects
+        nothing visible, so printing that raw hid it behind ``<U+2800>`` while the banner said "as written"."""
+        from pyrxd.cli.hashmark_cmds import _escaped_positions
+
+        assert _escaped_positions("x\u2800\ufe0f y") == [False, True, True, False, False]
+        assert _escaped_positions("\u2764\ufe0f") == [False, False], "the honest heart + FE0F still prints as written"
 
     def test_an_ordinary_ascii_space_is_untouched(self, runner, tmp_path, monkeypatch) -> None:
         """The honest path: ASCII spaces, and a label of nothing else, print as typed with no banner."""
