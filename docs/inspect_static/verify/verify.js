@@ -748,13 +748,21 @@ function namedOutputNote(named, payload) {
   const count = payload.output_count;
   if (!Number.isInteger(n) || !Number.isInteger(count)) return null;
   const marked = hashmarkRecords(payload).map((r) => r.vout).filter((v) => Number.isInteger(v));
+  // WHAT COULD NOT BE READ qualifies every sentence about where the records are: with an output
+  // unread, "its record" and "carries N records" are counts nobody finished. The same wording rule
+  // as `pyrxd verify` (`_named_output` / `_unread_clause` in src/pyrxd/cli/hashmark_cmds.py).
+  const unread = unreadVouts(payload);
+  const could = unread.length > 0 ? " this page could read" : "";
   // A COUNT past one, never a list: a transaction can carry tens of thousands of records, and
   // this sentence must not grow with it (see MAX_MARK_PANELS).
-  const where = marked.length === 0
-    ? "It carries no HashMark record in any output."
+  const where = (marked.length === 0
+    ? `It carries no HashMark record in any output${could}.`
     : marked.length === 1
-      ? `Its HashMark record is in output ${marked[0]}, and the panel below is about that output.`
-      : `It carries ${marked.length} HashMark records in other outputs; each panel below names its own.`;
+      ? (unread.length > 0
+        ? `The only HashMark record this page could read is in output ${marked[0]}, and the panel below is about that output.`
+        : `Its HashMark record is in output ${marked[0]}, and the panel below is about that output.`)
+      : `It carries ${marked.length} HashMark records${could} in other outputs; each panel below names its own.`)
+    + unreadClause(unread.filter((v) => v !== n).length);
   if (n < 0 || n >= count) {
     return (
       `That transaction has ${count} output${count === 1 ? "" : "s"} (numbered 0 to ${count - 1}), ` +
@@ -779,8 +787,7 @@ function namedOutputNote(named, payload) {
   // `type: "error"` (the per-output try/except in `classify_raw_tx`). Whether that output is a
   // record is not known either way, so it gets neither sentence — the same line `pyrxd verify`
   // draws (`_named_output` in src/pyrxd/cli/hashmark_cmds.py).
-  const outputs = Array.isArray(payload.outputs) ? payload.outputs : [];
-  if (outputs.some((row) => row && row.vout === n && row.type === "error")) {
+  if (unread.includes(n)) {
     return (
       `Output ${n}, the one you named, could not be classified here, so this page cannot say ` +
       `whether it is a HashMark record, and nothing below is about it. ${where}`
@@ -791,6 +798,23 @@ function namedOutputNote(named, payload) {
   );
 }
 
+// The outputs the classifier could not read: its per-output try/except makes each a row of
+// `type: "error"`. Whether any of them is a HashMark record is UNKNOWN. This page classifies with
+// no row limit (it passes no `max_rows`), so every output has a row and none can be missing here.
+function unreadVouts(payload) {
+  const outputs = payload && Array.isArray(payload.outputs) ? payload.outputs : [];
+  return outputs
+    .filter((row) => row && row.type === "error" && Number.isInteger(row.vout))
+    .map((row) => row.vout);
+}
+
+// The sentence for `k` outputs, other than the one named, that could not be read.
+function unreadClause(k) {
+  if (k <= 0) return "";
+  if (k === 1) return " 1 other output could not be classified here, so whether it is a HashMark record is unknown.";
+  return ` ${k} other outputs could not be classified here, so whether any of them is a HashMark record is unknown.`;
+}
+
 // NO MARK, SAID ABOUT WHAT WAS ACTUALLY READ. "It is not a HashMark record" is a claim about
 // one script, and it was being printed for every input that was not a transaction number —
 // including an outpoint and a contract id that point at a real mark, and a raw transaction,
@@ -799,7 +823,18 @@ function namedOutputNote(named, payload) {
 // not know) only what the page did and did not find.
 function renderNoMark(result, payload) {
   const sec = el("section", { class: "problem" });
-  if (result.form === "txid") {
+  const unread = unreadVouts(payload);
+  if (result.form === "txid" && unread.length > 0) {
+    // AN OUTPUT THAT COULD NOT BE READ MAY BE A RECORD, so "none of its outputs carries one" and
+    // "it is simply not a mark" would be claims nobody finished. Say what was read, and what was not.
+    const k = unread.length;
+    sec.appendChild(el("h2", { class: "problem-title", text: "No HashMark record could be read here" }));
+    sec.appendChild(para(
+      "That transaction is on the chain, and none of the outputs this page could read carries a " +
+      `HashMark record. ${k} ${k === 1 ? "output" : "outputs"} could not be classified here, so ` +
+      `whether ${k === 1 ? "it is" : "any of them is"} a record is unknown.`,
+    ));
+  } else if (result.form === "txid") {
     sec.appendChild(el("h2", { class: "problem-title", text: "There is no HashMark here" }));
     sec.appendChild(para(
       "That transaction is on the chain, and none of its outputs carries a HashMark " +

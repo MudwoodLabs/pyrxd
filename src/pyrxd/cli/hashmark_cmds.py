@@ -44,7 +44,7 @@ from ..glyph.client import BroadcastEchoMismatch
 from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
-from ..security.types import Txid
+from ..security.types import _TXID_RE, Txid
 
 # THE §7.6 MACHINERY IS IMPORTED, NOT RESTATED. `verify` is a new entry point onto the verdict
 # `glyph inspect` already computes — the form-1/form-2 resolution, the degrade-with-a-reason,
@@ -1151,6 +1151,7 @@ def _verify_target(arg: str) -> tuple[str, dict | None]:
     if ":" in wanted:
         try:
             ref = _inspect_outpoint(wanted)
+            _require_whole_txid(str(ref["txid"]))
         except ValidationError as exc:
             raise _outpoint_refusal(wanted, exc) from exc
         return str(ref["txid"]), {
@@ -1164,10 +1165,25 @@ def _verify_target(arg: str) -> tuple[str, dict | None]:
         ref = _inspect_contract(lowered)
         return str(ref["txid"]), {"form": "contract", "input": lowered, "txid": str(ref["txid"]), "vout": ref["vout"]}
     try:
+        # `.strip()` above already removed any trailing newline, so `Txid`'s `$` gap cannot reach here.
         Txid(lowered)
     except ValidationError as exc:
         raise UserError("that is not a transaction id", cause=str(exc), fix=_NOT_A_TXID_FIX) from exc
     return lowered, None
+
+
+def _require_whole_txid(txid: str) -> None:
+    """Refuse a txid that ``Txid`` accepted with a trailing newline.
+
+    ``_TXID_RE`` is anchored ``^…$`` and ``Txid`` applies it with ``.match``, and ``$`` also matches
+    just before a final ``\n``. So ``"<txid>\n:0"`` parsed as an outpoint whose txid ends in a
+    newline, and that string was sent to ElectrumX: exit 2, "could not reach ElectrumX", for what is
+    an input error, which 0.25.0 refused with exit 1. ``fullmatch`` has no such gap. Applied here, at
+    this command's one outpoint call site, rather than in ``Txid``, whose other callers are a
+    separate change.
+    """
+    if not _TXID_RE.fullmatch(txid):
+        raise ValidationError(f"Txid must be 64 lowercase hex chars (got length {len(txid)})")
 
 
 def _outpoint_refusal(wanted: str, exc: ValidationError) -> UserError:
@@ -1189,6 +1205,23 @@ def _outpoint_refusal(wanted: str, exc: ValidationError) -> UserError:
         fix=f"the part before ':' holds a transaction id, {txid}. Give that alone as the argument to check "
         f"that transaction, or name one of its outputs by number, with no spaces, as in {txid}:0",
     )
+
+
+def _unread_vouts(payload: dict) -> list[Any]:
+    """The outputs the classifier could not read: its per-output ``except`` makes each a row of
+    ``type: "error"``. Whether any of them is a HashMark record is UNKNOWN — neither "is one" nor
+    "is not one" may be said of it. ``verify`` classifies with no row limit, so every output has a
+    row and none can be missing from this list."""
+    return [row.get("vout") for row in payload.get("outputs") or [] if row.get("type") == "error"]
+
+
+def _unread_clause(k: int) -> str:
+    """The sentence for ``k`` outputs other than the named one that could not be read."""
+    if k <= 0:
+        return ""
+    if k == 1:
+        return " 1 other output could not be classified here, so whether it is a HashMark record is unknown."
+    return f" {k} other outputs could not be classified here, so whether any of them is a HashMark record is unknown."
 
 
 def _outputs_phrase(count: Any) -> str:
@@ -1233,20 +1266,28 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
         if refusal_vout is not None and refusal_vout != verdict_vout
         else ""
     )
-    if len(record_vouts) == 1:
+    # WHAT COULD NOT BE READ qualifies every sentence about where the records are: with an output
+    # unread, "the transaction's record" and "carries N records" are counts nobody finished.
+    unread = _unread_vouts(payload)
+    could = " that could be read" if unread else ""
+    if len(record_vouts) == 1 and not unread:
         where = f"The transaction's HashMark record is in output {record_vouts[0]}, and the verdict below is about it."
+    elif len(record_vouts) == 1:
+        where = (
+            f"The only HashMark record that could be read is in output {record_vouts[0]}, and the verdict below "
+            "is about it."
+        )
     else:
         where = (
-            f"The transaction carries {len(record_vouts)} HashMark records in other outputs; the verdict below is "
-            f"about the one at vout {verdict_vout}{but_sig}, and each is listed separately."
+            f"The transaction carries {len(record_vouts)} HashMark records{could} in other outputs; the verdict "
+            f"below is about the one at vout {verdict_vout}{but_sig}, and each is listed separately."
         )
+    where += _unread_clause(sum(1 for v in unread if v != n))
     exists = isinstance(count, int) and 0 <= n < count
     holds = n in record_vouts
-    # A row the classifier crashed on reads `type: "error"`. It is not KNOWN to be a record, and it is
-    # not known not to be one either, so it gets neither sentence.
-    unreadable = not holds and any(
-        r.get("vout") == n and r.get("type") == "error" for r in payload.get("outputs") or []
-    )
+    # A row the classifier crashed on is not KNOWN to be a record, and not known not to be one either,
+    # so it gets neither sentence.
+    unreadable = not holds and n in unread
     if not exists:
         says.append(
             f"That transaction has {_outputs_phrase(count)}, so there is no output {n}: what you gave points at "
@@ -1274,6 +1315,10 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
         # None when it could not be classified: not known either way.
         "output_holds_record": None if unreadable else holds,
         "verdict_is_about_it": holds and n == verdict_vout,
+        # WHICH record the verdict's signature line is about. Usually the verdict's own record; when a
+        # record elsewhere does not decode or verify, that one — the caveat `says` spells out, which a
+        # consumer reading only `verdict_is_about_it` would otherwise lose.
+        "signature_line_vout": refusal_vout if refusal_vout is not None else verdict_vout,
         "says": says,
     }
 
@@ -1415,24 +1460,42 @@ def verify_cmd(
     # FROM THE ROWS, so a record and its vout cannot come apart: every check below is attached
     # to a record, and the summary names the record by the vout of the row it came from.
     records = [row["hashmark"] for row in rows]
+    # NO RECORD, SAID ABOUT WHAT WAS READ. An output the classifier could not read may be a record,
+    # so with one unread "none of them decodes" / "no HashMark record" would be claims nobody finished.
+    unread = _unread_vouts(payload) if not records else []
+    count = payload.get("output_count", "?")
+    none_found = (
+        f"{wanted} has {count} output(s); none of those that could be read decodes as a HashMark, and "
+        f"{len(unread)} could not be classified here, so whether {'it is' if len(unread) == 1 else 'any of them is'} "
+        "one is unknown"
+        if unread
+        else f"{wanted} has {count} output(s) and none of them decodes as a HashMark"
+    )
     if not records and named is not None:
         # NOT the digest hint below: an outpoint and a contract id are not the shape of a digest.
-        count, n = payload.get("output_count", "?"), named["vout"]
-        which = (
-            f"output {n}, the one you named, among them"
-            if isinstance(count, int) and 0 <= n < count
-            else f"and there is no output {n}, the one you named: it has {_outputs_phrase(count)}"
-        )
+        n = named["vout"]
+        if not (isinstance(count, int) and 0 <= n < count):
+            which = f"and there is no output {n}, the one you named: it has {_outputs_phrase(count)}"
+        elif n in unread:
+            which = f"output {n}, the one you named, is one that could not be classified"
+        elif unread:
+            which = f"output {n}, the one you named, could be read, and is not one"
+        else:
+            which = f"output {n}, the one you named, among them"
         raise UserError(
-            "no HashMark record in the transaction you named an output of",
-            cause=f"{wanted} has {count} output(s) and none of them decodes as a HashMark — {which}",
+            "no HashMark record could be read in the transaction you named an output of"
+            if unread
+            else "no HashMark record in the transaction you named an output of",
+            cause=f"{none_found} — {which}",
             fix=f"what you gave points at transaction {wanted}, and a mark is checked by the transaction "
             "that carries it: check that you were given the mark's own transaction or output",
         )
     if not records:
         raise UserError(
-            "no HashMark record in that transaction",
-            cause=f"{wanted} has {payload.get('output_count', '?')} output(s) and none of them decodes as a HashMark",
+            "no HashMark record could be read in that transaction"
+            if unread
+            else "no HashMark record in that transaction",
+            cause=none_found,
             fix="check the txid. A digest is the same shape as a txid and is not one: if that is "
             "what you have, give the mark's txid and pass the digest with --digest.",
         )

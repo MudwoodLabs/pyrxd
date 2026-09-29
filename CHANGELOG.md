@@ -17,7 +17,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on stderr under `--quiet`. A `<txid>:<n>` that does not parse is refused with its txid named.
   The `/verify/` page already did this, except that it called a named output its classifier could
   not read "NOT a HashMark record". It now says, as the command does, that whether that output is
-  a record is unknown.
+  a record is unknown. Where an output could not be read, neither surface says a transaction has
+  "no HashMark record" or counts its records as final: both say what could be read and how many
+  outputs could not. `named_by.signature_line_vout` in `--json` says which record the verdict's
+  signature line is about.
 
 ## [0.25.0] — 2026-09-26
 

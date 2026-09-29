@@ -32,6 +32,22 @@ from pyrxd.keys import PrivateKey
 from tests.test_hashmark_verify_cli import _FakeServer, _mark_script, _run, _tx_with
 
 _CHANGE = b"\x76\xa9\x14" + bytes(range(20)) + b"\x88\xac"  # a P2PKH change output: not a record
+# Another P2PKH, which the tests below make the classifier CRASH on, so its row is `type: "error"`.
+_UNREAD = b"\x76\xa9\x14" + bytes([7] * 20) + b"\x88\xac"
+
+
+def _crash_on(monkeypatch, *scripts: bytes) -> None:
+    """Plant a crash in the REAL classifier for ``scripts`` only. The row that reaches the command is
+    then the one `classify_raw_tx`'s own per-output ``except`` builds, not a hand-written dict."""
+    real = _inspect_core._classify_script
+    doomed = {s.hex() for s in scripts}
+
+    def crashing(script_hex: str, **kw):
+        if script_hex in doomed:
+            raise RuntimeError("planted classifier crash")
+        return real(script_hex, **kw)
+
+    monkeypatch.setattr(_inspect_core, "_classify_script", crashing)
 
 
 def _contract(txid: str, vout: int) -> str:
@@ -204,12 +220,27 @@ class TestSeveralRecords:
         assert "record:     vout 0" in r.output, "the verdict must be about the vout the sentence names"
         assert "HashMark record at vout 1:" in r.output, "the section the sentence points at must exist"
 
+        j = _verify(monkeypatch, tmp_path, two_marks["server"], f"{txid}:1", "--digest", two_marks["digest"], "--json")
+        out = json.loads(j.stdout)
+        named = out["named_by"]
+        assert out["verdict_record"]["vout"] == 0, "the premise: the verdict is about output 0"
+        assert named["output_holds_record"] is True
+        assert named["verdict_is_about_it"] is False, "output 1 holds a record the verdict is NOT about"
+        assert named["signature_line_vout"] == 0
+
     def test_the_named_record_is_the_one_the_verdict_is_about(self, monkeypatch, tmp_path, two_marks) -> None:
         txid = two_marks["txid"]
         r = _verify(monkeypatch, tmp_path, two_marks["server"], f"{txid}:0", "--digest", two_marks["digest"])
         assert r.exit_code == 0, r.output
         assert "Output 0, the one you named, holds the HashMark record the verdict below is about." in (
             _said_before_the_verdict(r.output)
+        )
+        j = _verify(monkeypatch, tmp_path, two_marks["server"], f"{txid}:0", "--digest", two_marks["digest"], "--json")
+        named = json.loads(j.stdout)["named_by"]
+        assert (named["output_holds_record"], named["verdict_is_about_it"], named["signature_line_vout"]) == (
+            True,
+            True,
+            0,
         )
 
     def test_not_a_record_says_how_many_there_are_and_which_one_the_verdict_is_about(
@@ -224,6 +255,9 @@ class TestSeveralRecords:
             "The transaction carries 2 HashMark records in other outputs; the verdict below is about the one at "
             "vout 0, and each is listed separately." in said
         )
+        j = _verify(monkeypatch, tmp_path, two_marks["server"], f"{txid}:2", "--digest", two_marks["digest"], "--json")
+        named = json.loads(j.stdout)["named_by"]
+        assert (named["output_holds_record"], named["verdict_is_about_it"]) == (False, False)
 
 
 class TestAForgedRecordBesideAGoodOne:
@@ -267,6 +301,19 @@ class TestAForgedRecordBesideAGoodOne:
         assert "record:     vout 0" in r.output
         assert "the signature line is about the record at vout 1" in _flat(r.output)
 
+    @pytest.mark.parametrize(("n", "about_it"), [(0, True), (1, False), (2, False)])
+    def test_the_json_carries_the_caveat_the_text_does(self, monkeypatch, tmp_path, forged_at_1, n, about_it) -> None:
+        """``verdict_is_about_it: true`` beside ``verdict_holds: false`` read as "the record you named
+        failed", when what failed is the signature line — about vout 1. The text said so; the JSON
+        did not, so a consumer reading the fields lost the caveat."""
+        j = _verify(monkeypatch, tmp_path, forged_at_1["server"], f"{forged_at_1['txid']}:{n}", "--json")
+        assert j.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, j.output
+        out = json.loads(j.stdout)
+        assert out["verdict_holds"] is False
+        assert out["named_by"]["verdict_is_about_it"] is about_it
+        assert out["named_by"]["signature_line_vout"] == 1, "the vout the signature line is about"
+        assert out["named_by"]["signature_line_vout"] == out["verdict_record"]["refusal_vout"]
+
 
 # --------------------------------------------------------------------------- unknown, not "not a record"
 
@@ -274,22 +321,91 @@ class TestAForgedRecordBesideAGoodOne:
 def test_an_output_the_classifier_could_not_read_is_not_called_a_non_record(monkeypatch, tmp_path, two_outputs) -> None:
     """A classifier crash becomes a ``type: "error"`` row. Whether that output is a record is
     UNKNOWN, and "is NOT a HashMark record" would be a claim nobody established."""
-    real = _inspect_core._classify_script
-
-    def crash_on_the_change(script_hex: str, **kw):
-        if script_hex == _CHANGE.hex():
-            raise RuntimeError("planted classifier crash")
-        return real(script_hex, **kw)
-
-    monkeypatch.setattr(_inspect_core, "_classify_script", crash_on_the_change)
+    _crash_on(monkeypatch, _CHANGE)
     r = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{two_outputs['txid']}:1")
     assert r.exit_code == 0, r.output
     said = _said_before_the_verdict(r.output)
     assert "Output 1, the one you named, could not be classified here, so this cannot say whether it is a" in said
     assert "is NOT a HashMark record" not in said
+    # "The transaction's record" would claim a count nobody finished; and no OTHER output is unread.
+    assert "The only HashMark record that could be read is in output 0, and the verdict below is about it." in said
+    assert "other output" not in said
 
     j = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{two_outputs['txid']}:1", "--json")
     assert json.loads(j.stdout)["named_by"]["output_holds_record"] is None
+
+
+def test_an_unread_output_ELSEWHERE_does_not_make_the_named_one_unread(monkeypatch, tmp_path) -> None:
+    """The error row is at output 2; the reader named output 1, a change output that WAS read. Output 1
+    is judged on its own row — "NOT a HashMark record" — and output 2 is reported as unread. A check
+    that asked "is ANY output unread?" instead of "is THIS one?" would call output 1 unread."""
+    content = b"the advisory, as published\n"
+    txid, raw = _tx_with(_mark_script(content, PrivateKey()), _CHANGE, _UNREAD)
+    _crash_on(monkeypatch, _UNREAD)
+    server = _FakeServer({txid: raw})
+    r = _verify(monkeypatch, tmp_path, server, f"{txid}:1")
+    assert r.exit_code == 0, r.output
+    said = _said_before_the_verdict(r.output)
+    assert "Output 1, the one you named, is NOT a HashMark record, so the verdict below is not about it." in said
+    assert (
+        "The only HashMark record that could be read is in output 0, and the verdict below is about it. 1 other "
+        "output could not be classified here, so whether it is a HashMark record is unknown." in said
+    )
+    assert "Output 1, the one you named, could not be classified" not in said
+
+    named = json.loads(_verify(monkeypatch, tmp_path, server, f"{txid}:1", "--json").stdout)["named_by"]
+    assert named["output_holds_record"] is False, "output 1 was read, and is not a record"
+
+
+@pytest.mark.parametrize(("spell", "gave"), FORMS)
+class TestNoMarkAndAnOutputThatCouldNotBeRead:
+    """No record was found, and one output could not be read — so "no HashMark record" and "none of
+    them decodes" are claims nobody finished. Output 0 crashes the classifier; output 1 is read."""
+
+    @pytest.fixture
+    def unread_at_0(self, monkeypatch):
+        txid, raw = _tx_with(_UNREAD, _CHANGE)
+        _crash_on(monkeypatch, _UNREAD)
+        return {"txid": txid, "server": _FakeServer({txid: raw})}
+
+    def test_naming_the_unread_output(self, monkeypatch, tmp_path, unread_at_0, spell, gave) -> None:
+        r = _verify(monkeypatch, tmp_path, unread_at_0["server"], spell(unread_at_0["txid"], 0))
+        assert r.exit_code == 1, r.output
+        flat = _flat(r.output)
+        assert "no HashMark record could be read in the transaction you named an output of" in flat
+        assert (
+            f"{unread_at_0['txid']} has 2 output(s); none of those that could be read decodes as a HashMark, and 1 "
+            "could not be classified here, so whether it is one is unknown — output 0, the one you named, is one "
+            "that could not be classified" in flat
+        )
+        assert "among them" not in flat and "none of them decodes" not in flat
+
+    def test_naming_the_output_that_was_read(self, monkeypatch, tmp_path, unread_at_0, spell, gave) -> None:
+        r = _verify(monkeypatch, tmp_path, unread_at_0["server"], spell(unread_at_0["txid"], 1))
+        assert r.exit_code == 1, r.output
+        flat = _flat(r.output)
+        assert "output 1, the one you named, could be read, and is not one" in flat
+        assert "none of them decodes" not in flat
+
+    def test_naming_an_output_it_does_not_have(self, monkeypatch, tmp_path, unread_at_0, spell, gave) -> None:
+        r = _verify(monkeypatch, tmp_path, unread_at_0["server"], spell(unread_at_0["txid"], 2))
+        assert r.exit_code == 1, r.output
+        flat = _flat(r.output)
+        assert "1 could not be classified here" in flat
+        assert "and there is no output 2, the one you named: it has 2 outputs (numbered 0 to 1)" in flat
+
+
+def test_a_bare_txid_with_no_mark_and_an_unread_output_says_what_was_read(monkeypatch, tmp_path) -> None:
+    """The same claim on the bare-txid path: "no HashMark record in that transaction" is unfinished
+    when an output could not be read. The ordinary no-mark refusal is unchanged (next test)."""
+    txid, raw = _tx_with(_UNREAD, _CHANGE)
+    _crash_on(monkeypatch, _UNREAD)
+    r = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), txid)
+    assert r.exit_code == 1, r.output
+    flat = _flat(r.output)
+    assert "no HashMark record could be read in that transaction" in flat
+    assert "none of those that could be read decodes as a HashMark, and 1 could not be classified here" in flat
+    assert "--digest" in flat, "a bare txid keeps the digest hint"
 
 
 # --------------------------------------------------------------------------- no record at all
@@ -341,6 +457,25 @@ class TestARefusalNamesTheTxidYouTyped:
         assert r.exit_code == 1, r.output
         assert "that is not an output reference" in _flat(r.output)
         assert f"holds a transaction id, {txid}." in _flat(r.output)
+
+    def test_a_newline_before_the_colon_is_an_input_error_not_a_network_one(
+        self, monkeypatch, tmp_path, two_outputs
+    ) -> None:
+        """``Txid`` matches ``^[0-9a-f]{64}$`` with ``.match``, and ``$`` matches before a final newline,
+        so ``"<txid>\\n:0"`` parsed, and the txid WITH its newline was sent to ElectrumX: exit 2,
+        "could not reach ElectrumX". It is refused before the network, as 0.25.0 refused it."""
+        txid = two_outputs["txid"]
+        r = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{txid}\n:0")
+        assert r.exit_code == 1, r.output
+        flat = _flat(r.output)
+        assert "that is not an output reference" in flat
+        assert f"holds a transaction id, {txid}." in flat
+        assert "ElectrumX" not in flat
+        assert two_outputs["server"].calls == [], "refused before the network"
+
+        # The honest neighbour: whitespace AROUND the whole argument is what a shell adds, and is trimmed.
+        ok = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{txid}:0\n")
+        assert ok.exit_code == 0, ok.output
 
     def test_a_bad_txid_before_the_colon_is_not_called_one(self, monkeypatch, tmp_path, two_outputs) -> None:
         r = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{two_outputs['txid'][:-1]}:0")
