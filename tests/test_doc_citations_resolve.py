@@ -617,8 +617,8 @@ def _without_module_prefix(parts: list[str], path: str) -> list[str]:
 
     Only a prefix that is a contiguous run of *path*'s own components is dropped (so
     ``pyrxd.glyph``, the re-export path, is too), and at least one part is always kept. A
-    prefix that names anything else (``Wrong.method``) is left alone, and the name is then held
-    to whichever rule its full spelling reaches.
+    prefix that names anything else (``Wrong.method``) is left alone, and ``check_symbol``
+    then refuses the name if the file defines ``method`` under some other qualifier.
     """
     module = path.removesuffix(".py").split("/")
     if module[-1] == "__init__":
@@ -629,9 +629,35 @@ def _without_module_prefix(parts: list[str], path: str) -> list[str]:
     return parts
 
 
-def _lands_on(d: Definition, first: int, last: int) -> bool:
-    """The cited lines are inside the definition, or the definition is inside the cited lines."""
-    return (d.first <= first and last <= d.last) or (first <= d.first and d.last <= last)
+#: How many lines a citation of a definition may take in above it (a leading comment and a
+#: blank) and below it (the two blank lines PEP 8 leaves after a top-level definition). Only
+#: blank and comment lines count. Measured on the real docs when this was set: every one of the
+#: 35 citations the definition rule checked lay INSIDE its definition, so honest citations use
+#: none of this; it is room for a comment, not for code.
+_LEAD_ALLOWANCE = 3
+_TRAIL_ALLOWANCE = 2
+
+
+def _is_filler(line: str) -> bool:
+    """A blank or comment-only line: the only kind a citation may take in beside a definition."""
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _lands_on(d: Definition, first: int, last: int, lines: list[str]) -> bool:
+    """The cited lines overlap the definition, and any they take in outside it are at most
+    ``_LEAD_ALLOWANCE`` lines above it and ``_TRAIL_ALLOWANCE`` below, all blank or comments.
+
+    So a range inside the definition passes, and so does one that adds a leading comment. A
+    range that holds the definition among other code does not, however much of it there is:
+    ``swap_state.py:1-800`` contains ``NegotiatedTerms.to_dict`` and says nothing about where.
+    """
+    if last < d.first or first > d.last:
+        return False
+    if d.first - first > _LEAD_ALLOWANCE or last - d.last > _TRAIL_ALLOWANCE:
+        return False
+    outside = [*range(first, d.first), *range(d.last + 1, last + 1)]
+    return all(0 < n <= len(lines) and _is_filler(lines[n - 1]) for n in outside)
 
 
 def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None]:
@@ -645,12 +671,15 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
       one qualified name (bare ``to_dict``, with ``NegotiatedTerms.to_dict`` and
       ``SwapRecord.to_dict`` both defined) and none of them exactly, the citation is refused
       as ambiguous: which one the doc meant cannot be known, the same stance as a bare file
-      name two files share. Otherwise the cited lines must lie inside one of the definitions
-      (decorators through last line), or contain one whole. Inside, because the docs
-      deliberately cite a branch inside a function (``holder_hash``'s ``rxd`` branch); whole,
-      because a range may cite a definition with its surroundings. A range that only
-      straddles an edge, starting before a definition and ending inside it or the reverse,
-      is how a range looks after the code moved under it, so it is refused.
+      name two files share. A dotted name the file does not define, when the file DOES define
+      its last part (``Wrong.iter_input_refs``, ``X.to_dict``), is refused as naming nothing:
+      falling through to the occurrence rule would accept it wherever the last part appears.
+      Otherwise the cited lines must land on one of the definitions (decorators through last
+      line), see ``_lands_on``: inside it, because the docs deliberately cite a branch inside
+      a function (``holder_hash``'s ``rxd`` branch), or over it with at most a few blank or
+      comment lines either side. A range that takes in other code — straddling an edge, or
+      holding the whole definition among its neighbours — is how a range looks after the
+      code moved under it, or one too wide to say where the name is, so it is refused.
     * ``"occurrence"`` — *path* is not Python (the vendored C++), or does not define the
       name (a dict key, a string value, an imported name). The name's last part must then
       appear as a whole word in the cited lines. This is weaker: it cannot tell a C++
@@ -664,6 +693,7 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
     assert cit.symbol is not None, "only a citation that names a symbol has one to check"
     first, last = cit.start, cit.end if cit.end is not None else cit.start
     parts = cit.symbol.split(".")
+    lines = source.splitlines()
     if path.endswith(".py"):
         try:
             definitions = python_definitions(source)
@@ -680,6 +710,12 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
         if not defined:
             parts = _without_module_prefix(parts, path)
             defined = matching(parts)
+        if not defined and len(parts) > 1 and (same_last := matching(parts[-1:])):
+            return "definition", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` names nothing {path} defines — it "
+                f"defines `{parts[-1]}` only as {', '.join(sorted({d.qualname for d in same_last}))}. "
+                "Correct the qualified name."
+            )
         exact = [d for d in defined if d.qualname == ".".join(parts)]
         defined = exact or defined
         qualnames = sorted({d.qualname for d in defined})
@@ -690,7 +726,7 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
                 "against the one it means."
             )
         if defined:
-            if any(_lands_on(d, first, last) for d in defined):
+            if any(_lands_on(d, first, last, lines) for d in defined):
                 return "definition", None
             spans = ", ".join(
                 str(d.first) if d.first == d.last else f"{d.first}-{d.last}"
@@ -698,10 +734,11 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
             )
             return "definition", (
                 f"{cit.where}: `{cit.symbol}` is cited at `{cit.text}`, but {path} defines it at "
-                f"line(s) {spans}, and the cited lines are not inside it. Re-cite it where it is."
+                f"line(s) {spans}, and the cited lines are not on it (inside it, or over it with at "
+                f"most {_LEAD_ALLOWANCE} blank or comment lines above and {_TRAIL_ALLOWANCE} below). "
+                "Re-cite it where it is."
             )
     word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(parts[-1])}(?![A-Za-z0-9_])")
-    lines = source.splitlines()
     if any(word.search(line) for line in lines[first - 1 : last]):
         return "occurrence", None
     seen = [n for n, line in enumerate(lines, 1) if word.search(line)]
@@ -1119,8 +1156,9 @@ class TestTheSymbolRule:
             ("Other.method", 24, None),
             ("Other.method", 24, 25),
             ("decorated", 8, 11),  # exactly the definition
-            ("decorated", 4, 11),  # a range that holds the whole definition
-            ("Outer", 4, 25),
+            ("decorated", 6, 11),  # with the blank lines above it
+            ("decorated", 8, 13),  # with the blank lines below it
+            ("Outer", 12, 22),  # both
             ("fallback_name", 28, None),  # the import is a binding: the same scope assigns it
             ("fallback_name", 30, None),
         ],
@@ -1141,6 +1179,10 @@ class TestTheSymbolRule:
             ("decorated", 10, 14, "8-11"),  # starts inside, runs past the end
             ("Outer.method", 15, 18, "17-20"),  # starts before, ends inside
             ("fallback_name", 25, None, "28, 30"),
+            ("decorated", 4, 11, "8-11"),  # holds the whole definition, and code above it
+            ("Outer", 4, 25, "14-20"),  # holds it among its neighbours
+            ("Outer.method", 1, 30, "17-20"),  # the whole file
+            ("Outer.method", 17, 25, "17-20"),  # blank lines and then another class below
         ],
     )
     def test_a_citation_beside_its_definition_is_refused(
@@ -1149,6 +1191,100 @@ class TestTheSymbolRule:
         rule, problem = check_symbol(self._cite(symbol, start, end), "a.py", self._SOURCE)
         assert rule == "definition"
         assert problem is not None and f"defines it at line(s) {defined_at}," in problem and "d.md:7" in problem
+
+    #: A leading comment block above a function, and code after it. Line numbers as above.
+    _COMMENTED = "\n".join(
+        [
+            "# 1",  # 1
+            "# 2",  # 2
+            "# 3",  # 3
+            "# 4",  # 4
+            "def foo():",  # 5
+            "    a = 1",  # 6
+            "    return a",  # 7
+            "",  # 8
+            "BAR = 2",  # 9
+            "",
+        ]
+    )
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (3, 6),  # the comment just above it and its first lines
+            (2, 7),  # three comment lines and the whole function
+            (5, 8),  # the function and the blank line below it
+            (4, 5),
+        ],
+    )
+    def test_a_range_may_take_in_a_leading_comment(self, start: int, end: int) -> None:
+        """The honest half of the bound: a range starting on the comment that introduces a
+        function, and running into it, cites the function. It used to be refused as a
+        straddle."""
+        assert check_symbol(self._cite("foo", start, end), "a.py", self._COMMENTED) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (1, 7),  # four comment lines above: past the allowance
+            (5, 9),  # runs on to the next line of code, inside the allowance
+            (1, 9),  # holds the function among its neighbours
+            (4, 4),  # only the comment, not the function
+        ],
+    )
+    def test_a_range_is_bounded_around_the_definition(self, start: int, end: int) -> None:
+        """A range that holds the definition is not enough: ``1-800`` holds everything. It
+        may take in at most ``_LEAD_ALLOWANCE`` comment or blank lines above and
+        ``_TRAIL_ALLOWANCE`` below, and no code."""
+        assert (_LEAD_ALLOWANCE, _TRAIL_ALLOWANCE) == (3, 2), "the cases here are sized to these"
+        rule, problem = check_symbol(self._cite("foo", start, end), "a.py", self._COMMENTED)
+        assert rule == "definition"
+        assert problem is not None and "defines it at line(s) 5-7," in problem
+
+    def test_a_range_holding_a_real_method_among_its_neighbours_is_refused(self) -> None:
+        """The review's case, through the real file: ``NegotiatedTerms.to_dict`` cited at a
+        range that holds it and much else, and at the whole file. Built from wherever the
+        method is today, and paired with the method's own lines, which must pass."""
+        path = "src/pyrxd/gravity/swap_state.py"
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        (real,) = [d for d in python_definitions(source) if d.qualname == "NegotiatedTerms.to_dict"]
+        whole = len(source.splitlines())
+        for start, end in ((real.first - 100, real.last + 100), (1, whole)):
+            (cit,) = citations_in("d.md", f"`NegotiatedTerms.to_dict` (`{path}:{start}-{end}`)")
+            assert check_citation(cit, [path], source.splitlines()) is None
+            rule, problem = check_symbol(cit, path, source)
+            assert rule == "definition" and problem is not None and f"line(s) {real.first}-{real.last}," in problem
+        (cit,) = citations_in("d.md", f"`NegotiatedTerms.to_dict` (`{path}:{real.first}-{real.last}`)")
+        assert check_symbol(cit, path, source) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("path", "wrong", "right"),
+        [
+            ("src/pyrxd/gravity/swap_state.py", "X.to_dict", "SwapRecord.to_dict"),
+            ("src/pyrxd/glyph/script.py", "Wrong.iter_input_refs", "iter_input_refs"),
+        ],
+    )
+    def test_a_wrongly_qualified_name_is_refused_where_the_right_one_passes(
+        self, path: str, wrong: str, right: str
+    ) -> None:
+        """The file defines the last part, but not under that qualifier. Cited at the real
+        definition's own lines, the correct name passes and the wrong one must not: it names
+        nothing, and the occurrence rule would have accepted it anywhere the word appears."""
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        (real,) = [d for d in python_definitions(source) if d.qualname == right]
+        rule, problem = check_symbol(self._cite(wrong, real.first, real.last), path, source)
+        assert rule == "definition"
+        assert problem is not None and "names nothing" in problem and right in problem
+        assert check_symbol(self._cite(right, real.first, real.last), path, source) == ("definition", None)
+
+    def test_a_wrong_qualifier_is_refused_on_synthetic_input(self) -> None:
+        rule, problem = check_symbol(self._cite("Wrong.method", 24, 25), "a.py", self._SOURCE)
+        assert rule == "definition"
+        assert problem is not None and "only as Other.method, Outer.method" in problem
+        assert check_symbol(self._cite("Other.method", 24, 25), "a.py", self._SOURCE) == ("definition", None)
+        # A dotted name whose last part the file does not define at all is still read by
+        # the occurrence rule: ``self.local`` is not a definition anywhere.
+        assert check_symbol(self._cite("self.local", 10), "a.py", self._SOURCE) == ("occurrence", None)
 
     @pytest.mark.parametrize(
         ("symbol", "start", "end"),
