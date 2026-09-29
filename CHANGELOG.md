@@ -23,6 +23,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
   current one; the constructor does not expand `~`, and its docstring now says so.
 
+- **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
+  in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
+  banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,
+  U+3000, ...) and a reviewed list of other characters that render as blank (U+2800 BRAILLE
+  PATTERN BLANK, U+1D159, U+FFFC, U+13441 and U+13442) is now printed as `<U+XXXX>` and named in
+  the banner. No Unicode property marks every character a font draws as blank, so that list
+  cannot be complete; the `ascii:` line under the label still names every codepoint. The ASCII
+  space is printed as typed, and the label is signed as typed either way.
+
 - **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
   `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
   an older pending run in a group when another queues, so a PR build could leave the published
