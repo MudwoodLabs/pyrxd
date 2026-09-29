@@ -29,6 +29,70 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded.
 ### Fixed
 
+- **Every broadcast through a pyrxd client now checks the server's txid echo (#780).**
+  `HdWallet.send`/`send_max` and `RxdWallet.send`/`send_max` returned the txid the server echoed
+  from `blockchain.transaction.broadcast` without comparing it to the transaction they built, so a
+  lying or broken server could make them report a txid for some other transaction. `RxdWallet`
+  builds a plain `ElectrumXClient`, so it did this in normal use. `pyrxd wallet send`/`sweep`,
+  the swap-book commands and `glyph claim-dmint` had the same code, but the CLI's
+  `FailoverElectrumXClient` already compared the echo and raised `NetworkError`, which
+  `wallet send` printed as "could not reach ElectrumX". `GlyphClient` already refused a
+  mismatched echo (0.19.0). The check now lives in `ElectrumXClient.broadcast`, the only code in pyrxd that sends that RPC,
+  as `pyrxd.network.electrumx.verified_broadcast_txid`. `GlyphClient` and
+  `FailoverElectrumXClient` call the same check. On a mismatch it raises `BroadcastEchoMismatch`
+  with the txid hashed from the sent bytes (`local_txid`) and the server's claim (`echoed`), and
+  says the server may not have relayed the transaction. The CLI prints the local txid to check on
+  an explorer and says not to re-run blindly, because a re-run builds a new transaction.
+  - **Changed error type:** `FailoverElectrumXClient.broadcast` now raises
+    `BroadcastEchoMismatch` on a mismatch instead of `NetworkError`. It is neither a
+    `NetworkError` nor a `ValidationError`, so an `except NetworkError` handler does not catch it
+    unless code in between wraps it. `RadiantChainIO.broadcast`, the Gravity legs' chain helper,
+    wraps every client exception as `NetworkError`, this one included. So under a mismatch the
+    autonomous `ClaimExecutor` records a transient failure and, on its next tick, builds a new
+    claim with a new fee input, as it does after any failed broadcast. That cannot pay twice:
+    the covenant output can be spent once and every claim pays the same fixed destination, so at
+    most one claim confirms, and a claim's fee input is spent only if that claim confirms. A
+    rebuilt claim that conflicts with one already in the mempool is refused by the node. Each
+    retry does take a new input from the fee source until a claim confirms.
+    `tests/test_claim_executor_echo_mismatch_rebuilds.py` runs this through a real leg and
+    client. `SwapCoordinator.mutual_refund` likewise reports any leg failure, this one included,
+    inside its own `NetworkError`; a retried Radiant refund spends the same covenant output, so it
+    cannot pay twice either. `BroadcastEchoMismatch` has moved to `pyrxd.security.errors`;
+    `pyrxd.BroadcastEchoMismatch` and `pyrxd.glyph.client.BroadcastEchoMismatch` are the same
+    class.
+  - **Glyph commit steps:** a mismatched commit or reveal echo now stops `mint-nft`, `deploy-ft`
+    and `deploy-dmint`, whatever the client; they no longer warn and continue on the local txid.
+    `mint-nft` saves its pending record under the local txid before the commit broadcast, so its
+    error names the `glyph resume-mint` command, and with `--json` it prints the
+    `commit_broadcast_failed_may_have_relayed` recovery document on stdout, as it did when the
+    failover client reported the mismatch as `NetworkError`. `deploy-ft` and `deploy-dmint` keep
+    no record, so `resume-mint` cannot reveal their commit; their error names the SDK rebuild of
+    the reveal with the local commit txid. For `deploy-dmint` that rebuild is printed as code with
+    every deploy parameter the command used: the V1 or V2 params class, the contract numbers, the
+    DAA settings in the SDK's form (`max_adjustment_log2`, schedule targets), and the `lastTime`
+    the build stamped when `--last-time` was not given. The commit does not check any of them, so
+    a reveal rebuilt with a different value would still spend it and deploy a different token.
+    A regtest test (`tests/test_dmint_commit_echo_recovery_regtest_e2e.py`) runs the printed code
+    after a mismatched commit echo and gets contract outputs byte-identical to the ones the
+    command built. `GlyphMinter` given a pyrxd client likewise raises at a
+    mismatched commit or reveal echo, where it used to warn and carry on. Its pending record,
+    saved under the local txid before the commit broadcast, is kept; the second copy under the
+    echoed txid is no longer written.
+  - **Not covered:** a client you inject that is not a pyrxd `ElectrumXClient`, into the Gravity
+    legs or `GlyphMinter` (both accept any object with `broadcast`). `HdWallet.send`/`send_max`
+    now check the echo themselves, so any client passed there is covered. Bitcoin broadcasters
+    are out of scope: `BitcoinCoreBroadcaster` returns the node's reply unchecked.
+    `tests/test_broadcast_echo_is_checked_everywhere.py` finds every `.broadcast(` call site in
+    `src/pyrxd` and fails on a new one that neither feeds its reply into the check nor is bound
+    to a pyrxd client. Every binding of the receiver's name in that function must be a pyrxd
+    client, and the check counts only when called by its bare name, which may only be bound to the
+    real check or an import of it. It also refuses `.broadcast` taken without being called,
+    `broadcast` fetched or set by a constant name (`getattr`, `inspect.getattr_static`,
+    `setattr`, a `__dict__` subscript and similar), and the RPC name spelled outside
+    `ElectrumXClient.broadcast`. It is a static scan of `src/pyrxd` only. Its known blind spots,
+    each pinned by the test: an attribute looked up by a computed name (`getattr(c, name)`,
+    `type(c).__dict__[name]`), an RPC name built at runtime, and code run from a string (`exec`,
+    `eval`).
 - **`glyph list` checks what the server lists against the transactions it serves (#782).**
   `GlyphScanner` took a token's owner from its script without comparing it with the address, and
   an FT's amount from the server's UTXO record: a server listing another key's NFT under the

@@ -67,7 +67,7 @@ from ..security.errors import (
     ValidationError,
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
-from .electrumx import ElectrumXClient, UtxoRecord
+from .electrumx import ElectrumXClient, UtxoRecord, verified_broadcast_txid
 from .registry import Endpoint, NetworkProfile
 
 logger = logging.getLogger(__name__)
@@ -368,15 +368,17 @@ class FailoverElectrumXClient:
                 logger.warning("broadcast failed on %s (%s); next endpoint", endpoint.url, type(exc).__name__)
                 await self._discard(endpoint)
                 continue
-            if str(result) != str(expected_txid):
-                # The txid is a pure function of the bytes we sent; a server that
-                # returns a different one is either broken or answering about some
-                # other transaction. Refuse to hand that value back to a caller who
-                # will use it to poll for confirmation — and do NOT promote a server
-                # that just demonstrated it answers about the wrong transaction.
-                raise NetworkError(f"ElectrumX returned txid {result} for a transaction whose id is {expected_txid}")
+            # The txid is a pure function of the bytes we sent; a server that returns a
+            # different one is either broken or answering about some other transaction.
+            # Refuse to hand that value back to a caller who will use it to poll for
+            # confirmation — and do NOT promote a server that just demonstrated it answers
+            # about the wrong transaction. The default factory's ElectrumXClient has already
+            # run this same check; a custom factory's client may not have. Not retried on
+            # the next endpoint: the transaction may already have relayed, which is a
+            # question for the chain, not for another server.
+            verified = verified_broadcast_txid(payload, result)
             self._promote(endpoint)
-            return expected_txid
+            return verified
         raise NetworkError(f"broadcast failed on all {len(self._order)} ElectrumX endpoint(s)") from last_exc
 
     async def _holds_tx(self, endpoint: Endpoint, expected_txid: Txid, payload: bytes) -> bool:

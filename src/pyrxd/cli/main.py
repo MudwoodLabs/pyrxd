@@ -33,10 +33,11 @@ from pathlib import Path
 import click
 
 from .. import __version__ as _pyrxd_version
+from ..security.errors import BroadcastEchoMismatch
 from . import config as _config
 from . import errors as _errors
 from .context import CliContext
-from .errors import CliError
+from .errors import CliError, UserError
 
 
 class _SafePath(click.Path):
@@ -56,7 +57,34 @@ class _SafePath(click.Path):
             self.fail(f"invalid path: {exc}", param, ctx)
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+class _PyrxdGroup(click.Group):
+    """The root group. Renders a broadcast-echo mismatch the same way on every command.
+
+    :meth:`pyrxd.network.electrumx.ElectrumXClient.broadcast` raises
+    :class:`BroadcastEchoMismatch` from inside every command that broadcasts, so the
+    rendering lives here rather than at each of them. It must not read as "could not reach
+    ElectrumX": the transaction may have relayed, and a re-run BUILDS A NEW transaction —
+    for a send, one that pays again if the first went through. Nor may it print the
+    server's txid as the transaction's.
+
+    Commands that already turn the mismatch into their own :class:`UserError` (the glyph
+    transfers and airdrop, ``mark``) keep their wording; this catches the rest.
+    """
+
+    def invoke(self, ctx: click.Context):  # type: ignore[override]
+        try:
+            return super().invoke(ctx)
+        except BroadcastEchoMismatch as exc:
+            raise UserError(
+                "the server returned a different transaction id than the one we signed",
+                cause=str(exc),
+                fix=f"check {exc.local_txid} on an explorer before doing anything else — if it is "
+                "there the transaction went through and only the server's reply was wrong. Do not "
+                "re-run blindly: a re-run builds a new transaction.",
+            ) from exc
+
+
+@click.group(cls=_PyrxdGroup, context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(_pyrxd_version, "--version", "-V", prog_name="pyrxd")
 @click.option(
     "--network",

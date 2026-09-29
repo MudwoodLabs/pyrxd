@@ -289,10 +289,14 @@ class RadiantChainIO:
 
         ``True`` = unspent considering the mempool; ``False`` = spent (confirmed OR by a
         PENDING mempool tx); ``None`` = the client cannot answer (the caller keeps its own
-        idempotency guard). Lets the autonomous claim executor treat a covenant already spent
-        IN THE MEMPOOL as claimed — killing the per-tick re-carve drain WITHOUT a durable
-        cross-restart store and WITHOUT the SeenStore's eviction blind spot (a truly-unspent
-        covenant, e.g. after a claim is evicted by a reorg, correctly re-fires).
+        idempotency guard). With a client that answers, the autonomous claim executor treats a
+        covenant already spent IN THE MEMPOOL as claimed, which stops the per-tick re-carve
+        without a durable cross-restart store.
+
+        It delegates to an optional client method, ``txout_unspent_incl_mempool(txid, vout)``.
+        No client shipped in pyrxd implements it (``ElectrumXClient`` does not), so with those
+        clients this returns ``None`` and the caller's other guards (the SeenStore, the
+        mempool-blind covenant scan) are all there is.
         """
         fn = getattr(self._client, "txout_unspent_incl_mempool", None)
         if not callable(fn):
