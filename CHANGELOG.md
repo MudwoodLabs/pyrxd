@@ -14,7 +14,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Form-2 source identity (#754).** An internationalised host and its punycode spelling now
   count as one source (and one endpoint), so one server behind both URLs cannot corroborate
   itself; the A-label is then canonicalised like any other host, so a trailing `。` or a
-  full-width IP literal folds too. `NetworkProfile` and the config loader raise `ValidationError`
+  full-width IP literal folds too. `NetworkProfile` (and so `require_profile()` on a loaded config) raises `ValidationError`
   for a malformed IPv6 endpoint URL such as `wss://[::1`, not a raw `ValueError` (the CLI still
   reports either as an unexpected failure, #775). The `--json` mark anchor gains a
   `header_bound` key, so a reader can tell whether the height was checked against the endpoint's

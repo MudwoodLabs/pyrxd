@@ -58,6 +58,11 @@ def test_an_index_too_long_for_int_is_refused_not_crashed() -> None:
     assert "unexpected failure" not in result.output
 
 
+def test_leading_zeros_past_the_int_limit_still_parse() -> None:
+    """Zero-padding is not a larger number: 4300 zeros then ``1`` is output 1, like ``0001``."""
+    assert _inspect_outpoint(f"{TXID}:{'0' * 4300}1")["vout"] == 1
+
+
 def test_the_cli_refuses_an_underscored_index_and_accepts_the_plain_one() -> None:
     refused = CliRunner().invoke(cli, ["--json", "glyph", "inspect", f"{TXID}:1_0"])
     assert refused.exit_code != 0

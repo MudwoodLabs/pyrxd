@@ -56,8 +56,23 @@ def test_a_bare_tilde_string_is_still_used_as_given(tmp_path, monkeypatch) -> No
 
 
 _REPO = Path(__file__).resolve().parents[1]
-_ANY_STORE_CALL = re.compile(r"PendingStore\(")
-_BARE_TILDE_ARG = re.compile(r"PendingStore\(\s*[rbfu]?[\"']~")
+_STORE_CALL = re.compile(r"\bJsonFilePendingStore\(")
+
+
+def _call_args(text: str, open_paren: int) -> str:
+    """The argument text of the call whose ``(`` is at *open_paren*, up to its matching ``)``."""
+    depth = 0
+    for i in range(open_paren, len(text)):
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        if depth == 0:
+            return text[open_paren + 1 : i]
+    return text[open_paren + 1 :]
+
+
+def _uses_tilde_unexpanded(args: str) -> bool:
+    """A ``~`` reaches the constructor unexpanded: in a string literal, positional or ``directory=``,
+    bare or wrapped in ``Path(...)``, and no ``expanduser`` anywhere in the argument."""
+    return re.search(r"[\"']~", args) is not None and "expanduser" not in args
 
 
 def _shipped_text_files() -> list[Path]:
@@ -69,17 +84,34 @@ def _shipped_text_files() -> list[Path]:
 
 
 def test_no_shipped_example_hands_a_store_a_bare_tilde_string() -> None:
-    """The docstring test above runs two examples it names; this one finds every example (#755).
+    """The docstring test above runs two examples it names; this one scans every ``JsonFilePendingStore(`` call (#755).
 
     The README carried the same bare ``"~/..."`` string after both docstrings were fixed, because the
     list above is typed by hand. This scan derives its scope from the tree instead.
     """
-    calls, offenders = 0, []
+    calls: dict[str, int] = {}
+    offenders = []
     for path in _shipped_text_files():
         text = path.read_text(encoding="utf-8", errors="replace")
-        calls += len(_ANY_STORE_CALL.findall(text))
-        offenders += [
-            f"{path.relative_to(_REPO)}:{text.count(chr(10), 0, m.start()) + 1}" for m in _BARE_TILDE_ARG.finditer(text)
-        ]
-    assert calls >= 3, f"found only {calls} store constructions; the scan has stopped seeing the examples"
-    assert not offenders, f"a store is built from a bare '~' string (it is used as given): {offenders}"
+        rel = str(path.relative_to(_REPO))
+        for m in _STORE_CALL.finditer(text):
+            calls[rel] = calls.get(rel, 0) + 1
+            if _uses_tilde_unexpanded(_call_args(text, m.end() - 1)):
+                offenders.append(f"{rel}:{text.count(chr(10), 0, m.start()) + 1}")
+    # Non-vacuity, by place: the README is where #755's gap survived, so it must be seen.
+    assert calls.get("README.md", 0) >= 1, f"the scan no longer sees the README's store example: {calls}"
+    assert any(k.startswith("examples/") for k in calls), f"the scan no longer sees the examples: {calls}"
+    assert not offenders, f"a store is built from an unexpanded '~' path (it is used as given): {offenders}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    ['"~/x"', 'Path("~/x")', 'directory="~/x"', 'r"~/x"', "'~/x'", '"""~/x"""'],
+)
+def test_the_scan_flags_every_spelling_of_an_unexpanded_tilde(args) -> None:
+    assert _uses_tilde_unexpanded(args)
+
+
+@pytest.mark.parametrize("args", ['Path("~/x").expanduser()', "STORE_DIR", 'os.path.expanduser("~/x")', '"./pending"'])
+def test_the_scan_passes_an_expanded_or_tilde_free_path(args) -> None:
+    assert not _uses_tilde_unexpanded(args)

@@ -575,8 +575,8 @@ def _inspect_outpoint(s: str) -> dict:
         # injection exploits.
         raise ValidationError(f"vout is not an integer: {_sanitize_display_string(vout_str)!r}")
     try:
-        vout = int(vout_str, 10)
-    except ValueError as exc:  # more digits than int() will convert (4300 by default)
+        vout = int(vout_str.lstrip("0") or "0", 10)  # leading zeros never count toward int()'s digit limit
+    except ValueError as exc:  # more significant digits than int() will convert (4300 by default)
         raise ValidationError("vout must be 0..2^32-1") from exc
     ref = GlyphRef(txid=Txid(txid_str.lower()), vout=vout)
     return {
