@@ -35,18 +35,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documentation
 
+- **Two published docs described code that has changed.** Both were found by a new check that a
+  citation written next to a code name lands on that name (`tests/test_doc_citations_resolve.py`):
+  - Glyph spec §16.4 said `COMMIT_SCRIPT_RE` accepts any byte at the commit script's ref-type
+    position. That stopped being true in 0.25.0, which accepts only `OP_1` (FT) and `OP_2` (NFT)
+    there. The section now says so.
+  - The HTLC handshake wire format named the credential gate `pre_btc_lock_gate`, which is not a
+    function in pyrxd, and cited lines inside an unrelated docstring. It now names the rule,
+    `_credential_binding_failure`, and both places that run it: the taker's pre-fund gate
+    `pre_btc_lock_check`, and the maker's path before `BOTH_LOCKED`.
+    The same document cited the `require_measured` refusal and
+    `measure_margin_from_btc_block_times` at lines that had moved, and now writes
+    `NegotiatedTerms.to_dict` where a bare `to_dict` could equally have meant `SwapRecord`'s.
 - Doc citations into `glyph/script.py` and `glyph/_inspect_core.py` re-pointed at the code they
-  name. Several in the Glyph protocol spec had already drifted before this change: the 63-byte NFT
-  script, the FT script, the payload hash, the mutable NFT size and `COMMIT_SCRIPT_RE`. The
-  spec's §16.4 said `COMMIT_SCRIPT_RE` matches any ref-type byte, which stopped being true in
-  0.25.0. It now says that.
-- `tests/test_doc_citations_resolve.py` checks two kinds of citation it could not see before. A
-  bare `` `:N` `` is read against the file named before it. A citation written directly after a
-  backticked name that its file defines must overlap that definition. On the docs as they stood,
-  those checks found 13 drifted citations, including some in `docs/htlc-handshake-wire-format.md`,
-  `docs/security-audit-scope.md` and a how-to. All 13 are re-cited. Other line citations in
-  `docs/htlc-handshake-wire-format.md` name no file on their table row, or no symbol, so these
-  checks cannot see them, and they were not re-derived here.
+  name, after the 65-byte DAT change moved it. Several in the Glyph protocol spec had already
+  drifted before this change: the 63-byte NFT script, the FT script, the payload hash and the
+  mutable NFT size.
+- `tests/test_doc_citations_resolve.py` reads a bare `` `:N` `` citation against the file named
+  before it on the same line, or earlier in the same paragraph (a table row does not inherit from
+  the row above). Those citations were invisible to it before. A bare citation is held to the same
+  checks as any other, including the symbol rule above when a code name is written beside it.
+  When this check was first written, with a symbol check of its own that the symbol rule above
+  replaces, the two found 13 drifted citations, including some in
+  `docs/htlc-handshake-wire-format.md`, `docs/security-audit-scope.md` and a how-to. All 13 are
+  re-cited. Other line citations in `docs/htlc-handshake-wire-format.md` name no file on their
+  table row, or no symbol, so these checks cannot see them, and they were not re-derived here.
 
 ## [0.25.0] — 2026-09-26
 
