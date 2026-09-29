@@ -7,6 +7,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
 
 
@@ -179,9 +180,13 @@ class TestExportXpubCoinType:
 class TestUtxosCmd:
     """Cut 3 — read-only diagnostic. Covered with mocked ElectrumX."""
 
-    def test_no_used_addresses_returns_empty_table(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+    def test_no_used_addresses_returns_empty_table(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, fake_client_factory
+    ) -> None:
         mnemonic = _create_wallet(runner, tmp_wallet_path)
-        # Fresh wallet has no used addresses → empty result.
+        # `utxos` scans the chain before reading (#759), so it needs a client: an empty chain.
+        monkeypatch.setattr(CliContext, "make_client", lambda self: fake_client_factory())
+        # Fresh wallet, nothing on chain → empty result.
         result = runner.invoke(
             cli,
             ["--wallet", str(tmp_wallet_path), "--json", "utxos"],
@@ -192,8 +197,11 @@ class TestUtxosCmd:
         body = result.output[result.output.find("[") :].strip()
         assert body == "[]"
 
-    def test_min_photons_flag_accepted(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+    def test_min_photons_flag_accepted(
+        self, runner: CliRunner, tmp_wallet_path: Path, monkeypatch, fake_client_factory
+    ) -> None:
         mnemonic = _create_wallet(runner, tmp_wallet_path)
+        monkeypatch.setattr(CliContext, "make_client", lambda self: fake_client_factory())
         result = runner.invoke(
             cli,
             ["--wallet", str(tmp_wallet_path), "--json", "utxos", "--min-photons", "1000000"],

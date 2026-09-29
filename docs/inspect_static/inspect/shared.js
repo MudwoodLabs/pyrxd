@@ -400,28 +400,42 @@ async function bootPyrxdRuntime(options) {
     //     lazy ``__getattr__``s in pyrxd's package ``__init__``s might
     //     if a downstream caller touches it. Cheap to load preemptively
     //     (the glue.py shim aliases ``Cryptodome`` → ``Crypto``).
-    //   - ``hashlib`` — Pyodide's OpenSSL-backed ``_hashlib`` (with its
-    //     ``openssl`` dependency). Without it ``hashlib`` has no SHA-512/256,
-    //     which is the Radiant block hash (``pyrxd.hash.radiant_block_hash``)
-    //     that binds a mark's height to its header. MEASURED in headless
-    //     Chromium on Pyodide 0.26.4: ``hashlib.new("sha512_256")`` raised
-    //     "unsupported hash type" until this package was loaded — and it has
-    //     to be loaded BEFORE anything imports ``hashlib`` (micropip does),
-    //     because ``hashlib`` decides at import time what it can build. So
-    //     it is first in this, the first load.
     //
-    //     WHAT ELSE THAT CHANGES, said plainly. Once loaded, OpenSSL computes
-    //     EVERY hash ``hashlib`` hands out, not just the block hash: measured
-    //     in headless Chromium, ``hashlib.sha256`` is ``openssl_sha256`` and
-    //     ``ripemd160`` is OpenSSL's too — so the double-SHA256 and hash160 in
-    //     the SIGNATURE verdict run on it as well. It is OpenSSL 1.1.1n, which
-    //     is end-of-life, used here for hashing only (no TLS). It is not a new
-    //     trusted party — the same CDN already serves the interpreter that
-    //     runs everything — but it is about 3.7 MB more code (1,665,188 B +
-    //     2,025,903 B, measured), and like every Pyodide package it is checked
-    //     only against a ``pyodide-lock.json`` fetched, unverified, from that
-    //     same CDN. See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
-    await pyodide.loadPackage(["hashlib", "micropip", "pycryptodome"]);
+    // NOT ``hashlib`` (Pyodide's OpenSSL-backed ``_hashlib`` and its
+    // ``openssl`` dependency), deliberately — #757. Pyodide 0.26.4's built-in
+    // ``hashlib`` has no SHA-512/256, the Radiant block hash that binds a
+    // mark's height to its header, and #756 loaded that package to get it.
+    // But once loaded, OpenSSL 1.1.1n (end-of-life) computed EVERY hash
+    // ``hashlib`` hands out — measured in headless Chromium, the SHA-256 and
+    // RIPEMD-160 behind the SIGNATURE verdict included — and it was about
+    // 3.7 MB more code (1,665,188 B + 2,025,903 B), checked only against a
+    // ``pyodide-lock.json`` fetched, unverified, from the same CDN.
+    // ``pyrxd.hash`` now computes SHA-512/256 in pure Python wherever
+    // ``hashlib`` cannot, so the block hash needs no package. Measured in
+    // headless Chromium with this boot: ``hashlib.sha256`` is CPython's
+    // built-in ``_sha2`` one, ``pyrxd.hash`` picks its pure-Python RIPEMD-160,
+    // and /verify/ still binds a mark to its block and VERIFIES its signature.
+    // This is the package set the boot loaded before #756.
+    //
+    // WHAT KEEPS IT OUT, and what does not. Two layers, each claiming only its
+    // own (tests/web/test_the_boot_loads_no_openssl.py):
+    //   * STATIC CHECKS OF THE KNOWN LOAD PATHS. This function is run under Node
+    //     against a stand-in Pyodide that records every call: `loadPyodide` may
+    //     be passed only allowlisted options (`fullStdLib` is refused),
+    //     `loadPackage` must ask for exactly micropip and pycryptodome,
+    //     `loadPackagesFromImports` must not be called, and the Python it runs
+    //     may micropip-install only the two SHA-checked wheels, the pyrxd one
+    //     with deps=False. These catch the spellings someone thought of, not
+    //     every way a package can get into a Pyodide runtime.
+    //   * WHAT RAN, AT RUNTIME. `glue.hashing_backend` reports, in the running tab,
+    //     which code computes the block hash, SHA-256 and RIPEMD-160, and whether
+    //     `_hashlib` or `_ssl` is importable, and both pages print that in their
+    //     footer ("hashing: …"). It does not look for other copies of OpenSSL
+    //     (the `cryptography` package's, say), so it never says "no OpenSSL".
+    //     Reported, never refused: OpenSSL here is more code from the CDN, not a
+    //     wrong answer.
+    // See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
+    await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)
     // and SHA-256 pinned in manifest.json. Fetch each, verify the
@@ -517,6 +531,8 @@ _pyrxd_version_blob = (
       // universe from glue.py's public functions, and a boot that called this one
       // off the module object would be the one glue function nothing could see.
       installSignatureBackend: glue.install_signature_backend,
+      // Not a per-check bridge either: read once, below, for the footer.
+      hashingBackend: glue.hashing_backend,
     };
     versionText = String(pyodide.globals.get("_pyrxd_version_blob"));
     // AFTER the glue is importable and BEFORE the page is told it is ready, so the
@@ -536,7 +552,32 @@ _pyrxd_version_blob = (
   }
 
   onProgress(100);
-  return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck };
+  const hashing = readHashingBackend(bridges);
+  return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck, hashing };
+}
+
+// WHICH CODE COMPUTES THIS TAB'S HASHES, as the runtime itself reports it (#757): the block
+// hash, SHA-256 and RIPEMD-160, and whether `_hashlib` or `_ssl` is importable. Both pages print
+// its `summary` in their footer. It does not look for every copy of OpenSSL, and says only what
+// it looked at. Reported, never refused: OpenSSL here is more code from the CDN, not a wrong
+// answer. Never throws — a diagnostic must not stop the page loading.
+function readHashingBackend(bridges) {
+  try {
+    const report = fromPy(bridges.hashingBackend());
+    if (report && typeof report.summary === "string") return report;
+  } catch (_) {
+    // Fall through: say the report is missing, and claim nothing about what is loaded.
+  }
+  return { summary: "hashing: this tab's hashing report could not be read" };
+}
+
+// The footer's build line: the deployed commit, then which code computes this tab's hashes.
+// Text only; the caller sets it with `textContent`.
+function buildLine(runtime) {
+  const parts = [];
+  if (runtime.gitSha) parts.push(`build: ${runtime.gitSha}`);
+  if (runtime.hashing && runtime.hashing.summary) parts.push(runtime.hashing.summary);
+  return parts.join(" · ");
 }
 
 // Convert a Pyodide return value to a plain JS object and release the proxy.
