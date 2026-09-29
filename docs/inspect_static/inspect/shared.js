@@ -427,10 +427,13 @@ async function bootPyrxdRuntime(options) {
     //     may micropip-install only the two SHA-checked wheels, the pyrxd one
     //     with deps=False. These catch the spellings someone thought of, not
     //     every way a package can get into a Pyodide runtime.
-    //   * THE OUTCOME, AT RUNTIME. `glue.hashing_backend` reports, in the running
-    //     tab, whether OpenSSL computes the hashes or is importable at all, and
-    //     both pages print that in their footer ("hashing: …"). Reported, never
-    //     refused: OpenSSL here is more code from the CDN, not a wrong answer.
+    //   * WHAT RAN, AT RUNTIME. `glue.hashing_backend` reports, in the running tab,
+    //     which code computes the block hash, SHA-256 and RIPEMD-160, and whether
+    //     `_hashlib` or `_ssl` is importable, and both pages print that in their
+    //     footer ("hashing: …"). It does not look for other copies of OpenSSL
+    //     (the `cryptography` package's, say), so it never says "no OpenSSL".
+    //     Reported, never refused: OpenSSL here is more code from the CDN, not a
+    //     wrong answer.
     // See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
     await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
@@ -553,11 +556,11 @@ _pyrxd_version_blob = (
   return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck, hashing };
 }
 
-// WHICH CODE COMPUTES THIS TAB'S HASHES, as the runtime itself reports it (#757). The boot
-// above does not load Pyodide's OpenSSL, and static tests catch the known ways it could; this
-// is the outcome, whichever way OpenSSL might have arrived, and both pages print its `summary`
-// in their footer. Reported, never refused: OpenSSL here is more code from the CDN, not a
-// wrong answer. Never throws — a diagnostic must not stop the page loading.
+// WHICH CODE COMPUTES THIS TAB'S HASHES, as the runtime itself reports it (#757): the block
+// hash, SHA-256 and RIPEMD-160, and whether `_hashlib` or `_ssl` is importable. Both pages print
+// its `summary` in their footer. It does not look for every copy of OpenSSL, and says only what
+// it looked at. Reported, never refused: OpenSSL here is more code from the CDN, not a wrong
+// answer. Never throws — a diagnostic must not stop the page loading.
 function readHashingBackend(bridges) {
   try {
     const report = fromPy(bridges.hashingBackend());

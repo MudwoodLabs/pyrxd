@@ -1167,21 +1167,33 @@ def judge_file_digest(expected_hex: object, computed_hex: object, algorithm: obj
 
 
 def hashing_backend() -> dict:
-    """Which code computes this tab's hashes, and whether OpenSSL is in this runtime at all (#757).
+    """Which code computes this tab's three hashes, and whether two named OpenSSL modules exist (#757).
 
-    The pages deliberately do not load Pyodide's OpenSSL (its ``hashlib`` package, OpenSSL 1.1.1n,
-    end of life): ``pyrxd.hash`` computes SHA-512/256 in pure Python instead. Static tests catch
-    the KNOWN ways the boot could load it again; they cannot close every way. This reports the
-    OUTCOME, at runtime, whichever way OpenSSL got here, and the pages show it in their footer.
+    The pages deliberately do not load Pyodide's ``hashlib`` package (``_hashlib``, its OpenSSL
+    1.1.1n binding, end of life): ``pyrxd.hash`` computes SHA-512/256 in pure Python instead.
+    Static tests catch the KNOWN ways the boot could load it again; they cannot close every way.
+    This reports, at runtime, what those three hashes actually run on in this tab, and the pages
+    show it in their footer.
 
-    Two signals, read without importing anything new:
+    What it checks, each read without importing anything new beyond ``pyrxd.hash``:
 
-    * ``hashlib.sha256.__module__``. ``"_hashlib"`` is OpenSSL: then OpenSSL computes SHA-256,
-      and with it every hash ``hashlib`` hands out, the signature check's included. CPython's
-      own implementations live in ``_sha2`` (``_sha256`` before 3.12).
-    * ``importlib.util.find_spec`` for ``_hashlib`` (Pyodide's ``hashlib`` package) and ``_ssl``
-      (its ``ssl`` package): either being importable means OpenSSL's code is in this runtime,
-      even while ``hashlib`` is not using it.
+    * **The block hash (SHA-512/256).** Whether ``hashlib.new("sha512_256")`` works — the same
+      test ``pyrxd.hash._sha512_256`` makes on every call. If it raises ``ValueError``, pyrxd's
+      pure-Python SHA-512/256 computes the block hash; otherwise the module of ``hashlib``'s
+      object is named (``_hashlib`` is OpenSSL).
+    * **SHA-256** (the signature check's double SHA-256): ``hashlib.sha256.__module__`` —
+      ``_hashlib`` is OpenSSL, ``_sha2`` (``_sha256`` before 3.12) is CPython's own.
+    * **RIPEMD-160** (hash160): which implementation ``pyrxd.hash`` selected when it was imported,
+      its pure-Python one or ``hashlib``'s.
+    * **Whether ``_hashlib`` or ``_ssl`` is importable** (Pyodide's ``hashlib`` and ``ssl``
+      packages, both OpenSSL), even while nothing above uses them.
+
+    What it does NOT check: any OTHER copy of OpenSSL in the runtime. Pyodide's ``cryptography``
+    package carries its own OpenSSL (1.1.1w), and its bare ``openssl`` package is the library
+    alone; neither makes ``_hashlib`` or ``_ssl`` importable, so with either loaded this reports
+    neither module (measured in Pyodide 0.26.4 by the #764 round-4 review, against the previous
+    wording, which then said "no OpenSSL"). So the footer names the modules it looked for and
+    never says "no OpenSSL".
 
     REPORTED, NOT REFUSED. OpenSSL here is more code fetched from the CDN, not a wrong answer: its
     SHA-256 is still SHA-256. So nothing is withheld because of it. Never raises — a diagnostic
@@ -1191,20 +1203,44 @@ def hashing_backend() -> dict:
         import hashlib
         import importlib.util
 
-        computes = getattr(hashlib.sha256, "__module__", None) == "_hashlib"
+        import pyrxd.hash as pyrxd_hash
+
+        def by(module: object) -> str:
+            return "OpenSSL (_hashlib)" if module == "_hashlib" else f"CPython's {module}"
+
+        try:
+            block = by(type(hashlib.new("sha512_256")).__module__)
+        except ValueError:
+            block = "pyrxd's pure Python"
+        sha256 = by(getattr(hashlib.sha256, "__module__", None))
+        if pyrxd_hash._ripemd160_impl is pyrxd_hash._ripemd160_pure_python:
+            ripemd = "pyrxd's pure Python"
+        else:
+            ripemd = by(type(hashlib.new("ripemd160")).__module__)
         present = [name for name in ("_hashlib", "_ssl") if importlib.util.find_spec(name) is not None]
     except Exception as exc:
         return {
-            "openssl": None,
-            "summary": "hashing: could not tell whether OpenSSL is loaded "
+            "block_hash": None,
+            "sha256": None,
+            "ripemd160": None,
+            "openssl_modules": None,
+            "summary": "hashing: could not tell which code computes the hashes "
             f"({_truncate(_inspect.sanitize_display_string(_safe_error(exc)), cap=80)})",
         }
-    if computes:
-        return {"openssl": True, "summary": "hashing: OpenSSL is loaded in this tab and computes its hashes"}
-    if present:
-        return {
-            "openssl": True,
-            "summary": f"hashing: OpenSSL is loaded in this tab ({', '.join(present)}), though Python's "
-            "built-ins compute its hashes",
-        }
-    return {"openssl": False, "summary": "hashing: Python's built-ins, no OpenSSL"}
+    groups: dict[str, list[str]] = {}
+    for name, code in (("block hash", block), ("SHA-256", sha256), ("RIPEMD-160", ripemd)):
+        groups.setdefault(code, []).append(name)
+    computed = ", ".join(f"{_and(names)} by {code}" for code, names in groups.items())
+    modules = f"{_and(present)} importable" if present else "no _hashlib or _ssl module"
+    return {
+        "block_hash": block,
+        "sha256": sha256,
+        "ripemd160": ripemd,
+        "openssl_modules": present,
+        "summary": f"hashing: {computed}; {modules}",
+    }
+
+
+def _and(names: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"

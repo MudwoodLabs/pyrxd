@@ -30,8 +30,15 @@
 //
 // Contract:
 //   node boot_packages_harness.mjs [--shared <path to a shared.js variant>] [--hashing-report <json>]
+//                                  [--page <json>]
 //     --hashing-report: what the stand-in glue's `hashing_backend` returns, as a dict the page
 //     converts with `toJs` — so the footer plumbing (readHashingBackend, buildLine) runs for real.
+//     --page: {"base": "https://pages.invalid/verify/", "scripts": [path, …]} — RENDER a page
+//     instead of calling the boot directly: the scripts its index.html loads are run verbatim,
+//     in that order, against a stub DOM, so the page's OWN `boot()` (which runs at load) calls
+//     `bootPyrxdRuntime` and writes the footer. The output then also carries
+//     "rendered": {"build-version": "…", "error-block": "…"} — the text the page left in those
+//     elements — and "footer" stays null, since nothing here calls `buildLine`.
 //   stdout (last line): JSON {
 //     "finished": bool, "error": string|null, "progress": [n, …],
 //     "loadPyodideOptions": [{…}, …]   (JSON-able part of each options object),
@@ -56,8 +63,9 @@ const INSPECT_DIR = resolve(STATIC, "inspect");
 const args = process.argv.slice(2);
 const sharedPath = args.includes("--shared") ? resolve(args[args.indexOf("--shared") + 1]) : resolve(INSPECT_DIR, "shared.js");
 const hashingReport = args.includes("--hashing-report") ? JSON.parse(args[args.indexOf("--hashing-report") + 1]) : null;
+const page = args.includes("--page") ? JSON.parse(args[args.indexOf("--page") + 1]) : null;
 
-const PAGE_BASE = "https://pages.invalid/verify/";
+const PAGE_BASE = page ? page.base : "https://pages.invalid/verify/";
 const WHEEL = "pyrxd-0.0.0-py3-none-any.whl";
 const CBOR2 = "cbor2-5.4.6-py3-none-any.whl";
 const placeholder = (name) => Buffer.from(`placeholder bytes for ${name}; never installed\n`, "utf8");
@@ -87,6 +95,7 @@ const record = {
   fetches: [],
   hashing: null,
   footer: null,
+  rendered: null,
 };
 
 // Answer a same-origin URL the way GitHub Pages would, and REFUSE anything else — the boot
@@ -172,6 +181,27 @@ const fakePyodide = new Proxy(modelled, {
   },
 });
 
+// The stub DOM for --page: every id the page asks for exists (so no page code bails early on a
+// missing element), and each keeps what the page wrote to it. Only what a boot touches is modelled.
+class StubElement {
+  constructor() {
+    this.textContent = "";
+    this.hidden = undefined;
+    this.disabled = true;
+    this.value = "";
+  }
+  focus() {}
+  addEventListener() {}
+  getAttribute() {
+    return null;
+  }
+}
+const elements = new Map();
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, new StubElement());
+  return elements.get(id);
+}
+
 const sandbox = {
   console: { log() {}, warn() {}, error() {} },
   URL,
@@ -197,7 +227,9 @@ const sandbox = {
     record.loadPyodideOptions.push(jsonable(options));
     return fakePyodide;
   },
-  document: { baseURI: PAGE_BASE, createElement: () => ({}), getElementById: () => null, querySelectorAll: () => [] },
+  document: page
+    ? { baseURI: PAGE_BASE, createElement: () => new StubElement(), getElementById: byId, querySelectorAll: () => [] }
+    : { baseURI: PAGE_BASE, createElement: () => ({}), getElementById: () => null, querySelectorAll: () => [] },
   WebSocket: class {},
   navigator: {},
   location: { href: PAGE_BASE, search: "" },
@@ -206,6 +238,29 @@ const sandbox = {
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
+
+if (page) {
+  // The page's own boot() runs at load and is not handed back, so wait for what it does at its
+  // end: un-hide the ready block, or the error block. Both are set in the same synchronous run as
+  // the footer, so seeing either means the footer write, if any, has happened.
+  try {
+    for (const script of page.scripts) {
+      vm.runInContext(await readFile(script, "utf8"), sandbox, { filename: script });
+    }
+    const deadline = Date.now() + 60_000;
+    while (byId("ready-content").hidden !== false && byId("error-content").hidden !== false) {
+      if (Date.now() > deadline) throw new Error("the page's boot neither finished nor failed within 60 s");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    record.finished = byId("ready-content").hidden === false;
+  } catch (err) {
+    record.error = String((err && err.message) || err);
+  }
+  record.rendered = { "build-version": byId("build-version").textContent, "error-block": byId("error-block").textContent };
+  process.stdout.write(JSON.stringify(record) + "\n");
+  process.exit(0);
+}
+
 vm.runInContext(await readFile(sharedPath, "utf8"), sandbox, { filename: sharedPath });
 
 if (typeof sandbox.bootPyrxdRuntime !== "function") {
