@@ -552,3 +552,86 @@ class TestEverySpendPathCrossesTheScan:
             if ".collect_spendable(" in path.read_text(encoding="utf-8")
         }
         assert {"hashmark_tx.py", "cli/glyph_cmds.py", "cli/swap_book_cmds.py", "cli/query_cmds.py"} <= callers
+
+
+class TestThePartialViewGatesAreEachPinned:
+    """Branches of the partial-view rule that the tests above did not reach (#768 re-attack).
+
+    Deleting the ``wallet send`` gate for "every read failed", or cancel's token filter, broke no
+    test. Each is pinned here, with only the network faked.
+    """
+
+    @staticmethod
+    def _to() -> str:
+        return HdWallet.from_mnemonic(MNEMONIC).derive_address(0, 0)
+
+    def test_send_with_every_read_failed_is_a_network_error_not_fund_the_wallet(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        chain = _Chain({first: _utxo()}, fail_utxos=True)
+        r = _run(tmp_path, monkeypatch, chain, mnemonic, "wallet", "send", "--to", self._to(), "--amount", "1000000")
+        assert r.exit_code == 2, (r.output, r.exception)
+        assert "could not reach ElectrumX" in r.output
+        assert "fund the wallet" not in r.output, "the #759 false advice is back"
+        assert chain.broadcasts == []
+
+    def test_a_partial_send_never_pays_change_to_an_unread_used_address(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        w = HdWallet.from_mnemonic(mnemonic)
+        c0, c1 = w.derive_address(1, 0), w.derive_address(1, 1)
+        chain = _Chain({first: _utxo("aa" * 32), c0: _utxo("bb" * 32)}, unreadable={c0})
+        r = _run(tmp_path, monkeypatch, chain, mnemonic, "wallet", "send", "--to", self._to(), "--amount", "1000000")
+        assert r.exit_code == 0, (r.output, r.exception)
+        tx = Transaction.from_hex(chain.broadcasts[0].hex())
+        assert [(i.source_txid, i.source_output_index) for i in tx.inputs] == [("aa" * 32, 0)]
+        scripts = [o.locking_script.serialize() for o in tx.outputs]
+        assert P2PKH().lock(c0).serialize() not in scripts, "change reused the unread (used) address"
+        assert scripts[1] == P2PKH().lock(c1).serialize(), "change is the next fresh internal address"
+
+    def test_cancel_never_takes_a_token_listed_under_a_plain_address_as_fee_funding(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20, Txid
+
+        class _InjectChain(_TxChain):
+            """A hostile server: a plain address's listunspent also 'holds' a big FT UTXO of that key."""
+
+            def __init__(self, funded, *, unreadable, inject_at: str, inject_tx: Transaction):
+                super().__init__(funded, unreadable=unreadable)
+                self.inject_sh = bytes(script_hash_for_address(inject_at))
+                self.inject_tx = inject_tx
+                self.txs[inject_tx.txid()] = inject_tx
+
+            async def get_utxos(self, script_hash):
+                out = list(await super().get_utxos(script_hash))
+                if bytes(script_hash) == self.inject_sh:
+                    out.append(_utxo(self.inject_tx.txid(), 0, self.inject_tx.outputs[0].satoshis))
+                return out
+
+        mnemonic, _first = _new_wallet(tmp_path, monkeypatch)
+        w = HdWallet.from_mnemonic(mnemonic)
+        a0, a1, a2, a3 = (w.derive_address(0, i) for i in range(4))
+        pkh0 = w.privkey_for(0, 0).public_key().hash160()
+        pkh1 = w.privkey_for(0, 1).public_key().hash160()
+        give = _src(Script(build_ft_locking_script(Hex20(pkh0), GlyphRef(txid=Txid("cd" * 32), vout=0))), 777)
+        # Far bigger than any fee target, so ONLY the token filter keeps it out of the inputs.
+        other_ft = _src(
+            Script(build_ft_locking_script(Hex20(pkh1), GlyphRef(txid=Txid("ef" * 32), vout=1))), 50 * _FUND
+        )
+        chain = _InjectChain(
+            {
+                a0: give,
+                a1: _src(P2PKH().lock(a1), 1_000),
+                a2: _src(P2PKH().lock(a2), _FUND),
+                a3: _src(P2PKH().lock(a3), _FUND),
+            },
+            unreadable={a3},
+            inject_at=a1,
+            inject_tx=other_ft,
+        )
+        r = _run(tmp_path, monkeypatch, chain, mnemonic, "swap", "cancel", "--give", f"{give.txid()}:0")
+        assert r.exit_code == 0, (r.output, r.exception)
+        ins = [(i.source_txid, i.source_output_index) for i in Transaction.from_hex(chain.broadcasts[0].hex()).inputs]
+        assert (other_ft.txid(), 0) not in ins, "an FT UTXO was burned as fee funding"
+        assert (give.txid(), 0) in ins
