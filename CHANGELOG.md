@@ -23,6 +23,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
   current one; the constructor does not expand `~`, and its docstring now says so.
 
+- **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
+  `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
+  an older pending run in a group when another queues, so a PR build could leave the published
+  docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
+  build has a group per ref.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)
