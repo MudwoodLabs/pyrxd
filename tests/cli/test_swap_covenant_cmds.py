@@ -94,7 +94,7 @@ class _FakeWallet:
     def __init__(self, triples: list) -> None:
         self._triples = triples
 
-    async def collect_spendable(self, client) -> list:
+    async def collect_spendable(self, client, *, strict: bool = True) -> list:  # HdWallet's signature
         return self._triples
 
 

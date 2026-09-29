@@ -287,9 +287,11 @@ need to know:
 
 - `HdWallet.load(path, mnemonic)` — opens the encrypted wallet
   file. Raises if the mnemonic does not decrypt it.
-- `await wallet.refresh(client)` — gap-limit scan; must run
-  before `collect_spendable` on a freshly-loaded wallet.
-- `await wallet.collect_spendable(client)` — returns
+- `await wallet.refresh(client)` — the gap-limit scan.
+  `collect_spendable` runs it itself (since #759), so the call
+  above matters only if you also use `get_balance` or
+  `get_utxos`, which do not scan.
+- `await wallet.collect_spendable(client)` — scans, then returns
   `(utxo, address, privkey)` triples covering every UTXO across
   every used address.
 - `wallet.build_send_tx(triples, to_address, photons)` — picks
