@@ -19,28 +19,105 @@ is what keeps them repaired.
 What this test proves
 ---------------------
 For every citation naming a file this repo contains: the file exists, the cited
-line numbers are within it, and they are not blank.
+line numbers are within it, and they are not blank. And for every citation
+written NEXT TO A CODE NAME, that the cited lines are that name's (the symbol
+rule, below).
 
 **What it does NOT prove — read this before trusting a green run.** It cannot
-tell that the cited line says what the doc claims. A citation that has drifted
-from ``build_ft_locking_script`` onto some *other* non-blank line passes here.
-That failure mode is real and was the majority of the rot found: of the 29
-citations that named a uniquely-defined function or class on their own doc line,
-**23 pointed outside that symbol's definition** while landing on perfectly
-non-blank lines. This is a DETECT-level floor for the mechanical half, not a
-proof the citations are right. The structural fix for the other half is to cite
-symbols rather than lines; see the note at the bottom of this module.
+tell that a cited line says what the doc claims. A citation with no name beside
+it that has drifted from ``build_ft_locking_script`` onto some *other* non-blank
+line passes here. That failure mode is real and was the majority of the rot
+found: of the 29 citations that named a uniquely-defined function or class on
+their own doc line, **23 pointed outside that symbol's definition** while landing
+on perfectly non-blank lines. The symbol rule closes that gap only where the doc
+writes the name beside the citation in one of the forms below. This is a
+DETECT-level floor, not a proof the citations are right. The structural fix is to
+cite symbols rather than lines; see the note at the bottom of this module.
 
 Scope
 -----
-Derived, not hand-kept: every ``docs/**/*.md`` **except** the three dated
+Derived, not hand-kept: every tracked ``docs/**/*.md`` **except** the three dated
 subtrees. ``docs/brainstorms/`` and ``docs/plans/`` are working drafts and
 ``docs/solutions/`` are incident records — a record that names a file as it stood
 in May is not stale, it is a record. (The same split as
 ``tests/test_docs_are_current.py`` and
 ``tests/test_protocol_lock_ordering_docs_are_current.py``, but stated as an
 EXCLUDE list so a new docs subdirectory is scanned by default rather than
-silently unscanned.)
+silently unscanned.) The symbol rule reads ``docs/solutions/`` too; see below.
+
+"Tracked" means what ``git ls-files`` lists, because that is what CI checks out.
+Reading the filesystem instead let an untracked local draft fail the gate on one
+machine and never in CI. Where there is no git work tree (a ``git archive``
+export, an unpacked sdist) the files on disk are read instead; see
+``_tracked_files``.
+
+The symbol rule
+---------------
+A citation written next to a code name says where that name is, so it can be
+checked mechanically. ``symbol_named_by`` reads exactly these forms, with
+``CITE`` a citation filling its own backtick span:
+
+* ```name` (`CITE`)``, ```name`, `CITE```, ```name` at `CITE```;
+* ```CITE` (`name` …)``;
+* ```CITE name``` (the name inside the citation's own backticks).
+
+``name`` is an identifier, optionally dotted (``Class.method``,
+``pyrxd.glyph.script.iter_input_refs``) or written with ``()``. A name that ends
+or starts a LIST of names (```a`, `b` and `c` (`CITE`)``) is not taken, because
+the citation then speaks for the list; nor is a Python keyword (``None``), a
+backticked file name (``htlc_spend.py``), or, in the ```CITE name``` form, a plain
+lowercase word (```x.py:14 onwards```). ``check_symbol`` then applies one of two
+rules. If the cited file is Python and defines the name (``def``, ``class``, or a
+module- or class-level assignment, found with ``ast``; a leading module path is
+dropped first), the cited lines must lie inside that definition or contain it
+whole, and a bare name the file defines in several places (``to_dict`` on two
+classes) must be qualified. Otherwise (the vendored C++, or a name the file only
+uses) the name must appear in the cited lines.
+
+"Inside or whole", not "the ``def`` line is cited", because the docs deliberately
+cite lines inside a definition: ``holder_hash``'s ``rxd`` branch, the field lines
+of ``BtcHtlcLocator``. Measured on the docs as they stood when this rule was added,
+requiring the ``def`` line would have refused 5 such citations, each of which
+lands on the lines its sentence describes. Not mere overlap either: a range that
+straddles one edge of a definition is what a range looks like after the code
+moved under it (``iter_input_refs`` at ``:1100-1120`` or ``:1142-1172``, when it is
+defined at 1120-1142), and overlap passed both. Requiring qualification of an
+ambiguous bare name refused one citation in the docs (``to_dict``, meaning
+``NegotiatedTerms.to_dict``); the other two changes refused none.
+
+The list exception exists for the same reason: 3 citations name a list, and one
+of them (``WAVE_TREASURY_ADDRESS_DEFAULT`` and ``wave_name_price``, cited at
+``:65`` and ``:73-86``) is correct but fails if read as naming its last member.
+
+``docs/solutions/`` is read by this rule though not by the blank-line gate. A
+record may cite a file as it stood in May, but a citation that names its own
+subject says where that subject IS, and people and agents read these records as
+current guidance. Where the named thing no longer exists, the fix is to say so in
+the record, not to point the citation somewhere else.
+
+Measured when the rule was added (the figures further up were measured for the
+blank-line gate when it was written): 37 symbol citations resolved to a file
+here, 30 in the published docs and 7 in ``docs/solutions/``. Fifteen failed: 9
+in the published docs and 6 in ``docs/solutions/``, one of those on a blank line
+that the blank-line gate never saw because it does not read that subtree. Another
+14 could not be resolved to a file here (Photonic Wallet sources, mostly) and were
+not checked. All 15 were fixed in the change that added the rule. Two needed more
+than a new line number: ``pre_btc_lock_gate`` is not a function in pyrxd, and
+Glyph spec §16.4 described a ``COMMIT_SCRIPT_RE`` that 0.25.0 had changed.
+
+What the symbol rule cannot see: a citation with no name beside it; a citation
+for a list of names; a continuation citation with no file
+(```REF_OPCODES` (`:1075`)``), whose file is whichever one the prose last named;
+a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a
+citation that drifted WITHIN its definition (a line of a long function that now
+lands on a different line of the same function); a C++ citation that lands on a
+call rather than the definition, since the occurrence rule accepts both; a real
+all-lowercase function name written as ```x.py:14 check```, read as prose; and a
+symbol citation in ``docs/solutions/`` naming a file this repo does not contain,
+which is not held to the out-of-scope inventory below. A cited Python file that
+does not parse on the running interpreter is reported, not passed. In the other direction, it refuses a citation that deliberately points at
+a USE of a name the same Python file defines: cite the definition, or write the
+citation so it does not sit directly beside the name.
 
 Resolution, and why bare ``file.py:N`` is checked too
 -----------------------------------------------------
@@ -70,8 +147,12 @@ reports the citations the move invalidated.
 
 from __future__ import annotations
 
+import ast
+import functools
 import json
+import keyword
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,6 +162,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 #: Dated working space. See the Scope note in the module docstring.
 _DATED_SUBTREES = frozenset({"brainstorms", "plans", "solutions"})
+
+#: The dated subtree the SYMBOL rule reads anyway. See "The symbol rule" in the module docstring.
+_SYMBOL_RULE_ALSO_READS = frozenset({"solutions"})
 
 _VENDOR_ROOT = _ROOT / "tests" / "vendor" / "radiant_core"
 _MANIFEST = _VENDOR_ROOT / "MANIFEST.json"
@@ -190,37 +274,100 @@ class Citation:
     target: str
     start: int
     end: int | None
+    #: The code name written next to this citation, when it is written in one of the forms
+    #: ``symbol_named_by`` recognises. ``None`` for a citation that names no symbol.
+    symbol: str | None = None
 
     @property
     def where(self) -> str:
         return f"{self.doc}:{self.doc_line}"
 
 
-def _scanned_docs() -> list[Path]:
-    docs_root = _ROOT / "docs"
-    return sorted(p for p in docs_root.rglob("*.md") if p.relative_to(docs_root).parts[0] not in _DATED_SUBTREES)
+def _tracked_files(root: Path) -> list[str] | None:
+    """The files git tracks under *root*, repo-relative; ``None`` if *root* is not a git work tree.
+
+    What CI checks out is the tracked set, so that is what this test reads. Walking the
+    filesystem instead let an untracked local draft (a ``docs/design/`` note, a scratch
+    ``proof.py``) fail the gate, or make a bare basename ambiguous, on one machine and never in
+    CI. ``None`` sends the caller to the filesystem walk: in a ``git archive`` export or an
+    unpacked sdist the files on disk ARE the tracked set, and anywhere else the walk sees a
+    superset, which can only add citations to check and candidates to disambiguate. Neither
+    direction hides a rotted citation.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=root, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:  # no git on PATH
+        return None
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root.resolve():
+        return None
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True).stdout
+    return [p for p in listed.decode("utf-8").split("\0") if p]
 
 
-def _repo_files() -> list[str]:
-    """Every file in the checkout, as a repo-relative posix path.
+def _walked_files(root: Path) -> list[str]:
+    """Every file under *root*, for when there is no git work tree to ask. See ``_tracked_files``.
 
-    Hidden directories are pruned, which is what keeps a local ``.venv`` (and its
-    thousands of same-named modules) out of the candidate set.
+    Hidden and ``_PRUNED_DIR_NAMES`` directories are not descended into, so a local
+    ``.venv`` costs nothing here; ``_repo_files`` applies the same pruning to either listing.
     """
     out: list[str] = []
-    stack = [_ROOT]
+    stack = [root]
     while stack:
         directory = stack.pop()
         for entry in directory.iterdir():
             if entry.is_symlink():
                 continue
             if entry.is_dir():
-                if entry.name.startswith(".") or entry.name in _PRUNED_DIR_NAMES or entry in _PRUNED_DIRS:
-                    continue
-                stack.append(entry)
+                if not (entry.name.startswith(".") or entry.name in _PRUNED_DIR_NAMES):
+                    stack.append(entry)
             elif entry.is_file():
-                out.append(entry.relative_to(_ROOT).as_posix())
+                out.append(entry.relative_to(root).as_posix())
     return out
+
+
+def _repo_files() -> list[str]:
+    """Every file in the checkout, as a repo-relative posix path.
+
+    Tracked files when git can say which those are, else every file on disk. Hidden
+    directories are pruned either way, which is what keeps a local ``.venv`` (and its
+    thousands of same-named modules) out of the candidate set when there is no index to
+    consult.
+    """
+    listed = _tracked_files(_ROOT)
+    if listed is None:
+        listed = _walked_files(_ROOT)
+    pruned = {d.relative_to(_ROOT).as_posix() for d in _PRUNED_DIRS}
+    out: list[str] = []
+    for rel in listed:
+        dirs = rel.split("/")[:-1]
+        if any(d.startswith(".") or d in _PRUNED_DIR_NAMES for d in dirs):
+            continue
+        if any(rel.startswith(p + "/") for p in pruned):
+            continue
+        path = _ROOT / rel
+        if path.is_symlink() or not path.is_file():  # a tracked file deleted locally, or a submodule
+            continue
+        out.append(rel)
+    return out
+
+
+def _docs(subtrees_also_read: frozenset[str] = frozenset()) -> list[str]:
+    """``docs/**/*.md`` minus the dated subtrees, plus any of those named in *subtrees_also_read*."""
+    out = []
+    for rel in _repo_files():
+        parts = rel.split("/")
+        if parts[0] != "docs" or len(parts) < 2 or not rel.endswith(".md"):
+            continue
+        if len(parts) > 2 and parts[1] in _DATED_SUBTREES and parts[1] not in subtrees_also_read:
+            continue
+        out.append(rel)
+    return sorted(out)
+
+
+def _scanned_docs() -> list[str]:
+    return _docs()
 
 
 def _suffix_index(files: list[str]) -> dict[str, list[str]]:
@@ -253,22 +400,33 @@ def _upstream_index() -> dict[str, str]:
     return index
 
 
-def _citations() -> list[Citation]:
+def citations_in(doc: str, text: str) -> list[Citation]:
+    """Every citation in one document's *text*, with the symbol it names where it names one.
+
+    Read over the whole text rather than line by line, so a name and its citation that a
+    hard wrap put on different lines are still seen together. ``_CITE_RE`` cannot itself
+    span a newline, so it finds exactly what a line-by-line pass would.
+    """
     found: list[Citation] = []
-    for doc in _scanned_docs():
-        rel = doc.relative_to(_ROOT).as_posix()
-        for lineno, line in enumerate(doc.read_text(encoding="utf-8").splitlines(), 1):
-            for match in _CITE_RE.finditer(line):
-                found.append(
-                    Citation(
-                        doc=rel,
-                        doc_line=lineno,
-                        text=match.group(0),
-                        target=match.group(1),
-                        start=int(match.group(3)),
-                        end=int(match.group(4)) if match.group(4) else None,
-                    )
-                )
+    for match in _CITE_RE.finditer(text):
+        found.append(
+            Citation(
+                doc=doc,
+                doc_line=text.count("\n", 0, match.start()) + 1,
+                text=match.group(0),
+                target=match.group(1),
+                start=int(match.group(3)),
+                end=int(match.group(4)) if match.group(4) else None,
+                symbol=symbol_named_by(text, match.start(), match.end()),
+            )
+        )
+    return found
+
+
+def _citations(docs: list[str] | None = None) -> list[Citation]:
+    found: list[Citation] = []
+    for rel in _scanned_docs() if docs is None else docs:
+        found.extend(citations_in(rel, (_ROOT / rel).read_text(encoding="utf-8")))
     return found
 
 
@@ -308,6 +466,334 @@ def check_citation(cit: Citation, candidates: list[str], source_lines: list[str]
                 "The code it named has moved; find it and re-cite it."
             )
     return None
+
+
+# ---------------------------------------------------------------------------
+# The symbol rule: a citation written next to a code name must land on that name
+# ---------------------------------------------------------------------------
+
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_DOTTED = rf"(?P<name>{_IDENT}(?:\.{_IDENT})*)(?:\(\))?"
+#: A code name that fills its own backtick span: ``name``, ``Class.method``, ``name()``.
+_NAME = rf"`{_DOTTED}`"
+
+#: How far either side of a citation to look for its name. Longer than any name and joiner.
+_WINDOW = 200
+
+#: The name comes first, and the citation is a backtick span of its own right after it:
+#: ``name`` (``path:N``  |  ``name``, ``path:N``  |  ``name`` at ``path:N``.
+#: Matched against the text up to and including the citation's opening backtick.
+_NAME_THEN_CITE = re.compile(rf"{_NAME}(?:\s*\(\s*|,\s*|\s+at\s+)`\Z")
+#: The citation comes first and opens a parenthetical that starts with the name:
+#: ``path:N`` (``name``.  Matched from the citation's closing backtick.
+_CITE_THEN_NAME = re.compile(rf"\A`\s*\(\s*{_NAME}")
+#: The name shares the citation's backticks: ``path:N name``.  Matched from the citation's end.
+_CITE_WITH_NAME = re.compile(rf"\A[ \t]+{_DOTTED}`")
+
+#: The name is the LAST of a list — ``a``, ``b`` and (ETH) ``c`` (``path:N``) — so the
+#: citation speaks for the list, not for ``c``. Only a joiner directly after another
+#: backtick span counts, with at most one short parenthetical between it and the name, so
+#: an ordinary word before the name ("the shared ``c``") never reads as a list.
+_LIST_BEFORE = re.compile(r"`\s*(?:,|\band|\bor)\s*(?:\([^()`\n]*\)\s*)?\Z")
+#: The mirror, for a name that is the FIRST of a list: ``path:N`` (``a``, ``b``).
+_LIST_AFTER = re.compile(r"\A\s*(?:,|and\b|or\b)\s*`")
+
+
+def symbol_named_by(text: str, start: int, end: int) -> str | None:
+    """The code name written next to the citation at ``text[start:end]``, or ``None``.
+
+    These forms, and only these, name a symbol (``CITE`` is the citation):
+
+    * ```name` (`CITE`)``, ```name`, `CITE```, ```name` at `CITE``` — the citation fills a
+      backtick span of its own, directly after the name;
+    * ```CITE` (`name` …)`` — the citation fills its own span and the parenthetical after it
+      opens with the name;
+    * ```CITE name``` — the name inside the citation's own backticks.
+
+    A name that ends or starts a list of names is not taken: the citation then belongs to
+    the list, and a rule that picked one member would refuse citations that are correct.
+    Whitespace between the parts may include a newline, so a hard wrap hides nothing.
+    """
+    if start == 0 or text[start - 1] != "`":
+        return None
+    after = text[end : end + _WINDOW]
+    within = _CITE_WITH_NAME.match(after)
+    if within:
+        return _code_name(within.group("name"), within.group(0).strip(" \t`"))
+    if not after.startswith("`"):
+        return None  # the citation shares its backticks with something other than a name
+    before = text[max(0, start - _WINDOW) : start]
+    first = _NAME_THEN_CITE.search(before)
+    if first:
+        name_at = start - len(before) + first.start()
+        if _LIST_BEFORE.search(text[max(0, name_at - _WINDOW) : name_at]):
+            return None
+        return _code_name(first.group("name"))
+    second = _CITE_THEN_NAME.match(after)
+    if second:
+        if _LIST_AFTER.match(after[second.end() :]):
+            return None
+        return _code_name(second.group("name"))
+    return None
+
+
+def _code_name(name: str, written: str | None = None) -> str | None:
+    """*name*, unless it is a Python keyword (```CITE` (`None` if …)`` names no symbol).
+
+    *written* is given for the ```CITE name``` form, where the name shares the citation's
+    backticks with no punctuation to mark it as code. There a plain lowercase word
+    (```x.py:14 onwards```) is prose, so only a name that LOOKS like code is taken: one with
+    an underscore, a dot, a capital, a digit or ``()``. A real function called ``check``
+    written that way is therefore not checked; written in any other form, it is.
+    """
+    if keyword.iskeyword(name.split(".")[0]):
+        return None
+    if written is not None and not re.search(r"[_.A-Z0-9(]", written):
+        return None
+    return name
+
+
+@dataclass(frozen=True)
+class Definition:
+    """One name a Python file binds, and the lines it spans (decorators included)."""
+
+    qualname: str
+    first: int
+    last: int
+
+
+@functools.cache
+def python_definitions(source: str) -> tuple[Definition, ...]:
+    """Every ``def``, ``async def`` and ``class`` in *source*, at any depth, and every ``name =``
+    or ``name: T =`` at module or class level (a function's locals are not definitions).
+
+    Qualified by the classes and functions around them, so ``NegotiatedTerms.to_dict`` and
+    ``SwapRecord.to_dict`` stay apart. An ``import`` is deliberately NOT a definition: a
+    citation to a module that merely uses an imported name is held to the occurrence rule,
+    not told that the name "is defined" at its import line. The exception is an import of a
+    name the same scope ALSO assigns (``try: from x import y`` / ``except ImportError: y =
+    None``): the import is then one of the name's bindings, and a citation of it is correct.
+
+    Raises ``SyntaxError`` when *source* does not parse on the running Python; ``check_symbol``
+    reports that rather than letting it pass or crash the scan.
+    """
+    out: list[Definition] = []
+    imported: list[Definition] = []
+
+    def visit(node: ast.AST, prefix: str, in_function: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                first = min([d.lineno for d in child.decorator_list] + [child.lineno])
+                out.append(Definition(prefix + child.name, first, child.end_lineno or child.lineno))
+                is_function = not isinstance(child, ast.ClassDef)
+                visit(child, f"{prefix}{child.name}.", in_function or is_function)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                if in_function:
+                    continue
+                for alias in child.names:
+                    if alias.name != "*":
+                        bound = alias.asname or alias.name.split(".")[0]
+                        imported.append(Definition(prefix + bound, child.lineno, child.end_lineno or child.lineno))
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                if in_function:
+                    continue
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                for target in targets:
+                    for leaf in ast.walk(target):
+                        if isinstance(leaf, ast.Name):
+                            out.append(Definition(prefix + leaf.id, child.lineno, child.end_lineno or child.lineno))
+            else:
+                visit(child, prefix, in_function)
+
+    visit(ast.parse(source), "", False)
+    assigned = {d.qualname for d in out}
+    out.extend(d for d in imported if d.qualname in assigned)
+    return tuple(out)
+
+
+def _without_module_prefix(parts: list[str], path: str) -> list[str]:
+    """*parts* with a leading module path dropped: ``pyrxd.glyph.script.iter_input_refs``,
+    cited in ``src/pyrxd/glyph/script.py``, is ``iter_input_refs``.
+
+    Only a prefix that is a contiguous run of *path*'s own components is dropped (so
+    ``pyrxd.glyph``, the re-export path, is too), and at least one part is always kept. A
+    prefix that names anything else (``Wrong.method``) is left alone, and ``check_symbol``
+    then refuses the name if the file defines ``method`` under some other qualifier.
+    """
+    module = path.removesuffix(".py").split("/")
+    if module[-1] == "__init__":
+        module = module[:-1]
+    for k in range(len(parts) - 1, 0, -1):
+        if any(module[i : i + k] == parts[:k] for i in range(len(module) - k + 1)):
+            return parts[k:]
+    return parts
+
+
+#: How many lines a citation of a definition may take in above it (a leading comment and a
+#: blank) and below it (the two blank lines PEP 8 leaves after a top-level definition). Only
+#: blank and comment lines count. Measured on the real docs when this was set: every one of the
+#: 35 citations the definition rule checked lay INSIDE its definition, so honest citations use
+#: none of this; it is room for a comment, not for code.
+_LEAD_ALLOWANCE = 3
+_TRAIL_ALLOWANCE = 2
+
+
+def _is_filler(line: str) -> bool:
+    """A blank or comment-only line: the only kind a citation may take in beside a definition."""
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _lands_on(d: Definition, first: int, last: int, lines: list[str]) -> bool:
+    """The cited lines overlap the definition, and any they take in outside it are at most
+    ``_LEAD_ALLOWANCE`` lines above it and ``_TRAIL_ALLOWANCE`` below, all blank or comments.
+
+    So a range inside the definition passes, and so does one that adds a leading comment. A
+    range that holds the definition among other code does not, however much of it there is:
+    ``swap_state.py:1-800`` contains ``NegotiatedTerms.to_dict`` and says nothing about where.
+    """
+    if last < d.first or first > d.last:
+        return False
+    if d.first - first > _LEAD_ALLOWANCE or last - d.last > _TRAIL_ALLOWANCE:
+        return False
+    outside = [*range(first, d.first), *range(d.last + 1, last + 1)]
+    return all(0 < n <= len(lines) and _is_filler(lines[n - 1]) for n in outside)
+
+
+def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None]:
+    """Return ``(rule, problem)`` for a citation that names ``cit.symbol``; ``problem`` is ``None`` if it holds.
+
+    ``rule`` is which of the two applied:
+
+    * ``"definition"`` — *path* is Python and defines the name (see ``python_definitions``;
+      a dotted name must match the trailing parts of the qualified name, after any leading
+      module path is dropped, see ``_without_module_prefix``). If the name matches more than
+      one qualified name (bare ``to_dict``, with ``NegotiatedTerms.to_dict`` and
+      ``SwapRecord.to_dict`` both defined) and none of them exactly, the citation is refused
+      as ambiguous: which one the doc meant cannot be known, the same stance as a bare file
+      name two files share. A dotted name the file does not define, when the file DOES define
+      its last part (``Wrong.iter_input_refs``, ``X.to_dict``), is refused as naming nothing:
+      falling through to the occurrence rule would accept it wherever the last part appears.
+      Otherwise the cited lines must land on one of the definitions (decorators through last
+      line), see ``_lands_on``: inside it, because the docs deliberately cite a branch inside
+      a function (``holder_hash``'s ``rxd`` branch), or over it with at most a few blank or
+      comment lines either side. A range that takes in other code — straddling an edge, or
+      holding the whole definition among its neighbours — is how a range looks after the
+      code moved under it, or one too wide to say where the name is, so it is refused.
+    * ``"occurrence"`` — *path* is not Python (the vendored C++), or does not define the
+      name (a dict key, a string value, an imported name). The name's last part must then
+      appear as a whole word in the cited lines. This is weaker: it cannot tell a C++
+      definition from a call.
+    * ``"unparsed"`` — *path* is Python that does not parse on the running interpreter (newer
+      syntax than it knows), so where it defines the name is unknown. Always a problem: an
+      unverifiable citation is reported, not passed.
+
+    Split out from the scan so both rules can be exercised against synthetic inputs.
+    """
+    assert cit.symbol is not None, "only a citation that names a symbol has one to check"
+    first, last = cit.start, cit.end if cit.end is not None else cit.start
+    parts = cit.symbol.split(".")
+    lines = source.splitlines()
+    if path.endswith(".py"):
+        try:
+            definitions = python_definitions(source)
+        except (SyntaxError, ValueError) as exc:
+            return "unparsed", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` cannot be checked: {path} does not parse "
+                f"on this Python ({exc}). Run this test on a Python that parses it."
+            )
+
+        def matching(name: list[str]) -> list[Definition]:
+            return [d for d in definitions if d.qualname.split(".")[-len(name) :] == name]
+
+        defined = matching(parts)
+        if not defined:
+            parts = _without_module_prefix(parts, path)
+            defined = matching(parts)
+        if not defined and len(parts) > 1 and (same_last := matching(parts[-1:])):
+            return "definition", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` names nothing {path} defines — it "
+                f"defines `{parts[-1]}` only as {', '.join(sorted({d.qualname for d in same_last}))}. "
+                "Correct the qualified name."
+            )
+        exact = [d for d in defined if d.qualname == ".".join(parts)]
+        defined = exact or defined
+        qualnames = sorted({d.qualname for d in defined})
+        if len(qualnames) > 1:
+            return "definition", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` is ambiguous — {path} defines "
+                f"{', '.join(qualnames)}. Write the qualified name, so the citation can be checked "
+                "against the one it means."
+            )
+        if defined:
+            if any(_lands_on(d, first, last, lines) for d in defined):
+                return "definition", None
+            spans = ", ".join(
+                str(d.first) if d.first == d.last else f"{d.first}-{d.last}"
+                for d in sorted(defined, key=lambda d: d.first)
+            )
+            return "definition", (
+                f"{cit.where}: `{cit.symbol}` is cited at `{cit.text}`, but {path} defines it at "
+                f"line(s) {spans}, and the cited lines are not on it (inside it, or over it with at "
+                f"most {_LEAD_ALLOWANCE} blank or comment lines above and {_TRAIL_ALLOWANCE} below). "
+                "Re-cite it where it is."
+            )
+    word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(parts[-1])}(?![A-Za-z0-9_])")
+    if any(word.search(line) for line in lines[first - 1 : last]):
+        return "occurrence", None
+    seen = [n for n, line in enumerate(lines, 1) if word.search(line)]
+    if seen:
+        where = ", ".join(map(str, seen[:5])) + (" …" if len(seen) > 5 else "")
+        elsewhere = f"it does appear at line(s) {where}"
+    else:
+        elsewhere = (
+            "it appears nowhere in that file. If it was removed or renamed, say so in the doc "
+            "rather than pointing the citation somewhere else"
+        )
+    return "occurrence", (f"{cit.where}: `{cit.symbol}` does not appear in `{cit.text}` ({path}); {elsewhere}.")
+
+
+def _is_symbol(name: str, suffixes: dict[str, list[str]], upstream: dict[str, str]) -> bool:
+    """A backticked ``htlc_spend.py`` next to a citation names a FILE, not a symbol."""
+    return "." not in name or not _candidates(name, suffixes, upstream)
+
+
+@dataclass(frozen=True)
+class SymbolScan:
+    """What the symbol rule saw: the citations it checked, each with the rule applied, and
+    the problems found. A citation whose file this repo does not contain is not checked."""
+
+    checked: list[tuple[Citation, str]]
+    problems: list[str]
+
+
+def _symbol_scan() -> SymbolScan:
+    suffixes = _suffix_index([f for f in _repo_files() if not f.startswith("tests/vendor/")])
+    upstream = _upstream_index()
+    sources: dict[str, str] = {}
+    checked: list[tuple[Citation, str]] = []
+    problems: list[str] = []
+    for cit in _citations(_docs(_SYMBOL_RULE_ALSO_READS)):
+        if cit.symbol is None or not _is_symbol(cit.symbol, suffixes, upstream):
+            continue
+        candidates = _candidates(cit.target, suffixes, upstream)
+        if not candidates:
+            continue
+        lines = None
+        if len(candidates) == 1:
+            path = candidates[0]
+            if path not in sources:
+                sources[path] = (_ROOT / path).read_text(encoding="utf-8", errors="replace")
+            lines = sources[path].splitlines()
+        # The mechanical checks first: a docs/solutions/ citation is read ONLY here, and a
+        # symbol cannot be looked for past the end of a file or in an ambiguous one.
+        problem = check_citation(cit, candidates, lines)
+        if problem is None:
+            rule, problem = check_symbol(cit, candidates[0], sources[candidates[0]])
+            checked.append((cit, rule))
+        if problem:
+            problems.append(problem)
+    return SymbolScan(checked, problems)
 
 
 def _scan() -> tuple[list[Citation], dict[str, list[str]], list[Citation], list[str]]:
@@ -386,6 +872,37 @@ def test_the_excluded_dated_subtrees_still_exist() -> None:
         f"_DATED_SUBTREES names directories that no longer exist: {missing}. "
         "Update the exclusion to match the docs tree."
     )
+    assert _SYMBOL_RULE_ALSO_READS <= _DATED_SUBTREES, (
+        "_SYMBOL_RULE_ALSO_READS re-admits subtrees the main scan excludes; one it does not "
+        f"exclude would re-admit nothing: {sorted(_SYMBOL_RULE_ALSO_READS - _DATED_SUBTREES)}"
+    )
+
+
+def test_only_tracked_files_are_read(tmp_path: Path) -> None:
+    """An untracked draft must not fail the gate locally when CI never sees it — and a
+    directory git knows nothing about must fall back to reading what is on disk.
+
+    Run against a real throwaway repository, because what is under test is what ``git
+    ls-files`` says, and a stub would only repeat what this test told it.
+    """
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "tracked.md").write_text("`a.py:1`\n", encoding="utf-8")
+    (repo / "docs" / "draft.md").write_text("`a.py:99`\n", encoding="utf-8")
+    env = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", *env, "-C", str(repo), "add", "docs/tracked.md"], check=True)
+    assert _tracked_files(repo) == ["docs/tracked.md"]
+
+    plain = tmp_path / "export"
+    (plain / "docs").mkdir(parents=True)
+    (plain / "docs" / "draft.md").write_text("", encoding="utf-8")
+    assert _tracked_files(plain) is None, "a directory outside any git work tree has no index to ask"
+    assert _walked_files(plain) == ["docs/draft.md"]
+
+    # A subdirectory of a work tree is not a work tree's root: the listing would be
+    # relative to the wrong place, so it too falls back to the walk.
+    assert _tracked_files(repo / "docs") is None
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +990,410 @@ class TestTheCheckerFires:
 
 
 # ---------------------------------------------------------------------------
+# 2b. The symbol rule
+# ---------------------------------------------------------------------------
+
+#: Non-vacuity floor for the symbol rule. See the measurement in the module docstring; the
+#: floor sits below it so ordinary doc churn does not trip it, and far above zero so a form
+#: regex that stops matching cannot pass as a clean run.
+_MIN_SYMBOL_CHECKED = 25
+
+
+@pytest.fixture(scope="module")
+def symbol_scan() -> SymbolScan:
+    return _symbol_scan()
+
+
+def test_every_symbol_citation_lands_on_its_symbol(symbol_scan) -> None:
+    """The gate for the half the blank-line check cannot see.
+
+    A citation written next to a code name that lands on some OTHER non-blank line passes
+    ``test_every_cited_line_lands_on_real_code`` — the Glyph spec cited ``iter_input_refs``
+    at the delegate builder, and ``docs/security-audit-scope.md`` cited ``REF_OPCODES`` at a
+    P2PKH byte string for months, both green. See ``check_symbol`` for the two rules.
+    """
+    assert not symbol_scan.problems, "doc citations do not land on the code they name:\n  " + "\n  ".join(
+        symbol_scan.problems
+    )
+
+
+def test_the_symbol_rule_is_not_vacuous(symbol_scan) -> None:
+    """A form regex that matches nothing makes the gate above pass over nothing.
+
+    So the rule must have checked a real number of citations, through BOTH rules, and in
+    both the published docs and ``docs/solutions/`` — each is a way the scan could quietly
+    stop reaching something while every assertion above stays green.
+    """
+    checked = symbol_scan.checked
+    assert len(checked) >= _MIN_SYMBOL_CHECKED, (
+        f"the symbol rule checked only {len(checked)} citations — check _NAME_THEN_CITE, "
+        "_CITE_THEN_NAME and _CITE_WITH_NAME before lowering this floor."
+    )
+    rules = {rule for _, rule in checked}
+    assert rules == {"definition", "occurrence"}, (
+        f"only these rules ran over the real docs: {sorted(rules)}. The definition rule covers "
+        "Python targets; the occurrence rule covers the vendored C++."
+    )
+    subtrees = {cit.doc.split("/")[1] for cit, _ in checked}
+    assert subtrees >= _SYMBOL_RULE_ALSO_READS, (
+        f"no citation in {sorted(_SYMBOL_RULE_ALSO_READS - subtrees)} was checked, though the rule is meant to read it"
+    )
+    assert subtrees - _DATED_SUBTREES, "no citation in the published docs was checked"
+
+
+class TestTheSymbolRule:
+    """Both halves of the rule on synthetic inputs: which citations name a symbol, and
+    whether the named symbol is where they say. Refusals are paired with honest cases."""
+
+    # Line numbers matter below; the comment on each line is the number.
+    _SOURCE = "\n".join(
+        [
+            "import os",  # 1
+            "from x import imported_name",  # 2
+            "",  # 3
+            "CONSTANT = 1",  # 4
+            "annotated: int = 2",  # 5
+            "",  # 6
+            "",  # 7
+            "@decorator",  # 8
+            "def decorated():",  # 9
+            "    local = 3",  # 10
+            "    return local",  # 11
+            "",  # 12
+            "",  # 13
+            "class Outer:",  # 14
+            "    attr = 4",  # 15
+            "",  # 16
+            "    def method(self):",  # 17
+            "        if os:",  # 18
+            "            return 5",  # 19
+            "        return 6  # CONSTANT is read here",  # 20
+            "",  # 21
+            "",  # 22
+            "class Other:",  # 23
+            "    def method(self):",  # 24
+            "        return imported_name",  # 25
+            "",  # 26
+            "try:",  # 27
+            "    from y import fallback_name",  # 28
+            "except ImportError:",  # 29
+            "    fallback_name = None",  # 30
+            "",
+        ]
+    )
+
+    @staticmethod
+    def _cite(symbol: str, start: int, end: int | None = None) -> Citation:
+        text = f"a.py:{start}" + (f"-{end}" if end is not None else "")
+        return Citation("d.md", 7, text, "a.py", start, end, symbol)
+
+    # -- which citations name a symbol ------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "name"),
+        [
+            ("see `iter_input_refs` (`script.py:12`) here", "iter_input_refs"),
+            ("guess (`TruncatedScriptError`,\n`script.py:12`)", "TruncatedScriptError"),
+            ("`dMintScript` at `script.py:12`", "dMintScript"),
+            ("`swap_state.py:12` (`NegotiatedTerms` and its wire form)", "NegotiatedTerms"),
+            ("(`failover.py:12 _holds_tx`)", "_holds_tx"),
+            ("`build()` (`proof.py:12`)", "build"),
+            ("`NegotiatedTerms.__post_init__` (`swap_state.py:12`)", "NegotiatedTerms.__post_init__"),
+            ("(`x.py:12 Foo`)", "Foo"),
+            ("(`x.py:12 build()`)", "build"),
+            ("`x.py:12` (`none_left` if absent)", "none_left"),
+            ("the shared `REF_OPCODES`\n(`glyph/script.py:12`), locked", "REF_OPCODES"),
+            ("`foo` resolves and `bar` (`x.py:12`)", "bar"),
+        ],
+    )
+    def test_each_written_form_is_read(self, text: str, name: str) -> None:
+        (cit,) = citations_in("d.md", text)
+        assert cit.symbol == name
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "`a` and `b` (`x.py:12`)",
+            "`a`, `b` (`x.py:12`)",
+            "carries `a`, `b` and (ETH) `c`\n(`x.py:12`)",
+            "`x.py:12` (`a`, `b`)",
+            "`x.py:12` (`a` and `b`)",
+            "`x.py:12, 40-41` (`a`)",
+            "`a` (see `x.py:12`)",
+            "`a` x.py:12",
+            "`a = 1` (`x.py:12`)",
+            "`x.py:12 and more`",
+            "`x.py:14 onwards`",  # a word after the line number is prose, not a name
+            "`x.py:12` (`None` if absent)",  # a keyword is not a symbol
+            "`True` (`x.py:12`)",
+        ],
+    )
+    def test_a_citation_with_no_single_named_subject_names_none(self, text: str) -> None:
+        """A list of names, a citation sharing its backticks, or a name not directly beside
+        it: the citation's subject is not one symbol, so the rule must not pick one."""
+        (cit,) = citations_in("d.md", text)
+        assert cit.symbol is None
+
+    def test_a_file_named_beside_a_citation_is_not_a_symbol(self) -> None:
+        suffixes = _suffix_index(["src/pyrxd/gravity/htlc_spend.py"])
+        assert not _is_symbol("htlc_spend.py", suffixes, {})
+        assert _is_symbol("NegotiatedTerms.to_dict", suffixes, {})
+        assert _is_symbol("to_dict", suffixes, {})
+
+    # -- whether the symbol is where the citation says --------------------------------
+
+    @pytest.mark.parametrize(
+        ("symbol", "start", "end"),
+        [
+            ("CONSTANT", 4, None),
+            ("annotated", 5, None),
+            ("decorated", 8, None),  # the decorator line
+            ("decorated", 9, None),
+            ("decorated", 10, 11),  # a line inside the body
+            ("Outer", 14, 20),
+            ("Outer.attr", 15, None),
+            ("Outer.method", 18, 19),  # a branch inside the method
+            ("Other.method", 24, None),
+            ("Other.method", 24, 25),
+            ("decorated", 8, 11),  # exactly the definition
+            ("decorated", 6, 11),  # with the blank lines above it
+            ("decorated", 8, 13),  # with the blank lines below it
+            ("Outer", 12, 22),  # both
+            ("fallback_name", 28, None),  # the import is a binding: the same scope assigns it
+            ("fallback_name", 30, None),
+        ],
+    )
+    def test_a_citation_on_its_definition_is_accepted(self, symbol: str, start: int, end: int | None) -> None:
+        assert check_symbol(self._cite(symbol, start, end), "a.py", self._SOURCE) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("symbol", "start", "end", "defined_at"),
+        [
+            ("decorated", 4, None, "8-11"),
+            ("CONSTANT", 5, None, "4"),
+            ("CONSTANT", 20, None, "4"),  # MENTIONED on the cited line, defined elsewhere
+            ("Other.method", 17, 20, "24-25"),  # the other class's method
+            ("Outer", 23, 25, "14-20"),
+            ("decorated", 1, 8, "8-11"),  # a drifted range: ends on the decorator
+            ("decorated", 4, 9, "8-11"),  # ends inside the definition
+            ("decorated", 10, 14, "8-11"),  # starts inside, runs past the end
+            ("Outer.method", 15, 18, "17-20"),  # starts before, ends inside
+            ("fallback_name", 25, None, "28, 30"),
+            ("decorated", 4, 11, "8-11"),  # holds the whole definition, and code above it
+            ("Outer", 4, 25, "14-20"),  # holds it among its neighbours
+            ("Outer.method", 1, 30, "17-20"),  # the whole file
+            ("Outer.method", 17, 25, "17-20"),  # blank lines and then another class below
+        ],
+    )
+    def test_a_citation_beside_its_definition_is_refused(
+        self, symbol: str, start: int, end: int | None, defined_at: str
+    ) -> None:
+        rule, problem = check_symbol(self._cite(symbol, start, end), "a.py", self._SOURCE)
+        assert rule == "definition"
+        assert problem is not None and f"defines it at line(s) {defined_at}," in problem and "d.md:7" in problem
+
+    #: A leading comment block above a function, and code after it. Line numbers as above.
+    _COMMENTED = "\n".join(
+        [
+            "# 1",  # 1
+            "# 2",  # 2
+            "# 3",  # 3
+            "# 4",  # 4
+            "def foo():",  # 5
+            "    a = 1",  # 6
+            "    return a",  # 7
+            "",  # 8
+            "BAR = 2",  # 9
+            "",
+        ]
+    )
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (3, 6),  # the comment just above it and its first lines
+            (2, 7),  # three comment lines and the whole function
+            (5, 8),  # the function and the blank line below it
+            (4, 5),
+        ],
+    )
+    def test_a_range_may_take_in_a_leading_comment(self, start: int, end: int) -> None:
+        """The honest half of the bound: a range starting on the comment that introduces a
+        function, and running into it, cites the function. It used to be refused as a
+        straddle."""
+        assert check_symbol(self._cite("foo", start, end), "a.py", self._COMMENTED) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (1, 7),  # four comment lines above: past the allowance
+            (5, 9),  # runs on to the next line of code, inside the allowance
+            (1, 9),  # holds the function among its neighbours
+            (4, 4),  # only the comment, not the function
+        ],
+    )
+    def test_a_range_is_bounded_around_the_definition(self, start: int, end: int) -> None:
+        """A range that holds the definition is not enough: ``1-800`` holds everything. It
+        may take in at most ``_LEAD_ALLOWANCE`` comment or blank lines above and
+        ``_TRAIL_ALLOWANCE`` below, and no code."""
+        assert (_LEAD_ALLOWANCE, _TRAIL_ALLOWANCE) == (3, 2), "the cases here are sized to these"
+        rule, problem = check_symbol(self._cite("foo", start, end), "a.py", self._COMMENTED)
+        assert rule == "definition"
+        assert problem is not None and "defines it at line(s) 5-7," in problem
+
+    def test_a_range_holding_a_real_method_among_its_neighbours_is_refused(self) -> None:
+        """The review's case, through the real file: ``NegotiatedTerms.to_dict`` cited at a
+        range that holds it and much else, and at the whole file. Built from wherever the
+        method is today, and paired with the method's own lines, which must pass."""
+        path = "src/pyrxd/gravity/swap_state.py"
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        (real,) = [d for d in python_definitions(source) if d.qualname == "NegotiatedTerms.to_dict"]
+        whole = len(source.splitlines())
+        for start, end in ((real.first - 100, real.last + 100), (1, whole)):
+            (cit,) = citations_in("d.md", f"`NegotiatedTerms.to_dict` (`{path}:{start}-{end}`)")
+            assert check_citation(cit, [path], source.splitlines()) is None
+            rule, problem = check_symbol(cit, path, source)
+            assert rule == "definition" and problem is not None and f"line(s) {real.first}-{real.last}," in problem
+        (cit,) = citations_in("d.md", f"`NegotiatedTerms.to_dict` (`{path}:{real.first}-{real.last}`)")
+        assert check_symbol(cit, path, source) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("path", "wrong", "right"),
+        [
+            ("src/pyrxd/gravity/swap_state.py", "X.to_dict", "SwapRecord.to_dict"),
+            ("src/pyrxd/glyph/script.py", "Wrong.iter_input_refs", "iter_input_refs"),
+        ],
+    )
+    def test_a_wrongly_qualified_name_is_refused_where_the_right_one_passes(
+        self, path: str, wrong: str, right: str
+    ) -> None:
+        """The file defines the last part, but not under that qualifier. Cited at the real
+        definition's own lines, the correct name passes and the wrong one must not: it names
+        nothing, and the occurrence rule would have accepted it anywhere the word appears."""
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        (real,) = [d for d in python_definitions(source) if d.qualname == right]
+        rule, problem = check_symbol(self._cite(wrong, real.first, real.last), path, source)
+        assert rule == "definition"
+        assert problem is not None and "names nothing" in problem and right in problem
+        assert check_symbol(self._cite(right, real.first, real.last), path, source) == ("definition", None)
+
+    def test_a_wrong_qualifier_is_refused_on_synthetic_input(self) -> None:
+        rule, problem = check_symbol(self._cite("Wrong.method", 24, 25), "a.py", self._SOURCE)
+        assert rule == "definition"
+        assert problem is not None and "only as Other.method, Outer.method" in problem
+        assert check_symbol(self._cite("Other.method", 24, 25), "a.py", self._SOURCE) == ("definition", None)
+        # A dotted name whose last part the file does not define at all is still read by
+        # the occurrence rule: ``self.local`` is not a definition anywhere.
+        assert check_symbol(self._cite("self.local", 10), "a.py", self._SOURCE) == ("occurrence", None)
+
+    @pytest.mark.parametrize(
+        ("symbol", "start", "end"),
+        [
+            ("imported_name", 25, None),  # an import is not a definition, so a use is fine
+            ("imported_name", 2, None),
+            ("local", 10, None),  # a function's local is not a definition either
+        ],
+    )
+    def test_a_name_the_file_does_not_define_is_accepted_where_it_appears(
+        self, symbol: str, start: int, end: int | None
+    ) -> None:
+        assert check_symbol(self._cite(symbol, start, end), "a.py", self._SOURCE) == ("occurrence", None)
+
+    def test_a_bare_name_several_things_define_is_refused_as_ambiguous(self) -> None:
+        """Bare ``method`` is ``Outer.method`` and ``Other.method`` here. Landing on either
+        proves nothing about the one the doc meant, so the doc must say which."""
+        for start, end in ((17, 20), (24, 25)):
+            rule, problem = check_symbol(self._cite("method", start, end), "a.py", self._SOURCE)
+            assert rule == "definition"
+            assert problem is not None and "ambiguous" in problem and "Other.method, Outer.method" in problem
+
+    def test_a_bare_name_with_one_exact_definition_is_that_definition(self) -> None:
+        """The honest path beside the ambiguity: an unqualified name that IS a module-level
+        definition means that one, even where a class also has a member of the name."""
+        source = "def run():\n    pass\n\n\nclass C:\n    def run(self):\n        pass\n"
+        assert check_symbol(self._cite("run", 1, 2), "a.py", source) == ("definition", None)
+        rule, problem = check_symbol(self._cite("run", 6, 7), "a.py", source)
+        assert rule == "definition" and problem is not None and "defines it at line(s) 1-2," in problem
+        assert check_symbol(self._cite("C.run", 6, 7), "a.py", source) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("symbol", "start", "problem"),
+        [
+            ("pkg.a.decorated", 9, None),
+            ("a.decorated", 10, None),
+            ("pkg.a.Outer.method", 18, None),
+            ("pkg.a.CONSTANT", 4, None),
+            ("pkg.a.CONSTANT", 20, "defines it at line(s) 4,"),  # mentioned on 20, defined on 4
+            ("pkg.a.method", 24, "ambiguous"),
+        ],
+    )
+    def test_a_module_qualified_name_is_held_to_the_definition_rule(
+        self, symbol: str, start: int, problem: str | None
+    ) -> None:
+        rule, found = check_symbol(self._cite(symbol, start), "src/pkg/a.py", self._SOURCE)
+        assert rule == "definition"
+        assert (found is None) if problem is None else (found is not None and problem in found)
+
+    def test_a_prefix_that_is_not_the_module_is_not_dropped(self) -> None:
+        """``Wrong.method`` must not be read as bare ``method``: only the file's own module
+        path is dropped, so a wrong class name gets no help from the definition rule."""
+        assert _without_module_prefix(["Wrong", "method"], "src/pkg/a.py") == ["Wrong", "method"]
+        assert _without_module_prefix(["pkg", "a", "f"], "src/pkg/a.py") == ["f"]
+        assert _without_module_prefix(["pkg", "f"], "src/pkg/__init__.py") == ["f"]
+        assert _without_module_prefix(["a"], "src/pkg/a.py") == ["a"]
+
+    def test_a_file_that_does_not_parse_is_reported_not_passed(self) -> None:
+        """A cited file in syntax newer than the running Python must not crash the scan, and
+        must not pass either: nothing is known about where it defines anything."""
+        rule, problem = check_symbol(self._cite("f", 1), "a.py", "def f(:\n    pass\n")
+        assert rule == "unparsed" and problem is not None and "does not parse" in problem and "d.md:7" in problem
+        assert check_symbol(self._cite("f", 1), "a.py", "def f():\n    pass\n") == ("definition", None)
+
+    def test_a_name_the_file_does_not_define_is_refused_where_it_does_not_appear(self) -> None:
+        rule, problem = check_symbol(self._cite("local", 4), "a.py", self._SOURCE)
+        assert rule == "occurrence"
+        assert problem is not None and "does appear at line(s) 10, 11" in problem
+
+    def test_a_name_that_appears_nowhere_says_so(self) -> None:
+        """The "no longer exists" case: the fix is to say so in the doc, not to re-point it."""
+        rule, problem = check_symbol(self._cite("pre_btc_lock_gate", 9), "a.py", self._SOURCE)
+        assert rule == "occurrence"
+        assert problem is not None and "appears nowhere in that file" in problem
+
+    def test_a_non_python_file_is_held_to_the_occurrence_rule(self) -> None:
+        source = "static bool check(int x) {\n    return helper(x);\n}\n"
+        assert check_symbol(self._cite("check", 1), "v.h", source) == ("occurrence", None)
+        assert check_symbol(self._cite("helper", 2), "v.h", source) == ("occurrence", None)
+        rule, problem = check_symbol(self._cite("check", 2, 3), "v.h", source)
+        assert rule == "occurrence" and problem is not None and "does appear at line(s) 1" in problem
+
+    def test_the_citation_from_issue_752_is_refused_against_the_real_file(self) -> None:
+        """The defect this rule exists for, through the production path and the real source.
+
+        The Glyph spec cited ``iter_input_refs`` at the delegate builder: every cited line
+        real code, none of it the function. Rebuilt here from whatever ``script.py`` holds
+        today — the first other definition that does not overlap the real one — so it keeps
+        meaning the same thing as lines move. The blank-line rule must PASS it (that is the
+        gap) and the symbol rule must refuse it (that is the fix).
+        """
+        path = "src/pyrxd/glyph/script.py"
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        definitions = python_definitions(source)
+        (real,) = [d for d in definitions if d.qualname == "iter_input_refs"]
+        elsewhere = next(
+            d
+            for d in definitions
+            if "." not in d.qualname and d.first < d.last and (d.last < real.first or d.first > real.last)
+        )
+        (cit,) = citations_in("spec.md", f"walker is `iter_input_refs` (`{path}:{elsewhere.first}-{elsewhere.last}`)")
+        assert cit.symbol == "iter_input_refs"
+        assert check_citation(cit, [path], source.splitlines()) is None, "the blank-line rule was meant to miss this"
+        rule, problem = check_symbol(cit, path, source)
+        assert rule == "definition"
+        assert problem is not None and f"line(s) {real.first}-{real.last}," in problem
+
+
+# ---------------------------------------------------------------------------
 # 3. The exemption, pinned in both directions
 # ---------------------------------------------------------------------------
 
@@ -534,8 +1455,10 @@ def test_no_out_of_scope_entry_masks_a_checkable_file(scan) -> None:
 #
 # Line numbers are the wrong unit for these citations and this test cannot fix
 # that. It catches the citation that drifted onto whitespace or off the end of
-# the file; it cannot catch the one that drifted onto a different function, which
-# was the larger half of the rot measured above (23 of 29 checkable cases). A
+# the file, and — when the doc writes the code name beside it — the one that
+# drifted onto a different function. A citation with no name beside it can still
+# drift onto a different function unseen; drift of that kind was the larger half of
+# the rot measured when this file was written (23 of 29 checkable cases). A
 # symbol citation — ``swap_coordinator.py::SwapCoordinator.pre_btc_lock_check`` —
 # does not move when a line is inserted above it, and resolves exactly via
 # ``ast``, so both halves become checkable at once.

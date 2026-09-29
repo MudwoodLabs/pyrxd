@@ -614,7 +614,7 @@ every implementation equally.
 (Radiant-Core `src/script/script.cpp:600-607`). The last one means: within a
 single transaction, a ref pushed as a singleton by output *i* may not appear in
 the push-ref set of **any** output *j ≠ i*
-(`validateDisallowedSiblingsRefRule`, `src/validation.h:945-968`).
+(`validateDisallowedSiblingsRefRule`, `src/validation.h:997-1020`).
 
 So a transaction that both (a) creates an output carrying `0xd0 <child_ref>` and
 (b) keeps the child NFT alive as `0xd8 <child_ref>` is rejected with
@@ -978,7 +978,7 @@ Two rules, and exactly two:
 1. **`sum_in ≥ sum_out`.** The total photons on outputs bearing this token's code
    script may not exceed the total on the inputs. Inflation is impossible;
    **burning is permitted.** This is `≥`, not `=` — opcode `0xa2` is
-   `OP_GREATERTHANOREQUAL` (`src/pyrxd/constants.py:244`).
+   `OP_GREATERTHANOREQUAL` (`src/pyrxd/constants.py:379`).
 2. **`n_ref == n_csh`.** The number of outputs carrying the token's ref equals the
    number of outputs whose code script hashes to the FT code script. This is what
    prevents the ref being smuggled into an output of any other shape — including
@@ -1467,12 +1467,14 @@ directions, and unevenly:
   it does mean `decode(encode(x)) != x` for an encrypted envelope. A caller that
   needs the exact bytes a token arrived as reads `GlyphMetadata.source_cbor`.
 
-### 16.4 Commit script ref-type byte is under-validated
+### 16.4 Commit script ref-type byte (validated since 0.25.0)
 
-`COMMIT_SCRIPT_RE` (`src/pyrxd/glyph/script.py:119`) matches any byte at the
-ref-type position, not only `0x51`/`0x52`. A script with, say, `0x53` there
-classifies as a commit but describes a ref type Radiant does not define. Behaviour
-for such a script is undefined.
+`COMMIT_SCRIPT_RE` (`src/pyrxd/glyph/script.py:164`) accepts only `0x51` (`OP_1`,
+an FT commit) or `0x52` (`OP_2`, an NFT commit) at the ref-type position. Before
+0.25.0 it matched any byte there, so a script with, say, `0x53` classified as a
+commit while describing a ref type Radiant does not define. Such a script is now
+not a commit to pyrxd: `is_commit_script` returns `False` for it, and the commit
+field extractors raise `ValidationError`.
 
 ### 16.5 Carrier values
 

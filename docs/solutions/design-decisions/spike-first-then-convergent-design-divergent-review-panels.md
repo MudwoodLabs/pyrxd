@@ -174,10 +174,12 @@ def test_bch_block_840000_pow_valid(self):
         "000000000000000000b3cfd73dbd87c5e6cae26d89a5956ee78193733f61340e"
 ```
 
-`verify_header_pow` (`src/pyrxd/spv/pow.py:25`) only builds the target
+`verify_header_pow` (`src/pyrxd/spv/pow.py:32`) only builds the target
 from the header's own nBits and does an 8-chunk big-endian
 `hash < target` comparison; `verify_chain` (`src/pyrxd/spv/chain.py:22`)
-only checks `header[i].prevHash == hash256(header[i-1])`. Neither
+only checked `header[i].prevHash == hash256(header[i-1])` (it has since
+gained optional `chain_anchor` and `expected_nbits` checks, against values
+the caller supplies). Neither
 references BTC's epoch retargeting or BCH's aserti3-2d difficulty
 algorithm — so the "add BCH support" work was already done by the
 original chain-agnostic design.

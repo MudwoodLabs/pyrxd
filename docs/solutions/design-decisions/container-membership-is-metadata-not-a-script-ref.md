@@ -75,7 +75,7 @@ fixing it does not rescue the design, for the next reason.
 }
 ```
 
-`validateDisallowedSiblingsRefRule` (`src/validation.h:945-968`) then rejects any
+`validateDisallowedSiblingsRefRule` (`src/validation.h:997-1020`) then rejects any
 transaction in which a singleton's ref appears in the push-ref set of a
 **different** output. So the child cannot be re-created alongside the container
 that names it:
