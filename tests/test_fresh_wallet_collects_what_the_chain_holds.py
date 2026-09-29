@@ -48,15 +48,22 @@ class _Chain:
 
     ``get_history`` answers for exactly the addresses holding something, the way a real server
     does: an address with a UTXO has history. ``fail_history`` makes every history read fail;
-    ``fail_utxos`` makes every UTXO read fail while history still answers.
+    ``fail_utxos`` makes every UTXO read fail while history still answers, and ``unreadable``
+    makes it fail for those addresses only.
     """
 
     def __init__(
-        self, funded: dict[str, UtxoRecord] | None = None, *, fail_history: bool = False, fail_utxos: bool = False
+        self,
+        funded: dict[str, UtxoRecord] | None = None,
+        *,
+        fail_history: bool = False,
+        fail_utxos: bool = False,
+        unreadable: set[str] = frozenset(),
     ) -> None:
         self.by_hash = {bytes(script_hash_for_address(a)): (a, u) for a, u in (funded or {}).items()}
         self.fail_history = fail_history
         self.fail_utxos = fail_utxos
+        self.unreadable = {bytes(script_hash_for_address(a)) for a in unreadable}
         self.broadcasts: list[bytes] = []
 
     async def __aenter__(self) -> _Chain:
@@ -72,7 +79,7 @@ class _Chain:
         return [{"tx_hash": hit[1].tx_hash, "height": 1}] if hit else []
 
     async def get_utxos(self, script_hash):
-        if self.fail_utxos:
+        if self.fail_utxos or bytes(script_hash) in self.unreadable:
             raise NetworkError("simulated: listunspent failed for this address")
         hit = self.by_hash.get(bytes(script_hash))
         return [hit[1]] if hit else []
@@ -382,6 +389,108 @@ class TestMarkSignsWithAnUnrecordedAddress:
         assert chain.broadcasts == []
 
 
+# --------------------------------------------------------------------------- partial views
+
+
+class _TxChain(_Chain):
+    """``_Chain`` serving real source transactions, which the swap commands fetch and check."""
+
+    def __init__(self, funded: dict[str, Transaction], *, unreadable: set[str] = frozenset()) -> None:
+        super().__init__(
+            {a: _utxo(t.txid(), 0, t.outputs[0].satoshis) for a, t in funded.items()}, unreadable=unreadable
+        )
+        self.txs = {t.txid(): t for t in funded.values()}
+
+    async def get_transaction(self, txid):
+        return self.txs[str(txid)].serialize()
+
+
+def _src(locking: Script, value: int) -> Transaction:
+    tx = Transaction()
+    tx.add_output(TransactionOutput(locking, value))
+    return tx
+
+
+class TestAPartialViewThatIsEnoughSpends:
+    """The CLI spend paths that collect non-strictly, each in both directions.
+
+    An amount send and a cancel need only ENOUGH. With enough readable, an address whose UTXO
+    read fails must not refuse them (that would be a guard refusing valid work, and a cancel
+    races every holder of the signed advert). With too little readable AND a failed read, the
+    shortfall is not a shortfall to fund: it is reported as the failed read, never as "fund".
+    """
+
+    def _addresses(self, mnemonic: str) -> tuple[str, str, str]:
+        w = HdWallet.from_mnemonic(mnemonic)
+        return w.derive_address(0, 0), w.derive_address(0, 1), w.derive_address(0, 2)
+
+    # ---- pyrxd wallet send (in-process)
+
+    def _send(self, tmp_path, monkeypatch, amount: int, *, unreadable: bool = True):
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        _a0, a1, _a2 = self._addresses(mnemonic)
+        chain = _Chain({first: _utxo("aa" * 32), a1: _utxo("bb" * 32)}, unreadable={a1} if unreadable else set())
+        to = HdWallet.from_mnemonic(MNEMONIC).derive_address(0, 0)
+        result = _run(tmp_path, monkeypatch, chain, mnemonic, "wallet", "send", "--to", to, "--amount", str(amount))
+        return result, chain
+
+    def test_wallet_send_with_enough_readable_sends(self, tmp_path, monkeypatch) -> None:
+        result, chain = self._send(tmp_path, monkeypatch, 1_000_000)
+        assert result.exit_code == 0, (result.output, result.exception)
+        sent = Transaction.from_hex(chain.broadcasts[0].hex())
+        assert [(i.source_txid, i.source_output_index) for i in sent.inputs] == [("aa" * 32, 0)]
+
+    def test_wallet_send_short_with_a_failed_read_is_a_network_error(self, tmp_path, monkeypatch) -> None:
+        result, chain = self._send(tmp_path, monkeypatch, 3 * _FUND // 2)
+        assert result.exit_code == 2, result.output
+        assert "could not reach ElectrumX" in result.output
+        assert "1 of this wallet's address reads failed" in result.output
+        assert "fund the wallet" not in result.output
+        assert chain.broadcasts == []
+
+    def test_wallet_send_short_with_every_read_answered_is_still_insufficient(self, tmp_path, monkeypatch) -> None:
+        """The control: nothing failed, so a real shortfall is still reported as one."""
+        result, chain = self._send(tmp_path, monkeypatch, 3 * _FUND, unreadable=False)
+        assert result.exit_code != 0
+        # `wallet send` lets the library's ValidationError propagate (unchanged here).
+        assert isinstance(result.exception, ValidationError), (result.output, result.exception)
+        assert "Insufficient funds" in str(result.exception)
+        assert "address reads failed" not in result.output
+        assert chain.broadcasts == []
+
+    # ---- pyrxd swap cancel
+
+    def _cancel(self, tmp_path, monkeypatch, *, funder_value: int):
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20, Txid
+
+        mnemonic, _first = _new_wallet(tmp_path, monkeypatch)
+        a0, a1, a2 = self._addresses(mnemonic)
+        pkh0 = HdWallet.from_mnemonic(mnemonic).privkey_for(0, 0).public_key().hash160()
+        # An FT give: a cancel conserves every unit, so its fee needs separate plain-RXD funding.
+        give = _src(Script(build_ft_locking_script(Hex20(pkh0), GlyphRef(txid=Txid("cd" * 32), vout=0))), 777)
+        chain = _TxChain(
+            {a0: give, a1: _src(P2PKH().lock(a1), funder_value), a2: _src(P2PKH().lock(a2), _FUND)},
+            unreadable={a2},
+        )
+        result = _run(tmp_path, monkeypatch, chain, mnemonic, "swap", "cancel", "--give", f"{give.txid()}:0")
+        return result, chain, give
+
+    def test_swap_cancel_with_enough_readable_cancels(self, tmp_path, monkeypatch) -> None:
+        result, chain, give = self._cancel(tmp_path, monkeypatch, funder_value=_FUND)
+        assert result.exit_code == 0, (result.output, result.exception)
+        sent = Transaction.from_hex(chain.broadcasts[0].hex())
+        assert (give.txid(), 0) in [(i.source_txid, i.source_output_index) for i in sent.inputs]
+
+    def test_swap_cancel_short_with_a_failed_read_is_a_network_error(self, tmp_path, monkeypatch) -> None:
+        result, chain, _give = self._cancel(tmp_path, monkeypatch, funder_value=1_000)
+        assert result.exit_code != 0
+        assert "1 of this wallet's address reads failed" in result.output
+        assert "fund the wallet" not in result.output
+        assert chain.broadcasts == []
+
+
 # --------------------------------------------------------------------------- the funnel
 
 
@@ -404,15 +513,18 @@ class TestEverySpendPathCrossesTheScan:
     def test_only_the_named_callers_accept_a_partial_view(self) -> None:
         """``collect_spendable`` is strict by default, so a caller that turns "nothing found"
         into "fund this wallet" cannot be handed a partial view by a failed read. Opting out is
-        a judgement, so the set of callers that pass ``strict=False`` is pinned: ``send`` (an
-        amount only needs *enough*) and the read-only ``utxos`` listing. Any change to the set
-        fails here and has to say why."""
+        a judgement, so the set of callers that pass ``strict=False`` is pinned. The spend paths
+        are the three that need only *enough* and race a clock: ``HdWallet.send``, the CLI's
+        in-process ``wallet send`` and ``swap cancel`` (the revocation race). Each reports a
+        shortfall after a failed read as the read failure (``TestAPartialViewThatIsEnoughSpends``).
+        The fourth is not a spend: the read-only ``utxos`` listing. Any change to the set fails
+        here and has to say why."""
         calls: list[tuple[str, str]] = []
         opted_out: set[tuple[str, str]] = set()
 
         def visit(node: ast.AST, where: str, func: str) -> None:
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                func = node.name
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                func = node.name if func == "<module>" else f"{func}.{node.name}"
             if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "collect_spendable":
                 calls.append((where, func))
                 for kw in node.keywords:
@@ -425,7 +537,12 @@ class TestEverySpendPathCrossesTheScan:
         for path in sorted(_SRC.rglob("*.py")):
             visit(ast.parse(path.read_text(encoding="utf-8")), path.relative_to(_SRC).as_posix(), "<module>")
         assert ("hashmark_tx.py", "build_hashmark_mark") in calls, "the walk found no callers — it is broken"
-        assert opted_out == {("hd/wallet.py", "send"), ("cli/query_cmds.py", "_query")}
+        assert opted_out == {
+            ("hd/wallet.py", "HdWallet.send"),
+            ("cli/wallet_cmds.py", "_send_in_process._run"),
+            ("cli/swap_book_cmds.py", "swap_cancel_cmd._run"),
+            ("cli/query_cmds.py", "utxos_cmd._query"),  # not a spend: a read-only listing
+        }
 
     def test_there_are_spend_paths_to_protect(self) -> None:
         """Paired with the one above: a scan that found no callers would pass it vacuously."""

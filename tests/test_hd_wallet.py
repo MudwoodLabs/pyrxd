@@ -2085,6 +2085,29 @@ class TestAFailedReadIsNotAnAnswer:
         client.broadcast = _broadcast
         assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == "ab" * 32
 
+    def test_send_short_on_a_partial_view_is_a_network_error_not_insufficient_funds(self):
+        """The pair: when what WAS read cannot cover the send and a read failed, the
+        missing funds may sit at the unread address — so it is the read failure that is
+        reported, not "Insufficient funds", and nothing is broadcast."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(
+            {addrs[1]},
+            utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=1_000_000_000)] for i, a in enumerate(addrs)},
+        )
+        broadcasts = []
+
+        async def _broadcast(raw):
+            broadcasts.append(raw)
+            return "ab" * 32
+
+        client.broadcast = _broadcast
+        with pytest.raises(NetworkError, match="1 of this wallet's address reads failed"):
+            asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=2_500_000_000))
+        assert broadcasts == []
+
 
 # ── the seed file's permission check must bind to the bytes read ─────────────
 #

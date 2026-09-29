@@ -83,7 +83,7 @@ from ..wallet import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from ..network.electrumx import ElectrumXClient
 
@@ -270,6 +270,37 @@ def _read_wallet_file(path: Path) -> tuple[bytes, int | None]:
     if len(raw) > _MAX_WALLET_FILE_BYTES:
         raise ValidationError(f"Wallet file at {path} is larger than {_MAX_WALLET_FILE_BYTES} bytes — refusing to read")
     return raw, st.st_mode & 0o777
+
+
+class Spendable(list):
+    """What :meth:`HdWallet.collect_spendable` returns: the ``(utxo, address, privkey)`` triples,
+    plus ``unread``, the addresses whose UTXO read failed.
+
+    ``unread`` is always empty after a strict collection, which raises instead. After a
+    non-strict one it is what a caller needs before it reports a shortfall: "fund this
+    wallet" is false when the funds may sit at an address that could not be read. See
+    :func:`raise_if_reads_failed`.
+    """
+
+    def __init__(self, triples: Iterable[tuple[UtxoRecord, str, PrivateKey]] = (), *, unread: Iterable[str] = ()):
+        super().__init__(triples)
+        self.unread: tuple[str, ...] = tuple(unread)
+
+
+def raise_if_reads_failed(triples: object, shortfall: str) -> None:
+    """Raise :class:`NetworkError` if *triples* came from a collection that could not read everything.
+
+    Call it where a partial collection turned out to be NOT enough, just before reporting
+    the shortfall. When every read answered (or *triples* is a plain list from a wallet that
+    does not report reads), it returns and the caller reports the shortfall as usual.
+    """
+    unread = getattr(triples, "unread", ())
+    if unread:
+        raise NetworkError(
+            f"{shortfall}, but {len(unread)} of this wallet's address reads failed, so what those "
+            "addresses hold was not counted — this is not a shortfall to fund. Retry, or use a "
+            "different ElectrumX endpoint."
+        )
 
 
 @dataclass
@@ -938,10 +969,11 @@ class HdWallet:
         ``strict`` raises instead of returning a short list. It is for callers
         whose result is a completeness CLAIM (see :meth:`send_max`). A spend's
         shortfall message is one too — "fund this wallet" is a claim about every
-        address — so :meth:`collect_spendable` is strict by default; :meth:`send`,
-        which only needs *enough*, opts out, because refusing it over one
-        unreadable address would be a fail-closed refusal to move funds — worse
-        than the partial view whenever a deadline is running.
+        address — so :meth:`collect_spendable` is strict by default. The callers
+        that only need *enough* opt out (see there), because refusing them over
+        one unreadable address would be a fail-closed refusal to move funds —
+        worse than the partial view whenever a deadline is running — and report
+        a shortfall after a failed read through :func:`raise_if_reads_failed`.
         """
         results = await asyncio.gather(*[read(r.address) for r in used], return_exceptions=True)
         failures = [r for r in results if isinstance(r, BaseException)]
@@ -1208,9 +1240,7 @@ class HdWallet:
         tx_input.source_transaction = _SrcTx()
         return tx_input
 
-    async def collect_spendable(
-        self, client: ElectrumXClient, *, strict: bool = True
-    ) -> list[tuple[UtxoRecord, str, PrivateKey]]:
+    async def collect_spendable(self, client: ElectrumXClient, *, strict: bool = True) -> Spendable:
         """Return ``(utxo, address, privkey)`` triples for every UTXO across known addresses.
 
         Address→key mapping is preserved so signing works correctly per UTXO.
@@ -1232,9 +1262,12 @@ class HdWallet:
         wallet — "fund this wallet", "no spendable UTXOs", "not held by this
         wallet" — and after a failed read that claim is false: ``pyrxd mark``
         printed "fund this wallet" when ``get_utxos`` failed for the one funded
-        address. ``strict=False`` returns the partial view and LOGS the failed
-        reads; it is for a caller that only needs *enough* and says nothing about
-        the rest, which is :meth:`send`. The scan above fails closed either way.
+        address. ``strict=False`` returns the partial view, LOGS the failed reads
+        and names them in :attr:`Spendable.unread`; it is for a caller that only
+        needs *enough* (:meth:`send`, ``pyrxd wallet send``, ``pyrxd swap
+        cancel``), which must go through :func:`raise_if_reads_failed` before it
+        reports that what it read is not enough. The scan above fails closed
+        either way.
         """
         # An address already known to be used stays used through the scan even if this server
         # reports no history for it (_scan_chain never demotes), so a lagging or partial index
@@ -1242,7 +1275,7 @@ class HdWallet:
         await self.refresh(client)
         used = [rec for rec in self.addresses.values() if rec.used]
         if not used:
-            return []
+            return Spendable()
 
         # Fan out one get_utxos call per used address; preserve the
         # address (and therefore the key derivation path) per result.
@@ -1257,13 +1290,15 @@ class HdWallet:
         # used address — see _scan_chain).
         account_xprv = self._xprv
         triples: list[tuple[UtxoRecord, str, PrivateKey]] = []
+        unread: list[str] = []
         for rec, result in zip(used, results, strict=True):
             if not isinstance(result, list):
-                continue  # already reported by _read_per_address
+                unread.append(rec.address)  # already logged by _read_per_address
+                continue
             privkey = self._privkey_for(rec.change, rec.index, account_xprv)
             for utxo in result:
                 triples.append((utxo, rec.address, privkey))
-        return triples
+        return Spendable(triples, unread=unread)
 
     def build_send_tx(
         self,
@@ -1321,6 +1356,7 @@ class HdWallet:
             error_type=ValidationError,
         )
         if not triples:
+            raise_if_reads_failed(triples, "no UTXOs to send from")
             raise ValidationError("Insufficient funds: no UTXOs supplied")
 
         if change_address is None:
@@ -1341,12 +1377,16 @@ class HdWallet:
         # raised "Insufficient funds after fee" with UTXOs still unselected.
         per_input_fee_cushion = SELECTION_INPUT_BYTES * fee_rate
         base_fee_cushion = SELECTION_BASE_BYTES * fee_rate
-        n_selected = greedy_select_count(
-            [t[0].value for t in sorted_triples],
-            photons,
-            base_cushion=base_fee_cushion,
-            per_input_cushion=per_input_fee_cushion,
-        )
+        try:
+            n_selected = greedy_select_count(
+                [t[0].value for t in sorted_triples],
+                photons,
+                base_cushion=base_fee_cushion,
+                per_input_cushion=per_input_fee_cushion,
+            )
+        except ValidationError:
+            raise_if_reads_failed(triples, f"the UTXOs read cannot fund {photons:,} photons")
+            raise
 
         # Trial pass. The cushion is an ESTIMATE and ``fee`` is a MEASUREMENT; where they
         # disagree, take one more UTXO and measure again rather than refusing a send the
@@ -1371,6 +1411,7 @@ class HdWallet:
             if total_in >= photons + fee:
                 break
             if n_selected >= len(sorted_triples):
+                raise_if_reads_failed(triples, f"the UTXOs read cannot fund {photons:,} photons and the fee")
                 raise ValidationError("Insufficient funds after fee")
             n_selected += 1
 
@@ -1479,8 +1520,9 @@ class HdWallet:
         Collects with ``strict=False``: an amount send needs *enough*, not *all*,
         so an address whose UTXO read failed is logged and skipped rather than
         refusing a send the other addresses can fund. The gap-limit scan before it
-        still fails closed. When what remains is short, the error is the ordinary
-        insufficient-funds one, and the logged warning is what says a read failed.
+        still fails closed. When what was read is short AND a read failed, it
+        raises :class:`NetworkError` rather than calling that insufficient funds
+        (:func:`raise_if_reads_failed`, inside :meth:`build_send_tx`).
         """
         triples = await self.collect_spendable(client, strict=False)
         tx = self.build_send_tx(

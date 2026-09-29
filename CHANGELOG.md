@@ -32,10 +32,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`HdWallet.collect_spendable` is strict by default.** A failed per-address UTXO read now
   raises `NetworkError` instead of returning what the other addresses answered, because the
-  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs". Pass
-  `strict=False` for the partial view: `HdWallet.send` does, since an amount send needs only
-  enough. `pyrxd utxos` keeps the partial view too. `pyrxd balance` and `pyrxd glyph list` are
-  unchanged: they read only the addresses the wallet file records as used, and do not scan.
+  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs".
+  - **Strict** (any failed read is a network error): `pyrxd mark`; every `glyph` command that
+    spends; `pyrxd swap reserve`, `post`, `take` and `refund`; `pyrxd wallet sweep` and
+    `HdWallet.send_max`; and the SDK builders that fund from the wallet (`GlyphMinter` and
+    `GlyphClient` mints, `build_ft_transfer`, `build_ft_airdrop`, `build_nft_transfer`,
+    `build_timelock_reveal`, `build_hashmark_mark`).
+  - **Partial view** (`strict=False`): `HdWallet.send`, `pyrxd wallet send` when it signs
+    in-process, and `pyrxd swap cancel`. Each needs only enough, and a cancel races every
+    holder of the signed advert. Each goes ahead when what it read is enough. When it is not
+    and a read failed, it raises `NetworkError` naming the failed reads, never "fund the
+    wallet" or "insufficient funds". The helper is `pyrxd.hd.wallet.raise_if_reads_failed`,
+    and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
+    it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
+    any failed read fails it.
+  - `pyrxd utxos` lists the partial view. `pyrxd balance` and `pyrxd glyph list` are
+    unchanged: they read only the addresses the wallet file records as used, and do not scan.
 
 ## [0.25.0] — 2026-09-26
 
