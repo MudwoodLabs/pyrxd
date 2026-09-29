@@ -672,7 +672,7 @@ raises anything. Verified: `balance_cmd` sums `client.get_balance(...)`
 across every used address's raw scripthash
 ([`src/pyrxd/cli/query_cmds.py:97-145`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
 and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
-([`:148-195`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
+([`:148-197`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
 at `src/pyrxd/hd/wallet.py:938-970`). Neither path decodes the locking
