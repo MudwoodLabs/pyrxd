@@ -52,8 +52,9 @@ _OUT_OF_SCOPE_PREFIXES = (
 #: `serialize_ecdsa_der`/`deserialize_ecdsa_der` (the consensus-strict DER parser every
 #: signature now goes through), `decode_address`, `decode_wif`, `encode_script_num`/
 #: `decode_script_num` and `encode_pushdata` into it, growing it to 794 lines, and the reason
-#: went stale without anyone touching this line. It is now mutation-tested in the `cryptoprim`
-#: group instead (scripts/mutation_test.sh) and has no entry here at all.
+#: went stale without anyone touching this line. It is now mutation-tested in the `cryptoutils`
+#: group instead (split out of `cryptoprim` on 2026-09-29; scripts/mutation_test.sh) and has no
+#: entry here at all.
 _OUT_OF_SCOPE_MODULES = {
     "__main__": "`python -m pyrxd` entry point",
     "devnet": "local dev helper, never on a value path",

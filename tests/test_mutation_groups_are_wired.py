@@ -233,6 +233,97 @@ def test_every_shard_of_a_sharded_group_is_a_job_and_every_job_name_is_unique() 
     assert unsharded and all("shard" not in e and e["name"] == e["group"] for e in unsharded)
 
 
+#: Groups split out of one parent because the parent did not fit the workflow's 330-minute job
+#: timeout: parent -> children. REVIEWED, not derived — which group a split came from is history,
+#: not something the script can express. The test below pins that each child still runs its
+#: parent's exact test command, so a split only ever moves modules between jobs and never changes
+#: what a module is tested against.
+_SPLIT_FROM: dict[str, tuple[str, ...]] = {
+    "transaction": ("txpreimage",),
+    "dmint": ("dmintchain", "dmintminer"),
+    "verdicts": ("mutchain", "waveverdicts"),
+    "covenants": ("htlccovenant", "radiantleg", "rswpcovenant"),
+    "gravitycore": ("gravitystate", "gravitymaker", "gravitylegs"),
+    "cryptoprim": ("cryptokeys", "cryptosec", "cryptoutils", "cryptohash"),
+    "glyphverify": ("glyphscan", "glyphinspector", "waverules", "inspectcore"),
+    "wire": ("hashmark", "wiretx"),
+}
+
+
+def _group_settings(groups: list[str]) -> dict[str, tuple[str, str, str]]:
+    """group -> (tests, timeout, marker), by RUNNING the script's own three functions in bash.
+
+    Evaluated rather than regex-parsed, so a child that differs only in `$GAPS` placement, or
+    that falls through to a `*)` default its parent does not, is seen exactly as the script
+    would build its cosmic-ray test command."""
+    import subprocess
+
+    body = _SCRIPT.read_text(encoding="utf-8")
+    parts = [re.search(r"^GAPS=.*$", body, re.M).group(0)]  # type: ignore[union-attr]
+    for fn in ("group_tests", "group_timeout", "group_marker"):
+        start = body.index(f"{fn}() {{")
+        parts.append(body[start : body.index("\n}\n", start) + 3])
+    parts.append(
+        'for g in "$@"; do printf \'%s\\t%s\\t%s\\t%s\\n\' "$g" "$(group_tests "$g")" "$(group_timeout "$g")" "$(group_marker "$g")"; done'
+    )
+    out = subprocess.run(["bash", "-c", "\n".join(parts), "bash", *groups], capture_output=True, text=True, check=True)
+    rows = [line.split("\t") for line in out.stdout.splitlines()]
+    return {g: (t, to, mk) for g, t, to, mk in rows}
+
+
+def test_a_split_group_keeps_its_parents_exact_test_command() -> None:
+    """A child with a shorter test list would score its modules against less than before, and
+    the lower kill rate would read as a finding about the code rather than about the split. The
+    marker matters as much: the consensus groups run WITHOUT `-m 'not integration'`, so a
+    consensus child that fell through to the default marker would run a different suite."""
+    families = [(p, c) for p, kids in _SPLIT_FROM.items() for c in kids]
+    settings = _group_settings(sorted({g for pair in families for g in pair}))
+    assert len(settings) == len({g for pair in families for g in pair}), "bash evaluated fewer groups than asked"
+    for parent, child in families:
+        assert settings[parent][0].startswith("tests/"), f"{parent}: group_tests is empty; the evaluation broke"
+        assert settings[child] == settings[parent], (
+            f"{child} was split from {parent} but its (tests, timeout, marker) differ:\n"
+            f"  {parent}: {settings[parent]}\n  {child}: {settings[child]}"
+        )
+    groups = _script_groups()
+    stale = sorted({g for pair in families for g in pair} - groups)
+    assert not stale, f"_SPLIT_FROM names groups the script no longer defines: {stale}"
+
+
+def test_the_split_check_fires_on_a_child_with_a_different_marker() -> None:
+    """Plant: `txpreimage` is a consensus child, so it must share `transaction`'s empty marker.
+    Evaluated through the same function the test above uses, with the arm dropped from the
+    marker case, which is exactly the edit a future split could forget."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    assert "|txpreimage|" in body, "txpreimage is no longer in group_marker's consensus arm; update this plant"
+    import subprocess
+
+    start = body.index("group_marker() {")
+    fn = body[start : body.index("\n}\n", start) + 3].replace("|txpreimage|", "|")
+    out = subprocess.run(
+        ["bash", "-c", fn + '\nprintf "[%s][%s]" "$(group_marker transaction)" "$(group_marker txpreimage)"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out == "[][-m 'not integration']", out
+
+
+def test_no_module_is_mutated_by_two_groups() -> None:
+    """A split that copied a module into a child without removing it from the parent would run
+    it twice (twice the minutes) and report two scores for one file. Derived from group_files()."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    start = body.index("group_files() {")
+    block = body[start : body.index("\n}\n", start)]
+    owner: dict[str, list[str]] = {}
+    for g, mods in re.findall(r'^\s{4}([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', block, re.M):
+        for m in mods.split():
+            owner.setdefault(m, []).append(g)
+    assert len(owner) > 100, f"only {len(owner)} modules parsed from group_files(); the parse broke"
+    dup = {m: gs for m, gs in owner.items() if len(gs) > 1}
+    assert not dup, f"modules mutated by more than one group: {dup}"
+
+
 def test_the_mutate_step_passes_the_shard_and_names_its_files_by_job() -> None:
     """The shard index reaches the script only through the step's env, and two shards of one
     group share `matrix.group` — so a log or artifact named by group would collide."""
@@ -315,6 +406,16 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
         38: "thirty-eight",
         39: "thirty-nine",
         40: "forty",
+        41: "forty-one",
+        42: "forty-two",
+        43: "forty-three",
+        44: "forty-four",
+        45: "forty-five",
+        46: "forty-six",
+        47: "forty-seven",
+        48: "forty-eight",
+        49: "forty-nine",
+        50: "fifty",
     }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"

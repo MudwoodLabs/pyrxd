@@ -126,9 +126,11 @@ jobs:
     runs-on: ubuntu-latest
     # Generous but bounded. A group that blows this budget should be split in
     # scripts/mutation_test.sh, not given more hours — that is how `wallet` and `hdwallet` came to
-    # be two groups instead of one, and how `wire`, `verdicts` and `glyphverify` became eleven
-    # after run 36521398529 cancelled them (and `inspectcli`) here with no score. A single module
-    # too big for one job is sharded instead (group_shards in the script).
+    # be two groups instead of one, how `wire`, `verdicts` and `glyphverify` became eleven after
+    # run 36521398529 cancelled them (and `inspectcli`) here with no score, and how `transaction`,
+    # `dmint`, `covenants`, `gravitycore` and `cryptoprim` became eighteen after scheduled run
+    # 36558376548 cancelled four of them and left `transaction` 11 minutes short of the limit.
+    # A single module too big for one job is sharded instead (group_shards in the script).
     timeout-minutes: 330
     strategy:
       fail-fast: false
