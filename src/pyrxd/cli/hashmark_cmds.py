@@ -5,9 +5,10 @@ Glyph protocol, which is why this command sits at the top level beside ``balance
 ``utxos`` rather than under ``glyph``.
 
 Shaped after ``pyrxd glyph timelock-reveal``: the same ``--dry-run`` and ``--passphrase``
-options, the same ``_load_wallet`` / ``_confirm_or_abort`` flow, the same three output modes, and the same rule that the bytes shown to the operator are the
-bytes broadcast (:func:`~pyrxd.hashmark_tx.broadcast_hashmark_mark` sends the build that
-was displayed, never a rebuilt one).
+options, the same ``_load_wallet`` / ``_confirm_or_abort`` flow, the same three output
+modes, and the same rule that the bytes shown to the operator are the bytes broadcast
+(:func:`~pyrxd.hashmark_tx.broadcast_hashmark_mark` sends the build that was displayed,
+never a rebuilt one).
 
 **What this file adds that the library deliberately cannot.** §5.4 makes canonicalising a
 label an encoder obligation *and* requires that the user be shown the result, "because
@@ -52,7 +53,7 @@ from ..security.types import _TXID_RE, Txid
 from . import glyph_inspect as _inspect
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
-from .glyph_helpers import _BroadcastSummary, _confirm_or_abort
+from .glyph_helpers import _BroadcastSummary, _confirm_or_abort, _deprecated_allow_overpay_option
 from .glyph_inspect import (
     _attach_name_at_mark,
     _attach_wave_identity,
@@ -82,35 +83,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: the signer drifted with the funding UTXO, two marks by one person would be two
 #: strangers, and no amount of later tooling could stitch them back together.
 _DEFAULT_SIGNER_CHANGE, _DEFAULT_SIGNER_INDEX = 0, 0
-
-
-def _allow_overpay_is_deprecated(click_ctx: click.Context, param: click.Parameter, value: bool) -> None:
-    """``mark --allow-overpay``: accepted so existing scripts keep working, and nothing else (#793).
-
-    The flag could never change anything. Its value went only to
-    :func:`~pyrxd.hashmark_tx.build_hashmark_mark`, and there only to the rate CEILING in
-    :func:`~pyrxd.fee_sizing.assert_fee_rate_clears_relay_floor` — which can refuse only a
-    rate above that ceiling. ``mark`` has no ``--fee-rate``: its rate is ``ctx.fee_rate``,
-    set once in :func:`pyrxd.cli.main.cli` from a config that
-    :func:`pyrxd.cli.config.validated_fee_rate` has already refused above the same ceiling,
-    with no ``allow_overpay`` reachable from a config file or ``PYRXD_FEE_RATE``. No rate
-    that reached the builder could differ with or without the flag.
-
-    ``expose_value=False`` is the fix, not a tidy-up: ``mark_cmd`` no longer has an
-    ``allow_overpay`` parameter to forward, so the flag cannot be wired back into the build
-    by accident. The note goes to STDERR so ``--json`` and ``--quiet`` output is unchanged.
-    """
-    if value:
-        from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
-
-        ceiling = relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE
-        click.echo(
-            "note: --allow-overpay is deprecated and has no effect on `pyrxd mark`. mark takes its "
-            "fee rate from the config (fee_rate, [networks.<net>] fee_rate or PYRXD_FEE_RATE), and a "
-            f"rate above the {ceiling:,} photons/byte overpay ceiling is refused when the config is "
-            "loaded, before mark runs. Drop the flag; it is accepted only so existing scripts keep working.",
-            err=True,
-        )
 
 
 def _canonical_label(label: str | None) -> tuple[str | None, bool]:
@@ -409,14 +381,7 @@ def _mark_lines(
     default=False,
     help="Hash, sign, fund and print the exact record and transaction — and broadcast nothing.",
 )
-@click.option(
-    "--allow-overpay",
-    is_flag=True,
-    default=False,
-    hidden=True,
-    expose_value=False,
-    callback=_allow_overpay_is_deprecated,
-)
+@_deprecated_allow_overpay_option("mark")
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def mark_cmd(

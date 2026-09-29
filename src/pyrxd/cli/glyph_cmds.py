@@ -141,6 +141,7 @@ from .glyph_helpers import (
     _BroadcastSummary,
     _build_glyph_unlock,
     _confirm_or_abort,
+    _deprecated_allow_overpay_option,
     _fetch_dmint_contract,
     _metadata_summary,
     _parse_ref,
@@ -3280,16 +3281,9 @@ async def _airdrop_ft_inner(
 @click.argument("ref", type=str)
 @click.option("--to", "to_address", required=True, help="Recipient address.")
 @click.option("--passphrase/--no-passphrase", default=False)
-@click.option(
-    "--allow-overpay",
-    is_flag=True,
-    default=False,
-    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
-    "ceiling (10x the relay floor). It does NOT relax the underpay invariant. Exists so a "
-    "refusal is never a dead end on a chain with no RBF or CPFP.",
-)
+@_deprecated_allow_overpay_option("glyph transfer-nft")
 @click.pass_obj
-def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool, allow_overpay: bool) -> None:
+def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool) -> None:
     """Transfer the NFT singleton REF (txid:vout) to --to ADDRESS."""
     glyph_ref = _parse_ref(ref)
 
@@ -3311,9 +3305,7 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
     async def _do_transfer() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _transfer_nft_inner(
-                ctx, wallet, glyph_ref, to_pkh, to_address, client, allow_overpay=allow_overpay
-            )
+            return await _transfer_nft_inner(ctx, wallet, glyph_ref, to_pkh, to_address, client)
 
     try:
         result = asyncio.run(_do_transfer())
@@ -3379,8 +3371,6 @@ async def _transfer_nft_inner(
     to_pkh: Hex20,
     to_address: str,
     client: ElectrumXClient,
-    *,
-    allow_overpay: bool = False,
 ) -> dict:
     """Find the singleton NFT utxo and re-lock it to to_pkh.
 
@@ -3401,7 +3391,6 @@ async def _transfer_nft_inner(
             to_pkh,
             client=client,
             fee_rate=ctx.fee_rate,
-            allow_overpay=allow_overpay,
         )
     except NoHoldingsError as exc:
         raise UserError(

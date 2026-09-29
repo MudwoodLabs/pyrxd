@@ -47,7 +47,7 @@ from ..glyph.timelock_reveal_tx import (
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
-from .glyph_helpers import _BroadcastSummary, _confirm_or_abort, _parse_ref
+from .glyph_helpers import _BroadcastSummary, _confirm_or_abort, _deprecated_allow_overpay_option, _parse_ref
 from .prompts import _load_wallet
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -566,12 +566,7 @@ def _reveal_lines(build: TimelockRevealBuild, *, network: str, fee_rate: int) ->
     help="Run every check, build and sign the transaction, print exactly what would be published "
     "— and broadcast nothing.",
 )
-@click.option(
-    "--allow-overpay",
-    is_flag=True,
-    default=False,
-    help="Accept a fee far above what the signed transaction's size demands. Does NOT relax the underpay invariant.",
-)
+@_deprecated_allow_overpay_option("glyph timelock-reveal")
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def timelock_reveal_cmd(
@@ -581,7 +576,6 @@ def timelock_reveal_cmd(
     hint: str,
     allow_early: bool,
     dry_run: bool,
-    allow_overpay: bool,
     passphrase: bool,
 ) -> None:
     """Publish the decryption key for the timelocked token REF (txid:vout).
@@ -620,7 +614,6 @@ def timelock_reveal_cmd(
                 cek=cek,
                 hint=hint,
                 allow_early=allow_early,
-                allow_overpay=allow_overpay,
             )
             if dry_run:
                 return build, None
