@@ -10,10 +10,14 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Single in-flight deploy at a time, but don't cancel a running one.
-concurrency:
-  group: pages
-  cancel-in-progress: false
+# NO workflow-level concurrency group, on purpose (#749). This file used one repository-wide
+# `pages` group for every run. GitHub keeps at most ONE pending run per group and cancels the
+# older pending one when another queues, even with `cancel-in-progress: false`, so a PR's build
+# from any branch could cancel another branch's pending build, and could cancel a pending DEPLOY
+# from main, leaving the published docs and the /inspect/ and /verify/ pages stale with nothing
+# red to say so. Now each job has its own group: `build` one per ref, so PR builds only ever
+# displace builds of the same PR, and `deploy` the `pages` group, which only deploys join.
+# Guarded by tests/test_docs_deploy_concurrency_is_not_shared_with_pr_builds.py.
 
 permissions:
   contents: read
@@ -22,6 +26,11 @@ jobs:
   build:
     name: Build Sphinx HTML
     runs-on: ubuntu-latest
+    # Per ref: a PR's build never shares a group with main's, or with another PR's. A newer push
+    # to the same PR cancels its superseded build; main's builds are never cancelled mid-run.
+    concurrency:
+      group: docs-build-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -164,6 +173,11 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    # Single in-flight deploy at a time, but don't cancel a running one. Only this job joins
+    # `pages`, and it never runs on a pull_request, so no PR run can displace a pending deploy.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write
