@@ -5,7 +5,8 @@ the gap-limit scan (``HdWallet.refresh``) marks an address used, and no command 
 and #779 made the spend and read paths scan, without saving). So on a ``pyrxd wallet new`` file,
 ``address`` printed index 0 every time, including after index 0 was paid: address reuse. The same
 held for ``--change``. It now runs the scan first and prints the first address on the chain with
-no history; a scan that cannot finish exits 2 and prints no address.
+no history at its P2PKH script hash; a scan that cannot finish exits 2 and prints no address. An
+address that has only received a Glyph token is not seen (#787); the xfail at the end pins that.
 
 Every test drives the real command on the real ``pyrxd wallet new`` file, with the mnemonic typed
 at the real prompt. The one fake is the ElectrumX client, swapped in at ``CliContext.make_client``.
@@ -21,9 +22,13 @@ from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
+from pyrxd.glyph.script import build_ft_locking_script, build_nft_locking_script
+from pyrxd.glyph.types import GlyphRef
 from pyrxd.hd.wallet import HdWallet
-from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address
+from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address, script_hash_for_script
 from pyrxd.security.errors import NetworkError
+from pyrxd.security.types import Txid
+from pyrxd.utils import address_to_public_key_hash
 
 
 class _ElectrumX:
@@ -249,5 +254,45 @@ class TestAnAddressNotProvenUnusedIsNotHandedOut:
 
     def test_help_says_it_scans(self) -> None:
         text = " ".join(CliRunner().invoke(cli, ["address", "--help"]).output.split())
-        assert "no chain history, after a gap-limit scan" in text
+        assert "no plain-RXD history, after a gap-limit scan" in text
         assert "Reads nothing from the network" in text
+
+
+# --------------------------------------------------------------------------- the token-only gap (#787)
+
+
+class TestAnAddressHoldingOnlyATokenIsKnownGap:
+    """What the scan does NOT check: history under a token output's script hash.
+
+    ``HdWallet.refresh`` reads each address's P2PKH script hash and nothing else. A Radiant
+    ElectrumX (RXinDexer) lists a token output under its script hash with the refs zeroed, not
+    under the owner's P2PKH hash, so an address that has only ever received a token has no
+    history the scan reads, and ``address`` hands it out again. Confirmed on mainnet; tracked as
+    #787, and fixed there, not here.
+
+    The fake server lists index 0's token ONLY under the zeroed-ref hash, and its P2PKH hash
+    has no history: the shape measured on mainnet. The zeroed-ref hash is computed here, by
+    building the same token script with an all-zero ref, because the helper that computes it
+    (``script_hash_for_output``, PR #784) is not on main. ``strict=True``: when #787 lands this
+    XPASSes and fails the run, which forces the marker out.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="#787: the scan reads only the P2PKH script hash; RXinDexer lists a token output "
+        "under its zeroed-ref script hash, so a token-only address looks unused",
+    )
+    @pytest.mark.parametrize("builder", [build_nft_locking_script, build_ft_locking_script], ids=["nft", "ft"])
+    def test_an_address_that_received_only_a_token_is_not_handed_out_again(
+        self, tmp_path, monkeypatch, builder
+    ) -> None:
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        owner = w.derive_address(0, 0)
+        zeroed_ref = GlyphRef(txid=Txid("00" * 32), vout=0)
+        assert zeroed_ref.to_bytes() == bytes(36)
+        token_hash = bytes(script_hash_for_script(builder(address_to_public_key_hash(owner), zeroed_ref)))
+        server = _ElectrumX()
+        server.history[token_hash] = [_txid(7)]
+        assert bytes(script_hash_for_address(owner)) not in server.history, "the P2PKH hash must be empty"
+        assert _answer(_run(tmp_path, monkeypatch, server, mnemonic)) == _at(w, 0, 1)

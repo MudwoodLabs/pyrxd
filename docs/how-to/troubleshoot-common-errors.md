@@ -670,9 +670,9 @@ with no indication it's a token carrier.
 **There is no error string for this** — it's an honest gap, not a bug that
 raises anything. Verified: `balance_cmd` sums `client.get_balance(...)`
 across every used address's raw scripthash
-([`src/pyrxd/cli/query_cmds.py:228-288`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
+([`src/pyrxd/cli/query_cmds.py:233-293`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
 and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
-([`:291-348`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
+([`:296-353`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
 at `src/pyrxd/hd/wallet.py:1243-1301`). Neither path decodes the locking
