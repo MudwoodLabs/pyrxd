@@ -8,6 +8,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd verify` accepts an output reference (`<txid>:<n>`) and a 72-character contract id**
+  (#745). It refused both with "that is not a transaction id", about input that had one in it, and
+  a fix hint that talked only about digests. When the transaction has the output named, either form
+  checks that transaction, with the same verdict its txid gets, and says first what the named
+  output is: the record the verdict is about, another record, not a record (and which output holds
+  the record), or an output that could not be read, so whether it is a record is unknown. The same
+  sentences are in `--json` under `named_by`, and on stderr under `--quiet`. An output the
+  transaction does not have is bad input: exit 1 and no verdict in every mode (no report, no JSON
+  document, no `HOLDS`), and the error says how many outputs the transaction has. A `<txid>:<n>`
+  that does not parse is refused with its txid named. The `/verify/` page already checked the
+  transaction a pointer names and said what the named output is. It called a named output its
+  classifier could not read "NOT a HashMark record", and now says that whether that output is a
+  record is unknown. It drew the transaction's verdict under an output the transaction does not
+  have, and now shows that as an input error with no verdict, headed by the sentence the command's
+  error leads with. Where an output could not be read, neither surface says a transaction has "no
+  HashMark record" or counts its records as final: both say what could be read and how many outputs
+  could not. `named_by.signature_line_vout` in `--json` says which record the verdict's signature
+  line is about.
 - **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
   `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
   scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
