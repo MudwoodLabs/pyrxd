@@ -90,6 +90,14 @@ def upstream() -> tuple[ModuleType, ModuleType]:
     return glyph, wave_index
 
 
+def upstream_script() -> ModuleType:
+    """``electrumx.lib.script`` from the vendored copy, held to the manifest like :func:`upstream`."""
+    upstream()
+    script = importlib.import_module("electrumx.lib.script")
+    assert Path(script.__file__).resolve().is_relative_to(VENDOR_DIR.resolve()), script.__file__
+    return script
+
+
 # ─────────────────────────────────────────────── what process_tx reads ──
 
 
