@@ -2,7 +2,7 @@ This release fixes two bugs that made core commands useless on mainnet: a wallet
 
 ## A `pyrxd wallet new` wallet can spend (#759)
 
-Spend commands, `utxos`, `balance` and `glyph list` read only the addresses a gap-limit scan had marked used, and nothing ran or saved that scan. A funded new wallet had nothing to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet", and `balance` showed 0. Every one of these commands now runs the scan first. The scan is not saved, so the wallet file is unchanged. `glyph resume-mint` can also reveal a new wallet's interrupted commit.
+Spend commands, `utxos`, `balance` and `glyph list` read only the addresses a gap-limit scan had marked used. Only `wallet send` and `balance --refresh` ran that scan, and nothing saved it. A funded new wallet had nothing to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet", and `balance` showed 0. Every one of these commands now runs the scan first. The scan is not saved, so the wallet file is unchanged. `glyph resume-mint` can also reveal a new wallet's interrupted commit.
 
 This resolves the known issue in 0.25.0's notes: **`pyrxd mark` now works from a `wallet new` wallet.**
 
@@ -14,7 +14,7 @@ Still open: an address that has only ever received tokens, and no plain RXD, is 
 
 ## Also in this release
 
-- **ETH↔RXD swaps:** `assert_eth_deadline_is_claimable` accepted a deadline one second too close, and left out the 96 s the maker's claim guard needs to get its claim mined (#791). The effect was liveness, not loss: the claim was refused before anything was broadcast, the preimage stayed secret, and both legs refunded after their timeouts.
+- **ETH↔RXD swaps:** `assert_eth_deadline_is_claimable` accepted a deadline one second too close, and left out the 96 s the maker's claim guard needs to get its claim mined (#791). The effect was liveness, not loss: the swap could be funded, but the maker's claim was then refused before it was broadcast, so the preimage stayed secret and both legs refunded after their timeouts.
 - **`pyrxd address`** no longer hands out an address that has been paid plain RXD (#781).
 - **Broadcast echo:** `HdWallet.send`/`send_max` and `RxdWallet.send`/`send_max` returned whatever txid the server echoed. Every broadcast through a pyrxd client now checks the echo against the transaction it sent (#780).
 - **`pyrxd mark`** shows non-ASCII blank characters in a label as `<U+XXXX>` in the confirmation (#747).

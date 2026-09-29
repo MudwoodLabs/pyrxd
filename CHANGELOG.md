@@ -124,9 +124,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A wallet made with `pyrxd wallet new` could not spend, and showed a balance of 0 (#759,
   #768, #779).** `pyrxd mark`, the `glyph` spend commands, the `swap-book` commands, `utxos`,
-  `balance` and `glyph list` read only addresses a gap-limit scan had marked used. Nothing ran or
-  saved that scan (`balance` ran it only under `--refresh`), so a funded new wallet had nothing to
-  spend or show: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet", and `balance`
+  `balance` and `glyph list` read only addresses a gap-limit scan had marked used. Only `wallet
+  send` and `balance --refresh` ran that scan, and nothing saved it, so a funded new wallet had
+  nothing to spend or show: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet", and `balance`
   showed 0 for a wallet funded at its first receive address.
   - `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) on every call. Every
     in-process spend path in the CLI and the SDK reads the wallet's UTXOs through that one method,
@@ -177,7 +177,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   finality + stall + rounding was accepted for funding, and if the taker's funding took that
   whole finality-plus-stall budget to become final, the maker's leg then refused to claim it.
   That second defect is not limited by margin size. **Impact: liveness, not loss.** The claim
-  guard refuses BEFORE anything is broadcast and raises `PreRevealExpired`, so the preimage is
+  guard refuses BEFORE it broadcasts the claim and raises `PreRevealExpired`, so the preimage is
   still secret and the coordinator does not zeroize it or advance the swap. Neither leg can be
   claimed without `p`, so both refund: the taker's ETH after `eth_timeout`, the maker's RXD after
   `t_rxd`. No principal was at risk; the cost was the swap failing, the funding and refund fees,
