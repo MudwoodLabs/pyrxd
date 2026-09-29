@@ -740,8 +740,9 @@ function namedByNote(named) {
 // change output (`:1`) or an output that does not exist (`:7` of a two-output transaction)
 // sat above a green VERIFIED about a DIFFERENT output, and the page never said which. The
 // facts told apart: the named output holds a record that is drawn below, or one past the
-// panel limit that is not; it exists and is not a record; or the transaction has no such
-// output. Null when there is nothing to compare against.
+// panel limit that is not; it exists and is not a record; it exists and could not be read, so
+// whether it is a record is unknown; or the transaction has no such output. Null when there is
+// nothing to compare against.
 function namedOutputNote(named, payload) {
   const n = named.vout;
   const count = payload.output_count;
@@ -773,6 +774,17 @@ function namedOutputNote(named, payload) {
       );
     }
     return `Output ${n}, the one you named, holds the record in the panel below marked "output ${n}".`;
+  }
+  // UNREAD IS NOT "NOT A RECORD". The classifier turns an output it crashed on into a row of
+  // `type: "error"` (the per-output try/except in `classify_raw_tx`). Whether that output is a
+  // record is not known either way, so it gets neither sentence — the same line `pyrxd verify`
+  // draws (`_named_output` in src/pyrxd/cli/hashmark_cmds.py).
+  const outputs = Array.isArray(payload.outputs) ? payload.outputs : [];
+  if (outputs.some((row) => row && row.vout === n && row.type === "error")) {
+    return (
+      `Output ${n}, the one you named, could not be classified here, so this page cannot say ` +
+      `whether it is a HashMark record, and nothing below is about it. ${where}`
+    );
   }
   return (
     `Output ${n}, the one you named, is NOT a HashMark record, so nothing below is about it. ${where}`

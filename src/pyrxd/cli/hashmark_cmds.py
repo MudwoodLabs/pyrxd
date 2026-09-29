@@ -1205,11 +1205,11 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     The terminal's counterpart of the /verify/ page's ``namedByNote`` and ``namedOutputNote``. The
     named output holds the record the verdict is about; holds a record the verdict is NOT about (the
     verdict is about ONE record, and it need not be this one); is not a record, and then where the
-    record is; or does not exist. Two cases are added that the page does not have: an output the
-    classifier could not read (the page calls it "NOT a HashMark record", which nobody established),
-    and — because this prints ONE verdict where the page draws a panel per record — the verdict's
-    signature line being about another record. Without this, ``<txid>:1`` — a change output — would
-    sit above a verdict about output 0 with nothing saying so.
+    record is; could not be read, so whether it is a record is unknown; or does not exist. One case
+    is added that the page does not need: because this prints ONE verdict where the page draws a
+    panel per record, the verdict's signature line can be about another record, and the sentence
+    says so. Without this, ``<txid>:1`` — a change output — would sit above a verdict about output
+    0 with nothing saying so.
 
     NEVER A REFUSAL, AND NEVER A DIFFERENT VERDICT. The verdict is the one the bare txid gets: naming
     an output does not change what the transaction carries. What it changes is what the reader will

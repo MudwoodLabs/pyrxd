@@ -15,7 +15,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the verdict is about, another record, not a record (and which output holds the record), or an
   output the transaction does not have. The same sentences are in `--json` under `named_by`, and
   on stderr under `--quiet`. A `<txid>:<n>` that does not parse is refused with its txid named.
-  The `/verify/` page already did this.
+  The `/verify/` page already did this, except that it called a named output its classifier could
+  not read "NOT a HashMark record". It now says, as the command does, that whether that output is
+  a record is unknown.
 
 ## [0.25.0] — 2026-09-26
 

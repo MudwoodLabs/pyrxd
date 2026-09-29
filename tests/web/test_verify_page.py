@@ -1681,6 +1681,58 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert "carries a HashMark record" not in flat
         assert out["statuses"] == ["RECORD DOES NOT DECODE"]
 
+    @pytest.mark.parametrize("shape", ["outpoint", "contract"])
+    def test_a_named_output_the_classifier_could_not_read_is_not_called_a_non_record(
+        self, shape, limit, monkeypatch, tmp_path
+    ) -> None:
+        """An output the classifier crashed on becomes a ``type: "error"`` row. Whether it is a
+        record is UNKNOWN, and "is NOT a HashMark record" is a claim nobody established — and
+        ``pyrxd verify`` already refuses to make it, so the page saying it put the two surfaces in
+        disagreement about the same output of the same transaction.
+
+        The crash is planted in the real classifier (``_classify_script``) for the change output
+        only, so the row reaching ``verify.js`` is the one ``classify_raw_tx``'s own per-output
+        ``except`` builds, not a hand-written dict."""
+        from pyrxd.glyph import _inspect_core
+
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        real = _inspect_core._classify_script
+
+        def crash_on_the_change(script_hex: str, **kw):
+            if script_hex == change.hex():
+                raise RuntimeError("planted classifier crash")
+            return real(script_hex, **kw)
+
+        monkeypatch.setattr(_inspect_core, "_classify_script", crash_on_the_change)
+        txid, raw, fetched = _tx_result(_signed_script(b"the advisory, as published\n"), change, limit=limit)
+        rows = {r["vout"]: r for r in fetched["payload"]["outputs"]}
+        assert rows[1]["type"] == "error" and "hashmark" not in rows[1], "the premise: output 1 was not read"
+
+        out = self._check(self._named(txid, 1, shape), txid, raw.hex(), fetched)
+        flat = " ".join(out["text"].split())
+        said = (
+            "Output 1, the one you named, could not be classified here, so this page cannot say whether it is a "
+            "HashMark record, and nothing below is about it."
+        )
+        assert said in flat, f"the page did not say output 1 is unread:\n{flat}"
+        assert "NOT a HashMark record" not in flat, "an unread output was called a non-record"
+        assert "Its HashMark record is in output 0, and the panel below is about that output." in flat
+        assert flat.index(said) < flat.index("VERIFIED"), "the caveat is below the verdict it qualifies"
+
+        # THE OTHER SURFACE, over the same bytes and the same planted crash: it draws the same line.
+        from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+        r = _run(
+            monkeypatch,
+            _FakeServer({txid: raw}),
+            ["verify", self._named(txid, 1, shape), "--min-confirmations", "1"],
+            tmp_path=tmp_path,
+        )
+        assert r.exit_code == 0, r.output
+        cli = " ".join(r.output.split())
+        assert "Output 1, the one you named, could not be classified here" in cli
+        assert "NOT a HashMark record" not in cli
+
     def test_a_named_output_past_the_panel_limit_is_not_pointed_at_a_panel_that_is_not_drawn(self, limit) -> None:
         """Past MAX_MARK_PANELS a record is counted, not drawn, so "the panel below marked output
         N" would point at nothing. The note says so instead."""
