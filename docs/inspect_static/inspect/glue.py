@@ -1164,3 +1164,47 @@ def judge_file_digest(expected_hex: object, computed_hex: object, algorithm: obj
             "status": "NOT CHECKED",
             "meaning": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
         }
+
+
+def hashing_backend() -> dict:
+    """Which code computes this tab's hashes, and whether OpenSSL is in this runtime at all (#757).
+
+    The pages deliberately do not load Pyodide's OpenSSL (its ``hashlib`` package, OpenSSL 1.1.1n,
+    end of life): ``pyrxd.hash`` computes SHA-512/256 in pure Python instead. Static tests catch
+    the KNOWN ways the boot could load it again; they cannot close every way. This reports the
+    OUTCOME, at runtime, whichever way OpenSSL got here, and the pages show it in their footer.
+
+    Two signals, read without importing anything new:
+
+    * ``hashlib.sha256.__module__``. ``"_hashlib"`` is OpenSSL: then OpenSSL computes SHA-256,
+      and with it every hash ``hashlib`` hands out, the signature check's included. CPython's
+      own implementations live in ``_sha2`` (``_sha256`` before 3.12).
+    * ``importlib.util.find_spec`` for ``_hashlib`` (Pyodide's ``hashlib`` package) and ``_ssl``
+      (its ``ssl`` package): either being importable means OpenSSL's code is in this runtime,
+      even while ``hashlib`` is not using it.
+
+    REPORTED, NOT REFUSED. OpenSSL here is more code fetched from the CDN, not a wrong answer: its
+    SHA-256 is still SHA-256. So nothing is withheld because of it. Never raises — a diagnostic
+    that could stop the page would be worse than none.
+    """
+    try:
+        import hashlib
+        import importlib.util
+
+        computes = getattr(hashlib.sha256, "__module__", None) == "_hashlib"
+        present = [name for name in ("_hashlib", "_ssl") if importlib.util.find_spec(name) is not None]
+    except Exception as exc:
+        return {
+            "openssl": None,
+            "summary": "hashing: could not tell whether OpenSSL is loaded "
+            f"({_truncate(_inspect.sanitize_display_string(_safe_error(exc)), cap=80)})",
+        }
+    if computes:
+        return {"openssl": True, "summary": "hashing: OpenSSL is loaded in this tab and computes its hashes"}
+    if present:
+        return {
+            "openssl": True,
+            "summary": f"hashing: OpenSSL is loaded in this tab ({', '.join(present)}), though Python's "
+            "built-ins compute its hashes",
+        }
+    return {"openssl": False, "summary": "hashing: Python's built-ins, no OpenSSL"}

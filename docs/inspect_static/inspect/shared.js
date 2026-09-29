@@ -417,17 +417,21 @@ async function bootPyrxdRuntime(options) {
     // and /verify/ still binds a mark to its block and VERIFIES its signature.
     // This is the package set the boot loaded before #756.
     //
-    // WHAT THE TEST CHECKS, and only that: tests/web/test_the_boot_loads_no_openssl.py
-    // runs this function under Node against a stand-in Pyodide that records
-    // every call, and fails unless the packages it asks for — through
-    // `loadPyodide`'s options, `loadPackage` in any form, or
-    // `loadPackagesFromImports` — are exactly micropip and pycryptodome, and the
-    // Python it runs micropip-installs only the two SHA-checked wheels. It also
-    // fails on a package-loading call anywhere in the page scripts outside this
-    // function, and on any line of page code, other than a whole-line comment,
-    // naming hashlib or openssl. It does NOT check what those two packages pull
-    // in (Pyodide 0.26.4's lockfile: micropip needs packaging, pycryptodome
-    // nothing). See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
+    // WHAT KEEPS IT OUT, and what does not. Two layers, each claiming only its
+    // own (tests/web/test_the_boot_loads_no_openssl.py):
+    //   * STATIC CHECKS OF THE KNOWN LOAD PATHS. This function is run under Node
+    //     against a stand-in Pyodide that records every call: `loadPyodide` may
+    //     be passed only allowlisted options (`fullStdLib` is refused),
+    //     `loadPackage` must ask for exactly micropip and pycryptodome,
+    //     `loadPackagesFromImports` must not be called, and the Python it runs
+    //     may micropip-install only the two SHA-checked wheels, the pyrxd one
+    //     with deps=False. These catch the spellings someone thought of, not
+    //     every way a package can get into a Pyodide runtime.
+    //   * THE OUTCOME, AT RUNTIME. `glue.hashing_backend` reports, in the running
+    //     tab, whether OpenSSL computes the hashes or is importable at all, and
+    //     both pages print that in their footer ("hashing: …"). Reported, never
+    //     refused: OpenSSL here is more code from the CDN, not a wrong answer.
+    // See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
     await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)
@@ -524,6 +528,8 @@ _pyrxd_version_blob = (
       // universe from glue.py's public functions, and a boot that called this one
       // off the module object would be the one glue function nothing could see.
       installSignatureBackend: glue.install_signature_backend,
+      // Not a per-check bridge either: read once, below, for the footer.
+      hashingBackend: glue.hashing_backend,
     };
     versionText = String(pyodide.globals.get("_pyrxd_version_blob"));
     // AFTER the glue is importable and BEFORE the page is told it is ready, so the
@@ -543,7 +549,32 @@ _pyrxd_version_blob = (
   }
 
   onProgress(100);
-  return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck };
+  const hashing = readHashingBackend(bridges);
+  return { pyodide, bridges, versionText, gitSha: manifest.git_sha, signatureCheck, hashing };
+}
+
+// WHICH CODE COMPUTES THIS TAB'S HASHES, as the runtime itself reports it (#757). The boot
+// above does not load Pyodide's OpenSSL, and static tests catch the known ways it could; this
+// is the outcome, whichever way OpenSSL might have arrived, and both pages print its `summary`
+// in their footer. Reported, never refused: OpenSSL here is more code from the CDN, not a
+// wrong answer. Never throws — a diagnostic must not stop the page loading.
+function readHashingBackend(bridges) {
+  try {
+    const report = fromPy(bridges.hashingBackend());
+    if (report && typeof report.summary === "string") return report;
+  } catch (_) {
+    // Fall through: say the report is missing, and claim nothing about what is loaded.
+  }
+  return { summary: "hashing: this tab's hashing report could not be read" };
+}
+
+// The footer's build line: the deployed commit, then which code computes this tab's hashes.
+// Text only; the caller sets it with `textContent`.
+function buildLine(runtime) {
+  const parts = [];
+  if (runtime.gitSha) parts.push(`build: ${runtime.gitSha}`);
+  if (runtime.hashing && runtime.hashing.summary) parts.push(runtime.hashing.summary);
+  return parts.join(" · ");
 }
 
 // Convert a Pyodide return value to a plain JS object and release the proxy.

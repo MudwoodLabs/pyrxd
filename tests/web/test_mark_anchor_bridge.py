@@ -168,6 +168,12 @@ class TestTheAnchorIsReachableFromTheBrowser:
 
             pulled = sorted(n for n in sys.modules if n.split(".", 1)[0] in heavy)
         finally:
+            # Drop what THIS import added before restoring, or a module first imported here
+            # outlives the restore, bound to copies of its dependencies that the restore then
+            # replaces. Observed: with a test file that imports the glue running first, 22 tests
+            # below failed, in that order only; dropping the added modules fixed it.
+            for name in [n for n in sys.modules if n not in saved]:
+                sys.modules.pop(name)
             sys.modules.update(saved)
         assert not pulled, (
             f"importing pyrxd.glyph.mark_anchor pulled {pulled}, none of which has a pure-Python "

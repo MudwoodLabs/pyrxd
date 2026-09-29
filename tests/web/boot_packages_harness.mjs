@@ -29,7 +29,9 @@
 //     the boot tolerates by design — and the boot carries on to the end.
 //
 // Contract:
-//   node boot_packages_harness.mjs [--shared <path to a shared.js variant>]
+//   node boot_packages_harness.mjs [--shared <path to a shared.js variant>] [--hashing-report <json>]
+//     --hashing-report: what the stand-in glue's `hashing_backend` returns, as a dict the page
+//     converts with `toJs` — so the footer plumbing (readHashingBackend, buildLine) runs for real.
 //   stdout (last line): JSON {
 //     "finished": bool, "error": string|null, "progress": [n, …],
 //     "loadPyodideOptions": [{…}, …]   (JSON-able part of each options object),
@@ -37,7 +39,8 @@
 //     "loadPackagesFromImports": [args, …],
 //     "python": [source, …]             (everything handed to runPython / runPythonAsync),
 //     "unknown": [{"path": "...", "args": [...]}, …],
-//     "fetches": [url, …]
+//     "fetches": [url, …],
+//     "hashing": {…} (the runtime's report), "footer": "…" (buildLine(runtime))
 //   }
 
 import { createHash } from "node:crypto";
@@ -52,6 +55,7 @@ const INSPECT_DIR = resolve(STATIC, "inspect");
 
 const args = process.argv.slice(2);
 const sharedPath = args.includes("--shared") ? resolve(args[args.indexOf("--shared") + 1]) : resolve(INSPECT_DIR, "shared.js");
+const hashingReport = args.includes("--hashing-report") ? JSON.parse(args[args.indexOf("--hashing-report") + 1]) : null;
 
 const PAGE_BASE = "https://pages.invalid/verify/";
 const WHEEL = "pyrxd-0.0.0-py3-none-any.whl";
@@ -81,6 +85,8 @@ const record = {
   python: [],
   unknown: [],
   fetches: [],
+  hashing: null,
+  footer: null,
 };
 
 // Answer a same-origin URL the way GitHub Pages would, and REFUSE anything else — the boot
@@ -121,7 +127,18 @@ function recorder(path) {
   });
 }
 
-const glueModule = new Proxy({}, { get: (_t, prop) => (typeof prop === "symbol" || prop === "then" ? undefined : () => null) });
+// A PyProxy-shaped dict: `fromPy` converts it with `toJs` and then `destroy`s it, as it would a real one.
+const pyDict = (obj) => ({ toJs: () => ({ ...obj }), destroy: () => undefined });
+const glueModule = new Proxy(
+  {},
+  {
+    get: (_t, prop) => {
+      if (typeof prop === "symbol" || prop === "then") return undefined;
+      if (prop === "hashing_backend" && hashingReport) return () => pyDict(hashingReport);
+      return () => null;
+    },
+  },
+);
 
 const modelled = {
   loadPackage: async (names) => {
@@ -197,13 +214,15 @@ if (typeof sandbox.bootPyrxdRuntime !== "function") {
 
 try {
   // The URLs /verify/ passes (verify.js), resolved the same way.
-  await sandbox.bootPyrxdRuntime({
+  const runtime = await sandbox.bootPyrxdRuntime({
     wheelsBase: new URL("../inspect/wheels/", PAGE_BASE).toString(),
     glueUrl: new URL("../inspect/glue.py", PAGE_BASE).toString(),
     curveUrl: new URL("../inspect/secp256k1-bridge.js", PAGE_BASE).toString(),
     onProgress: (pct) => record.progress.push(pct),
   });
   record.finished = true;
+  record.hashing = jsonable(runtime.hashing);
+  record.footer = sandbox.buildLine(runtime);
 } catch (err) {
   record.error = String((err && err.message) || err);
 }

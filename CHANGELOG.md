@@ -20,9 +20,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1 MiB inputs, random inputs, and real mainnet headers whose block hashes come from the chain
   itself. If the fallback ever fails too, `radiant_block_hash` raises a `ValueError` that starts
   with the fallback's own error, so the pages, which show 80 characters of it, say why the block
-  hash cannot be computed here rather than blaming the server. A test runs the pages' boot against
-  a recording stand-in for Pyodide and fails unless the packages it asks for are exactly `micropip`
-  and `pycryptodome`.
+  hash cannot be computed here rather than blaming the server. Both pages now say in their footer
+  which code computes their hashes (`hashing: Python's built-ins, no OpenSSL`), read from the
+  running tab, so OpenSSL arriving by any route is visible; static checks of the boot catch the
+  known ways it could be loaded.
 
 ## [0.25.0] — 2026-09-26
 
