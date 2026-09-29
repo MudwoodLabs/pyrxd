@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`glyph inspect` recognises the 65-byte DAT commit mainnet DAT tokens use (#751).**
+  `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
+  by neither pyrxd nor Photonic. A reveal spending it read `not-a-commit`, which undersold a real
+  commitment: the script forces the spender to push a payload whose hash256 is `h`, and checks no
+  ref. It is now read from those semantics: the reveal's payload binding is `bound-no-token`
+  (or `mismatch` for another payload), and the script itself classifies as `commit-dat`. Only the
+  exact bare 65-byte form is recognised.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)

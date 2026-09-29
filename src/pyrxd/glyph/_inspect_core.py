@@ -875,6 +875,7 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
         is_nft_script,
         parse_authority_gated_script,
         parse_dat_commit_script,
+        parse_dat_gly_only_commit_script,
         parse_delegate_burn_script,
         parse_legacy_container_script,
         parse_mutable_nft_script,
@@ -1198,6 +1199,20 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
             row["delegate_base_ref"] = f"{_delegate_ref.txid}:{_delegate_ref.vout}"
         return row
 
+    # The 65-byte DAT commit mainnet DAT tokens use: no "dat" push, bare only (#751). Read by
+    # what it does — it hash-locks a payload and checks no ref — not by who built it.
+    parsed_dat65 = parse_dat_gly_only_commit_script(script)
+    if parsed_dat65 is not None:
+        dat_hash, dat_pkh = parsed_dat65
+        return {
+            **base,
+            "type": "commit-dat",
+            "payload_hash": dat_hash.hex(),
+            "owner_pkh": bytes(dat_pkh).hex(),
+            "note": 'the 65-byte DAT commit form (no "dat" push, which neither pyrxd nor Photonic emits): '
+            "it hash-locks the payload and checks no ref, so a reveal spending it creates no token",
+        }
+
     if is_commit_nft_script(script_hex):
         # `split_delegate_commit_prefix` recovers the base ref from ALL THREE commit
         # types, but only the DAT branch used to emit it — the one commit type whose
@@ -1491,24 +1506,27 @@ def _commit_obligation(spent_script: bytes) -> tuple[str, bytes, int | None] | N
     ref appear in NO output — it mints nothing — and reading one as a commit is how a decoy
     placed first read ``bound``.
 
-    WHICH DAT FORMS. The ones the two builders emit, read from their source rather than from
-    samples: Photonic's ``datCommitScript`` at ``becf41a7`` (unchanged since it was added in
-    ``36d8d34``, 2024-04-05) and pyrxd's :func:`~pyrxd.glyph.script.build_dat_commit_locking_script`
-    both build ``OP_HASH256 <h> OP_EQUALVERIFY "dat" OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH,
-    70 bytes, or 126 behind a delegate prefix. Mainnet also carries a 65-byte form with no ``"dat"``
-    push (``77df45a9…1b22:0``), which neither builder emits and whose builder is not known here.
-    It is NOT recognised: the templates here are the ones the builders are known to emit, not
-    ones inferred from samples. :func:`_payload_binding` says only that it is unrecognised, never
-    that nobody committed.
+    WHICH DAT FORMS. Two. The one the two builders emit, read from their source: Photonic's
+    ``datCommitScript`` at ``becf41a7`` (unchanged since it was added in ``36d8d34``, 2024-04-05)
+    and pyrxd's :func:`~pyrxd.glyph.script.build_dat_commit_locking_script` both build
+    ``OP_HASH256 <h> OP_EQUALVERIFY "dat" OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH, 70 bytes,
+    or 126 behind a delegate prefix. And the 65-byte form mainnet DAT tokens use, with no ``"dat"``
+    push (``77df45a9…1b22:0``), which neither builder emits (#751). That one is recognised from
+    the script's own semantics, not from who built it: ``OP_HASH256 <h> OP_EQUALVERIFY`` forces
+    the spender to push a payload whose hash256 is ``h``, and nothing in it checks a ref, so it is
+    a DAT commit in exactly the sense :func:`_payload_binding` needs — it binds a payload and
+    creates no token. Only the bare 65-byte script is read
+    (:func:`~pyrxd.glyph.script.parse_dat_gly_only_commit_script`).
     """
     from .script import (
         extract_payload_hash_from_commit_script,
         is_commit_ft_script,
         is_commit_nft_script,
         parse_dat_commit_script,
+        parse_dat_gly_only_commit_script,
     )
 
-    dat = parse_dat_commit_script(spent_script)
+    dat = parse_dat_commit_script(spent_script) or parse_dat_gly_only_commit_script(spent_script)
     if dat is not None:
         return "dat", dat[0], None
     script_hex = spent_script.hex()
@@ -1602,9 +1620,9 @@ def _payload_binding(
     ``not-a-commit``
         The attributed input spent a script that is none of the commit templates pyrxd recognises
         (:func:`_commit_obligation`). That is ALL it says. It is not evidence that nobody committed
-        to the envelope: the mainnet DAT reveal ``e5c67100…be5d`` spends a 65-byte hash-lock
-        neither builder emits (``77df45a9…1b22:0``) whose ``payload_hash`` is its envelope's, and
-        it reads this (``tests/fixtures/dat_65_byte_commit_mainnet.json``).
+        to the envelope: a script pyrxd does not recognise may still hash-lock it. (The mainnet
+        DAT reveal ``e5c67100…be5d`` used to read this, for a 65-byte commit neither builder emits;
+        that form is recognised now and reads ``bound-no-token``, #751.)
     ``unchecked``
         The spent script (or the envelope's bytes) was not available.
 

@@ -362,13 +362,13 @@ class TestADatCommitBindsData:
         verdict = _bind(cbor, body, [_P2PKH])
         assert (verdict["state"], verdict["commit"]) == ("bound-no-token", "dat")
 
-    def test_the_65_byte_mainnet_dat_commit_is_unrecognised_and_says_only_that(self) -> None:
-        """#743 round 2, L1. A real DAT reveal (``e5c67100…be5d``, block 449835) spends a 65-byte
-        commit — ``OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH, no ``"dat"`` push —
-        that neither Photonic's builder nor pyrxd's emits, and whose ``h`` IS the envelope's
-        ``sha256d``. It stays unrecognised (the templates are the builders', not inferred from a
-        sample), and the verdict says exactly that. It used to add "so nothing here shows that
-        anyone committed to this envelope", which this transaction makes false.
+    def test_the_65_byte_mainnet_dat_commit_reads_bound_no_token(self) -> None:
+        """#751 (was #743 round 2, L1). A real DAT reveal (``e5c67100…be5d``, block 449835) spends a
+        65-byte commit — ``OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH, no
+        ``"dat"`` push — that neither Photonic's builder nor pyrxd's emits, and whose ``h`` IS the
+        envelope's ``sha256d``. It read ``not-a-commit``, which was true but undersold a real
+        commitment: the script forces the spender to push a payload hashing to ``h``, and checks no
+        ref. It is now read by those semantics as ``bound-no-token``.
 
         Through the real ``--fetch`` path, with the mainnet bytes."""
         import json
@@ -395,10 +395,82 @@ class TestADatCommitBindsData:
         metadata = payload["metadata"]
         assert commit["txid"] in client.requested
         assert (metadata["classification"], metadata["mints"]) == ("dat", False)
-        assert metadata["payload_binding"] == {
-            "state": "not-a-commit",
-            "reason": "the output the attributed input spent is not a commit template pyrxd recognises",
-        }
+        binding = metadata["payload_binding"]
+        assert (binding["state"], binding["commit"]) == ("bound-no-token", "dat")
+        assert "creates no token" in binding["reason"]
+
+
+class TestThe65ByteDatCommit:
+    """#751: ``OP_HASH256 <32> OP_EQUALVERIFY <"gly"> OP_EQUALVERIFY <P2PKH>``, recognised from the
+    script's own semantics — it hash-locks the payload and checks no ref — and nothing looser."""
+
+    @staticmethod
+    def _transcribed(h: bytes, pkh: bytes) -> bytes:
+        """The template, op by op, NOT from pyrxd's regex or any builder."""
+        return (
+            b"\xaa" + b"\x20" + h + b"\x88"  # OP_HASH256 <32-byte h> OP_EQUALVERIFY
+            + b"\x03gly" + b"\x88"  # <"gly"> OP_EQUALVERIFY
+            + b"\x76\xa9\x14" + pkh + b"\x88\xac"  # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        )  # fmt: skip
+
+    def test_the_transcription_is_the_mainnet_script_byte_for_byte(self) -> None:
+        import json
+        from pathlib import Path
+
+        from pyrxd.glyph.script import parse_dat_gly_only_commit_script
+
+        pair = json.loads(
+            (Path(__file__).resolve().parent / "fixtures" / "dat_65_byte_commit_mainnet.json").read_text()
+        )
+        spent = bytes(Transaction.from_hex(bytes.fromhex(pair["commit"]["raw"])).outputs[0].locking_script.serialize())
+        h, pkh = spent[2:34], spent[43:63]
+        assert self._transcribed(h, pkh) == spent and len(spent) == 65
+        assert parse_dat_gly_only_commit_script(spent) == (h, Hex20(pkh))
+
+    def test_a_transcribed_commit_binds_its_payload(self) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        verdict = _bind(cbor, self._transcribed(hash256(cbor), os.urandom(20)), [_P2PKH])
+        assert (verdict["state"], verdict["commit"]) == ("bound-no-token", "dat")
+
+    def test_it_is_never_bound_to_a_token(self) -> None:
+        """No ref check, so an NFT for its outpoint in the outputs does not make it ``bound``."""
+        _, cbor = _envelope("Tether USD", GlyphProtocol.NFT)
+        verdict = _bind(cbor, self._transcribed(hash256(cbor), os.urandom(20)), [_nft_out(_OUTPOINT_TXID)])
+        assert verdict["state"] == "bound-no-token"
+
+    def test_a_65_byte_commit_to_another_payload_is_a_mismatch(self) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        _, other = _envelope("other", GlyphProtocol.DAT)
+        assert _bind(cbor, self._transcribed(hash256(other), os.urandom(20)), [_P2PKH])["state"] == "mismatch"
+
+    def test_glyph_inspect_names_the_script_itself_a_dat_commit(self) -> None:
+        from pyrxd.glyph._inspect_core import _classify_script
+
+        h, pkh = os.urandom(32), os.urandom(20)
+        row = _classify_script(self._transcribed(h, pkh).hex(), network="mainnet")
+        assert (row["type"], row["payload_hash"], row["owner_pkh"]) == ("commit-dat", h.hex(), pkh.hex())
+        assert "65-byte" in row["note"]
+        # The honest pair: the 70-byte form is still a DAT commit, with its own note.
+        seventy = _classify_script(build_dat_commit_locking_script(h, Hex20(pkh)).hex(), network="mainnet")
+        assert seventy["type"] == "commit-dat" and "65-byte" not in seventy["note"]
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda s: s[:-1],  # 64 bytes
+            lambda s: s + b"\x75",  # 66 bytes: a trailing OP_DROP
+            lambda s: s.replace(b"\x03gly", b"\x03glz"),  # another marker
+            lambda s: s[:34] + b"\x87" + s[35:],  # OP_EQUAL, not OP_EQUALVERIFY, after the hash
+            lambda s: s[:40] + b"\x87" + s[41:],  # OP_EQUAL after "gly"
+            lambda s: b"\xa8" + s[1:],  # OP_SHA256, not OP_HASH256
+            lambda s: b"\xd0" + GlyphRef(txid="ef" * 32, vout=0).to_bytes() + b"\x75" + s,  # a ref prefix
+        ],
+        ids=["64-bytes", "66-bytes", "glz", "equal-after-hash", "equal-after-gly", "sha256", "ref-prefix"],
+    )
+    def test_a_near_miss_is_not_recognised(self, mutate) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        near = mutate(self._transcribed(hash256(cbor), os.urandom(20)))
+        assert _bind(cbor, near, [_P2PKH])["state"] == "not-a-commit"
 
 
 def test_a_commit_that_committed_to_a_DIFFERENT_payload_reads_mismatch() -> None:
@@ -413,7 +485,7 @@ def test_a_commit_that_committed_to_a_DIFFERENT_payload_reads_mismatch() -> None
 def test_an_input_that_spent_something_other_than_a_commit_says_so() -> None:
     """Distinct from `unchecked`: the spent script is here and pyrxd does not recognise it — and
     that is ALL the reason says. It used to add "so nothing here shows that anyone committed to
-    this envelope", which is false for the 65-byte mainnet DAT commit below."""
+    this envelope", which a script pyrxd does not recognise can make false."""
     _, cbor = _envelope("x")
     verdict = _bind(cbor, _P2PKH, [_nft_out(_OUTPOINT_TXID)])
     assert verdict == {

@@ -233,7 +233,7 @@ What each `payload_binding` state establishes:
 | `bound-no-token` | The same hash match against a DAT commit. A DAT commit demands no ref, so the payload is data and describes no output — whatever protocol it declares. | That a token was created. A DAT commit mints nothing, which makes it exactly what a decoy input placed first could spend. |
 | `mismatch` | The spent commit committed to a different payload. A node rejects that spend, so these are bytes that were never mined (pasted raw, or served for a txid no block holds). Flagged. | — |
 | `commit-unsatisfied` | The hash matches, and the outputs do not carry the commit's ref as it demands. A node rejects that spend too. Flagged. | — |
-| `not-a-commit` | The output the attributed input spent is not a commit template pyrxd recognises: the NFT, FT and DAT commits pyrxd and Photonic build (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing). | That nobody committed to the envelope. A script pyrxd does not recognise may still hash-lock it: the mainnet DAT reveal `e5c67100…be5d` spends a 65-byte commit with no `"dat"` push that neither builder emits, and reads `not-a-commit`. |
+| `not-a-commit` | The output the attributed input spent is not a commit template pyrxd recognises: the NFT, FT and DAT commits pyrxd and Photonic build (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing), and the 65-byte DAT commit with no `"dat"` push that mainnet DAT tokens use (recognised from what the script does: it hash-locks the payload and checks no ref). | That nobody committed to the envelope. A script pyrxd does not recognise may still hash-lock it. |
 | `unchecked` | The spent output, or the envelope's bytes, was not available. | — |
 
 ---
