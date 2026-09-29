@@ -230,10 +230,10 @@ What each `payload_binding` state establishes:
 | state | what it means | what it does NOT mean |
 |---|---|---|
 | `bound` | The attributed input spent an NFT or FT commit whose payload hash is the envelope shown, and this transaction's outputs carry that commit's outpoint as the ref type the commit demands. `first_ref_output` and `ref_output_count` say where; the reason names up to three. | That the name belongs to any OTHER output. A reveal minting two tokens is `bound` for whichever input is attributed, and only for that input's token. That a node would accept the transaction: signatures are not checked, nor the rest of the reference rules — a singleton beside a normal push of the same ref reads `bound`, and a node refuses it. |
-| `bound-no-token` | The same hash match against a DAT commit. A DAT commit demands no ref, so the payload is data and describes no output — whatever protocol it declares. | That a token was created. A DAT commit mints nothing, which makes it exactly what a decoy input placed first could spend. |
+| `bound-no-token` | The same hash match against a commit that demands no token: a DAT commit, or the 65-byte hash-lock with no `"dat"` push seen under mainnet DAT reveals. The payload is bound as data, whatever protocol it declares. The reason says whether any output carries the commit's outpoint as a ref anyway: if none does, the payload describes no output here; if one does, the reason names it. | That a token was, or was not, created: the commit demands none and does not prevent one. Nor that the 65-byte form is DAT: nothing in that script says so. A commit that demands no token is exactly what a decoy input placed first could spend. |
 | `mismatch` | The spent commit committed to a different payload. A node rejects that spend, so these are bytes that were never mined (pasted raw, or served for a txid no block holds). Flagged. | — |
 | `commit-unsatisfied` | The hash matches, and the outputs do not carry the commit's ref as it demands. A node rejects that spend too. Flagged. | — |
-| `not-a-commit` | The output the attributed input spent is not a commit template pyrxd recognises: the NFT, FT and DAT commits pyrxd and Photonic build (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing). | That nobody committed to the envelope. A script pyrxd does not recognise may still hash-lock it: the mainnet DAT reveal `e5c67100…be5d` spends a 65-byte commit with no `"dat"` push that neither builder emits, and reads `not-a-commit`. |
+| `not-a-commit` | The output the attributed input spent is not a commit template pyrxd recognises: the NFT, FT and DAT commits pyrxd and Photonic build (only ref-type `OP_1`/`OP_2` counts: an `OP_0` commit mints nothing), and the 65-byte hash-lock commit with no `"dat"` push seen under mainnet DAT reveals (recognised from what the script does: it hash-locks the payload and checks no ref). | That nobody committed to the envelope. A script pyrxd does not recognise may still hash-lock it. |
 | `unchecked` | The spent output, or the envelope's bytes, was not available. | — |
 
 ---
@@ -316,11 +316,16 @@ rows are unaffected, which is the point of the per-output `try`.
 
 `commit-dat` is the commit half of a DAT (data-storage) glyph. It
 differs from `commit-nft` / `commit-ft` by having **no**
-`OP_REFTYPE_OUTPUT` block, which is the whole point: its reveal obliges
-no token output and mints nothing. What survives is the payload in the
-reveal's scriptSig. It also carries an extra `dat` marker push, so
-every field after the payload hash sits at a different offset than in
-the other two commits.
+`OP_REFTYPE_OUTPUT` block, which is the whole point: it does not oblige
+its reveal to create a token output (and does not prevent one). What
+survives is the payload in the reveal's scriptSig. Two forms read as
+`commit-dat`. The 70-byte form pyrxd and Photonic build carries an extra
+`dat` marker push, so every field after the payload hash sits at a
+different offset than in the other two commits. The 65-byte form has no
+`dat` push and neither builder emits it (#751). It is filed here for
+what its script does, which is hash-lock the payload and check no ref,
+and because the reveals seen spending it are DAT reveals. Nothing in the
+script itself says DAT, and its row's `note` says so.
 
 `op_return-burn` is a Glyph BURN proof — an `OP_RETURN` declaring that a
 token was destroyed. Read the `note` on that row before believing it:
@@ -625,7 +630,7 @@ narrower than they look.
 | Artifact | Source | What is actually checked |
 |----------|--------|--------------------------|
 | Pyodide loader (`pyodide.js`) | jsdelivr CDN | Subresource Integrity (SHA-384) on the `<script>` tag in `index.html`. This is the **only** `integrity=` attribute on the page. |
-| Everything else Pyodide loads — `pyodide.asm.js`, `pyodide.asm.wasm`, `python_stdlib.zip`, the lockfile, and the `hashlib` (with its `openssl` dependency) / `micropip` / `pycryptodome` packages | jsdelivr CDN, under the `indexURL` passed to `loadPyodide` | **No SRI.** These are fetched by the loader script itself, after it runs. Whatever integrity Pyodide applies to its own packages is anchored in a lockfile that comes from the same `indexURL`, which this page does not pin. The `hashlib` package is Pyodide's OpenSSL binding — OpenSSL 1.1.1n, end-of-life, used here for hashing only — and it is loaded for the Radiant block hash (SHA-512/256), which Pyodide's built-in `hashlib` lacks. Once it is loaded, OpenSSL computes **every** hash `hashlib` provides, including the SHA-256 and RIPEMD-160 in the signature verdict (measured in headless Chromium: `hashlib.sha256` is `openssl_sha256`). That is no new trusted party — the same CDN serves the interpreter — but it is about 3.7 MB more code (1,665,188 + 2,025,903 bytes, measured), checked only against that same unpinned lockfile. |
+| Everything else Pyodide loads — `pyodide.asm.js`, `pyodide.asm.wasm`, `python_stdlib.zip`, the lockfile, and the `micropip` / `pycryptodome` packages | jsdelivr CDN, under the `indexURL` passed to `loadPyodide` | **No SRI.** These are fetched by the loader script itself, after it runs. Whatever integrity Pyodide applies to its own packages is anchored in a lockfile that comes from the same `indexURL`, which this page does not pin. The page does **not** load Pyodide's `hashlib` package (its OpenSSL 1.1.1n binding, end-of-life) or that package's `openssl` dependency. It did briefly (#756), for the Radiant block hash (SHA-512/256), which Pyodide's built-in `hashlib` lacks — and with it loaded, OpenSSL computed **every** hash `hashlib` provides, the SHA-256 and RIPEMD-160 in the signature verdict included, for about 3.7 MB more code (1,665,188 + 2,025,903 bytes, measured). Since #757, `pyrxd.hash` computes SHA-512/256 in pure Python where `hashlib` has none, SHA-256 is CPython's built-in `_sha2`, and RIPEMD-160 is pyrxd's own pure-Python fallback (measured in headless Chromium). Two things keep it that way, and each claims only its own: static checks of the known load paths (the boot, run under Node against a recording stand-in for Pyodide, may pass `loadPyodide` only allowlisted options, so not `fullStdLib`; must ask `loadPackage` for exactly `micropip` and `pycryptodome`; and may micropip-install only the two SHA-checked wheels), which catch the spellings someone thought of and not every way; and the page itself, which reports at runtime in its footer which code computes the block hash, SHA-256 and RIPEMD-160, and whether `_hashlib` or `_ssl` (Python's OpenSSL modules) is importable (`hashing: block hash and RIPEMD-160 by pyrxd's pure Python, SHA-256 by CPython's _sha2; no _hashlib or _ssl module` is what the shipped boot should show). It does not look for other copies of OpenSSL, such as the one inside the `cryptography` package, so it never says "no OpenSSL". That report is shown, never acted on: OpenSSL here is more code from the CDN, not a wrong answer. |
 | `pyrxd` wheel | same-origin (`/inspect/wheels/`) | SHA-256 compared against `manifest.json` before `micropip.install`. |
 | Vendored `cbor2==5.4.6` wheel | same-origin (`/inspect/wheels/`) | SHA-256 compared against `manifest.json` before `micropip.install`. Separately, the docs workflow verifies the upstream PyPI bytes at build time against a hash pinned **in the workflow file**, which is in git — that one anchor does sit outside the deploy. |
 | `glue.py` (Python bootstrap) | same-origin | SHA-256 compared against `manifest.json` before evaluation. |

@@ -606,3 +606,42 @@ def test_the_page_and_the_cli_tell_each_failure_the_same_way() -> None:
     assert "exc.disagrees" in source and "exc.unserved" in source, "the page classifies the failure itself"
     cli = _inspect.getsource(sys.modules["pyrxd.cli.hashmark_cmds"])
     assert "exc.disagrees" in cli and "exc.unserved" in cli, "the CLI's advice classifies the failure itself"
+
+
+# ---------------------------------------------------------------------------
+# #754: whether the height was header-checked is a KEY, not only a caveat
+# ---------------------------------------------------------------------------
+
+
+def test_an_anchor_built_without_saying_is_not_header_bound() -> None:
+    """Pins the default. Planting ``header_bound: bool = True`` passed every test before this."""
+    from pyrxd.glyph.mark_anchor import MarkAnchor
+
+    anchor = MarkAnchor(txid=MARK, height=1000, confirmations=10, min_confirmations=6, source="e")
+    assert anchor.header_bound is False
+
+
+async def test_an_unbound_anchor_reports_header_bound_false_in_its_dict() -> None:
+    from pyrxd.glyph.mark_anchor import mark_anchor_dict
+
+    anchor = await _resolve(confirmations=10, tip=1009, bind=False)
+    assert anchor.header_bound is False
+    shown = mark_anchor_dict(anchor)
+    assert shown["header_bound"] is False
+    assert shown["caveat"] == UNVERIFIED_CAVEAT
+
+
+async def test_a_bound_anchor_reports_header_bound_true_in_its_dict() -> None:
+    """The honest path: a height checked against the endpoint's header says so."""
+    from pyrxd.glyph.mark_anchor import mark_anchor_dict
+
+    anchor = await _resolve(confirmations=10, tip=1009, verbose_extra={"blockhash": block_hash_at(1000)})
+    assert anchor.header_bound is True
+    shown = mark_anchor_dict(anchor)
+    assert shown["header_bound"] is True
+    assert shown["caveat"] == BOUND_CAVEAT
+
+
+def test_the_json_anchor_the_cli_prints_carries_header_bound(monkeypatch) -> None:
+    nam = _run(monkeypatch, _payload(MOVED_H160), _pair())
+    assert nam["anchor"]["header_bound"] is True

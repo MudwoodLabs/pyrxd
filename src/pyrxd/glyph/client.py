@@ -289,7 +289,8 @@ class GlyphClient:
 
     Usage::
 
-        client = GlyphClient(electrumx, wallet, store=JsonFilePendingStore("~/.pyrxd/pending"))
+        store = JsonFilePendingStore(Path("~/.pyrxd/pending").expanduser())
+        client = GlyphClient(electrumx, wallet, store=store)
         result = await client.mint_nft(metadata)
         receipt = await client.transfer_ft(ref, 250, recipient_pkh)
 
@@ -300,7 +301,9 @@ class GlyphClient:
 
     Args:
         client: an ElectrumX-style client — ``await broadcast(raw_tx: bytes) -> txid``,
-            ``await get_transaction(txid)``, ``await get_utxos(script_hash)``.
+            ``await get_transaction(txid)``, ``await get_utxos(script_hash)``, and
+            ``await get_history(script_hash)``, which an :class:`~pyrxd.hd.wallet.HdWallet`
+            calls for the gap-limit scan ``collect_spendable`` runs before every spend.
         wallet: an :class:`~pyrxd.hd.wallet.HdWallet`, or anything exposing
             ``await collect_spendable(client)``, ``privkey_for_address(address)`` and
             ``addresses``.

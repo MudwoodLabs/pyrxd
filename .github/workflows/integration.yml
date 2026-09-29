@@ -173,6 +173,7 @@ jobs:
             tests/test_fee_floor_boundary_regtest_e2e.py \
             tests/test_authority_regtest_e2e.py \
             tests/test_hashmark_regtest_e2e.py \
+            tests/test_fresh_wallet_spends_regtest_e2e.py \
             tests/test_glyph_timelock_regtest_e2e.py \
             tests/test_dat_and_burn_regtest_e2e.py \
             tests/test_delegate_regtest_e2e.py

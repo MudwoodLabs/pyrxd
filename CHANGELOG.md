@@ -6,13 +6,185 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The `/inspect/` and `/verify/` pages no longer load Pyodide's OpenSSL (#757).** Since 0.25.0
+  (#756) they loaded Pyodide's `hashlib` package, OpenSSL 1.1.1n (end-of-life), because Pyodide
+  0.26.4's built-in `hashlib` has no SHA-512/256, the Radiant block hash that binds a mark's height
+  to its header. With it loaded, OpenSSL computed every hash on the page, the SHA-256 and RIPEMD-160
+  behind the signature verdict included, and it was about 3.7 MB of extra code checked only against
+  a lockfile fetched from the same CDN. `pyrxd.hash.radiant_block_hash` now falls back to a
+  pure-Python SHA-512/256 (FIPS 180-4: SHA-512 from the §5.3.6.2 initial value, truncated to 256
+  bits) when `hashlib.new("sha512_256")` raises; CPython keeps using `hashlib`. The fallback is
+  tested against `hashlib` on the FIPS examples, every length from 0 to 384 bytes, fixed 8 KiB and
+  1 MiB inputs, random inputs, and real mainnet headers whose block hashes come from the chain
+  itself. If the fallback ever fails too, `radiant_block_hash` raises a `ValueError` that starts
+  with the fallback's own error, so the pages, which show 80 characters of it, say why the block
+  hash cannot be computed here rather than blaming the server. Both pages now say in their footer,
+  read from the running tab, which code computes the block hash, SHA-256 and RIPEMD-160, and
+  whether Python's OpenSSL modules `_hashlib` and `_ssl` are importable (`hashing: block hash and
+  RIPEMD-160 by pyrxd's pure Python, SHA-256 by CPython's _sha2; no _hashlib or _ssl module`). It
+  does not detect other copies of OpenSSL, such as the one inside the `cryptography` package, and
+  does not claim to. Static checks of the boot catch the known ways Pyodide's OpenSSL could be
+  loaded.
 ### Fixed
+
+- **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
+  `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
+  by neither pyrxd nor Photonic; both DAT reveals sampled in the 0.25.0 review spent this form. A
+  reveal spending it read `not-a-commit`, which undersold a real commitment: the script forces the
+  spender to push a payload whose hash256 is `h`, and checks no ref. It is now read from those
+  semantics: the reveal's payload binding is `bound-no-token` (or `mismatch` for another payload),
+  and the script itself classifies as `commit-dat`. Nothing in the script says DAT. It is filed
+  with the DAT commits because it has the same obligation, and its `note` and binding reason say
+  so. Only the exact bare 65-byte form is recognised.
+
+- **`bound-no-token` no longer says the payload "describes no output" of a reveal that mints.**
+  A commit that demands no token, the 70-byte DAT commit or the 65-byte form, does not prevent
+  one either: its reveal can still create the commit's outpoint as a ref. The reason used to say
+  "A DAT commit creates no token, so this payload describes no output of this transaction",
+  whatever the outputs held. It now says the commit demands no token, and then either that no
+  output carries its outpoint, which is the only case where it says the payload describes no
+  output, or which outputs do. The CLI and the /inspect/ page print this reason. The `commit-dat`
+  note now says "demands no token of its reveal, nor prevents one" instead of "creates no token".
+
+- **An outpoint's output index must be ASCII digits (#746).** `glyph inspect` and the
+  `/inspect/` and `/verify/` pages read `<txid>:1_0` as output 10 and accepted ` 1`, `+1` and
+  non-ASCII digits, through Python's `int()`. The index must now be ASCII `0`-`9`.
+- **Form-2 source identity (#754).** An internationalised host and its punycode spelling now
+  count as one source (and one endpoint), so one server behind both URLs cannot corroborate
+  itself; the A-label is then canonicalised like any other host, so a trailing `。` or a
+  full-width IP literal folds too. `NetworkProfile` (and so `require_profile()` on a loaded config) raises `ValidationError`
+  for a malformed IPv6 endpoint URL such as `wss://[::1`, not a raw `ValueError` (the CLI still
+  reports either as an unexpected failure, #775). The `--json` mark anchor gains a
+  `header_bound` key, so a reader can tell whether the height was checked against the endpoint's
+  block header without parsing the caveat.
+- **The `JsonFilePendingStore` examples in the README and the `GlyphMinter` and `GlyphClient`
+  docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
+  current one; the constructor does not expand `~`, and its docstring now says so.
+
+- **`pyrxd verify` accepts an output reference (`<txid>:<n>`) and a 72-character contract id**
+  (#745). It refused both with "that is not a transaction id", about input that had one in it, and
+  a fix hint that talked only about digests. When the transaction has the output named, either form
+  checks that transaction, with the same verdict its txid gets, and says first what the named
+  output is: the record the verdict is about, another record, not a record (and which output holds
+  the record), or an output that could not be read, so whether it is a record is unknown. The same
+  sentences are in `--json` under `named_by`, and on stderr under `--quiet`. An output the
+  transaction does not have is bad input: exit 1 and no verdict in every mode (no report, no JSON
+  document, no `HOLDS`), and the error says how many outputs the transaction has. A `<txid>:<n>`
+  that does not parse is refused with its txid named. The `/verify/` page already checked the
+  transaction a pointer names and said what the named output is. It called a named output its
+  classifier could not read "NOT a HashMark record", and now says that whether that output is a
+  record is unknown. It drew the transaction's verdict under an output the transaction does not
+  have, and now shows that as an input error with no verdict, headed by the sentence the command's
+  error leads with. Where an output could not be read, neither surface says a transaction has "no
+  HashMark record" or counts its records as final: both say what could be read and how many outputs
+  could not. `named_by.signature_line_vout` in `--json` says which record the verdict's signature
+  line is about.
+- **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
+  `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
+  scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
+  to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet".
+  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call.
+  Every in-process spend path in the CLI and the SDK reads the wallet's UTXOs through that one
+  method, so each now sees the wallet's funds; `wallet send` through the signing agent already
+  ran its own scan. A scan that cannot read an address fails as a network error rather than
+  reading as an empty wallet. Error hints that said to run `pyrxd balance --refresh` first,
+  which never helped because nothing saved the scan, now say what was scanned.
+- **`glyph resume-mint` can reveal a new wallet's commit.** `HdWallet.privkey_for_address`
+  looked only at the addresses the wallet file records, and a `wallet new` file records none,
+  so on regtest a new wallet's commit whose reveal was interrupted could not be resumed
+  ("address … is not known to this wallet"). The lookup now also derives, locally and with no
+  network, across the gap window on both chains; an address outside it is still refused.
+  `pyrxd mark --signer-address` and `GlyphMinter`'s reveal use the same lookup.
+- **A scan no longer marks a known-used address unused** when a server reports no history for
+  it. `collect_spendable` already read such an address on the call that scanned, but the scan
+  cleared its flag, so a lagging server hid its funds from the next call on the same wallet.
+
+### Changed
+
+- **`HdWallet.collect_spendable` is strict by default.** A failed per-address UTXO read now
+  raises `NetworkError` instead of returning what the other addresses answered, because the
+  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs".
+  - **Strict** (any failed read is a network error): `pyrxd mark`; every `glyph` command that
+    spends; `pyrxd swap reserve`, `post`, `take` and `refund`; `pyrxd wallet sweep` and
+    `HdWallet.send_max`; and the SDK builders that fund from the wallet (`GlyphMinter` and
+    `GlyphClient` mints, `build_ft_transfer`, `build_ft_airdrop`, `build_nft_transfer`,
+    `build_timelock_reveal`, `build_hashmark_mark`).
+  - **Partial view** (`strict=False`): `HdWallet.send`, `pyrxd wallet send` when it signs
+    in-process, and `pyrxd swap cancel`. Each needs only enough, and a cancel races every
+    holder of the signed advert. Each goes ahead when what it read is enough. When it is not
+    and a read failed, it raises `NetworkError` naming the failed reads, never "fund the
+    wallet" or "insufficient funds". The helper is `pyrxd.hd.wallet.raise_if_reads_failed`,
+    and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
+    it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
+    any failed read fails it.
+  - `pyrxd utxos` collects the partial view so it can name the addresses it could not read;
+    it then refuses to show that view as complete (next entry).
+- **`pyrxd balance` and `pyrxd glyph list` scan the chain by default.** Both read only the
+  addresses marked used, and only the gap-limit scan marks them. `balance` ran the scan only
+  under `--refresh`, `glyph list` never ran it, and nothing saves a scan, so a wallet made by
+  `pyrxd wallet new` and funded at its first receive address showed a balance of 0 and no
+  tokens. Both now run `HdWallet.refresh`, the scan `collect_spendable` runs, on every call.
+  The scan reads at least 20 addresses' history on each chain before the balance or token
+  reads. Its result is still not saved: the wallet file is unchanged, as it was under
+  `--refresh`. `balance --refresh` is still accepted and changes nothing. There is no opt-out,
+  because the old view read the network anyway, and it read only what something had marked
+  used, which on a `wallet new` file is nothing.
+- **`balance`, `glyph list` and `utxos` never show a partial view as the whole wallet.** A
+  scan that cannot read an address, or a read that fails for every used address, exits 2
+  and prints nothing. When some addresses answer and others fail, the command still exits 2.
+  The human output shows what the others hold, with an `INCOMPLETE` line on stdout naming the
+  unread addresses. JSON and `--quiet` output print nothing, since neither shape can say
+  "incomplete". Before, `utxos` listed the partial view and exited 0, and `balance` and
+  `glyph list` stopped at the first failed address. `utxos --addr A` is refused only when A's
+  own read fails.
+- **`GlyphScanner.scan_address` and `scan_script_hash` take `strict=`.** With `strict=True`, a
+  UTXO whose transaction cannot be fetched raises `NetworkError` rather than being logged and
+  left out of the result. The default is unchanged. `pyrxd glyph list` passes `strict=True`, so
+  a token it could not fetch fails the listing instead of dropping out of it.
+- **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
+  in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
+  banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,
+  U+3000, ...) and a reviewed list of other characters that render as blank (U+2800 BRAILLE
+  PATTERN BLANK, U+1D159, U+FFFC, U+13441 and U+13442) is now printed as `<U+XXXX>` and named in
+  the banner. No Unicode property marks every character a font draws as blank, so that list
+  cannot be complete; the `ascii:` line under the label still names every codepoint. The ASCII
+  space is printed as typed, and the label is signed as typed either way.
 
 - **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
   `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
   an older pending run in a group when another queues, so a PR build could leave the published
   docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
   build has a group per ref.
+
+### Documentation
+
+- **Two published docs described code that has changed.** Both were found by a new check that a
+  citation written next to a code name lands on that name (`tests/test_doc_citations_resolve.py`):
+  - Glyph spec §16.4 said `COMMIT_SCRIPT_RE` accepts any byte at the commit script's ref-type
+    position. That stopped being true in 0.25.0, which accepts only `OP_1` (FT) and `OP_2` (NFT)
+    there. The section now says so.
+  - The HTLC handshake wire format named the credential gate `pre_btc_lock_gate`, which is not a
+    function in pyrxd, and cited lines inside an unrelated docstring. It now names the rule,
+    `_credential_binding_failure`, and both places that run it: the taker's pre-fund gate
+    `pre_btc_lock_check`, and the maker's path before `BOTH_LOCKED`.
+    The same document cited the `require_measured` refusal and
+    `measure_margin_from_btc_block_times` at lines that had moved, and now writes
+    `NegotiatedTerms.to_dict` where a bare `to_dict` could equally have meant `SwapRecord`'s.
+- Doc citations into `glyph/script.py` and `glyph/_inspect_core.py` re-pointed at the code they
+  name, after the 65-byte DAT change moved it. Several in the Glyph protocol spec had already
+  drifted before this change: the 63-byte NFT script, the FT script, the payload hash and the
+  mutable NFT size.
+- `tests/test_doc_citations_resolve.py` reads a bare `` `:N` `` citation against the file named
+  before it on the same line, or earlier in the same paragraph (a table row does not inherit from
+  the row above). Those citations were invisible to it before. A bare citation is held to the same
+  checks as any other, including the symbol rule above when a code name is written beside it.
+  When this check was first written, with a symbol check of its own that the symbol rule above
+  replaces, the two found 13 drifted citations, including some in
+  `docs/htlc-handshake-wire-format.md`, `docs/security-audit-scope.md` and a how-to. All 13 are
+  re-cited. Other line citations in `docs/htlc-handshake-wire-format.md` name no file on their
+  table row, or no symbol, so these checks cannot see them, and they were not re-derived here.
 
 ## [0.25.0] — 2026-09-26
 

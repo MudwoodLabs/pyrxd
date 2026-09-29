@@ -183,13 +183,13 @@ in production code at all** — this class of bug is test-only in this repo. The
 structural rather than currently expensive, and all live in the tree-scanning guards:
 
 1. **Any new `source`-taking helper in `test_no_duplicate_consensus_constants.py`** must bottom out
-   in `_source_segment` (`:170`) or carry its own `@functools.cache`. Every existing `ast.walk` +
+   in `_source_segment` (`:192`) or carry its own `@functools.cache`. Every existing `ast.walk` +
    whole-`source` call site now does; a new one that does its own splitting silently reopens the
    hole.
-2. **`_strip_comments_and_docstrings` (`:192`) is the closest structural twin still uncached** —
+2. **`_strip_comments_and_docstrings` (`:214-223`) is the closest structural twin still uncached** —
    three whole-file `re.sub` calls, two using the backtracking-prone `(?:.|\n)*?`, invoked per file
    for each of 26 parametrised cases. Cheap today (1.04 s for the class on 3.12); a shape risk, not
-   a current cost.
+   a current cost. (Since cached, with item 3's `_python_files`, in #455.)
 3. **`_python_files(root)` (`:131`) re-runs `rglob` + `sorted` for every case**, and
    `path.read_text()` re-reads and re-decodes every file per case — the parse and the split are
    cached *on the source string*, so the disk read is the missing final layer.

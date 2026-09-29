@@ -55,6 +55,7 @@ import click
 from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
+from ..hd.wallet import raise_if_reads_failed
 from ..keys import PrivateKey
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Txid
@@ -350,16 +351,19 @@ class _WalletFunds:
         raise UserError(
             "the owner key for this output is not in this wallet",
             cause="no wallet address (spendable or derived) matches the output's owner pubkey-hash",
-            fix="run `pyrxd balance --refresh` to widen HD discovery, or check the outpoint/--wallet",
+            fix="check the outpoint and --wallet: the owner key is not within this wallet's scanned addresses",
         )
 
     def change_pkh(self) -> bytes:
         if not self.triples:
+            raise_if_reads_failed(self.triples, "no spendable UTXOs were read from this wallet")
             raise UserError("wallet has no spendable UTXOs", fix="fund the wallet first")
         return self.triples[0][2].public_key().hash160()
 
 
 async def _collect_funds(ctx: CliContext, client) -> _WalletFunds:
+    """The wallet's UTXOs, strictly: any failed read is a network error. ``swap cancel`` alone
+    collects a partial view (see there)."""
     wallet = _load_wallet(ctx)
     return _WalletFunds(triples=await wallet.collect_spendable(client), wallet=wallet)
 
@@ -383,6 +387,7 @@ async def _rxd_funding(
         total += out.satoshis
         if total >= target_photons:
             return picked
+    raise_if_reads_failed(funds.triples, f"the plain-RXD UTXOs read cannot fund {target_photons} photons")
     raise UserError(
         f"wallet cannot fund {target_photons} photons (found {total} across {len(picked)} plain UTXOs)",
         fix="fund the wallet, consolidate UTXOs, or lower the amount/fee",
@@ -410,6 +415,7 @@ async def _ft_funding(client, funds: _WalletFunds, ref, target_units: int) -> li
         total += asset.amount
         if total >= target_units:
             return picked
+    raise_if_reads_failed(funds.triples, f"the FT UTXOs read cannot fund {target_units} units")
     raise UserError(
         f"wallet cannot fund {target_units} units of the demanded FT (found {total} across {len(picked)} UTXOs)",
         fix="acquire the token, consolidate its UTXOs, or fund via the library take path",
@@ -818,7 +824,13 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
                 raise UserError(f"vout {give_vout} does not exist in {give_txid}")
             give_out = give_source.outputs[give_vout]
             give_spk = give_out.locking_script.serialize()
-            funds = await _collect_funds(ctx, client)
+            # Not strict, unlike every other swap command: a cancel is the revocation race —
+            # until it confirms, anyone holding the signed advert can fill at the old price — so
+            # an address whose UTXO read failed must not refuse a cancel the others can pay for.
+            # If what was read cannot pay the fee, _rxd_funding reports the failed reads as a
+            # network error, never as "fund the wallet".
+            wallet = _load_wallet(ctx)
+            funds = _WalletFunds(triples=await wallet.collect_spendable(client, strict=False), wallet=wallet)
             extra_lines: list[str] = []
             if is_refund_covenant(give_spk):
                 owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)

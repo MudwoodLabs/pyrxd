@@ -169,7 +169,8 @@ pyrxd address [--next | --index N] [--change]
 
 pyrxd balance [--refresh]
     Print confirmed/unconfirmed photon balance across the wallet.
-    --refresh first triggers a gap-limit scan via ElectrumX.
+    Always runs a gap-limit scan via ElectrumX first; --refresh, which
+    used to turn it on, is accepted and changes nothing.
 
 pyrxd utxos [--min-photons N] [--addr ADDRESS]
     List UTXOs (table or --json). Read-only diagnostic.
@@ -200,7 +201,7 @@ pyrxd glyph transfer-nft <ref> --to ADDRESS
     Transfer an NFT singleton.
 
 pyrxd glyph list [--type {nft,ft}]
-    Scan wallet addresses for Glyph holdings via GlyphScanner.
+    Gap-limit scan, then scan each used address for Glyph holdings via GlyphScanner.
     Default human table; --json for scripting.
 ```
 
