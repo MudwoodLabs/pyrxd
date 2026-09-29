@@ -125,7 +125,8 @@ async function boot() {
 
   STATUS_BLOCK.hidden = true;
   READY_BLOCK.hidden = false;
-  if (runtime.gitSha) BUILD_VERSION.textContent = `build: ${runtime.gitSha}`;
+  const footer = buildLine(runtime);
+  if (footer) BUILD_VERSION.textContent = footer;
   enableForm();
   hydrateFromUrl();
 }
