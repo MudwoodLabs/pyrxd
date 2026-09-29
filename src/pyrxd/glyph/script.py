@@ -317,11 +317,11 @@ def build_dat_commit_locking_script(
     The difference from :func:`build_commit_locking_script` is the whole point:
     there is **no** ``OP_REFTYPE_OUTPUT`` block. An NFT or FT commit obliges its
     reveal to produce an output of a given ref type — that is what mints the
-    token. A DAT reveal creates no token at all; it stores data, and the only
-    thing the commit binds is that the revealed payload hashes to
-    *payload_hash*.
+    token. A DAT commit demands no token of its reveal, nor prevents one; it
+    stores data, and the only thing it binds is that the revealed payload
+    hashes to *payload_hash*.
 
-    So a DAT reveal has nothing to transfer and nothing to own afterwards. The
+    So a DAT reveal need leave nothing to transfer or own afterwards. The
     payload is recovered from the reveal's scriptSig, exactly as for any other
     glyph, and lives as long as the chain does.
 

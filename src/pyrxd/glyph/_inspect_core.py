@@ -1218,8 +1218,8 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
 
     if is_commit_nft_script(script_hex):
         # `split_delegate_commit_prefix` recovers the base ref from ALL THREE commit
-        # types, but only the DAT branch used to emit it — the one commit type whose
-        # reveal mints nothing. So a 131-byte delegate-bound NFT commit, whose reveal
+        # types, but only the DAT branch used to emit it — the one commit type that
+        # demands no token of its reveal. So a 131-byte delegate-bound NFT commit, whose reveal
         # the covenant REJECTS without a burn output naming that base, rendered
         # identically to a plain 75-byte one on both surfaces.
         _dnft, _ = split_delegate_commit_prefix(script)
@@ -1909,8 +1909,8 @@ def _minting_inputs(inputs: Sequence, output_scripts: Sequence[bytes]) -> set[in
     A ref is created from the outpoint an input spends, and only by the transaction spending it,
     so these are the tokens this transaction MINTS — counted from what the outputs carry, not from
     how many envelopes the inputs push. An envelope on an input that is in no output mints nothing:
-    a DAT reveal, or a decoy spending a commit whose ``OP_REFTYPE_OUTPUT OP_0`` demands its ref be
-    in NO output (a node accepts that transaction).
+    a DAT reveal that pushes none (its commit demands no token, nor prevents one), or a decoy spending
+    a commit whose ``OP_REFTYPE_OUTPUT OP_0`` demands its ref be in NO output (a node accepts that).
 
     Pushed means ``OP_PUSHINPUTREF``/``OP_PUSHINPUTREFSINGLETON`` found by the consensus opcode walk,
     as in :func:`_output_ref_type`. A script is walked only if some ``0xd0``/``0xd8`` byte in it is
@@ -2015,8 +2015,8 @@ def _reveal_attribution(
     headlined over the token the transaction really minted (#743 round 2). Then the first MINTING
     payload, so a payload placed first on an input that mints and was never committed to —
     ``OP_2DROP`` + P2PKH, with an output pushing that input's own outpoint, which a node accepts
-    (round 3, case K) — headlined over the bound one beside it. A reveal that mints nothing (DAT)
-    is read as it always was. :meth:`GlyphInspector.find_reveal_metadata` keeps its first-wins rule.
+    (round 3, case K) — headlined over the bound one beside it. A reveal that mints nothing is read as
+    it always was; a DAT reveal that pushes its commit's outpoint mints, and is ranked like any other. :meth:`GlyphInspector.find_reveal_metadata` keeps its first-wins rule.
     """
     spent_scripts = spent_scripts or {}
     # No input past this one can outrank a minting payload already found: only a spent script

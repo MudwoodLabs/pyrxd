@@ -771,8 +771,9 @@ class TestTheDecoyThatANodeAccepts:
         assert metadata["payload_binding"]["state"] == "not-a-commit"
 
     def test_a_dat_commit_decoy_placed_first_is_not_the_headline_either(self) -> None:
-        """The same decoy built from a LEGITIMATE template: a DAT commit mints nothing either, so
-        the minted token is the headline and the DAT payload is listed as minting nothing."""
+        """The same decoy built from a LEGITIMATE template: a DAT commit demands no token, and this
+        reveal pushes none for it, so the minted token is the headline and the DAT payload is
+        listed as minting nothing."""
         real_suffix, real_cbor = _envelope("RealToken")
         _, decoy_cbor = _envelope("Tether USD")  # an NFT-protocol envelope...
         decoy_commit = _prev(build_dat_commit_locking_script(hash256(decoy_cbor), Hex20(os.urandom(20))))
@@ -931,6 +932,103 @@ def test_an_honest_dat_mint_built_by_pyrxd_reads_bound_no_token_end_to_end() -> 
     payload, _client = _run_cli_fetch([commit_tx], reveal)
     assert payload["metadata"]["name"] == "my-data"
     assert payload["metadata"]["payload_binding"]["state"] == "bound-no-token"
+
+
+class TestTheNoTokenReasonReadsTheOutpointInWireOrder:
+    """``bound-no-token`` names the outputs that carry the commit's outpoint as a ref, so it has
+    to build that ref's 36 wire bytes: the txid byte-reversed, then the vout little-endian.
+
+    Every other fixture above uses txid ``"ab" * 32`` at vout 0, which reads the same reversed
+    and in either endianness, so dropping the reversal or writing the vout big-endian passed
+    all of them (#773 round 2). These use a txid that is not a palindrome and vout 258
+    (``02 01 00 00`` little-endian, ``00 00 01 02`` big-endian), and put a ref in each WRONG
+    order beside the right one, so a wrong order names the wrong output.
+
+    WHAT THE MISORDERED OUTPUTS MODEL: a push of another outpoint's ref, which a node accepts
+    only from a transaction that also spends that outpoint. These reveals do not, so the unit
+    cases are not mineable. They exist to show which 36 bytes the reason looks for. The
+    correct output is built by :meth:`GlyphRef.to_bytes`, the encoder every locking-script
+    builder uses, not by repeating the expression under test.
+    """
+
+    _VOUT = 258
+
+    @staticmethod
+    def _misordered(txid: str, vout: int) -> dict[str, bytes]:
+        display = bytes.fromhex(txid)
+        wrong = {
+            "txid-not-reversed": display + vout.to_bytes(4, "little"),
+            "vout-big-endian": display[::-1] + vout.to_bytes(4, "big"),
+            "both": display + vout.to_bytes(4, "big"),
+        }
+        right = GlyphRef(txid=txid, vout=vout).to_bytes()
+        assert len({right, *wrong.values()}) == 4, "the premise: every order is a different 36 bytes"
+        return wrong
+
+    @staticmethod
+    def _nft_out_raw(wire: bytes) -> bytes:
+        """An NFT singleton output pushing *wire* as it stands: GlyphRef only writes the right order."""
+        assert len(wire) == 36
+        return b"\xd8" + wire + b"\x75\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+
+    @staticmethod
+    def _commit(form: str, cbor: bytes) -> bytes:
+        if form == "70-byte":
+            return build_dat_commit_locking_script(hash256(cbor), Hex20(os.urandom(20)))
+        return TestThe65ByteDatCommit._transcribed(hash256(cbor), os.urandom(20))
+
+    @staticmethod
+    def _txid() -> str:
+        txid = os.urandom(32)
+        assert txid != txid[::-1], "the premise: a txid that reads differently reversed"
+        return txid.hex()
+
+    @pytest.mark.parametrize("form", ["70-byte", "65-byte"])
+    def test_the_reason_names_the_output_carrying_the_outpoint_in_wire_order(self, form: str) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        txid = self._txid()
+        wrong = self._misordered(txid, self._VOUT)
+        outputs = [_P2PKH, *(self._nft_out_raw(w) for w in wrong.values()), _nft_out(txid, self._VOUT)]
+        verdict = _payload_binding(cbor, self._commit(form, cbor), f"{txid}:{self._VOUT}", outputs)
+        assert verdict["state"] == "bound-no-token"
+        assert verdict["reason"].endswith("nor prevents one: this transaction makes its outpoint a ref at output 4")
+
+    @pytest.mark.parametrize("form", ["70-byte", "65-byte"])
+    @pytest.mark.parametrize("order", ["txid-not-reversed", "vout-big-endian", "both"])
+    def test_a_ref_in_the_wrong_order_is_not_the_outpoint(self, form: str, order: str) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        txid = self._txid()
+        outputs = [_P2PKH, self._nft_out_raw(self._misordered(txid, self._VOUT)[order])]
+        verdict = _payload_binding(cbor, self._commit(form, cbor), f"{txid}:{self._VOUT}", outputs)
+        assert verdict["state"] == "bound-no-token"
+        assert "no output carries its outpoint as a ref: this payload describes no output" in verdict["reason"]
+        assert "makes its outpoint a ref" not in verdict["reason"]
+
+    def test_through_the_fetch_path_with_a_real_txid_and_vout_258(self) -> None:
+        """The production entry point: the commit is output 258 of a real (serialised, hashed)
+        transaction, and the reveal spends it with an NFT for that outpoint at output 4."""
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        commit_tx = Transaction(
+            tx_inputs=[],
+            tx_outputs=[TransactionOutput(Script(_P2PKH), 1)] * self._VOUT
+            + [TransactionOutput(Script(self._commit("70-byte", cbor)), 1000)],
+        )
+        funding = TransactionInput(source_txid=os.urandom(32).hex(), source_output_index=0)
+        funding.unlocking_script = Script(b"\x00")
+        commit_tx.inputs = [funding]
+        txid = commit_tx.txid()
+        assert bytes.fromhex(txid) != bytes.fromhex(txid)[::-1]
+        spend = TransactionInput(source_txid=txid, source_output_index=self._VOUT)
+        spend.unlocking_script = Script(_SIGPUB + build_dat_reveal_scriptsig_suffix(cbor))
+        wrong = self._misordered(txid, self._VOUT)
+        reveal = _reveal([spend], [_P2PKH, *(self._nft_out_raw(w) for w in wrong.values()), _nft_out(txid, self._VOUT)])
+        payload, client = _run_cli_fetch([commit_tx], reveal)
+        assert txid in client.requested
+        metadata = payload["metadata"]
+        assert metadata["input_outpoint"] == f"{txid}:{self._VOUT}"
+        binding = metadata["payload_binding"]
+        assert (binding["state"], binding["commit"]) == ("bound-no-token", "dat")
+        assert binding["reason"].endswith("nor prevents one: this transaction makes its outpoint a ref at output 4")
 
 
 def test_an_unfetchable_prevout_leaves_it_unchecked_not_crashed() -> None:

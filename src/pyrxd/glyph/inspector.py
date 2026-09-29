@@ -520,8 +520,8 @@ class GlyphInspector:
         # commit pops `"dat"` as well (see `build_dat_commit_locking_script`). Taking
         # `items[i + 1]` unconditionally hands `decode_payload` the four bytes `b"dat"`, it raises,
         # and the caller sees `None`: a DAT glyph minted by pyrxd was unreadable BY pyrxd, which
-        # for DAT means the entire content was unreachable, since a DAT reveal has no token output
-        # and the payload is all there is.
+        # for DAT means the entire content was unreachable, since a DAT commit demands no token output
+        # and the payload is the content.
         #
         # Only the one known marker is skipped. Skipping any short item would let a crafted
         # scriptSig push filler between the marker and a payload of its choosing.

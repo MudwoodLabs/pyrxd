@@ -261,8 +261,8 @@ class RevealParams:
 class RevealScripts:
     """Scripts needed to build the reveal tx — caller constructs the full tx."""
 
-    #: Output scriptPubKey. ``None`` for a DAT reveal, which mints nothing —
-    #: NOT ``b""``, which is a valid anyone-can-spend script.
+    #: Output scriptPubKey. ``None`` for a DAT reveal, whose commit demands no
+    #: token — NOT ``b""``, which is a valid anyone-can-spend script.
     locking_script: bytes | None
     scriptsig_suffix: bytes  # the 'gly' + CBOR portion; caller prepends sig+pubkey
     #: When not ``None``, the reveal MUST include this as an additional output
@@ -1162,11 +1162,11 @@ class GlyphBuilder:
         )
 
     def prepare_dat_commit(self, params: CommitParams) -> CommitResult:
-        """Prepare a DAT (data-storage) commit — a glyph that mints no token.
+        """Prepare a DAT (data-storage) commit — a glyph whose commit demands no token.
 
         Same two-transaction shape as :meth:`prepare_commit`, but the commit
-        carries no ``OP_REFTYPE_OUTPUT`` obligation, so the reveal creates no
-        NFT and no FT. What survives is the payload in the reveal's scriptSig.
+        carries no ``OP_REFTYPE_OUTPUT`` obligation: the reveal need create no
+        NFT or FT (nor is it prevented). What survives is the reveal's payload.
 
         Protocol must include ``GlyphProtocol.DAT`` (3). Build the reveal with
         :meth:`prepare_dat_reveal` — a DAT commit pops an extra ``"dat"`` marker
@@ -1187,7 +1187,7 @@ class GlyphBuilder:
     def prepare_dat_reveal(self, cbor_bytes: bytes, *, delegate_ref: GlyphRef | None = None) -> RevealScripts:
         """Prepare a DAT reveal's scriptSig suffix.
 
-        There is no ``locking_script``: a DAT reveal mints nothing, so the
+        There is no ``locking_script``: a DAT commit demands no token, so the
         caller's outputs are whatever they want to keep the value on (ordinary
         P2PKH change). :attr:`RevealScripts.locking_script` is returned empty to
         say so rather than handing back a token script that would be wrong.

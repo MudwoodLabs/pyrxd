@@ -316,8 +316,8 @@ rows are unaffected, which is the point of the per-output `try`.
 
 `commit-dat` is the commit half of a DAT (data-storage) glyph. It
 differs from `commit-nft` / `commit-ft` by having **no**
-`OP_REFTYPE_OUTPUT` block, which is the whole point: it obliges its
-reveal to create no token output (and does not prevent one). What
+`OP_REFTYPE_OUTPUT` block, which is the whole point: it does not oblige
+its reveal to create a token output (and does not prevent one). What
 survives is the payload in the reveal's scriptSig. Two forms read as
 `commit-dat`. The 70-byte form pyrxd and Photonic build carries an extra
 `dat` marker push, so every field after the payload hash sits at a
