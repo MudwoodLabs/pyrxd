@@ -27,7 +27,7 @@
 # or change a setting.
 #
 # THE `collect` JOB RUNS IN THE `traffic` ENVIRONMENT, which admits only main, so
-# the one job that can push to the data branch runs from main alone. It checks that
+# the job that writes the data branch runs from main alone. It checks that
 # restriction before anything else and fails, naming the fix, unless it is
 # exactly "Selected branches and tags" with the one branch rule `main`. That
 # includes the case GitHub creates silently: the first run that names an
@@ -191,7 +191,7 @@ jobs:
           if not policy:
               fail(
                   f"environment {env!r} has NO deployment branch restriction, so a workflow on any "
-                  "branch can run a job in it and read its secrets. GitHub creates an environment "
+                  "branch can run this job in it, not only main. GitHub creates an environment "
                   "exactly like that, silently, the first time a workflow names one that does not exist."
               )
           # 'Protected branches only' is refused: it admits every branch that is
