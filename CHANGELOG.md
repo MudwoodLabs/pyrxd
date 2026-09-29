@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pyrxd verify` accepts an output reference (`<txid>:<n>`) and a 72-character contract id**
+  (#745). It refused both with "that is not a transaction id", about input that had one in it,
+  and a fix hint that talked only about digests. Either form now checks the transaction it points
+  at, with the same verdict its txid gets, and says first what the named output is: the record
+  the verdict is about, another record, not a record (and which output holds the record), or an
+  output the transaction does not have. The same sentences are in `--json` under `named_by`, and
+  on stderr under `--quiet`. A `<txid>:<n>` that does not parse is refused with its txid named.
+  The `/verify/` page already did this.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)
