@@ -1176,13 +1176,28 @@ class HdWallet:
 
         Address→key mapping is preserved so signing works correctly per UTXO.
 
+        Runs the gap-limit scan (:meth:`refresh`) first, every call. An address is
+        read here only once it is marked ``used``, only the scan marks it, and the
+        mark is not something a caller can be trusted to have made: before this,
+        every CLI spend command but ``wallet send`` / ``wallet sweep`` collected
+        from a wallet nobody had scanned, so a freshly created, funded wallet
+        reported nothing to spend (#759). Scanning on every call, not once per
+        wallet, is deliberate too: a command that spends twice (a mint's commit,
+        then its reveal) needs the change address the first spend just used. A
+        scan that cannot read an address raises :class:`NetworkError` rather than
+        reading it as unused (see :meth:`refresh`).
+
         A per-address fetch that fails contributes nothing rather than crashing
         the whole collection — the caller decides whether the resulting balance is
         enough — but it is now LOGGED rather than dropped in silence, and
         ``strict=True`` refuses the partial result outright. Use ``strict`` when
         the answer is a claim about *all* the funds; :meth:`send_max` does.
         """
-        used = [r for r in self.addresses.values() if r.used]
+        # An address already known to be used is read even if this scan's server reports no
+        # history for it: a lagging or partial index must not hide funds the wallet knew about.
+        known_used = {key for key, rec in self.addresses.items() if rec.used}
+        await self.refresh(client)
+        used = [rec for key, rec in self.addresses.items() if rec.used or key in known_used]
         if not used:
             return []
 

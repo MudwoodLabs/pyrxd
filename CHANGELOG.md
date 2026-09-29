@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
+  `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
+  scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
+  to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet".
+  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call, so
+  every spend path, in the CLI and the SDK, sees the wallet's funds. A scan that cannot read an
+  address fails as a network error rather than reading as an empty wallet. Error hints that
+  said to run `pyrxd balance --refresh` first, which never helped because nothing saved the
+  scan, now say what was scanned.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)

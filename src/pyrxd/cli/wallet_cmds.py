@@ -624,7 +624,7 @@ def wallet_sweep(
     async def _sweep() -> dict[str, object]:
         client = ctx.make_client()
         async with client:
-            await wallet.refresh(client)
+            # collect_spendable runs the gap-limit scan itself (#759).
             # strict: this command's contract is "moves EVERYTHING under that path"
             # (docs/how-to/recover-funds-across-wallet-paths.md). A per-address read
             # that failed makes that false, and the confirmation block below would
@@ -857,7 +857,7 @@ def _send_in_process(
     async def _run() -> dict[str, object]:
         ex = ctx.make_client()
         async with ex:
-            await wallet.refresh(ex)
+            # collect_spendable runs the gap-limit scan itself (#759).
             triples = await wallet.collect_spendable(ex)
             if not triples:
                 raise UserError(

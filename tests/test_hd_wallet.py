@@ -1850,6 +1850,12 @@ class TestCollectSpendable:
                 return [_utxo(tx_hash="aa" * 32, value=100_000_000)]
             raise NetworkError("simulated failure")
 
+        async def _get_history(script_hash):
+            # collect_spendable scans first (#759): no history anywhere, so the scan stops at
+            # the gap limit and the two seeded addresses are read because they were known used.
+            return []
+
+        client.get_history = _get_history
         client.get_utxos = _get_utxos
         triples = asyncio.run(w.collect_spendable(client))
         # Only the working address contributed.
@@ -1920,10 +1926,13 @@ def _client_failing_on(addresses: set[str], *, utxo_map: dict) -> MagicMock:
     from pyrxd.security.errors import NetworkError
 
     failing = {script_hash_for_address(a) for a in addresses}
+    # History for the addresses that hold something, as a real server has it — not for every
+    # address, which would make the gap-limit scan collect_spendable runs (#759) never end.
+    with_history = failing | {script_hash_for_address(a) for a in utxo_map}
     client = MagicMock(spec=ElectrumXClient)
 
     async def _get_history(script_hash):
-        return [{"tx_hash": "aa" * 32, "height": 100}]
+        return [{"tx_hash": "aa" * 32, "height": 100}] if script_hash in with_history else []
 
     async def _get_utxos(script_hash):
         if script_hash in failing:

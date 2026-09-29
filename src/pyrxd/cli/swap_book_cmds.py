@@ -350,7 +350,7 @@ class _WalletFunds:
         raise UserError(
             "the owner key for this output is not in this wallet",
             cause="no wallet address (spendable or derived) matches the output's owner pubkey-hash",
-            fix="run `pyrxd balance --refresh` to widen HD discovery, or check the outpoint/--wallet",
+            fix="check the outpoint and --wallet: the owner key is not within this wallet's scanned addresses",
         )
 
     def change_pkh(self) -> bytes:
