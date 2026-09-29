@@ -11,7 +11,7 @@ Commands:
   glyph transfer-nft    NFT singleton transfer.
   glyph timelock-mint   Seal content behind a timelock and mint the NFT.
   glyph timelock-reveal Publish the key for a timelocked token (irreversible).
-  glyph list            Scan wallet addresses for Glyph holdings.
+  glyph list            Glyph holdings at the addresses the wallet file records as used.
 
 Design choices that follow the v0.3 plan:
 
@@ -1588,8 +1588,8 @@ async def _mint_nft_inner(
     if not triples:
         raise UserError(
             "no spendable UTXOs in the wallet",
-            cause="collect_spendable returned an empty list",
-            fix="fund the wallet, or run `pyrxd balance --refresh` to discover used addresses",
+            cause="the gap-limit scan found no UTXO on any address of this wallet",
+            fix="fund the wallet: its addresses were scanned up to the gap limit and none holds a UTXO",
         )
 
     # The NFT's carrier value on the reveal. Same number as
@@ -2639,7 +2639,7 @@ async def _select_ft_inputs(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -2799,7 +2799,7 @@ async def _transfer_ft_inner(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except NoFeeFundingError as exc:
         raise UserError(
@@ -3320,7 +3320,7 @@ async def _transfer_nft_inner(
     except NoHoldingsError as exc:
         raise UserError(
             f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+            fix="this wallet's addresses were scanned up to the gap limit; the NFT is owned elsewhere, or check --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -3382,7 +3382,11 @@ async def _transfer_nft_inner(
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
-    """Scan wallet addresses for Glyph holdings."""
+    """List Glyph holdings at the addresses this wallet file records as used.
+
+    It does not run the gap-limit scan the spend commands run, so a wallet whose file records
+    no used address (one made by `pyrxd wallet new`, for example) lists nothing here.
+    """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
     async def _do_scan() -> list[dict]:

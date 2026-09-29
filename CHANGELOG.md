@@ -23,6 +23,46 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
   current one; the constructor does not expand `~`, and its docstring now says so.
 
+- **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
+  `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
+  scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
+  to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet".
+  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call.
+  Every in-process spend path in the CLI and the SDK reads the wallet's UTXOs through that one
+  method, so each now sees the wallet's funds; `wallet send` through the signing agent already
+  ran its own scan. A scan that cannot read an address fails as a network error rather than
+  reading as an empty wallet. Error hints that said to run `pyrxd balance --refresh` first,
+  which never helped because nothing saved the scan, now say what was scanned.
+- **`glyph resume-mint` can reveal a new wallet's commit.** `HdWallet.privkey_for_address`
+  looked only at the addresses the wallet file records, and a `wallet new` file records none,
+  so on regtest a new wallet's commit whose reveal was interrupted could not be resumed
+  ("address … is not known to this wallet"). The lookup now also derives, locally and with no
+  network, across the gap window on both chains; an address outside it is still refused.
+  `pyrxd mark --signer-address` and `GlyphMinter`'s reveal use the same lookup.
+- **A scan no longer marks a known-used address unused** when a server reports no history for
+  it. `collect_spendable` already read such an address on the call that scanned, but the scan
+  cleared its flag, so a lagging server hid its funds from the next call on the same wallet.
+
+### Changed
+
+- **`HdWallet.collect_spendable` is strict by default.** A failed per-address UTXO read now
+  raises `NetworkError` instead of returning what the other addresses answered, because the
+  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs".
+  - **Strict** (any failed read is a network error): `pyrxd mark`; every `glyph` command that
+    spends; `pyrxd swap reserve`, `post`, `take` and `refund`; `pyrxd wallet sweep` and
+    `HdWallet.send_max`; and the SDK builders that fund from the wallet (`GlyphMinter` and
+    `GlyphClient` mints, `build_ft_transfer`, `build_ft_airdrop`, `build_nft_transfer`,
+    `build_timelock_reveal`, `build_hashmark_mark`).
+  - **Partial view** (`strict=False`): `HdWallet.send`, `pyrxd wallet send` when it signs
+    in-process, and `pyrxd swap cancel`. Each needs only enough, and a cancel races every
+    holder of the signed advert. Each goes ahead when what it read is enough. When it is not
+    and a read failed, it raises `NetworkError` naming the failed reads, never "fund the
+    wallet" or "insufficient funds". The helper is `pyrxd.hd.wallet.raise_if_reads_failed`,
+    and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
+    it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
+    any failed read fails it.
+  - `pyrxd utxos` lists the partial view. `pyrxd balance` and `pyrxd glyph list` are
+    unchanged: they read only the addresses the wallet file records as used, and do not scan.
 - **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
   in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
   banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,

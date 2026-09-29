@@ -164,7 +164,9 @@ def utxos_cmd(ctx: CliContext, min_photons: int, addr: str | None, passphrase: b
     async def _query() -> list[dict]:
         client = ctx.make_client()
         async with client:
-            triples = await wallet.collect_spendable(client)
+            # Not a spend: a read-only listing, kept as it was (a failed read is logged and
+            # that address is left out). Its strictness goes with `balance`'s, still undecided.
+            triples = await wallet.collect_spendable(client, strict=False)
             rows: list[dict] = []
             for utxo, address, _pk in triples:
                 if min_photons and utxo.value < min_photons:

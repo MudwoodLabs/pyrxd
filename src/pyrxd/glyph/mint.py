@@ -1328,7 +1328,8 @@ class GlyphMinter:
         triples = await self._wallet.collect_spendable(self._client)
         if not triples:
             raise InsufficientFundsError(
-                "no spendable UTXOs in the wallet (fund it, or refresh to discover used addresses)",
+                "no spendable UTXOs in the wallet: it was scanned up to the gap limit on both chains and no "
+                "address holds a UTXO. Fund it and retry",
                 available=0,
                 required=total_required,
             )
@@ -1704,8 +1705,8 @@ class GlyphMinter:
         except ValidationError as exc:
             raise ValidationError(
                 f"funding address {address} is not known to this wallet, so the reveal cannot be "
-                "signed. Load the wallet that created the commit (or refresh it so the address is "
-                "rediscovered) and retry — the pending record is left untouched."
+                "signed. Load the wallet that created the commit and retry — the pending record is "
+                "left untouched."
             ) from exc
 
     def _build_reveal_tx(self, pending: PendingMint, funding_key: Any, change_locking: Script) -> Transaction:

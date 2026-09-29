@@ -229,7 +229,8 @@ async def select_ft_inputs(
 
     if not ft_inputs:
         raise NoHoldingsError(
-            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet — refresh the wallet's used addresses and retry"
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet — its addresses were scanned up to the gap "
+            "limit on both chains; check the ref, and that this is the wallet that holds the token"
         )
     if total_ft < amount:
         raise InsufficientFundsError(f"insufficient FT balance: need {amount}, have {total_ft}")
