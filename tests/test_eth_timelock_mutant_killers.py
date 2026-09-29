@@ -216,3 +216,313 @@ def test_the_cross_clock_margin_is_immutable() -> None:
     m = _margin()
     with pytest.raises(dataclasses.FrozenInstanceError):
         m.eth_reorg_finality_s = 1  # type: ignore[misc]
+
+
+# ─────────────────────────────────────────────── second pass, 2026-09-29 ──
+#
+# The weekly run of 2026-09-22 measured 386 mutants, 316 killed, 70 survived (81%) against an 86%
+# floor; reproduced locally on `fa47d7f6` with the identical 386/316/70. The largest single cluster
+# was `assert_eth_deadline_is_claimable`: 32 survivors, because none of the four files in this
+# group's test list called it at all. Its production caller is `SwapCoordinator` (the ETH-leg
+# pre-funding checks), so the gate ran in production with nothing in this group able to see a
+# change to it. The rest are fail-closed input guards that were only ever exercised on their
+# happy path, and the `elapsed_blocks` term, which no test in the group ever set to a nonzero value.
+
+
+def _claimable(remaining_s: int, **margin_kw) -> None:
+    from pyrxd.gravity.eth_rxd_timelock import assert_eth_deadline_is_claimable
+
+    assert_eth_deadline_is_claimable(
+        now_unix_s=_NOW, eth_timeout_unix_s=_NOW + remaining_s, margin=_margin(**margin_kw)
+    )
+
+
+class TestTheEthDeadlineMustLeaveTimeToClaim:
+    """Killed mutants: every operator on `claim_reachable_s = finality + stall + rounding` (16),
+    every operator on `remaining_s = eth_timeout - now` (7), and `<` -> `<=` / `==` / `is` on the
+    comparison.
+
+    The maker acts on the counter leg only once the taker's funding is FINAL, so the deadline must
+    be at least finality + stall + rounding away. `_margin()` gives 768 + 3600 + 300 = 4668 s, and
+    every arithmetic mutant of that sum lands BELOW 4668 (computed: -2532 to 4412), so the refusal one
+    second short is what catches them. The acceptance exactly AT 4668 catches the `<=` direction.
+    """
+
+    REACHABLE = 768 + 3600 + 300
+
+    def test_a_deadline_exactly_at_the_claimable_floor_is_ACCEPTED(self) -> None:
+        """The honest boundary. Refusing it would turn away a swap the maker can still claim."""
+        _claimable(self.REACHABLE)
+
+    def test_one_second_short_of_the_floor_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="leaves too little time to claim"):
+            _claimable(self.REACHABLE - 1)
+
+    def test_a_deadline_far_short_of_the_floor_is_refused(self) -> None:
+        """Not only the boundary: `==` would refuse exactly one value and wave the rest through."""
+        with pytest.raises(ValidationError, match="leaves too little time to claim"):
+            _claimable(60)
+
+    def test_the_claim_burial_and_confirm_slack_are_NOT_part_of_the_floor(self) -> None:
+        """The floor is the time before the MAKER can act. Burial and confirm slack are time the
+        TAKER needs after the reveal; they belong to `total_s()` and the RXD window, not here.
+        Growing them must not move this boundary, in either direction."""
+        _claimable(self.REACHABLE, rxd_claim_burial_s=50_000, rxd_confirm_slack_s=50_000)
+        with pytest.raises(ValidationError, match="leaves too little time to claim"):
+            _claimable(self.REACHABLE - 1, rxd_claim_burial_s=0, rxd_confirm_slack_s=0)
+
+    @pytest.mark.parametrize("field", ["eth_reorg_finality_s", "eth_finality_stall_tolerance_s", "rounding_slack_s"])
+    def test_each_component_counts_in_full(self, field: str) -> None:
+        """One more second in any of the three components moves the floor by exactly one second."""
+        bumped = {
+            field: dict(eth_reorg_finality_s=768, eth_finality_stall_tolerance_s=3600, rounding_slack_s=300)[field] + 1
+        }
+        _claimable(self.REACHABLE + 1, **bumped)
+        with pytest.raises(ValidationError, match="leaves too little time to claim"):
+            _claimable(self.REACHABLE, **bumped)
+
+    def test_an_already_expired_deadline_is_refused_and_says_so(self) -> None:
+        """`eth_timeout % now` equals `eth_timeout - now` whenever `now <= eth_timeout < 2 * now`,
+        which is every realistic future deadline, so only a PAST deadline separates them — and a
+        past deadline is the case that must never fund."""
+        with pytest.raises(ValidationError, match=r"ALREADY EXPIRED"):
+            _claimable(-1)
+        with pytest.raises(ValidationError, match=r"ALREADY EXPIRED"):
+            _claimable(-86_400)
+
+    def test_a_close_but_FUTURE_deadline_is_not_called_expired(self) -> None:
+        """The label is the operator's only way to tell "dead swap" from "tight window"; calling a
+        live deadline expired sends them to abandon a swap that could be re-sized.
+
+        Deliberately NOT pinned: the label at `remaining_s == 0`. The ETH claim guard refuses once
+        `block.timestamp >= timeout` (eth_wallet/multi_rpc.py), so at exactly zero the deadline is
+        arguably already dead, and the code's current `< 0` does not say so. Pinning either answer
+        here would be pinning a wording question, not a behaviour; the refusal itself holds at 0.
+        """
+        with pytest.raises(ValidationError) as exc:
+            _claimable(1)
+        assert "ALREADY EXPIRED" not in str(exc.value)
+        with pytest.raises(ValidationError, match="leaves too little time to claim"):
+            _claimable(0)
+
+
+class TestTheGateSubtractsElapsedDepthExactly:
+    """Killed mutants: `remaining_blocks = t_rxd.value - elapsed_blocks` -> `+`, `|`, `^`, `<<`,
+    `>>`; `if elapsed_blocks < 0` -> `> 0`, `!= 0`, `< -1`.
+
+    No test in this group ever passed a nonzero `elapsed_blocks`, so the term the #482 fix added —
+    a maker locking its covenant early and presenting the swap late — was invisible to all of them.
+    `t_rxd` is RELATIVE from covenant mining; each block already mined opens the refund one
+    interval sooner.
+
+    Fixture: interval 600 s, `t_rxd` 12, `now` 0. With two blocks already mined, 10 remain and the
+    refund opens at exactly 6000 s; the deadline is set so 6000 is precisely what is required. A
+    third mined block (5400 s) must be refused. The values are chosen so every mutant differs:
+    12+2 = 12|2 = 12^2 = 14, 12<<2 = 48, 12>>2 = 3.
+    """
+
+    T_RXD = 12
+    INTERVAL = 600.0
+
+    def _gate(self, *, elapsed: int, required_open_s: int = 6000) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+        from pyrxd.gravity.eth_rxd_timelock import assert_covenant_confirms_before_eth_deadline
+
+        margin = _margin()
+        assert_covenant_confirms_before_eth_deadline(
+            now_unix_s=_NOW,
+            eth_timeout_unix_s=_NOW + required_open_s - margin.total_s(),
+            margin=margin,
+            t_rxd=Timelock(self.T_RXD, TimeUnit.BLOCKS),
+            rxd_block_interval_s=self.INTERVAL,
+            max_covenant_confirm_wait_s=0,
+            elapsed_blocks=elapsed,
+        )
+
+    def test_the_remaining_window_exactly_at_the_requirement_is_ACCEPTED(self) -> None:
+        """Honest path: a covenant with some depth that still clears the deadline plus margin."""
+        self._gate(elapsed=2)
+
+    def test_one_more_mined_block_is_REFUSED(self) -> None:
+        """The #482 direction: the maker's early lock has eaten into the taker's window."""
+        with pytest.raises(ValidationError, match="open too EARLY"):
+            self._gate(elapsed=3)
+
+    def test_the_refusal_names_the_blocks_actually_left(self) -> None:
+        with pytest.raises(ValidationError, match=r"\(9 blk left of 12\)"):
+            self._gate(elapsed=3)
+
+    def test_zero_depth_is_the_full_window(self) -> None:
+        self._gate(elapsed=0, required_open_s=7200)
+        with pytest.raises(ValidationError, match="open too EARLY"):
+            self._gate(elapsed=0, required_open_s=7201)
+
+    @pytest.mark.parametrize("bad", [-1, -2, -12])
+    def test_negative_depth_is_refused(self, bad: int) -> None:
+        """A negative depth would LENGTHEN the projected window — the optimistic direction."""
+        with pytest.raises(ValidationError, match="elapsed_blocks cannot be negative"):
+            self._gate(elapsed=bad)
+
+
+class TestTheGateRefusesNonsenseInputsWithTheRightReason:
+    """Killed mutants: the gate's `rxd_block_interval_s <= 0` -> `== 0` / `< 0` / `<= -1`;
+    `max_covenant_confirm_wait_s` bool guard `or` -> `and`; `max_covenant_confirm_wait_s < 0` ->
+    `< -1`.
+
+    Only the SIZER's copy of the interval guard was tested. The gate is called on its own by the
+    coordinator with a negotiated `t_rxd`, so its guard is the only one on that path. A zero or
+    negative interval projects the refund at or before `now`; under every mutant that is refused
+    anyway, but as "open too EARLY", which tells the operator the window is short when the real
+    fault is the interval they passed. The `match=` is what separates the two.
+    """
+
+    def _gate(self, **overrides) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+        from pyrxd.gravity.eth_rxd_timelock import assert_covenant_confirms_before_eth_deadline
+
+        kw = dict(
+            now_unix_s=_NOW,
+            eth_timeout_unix_s=_NOW,
+            margin=_margin(),
+            t_rxd=Timelock(10_000, TimeUnit.BLOCKS),
+            rxd_block_interval_s=36.0,
+            max_covenant_confirm_wait_s=0,
+        )
+        kw.update(overrides)
+        assert_covenant_confirms_before_eth_deadline(**kw)
+
+    def test_the_fixture_is_accepted(self) -> None:
+        """Honest path for every refusal below: only the named input differs."""
+        self._gate()
+        self._gate(max_covenant_confirm_wait_s=600)
+
+    @pytest.mark.parametrize("interval", [0.0, -0.5, -1.0, -36.0])
+    def test_a_non_positive_interval_is_refused_as_an_interval_error(self, interval: float) -> None:
+        with pytest.raises(ValidationError, match=r"rxd_block_interval_s must be > 0"):
+            self._gate(rxd_block_interval_s=interval)
+
+    @pytest.mark.parametrize("bad", [True, False, 1.5, "600"])
+    def test_a_non_int_confirm_wait_is_refused(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="max_covenant_confirm_wait_s must be int"):
+            self._gate(max_covenant_confirm_wait_s=bad)
+
+    @pytest.mark.parametrize("bad", [-1, -600])
+    def test_a_negative_confirm_wait_is_refused(self, bad: int) -> None:
+        with pytest.raises(ValidationError, match="max_covenant_confirm_wait_s must be >= 0"):
+            self._gate(max_covenant_confirm_wait_s=bad)
+
+
+class TestIntegerSecondsAreRequiredOnEveryEntryPoint:
+    """Killed mutant: `_require_int`'s `not isinstance(v, int) or isinstance(v, bool)` -> `and`.
+
+    Under the mutant a bool or a float passes. `True` is then the unix time 1 — a deadline in
+    1970 — and a float timestamp silently enters the ceil arithmetic. Either may still be refused
+    downstream for a DIFFERENT reason (no budget, too early), which is why each test matches the
+    type error specifically.
+    """
+
+    @pytest.mark.parametrize("bad", [True, 1_700_086_400.0])
+    def test_the_sizer_refuses_a_non_int_deadline(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="eth_timeout_unix_s must be int seconds"):
+            eth_absolute_to_rxd_relative_blocks(
+                eth_timeout_unix_s=bad, expected_rxd_lock_time_unix_s=_NOW, margin=_margin(), rxd_block_interval_s=36.0
+            )
+
+    @pytest.mark.parametrize("bad", [False, float(_NOW)])
+    def test_the_sizer_refuses_a_non_int_lock_time(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="expected_rxd_lock_time_unix_s must be int seconds"):
+            eth_absolute_to_rxd_relative_blocks(
+                eth_timeout_unix_s=_NOW + 86_400,
+                expected_rxd_lock_time_unix_s=bad,
+                margin=_margin(),
+                rxd_block_interval_s=36.0,
+            )
+
+    @pytest.mark.parametrize("field", ["now_unix_s", "eth_timeout_unix_s", "elapsed_blocks"])
+    @pytest.mark.parametrize("bad", [True, 2.0])
+    def test_the_gate_refuses_non_int_times(self, field: str, bad: object) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+        from pyrxd.gravity.eth_rxd_timelock import assert_covenant_confirms_before_eth_deadline
+
+        kw = dict(now_unix_s=_NOW, eth_timeout_unix_s=_NOW, elapsed_blocks=0)
+        kw[field] = bad
+        with pytest.raises(ValidationError, match=f"{field} must be int seconds"):
+            assert_covenant_confirms_before_eth_deadline(
+                margin=_margin(),
+                t_rxd=Timelock(10_000, TimeUnit.BLOCKS),
+                rxd_block_interval_s=36.0,
+                max_covenant_confirm_wait_s=0,
+                **kw,
+            )
+
+    @pytest.mark.parametrize("field", ["now_unix_s", "eth_timeout_unix_s"])
+    @pytest.mark.parametrize("bad", [True, 2.0])
+    def test_the_claimable_check_refuses_non_int_times(self, field: str, bad: object) -> None:
+        from pyrxd.gravity.eth_rxd_timelock import assert_eth_deadline_is_claimable
+
+        kw = dict(now_unix_s=_NOW, eth_timeout_unix_s=_NOW + 86_400)
+        kw[field] = bad
+        with pytest.raises(ValidationError, match=f"{field} must be int seconds"):
+            assert_eth_deadline_is_claimable(margin=_margin(), **kw)
+
+
+class TestANegativeBudgetIsRefusedAsNoBudget:
+    """Killed mutant: `if budget_s <= 0` -> `== 0`.
+
+    The existing test covers a budget of exactly zero. A NEGATIVE one — the RXD lock is already
+    past the ETH deadline plus the margin — slips past `== 0`, sizes to a negative block count and
+    is then refused by the safety floor, whose message tells the operator to lengthen a window that
+    cannot exist at all.
+    """
+
+    @pytest.mark.parametrize("budget", [-1, -86_400])
+    def test_a_negative_budget_is_refused_as_no_budget(self, budget: int) -> None:
+        with pytest.raises(ValidationError, match="no RXD timelock budget"):
+            _size_for_budget(budget, 36.0, lock_delay=0)
+
+
+class TestTheSuppliedTRxdCheck:
+    """Killed mutants: `assert_t_rxd_fits_the_eth_deadline`'s own `floor_blocks: int = 12` -> 11 /
+    13, and its unit guard `or` -> `and`.
+
+    The sizer's default floor is pinned above, but this function carries a SEPARATE default and
+    passes it through; `eth_swap_two_host.py` calls it without one. At 11 the check would accept an
+    11-block window the design calls unsafe; at 13 it would refuse the 12 the sizer emits.
+
+    The unit guard: under `and`, a SECONDS Timelock skips the check and its raw `.value` is then
+    compared as if it were blocks — 20,480 seconds read as 20,480 blocks.
+    """
+
+    @staticmethod
+    def _fits(t_rxd, budget_s: int, interval: float = 60.0, lock_delay: int = 600) -> None:
+        from pyrxd.gravity.eth_rxd_timelock import assert_t_rxd_fits_the_eth_deadline
+
+        assert_t_rxd_fits_the_eth_deadline(
+            t_rxd=t_rxd,
+            eth_timeout_unix_s=_NOW + budget_s - _margin().total_s() + lock_delay,
+            expected_rxd_lock_time_unix_s=_NOW + lock_delay,
+            margin=_margin(),
+            rxd_block_interval_s=interval,
+        )
+
+    def test_the_default_floor_admits_exactly_twelve(self) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+
+        # 661 s at 60 s/block is the first budget the sizer turns into 12 (measured above).
+        self._fits(Timelock(12, TimeUnit.BLOCKS), 661)
+
+    def test_the_default_floor_refuses_a_budget_worth_eleven(self) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+
+        with pytest.raises(ValidationError, match="below safety floor 12"):
+            self._fits(Timelock(11, TimeUnit.BLOCKS), 660)
+
+    def test_a_SECONDS_timelock_is_refused_not_read_as_blocks(self) -> None:
+        from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+
+        with pytest.raises(ValidationError, match="t_rxd must be a BLOCKS Timelock"):
+            self._fits(Timelock(20_480, TimeUnit.SECONDS), 661)
+
+    def test_a_non_Timelock_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="t_rxd must be a BLOCKS Timelock"):
+            self._fits(20_480, 661)
