@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
+  `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
+  an older pending run in a group when another queues, so a PR build could leave the published
+  docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
+  build has a group per ref.
+
 ### Documentation
 
 - **Two published docs described code that has changed.** Both were found by a new check that a
