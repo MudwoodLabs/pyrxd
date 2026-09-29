@@ -23,10 +23,12 @@ from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
+from pyrxd.glyph.scanner import owned_token_script_hashes
 from pyrxd.glyph.script import build_ft_locking_script, build_nft_locking_script
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.hd.wallet import HdWallet
-from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address
+from pyrxd.keys import PrivateKey
+from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address, script_hash_for_output
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
 from pyrxd.security.errors import NetworkError
@@ -34,6 +36,7 @@ from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from pyrxd.utils import address_to_public_key_hash
 
 _FUND = 100 * 100_000_000
 _CHANGE = 7_000_000
@@ -42,15 +45,21 @@ _CHANGE = 7_000_000
 class _ElectrumX:
     """Stands in for the ElectrumX client and nothing else: the reads these commands make.
 
-    *holdings* maps an address to the transactions paying it at vout 0. The server model is the
-    one the scanner and ``collect_spendable`` already assume (not re-verified against a live
-    server here): what an address holds, a token output included, is listed under its P2PKH
-    script hash, and an address holding something has history there.
+    *holdings* maps an address to the transactions paying it at vout 0. Every output is listed
+    where a Radiant ElectrumX lists it, under ``script_hash_for_output`` of its script: a plain
+    output under the address's P2PKH hash, a token output under its script with the refs zeroed.
+    That was measured against both public mainnet servers on 2026-09-29 (#782). It means an
+    address holding only a token has no P2PKH history, so the gap-limit scan does not mark it used
+    and ``glyph list`` does not read it; the tests that list tokens also fund their address.
 
     Failures, each the failure of one read: ``history_fails_after=n`` answers *n* history reads
     and fails every later one (a connection lost mid-scan); ``unreadable`` fails the balance and
     UTXO reads for those addresses; ``tx_unreadable`` fails the raw-transaction read for those
     txids.
+
+    Lies, each a server answer its own transaction contradicts: ``misfiled`` maps a script hash
+    to transactions it lists (at vout 0) there whatever their script, and ``values`` maps a txid
+    to the value the server reports for its vout 0.
     """
 
     def __init__(
@@ -60,12 +69,24 @@ class _ElectrumX:
         history_fails_after: int | None = None,
         unreadable: set[str] = frozenset(),
         tx_unreadable: set[str] = frozenset(),
+        misfiled: dict[bytes, list[Transaction]] | None = None,
+        values: dict[str, int] | None = None,
     ) -> None:
-        self.held = {bytes(script_hash_for_address(a)): txs for a, txs in (holdings or {}).items()}
-        self.txs = {tx.txid(): tx for txs in (holdings or {}).values() for tx in txs}
+        self.held: dict[bytes, list[tuple[Transaction, int]]] = {}
+        for txs in (holdings or {}).values():
+            for tx in txs:
+                for vout, out in enumerate(tx.outputs):
+                    listed_under = bytes(script_hash_for_output(out.locking_script.serialize()))
+                    self.held.setdefault(listed_under, []).append((tx, vout))
+        for script_hash, txs in (misfiled or {}).items():
+            self.held.setdefault(bytes(script_hash), []).extend((tx, 0) for tx in txs)
+        every_tx = [tx for txs in (holdings or {}).values() for tx in txs]
+        every_tx += [tx for txs in (misfiled or {}).values() for tx in txs]
+        self.txs = {tx.txid(): tx for tx in every_tx}
+        self.values = dict(values or {})
         self.history_fails_after = history_fails_after
         self.history_reads = 0
-        self.unreadable = {bytes(script_hash_for_address(a)) for a in unreadable}
+        self.unreadable = {bytes(h) for a in unreadable for h in _hashes_of(a)}
         self.tx_unreadable = set(tx_unreadable)
 
     async def __aenter__(self) -> _ElectrumX:
@@ -78,20 +99,23 @@ class _ElectrumX:
         self.history_reads += 1
         if self.history_fails_after is not None and self.history_reads > self.history_fails_after:
             raise NetworkError("simulated: the server dropped the connection mid-scan")
-        return [{"tx_hash": tx.txid(), "height": 1} for tx in self.held.get(bytes(script_hash), [])]
+        txids = dict.fromkeys(tx.txid() for tx, _vout in self.held.get(bytes(script_hash), []))
+        return [{"tx_hash": txid, "height": 1} for txid in txids]
 
-    def _read(self, script_hash) -> list[Transaction]:
+    def _read(self, script_hash) -> list[tuple[Transaction, int]]:
         if bytes(script_hash) in self.unreadable:
             raise NetworkError("simulated: this address's read failed")
         return self.held.get(bytes(script_hash), [])
 
     async def get_balance(self, script_hash):
-        return sum(tx.outputs[0].satoshis for tx in self._read(script_hash)), 0
+        return sum(tx.outputs[vout].satoshis for tx, vout in self._read(script_hash)), 0
 
     async def get_utxos(self, script_hash):
         return [
-            UtxoRecord(tx_hash=tx.txid(), tx_pos=0, value=tx.outputs[0].satoshis, height=1)
-            for tx in self._read(script_hash)
+            UtxoRecord(
+                tx_hash=tx.txid(), tx_pos=vout, value=self.values.get(tx.txid(), tx.outputs[vout].satoshis), height=1
+            )
+            for tx, vout in self._read(script_hash)
         ]
 
     async def get_transaction(self, txid):
@@ -100,6 +124,11 @@ class _ElectrumX:
             # a failed metadata lookup must leave the token listed with no name.
             raise NetworkError(f"simulated: no transaction {str(txid)[:16]}")
         return self.txs[str(txid)].serialize()
+
+
+def _hashes_of(address: str) -> tuple:
+    """Every script hash an address's outputs are listed under: its P2PKH hash and its token hashes."""
+    return (script_hash_for_address(address), *owned_token_script_hashes(Hex20(address_to_public_key_hash(address))))
 
 
 def _paying(locking: bytes, value: int, salt: int) -> Transaction:
@@ -272,7 +301,7 @@ class TestGlyphListScansByDefault:
         nft_tx, nft_ref = _nft(w, 0, 0, "ab")
         ft_tx, ft_ref = _ft(w, 1, 4, "cd", 5_000)
         first, change = w.derive_address(0, 0), w.derive_address(1, 4)
-        server = _ElectrumX({first: [nft_tx], change: [ft_tx]})
+        server = _ElectrumX({first: [_plain(first), nft_tx], change: [_plain(change, salt=2), ft_tx]})
         result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
         assert result.exit_code == 0, (result.output, result.exception)
         assert sorted((r["type"], r["ref"], r["address"], r["amount"]) for r in _json(result)) == [
@@ -303,7 +332,8 @@ class TestGlyphListScansByDefault:
         scanner used to log that and return an inventory without it."""
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
         nft_tx, _ref = _nft(w, 0, 0, "ab")
-        server = _ElectrumX({w.derive_address(0, 0): [nft_tx]}, tx_unreadable={nft_tx.txid()})
+        first = w.derive_address(0, 0)
+        server = _ElectrumX({first: [_plain(first), nft_tx]}, tx_unreadable={nft_tx.txid()})
         result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
         assert result.exit_code == 2, result.output
         assert _shown(result) == "", "no '[]'"
@@ -314,7 +344,7 @@ class TestGlyphListScansByDefault:
         nft_a, ref_a = _nft(w, 0, 0, "ab")
         nft_b, _ref_b = _nft(w, 0, 1, "cd")
         good, bad = w.derive_address(0, 0), w.derive_address(0, 1)
-        server = _ElectrumX({good: [nft_a], bad: [nft_b]}, unreadable={bad})
+        server = _ElectrumX({good: [_plain(good), nft_a], bad: [_plain(bad, salt=2), nft_b]}, unreadable={bad})
         human = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="human")
         assert human.exit_code == 2, human.output
         shown = _shown(human)
@@ -358,3 +388,85 @@ class TestUtxosFollowsTheSameRule:
         assert [(r["address"], r["value"]) for r in _json(result)] == [(good, _CHANGE)]
         refused = _run(tmp_path, monkeypatch, server, mnemonic, "utxos", "--addr", bad)
         assert refused.exit_code == 2, refused.output
+
+
+# --------------------------------------------------------------------------- glyph list, the server checked (#782)
+
+
+def _nft_hash(address: str) -> bytes:
+    return bytes(owned_token_script_hashes(Hex20(address_to_public_key_hash(address)))[0])
+
+
+class TestGlyphListChecksTheServer:
+    """``glyph list`` used to print another key's token, and an FT amount the server made up, with
+    exit 0. Each refusal has its honest twin: the wallet's own tokens, listed with the amounts
+    their transactions pay."""
+
+    @pytest.mark.parametrize("kind", ["nft", "ft"])
+    def test_another_keys_token_is_not_listed_as_the_wallets(self, tmp_path, monkeypatch, kind) -> None:
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        stranger = Hex20(PrivateKey().public_key().hash160())
+        ref = GlyphRef(txid=Txid("ab" * 32), vout=0)
+        builder = build_nft_locking_script if kind == "nft" else build_ft_locking_script
+        theirs = _paying(builder(stranger, ref), 5_000, 300)
+        ours_hash = bytes(
+            owned_token_script_hashes(Hex20(address_to_public_key_hash(first)))[0 if kind == "nft" else 1]
+        )
+        server = _ElectrumX({first: [_plain(first)]}, misfiled={ours_hash: [theirs]})
+        for mode in ("json", "human"):
+            result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode=mode)
+            assert result.exit_code == 2, result.output
+            assert _shown(result) == "", "nothing listed, not even '[]'"
+            assert "server inconsistency" in result.output
+            assert f"that {kind} output is owned by another key ({stranger.hex()}" in result.output
+
+    @pytest.mark.parametrize("kind", ["nft", "ft"])
+    def test_the_wallets_own_token_is_listed(self, tmp_path, monkeypatch, kind) -> None:
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        tx, ref = _nft(w, 0, 0, "ab") if kind == "nft" else _ft(w, 0, 0, "ab", 5_000)
+        server = _ElectrumX({first: [_plain(first), tx]})
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert result.exit_code == 0, (result.output, result.exception)
+        amount = "1" if kind == "nft" else "5000"
+        assert [(r["type"], r["ref"], r["address"], r["amount"]) for r in _json(result)] == [
+            (kind.upper(), ref, first, amount)
+        ]
+
+    @pytest.mark.parametrize("reported", [999_999_999, None], ids=["inflated", "honest"])
+    def test_an_ft_amount_is_what_its_transaction_pays(self, tmp_path, monkeypatch, reported) -> None:
+        """The transaction pays 5,000 units. A server reporting 999,999,999 used to be believed."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        ft_tx, ref = _ft(w, 0, 0, "cd", 5_000)
+        values = {} if reported is None else {ft_tx.txid(): reported}
+        server = _ElectrumX({first: [_plain(first), ft_tx]}, values=values)
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert [(r["ref"], r["amount"]) for r in _json(result)] == [(ref, "5000")]
+
+    def test_an_outpoint_not_at_the_address_is_refused(self, tmp_path, monkeypatch) -> None:
+        """The server lists, under the address's NFT hash, an output that is not there: here a
+        plain payment to the same address, so there is no token owner to compare."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        elsewhere = _plain(first, 1_234, salt=9)
+        server = _ElectrumX({first: [_plain(first)]}, misfiled={_nft_hash(first): [elsewhere]})
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert result.exit_code == 2, result.output
+        assert _shown(result) == ""
+        assert "server inconsistency" in result.output
+        assert "but its output is not there" in result.output
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="the gap-limit scan reads P2PKH history only, and a token output is not listed there, "
+        "so an address holding only a token is never marked used or read",
+    )
+    def test_an_address_holding_only_a_token_is_listed(self, tmp_path, monkeypatch) -> None:
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        nft_tx, ref = _nft(w, 0, 0, "ab")
+        server = _ElectrumX({w.derive_address(0, 0): [nft_tx]})
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert [r["ref"] for r in _json(result)] == [ref]

@@ -28,27 +28,68 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
-from ..network.electrumx import script_hash_for_address, script_hash_for_script
-from ..security.errors import NetworkError
-from ..security.types import Hex32
+from ..network.electrumx import _coerce_hex32, script_hash_for_output, script_hash_for_script
+from ..security.errors import NetworkError, ServerInconsistencyError
+from ..security.types import Hex20, Hex32
+from ..utils import address_to_public_key_hash
 from .inspector import GlyphInspector
 from .script import (
+    build_authority_gated_nft_script,
+    build_delegate_token_script,
+    build_ft_locking_script,
+    build_nft_locking_script,
     extract_owner_pkh_from_ft_script,
     extract_owner_pkh_from_nft_script,
 )
-from .types import GlyphFt, GlyphNft
+from .types import GlyphFt, GlyphNft, GlyphRef
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient, UtxoRecord
     from ..transaction.transaction import Transaction
     from .inspector import GlyphOutput
-    from .types import GlyphMetadata, GlyphRef
+    from .types import GlyphMetadata
 
 logger = logging.getLogger(__name__)
 
 GlyphItem = GlyphNft | GlyphFt
+
+# Any two distinct refs will do: the server zeroes refs before hashing (see
+# ``script_hash_for_output``), so the hash of each shape below depends on the owner alone.
+_REF_A = GlyphRef.from_bytes(b"\x01" * 36)
+_REF_B = GlyphRef.from_bytes(b"\x02" * 36)
+
+#: Every output shape ``GlyphInspector.find_glyphs`` reports with an owner, keyed by its
+#: ``glyph_type``, as a builder of that shape for a given owner. A Radiant ElectrumX lists an
+#: owner's outputs of one shape under one script hash, and it is NOT the owner's P2PKH hash, so
+#: these are the hashes :meth:`GlyphScanner.scan_address` reads. ``mut`` and ``dmint`` outputs
+#: have no owner key and are never returned as holdings, so they have no entry.
+#: ``tests/test_glyph_scanner.py`` checks this set against the types ``find_glyphs`` emits.
+OWNED_TOKEN_SHAPES: dict[str, Callable[[Hex20], bytes]] = {
+    "nft": lambda pkh: build_nft_locking_script(pkh, _REF_A),
+    "ft": lambda pkh: build_ft_locking_script(pkh, _REF_A),
+    "authority-gated-nft": lambda pkh: build_authority_gated_nft_script(pkh, _REF_A, _REF_B),
+    "delegate-token": lambda pkh: build_delegate_token_script(pkh, _REF_A),
+    # The dead pre-0.15.0 shape has no builder: OP_PUSHINPUTREF <container> + the NFT singleton.
+    "container-legacy": lambda pkh: b"\xd0" + _REF_B.to_bytes() + build_nft_locking_script(pkh, _REF_A),
+}
+
+
+def owned_token_script_hashes(owner_pkh: Hex20) -> tuple[Hex32, ...]:
+    """The script hashes a Radiant ElectrumX lists *owner_pkh*'s token outputs under, one per shape."""
+    return tuple(script_hash_for_output(build(owner_pkh)) for build in OWNED_TOKEN_SHAPES.values())
+
+
+def _server_inconsistency(strict: bool, what: str) -> None:
+    """Refuse a listing the server's own transaction contradicts: raise under *strict*, else log."""
+    if strict:
+        raise ServerInconsistencyError(
+            f"server inconsistency: {what}. Refusing to list it, or to show this address's inventory as complete"
+        )
+    logger.warning("Server inconsistency: %s; left out of the result", what)
+
 
 # Upper bound on how many candidate transactions the scanner will fetch while
 # searching a commit output's history for the reveal that spent it. A commit
@@ -98,6 +139,13 @@ class GlyphScanner:
     async def scan_address(self, address: str, *, strict: bool = False) -> list[GlyphItem]:
         """Return all Glyph outputs currently owned at *address*.
 
+        Reads the script hashes the address's token outputs are listed under
+        (:func:`owned_token_script_hashes`), not its P2PKH hash: a Radiant
+        ElectrumX lists a token output under its script with the refs zeroed,
+        so the P2PKH hash lists the address's plain outputs only. A token the
+        server lists here whose owner is not *address*'s key is refused as a
+        server inconsistency, not returned.
+
         Parameters
         ----------
         address:
@@ -113,8 +161,8 @@ class GlyphScanner:
             (see :meth:`_resolve_reveal_metadata`) — including transfer
             outputs whose commit-output history is unavailable.
         """
-        sh = script_hash_for_address(address)
-        return await self.scan_script_hash(sh, strict=strict)
+        owner = Hex20(address_to_public_key_hash(address))
+        return await self._scan(owned_token_script_hashes(owner), owner_pkh=owner, strict=strict)
 
     async def scan_script_hash(self, script_hash: Hex32 | bytes | str, *, strict: bool = False) -> list[GlyphItem]:
         """Return all Glyph outputs for *script_hash*.
@@ -123,12 +171,21 @@ class GlyphScanner:
         transaction metadata, then constructs typed GlyphNft / GlyphFt
         objects.
 
-        A UTXO whose raw transaction cannot be fetched is logged and left out
-        by default, so the result is then a lower bound on what the script
-        hash holds. ``strict=True`` raises :class:`NetworkError` instead; use
-        it when the result is shown as everything held (``pyrxd glyph list``
-        does). A metadata lookup that fails does not count: it leaves the
-        token in the result with ``metadata=None``.
+        What the server says is checked against the transaction it serves,
+        which ``get_transaction`` binds to the txid. A UTXO whose output is not
+        at *script_hash* (or does not exist), or is listed twice, is a server
+        inconsistency, and so is a token whose owner is not the address
+        :meth:`scan_address` was asked about. An FT's amount is the output's
+        value in that transaction, never the server's ``value``.
+
+        A UTXO whose raw transaction cannot be fetched or parsed, or that is a
+        server inconsistency, is logged and left out by default. For a failed
+        read the result is then a lower bound on what the script hash holds;
+        an inconsistent item was never shown to be held here. ``strict=True``
+        raises :class:`NetworkError` instead; use it when the result is shown
+        as everything held (``pyrxd glyph list`` does). A metadata lookup that
+        fails does not count: it leaves the token in the result with
+        ``metadata=None``.
 
         Concurrency: UTXO raw-tx fetches and reveal-metadata resolutions
         both run in parallel via ``asyncio.gather``. Pre-fix (closes
@@ -138,64 +195,118 @@ class GlyphScanner:
         batched version. Metadata is resolved once per distinct ref, so
         an FT split across many UTXOs costs one resolution, not N.
         """
+        return await self._scan((_coerce_hex32(script_hash),), owner_pkh=None, strict=strict)
+
+    async def _scan(self, script_hashes: Sequence[Hex32], *, owner_pkh: Hex20 | None, strict: bool) -> list[GlyphItem]:
         from ..transaction.transaction import Transaction
 
-        utxos = await self._client.get_utxos(script_hash)
-        if not utxos:
+        listings = await asyncio.gather(*[self._client.get_utxos(sh) for sh in script_hashes])
+        # Each UTXO with the script hash it was listed under, once per outpoint: a
+        # server that lists an FT outpoint twice would otherwise count it twice.
+        listed: list[tuple[UtxoRecord, bytes]] = []
+        seen: set[tuple[str, int]] = set()
+        for script_hash, utxos in zip(script_hashes, listings):
+            for utxo in utxos:
+                key = (str(utxo.tx_hash).lower(), utxo.tx_pos)
+                if key in seen:
+                    _server_inconsistency(strict, f"{utxo.tx_hash}:{utxo.tx_pos} is listed more than once")
+                    continue
+                seen.add(key)
+                listed.append((utxo, bytes(script_hash)))
+        if not listed:
             return []
 
         # Fetch all UTXO raw txs concurrently.
         raw_txs = await asyncio.gather(
-            *[self._client.get_transaction(utxo.tx_hash) for utxo in utxos],
+            *[self._client.get_transaction(utxo.tx_hash) for utxo, _sh in listed],
             return_exceptions=True,
         )
         failed = [raw for raw in raw_txs if isinstance(raw, Exception)]
         if strict and failed:
             raise NetworkError(
-                f"{len(failed)} of {len(utxos)} transaction reads failed for this address's outputs; "
+                f"{len(failed)} of {len(listed)} transaction reads failed for this address's outputs; "
                 "refusing to return an inventory that leaves them out"
             ) from failed[0]
 
-        # First pass: parse each UTXO's source tx, run the glyph inspector,
-        # collect every (utxo, glyph, source tx) triple we'd want metadata
-        # for. Two-pass split lets us issue all reveal-metadata resolutions
-        # as a single gather() instead of one-await-per-glyph; the source tx
-        # is kept because it is often the reveal itself.
+        # First pass: parse each UTXO's source tx, check it against the listing,
+        # run the glyph inspector, and collect every (utxo, glyph, source tx)
+        # triple we'd want metadata for. Two-pass split lets us issue all
+        # reveal-metadata resolutions as a single gather() instead of
+        # one-await-per-glyph; the source tx is kept because it is often the
+        # reveal itself, and because its output is where an FT's amount is read.
         pending: list[tuple[UtxoRecord, GlyphOutput, Transaction]] = []
-        for utxo, raw in zip(utxos, raw_txs):
+        for (utxo, listed_under), raw in zip(listed, raw_txs):
             if isinstance(raw, Exception):
                 logger.warning("Failed to fetch tx %s: %s", utxo.tx_hash, raw)
                 continue
 
             tx = Transaction.from_hex(bytes(raw))
             if tx is None:
+                if strict:
+                    raise NetworkError(
+                        f"transaction {utxo.tx_hash} was fetched but does not parse; "
+                        "refusing to return an inventory that leaves it out"
+                    )
                 logger.warning("Failed to parse tx %s", utxo.tx_hash)
                 continue
 
-            output_pairs = [(out.satoshis, out.locking_script.serialize()) for out in tx.outputs]
-            glyphs = self._inspector.find_glyphs(output_pairs)
+            outpoint = f"{utxo.tx_hash}:{utxo.tx_pos}"
+            if utxo.tx_pos >= len(tx.outputs):
+                _server_inconsistency(
+                    strict, f"{outpoint} is listed, but that transaction has {len(tx.outputs)} output(s)"
+                )
+                continue
+            output = tx.outputs[utxo.tx_pos]
+            script = output.locking_script.serialize()
 
-            for g in glyphs:
-                if g.vout != utxo.tx_pos:
-                    continue
-                if not g.spendable:
-                    # A pre-0.15.0 container-with-child-ref output. It is not a
-                    # transferable token, so it must not come back as a GlyphNft
-                    # — but staying silent would leave the holder wondering
-                    # where their carrier photons went.
-                    logger.warning(
-                        "Skipping unspendable %s output at %s:%d (container ref %s:%d, child ref %s:%d) — "
-                        "see pyrxd.glyph.script.is_legacy_container_script",
-                        g.glyph_type,
-                        utxo.tx_hash,
-                        utxo.tx_pos,
-                        g.ref.txid,
-                        g.ref.vout,
-                        g.child_ref.txid if g.child_ref else "?",
-                        g.child_ref.vout if g.child_ref else -1,
-                    )
-                    continue
-                pending.append((utxo, g, tx))
+            output_pairs = [(out.satoshis, out.locking_script.serialize()) for out in tx.outputs]
+            g = next((g for g in self._inspector.find_glyphs(output_pairs) if g.vout == utxo.tx_pos), None)
+
+            # The owner first, so that a foreign token is named as one. The script-hash check
+            # below refuses it too when scanning an address, since each hash read there binds
+            # the owner; this one says why.
+            if owner_pkh is not None and g is not None and g.owner_pkh is not None and g.owner_pkh != owner_pkh:
+                _server_inconsistency(
+                    strict,
+                    f"{outpoint} is listed under this address, but that {g.glyph_type} output is owned by "
+                    f"another key ({g.owner_pkh.hex()}, not {owner_pkh.hex()})",
+                )
+                continue
+            # A server can list any outpoint. Plain ElectrumX hashes the script as it is, a
+            # Radiant one with its refs zeroed; an output at neither is not at this hash.
+            if listed_under not in (bytes(script_hash_for_output(script)), bytes(script_hash_for_script(script))):
+                _server_inconsistency(
+                    strict, f"{outpoint} is listed under script hash {listed_under.hex()}, but its output is not there"
+                )
+                continue
+            if utxo.value != output.satoshis:
+                logger.warning(
+                    "Server reports %s as %d photons, but the transaction pays %d; using the transaction",
+                    outpoint,
+                    utxo.value,
+                    output.satoshis,
+                )
+
+            if g is None:
+                continue
+            if not g.spendable:
+                # A pre-0.15.0 container-with-child-ref output. It is not a
+                # transferable token, so it must not come back as a GlyphNft
+                # — but staying silent would leave the holder wondering
+                # where their carrier photons went.
+                logger.warning(
+                    "Skipping unspendable %s output at %s:%d (container ref %s:%d, child ref %s:%d) — "
+                    "see pyrxd.glyph.script.is_legacy_container_script",
+                    g.glyph_type,
+                    utxo.tx_hash,
+                    utxo.tx_pos,
+                    g.ref.txid,
+                    g.ref.vout,
+                    g.child_ref.txid if g.child_ref else "?",
+                    g.child_ref.vout if g.child_ref else -1,
+                )
+                continue
+            pending.append((utxo, g, tx))
 
         if not pending:
             return []
@@ -224,7 +335,7 @@ class GlyphScanner:
         }
 
         results: list[GlyphItem] = []
-        for utxo, g, _tx in pending:
+        for utxo, g, tx in pending:
             metadata = metadata_by_ref.get((str(g.ref.txid).lower(), g.ref.vout))
             script = g.script
 
@@ -266,7 +377,10 @@ class GlyphScanner:
                         GlyphFt(
                             ref=g.ref,
                             owner_pkh=pkh,
-                            amount=utxo.value,
+                            # From the transaction `get_transaction` bound to its txid,
+                            # not the server's UTXO record: on Radiant an FT output's value
+                            # IS its token amount, and the record is only the server's word.
+                            amount=tx.outputs[utxo.tx_pos].satoshis,
                             metadata=metadata,
                         )
                     )

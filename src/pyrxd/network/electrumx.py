@@ -275,11 +275,14 @@ def _coerce_hex32(value: Hex32 | bytes | bytearray | str) -> Hex32:
 def script_hash_for_script(locking_script: bytes) -> Hex32:
     """Return the ElectrumX ``script_hash`` for a raw *locking_script*.
 
-    ElectrumX indexes **every** output by ``sha256(locking_script)`` with the
-    bytes reversed (little-endian display order) — not just address-shaped
-    ones. Use this when you hold the script bytes rather than an address, e.g.
-    to ask for the history of a Glyph commit output (which is how the scanner
-    finds the reveal transaction that spent it).
+    This is ``sha256(locking_script)`` with the bytes reversed (little-endian
+    display order). It is the hash a Radiant ElectrumX lists an output under
+    only when the script carries no ref operand, or carries one but no
+    signature check: a commit output, a plain P2PKH. For a token output use
+    :func:`script_hash_for_output`, which applies the server's ref zeroing.
+    Use this when you hold the script bytes rather than an address, e.g. to ask
+    for the history of a Glyph commit output (which is how the scanner finds
+    the reveal transaction that spent it).
 
     Parameters
     ----------
@@ -292,6 +295,47 @@ def script_hash_for_script(locking_script: bytes) -> Hex32:
         The 32-byte script hash suitable for ElectrumX RPC calls.
     """
     return Hex32(sha256(bytes(locking_script))[::-1])
+
+
+# The opcodes whose presence makes a Radiant ElectrumX zero a script's refs before hashing it
+# (``CHECKSIG_OPS`` in RXinDexer ``electrumx/lib/script.py``).
+_INDEXER_CHECKSIG_OPCODES = frozenset({0xAC, 0xAD, 0xAE, 0xAF})
+
+
+def script_hash_for_output(locking_script: bytes) -> Hex32:
+    """Return the script hash a Radiant ElectrumX lists an output with *locking_script* under.
+
+    The server does not hash a ref-bearing script as it is. When the script has a signature
+    check, it replaces every ref operand with 36 zero bytes first, so every NFT one key owns is
+    listed under ONE hash, and every FT another (RXinDexer ``Script.zero_refs``, applied in
+    ``block_processor.py`` and ``mempool.py``). Measured 2026-09-29 against both public mainnet
+    servers: an NFT output was listed under this hash and not under the owner's P2PKH hash nor
+    under the hash of its script as it is.
+
+    A script with no ref, or no signature check, hashes as it is, which is
+    :func:`script_hash_for_script`. A script that does not decode also gets that plain hash here,
+    though RXinDexer (at the commit in ``tests/fixtures/rxindexer_upstream_pin.json``) does not
+    index such an output at all: ``zero_refs`` raises and ``_output_indexable`` skips it.
+    """
+    # Lazy: ``pyrxd.glyph`` is a heavier import than this module, and it owns the one
+    # opcode-aware walk this package allows (see ``iter_script_ops_strict``).
+    from ..constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
+    from ..glyph.script import TruncatedScriptError, iter_script_ops_strict
+
+    script = bytes(locking_script)
+    zeroed = bytearray(script)
+    has_checksig = False
+    start = 0
+    try:
+        for op in iter_script_ops_strict(script):
+            if op.opcode in _INDEXER_CHECKSIG_OPCODES:
+                has_checksig = True
+            elif op.opcode in REF_OPERAND_OPCODES:
+                zeroed[start + 1 : start + 1 + REF_OPERAND_WIDTH] = bytes(REF_OPERAND_WIDTH)
+            start = op.next_pos
+    except TruncatedScriptError:
+        return script_hash_for_script(script)
+    return script_hash_for_script(bytes(zeroed) if has_checksig else script)
 
 
 def script_hash_for_address(address: str) -> Hex32:
