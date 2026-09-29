@@ -18,10 +18,16 @@
 # nothing else. Not a classic PAT: the `repo` scope a classic one needs grants
 # full control of every repository its owner can reach.
 #
-# THE SECRET LIVES IN THE `traffic` ENVIRONMENT, not in the repository's secrets.
-# A repository secret is readable by any workflow on any branch that asks for it;
-# an environment secret only by a job that names the environment, and only from
-# the branches the environment admits (here: main). The `collect` job checks that
+# THE SECRET IS A REPOSITORY SECRET, on purpose. A repository secret is readable
+# by any workflow on any branch that asks for it, where an environment secret is
+# readable only by a job that names the environment, from the branches it admits.
+# The maintainer keeps TRAFFIC_TOKEN at repository level anyway, because reading it
+# gets little: the token is fine-grained, scoped to this one repository, and
+# read-only (Administration: Read-only and nothing else). It cannot push, publish
+# or change a setting.
+#
+# THE `collect` JOB RUNS IN THE `traffic` ENVIRONMENT, which admits only main, so
+# the one job that can push to the data branch runs from main alone. It checks that
 # restriction before anything else and fails, naming the fix, unless it is
 # exactly "Selected branches and tags" with the one branch rule `main`. That
 # includes the case GitHub creates silently: the first run that names an
@@ -30,13 +36,10 @@
 #   1. Settings -> Environments -> New environment `traffic` -> Deployment
 #      branches and tags -> "Selected branches and tags" -> add the branch rule
 #      `main`. Not "Protected branches only": the check refuses it.
-#   2. Create a NEW fine-grained PAT (resource owner MudwoodLabs, only this
-#      repository, Administration: Read-only) and store it with
-#      `gh secret set TRAFFIC_TOKEN --env traffic --repo MudwoodLabs/pyrxd`,
+#   2. Create a fine-grained PAT (resource owner MudwoodLabs, only this
+#      repository, Administration: Read-only and nothing else) and store it as a
+#      repository secret with `gh secret set TRAFFIC_TOKEN --repo MudwoodLabs/pyrxd`,
 #      typing the value at the prompt.
-#   3. Delete the repository-level copy with
-#      `gh secret delete TRAFFIC_TOKEN --repo MudwoodLabs/pyrxd` (no --env), and
-#      REVOKE the old token: deleting a secret does not revoke the token in it.
 # The collector exits 2 with the remediation if the token is missing or wrong.
 #
 # PULL REQUESTS run a separate job with a read-only token, no persisted
@@ -147,14 +150,14 @@ jobs:
           # Only the data checkout below pushes. This one keeps no credentials.
           persist-credentials: false
 
-      # TRAFFIC_TOKEN is only as protected as the environment holding it. GitHub
-      # CREATES a missing environment the first time a job names it, with no
-      # branch restriction, and a job in such an environment still reads a
-      # repository-level secret of the same name. So nothing would fail: it would
-      # quietly run unprotected. This step turns that into a red run naming the
-      # fix. It DETECTS a misconfiguration; it cannot enforce anything, since a
-      # workflow edited on another branch could delete it. The enforcement is the
-      # environment's own branch rule.
+      # The `traffic` environment is what keeps this job, which can push to the
+      # data branch, running from main only. GitHub CREATES a missing environment
+      # the first time a job names it, with no branch restriction, so nothing would
+      # fail: the job would quietly run from any branch. This step turns that into a
+      # red run naming the fix. It DETECTS a misconfiguration; it cannot enforce
+      # anything, since a workflow edited on another branch could delete it. The
+      # enforcement is the environment's own branch rule. (TRAFFIC_TOKEN itself is a
+      # repository secret, not this environment's; the header says why.)
       - name: Check the traffic environment admits only main
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,9 +170,9 @@ jobs:
           repo, env = os.environ["REPO"], os.environ["ENVIRONMENT"]
           fix = (
               f"Fix: Settings -> Environments -> {env} -> Deployment branches and tags -> "
-              "'Selected branches and tags' -> add the branch rule `main` (and nothing else); keep "
-              f"TRAFFIC_TOKEN as a secret of the {env} environment and delete the repository-level "
-              "one. See the header of .github/workflows/traffic.yml."
+              "'Selected branches and tags' -> add the branch rule `main` (and nothing else). "
+              "TRAFFIC_TOKEN stays a repository secret (fine-grained, read-only); see the header "
+              "of .github/workflows/traffic.yml."
           )
 
           def fail(message):
@@ -226,8 +229,8 @@ jobs:
         id: traffic
         continue-on-error: true
         env:
-          # A fine-grained PAT, Administration: Read-only, from the `traffic`
-          # environment. GITHUB_TOKEN cannot do this.
+          # A fine-grained PAT, Administration: Read-only, kept as a repository
+          # secret (see the header). GITHUB_TOKEN cannot do this.
           TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
           TRAFFIC_REPO: ${{ github.repository }}
           TRAFFIC_FILE: data/traffic.json
