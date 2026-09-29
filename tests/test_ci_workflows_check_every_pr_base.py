@@ -38,7 +38,12 @@ read, so `_REQUIRED_CHECKS` below is REVIEWED against the live setting, not deri
 from __future__ import annotations
 
 import itertools
+import json
 import re
+import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -294,8 +299,23 @@ _LIVE_PROTECTION: dict[str, Any] = {
 }
 
 
-#: Shell operators that end a command's argument list, as `shlex` (punctuation mode) splits them.
-_SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "<", ">", "<<", ">>", ">&", "<&", ";;"})
+#: The shell's metacharacters: outside quotes, each one ends a word.
+_METACHARACTERS = frozenset(" \t\n;&|()<>")
+
+#: Redirection operators as `shlex` (punctuation mode) returns them. The word after one is its
+#: target, not a command.
+_REDIRECTIONS = frozenset({"<", ">", ">>", "<<", "<<<", "<&", ">&", "<>", ">|", "&>", "&>>"})
+
+#: Reserved words after which the shell still expects a command word (`if gh ...`, `! gh ...`).
+_PREFIX_RESERVED_WORDS = frozenset({"!", "{", "if", "then", "else", "elif", "while", "until", "do", "time"})
+
+#: `NAME=value` (or `NAME+=value`, `NAME[i]=value`) before a command is an assignment, not the command.
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+
+#: The only heredoc this parser reads: `<<` or `<<-`, then a delimiter in single or double quotes
+#: that ends where the shell's word would. Quoting the delimiter is what stops the shell expanding
+#: the body, so the body is data.
+_QUOTED_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'(\w+)'|\"(\w+)\")(?=[ \t\n;&|()<>]|$)")
 
 #: `gh api` options that take a value, so the word after them is not the endpoint.
 _GH_API_VALUED_OPTIONS = frozenset(
@@ -330,52 +350,142 @@ _REVIEWED_GH_API_CALLS: list[list[str]] = [
     ],
 ]
 
+#: The first word of every simple command the script runs, as `_command_words` reads them.
+#: REVIEWED: read from the script on 2026-09-28. `say`, `ok` and `warn` are functions the script
+#: defines around `printf`; `{`, `}`, `if`, `then`, `fi` and `[[` are shell syntax. A command word
+#: not listed here fails the check until someone adds it, and a listed word the script no longer
+#: uses fails it too. Most ways to run text as a command (`bash -c`, `eval`, `python3 -c`, `.`,
+#: `xargs`, `trap`, `env`, `exec`) begin with a word that is not on this list.
+_REVIEWED_COMMAND_WORDS = frozenset(
+    {"set", "say", "ok", "warn", "printf", "{", "}", "gh", "if", "[[", "then", "exit", "fi", "cat"}
+)
 
-def _script_commands() -> str:
-    """The script as the shell would run it, minus what the shell does not run.
 
-    Heredoc BODIES are removed (they are data: the protection JSON, the printed follow-ups),
-    backslash continuations are joined, comments are dropped (a `#` that starts a word, outside
-    quotes, runs to the end of the line), and every newline outside quotes becomes `;`, so each
-    command's words end where the shell's do while a quoted multi-line argument stays whole.
+def _is_operator(word: str) -> bool:
+    """A control or redirection operator. `shlex` (punctuation mode) returns a RUN of the characters
+    `();<>|&` as one token, so `);`, `()` and `|&` arrive whole."""
+    return bool(word) and set(word) <= set("();<>|&")
+
+
+def _script_commands(text: str) -> str:
+    """`text` as the shell would run it, minus what the shell does not run.
+
+    One pass that tracks quoting the way bash does. Outside quotes: a backslash-newline is removed
+    (a line continuation, joined with no space), any other backslash keeps the next character from
+    being special, a `#` that begins a word drops the rest of the line, and a newline becomes `;`,
+    so each command's words end where the shell's do while a quoted multi-line argument stays
+    whole. A `<<` outside quotes opens a heredoc, and its body (the lines after this one, up to
+    the delimiter) is removed: it is data, because the delimiter must be quoted. Inside double
+    quotes a backslash-newline is removed too; inside single quotes nothing is special.
+
+    Rather than guess, it fails on forms it would otherwise read differently from bash: a heredoc
+    delimiter that is unquoted or written any other way, a heredoc never closed, `$'…'` quoting
+    (in which `\\'` does not end the string), and an unbalanced quote.
     """
-    text = _PROTECTION_SCRIPT.read_text(encoding="utf-8")
-    text = re.sub(r"<<-?'?(\w+)'?([^\n]*)\n.*?\n\1\n", r"<<\1\2\n", text, flags=re.S)
-    text = re.sub(r"\\\n", " ", text)
+    name = _PROTECTION_SCRIPT.name
     out: list[str] = []
     quote = ""
-    i = 0
-    while i < len(text):
+    word_start = True  # the next character would begin a word, so a `#` there begins a comment
+    heredocs: list[tuple[str, bool]] = []  # opened on the current line: (delimiter, strip leading tabs)
+    i, n = 0, len(text)
+    while i < n:
         c = text[i]
-        if quote:
+        if quote == "'":
             out.append(c)
-            if c == quote:
-                quote = ""
-            elif c == "\\" and quote == '"' and i + 1 < len(text):
-                out.append(text[i + 1])
-                i += 1
+            quote = "" if c == "'" else quote
+            i += 1
+        elif quote == '"':
+            if c == "\\" and i + 1 < n:
+                if text[i + 1] != "\n":
+                    out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append(c)
+            quote = "" if c == '"' else quote
+            i += 1
+        elif c == "\\" and i + 1 < n:
+            if text[i + 1] != "\n":
+                out.append(text[i : i + 2])
+                word_start = False
+            i += 2
         elif c in "'\"":
+            assert not (c == "'" and out and out[-1] == "$"), (
+                f"{name} uses `$'…'` (ANSI-C) quoting, in which `\\'` does not end the string; this "
+                f"parser would disagree with bash about where the string ends"
+            )
             quote = c
             out.append(c)
-        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
-            while i < len(text) and text[i] != "\n":
+            word_start = False
+            i += 1
+        elif c == "#" and word_start:
+            while i < n and text[i] != "\n":
                 i += 1
-            continue
+        elif text.startswith("<<<", i):
+            out.append(" <<< ")
+            word_start = True
+            i += 3
+        elif text.startswith("<<", i):
+            m = _QUOTED_HEREDOC.match(text, i)
+            line = text[i:].split("\n", 1)[0]
+            assert m, (
+                f"{name}: `{line}`: a heredoc must have a quoted delimiter, such as <<'EOF'. With an "
+                f"unquoted one the shell expands the body, so a `$(…)` in it runs; other forms this "
+                f"parser does not read"
+            )
+            delimiter = m.group(2) or m.group(3)
+            heredocs.append((delimiter, m.group(1) == "-"))
+            out.append(f" << {delimiter} ")
+            word_start = True
+            i = m.end()
+        elif c == "\n":
+            out.append(" ; ")
+            word_start = True
+            i += 1
+            for delimiter, strip_tabs in heredocs:
+                while True:
+                    assert i < n, f"{name}: the heredoc ended by {delimiter!r} is never closed"
+                    end = text.find("\n", i)
+                    end = n if end == -1 else end
+                    body_line, i = text[i:end], end + 1
+                    if (body_line.lstrip("\t") if strip_tabs else body_line) == delimiter:
+                        break
+            heredocs.clear()
         else:
-            out.append(" ; " if c == "\n" else c)
-        i += 1
-    assert not quote, f"unbalanced {quote} quote in {_PROTECTION_SCRIPT.name}; this parser cannot read it"
+            out.append(c)
+            word_start = c in _METACHARACTERS
+            i += 1
+    assert not quote, f"unbalanced {quote} quote in {name}; this parser cannot read it"
+    assert not heredocs, f"{name}: heredoc(s) {[d for d, _ in heredocs]} opened on the last line, with no body"
     return "".join(out)
 
 
-def _script_words() -> list[str]:
-    """`_script_commands()` split into shell words (quotes removed, variables NOT expanded)."""
-    import shlex
-
-    lex = shlex.shlex(_script_commands(), posix=True, punctuation_chars=True)
+def _script_words(text: str) -> list[str]:
+    """`_script_commands(text)` split into shell words (quotes removed, variables NOT expanded)."""
+    lex = shlex.shlex(_script_commands(text), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     return list(lex)
+
+
+def _command_words(words: list[str]) -> list[str]:
+    """The first word of every simple command, in order: the word at the start or after a control
+    operator, once any `NAME=value` assignments and redirections before it are skipped. After a
+    reserved word such as `if`, `then`, `!` or `{`, the next word is a command word as well."""
+    found: list[str] = []
+    expecting = True
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in _REDIRECTIONS:
+            i += 2
+            continue
+        if _is_operator(word):
+            expecting = True
+        elif expecting and not _ASSIGNMENT_WORD.match(word):
+            found.append(word)
+            expecting = word in _PREFIX_RESERVED_WORDS
+        i += 1
+    return found
 
 
 def _gh_api_calls(words: list[str]) -> list[list[str]]:
@@ -385,7 +495,7 @@ def _gh_api_calls(words: list[str]) -> list[list[str]]:
         if word == "gh" and words[i + 1 : i + 2] == ["api"]:
             argv = []
             for w in words[i + 2 :]:
-                if w in _SHELL_OPERATORS:
+                if _is_operator(w):
                     break
                 argv.append(w)
             calls.append(argv)
@@ -420,8 +530,6 @@ def test_the_protection_script_reproduces_the_live_rules_exactly() -> None:
     app-bound checks enforced for admins. A re-run would have silently switched the admin bypass
     back on. Pinning only those fields left the rest free to drift (a re-run could have allowed
     force pushes, or dropped linear history), so the WHOLE document is compared."""
-    import json
-
     bodies = re.findall(r"<<'EOF'[^\n]*\n(\{.*?\n\})\nEOF\n", _PROTECTION_SCRIPT.read_text(encoding="utf-8"), re.S)
     assert len(bodies) == 1, (
         f"expected exactly one JSON protection payload in {_PROTECTION_SCRIPT.name}, found {len(bodies)}"
@@ -444,42 +552,46 @@ def test_the_protection_script_reproduces_the_live_rules_exactly() -> None:
     )
 
 
-def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
-    """The script used to POST required signatures after its PUT. With admins enforced that
-    blocked every PR, so the maintainer switched it off, and a re-run would have switched it back
-    on. A first version of this test looked only at `gh api` lines containing `branches/`, and two
-    plants got past it: a DELETE of `enforce_admins` through a variable path, and a GraphQL
-    `updateBranchProtectionRule(isAdminEnforced: false)`.
-
-    What it checks, on the script's text split into shell words (heredoc bodies and comments
-    removed; variables are NOT expanded):
-
-    * every `gh` is `gh api`, every `api` follows `gh`, and no word is `eval`, `curl`, `wget` or
-      `source`, and nothing mentions `graphql` or `required_signatures`;
-    * `REPO` and `BRANCH` are each assigned exactly once, to `MudwoodLabs/pyrxd` and `main`;
-    * every endpoint is a literal path whose only variables are `${REPO}` and `${BRANCH}`;
-    * the method is never DELETE or POST, the only call whose endpoint mentions `protection` is
-      the PUT the test above checks, and the calls equal `_REVIEWED_GH_API_CALLS` word for word.
-
-    WHAT IT CANNOT SEE: it reads text, it is not a shell. A call assembled in a way none of the
-    above names (a command run from another file, an interpreter's own HTTP client) is invisible
-    to it. Review of this file remains the control for that."""
-    words = _script_words()
-    joined = " ".join(words).lower()
+def _check_protection_script(text: str) -> None:
+    """Every check `test_the_protection_script_makes_only_the_reviewed_api_calls` makes, on `text`."""
+    name = _PROTECTION_SCRIPT.name
+    words = _script_words(text)
+    assert "<<<" not in words, f"{name} uses a `<<<` here-string, which hands text to a command's input"
+    for word in words:
+        base = word.rsplit("/", 1)[-1]
+        assert base not in ("bash", "sh") and not base.startswith("python"), (
+            f"{name} runs `{word}`, an interpreter: the commands it is given are text this check cannot see"
+        )
+        assert "$(" not in word and "`" not in word, (
+            f"{name}: {word!r} holds a command substitution this check cannot split into commands "
+            f"(one inside quotes, or text that a later arithmetic evaluation could run)"
+        )
     for banned in ("eval", "curl", "wget", "source"):
-        assert banned not in words, f"{_PROTECTION_SCRIPT.name} runs `{banned}`, which this test cannot see through"
-    for text in ("graphql", "required_signatures"):
-        assert text not in joined, f"{_PROTECTION_SCRIPT.name} mentions {text!r} outside its comments and heredocs"
+        assert banned not in words, f"{name} runs `{banned}`, which this test cannot see through"
+    joined = " ".join(words).lower()
+    for mention in ("graphql", "required_signatures"):
+        assert mention not in joined, f"{name} mentions {mention!r} outside its comments and heredocs"
+    commands = _command_words(words)
+    for word in commands:
+        assert "$" not in word, f"{name} runs `{word}`, a command named by a variable or substitution"
     for i, word in enumerate(words):
         if word == "gh":
             assert words[i + 1 : i + 2] == ["api"], f"`gh {words[i + 1]}`: the script may use only `gh api`"
         if word == "api":
             assert i > 0 and words[i - 1] == "gh", f"`{words[i - 1]} api`: an API call not spelled `gh api`"
-    assignments = {name: [w for w in words if w.startswith(f"{name}=")] for name in ("REPO", "BRANCH")}
+    assignments = {var: [w for w in words if w.startswith(f"{var}=")] for var in ("REPO", "BRANCH")}
     assert assignments == {"REPO": ["REPO=MudwoodLabs/pyrxd"], "BRANCH": ["BRANCH=main"]}, assignments
+    unreviewed, unused = (
+        sorted(set(commands) - _REVIEWED_COMMAND_WORDS),
+        sorted(_REVIEWED_COMMAND_WORDS - set(commands)),
+    )
+    assert not unreviewed and not unused, (
+        f"{name} runs commands not in _REVIEWED_COMMAND_WORDS: {unreviewed}; listed there but no longer "
+        f"run: {unused}. Read what the new command can execute before adding it."
+    )
 
     calls = _gh_api_calls(words)
-    assert calls, f"found no `gh api` call in {_PROTECTION_SCRIPT.name}; this test checked nothing"
+    assert calls, f"found no `gh api` call in {name}; this test checked nothing"
     protection = []
     for argv in calls:
         method, endpoint = _method_and_endpoint(argv)
@@ -498,6 +610,180 @@ def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
     )
 
 
+def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
+    """The script used to POST required signatures after its PUT. With admins enforced that
+    blocked every PR, so the maintainer switched it off, and a re-run would have switched it back
+    on. A first version of this test looked only at `gh api` lines containing `branches/`, and two
+    plants got past it: a DELETE of `enforce_admins` through a variable path, and a GraphQL
+    `updateBranchProtectionRule(isAdminEnforced: false)`. The next version read a quoted `<<WORD`
+    as a heredoc and dropped the real commands after it, and could not see commands run from a
+    string or by another interpreter (issue #750); `_BYPASSES` holds each of those.
+
+    What it checks, on the script's text split into shell words (comments dropped; heredoc
+    bodies, which a quoted delimiter makes data, removed; variables NOT expanded):
+
+    * none of the forms `_script_commands` would read differently from bash: an unquoted heredoc
+      delimiter (the shell expands such a body, so a `$(…)` there would run), a heredoc never
+      closed, `$'…'` quoting, an unbalanced quote;
+    * no word is `bash`, `sh` or `python…` (with or without a directory), `eval`, `source`,
+      `curl` or `wget`; there is no `<<<`; no word holds `$(` or a backtick (a command
+      substitution inside quotes, which this parser does not split into commands); no command
+      word contains `$`;
+    * the first word of every simple command is in `_REVIEWED_COMMAND_WORDS`, and every word
+      listed there is still used;
+    * every `gh` is `gh api`, every `api` follows `gh`, and nothing mentions `graphql` or
+      `required_signatures`;
+    * `REPO` and `BRANCH` are each assigned exactly once, to `MudwoodLabs/pyrxd` and `main`;
+    * every endpoint is a literal path whose only variables are `${REPO}` and `${BRANCH}`;
+    * the method is never DELETE or POST, the only call whose endpoint mentions `protection` is
+      the PUT the test above checks, and the calls equal `_REVIEWED_GH_API_CALLS` word for word.
+
+    WHAT IT CANNOT SEE: it reads text, it is not a shell. A command the script builds while it
+    runs, out of pieces that are each harmless text, and then has the shell evaluate (arithmetic
+    evaluation of an array subscript is one route) is invisible to it; `_ASSEMBLED_AT_RUN_TIME`
+    is one, and a test below keeps this sentence true.
+    `test_under_bash_the_script_calls_gh_exactly_as_reviewed` runs the script and catches such a
+    `gh` call on the path that run takes (every call succeeds and the repository reads as
+    public). On any other path, only review of the script catches it."""
+    _check_protection_script(_PROTECTION_SCRIPT.read_text(encoding="utf-8"))
+
+
+#: The call every bypass below makes: switching off `enforce_admins` on main.
+_DELETE_ENFORCE_ADMINS = 'gh api -X DELETE "repos/${REPO}/branches/${BRANCH}/protection/enforce_admins" --silent'
+#: The same call with the variables written out, for text the script hands to another process.
+_DELETE_ENFORCE_ADMINS_LITERAL = (
+    "gh api -X DELETE repos/MudwoodLabs/pyrxd/branches/main/protection/enforce_admins --silent"
+)
+#: Each bypass is inserted after this line of the real script.
+_BYPASS_ANCHOR = 'ok "branch protection applied to ${BRANCH}"\n'
+
+#: Ways to hide a protection DELETE from the check, each with the text its failure must contain, so
+#: a plant cannot pass by tripping some other rule. The first six came from the review of #748
+#: (issue #750); the check then in place passed all six. The next eight were found while fixing
+#: it: all but the ANSI-C one passed that check too (the ANSI-C one made `shlex` raise), and
+#: `dot-source-from-a-heredoc` is caught by `_REVIEWED_COMMAND_WORDS` alone. The last
+#: pins this parser's own order of work: a backslash ending a quoted heredoc's body line is data,
+#: and must not join that line to the delimiter below it. The four that end "is a DELETE" use only
+#: reviewed command words, so they fail only if the parser now SEES the hidden call.
+_BYPASSES: dict[str, tuple[str, str]] = {
+    "quoted-heredoc-marker": (f'ok "see <<ok below"\n{_DELETE_ENFORCE_ADMINS}\nok\n', "is a DELETE"),
+    "heredoc-piped-to-bash": (f"cat <<'SH' | bash\n{_DELETE_ENFORCE_ADMINS_LITERAL}\nSH\n", "an interpreter"),
+    "bash-c": (f"bash -c '{_DELETE_ENFORCE_ADMINS_LITERAL}'\n", "an interpreter"),
+    "bash-here-string": (f"bash <<< '{_DELETE_ENFORCE_ADMINS_LITERAL}'\n", "here-string"),
+    "command-in-a-variable": (f'c="{_DELETE_ENFORCE_ADMINS_LITERAL}"; $c\n', "named by a variable"),
+    "python3-subprocess": (
+        f"python3 -c 'import shlex, subprocess; subprocess.run(shlex.split(\"{_DELETE_ENFORCE_ADMINS_LITERAL}\"))'\n",
+        "an interpreter",
+    ),
+    "unquoted-heredoc-body": (f"cat <<NOTES\n$({_DELETE_ENFORCE_ADMINS})\nNOTES\n", "quoted delimiter"),
+    "substitution-in-double-quotes": (f'ok "$({_DELETE_ENFORCE_ADMINS_LITERAL})"\n', "command substitution"),
+    "substitution-in-single-quotes-arithmetic": (
+        f"if [[ -v 'x[$({_DELETE_ENFORCE_ADMINS_LITERAL})]' ]]; then ok; fi\n",
+        "command substitution",
+    ),
+    "backticks-in-double-quotes": (f'ok "`{_DELETE_ENFORCE_ADMINS_LITERAL}`"\n', "command substitution"),
+    "ansi-c-quoting": (f"ok $'\\''; {_DELETE_ENFORCE_ADMINS}; ok $'\\''\n", "ANSI-C"),
+    "comment-after-line-continuation": (f"ok a\\\n#; {_DELETE_ENFORCE_ADMINS}\n", "is a DELETE"),
+    "comment-after-escaped-space": (f"ok a\\ #; {_DELETE_ENFORCE_ADMINS}\n", "is a DELETE"),
+    "dot-source-from-a-heredoc": (
+        f". /dev/stdin <<'SRC'\n{_DELETE_ENFORCE_ADMINS_LITERAL}\nSRC\n",
+        "not in _REVIEWED_COMMAND_WORDS",
+    ),
+    "backslash-ending-a-heredoc-body-line": (
+        f"cat <<'EOF'\na \\\nEOF\n{_DELETE_ENFORCE_ADMINS}\ncat <<'EOF'\nb\nEOF\n",
+        "is a DELETE",
+    ),
+}
+
+
+#: A DELETE the text check CANNOT see, kept so the docstring's WHAT IT CANNOT SEE stays true: `$`
+#: and `(` meet only when the script runs, and `[[ -v ]]` then evaluates the subscript, running it.
+_ASSEMBLED_AT_RUN_TIME = f"p='$'; x=\"a[${{p}}({_DELETE_ENFORCE_ADMINS_LITERAL})]\"; [[ -v $x ]] || ok\n"
+
+
+def _planted(plant: str) -> str:
+    text = _PROTECTION_SCRIPT.read_text(encoding="utf-8")
+    assert text.count(_BYPASS_ANCHOR) == 1, f"{_PROTECTION_SCRIPT.name} no longer has one {_BYPASS_ANCHOR!r}"
+    return text.replace(_BYPASS_ANCHOR, _BYPASS_ANCHOR + plant)
+
+
+@pytest.mark.parametrize("bypass", _BYPASSES)
+def test_each_known_bypass_fails_the_protection_script_check(bypass: str) -> None:
+    plant, failure = _BYPASSES[bypass]
+    with pytest.raises(AssertionError, match=re.escape(failure)):
+        _check_protection_script(_planted(plant))
+
+
+def _run_with_stub_gh(tmp_path: Path, text: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    """Run `text` under real bash with a PATH that holds ONLY a stand-in `gh`, which records its
+    arguments and answers the visibility query with `public`, plus `cat`, `bash` and `python3`
+    (the bypasses above need the last two). The real `gh` is not on that PATH, the environment
+    holds no token, and HOME is the test's own temporary directory."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "gh-calls.jsonl"
+    stub = bindir / "gh"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['GH_STUB_LOG'], 'a', encoding='utf-8') as f:\n"
+        "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if '.visibility' in sys.argv[1:]:\n"
+        "    print('public')\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    for tool in ("bash", "cat"):
+        found = shutil.which(tool)
+        assert found, f"`{tool}` is not installed; this test runs the script under it"
+        (bindir / tool).symlink_to(found)
+    (bindir / "python3").symlink_to(sys.executable)
+    assert shutil.which("gh", path=str(bindir)) == str(stub), "the stand-in gh is not the one on PATH"
+    script = tmp_path / _PROTECTION_SCRIPT.name
+    script.write_text(text, encoding="utf-8")
+    env = {"PATH": str(bindir), "HOME": str(tmp_path), "GH_STUB_LOG": str(log), "LC_ALL": "C.UTF-8"}
+    proc = subprocess.run(
+        [str(bindir / "bash"), str(script)], env=env, capture_output=True, text=True, timeout=60, check=False
+    )
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return proc, calls
+
+
+def test_under_bash_the_script_calls_gh_exactly_as_reviewed(tmp_path: Path) -> None:
+    """The honest path, and the check above measured against a real shell. The script runs to the
+    end, and the calls bash makes are `_REVIEWED_GH_API_CALLS` with `${REPO}` and `${BRANCH}`
+    expanded, argument for argument. A call the text check cannot see (see its WHAT IT CANNOT SEE)
+    still fails here, if it is on the path this run takes."""
+    proc, calls = _run_with_stub_gh(tmp_path, _PROTECTION_SCRIPT.read_text(encoding="utf-8"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    expanded = [
+        ["api", *(w.replace("${REPO}", "MudwoodLabs/pyrxd").replace("${BRANCH}", "main") for w in call)]
+        for call in _REVIEWED_GH_API_CALLS
+    ]
+    assert calls == expanded, f"under bash the script called gh as: {calls}"
+
+
+@pytest.mark.parametrize("bypass", _BYPASSES)
+def test_each_known_bypass_really_runs_the_delete_under_bash(tmp_path: Path, bypass: str) -> None:
+    """A plant that bash would not run proves nothing about the check, so each one is run: the
+    DELETE must reach the stand-in `gh`."""
+    proc, calls = _run_with_stub_gh(tmp_path, _planted(_BYPASSES[bypass][0]))
+    delete = _DELETE_ENFORCE_ADMINS_LITERAL.split()[1:]
+    assert delete in calls, f"bash did not run the DELETE (exit {proc.returncode}): {calls}\n{proc.stderr}"
+
+
+def test_a_call_assembled_at_run_time_passes_the_text_check_and_is_caught_under_bash(tmp_path: Path) -> None:
+    """Both halves of WHAT IT CANNOT SEE, executed. The text check passes `_ASSEMBLED_AT_RUN_TIME`;
+    if it starts failing it, the check has closed this gap, so move the plant into `_BYPASSES`
+    and correct that docstring. Under bash the DELETE runs, and the honest-path comparison above
+    would not match the calls."""
+    text = _planted(_ASSEMBLED_AT_RUN_TIME)
+    _check_protection_script(text)
+    proc, calls = _run_with_stub_gh(tmp_path, text)
+    assert _DELETE_ENFORCE_ADMINS_LITERAL.split()[1:] in calls, f"bash did not run the DELETE: {calls}\n{proc.stderr}"
+    assert len(calls) == len(_REVIEWED_GH_API_CALLS) + 1, calls
+
+
 def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:
     """The release runbook merged with `gh pr merge ... --admin`. That flag merges a PR that fails
     ANY requirement, required checks included, and with `enforce_admins` on it no longer works at
@@ -505,8 +791,6 @@ def test_no_doc_or_script_tells_anyone_to_admin_merge() -> None:
     CHANGELOG and the tests is read; backslash-continued command lines are joined first, so the
     flag cannot hide on the next line. The runbook's own (flagless) merge command must be SEEN,
     so a scan that read nothing cannot pass."""
-    import subprocess
-
     listed = subprocess.run(["git", "ls-files", "-z"], cwd=_ROOT, capture_output=True, check=True).stdout
     paths = [p for p in listed.decode().split("\0") if p and p != "CHANGELOG.md" and not p.startswith("tests/")]
     merge = re.compile(r"\bgh\s+pr\s+merge\b[^\n]*")
@@ -541,8 +825,6 @@ def test_no_doc_or_script_tells_anyone_to_publish_from_a_laptop() -> None:
     A laptop publish skips all three. The same file walk as the test above; the one legitimate
     publisher, `publish.yml`, uses the PyPA action rather than any of these commands. A known-bad
     line is matched first, so a matcher that finds nothing cannot pass."""
-    import subprocess
-
     assert _LOCAL_PUBLISH_COMMAND.search("     poetry build && poetry publish\n"), "the matcher misses the known case"
     assert not _LOCAL_PUBLISH_COMMAND.search("the attestations. `poetry publish` from a laptop would skip them\n")
     listed = subprocess.run(["git", "ls-files", "-z"], cwd=_ROOT, capture_output=True, check=True).stdout
