@@ -141,8 +141,8 @@ class TestTheHonestNeighbours:
 
     @pytest.mark.parametrize("surface", ["cli", "page"])
     def test_the_mainnet_dat_reveal_says_its_payload_mints_nothing(self, surface) -> None:
-        """One payload, no token: no count, and the headline says it mints nothing — which for a
-        DAT is simply true."""
+        """One payload, no token: no count, and the headline says it mints nothing — which for
+        this DAT reveal, whose outputs are P2PKH, is simply true."""
         payload = _classify(*_mainnet("dat_65_byte_commit_mainnet.json", "reveal"))
         assert "of_n_payloads" not in payload["metadata"] and payload["metadata"]["mints"] is False
         text = _cli(payload) if surface == "cli" else _page(payload)

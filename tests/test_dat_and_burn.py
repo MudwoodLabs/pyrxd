@@ -57,7 +57,7 @@ BASE = GlyphRef(txid="b2" * 32, vout=2)
 
 
 def test_dat_commit_is_70_bytes_and_has_no_reftype_block():
-    """The missing OP_REFTYPE_OUTPUT block is what makes the reveal mint nothing."""
+    """The missing OP_REFTYPE_OUTPUT block is why the reveal is not obliged to mint."""
     dat = build_dat_commit_locking_script(HASH, PKH)
     assert len(dat) == DAT_COMMIT_SCRIPT_SIZE == 70
     # The NFT/FT commits carry `da <OP_N> 9d` (OP_REFTYPE_OUTPUT ... VERIFY).
@@ -100,7 +100,7 @@ def test_both_suffixes_share_one_push_ladder():
 def test_the_reveal_parser_reads_a_dat_payload():
     """Regression: `items[i + 1]` after `gly` is the DAT MARKER, not the payload.
 
-    A DAT reveal has no token output, so the payload is the entire content. The
+    A DAT commit demands no token output, so the payload is the content. The
     parser returning None meant a DAT glyph pyrxd minted was unreadable by
     pyrxd, and the regtest suite is what surfaced it.
     """
@@ -136,7 +136,7 @@ def test_the_builder_refuses_a_dat_commit_for_non_dat_metadata():
 
 
 def test_a_dat_reveal_returns_no_locking_script():
-    """It mints nothing; handing back a token script would be a lie about that."""
+    """Its commit demands no token; handing back a token script would say it did."""
     builder = GlyphBuilder()
     cbor_bytes, _h = encode_payload(GlyphMetadata(protocol=[GlyphProtocol.DAT], name="blob"))
     # None, not b"": an empty scriptPubKey is a VALID anyone-can-spend script,
@@ -289,7 +289,7 @@ def test_the_inspector_names_both_shapes_and_qualifies_the_burn_claim():
     dat = _inspect_script(build_dat_commit_locking_script(HASH, PKH).hex())
     assert dat["type"] == "commit-dat"
     assert dat["payload_hash"] == HASH.hex() and dat["owner_pkh"] == bytes(PKH).hex()
-    assert "creates no token" in dat["note"]
+    assert "demands no token" in dat["note"] and "nor prevents one" in dat["note"]
 
     burn = _inspect_script(build_burn_proof_script(TOKEN, amount=7).hex())
     assert burn["type"] == "op_return-burn"

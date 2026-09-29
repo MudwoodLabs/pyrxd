@@ -43,6 +43,7 @@ Targets:
        — ``parse_delegate_{base,burn}_script``,
        ``split_delegate_commit_prefix``,
        ``parse_authority_gated_script``, ``parse_dat_commit_script``,
+       ``parse_dat_gly_only_commit_script``,
        ``parse_burn_proof`` (all return a value or ``None``, never raise),
        plus the verdict functions ``verify_burn`` /
        ``verify_relationship_claims`` / ``delegate_burn_refs`` /
@@ -100,6 +101,7 @@ from pyrxd.glyph.script import (
     iter_input_refs,
     parse_authority_gated_script,
     parse_dat_commit_script,
+    parse_dat_gly_only_commit_script,
     parse_delegate_base_script,
     parse_delegate_burn_script,
     parse_mutable_nft_script,
@@ -795,6 +797,8 @@ def _real_shapes() -> list[bytes]:
         build_commit_locking_script(payload_hash, pkh, is_nft=False, delegate_ref=b),
         build_dat_commit_locking_script(payload_hash, pkh),
         build_dat_commit_locking_script(payload_hash, pkh, delegate_ref=a),
+        # The 65-byte hash-lock commit (#751). No builder emits it, so it is spelled out.
+        b"\xaa\x20" + payload_hash + b"\x88\x03gly\x88\x76\xa9\x14" + bytes(pkh) + b"\x88\xac",
         build_authority_gated_nft_script(pkh, a, b),
         build_nft_locking_script(pkh, a),
         build_burn_proof_script(a, amount=7, burn_reason="x" * 40),
@@ -832,6 +836,7 @@ def test_new_shape_parsers_never_raise(data):
         ("parse_delegate_burn_script", parse_delegate_burn_script),
         ("parse_authority_gated_script", parse_authority_gated_script),
         ("parse_dat_commit_script", parse_dat_commit_script),
+        ("parse_dat_gly_only_commit_script", parse_dat_gly_only_commit_script),
         ("parse_burn_proof", parse_burn_proof),
         ("split_delegate_commit_prefix", split_delegate_commit_prefix),
     ):

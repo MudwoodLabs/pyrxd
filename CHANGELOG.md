@@ -29,6 +29,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded.
 ### Fixed
 
+- **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
+  `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
+  by neither pyrxd nor Photonic; both DAT reveals sampled in the 0.25.0 review spent this form. A
+  reveal spending it read `not-a-commit`, which undersold a real commitment: the script forces the
+  spender to push a payload whose hash256 is `h`, and checks no ref. It is now read from those
+  semantics: the reveal's payload binding is `bound-no-token` (or `mismatch` for another payload),
+  and the script itself classifies as `commit-dat`. Nothing in the script says DAT. It is filed
+  with the DAT commits because it has the same obligation, and its `note` and binding reason say
+  so. Only the exact bare 65-byte form is recognised.
+
+- **`bound-no-token` no longer says the payload "describes no output" of a reveal that mints.**
+  A commit that demands no token, the 70-byte DAT commit or the 65-byte form, does not prevent
+  one either: its reveal can still create the commit's outpoint as a ref. The reason used to say
+  "A DAT commit creates no token, so this payload describes no output of this transaction",
+  whatever the outputs held. It now says the commit demands no token, and then either that no
+  output carries its outpoint, which is the only case where it says the payload describes no
+  output, or which outputs do. The CLI and the /inspect/ page print this reason. The `commit-dat`
+  note now says "demands no token of its reveal, nor prevents one" instead of "creates no token".
+
 - **An outpoint's output index must be ASCII digits (#746).** `glyph inspect` and the
   `/inspect/` and `/verify/` pages read `<txid>:1_0` as output 10 and accepted ` 1`, `+1` and
   non-ASCII digits, through Python's `int()`. The index must now be ASCII `0`-`9`.
@@ -153,6 +172,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     The same document cited the `require_measured` refusal and
     `measure_margin_from_btc_block_times` at lines that had moved, and now writes
     `NegotiatedTerms.to_dict` where a bare `to_dict` could equally have meant `SwapRecord`'s.
+- Doc citations into `glyph/script.py` and `glyph/_inspect_core.py` re-pointed at the code they
+  name, after the 65-byte DAT change moved it. Several in the Glyph protocol spec had already
+  drifted before this change: the 63-byte NFT script, the FT script, the payload hash and the
+  mutable NFT size.
+- `tests/test_doc_citations_resolve.py` reads a bare `` `:N` `` citation against the file named
+  before it on the same line, or earlier in the same paragraph (a table row does not inherit from
+  the row above). Those citations were invisible to it before. A bare citation is held to the same
+  checks as any other, including the symbol rule above when a code name is written beside it.
+  When this check was first written, with a symbol check of its own that the symbol rule above
+  replaces, the two found 13 drifted citations, including some in
+  `docs/htlc-handshake-wire-format.md`, `docs/security-audit-scope.md` and a how-to. All 13 are
+  re-cited. Other line citations in `docs/htlc-handshake-wire-format.md` name no file on their
+  table row, or no symbol, so these checks cannot see them, and they were not re-derived here.
 
 ## [0.25.0] — 2026-09-26
 

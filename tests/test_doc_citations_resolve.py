@@ -18,8 +18,9 @@ is what keeps them repaired.
 
 What this test proves
 ---------------------
-For every citation naming a file this repo contains: the file exists, the cited
-line numbers are within it, and they are not blank. And for every citation
+For every citation naming a file this repo contains, including a bare ``:N``
+that follows one: the file exists, the cited line numbers are within it, and
+they are not blank. And for every citation
 written NEXT TO A CODE NAME, that the cited lines are that name's (the symbol
 rule, below).
 
@@ -106,9 +107,8 @@ than a new line number: ``pre_btc_lock_gate`` is not a function in pyrxd, and
 Glyph spec §16.4 described a ``COMMIT_SCRIPT_RE`` that 0.25.0 had changed.
 
 What the symbol rule cannot see: a citation with no name beside it; a citation
-for a list of names; a continuation citation with no file
-(```REF_OPCODES` (`:1075`)``), whose file is whichever one the prose last named;
-a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a
+for a list of names; a bare ``:N`` citation with no file named before it (see
+below); a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a
 citation that drifted WITHIN its definition (a line of a long function that now
 lands on a different line of the same function); a C++ citation that lands on a
 call rather than the definition, since the occurrence rule accepts both; a real
@@ -118,6 +118,25 @@ which is not held to the out-of-scope inventory below. A cited Python file that
 does not parse on the running interpreter is reported, not passed. In the other direction, it refuses a citation that deliberately points at
 a USE of a name the same Python file defines: cite the definition, or write the
 citation so it does not sit directly beside the name.
+
+Bare ``:N`` citations
+---------------------
+A doc often cites a second line of the same file as a bare ``:N`` in backticks
+(``iter_input_refs`` (``script.py:1144-1166``) over ``REF_OPCODES`` (``:1099``)).
+``_CITE_RE`` needs a file name, so those were invisible to this test: two in the
+Glyph spec had drifted off their code when #773 was reviewed. A bare ``:N`` reads
+the file most recently NAMED before it (in backticks, with or without a line) on
+the same line, or else earlier in the same paragraph; a table row does not
+inherit from the row above it, whose file is usually a column's, not a row's. A
+bare ``:N`` with no file named before it is not checked. Once attributed, a bare
+citation is an ordinary one: the blank-line gate reads it, and so does the
+symbol rule when a code name is written beside it.
+
+Measured when bare citations were first read (#773, with a symbol check of its
+own that the symbol rule above has replaced), on the docs as they stood then: 39
+bare citations, 23 attributed and 16 not (table rows that name no file, all in
+``docs/htlc-handshake-wire-format.md``). Those checks found 13 citations the
+name-and-line check had passed or could not see; all were re-cited in #773.
 
 Resolution, and why bare ``file.py:N`` is checked too
 -----------------------------------------------------
@@ -186,6 +205,16 @@ _PRUNED_DIRS = (_ROOT / "docs" / "_build",)
 #: missing file. The extension must start with a letter so a bare IPv4 address
 #: (``127.0.0.1:7332``) is not read as a citation to a file called ``0.1``.
 _CITE_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.([A-Za-z][A-Za-z0-9]*)):(\d+)(?:-(\d+))?")
+
+#: A file NAMED in backticks, with or without a line: what a later bare ``:N`` reads as its file.
+#: ``adapters.py`` counts although it carries no line — ``adapters.py`` a ... (``:142``) means
+#: adapters.py, not whichever file was last cited WITH a line.
+_FILE_MENTION_RE = re.compile(
+    r"`((?:[A-Za-z0-9_][A-Za-z0-9_./-]*/)?[A-Za-z0-9_][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9]*)(?::\d+(?:-\d+)?(?:,\s*\d+)*)?`"
+)
+
+#: A bare continuation citation, ``:N`` or ``:N-M`` alone in backticks. It names no file.
+_BARE_RE = re.compile(r"`:(\d+)(?:-(\d+))?`")
 
 #: Citations that name a file this repository does not contain, with why.
 #:
@@ -262,6 +291,10 @@ _OUT_OF_SCOPE: dict[str, str] = {
 _MIN_DOCS = 50
 _MIN_CITATIONS = 200
 _MIN_RESOLVED = 180
+#: Measured: 22 bare citations attributed to a file this repo has when #773 first read them, and
+#: 56 when it was reconciled with #766 (847 citations in all by then).
+#: A floor, for the same reason as the three above.
+_MIN_BARE_RESOLVED = 15
 
 
 @dataclass(frozen=True)
@@ -277,6 +310,8 @@ class Citation:
     #: The code name written next to this citation, when it is written in one of the forms
     #: ``symbol_named_by`` recognises. ``None`` for a citation that names no symbol.
     symbol: str | None = None
+    #: Written as a bare ``:N``; ``target`` is the file named before it (see the module docstring).
+    bare: bool = False
 
     @property
     def where(self) -> str:
@@ -420,6 +455,52 @@ def citations_in(doc: str, text: str) -> list[Citation]:
                 symbol=symbol_named_by(text, match.start(), match.end()),
             )
         )
+    found.extend(_bare_citations_in(doc, text))
+    return sorted(found, key=lambda c: c.doc_line)
+
+
+def _bare_citations_in(doc: str, text: str) -> list[Citation]:
+    """Every bare ``:N`` in *text* that a file named before it attributes (module docstring).
+
+    The file is the one last named on the same line, or else earlier in the same paragraph; a
+    table row does not inherit from the row above. The symbol beside it is read by
+    ``symbol_named_by`` over the whole text, as for any other citation.
+    """
+    found: list[Citation] = []
+    paragraph: str | None = None  # the file last named in this paragraph (not in a table)
+    offset = 0  # where this line starts in *text*
+    for lineno, line in enumerate(text.split("\n"), 1):
+        is_row = line.lstrip().startswith("|")
+        if not line.strip() or is_row:
+            paragraph = None
+        on_line: str | None = None  # the file last named earlier on this line
+        events = sorted(
+            [(m.start(), 0, "named", m) for m in _FILE_MENTION_RE.finditer(line)]
+            + [(m.start(), 1, "full", m) for m in _CITE_RE.finditer(line)]
+            + [(m.start(), 1, "bare", m) for m in _BARE_RE.finditer(line)],
+            key=lambda e: (e[0], e[1]),
+        )
+        for _, _, kind, match in events:
+            if kind != "bare":
+                on_line = paragraph = match.group(1)
+                continue
+            named = on_line or (None if is_row else paragraph)
+            if named is None:
+                continue  # nothing names its file; see the module docstring
+            found.append(
+                Citation(
+                    doc=doc,
+                    doc_line=lineno,
+                    text=f"{match.group(0).strip('`')} (read as {named})",
+                    target=named,
+                    start=int(match.group(1)),
+                    end=int(match.group(2)) if match.group(2) else None,
+                    # Inside the backticks, as symbol_named_by expects of a citation.
+                    symbol=symbol_named_by(text, offset + match.start() + 1, offset + match.end() - 1),
+                    bare=True,
+                )
+            )
+        offset += len(line) + 1
     return found
 
 
@@ -858,6 +939,11 @@ def test_the_scan_is_not_vacuous(scan) -> None:
         "the real check below runs over nothing."
     )
     assert resolved, "no citation resolved to any file at all"
+    bare = sum(1 for cit in cits if cit.bare and cit not in unresolved)
+    assert bare >= _MIN_BARE_RESOLVED, (
+        f"only {bare} bare `:N` citations were attributed to a file this repo has — check "
+        "_BARE_RE and _FILE_MENTION_RE; an attribution rule that finds nothing passes silently."
+    )
 
 
 def test_the_excluded_dated_subtrees_still_exist() -> None:
@@ -987,6 +1073,32 @@ class TestTheCheckerFires:
         suffixes = _suffix_index(["src/pyrxd/glyph/script.py"])
         assert _candidates("src/pyrxd/glyph/gone.py", suffixes, {}) == []
         assert _candidates("src/pyrxd/glyph/script.py", suffixes, {}) == ["src/pyrxd/glyph/script.py"]
+
+    def test_a_bare_citation_reads_the_file_named_before_it(self) -> None:
+        text = (
+            "`script.py:12` over `REF_OPCODES` (`:99`), and\n"  # on the same line
+            "`adapters.py` holds `Source` (`:7`)\n"  # named without a line
+            "then `:8` on the next line of the paragraph\n"
+            "\n"
+            "a new paragraph `:9`\n"  # nothing named: not attributed
+            "| `swap.py:1` | row |\n"
+            "| `:2` | the next row |\n"  # a row does not inherit from the row above
+        )
+        got = [(c.doc_line, c.target, c.start, c.symbol) for c in citations_in("d.md", text) if c.bare]
+        assert got == [
+            (1, "script.py", 99, "REF_OPCODES"),
+            (2, "adapters.py", 7, "Source"),
+            (3, "adapters.py", 8, None),
+        ]
+
+    def test_a_bare_citation_is_held_to_the_blank_line_check(self) -> None:
+        """The #773 shape: a bare ``:N`` that drifted onto a blank line, invisible before."""
+        (cit,) = [c for c in citations_in("d.md", "`a.py:1` and then (`:2`)") if c.bare]
+        assert (cit.target, cit.start) == ("a.py", 2)
+        problem = check_citation(cit, ["a.py"], ["x = 1", "", "y = 2"])
+        assert problem is not None and "BLANK line 2" in problem
+        (honest,) = [c for c in citations_in("d.md", "`a.py:1` and then (`:3`)") if c.bare]
+        assert check_citation(honest, ["a.py"], ["x = 1", "", "y = 2"]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1503,18 @@ class TestTheSymbolRule:
         rule, problem = check_symbol(cit, path, source)
         assert rule == "definition"
         assert problem is not None and f"line(s) {real.first}-{real.last}," in problem
+
+    def test_a_bare_citation_beside_a_name_is_held_to_the_symbol_rule(self) -> None:
+        """The #773 shape: ``REF_OPCODES`` (``:1075``), a bare citation on a real, non-blank
+        line of the wrong code. Read against the file named before it, then refused, with the
+        honest citation of the same name accepted."""
+        (cit,) = [c for c in citations_in("d.md", "`a.py:1`. Then `CONSTANT` (`:10`)") if c.bare]
+        assert (cit.target, cit.start, cit.symbol) == ("a.py", 10, "CONSTANT")
+        assert check_citation(cit, ["a.py"], self._SOURCE.splitlines()) is None, "the premise: line 10 is not blank"
+        rule, problem = check_symbol(cit, "a.py", self._SOURCE)
+        assert rule == "definition" and problem is not None and "defines it at line(s) 4," in problem
+        (honest,) = [c for c in citations_in("d.md", "`a.py:1`. Then `CONSTANT` (`:4`)") if c.bare]
+        assert check_symbol(honest, "a.py", self._SOURCE) == ("definition", None)
 
 
 # ---------------------------------------------------------------------------
