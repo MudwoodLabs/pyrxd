@@ -61,20 +61,29 @@ checked mechanically. ``symbol_named_by`` reads exactly these forms, with
 * ```CITE` (`name` …)``;
 * ```CITE name``` (the name inside the citation's own backticks).
 
-``name`` is an identifier, optionally dotted (``Class.method``) or written with
-``()``. A name that ends or starts a LIST of names (```a`, `b` and `c` (`CITE`)``)
-is not taken, because the citation then speaks for the list; a backticked file
-name (``htlc_spend.py``) is not a symbol. ``check_symbol`` then applies one of
-two rules. If the cited file is Python and defines the name (``def``, ``class``,
-or a module- or class-level assignment, found with ``ast``), the cited lines must
-overlap that definition. Otherwise (the vendored C++, or a name the file only
+``name`` is an identifier, optionally dotted (``Class.method``,
+``pyrxd.glyph.script.iter_input_refs``) or written with ``()``. A name that ends
+or starts a LIST of names (```a`, `b` and `c` (`CITE`)``) is not taken, because
+the citation then speaks for the list; nor is a Python keyword (``None``), a
+backticked file name (``htlc_spend.py``), or, in the ```CITE name``` form, a plain
+lowercase word (```x.py:14 onwards```). ``check_symbol`` then applies one of two
+rules. If the cited file is Python and defines the name (``def``, ``class``, or a
+module- or class-level assignment, found with ``ast``; a leading module path is
+dropped first), the cited lines must lie inside that definition or contain it
+whole, and a bare name the file defines in several places (``to_dict`` on two
+classes) must be qualified. Otherwise (the vendored C++, or a name the file only
 uses) the name must appear in the cited lines.
 
-"Overlap", not "the ``def`` line is cited", because the docs deliberately cite
-lines inside a definition: ``holder_hash``'s ``rxd`` branch, the field lines of
-``BtcHtlcLocator``. Measured on the docs as they stood when this rule was added,
+"Inside or whole", not "the ``def`` line is cited", because the docs deliberately
+cite lines inside a definition: ``holder_hash``'s ``rxd`` branch, the field lines
+of ``BtcHtlcLocator``. Measured on the docs as they stood when this rule was added,
 requiring the ``def`` line would have refused 5 such citations, each of which
-lands on the lines its sentence describes.
+lands on the lines its sentence describes. Not mere overlap either: a range that
+straddles one edge of a definition is what a range looks like after the code
+moved under it (``iter_input_refs`` at ``:1100-1120`` or ``:1142-1172``, when it is
+defined at 1120-1142), and overlap passed both. Requiring qualification of an
+ambiguous bare name refused one citation in the docs (``to_dict``, meaning
+``NegotiatedTerms.to_dict``); the other two changes refused none.
 
 The list exception exists for the same reason: 3 citations name a list, and one
 of them (``WAVE_TREASURY_ADDRESS_DEFAULT`` and ``wave_name_price``, cited at
@@ -99,11 +108,14 @@ Glyph spec §16.4 described a ``COMMIT_SCRIPT_RE`` that 0.25.0 had changed.
 What the symbol rule cannot see: a citation with no name beside it; a citation
 for a list of names; a continuation citation with no file
 (```REF_OPCODES` (`:1075`)``), whose file is whichever one the prose last named;
-a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a C++
-citation that lands on a call rather than the definition, since the occurrence
-rule accepts both; and a symbol citation in ``docs/solutions/`` naming a file
-this repo does not contain, which is not held to the out-of-scope inventory
-below. In the other direction, it refuses a citation that deliberately points at
+a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a
+citation that drifted WITHIN its definition (a line of a long function that now
+lands on a different line of the same function); a C++ citation that lands on a
+call rather than the definition, since the occurrence rule accepts both; a real
+all-lowercase function name written as ```x.py:14 check```, read as prose; and a
+symbol citation in ``docs/solutions/`` naming a file this repo does not contain,
+which is not held to the out-of-scope inventory below. A cited Python file that
+does not parse on the running interpreter is reported, not passed. In the other direction, it refuses a citation that deliberately points at
 a USE of a name the same Python file defines: cite the definition, or write the
 citation so it does not sit directly beside the name.
 
@@ -138,6 +150,7 @@ from __future__ import annotations
 import ast
 import functools
 import json
+import keyword
 import re
 import subprocess
 from dataclasses import dataclass
@@ -506,7 +519,7 @@ def symbol_named_by(text: str, start: int, end: int) -> str | None:
     after = text[end : end + _WINDOW]
     within = _CITE_WITH_NAME.match(after)
     if within:
-        return within.group("name")
+        return _code_name(within.group("name"), within.group(0).strip(" \t`"))
     if not after.startswith("`"):
         return None  # the citation shares its backticks with something other than a name
     before = text[max(0, start - _WINDOW) : start]
@@ -515,13 +528,29 @@ def symbol_named_by(text: str, start: int, end: int) -> str | None:
         name_at = start - len(before) + first.start()
         if _LIST_BEFORE.search(text[max(0, name_at - _WINDOW) : name_at]):
             return None
-        return first.group("name")
+        return _code_name(first.group("name"))
     second = _CITE_THEN_NAME.match(after)
     if second:
         if _LIST_AFTER.match(after[second.end() :]):
             return None
-        return second.group("name")
+        return _code_name(second.group("name"))
     return None
+
+
+def _code_name(name: str, written: str | None = None) -> str | None:
+    """*name*, unless it is a Python keyword (```CITE` (`None` if …)`` names no symbol).
+
+    *written* is given for the ```CITE name``` form, where the name shares the citation's
+    backticks with no punctuation to mark it as code. There a plain lowercase word
+    (```x.py:14 onwards```) is prose, so only a name that LOOKS like code is taken: one with
+    an underscore, a dot, a capital, a digit or ``()``. A real function called ``check``
+    written that way is therefore not checked; written in any other form, it is.
+    """
+    if keyword.iskeyword(name.split(".")[0]):
+        return None
+    if written is not None and not re.search(r"[_.A-Z0-9(]", written):
+        return None
+    return name
 
 
 @dataclass(frozen=True)
@@ -541,9 +570,15 @@ def python_definitions(source: str) -> tuple[Definition, ...]:
     Qualified by the classes and functions around them, so ``NegotiatedTerms.to_dict`` and
     ``SwapRecord.to_dict`` stay apart. An ``import`` is deliberately NOT a definition: a
     citation to a module that merely uses an imported name is held to the occurrence rule,
-    not told that the name "is defined" at its import line.
+    not told that the name "is defined" at its import line. The exception is an import of a
+    name the same scope ALSO assigns (``try: from x import y`` / ``except ImportError: y =
+    None``): the import is then one of the name's bindings, and a citation of it is correct.
+
+    Raises ``SyntaxError`` when *source* does not parse on the running Python; ``check_symbol``
+    reports that rather than letting it pass or crash the scan.
     """
     out: list[Definition] = []
+    imported: list[Definition] = []
 
     def visit(node: ast.AST, prefix: str, in_function: bool) -> None:
         for child in ast.iter_child_nodes(node):
@@ -552,6 +587,13 @@ def python_definitions(source: str) -> tuple[Definition, ...]:
                 out.append(Definition(prefix + child.name, first, child.end_lineno or child.lineno))
                 is_function = not isinstance(child, ast.ClassDef)
                 visit(child, f"{prefix}{child.name}.", in_function or is_function)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                if in_function:
+                    continue
+                for alias in child.names:
+                    if alias.name != "*":
+                        bound = alias.asname or alias.name.split(".")[0]
+                        imported.append(Definition(prefix + bound, child.lineno, child.end_lineno or child.lineno))
             elif isinstance(child, (ast.Assign, ast.AnnAssign)):
                 if in_function:
                     continue
@@ -564,7 +606,32 @@ def python_definitions(source: str) -> tuple[Definition, ...]:
                 visit(child, prefix, in_function)
 
     visit(ast.parse(source), "", False)
+    assigned = {d.qualname for d in out}
+    out.extend(d for d in imported if d.qualname in assigned)
     return tuple(out)
+
+
+def _without_module_prefix(parts: list[str], path: str) -> list[str]:
+    """*parts* with a leading module path dropped: ``pyrxd.glyph.script.iter_input_refs``,
+    cited in ``src/pyrxd/glyph/script.py``, is ``iter_input_refs``.
+
+    Only a prefix that is a contiguous run of *path*'s own components is dropped (so
+    ``pyrxd.glyph``, the re-export path, is too), and at least one part is always kept. A
+    prefix that names anything else (``Wrong.method``) is left alone, and the name is then held
+    to whichever rule its full spelling reaches.
+    """
+    module = path.removesuffix(".py").split("/")
+    if module[-1] == "__init__":
+        module = module[:-1]
+    for k in range(len(parts) - 1, 0, -1):
+        if any(module[i : i + k] == parts[:k] for i in range(len(module) - k + 1)):
+            return parts[k:]
+    return parts
+
+
+def _lands_on(d: Definition, first: int, last: int) -> bool:
+    """The cited lines are inside the definition, or the definition is inside the cited lines."""
+    return (d.first <= first and last <= d.last) or (first <= d.first and d.last <= last)
 
 
 def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None]:
@@ -573,14 +640,24 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
     ``rule`` is which of the two applied:
 
     * ``"definition"`` — *path* is Python and defines the name (see ``python_definitions``;
-      a dotted name must match the trailing parts of the qualified name). The cited lines
-      must overlap one of those definitions, decorators through last line. Overlap rather
-      than "the ``def`` line is cited" because the docs deliberately cite a branch inside a
-      function (``holder_hash``'s ``rxd`` branch), and that is a correct citation.
+      a dotted name must match the trailing parts of the qualified name, after any leading
+      module path is dropped, see ``_without_module_prefix``). If the name matches more than
+      one qualified name (bare ``to_dict``, with ``NegotiatedTerms.to_dict`` and
+      ``SwapRecord.to_dict`` both defined) and none of them exactly, the citation is refused
+      as ambiguous: which one the doc meant cannot be known, the same stance as a bare file
+      name two files share. Otherwise the cited lines must lie inside one of the definitions
+      (decorators through last line), or contain one whole. Inside, because the docs
+      deliberately cite a branch inside a function (``holder_hash``'s ``rxd`` branch); whole,
+      because a range may cite a definition with its surroundings. A range that only
+      straddles an edge, starting before a definition and ending inside it or the reverse,
+      is how a range looks after the code moved under it, so it is refused.
     * ``"occurrence"`` — *path* is not Python (the vendored C++), or does not define the
       name (a dict key, a string value, an imported name). The name's last part must then
       appear as a whole word in the cited lines. This is weaker: it cannot tell a C++
       definition from a call.
+    * ``"unparsed"`` — *path* is Python that does not parse on the running interpreter (newer
+      syntax than it knows), so where it defines the name is unknown. Always a problem: an
+      unverifiable citation is reported, not passed.
 
     Split out from the scan so both rules can be exercised against synthetic inputs.
     """
@@ -588,11 +665,37 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
     first, last = cit.start, cit.end if cit.end is not None else cit.start
     parts = cit.symbol.split(".")
     if path.endswith(".py"):
-        defined = [d for d in python_definitions(source) if d.qualname.split(".")[-len(parts) :] == parts]
+        try:
+            definitions = python_definitions(source)
+        except (SyntaxError, ValueError) as exc:
+            return "unparsed", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` cannot be checked: {path} does not parse "
+                f"on this Python ({exc}). Run this test on a Python that parses it."
+            )
+
+        def matching(name: list[str]) -> list[Definition]:
+            return [d for d in definitions if d.qualname.split(".")[-len(name) :] == name]
+
+        defined = matching(parts)
+        if not defined:
+            parts = _without_module_prefix(parts, path)
+            defined = matching(parts)
+        exact = [d for d in defined if d.qualname == ".".join(parts)]
+        defined = exact or defined
+        qualnames = sorted({d.qualname for d in defined})
+        if len(qualnames) > 1:
+            return "definition", (
+                f"{cit.where}: `{cit.symbol}` at `{cit.text}` is ambiguous — {path} defines "
+                f"{', '.join(qualnames)}. Write the qualified name, so the citation can be checked "
+                "against the one it means."
+            )
         if defined:
-            if any(d.first <= last and first <= d.last for d in defined):
+            if any(_lands_on(d, first, last) for d in defined):
                 return "definition", None
-            spans = ", ".join(str(d.first) if d.first == d.last else f"{d.first}-{d.last}" for d in defined)
+            spans = ", ".join(
+                str(d.first) if d.first == d.last else f"{d.first}-{d.last}"
+                for d in sorted(defined, key=lambda d: d.first)
+            )
             return "definition", (
                 f"{cit.where}: `{cit.symbol}` is cited at `{cit.text}`, but {path} defines it at "
                 f"line(s) {spans}, and the cited lines are not inside it. Re-cite it where it is."
@@ -933,6 +1036,11 @@ class TestTheSymbolRule:
             "class Other:",  # 23
             "    def method(self):",  # 24
             "        return imported_name",  # 25
+            "",  # 26
+            "try:",  # 27
+            "    from y import fallback_name",  # 28
+            "except ImportError:",  # 29
+            "    fallback_name = None",  # 30
             "",
         ]
     )
@@ -954,6 +1062,9 @@ class TestTheSymbolRule:
             ("(`failover.py:12 _holds_tx`)", "_holds_tx"),
             ("`build()` (`proof.py:12`)", "build"),
             ("`NegotiatedTerms.__post_init__` (`swap_state.py:12`)", "NegotiatedTerms.__post_init__"),
+            ("(`x.py:12 Foo`)", "Foo"),
+            ("(`x.py:12 build()`)", "build"),
+            ("`x.py:12` (`none_left` if absent)", "none_left"),
             ("the shared `REF_OPCODES`\n(`glyph/script.py:12`), locked", "REF_OPCODES"),
             ("`foo` resolves and `bar` (`x.py:12`)", "bar"),
         ],
@@ -975,6 +1086,9 @@ class TestTheSymbolRule:
             "`a` x.py:12",
             "`a = 1` (`x.py:12`)",
             "`x.py:12 and more`",
+            "`x.py:14 onwards`",  # a word after the line number is prose, not a name
+            "`x.py:12` (`None` if absent)",  # a keyword is not a symbol
+            "`True` (`x.py:12`)",
         ],
     )
     def test_a_citation_with_no_single_named_subject_names_none(self, text: str) -> None:
@@ -1003,8 +1117,12 @@ class TestTheSymbolRule:
             ("Outer.attr", 15, None),
             ("Outer.method", 18, 19),  # a branch inside the method
             ("Other.method", 24, None),
-            ("method", 24, 25),  # a bare name matches either class's method
-            ("decorated", 1, 8),  # a range that only touches the decorator
+            ("Other.method", 24, 25),
+            ("decorated", 8, 11),  # exactly the definition
+            ("decorated", 4, 11),  # a range that holds the whole definition
+            ("Outer", 4, 25),
+            ("fallback_name", 28, None),  # the import is a binding: the same scope assigns it
+            ("fallback_name", 30, None),
         ],
     )
     def test_a_citation_on_its_definition_is_accepted(self, symbol: str, start: int, end: int | None) -> None:
@@ -1018,6 +1136,11 @@ class TestTheSymbolRule:
             ("CONSTANT", 20, None, "4"),  # MENTIONED on the cited line, defined elsewhere
             ("Other.method", 17, 20, "24-25"),  # the other class's method
             ("Outer", 23, 25, "14-20"),
+            ("decorated", 1, 8, "8-11"),  # a drifted range: ends on the decorator
+            ("decorated", 4, 9, "8-11"),  # ends inside the definition
+            ("decorated", 10, 14, "8-11"),  # starts inside, runs past the end
+            ("Outer.method", 15, 18, "17-20"),  # starts before, ends inside
+            ("fallback_name", 25, None, "28, 30"),
         ],
     )
     def test_a_citation_beside_its_definition_is_refused(
@@ -1039,6 +1162,56 @@ class TestTheSymbolRule:
         self, symbol: str, start: int, end: int | None
     ) -> None:
         assert check_symbol(self._cite(symbol, start, end), "a.py", self._SOURCE) == ("occurrence", None)
+
+    def test_a_bare_name_several_things_define_is_refused_as_ambiguous(self) -> None:
+        """Bare ``method`` is ``Outer.method`` and ``Other.method`` here. Landing on either
+        proves nothing about the one the doc meant, so the doc must say which."""
+        for start, end in ((17, 20), (24, 25)):
+            rule, problem = check_symbol(self._cite("method", start, end), "a.py", self._SOURCE)
+            assert rule == "definition"
+            assert problem is not None and "ambiguous" in problem and "Other.method, Outer.method" in problem
+
+    def test_a_bare_name_with_one_exact_definition_is_that_definition(self) -> None:
+        """The honest path beside the ambiguity: an unqualified name that IS a module-level
+        definition means that one, even where a class also has a member of the name."""
+        source = "def run():\n    pass\n\n\nclass C:\n    def run(self):\n        pass\n"
+        assert check_symbol(self._cite("run", 1, 2), "a.py", source) == ("definition", None)
+        rule, problem = check_symbol(self._cite("run", 6, 7), "a.py", source)
+        assert rule == "definition" and problem is not None and "defines it at line(s) 1-2," in problem
+        assert check_symbol(self._cite("C.run", 6, 7), "a.py", source) == ("definition", None)
+
+    @pytest.mark.parametrize(
+        ("symbol", "start", "problem"),
+        [
+            ("pkg.a.decorated", 9, None),
+            ("a.decorated", 10, None),
+            ("pkg.a.Outer.method", 18, None),
+            ("pkg.a.CONSTANT", 4, None),
+            ("pkg.a.CONSTANT", 20, "defines it at line(s) 4,"),  # mentioned on 20, defined on 4
+            ("pkg.a.method", 24, "ambiguous"),
+        ],
+    )
+    def test_a_module_qualified_name_is_held_to_the_definition_rule(
+        self, symbol: str, start: int, problem: str | None
+    ) -> None:
+        rule, found = check_symbol(self._cite(symbol, start), "src/pkg/a.py", self._SOURCE)
+        assert rule == "definition"
+        assert (found is None) if problem is None else (found is not None and problem in found)
+
+    def test_a_prefix_that_is_not_the_module_is_not_dropped(self) -> None:
+        """``Wrong.method`` must not be read as bare ``method``: only the file's own module
+        path is dropped, so a wrong class name gets no help from the definition rule."""
+        assert _without_module_prefix(["Wrong", "method"], "src/pkg/a.py") == ["Wrong", "method"]
+        assert _without_module_prefix(["pkg", "a", "f"], "src/pkg/a.py") == ["f"]
+        assert _without_module_prefix(["pkg", "f"], "src/pkg/__init__.py") == ["f"]
+        assert _without_module_prefix(["a"], "src/pkg/a.py") == ["a"]
+
+    def test_a_file_that_does_not_parse_is_reported_not_passed(self) -> None:
+        """A cited file in syntax newer than the running Python must not crash the scan, and
+        must not pass either: nothing is known about where it defines anything."""
+        rule, problem = check_symbol(self._cite("f", 1), "a.py", "def f(:\n    pass\n")
+        assert rule == "unparsed" and problem is not None and "does not parse" in problem and "d.md:7" in problem
+        assert check_symbol(self._cite("f", 1), "a.py", "def f():\n    pass\n") == ("definition", None)
 
     def test_a_name_the_file_does_not_define_is_refused_where_it_does_not_appear(self) -> None:
         rule, problem = check_symbol(self._cite("local", 4), "a.py", self._SOURCE)

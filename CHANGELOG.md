@@ -25,6 +25,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     function in pyrxd, and cited lines inside an unrelated docstring. It now names the rule,
     `_credential_binding_failure`, and both places that run it: the taker's pre-fund gate
     `pre_btc_lock_check`, and the maker's path before `BOTH_LOCKED`.
+    The same document cited the `require_measured` refusal and
+    `measure_margin_from_btc_block_times` at lines that had moved, and now writes
+    `NegotiatedTerms.to_dict` where a bare `to_dict` could equally have meant `SwapRecord`'s.
 
 ## [0.25.0] — 2026-09-26
 

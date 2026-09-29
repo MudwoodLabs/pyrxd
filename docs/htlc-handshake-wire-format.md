@@ -230,8 +230,8 @@ MUST verify, before acting on it (`swap_coordinator.py:1636-1656`):
 
 ## The `terms` object
 
-The canonical wire form of `NegotiatedTerms`, produced by `to_dict` (`swap_state.py:463-494`) and
-consumed by `from_dict` (`:496-515`). All hex is bare lowercase with no `0x` prefix.
+The canonical wire form of `NegotiatedTerms`, produced by `NegotiatedTerms.to_dict`
+(`swap_state.py:463-494`) and consumed by `NegotiatedTerms.from_dict` (`:496-515`). All hex is bare lowercase with no `0x` prefix.
 
 | Key | Type | Req. | Constraint | Source |
 |---|---|---|---|---|
@@ -394,8 +394,8 @@ not a negotiated field — the taker checks the maker's `terms` against the *tak
 refuses on failure (`scripts/btc_swap_two_host.py:562-565`). The shipped default is
 `ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36` (`swap_coordinator.py:153`), which is **labelled ESTIMATED
 and is test-only**: a policy constructed with `require_measured=True` refuses to use it
-(`:271-275`). A real-value swap MUST supply a margin measured from real block data
-(`measure_margin_from_btc_block_times`, `:378-472`).
+(`:460-464`). A real-value swap MUST supply a margin measured from real block data
+(`measure_margin_from_btc_block_times`, `:643-743`).
 
 **Two traps.**
 
