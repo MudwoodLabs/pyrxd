@@ -31,6 +31,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from ..network.electrumx import script_hash_for_address, script_hash_for_script
+from ..security.errors import NetworkError
 from ..security.types import Hex32
 from .inspector import GlyphInspector
 from .script import (
@@ -94,13 +95,15 @@ class GlyphScanner:
         self._client = client
         self._inspector = GlyphInspector()
 
-    async def scan_address(self, address: str) -> list[GlyphItem]:
+    async def scan_address(self, address: str, *, strict: bool = False) -> list[GlyphItem]:
         """Return all Glyph outputs currently owned at *address*.
 
         Parameters
         ----------
         address:
             Base58Check-encoded P2PKH address.
+        strict:
+            See :meth:`scan_script_hash`.
 
         Returns
         -------
@@ -111,14 +114,21 @@ class GlyphScanner:
             outputs whose commit-output history is unavailable.
         """
         sh = script_hash_for_address(address)
-        return await self.scan_script_hash(sh)
+        return await self.scan_script_hash(sh, strict=strict)
 
-    async def scan_script_hash(self, script_hash: Hex32 | bytes | str) -> list[GlyphItem]:
+    async def scan_script_hash(self, script_hash: Hex32 | bytes | str, *, strict: bool = False) -> list[GlyphItem]:
         """Return all Glyph outputs for *script_hash*.
 
         Fetches UTXOs, raw transactions, and (where available) reveal
         transaction metadata, then constructs typed GlyphNft / GlyphFt
         objects.
+
+        A UTXO whose raw transaction cannot be fetched is logged and left out
+        by default, so the result is then a lower bound on what the script
+        hash holds. ``strict=True`` raises :class:`NetworkError` instead; use
+        it when the result is shown as everything held (``pyrxd glyph list``
+        does). A metadata lookup that fails does not count: it leaves the
+        token in the result with ``metadata=None``.
 
         Concurrency: UTXO raw-tx fetches and reveal-metadata resolutions
         both run in parallel via ``asyncio.gather``. Pre-fix (closes
@@ -139,6 +149,12 @@ class GlyphScanner:
             *[self._client.get_transaction(utxo.tx_hash) for utxo in utxos],
             return_exceptions=True,
         )
+        failed = [raw for raw in raw_txs if isinstance(raw, Exception)]
+        if strict and failed:
+            raise NetworkError(
+                f"{len(failed)} of {len(utxos)} transaction reads failed for this address's outputs; "
+                "refusing to return an inventory that leaves them out"
+            ) from failed[0]
 
         # First pass: parse each UTXO's source tx, run the glyph inspector,
         # collect every (utxo, glyph, source tx) triple we'd want metadata

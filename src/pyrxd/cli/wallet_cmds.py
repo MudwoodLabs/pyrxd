@@ -21,7 +21,7 @@ from ..constants import Network
 from ..hd.bip32 import Xpub
 from ..hd.bip39 import mnemonic_from_entropy
 from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
-from ..hd.wallet import HdWallet
+from ..hd.wallet import HdWallet, raise_if_reads_failed
 from ..security.errors import NetworkError, ValidationError
 from ..security.rng import secure_random_bytes
 from ..utils import validate_address
@@ -624,7 +624,7 @@ def wallet_sweep(
     async def _sweep() -> dict[str, object]:
         client = ctx.make_client()
         async with client:
-            await wallet.refresh(client)
+            # collect_spendable runs the gap-limit scan itself (#759).
             # strict: this command's contract is "moves EVERYTHING under that path"
             # (docs/how-to/recover-funds-across-wallet-paths.md). A per-address read
             # that failed makes that false, and the confirmation block below would
@@ -857,9 +857,14 @@ def _send_in_process(
     async def _run() -> dict[str, object]:
         ex = ctx.make_client()
         async with ex:
-            await wallet.refresh(ex)
-            triples = await wallet.collect_spendable(ex)
+            # collect_spendable runs the gap-limit scan itself (#759). Not strict: an amount send
+            # needs enough, not all, so an address whose UTXO read failed must not refuse a send
+            # the others can fund. When what was read is short, a failed read is reported as the
+            # network error it is, never as "fund the wallet" (raise_if_reads_failed, here and
+            # inside build_send_tx).
+            triples = await wallet.collect_spendable(ex, strict=False)
             if not triples:
+                raise_if_reads_failed(triples, "no spendable funds were read from this wallet")
                 raise UserError(
                     "no spendable funds in this wallet",
                     cause="the scan found no UTXOs",

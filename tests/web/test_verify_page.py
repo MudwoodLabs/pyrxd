@@ -1637,15 +1637,41 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert flat.index(said) < flat.index("VERIFIED"), "the caveat is below the verdict it qualifies"
 
     @pytest.mark.parametrize("shape", ["outpoint", "contract"])
-    def test_naming_an_output_the_transaction_does_not_have_says_so(self, shape, limit) -> None:
+    def test_naming_an_output_the_transaction_does_not_have_is_an_input_error(
+        self, shape, limit, monkeypatch, tmp_path
+    ) -> None:
+        """An input error, not a verified result. `<txid>:7` of a two-output transaction drew the mark's
+        green VERIFIED under a note saying there was no output 7. Now it draws the refusal and no
+        panel, looks nothing further up, and says what `pyrxd verify` says as it exits 1."""
         txid, raw_hex, fetched = self._mark_and_change_tx(limit)
-        out = self._check(self._named(txid, 7, shape), txid, raw_hex, fetched)
+        given = self._named(txid, 7, shape)
+        out = self._check(given, txid, raw_hex, fetched)
         flat = " ".join(out["text"].split())
-        said = "That transaction has 2 outputs (numbered 0 to 1), so there is no output 7"
-        assert said in flat, f"the page did not say output 7 does not exist:\n{flat}"
-        assert "Its HashMark record is in output 0" in flat
-        assert "output 0" in out["panels"][0].split("\n")
-        assert flat.index(said) < flat.index("VERIFIED")
+        said = "That transaction has only 2 outputs (numbered 0 to 1), so there is no output 7."
+        assert said in flat, f"the page did not refuse output 7:\n{flat}"
+        assert "so this page gives no verdict" in flat
+        assert f"paste its transaction number alone: {txid}" in flat
+        assert out["statuses"] == [] and out["panels"] == [], "a verdict was drawn for a pointer to nothing"
+        assert "VERIFIED" not in flat and "Its HashMark record is in output 0" not in flat
+        assert "problem" in out["classes"]
+        # What was looked up is still said, above the refusal.
+        assert f"which points at output 7 of transaction {txid}" in flat
+        # Refused before the block: the transaction is the only thing asked for.
+        assert out["requested"] == [["blockchain.transaction.get", [txid, False]]]
+        assert out["calls"]["anchor"] == []
+
+        # The command, over the same bytes: exit 1, the same sentence, nothing on stdout.
+        from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+        r = _run(
+            monkeypatch,
+            _FakeServer({txid: bytes.fromhex(raw_hex)}),
+            ["verify", given, "--min-confirmations", "1"],
+            tmp_path=tmp_path,
+        )
+        assert r.exit_code == 1, r.output
+        assert r.stdout == ""
+        assert said[1:-1] in " ".join(r.stderr.split()), "the page and the command say different things"
 
     @pytest.mark.parametrize("shape", ["outpoint", "contract"])
     def test_the_first_output_number_past_the_end_does_not_exist(self, shape, limit) -> None:
@@ -1658,16 +1684,42 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         count = fetched["payload"]["output_count"]
         assert count == 2, "the premise"
 
-        past = " ".join(self._check(self._named(txid, count, shape), txid, raw_hex, fetched)["text"].split())
+        past_out = self._check(self._named(txid, count, shape), txid, raw_hex, fetched)
+        past = " ".join(past_out["text"].split())
         assert (
-            f"That transaction has {count} outputs (numbered 0 to {count - 1}), so there is no output {count}" in past
+            f"That transaction has only {count} outputs (numbered 0 to {count - 1}), so there is no output {count}."
+            in past
         )
         assert f"Output {count}, the one you named" not in past, "an output that does not exist was described"
+        assert past_out["statuses"] == [], "an output that does not exist got a verdict"
 
-        # The honest neighbour: the LAST output that does exist is judged as an output, not refused.
-        last = " ".join(self._check(self._named(txid, count - 1, shape), txid, raw_hex, fetched)["text"].split())
+        # The honest neighbour: the LAST output that does exist is judged as an output, not refused,
+        # and the transaction's mark still verifies under it.
+        last_out = self._check(self._named(txid, count - 1, shape), txid, raw_hex, fetched)
+        last = " ".join(last_out["text"].split())
         assert f"Output {count - 1}, the one you named, is NOT a HashMark record" in last
         assert "so there is no output" not in last
+        assert last_out["statuses"] == ["VERIFIED"]
+
+    def test_the_renderer_refuses_a_missing_output_whatever_route_the_result_took(self, limit) -> None:
+        """THE SAME REFUSAL AT THE RENDERER. `renderReport` is where every result is drawn, so a
+        result that names a missing output is drawn as the input error even if it never passed
+        through the lookup that refuses it first. The honest neighbour (output 1 exists) still
+        gets its verdict."""
+        txid, _raw_hex, fetched = self._mark_and_change_tx(limit)
+        missing = _page({**fetched, "named_by": {"form": "outpoint", "txid": txid, "vout": 2}})
+        flat = " ".join(missing["text"].split())
+        assert "That transaction has only 2 outputs (numbered 0 to 1), so there is no output 2." in flat
+        assert missing["statuses"] == [] and missing["panels"] == []
+
+        present = _page({**fetched, "named_by": {"form": "outpoint", "txid": txid, "vout": 1}})
+        assert present["statuses"] == ["VERIFIED"]
+        assert "so there is no output" not in " ".join(present["text"].split())
+
+    def test_a_one_output_transaction_is_refused_in_the_singular(self, limit) -> None:
+        txid, raw, fetched = _tx_result(_signed_script(b"alone\n"), limit=limit)
+        flat = " ".join(self._check(f"{txid}:1", txid, raw.hex(), fetched)["text"].split())
+        assert "That transaction has only 1 output (numbered 0), so there is no output 1." in flat
 
     def test_a_named_output_whose_record_does_not_decode_is_not_called_a_hashmark_record(self, limit) -> None:
         """The positive sentence must not certify what the panel below refutes: a record that
@@ -1746,6 +1798,254 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert ["blockchain.transaction.get", [other, False]] in out["requested"]
         assert f"which points at output 3 of transaction {other}" in flat
         assert "did not give back a transaction for that number" in flat
+
+
+# ─────────────────────────────── an output the classifier could not read ──
+
+_UNREAD_SCRIPT = b"\x76\xa9\x14" + bytes([7] * 20) + b"\x88\xac"  # made to crash the classifier below
+
+
+def _crash_on(monkeypatch, *scripts: bytes) -> None:
+    """Plant a crash in the REAL classifier (``_classify_script``) for ``scripts`` only, so the row that
+    reaches ``verify.js`` is the one ``classify_raw_tx``'s own per-output ``except`` builds."""
+    from pyrxd.glyph import _inspect_core
+
+    real = _inspect_core._classify_script
+    doomed = {sc.hex() for sc in scripts}
+
+    def crashing(script_hex: str, **kw):
+        if script_hex in doomed:
+            raise RuntimeError("planted classifier crash")
+        return real(script_hex, **kw)
+
+    monkeypatch.setattr(_inspect_core, "_classify_script", crashing)
+
+
+def _check_named(text: str, txid: str, raw_hex: str, fetched: dict) -> dict:
+    """``onCheck`` on ``text``, against a server holding ``raw_hex``, every bridge answer from ``glue``."""
+    glue = _glue()
+    case = {
+        "text": text,
+        "raw": {txid: raw_hex},
+        "confirmations": 5,
+        "run_returns": [glue.run(text)],
+        "fetch_returns": [fetched],
+        "anchor_returns": [glue.mark_anchor(txid, json.dumps({"txid": txid, "confirmations": 5}), 460572)],
+    }
+    return _render({"case": {"check": case}})["case"]
+
+
+def _cli_says(monkeypatch, tmp_path, text: str, txid: str, raw: bytes):
+    """The real ``pyrxd verify`` over the same bytes (the planted crash is still in place)."""
+    from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+    return _run(monkeypatch, _FakeServer({txid: raw}), ["verify", text, "--min-confirmations", "1"], tmp_path=tmp_path)
+
+
+def _named_as(txid: str, vout: int, shape: str) -> str:
+    return f"{txid}:{vout}" if shape == "outpoint" else f"{txid}{vout:08x}"
+
+
+@pytest.mark.parametrize("shape", ["outpoint", "contract"])
+class TestAnOutputTheClassifierCouldNotRead:
+    """An output the classifier crashed on is a ``type: "error"`` row, and whether it is a HashMark
+    record is UNKNOWN. Neither surface may call it "NOT a HashMark record", and neither may say "no
+    HashMark record" of a transaction in which it could not read one. Every case renders the page
+    through ``verify.js`` AND runs the real ``pyrxd verify`` over the same bytes, so the two surfaces
+    are held to the same sentence rather than each to its own."""
+
+    def test_the_named_output_could_not_be_read(self, shape, limit, monkeypatch, tmp_path) -> None:
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, change)
+        txid, raw, fetched = _tx_result(_signed_script(b"the advisory, as published\n"), change, limit=limit)
+        rows = {r["vout"]: r for r in fetched["payload"]["outputs"]}
+        assert rows[1]["type"] == "error" and "hashmark" not in rows[1], "the premise: output 1 was not read"
+
+        out = _check_named(_named_as(txid, 1, shape), txid, raw.hex(), fetched)
+        flat = " ".join(out["text"].split())
+        said = (
+            "Output 1, the one you named, could not be classified here, so this page cannot say whether it is a "
+            "HashMark record, and nothing below is about it."
+        )
+        assert said in flat, f"the page did not say output 1 is unread:\n{flat}"
+        assert "NOT a HashMark record" not in flat, "an unread output was called a non-record"
+        assert "The only HashMark record this page could read is in output 0" in flat
+        assert "other output" not in flat, "no OTHER output is unread"
+        assert flat.index(said) < flat.index("VERIFIED"), "the caveat is below the verdict it qualifies"
+
+        cli = " ".join(_cli_says(monkeypatch, tmp_path, _named_as(txid, 1, shape), txid, raw).output.split())
+        assert "Output 1, the one you named, could not be classified here" in cli
+        assert "The only HashMark record that could be read is in output 0" in cli
+        assert "NOT a HashMark record" not in cli
+
+    def test_an_unread_output_elsewhere_does_not_make_the_named_one_unread(
+        self, shape, limit, monkeypatch, tmp_path
+    ) -> None:
+        """The error row is at output 2; the reader named output 1, which WAS read. "Is THIS output
+        unread?", not "is ANY output unread?"."""
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, _UNREAD_SCRIPT)
+        txid, raw, fetched = _tx_result(
+            _signed_script(b"the advisory, as published\n"), change, _UNREAD_SCRIPT, limit=limit
+        )
+        rows = {r["vout"]: r for r in fetched["payload"]["outputs"]}
+        assert rows[2]["type"] == "error" and rows[1]["type"] != "error", "the premise"
+
+        flat = " ".join(_check_named(_named_as(txid, 1, shape), txid, raw.hex(), fetched)["text"].split())
+        assert "Output 1, the one you named, is NOT a HashMark record, so nothing below is about it." in flat
+        assert (
+            "The only HashMark record this page could read is in output 0, and the panel below is about that "
+            "output. 1 other output could not be classified here, so whether it is a HashMark record is unknown."
+        ) in flat
+        assert "Output 1, the one you named, could not be classified" not in flat
+
+        cli = " ".join(_cli_says(monkeypatch, tmp_path, _named_as(txid, 1, shape), txid, raw).output.split())
+        assert "Output 1, the one you named, is NOT a HashMark record" in cli
+        assert "1 other output could not be classified here, so whether it is a HashMark record is unknown." in cli
+
+    def test_no_mark_and_the_named_output_could_not_be_read(self, shape, limit, monkeypatch, tmp_path) -> None:
+        """THE PATH ROUND 2 MISSED. With no record anywhere, the note said "could not be classified"
+        and then "It carries no HashMark record in any output", and the panel under it "none of its
+        outputs carries a HashMark record" — a sentence and its own contradiction, on one screen."""
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, _UNREAD_SCRIPT)
+        txid, raw, fetched = _tx_result(_UNREAD_SCRIPT, change, limit=limit)
+        assert fetched["payload"]["outputs"][0]["type"] == "error", "the premise"
+
+        flat = " ".join(_check_named(_named_as(txid, 0, shape), txid, raw.hex(), fetched)["text"].split())
+        assert "Output 0, the one you named, could not be classified here" in flat
+        assert "It carries no HashMark record in any output this page could read." in flat
+        assert "No HashMark record could be read here" in flat
+        assert (
+            "none of the outputs this page could read carries a HashMark record. 1 output could not be "
+            "classified here, so whether it is a record is unknown." in flat
+        )
+        assert "in any output." not in flat and "There is no HashMark here" not in flat
+        assert "none of its outputs carries" not in flat and "simply not a mark" not in flat
+
+        r = _cli_says(monkeypatch, tmp_path, _named_as(txid, 0, shape), txid, raw)
+        assert r.exit_code == 1, r.output
+        cli = " ".join(r.output.split())
+        assert "no HashMark record could be read in the transaction you named an output of" in cli
+        assert "output 0, the one you named, is one that could not be classified" in cli
+        assert "among them" not in cli and "none of them decodes" not in cli
+
+    def test_no_mark_and_another_output_could_not_be_read(self, shape, limit, monkeypatch, tmp_path) -> None:
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, _UNREAD_SCRIPT)
+        txid, raw, fetched = _tx_result(_UNREAD_SCRIPT, change, limit=limit)
+
+        flat = " ".join(_check_named(_named_as(txid, 1, shape), txid, raw.hex(), fetched)["text"].split())
+        assert "Output 1, the one you named, is NOT a HashMark record, so nothing below is about it." in flat
+        assert (
+            "It carries no HashMark record in any output this page could read. 1 other output could not be "
+            "classified here" in flat
+        )
+        assert "There is no HashMark here" not in flat
+
+        cli = " ".join(_cli_says(monkeypatch, tmp_path, _named_as(txid, 1, shape), txid, raw).output.split())
+        assert "output 1, the one you named, could be read, and is not one" in cli
+
+    def test_several_unread_and_no_mark_is_counted_not_listed(self, shape, limit, monkeypatch, tmp_path) -> None:
+        """TWO unread outputs: the plural sentences, on both surfaces."""
+        other_unread = b"\x76\xa9\x14" + bytes([9] * 20) + b"\x88\xac"
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, _UNREAD_SCRIPT, other_unread)
+        txid, raw, fetched = _tx_result(_UNREAD_SCRIPT, other_unread, change, limit=limit)
+
+        flat = " ".join(_check_named(_named_as(txid, 2, shape), txid, raw.hex(), fetched)["text"].split())
+        assert (
+            "It carries no HashMark record in any output this page could read. 2 other outputs could not be "
+            "classified here, so whether any of them is a HashMark record is unknown." in flat
+        )
+        assert "2 outputs could not be classified here, so whether any of them is a record is unknown." in flat
+
+        cli = " ".join(_cli_says(monkeypatch, tmp_path, _named_as(txid, 2, shape), txid, raw).output.split())
+        assert (
+            "none of those that could be read decodes as a HashMark, and 2 could not be classified here, so whether "
+            "any of them is one is unknown — output 2, the one you named, could be read, and is not one" in cli
+        )
+
+    def test_several_records_and_an_unread_output(self, shape, limit, monkeypatch, tmp_path) -> None:
+        """Two records were read and one output was not: "carries 2 records" is a count nobody finished."""
+        change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+        _crash_on(monkeypatch, _UNREAD_SCRIPT)
+        txid, raw, fetched = _tx_result(
+            _signed_script(b"one\n"), _signed_script(b"two\n"), _UNREAD_SCRIPT, change, limit=limit
+        )
+
+        flat = " ".join(_check_named(_named_as(txid, 3, shape), txid, raw.hex(), fetched)["text"].split())
+        assert (
+            "It carries 2 HashMark records this page could read in other outputs; each panel below names its own. "
+            "1 other output could not be classified here" in flat
+        )
+
+        cli = " ".join(_cli_says(monkeypatch, tmp_path, _named_as(txid, 3, shape), txid, raw).output.split())
+        assert (
+            "The transaction carries 2 HashMark records that could be read in other outputs; the verdict below is "
+            "about the one at vout 0, and each is listed separately. 1 other output could not be classified here" in cli
+        )
+
+
+@pytest.mark.parametrize(
+    ("k", "said"), [(1, "1 output could not"), (2, "2 outputs could not")], ids=["one-unread", "two-unread"]
+)
+@pytest.mark.parametrize("named", [True, False], ids=["named", "bare"])
+def test_the_count_of_marks_is_what_this_page_could_read(named, k, said, limit, monkeypatch, tmp_path) -> None:
+    """A count nobody finished: "This transaction carries 2 marks" over an output the page could not
+    read, the page's counterpart of the CLI's "the only HashMark record in this transaction". Both
+    surfaces, over the same bytes. Output 2 (named, when named) is the first unread one."""
+    unread = (_UNREAD_SCRIPT, b"\x76\xa9\x14" + bytes([9] * 20) + b"\x88\xac")[:k]
+    _crash_on(monkeypatch, *unread)
+    txid, raw, fetched = _tx_result(_signed_script(b"one\n"), _signed_script(b"two\n"), *unread, limit=limit)
+    if named:
+        flat = " ".join(_check_named(f"{txid}:2", txid, raw.hex(), fetched)["text"].split())
+    else:
+        glue = _glue()
+        anchor = glue.mark_anchor(txid, json.dumps({"txid": txid, "confirmations": 5}), 460572)
+        case = {
+            "text": txid,
+            "raw": {txid: raw.hex()},
+            "run_returns": [],
+            "fetch_returns": [fetched],
+            "anchor_returns": [anchor],
+        }
+        flat = " ".join(_render({"case": {"check": case}})["case"]["text"].split())
+    assert f"This transaction carries 2 marks this page could read; {said} be classified here." in flat
+    assert "This transaction carries 2 marks. " not in flat
+
+    cli = _cli_says(monkeypatch, tmp_path, f"{txid}:2" if named else txid, txid, raw)
+    record_line = next(ln for ln in cli.output.splitlines() if ln.strip().startswith("record:"))
+    assert "one of 2 HashMark records that could be read" in record_line, record_line
+
+
+def test_a_bare_txid_with_no_mark_and_an_unread_output_is_not_called_markless(limit, monkeypatch, tmp_path) -> None:
+    """The same unfinished claim on the bare-txid path, which shares ``renderNoMark``. The honest
+    neighbour — every output read, still "There is no HashMark here" — is the end of this test."""
+    change = b"\x76\xa9\x14" + os.urandom(20) + b"\x88\xac"
+    _crash_on(monkeypatch, _UNREAD_SCRIPT)
+    txid, raw, fetched = _tx_result(_UNREAD_SCRIPT, change, limit=limit)
+    case = {"text": txid, "raw": {txid: raw.hex()}, "run_returns": [], "fetch_returns": [fetched], "anchor_returns": []}
+    flat = " ".join(_render({"case": {"check": case}})["case"]["text"].split())
+    assert "No HashMark record could be read here" in flat
+    assert "There is no HashMark here" not in flat and "simply not a mark" not in flat
+
+    r = _cli_says(monkeypatch, tmp_path, txid, txid, raw)
+    assert r.exit_code == 1, r.output
+    assert "no HashMark record could be read in that transaction" in " ".join(r.output.split())
+
+    # Every output read (the planted crash removed): the ordinary answer, unchanged.
+    monkeypatch.undo()
+    txid2, raw2, fetched2 = _tx_result(_UNREAD_SCRIPT, change, limit=limit)
+    case2 = {
+        "text": txid2,
+        "raw": {txid2: raw2.hex()},
+        "run_returns": [],
+        "fetch_returns": [fetched2],
+        "anchor_returns": [],
+    }
+    flat2 = " ".join(_render({"case": {"check": case2}})["case"]["text"].split())
+    assert "There is no HashMark here" in flat2 and "could be read" not in flat2
 
 
 # ─────────────────────────────────────── a confirmation count includes the block ──

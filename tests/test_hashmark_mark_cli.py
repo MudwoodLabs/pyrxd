@@ -37,7 +37,9 @@ import pytest
 from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
+from pyrxd.cli.hashmark_cmds import _BLANKS_OUTSIDE_ZS
 from pyrxd.constants import GENESIS_BLOCK_HASHES
+from pyrxd.glyph._inspect_core import _sanitize_display_string
 from pyrxd.hashmark_tx import (
     MARK_MODELLED_BYTES,
     MarkPlan,
@@ -810,17 +812,15 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         assert _BANNER in result.output and f"ascii: {_SCOTLAND!a}" in result.output
         assert decode_hashmark(_published_script(h)).label == _SCOTLAND
 
-    @pytest.mark.parametrize(
-        "label",
-        ["inv\u043eice 42", "pay\u2800me"],  # a CYRILLIC small o; BRAILLE PATTERN BLANK
-        ids=["cyrillic-o", "braille-blank"],
-    )
+    @pytest.mark.parametrize("label", ["inv\u043eice 42"], ids=["cyrillic-o"])  # a CYRILLIC small o
     def test_a_character_that_looks_like_something_else_is_named_by_the_ascii_form(
         self, runner, tmp_path, monkeypatch, label
     ) -> None:
-        """Neither is default-ignorable and neither is replaced by the reader: each renders as
-        SOMETHING, just not what it is, so neither is escaped and the banner stays quiet. The
-        ``ascii()`` form is the only place the operator can see the codepoint about to be signed."""
+        """Not default-ignorable, not replaced by the reader, not blank: it renders as SOMETHING,
+        just not what it is, so it is not escaped and the banner stays quiet. The ``ascii()`` form
+        is the only place the operator can see the codepoint about to be signed. (U+2800 BRAILLE
+        PATTERN BLANK used to be the second case here; it renders as white space, and is escaped
+        since #747 — see :class:`TestBlankCharactersAreEscapedOnTheConfirmationLine`.)"""
         result, _ = _invoke(
             runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
         )
@@ -860,6 +860,69 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         )
         assert result.exit_code == 0, result.output
         assert "label:       advisory" in result.output and "ascii: " not in result.output
+
+
+#: The Zs blanks #747 names, plus every non-Zs blank the code recognises (read from the code, so a
+#: character added there is exercised here without anyone remembering to add it).
+_BLANKS = ["\u00a0", "\u2002", "\u2007", "\u200a", "\u202f", "\u205f", "\u3000", *sorted(_BLANKS_OUTSIDE_ZS)]
+
+
+class TestBlankCharactersAreEscapedOnTheConfirmationLine:
+    """#747: a word spelled in blank characters after ``invoice 42`` showed as ``invoice 42`` plus
+    trailing space, with no banner. Only the ``ascii:`` line revealed the codepoints."""
+
+    @pytest.mark.parametrize("blank", _BLANKS, ids=[f"U+{ord(b):04X}" for b in _BLANKS])
+    def test_each_blank_is_escaped_named_and_still_signed(self, runner, tmp_path, monkeypatch, blank) -> None:
+        import unicodedata
+
+        h = _MarkHarness()
+        label = "invoice 42" + blank * 3 + "x"  # not trailing: canonicalisation strips trailing Zs
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
+        assert result.exit_code == 0, result.output
+        assert blank not in result.output, "reached the terminal raw"
+        assert f"label:       invoice 42{f'<U+{ord(blank):04X}>' * 3}x" in result.output
+        assert _BANNER in result.output and "AS BLANK SPACE" in result.output
+        name = unicodedata.name(blank, "(no Unicode name: unassigned or private use)")  # U+13441 is new in Unicode 15
+        read = "verify prints it as ?" if _sanitize_display_string(blank) != blank else "verify prints it as written"
+        assert f"U+{ord(blank):04X}  {name} — shown above as <U+{ord(blank):04X}>; {read}\n" in result.output
+        assert decode_hashmark(_published_script(h)).label == label, "shown, and signed as typed"
+
+    def test_every_zs_character_but_the_ascii_space_is_escaped(self) -> None:
+        """The rule is the category, not the list above: a Zs blank #747 did not name is escaped too."""
+        import sys
+        import unicodedata
+
+        from pyrxd.cli.hashmark_cmds import _escaped_positions
+
+        zs = [chr(c) for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c)) == "Zs"]
+        assert " " in zs and len(zs) > 10
+        for ch in zs:
+            assert _escaped_positions("a" + ch + "b") == [False, ch != " ", False], f"U+{ord(ch):04X}"
+
+    def test_the_non_zs_blank_list_is_the_reviewed_set(self) -> None:
+        """REVIEWED, NOT DERIVED: no Unicode property says "renders as blank", so the list is a judgement.
+
+        Pinned so a change to it is made on purpose. U+FFFC and the two Egyptian blanks were added
+        after a review drew a word in them that DejaVu Sans Mono showed as empty space.
+        """
+        assert frozenset({"\u2800", "\U0001d159", "\ufffc", "\U00013441", "\U00013442"}) == _BLANKS_OUTSIDE_ZS
+
+    def test_a_selector_after_an_escaped_blank_is_escaped_too(self) -> None:
+        """U+2800 is So, the category an emoji base has; once it is escaped, a U+FE0F after it selects
+        nothing visible, so printing that raw hid it behind ``<U+2800>`` while the banner said "as written"."""
+        from pyrxd.cli.hashmark_cmds import _escaped_positions
+
+        assert _escaped_positions("x\u2800\ufe0f y") == [False, True, True, False, False]
+        assert _escaped_positions("\u2764\ufe0f") == [False, False], "the honest heart + FE0F still prints as written"
+
+    def test_an_ordinary_ascii_space_is_untouched(self, runner, tmp_path, monkeypatch) -> None:
+        """The honest path: ASCII spaces, and a label of nothing else, print as typed with no banner."""
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", "invoice 42 for may"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "label:       invoice 42 for may" in result.output
+        assert _BANNER not in result.output and "<U+" not in result.output
 
 
 #: Round 3. Every label here reached the signature with NO escape and NO banner in round 2, which
