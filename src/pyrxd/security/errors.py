@@ -430,14 +430,17 @@ class BroadcastEchoMismatch(RxdSdkError):
     transaction, paying twice if the first one went through.
 
     Carries ``local_txid`` (hashed from the bytes that were sent) so the caller can check
-    the chain for what was actually sent, and ``echoed`` (the server's claim, unverified).
+    the chain for what was actually sent, ``echoed`` (the server's claim, unverified), and
+    ``raw_tx`` (the exact bytes sent, or ``None`` when the raiser did not have them). A
+    retry loop re-sends ``raw_tx`` unchanged rather than building a new transaction: the
+    same bytes cannot pay twice, a rebuilt transaction can.
 
     Raised by :func:`pyrxd.network.electrumx.verified_broadcast_txid`, the one echo
     check; re-exported as ``pyrxd.glyph.client.BroadcastEchoMismatch`` and
     ``pyrxd.BroadcastEchoMismatch``.
     """
 
-    def __init__(self, local_txid: str, echoed: object) -> None:
+    def __init__(self, local_txid: str, echoed: object, raw_tx: bytes | None = None) -> None:
         super().__init__(
             f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
             f"{local_txid!r}. The server may not have relayed what was sent. Check "
@@ -446,6 +449,7 @@ class BroadcastEchoMismatch(RxdSdkError):
         )
         self.local_txid = local_txid
         self.echoed = echoed
+        self.raw_tx = None if raw_tx is None else bytes(raw_tx)
 
 
 class InsufficientConfirmationsError(NetworkError):

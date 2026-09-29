@@ -61,8 +61,9 @@ from pyrxd.gravity.htlc_covenant import (
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
+from pyrxd.hash import hash256
 from pyrxd.network._guards import finite_int
-from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
+from pyrxd.security.errors import BroadcastEchoMismatch, InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
 
@@ -165,6 +166,13 @@ class RadiantChainIO:
             raise ValidationError("raw_tx must be non-empty bytes")
         try:
             return str(await self._client.broadcast(bytes(raw_tx)))
+        except BroadcastEchoMismatch:
+            # NOT a transport failure, so not wrapped as one. The server answered with a txid
+            # for some other transaction: this one may well have relayed. Wrapped as
+            # NetworkError it read as "retry", and the claim executor's retry BUILDS A NEW
+            # claim with a fresh fee input every tick (#786 review). Callers get the real
+            # type, with ``local_txid`` and the exact ``raw_tx`` that was sent.
+            raise
         except Exception as exc:
             msg = str(exc).lower()
             if "already" in msg and ("known" in msg or "mempool" in msg or "chain" in msg):
@@ -859,9 +867,25 @@ class RadiantCovenantLeg:
         return await self._broadcast(tx)
 
     async def _broadcast(self, tx: Any) -> str:
-        raw = tx.serialize()
+        return await self._send_raw(tx.serialize(), str(tx.txid()))
+
+    async def resend_signed(self, raw_tx: bytes) -> str:
+        """Re-send a transaction this leg already signed, byte for byte. Returns its txid.
+
+        For a caller holding the bytes of a spend whose broadcast ended ambiguously (a
+        :class:`~pyrxd.security.errors.BroadcastEchoMismatch` carries them as ``raw_tx``).
+        Re-sending the SAME bytes cannot pay twice — at most one copy of a transaction
+        confirms — whereas calling :meth:`claim_asset` again builds a new transaction with a
+        new fee input. Idempotent on an already-known transaction, like every leg broadcast.
+        """
+        if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
+            raise ValidationError("raw_tx must be non-empty bytes")
+        raw = bytes(raw_tx)
+        return await self._send_raw(raw, hash256(raw)[::-1].hex())
+
+    async def _send_raw(self, raw: bytes, local_txid: str) -> str:
         try:
             return await self.chain_io.broadcast(raw)
         except _AlreadyKnown:
             # Idempotent: the node already has this exact tx -> its txid is authoritative.
-            return str(tx.txid())
+            return local_txid

@@ -66,7 +66,7 @@ from ..hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
 from ..hd.bip39 import seed_from_mnemonic
 from ..hd.descriptor import AccountDescriptors, account_descriptors
 from ..keys import PrivateKey
-from ..network.electrumx import UtxoRecord, script_hash_for_address
+from ..network.electrumx import UtxoRecord, script_hash_for_address, verified_broadcast_txid
 from ..script.type import P2PKH
 from ..security.errors import KeyMaterialError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
@@ -1534,8 +1534,10 @@ class HdWallet:
             allow_overpay=allow_overpay,
             change_address=change_address,
         )
-        txid = await client.broadcast(tx.serialize())
-        return str(txid)
+        raw = tx.serialize()
+        # Checked here as well as in ElectrumXClient.broadcast: `client` is the caller's, and a
+        # client that is not a pyrxd one would otherwise hand back whatever the server said.
+        return str(verified_broadcast_txid(raw, await client.broadcast(raw)))
 
     async def send_max(
         self,
@@ -1563,8 +1565,8 @@ class HdWallet:
             allow_below_relay_floor=allow_below_relay_floor,
             allow_overpay=allow_overpay,
         )
-        txid = await client.broadcast(tx.serialize())
-        return str(txid)
+        raw = tx.serialize()
+        return str(verified_broadcast_txid(raw, await client.broadcast(raw)))  # as in `send`
 
 
 def _derive_enc_key(seed: bytes, salt: bytes) -> bytes:

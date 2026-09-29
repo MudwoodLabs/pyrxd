@@ -13,6 +13,7 @@ import pytest
 
 import pyrxd.constants
 import pyrxd.hd.wallet
+from pyrxd.hash import hash256
 from pyrxd.hd import wallet as hd_wallet_module
 from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
@@ -1879,13 +1880,17 @@ class TestSendBroadcast:
             utxo_map={addr: [_utxo(value=1_000_000_000)]},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
-            return "ab" * 32
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
 
         client.broadcast = _broadcast
 
         txid = asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
-        assert txid == "ab" * 32
+        assert txid == hash256(sent[0])[::-1].hex()
 
     def test_send_max_returns_txid(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
@@ -1896,13 +1901,17 @@ class TestSendBroadcast:
             utxo_map={addr: [_utxo(value=1_000_000_000)]},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
-            return "cd" * 32
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
 
         client.broadcast = _broadcast
 
         txid = asyncio.run(w.send_max(client, _RECIPIENT_ADDR))
-        assert txid == "cd" * 32
+        assert txid == hash256(sent[0])[::-1].hex()
 
     def test_send_with_no_utxos_raises(self):
         w = HdWallet.from_mnemonic(MNEMONIC)  # no used addresses → no UTXOs
@@ -2079,11 +2088,15 @@ class TestAFailedReadIsNotAnAnswer:
             utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=1_000_000_000)] for i, a in enumerate(addrs)},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
-            return "ab" * 32
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
 
         client.broadcast = _broadcast
-        assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == "ab" * 32
+        assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == hash256(sent[0])[::-1].hex()
 
     def test_send_short_on_a_partial_view_is_a_network_error_not_insufficient_funds(self):
         """The pair: when what WAS read cannot cover the send and a read failed, the

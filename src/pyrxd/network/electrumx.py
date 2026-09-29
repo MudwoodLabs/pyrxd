@@ -335,7 +335,7 @@ def verified_broadcast_txid(raw_tx: bytes, echoed: object) -> Txid:
     """
     local = Txid(hash256(bytes(raw_tx))[::-1].hex())
     if str(echoed) != str(local):
-        raise BroadcastEchoMismatch(str(local), echoed)
+        raise BroadcastEchoMismatch(str(local), echoed, raw_tx=bytes(raw_tx))
     return local
 
 

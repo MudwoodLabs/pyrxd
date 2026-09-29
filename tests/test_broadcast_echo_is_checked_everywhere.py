@@ -200,16 +200,31 @@ class TestSwapCancelCli:
 
 #: The one check, and the helpers that provably delegate to it (asserted below).
 _CHECK = "verified_broadcast_txid"
-_LOCAL_CHECKS = {_CHECK, "_confirmed_txid"}
+_LOCAL_CHECKS = {_CHECK, "_confirmed_txid", "_local_commit_txid", "_confirmed_reveal_txid"}
+_DELEGATES = {
+    ("glyph/client.py", "_confirmed_txid"),
+    ("cli/glyph_cmds.py", "_local_commit_txid"),
+    ("cli/glyph_cmds.py", "_confirmed_reveal_txid"),
+    ("network/failover.py", "FailoverElectrumXClient.broadcast"),
+}
 
-#: Broadcast sites that neither run the check in their own function nor provably hold a pyrxd
+_RPC = "blockchain.transaction.broadcast"
+_RPC_FAMILY = "blockchain.transaction"
+_FUNNEL = ("network/electrumx.py", "ElectrumXClient.broadcast")
+#: The other ``blockchain.transaction.*`` RPCs pyrxd sends. Pinned both ways below: a new one
+#: must be added here on purpose, and one that is gone must leave.
+_OTHER_TRANSACTION_RPCS = {"blockchain.transaction.get", "blockchain.transaction.get_merkle"}
+#: Functions that fetch an attribute by a name given as a value.
+_BY_NAME = {"getattr", "attrgetter", "methodcaller"}
+
+#: Broadcast sites that neither feed their reply into the check nor provably hold a pyrxd
 #: ElectrumX client. REVIEWED, not derived: each reason is a judgement, so the MEMBERSHIP is
 #: pinned — adding a broadcast site that fits neither rule fails the test until it is either
 #: routed through the check or listed here with a reason someone has read.
 _EXEMPT = {
     # Bitcoin, not Radiant. A segwit txid is not hash256(raw), so the Radiant check does not
     # apply. MempoolSpaceBroadcaster binds its own echo (network/bitcoin.py);
-    # BitcoinCoreRpcBroadcaster (htlc_leg.py) returns the node's reply unchecked.
+    # BitcoinCoreBroadcaster (htlc_leg.py) returns the node's reply unchecked.
     ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.fund"): "BTC broadcaster",
     ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.claim"): "BTC broadcaster",
     ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.refund"): "BTC broadcaster",
@@ -220,7 +235,7 @@ _EXEMPT = {
     ("gravity/maker.py", "GravityMakerSession.cancel_offer"): "injected Radiant client",
     ("gravity/trade.py", "GravityTrade._broadcast_radiant"): "injected Radiant client",
     ("gravity/radiant_leg.py", "RadiantChainIO.broadcast"): "injected Radiant client",
-    ("gravity/radiant_leg.py", "RadiantCovenantLeg._broadcast"): "injected Radiant client (via RadiantChainIO)",
+    ("gravity/radiant_leg.py", "RadiantCovenantLeg._send_raw"): "injected Radiant client (via RadiantChainIO)",
     # GlyphMinter compares the echo inline with its own post-broadcast policy (a commit record is
     # filed under both keys; a reveal waits on the local txid). With a pyrxd client the funnel
     # raises first.
@@ -234,15 +249,15 @@ def _parse(path: Path) -> ast.Module:
 
 
 def _walk_with_scope(tree: ast.AST):
-    """Yield ``(node, scope)`` where scope is the list of enclosing class/function defs."""
+    """Yield ``(node, scope, parent)``; scope is the list of enclosing class/function defs."""
 
-    def visit(node: ast.AST, scope: list[ast.AST]):
-        yield node, scope
+    def visit(node: ast.AST, scope: list[ast.AST], parent: ast.AST | None):
+        yield node, scope, parent
         inner = [*scope, node] if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) else scope
         for child in ast.iter_child_nodes(node):
-            yield from visit(child, inner)
+            yield from visit(child, inner, node)
 
-    yield from visit(tree, [])
+    yield from visit(tree, [], None)
 
 
 def _qualname(scope: list[ast.AST]) -> str:
@@ -253,11 +268,59 @@ def _functions(scope: list[ast.AST]) -> list[ast.AST]:
     return [n for n in scope if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
 
 
-def _calls_a_check(fn: ast.AST) -> bool:
-    return any(
-        isinstance(n, ast.Call) and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) in _LOCAL_CHECKS
-        for n in ast.walk(fn)
+def _fold(node: ast.AST) -> str | None:
+    """The string a constant expression evaluates to, or None if it is not one."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = [_fold(v.value if isinstance(v, ast.FormattedValue) else v) for v in node.values]
+        return None if any(p is None for p in parts) else "".join(parts)  # type: ignore[arg-type]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.List | ast.Tuple)
+    ):
+        sep, parts = _fold(node.func.value), [_fold(e) for e in node.args[0].elts]
+        return None if sep is None or any(p is None for p in parts) else sep.join(parts)  # type: ignore[arg-type]
+    return None
+
+
+def _docstrings(tree: ast.AST) -> set[int]:
+    """ids of bare string statements (docstrings): text, never a value anything can send."""
+    return {
+        id(n.value)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)
+    }
+
+
+def _is_check_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) in (
+        _LOCAL_CHECKS
     )
+
+
+def _reply_is_checked(call: ast.Call, parent: ast.AST | None, fn: ast.AST, parents: dict[int, ast.AST]) -> bool:
+    """Does this broadcast's REPLY reach the check, in the function that sends it?
+
+    Either the call sits inside a check call's arguments, or it is assigned to a name that is
+    then passed to a check call. Calling the check on something else does not count.
+    """
+    checks = [n for n in ast.walk(fn) if _is_check_call(n)]
+    if any(call in ast.walk(c) for c in checks):
+        return True
+    holder = parent
+    if isinstance(holder, ast.Await):
+        holder = parents.get(id(holder))
+    if isinstance(holder, ast.Assign) and len(holder.targets) == 1 and isinstance(holder.targets[0], ast.Name):
+        name = holder.targets[0].id
+        return any(isinstance(a, ast.Name) and a.id == name for c in checks for arg in c.args for a in ast.walk(arg))
+    return False
 
 
 #: Client factories whose production return is a pyrxd ElectrumX client — pinned by
@@ -274,15 +337,14 @@ def _is_pyrxd_client_expr(expr: ast.AST) -> bool:
 
 
 def _receiver_is_a_pyrxd_client(receiver: ast.AST, fns: list[ast.AST]) -> bool:
-    """Is the broadcast receiver provably a pyrxd ElectrumX client, from its binding?"""
+    """Is the broadcast receiver BOUND to a pyrxd ElectrumX client? An annotation is not a binding."""
     if not isinstance(receiver, ast.Name):
         return False
     name = receiver.id
     for fn in reversed(fns):  # innermost first; nested `_run` closures bind in the outer def
         args = fn.args  # type: ignore[attr-defined]
-        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
-            if arg.arg == name and arg.annotation is not None:
-                return "ElectrumXClient" in ast.unparse(arg.annotation)
+        if any(arg.arg == name for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]):
+            return False  # a parameter: whatever the caller passed, whatever its annotation says
         for n in ast.walk(fn):
             if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
                 return _is_pyrxd_client_expr(n.value)
@@ -294,49 +356,136 @@ def _receiver_is_a_pyrxd_client(receiver: ast.AST, fns: list[ast.AST]) -> bool:
     return False
 
 
-def _broadcast_sites() -> list[tuple[str, str, str]]:
-    """Every ``<x>.broadcast(...)`` call in src/pyrxd as ``(path, qualname, how it is covered)``."""
-    sites = []
-    for path in sorted(_SRC.rglob("*.py")):
-        rel = path.relative_to(_SRC).as_posix()
-        for node, scope in _walk_with_scope(_parse(path)):
-            if not (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "broadcast"):
-                continue
+def _scan(tree: ast.Module, rel: str) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """``(sites, violations)`` for one module. A site is ``(path, qualname, how it is covered)``;
+    a violation is ``(path, qualname, which rule it breaks)``."""
+    docstrings = _docstrings(tree)
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    sites, violations = [], []
+    for node, scope, parent in _walk_with_scope(tree):
+        where = (rel, _qualname(scope))
+        # Rule 1: the RPC name.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            if _RPC_FAMILY in node.value and node.value not in _OTHER_TRANSACTION_RPCS and where != _FUNNEL:
+                violations.append((*where, f"RPC name string {node.value!r} outside the funnel"))
+        elif isinstance(node, ast.BinOp | ast.JoinedStr | ast.Call) and _fold(node) == _RPC and where != _FUNNEL:
+            violations.append((*where, "an expression folding to the broadcast RPC name"))
+        # Rule 2: `.broadcast` is only ever called.
+        called = isinstance(parent, ast.Call) and parent.func is node
+        if isinstance(node, ast.Attribute) and node.attr == "broadcast" and not called:
+            violations.append((*where, "`.broadcast` accessed without being called"))
+        # Rule 3: never fetched by name.
+        fetcher = isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
+        if fetcher in _BY_NAME and any(_fold(a) == "broadcast" for a in node.args):  # type: ignore[union-attr]
+            violations.append((*where, "`broadcast` fetched by name"))
+        # Rule 4: every direct call is covered.
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "broadcast":
             fns = _functions(scope)
-            if fns and _calls_a_check(fns[-1]):
-                how = "checks locally"
+            if fns and _reply_is_checked(node, parent, fns[-1], parents):
+                how = "reply checked"
             elif _receiver_is_a_pyrxd_client(node.func.value, fns):  # type: ignore[attr-defined]
                 how = "pyrxd client"
             else:
                 how = "unchecked"
-            sites.append((rel, _qualname(scope), how))
-    return sites
+            sites.append((*where, how))
+    return sites, violations
+
+
+def _scan_src() -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    sites, violations = [], []
+    for path in sorted(_SRC.rglob("*.py")):
+        s, v = _scan(_parse(path), path.relative_to(_SRC).as_posix())
+        sites += s
+        violations += v
+    return sites, violations
+
+
+def _scan_snippet(source: str) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    return _scan(ast.parse(source), "snippet.py")
 
 
 class TestEveryBroadcastSiteCrossesTheCheck:
-    def test_the_broadcast_rpc_is_issued_in_exactly_one_place_and_it_checks(self) -> None:
-        """The funnel: ``blockchain.transaction.broadcast`` is sent from one function, which checks."""
+    """The guard: every way to send a broadcast crosses the one check.
+
+    What the guard proves, and what it cannot. It is a static scan of src/pyrxd, so it proves
+    only what the source says, and its rules are:
+
+    1. ``blockchain.transaction.broadcast`` is spelled in exactly one function, which runs the
+       check. Every other string constant mentioning ``blockchain.transaction`` must be one of the
+       other transaction RPCs (pinned below), and no constant expression anywhere else — ``+``,
+       an f-string of constants, ``"sep".join`` of constants — may fold to the broadcast name.
+    2. ``.broadcast`` is only ever CALLED, directly. An alias (``send = c.broadcast``), a
+       ``functools.partial``, a callback registration — any other access — fails, because the
+       call it leads to is invisible to rule 4.
+    3. ``broadcast`` is never fetched by name (``getattr``, ``operator.attrgetter``,
+       ``operator.methodcaller``) with a constant name.
+    4. Every direct ``.broadcast(...)`` call either feeds its reply into the check (or a helper
+       that provably delegates to it) in the same function, or has a receiver BOUND to a pyrxd
+       client there (a pinned factory or a constructor), or is in the pinned exempt set. A type
+       annotation is not a binding and does not count: nothing enforces it at runtime.
+
+    KNOWN BLIND SPOTS — each is pinned by
+    ``TestTheGuardItself.test_the_known_blind_spots_are_still_blind``, so a guard that learns to
+    see one fails that test until the entry is removed here:
+
+    - DYNAMIC GETATTR: ``getattr(c, name)`` where ``name`` is not a constant. pyrxd has many
+      legitimate dynamic ``getattr`` calls, so refusing all of them is not a rule anyone would
+      keep.
+    - RUNTIME RPC NAME: an RPC name assembled at runtime from parts none of which is a constant
+      mentioning ``blockchain.transaction`` (e.g. read from config, or ``".".join(parts)`` over a
+      variable).
+    """
+
+    def test_the_broadcast_rpc_is_spelled_in_exactly_one_place_and_it_checks(self) -> None:
+        """The funnel: ``blockchain.transaction.broadcast`` is written in one function, which checks."""
         senders = []
         for path in sorted(_SRC.rglob("*.py")):
-            for node, scope in _walk_with_scope(_parse(path)):
-                if isinstance(node, ast.Constant) and node.value == "blockchain.transaction.broadcast":
+            tree = _parse(path)
+            docstrings = _docstrings(tree)
+            for node, scope, _parent in _walk_with_scope(tree):
+                if id(node) not in docstrings and _fold(node) == _RPC:
                     senders.append((path.relative_to(_SRC).as_posix(), _qualname(scope), _functions(scope)))
-        assert [(p, q) for p, q, _ in senders] == [("network/electrumx.py", "ElectrumXClient.broadcast")], senders
-        assert _calls_a_check(senders[0][2][-1]), "ElectrumXClient.broadcast must run the echo check"
+        assert [(p, q) for p, q, _ in senders] == [_FUNNEL], senders
+        assert any(
+            isinstance(n, ast.Call) and getattr(n.func, "id", None) == _CHECK for n in ast.walk(senders[0][2][-1])
+        )
+
+    def test_no_other_path_to_the_rpc_or_the_method(self) -> None:
+        """Rules 1-3 over all of src/pyrxd: no stray RPC name, no alias, no fetch by name."""
+        _sites, violations = _scan_src()
+        assert violations == []
+
+    def test_the_other_transaction_rpcs_are_exactly_the_pinned_set(self) -> None:
+        found = set()
+        for path in sorted(_SRC.rglob("*.py")):
+            tree = _parse(path)
+            docstrings = _docstrings(tree)
+            found |= {
+                n.value
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Constant)
+                and isinstance(n.value, str)
+                and n.value.startswith(_RPC_FAMILY + ".")
+                and id(n) not in docstrings
+            }
+        assert found == {*_OTHER_TRANSACTION_RPCS, _RPC}
 
     def test_the_other_checks_delegate_to_the_one_check(self) -> None:
-        """``_confirmed_txid`` and the failover are not second checks: each calls the one."""
+        """The helpers counted as checks are not second checks: each calls the one."""
         found = {}
-        for rel, name in (("glyph/client.py", "_confirmed_txid"), ("network/failover.py", "broadcast")):
-            for node, scope in _walk_with_scope(_parse(_SRC / rel)):
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
-                    found[(rel, _qualname([*scope, node]))] = any(
+        for rel in sorted({r for r, _ in _DELEGATES}):
+            for node, scope, _parent in _walk_with_scope(_parse(_SRC / rel)):
+                key = (
+                    (rel, _qualname([*scope, node]))
+                    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                    else None
+                )
+                if key in _DELEGATES:
+                    found[key] = any(
                         isinstance(n, ast.Call) and getattr(n.func, "id", None) == _CHECK for n in ast.walk(node)
                     )
-        assert found == {
-            ("glyph/client.py", "_confirmed_txid"): True,
-            ("network/failover.py", "FailoverElectrumXClient.broadcast"): True,
-        }
+        assert found == dict.fromkeys(_DELEGATES, True)
+        assert {name for _rel, name in _DELEGATES if "." not in name} | {_CHECK} == _LOCAL_CHECKS
 
     def test_the_client_factories_return_checked_clients(self) -> None:
         """The factory rule leans on this: every function so named returns a pyrxd client.
@@ -345,7 +494,7 @@ class TestEveryBroadcastSiteCrossesTheCheck:
         ``None`` in production (``main.cli`` never sets it)."""
         found = {}
         for path in sorted(_SRC.rglob("*.py")):
-            for node, scope in _walk_with_scope(_parse(path)):
+            for node, scope, _parent in _walk_with_scope(_parse(path)):
                 if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _FACTORIES:
                     returns = sorted(ast.unparse(n.value) for n in ast.walk(node) if isinstance(n, ast.Return))
                     found[(path.relative_to(_SRC).as_posix(), _qualname([*scope, node]))] = returns
@@ -357,18 +506,75 @@ class TestEveryBroadcastSiteCrossesTheCheck:
         }
 
     def test_every_broadcast_site_is_checked_or_reviewed(self) -> None:
-        sites = _broadcast_sites()
+        sites, _violations = _scan_src()
         # Non-vacuity: sites this file's behavioural tests exercise, each through the funnel.
         by_where = {(p, q): how for p, q, how in sites}
-        assert by_where[("hd/wallet.py", "HdWallet.send")] == "pyrxd client"
+        assert by_where[("hd/wallet.py", "HdWallet.send")] == "reply checked"
         assert by_where[("cli/wallet_cmds.py", "_send_in_process._run")] == "pyrxd client"
         assert by_where[("cli/swap_book_cmds.py", "swap_cancel_cmd._run")] == "pyrxd client"
-        assert by_where[("glyph/client.py", "GlyphClient.transfer_ft")] == "checks locally"
+        assert by_where[("glyph/client.py", "GlyphClient.transfer_ft")] == "reply checked"
 
         unchecked = {(p, q) for p, q, how in sites if how == "unchecked"}
         assert unchecked - set(_EXEMPT) == set(), (
-            "a broadcast site neither runs verified_broadcast_txid nor provably holds a pyrxd "
-            f"ElectrumX client: {sorted(unchecked - set(_EXEMPT))}"
+            "a broadcast site neither feeds its reply into verified_broadcast_txid nor is bound to a "
+            f"pyrxd ElectrumX client: {sorted(unchecked - set(_EXEMPT))}"
         )
         # The other direction: an exemption whose site is gone, or is now checked, must go.
         assert set(_EXEMPT) - unchecked == set(), f"stale exemptions: {sorted(set(_EXEMPT) - unchecked)}"
+
+
+class TestTheGuardItself:
+    """The guard against inputs whose answer is known: the bypasses a review planted, and its blind spots."""
+
+    #: The four bypasses review #786 planted in src/pyrxd/wallet.py, which the first guard passed.
+    BYPASSES = {
+        "method alias": "async def f(c, raw):\n    send = c.broadcast\n    return await send(raw)\n",
+        "getattr with a constant": 'async def f(c, raw):\n    return await getattr(c, "broadcast")(raw)\n',
+        "RPC name by concatenation": (
+            'async def f(c, raw):\n    return await c._call("blockchain.transaction." + "broadcast", [raw.hex()])\n'
+        ),
+        "annotation naming ElectrumXClient": (
+            'async def f(c: "ElectrumXClient | object", raw):\n    return await c.broadcast(raw)\n'
+        ),
+        # Two more spellings of the same bypasses, so the rules are not fitted to the four above.
+        "partial": "import functools\ndef f(c):\n    return functools.partial(c.broadcast)\n",
+        "concatenation in another order": 'M = "blockchain." + "transaction.broadcast"\n',
+    }
+
+    @pytest.mark.parametrize("name", sorted(BYPASSES))
+    def test_each_review_bypass_fails_the_guard(self, name: str) -> None:
+        sites, violations = _scan_snippet(self.BYPASSES[name])
+        unchecked = [s for s in sites if s[2] == "unchecked"]
+        assert violations or unchecked, f"the guard passed the {name!r} bypass"
+
+    def test_the_honest_shapes_pass(self) -> None:
+        honest = (
+            "async def f(c, raw):\n    echoed = await c.broadcast(raw)\n    return verified_broadcast_txid(raw, echoed)\n"
+            "async def g(ctx, raw):\n    client = ctx.make_client()\n    return await client.broadcast(raw)\n"
+            "async def h(c, raw):\n    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        )
+        sites, violations = _scan_snippet(honest)
+        assert violations == []
+        assert [how for _p, _q, how in sites] == ["reply checked", "pyrxd client", "reply checked"]
+
+    def test_calling_the_check_on_something_else_does_not_count(self) -> None:
+        src = (
+            "async def f(c, raw, other):\n"
+            "    verified_broadcast_txid(other, other)\n"
+            "    return await c.broadcast(raw)\n"
+        )
+        sites, _violations = _scan_snippet(src)
+        assert [how for _p, _q, how in sites] == ["unchecked"]
+
+    #: Pinned: see KNOWN BLIND SPOTS in :class:`TestEveryBroadcastSiteCrossesTheCheck`'s docstring.
+    BLIND_SPOTS = {
+        "DYNAMIC GETATTR": "async def f(c, raw, name):\n    return await getattr(c, name)(raw)\n",
+        "RUNTIME RPC NAME": "async def f(c, raw, parts):\n    return await c._call('.'.join(parts), [raw.hex()])\n",
+    }
+
+    @pytest.mark.parametrize("name", sorted(BLIND_SPOTS))
+    def test_the_known_blind_spots_are_still_blind(self, name: str) -> None:
+        """If this fails, the guard has learned to see it: remove it from KNOWN BLIND SPOTS."""
+        sites, violations = _scan_snippet(self.BLIND_SPOTS[name])
+        assert violations == [] and [s for s in sites if s[2] == "unchecked"] == []
+        assert f"- {name}:" in (TestEveryBroadcastSiteCrossesTheCheck.__doc__ or ""), "documented in the guard"
