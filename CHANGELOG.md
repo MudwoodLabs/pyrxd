@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The `/inspect/` and `/verify/` pages no longer load Pyodide's OpenSSL (#757).** Since 0.25.0
+  (#756) they loaded Pyodide's `hashlib` package, OpenSSL 1.1.1n (end-of-life), because Pyodide
+  0.26.4's built-in `hashlib` has no SHA-512/256, the Radiant block hash that binds a mark's height
+  to its header. With it loaded, OpenSSL computed every hash on the page, the SHA-256 and RIPEMD-160
+  behind the signature verdict included, and it was about 3.7 MB of extra code checked only against
+  a lockfile fetched from the same CDN. `pyrxd.hash.radiant_block_hash` now falls back to a
+  pure-Python SHA-512/256 (FIPS 180-4: SHA-512 from the §5.3.6.2 initial value, truncated to 256
+  bits) when `hashlib.new("sha512_256")` raises; CPython keeps using `hashlib`. The fallback is
+  tested against `hashlib` on the FIPS examples, every length from 0 to 384 bytes, random inputs,
+  and real mainnet headers whose block hashes come from the chain itself. If the fallback ever
+  fails too, `radiant_block_hash` raises a `ValueError` naming both causes, and the pages still say
+  the block hash cannot be computed here rather than blaming the server.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)

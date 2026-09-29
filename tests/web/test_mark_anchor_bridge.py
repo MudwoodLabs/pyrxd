@@ -572,56 +572,112 @@ class TestTheBridgeBindsTheHeightThroughTheOneRule:
         assert answer.get("needs_headers") == [_KNOWN_HEIGHT - 1], answer
 
     @staticmethod
-    def _without_sha512_256(monkeypatch) -> None:
-        """Reproduce Pyodide without its OpenSSL-backed ``_hashlib``: MEASURED in headless Chromium
-        on Pyodide 0.26.4, ``hashlib.new("sha512_256")`` raises exactly this."""
+    def _without_hashlibs_sha512_256(monkeypatch) -> list[str]:
+        """Reproduce Pyodide as the pages boot it (#757, no OpenSSL package): MEASURED in headless
+        Chromium on Pyodide 0.26.4, ``hashlib.new("sha512_256")`` then raises exactly this. The
+        pure-Python fallback in ``pyrxd.hash`` is NOT touched. Returns the refused calls."""
         import hashlib
 
         real_new = hashlib.new
+        refused: list[str] = []
 
         def new(name, *args, **kwargs):
             if name == "sha512_256":
+                refused.append(name)
                 raise ValueError("unsupported hash type sha512_256")
             return real_new(name, *args, **kwargs)
 
         monkeypatch.setattr(hashlib, "new", new)
+        return refused
+
+    @classmethod
+    def _without_any_sha512_256(cls, monkeypatch) -> None:
+        """...and the pure-Python fallback failing as well. Practically unreachable now, which is
+        exactly why the refusal it leads to is pinned here rather than trusted."""
+        import pyrxd.hash
+
+        cls._without_hashlibs_sha512_256(monkeypatch)
+
+        def broken(payload: bytes) -> bytes:
+            raise RuntimeError("simulated fallback failure")
+
+        monkeypatch.setattr(pyrxd.hash, "_sha512_256_pure_python", broken)
+
+    def test_without_hashlibs_sha512_256_the_page_still_binds_the_block(self, glue, monkeypatch) -> None:
+        """THE PAGES' OWN CONDITION since #757. With ``hashlib`` refusing SHA-512/256, the bridge
+        still lands on 460,572 from the real headers — hashing 460,571 (no match) first — so the
+        pure-Python fallback is what binds the height on the pages, through the page's entry point."""
+        refused = self._without_hashlibs_sha512_256(monkeypatch)
+        anchor, asked = _page_loop(glue, _verbose(), _MEASURED_TIP - 1, _MEASURED_HEADERS)
+        assert anchor["resolved"] is True and anchor["height"] == _KNOWN_HEIGHT
+        assert anchor["header_bound"] is True
+        assert asked == [_KNOWN_HEIGHT - 1, _KNOWN_HEIGHT]
+        assert refused, "hashlib was never asked for sha512_256, so this proved nothing about the fallback"
 
     def test_a_runtime_that_cannot_hash_a_block_says_so_and_fetches_nothing(self, glue, monkeypatch) -> None:
         """FOUND IN THE BROWSER, not here: the first live run in Chromium showed the page blaming
         the server ("its index and its node disagree") for a hash its own Python could not compute.
         The rule catches the hashing error as an unreadable header, so the reason has to be decided
-        before the rule runs out of heights — and no header should be asked for at all."""
-        self._without_sha512_256(monkeypatch)
+        before the rule runs out of heights — and no header should be asked for at all. It now
+        takes the fallback failing as well as ``hashlib``, and the reason says so."""
+        self._without_any_sha512_256(monkeypatch)
         answer = glue.mark_anchor(_TXID, _verbose(), _MEASURED_TIP)
         assert answer["resolved"] is False
         assert "needs_headers" not in answer and "height" not in answer
         assert "this browser's Python cannot compute a Radiant block hash" in answer["reason"]
+        assert "no SHA-512/256 here: hashlib refused it and the pure-Python fallback failed" in answer["reason"]
         assert "disagree" not in answer["reason"]
 
     def test_an_unmined_mark_is_not_refused_over_a_hash_it_does_not_need(self, glue, monkeypatch) -> None:
         """The honest neighbour: no block, no header, no hash — the answer is unchanged."""
-        self._without_sha512_256(monkeypatch)
+        self._without_any_sha512_256(monkeypatch)
         answer = glue.mark_anchor(_TXID, _verbose(confirmations=0), _MEASURED_TIP)
         assert answer["resolved"] is True and answer["height"] is None
 
-    def test_the_boot_loads_the_hash_before_anything_imports_hashlib(self) -> None:
-        """The Radiant block hash is ``hashlib.new("sha512_256")``, which Pyodide only has once its
-        ``hashlib`` package (OpenSSL) is loaded, and only if that happens before ``hashlib`` is first
-        imported — micropip imports it. So the boot's FIRST ``loadPackage`` must name it, and must
-        come before micropip is used. Gated on the library really using that algorithm."""
-        import inspect as _i
+    def test_the_boot_does_not_load_pyodides_openssl(self, monkeypatch) -> None:
+        """The pages must NOT load Pyodide's ``hashlib`` package or its ``openssl`` dependency (#757).
+
+        WHY ABSENT. PR #756 loaded it because Pyodide 0.26.4's ``hashlib`` has no SHA-512/256 (the
+        Radiant block hash) without it. Once loaded, OpenSSL 1.1.1n — end of life — computed EVERY
+        hash on the page, the SHA-256 and RIPEMD-160 behind the signature verdict included
+        (measured in headless Chromium), and it was about 3.7 MB more code checked only against a
+        lockfile fetched unverified from the same CDN. ``pyrxd.hash`` now computes SHA-512/256 in
+        pure Python where ``hashlib`` cannot, so the package buys nothing.
+
+        Gated on that premise holding BEHAVIOURALLY: with ``hashlib`` refusing the name, the block
+        hash of the mainnet genesis header must still be the registry's genesis hash. If it is not,
+        dropping the package broke the pages, and this test must fail rather than pass on a scan.
+
+        The scan covers every package-loading call in every page script (``loadPackage`` in any
+        form, ``loadPackagesFromImports``, ``micropip.install``), and must find the known
+        ``micropip`` load — the control that it is reading the real boot and not an empty set.
+        """
         import re
 
+        from pyrxd.constants import GENESIS_BLOCK_HASHES
         from pyrxd.hash import radiant_block_hash
+        from tests.network.test_registry import _MAINNET_GENESIS_HEADER_HEX
 
-        assert 'hashlib.new("sha512_256"' in _i.getsource(radiant_block_hash), (
-            "the premise: the block hash is OpenSSL's SHA-512/256 — if it no longer is, re-read this test"
+        refused = self._without_hashlibs_sha512_256(monkeypatch)
+        genesis = bytes.fromhex(_MAINNET_GENESIS_HEADER_HEX)
+        assert radiant_block_hash(genesis) == GENESIS_BLOCK_HASHES["mainnet"], (
+            "the premise: without hashlib's SHA-512/256 the block hash must still be right — it is not, "
+            "so the pages cannot drop Pyodide's OpenSSL package"
         )
-        shared = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
-        first = re.search(r"loadPackage\(\[([^\]]*)\]\)", shared)
-        assert first, "no pyodide.loadPackage([...]) in shared.js — this scan is broken"
-        assert '"hashlib"' in first.group(1), f"the first loadPackage is {first.group(1)} — no hashlib"
-        assert first.start() < shared.index("import micropip"), "micropip is imported before hashlib is loaded"
+        assert refused, "the premise check never reached hashlib, so it proved nothing"
+
+        page_root = _GLUE_DIR.parent
+        scripts = [p for p in sorted(page_root.rglob("*")) if p.suffix in {".js", ".html"} and "vendor" not in p.parts]
+        loads: list[tuple[str, str]] = []
+        for path in scripts:
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"(loadPackage|loadPackagesFromImports|micropip\.install)\s*\(([^)]*)\)", text):
+                loads.append((f"{path.relative_to(page_root)}: {match.group(1)}", match.group(2)))
+        assert any(call.endswith("loadPackage") and '"micropip"' in args for call, args in loads), (
+            f"the known micropip load was not found in {[c for c, _ in loads]} — this scan is broken"
+        )
+        offenders = [f"{call}({args})" for call, args in loads if re.search(r"hashlib|openssl", args, re.IGNORECASE)]
+        assert not offenders, f"the pages load Pyodide's OpenSSL again: {offenders}"
 
     def test_the_pages_safety_stop_is_above_what_the_rule_can_ask(self) -> None:
         """`MAX_HEADER_REQUESTS` in shared.js only stops a runaway loop; it must never cut off a

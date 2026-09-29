@@ -862,12 +862,13 @@ def _block_hash_unavailable() -> str | None:
     """Why this runtime cannot compute a Radiant block hash, or None if it can.
 
     The binding compares a header's hash with the block the node names, and the Radiant block
-    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have unless its OpenSSL-backed
-    ``_hashlib`` package was loaded before ``hashlib`` was first imported (measured: "unsupported
-    hash type sha512_256" otherwise; the boot in ``shared.js`` loads it first). If that ever
-    fails, the rule would catch the hashing error as a header it "could not read" and try the
-    next height, and this page would then blame the SERVER for disagreeing with itself. Checked
-    here, first, so the reason is the true one and no header is fetched for nothing.
+    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have (measured: "unsupported hash
+    type sha512_256"), because the boot in ``shared.js`` deliberately does not load Pyodide's
+    OpenSSL package (#757). ``pyrxd.hash`` computes it in pure Python instead, so this should
+    never refuse. If that fallback ever fails too, the rule would catch the hashing error as a
+    header it "could not read" and try the next height, and this page would then blame the SERVER
+    for disagreeing with itself. Checked here, first, so the reason is the true one and no header
+    is fetched for nothing.
     """
     from pyrxd.hash import radiant_block_hash
 

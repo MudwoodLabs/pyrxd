@@ -400,28 +400,25 @@ async function bootPyrxdRuntime(options) {
     //     lazy ``__getattr__``s in pyrxd's package ``__init__``s might
     //     if a downstream caller touches it. Cheap to load preemptively
     //     (the glue.py shim aliases ``Cryptodome`` → ``Crypto``).
-    //   - ``hashlib`` — Pyodide's OpenSSL-backed ``_hashlib`` (with its
-    //     ``openssl`` dependency). Without it ``hashlib`` has no SHA-512/256,
-    //     which is the Radiant block hash (``pyrxd.hash.radiant_block_hash``)
-    //     that binds a mark's height to its header. MEASURED in headless
-    //     Chromium on Pyodide 0.26.4: ``hashlib.new("sha512_256")`` raised
-    //     "unsupported hash type" until this package was loaded — and it has
-    //     to be loaded BEFORE anything imports ``hashlib`` (micropip does),
-    //     because ``hashlib`` decides at import time what it can build. So
-    //     it is first in this, the first load.
     //
-    //     WHAT ELSE THAT CHANGES, said plainly. Once loaded, OpenSSL computes
-    //     EVERY hash ``hashlib`` hands out, not just the block hash: measured
-    //     in headless Chromium, ``hashlib.sha256`` is ``openssl_sha256`` and
-    //     ``ripemd160`` is OpenSSL's too — so the double-SHA256 and hash160 in
-    //     the SIGNATURE verdict run on it as well. It is OpenSSL 1.1.1n, which
-    //     is end-of-life, used here for hashing only (no TLS). It is not a new
-    //     trusted party — the same CDN already serves the interpreter that
-    //     runs everything — but it is about 3.7 MB more code (1,665,188 B +
-    //     2,025,903 B, measured), and like every Pyodide package it is checked
-    //     only against a ``pyodide-lock.json`` fetched, unverified, from that
-    //     same CDN. See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
-    await pyodide.loadPackage(["hashlib", "micropip", "pycryptodome"]);
+    // NOT ``hashlib`` (Pyodide's OpenSSL-backed ``_hashlib`` and its
+    // ``openssl`` dependency), deliberately — #757. Pyodide 0.26.4's built-in
+    // ``hashlib`` has no SHA-512/256, the Radiant block hash that binds a
+    // mark's height to its header, and #756 loaded that package to get it.
+    // But once loaded, OpenSSL 1.1.1n (end-of-life) computed EVERY hash
+    // ``hashlib`` hands out — measured in headless Chromium, the SHA-256 and
+    // RIPEMD-160 behind the SIGNATURE verdict included — and it was about
+    // 3.7 MB more code (1,665,188 B + 2,025,903 B), checked only against a
+    // ``pyodide-lock.json`` fetched, unverified, from the same CDN.
+    // ``pyrxd.hash`` now computes SHA-512/256 in pure Python wherever
+    // ``hashlib`` cannot, so the block hash needs no package. Measured in
+    // headless Chromium with this boot: ``hashlib.sha256`` is CPython's
+    // built-in ``_sha2`` one, ``pyrxd.hash`` picks its pure-Python RIPEMD-160,
+    // and /verify/ still binds a mark to its block and VERIFIES its signature.
+    // This is the package set the boot loaded before #756. Adding the package
+    // back is caught by tests/web/test_mark_anchor_bridge.py. See the no-SRI
+    // row in docs/concepts/glyph-inspect-tool.md.
+    await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)
     // and SHA-256 pinned in manifest.json. Fetch each, verify the
