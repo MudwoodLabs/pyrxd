@@ -169,35 +169,31 @@ class TestTheFundingBar:
 
 
 class TestTheFileIsStreamed:
-    def test_it_is_read_in_bounded_chunks_that_are_not_tiny(self, tmp_path, monkeypatch) -> None:
-        """Streamed, so a large file is never held whole — and in chunks large enough that a
-        multi-gigabyte file is not read a byte at a time."""
-        import builtins
+    def test_a_large_file_is_digested_whole_without_being_held_whole(self, tmp_path) -> None:
+        """Streamed: the digest is ``hashlib`` over the WHOLE content of a file spanning many read
+        chunks (random bytes and an unaligned length, so a dropped, repeated or reordered chunk
+        changes it), while the memory Python allocates to compute it stays far below the file's
+        size. Measured by ``tracemalloc``, not by watching how the file is read, so any streaming
+        implementation (``read``, ``readinto``, ``hashlib.file_digest``) passes and a whole-file
+        read does not."""
+        import os
+        import tracemalloc
 
-        blob = b"\x5a" * (2 * 1024 * 1024 + 3)
+        size = 32 * 1024 * 1024 + 7
+        blob = os.urandom(size)
         target = tmp_path / "big.bin"
         target.write_bytes(blob)
-        sizes: list[int] = []
-        real_open = builtins.open
+        expected = hashlib.sha256(blob).digest()
+        del blob
 
-        class _Spy:
-            def __init__(self, fh):
-                self._fh = fh
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return self._fh.__exit__(*exc)
-
-            def read(self, n=-1):
-                sizes.append(n)
-                return self._fh.read(n)
-
-        monkeypatch.setattr(builtins, "open", lambda p, mode="r", *a, **k: _Spy(real_open(p, mode, *a, **k)))
-        assert digest_file(target) == hashlib.sha256(blob).digest()
-        assert sizes, "the file was not read through open().read"
-        assert all(64 * 1024 <= n <= 16 * 1024 * 1024 for n in sizes), sizes
+        tracemalloc.start()
+        try:
+            got = digest_file(target)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert got == expected
+        assert peak < size // 4, f"digesting a {size}-byte file peaked at {peak} bytes"
 
 
 class TestAPlanAndABuildCannotBeEditedAfterTheirChecks:
@@ -488,6 +484,25 @@ class TestTheJsonSaysWhatWasTyped:
         out = json.loads(_dry(runner, tmp_path, monkeypatch, "--label", "advisory", top=["--json"]).stdout)
         assert out["label"] == "advisory"
         assert out["label_as_typed"] is None
+
+    @pytest.mark.parametrize("label", ["x́", "क़ष"], ids=["x-acute", "devanagari-nukta"])
+    def test_a_label_NFC_returns_as_an_equal_new_string_is_unchanged(
+        self, runner, tmp_path, monkeypatch, label
+    ) -> None:
+        """ "Changed" is a comparison of TEXT, not of objects. NFC hands back a NEW string for these
+        labels (a combining mark with no precomposed form; a Devanagari nukta pair NFC may not
+        recompose) that is character-for-character what was typed. Asking whether it is the same
+        object would announce a canonicalisation that did not happen."""
+        from pyrxd.script.hashmark import canonicalize_label
+
+        canonical = canonicalize_label(label)
+        # The premise, checked rather than assumed: equal text, different object.
+        assert canonical == label and canonical is not label
+
+        out = json.loads(_dry(runner, tmp_path, monkeypatch, "--label", label, top=["--json"]).stdout)
+        assert out["label"] == label
+        assert out["label_as_typed"] is None
+        assert "LABEL CANONICALISED" not in _dry(runner, tmp_path, monkeypatch, "--label", label).output
 
 
 # ---------------------------------------------------------------------------------------------
@@ -823,3 +838,63 @@ class TestTheSignatureLineSaysWhichRecordItIsAbout:
         says = " ".join(json.loads(named.stdout)["named_by"]["says"])
         assert "Output 0, the one you named, holds the HashMark record the verdict below is about." in says
         assert "except its signature line" not in says
+
+
+class TestAnOutputNumberedAbove256IsComparedByValue:
+    """Output numbers are compared as NUMBERS. The number the user typed (``<txid>:300``) and the
+    number a classified row carries are made separately, and above 256 CPython does not share int
+    objects, so an identity comparison between them is false for equal values. Every case here is
+    at vout 300 for that reason; at a small vout the same comparison passes by accident."""
+
+    def test_naming_the_verdicts_own_record_at_vout_300_says_so(self, monkeypatch, tmp_path) -> None:
+        from tests.test_hashmark_verify_cli import _mark_script
+        from tests.test_verify_names_the_output_you_gave import _CHANGE
+
+        txid, server = _serve(*([_CHANGE] * 300), _mark_script(b"c", PrivateKey()))
+        r = _verify(monkeypatch, tmp_path, server, f"{txid}:300", top=["--json"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.stdout)
+        assert out["verdict_record"]["vout"] == 300
+        named = out["named_by"]
+        assert (named["output_holds_record"], named["verdict_is_about_it"]) == (True, True)
+        says = " ".join(named["says"])
+        assert "Output 300, the one you named, holds the HashMark record the verdict below is about." in says
+        assert "but the verdict below is about" not in says
+
+        human = " ".join(_verify(monkeypatch, tmp_path, server, f"{txid}:300").output.split())
+        assert "Output 300, the one you named, holds the HashMark record the verdict below is about." in human
+
+    def test_a_record_at_vout_300_that_the_verdict_is_NOT_about_says_that(self, monkeypatch, tmp_path) -> None:
+        """The honest pair: two equal records, so the verdict takes the lowest vout (0), and naming
+        300 must say the verdict is about another record."""
+        from tests.test_hashmark_verify_cli import _mark_script
+        from tests.test_verify_names_the_output_you_gave import _CHANGE
+
+        txid, server = _serve(_mark_script(b"c", PrivateKey()), *([_CHANGE] * 299), _mark_script(b"d", PrivateKey()))
+        out = json.loads(_verify(monkeypatch, tmp_path, server, f"{txid}:300", top=["--json"]).stdout)
+        assert out["verdict_record"]["vout"] == 0
+        named = out["named_by"]
+        assert (named["output_holds_record"], named["verdict_is_about_it"]) == (True, False)
+        assert (
+            "Output 300, the one you named, holds a HashMark record, but the verdict below is about the record "
+            "at vout 0."
+        ) in " ".join(named["says"])
+
+    def test_an_unread_output_300_is_not_counted_among_the_OTHER_unread_outputs(self, monkeypatch, tmp_path) -> None:
+        from tests.test_hashmark_verify_cli import _mark_script
+        from tests.test_verify_names_the_output_you_gave import _CHANGE, _UNREAD, _crash_on
+
+        txid, server = _serve(_mark_script(b"c", PrivateKey()), *([_CHANGE] * 299), _UNREAD)
+        _crash_on(monkeypatch, _UNREAD)
+        says = " ".join(
+            json.loads(_verify(monkeypatch, tmp_path, server, f"{txid}:300", top=["--json"]).stdout)["named_by"]["says"]
+        )
+        assert "Output 300, the one you named, could not be classified here" in says
+        assert "The only HashMark record that could be read is in output 0, and the verdict below is about it." in says
+        assert "other output" not in says, says
+
+        # The honest pair: naming another output, the unread vout 300 IS one of the others.
+        says1 = " ".join(
+            json.loads(_verify(monkeypatch, tmp_path, server, f"{txid}:1", top=["--json"]).stdout)["named_by"]["says"]
+        )
+        assert "1 other output could not be classified here, so whether it is a HashMark record is unknown." in says1
