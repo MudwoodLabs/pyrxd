@@ -17,6 +17,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot be complete; the `ascii:` line under the label still names every codepoint. The ASCII
   space is printed as typed, and the label is signed as typed either way.
 
+- **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
+  `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
+  an older pending run in a group when another queues, so a PR build could leave the published
+  docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
+  build has a group per ref.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)
