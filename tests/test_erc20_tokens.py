@@ -288,3 +288,168 @@ class TestTheDecimalsGuardIsLoadBearing:
         from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
 
         asyncio.run(assert_token_matches_chain(self._rpc(6), token_for("USDC", 1)))
+
+
+class TestRegistryAndConstructorBoundsFromTheMutationRun:
+    """Added from the 2026-09-29 `ethleg` mutation run: the USDT pins and the constructor's
+    numeric bounds could each be changed with no test failing."""
+
+    def test_every_pinned_token_is_six_decimals(self) -> None:
+        # USDC was pinned by the test above; USDT on Optimism and Base was not. A 7 there is a
+        # 10x error on every amount on that chain.
+        assert {(s, c): t.decimals for (s, c), t in KNOWN_TOKENS.items()} == {k: 6 for k in KNOWN_TOKENS}
+
+    @pytest.mark.parametrize("decimals", [0, 18, 36])
+    def test_decimals_across_the_allowed_range_are_accepted(self, decimals: int) -> None:
+        assert Erc20Token("T", "0x" + "ab" * 20, decimals, 1).decimals == decimals
+
+    @pytest.mark.parametrize("decimals", [-1, 37, True, "6"])
+    def test_decimals_outside_0_to_36_or_not_an_int_are_refused(self, decimals) -> None:
+        with pytest.raises(ValidationError, match="decimals"):
+            Erc20Token("T", "0x" + "ab" * 20, decimals, 1)
+
+    @pytest.mark.parametrize("chain_id", [0, -1, True, "1"])
+    def test_a_chain_id_that_is_not_a_positive_int_is_refused(self, chain_id) -> None:
+        with pytest.raises(ValidationError, match="chain_id"):
+            Erc20Token("T", "0x" + "ab" * 20, 6, chain_id)
+
+
+class TestTheDecimalsCrossCheckFromTheMutationRun:
+    """`assert_token_matches_chain`, beyond the 18-vs-6 case above (2026-09-29 `ethleg` run).
+
+    A chain reporting FEWER decimals than the pin is just as wrong as one reporting more, and the
+    read must happen at the checkpoint the caller pinned — reading decimals at the tip while the
+    rest of a verification pass reads `finalized` is the mixed-checkpoint read the docstring of
+    `balance_of` warns about. Neither was asserted anywhere.
+    """
+
+    @staticmethod
+    def _rpc(on_chain_decimals: int, seen: list):
+        class _Call:
+            async def call(self, *, block_identifier):
+                seen.append(block_identifier)
+                return on_chain_decimals
+
+        class _Fns:
+            def decimals(self):
+                return _Call()
+
+        class _Contract:
+            functions = _Fns()
+
+        class _Eth:
+            def contract(self, *a, **k):
+                return _Contract()
+
+        class _W3:
+            eth = _Eth()
+
+        class _Rpc:
+            w3 = _W3()
+
+        return _Rpc()
+
+    def test_a_chain_reporting_FEWER_decimals_than_the_pin_is_refused_with_the_right_factor(self) -> None:
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+
+        token = Erc20Token("T18", "0x" + "ab" * 20, 18, 1)
+        with pytest.raises(ValidationError, match=r"decimals=6 .* says 18\. .* 10\^12 in every amount"):
+            asyncio.run(assert_token_matches_chain(self._rpc(6, []), token))
+
+    def test_the_message_states_the_factor_for_the_upward_case_too(self) -> None:
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+
+        with pytest.raises(ValidationError, match=r"10\^3 in every amount"):
+            asyncio.run(assert_token_matches_chain(self._rpc(9, []), token_for("USDC", 1)))
+
+    def test_the_read_defaults_to_latest_and_honours_a_pinned_checkpoint(self) -> None:
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+
+        seen: list = []
+        usdc = token_for("USDC", 1)
+        asyncio.run(assert_token_matches_chain(self._rpc(6, seen), usdc))
+        asyncio.run(assert_token_matches_chain(self._rpc(6, seen), usdc, block_identifier="finalized"))
+        asyncio.run(assert_token_matches_chain(self._rpc(6, seen), usdc, block_identifier=12_345))
+        assert seen == ["latest", "finalized", 12_345]
+
+    def test_a_decimals_read_that_FAILS_is_a_network_error_not_a_pass(self) -> None:
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import assert_token_matches_chain
+        from pyrxd.security.errors import NetworkError
+
+        class _Down:
+            @property
+            def w3(self):
+                raise ConnectionError("endpoint unreachable")
+
+        with pytest.raises(NetworkError, match="could not read decimals"):
+            asyncio.run(assert_token_matches_chain(_Down(), token_for("USDC", 1)))
+
+    def test_balance_of_defaults_to_latest_and_honours_a_pinned_checkpoint(self) -> None:
+        # A balance read at the tip while the immutables were read at `finalized` lets a reorg show
+        # funding the finalized state does not have — the pin must reach the call.
+        import asyncio
+
+        from pyrxd.eth_wallet.erc20 import balance_of
+
+        seen: list = []
+
+        class _Call:
+            async def call(self, *, block_identifier):
+                seen.append(block_identifier)
+                return 1_234_567
+
+        class _Fns:
+            def balanceOf(self, _who):
+                return _Call()
+
+        from types import SimpleNamespace
+
+        rpc = SimpleNamespace(
+            w3=SimpleNamespace(eth=SimpleNamespace(contract=lambda **_k: SimpleNamespace(functions=_Fns())))
+        )
+        usdc, who = token_for("USDC", 1), "0x" + "11" * 20
+        assert asyncio.run(balance_of(rpc, usdc, who)) == 1_234_567
+        assert asyncio.run(balance_of(rpc, usdc, who, "finalized")) == 1_234_567
+        assert seen == ["latest", "finalized"]
+
+
+class TestReverseLookupAndAmountBoundsFromTheMutationRun:
+    """`token_by_address`'s honest path ran under no test — deleting its loop left the suite green —
+    and `base_units`' integer-digit cap was never touched at its edge (2026-09-29 `ethleg` run)."""
+
+    @pytest.mark.parametrize(("symbol", "chain_id"), sorted(KNOWN_TOKENS))
+    def test_every_pinned_token_resolves_back_from_its_address(self, symbol: str, chain_id: int) -> None:
+        token = KNOWN_TOKENS[(symbol, chain_id)]
+        # Upper-cased input: the lookup normalises, so a checksummed paste still resolves.
+        assert token_by_address(token.address.upper().replace("0X", "0x"), chain_id) is token
+
+    def test_the_chain_id_is_compared_by_value(self) -> None:
+        # A chain id parsed from config or JSON is a fresh int; 8453 is outside CPython's small-int
+        # cache, so an identity comparison would miss every such lookup.
+        base_usdc = token_for("USDC", 8453)
+        assert token_by_address(base_usdc.address, int("8453")) is base_usdc
+
+    def test_a_pinned_address_asked_about_on_a_LOWER_chain_id_is_not_that_token(self) -> None:
+        base_usdc = token_for("USDC", 8453)
+        with pytest.raises(ValidationError, match="no pinned token"):
+            token_by_address(base_usdc.address, 10)
+
+    def test_a_token_cannot_be_mutated_in_place(self) -> None:
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            token_for("USDC", 1).decimals = 18  # type: ignore[misc]
+
+    def test_the_integer_digit_cap_is_exactly_32(self) -> None:
+        t = Erc20Token("T", "0x" + "ab" * 20, 0, 1)
+        assert t.base_units("9" * 32) == int("9" * 32)
+        with pytest.raises(ValidationError, match="33 integer digits"):
+            t.base_units("9" * 33)
