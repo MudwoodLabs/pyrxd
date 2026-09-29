@@ -39,7 +39,7 @@ import json
 import shlex
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -3914,7 +3914,7 @@ def deploy_dmint_cmd(
     async def _do() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _deploy_dmint_inner(ctx, wallet, deploy_params, client)
+            return await _deploy_dmint_inner(ctx, wallet, deploy_params, client, metadata_file=metadata_file)
 
     try:
         result = asyncio.run(_do())
@@ -3951,11 +3951,67 @@ def deploy_dmint_cmd(
         click.echo(f"\n  claim with:   {_claim_hint}")
 
 
+def _py_literal(value: object) -> str:
+    """*value* as the Python source a deploy-params constructor takes."""
+    from enum import Enum
+
+    if isinstance(value, Hex20):
+        return f"Hex20(bytes.fromhex({bytes(value).hex()!r}))"
+    if isinstance(value, Enum):
+        return f"{type(value).__name__}.{value.name}"
+    if isinstance(value, bytes | bytearray):
+        return repr(bytes(value))
+    return repr(value)
+
+
+def _dmint_reveal_rebuild(
+    params: DmintV1DeployParams | DmintV2DeployParams,
+    *,
+    last_time: int | None,
+    metadata_file: Path | None,
+    commit_txid: str,
+) -> str:
+    """The SDK code that rebuilds this deploy's reveal outputs, with EVERY parameter the CLI used.
+
+    The commit script checks the CBOR body's hash, the owner key and that the token ref is carried
+    as an FT (``build_commit_locking_script``). The contract parameters (V1 or V2, heights, reward,
+    difficulty, DAA mode and its settings, premine, OP_RETURN) are written only into the reveal. A reveal rebuilt with any other value still
+    spends the commit and deploys a different token, permanently. So every field of the params
+    object is printed from the object itself, in the form the constructor takes — including the
+    ``lastTime`` the build resolved when ``--last-time`` was not given, and ``max_adjustment_log2``
+    (log2 of ``--max-adjustment``) and the schedule's targets (not the ``--schedule`` difficulties).
+    """
+    args = []
+    for f in fields(params):
+        if f.name == "metadata":
+            src = f"_read_metadata_file(Path({str(metadata_file)!r}))" if metadata_file else "<your metadata>"
+            args.append(f"metadata={src}")
+            continue
+        value = getattr(params, f.name)
+        if f.name == "last_time" and last_time is not None:
+            value = last_time  # the RESOLVED deploy time, not the None that means "now"
+        args.append(f"{f.name}={_py_literal(value)}")
+    return "\n".join(
+        [
+            "from pathlib import Path",
+            "from pyrxd.cli.glyph_helpers import _read_metadata_file",
+            f"from pyrxd.glyph.builder import GlyphBuilder, {type(params).__name__}",
+            "from pyrxd.glyph.dmint import DaaMode, DmintAlgo",
+            "from pyrxd.security.types import Hex20",
+            f"params = {type(params).__name__}({', '.join(args)})",
+            "deploy = GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)",
+            f"rev = deploy.build_reveal_outputs({commit_txid!r})",
+        ]
+    )
+
+
 async def _deploy_dmint_inner(
     ctx: CliContext,
     wallet: HdWallet,
     deploy_params: DmintV1DeployParams | DmintV2DeployParams,
     client: ElectrumXClient,
+    *,
+    metadata_file: Path | None = None,
 ) -> dict:
     # Version-agnostic: V1 and V2 DeployResult share the commit_result /
     # build_reveal_outputs interface, so the only V1-vs-V2 difference is which
@@ -4080,14 +4136,23 @@ async def _deploy_dmint_inner(
         _echoed_commit = await client.broadcast(commit_tx.serialize())
         commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
     except BroadcastEchoMismatch as exc:
+        rebuild = _dmint_reveal_rebuild(
+            deploy_params,
+            last_time=getattr(deploy, "last_time", None),
+            metadata_file=metadata_file,
+            commit_txid=str(exc.local_txid),
+        )
         raise _deploy_commit_echo_refused(
             exc,
             commit_value=commit0_value,
             reveal_recipe=(
-                "GlyphBuilder().prepare_dmint_deploy(<the same deploy parameters>, allow_v2_deploy=True)"
-                ".build_reveal_outputs(<the txid above>), spending the commit's output 0 (the hashlock, "
-                f"{commit0_value} photons) and outputs 1 to {num_contracts} (the contract ref seeds), signed by "
-                f"this wallet's key for {owner_pkh.hex()}"
+                f"run\n{rebuild}\n"
+                "Use every parameter EXACTLY as printed. The commit checks the metadata body, the owner key and "
+                "that the token ref is carried as an FT, and none of the contract parameters, so a reveal built "
+                "with any other value still spends the commit and deploys a different token, permanently. Then build the reveal from rev, spending the commit's output 0 (the "
+                f"hashlock, {commit0_value} photons) and outputs 1 to {num_contracts} (the contract ref seeds), "
+                "with rev's outputs in its order (the contracts, then the premine, then the OP_RETURN, then "
+                f"change), signed by this wallet's key for {owner_pkh.hex()}"
             ),
         ) from exc
     # stderr (all modes): if the reveal later fails, the confirmed commit is recoverable.

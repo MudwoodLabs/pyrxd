@@ -36,13 +36,6 @@ Safety properties (mirroring the v2 refund discipline + the divergent-review har
   opted into single-source (dust); the claim has NO consensus backstop (unlike the BIP68 refund).
 * **Idempotent.** A spent covenant (the asset already claimed, by anyone — the keyless claim is
   third-party-broadcastable) is a clean DECLINED no-op, not a FAILED page.
-* **An ambiguous broadcast is never answered with a new transaction.** When the server's broadcast
-  reply names some other txid (:class:`~pyrxd.security.errors.BroadcastEchoMismatch`), the claim
-  may have relayed. The executor keeps the claim's locally computed txid and signed bytes; on a
-  later tick it first looks the txid up on the chain, and if it is not there it re-sends those
-  SAME bytes. It does not call ``claim_asset`` again for that covenant, so no new fee input is
-  dispensed. The record is in memory only: after a restart the covenant-spent and mempool checks
-  are what stand between a relayed claim and a rebuilt one, as before.
 """
 
 from __future__ import annotations
@@ -63,13 +56,7 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import (
-    BroadcastEchoMismatch,
-    InsufficientFundsError,
-    NetworkError,
-    PolicyRejection,
-    ValidationError,
-)
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -348,12 +335,6 @@ class ClaimExecutor:
         # DEEPER of single-node and quorum; a None/raise (below quorum) fails CLOSED. None → single-source posture.
         self._rxd_depth_corroborator = rxd_depth_corroborator
         self._claim_dust_ceiling = int(claim_dust_ceiling)
-        # Claims whose broadcast reply named another txid, keyed by covenant outpoint:
-        # ``(locally computed txid, the signed bytes or None)``. While an entry exists the executor
-        # never builds a new claim for that covenant — see ``_settle_ambiguous_claim``. An entry is
-        # kept once the claim is found or re-sent (so later ticks look it up again rather than
-        # rebuild, with or without a SeenStore) and dropped only when its bytes provably cannot land.
-        self._ambiguous_claims: dict[str, tuple[str, bytes | None]] = {}
 
     @property
     def _value_bearing(self) -> bool:
@@ -481,7 +462,8 @@ class ClaimExecutor:
         # (gettxout include_mempool) treats a covenant spent IN THE MEMPOOL as already claimed: it kills the
         # per-tick re-carve drain with NO durable cross-restart state AND no eviction blind spot (a covenant
         # that becomes truly unspent again — e.g. a reorg-evicted claim — correctly re-fires). None / absent →
-        # the client cannot answer → fall through to the SeenStore guard.
+        # the client cannot answer → fall through to the SeenStore guard. No client shipped in pyrxd answers
+        # (``ElectrumXClient`` has no ``txout_unspent_incl_mempool``), so with those this check abstains.
         mempool_check = getattr(leg.chain_io, "covenant_unspent_incl_mempool", None)
         if callable(mempool_check):
             try:
@@ -554,36 +536,8 @@ class ClaimExecutor:
             return ExecOutcome.DECLINED, f"fresh re-assess is {finality.value} (window not safe to claim now)"
 
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
-        #    A claim whose earlier broadcast was ambiguous is settled from the chain first, and at most
-        #    re-sent byte for byte — never rebuilt (see _settle_ambiguous_claim).
-        ambiguous = self._ambiguous_claims.get(outpoint)
         try:
-            if ambiguous is not None:
-                settled = await self._settle_ambiguous_claim(leg, outpoint, *ambiguous)
-                if isinstance(settled, tuple):
-                    return settled
-                txid = settled
-            else:
-                txid = await leg.claim_asset(record, bytes(p))
-        except BroadcastEchoMismatch as exc:
-            # The server named a different txid: the claim MAY have relayed. Not seen-marked (it may
-            # not have), and not left to the generic retry either, which would BUILD A NEW claim with
-            # a fresh fee input every tick. Keep the local txid and the signed bytes; the next tick
-            # asks the chain for that txid before re-sending anything.
-            self._ambiguous_claims[outpoint] = (str(exc.local_txid), exc.raw_tx)
-            logger.error(
-                "autonomous claim swap %s: the broadcast reply named txid %s, but the claim sent hashes to %s — "
-                "it may have relayed. The next tick looks for %s and re-sends the same bytes if it is absent; "
-                "no new claim is built for this covenant",
-                swap_id,
-                exc.echoed,
-                exc.local_txid,
-                exc.local_txid,
-            )
-            return ExecOutcome.FAILED, (
-                f"claim broadcast ambiguous: server echoed {exc.echoed!r}, the claim sent is {exc.local_txid} "
-                "and may have relayed; next tick checks the chain for it before re-sending the same bytes"
-            )
+            txid = await leg.claim_asset(record, bytes(p))
         except InsufficientFundsError as exc:
             # PRE-BROADCAST fee gate (gap-closure A1): the dispensed fee input is below the
             # node's relay floor, so the leg refused to broadcast. Nothing went on-chain and no
@@ -611,13 +565,6 @@ class ClaimExecutor:
             )
             return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
         except PolicyRejection as exc:
-            if ambiguous is not None:
-                # The node refused the RE-SENT bytes, and step 1 of the settle did not find them on the
-                # chain. Those bytes cannot land (e.g. the fee input is gone), so drop them; the next
-                # tick re-reads the covenant (pinned + mempool-aware, above) and builds a claim only if
-                # it is still unspent. Not seen-marked: that would disarm a claim still owed.
-                self._ambiguous_claims.pop(outpoint, None)
-                return ExecOutcome.FAILED, f"the re-sent claim {ambiguous[0]} was rejected: {exc}"
             # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
             # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input
             # on every attempt — so a FAILED here would burn fees every tick, forever.
@@ -653,47 +600,6 @@ class ClaimExecutor:
             record.terms.radiant_amount,
         )
         return ExecOutcome.BROADCAST, None
-
-    async def _settle_ambiguous_claim(
-        self, leg, outpoint: str, local_txid: str, raw_tx: bytes | None
-    ) -> str | tuple[ExecOutcome, str]:
-        """Resolve a claim whose earlier broadcast reply named another txid. Never builds a new claim.
-
-        1. Ask the chain for the claim's LOCALLY computed txid. Present (mined or in the mempool) →
-           the claim relayed: mark seen and return an idempotent DECLINED, like the other
-           already-claimed no-ops. The entry stays, so without a SeenStore the next tick asks again
-           instead of rebuilding.
-        2. Absent, or the read failed → re-send the SAME signed bytes (``leg.resend_signed``). The
-           same bytes cannot pay twice. Returns the txid on success, for the caller's BROADCAST
-           path; a raise goes to the caller's handlers (a second mismatch keeps the entry).
-        3. No bytes to re-send (a client that raised the mismatch without them) and not on the
-           chain → drop the entry and FAIL this tick, so the NEXT tick may build a claim. Checked
-           first, rebuilt second: the order the ambiguity requires.
-        """
-        try:
-            await leg.chain_io.confirmations(local_txid)
-        except Exception as exc:
-            logger.warning(
-                "claim %s (ambiguous broadcast) not found on a chain read (%s: %s); re-sending the same bytes",
-                local_txid,
-                type(exc).__name__,
-                exc,
-            )
-        else:
-            if self._seen is not None:
-                await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
-            return (
-                ExecOutcome.DECLINED,
-                f"the claim sent on an earlier tick ({local_txid}) is on the chain — idempotent no-op",
-            )
-        if raw_tx is None:
-            self._ambiguous_claims.pop(outpoint, None)
-            return (
-                ExecOutcome.FAILED,
-                f"claim {local_txid} (ambiguous broadcast) is not on the chain and its bytes were not kept; "
-                "the next tick builds a new claim",
-            )
-        return await leg.resend_signed(raw_tx)
 
     def _check_value_cap(self, record: SwapRecord) -> str | None:
         """Return a decline reason if the swap's value exceeds the reorg-protected ceiling, else None.

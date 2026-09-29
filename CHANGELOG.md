@@ -47,15 +47,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `BroadcastEchoMismatch` on a mismatch instead of `NetworkError`. It is neither a
     `NetworkError` nor a `ValidationError`, so an `except NetworkError` handler does not catch it
     unless code in between wraps it. `RadiantChainIO.broadcast`, the Gravity legs' chain helper,
-    did wrap every exception as `NetworkError`, so the autonomous `ClaimExecutor` read a mismatch
-    as a transient failure and built a new claim, with a new fee input, on every later tick. It
-    now lets the mismatch through, and `ClaimExecutor` never rebuilds that claim: on the next
-    tick it looks up the claim's locally computed txid and, if the chain does not have it,
-    re-sends the same signed bytes (the exception carries them as `raw_tx`). That record is in
-    memory only; after a restart the executor's existing covenant-spent checks apply, as before.
-    `SwapCoordinator.mutual_refund` still reports any leg failure, this one included, inside its
-    own `NetworkError`; a retried Radiant refund spends the same covenant output, so it cannot
-    pay twice. `BroadcastEchoMismatch` has moved to `pyrxd.security.errors`;
+    wraps every client exception as `NetworkError`, this one included. So under a mismatch the
+    autonomous `ClaimExecutor` records a transient failure and, on its next tick, builds a new
+    claim with a new fee input, as it does after any failed broadcast. That cannot pay twice:
+    the covenant output can be spent once and every claim pays the same fixed destination, so at
+    most one claim confirms, and a claim's fee input is spent only if that claim confirms. A
+    rebuilt claim that conflicts with one already in the mempool is refused by the node. Each
+    retry does take a new input from the fee source until a claim confirms.
+    `tests/test_claim_executor_echo_mismatch_rebuilds.py` runs this through a real leg and
+    client. `SwapCoordinator.mutual_refund` likewise reports any leg failure, this one included,
+    inside its own `NetworkError`; a retried Radiant refund spends the same covenant output, so it
+    cannot pay twice either. `BroadcastEchoMismatch` has moved to `pyrxd.security.errors`;
     `pyrxd.BroadcastEchoMismatch` and `pyrxd.glyph.client.BroadcastEchoMismatch` are the same
     class.
   - **Glyph commit steps:** a mismatched commit or reveal echo now stops `mint-nft`, `deploy-ft`
@@ -65,7 +67,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `commit_broadcast_failed_may_have_relayed` recovery document on stdout, as it did when the
     failover client reported the mismatch as `NetworkError`. `deploy-ft` and `deploy-dmint` keep
     no record, so `resume-mint` cannot reveal their commit; their error names the SDK rebuild of
-    the reveal with the local commit txid. `GlyphMinter` given a pyrxd client likewise raises at a
+    the reveal with the local commit txid. For `deploy-dmint` that rebuild is printed as code with
+    every deploy parameter the command used: the V1 or V2 params class, the contract numbers, the
+    DAA settings in the SDK's form (`max_adjustment_log2`, schedule targets), and the `lastTime`
+    the build stamped when `--last-time` was not given. The commit does not check any of them, so
+    a reveal rebuilt with a different value would still spend it and deploy a different token.
+    A regtest test (`tests/test_dmint_commit_echo_recovery_regtest_e2e.py`) runs the printed code
+    after a mismatched commit echo and gets contract outputs byte-identical to the ones the
+    command built. `GlyphMinter` given a pyrxd client likewise raises at a
     mismatched commit or reveal echo, where it used to warn and carry on. Its pending record,
     saved under the local txid before the commit broadcast, is kept; the second copy under the
     echoed txid is no longer written.
@@ -74,11 +83,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     now check the echo themselves, so any client passed there is covered. Bitcoin broadcasters
     are out of scope: `BitcoinCoreBroadcaster` returns the node's reply unchecked.
     `tests/test_broadcast_echo_is_checked_everywhere.py` finds every `.broadcast(` call site in
-    the source and fails on a new one that neither feeds its reply into the check nor is bound to
-    a pyrxd client; it also refuses `.broadcast` taken without being called, `broadcast` fetched
-    by name, and the RPC name spelled outside `ElectrumXClient.broadcast`. It cannot see a
-    `getattr` with a computed name or an RPC name built at runtime; the test pins both as known
-    blind spots.
+    `src/pyrxd` and fails on a new one that neither feeds its reply into the check nor is bound
+    to a pyrxd client. Every binding of the receiver's name in that function must be a pyrxd
+    client, and the check counts only when called by its bare name, which may only be bound to the
+    real check or an import of it. It also refuses `.broadcast` taken without being called,
+    `broadcast` fetched or set by a constant name (`getattr`, `inspect.getattr_static`,
+    `setattr`, a `__dict__` subscript and similar), and the RPC name spelled outside
+    `ElectrumXClient.broadcast`. It is a static scan of `src/pyrxd` only. Its known blind spots,
+    each pinned by the test: an attribute looked up by a computed name (`getattr(c, name)`,
+    `type(c).__dict__[name]`), an RPC name built at runtime, and code run from a string (`exec`,
+    `eval`).
 
 - **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
   `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted

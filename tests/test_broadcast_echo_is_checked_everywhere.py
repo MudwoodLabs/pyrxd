@@ -215,7 +215,27 @@ _FUNNEL = ("network/electrumx.py", "ElectrumXClient.broadcast")
 #: must be added here on purpose, and one that is gone must leave.
 _OTHER_TRANSACTION_RPCS = {"blockchain.transaction.get", "blockchain.transaction.get_merkle"}
 #: Functions that fetch an attribute by a name given as a value.
-_BY_NAME = {"getattr", "attrgetter", "methodcaller"}
+_BY_NAME = {
+    "getattr",
+    "attrgetter",
+    "methodcaller",
+    "getattr_static",
+    "__getattribute__",
+    "__getattr__",
+    "get",
+    "setattr",
+    "delattr",
+}
+#: Where each check name may be DEFINED, as ``(path, qualname)``, and the module it may be
+#: imported from. Any other binding of one of these names (a local ``def``, an assignment, a
+#: parameter, an import from elsewhere, ``import ... as``) is a violation: the guard counts a call
+#: by NAME, so a name bound to something else would be counted as the check.
+_CHECK_HOMES = {
+    _CHECK: ("network/electrumx.py", "pyrxd.network.electrumx"),
+    "_confirmed_txid": ("glyph/client.py", "pyrxd.glyph.client"),
+    "_local_commit_txid": ("cli/glyph_cmds.py", "pyrxd.cli.glyph_cmds"),
+    "_confirmed_reveal_txid": ("cli/glyph_cmds.py", "pyrxd.cli.glyph_cmds"),
+}
 
 #: Broadcast sites that neither feed their reply into the check nor provably hold a pyrxd
 #: ElectrumX client. REVIEWED, not derived: each reason is a judgement, so the MEMBERSHIP is
@@ -235,7 +255,7 @@ _EXEMPT = {
     ("gravity/maker.py", "GravityMakerSession.cancel_offer"): "injected Radiant client",
     ("gravity/trade.py", "GravityTrade._broadcast_radiant"): "injected Radiant client",
     ("gravity/radiant_leg.py", "RadiantChainIO.broadcast"): "injected Radiant client",
-    ("gravity/radiant_leg.py", "RadiantCovenantLeg._send_raw"): "injected Radiant client (via RadiantChainIO)",
+    ("gravity/radiant_leg.py", "RadiantCovenantLeg._broadcast"): "injected Radiant client (via RadiantChainIO)",
     # GlyphMinter compares the echo inline with its own post-broadcast policy (a commit record is
     # filed under both keys; a reveal waits on the local txid). With a pyrxd client the funnel
     # raises first.
@@ -300,9 +320,9 @@ def _docstrings(tree: ast.AST) -> set[int]:
 
 
 def _is_check_call(node: ast.AST) -> bool:
-    return isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) in (
-        _LOCAL_CHECKS
-    )
+    """A call to the check, or a delegate, by its bare name. An attribute call (``x.verified_broadcast_txid``)
+    does not count: its receiver could be anything. Rule 5 makes the bare name mean the real one."""
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _LOCAL_CHECKS
 
 
 def _reply_is_checked(call: ast.Call, parent: ast.AST | None, fn: ast.AST, parents: dict[int, ast.AST]) -> bool:
@@ -336,24 +356,86 @@ def _is_pyrxd_client_expr(expr: ast.AST) -> bool:
     return name in {*_FACTORIES, "ElectrumXClient", "FailoverElectrumXClient"}
 
 
+def _bindings(fn: ast.AST, name: str) -> list[ast.AST | None]:
+    """Every binding of *name* anywhere in *fn* (nested defs included): the bound expression for a
+    plain ``name = <expr>`` or ``with <expr> as name``, and ``None`` for any other kind of binding
+    (a parameter, a ``for`` target, unpacking, ``+=``, a walrus, ``except ... as``, an import)."""
+    found: list[ast.AST | None] = []
+    plain: set[int] = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            if n.targets[0].id == name:
+                found.append(n.value)
+                plain.add(id(n.targets[0]))
+        elif isinstance(n, ast.AsyncWith | ast.With):
+            for item in n.items:
+                v = item.optional_vars
+                if isinstance(v, ast.Name) and v.id == name:
+                    found.append(item.context_expr)
+                    plain.add(id(v))
+    for n in ast.walk(fn):
+        other = (
+            (isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store | ast.Del) and id(n) not in plain)
+            or (isinstance(n, ast.arg) and n.arg == name)
+            or (isinstance(n, ast.ExceptHandler) and n.name == name)
+            or (isinstance(n, ast.alias) and (n.asname or n.name) == name)
+            or (isinstance(n, ast.Global | ast.Nonlocal) and name in n.names)
+        )
+        if other:
+            found.append(None)
+    return found
+
+
 def _receiver_is_a_pyrxd_client(receiver: ast.AST, fns: list[ast.AST]) -> bool:
-    """Is the broadcast receiver BOUND to a pyrxd ElectrumX client? An annotation is not a binding."""
+    """Is the broadcast receiver BOUND to a pyrxd ElectrumX client? An annotation is not a binding.
+
+    EVERY binding of the name in the innermost function that binds it must be a pyrxd client, so a
+    reassignment (``client = make_client(); client = other``) or a branch (``if x: client =
+    ElectrumXClient(...) else: client = injected``) is not counted as one."""
     if not isinstance(receiver, ast.Name):
         return False
     name = receiver.id
     for fn in reversed(fns):  # innermost first; nested `_run` closures bind in the outer def
-        args = fn.args  # type: ignore[attr-defined]
-        if any(arg.arg == name for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]):
-            return False  # a parameter: whatever the caller passed, whatever its annotation says
-        for n in ast.walk(fn):
-            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
-                return _is_pyrxd_client_expr(n.value)
-            if isinstance(n, ast.AsyncWith | ast.With):
-                for item in n.items:
-                    v = item.optional_vars
-                    if isinstance(v, ast.Name) and v.id == name:
-                        return _is_pyrxd_client_expr(item.context_expr)
+        bound = _bindings(fn, name)
+        if bound:
+            return all(b is not None and _is_pyrxd_client_expr(b) for b in bound)
     return False
+
+
+def _absolute_module(rel: str, node: ast.ImportFrom) -> str:
+    """The absolute module an ``ImportFrom`` in src/pyrxd/<rel> names."""
+    if node.level == 0:
+        return node.module or ""
+    package = ["pyrxd", *rel.split("/")[:-1]]
+    base = package[: len(package) - (node.level - 1)]
+    return ".".join([*base, *([node.module] if node.module else [])])
+
+
+def _check_name_violations(node: ast.AST, scope: list[ast.AST], parent: ast.AST | None, rel: str) -> list[str]:
+    """Rule 5: a check name is bound only by its own definition or an import from its module."""
+    out = []
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) and node.name in _CHECK_HOMES:
+        home_file, _mod = _CHECK_HOMES[node.name]
+        if (rel, _qualname([*scope, node])) != (home_file, node.name):
+            out.append(f"defines {node.name!r} outside its home")
+    elif isinstance(node, ast.alias) and (node.asname or node.name.split(".")[-1]) in _CHECK_HOMES:
+        bound = node.asname or node.name
+        ok = (
+            isinstance(parent, ast.ImportFrom)
+            and node.asname is None
+            and _absolute_module(rel, parent) == _CHECK_HOMES[bound][1]
+        )
+        if not ok:
+            out.append(f"binds {bound!r} by an import that is not its home module")
+    elif isinstance(node, ast.Name) and node.id in _CHECK_HOMES and isinstance(node.ctx, ast.Store | ast.Del):
+        out.append(f"assigns to {node.id!r}")
+    elif isinstance(node, ast.arg) and node.arg in _CHECK_HOMES:
+        out.append(f"a parameter named {node.arg!r}")
+    elif isinstance(node, ast.ExceptHandler) and node.name in _CHECK_HOMES:
+        out.append(f"binds {node.name!r} in an except clause")
+    elif isinstance(node, ast.Global | ast.Nonlocal) and set(node.names) & set(_CHECK_HOMES):
+        out.append("rebinds a check name through global/nonlocal")
+    return out
 
 
 def _scan(tree: ast.Module, rel: str) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
@@ -374,10 +456,15 @@ def _scan(tree: ast.Module, rel: str) -> tuple[list[tuple[str, str, str]], list[
         called = isinstance(parent, ast.Call) and parent.func is node
         if isinstance(node, ast.Attribute) and node.attr == "broadcast" and not called:
             violations.append((*where, "`.broadcast` accessed without being called"))
-        # Rule 3: never fetched by name.
+        # Rule 3: never fetched by name — by a lookup call, or by subscripting a namespace
+        # (``type(c).__dict__["broadcast"]``, ``vars(c)["broadcast"]``).
         fetcher = isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
         if fetcher in _BY_NAME and any(_fold(a) == "broadcast" for a in node.args):  # type: ignore[union-attr]
             violations.append((*where, "`broadcast` fetched by name"))
+        if isinstance(node, ast.Subscript) and _fold(node.slice) == "broadcast":
+            violations.append((*where, "`broadcast` fetched by subscript"))
+        # Rule 5: a check name means the real check.
+        violations += [(*where, v) for v in _check_name_violations(node, scope, parent, rel)]
         # Rule 4: every direct call is covered.
         if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "broadcast":
             fns = _functions(scope)
@@ -417,23 +504,33 @@ class TestEveryBroadcastSiteCrossesTheCheck:
     2. ``.broadcast`` is only ever CALLED, directly. An alias (``send = c.broadcast``), a
        ``functools.partial``, a callback registration — any other access — fails, because the
        call it leads to is invisible to rule 4.
-    3. ``broadcast`` is never fetched by name (``getattr``, ``operator.attrgetter``,
-       ``operator.methodcaller``) with a constant name.
+    3. ``broadcast`` is never fetched or set by a constant name: not by a lookup call
+       (``getattr``, ``operator.attrgetter``/``methodcaller``, ``inspect.getattr_static``,
+       ``__getattribute__``, ``.get``, ``setattr``, ``delattr``) and not by subscripting a
+       namespace (``type(c).__dict__["broadcast"]``, ``vars(c)["broadcast"]``).
     4. Every direct ``.broadcast(...)`` call either feeds its reply into the check (or a helper
        that provably delegates to it) in the same function, or has a receiver BOUND to a pyrxd
        client there (a pinned factory or a constructor), or is in the pinned exempt set. A type
-       annotation is not a binding and does not count: nothing enforces it at runtime.
+       annotation is not a binding and does not count: nothing enforces it at runtime. EVERY
+       binding of the receiver's name in that function must be a pyrxd client, so a reassigned
+       or branch-bound receiver does not count. The check counts only when called by its bare
+       name, not as an attribute of some object.
+    5. The check's name, and each delegate's, means the real one: in src/pyrxd it is bound only by
+       its own definition or by an import from its home module. A local ``def``, an assignment,
+       a parameter, ``import ... as`` or an import from anywhere else is a violation.
 
     KNOWN BLIND SPOTS — each is pinned by
     ``TestTheGuardItself.test_the_known_blind_spots_are_still_blind``, so a guard that learns to
     see one fails that test until the entry is removed here:
 
-    - DYNAMIC GETATTR: ``getattr(c, name)`` where ``name`` is not a constant. pyrxd has many
-      legitimate dynamic ``getattr`` calls, so refusing all of them is not a rule anyone would
-      keep.
+    - DYNAMIC GETATTR: ``getattr(c, name)`` or ``type(c).__dict__[name]`` where ``name`` is not a
+      constant. pyrxd has many legitimate dynamic ``getattr`` calls, so refusing all of them is
+      not a rule anyone would keep.
     - RUNTIME RPC NAME: an RPC name assembled at runtime from parts none of which is a constant
       mentioning ``blockchain.transaction`` (e.g. read from config, or ``".".join(parts)`` over a
       variable).
+    - CODE AS DATA: source text run by ``exec``/``eval`` (or compiled at runtime) is a string to
+      this scan, so a ``.broadcast(`` inside it is invisible.
     """
 
     def test_the_broadcast_rpc_is_spelled_in_exactly_one_place_and_it_checks(self) -> None:
@@ -539,6 +636,52 @@ class TestTheGuardItself:
         # Two more spellings of the same bypasses, so the rules are not fitted to the four above.
         "partial": "import functools\ndef f(c):\n    return functools.partial(c.broadcast)\n",
         "concatenation in another order": 'M = "blockchain." + "transaction.broadcast"\n',
+        # The three the round-2 re-attack of #786 found, and more spellings of each.
+        "reassigned receiver": (
+            "async def f(ctx, other, raw):\n    client = ctx.make_client()\n    client = other\n"
+            "    return await client.broadcast(raw)\n"
+        ),
+        "branch-bound receiver": (
+            "async def f(other, raw, x):\n    if x:\n        client = ElectrumXClient(['u'])\n    else:\n"
+            "        client = other\n    return await client.broadcast(raw)\n"
+        ),
+        "receiver rebound by a for loop": (
+            "async def f(ctx, cs, raw):\n    client = ctx.make_client()\n    for client in cs:\n        pass\n"
+            "    return await client.broadcast(raw)\n"
+        ),
+        "receiver rebound by a closure": (
+            "async def f(ctx, other, raw):\n    client = ctx.make_client()\n    def g():\n        nonlocal client\n"
+            "        client = other\n    g()\n    return await client.broadcast(raw)\n"
+        ),
+        "local function shadowing the check": (
+            "def verified_broadcast_txid(raw, echoed):\n    return echoed\n"
+            "async def f(c, raw):\n    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        ),
+        "nested function shadowing the check": (
+            "async def f(c, raw):\n    def verified_broadcast_txid(raw, echoed):\n        return echoed\n"
+            "    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        ),
+        "check name assigned": (
+            "verified_broadcast_txid = lambda raw, echoed: echoed\n"
+            "async def f(c, raw):\n    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        ),
+        "check name imported from elsewhere": (
+            "from pyrxd.fake import verified_broadcast_txid\n"
+            "async def f(c, raw):\n    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        ),
+        "delegate imported under an alias": (
+            "from pyrxd.fake import passthrough as _confirmed_txid\n"
+            "async def f(c, b):\n    echoed = await c.broadcast(b.raw)\n    return _confirmed_txid(b, echoed)\n"
+        ),
+        "check called as an attribute": (
+            "async def f(c, x, raw):\n    return x.verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        ),
+        "class __dict__ subscript": "async def f(c, raw):\n    return await type(c).__dict__['broadcast'](c, raw)\n",
+        "vars().get": "async def f(c, raw):\n    return await vars(type(c)).get('broadcast')(c, raw)\n",
+        "inspect.getattr_static": (
+            "import inspect\nasync def f(c, raw):\n    return await inspect.getattr_static(c, 'broadcast')(raw)\n"
+        ),
+        "setattr on the class": "def f(cls, fake):\n    setattr(cls, 'broadcast', fake)\n",
     }
 
     @pytest.mark.parametrize("name", sorted(BYPASSES))
@@ -557,6 +700,25 @@ class TestTheGuardItself:
         assert violations == []
         assert [how for _p, _q, how in sites] == ["reply checked", "pyrxd client", "reply checked"]
 
+    def test_the_honest_bindings_pass(self) -> None:
+        """Rule 4's every-binding test and rule 5 do not refuse the shapes pyrxd really uses."""
+        src = (
+            "from ..network.electrumx import verified_broadcast_txid\n"
+            "async def f(ctx, raw, x):\n"
+            "    if x:\n        client = ctx.make_client()\n    else:\n        client = ElectrumXClient(['u'])\n"
+            "    return await client.broadcast(raw)\n"
+            "async def g(ctx, raw):\n"
+            "    async with ctx.make_client() as client:\n        return await client.broadcast(raw)\n"
+            "async def h(c, raw):\n    return verified_broadcast_txid(raw, await c.broadcast(raw))\n"
+        )
+        sites, violations = _scan(ast.parse(src), "hd/wallet.py")
+        assert violations == []
+        assert [how for _p, _q, how in sites] == ["pyrxd client", "pyrxd client", "reply checked"]
+        # An import from the home module, relative or absolute, is not a shadow; from elsewhere it is.
+        home = "from .glyph.client import _confirmed_txid\n"
+        assert _scan(ast.parse(home), "hashmark_tx.py")[1] == []
+        assert _scan(ast.parse(home), "cli/hashmark_cmds.py")[1] != [], "resolves to pyrxd.cli.glyph.client"
+
     def test_calling_the_check_on_something_else_does_not_count(self) -> None:
         src = (
             "async def f(c, raw, other):\n"
@@ -568,8 +730,11 @@ class TestTheGuardItself:
 
     #: Pinned: see KNOWN BLIND SPOTS in :class:`TestEveryBroadcastSiteCrossesTheCheck`'s docstring.
     BLIND_SPOTS = {
-        "DYNAMIC GETATTR": "async def f(c, raw, name):\n    return await getattr(c, name)(raw)\n",
+        "DYNAMIC GETATTR": (
+            "async def f(c, raw, name):\n    await getattr(c, name)(raw)\n    return await type(c).__dict__[name](c, raw)\n"
+        ),
         "RUNTIME RPC NAME": "async def f(c, raw, parts):\n    return await c._call('.'.join(parts), [raw.hex()])\n",
+        "CODE AS DATA": "def f(c, raw):\n    return eval('c.broadcast(raw)')\n",
     }
 
     @pytest.mark.parametrize("name", sorted(BLIND_SPOTS))

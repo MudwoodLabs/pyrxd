@@ -346,7 +346,6 @@ _SAMPLE_ARGS: dict[str, object] = {
     "tx_hash": "0x" + "ab" * 32,
     "local_txid": "cd" * 32,
     "echoed": "ef" * 32,
-    "raw_tx": b"\x01" * 80,
 }
 
 
