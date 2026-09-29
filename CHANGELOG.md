@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The `/inspect/` and `/verify/` pages no longer load Pyodide's OpenSSL (#757).** Since 0.25.0
+  (#756) they loaded Pyodide's `hashlib` package, OpenSSL 1.1.1n (end-of-life), because Pyodide
+  0.26.4's built-in `hashlib` has no SHA-512/256, the Radiant block hash that binds a mark's height
+  to its header. With it loaded, OpenSSL computed every hash on the page, the SHA-256 and RIPEMD-160
+  behind the signature verdict included, and it was about 3.7 MB of extra code checked only against
+  a lockfile fetched from the same CDN. `pyrxd.hash.radiant_block_hash` now falls back to a
+  pure-Python SHA-512/256 (FIPS 180-4: SHA-512 from the §5.3.6.2 initial value, truncated to 256
+  bits) when `hashlib.new("sha512_256")` raises; CPython keeps using `hashlib`. The fallback is
+  tested against `hashlib` on the FIPS examples, every length from 0 to 384 bytes, fixed 8 KiB and
+  1 MiB inputs, random inputs, and real mainnet headers whose block hashes come from the chain
+  itself. If the fallback ever fails too, `radiant_block_hash` raises a `ValueError` that starts
+  with the fallback's own error, so the pages, which show 80 characters of it, say why the block
+  hash cannot be computed here rather than blaming the server. Both pages now say in their footer,
+  read from the running tab, which code computes the block hash, SHA-256 and RIPEMD-160, and
+  whether Python's OpenSSL modules `_hashlib` and `_ssl` are importable (`hashing: block hash and
+  RIPEMD-160 by pyrxd's pure Python, SHA-256 by CPython's _sha2; no _hashlib or _ssl module`). It
+  does not detect other copies of OpenSSL, such as the one inside the `cryptography` package, and
+  does not claim to. Static checks of the boot catch the known ways Pyodide's OpenSSL could be
+  loaded.
 ### Fixed
 
 - **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
@@ -27,6 +48,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   output, or which outputs do. The CLI and the /inspect/ page print this reason. The `commit-dat`
   note now says "demands no token of its reveal, nor prevents one" instead of "creates no token".
 
+- **An outpoint's output index must be ASCII digits (#746).** `glyph inspect` and the
+  `/inspect/` and `/verify/` pages read `<txid>:1_0` as output 10 and accepted ` 1`, `+1` and
+  non-ASCII digits, through Python's `int()`. The index must now be ASCII `0`-`9`.
+- **Form-2 source identity (#754).** An internationalised host and its punycode spelling now
+  count as one source (and one endpoint), so one server behind both URLs cannot corroborate
+  itself; the A-label is then canonicalised like any other host, so a trailing `。` or a
+  full-width IP literal folds too. `NetworkProfile` (and so `require_profile()` on a loaded config) raises `ValidationError`
+  for a malformed IPv6 endpoint URL such as `wss://[::1`, not a raw `ValueError` (the CLI still
+  reports either as an unexpected failure, #775). The `--json` mark anchor gains a
+  `header_bound` key, so a reader can tell whether the height was checked against the endpoint's
+  block header without parsing the caveat.
+- **The `JsonFilePendingStore` examples in the README and the `GlyphMinter` and `GlyphClient`
+  docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
+  current one; the constructor does not expand `~`, and its docstring now says so.
+
+- **`pyrxd verify` accepts an output reference (`<txid>:<n>`) and a 72-character contract id**
+  (#745). It refused both with "that is not a transaction id", about input that had one in it, and
+  a fix hint that talked only about digests. When the transaction has the output named, either form
+  checks that transaction, with the same verdict its txid gets, and says first what the named
+  output is: the record the verdict is about, another record, not a record (and which output holds
+  the record), or an output that could not be read, so whether it is a record is unknown. The same
+  sentences are in `--json` under `named_by`, and on stderr under `--quiet`. An output the
+  transaction does not have is bad input: exit 1 and no verdict in every mode (no report, no JSON
+  document, no `HOLDS`), and the error says how many outputs the transaction has. A `<txid>:<n>`
+  that does not parse is refused with its txid named. The `/verify/` page already checked the
+  transaction a pointer names and said what the named output is. It called a named output its
+  classifier could not read "NOT a HashMark record", and now says that whether that output is a
+  record is unknown. It drew the transaction's verdict under an output the transaction does not
+  have, and now shows that as an input error with no verdict, headed by the sentence the command's
+  error leads with. Where an output could not be read, neither surface says a transaction has "no
+  HashMark record" or counts its records as final: both say what could be read and how many outputs
+  could not. `named_by.signature_line_vout` in `--json` says which record the verdict's signature
+  line is about.
 - **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
   `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
   scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
@@ -65,8 +119,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
     it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
     any failed read fails it.
-  - `pyrxd utxos` lists the partial view. `pyrxd balance` and `pyrxd glyph list` are
-    unchanged: they read only the addresses the wallet file records as used, and do not scan.
+  - `pyrxd utxos` collects the partial view so it can name the addresses it could not read;
+    it then refuses to show that view as complete (next entry).
+- **`pyrxd balance` and `pyrxd glyph list` scan the chain by default.** Both read only the
+  addresses marked used, and only the gap-limit scan marks them. `balance` ran the scan only
+  under `--refresh`, `glyph list` never ran it, and nothing saves a scan, so a wallet made by
+  `pyrxd wallet new` and funded at its first receive address showed a balance of 0 and no
+  tokens. Both now run `HdWallet.refresh`, the scan `collect_spendable` runs, on every call.
+  The scan reads at least 20 addresses' history on each chain before the balance or token
+  reads. Its result is still not saved: the wallet file is unchanged, as it was under
+  `--refresh`. `balance --refresh` is still accepted and changes nothing. There is no opt-out,
+  because the old view read the network anyway, and it read only what something had marked
+  used, which on a `wallet new` file is nothing.
+- **`balance`, `glyph list` and `utxos` never show a partial view as the whole wallet.** A
+  scan that cannot read an address, or a read that fails for every used address, exits 2
+  and prints nothing. When some addresses answer and others fail, the command still exits 2.
+  The human output shows what the others hold, with an `INCOMPLETE` line on stdout naming the
+  unread addresses. JSON and `--quiet` output print nothing, since neither shape can say
+  "incomplete". Before, `utxos` listed the partial view and exited 0, and `balance` and
+  `glyph list` stopped at the first failed address. `utxos --addr A` is refused only when A's
+  own read fails.
+- **`GlyphScanner.scan_address` and `scan_script_hash` take `strict=`.** With `strict=True`, a
+  UTXO whose transaction cannot be fetched raises `NetworkError` rather than being logged and
+  left out of the result. The default is unchanged. `pyrxd glyph list` passes `strict=True`, so
+  a token it could not fetch fails the listing instead of dropping out of it.
 - **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
   in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
   banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,

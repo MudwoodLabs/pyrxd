@@ -364,6 +364,9 @@ def mark_anchor_dict(anchor) -> dict:
         "deep_enough": anchor.usable_for_point_in_time,
         "source": _sanitize_display_string(anchor.source),
         "height_is_verified": anchor.height_is_verified,
+        # Whether the height was checked against the endpoint's own block header. Carried as a
+        # key so a JSON reader need not parse the caveat to learn it (#754).
+        "header_bound": anchor.header_bound,
         "caveat": anchor.caveat,
     }
 

@@ -670,12 +670,12 @@ with no indication it's a token carrier.
 **There is no error string for this** — it's an honest gap, not a bug that
 raises anything. Verified: `balance_cmd` sums `client.get_balance(...)`
 across every used address's raw scripthash
-([`src/pyrxd/cli/query_cmds.py:97-145`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
+([`src/pyrxd/cli/query_cmds.py:189-249`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
 and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
-([`:148-197`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
+([`:252-309`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
-at `src/pyrxd/hd/wallet.py:938-970`). Neither path decodes the locking
+at `src/pyrxd/hd/wallet.py:1243-1301`). Neither path decodes the locking
 script to check whether it's a Glyph FT/NFT envelope versus plain P2PKH —
 both just report the UTXO's raw `value` field from ElectrumX. A Glyph
 carrier's photon value (the 546-dust NFT carrier, or an FT's premined
@@ -684,12 +684,10 @@ supply amount) gets counted exactly like spendable RXD, which it is
 
 **Fix:** `pyrxd glyph list --type ft` (or `--type nft`, or `--type all`) —
 `list_cmd` in [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py) —
-reads the addresses the wallet file records as used and decodes the Glyph
-envelope, so token holdings show up as tokens, separate from the plain-RXD
-balance. Use this whenever you need to know what's actually spendable versus
-what's a token carrier. It does not run the gap-limit scan the spend commands
-run, so on a wallet whose file records no used address yet (one made by
-`pyrxd wallet new`) it lists nothing.
+runs the same gap-limit scan as `balance` and the spend commands, then decodes
+the Glyph envelope at each address it finds used, so token holdings show up as
+tokens, separate from the plain-RXD balance. Use this whenever you need to know
+what's actually spendable versus what's a token carrier.
 
 ---
 
