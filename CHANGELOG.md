@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Documentation
+
+- **Two published docs described code that has changed.** Both were found by a new check that a
+  citation written next to a code name lands on that name (`tests/test_doc_citations_resolve.py`):
+  - Glyph spec §16.4 said `COMMIT_SCRIPT_RE` accepts any byte at the commit script's ref-type
+    position. That stopped being true in 0.25.0, which accepts only `OP_1` (FT) and `OP_2` (NFT)
+    there. The section now says so.
+  - The HTLC handshake wire format named the credential gate `pre_btc_lock_gate`, which is not a
+    function in pyrxd, and cited lines inside an unrelated docstring. It now names the rule,
+    `_credential_binding_failure`, and both places that run it: the taker's pre-fund gate
+    `pre_btc_lock_check`, and the maker's path before `BOTH_LOCKED`.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)

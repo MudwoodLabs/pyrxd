@@ -45,9 +45,9 @@ that only releases it against required outputs. It cannot be made binding on a
 Checked, not assumed:
 
 1. **The locking scripts do not constrain payments.**
-   `build_nft_locking_script` (`src/pyrxd/glyph/script.py:127-133`) is
+   `build_nft_locking_script` (`src/pyrxd/glyph/script.py:225-230`) is
    `OP_PUSHINPUTREFSINGLETON <ref> OP_DROP` followed by a bare P2PKH tail — 63
-   bytes, no output introspection. `build_ft_locking_script` (`:135-143`) is a
+   bytes, no output introspection. `build_ft_locking_script` (`:233-240`) is a
    bare P2PKH prefix plus a 12-byte conservation epilogue. Conservation
    constrains *how many units of the ref* may exist on the output side. It says
    nothing about where **value** goes, so it cannot require a payment to anybody.
@@ -60,7 +60,7 @@ Checked, not assumed:
    that forbids transfer entirely rather than pricing it.
 
 3. **pyrxd's own type already said so.** `GlyphRoyalty`
-   (`src/pyrxd/glyph/types.py:171-180`) documents itself as an "on-chain royalty
+   (`src/pyrxd/glyph/types.py:238-247`) documents itself as an "on-chain royalty
    **hint** for secondary-market wallets", and its `enforced` field means
    "whether *wallets* should enforce this royalty" — not the chain.
 
