@@ -27,6 +27,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does not detect other copies of OpenSSL, such as the one inside the `cryptography` package, and
   does not claim to. Static checks of the boot catch the known ways Pyodide's OpenSSL could be
   loaded.
+
+### Deprecated
+
+- **`pyrxd mark --allow-overpay` has no effect, and is deprecated (#793).** It could never
+  change anything. `mark` has no `--fee-rate`; its rate comes from the config (`fee_rate`,
+  `[networks.<net>] fee_rate` or `PYRXD_FEE_RATE`), which refuses any rate above the 100,000
+  photons/byte overpay ceiling when it is loaded, before `mark` runs. The flag's only effect
+  was to lift that same ceiling inside the builder, for a rate that could not reach it. `mark`
+  still accepts the flag, so scripts that pass it keep working, but it is hidden from
+  `mark --help`, and passing it prints a one-line note on stderr saying it has no effect and
+  why. Stdout is unchanged, so `--json` and `--quiet` output is byte-identical with and
+  without it. The SDK's `build_hashmark_mark(allow_overpay=...)` is unchanged: a library
+  caller passes its own rate, so there it still decides. The `--allow-overpay` flags on
+  `wallet send`, `wallet sweep`, `glyph transfer-ft`, `glyph airdrop-ft`, `glyph transfer-nft`,
+  `glyph timelock-reveal` and the swap-recovery commands are unchanged.
+
 ### Fixed
 
 - **`assert_eth_deadline_is_claimable` accepted a deadline one second too close, and left out
