@@ -29,6 +29,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded.
 ### Fixed
 
+- **`assert_eth_deadline_is_claimable` accepted a deadline one second too close, and left out
+  the claim's inclusion time (#791).** The ETH HTLC's `claim` reverts once `block.timestamp >= timeout`, so a
+  claim must be mined strictly before the deadline. The pre-funding check compared with a strict
+  `<`, so it accepted a deadline exactly at its floor; with an all-zero `CrossClockMargin` that
+  meant accepting a deadline equal to `now`, which the contract has already expired. That case is
+  reachable only with margins below real-value minimums: real-value mode requires a stall
+  tolerance of at least 3,600 s. The floor also left out `CLAIM_INCLUSION_BUDGET_S` (96 s), the
+  head-room the maker's own claim guard in `eth_wallet/htlc_leg.py` requires before it will
+  broadcast. So a deadline within 96 s above finality + stall + rounding was accepted for
+  funding, and then the maker's leg refused to claim it. That second defect is not limited by margin size.
+  The check now refuses `remaining <= finality + stall + rounding + 96`, and labels
+  `remaining <= 0` as `ALREADY EXPIRED`. The budget is now defined once in
+  `gravity/eth_rxd_timelock.py`, and `htlc_leg` re-exports it, so the two cannot drift apart.
+
 - **Every broadcast through a pyrxd client now checks the server's txid echo (#780).**
   `HdWallet.send`/`send_max` and `RxdWallet.send`/`send_max` returned the txid the server echoed
   from `blockchain.transaction.broadcast` without comparing it to the transaction they built, so a
