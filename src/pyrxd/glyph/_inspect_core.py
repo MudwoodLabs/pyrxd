@@ -565,15 +565,19 @@ def _inspect_outpoint(s: str) -> dict:
         # tells them what was wrong; they already know what they pasted.
         raise ValidationError("outpoint must be exactly one 'txid:vout'")
     txid_str, vout_str = s.split(":", 1)
-    try:
-        vout = int(vout_str, 10)
-    except ValueError as exc:
+    # ASCII digits and nothing else. ``int()`` also takes ``1_0`` (as 10), `` 1``, ``+1`` and
+    # non-ASCII digits such as ``١``, none of which is the documented ``<txid>:<n>`` form (#746).
+    if not (vout_str.isascii() and vout_str.isdigit()):
         # Same defence: ``vout_str`` is whatever the user pasted after
         # the colon. Sanitise before embedding so attacker bytes can't
         # reach the terminal. The sanitiser strips control / format /
         # combining codepoints — exactly the surface that terminal
         # injection exploits.
-        raise ValidationError(f"vout is not an integer: {_sanitize_display_string(vout_str)!r}") from exc
+        raise ValidationError(f"vout is not an integer: {_sanitize_display_string(vout_str)!r}")
+    try:
+        vout = int(vout_str.lstrip("0") or "0", 10)  # leading zeros never count toward int()'s digit limit
+    except ValueError as exc:  # more significant digits than int() will convert (4300 by default)
+        raise ValidationError("vout must be 0..2^32-1") from exc
     ref = GlyphRef(txid=Txid(txid_str.lower()), vout=vout)
     return {
         "form": "outpoint",

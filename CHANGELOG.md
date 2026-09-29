@@ -29,6 +29,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded.
 ### Fixed
 
+- **An outpoint's output index must be ASCII digits (#746).** `glyph inspect` and the
+  `/inspect/` and `/verify/` pages read `<txid>:1_0` as output 10 and accepted ` 1`, `+1` and
+  non-ASCII digits, through Python's `int()`. The index must now be ASCII `0`-`9`.
+- **Form-2 source identity (#754).** An internationalised host and its punycode spelling now
+  count as one source (and one endpoint), so one server behind both URLs cannot corroborate
+  itself; the A-label is then canonicalised like any other host, so a trailing `。` or a
+  full-width IP literal folds too. `NetworkProfile` (and so `require_profile()` on a loaded config) raises `ValidationError`
+  for a malformed IPv6 endpoint URL such as `wss://[::1`, not a raw `ValueError` (the CLI still
+  reports either as an unexpected failure, #775). The `--json` mark anchor gains a
+  `header_bound` key, so a reader can tell whether the height was checked against the endpoint's
+  block header without parsing the caveat.
+- **The `JsonFilePendingStore` examples in the README and the `GlyphMinter` and `GlyphClient`
+  docstrings expand `~` (#755).** Run as written they created a directory literally named `~` under the
+  current one; the constructor does not expand `~`, and its docstring now says so.
+
 - **`pyrxd verify` accepts an output reference (`<txid>:<n>`) and a 72-character contract id**
   (#745). It refused both with "that is not a transaction id", about input that had one in it, and
   a fix hint that talked only about digests. When the transaction has the output named, either form
