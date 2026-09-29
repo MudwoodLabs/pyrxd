@@ -93,8 +93,10 @@ def _sha512_256(payload: bytes) -> bytes:
     dwarfs one caught ``ValueError``, and a test can then reproduce Pyodide by making
     ``hashlib.new`` refuse the name, without reaching into this module.
 
-    If the fallback fails too, the ``ValueError`` names both causes, so a caller that reports
-    "cannot compute a Radiant block hash" (the pages' ``glue.py``) reports the true reason.
+    If the fallback fails too, the ``ValueError`` STARTS with the fallback's own error — the
+    unexpected one, since ``hashlib`` refusing is simply Pyodide — and only then says where it
+    happened and why ``hashlib`` could not help. It starts there because callers cap what they
+    display: the pages' ``glue.py`` shows 80 characters, and a preamble would fill them.
     """
     try:
         return hashlib.new("sha512_256", payload).digest()
@@ -102,10 +104,9 @@ def _sha512_256(payload: bytes) -> bytes:
         try:
             return _sha512_256_pure_python(payload)
         except Exception as exc:
-            # The cause first: callers cap what they display (the pages at 80 characters).
             raise ValueError(
-                "no SHA-512/256 here: hashlib refused it and the pure-Python fallback failed "
-                f"(hashlib: {unsupported}; fallback: {exc!r})"
+                f"{type(exc).__name__}: {exc} — in the pure-Python SHA-512/256, run because hashlib "
+                f"has none ({unsupported})"
             ) from exc
 
 
@@ -418,17 +419,22 @@ def _sha512_compress(state: _Sha512State, block: bytes) -> _Sha512State:
     )
 
 
+def _sha512_padding(length: int) -> bytes:
+    """What FIPS 180-4 §5.1.2 appends to a message of *length* bytes: a single 1 bit, zeros until
+    the length is 896 mod 1024 bits, then the message length IN BITS as a 128-bit big-endian
+    integer. Separate so the length field can be tested at lengths no test could hash."""
+    return b"\x80" + b"\x00" * ((111 - length) % 128) + (length * 8).to_bytes(16, "big")
+
+
 def _sha512_256_pure_python(payload: bytes) -> bytes:
     """SHA-512/256 in pure Python: SHA-512 from the §5.3.6.2 initial value, truncated to 256 bits.
 
     Tested against ``hashlib.new("sha512_256")`` in ``tests/test_sha512_256_fallback.py``: the
-    FIPS examples, every length across the padding boundaries, random inputs, and real Radiant
-    mainnet headers. Reached only through :func:`_sha512_256`.
+    FIPS examples, every length across the padding boundaries, fixed 8 KiB and 1 MiB inputs,
+    random inputs, and real Radiant mainnet headers. Reached only through :func:`_sha512_256`.
     """
     data = bytes(payload)
-    # §5.1.2: a single 1 bit, zeros until the length is 896 mod 1024 bits, then the message
-    # length in bits as a 128-bit big-endian integer.
-    padded = data + b"\x80" + b"\x00" * ((111 - len(data)) % 128) + (len(data) * 8).to_bytes(16, "big")
+    padded = data + _sha512_padding(len(data))
     state: _Sha512State = _SHA512_256_IV
     for offset in range(0, len(padded), 128):
         state = _sha512_compress(state, padded[offset : offset + 128])

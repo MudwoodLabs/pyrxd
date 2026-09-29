@@ -16,10 +16,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a lockfile fetched from the same CDN. `pyrxd.hash.radiant_block_hash` now falls back to a
   pure-Python SHA-512/256 (FIPS 180-4: SHA-512 from the §5.3.6.2 initial value, truncated to 256
   bits) when `hashlib.new("sha512_256")` raises; CPython keeps using `hashlib`. The fallback is
-  tested against `hashlib` on the FIPS examples, every length from 0 to 384 bytes, random inputs,
-  and real mainnet headers whose block hashes come from the chain itself. If the fallback ever
-  fails too, `radiant_block_hash` raises a `ValueError` naming both causes, and the pages still say
-  the block hash cannot be computed here rather than blaming the server.
+  tested against `hashlib` on the FIPS examples, every length from 0 to 384 bytes, fixed 8 KiB and
+  1 MiB inputs, random inputs, and real mainnet headers whose block hashes come from the chain
+  itself. If the fallback ever fails too, `radiant_block_hash` raises a `ValueError` that starts
+  with the fallback's own error, so the pages, which show 80 characters of it, say why the block
+  hash cannot be computed here rather than blaming the server. A test runs the pages' boot against
+  a recording stand-in for Pyodide and fails unless the packages it asks for are exactly `micropip`
+  and `pycryptodome`.
 
 ## [0.25.0] — 2026-09-26
 

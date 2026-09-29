@@ -415,9 +415,19 @@ async function bootPyrxdRuntime(options) {
     // headless Chromium with this boot: ``hashlib.sha256`` is CPython's
     // built-in ``_sha2`` one, ``pyrxd.hash`` picks its pure-Python RIPEMD-160,
     // and /verify/ still binds a mark to its block and VERIFIES its signature.
-    // This is the package set the boot loaded before #756. Adding the package
-    // back is caught by tests/web/test_mark_anchor_bridge.py. See the no-SRI
-    // row in docs/concepts/glyph-inspect-tool.md.
+    // This is the package set the boot loaded before #756.
+    //
+    // WHAT THE TEST CHECKS, and only that: tests/web/test_the_boot_loads_no_openssl.py
+    // runs this function under Node against a stand-in Pyodide that records
+    // every call, and fails unless the packages it asks for — through
+    // `loadPyodide`'s options, `loadPackage` in any form, or
+    // `loadPackagesFromImports` — are exactly micropip and pycryptodome, and the
+    // Python it runs micropip-installs only the two SHA-checked wheels. It also
+    // fails on a package-loading call anywhere in the page scripts outside this
+    // function, and on any line of page code, other than a whole-line comment,
+    // naming hashlib or openssl. It does NOT check what those two packages pull
+    // in (Pyodide 0.26.4's lockfile: micropip needs packaging, pycryptodome
+    // nothing). See the no-SRI row in docs/concepts/glyph-inspect-tool.md.
     await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
     // Both wheels are vendored same-origin (under /inspect/wheels/)

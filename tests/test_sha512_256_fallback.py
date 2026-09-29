@@ -140,11 +140,33 @@ class TestItAgreesWithHashlib:
                 f"seed {seed}, input #{i} ({length} bytes) disagrees with hashlib"
             )
 
+    @pytest.mark.parametrize("length", [8 * 1024, 1024 * 1024], ids=["8KiB", "1MiB"])
+    def test_on_fixed_long_inputs(self, length: int) -> None:
+        """FIXED, not random, so a defect in the length field is caught every run. 8 KiB is 2^16
+        bits: a length field cut to 16 bits reads it as 0. Round 2 of #764 measured the random
+        test catching that plant in only 181 of 200 runs. (A field cut to 32 bits needs 512 MiB to
+        show in a digest; :class:`TestTheLengthField` catches that one without hashing.)"""
+        message = bytes((i * 31 + 7) & 0xFF for i in range(length))
+        assert _sha512_256_pure_python(message) == _hashlib_sha512_256(message)
+
     def test_bytearray_and_memoryview_hash_as_their_bytes(self) -> None:
         message = b"radiant header bytes" * 5
         expected = _hashlib_sha512_256(message)
         assert _sha512_256_pure_python(bytearray(message)) == expected
         assert _sha512_256_pure_python(memoryview(message)) == expected
+
+
+class TestTheLengthField:
+    """The 128-bit length FIPS 180-4 §5.1.2 appends, at lengths no test could hash. A field cut
+    to 16, 32 or 64 bits agrees with the full one on every input a test can afford, so only
+    this sees it."""
+
+    @pytest.mark.parametrize("length", [0, 111, 112, 8 * 1024, 2**29, 2**32 + 1, 2**61 + 3, 2**64 + 5, 2**100 + 7])
+    def test_it_is_the_whole_bit_length_big_endian(self, length: int) -> None:
+        padding = pyrxd_hash._sha512_padding(length)
+        assert padding[0] == 0x80 and not any(padding[1:-16])
+        assert (length + len(padding)) % 128 == 0 and 17 <= len(padding) <= 144
+        assert int.from_bytes(padding[-16:], "big") == length * 8
 
 
 class TestRealRadiantHeaders:
@@ -246,7 +268,8 @@ class TestTheRefusalStillTellsTheTruth:
         with pytest.raises(ValueError) as caught:
             radiant_block_hash(bytes(80))
         message = str(caught.value)
-        assert message.startswith("no SHA-512/256 here: hashlib refused it and the pure-Python fallback failed")
+        # The fallback's own error FIRST: callers cap what they show (the pages at 80 characters).
+        assert message.startswith("RuntimeError: simulated fallback failure — in the pure-Python SHA-512/256")
         assert "unsupported hash type sha512_256" in message
         assert "simulated fallback failure" in message
         assert hashlib_without_sha512_256 == ["sha512_256"]

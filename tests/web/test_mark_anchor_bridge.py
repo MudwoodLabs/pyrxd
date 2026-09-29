@@ -625,7 +625,9 @@ class TestTheBridgeBindsTheHeightThroughTheOneRule:
         assert answer["resolved"] is False
         assert "needs_headers" not in answer and "height" not in answer
         assert "this browser's Python cannot compute a Radiant block hash" in answer["reason"]
-        assert "no SHA-512/256 here: hashlib refused it and the pure-Python fallback failed" in answer["reason"]
+        # THE CAUSE ITSELF must survive the page's 80-character cap, not just a preamble about
+        # there being one: round 2 of #764 found the page showing "…fallback failed (ha…)".
+        assert "(RuntimeError: simulated fallback failure" in answer["reason"], answer["reason"]
         assert "disagree" not in answer["reason"]
 
     def test_an_unmined_mark_is_not_refused_over_a_hash_it_does_not_need(self, glue, monkeypatch) -> None:
@@ -633,51 +635,6 @@ class TestTheBridgeBindsTheHeightThroughTheOneRule:
         self._without_any_sha512_256(monkeypatch)
         answer = glue.mark_anchor(_TXID, _verbose(confirmations=0), _MEASURED_TIP)
         assert answer["resolved"] is True and answer["height"] is None
-
-    def test_the_boot_does_not_load_pyodides_openssl(self, monkeypatch) -> None:
-        """The pages must NOT load Pyodide's ``hashlib`` package or its ``openssl`` dependency (#757).
-
-        WHY ABSENT. PR #756 loaded it because Pyodide 0.26.4's ``hashlib`` has no SHA-512/256 (the
-        Radiant block hash) without it. Once loaded, OpenSSL 1.1.1n — end of life — computed EVERY
-        hash on the page, the SHA-256 and RIPEMD-160 behind the signature verdict included
-        (measured in headless Chromium), and it was about 3.7 MB more code checked only against a
-        lockfile fetched unverified from the same CDN. ``pyrxd.hash`` now computes SHA-512/256 in
-        pure Python where ``hashlib`` cannot, so the package buys nothing.
-
-        Gated on that premise holding BEHAVIOURALLY: with ``hashlib`` refusing the name, the block
-        hash of the mainnet genesis header must still be the registry's genesis hash. If it is not,
-        dropping the package broke the pages, and this test must fail rather than pass on a scan.
-
-        The scan covers every package-loading call in every page script (``loadPackage`` in any
-        form, ``loadPackagesFromImports``, ``micropip.install``), and must find the known
-        ``micropip`` load — the control that it is reading the real boot and not an empty set.
-        """
-        import re
-
-        from pyrxd.constants import GENESIS_BLOCK_HASHES
-        from pyrxd.hash import radiant_block_hash
-        from tests.network.test_registry import _MAINNET_GENESIS_HEADER_HEX
-
-        refused = self._without_hashlibs_sha512_256(monkeypatch)
-        genesis = bytes.fromhex(_MAINNET_GENESIS_HEADER_HEX)
-        assert radiant_block_hash(genesis) == GENESIS_BLOCK_HASHES["mainnet"], (
-            "the premise: without hashlib's SHA-512/256 the block hash must still be right — it is not, "
-            "so the pages cannot drop Pyodide's OpenSSL package"
-        )
-        assert refused, "the premise check never reached hashlib, so it proved nothing"
-
-        page_root = _GLUE_DIR.parent
-        scripts = [p for p in sorted(page_root.rglob("*")) if p.suffix in {".js", ".html"} and "vendor" not in p.parts]
-        loads: list[tuple[str, str]] = []
-        for path in scripts:
-            text = path.read_text(encoding="utf-8")
-            for match in re.finditer(r"(loadPackage|loadPackagesFromImports|micropip\.install)\s*\(([^)]*)\)", text):
-                loads.append((f"{path.relative_to(page_root)}: {match.group(1)}", match.group(2)))
-        assert any(call.endswith("loadPackage") and '"micropip"' in args for call, args in loads), (
-            f"the known micropip load was not found in {[c for c, _ in loads]} — this scan is broken"
-        )
-        offenders = [f"{call}({args})" for call, args in loads if re.search(r"hashlib|openssl", args, re.IGNORECASE)]
-        assert not offenders, f"the pages load Pyodide's OpenSSL again: {offenders}"
 
     def test_the_pages_safety_stop_is_above_what_the_rule_can_ask(self) -> None:
         """`MAX_HEADER_REQUESTS` in shared.js only stops a runaway loop; it must never cut off a
