@@ -163,12 +163,23 @@ COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda
 # first had its decoy envelope read as the payload a commit bound (``payload_binding``).
 COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda5[12]9d76a914[0-9a-f]{40}88ac$")
 
-# A DAT commit carries NO OP_REFTYPE_OUTPUT block — a DAT reveal mints nothing —
-# and adds a "dat" marker push ahead of "gly". 70 bytes.
+# A DAT commit carries NO OP_REFTYPE_OUTPUT block — it demands no token of its reveal (and does
+# not prevent one) — and adds a "dat" marker push ahead of "gly". 70 bytes.
 DAT_COMMIT_SCRIPT_SIZE = 70
 DAT_COMMIT_SCRIPT_RE = re.compile(
     r"^aa20([0-9a-f]{64})8803646174880367 6c798876a914([0-9a-f]{40})88ac$".replace(" ", "")
 )
+
+# A 65-byte hash-lock commit (#751): the 70-byte form without the "dat" push,
+# ``OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH. Neither builder emits it
+# (Photonic's ``datCommitScript`` at ``becf41a7`` and pyrxd's both emit the 70-byte form). It is
+# read from what the script does, not from who built it: it forces the spender to push a payload
+# whose hash256 is ``h``, and it has no ``OP_REFTYPE_OUTPUT`` check, so it demands no token of the
+# reveal — nor prevents one. Nothing in the script says DAT; it is filed with the DAT commits for
+# that shared obligation, and because the reveals seen spending it are DAT reveals (``p = [3]``:
+# ``77df45a9…1b22:0``, spent by ``e5c67100…be5d``). Bare only: no delegate prefix has been seen on
+# it, and none is accepted.
+DAT_GLY_ONLY_COMMIT_SCRIPT_RE = re.compile(r"^aa20([0-9a-f]{64})8803676c798876a914([0-9a-f]{40})88ac$")
 
 # --- Authority-gated NFT (Photonic ``packages/lib/src/authority.ts:239``) -----
 # ``OP_REQUIREINPUTREF <auth_ref> OP_DROP OP_PUSHINPUTREFSINGLETON <ref> OP_DROP``
@@ -306,11 +317,11 @@ def build_dat_commit_locking_script(
     The difference from :func:`build_commit_locking_script` is the whole point:
     there is **no** ``OP_REFTYPE_OUTPUT`` block. An NFT or FT commit obliges its
     reveal to produce an output of a given ref type — that is what mints the
-    token. A DAT reveal creates no token at all; it stores data, and the only
-    thing the commit binds is that the revealed payload hashes to
-    *payload_hash*.
+    token. A DAT commit demands no token of its reveal, nor prevents one; it
+    stores data, and the only thing it binds is that the revealed payload
+    hashes to *payload_hash*.
 
-    So a DAT reveal has nothing to transfer and nothing to own afterwards. The
+    So a DAT reveal need leave nothing to transfer or own afterwards. The
     payload is recovered from the reveal's scriptSig, exactly as for any other
     glyph, and lives as long as the chain does.
 
@@ -356,6 +367,19 @@ def parse_dat_commit_script(script: bytes) -> tuple[bytes, Hex20] | None:
     """
     _delegate_ref, core = split_delegate_commit_prefix(script)
     m = DAT_COMMIT_SCRIPT_RE.fullmatch(core.hex().lower())
+    if m is None:
+        return None
+    return bytes.fromhex(m.group(1)), Hex20(bytes.fromhex(m.group(2)))
+
+
+def parse_dat_gly_only_commit_script(script: bytes) -> tuple[bytes, Hex20] | None:
+    """Return ``(payload_hash, owner_pkh)`` from the 65-byte hash-lock commit, or ``None``.
+
+    See :data:`DAT_GLY_ONLY_COMMIT_SCRIPT_RE` for the template, why it is read by what it does,
+    and why it is filed with the DAT commits although it has no ``"dat"`` push. Exactly 65 bytes,
+    no delegate prefix.
+    """
+    m = DAT_GLY_ONLY_COMMIT_SCRIPT_RE.fullmatch(bytes(script).hex())
     if m is None:
         return None
     return bytes.fromhex(m.group(1)), Hex20(bytes.fromhex(m.group(2)))

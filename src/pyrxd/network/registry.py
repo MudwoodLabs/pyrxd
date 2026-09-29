@@ -142,6 +142,12 @@ def _canonical_host(host: str) -> str:
     IPv6 address; ``203.0.113.7`` and ``0xcb.0.113.7`` are one IPv4 address; ``::ffff:203.0.113.7``
     is that IPv4 address too. Names that are not IP literals are only case- and dot-folded — whether
     two NAMES reach one machine is not visible in a URL, and nothing here claims to see it.
+    An internationalised name is folded to its punycode A-label, the spelling that is connected to.
+
+    Not folded, because the URL does not show them to be one host: an IPv6 zone id spelled
+    ``%eth0`` and ``%25eth0`` (link-local addresses only), and a NAT64 (``64:ff9b::/96``) or
+    IPv4-compatible IPv6 address next to the IPv4 address it embeds. Whether those reach one
+    machine depends on the network, the same limit as a hostname next to its IP address.
     """
     host = host.strip().rstrip(".").lower()
     if ":" in host:  # IPv6 (urlsplit has already removed the brackets); a zone id is kept verbatim
@@ -157,6 +163,16 @@ def _canonical_host(host: str) -> str:
         try:
             return str(ipaddress.IPv4Address(socket.inet_aton(host)))
         except OSError:  # e.g. "08": not a valid octal part, so not an address — keep the name
+            return host
+    if not host.isascii():
+        # An internationalised name is one host in two spellings: websockets connects
+        # ``bücher.example`` to ``xn--bcher-kva.example`` (#754). Fold to the A-label, the form
+        # that goes on the wire. A name the codec cannot encode is kept as typed.
+        try:
+            # Re-canonicalised: the codec maps ``。`` to ``.`` and full-width digits to ASCII,
+            # so the A-label can still carry a trailing dot or spell an IP literal.
+            return _canonical_host(host.encode("idna").decode("ascii"))
+        except UnicodeError:
             return host
     return host
 
@@ -199,6 +215,10 @@ class Endpoint:
         object.__setattr__(self, "url", url)
         if not (url.startswith("wss://") or url.startswith("ws://")):
             raise ValidationError(f"endpoint url must start with wss:// or ws:// (got {url.split(':', 1)[0]!r})")
+        try:
+            urlsplit(url)
+        except ValueError as exc:  # e.g. "wss://[::1": an unclosed IPv6 bracket (#754)
+            raise ValidationError(f"endpoint url is malformed: {exc}") from exc
         if url.startswith("ws://") and not self.allow_insecure:
             raise ValidationError(
                 f"insecure endpoint {url!r} rejected. Use wss://, or set allow_insecure for this network."
@@ -272,7 +292,10 @@ def _is_loopback_url(url: str) -> bool:
     ``127.0.0.1.evil.com``, ``localhost.evil.com``, a bare ``0.0.0.0``, a LAN address and the
     abbreviated ``127.1`` (which :mod:`ipaddress` rejects) all do not.
     """
-    host = urlsplit(url).hostname  # lowercases, strips userinfo and IPv6 brackets
+    try:
+        host = urlsplit(url).hostname  # lowercases, strips userinfo and IPv6 brackets
+    except ValueError:  # malformed (e.g. an unclosed IPv6 bracket): not provably loopback
+        return False
     if not host:
         return False
     if host == "localhost":

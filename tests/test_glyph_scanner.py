@@ -23,21 +23,33 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pyrxd.base58 import base58check_encode
 from pyrxd.glyph.payload import GLY_MARKER, encode_payload
-from pyrxd.glyph.scanner import _MAX_REVEAL_CANDIDATES, GlyphScanner
+from pyrxd.glyph.scanner import (
+    _MAX_REVEAL_CANDIDATES,
+    OWNED_TOKEN_SHAPES,
+    GlyphScanner,
+    owned_token_script_hashes,
+)
 from pyrxd.glyph.script import (
     build_commit_locking_script,
     build_ft_locking_script,
     build_nft_locking_script,
 )
 from pyrxd.glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
-from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord, script_hash_for_script
+from pyrxd.network.electrumx import (
+    ElectrumXClient,
+    UtxoRecord,
+    script_hash_for_address,
+    script_hash_for_output,
+    script_hash_for_script,
+)
 from pyrxd.script.script import Script
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import NetworkError, ServerInconsistencyError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -150,6 +162,12 @@ FT_MINT = _Mint(
     satoshis=1000,
 )
 
+# Where a Radiant ElectrumX lists PKH's outputs of each kind: the script with its refs zeroed.
+# Every NFT one key owns is listed under SH_NFT, and every FT under SH_FT.
+SH_NFT = script_hash_for_output(NFT_MINT.lock).hex()
+SH_FT = script_hash_for_output(FT_MINT.lock).hex()
+ADDRESS = base58check_encode(b"\x00" + PKH)  # PKH's mainnet P2PKH address
+
 
 def _chain(*mints: _Mint, drop: tuple[str, ...] = ()) -> tuple[dict, dict]:
     """Return ``(tx_map, history_map)`` for *mints*, minus any txid in *drop*."""
@@ -165,20 +183,28 @@ def _chain(*mints: _Mint, drop: tuple[str, ...] = ()) -> tuple[dict, dict]:
 
 
 def _new_calls() -> dict[str, list[str]]:
-    return {"get_transaction": [], "get_history": []}
+    return {"get_transaction": [], "get_history": [], "get_utxos": []}
 
 
 def _mock_client(
-    utxos: list[UtxoRecord],
+    utxos: list[UtxoRecord] | dict[str, list[UtxoRecord]],
     tx_map: dict,
     history_map: dict | None = None,
     calls: dict | None = None,
 ) -> MagicMock:
-    """Build a mock ElectrumXClient with pre-canned UTXO / tx / history data."""
+    """Build a mock ElectrumXClient with pre-canned UTXO / tx / history data.
+
+    *utxos* is either one listing, returned for every script hash asked about, or a map from
+    script hash (hex) to the listing for that hash.
+    """
     client = MagicMock(spec=ElectrumXClient)
     recorded = calls if calls is not None else _new_calls()
 
     async def _get_utxos(script_hash):
+        key = script_hash.hex() if hasattr(script_hash, "hex") else str(script_hash)
+        recorded["get_utxos"].append(key)
+        if isinstance(utxos, dict):
+            return list(utxos.get(key, []))
         return utxos
 
     async def _get_transaction(txid):
@@ -298,15 +324,17 @@ class TestGlyphScannerEmptyWallet:
         result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
-    def test_scan_address_calls_script_hash_for_address(self):
-        client = _mock_client(utxos=[], tx_map={})
-        scanner = GlyphScanner(client)
-        with patch(
-            "pyrxd.glyph.scanner.script_hash_for_address",
-            return_value=bytes([0xCC] * 32),
-        ):
-            result = asyncio.run(scanner.scan_address("any-address"))
+    def test_scan_address_reads_the_token_hashes_not_the_p2pkh_hash(self):
+        """A Radiant ElectrumX lists an address's token outputs under their scripts with the refs
+        zeroed, and its P2PKH hash lists only its plain outputs (measured on both public mainnet
+        servers, 2026-09-29). Reading the P2PKH hash found no token on a real server."""
+        calls = _new_calls()
+        scanner = GlyphScanner(_mock_client(utxos=[], tx_map={}, calls=calls))
+        result = asyncio.run(scanner.scan_address(ADDRESS))
         assert result == []
+        assert sorted(calls["get_utxos"]) == sorted(sh.hex() for sh in owned_token_script_hashes(PKH))
+        assert SH_NFT in calls["get_utxos"] and SH_FT in calls["get_utxos"]
+        assert script_hash_for_address(ADDRESS).hex() not in calls["get_utxos"]
 
 
 class TestGlyphScannerNftOutput:
@@ -315,7 +343,7 @@ class TestGlyphScannerNftOutput:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert len(result) == 1
         item = result[0]
         assert isinstance(item, GlyphNft)
@@ -334,7 +362,7 @@ class TestGlyphScannerNftOutput:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert result[0].metadata is not None
         assert result[0].metadata.name == "TestNFT"
 
@@ -348,7 +376,7 @@ class TestGlyphScannerNftOutput:
         utxos = [UtxoRecord(tx_hash=TXID_REVEAL, tx_pos=0, value=546, height=101)]
         calls = _new_calls()
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history, calls))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert result[0].metadata is not None
         assert result[0].metadata.name == "TestNFT"
         assert calls["get_history"] == []
@@ -360,7 +388,7 @@ class TestGlyphScannerNftOutput:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert len(result) == 1
         assert result[0].metadata is None
 
@@ -389,7 +417,7 @@ class TestGlyphScannerContainers:
     def _scan(self, mint: _Mint) -> GlyphNft:
         tx_map, history = _chain(mint)
         utxos = [UtxoRecord(tx_hash=mint.reveal_txid, tx_pos=0, value=546, height=101)]
-        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash(SH_NFT))
         assert len(result) == 1
         return result[0]
 
@@ -404,7 +432,7 @@ class TestGlyphScannerContainers:
     def test_a_plain_nft_is_not_flagged_as_a_container(self):
         tx_map, history = _chain(NFT_MINT)
         utxos = [UtxoRecord(tx_hash=TXID_REVEAL, tx_pos=0, value=546, height=101)]
-        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash(SH_NFT))
         assert result[0].is_container is False
 
     def test_member_surfaces_the_container_it_belongs_to(self):
@@ -418,7 +446,7 @@ class TestGlyphScannerContainers:
         transfer_txid = "e7" * 32
         tx_map[transfer_txid] = self.MEMBER_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=transfer_txid, tx_pos=0, value=546, height=102)]
-        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash(SH_NFT))
         assert len(result) == 1
         assert result[0].metadata is None
         assert result[0].container_refs == ()
@@ -434,7 +462,7 @@ class TestGlyphScannerContainers:
         utxos = [UtxoRecord(tx_hash=legacy_txid, tx_pos=0, value=10_000, height=103)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
         with caplog.at_level(logging.WARNING):
-            result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+            result = asyncio.run(scanner.scan_script_hash(script_hash_for_output(legacy_script).hex()))
         assert result == []
         assert "unspendable container-legacy" in caplog.text
 
@@ -445,7 +473,7 @@ class TestGlyphScannerFtOutput:
         tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=1000, height=50)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_FT))
         assert len(result) == 1
         item = result[0]
         assert isinstance(item, GlyphFt)
@@ -458,7 +486,7 @@ class TestGlyphScannerFtOutput:
         tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=1000, height=50)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_FT))
         assert result[0].metadata is not None
         assert result[0].metadata.name == "TestFT"
         assert GlyphProtocol.FT in result[0].metadata.protocol
@@ -467,10 +495,16 @@ class TestGlyphScannerFtOutput:
         """N UTXOs of one token cost one reveal resolution, not N."""
         tx_map, history = _chain(FT_MINT)
         tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex()
-        utxos = [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=1000, height=50 + i) for i in range(4)]
+        # Four outpoints. One outpoint listed four times is a server inconsistency (it would count
+        # an FT four times), and is refused; see TestServerInconsistency.
+        utxos = []
+        for i in range(4):
+            txid = f"{0xF0 + i:02x}" * 32
+            tx_map[txid] = FT_MINT.transfer_tx_hex()
+            utxos.append(UtxoRecord(tx_hash=txid, tx_pos=0, value=1000, height=50 + i))
         calls = _new_calls()
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history, calls))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_FT))
         assert len(result) == 4
         assert all(r.metadata is not None and r.metadata.name == "TestFT" for r in result)
         assert len(calls["get_history"]) == 1
@@ -483,7 +517,7 @@ class TestGlyphScannerVoutFiltering:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=1, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert result == []
 
 
@@ -492,8 +526,30 @@ class TestGlyphScannerNetworkErrors:
         """If get_transaction raises for a UTXO tx, that UTXO is skipped."""
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map={}))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert result == []
+
+    def test_failed_tx_fetch_raises_when_strict(self):
+        """``strict=True``, which ``pyrxd glyph list`` passes: the UTXO whose transaction could not
+        be fetched fails the scan, instead of vanishing from an inventory shown as complete."""
+        utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
+        scanner = GlyphScanner(_mock_client(utxos, tx_map={}))
+        with pytest.raises(NetworkError, match="1 of 1 transaction reads failed"):
+            asyncio.run(scanner.scan_script_hash(SH_NFT, strict=True))
+        by_address = GlyphScanner(_mock_client({SH_NFT: utxos}, tx_map={}))
+        with pytest.raises(NetworkError, match="1 of 1 transaction reads failed"):
+            asyncio.run(by_address.scan_address(ADDRESS, strict=True))
+
+    def test_strict_returns_a_token_whose_metadata_lookup_failed(self):
+        """The honest half: strict is about the holding, not the name. The commit tx is missing,
+        so the metadata lookup fails, and the token still comes back, with ``metadata=None``."""
+        tx_map, history = _chain(NFT_MINT, drop=(TXID_COMMIT,))
+        tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
+        utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
+        scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT, strict=True))
+        assert len(result) == 1
+        assert result[0].metadata is None
 
     def test_failed_commit_fetch_returns_none_metadata(self):
         """If the commit tx is unavailable, metadata is None but the Glyph stands."""
@@ -501,7 +557,7 @@ class TestGlyphScannerNetworkErrors:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert len(result) == 1
         assert result[0].metadata is None
 
@@ -511,7 +567,7 @@ class TestGlyphScannerNetworkErrors:
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history_map={}))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert len(result) == 1
         assert result[0].metadata is None
 
@@ -525,28 +581,29 @@ class TestGlyphScannerMixed:
             UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100),
             UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=1000, height=50),
         ]
-        scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        # Each listed where a Radiant ElectrumX lists it: the NFT under the address's NFT hash,
+        # the FT under its FT hash.
+        scanner = GlyphScanner(_mock_client({SH_NFT: utxos[:1], SH_FT: utxos[1:]}, tx_map, history))
+        result = asyncio.run(scanner.scan_address(ADDRESS))
         types = {type(r).__name__ for r in result}
         assert "GlyphNft" in types
         assert "GlyphFt" in types
         assert {r.metadata.name for r in result} == {"TestNFT", "TestFT"}
 
-    def test_scan_address_delegates_to_scan_script_hash(self):
-        """scan_address() should yield same result as scan_script_hash() for the address."""
-        tx_map, history = _chain(NFT_MINT)
+    def test_scan_address_is_scan_script_hash_over_the_token_hashes(self):
+        """scan_address() returns what scan_script_hash() returns for each of the address's hashes."""
+        tx_map, history = _chain(NFT_MINT, FT_MINT)
         tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
-        utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
-        scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-
-        with patch(
-            "pyrxd.glyph.scanner.script_hash_for_address",
-            return_value=bytes([0xCC] * 32),
-        ):
-            result_addr = asyncio.run(scanner.scan_address("any-address"))
-        result_sh = asyncio.run(scanner.scan_script_hash("cc" * 32))
-        assert len(result_addr) == len(result_sh)
-        assert type(result_addr[0]) is type(result_sh[0])
+        tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex()
+        listing = {
+            SH_NFT: [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)],
+            SH_FT: [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=1000, height=50)],
+        }
+        scanner = GlyphScanner(_mock_client(listing, tx_map, history))
+        result_addr = asyncio.run(scanner.scan_address(ADDRESS))
+        result_sh = [item for sh in (SH_NFT, SH_FT) for item in asyncio.run(scanner.scan_script_hash(sh))]
+        assert result_addr == result_sh
+        assert len(result_addr) == 2
 
 
 class TestGlyphScannerNonGlyphUtxos:
@@ -556,7 +613,7 @@ class TestGlyphScannerNonGlyphUtxos:
         plain_tx_hex = _tx([(TXID_FUNDING, 0, _p2pkh_scriptsig())], [(p2pkh_script, 1000)])
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=1000, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, {TXID_TRANSFER: plain_tx_hex}))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(script_hash_for_output(p2pkh_script).hex()))
         assert result == []
 
 
@@ -594,7 +651,7 @@ class TestRevealResolution:
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         calls = _new_calls()
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history, calls))
-        asyncio.run(scanner.scan_script_hash("cc" * 32))
+        asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert calls["get_history"] == [NFT_MINT.commit_script_hash]
 
     def test_decoys_in_history_are_ignored(self):
@@ -610,7 +667,7 @@ class TestRevealResolution:
         ]
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         assert result[0].metadata is not None
         assert result[0].metadata.name == "TestNFT"
 
@@ -631,7 +688,7 @@ class TestRevealResolution:
         utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
         calls = _new_calls()
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history, calls))
-        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash(SH_NFT))
         # The token still resolves; the metadata is given up rather than paying
         # for an unbounded walk.
         assert len(result) == 1
@@ -712,7 +769,7 @@ class TestRevealMetadataConcurrency:
         base.get_transaction = _tracking_get_transaction
 
         scanner = GlyphScanner(base)
-        result = await scanner.scan_script_hash("cc" * 32)
+        result = await scanner.scan_script_hash(SH_NFT)
 
         assert len(result) == 5
         assert all(r.metadata is not None for r in result)
@@ -741,8 +798,227 @@ class TestRevealMetadataConcurrency:
             UtxoRecord(tx_hash=broken_transfer, tx_pos=0, value=546, height=101),
         ]
         scanner = GlyphScanner(_mock_client(utxos, tx_map, history_map))
-        result = await scanner.scan_script_hash("cc" * 32)
+        result = await scanner.scan_script_hash(SH_NFT)
         assert len(result) == 2  # both glyphs survived
         by_ref = {r.ref: r for r in result}
         assert by_ref[NFT_MINT.ref].metadata is not None
         assert by_ref[broken.ref].metadata is None
+
+
+# ---------------------------------------------------------------------------
+# #782: what the server says is checked against the transaction it serves
+# ---------------------------------------------------------------------------
+
+OTHER_PKH = Hex20(bytes.fromhex("cc" * 20))  # another key's hash160
+TXID_FOREIGN = "fa" * 32
+
+
+def _one_output_tx(lock: bytes, satoshis: int) -> str:
+    return _tx([(TXID_FUNDING, 9, _p2pkh_scriptsig())], [(lock, satoshis)])
+
+
+class TestServerInconsistency:
+    """``get_transaction`` binds the transaction to its txid, so what it says outranks the listing.
+
+    Before #782 the scanner took a token's owner from the script without comparing it with the
+    address, and an FT's amount from the server's UTXO record: a server listing another key's NFT
+    under our address got it shown, and a 5,000-unit FT was shown as 999,999,999. Each refusal
+    here has an honest-path twin below it.
+    """
+
+    @staticmethod
+    def _foreign(kind: str) -> tuple[dict, dict, str]:
+        """The server lists, under our *kind* hash, a *kind* output locked to another key."""
+        mint = NFT_MINT if kind == "nft" else FT_MINT
+        builder = build_nft_locking_script if kind == "nft" else build_ft_locking_script
+        tx_map, history = _chain(mint)
+        tx_map[TXID_FOREIGN] = _one_output_tx(builder(OTHER_PKH, mint.ref), 5_000)
+        listing = {
+            SH_NFT if kind == "nft" else SH_FT: [UtxoRecord(tx_hash=TXID_FOREIGN, tx_pos=0, value=5_000, height=1)]
+        }
+        return listing, tx_map, history
+
+    @pytest.mark.parametrize("kind", ["nft", "ft"])
+    def test_another_keys_token_is_a_server_inconsistency_when_strict(self, kind):
+        listing, tx_map, history = self._foreign(kind)
+        scanner = GlyphScanner(_mock_client(listing, tx_map, history))
+        with pytest.raises(
+            ServerInconsistencyError, match=f"server inconsistency: .* that {kind} output is owned by another key"
+        ):
+            asyncio.run(scanner.scan_address(ADDRESS, strict=True))
+
+    @pytest.mark.parametrize("kind", ["nft", "ft"])
+    def test_another_keys_token_is_left_out_by_default(self, kind, caplog):
+        listing, tx_map, history = self._foreign(kind)
+        scanner = GlyphScanner(_mock_client(listing, tx_map, history))
+        with caplog.at_level(logging.WARNING):
+            assert asyncio.run(scanner.scan_address(ADDRESS)) == []
+        assert "owned by another key" in caplog.text
+
+    def test_the_wallets_own_tokens_are_listed_when_strict(self):
+        """The honest path: our NFT and FT, each under its own hash, both returned under strict."""
+        tx_map, history = _chain(NFT_MINT, FT_MINT)
+        tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
+        tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex(satoshis=5_000)
+        listing = {
+            SH_NFT: [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=1)],
+            SH_FT: [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=5_000, height=1)],
+        }
+        result = asyncio.run(GlyphScanner(_mock_client(listing, tx_map, history)).scan_address(ADDRESS, strict=True))
+        assert sorted((type(r).__name__, r.ref, getattr(r, "amount", 1)) for r in result) == [
+            ("GlyphFt", FT_MINT.ref, 5_000),
+            ("GlyphNft", NFT_MINT.ref, 1),
+        ]
+        assert all(r.owner_pkh == PKH for r in result)
+
+    @pytest.mark.parametrize("value", [5_000, 999_999_999, 1])
+    def test_an_fts_amount_is_what_the_transaction_pays(self, value, caplog):
+        """The transaction pays 5,000; the server's record says *value*. 5,000 is shown either way,
+        and a record that disagrees is logged. ``value=5_000`` is the honest record."""
+        tx_map, history = _chain(FT_MINT)
+        tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex(satoshis=5_000)
+        listing = {SH_FT: [UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=value, height=1)]}
+        with caplog.at_level(logging.WARNING):
+            result = asyncio.run(
+                GlyphScanner(_mock_client(listing, tx_map, history)).scan_address(ADDRESS, strict=True)
+            )
+        assert [r.amount for r in result] == [5_000]
+        assert ("the transaction pays 5000" in caplog.text) is (value != 5_000)
+
+    def test_an_output_not_at_the_scanned_hash_is_refused(self, caplog):
+        """``scan_script_hash`` knows no owner, so only the hash can refuse another key's NFT."""
+        listing, tx_map, history = self._foreign("nft")
+        scanner = GlyphScanner(_mock_client(listing, tx_map, history))
+        with pytest.raises(
+            ServerInconsistencyError, match=f"is listed under script hash {SH_NFT}, but its output is not there"
+        ):
+            asyncio.run(scanner.scan_script_hash(SH_NFT, strict=True))
+        with caplog.at_level(logging.WARNING):
+            assert asyncio.run(scanner.scan_script_hash(SH_NFT)) == []
+        assert "its output is not there" in caplog.text
+
+    def test_a_plain_output_listed_under_a_token_hash_is_refused(self):
+        """Not a token, so no owner to compare: the hash check is what refuses it."""
+        p2pkh = bytes.fromhex("76a914") + PKH + bytes.fromhex("88ac")
+        tx_map = {TXID_FOREIGN: _one_output_tx(p2pkh, 5_000)}
+        listing = {SH_NFT: [UtxoRecord(tx_hash=TXID_FOREIGN, tx_pos=0, value=5_000, height=1)]}
+        with pytest.raises(ServerInconsistencyError, match="its output is not there"):
+            asyncio.run(GlyphScanner(_mock_client(listing, tx_map)).scan_address(ADDRESS, strict=True))
+
+    @pytest.mark.parametrize(
+        "script_hash",
+        [SH_NFT, script_hash_for_script(NFT_MINT.lock).hex()],
+        ids=["radiant-electrumx-zeroed-refs", "plain-electrumx-whole-script"],
+    )
+    def test_an_output_at_the_scanned_hash_is_listed(self, script_hash):
+        """The honest path for the hash check, under both hashes a server can list an output by."""
+        tx_map, history = _chain(NFT_MINT)
+        listing = {script_hash: [UtxoRecord(tx_hash=TXID_REVEAL, tx_pos=0, value=546, height=1)]}
+        result = asyncio.run(
+            GlyphScanner(_mock_client(listing, tx_map, history)).scan_script_hash(script_hash, strict=True)
+        )
+        assert [r.ref for r in result] == [NFT_MINT.ref]
+
+    def test_an_output_index_past_the_transaction_is_refused(self):
+        tx_map, history = _chain(NFT_MINT)
+        listing = {SH_NFT: [UtxoRecord(tx_hash=TXID_REVEAL, tx_pos=1, value=546, height=1)]}
+        with pytest.raises(ServerInconsistencyError, match="has 1 output"):
+            asyncio.run(GlyphScanner(_mock_client(listing, tx_map, history)).scan_script_hash(SH_NFT, strict=True))
+
+    def test_an_outpoint_listed_twice_is_counted_once(self, caplog):
+        """A duplicated FT outpoint would otherwise double the balance shown."""
+        tx_map, history = _chain(FT_MINT)
+        tx_map[TXID_FT_TRANSFER] = FT_MINT.transfer_tx_hex(satoshis=5_000)
+        utxo = UtxoRecord(tx_hash=TXID_FT_TRANSFER, tx_pos=0, value=5_000, height=1)
+        scanner = GlyphScanner(_mock_client({SH_FT: [utxo, utxo]}, tx_map, history))
+        with pytest.raises(ServerInconsistencyError, match="is listed more than once"):
+            asyncio.run(scanner.scan_address(ADDRESS, strict=True))
+        with caplog.at_level(logging.WARNING):
+            assert [r.amount for r in asyncio.run(scanner.scan_address(ADDRESS))] == [5_000]
+
+    def test_a_transaction_that_does_not_parse_fails_a_strict_scan(self, caplog):
+        """Was dropped silently even under strict (#782, minor)."""
+        listing = {SH_NFT: [UtxoRecord(tx_hash=TXID_FOREIGN, tx_pos=0, value=546, height=1)]}
+        scanner = GlyphScanner(_mock_client(listing, {TXID_FOREIGN: "0102"}))
+        with pytest.raises(NetworkError, match="was fetched but does not parse"):
+            asyncio.run(scanner.scan_address(ADDRESS, strict=True))
+        with caplog.at_level(logging.WARNING):
+            assert asyncio.run(scanner.scan_address(ADDRESS)) == []
+        assert "Failed to parse tx" in caplog.text
+
+
+class TestScriptHashForOutput:
+    """The hash a Radiant ElectrumX lists an output under (RXinDexer ``Script.zero_refs``)."""
+
+    # Mainnet 70218e2c4f76c066…:0, an NFT. Both public servers listed it under the zeroed-ref hash
+    # and under neither the owner's P2PKH hash nor the hash of this script (probed 2026-09-29).
+    MAINNET_NFT = bytes.fromhex(
+        "d845a8ecaf4ab00a0c19ea26f19d259bdbea1538c89362fc04822224c9269c5a4c00000000"
+        "7576a914d84b8c371ea11f051dfed9daae05c8dee24d9eba88ac"
+    )
+
+    def test_a_token_script_is_hashed_with_its_refs_zeroed(self):
+        from pyrxd.hash import sha256
+
+        zeroed = b"\xd8" + bytes(36) + self.MAINNET_NFT[37:]
+        assert bytes(script_hash_for_output(self.MAINNET_NFT)) == sha256(zeroed)[::-1]
+        assert script_hash_for_output(self.MAINNET_NFT) != script_hash_for_script(self.MAINNET_NFT)
+
+    def test_the_hash_depends_on_the_owner_not_the_ref(self):
+        other_ref = GlyphRef(txid=Txid("12" * 32), vout=3)
+        assert script_hash_for_output(build_ft_locking_script(PKH, other_ref)) == script_hash_for_output(FT_MINT.lock)
+        assert script_hash_for_output(build_ft_locking_script(OTHER_PKH, FT_MINT.ref)) != script_hash_for_output(
+            FT_MINT.lock
+        )
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            bytes.fromhex("76a914") + b"\xd8" * 20 + bytes.fromhex("88ac"),  # ref-range bytes inside a push
+            b"\xd8" + bytes(range(36)) + b"\x75\x51",  # a ref, but no signature check
+            b"\xd8\x00\x01",  # truncated ref operand
+            NFT_MINT.commit_script,  # no ref at all
+        ],
+        ids=["push-data", "no-checksig", "truncated", "commit"],
+    )
+    def test_other_scripts_are_hashed_as_they_are(self, script):
+        assert script_hash_for_output(script) == script_hash_for_script(script)
+
+
+class TestOwnedTokenShapes:
+    """``scan_address`` reads one hash per shape in ``OWNED_TOKEN_SHAPES``. A shape missing there
+    is a token ``glyph list`` cannot see, so the set is checked against what ``find_glyphs`` emits."""
+
+    # Pinned, not derived: the shapes that carry no owner key (a mutable-state output and a dMint
+    # contract). Adding a shape to find_glyphs fails the test below until it is put in one set.
+    OWNERLESS = frozenset({"mut", "dmint"})
+
+    @staticmethod
+    def _emitted_glyph_types() -> set[str]:
+        import ast
+        import inspect
+        import textwrap
+
+        from pyrxd.glyph import inspector
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(inspector.GlyphInspector.find_glyphs)))
+        return {
+            kw.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "glyph_type" and isinstance(kw.value, ast.Constant)
+        }
+
+    def test_every_owned_shape_find_glyphs_emits_is_read(self):
+        emitted = self._emitted_glyph_types()
+        assert "nft" in emitted and "ft" in emitted, f"the derivation found nothing real: {emitted}"
+        assert emitted >= self.OWNERLESS
+        assert set(OWNED_TOKEN_SHAPES) == emitted - self.OWNERLESS
+
+    @pytest.mark.parametrize("glyph_type", sorted(OWNED_TOKEN_SHAPES))
+    def test_each_template_is_the_shape_it_is_filed_under(self, glyph_type):
+        from pyrxd.glyph.inspector import GlyphInspector
+
+        found = GlyphInspector().find_glyphs([(1, OWNED_TOKEN_SHAPES[glyph_type](PKH))])
+        assert [(g.glyph_type, g.owner_pkh) for g in found] == [(glyph_type, PKH)]

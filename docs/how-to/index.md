@@ -28,10 +28,9 @@ troubleshoot-common-errors
 ## Available now
 
 - **[Receive funds and check your balance](receive-and-check-balance.md)** — the
-  read-only wallet basics: `pyrxd address` for a receive address, `pyrxd balance
-  --refresh` to confirm money arrived, `pyrxd utxos` to see exactly what you
-  hold, and `wallet export-xpub` for watch-only receiving. No signing, no
-  mnemonic.
+  read-only wallet basics: `pyrxd address` for a receive address, `pyrxd balance`
+  to confirm money arrived, `pyrxd utxos` to see exactly what you hold, and
+  `wallet export-xpub` for watch-only receiving. No signing, no broadcast.
 - **[Export a watch-only output-script descriptor](export-a-watch-only-descriptor.md)**
   — `wallet export-xpub --descriptor` emits `pkh()` descriptors for the receive
   and change chains with master-fingerprint key origin, ready for another

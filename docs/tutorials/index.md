@@ -26,7 +26,7 @@ cross-chain-swap
   no mainnet RXD, nothing at risk. **Start here if you want to build.**
 - **[Your first Radiant transaction](your-first-radiant-transaction.md)** —
   fresh `pip install` to a built, signed RXD send. Walks through
-  `pyrxd wallet new`, `pyrxd address`, `pyrxd balance --refresh`,
+  `pyrxd wallet new`, `pyrxd address`, `pyrxd balance`,
   `pyrxd utxos`, and a short Python script using
   `HdWallet.build_send_tx(...)`. Broadcast is gated behind a
   `DRY_RUN=0 I_UNDERSTAND_THIS_IS_REAL=yes` env-var pair so dry-run

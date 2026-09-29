@@ -652,6 +652,10 @@ class JsonFilePendingStore(PendingStore):
     partial write. It then re-reads the file and compares before returning, because a
     write that reported success and landed corrupt is indistinguishable from a good one
     until the reveal fails, by which point the commit is already on-chain.
+
+    *directory* is used as given: ``~`` is NOT expanded, so pass
+    ``Path("~/.pyrxd/pending-mints").expanduser()``, not the bare string, or the records land
+    in a directory literally named ``~`` under the current one (#755).
     """
 
     def __init__(self, directory: str | os.PathLike[str]) -> None:
@@ -957,7 +961,7 @@ class GlyphMinter:
 
     Usage::
 
-        store = JsonFilePendingStore("~/.pyrxd/pending-mints")
+        store = JsonFilePendingStore(Path("~/.pyrxd/pending-mints").expanduser())
         minter = GlyphMinter(client, wallet, store)
         result = await minter.mint_nft(metadata)
 
@@ -1324,7 +1328,8 @@ class GlyphMinter:
         triples = await self._wallet.collect_spendable(self._client)
         if not triples:
             raise InsufficientFundsError(
-                "no spendable UTXOs in the wallet (fund it, or refresh to discover used addresses)",
+                "no spendable UTXOs in the wallet: it was scanned up to the gap limit on both chains and no "
+                "address holds a UTXO. Fund it and retry",
                 available=0,
                 required=total_required,
             )
@@ -1700,8 +1705,8 @@ class GlyphMinter:
         except ValidationError as exc:
             raise ValidationError(
                 f"funding address {address} is not known to this wallet, so the reveal cannot be "
-                "signed. Load the wallet that created the commit (or refresh it so the address is "
-                "rediscovered) and retry — the pending record is left untouched."
+                "signed. Load the wallet that created the commit and retry — the pending record is "
+                "left untouched."
             ) from exc
 
     def _build_reveal_tx(self, pending: PendingMint, funding_key: Any, change_locking: Script) -> Transaction:

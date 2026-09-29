@@ -540,6 +540,16 @@ re-run the mint while the commit may still confirm.
   `payload_hash`. Re-encoding an edited metadata file produces a different hash
   and the output becomes unspendable — there is no owner-only escape path.
 
+  **For `glyph deploy-dmint`, use the code its error prints, not the snippet
+  above.** The commit checks the metadata body, the owner key and that the
+  token ref is carried as an FT. It checks none of the dMint contract
+  parameters, so a reveal built with other code or other values can still
+  spend the commit, and the token it creates is permanent. When the commit
+  broadcast's reply names a different txid, `deploy-dmint` prints the
+  `prepare_dmint_deploy` code with every parameter the command used, including
+  the `lastTime` it stamped. `deploy-ft` names `prepare_ft_deploy_reveal` with
+  its treasury and supply.
+
 ---
 
 ## 7b. "no ElectrumX endpoint is configured for network 'regtest'"
@@ -670,12 +680,12 @@ with no indication it's a token carrier.
 **There is no error string for this** — it's an honest gap, not a bug that
 raises anything. Verified: `balance_cmd` sums `client.get_balance(...)`
 across every used address's raw scripthash
-([`src/pyrxd/cli/query_cmds.py:97-145`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
+([`src/pyrxd/cli/query_cmds.py:233-293`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py)),
 and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
-([`:148-196`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
+([`:296-353`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
-at `src/pyrxd/hd/wallet.py:938-970`). Neither path decodes the locking
+at `src/pyrxd/hd/wallet.py:1243-1301`). Neither path decodes the locking
 script to check whether it's a Glyph FT/NFT envelope versus plain P2PKH —
 both just report the UTXO's raw `value` field from ElectrumX. A Glyph
 carrier's photon value (the 546-dust NFT carrier, or an FT's premined
@@ -684,9 +694,10 @@ supply amount) gets counted exactly like spendable RXD, which it is
 
 **Fix:** `pyrxd glyph list --type ft` (or `--type nft`, or `--type all`) —
 `list_cmd` in [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py) —
-scans wallet addresses and decodes the Glyph envelope, so token holdings
-show up as tokens, separate from the plain-RXD balance. Use this whenever
-you need to know what's actually spendable versus what's a token carrier.
+runs the same gap-limit scan as `balance` and the spend commands, then decodes
+the Glyph envelope at each address it finds used, so token holdings show up as
+tokens, separate from the plain-RXD balance. Use this whenever you need to know
+what's actually spendable versus what's a token carrier.
 
 ---
 

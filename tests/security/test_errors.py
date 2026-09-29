@@ -344,6 +344,8 @@ _SAMPLE_ARGS: dict[str, object] = {
     "attempts": 9,
     "elapsed_s": 1.5,
     "tx_hash": "0x" + "ab" * 32,
+    "local_txid": "cd" * 32,
+    "echoed": "ef" * 32,
 }
 
 

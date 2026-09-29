@@ -68,8 +68,9 @@ operands the parser skips.
 The FT epilogue `dec0e9aa76e378e4a269e69d` contains
 `OP_CODESCRIPTHASHVALUESUM_UTXOS` (`e3`) / `_OUTPUTS` (`e4`) +
 `OP_NUMEQUALVERIFY` (`9d`), and it runs at spend time.
-`getCodeScriptHashValueSumOutputs` (`src/script/interpreter.cpp:2215`)
-sums photons of **outputs whose code-script HASH matches the FT's**.
+`getCodeScriptHashValueSumOutputs` (`src/script/interpreter.cpp:2408-2426`,
+the `OP_CODESCRIPTHASHVALUESUM_OUTPUTS` case that calls it) sums photons of
+**outputs whose code-script HASH matches the FT's**.
 Moving the FT into a foreign covenant output → outputs-sum 0 ≠
 inputs-sum → fail. **An FT can only flow to outputs carrying its exact
 code-script.** This is why "lock the FT into the covenant" is impossible,
@@ -157,11 +158,13 @@ skipping pushdata — and assert the ref set is **exactly** what you
 intended.
 
 Do **not** hand-port a fresh byte-walker. The walker at
-`src/pyrxd/glyph/dmint/chain.py:494` (`is_token_bearing_script`) already
+`src/pyrxd/glyph/dmint/chain.py:573` (`is_token_bearing_script`) already
 implements the correct traversal; extract a shared
 `count_input_refs(script)` primitive from it rather than maintaining two
 divergent walkers (a reserved `0xd4`–`0xd7` opcode is exactly how two
-walkers drift).
+walkers drift). That has since been done: `is_token_bearing_script` and
+`count_input_refs` both run on the one opcode walker, `iter_input_refs`
+in `src/pyrxd/glyph/script.py`.
 
 ```python
 REF_OPCODES = {0xD0, 0xD1, 0xD2, 0xD3, 0xD8}

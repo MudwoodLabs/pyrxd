@@ -462,7 +462,8 @@ class ClaimExecutor:
         # (gettxout include_mempool) treats a covenant spent IN THE MEMPOOL as already claimed: it kills the
         # per-tick re-carve drain with NO durable cross-restart state AND no eviction blind spot (a covenant
         # that becomes truly unspent again — e.g. a reorg-evicted claim — correctly re-fires). None / absent →
-        # the client cannot answer → fall through to the SeenStore guard.
+        # the client cannot answer → fall through to the SeenStore guard. No client shipped in pyrxd answers
+        # (``ElectrumXClient`` has no ``txout_unspent_incl_mempool``), so with those this check abstains.
         mempool_check = getattr(leg.chain_io, "covenant_unspent_incl_mempool", None)
         if callable(mempool_check):
             try:

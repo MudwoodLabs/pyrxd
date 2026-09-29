@@ -37,7 +37,9 @@ import pytest
 from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
+from pyrxd.cli.hashmark_cmds import _BLANKS_OUTSIDE_ZS
 from pyrxd.constants import GENESIS_BLOCK_HASHES
+from pyrxd.glyph._inspect_core import _sanitize_display_string
 from pyrxd.hashmark_tx import (
     MARK_MODELLED_BYTES,
     MarkPlan,
@@ -810,17 +812,15 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         assert _BANNER in result.output and f"ascii: {_SCOTLAND!a}" in result.output
         assert decode_hashmark(_published_script(h)).label == _SCOTLAND
 
-    @pytest.mark.parametrize(
-        "label",
-        ["inv\u043eice 42", "pay\u2800me"],  # a CYRILLIC small o; BRAILLE PATTERN BLANK
-        ids=["cyrillic-o", "braille-blank"],
-    )
+    @pytest.mark.parametrize("label", ["inv\u043eice 42"], ids=["cyrillic-o"])  # a CYRILLIC small o
     def test_a_character_that_looks_like_something_else_is_named_by_the_ascii_form(
         self, runner, tmp_path, monkeypatch, label
     ) -> None:
-        """Neither is default-ignorable and neither is replaced by the reader: each renders as
-        SOMETHING, just not what it is, so neither is escaped and the banner stays quiet. The
-        ``ascii()`` form is the only place the operator can see the codepoint about to be signed."""
+        """Not default-ignorable, not replaced by the reader, not blank: it renders as SOMETHING,
+        just not what it is, so it is not escaped and the banner stays quiet. The ``ascii()`` form
+        is the only place the operator can see the codepoint about to be signed. (U+2800 BRAILLE
+        PATTERN BLANK used to be the second case here; it renders as white space, and is escaped
+        since #747 — see :class:`TestBlankCharactersAreEscapedOnTheConfirmationLine`.)"""
         result, _ = _invoke(
             runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", label]
         )
@@ -860,6 +860,69 @@ class TestALabelsNonPrintingCharactersAreShownBeforeTheyAreSigned:
         )
         assert result.exit_code == 0, result.output
         assert "label:       advisory" in result.output and "ascii: " not in result.output
+
+
+#: The Zs blanks #747 names, plus every non-Zs blank the code recognises (read from the code, so a
+#: character added there is exercised here without anyone remembering to add it).
+_BLANKS = ["\u00a0", "\u2002", "\u2007", "\u200a", "\u202f", "\u205f", "\u3000", *sorted(_BLANKS_OUTSIDE_ZS)]
+
+
+class TestBlankCharactersAreEscapedOnTheConfirmationLine:
+    """#747: a word spelled in blank characters after ``invoice 42`` showed as ``invoice 42`` plus
+    trailing space, with no banner. Only the ``ascii:`` line revealed the codepoints."""
+
+    @pytest.mark.parametrize("blank", _BLANKS, ids=[f"U+{ord(b):04X}" for b in _BLANKS])
+    def test_each_blank_is_escaped_named_and_still_signed(self, runner, tmp_path, monkeypatch, blank) -> None:
+        import unicodedata
+
+        h = _MarkHarness()
+        label = "invoice 42" + blank * 3 + "x"  # not trailing: canonicalisation strips trailing Zs
+        result, _ = _invoke(runner, tmp_path, monkeypatch, harness=h, top=["--yes"], extra=["--label", label])
+        assert result.exit_code == 0, result.output
+        assert blank not in result.output, "reached the terminal raw"
+        assert f"label:       invoice 42{f'<U+{ord(blank):04X}>' * 3}x" in result.output
+        assert _BANNER in result.output and "AS BLANK SPACE" in result.output
+        name = unicodedata.name(blank, "(no Unicode name: unassigned or private use)")  # U+13441 is new in Unicode 15
+        read = "verify prints it as ?" if _sanitize_display_string(blank) != blank else "verify prints it as written"
+        assert f"U+{ord(blank):04X}  {name} — shown above as <U+{ord(blank):04X}>; {read}\n" in result.output
+        assert decode_hashmark(_published_script(h)).label == label, "shown, and signed as typed"
+
+    def test_every_zs_character_but_the_ascii_space_is_escaped(self) -> None:
+        """The rule is the category, not the list above: a Zs blank #747 did not name is escaped too."""
+        import sys
+        import unicodedata
+
+        from pyrxd.cli.hashmark_cmds import _escaped_positions
+
+        zs = [chr(c) for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c)) == "Zs"]
+        assert " " in zs and len(zs) > 10
+        for ch in zs:
+            assert _escaped_positions("a" + ch + "b") == [False, ch != " ", False], f"U+{ord(ch):04X}"
+
+    def test_the_non_zs_blank_list_is_the_reviewed_set(self) -> None:
+        """REVIEWED, NOT DERIVED: no Unicode property says "renders as blank", so the list is a judgement.
+
+        Pinned so a change to it is made on purpose. U+FFFC and the two Egyptian blanks were added
+        after a review drew a word in them that DejaVu Sans Mono showed as empty space.
+        """
+        assert frozenset({"\u2800", "\U0001d159", "\ufffc", "\U00013441", "\U00013442"}) == _BLANKS_OUTSIDE_ZS
+
+    def test_a_selector_after_an_escaped_blank_is_escaped_too(self) -> None:
+        """U+2800 is So, the category an emoji base has; once it is escaped, a U+FE0F after it selects
+        nothing visible, so printing that raw hid it behind ``<U+2800>`` while the banner said "as written"."""
+        from pyrxd.cli.hashmark_cmds import _escaped_positions
+
+        assert _escaped_positions("x\u2800\ufe0f y") == [False, True, True, False, False]
+        assert _escaped_positions("\u2764\ufe0f") == [False, False], "the honest heart + FE0F still prints as written"
+
+    def test_an_ordinary_ascii_space_is_untouched(self, runner, tmp_path, monkeypatch) -> None:
+        """The honest path: ASCII spaces, and a label of nothing else, print as typed with no banner."""
+        result, _ = _invoke(
+            runner, tmp_path, monkeypatch, harness=_MarkHarness(), extra=["--dry-run", "--label", "invoice 42 for may"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "label:       invoice 42 for may" in result.output
+        assert _BANNER not in result.output and "<U+" not in result.output
 
 
 #: Round 3. Every label here reached the signature with NO escape and NO banner in round 2, which
@@ -1187,14 +1250,17 @@ class TestTheNetworkIsPartOfWhatIsSigned:
         assert verify_attestation(decode_hashmark(_published_script(h))).valid
 
 
-class TestTheOtherTwoOutputModesAndTheOverpayFlag:
-    """The paths a scripted caller takes, and the one flag that lets a refusal through.
+class TestTheOtherTwoOutputModesAndTheBuildersOverpayParameter:
+    """The paths a scripted caller takes, and the builder's one parameter that lets a refusal through.
 
-    ``--quiet`` and ``--allow-overpay`` are pass-throughs, which is exactly why they go
-    untested: nothing about them looks like new logic. A ``quiet_field`` naming a key the
-    payload does not have prints an EMPTY LINE and exits 0 — a scripted caller reads that
-    as "no txid" and cannot tell it from a failure, and no assertion about the payload
-    dict would notice.
+    ``--quiet`` is a pass-through, which is exactly why it goes untested: nothing about it
+    looks like new logic. A ``quiet_field`` naming a key the payload does not have prints an
+    EMPTY LINE and exits 0 — a scripted caller reads that as "no txid" and cannot tell it
+    from a failure, and no assertion about the payload dict would notice.
+
+    The overpay tests here are about the SDK's ``build_hashmark_mark(allow_overpay=...)``,
+    which a library caller can reach with any rate. ``mark --allow-overpay`` never could:
+    see :class:`TestMarkAllowOverpayIsDeprecated` (#793).
     """
 
     def test_quiet_mode_prints_the_txid_and_nothing_else(self, runner, tmp_path, monkeypatch) -> None:
@@ -1214,10 +1280,10 @@ class TestTheOtherTwoOutputModesAndTheOverpayFlag:
         assert h.broadcast_calls == []
 
     def test_the_overpay_bound_is_the_shared_one(self) -> None:
-        """What ``--allow-overpay`` forwards to, asserted at the seam rather than through
-        the CLI: the CLI has no fee-rate option of its own — the rate comes from the
-        config — so driving the bound through ``mark`` would mean writing a config file to
-        test somebody else's gate. Named here so the flag is not silently decorative."""
+        """The builder's ``allow_overpay`` goes to the shared rate gate. This docstring used
+        to say the CLI flag forwarded here, and that the CLI has no fee-rate option of its
+        own. Both were true, and together they meant the flag could never matter: the
+        config refuses every rate this gate would (#793)."""
         import inspect
 
         from pyrxd.hashmark_tx import build_hashmark_mark
@@ -1236,6 +1302,119 @@ class TestTheOtherTwoOutputModesAndTheOverpayFlag:
             asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over))
         build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over, allow_overpay=True))
         assert build.fee >= len(build.serialize()) * over
+
+
+class TestMarkAllowOverpayIsDeprecated:
+    """``mark --allow-overpay`` is accepted, hidden, does nothing, and says so on stderr (#793).
+
+    It could never do anything: its value reached only the rate ceiling in
+    ``assert_fee_rate_clears_relay_floor``, and ``mark``'s rate is the config's, which
+    ``validated_fee_rate`` has already refused above that ceiling before ``mark`` runs.
+    :meth:`test_a_rate_the_flag_could_have_let_through_never_reaches_mark` pins that premise;
+    if it ever stops holding, the deprecation note is false and that test fails.
+
+    Every run passes ``--config`` at a path that does not exist, so the fee rate is the
+    built-in default rather than whatever the machine running the suite has configured.
+    """
+
+    _NOTE = "--allow-overpay is deprecated and has no effect on `pyrxd mark`"
+
+    @staticmethod
+    def _run(runner, tmp_path, monkeypatch, h, *, top=(), extra=()):
+        monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+        config = ("--config", str(tmp_path / "absent-config.toml"))
+        return _invoke(runner, tmp_path, monkeypatch, harness=h, top=(*config, *top), extra=extra)[0]
+
+    @pytest.mark.parametrize("mode", [(), ("--json",), ("--quiet",)], ids=["human", "json", "quiet"])
+    def test_the_flag_changes_no_byte_of_stdout_and_notes_itself_once_on_stderr(
+        self, runner, tmp_path, monkeypatch, mode
+    ) -> None:
+        """One harness for both runs: its keys are fixed and signing is RFC 6979, so the two
+        dry runs build byte-identical transactions and any stdout difference is the flag's."""
+        h = _MarkHarness()
+        without = self._run(runner, tmp_path, monkeypatch, h, top=mode, extra=["--dry-run"])
+        with_flag = self._run(runner, tmp_path, monkeypatch, h, top=mode, extra=["--allow-overpay", "--dry-run"])
+        assert without.exit_code == 0, without.output
+        assert with_flag.exit_code == 0, with_flag.output
+        assert without.stdout_bytes, "an empty stdout would make the comparison vacuous"
+        assert with_flag.stdout_bytes == without.stdout_bytes
+        assert self._NOTE not in without.stderr
+        assert with_flag.stderr.count(self._NOTE) == 1, with_flag.stderr
+        note_lines = [ln for ln in with_flag.stderr.splitlines() if self._NOTE in ln]
+        assert with_flag.stderr.replace(note_lines[0] + "\n", "", 1) == without.stderr
+        assert h.broadcast_calls == []
+
+    def test_the_note_says_why(self, runner, tmp_path, monkeypatch) -> None:
+        from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        ceiling = relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE
+        r = self._run(runner, tmp_path, monkeypatch, _MarkHarness(), extra=["--allow-overpay", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert f"above the {ceiling:,} photons/byte overpay ceiling is refused when the config is loaded" in r.stderr
+
+    def test_the_flag_is_not_in_the_help(self, runner) -> None:
+        from pyrxd.cli.main import cli
+
+        r = runner.invoke(cli, ["mark", "--help"])
+        assert r.exit_code == 0, r.output
+        assert "--dry-run" in r.output, "control: a flag the help does list"
+        assert "--allow-overpay" not in r.output
+        assert "overpay" not in r.output.lower()
+
+    def test_the_builder_is_never_told_to_allow_an_overpay(self, runner, tmp_path, monkeypatch) -> None:
+        """The flag is ``expose_value=False``, so there is nothing to forward; this pins it."""
+        import pyrxd.hashmark_tx as ht
+
+        real = ht.build_hashmark_mark
+        seen: list[dict] = []
+
+        async def _spy(*args, **kwargs):
+            seen.append(kwargs)
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(ht, "build_hashmark_mark", _spy)
+        r = self._run(runner, tmp_path, monkeypatch, _MarkHarness(), extra=["--allow-overpay", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert len(seen) == 1, "control: the spy saw the build"
+        assert seen[0].get("allow_overpay", False) is False, seen[0]
+
+    @pytest.mark.parametrize(
+        ("rate", "reaches_mark"), [(100_000, True), (100_001, False)], ids=["at-ceiling", "over-ceiling"]
+    )
+    def test_a_rate_the_flag_could_have_let_through_never_reaches_mark(
+        self, runner, tmp_path, monkeypatch, rate, reaches_mark
+    ) -> None:
+        """The premise of the note, driven through the real config. The ceiling itself is
+        accepted (the honest-path half), one photon over it is refused before ``mark``'s
+        own options are even parsed — so the note is never printed and no wallet is opened."""
+        from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        assert relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE == 100_000
+        h = _MarkHarness(fund_value=50_000_000 * MAX_FEE_OVERPAY_MULTIPLE)
+        monkeypatch.setenv("PYRXD_FEE_RATE", str(rate))
+        config = ("--config", str(tmp_path / "absent-config.toml"))
+        r = _invoke(runner, tmp_path, monkeypatch, harness=h, top=config, extra=["--allow-overpay", "--dry-run"])[0]
+        if reaches_mark:
+            assert r.exit_code == 0, r.output
+            assert self._NOTE in r.stderr
+        else:
+            assert r.exit_code != 0
+            assert "above the 10x ceiling" in str(r.exception) + r.output, r.output
+            assert self._NOTE not in r.output
+        assert h.broadcast_calls == []
+
+    def test_a_networks_table_rate_over_the_ceiling_never_reaches_mark(self, runner, tmp_path, monkeypatch) -> None:
+        """The other config route to ``ctx.fee_rate``: ``[networks.<net>] fee_rate``."""
+        monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+        cfg = tmp_path / "config.toml"
+        cfg.write_text("[networks.mainnet]\nfee_rate = 100001\n")
+        h = _MarkHarness()
+        r = _invoke(
+            runner, tmp_path, monkeypatch, harness=h, top=("--config", str(cfg)), extra=["--allow-overpay", "--dry-run"]
+        )[0]
+        assert r.exit_code != 0
+        assert "above the 10x ceiling" in str(r.exception) + r.output, r.output
+        assert self._NOTE not in r.output
 
 
 class TestTheWalletContractHoldsAgainstARealHdWallet:

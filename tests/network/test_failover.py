@@ -20,6 +20,7 @@ from pyrxd.network.electrumx import ElectrumXClient, _rpc_error
 from pyrxd.network.failover import FailoverElectrumXClient
 from pyrxd.network.registry import Endpoint, NetworkProfile
 from pyrxd.security.errors import (
+    BroadcastEchoMismatch,
     NetworkError,
     PolicyRejection,
     RpcMethodNotFound,
@@ -429,8 +430,12 @@ async def test_broadcast_rejects_a_txid_that_is_not_the_hash_of_what_was_sent() 
     client, fakes = build([A])
     fakes[A].broadcast_result = "ff" * 32
 
-    with pytest.raises(NetworkError, match="returned txid"):
+    # The shared echo check's error, not a NetworkError (#780): a NetworkError reads as
+    # "retry", and the transaction may already have relayed.
+    with pytest.raises(BroadcastEchoMismatch, match="may not have relayed") as info:
         await client.broadcast(_RAW_TX)
+    assert info.value.echoed == "ff" * 32
+    assert info.value.local_txid == double_sha256(bytes(_RAW_TX))[::-1].hex()
 
 
 async def test_broadcast_all_endpoints_down_raises() -> None:

@@ -164,6 +164,25 @@ for g, mods in groups.items():
         if t not in seen and (ROOT / t).exists() and not re.search(r"regtest|_e2e|xchain", t):
             chosen.append(t)
             seen.add(t)
+
+    # Files under a test directory with its own conftest.py go LAST, one directory per run.
+    # Ranking by coverage interleaved them (`tests/cli/x.py tests/test_y.py tests/cli/z.py`), and
+    # pytest 9.1.1 then stops applying that directory's conftest to the later file: its
+    # fixtures vanish, the clean-suite baseline goes red, and the harness refuses the group.
+    # That is how `glyphverify` and `walletcore` never ran. The same rule is enforced on the
+    # applied lists by tests/test_mutation_groups_are_wired.py.
+    def conftest_dir(t: str) -> str | None:
+        for parent in Path(t).parents:
+            if parent.as_posix() not in ("tests", ".") and (ROOT / parent / "conftest.py").exists():
+                return parent.as_posix()
+        return None
+
+    runs: dict[str, list[str]] = {}
+    for t in chosen:
+        if (d := conftest_dir(t)) is not None:
+            runs.setdefault(d, []).append(t)
+    chosen[:] = [t for t in chosen if conftest_dir(t) is None] + [t for run in runs.values() for t in run]
+
     # THREE REASONS A MODULE HAS NO COVERING TEST, and only one is a defect. Reporting them as
     # one bucket produced a false finding against an established group: `eth_wallet/keys`,
     # `locator` and `private_submit` looked untested and are simply on coverage's `omit` list —

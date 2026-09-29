@@ -43,6 +43,24 @@ def _groups_named(var: str) -> list[str]:
     return m.group(1).split()
 
 
+def _shards() -> dict[str, int]:
+    """`group_shards()` from the script: group -> number of jobs its mutants are spread over.
+
+    Parsed from the same file for the same reason as the group lists: a shard count stated here
+    as well would be a second copy of it. A group absent from the table runs as one job.
+    """
+    body = _SCRIPT.read_text()
+    start = body.find("group_shards() {")
+    if start < 0:
+        raise SystemExit(f"group_shards() not found in {_SCRIPT}")
+    block = body[start : body.index("\n}\n", start)]
+    out = {g: int(n) for g, n in re.findall(r'^\s+([a-z0-9_]+)\)\s+echo "(\d+)" ;;', block, re.M)}
+    bad = {g: n for g, n in out.items() if n < 2}
+    if bad:
+        raise SystemExit(f"group_shards() lists groups with fewer than 2 shards: {bad}")
+    return out
+
+
 def _value_groups() -> list[str]:
     """Every group the weekly workflow should run — CONSENSUS first, then VALUE.
 
@@ -87,6 +105,10 @@ def main() -> int:
     unknown = sorted(set(_MIN_KILL) - set(all_groups))
     if unknown:
         raise SystemExit(f"threshold set for group(s) not in VALUE_GROUPS: {unknown}")
+    shards = _shards()
+    unknown = sorted(set(shards) - set(all_groups))
+    if unknown:
+        raise SystemExit(f"group_shards() names group(s) the workflow does not run: {unknown}")
 
     groups = all_groups
     wanted = args.only.split()
@@ -96,12 +118,21 @@ def main() -> int:
             raise SystemExit(f"unknown group(s): {bad}; known: {all_groups}")
         groups = [g for g in all_groups if g in wanted]
 
-    matrix = {
-        "group": groups,
-        # Only floors for groups actually being run — an include entry for an absent group is
-        # inert, but emitting it invites the same "looks gated, runs report-only" confusion.
-        "include": [{"group": g, "min_kill": str(v)} for g, v in _MIN_KILL.items() if g in groups],
-    }
+    # One entry per JOB. `name` is unique per job and names its check and its artifacts; `shard`
+    # is set only on a sharded group's jobs (the script refuses MUTATION_SHARD for any other);
+    # `min_kill` only where a floor exists. An include-only matrix, because a sharded group is
+    # several jobs while every other group is one.
+    include: list[dict[str, str]] = []
+    for g in groups:
+        base = {"group": g}
+        if g in _MIN_KILL:
+            base["min_kill"] = str(_MIN_KILL[g])
+        n = shards.get(g, 1)
+        if n == 1:
+            include.append({**base, "name": g})
+        else:
+            include.extend({**base, "name": f"{g}-shard{k}of{n}", "shard": str(k)} for k in range(1, n + 1))
+    matrix = {"include": include}
     json.dump(matrix, sys.stdout, separators=(",", ":"))
     return 0
 

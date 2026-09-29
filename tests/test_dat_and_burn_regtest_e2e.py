@@ -100,7 +100,7 @@ def _dat_reveal(node, *, use_ordinary_suffix: bool):  # noqa: F811
                 unlocking_script_template=_reveal_unlock(owner, suffix),
             )
         ],
-        # A DAT reveal mints nothing: the only output is ordinary change.
+        # This DAT reveal mints nothing: the only output is ordinary change.
         tx_outputs=[TransactionOutput(P2PKH().lock(owner.public_key().hash160()), _COMMIT_VALUE - _FEE)],
     )
     return {"tx": reveal, "commit_txid": commit_txid, "commit_script": commit.commit_script}

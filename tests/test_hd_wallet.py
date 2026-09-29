@@ -13,6 +13,7 @@ import pytest
 
 import pyrxd.constants
 import pyrxd.hd.wallet
+from pyrxd.hash import hash256
 from pyrxd.hd import wallet as hd_wallet_module
 from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
@@ -1834,7 +1835,10 @@ class TestCollectSpendable:
         assert triples == []
 
     def test_drops_failed_address_lookups(self):
-        """A per-address failure must not crash the whole collection."""
+        """Non-strict: a per-address failure must not crash the whole collection.
+
+        ``strict=False`` is the mode :meth:`HdWallet.send` uses; the default is strict
+        (``TestAFailedReadIsNotAnAnswer.test_the_default_refuses_a_partial_read``)."""
         from pyrxd.security.errors import NetworkError
 
         w = HdWallet.from_mnemonic(MNEMONIC)
@@ -1850,8 +1854,14 @@ class TestCollectSpendable:
                 return [_utxo(tx_hash="aa" * 32, value=100_000_000)]
             raise NetworkError("simulated failure")
 
+        async def _get_history(script_hash):
+            # collect_spendable scans first (#759): no history anywhere, so the scan stops at
+            # the gap limit and the two seeded addresses are read because they were known used.
+            return []
+
+        client.get_history = _get_history
         client.get_utxos = _get_utxos
-        triples = asyncio.run(w.collect_spendable(client))
+        triples = asyncio.run(w.collect_spendable(client, strict=False))
         # Only the working address contributed.
         assert len(triples) == 1
 
@@ -1870,13 +1880,17 @@ class TestSendBroadcast:
             utxo_map={addr: [_utxo(value=1_000_000_000)]},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
-            return "ab" * 32
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
 
         client.broadcast = _broadcast
 
         txid = asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
-        assert txid == "ab" * 32
+        assert txid == hash256(sent[0])[::-1].hex()
 
     def test_send_max_returns_txid(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
@@ -1887,13 +1901,17 @@ class TestSendBroadcast:
             utxo_map={addr: [_utxo(value=1_000_000_000)]},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
-            return "cd" * 32
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
 
         client.broadcast = _broadcast
 
         txid = asyncio.run(w.send_max(client, _RECIPIENT_ADDR))
-        assert txid == "cd" * 32
+        assert txid == hash256(sent[0])[::-1].hex()
 
     def test_send_with_no_utxos_raises(self):
         w = HdWallet.from_mnemonic(MNEMONIC)  # no used addresses → no UTXOs
@@ -1920,10 +1938,13 @@ def _client_failing_on(addresses: set[str], *, utxo_map: dict) -> MagicMock:
     from pyrxd.security.errors import NetworkError
 
     failing = {script_hash_for_address(a) for a in addresses}
+    # History for the addresses that hold something, as a real server has it — not for every
+    # address, which would make the gap-limit scan collect_spendable runs (#759) never end.
+    with_history = failing | {script_hash_for_address(a) for a in utxo_map}
     client = MagicMock(spec=ElectrumXClient)
 
     async def _get_history(script_hash):
-        return [{"tx_hash": "aa" * 32, "height": 100}]
+        return [{"tx_hash": "aa" * 32, "height": 100}] if script_hash in with_history else []
 
     async def _get_utxos(script_hash):
         if script_hash in failing:
@@ -1962,6 +1983,11 @@ class TestAFailedReadIsNotAnAnswer:
     fail-closed refusal of a legitimate spend — potentially during a timelock
     race. "Sweep everything" is a completeness claim, and a partial view makes it
     a false one. So: warn on the first, refuse on the second.
+
+    A spend's shortfall message is a completeness claim too: "fund this wallet"
+    says no address holds enough. ``pyrxd mark`` printed it when ``get_utxos``
+    failed for the one funded address (#759 review). So ``collect_spendable`` is
+    strict by DEFAULT, and :meth:`HdWallet.send` — the "enough" case — opts out.
     """
 
     def test_a_partial_read_is_reported_not_swallowed(self, caplog):
@@ -1972,8 +1998,8 @@ class TestAFailedReadIsNotAnAnswer:
             utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=100_000_000)] for i, a in enumerate(addrs)},
         )
         with caplog.at_level("WARNING"):
-            triples = asyncio.run(w.collect_spendable(client))
-        assert len(triples) == 2  # the tolerant default is preserved
+            triples = asyncio.run(w.collect_spendable(client, strict=False))
+        assert len(triples) == 2  # the tolerant mode, which send() uses
         assert any("1 of 3" in r.message for r in caplog.records), (
             "a dropped address must leave a trace — the SDK path had no logging at all, "
             "so the only signal was a balance that quietly came back smaller"
@@ -2005,6 +2031,17 @@ class TestAFailedReadIsNotAnAnswer:
         client = _client_failing_on({addrs[1]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
         with pytest.raises(NetworkError, match="1 of 3"):
             asyncio.run(getattr(w, reader)(client, strict=True))
+
+    def test_the_default_refuses_a_partial_read(self):
+        """No keyword: the spend callers (``mark``, the glyph and swap-book commands, the SDK
+        builders) pass none, so the default is what makes their "fund this wallet" true."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on({addrs[1]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
+        with pytest.raises(NetworkError, match="1 of 3"):
+            asyncio.run(w.collect_spendable(client))
 
     def test_strict_is_satisfied_when_every_read_answers(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
@@ -2051,11 +2088,38 @@ class TestAFailedReadIsNotAnAnswer:
             utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=1_000_000_000)] for i, a in enumerate(addrs)},
         )
 
+        sent: list[bytes] = []
+
         async def _broadcast(raw):
+            # The txid of what was sent: `send` checks the echo itself now, for any client (#786 review).
+            sent.append(raw)
+            return hash256(raw)[::-1].hex()
+
+        client.broadcast = _broadcast
+        assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == hash256(sent[0])[::-1].hex()
+
+    def test_send_short_on_a_partial_view_is_a_network_error_not_insufficient_funds(self):
+        """The pair: when what WAS read cannot cover the send and a read failed, the
+        missing funds may sit at the unread address — so it is the read failure that is
+        reported, not "Insufficient funds", and nothing is broadcast."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(
+            {addrs[1]},
+            utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=1_000_000_000)] for i, a in enumerate(addrs)},
+        )
+        broadcasts = []
+
+        async def _broadcast(raw):
+            broadcasts.append(raw)
             return "ab" * 32
 
         client.broadcast = _broadcast
-        assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == "ab" * 32
+        with pytest.raises(NetworkError, match="1 of this wallet's address reads failed"):
+            asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=2_500_000_000))
+        assert broadcasts == []
 
 
 # ── the seed file's permission check must bind to the bytes read ─────────────

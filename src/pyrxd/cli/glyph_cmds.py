@@ -11,7 +11,7 @@ Commands:
   glyph transfer-nft    NFT singleton transfer.
   glyph timelock-mint   Seal content behind a timelock and mint the NFT.
   glyph timelock-reveal Publish the key for a timelocked token (irreversible).
-  glyph list            Scan wallet addresses for Glyph holdings.
+  glyph list            Glyph holdings across the wallet, after the gap-limit scan.
 
 Design choices that follow the v0.3 plan:
 
@@ -39,7 +39,7 @@ import json
 import shlex
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -111,6 +111,7 @@ from ..network.confirm import (
     DEFAULT_POLL_INTERVAL_S,
     wait_for_confirmation,
 )
+from ..network.electrumx import verified_broadcast_txid
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata
 from ..security.errors import (
@@ -121,6 +122,7 @@ from ..security.errors import (
     MaxAttemptsError,
     NetworkError,
     PolicyRejection,
+    ServerInconsistencyError,
     UnrecognizedDaaBytecodeError,
     ValidationError,
 )
@@ -139,6 +141,7 @@ from .glyph_helpers import (
     _BroadcastSummary,
     _build_glyph_unlock,
     _confirm_or_abort,
+    _deprecated_allow_overpay_option,
     _fetch_dmint_contract,
     _metadata_summary,
     _parse_ref,
@@ -149,6 +152,7 @@ from .glyph_inspect import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from .glyph_inspect import _sanitize_display_string as _sanitize_display_string
 from .glyph_inspect import inspect_cmd
 from .prompts import _load_wallet
+from .query_cmds import AddressReads, refuse_if_incomplete, scan_then_read
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -1407,8 +1411,13 @@ async def _reveal_committed(
             client, fee.label, allow_unverified=allow_unverified_wave_name, resume_unverified=resume_unverified
         )
     _refuse_an_unusable_archive(store, before="the reveal")
-    _echoed_reveal = await client.broadcast(reveal_hex)
-    reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
+    try:
+        _echoed_reveal = await client.broadcast(reveal_hex)
+        reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
+    except BroadcastEchoMismatch as exc:
+        # The reveal may have relayed: from here the recovery must say so, under the LOCAL txid.
+        progress.reveal_txid = str(exc.local_txid)
+        raise
     progress.reveal_txid = str(reveal_txid)
     if ctx.output_mode == "human":
         click.echo(f"\nreveal broadcast: {reveal_txid}")
@@ -1510,6 +1519,16 @@ async def _after_commit(
         raise NetworkBoundaryError(
             "a server stopped answering after the commit was broadcast", cause=str(exc), fix=_recovery()
         ) from exc
+    except BroadcastEchoMismatch as exc:
+        # A server answered with some other txid — not an interruption. For the reveal,
+        # `_reveal_committed` has recorded the LOCAL txid as broadcast, so the recovery says the
+        # reveal may be out there rather than offering to reveal again.
+        _document()
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer before doing anything else — {_recovery()}",
+        ) from exc
     except BaseException:
         click.echo(f"\ninterrupted after the commit was broadcast. {_recovery()}", err=True)
         raise
@@ -1588,8 +1607,8 @@ async def _mint_nft_inner(
     if not triples:
         raise UserError(
             "no spendable UTXOs in the wallet",
-            cause="collect_spendable returned an empty list",
-            fix="fund the wallet, or run `pyrxd balance --refresh` to discover used addresses",
+            cause="the gap-limit scan found no UTXO on any address of this wallet",
+            fix="fund the wallet: its addresses were scanned up to the gap limit and none holds a UTXO",
         )
 
     # The NFT's carrier value on the reveal. Same number as
@@ -1818,9 +1837,11 @@ def _commit_broadcast_uncertain(
 ) -> None:
     """Say what is true when the commit broadcast did not return: it may have relayed.
 
-    A :class:`NetworkError` becomes a :class:`NetworkBoundaryError` carrying both answers (and,
-    in ``--json`` mode, a JSON document on stdout). Anything else — Ctrl-C, a crash — prints
-    the same text to stderr and lets the caller re-raise it. The record exists already.
+    A :class:`NetworkError` becomes a :class:`NetworkBoundaryError` carrying both answers, and a
+    :class:`BroadcastEchoMismatch` (the server answered with some other txid) a
+    :class:`UserError` carrying the same; either way ``--json`` mode also prints a JSON recovery
+    document on stdout. Anything else — Ctrl-C, a crash — prints the same text to stderr and
+    lets the caller re-raise it. The record exists already, under the LOCAL txid.
     """
     record = _shown_path(store.directory / f"{pending.commit_txid}.json")
     recovery = _commit_recovery(ctx, pending, store.directory, _Progress(), source=source)
@@ -1828,6 +1849,25 @@ def _commit_broadcast_uncertain(
         f"look up {pending.commit_txid} on a block explorer before running anything else. If it is there: "
         f"{recovery} If it never appears, nothing was spent: delete {record} and mint again."
     )
+    if isinstance(exc, BroadcastEchoMismatch):
+        if ctx.output_mode == "json":
+            doc = _json_recovery_document(
+                ctx,
+                pending,
+                store.directory,
+                _Progress(),
+                source=source,
+                # The status this case carried before #780, when the failover client reported a
+                # mismatch as NetworkError: a program keyed on it keeps working.
+                status="commit_broadcast_failed_may_have_relayed",
+            )
+            click.echo(emit(doc, mode="json"))
+        raise UserError(
+            "the server returned a different transaction id than the commit we signed, so the commit may or may "
+            "not have reached the network",
+            cause=str(exc),
+            fix=fix,
+        ) from exc
     if not isinstance(exc, NetworkError):
         click.echo(
             f"\ninterrupted while the commit was being broadcast: it may or may not have reached the network. {fix}",
@@ -2466,8 +2506,19 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    _echoed_commit = await client.broadcast(commit_tx.serialize())
-    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
+    try:
+        _echoed_commit = await client.broadcast(commit_tx.serialize())
+        commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
+    except BroadcastEchoMismatch as exc:
+        raise _deploy_commit_echo_refused(
+            exc,
+            commit_value=commit_value,
+            reveal_recipe=(
+                "GlyphBuilder().prepare_ft_deploy_reveal(commit_txid=<the txid above>, commit_vout=0, "
+                f"commit_value={commit_value}, cbor_bytes=<encoded from the metadata>, "
+                f"premine_pkh={treasury_pkh.hex()}, premine_amount={supply})"
+            ),
+        ) from exc
 
     if ctx.output_mode == "human":
         click.echo(f"\ncommit broadcast: {commit_txid}")
@@ -2503,8 +2554,11 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
-    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
+    try:
+        _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+        reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
+    except BroadcastEchoMismatch as exc:
+        raise _reveal_echo_refused(exc) from exc
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -2639,7 +2693,7 @@ async def _select_ft_inputs(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -2679,8 +2733,13 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
     outpoint, carrying the wrong ref, which can never spend the real commit. That commit
     is a hashlock with no owner-only path, so its value is gone.
 
-    Warns rather than raises: the commit may well have relayed, and the caller needs the
-    locally derived txid to carry on with the reveal either way.
+    RAISES :class:`~pyrxd.security.errors.BroadcastEchoMismatch` on a mismatch, through
+    :func:`~pyrxd.network.electrumx.verified_broadcast_txid` — the same check, and the same
+    exception, a pyrxd client's ``broadcast`` raises before this ever runs. (It used to warn
+    and carry on; with every pyrxd client that branch could no longer be reached, and it
+    kept a second behaviour alive for any other client.) The caller turns the exception into
+    its own recovery: ``mint-nft`` through ``_after_commit`` and its pending record,
+    ``deploy-ft`` and ``deploy-dmint`` through :func:`_deploy_commit_echo_refused`.
     """
     from ..transaction.transaction import Transaction
 
@@ -2710,23 +2769,58 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
                 "file and the SAME wallet. See docs/how-to/troubleshoot-common-errors.md"
             ),
         )
-    local = str(tx.txid())
-    if str(echoed) != local:
-        click.echo(
-            f"warning: the server returned txid {echoed} but the commit we signed hashes "
-            f"to {local}. Continuing with {local}; if the reveal fails, check both on an "
-            "explorer.",
-            err=True,
-        )
-    return local
+    return str(verified_broadcast_txid(tx.serialize(), echoed))
+
+
+def _deploy_commit_echo_refused(exc: BroadcastEchoMismatch, *, commit_value: int, reveal_recipe: str) -> UserError:
+    """The error for a mismatched COMMIT echo in ``deploy-ft`` / ``deploy-dmint``.
+
+    Those two commands keep no pending record, so ``resume-mint`` cannot reveal their commit
+    (it rebuilds an NFT/plain-FT reveal from a record, and has no premine or dMint contracts
+    to rebuild). A commit that relayed is a hashlock with no owner-only spend path: only a
+    reveal pushing byte-identical CBOR spends it. So the message names the recovery that
+    exists, the SDK rebuild, with the LOCALLY computed txid — the server's is the one thing
+    it must not be built on.
+    """
+    local = str(exc.local_txid)
+    return UserError(
+        "the server returned a different transaction id than the commit we signed",
+        cause=str(exc),
+        fix=(
+            f"look up {local} on a block explorer before running anything else. If it never appears, nothing "
+            "was spent and the deploy can be run again. If it IS there, the commit relayed and holds "
+            f"{commit_value:,} photons that only its reveal can spend. This command keeps no pending record, so "
+            f"`glyph resume-mint` cannot reveal it, and re-running would commit, and spend, again. Rebuild the "
+            f"reveal with the SDK: {reveal_recipe}, with commit_txid={local} (never the echoed id), the SAME "
+            "unmodified metadata file and the SAME wallet. See docs/how-to/troubleshoot-common-errors.md"
+        ),
+    )
+
+
+def _reveal_echo_refused(exc: BroadcastEchoMismatch) -> UserError:
+    """The error for a mismatched REVEAL echo in ``deploy-ft`` / ``deploy-dmint``.
+
+    The reveal is where those commands end, and what they print from its txid are outpoints —
+    ``deploy-dmint``'s contracts and premine — that miners grind against and the owner spends.
+    Built on the echo, they would name a transaction that does not exist.
+    """
+    local = str(exc.local_txid)
+    return UserError(
+        "the server returned a different transaction id than the reveal we signed",
+        cause=str(exc),
+        fix=f"check {local} on an explorer — if it is there the deploy completed and only the "
+        "server's reply was wrong, and every outpoint is under that txid. Do not use the echoed id: "
+        "outpoints derived from it would point at a transaction that does not exist.",
+    )
 
 
 def _confirmed_reveal_txid(reveal_tx_or_hex: object, echoed: object) -> str:
     """The reveal txid derived from the bytes we signed. RAISES on a mismatch.
 
-    The counterpart to :func:`_local_commit_txid`, and deliberately stricter. That one
-    warns because a commit has a next phase to carry on with, and the caller needs the
-    derived value to build it. A reveal is where the mint ENDS, so there is no later step
+    The counterpart to :func:`_local_commit_txid`, and like it delegates to
+    :func:`~pyrxd.network.electrumx.verified_broadcast_txid`, raising
+    :class:`~pyrxd.security.errors.BroadcastEchoMismatch` (the root group renders it with
+    the local txid). A reveal is where the mint ENDS, so there is no later step
     to notice the discrepancy — and what the CLI prints from this txid is not merely a
     receipt. ``deploy-dmint`` builds its ``contracts`` outpoints and ``premine_outpoint``
     from it, which is what miners then grind against and what the owner later spends. Take
@@ -2746,16 +2840,7 @@ def _confirmed_reveal_txid(reveal_tx_or_hex: object, echoed: object) -> str:
             cause="the signed reveal bytes did not parse back into a transaction",
             fix=f"the server echoed {echoed} — check it on an explorer before spending anything built on it",
         )
-    local = str(tx.txid())
-    if str(echoed) != local:
-        raise UserError(
-            "the server returned a different transaction id than the reveal we signed",
-            cause=f"echoed {echoed}, but the signed reveal hashes to {local}",
-            fix=f"check {local} on an explorer — if it is there the mint completed and only the "
-            "server's reply was wrong. Do not use the echoed id: outpoints derived from it "
-            "would point at a transaction that does not exist.",
-        )
-    return local
+    return str(verified_broadcast_txid(tx.serialize(), echoed))
 
 
 async def _transfer_ft_inner(
@@ -2799,7 +2884,7 @@ async def _transfer_ft_inner(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except NoFeeFundingError as exc:
         raise UserError(
@@ -2844,10 +2929,11 @@ async def _transfer_ft_inner(
             ),
         ],
     )
-    echoed = await client.broadcast(raw)
     # Report the txid of what we signed. A server that drops the transfer and echoes some
-    # other well-formed txid would otherwise have the CLI print it as success.
+    # other well-formed txid would otherwise have the CLI print it as success. The broadcast
+    # is inside the `try` because a pyrxd client raises the mismatch itself (#780).
     try:
+        echoed = await client.broadcast(raw)
         txid = _confirmed_txid(build, echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(
@@ -3165,13 +3251,14 @@ async def _airdrop_ft_inner(
             ),
         ],
     )
-    _echoed = await client.broadcast(airdrop_result.tx.serialize())
-    # RAISE on a mismatch, like `transfer-ft` and `transfer-nft` — not the commit
-    # helper's warn-and-continue. That helper warns because a commit has a next phase to
-    # carry on with; an airdrop is terminal, so a warning on a non-tty run is no warning
-    # at all and `--json` would report success for tokens that never moved. It is also
-    # the widest blast radius of the three: N recipients in one transaction.
+    # RAISE on a mismatch, like `transfer-ft` and `transfer-nft`. (The commit helper used to
+    # warn and continue, because a commit has a next phase; an airdrop is terminal, so a
+    # warning on a non-tty run is no warning at all and `--json` would report success for
+    # tokens that never moved. The commit helper raises too now, #786 review.) It is also
+    # the widest blast radius of the three: N recipients in one transaction. The broadcast
+    # is inside the `try` because a pyrxd client raises the mismatch itself (#780).
     try:
+        _echoed = await client.broadcast(airdrop_result.tx.serialize())
         txid = _confirmed_txid(airdrop_result, _echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(
@@ -3194,16 +3281,9 @@ async def _airdrop_ft_inner(
 @click.argument("ref", type=str)
 @click.option("--to", "to_address", required=True, help="Recipient address.")
 @click.option("--passphrase/--no-passphrase", default=False)
-@click.option(
-    "--allow-overpay",
-    is_flag=True,
-    default=False,
-    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
-    "ceiling (10x the relay floor). It does NOT relax the underpay invariant. Exists so a "
-    "refusal is never a dead end on a chain with no RBF or CPFP.",
-)
+@_deprecated_allow_overpay_option("glyph transfer-nft")
 @click.pass_obj
-def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool, allow_overpay: bool) -> None:
+def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool) -> None:
     """Transfer the NFT singleton REF (txid:vout) to --to ADDRESS."""
     glyph_ref = _parse_ref(ref)
 
@@ -3225,9 +3305,7 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
     async def _do_transfer() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _transfer_nft_inner(
-                ctx, wallet, glyph_ref, to_pkh, to_address, client, allow_overpay=allow_overpay
-            )
+            return await _transfer_nft_inner(ctx, wallet, glyph_ref, to_pkh, to_address, client)
 
     try:
         result = asyncio.run(_do_transfer())
@@ -3293,8 +3371,6 @@ async def _transfer_nft_inner(
     to_pkh: Hex20,
     to_address: str,
     client: ElectrumXClient,
-    *,
-    allow_overpay: bool = False,
 ) -> dict:
     """Find the singleton NFT utxo and re-lock it to to_pkh.
 
@@ -3315,12 +3391,11 @@ async def _transfer_nft_inner(
             to_pkh,
             client=client,
             fee_rate=ctx.fee_rate,
-            allow_overpay=allow_overpay,
         )
     except NoHoldingsError as exc:
         raise UserError(
             f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+            fix="this wallet's addresses were scanned up to the gap limit; the NFT is owned elsewhere, or check --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -3353,8 +3428,8 @@ async def _transfer_nft_inner(
             ),
         ],
     )
-    echoed = await client.broadcast(raw)
-    try:
+    try:  # the broadcast too: a pyrxd client raises the mismatch itself (#780)
+        echoed = await client.broadcast(raw)
         txid = _confirmed_txid(build, echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(
@@ -3382,49 +3457,89 @@ async def _transfer_nft_inner(
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
-    """Scan wallet addresses for Glyph holdings."""
-    wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+    """List Glyph holdings across the wallet.
 
-    async def _do_scan() -> list[dict]:
+    Runs the gap-limit scan first, on both chains (the one every spend command runs), so it
+    lists tokens at any address inside the gap window, including on a wallet `pyrxd wallet new`
+    just made. Nothing is saved to the wallet file.
+
+    An address that cannot be read, or a token output whose transaction cannot be fetched, is
+    never listed as holding nothing: the command exits 2, and only the human output shows what
+    the other addresses hold, marked INCOMPLETE.
+    """
+    wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+    # The per-address reader logs a failed read and keeps only the address, which would report a
+    # server that contradicts its own transactions as one that could not be reached.
+    inconsistent: list[str] = []
+
+    async def _do_scan() -> AddressReads:
         client = ctx.make_client()
         async with client:
             scanner = GlyphScanner(client)
-            rows: list[dict] = []
-            for rec in [r for r in wallet.addresses.values() if r.used]:
-                items = await scanner.scan_address(rec.address)
-                for item in items:
-                    if isinstance(item, GlyphNft) and kind in ("nft", "all"):
-                        rows.append(
-                            {
-                                "type": "NFT",
-                                "ref": f"{item.ref.txid}:{item.ref.vout}",
-                                "address": rec.address,
-                                "amount": "1",
-                                "name": (item.metadata.name if item.metadata else ""),
-                            }
-                        )
-                    elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
-                        rows.append(
-                            {
-                                "type": "FT",
-                                "ref": f"{item.ref.txid}:{item.ref.vout}",
-                                "address": rec.address,
-                                "amount": str(item.amount),
-                                "name": (item.metadata.name if item.metadata else ""),
-                            }
-                        )
-            return rows
+
+            # strict: an output whose transaction could not be fetched fails the address's read,
+            # rather than leaving the token out of a list that is then shown as complete; and a
+            # listing the transaction contradicts (another key's token, an output not at the
+            # address) fails it rather than being shown as the wallet's (#782).
+            async def _read(address: str) -> list:
+                try:
+                    return await scanner.scan_address(address, strict=True)
+                except ServerInconsistencyError as exc:
+                    inconsistent.append(str(exc))
+                    raise
+
+            return await scan_then_read(wallet, client, _read, what="glyph scan")
 
     try:
-        rows = asyncio.run(_do_scan())
+        reads = asyncio.run(_do_scan())
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
             fix=f"check that {ctx.electrumx_url} is reachable",
         ) from exc
+    if inconsistent:
+        # Nothing is listed, not even what the other addresses returned: they came from the same
+        # server, and it has just listed something as this wallet's that is not.
+        raise NetworkBoundaryError(
+            "the ElectrumX server's answer contradicts its own transactions",
+            cause=inconsistent[0] + (f" ({len(inconsistent) - 1} more like it)" if len(inconsistent) > 1 else ""),
+            fix=f"use a different endpoint (--electrumx URL); {ctx.electrumx_url} listed something as this wallet's "
+            "that its own transaction shows is not",
+        )
+
+    rows: list[dict] = []
+    for address, items in reads.answered:
+        for item in items:
+            if isinstance(item, GlyphNft) and kind in ("nft", "all"):
+                rows.append(
+                    {
+                        "type": "NFT",
+                        "ref": f"{item.ref.txid}:{item.ref.vout}",
+                        "address": address,
+                        "amount": "1",
+                        "name": (item.metadata.name if item.metadata else ""),
+                    }
+                )
+            elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
+                rows.append(
+                    {
+                        "type": "FT",
+                        "ref": f"{item.ref.txid}:{item.ref.vout}",
+                        "address": address,
+                        "amount": str(item.amount),
+                        "name": (item.metadata.name if item.metadata else ""),
+                    }
+                )
 
     columns = ["type", "ref", "address", "amount", "name"]
+    refuse_if_incomplete(
+        ctx,
+        reads.unread,
+        reads.used,
+        what="this list",
+        view=emit_table(rows, columns, mode="human") if rows else "",
+    )
     click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
 
 
@@ -3809,7 +3924,7 @@ def deploy_dmint_cmd(
     async def _do() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _deploy_dmint_inner(ctx, wallet, deploy_params, client)
+            return await _deploy_dmint_inner(ctx, wallet, deploy_params, client, metadata_file=metadata_file)
 
     try:
         result = asyncio.run(_do())
@@ -3846,11 +3961,67 @@ def deploy_dmint_cmd(
         click.echo(f"\n  claim with:   {_claim_hint}")
 
 
+def _py_literal(value: object) -> str:
+    """*value* as the Python source a deploy-params constructor takes."""
+    from enum import Enum
+
+    if isinstance(value, Hex20):
+        return f"Hex20(bytes.fromhex({bytes(value).hex()!r}))"
+    if isinstance(value, Enum):
+        return f"{type(value).__name__}.{value.name}"
+    if isinstance(value, bytes | bytearray):
+        return repr(bytes(value))
+    return repr(value)
+
+
+def _dmint_reveal_rebuild(
+    params: DmintV1DeployParams | DmintV2DeployParams,
+    *,
+    last_time: int | None,
+    metadata_file: Path | None,
+    commit_txid: str,
+) -> str:
+    """The SDK code that rebuilds this deploy's reveal outputs, with EVERY parameter the CLI used.
+
+    The commit script checks the CBOR body's hash, the owner key and that the token ref is carried
+    as an FT (``build_commit_locking_script``). The contract parameters (V1 or V2, heights, reward,
+    difficulty, DAA mode and its settings, premine, OP_RETURN) are written only into the reveal. A reveal rebuilt with any other value still
+    spends the commit and deploys a different token, permanently. So every field of the params
+    object is printed from the object itself, in the form the constructor takes — including the
+    ``lastTime`` the build resolved when ``--last-time`` was not given, and ``max_adjustment_log2``
+    (log2 of ``--max-adjustment``) and the schedule's targets (not the ``--schedule`` difficulties).
+    """
+    args = []
+    for f in fields(params):
+        if f.name == "metadata":
+            src = f"_read_metadata_file(Path({str(metadata_file)!r}))" if metadata_file else "<your metadata>"
+            args.append(f"metadata={src}")
+            continue
+        value = getattr(params, f.name)
+        if f.name == "last_time" and last_time is not None:
+            value = last_time  # the RESOLVED deploy time, not the None that means "now"
+        args.append(f"{f.name}={_py_literal(value)}")
+    return "\n".join(
+        [
+            "from pathlib import Path",
+            "from pyrxd.cli.glyph_helpers import _read_metadata_file",
+            f"from pyrxd.glyph.builder import GlyphBuilder, {type(params).__name__}",
+            "from pyrxd.glyph.dmint import DaaMode, DmintAlgo",
+            "from pyrxd.security.types import Hex20",
+            f"params = {type(params).__name__}({', '.join(args)})",
+            "deploy = GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)",
+            f"rev = deploy.build_reveal_outputs({commit_txid!r})",
+        ]
+    )
+
+
 async def _deploy_dmint_inner(
     ctx: CliContext,
     wallet: HdWallet,
     deploy_params: DmintV1DeployParams | DmintV2DeployParams,
     client: ElectrumXClient,
+    *,
+    metadata_file: Path | None = None,
 ) -> dict:
     # Version-agnostic: V1 and V2 DeployResult share the commit_result /
     # build_reveal_outputs interface, so the only V1-vs-V2 difference is which
@@ -3971,8 +4142,29 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    _echoed_commit = await client.broadcast(commit_tx.serialize())
-    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
+    try:
+        _echoed_commit = await client.broadcast(commit_tx.serialize())
+        commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
+    except BroadcastEchoMismatch as exc:
+        rebuild = _dmint_reveal_rebuild(
+            deploy_params,
+            last_time=getattr(deploy, "last_time", None),
+            metadata_file=metadata_file,
+            commit_txid=str(exc.local_txid),
+        )
+        raise _deploy_commit_echo_refused(
+            exc,
+            commit_value=commit0_value,
+            reveal_recipe=(
+                f"run\n{rebuild}\n"
+                "Use every parameter EXACTLY as printed. The commit checks the metadata body, the owner key and "
+                "that the token ref is carried as an FT, and none of the contract parameters, so a reveal built "
+                "with any other value still spends the commit and deploys a different token, permanently. Then build the reveal from rev, spending the commit's output 0 (the "
+                f"hashlock, {commit0_value} photons) and outputs 1 to {num_contracts} (the contract ref seeds), "
+                "with rev's outputs in its order (the contracts, then the premine, then the OP_RETURN, then "
+                f"change), signed by this wallet's key for {owner_pkh.hex()}"
+            ),
+        ) from exc
     # stderr (all modes): if the reveal later fails, the confirmed commit is recoverable.
     click.echo(f"commit broadcast: {commit_txid}", err=True)
     if ctx.output_mode == "human":
@@ -4034,8 +4226,11 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
-    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
+    try:
+        _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+        reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
+    except BroadcastEchoMismatch as exc:
+        raise _reveal_echo_refused(exc) from exc
     mineable_supply = reward * max_height * num_contracts
     return {
         "version": "V2" if is_v2 else "V1",

@@ -9,10 +9,12 @@ in this repository that token can push.
 
 The same review found the rest of what this file pins:
 
-* TRAFFIC_TOKEN was a REPOSITORY secret, readable by any workflow on any branch that names it.
-  It now lives in the `traffic` environment, which admits only main, and the job checks that
-  restriction before using it, because GitHub silently creates an unrestricted environment the
-  first time a workflow names one that does not exist.
+* The job holding the write token ran from any branch. It now runs in the `traffic` environment,
+  which admits only main, and checks that restriction before using TRAFFIC_TOKEN, because GitHub
+  silently creates an unrestricted environment the first time a workflow names one that does not
+  exist. TRAFFIC_TOKEN itself is a REPOSITORY secret, readable by any workflow on any branch that
+  names it; the maintainer keeps it there because it is fine-grained and read-only (see the
+  header of traffic.yml).
 * PR runs and scheduled runs shared one concurrency group, so a pending PR run could cancel a
   pending scheduled one: GitHub keeps one PENDING run per group and cancels the older one even
   with `cancel-in-progress: false`.
@@ -23,10 +25,10 @@ Everything here reads the workflow YAML, and the environment check's shell step 
 against a stand-in `gh` that answers with canned API responses, so the step that runs in CI is
 the step that is tested.
 
-WHAT THIS CANNOT SEE. Whether the environment really exists, whether the repository-level
-TRAFFIC_TOKEN was deleted, and whether GitHub honours the settings; those live in repository
-settings, which CI cannot read with the tokens it has. The environment check covers the first at
-run time; the second needs the maintainer (see the PR that introduced this file).
+WHAT THIS CANNOT SEE. Whether the environment really exists, whether TRAFFIC_TOKEN is as narrow
+as the header says, and whether GitHub honours the settings; those live in repository settings,
+which CI cannot read with the tokens it has. The environment check covers the first at run time;
+the second needs the maintainer.
 """
 
 from __future__ import annotations

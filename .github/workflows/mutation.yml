@@ -22,7 +22,9 @@ name: Mutation (scheduled)
 # group's tests would import the first group's mutant and mis-score it. Separate runners give
 # each group its own checkout for free, and make the wall-clock the slowest group rather than
 # the sum of all of them. `fail-fast: false` because one group's score says nothing about
-# another's, and a survivor list is worth having even when a sibling job died.
+# another's, and a survivor list is worth having even when a sibling job died. A group whose one
+# module cannot finish inside the job timeout is SHARDED over several jobs (group_shards in
+# scripts/mutation_test.sh); `matrix.name` tells those jobs, and their artifacts, apart.
 #
 # Report-only on purpose
 # ----------------------
@@ -38,6 +40,11 @@ name: Mutation (scheduled)
 # HAVE been triaged — annotation rewrites under `from __future__ import annotations`, `*,` -> `/,`
 # keyword-only markers, and error-message f-strings in `# pragma: no cover` branches. Their floors
 # are measured, not aspirational, and exist so the number can only go up.
+#
+# Until 2026-09-28 they did not: the step piped into `tee` without pipefail, so a score under
+# the floor printed FAIL and the job stayed green (see the comment on the `mutate` step).
+# Both groups sat under their floors on 2026-09-22 (ethtimelock 81 < 86, ethleg 64 < 65), so
+# the fix turns them red. Whether to lower a floor is a maintainer decision, not this file's.
 #
 # Both groups were also missing from the matrix below when they were added to the script, so
 # nothing ran them. That is the same defect this branch kept finding elsewhere — a capability with
@@ -115,17 +122,25 @@ jobs:
     needs: discover
     # Don't burn scheduled minutes on forks; manual dispatch still works anywhere.
     if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
-    name: mutate (${{ matrix.group }})
+    name: mutate (${{ matrix.name }})
     runs-on: ubuntu-latest
-    # Generous but bounded. `hdwallet` and `network` are the long poles; a group that blows
-    # this budget should be split in scripts/mutation_test.sh, not given more hours — that is
-    # how `wallet` and `hdwallet` came to be two groups instead of one.
+    # Generous but bounded. A group that blows this budget should be split in
+    # scripts/mutation_test.sh, not given more hours — that is how `wallet` and `hdwallet` came to
+    # be two groups instead of one, how `wire`, `verdicts` and `glyphverify` became eleven after
+    # run 36521398529 cancelled them (and `inspectcli`) here with no score, and how `transaction`,
+    # `dmint`, `covenants`, `gravitycore` and `cryptoprim` became eighteen after scheduled run
+    # 36558376548 cancelled four of them and left `transaction` 11 minutes short of the limit.
+    # A single module too big for one job is sharded instead (group_shards in the script).
     timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # This job uploads hidden paths (include-hidden-files below), and `.git/config` is where
+        # checkout persists the token. Nothing here pushes, so do not persist it at all.
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -143,6 +158,7 @@ jobs:
       - name: Install dependencies
         run: poetry install --sync --no-interaction
       - name: Run mutation testing
+        id: mutate
         env:
           # Keep the session databases: the survivor Markdown is generated from them, and
           # they are what a reviewer re-queries when a row needs more context than the table.
@@ -155,19 +171,54 @@ jobs:
           # same textual-substitution hazard fixed above in the `groups` step.
           MATRIX_GROUP: ${{ matrix.group }}
           MATRIX_MIN_KILL: ${{ matrix.min_kill }}
+          MATRIX_NAME: ${{ matrix.name }}
+          # Empty unless this job is one shard of a sharded group; the script refuses it otherwise.
+          MUTATION_SHARD: ${{ matrix.shard }}
+        # `set -o pipefail` is what makes this step's colour mean anything. With no `shell:`
+        # the runner uses `bash -e {0}`, which has no pipefail, so the pipeline's status was
+        # `tee`'s: every fail-closed exit in scripts/mutation_test.sh (red baseline, zero
+        # mutants, incomplete sweep, kill rate under the floor) was reported as success.
+        # Run 35710549260 (2026-09-22) shows it: ethtimelock logged "81% < threshold 86%",
+        # glyphverify and walletcore never got past a red baseline, and all three were green.
+        # tests/test_workflow_pipes_propagate_failure.py fails on any piped step without this.
+        #
+        # cosmic-ray's `local` distributor runs one mutant at a time, so this job uses one of the
+        # runner's cores; the line below records how many there are, rather than assuming it.
         run: |
+          set -o pipefail
+          echo "runner cores: $(nproc)"
           mkdir -p "$MUTATION_SESSION_DIR" "$MUTATION_REPORT_DIR"
           MUTATION_MIN_KILL_PCT="$MATRIX_MIN_KILL" \
-            poetry run bash scripts/mutation_test.sh "$MATRIX_GROUP" | tee "mutation-${MATRIX_GROUP}.log"
-      - name: Upload survivor list and session databases
-        # `always()`: a timed-out or failed group still produced partial sessions, and the
-        # survivors found before it stopped are still real.
-        if: always()
+            poetry run bash scripts/mutation_test.sh "$MATRIX_GROUP" | tee "mutation-${MATRIX_NAME}.log"
+      # Both paths below are under DOT-directories, and upload-artifact has skipped hidden files by
+      # default since v4.4. Without `include-hidden-files: true` this job uploaded the log and
+      # nothing else — run 36521398529's artifacts held only `mutation-<group>.log`, for completed
+      # groups too — while the comment here said partial sessions were kept.
+      # tests/test_workflow_uploads_include_hidden_files.py fails on any upload step that repeats it.
+      #
+      # The survivor list is the job's output (see "Report-only on purpose" above), so a sweep that
+      # SUCCEEDED without one fails here rather than warning. A failed sweep may have stopped before
+      # writing it (a red baseline), so there it only warns; the script itself fails a finished sweep
+      # with no list. A timed-out job is cancelled and has none: its partial sessions go up below.
+      - name: Upload survivor list
+        if: always() && (steps.mutate.outcome == 'success' || steps.mutate.outcome == 'failure')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutation-${{ matrix.group }}
+          name: mutation-${{ matrix.name }}-survivors
+          path: .mutation-reports/survivors-*.md
+          include-hidden-files: true
+          if-no-files-found: ${{ steps.mutate.outcome == 'success' && 'error' || 'warn' }}
+          retention-days: 90
+      - name: Upload log and session databases
+        # `always()`: a timed-out or failed group still produced partial sessions, and the
+        # survivors found before it stopped are still real — re-query them with cr-report.
+        if: always() && steps.mutate.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-${{ matrix.name }}
           path: |
-            mutation-${{ matrix.group }}.log
-            .mutation-reports/
+            mutation-${{ matrix.name }}.log
             .mutation-sessions/*.sqlite
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 90

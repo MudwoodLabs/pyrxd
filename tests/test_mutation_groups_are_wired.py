@@ -70,8 +70,8 @@ def _value_groups() -> set[str]:
     return set(m.group(1).split())
 
 
-def _matrix_groups() -> set[str]:
-    """What the workflow will actually run — obtained by running the generator the workflow runs."""
+def _matrix() -> list[dict[str, str]]:
+    """The workflow's job list — obtained by running the generator the workflow runs."""
     import json
     import subprocess
 
@@ -81,7 +81,12 @@ def _matrix_groups() -> set[str]:
         text=True,
         check=True,
     ).stdout
-    return set(json.loads(out)["group"])
+    return json.loads(out)["include"]
+
+
+def _matrix_groups() -> set[str]:
+    """What the workflow will actually run."""
+    return {e["group"] for e in _matrix()}
 
 
 def test_every_VALUE_group_is_RUN_weekly_by_the_workflow() -> None:
@@ -197,9 +202,135 @@ def test_a_threshold_names_a_group_that_exists() -> None:
     assert r.returncode == 0, f"the generator refuses to emit: {r.stderr.strip()}"
     import json
 
-    for entry in json.loads(r.stdout)["include"]:
+    floored = [e for e in json.loads(r.stdout)["include"] if "min_kill" in e]
+    assert floored, "no job carries a kill floor; ethleg and ethtimelock should"
+    for entry in floored:
         assert entry["group"] in _matrix_groups()
         assert str(entry["min_kill"]).isdigit()
+
+
+def _script_shards() -> dict[str, int]:
+    """`group_shards()` as the script declares it, parsed here independently of the generator."""
+    body = _SCRIPT.read_text()
+    start = body.index("group_shards() {")
+    block = body[start : body.index("\n}\n", start)]
+    return {g: int(n) for g, n in re.findall(r'^\s+([a-z0-9_]+)\)\s+echo "(\d+)" ;;', block, re.M)}
+
+
+def test_every_shard_of_a_sharded_group_is_a_job_and_every_job_name_is_unique() -> None:
+    """A sharded group is N jobs. If the generator emitted fewer, the missing shards' mutants
+    would never run while every job that did run went green. Job names also name the artifacts,
+    and a duplicate would make the second upload fail."""
+    shards = _script_shards()
+    assert shards, "group_shards() lists no group; the parse broke (inspectcore and inspectcli are sharded)"
+    jobs = _matrix()
+    names = [e["name"] for e in jobs]
+    assert len(names) == len(set(names)), f"duplicate job names: {sorted(n for n in names if names.count(n) > 1)}"
+    for group, n in shards.items():
+        got = sorted(int(e["shard"]) for e in jobs if e["group"] == group)
+        assert got == list(range(1, n + 1)), f"{group}: group_shards says {n}, the matrix runs shards {got}"
+    unsharded = [e for e in jobs if e["group"] not in shards]
+    assert unsharded and all("shard" not in e and e["name"] == e["group"] for e in unsharded)
+
+
+#: Groups split out of one parent because the parent did not fit the workflow's 330-minute job
+#: timeout: parent -> children. REVIEWED, not derived — which group a split came from is history,
+#: not something the script can express. The test below pins that each child still runs its
+#: parent's exact test command, so a split only ever moves modules between jobs and never changes
+#: what a module is tested against.
+_SPLIT_FROM: dict[str, tuple[str, ...]] = {
+    "transaction": ("txpreimage",),
+    "dmint": ("dmintchain", "dmintminer"),
+    "verdicts": ("mutchain", "waveverdicts"),
+    "covenants": ("htlccovenant", "radiantleg", "rswpcovenant"),
+    "gravitycore": ("gravitystate", "gravitymaker", "gravitylegs"),
+    "cryptoprim": ("cryptokeys", "cryptosec", "cryptoutils", "cryptohash"),
+    "glyphverify": ("glyphscan", "glyphinspector", "waverules", "inspectcore"),
+    "wire": ("hashmark", "wiretx"),
+}
+
+
+def _group_settings(groups: list[str]) -> dict[str, tuple[str, str, str]]:
+    """group -> (tests, timeout, marker), by RUNNING the script's own three functions in bash.
+
+    Evaluated rather than regex-parsed, so a child that differs only in `$GAPS` placement, or
+    that falls through to a `*)` default its parent does not, is seen exactly as the script
+    would build its cosmic-ray test command."""
+    import subprocess
+
+    body = _SCRIPT.read_text(encoding="utf-8")
+    parts = [re.search(r"^GAPS=.*$", body, re.M).group(0)]  # type: ignore[union-attr]
+    for fn in ("group_tests", "group_timeout", "group_marker"):
+        start = body.index(f"{fn}() {{")
+        parts.append(body[start : body.index("\n}\n", start) + 3])
+    parts.append(
+        'for g in "$@"; do printf \'%s\\t%s\\t%s\\t%s\\n\' "$g" "$(group_tests "$g")" "$(group_timeout "$g")" "$(group_marker "$g")"; done'
+    )
+    out = subprocess.run(["bash", "-c", "\n".join(parts), "bash", *groups], capture_output=True, text=True, check=True)
+    rows = [line.split("\t") for line in out.stdout.splitlines()]
+    return {g: (t, to, mk) for g, t, to, mk in rows}
+
+
+def test_a_split_group_keeps_its_parents_exact_test_command() -> None:
+    """A child with a shorter test list would score its modules against less than before, and
+    the lower kill rate would read as a finding about the code rather than about the split. The
+    marker matters as much: the consensus groups run WITHOUT `-m 'not integration'`, so a
+    consensus child that fell through to the default marker would run a different suite."""
+    families = [(p, c) for p, kids in _SPLIT_FROM.items() for c in kids]
+    settings = _group_settings(sorted({g for pair in families for g in pair}))
+    assert len(settings) == len({g for pair in families for g in pair}), "bash evaluated fewer groups than asked"
+    for parent, child in families:
+        assert settings[parent][0].startswith("tests/"), f"{parent}: group_tests is empty; the evaluation broke"
+        assert settings[child] == settings[parent], (
+            f"{child} was split from {parent} but its (tests, timeout, marker) differ:\n"
+            f"  {parent}: {settings[parent]}\n  {child}: {settings[child]}"
+        )
+    groups = _script_groups()
+    stale = sorted({g for pair in families for g in pair} - groups)
+    assert not stale, f"_SPLIT_FROM names groups the script no longer defines: {stale}"
+
+
+def test_the_split_check_fires_on_a_child_with_a_different_marker() -> None:
+    """Plant: `txpreimage` is a consensus child, so it must share `transaction`'s empty marker.
+    Evaluated through the same function the test above uses, with the arm dropped from the
+    marker case, which is exactly the edit a future split could forget."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    assert "|txpreimage|" in body, "txpreimage is no longer in group_marker's consensus arm; update this plant"
+    import subprocess
+
+    start = body.index("group_marker() {")
+    fn = body[start : body.index("\n}\n", start) + 3].replace("|txpreimage|", "|")
+    out = subprocess.run(
+        ["bash", "-c", fn + '\nprintf "[%s][%s]" "$(group_marker transaction)" "$(group_marker txpreimage)"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out == "[][-m 'not integration']", out
+
+
+def test_no_module_is_mutated_by_two_groups() -> None:
+    """A split that copied a module into a child without removing it from the parent would run
+    it twice (twice the minutes) and report two scores for one file. Derived from group_files()."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    start = body.index("group_files() {")
+    block = body[start : body.index("\n}\n", start)]
+    owner: dict[str, list[str]] = {}
+    for g, mods in re.findall(r'^\s{4}([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', block, re.M):
+        for m in mods.split():
+            owner.setdefault(m, []).append(g)
+    assert len(owner) > 100, f"only {len(owner)} modules parsed from group_files(); the parse broke"
+    dup = {m: gs for m, gs in owner.items() if len(gs) > 1}
+    assert not dup, f"modules mutated by more than one group: {dup}"
+
+
+def test_the_mutate_step_passes_the_shard_and_names_its_files_by_job() -> None:
+    """The shard index reaches the script only through the step's env, and two shards of one
+    group share `matrix.group` — so a log or artifact named by group would collide."""
+    wf = _WORKFLOW.read_text()
+    assert "MUTATION_SHARD: ${{ matrix.shard }}" in wf
+    assert "matrix.group }}.log" not in wf and "name: mutation-${{ matrix.group }}" not in wf
+    assert 'tee "mutation-${MATRIX_NAME}.log"' in wf
 
 
 def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
@@ -265,6 +396,26 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
         28: "twenty-eight",
         29: "twenty-nine",
         30: "thirty",
+        31: "thirty-one",
+        32: "thirty-two",
+        33: "thirty-three",
+        34: "thirty-four",
+        35: "thirty-five",
+        36: "thirty-six",
+        37: "thirty-seven",
+        38: "thirty-eight",
+        39: "thirty-nine",
+        40: "forty",
+        41: "forty-one",
+        42: "forty-two",
+        43: "forty-three",
+        44: "forty-four",
+        45: "forty-five",
+        46: "forty-six",
+        47: "forty-seven",
+        48: "forty-eight",
+        49: "forty-nine",
+        50: "fifty",
     }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"
@@ -429,3 +580,99 @@ def test_a_declared_test_actually_REACHES_a_mutation_group() -> None:
         "declaration does nothing. Re-run scripts/derive_mutation_test_lists.py and apply the "
         "result to scripts/mutation_test.sh:\n  " + "\n  ".join(missing)
     )
+
+
+def _group_test_lists() -> dict[str, list[str]]:
+    """group -> its test list, as `group_tests()` echoes it, with `$GAPS` expanded."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    gaps_m = re.search(r'^GAPS="([^"]*)"', body, re.M)
+    assert gaps_m, "GAPS is no longer a simple double-quoted assignment; this expansion is stale"
+    out: dict[str, list[str]] = {}
+    for line in body.split("\n"):
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        if m:
+            items: list[str] = []
+            for token in m.group(2).split():
+                items.extend(gaps_m.group(1).split() if token == "$GAPS" else [token])
+            out[m.group(1)] = items
+    return out
+
+
+def _conftest_dir_of(path: str) -> str | None:
+    """The nearest directory below `tests/` that holds a conftest.py and contains `path`
+    (a file, or a directory argument such as `tests/security/`), else None.
+
+    DERIVED from the tree: a conftest.py added to `tests/security/` tomorrow puts every list
+    that splits `tests/security/*` in scope at once, which is exactly when they would break."""
+    p = Path(path.rstrip("/"))
+    for d in [p, *p.parents]:
+        if d.as_posix() in ("tests", "."):
+            return None
+        if (_ROOT / d / "conftest.py").exists():
+            return d.as_posix()
+    return None
+
+
+def _conftest_splits(tests: list[str]) -> list[str]:
+    """Directories whose files do not form ONE contiguous run in `tests`."""
+    split: list[str] = []
+    seen_closed: set[str] = set()
+    previous: str | None = None
+    for t in tests:
+        d = _conftest_dir_of(t)
+        if d != previous and previous is not None:
+            seen_closed.add(previous)
+        if d is not None and d in seen_closed and d not in split:
+            split.append(d)
+        previous = d
+    return split
+
+
+def test_files_under_a_conftest_directory_stay_CONTIGUOUS_in_every_group() -> None:
+    """The rule was already written down, twice, and the lists broke it anyway.
+
+    `scripts/mutation_test.sh` and docs/how-to/mutation-testing.md both say `tests/cli/*` must
+    stay contiguous: pytest 9.1.1, given `tests/cli/a.py tests/test_b.py tests/cli/c.py`, stops
+    applying `tests/cli/conftest.py` to `c.py`, so its `runner` fixture is "not found". The
+    `glyphverify` list split `test_glyph_inspect_cmds.py` from `test_glyph_cmds.py` (76 errors)
+    and `walletcore` split three tests/cli files (8 errors in `test_swap_book_cmds.py`). Both
+    baselines went red, the harness refused both groups, and weekly run 35710549260 reported
+    them green for a second, unrelated reason (the workflow step lost the exit code to `tee`).
+    Neither group had produced a score. Prose rules do not run; this does.
+
+    Only directories that HAVE a conftest.py are held to it, since that is the mechanism;
+    `tests/security/` and `tests/network/` are split in several lists today and are harmless
+    until one of them grows a conftest, at which point this fails for them too.
+    """
+    lists = _group_test_lists()
+    assert len(lists) > 20, f"only {len(lists)} test lists parsed — the case-line regex stopped matching"
+
+    # Non-vacuity: at least one group must put 2+ files from one conftest directory in its list,
+    # or this passes because there was nothing that could be split.
+    from collections import Counter
+
+    multi = [
+        g for g, tests in lists.items() if any(n >= 2 for d, n in Counter(map(_conftest_dir_of, tests)).items() if d)
+    ]
+    assert multi, "no group names two files from one conftest directory — this guard is checking nothing"
+
+    bad = {g: split for g, tests in lists.items() if (split := _conftest_splits(tests))}
+    assert not bad, (
+        "these groups split a conftest directory across their test list, so pytest drops that "
+        "conftest for the later files and the clean-suite baseline goes red (the group then never "
+        f"runs): {bad}. Move each directory's files into one contiguous run, last."
+    )
+
+
+def test_the_contiguity_check_fires_on_the_list_that_broke_glyphverify() -> None:
+    """Plant: the pre-fix `glyphverify` ordering, tests/cli split by a top-level file."""
+    old = [
+        "tests/test_inspect_script_shapes.py",
+        "tests/cli/test_glyph_inspect_cmds.py",
+        "tests/test_inspect_core_classification.py",
+        "tests/cli/test_glyph_cmds.py",
+    ]
+    assert _conftest_splits(old) == ["tests/cli"]
+    # Honest path: the same files, contiguous, are fine wherever the run sits.
+    assert _conftest_splits([old[0], old[2], old[1], old[3]]) == []
+    assert _conftest_splits([old[1], old[3], old[0], old[2]]) == []

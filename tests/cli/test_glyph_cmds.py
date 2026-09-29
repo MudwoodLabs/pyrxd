@@ -833,15 +833,11 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -897,20 +893,14 @@ class TestDmintCliAssembly:
 
         captured: list[bytes] = []
 
-        # LIE on the commit broadcast, truthfully echo everything after it.
-        #
-        # An honest echo here proves nothing: code that trusts the server and code that
-        # derives the txid locally both pass, because the two values agree. The lie is
-        # the whole point of the fixture — it is what fails if `_local_commit_txid` is
-        # ever reverted to `str(echoed)`.
-        COMMIT_LIE = "de" * 32
-
+        # Echo honestly. This fixture used to LIE on the commit, to prove the reveal is built
+        # on the locally derived txid rather than the echo. A lie now stops the deploy at the
+        # commit (`_local_commit_txid` raises, #786 review; tests/cli/test_commit_echo_mismatch.py),
+        # so no reveal can be built on the echo at all.
         async def _bcast(raw: bytes) -> str:
             from pyrxd.transaction.transaction import Transaction
 
             captured.append(raw)
-            if len(captured) == 1:
-                return COMMIT_LIE
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -932,10 +922,8 @@ class TestDmintCliAssembly:
         result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
 
         commit_txid = Transaction.from_hex(captured[0]).txid()
-        # The derived txid wins over the server's reply, and the reveal is built against
-        # the REAL commit — not the lie. If either regresses, the token's ref points at a
-        # transaction that does not exist and the commit becomes unspendable.
-        assert commit_txid != COMMIT_LIE
+        # The reveal is built against the REAL commit. If that regresses, the token's ref
+        # points at a transaction that does not exist and the commit becomes unspendable.
         assert result["commit_txid"] == commit_txid
         reveal = Transaction.from_hex(captured[1])
         assert reveal is not None
@@ -972,15 +960,11 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1039,15 +1023,11 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1134,15 +1114,11 @@ class TestMultiTxGlyphAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1556,15 +1532,11 @@ class TestDmintV2CliPaths:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1611,15 +1583,11 @@ class TestDmintV2CliPaths:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1665,15 +1633,11 @@ class TestRevealFeeGuard:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
-            # carries on by design, so a lie there is a legitimate thing to exercise; the
-            # reveal helper now RAISES, because outpoints the user spends against are built
-            # from that txid. These fakes echoed constants for both, which is why nothing
-            # noticed the reveal was never verified.
+            # Echo the txid of what was sent. A lie now stops the command at whichever
+            # broadcast it hits (both txid helpers raise, #786 review), which
+            # tests/cli/test_commit_echo_mismatch.py covers through the root `cli`.
             from pyrxd.transaction.transaction import Transaction
 
-            if len(captured) == 1:
-                return "11" * 32
             return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
@@ -1949,6 +1913,19 @@ class TestTransferFtAllowOverpayIsWiredThrough:
     A flag that parses but does not reach the thing it names is worse than no flag,
     because it reads as an escape hatch while being a dead end. So these assert on
     the value that arrives at the library call.
+
+    These prove WIRING only, not that the flag changes any outcome. Today it cannot, on
+    ``transfer-ft`` or ``airdrop-ft``. The rate ceiling is enforced by the config loader
+    first (``validated_fee_rate``, as for ``mark`` in #793). ``assert_fee_matches_size``
+    can refuse only a fee well above size x rate, which needs the funding remainder to
+    go to the fee instead of to change. ``ft_funding`` (``pyrxd.glyph.transfer``) demands
+    a funding UTXO of at least twice its fee estimate (``needed = est_bytes * fee_rate *
+    2``), so the remainder is always large enough to return as change. The review of #795
+    drove both commands through the real CLI across rates and funding values and found no
+    case where the flag changed the result. With that 2x rule bypassed, the flag did
+    change it. So the flag stays as an escape hatch: it becomes live if that funding rule
+    is relaxed. For the commands where it was dead by construction, see
+    ``tests/cli/test_dead_allow_overpay_flags.py``.
     """
 
     def _capture(self, monkeypatch):
@@ -2083,10 +2060,11 @@ class TestTransferFtAllowOverpayIsWiredThrough:
 
 class TestTerminalBroadcastsRaiseRatherThanWarn:
     """Three adversarial lanes independently flagged the same line: ``airdrop-ft``
-    reported its txid through the mint-commit helper, which warns and carries on.
+    reported its txid through the mint-commit helper, which then warned and carried on.
 
-    The commit helper warns for a reason that is specific to a commit — there is a reveal
-    still to come, and the caller needs the locally derived txid to build it. An airdrop
+    (Since the #786 review the commit helper raises too, and the deploy commands turn that
+    into a recovery; the terminal paths keep ``_confirmed_txid``'s own wording.) The commit
+    helper warned for a reason specific to a commit — there is a reveal still to come. An airdrop
     is terminal. A warning on a non-tty run is no warning at all, and ``--json`` would
     have reported success for tokens that never moved, to the widest blast radius of the
     three paths: N recipients in one transaction.
@@ -2112,12 +2090,12 @@ class TestTerminalBroadcastsRaiseRatherThanWarn:
         body = self._body(fn)
         assert "_confirmed_txid" in body, f"{fn} must verify its broadcast txid by raising"
         assert "_local_commit_txid" not in body, (
-            f"{fn} is terminal — the warn-and-continue commit helper is the wrong one here"
+            f"{fn} is terminal — the commit helper, whose failure names a reveal recovery, is the wrong one here"
         )
 
     def test_the_commit_helper_is_still_used_where_a_phase_follows(self) -> None:
-        """The counterpart: a commit legitimately warns, because the reveal still needs
-        the derived txid whatever the server said."""
+        """The counterpart: a commit derives its txid through its own helper, whose failure
+        the deploy commands turn into a recovery naming the SDK rebuild (#786 review)."""
         import inspect
 
         from pyrxd.cli import glyph_cmds

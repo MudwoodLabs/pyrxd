@@ -862,12 +862,13 @@ def _block_hash_unavailable() -> str | None:
     """Why this runtime cannot compute a Radiant block hash, or None if it can.
 
     The binding compares a header's hash with the block the node names, and the Radiant block
-    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have unless its OpenSSL-backed
-    ``_hashlib`` package was loaded before ``hashlib`` was first imported (measured: "unsupported
-    hash type sha512_256" otherwise; the boot in ``shared.js`` loads it first). If that ever
-    fails, the rule would catch the hashing error as a header it "could not read" and try the
-    next height, and this page would then blame the SERVER for disagreeing with itself. Checked
-    here, first, so the reason is the true one and no header is fetched for nothing.
+    hash is SHA-512/256 — which Pyodide's ``hashlib`` does NOT have (measured: "unsupported hash
+    type sha512_256"), because the boot in ``shared.js`` deliberately does not load Pyodide's
+    OpenSSL package (#757). ``pyrxd.hash`` computes it in pure Python instead, so this should
+    never refuse. If that fallback ever fails too, the rule would catch the hashing error as a
+    header it "could not read" and try the next height, and this page would then blame the SERVER
+    for disagreeing with itself. Checked here, first, so the reason is the true one and no header
+    is fetched for nothing.
     """
     from pyrxd.hash import radiant_block_hash
 
@@ -1163,3 +1164,83 @@ def judge_file_digest(expected_hex: object, computed_hex: object, algorithm: obj
             "status": "NOT CHECKED",
             "meaning": _truncate(_inspect.sanitize_display_string(_safe_error(exc))),
         }
+
+
+def hashing_backend() -> dict:
+    """Which code computes this tab's three hashes, and whether two named OpenSSL modules exist (#757).
+
+    The pages deliberately do not load Pyodide's ``hashlib`` package (``_hashlib``, its OpenSSL
+    1.1.1n binding, end of life): ``pyrxd.hash`` computes SHA-512/256 in pure Python instead.
+    Static tests catch the KNOWN ways the boot could load it again; they cannot close every way.
+    This reports, at runtime, what those three hashes actually run on in this tab, and the pages
+    show it in their footer.
+
+    What it checks, each read without importing anything new beyond ``pyrxd.hash``:
+
+    * **The block hash (SHA-512/256).** Whether ``hashlib.new("sha512_256")`` works — the same
+      test ``pyrxd.hash._sha512_256`` makes on every call. If it raises ``ValueError``, pyrxd's
+      pure-Python SHA-512/256 computes the block hash; otherwise the module of ``hashlib``'s
+      object is named (``_hashlib`` is OpenSSL).
+    * **SHA-256** (the signature check's double SHA-256): ``hashlib.sha256.__module__`` —
+      ``_hashlib`` is OpenSSL, ``_sha2`` (``_sha256`` before 3.12) is CPython's own.
+    * **RIPEMD-160** (hash160): which implementation ``pyrxd.hash`` selected when it was imported,
+      its pure-Python one or ``hashlib``'s.
+    * **Whether ``_hashlib`` or ``_ssl`` is importable** (Pyodide's ``hashlib`` and ``ssl``
+      packages, both OpenSSL), even while nothing above uses them.
+
+    What it does NOT check: any OTHER copy of OpenSSL in the runtime. Pyodide's ``cryptography``
+    package carries its own OpenSSL (1.1.1w), and its bare ``openssl`` package is the library
+    alone; neither makes ``_hashlib`` or ``_ssl`` importable, so with either loaded this reports
+    neither module (measured in Pyodide 0.26.4 by the #764 round-4 review, against the previous
+    wording, which then said "no OpenSSL"). So the footer names the modules it looked for and
+    never says "no OpenSSL".
+
+    REPORTED, NOT REFUSED. OpenSSL here is more code fetched from the CDN, not a wrong answer: its
+    SHA-256 is still SHA-256. So nothing is withheld because of it. Never raises — a diagnostic
+    that could stop the page would be worse than none.
+    """
+    try:
+        import hashlib
+        import importlib.util
+
+        import pyrxd.hash as pyrxd_hash
+
+        def by(module: object) -> str:
+            return "OpenSSL (_hashlib)" if module == "_hashlib" else f"CPython's {module}"
+
+        try:
+            block = by(type(hashlib.new("sha512_256")).__module__)
+        except ValueError:
+            block = "pyrxd's pure Python"
+        sha256 = by(getattr(hashlib.sha256, "__module__", None))
+        if pyrxd_hash._ripemd160_impl is pyrxd_hash._ripemd160_pure_python:
+            ripemd = "pyrxd's pure Python"
+        else:
+            ripemd = by(type(hashlib.new("ripemd160")).__module__)
+        present = [name for name in ("_hashlib", "_ssl") if importlib.util.find_spec(name) is not None]
+    except Exception as exc:
+        return {
+            "block_hash": None,
+            "sha256": None,
+            "ripemd160": None,
+            "openssl_modules": None,
+            "summary": "hashing: could not tell which code computes the hashes "
+            f"({_truncate(_inspect.sanitize_display_string(_safe_error(exc)), cap=80)})",
+        }
+    groups: dict[str, list[str]] = {}
+    for name, code in (("block hash", block), ("SHA-256", sha256), ("RIPEMD-160", ripemd)):
+        groups.setdefault(code, []).append(name)
+    computed = ", ".join(f"{_and(names)} by {code}" for code, names in groups.items())
+    modules = f"{_and(present)} importable" if present else "no _hashlib or _ssl module"
+    return {
+        "block_hash": block,
+        "sha256": sha256,
+        "ripemd160": ripemd,
+        "openssl_modules": present,
+        "summary": f"hashing: {computed}; {modules}",
+    }
+
+
+def _and(names: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"

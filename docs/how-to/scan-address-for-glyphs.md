@@ -72,9 +72,17 @@ A few things to know:
 - **A failed reveal does not poison the result.** If the reveal for one
   Glyph cannot be fetched, that item still returns with
   `metadata=None`; the others come back with their metadata.
-- **There is also `scan_script_hash(...)`** if you have already
-  converted the address to a 32-byte script hash (e.g. for a non-P2PKH
-  template).
+- **Tokens are not listed under the address's P2PKH script hash.** A
+  Radiant ElectrumX lists a token output under its script with every ref
+  zeroed (`script_hash_for_output`), so one address has one hash per
+  token shape. `scan_address` reads each of them
+  (`owned_token_script_hashes`). There is also `scan_script_hash(...)`
+  for one hash you already have.
+- **The listing is checked against the transactions.** A listed output
+  that is another key's token, or is not at the hash it was listed
+  under, is left out with a warning; pass `strict=True` to raise
+  `ServerInconsistencyError` instead. An FT's `amount` is what its
+  transaction pays, not the server's UTXO record.
 
 ---
 
