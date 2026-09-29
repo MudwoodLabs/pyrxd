@@ -229,7 +229,7 @@ async function lookUp(text, token) {
     // mark is checked by, so that is what is fetched, and the page says it did so.
     const named = transactionNamedBy(classified);
     if (named) {
-      const result = await lookUpTransaction(named.txid, token);
+      const result = await lookUpTransaction(named.txid, token, named);
       if (result) result.named_by = named;
       return result;
     }
@@ -251,8 +251,9 @@ function transactionNamedBy(classified) {
   return { form: classified.form, txid, vout: payload.vout };
 }
 
-// One transaction, by number: fetch it, classify it, and place any mark in a block.
-async function lookUpTransaction(txid, token) {
+// One transaction, by number: fetch it, classify it, and place any mark in a block. `named` is
+// the output the reader named (an outpoint or a contract id), or undefined for a bare number.
+async function lookUpTransaction(txid, token, named) {
   setFormStatus("Looking up the transaction…");
   let rawHex;
   try {
@@ -273,6 +274,12 @@ async function lookUpTransaction(txid, token) {
   } catch (err) {
     return bridgeError(err);
   }
+
+  // AN OUTPUT THE TRANSACTION DOES NOT HAVE IS BAD INPUT, refused here, before the block is looked
+  // up: there will be no verdict to date. `renderReport` applies the same refusal, so a result that
+  // reaches it by any other route cannot draw a verdict under a pointer to nothing either.
+  const missing = named ? missingOutputProblem(named, result) : null;
+  if (missing) return missing;
 
   // THE BLOCK, and only when there is a mark to place in one. A HashMark's whole
   // claim is "no later than the block that confirms this", so the block is not
@@ -559,13 +566,17 @@ const MAX_MARK_PANELS = 50;
 // classification dict and returns DOM, touching no globals and no network, which is
 // what lets `tests/web/verify_render_harness.mjs` drive the real renderer under Node
 // against payloads the real Python classifier produced.
-function renderReport(result) {
+function renderReport(given) {
   const wrap = el("div", { class: "report" });
 
   // SAY WHAT WAS LOOKED UP, when it is not what was typed. A reader who pasted an outpoint
   // or a contract id is shown the transaction it points at, and must be able to tell —
   // including when the OUTPUT they named is not the mark, or is not there at all.
-  const named = result && result.named_by;
+  const named = given && given.named_by;
+  // NO VERDICT UNDER A POINTER TO NOTHING. An output the transaction does not have is an input
+  // error, drawn as one (`missingOutputProblem`), never as the transaction's verdict.
+  const missing = named && given.ok ? missingOutputProblem(named, given) : null;
+  const result = missing ? { ...missing, named_by: named } : given;
   if (named) {
     wrap.appendChild(para(namedByNote(named), "answer-body multi-note"));
     if (result.ok) {
@@ -744,12 +755,12 @@ function namedByNote(named) {
 }
 
 // THE OUTPUT THE READER NAMED, against what the transaction actually has. Without this a
-// change output (`:1`) or an output that does not exist (`:7` of a two-output transaction)
-// sat above a green VERIFIED about a DIFFERENT output, and the page never said which. The
-// facts told apart: the named output holds a record that is drawn below, or one past the
-// panel limit that is not; it exists and is not a record; it exists and could not be read, so
-// whether it is a record is unknown; or the transaction has no such output. Null when there is
-// nothing to compare against.
+// change output (`:1`) sat above a green VERIFIED about a DIFFERENT output, and the page never
+// said which. The facts told apart: the named output holds a record that is drawn below, or one
+// past the panel limit that is not; it is not a record; or it could not be read, so whether it
+// is a record is unknown. An output the transaction does not have never gets here: it is an
+// input error (`missingOutputProblem`), and this returns null for it rather than a sentence.
+// Null too when there is nothing to compare against.
 function namedOutputNote(named, payload) {
   const n = named.vout;
   const count = payload.output_count;
@@ -770,12 +781,7 @@ function namedOutputNote(named, payload) {
         : `Its HashMark record is in output ${marked[0]}, and the panel below is about that output.`)
       : `It carries ${marked.length} HashMark records${could} in other outputs; each panel below names its own.`)
     + unreadClause(unread.filter((v) => v !== n).length);
-  if (n < 0 || n >= count) {
-    return (
-      `That transaction has ${count} output${count === 1 ? "" : "s"} (numbered 0 to ${count - 1}), ` +
-      `so there is no output ${n}: what you were given points at nothing in it. ${where}`
-    );
-  }
+  if (n < 0 || n >= count) return null;
   const at = marked.indexOf(n);
   if (at !== -1) {
     // "HOLDS THE RECORD", not "carries a HashMark record": the record there may be one that
@@ -803,6 +809,34 @@ function namedOutputNote(named, payload) {
   return (
     `Output ${n}, the one you named, is NOT a HashMark record, so nothing below is about it. ${where}`
   );
+}
+
+// AN OUTPUT THE TRANSACTION DOES NOT HAVE, as the input error it is — the page's counterpart of
+// `pyrxd verify`'s exit 1 (`_require_named_output` in src/pyrxd/cli/hashmark_cmds.py), in the
+// same words. `<txid>:7` of a two-output transaction used to draw the transaction's green
+// VERIFIED under a note saying there was no output 7: a verified result for a pointer to nothing.
+// Null when the output exists (whatever it holds, the report says so) or when there is nothing
+// to compare against.
+function missingOutputProblem(named, result) {
+  const payload = (result && result.ok && result.payload) || {};
+  const n = named.vout;
+  const count = payload.output_count;
+  if (!Number.isInteger(n) || !Number.isInteger(count) || (n >= 0 && n < count)) return null;
+  const has = count <= 0
+    ? "has no outputs"
+    : count === 1
+      ? "has only 1 output (numbered 0)"
+      : `has only ${count} outputs (numbered 0 to ${count - 1})`;
+  return {
+    ok: false,
+    form: "error",
+    error: `That transaction ${has}, so there is no output ${n}.`,
+    hint:
+      "What you were given points at nothing in that transaction, so this page gives no verdict. " +
+      "Check the output number you were given. To check the transaction itself, paste its " +
+      `transaction number alone: ${safeText(named.txid)}`,
+    detail: "",
+  };
 }
 
 // The outputs the classifier could not read: its per-output try/except makes each a row of

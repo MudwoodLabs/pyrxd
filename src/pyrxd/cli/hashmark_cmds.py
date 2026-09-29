@@ -1155,7 +1155,8 @@ def _verify_target(arg: str) -> tuple[str, dict | None]:
 
     An outpoint and a contract id NAME AN OUTPUT, and neither is a record. A mark is checked by the
     transaction that carries it, so that transaction is what is fetched, and :func:`_named_output`
-    then says what the named output turned out to be. Refusing them told the user "that is not a
+    then says what the named output turned out to be — or :func:`_require_named_output` refuses it,
+    when the transaction has no such output. Refusing them told the user "that is not a
     transaction id" about input that had one in it (#745).
     """
     wanted = arg.strip()
@@ -1243,20 +1244,48 @@ def _outputs_phrase(count: Any) -> str:
     return "1 output (numbered 0)" if count == 1 else f"{count} outputs (numbered 0 to {count - 1})"
 
 
+def _require_named_output(named: dict, payload: dict) -> None:
+    """Refuse an output the transaction does not have. That is bad input: exit 1, and no verdict.
+
+    ``<txid>:7`` of a two-output transaction points at nothing. It used to be checked anyway: the
+    transaction's verdict was printed under a sentence saying there was no output 7, with exit 0
+    whenever the mark held, and ``--quiet`` printed a bare ``HOLDS``. A gate that reads the exit code
+    passed a pointer to nothing. Now it is refused like any other argument that does not say what it
+    claims to, the same way in every output mode (nothing on stdout: no report, no JSON document, no
+    token), and before the block or a WAVE name is looked up.
+
+    Only a MISSING output is refused. An output that exists is never refused here, whatever it holds;
+    :func:`_named_output` says what it is above the verdict.
+    """
+    n, count = named["vout"], payload.get("output_count")
+    if isinstance(count, int) and 0 <= n < count:
+        return
+    what = "an output reference" if named["form"] == "outpoint" else "a contract id"
+    only = "only " if isinstance(count, int) and count > 0 else ""
+    raise UserError(
+        f"that transaction has {only}{_outputs_phrase(count)}, so there is no output {n}",
+        cause=f"you gave {what}, {named['input']}, which names output {n} of transaction {named['txid']}. "
+        "It points at nothing in that transaction, so no verdict was given",
+        fix="check the output number you were given. To check the transaction itself, give its txid "
+        f"alone as the argument: {named['txid']}",
+    )
+
+
 def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout: Any, refusal_vout: Any) -> dict:
     """What the output the user NAMED turned out to be — said before the verdict, every sentence true.
 
     The terminal's counterpart of the /verify/ page's ``namedByNote`` and ``namedOutputNote``. The
     named output holds the record the verdict is about; holds a record the verdict is NOT about (the
     verdict is about ONE record, and it need not be this one); is not a record, and then where the
-    record is; could not be read, so whether it is a record is unknown; or does not exist. One case
+    record is; or could not be read, so whether it is a record is unknown. An output the transaction
+    does not have never reaches this: :func:`_require_named_output` refused it. One case
     is added that the page does not need: because this prints ONE verdict where the page draws a
     panel per record, the verdict's signature line can be about another record, and the sentence
     says so. Without this, ``<txid>:1`` — a change output — would sit above a verdict about output
     0 with nothing saying so.
 
-    NEVER A REFUSAL, AND NEVER A DIFFERENT VERDICT. The verdict is the one the bare txid gets: naming
-    an output does not change what the transaction carries. What it changes is what the reader will
+    NEVER A REFUSAL, AND NEVER A DIFFERENT VERDICT, for an output that exists. The verdict is the one
+    the bare txid gets: naming an output does not change what the transaction carries. What it changes is what the reader will
     believe they were shown, and that is what these sentences are for. ``says`` is printed in every
     mode — above the report, in ``--json``, and to stderr under ``--quiet``.
 
@@ -1265,7 +1294,7 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     record (``refusal_vout``), as its own record line says. Leaving it out would make the sentence
     above the verdict contradict the line inside it.
     """
-    n, count = named["vout"], payload.get("output_count")
+    n = named["vout"]
     record_vouts = [row.get("vout") for row in rows]
     if named["form"] == "outpoint":
         says = [f"You gave an output reference, read as output {n} of transaction {named['txid']}."]
@@ -1294,17 +1323,11 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
             f"below is about the one at vout {verdict_vout}{but_sig}, and each is listed separately."
         )
     where += _unread_clause(sum(1 for v in unread if v != n))
-    exists = isinstance(count, int) and 0 <= n < count
     holds = n in record_vouts
     # A row the classifier crashed on is not KNOWN to be a record, and not known not to be one either,
     # so it gets neither sentence.
     unreadable = not holds and n in unread
-    if not exists:
-        says.append(
-            f"That transaction has {_outputs_phrase(count)}, so there is no output {n}: what you gave points at "
-            f"nothing in it. {where}"
-        )
-    elif holds and n == verdict_vout:
+    if holds and n == verdict_vout:
         says.append(f"Output {n}, the one you named, holds the HashMark record the verdict below is about{but_sig}.")
     elif holds:
         says.append(
@@ -1322,7 +1345,6 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
         )
     return {
         **named,
-        "output_exists": exists,
         # None when it could not be classified: not known either way.
         "output_holds_record": None if unreadable else holds,
         "verdict_is_about_it": holds and n == verdict_vout,
@@ -1395,8 +1417,9 @@ def verify_cmd(
     TXID is the transaction carrying the mark — or one of its outputs, written <txid>:<n> or as a
     72-character contract id. Those name an output, not a record: the whole transaction is checked
     and gets the same verdict as its txid, and the report first says what the named output is —
-    the record the verdict is about, another record, not a record, not there at all, or one this
-    build could not read.
+    the record the verdict is about, another record, not a record, or one this build could not
+    read. An output the transaction does not have is bad input: exit 1, no verdict, and the error
+    says how many outputs the transaction has.
 
     \b
     A DIGEST AND A TXID ARE THE SAME SHAPE — both are 64 lowercase hex characters, and nothing
@@ -1467,6 +1490,10 @@ def verify_cmd(
     _require_min_confirmations(min_confirmations, needed_by="pyrxd verify", command=f"pyrxd verify {rerun}")
 
     payload = _run_fetch_inspect(ctx, form="txid", value=wanted)
+    if named is not None:
+        # FIRST, before anything is said about what the transaction carries: an output it does not
+        # have is bad input, whether or not there is a mark in it.
+        _require_named_output(named, payload)
     rows = [row for row in (payload.get("outputs") or []) if row.get("hashmark")]
     # FROM THE ROWS, so a record and its vout cannot come apart: every check below is attached
     # to a record, and the summary names the record by the vout of the row it came from.
@@ -1485,9 +1512,7 @@ def verify_cmd(
     if not records and named is not None:
         # NOT the digest hint below: an outpoint and a contract id are not the shape of a digest.
         n = named["vout"]
-        if not (isinstance(count, int) and 0 <= n < count):
-            which = f"and there is no output {n}, the one you named: it has {_outputs_phrase(count)}"
-        elif n in unread:
+        if n in unread:
             which = f"output {n}, the one you named, is one that could not be classified"
         elif unread:
             which = f"output {n}, the one you named, could be read, and is not one"
@@ -1579,8 +1604,8 @@ def verify_cmd(
         click.echo(emit(out, mode="json"))
     elif ctx.output_mode == "quiet":
         if said:
-            # To stderr: stdout stays ONE token. But not dropped — `<txid>:7` quietly printing HOLDS
-            # about output 0 is the silence this disclosure exists to end.
+            # To stderr: stdout stays ONE token. But not dropped — `<txid>:1`, a change output,
+            # quietly printing HOLDS about output 0 is the silence this disclosure exists to end.
             click.echo("\n".join(said), err=True)
         # ONE token, and it is the answer — not the txid the caller already typed.
         click.echo("HOLDS" if not failed else "DOES-NOT-HOLD")

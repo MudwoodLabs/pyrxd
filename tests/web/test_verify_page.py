@@ -1637,15 +1637,41 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         assert flat.index(said) < flat.index("VERIFIED"), "the caveat is below the verdict it qualifies"
 
     @pytest.mark.parametrize("shape", ["outpoint", "contract"])
-    def test_naming_an_output_the_transaction_does_not_have_says_so(self, shape, limit) -> None:
+    def test_naming_an_output_the_transaction_does_not_have_is_an_input_error(
+        self, shape, limit, monkeypatch, tmp_path
+    ) -> None:
+        """An input error, not a verified result. `<txid>:7` of a two-output transaction drew the mark's
+        green VERIFIED under a note saying there was no output 7. Now it draws the refusal and no
+        panel, looks nothing further up, and says what `pyrxd verify` says as it exits 1."""
         txid, raw_hex, fetched = self._mark_and_change_tx(limit)
-        out = self._check(self._named(txid, 7, shape), txid, raw_hex, fetched)
+        given = self._named(txid, 7, shape)
+        out = self._check(given, txid, raw_hex, fetched)
         flat = " ".join(out["text"].split())
-        said = "That transaction has 2 outputs (numbered 0 to 1), so there is no output 7"
-        assert said in flat, f"the page did not say output 7 does not exist:\n{flat}"
-        assert "Its HashMark record is in output 0" in flat
-        assert "output 0" in out["panels"][0].split("\n")
-        assert flat.index(said) < flat.index("VERIFIED")
+        said = "That transaction has only 2 outputs (numbered 0 to 1), so there is no output 7."
+        assert said in flat, f"the page did not refuse output 7:\n{flat}"
+        assert "so this page gives no verdict" in flat
+        assert f"paste its transaction number alone: {txid}" in flat
+        assert out["statuses"] == [] and out["panels"] == [], "a verdict was drawn for a pointer to nothing"
+        assert "VERIFIED" not in flat and "Its HashMark record is in output 0" not in flat
+        assert "problem" in out["classes"]
+        # What was looked up is still said, above the refusal.
+        assert f"which points at output 7 of transaction {txid}" in flat
+        # Refused before the block: the transaction is the only thing asked for.
+        assert out["requested"] == [["blockchain.transaction.get", [txid, False]]]
+        assert out["calls"]["anchor"] == []
+
+        # The command, over the same bytes: exit 1, the same sentence, nothing on stdout.
+        from tests.test_hashmark_verify_cli import _FakeServer, _run
+
+        r = _run(
+            monkeypatch,
+            _FakeServer({txid: bytes.fromhex(raw_hex)}),
+            ["verify", given, "--min-confirmations", "1"],
+            tmp_path=tmp_path,
+        )
+        assert r.exit_code == 1, r.output
+        assert r.stdout == ""
+        assert said[1:-1] in " ".join(r.stderr.split()), "the page and the command say different things"
 
     @pytest.mark.parametrize("shape", ["outpoint", "contract"])
     def test_the_first_output_number_past_the_end_does_not_exist(self, shape, limit) -> None:
@@ -1658,16 +1684,42 @@ class TestAPointerToAMarkIsNotToldItIsNotAMark:
         count = fetched["payload"]["output_count"]
         assert count == 2, "the premise"
 
-        past = " ".join(self._check(self._named(txid, count, shape), txid, raw_hex, fetched)["text"].split())
+        past_out = self._check(self._named(txid, count, shape), txid, raw_hex, fetched)
+        past = " ".join(past_out["text"].split())
         assert (
-            f"That transaction has {count} outputs (numbered 0 to {count - 1}), so there is no output {count}" in past
+            f"That transaction has only {count} outputs (numbered 0 to {count - 1}), so there is no output {count}."
+            in past
         )
         assert f"Output {count}, the one you named" not in past, "an output that does not exist was described"
+        assert past_out["statuses"] == [], "an output that does not exist got a verdict"
 
-        # The honest neighbour: the LAST output that does exist is judged as an output, not refused.
-        last = " ".join(self._check(self._named(txid, count - 1, shape), txid, raw_hex, fetched)["text"].split())
+        # The honest neighbour: the LAST output that does exist is judged as an output, not refused,
+        # and the transaction's mark still verifies under it.
+        last_out = self._check(self._named(txid, count - 1, shape), txid, raw_hex, fetched)
+        last = " ".join(last_out["text"].split())
         assert f"Output {count - 1}, the one you named, is NOT a HashMark record" in last
         assert "so there is no output" not in last
+        assert last_out["statuses"] == ["VERIFIED"]
+
+    def test_the_renderer_refuses_a_missing_output_whatever_route_the_result_took(self, limit) -> None:
+        """THE SAME REFUSAL AT THE RENDERER. `renderReport` is where every result is drawn, so a
+        result that names a missing output is drawn as the input error even if it never passed
+        through the lookup that refuses it first. The honest neighbour (output 1 exists) still
+        gets its verdict."""
+        txid, _raw_hex, fetched = self._mark_and_change_tx(limit)
+        missing = _page({**fetched, "named_by": {"form": "outpoint", "txid": txid, "vout": 2}})
+        flat = " ".join(missing["text"].split())
+        assert "That transaction has only 2 outputs (numbered 0 to 1), so there is no output 2." in flat
+        assert missing["statuses"] == [] and missing["panels"] == []
+
+        present = _page({**fetched, "named_by": {"form": "outpoint", "txid": txid, "vout": 1}})
+        assert present["statuses"] == ["VERIFIED"]
+        assert "so there is no output" not in " ".join(present["text"].split())
+
+    def test_a_one_output_transaction_is_refused_in_the_singular(self, limit) -> None:
+        txid, raw, fetched = _tx_result(_signed_script(b"alone\n"), limit=limit)
+        flat = " ".join(self._check(f"{txid}:1", txid, raw.hex(), fetched)["text"].split())
+        assert "That transaction has only 1 output (numbered 0), so there is no output 1." in flat
 
     def test_a_named_output_whose_record_does_not_decode_is_not_called_a_hashmark_record(self, limit) -> None:
         """The positive sentence must not certify what the panel below refutes: a record that

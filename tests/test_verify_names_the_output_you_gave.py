@@ -4,8 +4,12 @@ Both forms NAME AN OUTPUT of a transaction. ``verify`` refused them with "that i
 transaction id", about input that had one in it, and a fix hint that talked only about digests.
 The /verify/ page accepts both (``docs/inspect_static/verify/verify.js``: ``transactionNamedBy``,
 ``namedByNote``, ``namedOutputNote``): it checks the transaction the pointer names and, before any
-verdict, says whether the named output holds the record, holds something that is not a record
-(and which output does), or does not exist. This file holds the command to the same answers.
+verdict, says whether the named output holds the record or holds something that is not a record
+(and which output does). This file holds the command to the same answers.
+
+AN OUTPUT THE TRANSACTION DOES NOT HAVE IS BAD INPUT (``_require_named_output``; the page's
+``missingOutputProblem``): exit 1, no verdict, and the error says how many outputs there are. It was
+checked anyway, and ``<txid>:7`` exited 0 whenever the mark held.
 
 Driven through the REAL top-level command. Only the ElectrumX transport is faked
 (:class:`tests.test_hashmark_verify_cli._FakeServer`); every record is a real signed record over
@@ -141,39 +145,38 @@ class TestEachOutputYouCanName:
         assert "record:     vout 0" in r.output
 
     @pytest.mark.parametrize("n", [7, 2], ids=["well-past-the-end", "exactly-one-past-the-end"])
-    def test_an_output_the_transaction_does_not_have(self, monkeypatch, tmp_path, two_outputs, spell, gave, n) -> None:
+    @pytest.mark.parametrize("mode", ["human", "--json", "--quiet"])
+    def test_an_output_the_transaction_does_not_have_is_bad_input(
+        self, monkeypatch, tmp_path, two_outputs, spell, gave, n, mode
+    ) -> None:
+        """Exit 1 and no verdict, in every mode: no report, no JSON document, no HOLDS token."""
         txid = two_outputs["txid"]
-        r = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, n))
-        assert r.exit_code == 0, r.output
-        said = _said_before_the_verdict(r.output)
-        assert f"{gave} {n} of transaction {txid}." in said
-        assert (
-            f"That transaction has 2 outputs (numbered 0 to 1), so there is no output {n}: what you gave "
-            "points at nothing in it." in said
-        )
-        assert "The transaction's HashMark record is in output 0, and the verdict below is about it." in said
-        assert f"Output {n}, the one you named" not in said
+        given = spell(txid, n)
+        r = _verify(monkeypatch, tmp_path, two_outputs["server"], given, *([] if mode == "human" else [mode]))
+        assert r.exit_code == 1, r.output
+        assert r.stdout == "", f"a pointer to nothing printed a result on stdout:\n{r.stdout}"
+        err = _flat(r.stderr)
+        assert f"error: that transaction has only 2 outputs (numbered 0 to 1), so there is no output {n}" in err
+        what = "an output reference" if ":" in given else "a contract id"
+        assert f"you gave {what}, {given}, which names output {n} of transaction {txid}." in err
+        assert "so no verdict was given" in err
+        assert f"give its txid alone as the argument: {txid}" in err
+        assert "HOLDS" not in r.output and "VERDICT" not in r.output and "Mark: " not in r.output
+        # Refused before the block was looked up: the transaction is the only thing fetched.
+        assert two_outputs["server"].calls == [("get_transaction", txid)]
 
     def test_the_json_carries_the_same_sentences_and_the_facts_under_them(
         self, monkeypatch, tmp_path, two_outputs, spell, gave
     ) -> None:
         txid = two_outputs["txid"]
-        expected = {
-            0: (True, True, True),
-            1: (True, False, False),
-            2: (False, False, False),
-            7: (False, False, False),
-        }
-        for n, (exists, holds, about) in expected.items():
+        expected = {0: (True, True), 1: (False, False)}
+        for n, (holds, about) in expected.items():
             human = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, n))
             j = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, n), "--json")
             assert j.exit_code == 0, j.output
             named = json.loads(j.stdout)["named_by"]
-            assert (named["output_exists"], named["output_holds_record"], named["verdict_is_about_it"]) == (
-                exists,
-                holds,
-                about,
-            ), n
+            assert (named["output_holds_record"], named["verdict_is_about_it"]) == (holds, about), n
+            assert "output_exists" not in named, "a missing output is refused, so this would always be true"
             assert (named["txid"], named["vout"]) == (txid, n)
             assert named["form"] == ("outpoint" if ":" in spell(txid, n) else "contract")
             # ONE source for both: the human lines ARE the JSON's sentences.
@@ -182,7 +185,7 @@ class TestEachOutputYouCanName:
     def test_naming_an_output_never_changes_the_verdict(self, monkeypatch, tmp_path, two_outputs, spell, gave) -> None:
         txid = two_outputs["txid"]
         bare = json.loads(_verify(monkeypatch, tmp_path, two_outputs["server"], txid, "--json").stdout)
-        for n in (0, 1, 2, 7):
+        for n in (0, 1):
             named = json.loads(_verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, n), "--json").stdout)
             named.pop("named_by")
             assert named == bare, n
@@ -190,10 +193,36 @@ class TestEachOutputYouCanName:
     def test_quiet_mode_keeps_one_token_and_still_says_it(
         self, monkeypatch, tmp_path, two_outputs, spell, gave
     ) -> None:
-        r = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(two_outputs["txid"], 7), "--quiet")
+        """The honest path under --quiet: an output that EXISTS and is not the mark still holds."""
+        r = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(two_outputs["txid"], 1), "--quiet")
         assert r.exit_code == 0, r.output
         assert r.stdout.strip() == "HOLDS"
-        assert "there is no output 7" in _flat(r.stderr)
+        assert "Output 1, the one you named, is NOT a HashMark record" in _flat(r.stderr)
+
+    def test_the_last_output_is_judged_and_the_next_is_refused(
+        self, monkeypatch, tmp_path, two_outputs, spell, gave
+    ) -> None:
+        """THE BOUNDARY, both sides: outputs are numbered 0 to count-1, so ``count`` is the first that
+        does not exist. ``n > count`` for ``n >= count`` would judge it instead of refusing it."""
+        txid = two_outputs["txid"]
+        last = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, 1), "--json")
+        assert last.exit_code == 0, last.output
+        assert json.loads(last.stdout)["verdict_holds"] is True
+        past = _verify(monkeypatch, tmp_path, two_outputs["server"], spell(txid, 2), "--json")
+        assert past.exit_code == 1, past.output
+        assert past.stdout == ""
+
+
+def test_a_one_output_transaction_says_so_in_the_singular(monkeypatch, tmp_path) -> None:
+    """``count == 1``: "only 1 output (numbered 0)", not "numbered 0 to 0"."""
+    txid, raw = _tx_with(_mark_script(b"alone\n", PrivateKey()))
+    r = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), f"{txid}:1")
+    assert r.exit_code == 1, r.output
+    assert "that transaction has only 1 output (numbered 0), so there is no output 1" in _flat(r.stderr)
+    # The honest neighbour: its one output is the mark, and it verifies.
+    ok = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), f"{txid}:0")
+    assert ok.exit_code == 0, ok.output
+    assert "Output 0, the one you named, holds the HashMark record the verdict below is about." in _flat(ok.output)
 
 
 # --------------------------------------------------------------------------- several records
@@ -427,11 +456,12 @@ class TestNoMarkAndAnOutputThatCouldNotBeRead:
         assert "none of them decodes" not in flat
 
     def test_naming_an_output_it_does_not_have(self, monkeypatch, tmp_path, unread_at_0, spell, gave) -> None:
+        """The missing output is the error, and it comes first: nothing is said about the records."""
         r = _verify(monkeypatch, tmp_path, unread_at_0["server"], spell(unread_at_0["txid"], 2))
         assert r.exit_code == 1, r.output
         flat = _flat(r.output)
-        assert "1 could not be classified here" in flat
-        assert "and there is no output 2, the one you named: it has 2 outputs (numbered 0 to 1)" in flat
+        assert "that transaction has only 2 outputs (numbered 0 to 1), so there is no output 2" in flat
+        assert "HashMark" not in flat
 
 
 def test_a_bare_txid_with_no_mark_and_an_unread_output_says_what_was_read(monkeypatch, tmp_path) -> None:
@@ -468,11 +498,12 @@ class TestATransactionWithNoMark:
         assert "--digest" not in flat
 
     def test_an_output_it_does_not_have(self, monkeypatch, tmp_path, no_mark, spell, gave) -> None:
+        """The same refusal whether or not the transaction carries a mark."""
         r = _verify(monkeypatch, tmp_path, no_mark["server"], spell(no_mark["txid"], 2))
         assert r.exit_code == 1, r.output
         flat = _flat(r.output)
-        assert "there is no output 2, the one you named: it has 2 outputs (numbered 0 to 1)" in flat
-        assert "among them" not in flat
+        assert "that transaction has only 2 outputs (numbered 0 to 1), so there is no output 2" in flat
+        assert "no HashMark record" not in flat and "among them" not in flat
 
 
 # --------------------------------------------------------------------------- refusals
