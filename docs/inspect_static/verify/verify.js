@@ -604,8 +604,15 @@ function renderReport(result) {
   const shown = records.slice(0, MAX_MARK_PANELS);
   const hidden = records.length - shown.length;
   if (records.length > 1) {
+    // A COUNT NOBODY FINISHED when an output could not be read: it may be a mark too. Said as what
+    // this page could read, the same rule as `pyrxd verify`'s record line (`_verdict_record_about`).
+    const unreadCount = unreadVouts(payload).length;
+    const counted = unreadCount > 0
+      ? `This transaction carries ${records.length} marks this page could read; ${unreadCount} ` +
+        `${unreadCount === 1 ? "output" : "outputs"} could not be classified here. `
+      : `This transaction carries ${records.length} marks. `;
     wrap.appendChild(para(
-      `This transaction carries ${records.length} marks. Each is a separate record ` +
+      counted + "Each is a separate record " +
       (hidden > 0
         ? `and is checked on its own. The first ${shown.length} are shown below; the ` +
           `other ${hidden} are not shown on this page.`

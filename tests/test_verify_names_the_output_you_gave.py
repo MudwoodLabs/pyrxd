@@ -357,6 +357,45 @@ def test_an_unread_output_ELSEWHERE_does_not_make_the_named_one_unread(monkeypat
     assert named["output_holds_record"] is False, "output 1 was read, and is not a record"
 
 
+_UNREAD_TOO = b"\x76\xa9\x14" + bytes([9] * 20) + b"\x88\xac"  # a second output made unreadable
+
+
+@pytest.mark.parametrize(
+    ("k", "said"), [(1, "1 other output could not"), (2, "2 other outputs could not")], ids=["one-unread", "two-unread"]
+)
+@pytest.mark.parametrize("named", [True, False], ids=["named", "bare"])
+def test_the_verdicts_record_line_does_not_count_past_an_unread_output(monkeypatch, tmp_path, named, k, said) -> None:
+    """The verdict's ``record:`` line said "the only HashMark record in this transaction" directly
+    under the sentence saying an output could not be read. Named and bare share that line.
+    Mark at 0, change at 1, and ``k`` outputs after it that crash the classifier."""
+    content = b"the advisory, as published\n"
+    unread = (_UNREAD, _UNREAD_TOO)[:k]
+    txid, raw = _tx_with(_mark_script(content, PrivateKey()), _CHANGE, *unread)
+    _crash_on(monkeypatch, *unread)
+    r = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), f"{txid}:1" if named else txid)
+    assert r.exit_code == 0, r.output
+    record_line = next(ln for ln in r.output.splitlines() if ln.strip().startswith("record:"))
+    assert f"the only HashMark record that could be read; {said} be classified here" in record_line, record_line
+    assert "in this transaction" not in record_line
+
+
+def test_the_record_line_is_unchanged_when_every_output_was_read(monkeypatch, tmp_path, two_outputs) -> None:
+    """The honest neighbour: nothing unread, so the unqualified sentence is true and stays."""
+    r = _verify(monkeypatch, tmp_path, two_outputs["server"], two_outputs["txid"])
+    record_line = next(ln for ln in r.output.splitlines() if ln.strip().startswith("record:"))
+    assert "the only HashMark record in this transaction" in record_line
+
+
+def test_one_of_several_records_is_counted_as_read(monkeypatch, tmp_path) -> None:
+    """Two records read and one output not: "one of 2 HashMark records" is a count nobody finished."""
+    txid, raw = _tx_with(_mark_script(b"one\n", PrivateKey()), _mark_script(b"two\n", PrivateKey()), _UNREAD)
+    _crash_on(monkeypatch, _UNREAD)
+    r = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), txid)
+    assert r.exit_code == 0, r.output
+    record_line = next(ln for ln in r.output.splitlines() if ln.strip().startswith("record:"))
+    assert "one of 2 HashMark records that could be read here;" in record_line, record_line
+
+
 @pytest.mark.parametrize(("spell", "gave"), FORMS)
 class TestNoMarkAndAnOutputThatCouldNotBeRead:
     """No record was found, and one output could not be read — so "no HashMark record" and "none of

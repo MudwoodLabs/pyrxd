@@ -896,7 +896,7 @@ def _digest_match_lines(dm: dict | None, indent: str = "  ") -> list[str]:
     ]
 
 
-def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
+def _verify_lines(payload: dict, rows: list[dict], *, unread: int) -> list[str]:
     """The whole human answer: a summary, then the detail the summary is derived from.
 
     THE TWO HALVES CANNOT DISAGREE, and that is structural rather than careful. Every summary
@@ -911,7 +911,7 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
         f"  network:      {payload['network']}",
         "",
         "  VERDICT" + (" — holds" if payload["verdict_holds"] else " — DOES NOT HOLD"),
-        f"    record:     {'vout ' + str(payload['verdict_record']['vout']):<22} {_verdict_record_about(payload)}",
+        f"    record:     {'vout ' + str(payload['verdict_record']['vout']):<22} {_verdict_record_about(payload, unread=unread)}",
         f"    signature:  {checks['signature']['state']:<22} {_truncate_for_human(checks['signature']['reason'])}",
         f"    file:       {checks['digest']['state']:<22} {_truncate_for_human(checks['digest']['reason'])}",
         f"    name:       {checks['name']['state']:<22} {_truncate_for_human(checks['name']['reason'])}",
@@ -939,29 +939,40 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
     return lines
 
 
-def _verdict_record_about(payload: dict) -> str:
+def _verdict_record_about(payload: dict, *, unread: int) -> str:
     """Which record the summary lines describe, in words — and when one of them does not.
 
     Every summary line must be true of ONE record, and the reader has to be told which. The one
     line that can come from elsewhere is the signature line, when another record is broken or
     forged: that fails the whole transaction, and saying "all about THIS one" over it would put
     two records' facts under one heading, which is the defect this line exists to prevent.
+
+    ``unread`` is how many outputs the classifier could not read. Each may be a record, so with any
+    unread "the only HashMark record in this transaction" and "one of N" are counts nobody finished:
+    they become "that could be read". Keyword-only and required, so no caller can fall back to the
+    unqualified count by omission.
     """
     rec = payload["verdict_record"]
     n = rec["records_in_tx"]
     refused = rec.get("refusal_vout")
+    if n == 1 and unread:
+        return (
+            f"the only HashMark record that could be read; {unread} other "
+            f"{'output' if unread == 1 else 'outputs'} could not be classified here"
+        )
     if n == 1:
         return "the only HashMark record in this transaction"
+    records = f"{n} HashMark records that could be read" if unread else f"{n} HashMark records"
     if refused is not None and refused != rec["vout"]:
         return (
-            f"one of {n} HashMark records; file and name are about THIS one, and the signature line is "
+            f"one of {records}; file and name are about THIS one, and the signature line is "
             f"about the record at vout {refused}, because a broken or forged record anywhere fails the "
             "whole transaction"
         )
     if rec["all_record_checks_hold"]:
-        return f"one of {n} HashMark records here; signature, file and name below are all about THIS one"
+        return f"one of {records} here; signature, file and name below are all about THIS one"
     return (
-        f"of the {n} HashMark records here, none passes every check on its own; this is the closest, "
+        f"of the {records} here, none passes every check on its own; this is the closest, "
         "and each record is shown separately below"
     )
 
@@ -1462,7 +1473,7 @@ def verify_cmd(
     records = [row["hashmark"] for row in rows]
     # NO RECORD, SAID ABOUT WHAT WAS READ. An output the classifier could not read may be a record,
     # so with one unread "none of them decodes" / "no HashMark record" would be claims nobody finished.
-    unread = _unread_vouts(payload) if not records else []
+    unread = _unread_vouts(payload)
     count = payload.get("output_count", "?")
     none_found = (
         f"{wanted} has {count} output(s); none of those that could be read decodes as a HashMark, and "
@@ -1575,7 +1586,8 @@ def verify_cmd(
         click.echo("HOLDS" if not failed else "DOES-NOT-HOLD")
     else:
         # BEFORE the verdict: what the named output is decides how the verdict below should be read.
-        click.echo("\n".join([*said, "", *_verify_lines(out, rows)] if said else _verify_lines(out, rows)))
+        report = _verify_lines(out, rows, unread=len(unread))
+        click.echo("\n".join([*said, "", *report] if said else report))
 
     if failed:
         # AFTER the report, never instead of it. The reasons are on screen and in the JSON; the

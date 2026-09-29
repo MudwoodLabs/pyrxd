@@ -1935,6 +1935,38 @@ class TestAnOutputTheClassifierCouldNotRead:
         )
 
 
+@pytest.mark.parametrize(
+    ("k", "said"), [(1, "1 output could not"), (2, "2 outputs could not")], ids=["one-unread", "two-unread"]
+)
+@pytest.mark.parametrize("named", [True, False], ids=["named", "bare"])
+def test_the_count_of_marks_is_what_this_page_could_read(named, k, said, limit, monkeypatch, tmp_path) -> None:
+    """A count nobody finished: "This transaction carries 2 marks" over an output the page could not
+    read, the page's counterpart of the CLI's "the only HashMark record in this transaction". Both
+    surfaces, over the same bytes. Output 2 (named, when named) is the first unread one."""
+    unread = (_UNREAD_SCRIPT, b"\x76\xa9\x14" + bytes([9] * 20) + b"\x88\xac")[:k]
+    _crash_on(monkeypatch, *unread)
+    txid, raw, fetched = _tx_result(_signed_script(b"one\n"), _signed_script(b"two\n"), *unread, limit=limit)
+    if named:
+        flat = " ".join(_check_named(f"{txid}:2", txid, raw.hex(), fetched)["text"].split())
+    else:
+        glue = _glue()
+        anchor = glue.mark_anchor(txid, json.dumps({"txid": txid, "confirmations": 5}), 460572)
+        case = {
+            "text": txid,
+            "raw": {txid: raw.hex()},
+            "run_returns": [],
+            "fetch_returns": [fetched],
+            "anchor_returns": [anchor],
+        }
+        flat = " ".join(_render({"case": {"check": case}})["case"]["text"].split())
+    assert f"This transaction carries 2 marks this page could read; {said} be classified here." in flat
+    assert "This transaction carries 2 marks. " not in flat
+
+    cli = _cli_says(monkeypatch, tmp_path, f"{txid}:2" if named else txid, txid, raw)
+    record_line = next(ln for ln in cli.output.splitlines() if ln.strip().startswith("record:"))
+    assert "one of 2 HashMark records that could be read" in record_line, record_line
+
+
 def test_a_bare_txid_with_no_mark_and_an_unread_output_is_not_called_markless(limit, monkeypatch, tmp_path) -> None:
     """The same unfinished claim on the bare-txid path, which shares ``renderNoMark``. The honest
     neighbour — every output read, still "There is no HashMark here" — is the end of this test."""
