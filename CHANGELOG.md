@@ -29,6 +29,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded.
 ### Fixed
 
+- **Every broadcast through a pyrxd client now checks the server's txid echo (#780).**
+  `HdWallet.send`/`send_max` and `RxdWallet.send`/`send_max` returned the txid the server echoed
+  from `blockchain.transaction.broadcast` without comparing it to the transaction they built, so a
+  lying or broken server could make them report a txid for some other transaction. `RxdWallet`
+  builds a plain `ElectrumXClient`, so it did this in normal use. `pyrxd wallet send`/`sweep`,
+  the swap-book commands and `glyph claim-dmint` had the same code, but the CLI's
+  `FailoverElectrumXClient` already compared the echo and raised `NetworkError`, which
+  `wallet send` printed as "could not reach ElectrumX". `GlyphClient` already refused a
+  mismatched echo (0.19.0). The check now lives in `ElectrumXClient.broadcast`, the only code in pyrxd that sends that RPC,
+  as `pyrxd.network.electrumx.verified_broadcast_txid`. `GlyphClient` and
+  `FailoverElectrumXClient` call the same check. On a mismatch it raises `BroadcastEchoMismatch`
+  with the txid hashed from the sent bytes (`local_txid`) and the server's claim (`echoed`), and
+  says the server may not have relayed the transaction. The CLI prints the local txid to check on
+  an explorer and says not to re-run blindly, because a re-run builds a new transaction.
+  - **Changed error type:** `FailoverElectrumXClient.broadcast` now raises
+    `BroadcastEchoMismatch` on a mismatch instead of `NetworkError`. It is not a `NetworkError`,
+    so an `except NetworkError` retry loop no longer catches it. `BroadcastEchoMismatch` has moved
+    to `pyrxd.security.errors`; `pyrxd.BroadcastEchoMismatch` and
+    `pyrxd.glyph.client.BroadcastEchoMismatch` are the same class.
+  - **Glyph commit steps:** with a pyrxd client, a mismatched commit echo now stops `mint-nft`,
+    `deploy-ft` and `deploy-dmint` with this error. Under the CLI's failover client they already
+    stopped, with `NetworkError`. They do not warn and continue on the local txid.
+    `GlyphMinter` given a pyrxd client likewise raises at a mismatched commit or reveal echo,
+    where it used to warn and carry on. Its pending record, saved under the local txid before the
+    commit broadcast, is kept; the second copy under the echoed txid is no longer written.
+  - **Not covered:** a client you inject that is not a pyrxd `ElectrumXClient` (the Gravity legs
+    and `GlyphMinter` accept any object with `broadcast`). Bitcoin broadcasters are also out of
+    scope: `BitcoinCoreRpcBroadcaster` returns the node's reply unchecked.
+    `tests/test_broadcast_echo_is_checked_everywhere.py` finds every `.broadcast(` call site in
+    the source and fails on any new one that neither runs the check nor holds a pyrxd client.
+
 - **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
   `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
   by neither pyrxd nor Photonic; both DAT reveals sampled in the 0.25.0 review spent this form. A

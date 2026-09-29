@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import BroadcastEchoMismatch, NetworkError, ValidationError
 from pyrxd.security.types import BTC_MAX_SATS, RADIANT_MAX_PHOTONS, BlockHeight, RawTx, Txid
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -466,13 +466,26 @@ class TestBroadcastMalformedResponse:
 
     @pytest.mark.asyncio
     async def test_valid_txid_response_succeeds(self):
-        """Sanity: a well-formed 64-char hex txid passes through as Txid."""
-        good_txid = "a" * 64
-        ws = _make_ws_mock({"id": 1, "result": good_txid})
+        """Sanity: the txid of the sent bytes, echoed back, is returned as a Txid."""
+        ws = _make_ws_mock({"id": 1, "result": _VALID_TXID})
         with _patch_connect(ws):
             async with ElectrumXClient(["wss://example.com"]) as client:
                 result = await client.broadcast(_VALID_RAW_TX)
-        assert str(result) == good_txid
+        assert str(result) == _VALID_TXID
+
+    @pytest.mark.asyncio
+    async def test_a_well_formed_echo_of_another_txid_is_refused(self):
+        """#780: a well-formed txid that is not the hash of what was sent is refused.
+
+        Format-checking the echo is not enough — a lying server can name any real txid."""
+        other = "a" * 64
+        ws = _make_ws_mock({"id": 1, "result": other})
+        with _patch_connect(ws):
+            async with ElectrumXClient(["wss://example.com"]) as client:
+                with pytest.raises(BroadcastEchoMismatch, match="may not have relayed") as info:
+                    await client.broadcast(_VALID_RAW_TX)
+        assert info.value.local_txid == _VALID_TXID
+        assert info.value.echoed == other
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +632,7 @@ class TestResponseCorrelation:
         task = asyncio.create_task(client.broadcast(_VALID_RAW_TX))
         await _drain_until(lambda: len(send_log) == 1)
         assert len(send_log) == 1
-        good = "a" * 64
+        good = _VALID_TXID  # the echo must be the txid of what was sent (#780)
         await outbox.put(json.dumps({"id": send_log[0]["id"], "result": good}))
 
         result = await task
@@ -696,7 +709,7 @@ class TestResponseCorrelation:
         id_b = send_log[1]["id"]
 
         # Resolve B; leave A's response unsent → A times out.
-        good_txid = "a" * 64
+        good_txid = _VALID_TXID  # the echo must be the txid of what was sent (#780)
         await outbox.put(json.dumps({"id": id_b, "result": good_txid}))
 
         result_b = await task_b

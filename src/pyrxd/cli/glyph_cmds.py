@@ -2845,10 +2845,11 @@ async def _transfer_ft_inner(
             ),
         ],
     )
-    echoed = await client.broadcast(raw)
     # Report the txid of what we signed. A server that drops the transfer and echoes some
-    # other well-formed txid would otherwise have the CLI print it as success.
+    # other well-formed txid would otherwise have the CLI print it as success. The broadcast
+    # is inside the `try` because a pyrxd client raises the mismatch itself (#780).
     try:
+        echoed = await client.broadcast(raw)
         txid = _confirmed_txid(build, echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(
@@ -3166,13 +3167,14 @@ async def _airdrop_ft_inner(
             ),
         ],
     )
-    _echoed = await client.broadcast(airdrop_result.tx.serialize())
     # RAISE on a mismatch, like `transfer-ft` and `transfer-nft` — not the commit
     # helper's warn-and-continue. That helper warns because a commit has a next phase to
     # carry on with; an airdrop is terminal, so a warning on a non-tty run is no warning
     # at all and `--json` would report success for tokens that never moved. It is also
-    # the widest blast radius of the three: N recipients in one transaction.
+    # the widest blast radius of the three: N recipients in one transaction. The broadcast
+    # is inside the `try` because a pyrxd client raises the mismatch itself (#780).
     try:
+        _echoed = await client.broadcast(airdrop_result.tx.serialize())
         txid = _confirmed_txid(airdrop_result, _echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(
@@ -3354,8 +3356,8 @@ async def _transfer_nft_inner(
             ),
         ],
     )
-    echoed = await client.broadcast(raw)
-    try:
+    try:  # the broadcast too: a pyrxd client raises the mismatch itself (#780)
+        echoed = await client.broadcast(raw)
         txid = _confirmed_txid(build, echoed)
     except BroadcastEchoMismatch as exc:
         raise UserError(

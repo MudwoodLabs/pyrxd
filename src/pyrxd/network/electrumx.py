@@ -38,6 +38,7 @@ from ..hash import hash256, sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
 from ..security.errors import (
+    BroadcastEchoMismatch,
     NetworkError,
     PolicyRejection,
     RpcMethodNotFound,
@@ -314,6 +315,30 @@ def script_hash_for_address(address: str) -> Hex32:
     return script_hash_for_script(P2PKH().lock(address).serialize())
 
 
+def verified_broadcast_txid(raw_tx: bytes, echoed: object) -> Txid:
+    """The txid of *raw_tx*, after checking the server's broadcast echo against it.
+
+    The one broadcast-echo check in pyrxd. :meth:`ElectrumXClient.broadcast` calls it on
+    every reply, :class:`~pyrxd.network.failover.FailoverElectrumXClient` on the reply it
+    returns, and ``pyrxd.glyph.client._confirmed_txid`` delegates to it.
+
+    A broadcast reply is only format-checked by the transport. A lying or buggy server can
+    drop the transaction and echo any well-formed txid — including a real,
+    already-confirmed one — and a caller that prints or polls that value reports a
+    transaction that has nothing to do with what was sent. The txid is a pure function of
+    the bytes (SHA-256d, reversed; the same derivation as ``Transaction.txid``), so there
+    is no need to take the server's word for it.
+
+    Raises :class:`~pyrxd.security.errors.BroadcastEchoMismatch` on a mismatch rather than
+    warning: programmatic callers do not see warnings, and the exception carries the local
+    txid so the caller can check whether the transaction relayed anyway.
+    """
+    local = Txid(hash256(bytes(raw_tx))[::-1].hex())
+    if str(echoed) != str(local):
+        raise BroadcastEchoMismatch(str(local), echoed)
+    return local
+
+
 class ElectrumXClient:
     """Async ElectrumX JSON-RPC client.
 
@@ -542,6 +567,11 @@ class ElectrumXClient:
     async def broadcast(self, raw_tx: bytes) -> Txid:
         """Broadcast a raw transaction to the network.
 
+        This is the only place in pyrxd that issues ``blockchain.transaction.broadcast``,
+        so the echo check lives here rather than at each caller: every broadcast through a
+        pyrxd client crosses it, including :class:`~pyrxd.network.failover.FailoverElectrumXClient`,
+        which delegates to this method per endpoint.
+
         Parameters
         ----------
         raw_tx:
@@ -550,16 +580,26 @@ class ElectrumXClient:
         Returns
         -------
         Txid
-            The transaction id returned by the server.
+            The txid hashed from *raw_tx* — after the server's reply has been checked
+            against it. The server's reply is never returned as such.
+
+        Raises
+        ------
+        BroadcastEchoMismatch
+            The server replied with a well-formed txid for some other transaction. The
+            broadcast may or may not have relayed; the exception carries ``local_txid``.
+        NetworkError
+            Transport failure, or a reply that is not a txid at all.
         """
         validated = RawTx(raw_tx)
         result = await self._call("blockchain.transaction.broadcast", [validated.hex()])
         if not isinstance(result, str):
             raise NetworkError("Unexpected response type for broadcast result")
         try:
-            return Txid(result)
+            echoed = Txid(result)
         except ValidationError as exc:
             raise NetworkError("Server returned invalid txid after broadcast") from exc
+        return verified_broadcast_txid(bytes(validated), echoed)
 
     async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Photons, Photons]:
         """Return the confirmed and unconfirmed balance for *script_hash*, in photons.

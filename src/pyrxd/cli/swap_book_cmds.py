@@ -57,7 +57,7 @@ from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from ..hd.wallet import raise_if_reads_failed
 from ..keys import PrivateKey
-from ..security.errors import RxdSdkError, ValidationError
+from ..security.errors import BroadcastEchoMismatch, RxdSdkError, ValidationError
 from ..security.types import Txid
 from ..swap import Asset, FundingInput
 from ..swap.partial import _asset_of, _owner_pkh_of
@@ -1026,6 +1026,10 @@ def _finish(ctx: CliContext, run, *, quiet_field: str) -> None:
     try:
         payload = asyncio.run(run())
     except (UserError, click.ClickException):
+        raise
+    except BroadcastEchoMismatch:
+        # Not a generic SDK failure: the transaction may have relayed. The root group renders
+        # it with the local txid and the do-not-re-run advice, the same on every command.
         raise
     except RxdSdkError as exc:
         # Strip terminal-control bytes: the message can carry a hostile node/server string (review MEDIUM).

@@ -28,6 +28,7 @@ from typing import Any, ClassVar
 
 __all__ = [
     "Base58Error",
+    "BroadcastEchoMismatch",
     "ClaimNotConfirmed",
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
@@ -416,6 +417,35 @@ class PreRevealExpired(PreRevealAbort):
 
 class NetworkError(RxdSdkError):
     """Raised for transport / RPC / network failures."""
+
+
+class BroadcastEchoMismatch(RxdSdkError):
+    """The server's broadcast reply named a txid other than the transaction we sent.
+
+    Deliberately NOT a :class:`ValidationError`, and NOT a :class:`NetworkError`. Those
+    are what a caller retries on — a ``ValidationError`` is raised before anything is
+    sent, a ``NetworkError`` reads as "the server could not be reached" — whereas this
+    one can only happen after the broadcast, when the transaction may well have relayed.
+    A caller with ``except NetworkError: retry`` that rebuilds would send a SECOND
+    transaction, paying twice if the first one went through.
+
+    Carries ``local_txid`` (hashed from the bytes that were sent) so the caller can check
+    the chain for what was actually sent, and ``echoed`` (the server's claim, unverified).
+
+    Raised by :func:`pyrxd.network.electrumx.verified_broadcast_txid`, the one echo
+    check; re-exported as ``pyrxd.glyph.client.BroadcastEchoMismatch`` and
+    ``pyrxd.BroadcastEchoMismatch``.
+    """
+
+    def __init__(self, local_txid: str, echoed: object) -> None:
+        super().__init__(
+            f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
+            f"{local_txid!r}. The server may not have relayed what was sent. Check "
+            f"{local_txid} on an explorer before treating this transaction as done; if it is "
+            "there, the transaction went through and only the server's reply was wrong."
+        )
+        self.local_txid = local_txid
+        self.echoed = echoed
 
 
 class InsufficientConfirmationsError(NetworkError):

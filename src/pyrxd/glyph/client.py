@@ -31,7 +31,8 @@ from ..network.confirm import (
     DEFAULT_POLL_INTERVAL_S,
     _assert_positive_finite,
 )
-from ..security.errors import RxdSdkError, ValidationError
+from ..network.electrumx import verified_broadcast_txid
+from ..security.errors import BroadcastEchoMismatch, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
 from .ft import AirdropRecipient
@@ -128,29 +129,6 @@ class AirdropReceipt:
         )
 
 
-class BroadcastEchoMismatch(RxdSdkError):
-    """The server's txid did not match the transaction we signed.
-
-    Deliberately NOT a :class:`ValidationError`. Those are raised before anything is
-    SENT — ``transfer_nft``'s is raised after signing but before broadcast — whereas this
-    one can only happen after the broadcast, when the transaction may well have relayed.
-    A caller with ``except ValidationError: retry`` would re-broadcast a transfer that
-    already moved tokens.
-
-    Carries ``local_txid`` so the caller can check the chain for what was actually sent.
-    """
-
-    def __init__(self, local_txid: str, echoed: object) -> None:
-        super().__init__(
-            f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
-            f"{local_txid!r}. The server may not have relayed what was sent. Check "
-            f"{local_txid} on an explorer before treating this transfer as done; if it is "
-            "there, the transfer succeeded and only the server's reply was wrong."
-        )
-        self.local_txid = local_txid
-        self.echoed = echoed
-
-
 class _HasSignedTx(Protocol):
     """Anything carrying the signed transaction that is about to be broadcast.
 
@@ -185,10 +163,7 @@ def _confirmed_txid(build: _HasSignedTx, echoed: object) -> str:
     costs an exception on a transfer that may have relayed anyway — and the exception
     carries the local txid so that is checkable — while failing quietly costs the tokens.
     """
-    local = str(build.tx.txid())
-    if str(echoed) != local:
-        raise BroadcastEchoMismatch(local, echoed)
-    return local
+    return str(verified_broadcast_txid(build.tx.serialize(), echoed))
 
 
 class NftTransferReceipt:
