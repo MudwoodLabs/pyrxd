@@ -12,11 +12,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
   scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
   to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet".
-  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call, so
-  every spend path, in the CLI and the SDK, sees the wallet's funds. A scan that cannot read an
-  address fails as a network error rather than reading as an empty wallet. Error hints that
-  said to run `pyrxd balance --refresh` first, which never helped because nothing saved the
-  scan, now say what was scanned.
+  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call.
+  Every in-process spend path in the CLI and the SDK reads the wallet's UTXOs through that one
+  method, so each now sees the wallet's funds; `wallet send` through the signing agent already
+  ran its own scan. A scan that cannot read an address fails as a network error rather than
+  reading as an empty wallet. Error hints that said to run `pyrxd balance --refresh` first,
+  which never helped because nothing saved the scan, now say what was scanned.
+- **`glyph resume-mint` can reveal a new wallet's commit.** `HdWallet.privkey_for_address`
+  looked only at the addresses the wallet file records, and a `wallet new` file records none,
+  so on regtest a new wallet's commit whose reveal was interrupted could not be resumed
+  ("address … is not known to this wallet"). The lookup now also derives, locally and with no
+  network, across the gap window on both chains; an address outside it is still refused.
+  `pyrxd mark --signer-address` and `GlyphMinter`'s reveal use the same lookup.
+- **A scan no longer marks a known-used address unused** when a server reports no history for
+  it. `collect_spendable` already read such an address on the call that scanned, but the scan
+  cleared its flag, so a lagging server hid its funds from the next call on the same wallet.
+
+### Changed
+
+- **`HdWallet.collect_spendable` is strict by default.** A failed per-address UTXO read now
+  raises `NetworkError` instead of returning what the other addresses answered, because the
+  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs". Pass
+  `strict=False` for the partial view: `HdWallet.send` does, since an amount send needs only
+  enough. `pyrxd utxos` keeps the partial view too. `pyrxd balance` and `pyrxd glyph list` are
+  unchanged: they read only the addresses the wallet file records as used, and do not scan.
 
 ## [0.25.0] — 2026-09-26
 
