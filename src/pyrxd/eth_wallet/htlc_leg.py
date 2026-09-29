@@ -44,6 +44,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator, normalise_tx_hash
 from pyrxd.eth_wallet.multi_rpc import read_contract
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
+from pyrxd.gravity.eth_rxd_timelock import CLAIM_INCLUSION_BUDGET_S as _CLAIM_INCLUSION_BUDGET_S
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.security.errors import (
     ClaimNotConfirmed,
@@ -228,14 +229,14 @@ class _ClaimTooLate(Exception):
         self.permanent = permanent
 
 
-#: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting.
-#: ~8 Ethereum blocks at 12s. Sized to cover ordinary inclusion latency and a fee spike, not to be
-#: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
-#: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
-#: that does not is the preimage published for nothing.
 _LOG = logging.getLogger(__name__)
 
-CLAIM_INCLUSION_BUDGET_S: int = 96
+#: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting. DEFINED in
+#: :mod:`pyrxd.gravity.eth_rxd_timelock` and re-exported here, because the pre-funding check
+#: ``assert_eth_deadline_is_claimable`` must reserve the same number this leg's claim guard
+#: demands: while the two lived apart, the pre-funding check accepted deadlines this guard then
+#: refused to claim. See the definition for how it is sized.
+CLAIM_INCLUSION_BUDGET_S: int = _CLAIM_INCLUSION_BUDGET_S
 
 #: Seconds per L1 block, used ONLY to convert the budget above into a fee multiplier.
 _BLOCK_S: int = 12
