@@ -27,6 +27,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does not detect other copies of OpenSSL, such as the one inside the `cryptography` package, and
   does not claim to. Static checks of the boot catch the known ways Pyodide's OpenSSL could be
   loaded.
+
+### Deprecated
+
+- **`--allow-overpay` has no effect on `pyrxd mark`, `pyrxd glyph transfer-nft` or
+  `pyrxd glyph timelock-reveal`, and is deprecated on all three (#793).** It could never
+  change anything on them. None of the three has a `--fee-rate`: the rate comes from the
+  config (`fee_rate`, `[networks.<net>] fee_rate` or `PYRXD_FEE_RATE`), which refuses any
+  rate above the 100,000 photons/byte overpay ceiling when it is loaded, before the command
+  runs. The flag's only effect was to lift that same ceiling inside the builder, for a rate
+  that could not reach it. The three commands still accept the flag, so scripts that pass it
+  keep working. It is hidden from their `--help`, and passing it prints a one-line note on
+  stderr saying it has no effect and why. Stdout is unchanged, so `--json` and `--quiet`
+  output is byte-identical with and without it, and so is the transaction broadcast. All
+  three share one implementation, so they behave identically. The SDK's `allow_overpay=`
+  parameters (`build_hashmark_mark`, `build_nft_transfer`, `build_timelock_reveal` and the
+  `GlyphClient` methods) are unchanged: a library caller passes its own rate, so there the
+  parameter still decides. The flag on `wallet send`, `wallet sweep`, `swap build-claim` and
+  `swap build-refund` is unchanged and still decides the outcome. On `glyph transfer-ft` and
+  `glyph airdrop-ft` it is also unchanged. It cannot change the outcome there today, because
+  the fee-funding rule requires a funding UTXO of at least twice the fee estimate, but it is
+  kept as an escape hatch in case that rule is relaxed.
+
 ### Fixed
 
 - **`assert_eth_deadline_is_claimable` accepted a deadline one second too close, and left out

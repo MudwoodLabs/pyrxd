@@ -1913,6 +1913,19 @@ class TestTransferFtAllowOverpayIsWiredThrough:
     A flag that parses but does not reach the thing it names is worse than no flag,
     because it reads as an escape hatch while being a dead end. So these assert on
     the value that arrives at the library call.
+
+    These prove WIRING only, not that the flag changes any outcome. Today it cannot, on
+    ``transfer-ft`` or ``airdrop-ft``. The rate ceiling is enforced by the config loader
+    first (``validated_fee_rate``, as for ``mark`` in #793). ``assert_fee_matches_size``
+    can refuse only a fee well above size x rate, which needs the funding remainder to
+    go to the fee instead of to change. ``ft_funding`` (``pyrxd.glyph.transfer``) demands
+    a funding UTXO of at least twice its fee estimate (``needed = est_bytes * fee_rate *
+    2``), so the remainder is always large enough to return as change. The review of #795
+    drove both commands through the real CLI across rates and funding values and found no
+    case where the flag changed the result. With that 2x rule bypassed, the flag did
+    change it. So the flag stays as an escape hatch: it becomes live if that funding rule
+    is relaxed. For the commands where it was dead by construction, see
+    ``tests/cli/test_dead_allow_overpay_flags.py``.
     """
 
     def _capture(self, monkeypatch):

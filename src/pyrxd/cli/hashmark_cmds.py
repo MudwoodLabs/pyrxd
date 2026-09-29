@@ -4,11 +4,11 @@ HashMark is a THIRD-PARTY ``OP_RETURN`` format (see :mod:`pyrxd.script.hashmark`
 Glyph protocol, which is why this command sits at the top level beside ``balance`` and
 ``utxos`` rather than under ``glyph``.
 
-Shaped after ``pyrxd glyph timelock-reveal``: the same ``--dry-run``, ``--allow-overpay``
-and ``--passphrase`` options, the same ``_load_wallet`` / ``_confirm_or_abort`` flow, the
-same three output modes, and the same rule that the bytes shown to the operator are the
-bytes broadcast (:func:`~pyrxd.hashmark_tx.broadcast_hashmark_mark` sends the build that
-was displayed, never a rebuilt one).
+Shaped after ``pyrxd glyph timelock-reveal``: the same ``--dry-run`` and ``--passphrase``
+options, the same ``_load_wallet`` / ``_confirm_or_abort`` flow, the same three output
+modes, and the same rule that the bytes shown to the operator are the bytes broadcast
+(:func:`~pyrxd.hashmark_tx.broadcast_hashmark_mark` sends the build that was displayed,
+never a rebuilt one).
 
 **What this file adds that the library deliberately cannot.** §5.4 makes canonicalising a
 label an encoder obligation *and* requires that the user be shown the result, "because
@@ -53,7 +53,7 @@ from ..security.types import _TXID_RE, Txid
 from . import glyph_inspect as _inspect
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
-from .glyph_helpers import _BroadcastSummary, _confirm_or_abort
+from .glyph_helpers import _BroadcastSummary, _confirm_or_abort, _deprecated_allow_overpay_option
 from .glyph_inspect import (
     _attach_name_at_mark,
     _attach_wave_identity,
@@ -381,12 +381,7 @@ def _mark_lines(
     default=False,
     help="Hash, sign, fund and print the exact record and transaction — and broadcast nothing.",
 )
-@click.option(
-    "--allow-overpay",
-    is_flag=True,
-    default=False,
-    help="Accept a fee far above what the signed transaction's size demands. Does NOT relax the underpay invariant.",
-)
+@_deprecated_allow_overpay_option("mark")
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def mark_cmd(
@@ -395,7 +390,6 @@ def mark_cmd(
     label: str | None,
     signer_address: str | None,
     dry_run: bool,
-    allow_overpay: bool,
     passphrase: bool,
 ) -> None:
     """Publish a signed HashMark record committing to the digest of FILE_PATH.
@@ -470,7 +464,6 @@ def mark_cmd(
                 plan,
                 client=client,
                 fee_rate=ctx.fee_rate,
-                allow_overpay=allow_overpay,
             )
             if dry_run:
                 return build, None

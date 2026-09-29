@@ -13,6 +13,10 @@ imported by ``glyph_cmds``:
 * live dMint contract lookup (``_fetch_dmint_contract``) — shared by
   ``glyph_cmds`` (claim) and ``glyph_estimate`` (estimate), which is why it
   sits here rather than in either of them.
+* the deprecated, no-effect ``--allow-overpay`` option
+  (``_deprecated_allow_overpay_option``) — shared by ``mark``,
+  ``glyph transfer-nft`` and ``glyph timelock-reveal`` so all three behave
+  identically.
 
 These are glyph-specific; the shared ``_load_wallet`` lives in
 :mod:`pyrxd.cli.prompts` (it is used by query commands too).
@@ -24,6 +28,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import click
 
 from ..glyph.dmint import DmintCborPayload
 from ..glyph.mint import build_reveal_unlock_template
@@ -414,6 +420,63 @@ def _metadata_summary(metadata: GlyphMetadata) -> _BroadcastSummary:
         # pyrxd.glyph.royalty for the evidence behind that sentence.
         lines.append("             (ADVISORY — recorded on chain, not enforced by consensus)")
     return _BroadcastSummary(title="Metadata", lines=lines)
+
+
+# ---------------------------------------------------------------------------
+# The deprecated --allow-overpay on commands whose rate comes from the config
+# ---------------------------------------------------------------------------
+
+
+def _deprecated_allow_overpay_option(command: str):
+    """``--allow-overpay`` for a command on which it can never change anything (#793).
+
+    Used by ``pyrxd mark``, ``pyrxd glyph transfer-nft`` and ``pyrxd glyph timelock-reveal``.
+    On each, the flag's value went only to the rate CEILING in
+    :func:`~pyrxd.fee_sizing.assert_fee_rate_clears_relay_floor` (via
+    :func:`~pyrxd.hashmark_tx.build_hashmark_mark`,
+    :func:`~pyrxd.glyph.transfer.build_nft_transfer` and
+    :func:`~pyrxd.glyph.timelock_reveal_tx.build_timelock_reveal`), which can refuse only a
+    rate above that ceiling. None of the three has a ``--fee-rate``: the rate is
+    ``ctx.fee_rate``, set once in :func:`pyrxd.cli.main.cli` from a config that
+    :func:`pyrxd.cli.config.validated_fee_rate` has already refused above the same ceiling,
+    with no ``allow_overpay`` reachable from a config file or ``PYRXD_FEE_RATE``. No rate
+    that reached the builder could differ with or without the flag.
+
+    The option is still accepted, so scripts that pass it keep working. It is hidden from
+    ``--help``, and ``expose_value=False`` means the command has no ``allow_overpay``
+    parameter to forward, so the flag cannot be wired back into a build by accident. The
+    note goes to STDERR so ``--json`` and ``--quiet`` output is unchanged.
+
+    Not for ``glyph transfer-ft`` / ``airdrop-ft``: there the flag also relaxes
+    :func:`~pyrxd.glyph.transfer.assert_fee_matches_size`, which does not depend on the rate.
+
+    Args:
+        command: the command as typed after ``pyrxd``, e.g. ``"glyph transfer-nft"``.
+    """
+
+    def _note(click_ctx: click.Context, param: click.Parameter, value: bool) -> None:
+        if not value:
+            return
+        from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        ceiling = relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE
+        click.echo(
+            f"note: --allow-overpay is deprecated and has no effect on `pyrxd {command}`. That command "
+            "takes its fee rate from the config (fee_rate, [networks.<net>] fee_rate or PYRXD_FEE_RATE), "
+            f"and a rate above the {ceiling:,} photons/byte overpay ceiling is refused when the config is "
+            "loaded, before the command runs. Drop the flag; it is accepted only so existing scripts keep "
+            "working.",
+            err=True,
+        )
+
+    return click.option(
+        "--allow-overpay",
+        is_flag=True,
+        default=False,
+        hidden=True,
+        expose_value=False,
+        callback=_note,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1250,14 +1250,17 @@ class TestTheNetworkIsPartOfWhatIsSigned:
         assert verify_attestation(decode_hashmark(_published_script(h))).valid
 
 
-class TestTheOtherTwoOutputModesAndTheOverpayFlag:
-    """The paths a scripted caller takes, and the one flag that lets a refusal through.
+class TestTheOtherTwoOutputModesAndTheBuildersOverpayParameter:
+    """The paths a scripted caller takes, and the builder's one parameter that lets a refusal through.
 
-    ``--quiet`` and ``--allow-overpay`` are pass-throughs, which is exactly why they go
-    untested: nothing about them looks like new logic. A ``quiet_field`` naming a key the
-    payload does not have prints an EMPTY LINE and exits 0 — a scripted caller reads that
-    as "no txid" and cannot tell it from a failure, and no assertion about the payload
-    dict would notice.
+    ``--quiet`` is a pass-through, which is exactly why it goes untested: nothing about it
+    looks like new logic. A ``quiet_field`` naming a key the payload does not have prints an
+    EMPTY LINE and exits 0 — a scripted caller reads that as "no txid" and cannot tell it
+    from a failure, and no assertion about the payload dict would notice.
+
+    The overpay tests here are about the SDK's ``build_hashmark_mark(allow_overpay=...)``,
+    which a library caller can reach with any rate. ``mark --allow-overpay`` never could:
+    see :class:`TestMarkAllowOverpayIsDeprecated` (#793).
     """
 
     def test_quiet_mode_prints_the_txid_and_nothing_else(self, runner, tmp_path, monkeypatch) -> None:
@@ -1277,10 +1280,10 @@ class TestTheOtherTwoOutputModesAndTheOverpayFlag:
         assert h.broadcast_calls == []
 
     def test_the_overpay_bound_is_the_shared_one(self) -> None:
-        """What ``--allow-overpay`` forwards to, asserted at the seam rather than through
-        the CLI: the CLI has no fee-rate option of its own — the rate comes from the
-        config — so driving the bound through ``mark`` would mean writing a config file to
-        test somebody else's gate. Named here so the flag is not silently decorative."""
+        """The builder's ``allow_overpay`` goes to the shared rate gate. This docstring used
+        to say the CLI flag forwarded here, and that the CLI has no fee-rate option of its
+        own. Both were true, and together they meant the flag could never matter: the
+        config refuses every rate this gate would (#793)."""
         import inspect
 
         from pyrxd.hashmark_tx import build_hashmark_mark
@@ -1299,6 +1302,119 @@ class TestTheOtherTwoOutputModesAndTheOverpayFlag:
             asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over))
         build = asyncio.run(build_hashmark_mark(h.wallet, plan, client=h.client, fee_rate=over, allow_overpay=True))
         assert build.fee >= len(build.serialize()) * over
+
+
+class TestMarkAllowOverpayIsDeprecated:
+    """``mark --allow-overpay`` is accepted, hidden, does nothing, and says so on stderr (#793).
+
+    It could never do anything: its value reached only the rate ceiling in
+    ``assert_fee_rate_clears_relay_floor``, and ``mark``'s rate is the config's, which
+    ``validated_fee_rate`` has already refused above that ceiling before ``mark`` runs.
+    :meth:`test_a_rate_the_flag_could_have_let_through_never_reaches_mark` pins that premise;
+    if it ever stops holding, the deprecation note is false and that test fails.
+
+    Every run passes ``--config`` at a path that does not exist, so the fee rate is the
+    built-in default rather than whatever the machine running the suite has configured.
+    """
+
+    _NOTE = "--allow-overpay is deprecated and has no effect on `pyrxd mark`"
+
+    @staticmethod
+    def _run(runner, tmp_path, monkeypatch, h, *, top=(), extra=()):
+        monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+        config = ("--config", str(tmp_path / "absent-config.toml"))
+        return _invoke(runner, tmp_path, monkeypatch, harness=h, top=(*config, *top), extra=extra)[0]
+
+    @pytest.mark.parametrize("mode", [(), ("--json",), ("--quiet",)], ids=["human", "json", "quiet"])
+    def test_the_flag_changes_no_byte_of_stdout_and_notes_itself_once_on_stderr(
+        self, runner, tmp_path, monkeypatch, mode
+    ) -> None:
+        """One harness for both runs: its keys are fixed and signing is RFC 6979, so the two
+        dry runs build byte-identical transactions and any stdout difference is the flag's."""
+        h = _MarkHarness()
+        without = self._run(runner, tmp_path, monkeypatch, h, top=mode, extra=["--dry-run"])
+        with_flag = self._run(runner, tmp_path, monkeypatch, h, top=mode, extra=["--allow-overpay", "--dry-run"])
+        assert without.exit_code == 0, without.output
+        assert with_flag.exit_code == 0, with_flag.output
+        assert without.stdout_bytes, "an empty stdout would make the comparison vacuous"
+        assert with_flag.stdout_bytes == without.stdout_bytes
+        assert self._NOTE not in without.stderr
+        assert with_flag.stderr.count(self._NOTE) == 1, with_flag.stderr
+        note_lines = [ln for ln in with_flag.stderr.splitlines() if self._NOTE in ln]
+        assert with_flag.stderr.replace(note_lines[0] + "\n", "", 1) == without.stderr
+        assert h.broadcast_calls == []
+
+    def test_the_note_says_why(self, runner, tmp_path, monkeypatch) -> None:
+        from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        ceiling = relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE
+        r = self._run(runner, tmp_path, monkeypatch, _MarkHarness(), extra=["--allow-overpay", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert f"above the {ceiling:,} photons/byte overpay ceiling is refused when the config is loaded" in r.stderr
+
+    def test_the_flag_is_not_in_the_help(self, runner) -> None:
+        from pyrxd.cli.main import cli
+
+        r = runner.invoke(cli, ["mark", "--help"])
+        assert r.exit_code == 0, r.output
+        assert "--dry-run" in r.output, "control: a flag the help does list"
+        assert "--allow-overpay" not in r.output
+        assert "overpay" not in r.output.lower()
+
+    def test_the_builder_is_never_told_to_allow_an_overpay(self, runner, tmp_path, monkeypatch) -> None:
+        """The flag is ``expose_value=False``, so there is nothing to forward; this pins it."""
+        import pyrxd.hashmark_tx as ht
+
+        real = ht.build_hashmark_mark
+        seen: list[dict] = []
+
+        async def _spy(*args, **kwargs):
+            seen.append(kwargs)
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(ht, "build_hashmark_mark", _spy)
+        r = self._run(runner, tmp_path, monkeypatch, _MarkHarness(), extra=["--allow-overpay", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert len(seen) == 1, "control: the spy saw the build"
+        assert seen[0].get("allow_overpay", False) is False, seen[0]
+
+    @pytest.mark.parametrize(
+        ("rate", "reaches_mark"), [(100_000, True), (100_001, False)], ids=["at-ceiling", "over-ceiling"]
+    )
+    def test_a_rate_the_flag_could_have_let_through_never_reaches_mark(
+        self, runner, tmp_path, monkeypatch, rate, reaches_mark
+    ) -> None:
+        """The premise of the note, driven through the real config. The ceiling itself is
+        accepted (the honest-path half), one photon over it is refused before ``mark``'s
+        own options are even parsed — so the note is never printed and no wallet is opened."""
+        from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+        assert relay_floor_photons_per_byte() * MAX_FEE_OVERPAY_MULTIPLE == 100_000
+        h = _MarkHarness(fund_value=50_000_000 * MAX_FEE_OVERPAY_MULTIPLE)
+        monkeypatch.setenv("PYRXD_FEE_RATE", str(rate))
+        config = ("--config", str(tmp_path / "absent-config.toml"))
+        r = _invoke(runner, tmp_path, monkeypatch, harness=h, top=config, extra=["--allow-overpay", "--dry-run"])[0]
+        if reaches_mark:
+            assert r.exit_code == 0, r.output
+            assert self._NOTE in r.stderr
+        else:
+            assert r.exit_code != 0
+            assert "above the 10x ceiling" in str(r.exception) + r.output, r.output
+            assert self._NOTE not in r.output
+        assert h.broadcast_calls == []
+
+    def test_a_networks_table_rate_over_the_ceiling_never_reaches_mark(self, runner, tmp_path, monkeypatch) -> None:
+        """The other config route to ``ctx.fee_rate``: ``[networks.<net>] fee_rate``."""
+        monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+        cfg = tmp_path / "config.toml"
+        cfg.write_text("[networks.mainnet]\nfee_rate = 100001\n")
+        h = _MarkHarness()
+        r = _invoke(
+            runner, tmp_path, monkeypatch, harness=h, top=("--config", str(cfg)), extra=["--allow-overpay", "--dry-run"]
+        )[0]
+        assert r.exit_code != 0
+        assert "above the 10x ceiling" in str(r.exception) + r.output, r.output
+        assert self._NOTE not in r.output
 
 
 class TestTheWalletContractHoldsAgainstARealHdWallet:
