@@ -27,7 +27,7 @@ You will use:
 
 - `pyrxd wallet new` — generate a BIP39 mnemonic + HD wallet file.
 - `pyrxd address` — derive the next receive address.
-- `pyrxd balance --refresh` — scan the chain for funded addresses.
+- `pyrxd balance` — scan the chain for funded addresses.
 - `pyrxd utxos` — list the spendable outputs.
 - A short Python script — build, sign, and (optionally)
   broadcast the transaction. As of 0.8.0 there is also a
@@ -168,13 +168,14 @@ fee on its own — yes, high by Bitcoin habits; it is what the
 network requires to relay today.
 
 Wait for at least one confirmation before moving on. ElectrumX
-exposes unconfirmed outputs too, but `--refresh` is more useful
-when the funding transaction has actually landed.
+exposes unconfirmed outputs too (`balance` shows them as
+Pending), but the steps below are clearer once the funding
+transaction has actually landed.
 
 ## Step 5 — Find the UTXOs
 
 ```shell
-$ pyrxd balance --refresh
+$ pyrxd balance
 ```
 
 ```
@@ -183,13 +184,15 @@ Confirmed  2,500,000 photons (0.02500000 RXD)
 Pending    0 photons (0.00000000 RXD)
 ```
 
-The `--refresh` flag is what runs the BIP44 gap-limit scan:
+`balance` runs the BIP44 gap-limit scan first, every time:
 `pyrxd` walks both the external (`/0`) and internal (`/1`)
 chains, stopping after 20 consecutive unused addresses, and
-records which ones have on-chain history. Without `--refresh`
-a freshly-created wallet shows zero balance even when funded,
-because `pyrxd` has no record yet of which derived addresses to
-query.
+reads the balance of each one that has on-chain history. That
+is how a freshly-created wallet, whose file records no used
+address yet, finds its funds. The scan is not saved to the
+wallet file. (Before the scan became the default it ran only
+under `--refresh`; the flag is still accepted and changes
+nothing.)
 
 To see the individual outputs:
 
@@ -287,9 +290,11 @@ need to know:
 
 - `HdWallet.load(path, mnemonic)` — opens the encrypted wallet
   file. Raises if the mnemonic does not decrypt it.
-- `await wallet.refresh(client)` — gap-limit scan; must run
-  before `collect_spendable` on a freshly-loaded wallet.
-- `await wallet.collect_spendable(client)` — returns
+- `await wallet.refresh(client)` — the gap-limit scan.
+  `collect_spendable` runs it itself (since #759), so the call
+  above matters only if you also use `get_balance` or
+  `get_utxos`, which do not scan.
+- `await wallet.collect_spendable(client)` — scans, then returns
   `(utxo, address, privkey)` triples covering every UTXO across
   every used address.
 - `wallet.build_send_tx(triples, to_address, photons)` — picks
@@ -392,8 +397,8 @@ You now know enough to:
 
 - Create and load HD wallets via the CLI without ever touching
   the encrypted file directly.
-- Use `--refresh` to discover funded addresses on an empty-state
-  wallet, and `pyrxd utxos` to inspect them.
+- Use `pyrxd balance`, which scans the chain first, to find the
+  funds of an empty-state wallet, and `pyrxd utxos` to inspect them.
 - Build, sign, and broadcast plain RXD sends from Python with
   the `HdWallet.build_send_tx(...)` two-pass fee path.
 - Gate broadcast behind explicit env vars so a dry-run is the

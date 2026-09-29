@@ -11,7 +11,7 @@ Commands:
   glyph transfer-nft    NFT singleton transfer.
   glyph timelock-mint   Seal content behind a timelock and mint the NFT.
   glyph timelock-reveal Publish the key for a timelocked token (irreversible).
-  glyph list            Scan wallet addresses for Glyph holdings.
+  glyph list            Glyph holdings across the wallet, after the gap-limit scan.
 
 Design choices that follow the v0.3 plan:
 
@@ -149,6 +149,7 @@ from .glyph_inspect import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from .glyph_inspect import _sanitize_display_string as _sanitize_display_string
 from .glyph_inspect import inspect_cmd
 from .prompts import _load_wallet
+from .query_cmds import AddressReads, refuse_if_incomplete, scan_then_read
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -1588,8 +1589,8 @@ async def _mint_nft_inner(
     if not triples:
         raise UserError(
             "no spendable UTXOs in the wallet",
-            cause="collect_spendable returned an empty list",
-            fix="fund the wallet, or run `pyrxd balance --refresh` to discover used addresses",
+            cause="the gap-limit scan found no UTXO on any address of this wallet",
+            fix="fund the wallet: its addresses were scanned up to the gap limit and none holds a UTXO",
         )
 
     # The NFT's carrier value on the reveal. Same number as
@@ -2639,7 +2640,7 @@ async def _select_ft_inputs(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -2799,7 +2800,7 @@ async def _transfer_ft_inner(
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
         ) from exc
     except NoFeeFundingError as exc:
         raise UserError(
@@ -3320,7 +3321,7 @@ async def _transfer_nft_inner(
     except NoHoldingsError as exc:
         raise UserError(
             f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+            fix="this wallet's addresses were scanned up to the gap limit; the NFT is owned elsewhere, or check --wallet",
         ) from exc
     except InsufficientFundsError as exc:
         raise UserError(
@@ -3382,41 +3383,30 @@ async def _transfer_nft_inner(
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
-    """Scan wallet addresses for Glyph holdings."""
+    """List Glyph holdings across the wallet.
+
+    Runs the gap-limit scan first, on both chains (the one every spend command runs), so it
+    lists tokens at any address inside the gap window, including on a wallet `pyrxd wallet new`
+    just made. Nothing is saved to the wallet file.
+
+    An address that cannot be read, or a token output whose transaction cannot be fetched, is
+    never listed as holding nothing: the command exits 2, and only the human output shows what
+    the other addresses hold, marked INCOMPLETE.
+    """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
-    async def _do_scan() -> list[dict]:
+    async def _do_scan() -> AddressReads:
         client = ctx.make_client()
         async with client:
             scanner = GlyphScanner(client)
-            rows: list[dict] = []
-            for rec in [r for r in wallet.addresses.values() if r.used]:
-                items = await scanner.scan_address(rec.address)
-                for item in items:
-                    if isinstance(item, GlyphNft) and kind in ("nft", "all"):
-                        rows.append(
-                            {
-                                "type": "NFT",
-                                "ref": f"{item.ref.txid}:{item.ref.vout}",
-                                "address": rec.address,
-                                "amount": "1",
-                                "name": (item.metadata.name if item.metadata else ""),
-                            }
-                        )
-                    elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
-                        rows.append(
-                            {
-                                "type": "FT",
-                                "ref": f"{item.ref.txid}:{item.ref.vout}",
-                                "address": rec.address,
-                                "amount": str(item.amount),
-                                "name": (item.metadata.name if item.metadata else ""),
-                            }
-                        )
-            return rows
+            # strict: an output whose transaction could not be fetched fails the address's read,
+            # rather than leaving the token out of a list that is then shown as complete.
+            return await scan_then_read(
+                wallet, client, lambda address: scanner.scan_address(address, strict=True), what="glyph scan"
+            )
 
     try:
-        rows = asyncio.run(_do_scan())
+        reads = asyncio.run(_do_scan())
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
@@ -3424,7 +3414,38 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
             fix=f"check that {ctx.electrumx_url} is reachable",
         ) from exc
 
+    rows: list[dict] = []
+    for address, items in reads.answered:
+        for item in items:
+            if isinstance(item, GlyphNft) and kind in ("nft", "all"):
+                rows.append(
+                    {
+                        "type": "NFT",
+                        "ref": f"{item.ref.txid}:{item.ref.vout}",
+                        "address": address,
+                        "amount": "1",
+                        "name": (item.metadata.name if item.metadata else ""),
+                    }
+                )
+            elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
+                rows.append(
+                    {
+                        "type": "FT",
+                        "ref": f"{item.ref.txid}:{item.ref.vout}",
+                        "address": address,
+                        "amount": str(item.amount),
+                        "name": (item.metadata.name if item.metadata else ""),
+                    }
+                )
+
     columns = ["type", "ref", "address", "amount", "name"]
+    refuse_if_incomplete(
+        ctx,
+        reads.unread,
+        reads.used,
+        what="this list",
+        view=emit_table(rows, columns, mode="human") if rows else "",
+    )
     click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
 
 

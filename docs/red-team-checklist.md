@@ -61,7 +61,7 @@ This is the highest-stakes section. The mnemonic is the master key; any path tha
 
 ### 1.4 Network leakage
 
-- [ ] Run `pyrxd balance --refresh` against a wallet, capture the websocket traffic with `tcpdump` or by pointing `--electrumx` at a logging mock. Confirm the mnemonic NEVER appears in any outbound bytes. (Only address derivations / script hashes should go over the wire.)
+- [ ] Run `pyrxd balance` against a wallet, capture the websocket traffic with `tcpdump` or by pointing `--electrumx` at a logging mock. Confirm the mnemonic NEVER appears in any outbound bytes. (Only address derivations / script hashes should go over the wire.)
 - [ ] Same for `pyrxd glyph list`.
 
 ### 1.5 Memory leakage (best-effort, hard to verify)
@@ -148,10 +148,10 @@ This is a sampler; full coverage is issue #10.
 
 ### 4.1 ElectrumX unreachable
 
-- [ ] `pyrxd --electrumx wss://does-not-exist.example/ balance --refresh`. Should fail with NetworkError, exit code 2, fix-suggestion mentions the URL.
+- [ ] `pyrxd --electrumx wss://does-not-exist.example/ balance`. Should fail with NetworkError, exit code 2, fix-suggestion mentions the URL.
 - [ ] `pyrxd --electrumx ws://localhost:50001/ balance` (insecure scheme without flag). Should reject before trying to connect.
 - [ ] `pyrxd --electrumx http://example.com/ balance`. Wrong scheme. Should reject.
-- [ ] Drop your network connection mid-`balance --refresh`. Confirm timeout, clean error.
+- [ ] Drop your network connection mid-`balance`. Confirm timeout, clean error.
 
 ### 4.2 ElectrumX returns garbage
 
@@ -237,7 +237,7 @@ Threat scenario S7 from the threat model. As-shipped, the broadcast summary now 
 ## 8. Concurrent / race conditions (30 min)
 
 - [ ] Run two `pyrxd wallet new` in parallel against the same `--wallet` path. Whoever wins should win cleanly; the loser should fail with "already exists" not corrupt state.
-- [ ] Run `pyrxd balance --refresh` while another process is editing the same wallet's address dict (via `pyrxd address`, which adds an unused-receive entry). Confirm one of: success, clean error, no corruption.
+- [ ] Run `pyrxd balance` while another process is editing the same wallet's address dict (via `pyrxd address`, which adds an unused-receive entry). Confirm one of: success, clean error, no corruption.
 - [ ] `pyrxd setup --no-interactive` twice in parallel. Should be idempotent.
 
 **File issues for:** any data corruption observed, or any error message that misrepresents what happened.

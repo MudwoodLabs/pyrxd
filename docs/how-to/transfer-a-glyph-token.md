@@ -313,9 +313,12 @@ chain enforce anything), and `splits` (a list of `{"address": …, "bps": …}`)
 ## Failure modes
 
 - **`no FT holdings for <ref>` / `<NFT> is not held by this wallet`.** The
-  wallet doesn't see the token at any used address. Run `pyrxd balance
-  --refresh` to rescan, then retry. If it's still missing, the token is owned by
-  a different wallet/address.
+  wallet doesn't see the token at any of its addresses. The transfer commands
+  scan the wallet's addresses on both chains up to the gap limit before they
+  look, so there is nothing to refresh first: check the ref and `--wallet`. If
+  it's still missing, the token is owned by a different wallet or address, or
+  sits past the gap limit (see
+  [Recover funds across wallet paths](recover-funds-across-wallet-paths.md)).
 - **`insufficient FT balance: need N, have M`.** You're trying to send more
   units than you hold. Check with `pyrxd glyph list --type ft`.
 - **`FT transfer across multiple wallet addresses isn't supported`.**

@@ -26,6 +26,82 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   HashMark record" or counts its records as final: both say what could be read and how many outputs
   could not. `named_by.signature_line_vout` in `--json` says which record the verdict's signature
   line is about.
+- **A wallet made with `pyrxd wallet new` can spend what it is sent (#759).** `pyrxd mark`, the
+  `glyph` spend commands, the `swap-book` commands and `utxos` read only addresses a gap-limit
+  scan had marked used, and nothing ran or saved that scan, so a funded new wallet had nothing
+  to spend: `pyrxd mark` told a wallet holding 100 RXD to "fund this wallet".
+  `HdWallet.collect_spendable` now runs the scan (`HdWallet.refresh`) itself on every call.
+  Every in-process spend path in the CLI and the SDK reads the wallet's UTXOs through that one
+  method, so each now sees the wallet's funds; `wallet send` through the signing agent already
+  ran its own scan. A scan that cannot read an address fails as a network error rather than
+  reading as an empty wallet. Error hints that said to run `pyrxd balance --refresh` first,
+  which never helped because nothing saved the scan, now say what was scanned.
+- **`glyph resume-mint` can reveal a new wallet's commit.** `HdWallet.privkey_for_address`
+  looked only at the addresses the wallet file records, and a `wallet new` file records none,
+  so on regtest a new wallet's commit whose reveal was interrupted could not be resumed
+  ("address … is not known to this wallet"). The lookup now also derives, locally and with no
+  network, across the gap window on both chains; an address outside it is still refused.
+  `pyrxd mark --signer-address` and `GlyphMinter`'s reveal use the same lookup.
+- **A scan no longer marks a known-used address unused** when a server reports no history for
+  it. `collect_spendable` already read such an address on the call that scanned, but the scan
+  cleared its flag, so a lagging server hid its funds from the next call on the same wallet.
+
+### Changed
+
+- **`HdWallet.collect_spendable` is strict by default.** A failed per-address UTXO read now
+  raises `NetworkError` instead of returning what the other addresses answered, because the
+  spend paths turned a short result into "fund this wallet" or "no spendable UTXOs".
+  - **Strict** (any failed read is a network error): `pyrxd mark`; every `glyph` command that
+    spends; `pyrxd swap reserve`, `post`, `take` and `refund`; `pyrxd wallet sweep` and
+    `HdWallet.send_max`; and the SDK builders that fund from the wallet (`GlyphMinter` and
+    `GlyphClient` mints, `build_ft_transfer`, `build_ft_airdrop`, `build_nft_transfer`,
+    `build_timelock_reveal`, `build_hashmark_mark`).
+  - **Partial view** (`strict=False`): `HdWallet.send`, `pyrxd wallet send` when it signs
+    in-process, and `pyrxd swap cancel`. Each needs only enough, and a cancel races every
+    holder of the signed advert. Each goes ahead when what it read is enough. When it is not
+    and a read failed, it raises `NetworkError` naming the failed reads, never "fund the
+    wallet" or "insufficient funds". The helper is `pyrxd.hd.wallet.raise_if_reads_failed`,
+    and `collect_spendable` now returns a `Spendable` list whose `unread` names the addresses
+    it could not read. `pyrxd wallet send` through the signing agent collects on its own, and
+    any failed read fails it.
+  - `pyrxd utxos` collects the partial view so it can name the addresses it could not read;
+    it then refuses to show that view as complete (next entry).
+- **`pyrxd balance` and `pyrxd glyph list` scan the chain by default.** Both read only the
+  addresses marked used, and only the gap-limit scan marks them. `balance` ran the scan only
+  under `--refresh`, `glyph list` never ran it, and nothing saves a scan, so a wallet made by
+  `pyrxd wallet new` and funded at its first receive address showed a balance of 0 and no
+  tokens. Both now run `HdWallet.refresh`, the scan `collect_spendable` runs, on every call.
+  The scan reads at least 20 addresses' history on each chain before the balance or token
+  reads. Its result is still not saved: the wallet file is unchanged, as it was under
+  `--refresh`. `balance --refresh` is still accepted and changes nothing. There is no opt-out,
+  because the old view read the network anyway, and it read only what something had marked
+  used, which on a `wallet new` file is nothing.
+- **`balance`, `glyph list` and `utxos` never show a partial view as the whole wallet.** A
+  scan that cannot read an address, or a read that fails for every used address, exits 2
+  and prints nothing. When some addresses answer and others fail, the command still exits 2.
+  The human output shows what the others hold, with an `INCOMPLETE` line on stdout naming the
+  unread addresses. JSON and `--quiet` output print nothing, since neither shape can say
+  "incomplete". Before, `utxos` listed the partial view and exited 0, and `balance` and
+  `glyph list` stopped at the first failed address. `utxos --addr A` is refused only when A's
+  own read fails.
+- **`GlyphScanner.scan_address` and `scan_script_hash` take `strict=`.** With `strict=True`, a
+  UTXO whose transaction cannot be fetched raises `NetworkError` rather than being logged and
+  left out of the result. The default is unchanged. `pyrxd glyph list` passes `strict=True`, so
+  a token it could not fetch fails the listing instead of dropping out of it.
+- **`pyrxd mark` escapes blank characters on the label confirmation line (#747).** A word spelled
+  in non-ASCII blanks after `invoice 42` showed as `invoice 42` plus white space, with no
+  banner. Every Unicode Zs character but the ASCII space (NBSP, U+2002-200A, U+202F, U+205F,
+  U+3000, ...) and a reviewed list of other characters that render as blank (U+2800 BRAILLE
+  PATTERN BLANK, U+1D159, U+FFFC, U+13441 and U+13442) is now printed as `<U+XXXX>` and named in
+  the banner. No Unicode property marks every character a font draws as blank, so that list
+  cannot be complete; the `ascii:` line under the label still names every codepoint. The ASCII
+  space is printed as typed, and the label is signed as typed either way.
+
+- **A pull request's docs build can no longer cancel a pending docs deploy from main (#749).**
+  `docs.yml` put every run in one repository-wide `pages` concurrency group, and GitHub cancels
+  an older pending run in a group when another queues, so a PR build could leave the published
+  docs and the `/inspect/` and `/verify/` pages stale. Only the deploy job is in `pages` now; each
+  build has a group per ref.
 
 ## [0.25.0] — 2026-09-26
 

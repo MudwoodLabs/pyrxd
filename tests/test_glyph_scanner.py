@@ -495,6 +495,27 @@ class TestGlyphScannerNetworkErrors:
         result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
+    def test_failed_tx_fetch_raises_when_strict(self):
+        """``strict=True``, which ``pyrxd glyph list`` passes: the UTXO whose transaction could not
+        be fetched fails the scan, instead of vanishing from an inventory shown as complete."""
+        utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
+        scanner = GlyphScanner(_mock_client(utxos, tx_map={}))
+        with pytest.raises(NetworkError, match="1 of 1 transaction reads failed"):
+            asyncio.run(scanner.scan_script_hash("cc" * 32, strict=True))
+        with pytest.raises(NetworkError, match="1 of 1 transaction reads failed"):
+            asyncio.run(scanner.scan_address("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", strict=True))
+
+    def test_strict_returns_a_token_whose_metadata_lookup_failed(self):
+        """The honest half: strict is about the holding, not the name. The commit tx is missing,
+        so the metadata lookup fails, and the token still comes back, with ``metadata=None``."""
+        tx_map, history = _chain(NFT_MINT, drop=(TXID_COMMIT,))
+        tx_map[TXID_TRANSFER] = NFT_MINT.transfer_tx_hex()
+        utxos = [UtxoRecord(tx_hash=TXID_TRANSFER, tx_pos=0, value=546, height=100)]
+        scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32, strict=True))
+        assert len(result) == 1
+        assert result[0].metadata is None
+
     def test_failed_commit_fetch_returns_none_metadata(self):
         """If the commit tx is unavailable, metadata is None but the Glyph stands."""
         tx_map, history = _chain(NFT_MINT, drop=(TXID_COMMIT,))
