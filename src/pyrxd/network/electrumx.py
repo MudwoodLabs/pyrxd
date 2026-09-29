@@ -276,11 +276,15 @@ def _coerce_hex32(value: Hex32 | bytes | bytearray | str) -> Hex32:
 def script_hash_for_script(locking_script: bytes) -> Hex32:
     """Return the ElectrumX ``script_hash`` for a raw *locking_script*.
 
-    ElectrumX indexes **every** output by ``sha256(locking_script)`` with the
-    bytes reversed (little-endian display order) — not just address-shaped
-    ones. Use this when you hold the script bytes rather than an address, e.g.
-    to ask for the history of a Glyph commit output (which is how the scanner
-    finds the reveal transaction that spent it).
+    This is ``sha256(locking_script)`` with the bytes reversed (little-endian
+    display order). A Radiant ElectrumX lists an output under this hash only
+    when the script has no signature check, or has one but neither a ref
+    operand nor an ``OP_PUSHDATA1``/``2``/``4`` push: a commit output, a plain
+    P2PKH. For any other output use :func:`script_hash_for_output`, which
+    rewrites the script the way the server does before hashing it.
+    Use this when you hold the script bytes rather than an address, e.g. to ask
+    for the history of a Glyph commit output (which is how the scanner finds
+    the reveal transaction that spent it).
 
     Parameters
     ----------
@@ -293,6 +297,61 @@ def script_hash_for_script(locking_script: bytes) -> Hex32:
         The 32-byte script hash suitable for ElectrumX RPC calls.
     """
     return Hex32(sha256(bytes(locking_script))[::-1])
+
+
+# The opcodes whose presence makes a Radiant ElectrumX zero a script's refs before hashing it
+# (``CHECKSIG_OPS`` in RXinDexer ``electrumx/lib/script.py``).
+_INDEXER_CHECKSIG_OPCODES = frozenset({0xAC, 0xAD, 0xAE, 0xAF})
+
+
+def script_hash_for_output(locking_script: bytes) -> Hex32:
+    """Return the script hash a Radiant ElectrumX lists an output with *locking_script* under.
+
+    The server does not hash a ref-bearing script as it is. When the script has a signature
+    check, it hashes a rewritten copy in which every ref operand is 36 zero bytes, so every NFT
+    one key owns is listed under ONE hash, and every FT another (RXinDexer ``Script.zero_refs``,
+    applied in ``block_processor.py`` and ``mempool.py``). Measured 2026-09-29 against both
+    public mainnet servers: an NFT output was listed under this hash and not under the owner's
+    P2PKH hash nor under the hash of its script as it is.
+
+    The same rewrite also drops the length bytes of every ``OP_PUSHDATA1``/``2``/``4`` push,
+    keeping the opcode and the data. So a script with a signature check hashes as it is only when
+    it has neither a ref operand nor such a push; a script with no signature check always hashes
+    as it is, which is :func:`script_hash_for_script`. A script that does not decode also gets
+    that plain hash here, though RXinDexer (at the commit in
+    ``tests/fixtures/rxindexer_upstream_pin.json``) does not index such an output at all:
+    ``zero_refs`` raises and ``_output_indexable`` skips it.
+    """
+    # Lazy: ``pyrxd.glyph`` is a heavier import than this module, and it owns the one
+    # opcode-aware walk this package allows (see ``iter_script_ops_strict``).
+    from ..constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH, OpCode
+    from ..glyph.script import TruncatedScriptError, iter_script_ops_strict
+
+    # A byte-for-byte transcription of ``Script.zero_refs`` in RXinDexer
+    # ``electrumx/lib/script.py`` (lines 382-434 at the commit pinned in
+    # ``tests/fixtures/rxindexer_upstream_pin.json``, vendored under ``tests/vendor/rxindexer``),
+    # INCLUDING its quirk: for OP_PUSHDATA1/2/4 it appends the opcode (line 392) and the data
+    # (line 415) but never the length bytes it read (lines 404-410). That drops information
+    # from the hashed bytes and looks like a bug, but do NOT correct it here. This function's
+    # job is to name the hash the server indexes an output under, so the server's behaviour is
+    # the spec: a "fixed" rewrite hashes somewhere the server lists nothing.
+    # ``tests/test_script_hash_matches_rxindexer.py`` runs this against the vendored code.
+    op_pushdata4 = OpCode.OP_PUSHDATA4[0]
+    script = bytes(locking_script)
+    rewritten = bytearray()
+    has_checksig = False
+    try:
+        for op in iter_script_ops_strict(script):
+            rewritten.append(op.opcode)
+            if op.opcode in _INDEXER_CHECKSIG_OPCODES:
+                has_checksig = True
+            elif op.opcode <= op_pushdata4:  # OP_0 .. OP_PUSHDATA4: a push
+                rewritten += op.operand  # the data only; no OP_PUSHDATA1/2/4 length bytes
+            elif op.opcode in REF_OPERAND_OPCODES:
+                rewritten += bytes(REF_OPERAND_WIDTH)
+    except TruncatedScriptError:
+        return script_hash_for_script(script)
+    return script_hash_for_script(bytes(rewritten) if has_checksig else script)
 
 
 def script_hash_for_address(address: str) -> Hex32:

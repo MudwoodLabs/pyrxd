@@ -93,6 +93,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     each pinned by the test: an attribute looked up by a computed name (`getattr(c, name)`,
     `type(c).__dict__[name]`), an RPC name built at runtime, and code run from a string (`exec`,
     `eval`).
+- **`glyph list` checks what the server lists against the transactions it serves (#782).**
+  `GlyphScanner` took a token's owner from its script without comparing it with the address, and
+  an FT's amount from the server's UTXO record: a server listing another key's NFT under the
+  address got it printed, and a 5,000-unit FT was shown as 999,999,999, both with exit 0. An FT's
+  amount is now the value its transaction pays at that output (that transaction is bound to its
+  txid); a record that disagrees is logged. A listed UTXO whose output is a token owned by another
+  key, is not at the script hash it was listed under, does not exist, or is listed twice is a
+  server inconsistency: `strict=True`, which `glyph list` uses, raises the new
+  `ServerInconsistencyError` (a `NetworkError`), and `glyph list` exits 2 naming it, listing
+  nothing; the default `strict=False` leaves it out with a warning. Under `strict=True` a fetched
+  transaction that does not parse now raises instead of being dropped.
+- **`GlyphScanner.scan_address` reads where a Radiant ElectrumX lists tokens (#782).** It read the
+  address's P2PKH script hash, and a Radiant ElectrumX lists a token output under its script with
+  every ref zeroed, not there; measured on both public mainnet servers, an NFT was listed under
+  that hash and not under its owner's P2PKH hash. So `glyph list` found no token on a real server.
+  It now reads one hash per owned token shape (`owned_token_script_hashes`), computed by the new
+  `pyrxd.network.electrumx.script_hash_for_output`. Still open: the gap-limit scan reads P2PKH
+  history only, so an address holding a token and no plain output is not marked used and is not
+  listed.
+- **`pyrxd address` no longer hands out an address that has been paid plain RXD (#781).** With no
+  `--index`, it printed the first address the wallet file did not mark used. Only the gap-limit
+  scan marks an address used, and no command saves a scan, so on a `pyrxd wallet new` file it
+  printed index 0 every time, including after index 0 was paid. `--change` did the same on the
+  change chain. It now runs `HdWallet.refresh` first, the scan `balance`, `glyph list` and the
+  spend paths run, and prints the first address on the chain whose P2PKH script hash has no
+  history. An address that was paid and then spent from has that history, so it counts as used
+  though it holds nothing. If the scan cannot read an address, `address` exits 2 and prints no
+  address in any output mode. The scan is not saved. `--index N` still derives that index directly
+  and reads nothing from the network. **Not covered:** an address that has only ever received a
+  Glyph token. RXinDexer lists a token output under its script hash with the refs zeroed, not
+  under the owner's P2PKH hash, so the scan sees no history there and `address` can hand that
+  address out again (#787).
 
 - **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
   `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
