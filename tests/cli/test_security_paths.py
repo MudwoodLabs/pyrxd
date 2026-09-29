@@ -306,11 +306,13 @@ class TestQueryCommandPaths:
         assert "hunter2" not in result.output
 
     def test_address_next_on_change_chain(self, runner: CliRunner, tmp_path: Path) -> None:
-        _saved_wallet(tmp_path / "wallet.dat")
-        ctx = _ctx(tmp_path / "wallet.dat", output_mode="json")
+        wallet = _saved_wallet(tmp_path / "wallet.dat")
+        # `address` scans before it picks (#781): internal index 0 has history, so the answer is 1.
+        client = _funded_client_for(wallet._derive_address(1, 0))
+        ctx = _ctx(tmp_path / "wallet.dat", client, output_mode="json")
         result = runner.invoke(address_cmd, ["--change"], obj=ctx, input=f"{MNEMONIC}\n")
         assert result.exit_code == 0, result.output
-        assert "'/1/" in result.output  # internal (change) chain path
+        assert "'/1/1" in result.output  # internal (change) chain path, past the used index
 
     def test_balance_refresh_reports_confirmed(self, runner: CliRunner, tmp_path: Path) -> None:
         wallet = _saved_wallet(tmp_path / "wallet.dat")

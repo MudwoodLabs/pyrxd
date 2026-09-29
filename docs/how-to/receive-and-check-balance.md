@@ -21,7 +21,14 @@ $ pyrxd address
 ```
 
 With no flags, `address` prints the **next unused external receive address** —
-the right default for "where do I get paid." For deterministic lookups:
+the right default for "where do I get paid." It scans the chain first, the same
+scan `balance` runs, and prints the first receive address with no history on
+chain. An address that was paid and later spent from has history, so it is not
+handed out again. The scan is not saved to the wallet file. If an address cannot
+be read, `address` exits 2 and prints no address, because it cannot show the one
+it would print is unused. `--change` does the same on the change chain.
+
+For deterministic lookups, which read nothing from the network:
 
 ```console
 $ pyrxd address --index 5            # external address at index 5

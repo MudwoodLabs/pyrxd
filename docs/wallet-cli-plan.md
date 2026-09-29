@@ -163,8 +163,10 @@ These exist not because pyrxd should replace `radiant-cli`, but because a user w
 
 ```
 pyrxd address [--next | --index N] [--change]
-    --next       (default) next unused external receive address
-    --index N    deterministic index lookup
+    --next       (default) first external address with no chain history;
+                 runs the gap-limit scan first, not saved; exits 2 if the
+                 scan cannot read an address
+    --index N    deterministic index lookup, no network
     --change     internal chain instead of external
 
 pyrxd balance [--refresh]
