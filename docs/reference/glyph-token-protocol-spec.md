@@ -908,9 +908,9 @@ envelope carries more type information than the chain does.
 | CONTAINER | **not distinguishable** — byte-identical to an NFT by design (§7.5) | envelope only |
 | DAT, BURN, ENCRYPTED, TIMELOCK, AUTHORITY, WAVE | **not distinguishable** — envelope markers only | envelope only |
 
-`src/pyrxd/glyph/_inspect_core.py:1073-1228` is the dispatch order pyrxd uses — NFT, FT,
+`src/pyrxd/glyph/_inspect_core.py:1074-1229` is the dispatch order pyrxd uses — NFT, FT,
 container-legacy, MUT, commit-NFT, commit-FT, in that order — and
-`src/pyrxd/glyph/_inspect_core.py:1405-1469` is the envelope-side classification, which returns
+`src/pyrxd/glyph/_inspect_core.py:1406-1470` is the envelope-side classification, which returns
 the highest-specificity marker present.
 
 (Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,
