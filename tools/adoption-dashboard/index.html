@@ -174,6 +174,10 @@ h2 { margin: 0; font-size: 17px; font-weight: 600; text-wrap: balance; }
 .notes h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
 .notes p { margin: 0; font-size: 14px; color: var(--ink-2); max-width: 62ch; }
 
+.trends h2 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
+.trends ul { margin: 0 0 8px; padding-left: 18px; font-size: 14px; color: var(--ink-2); max-width: 78ch; }
+.trends li { margin-bottom: 4px; }
+
 details { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 16px; }
 summary { cursor: pointer; font-weight: 500; }
 .tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
@@ -206,6 +210,12 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
   </header>
 
   <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="trends" aria-labelledby="trends-h">
+    <h2 id="trends-h">What the last two weeks show</h2>
+    <ul id="trend-list"></ul>
+    <p class="note" id="trend-caveat"></p>
+  </section>
 
   <section class="panel" aria-labelledby="pypi-h">
     <div class="panel-head">
@@ -272,6 +282,33 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
     </div>
   </section>
 
+  <section class="notes" aria-label="Definitions">
+    <div>
+      <h3>Download</h3>
+      <p>One file fetched from PyPI, as counted by pypistats.org with mirrors excluded. A person who runs <span class="mono">pip install</span> can trigger more than one, and a CI job triggers one every run. It counts fetches, not people or projects.</p>
+    </div>
+    <div>
+      <h3>Page view, unique visitor</h3>
+      <p>A page view is one load of a page in this repository on github.com. A unique visitor is a distinct client GitHub counted within that one day. GitHub does not document exactly how it tells clients apart, so treat it as "roughly distinct browsers or accounts."</p>
+    </div>
+    <div>
+      <h3>Clone, unique cloner</h3>
+      <p>A clone is one <span class="mono">git clone</span> or fetch of the repository. A unique cloner is a distinct client GitHub counted that day, and it can be a person, a CI runner or a bot. Many clones from few unique cloners points to repeated automated checkouts. That is an interpretation, not something GitHub reports.</p>
+    </div>
+    <div>
+      <h3>Uniques do not add up across days</h3>
+      <p>Someone who visits or clones on two days is one unique on each. Summing the daily uniques therefore overstates how many distinct people there were. GitHub does not return a distinct count for a longer period, so this page does not show one.</p>
+    </div>
+    <div>
+      <h3>The newest day is partial</h3>
+      <p>Traffic for the current UTC day is still accumulating and is replaced with the full day the next time the collector runs. The trend lines above leave it out for that reason.</p>
+    </div>
+    <div>
+      <h3>7-day average and release ticks</h3>
+      <p>The 7-day line smooths weekday and weekend swings in downloads. Release ticks mark the publish date, and downloads often rise on those days because the release process itself installs the package.</p>
+    </div>
+  </section>
+
   <details>
     <summary>Daily numbers (table view)</summary>
     <div class="tables">
@@ -335,10 +372,51 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
   document.getElementById("gap-note").textContent =
     "pypistats returned no row for " + gaps + " of the " + pDays.length + " days since the first release. Those days are drawn as 0, most likely because nothing was downloaded on them.";
 
+  // ---------------------------------------------------------------- trends
+  // Week-over-week text is computed from the loaded data, never written by hand, so it
+  // cannot outlive the numbers. Both cut-offs below are judgement calls, not statistics:
+  // MIN_FOR_TREND is the smallest earlier-week total for which a percentage is worth
+  // printing (views here are often 0-30 a day, so small bases swing wildly), and
+  // SAME_BAND is the change under which the text says "about the same".
+  var TODAY = new Date().toISOString().slice(0, 10);
+  var MIN_FOR_TREND = 30, SAME_BAND = 10;
+  function weekOverWeek(days, vals) {
+    var kept = [];
+    days.forEach(function (d, i) { if (d < TODAY) kept.push(vals[i]); });  // drop the partial day
+    if (kept.length < 14) return null;
+    return { last: sum(kept.slice(-7)), prev: sum(kept.slice(-14, -7)) };
+  }
+  function trendText(label, w) {
+    if (!w) return label + ": fewer than 14 complete days of data, so no week-over-week comparison yet.";
+    var base = label + ": " + fmt.format(w.last) + " in the last 7 complete days, " + fmt.format(w.prev) + " in the 7 before.";
+    if (w.prev < MIN_FOR_TREND) return base + " Too few to call a trend.";
+    var pct = Math.round((w.last - w.prev) / w.prev * 100);
+    if (Math.abs(pct) < SAME_BAND) return base + " About the same (" + (pct > 0 ? "+" : "") + pct + "%).";
+    return base + " " + (pct > 0 ? "Up " : "Down ") + Math.abs(pct) + "%.";
+  }
+  var trendLines = [
+    trendText("PyPI downloads", weekOverWeek(pDays, pVals)),
+    trendText("GitHub page views", weekOverWeek(gDays, views)),
+    trendText("GitHub clones", weekOverWeek(gDays, clones))
+  ];
+  var cw = weekOverWeek(gDays, clones), cu = weekOverWeek(gDays, cloneU);
+  if (cw && cu && cu.last > 0 && cu.prev > 0) {
+    trendLines.push("Clones per unique cloner per day: " + fmtTick.format(cw.last / cu.last) + " in the last 7 complete days, " +
+      fmtTick.format(cw.prev / cu.prev) + " in the 7 before. A higher ratio usually means more repeated automated checkouts; it does not say who cloned.");
+  }
+  var trendListEl = document.getElementById("trend-list");
+  trendLines.forEach(function (t) {
+    var li = document.createElement("li"); li.textContent = t; trendListEl.appendChild(li);
+  });
+  document.getElementById("trend-caveat").textContent =
+    "These compare two 7-day windows of the numbers on this page. They do not say who is behind them (see Definitions). GitHub history here is " +
+    gDays.length + " days and PyPI history " + pDays.length + " days, so week-over-week is the longest comparison this page supports.";
+
   var spike = gDays.reduce(function (best, d, i) { return clones[i] > clones[best] ? i : best; }, 0);
-  document.getElementById("clone-note").textContent = DATA.clone_spike_note && DATA.clone_spike_note.date === gDays[spike]
-    ? DATA.clone_spike_note.text
-    : "Largest day: " + shortDay(gDays[spike]) + ", " + fmt.format(clones[spike]) + " clones.";
+  document.getElementById("clone-note").textContent =
+    "Largest day: " + shortDay(gDays[spike]) + ", " + fmt.format(clones[spike]) + " clones." +
+    gDays.filter(function (d) { return DATA.day_notes[d]; })
+      .map(function (d) { return " " + shortDay(d) + ": " + DATA.day_notes[d]; }).join("");
 
   document.getElementById("foot").textContent =
     "Fetched " + DATA.fetched + " · PyPI: pypistats.org, without mirrors, as saved daily to the traffic-data branch · GitHub: traffic-data branch · Releases: GitHub releases.";
@@ -581,7 +659,12 @@ Promise.all([
     releases: (rel || []).filter(function (r) { return !r.draft; })
       .map(function (r) { return { tag: r.tag_name, date: (r.published_at || "").slice(0, 10) }; })
       .sort(function (a, b) { return a.date < b.date ? -1 : 1; }),
-    clone_spike_note: { date: "2026-09-23", text: "Largest day: Sep 23, 1,042 clones. That day 12 pull requests merged and 262 workflow runs started (UTC)." }
+    // What was going on in the repo on a given day, shown under the clones chart for every day
+    // that appears in the data. Keyed by date, so a note stays visible after another day
+    // overtakes it as the largest. The 09-23 figures were counted on 2026-09-29 with the GitHub
+    // API: search `is:pr is:merged merged:2026-09-23` (12) and `actions/runs?created=2026-09-23`
+    // (389). An earlier hard-coded note said 262 runs, from a source that was not recorded.
+    day_notes: { "2026-09-23": "12 pull requests merged and 389 workflow runs were created that day (UTC)." }
   };
   var pLast = Object.keys(DATA.pypi_daily).sort().pop();
   var gLast = Object.keys(DATA.github.views).sort().pop();
