@@ -139,12 +139,12 @@ function showError(message) {
   ERROR_PRE.textContent = String(message);
 }
 
-function showReady(versionText, buildSha) {
+function showReady(versionText, footerLine) {
   STATUS_BLOCK.hidden = true;
   READY_BLOCK.hidden = false;
   VERSION_BLOCK.textContent = versionText;
-  if (buildSha) {
-    BUILD_VERSION.textContent = `build: ${buildSha}`;
+  if (footerLine) {
+    BUILD_VERSION.textContent = footerLine;
   }
 }
 
@@ -185,7 +185,7 @@ async function boot() {
   pyFileCheckPlan = runtime.bridges.fileCheckPlan;
   pyJudgeFileDigest = runtime.bridges.judgeFileDigest;
 
-  showReady(runtime.versionText, runtime.gitSha);
+  showReady(runtime.versionText, buildLine(runtime));
   enableForm();
   hydrateFromUrl();
 }

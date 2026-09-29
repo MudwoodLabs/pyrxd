@@ -39,12 +39,12 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from ..constants import genesis_hash_for
-from ..glyph._inspect_core import _truncate_for_human
+from ..glyph._inspect_core import _CONTRACT_HEX_LEN, _inspect_contract, _inspect_outpoint, _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
 from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
-from ..security.types import Txid
+from ..security.types import _TXID_RE, Txid
 
 # THE §7.6 MACHINERY IS IMPORTED, NOT RESTATED. `verify` is a new entry point onto the verdict
 # `glyph inspect` already computes — the form-1/form-2 resolution, the degrade-with-a-reason,
@@ -923,7 +923,7 @@ def _digest_match_lines(dm: dict | None, indent: str = "  ") -> list[str]:
     ]
 
 
-def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
+def _verify_lines(payload: dict, rows: list[dict], *, unread: int) -> list[str]:
     """The whole human answer: a summary, then the detail the summary is derived from.
 
     THE TWO HALVES CANNOT DISAGREE, and that is structural rather than careful. Every summary
@@ -938,7 +938,7 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
         f"  network:      {payload['network']}",
         "",
         "  VERDICT" + (" — holds" if payload["verdict_holds"] else " — DOES NOT HOLD"),
-        f"    record:     {'vout ' + str(payload['verdict_record']['vout']):<22} {_verdict_record_about(payload)}",
+        f"    record:     {'vout ' + str(payload['verdict_record']['vout']):<22} {_verdict_record_about(payload, unread=unread)}",
         f"    signature:  {checks['signature']['state']:<22} {_truncate_for_human(checks['signature']['reason'])}",
         f"    file:       {checks['digest']['state']:<22} {_truncate_for_human(checks['digest']['reason'])}",
         f"    name:       {checks['name']['state']:<22} {_truncate_for_human(checks['name']['reason'])}",
@@ -966,29 +966,40 @@ def _verify_lines(payload: dict, rows: list[dict]) -> list[str]:
     return lines
 
 
-def _verdict_record_about(payload: dict) -> str:
+def _verdict_record_about(payload: dict, *, unread: int) -> str:
     """Which record the summary lines describe, in words — and when one of them does not.
 
     Every summary line must be true of ONE record, and the reader has to be told which. The one
     line that can come from elsewhere is the signature line, when another record is broken or
     forged: that fails the whole transaction, and saying "all about THIS one" over it would put
     two records' facts under one heading, which is the defect this line exists to prevent.
+
+    ``unread`` is how many outputs the classifier could not read. Each may be a record, so with any
+    unread "the only HashMark record in this transaction" and "one of N" are counts nobody finished:
+    they become "that could be read". Keyword-only and required, so no caller can fall back to the
+    unqualified count by omission.
     """
     rec = payload["verdict_record"]
     n = rec["records_in_tx"]
     refused = rec.get("refusal_vout")
+    if n == 1 and unread:
+        return (
+            f"the only HashMark record that could be read; {unread} other "
+            f"{'output' if unread == 1 else 'outputs'} could not be classified here"
+        )
     if n == 1:
         return "the only HashMark record in this transaction"
+    records = f"{n} HashMark records that could be read" if unread else f"{n} HashMark records"
     if refused is not None and refused != rec["vout"]:
         return (
-            f"one of {n} HashMark records; file and name are about THIS one, and the signature line is "
+            f"one of {records}; file and name are about THIS one, and the signature line is "
             f"about the record at vout {refused}, because a broken or forged record anywhere fails the "
             "whole transaction"
         )
     if rec["all_record_checks_hold"]:
-        return f"one of {n} HashMark records here; signature, file and name below are all about THIS one"
+        return f"one of {records} here; signature, file and name below are all about THIS one"
     return (
-        f"of the {n} HashMark records here, none passes every check on its own; this is the closest, "
+        f"of the {records} here, none passes every check on its own; this is the closest, "
         "and each record is shown separately below"
     )
 
@@ -1152,6 +1163,226 @@ def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, pr
         ) from exc
 
 
+_NOT_A_TXID_FIX = (
+    "TXID is the transaction carrying the mark — 64 hex characters — or one of its outputs, written "
+    "<txid>:<n> or as a 72-character contract id. If what you have is the DIGEST (the same shape as a "
+    "txid), it locates nothing on its own: pass it with --digest and give the mark's txid as the argument."
+)
+
+
+def _verify_target(arg: str) -> tuple[str, dict | None]:
+    """The transaction ``verify`` checks, and — when the argument named one OUTPUT of it — which.
+
+    THREE FORMS, TOLD APART BY SHAPE, by the rules ``glyph inspect`` classifies with
+    (:func:`~pyrxd.glyph._inspect_core._classify_input`: a ``:`` means an outpoint, 72 hex a
+    contract id) and through the same two parsers the /verify/ page runs. 64 hex is a transaction
+    id, exactly as before; it is not handed to ``_classify_input``, which reads the rare 64-hex
+    string that parses as a time-lock script as a script, and here the argument has always been a
+    transaction.
+
+    An outpoint and a contract id NAME AN OUTPUT, and neither is a record. A mark is checked by the
+    transaction that carries it, so that transaction is what is fetched, and :func:`_named_output`
+    then says what the named output turned out to be — or :func:`_require_named_output` refuses it,
+    when the transaction has no such output. Refusing them told the user "that is not a
+    transaction id" about input that had one in it (#745).
+    """
+    wanted = arg.strip()
+    if ":" in wanted:
+        try:
+            ref = _inspect_outpoint(wanted)
+            _require_whole_txid(str(ref["txid"]))
+        except ValidationError as exc:
+            raise _outpoint_refusal(wanted, exc) from exc
+        return str(ref["txid"]), {
+            "form": "outpoint",
+            "input": ref["outpoint"],
+            "txid": str(ref["txid"]),
+            "vout": ref["vout"],
+        }
+    lowered = wanted.lower()
+    if len(lowered) == _CONTRACT_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
+        ref = _inspect_contract(lowered)
+        return str(ref["txid"]), {"form": "contract", "input": lowered, "txid": str(ref["txid"]), "vout": ref["vout"]}
+    try:
+        # `.strip()` above already removed any trailing newline, so `Txid`'s `$` gap cannot reach here.
+        Txid(lowered)
+    except ValidationError as exc:
+        raise UserError("that is not a transaction id", cause=str(exc), fix=_NOT_A_TXID_FIX) from exc
+    return lowered, None
+
+
+def _require_whole_txid(txid: str) -> None:
+    """Refuse a txid that ``Txid`` accepted with a trailing newline.
+
+    ``_TXID_RE`` is anchored ``^…$`` and ``Txid`` applies it with ``.match``, and ``$`` also matches
+    just before a final ``\n``. So ``"<txid>\n:0"`` parsed as an outpoint whose txid ends in a
+    newline, and that string was sent to ElectrumX: exit 2, "could not reach ElectrumX", for what is
+    an input error, which 0.25.0 refused with exit 1. ``fullmatch`` has no such gap. Applied here, at
+    this command's one outpoint call site, rather than in ``Txid``, whose other callers are a
+    separate change.
+    """
+    if not _TXID_RE.fullmatch(txid):
+        raise ValidationError(f"Txid must be 64 lowercase hex chars (got length {len(txid)})")
+
+
+def _outpoint_refusal(wanted: str, exc: ValidationError) -> UserError:
+    """The refusal for a ``<txid>:<n>`` that does not parse — and it NAMES THE TXID whenever there is one.
+
+    The part before the first ``:`` is named when, trimmed, it is a transaction id — including when
+    the parser refused it over the spaces around it (``<txid> :0``): the txid is still what the user
+    typed, and the cause says what was refused. Nothing else of the input is echoed: the cause is the
+    parser's own words, which sanitise what they quote, and a txid that validates is hex.
+    """
+    head = wanted.split(":", 1)[0]
+    try:
+        txid = Txid(head.strip().lower())
+    except ValidationError:
+        return UserError("the part before ':' is not a transaction id", cause=str(exc), fix=_NOT_A_TXID_FIX)
+    return UserError(
+        "that is not an output reference (<txid>:<n>)",
+        cause=str(exc),
+        fix=f"the part before ':' holds a transaction id, {txid}. Give that alone as the argument to check "
+        f"that transaction, or name one of its outputs by number, with no spaces, as in {txid}:0",
+    )
+
+
+def _unread_vouts(payload: dict) -> list[Any]:
+    """The outputs the classifier could not read: its per-output ``except`` makes each a row of
+    ``type: "error"``. Whether any of them is a HashMark record is UNKNOWN — neither "is one" nor
+    "is not one" may be said of it. ``verify`` classifies with no row limit, so every output has a
+    row and none can be missing from this list."""
+    return [row.get("vout") for row in payload.get("outputs") or [] if row.get("type") == "error"]
+
+
+def _unread_clause(k: int) -> str:
+    """The sentence for ``k`` outputs other than the named one that could not be read."""
+    if k <= 0:
+        return ""
+    if k == 1:
+        return " 1 other output could not be classified here, so whether it is a HashMark record is unknown."
+    return f" {k} other outputs could not be classified here, so whether any of them is a HashMark record is unknown."
+
+
+def _outputs_phrase(count: Any) -> str:
+    if not isinstance(count, int):
+        return f"{count} output(s)"
+    if count <= 0:
+        return "no outputs"
+    return "1 output (numbered 0)" if count == 1 else f"{count} outputs (numbered 0 to {count - 1})"
+
+
+def _require_named_output(named: dict, payload: dict) -> None:
+    """Refuse an output the transaction does not have. That is bad input: exit 1, and no verdict.
+
+    ``<txid>:7`` of a two-output transaction points at nothing. It used to be checked anyway: the
+    transaction's verdict was printed under a sentence saying there was no output 7, with exit 0
+    whenever the mark held, and ``--quiet`` printed a bare ``HOLDS``. A gate that reads the exit code
+    passed a pointer to nothing. Now it is refused like any other argument that does not say what it
+    claims to, the same way in every output mode (nothing on stdout: no report, no JSON document, no
+    token), and before the block or a WAVE name is looked up.
+
+    Only a MISSING output is refused. An output that exists is never refused here, whatever it holds;
+    :func:`_named_output` says what it is above the verdict.
+    """
+    n, count = named["vout"], payload.get("output_count")
+    if isinstance(count, int) and 0 <= n < count:
+        return
+    what = "an output reference" if named["form"] == "outpoint" else "a contract id"
+    only = "only " if isinstance(count, int) and count > 0 else ""
+    raise UserError(
+        f"that transaction has {only}{_outputs_phrase(count)}, so there is no output {n}",
+        cause=f"you gave {what}, {named['input']}, which names output {n} of transaction {named['txid']}. "
+        "It points at nothing in that transaction, so no verdict was given",
+        fix="check the output number you were given. To check the transaction itself, give its txid "
+        f"alone as the argument: {named['txid']}",
+    )
+
+
+def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout: Any, refusal_vout: Any) -> dict:
+    """What the output the user NAMED turned out to be — said before the verdict, every sentence true.
+
+    The terminal's counterpart of the /verify/ page's ``namedByNote`` and ``namedOutputNote``. The
+    named output holds the record the verdict is about; holds a record the verdict is NOT about (the
+    verdict is about ONE record, and it need not be this one); is not a record, and then where the
+    record is; or could not be read, so whether it is a record is unknown. An output the transaction
+    does not have never reaches this: :func:`_require_named_output` refused it. One case
+    is added that the page does not need: because this prints ONE verdict where the page draws a
+    panel per record, the verdict's signature line can be about another record, and the sentence
+    says so. Without this, ``<txid>:1`` — a change output — would sit above a verdict about output
+    0 with nothing saying so.
+
+    NEVER A REFUSAL, AND NEVER A DIFFERENT VERDICT, for an output that exists. The verdict is the one
+    the bare txid gets: naming an output does not change what the transaction carries. What it changes is what the reader will
+    believe they were shown, and that is what these sentences are for. ``says`` is printed in every
+    mode — above the report, in ``--json``, and to stderr under ``--quiet``.
+
+    "THE VERDICT IS ABOUT vout W" HAS ONE EXCEPTION, and it is stated wherever that is said: when a
+    record elsewhere does not decode or does not verify, the verdict's signature line is about THAT
+    record (``refusal_vout``), as its own record line says. Leaving it out would make the sentence
+    above the verdict contradict the line inside it.
+    """
+    n = named["vout"]
+    record_vouts = [row.get("vout") for row in rows]
+    if named["form"] == "outpoint":
+        says = [f"You gave an output reference, read as output {n} of transaction {named['txid']}."]
+    else:
+        says = [f"You gave a contract id, which names output {n} of transaction {named['txid']}."]
+    says.append("A mark is checked by the transaction that carries it, so that whole transaction was checked.")
+    but_sig = (
+        f", except its signature line, which is about the record at vout {refusal_vout}"
+        if refusal_vout is not None and refusal_vout != verdict_vout
+        else ""
+    )
+    # WHAT COULD NOT BE READ qualifies every sentence about where the records are: with an output
+    # unread, "the transaction's record" and "carries N records" are counts nobody finished.
+    unread = _unread_vouts(payload)
+    could = " that could be read" if unread else ""
+    if len(record_vouts) == 1 and not unread:
+        where = f"The transaction's HashMark record is in output {record_vouts[0]}, and the verdict below is about it."
+    elif len(record_vouts) == 1:
+        where = (
+            f"The only HashMark record that could be read is in output {record_vouts[0]}, and the verdict below "
+            "is about it."
+        )
+    else:
+        where = (
+            f"The transaction carries {len(record_vouts)} HashMark records{could} in other outputs; the verdict "
+            f"below is about the one at vout {verdict_vout}{but_sig}, and each is listed separately."
+        )
+    where += _unread_clause(sum(1 for v in unread if v != n))
+    holds = n in record_vouts
+    # A row the classifier crashed on is not KNOWN to be a record, and not known not to be one either,
+    # so it gets neither sentence.
+    unreadable = not holds and n in unread
+    if holds and n == verdict_vout:
+        says.append(f"Output {n}, the one you named, holds the HashMark record the verdict below is about{but_sig}.")
+    elif holds:
+        says.append(
+            f"Output {n}, the one you named, holds a HashMark record, but the verdict below is about the record at "
+            f'vout {verdict_vout}{but_sig}. Output {n}\'s own record is listed below as "HashMark record at vout {n}".'
+        )
+    elif unreadable:
+        says.append(
+            f"Output {n}, the one you named, could not be classified here, so this cannot say whether it is a "
+            f"HashMark record; the verdict below is not about it. {where}"
+        )
+    else:
+        says.append(
+            f"Output {n}, the one you named, is NOT a HashMark record, so the verdict below is not about it. {where}"
+        )
+    return {
+        **named,
+        # None when it could not be classified: not known either way.
+        "output_holds_record": None if unreadable else holds,
+        "verdict_is_about_it": holds and n == verdict_vout,
+        # WHICH record the verdict's signature line is about. Usually the verdict's own record; when a
+        # record elsewhere does not decode or verify, that one — the caveat `says` spells out, which a
+        # consumer reading only `verdict_is_about_it` would otherwise lose.
+        "signature_line_vout": refusal_vout if refusal_vout is not None else verdict_vout,
+        "says": says,
+    }
+
+
 @click.command(name="verify")
 @click.argument("txid")
 @click.option(
@@ -1210,7 +1441,12 @@ def verify_cmd(
     """Check a published HashMark record: who signed, what digest, which block — and, given a
     file, whether it matches.
 
-    TXID is the transaction carrying the mark.
+    TXID is the transaction carrying the mark — or one of its outputs, written <txid>:<n> or as a
+    72-character contract id. Those name an output, not a record: the whole transaction is checked
+    and gets the same verdict as its txid, and the report first says what the named output is —
+    the record the verdict is about, another record, not a record, or one this build could not
+    read. An output the transaction does not have is bad input: exit 1, no verdict, and the error
+    says how many outputs the transaction has.
 
     \b
     A DIGEST AND A TXID ARE THE SAME SHAPE — both are 64 lowercase hex characters, and nothing
@@ -1271,33 +1507,58 @@ def verify_cmd(
     # The same shape of refusal as --digest "" above, and for the same reason: an empty value is
     # a question typed wrong, not a question not asked. See `_require_wave_name`.
     wave_name = _require_wave_name(wave_name)
-    wanted = txid.strip().lower()
-    try:
-        Txid(wanted)
-    except ValidationError as exc:
-        raise UserError(
-            "that is not a transaction id",
-            cause=str(exc),
-            fix="TXID is the transaction carrying the mark — 64 hex characters. If what you have "
-            "is the DIGEST (the same shape), it locates nothing on its own: pass it with --digest "
-            "and give the mark's txid as the argument.",
-        ) from exc
+    wanted, named = _verify_target(txid)
     # The same refusal `glyph inspect --wave-name` raises, from the same function — one rule. The
     # WORDING is this command's: required here for EVERY run, not only the name ones, because
     # `verify` always places the mark at a height and a height with no floor under it is a number
     # nobody can act on. Naming --wave-name here refused `pyrxd verify <txid>` over a flag the user
     # had not passed. After the txid check, so the command it tells you to re-run is a valid one.
-    _require_min_confirmations(min_confirmations, needed_by="pyrxd verify", command=f"pyrxd verify {wanted}")
+    rerun = named["input"] if named is not None else wanted
+    _require_min_confirmations(min_confirmations, needed_by="pyrxd verify", command=f"pyrxd verify {rerun}")
 
     payload = _run_fetch_inspect(ctx, form="txid", value=wanted)
+    if named is not None:
+        # FIRST, before anything is said about what the transaction carries: an output it does not
+        # have is bad input, whether or not there is a mark in it.
+        _require_named_output(named, payload)
     rows = [row for row in (payload.get("outputs") or []) if row.get("hashmark")]
     # FROM THE ROWS, so a record and its vout cannot come apart: every check below is attached
     # to a record, and the summary names the record by the vout of the row it came from.
     records = [row["hashmark"] for row in rows]
+    # NO RECORD, SAID ABOUT WHAT WAS READ. An output the classifier could not read may be a record,
+    # so with one unread "none of them decodes" / "no HashMark record" would be claims nobody finished.
+    unread = _unread_vouts(payload)
+    count = payload.get("output_count", "?")
+    none_found = (
+        f"{wanted} has {count} output(s); none of those that could be read decodes as a HashMark, and "
+        f"{len(unread)} could not be classified here, so whether {'it is' if len(unread) == 1 else 'any of them is'} "
+        "one is unknown"
+        if unread
+        else f"{wanted} has {count} output(s) and none of them decodes as a HashMark"
+    )
+    if not records and named is not None:
+        # NOT the digest hint below: an outpoint and a contract id are not the shape of a digest.
+        n = named["vout"]
+        if n in unread:
+            which = f"output {n}, the one you named, is one that could not be classified"
+        elif unread:
+            which = f"output {n}, the one you named, could be read, and is not one"
+        else:
+            which = f"output {n}, the one you named, among them"
+        raise UserError(
+            "no HashMark record could be read in the transaction you named an output of"
+            if unread
+            else "no HashMark record in the transaction you named an output of",
+            cause=f"{none_found} — {which}",
+            fix=f"what you gave points at transaction {wanted}, and a mark is checked by the transaction "
+            "that carries it: check that you were given the mark's own transaction or output",
+        )
     if not records:
         raise UserError(
-            "no HashMark record in that transaction",
-            cause=f"{wanted} has {payload.get('output_count', '?')} output(s) and none of them decodes as a HashMark",
+            "no HashMark record could be read in that transaction"
+            if unread
+            else "no HashMark record in that transaction",
+            cause=none_found,
             fix="check the txid. A digest is the same shape as a txid and is not one: if that is "
             "what you have, give the mark's txid and pass the digest with --digest.",
         )
@@ -1358,14 +1619,27 @@ def verify_cmd(
         "verdict_holds": not failed,
         "verdict_failed_checks": failed,
     }
+    # Only when an output was named, so the bare-txid report is byte-for-byte what it was.
+    said: list[str] = []
+    if named is not None:
+        out["named_by"] = _named_output(
+            named, payload, rows, verdict_vout=w_vout, refusal_vout=refusal[0] if refusal else None
+        )
+        said = out["named_by"]["says"]
 
     if ctx.output_mode == "json":
         click.echo(emit(out, mode="json"))
     elif ctx.output_mode == "quiet":
+        if said:
+            # To stderr: stdout stays ONE token. But not dropped — `<txid>:1`, a change output,
+            # quietly printing HOLDS about output 0 is the silence this disclosure exists to end.
+            click.echo("\n".join(said), err=True)
         # ONE token, and it is the answer — not the txid the caller already typed.
         click.echo("HOLDS" if not failed else "DOES-NOT-HOLD")
     else:
-        click.echo("\n".join(_verify_lines(out, rows)))
+        # BEFORE the verdict: what the named output is decides how the verdict below should be read.
+        report = _verify_lines(out, rows, unread=len(unread))
+        click.echo("\n".join([*said, "", *report] if said else report))
 
     if failed:
         # AFTER the report, never instead of it. The reasons are on screen and in the JSON; the

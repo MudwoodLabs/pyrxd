@@ -279,14 +279,14 @@ pyrxd wallet new
 # Show the next unused receive address.
 pyrxd address
 
-# Check balance via ElectrumX.
-pyrxd balance --refresh
+# Check balance via ElectrumX (scans the wallet's addresses first).
+pyrxd balance
 
 # Look up a deterministic index without scanning.
 pyrxd address --index 5
 
 # Quiet mode for scripting.
-pyrxd --quiet balance --refresh
+pyrxd --quiet balance
 ```
 
 `pyrxd <command> --help` prints the full reference for any subcommand.
