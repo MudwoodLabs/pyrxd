@@ -429,3 +429,99 @@ def test_a_declared_test_actually_REACHES_a_mutation_group() -> None:
         "declaration does nothing. Re-run scripts/derive_mutation_test_lists.py and apply the "
         "result to scripts/mutation_test.sh:\n  " + "\n  ".join(missing)
     )
+
+
+def _group_test_lists() -> dict[str, list[str]]:
+    """group -> its test list, as `group_tests()` echoes it, with `$GAPS` expanded."""
+    body = _SCRIPT.read_text(encoding="utf-8")
+    gaps_m = re.search(r'^GAPS="([^"]*)"', body, re.M)
+    assert gaps_m, "GAPS is no longer a simple double-quoted assignment; this expansion is stale"
+    out: dict[str, list[str]] = {}
+    for line in body.split("\n"):
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "(tests/[^"]*)" ;;', line)
+        if m:
+            items: list[str] = []
+            for token in m.group(2).split():
+                items.extend(gaps_m.group(1).split() if token == "$GAPS" else [token])
+            out[m.group(1)] = items
+    return out
+
+
+def _conftest_dir_of(path: str) -> str | None:
+    """The nearest directory below `tests/` that holds a conftest.py and contains `path`
+    (a file, or a directory argument such as `tests/security/`), else None.
+
+    DERIVED from the tree: a conftest.py added to `tests/security/` tomorrow puts every list
+    that splits `tests/security/*` in scope at once, which is exactly when they would break."""
+    p = Path(path.rstrip("/"))
+    for d in [p, *p.parents]:
+        if d.as_posix() in ("tests", "."):
+            return None
+        if (_ROOT / d / "conftest.py").exists():
+            return d.as_posix()
+    return None
+
+
+def _conftest_splits(tests: list[str]) -> list[str]:
+    """Directories whose files do not form ONE contiguous run in `tests`."""
+    split: list[str] = []
+    seen_closed: set[str] = set()
+    previous: str | None = None
+    for t in tests:
+        d = _conftest_dir_of(t)
+        if d != previous and previous is not None:
+            seen_closed.add(previous)
+        if d is not None and d in seen_closed and d not in split:
+            split.append(d)
+        previous = d
+    return split
+
+
+def test_files_under_a_conftest_directory_stay_CONTIGUOUS_in_every_group() -> None:
+    """The rule was already written down, twice, and the lists broke it anyway.
+
+    `scripts/mutation_test.sh` and docs/how-to/mutation-testing.md both say `tests/cli/*` must
+    stay contiguous: pytest 9.1.1, given `tests/cli/a.py tests/test_b.py tests/cli/c.py`, stops
+    applying `tests/cli/conftest.py` to `c.py`, so its `runner` fixture is "not found". The
+    `glyphverify` list split `test_glyph_inspect_cmds.py` from `test_glyph_cmds.py` (76 errors)
+    and `walletcore` split three tests/cli files (8 errors in `test_swap_book_cmds.py`). Both
+    baselines went red, the harness refused both groups, and weekly run 35710549260 reported
+    them green for a second, unrelated reason (the workflow step lost the exit code to `tee`).
+    Neither group had produced a score. Prose rules do not run; this does.
+
+    Only directories that HAVE a conftest.py are held to it, since that is the mechanism;
+    `tests/security/` and `tests/network/` are split in several lists today and are harmless
+    until one of them grows a conftest, at which point this fails for them too.
+    """
+    lists = _group_test_lists()
+    assert len(lists) > 20, f"only {len(lists)} test lists parsed — the case-line regex stopped matching"
+
+    # Non-vacuity: at least one group must put 2+ files from one conftest directory in its list,
+    # or this passes because there was nothing that could be split.
+    from collections import Counter
+
+    multi = [
+        g for g, tests in lists.items() if any(n >= 2 for d, n in Counter(map(_conftest_dir_of, tests)).items() if d)
+    ]
+    assert multi, "no group names two files from one conftest directory — this guard is checking nothing"
+
+    bad = {g: split for g, tests in lists.items() if (split := _conftest_splits(tests))}
+    assert not bad, (
+        "these groups split a conftest directory across their test list, so pytest drops that "
+        "conftest for the later files and the clean-suite baseline goes red (the group then never "
+        f"runs): {bad}. Move each directory's files into one contiguous run, last."
+    )
+
+
+def test_the_contiguity_check_fires_on_the_list_that_broke_glyphverify() -> None:
+    """Plant: the pre-fix `glyphverify` ordering, tests/cli split by a top-level file."""
+    old = [
+        "tests/test_inspect_script_shapes.py",
+        "tests/cli/test_glyph_inspect_cmds.py",
+        "tests/test_inspect_core_classification.py",
+        "tests/cli/test_glyph_cmds.py",
+    ]
+    assert _conftest_splits(old) == ["tests/cli"]
+    # Honest path: the same files, contiguous, are fine wherever the run sits.
+    assert _conftest_splits([old[0], old[2], old[1], old[3]]) == []
+    assert _conftest_splits([old[1], old[3], old[0], old[2]]) == []

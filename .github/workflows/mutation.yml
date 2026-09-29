@@ -39,6 +39,11 @@ name: Mutation (scheduled)
 # keyword-only markers, and error-message f-strings in `# pragma: no cover` branches. Their floors
 # are measured, not aspirational, and exist so the number can only go up.
 #
+# Until 2026-09-28 they did not: the step piped into `tee` without pipefail, so a score under
+# the floor printed FAIL and the job stayed green (see the comment on the `mutate` step).
+# Both groups sat under their floors on 2026-09-22 (ethtimelock 81 < 86, ethleg 64 < 65), so
+# the fix turns them red. Whether to lower a floor is a maintainer decision, not this file's.
+#
 # Both groups were also missing from the matrix below when they were added to the script, so
 # nothing ran them. That is the same defect this branch kept finding elsewhere — a capability with
 # no caller — committed here while documenting it. If you add a group to
@@ -155,7 +160,15 @@ jobs:
           # same textual-substitution hazard fixed above in the `groups` step.
           MATRIX_GROUP: ${{ matrix.group }}
           MATRIX_MIN_KILL: ${{ matrix.min_kill }}
+        # `set -o pipefail` is what makes this step's colour mean anything. With no `shell:`
+        # the runner uses `bash -e {0}`, which has no pipefail, so the pipeline's status was
+        # `tee`'s: every fail-closed exit in scripts/mutation_test.sh (red baseline, zero
+        # mutants, incomplete sweep, kill rate under the floor) was reported as success.
+        # Run 35710549260 (2026-09-22) shows it: ethtimelock logged "81% < threshold 86%",
+        # glyphverify and walletcore never got past a red baseline, and all three were green.
+        # tests/test_workflow_pipes_propagate_failure.py fails on any piped step without this.
         run: |
+          set -o pipefail
           mkdir -p "$MUTATION_SESSION_DIR" "$MUTATION_REPORT_DIR"
           MUTATION_MIN_KILL_PCT="$MATRIX_MIN_KILL" \
             poetry run bash scripts/mutation_test.sh "$MATRIX_GROUP" | tee "mutation-${MATRIX_GROUP}.log"

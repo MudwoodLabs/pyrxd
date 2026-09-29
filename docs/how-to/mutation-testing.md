@@ -32,6 +32,8 @@ poetry run task mutate wire              # wire encodings and proofs — compact
 poetry run task mutate hdseed            # BIP39 mnemonics, BIP44 paths, and account discovery
 poetry run task mutate feecore           # the fee models beneath fee_sizing
 poetry run task mutate walletcore        # consensus constants and the partial/resolve swap halves
+poetry run task mutate markcli           # cli/hashmark_cmds.py — what `pyrxd mark`/`verify` print
+poetry run task mutate inspectcli        # cli/glyph_inspect.py — what `pyrxd glyph inspect` prints
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
@@ -40,7 +42,7 @@ poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg 
 poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the twenty-three value-moving groups
+poetry run task mutate value              # the twenty-five value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
@@ -137,7 +139,10 @@ Two constraints shape the value-group lists specifically:
   makes pytest 9.1.1 stop applying `tests/cli/conftest.py` to the later ones — the `runner` fixture
   disappears and 32 tests ERROR. Because cosmic-ray scores a non-zero exit as *killed*, that reads as
   a perfect score. This is a property of the suite, not of the harness: it reproduces with a plain
-  `pytest a b c` invocation.
+  `pytest a b c` invocation. The lists broke this rule anyway (`glyphverify` and `walletcore` fatally,
+  `wire` harmlessly), so `tests/test_mutation_groups_are_wired.py` now fails on any group that splits a
+  directory holding a `conftest.py`, and `scripts/derive_mutation_test_lists.py` emits those runs
+  contiguous and last.
 - **Group by the tests that decide, not by directory.** `wallet.py` and `hd/wallet.py` started as one
   group and their decisive suites turned out to be nearly disjoint, so each file's mutants were paying
   for the other file's tests — a ~15s clean suite where each half needs ~8s. They are two groups now.
