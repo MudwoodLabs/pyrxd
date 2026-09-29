@@ -46,6 +46,7 @@ __all__ = [
     "PreRevealExpired",
     "RpcMethodNotFound",
     "RxdSdkError",
+    "ServerInconsistencyError",
     "SpvVerificationError",
     "TlsPinMismatchError",
     "UnrecognizedDaaBytecodeError",
@@ -512,6 +513,20 @@ class RpcMethodNotFound(NetworkError):
     without dropping its client, and without that answer demoting it. Everywhere else — a
     non-idempotent extension call, a core method, or the genesis read behind the chain
     check — it is handled as a fault, like any other ``NetworkError``.
+
+    A subclass of :class:`NetworkError`, so every existing ``except NetworkError`` handler
+    still catches it.
+    """
+
+
+class ServerInconsistencyError(NetworkError):
+    """The server answered, and a transaction it served contradicts the rest of its answer.
+
+    Raised by :class:`~pyrxd.glyph.scanner.GlyphScanner` under ``strict`` when a UTXO the
+    server lists is not at the script hash it was listed under, or is a token owned by a key
+    other than the address being scanned (#782). The transaction is bound to its txid, so it
+    is the listing that is wrong. The operator response differs from a dropped connection:
+    retrying the same server will not help, and another endpoint might.
 
     A subclass of :class:`NetworkError`, so every existing ``except NetworkError`` handler
     still catches it.

@@ -121,6 +121,7 @@ from ..security.errors import (
     MaxAttemptsError,
     NetworkError,
     PolicyRejection,
+    ServerInconsistencyError,
     UnrecognizedDaaBytecodeError,
     ValidationError,
 )
@@ -3394,16 +3395,27 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
     the other addresses hold, marked INCOMPLETE.
     """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+    # The per-address reader logs a failed read and keeps only the address, which would report a
+    # server that contradicts its own transactions as one that could not be reached.
+    inconsistent: list[str] = []
 
     async def _do_scan() -> AddressReads:
         client = ctx.make_client()
         async with client:
             scanner = GlyphScanner(client)
+
             # strict: an output whose transaction could not be fetched fails the address's read,
-            # rather than leaving the token out of a list that is then shown as complete.
-            return await scan_then_read(
-                wallet, client, lambda address: scanner.scan_address(address, strict=True), what="glyph scan"
-            )
+            # rather than leaving the token out of a list that is then shown as complete; and a
+            # listing the transaction contradicts (another key's token, an output not at the
+            # address) fails it rather than being shown as the wallet's (#782).
+            async def _read(address: str) -> list:
+                try:
+                    return await scanner.scan_address(address, strict=True)
+                except ServerInconsistencyError as exc:
+                    inconsistent.append(str(exc))
+                    raise
+
+            return await scan_then_read(wallet, client, _read, what="glyph scan")
 
     try:
         reads = asyncio.run(_do_scan())
@@ -3413,6 +3425,15 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
             cause=str(exc),
             fix=f"check that {ctx.electrumx_url} is reachable",
         ) from exc
+    if inconsistent:
+        # Nothing is listed, not even what the other addresses returned: they came from the same
+        # server, and it has just listed something as this wallet's that is not.
+        raise NetworkBoundaryError(
+            "the ElectrumX server's answer contradicts its own transactions",
+            cause=inconsistent[0] + (f" ({len(inconsistent) - 1} more like it)" if len(inconsistent) > 1 else ""),
+            fix=f"use a different endpoint (--electrumx URL); {ctx.electrumx_url} listed something as this wallet's "
+            "that its own transaction shows is not",
+        )
 
     rows: list[dict] = []
     for address, items in reads.answered:
