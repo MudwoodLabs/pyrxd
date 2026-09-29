@@ -11,7 +11,7 @@ Commands:
   glyph transfer-nft    NFT singleton transfer.
   glyph timelock-mint   Seal content behind a timelock and mint the NFT.
   glyph timelock-reveal Publish the key for a timelocked token (irreversible).
-  glyph list            Scan wallet addresses for Glyph holdings.
+  glyph list            Glyph holdings at the addresses the wallet file records as used.
 
 Design choices that follow the v0.3 plan:
 
@@ -3382,7 +3382,11 @@ async def _transfer_nft_inner(
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
-    """Scan wallet addresses for Glyph holdings."""
+    """List Glyph holdings at the addresses this wallet file records as used.
+
+    It does not run the gap-limit scan the spend commands run, so a wallet whose file records
+    no used address (one made by `pyrxd wallet new`, for example) lists nothing here.
+    """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
     async def _do_scan() -> list[dict]:

@@ -816,6 +816,11 @@ class HdWallet:
         previously they were silently treated as "address unused",
         which made a funded wallet look empty after a flaky lookup.
 
+        An address already recorded as used is never marked unused by a
+        scan, even when this server reports no history for it: a server
+        that lags or indexes partially does not get to hide funds the
+        wallet already knew about.
+
         Returns the count of newly discovered used addresses.
         """
         newly_used = 0
@@ -842,12 +847,17 @@ class HdWallet:
             # potentially cause duplicate-spend scenarios when next-
             # receive picks it again.
             hist = await client.get_history(script_hash_for_address(addr))
-            is_used = bool(hist)
             old = self.addresses.get(pkey)
+            # Never demote. An address this wallet already knows is used stays used even when
+            # this server reports no history for it: a lagging or partial index must not hide
+            # funds the wallet knew about, on this scan or any later one. (Demoting here made a
+            # guard in collect_spendable protect only the first of two calls in a row.)
+            was_used = old is not None and old.used
+            is_used = bool(hist) or was_used
             self.addresses[pkey] = AddressRecord(address=addr, change=change, index=index, used=is_used)
             if is_used:
                 consecutive_unused = 0
-                if old is None or not old.used:
+                if not was_used:
                     newly_used += 1
             else:
                 consecutive_unused += 1
@@ -926,10 +936,12 @@ class HdWallet:
         answering and ``refresh()``'s own fail-closed gate sees a clean scan.
 
         ``strict`` raises instead of returning a short list. It is for callers
-        whose result is a completeness CLAIM (see :meth:`send_max`); an ordinary
-        spend only needs *enough*, and refusing it over one unreadable address
-        would be a fail-closed refusal to move funds — worse than the partial view
-        whenever a deadline is running.
+        whose result is a completeness CLAIM (see :meth:`send_max`). A spend's
+        shortfall message is one too — "fund this wallet" is a claim about every
+        address — so :meth:`collect_spendable` is strict by default; :meth:`send`,
+        which only needs *enough*, opts out, because refusing it over one
+        unreadable address would be a fail-closed refusal to move funds — worse
+        than the partial view whenever a deadline is running.
         """
         results = await asyncio.gather(*[read(r.address) for r in used], return_exceptions=True)
         failures = [r for r in results if isinstance(r, BaseException)]
@@ -1082,10 +1094,15 @@ class HdWallet:
         return self._derive_address(change, index)
 
     def privkey_for_address(self, address: str) -> PrivateKey:
-        """Derive the signing key for a **known** address.
+        """Derive the signing key for an address this wallet derives.
 
-        The derivation path is looked up in ``self.addresses`` rather than searched for,
-        so this is one ``ckd`` chain, not a scan.
+        The path is looked up in ``self.addresses`` first. An address not recorded there
+        is searched for locally, with no network: both chains, from index 0 to
+        :data:`_GAP_LIMIT` past the highest index the wallet knows on that chain. A
+        wallet file records only what something saved, and ``pyrxd wallet new`` saves
+        before it derives a single address, so without the search a new wallet could not
+        find the key for its own first receive address. On regtest that stranded a new
+        wallet's Glyph commit: ``glyph resume-mint`` refused to reveal it.
 
         Added for :class:`pyrxd.glyph.mint.GlyphMinter`, which must re-derive the key
         that spends a Glyph commit output after a crash. It deliberately does not
@@ -1094,14 +1111,36 @@ class HdWallet:
         (:meth:`collect_spendable` and this one), which is what makes it practical to
         drive the minter with a non-HD wallet in a test or a dev script.
 
-        :raises ValidationError: if the address is not one this wallet derived — the
-            caller has the wrong wallet, and signing with a key that hashes to a
-            different PKH would produce a transaction the network rejects.
+        :raises ValidationError: if the address is not one this wallet derives within
+            that window — the caller has the wrong wallet (or an address past the gap
+            limit), and signing with a key that hashes to a different PKH would produce
+            a transaction the network rejects.
+        """
+        change, index = self._path_for_address(address)
+        return self._privkey_for(change, index)
+
+    def _path_for_address(self, address: str) -> tuple[int, int]:
+        """``(change, index)`` of *address*: a recorded one, else one derived in the gap window.
+
+        The window is the one a gap-limit scan covers: on each chain, :data:`_GAP_LIMIT`
+        indices past the highest index this wallet knows (recorded, or below its tip). It
+        is searched without recording anything, so a lookup never changes the wallet.
         """
         for rec in self.addresses.values():
             if rec.address == address:
-                return self._privkey_for(rec.change, rec.index)
-        raise ValidationError(f"address {address} is not known to this wallet")
+                return rec.change, rec.index
+        account_xprv = self._xprv
+        for change, tip in ((0, self.external_tip), (1, self.internal_tip)):
+            known = {rec.index for rec in self.addresses.values() if rec.change == change}
+            stop = max(max(known, default=-1) + 1, tip) + _GAP_LIMIT
+            chain_xprv = account_xprv.ckd(change)
+            for index in range(stop):
+                if index not in known and chain_xprv.ckd(index).address() == address:
+                    return change, index
+        raise ValidationError(
+            f"address {address} is not known to this wallet: it is not recorded, and neither chain derives it "
+            f"within {_GAP_LIMIT} addresses past the highest index this wallet knows"
+        )
 
     def zeroize(self) -> None:
         """Scrub the seed and mark the wallet dead; it cannot derive or sign after.
@@ -1170,7 +1209,7 @@ class HdWallet:
         return tx_input
 
     async def collect_spendable(
-        self, client: ElectrumXClient, *, strict: bool = False
+        self, client: ElectrumXClient, *, strict: bool = True
     ) -> list[tuple[UtxoRecord, str, PrivateKey]]:
         """Return ``(utxo, address, privkey)`` triples for every UTXO across known addresses.
 
@@ -1187,17 +1226,21 @@ class HdWallet:
         scan that cannot read an address raises :class:`NetworkError` rather than
         reading it as unused (see :meth:`refresh`).
 
-        A per-address fetch that fails contributes nothing rather than crashing
-        the whole collection — the caller decides whether the resulting balance is
-        enough — but it is now LOGGED rather than dropped in silence, and
-        ``strict=True`` refuses the partial result outright. Use ``strict`` when
-        the answer is a claim about *all* the funds; :meth:`send_max` does.
+        ``strict`` (the default) raises :class:`NetworkError` when any address's
+        UTXO read fails, instead of returning what the other addresses answered.
+        Almost every caller turns a short result into a claim about the whole
+        wallet — "fund this wallet", "no spendable UTXOs", "not held by this
+        wallet" — and after a failed read that claim is false: ``pyrxd mark``
+        printed "fund this wallet" when ``get_utxos`` failed for the one funded
+        address. ``strict=False`` returns the partial view and LOGS the failed
+        reads; it is for a caller that only needs *enough* and says nothing about
+        the rest, which is :meth:`send`. The scan above fails closed either way.
         """
-        # An address already known to be used is read even if this scan's server reports no
-        # history for it: a lagging or partial index must not hide funds the wallet knew about.
-        known_used = {key for key, rec in self.addresses.items() if rec.used}
+        # An address already known to be used stays used through the scan even if this server
+        # reports no history for it (_scan_chain never demotes), so a lagging or partial index
+        # cannot hide funds the wallet knew about, on this call or the next.
         await self.refresh(client)
-        used = [rec for key, rec in self.addresses.items() if rec.used or key in known_used]
+        used = [rec for rec in self.addresses.values() if rec.used]
         if not used:
             return []
 
@@ -1432,8 +1475,14 @@ class HdWallet:
 
         Raises :class:`ValidationError` on bad inputs or insufficient
         funds, :class:`NetworkError` on RPC failure.
+
+        Collects with ``strict=False``: an amount send needs *enough*, not *all*,
+        so an address whose UTXO read failed is logged and skipped rather than
+        refusing a send the other addresses can fund. The gap-limit scan before it
+        still fails closed. When what remains is short, the error is the ordinary
+        insufficient-funds one, and the logged warning is what says a read failed.
         """
-        triples = await self.collect_spendable(client)
+        triples = await self.collect_spendable(client, strict=False)
         tx = self.build_send_tx(
             triples,
             to_address,

@@ -29,6 +29,10 @@ Each spend is paired with the honest refusal: an UNFUNDED wallet made the same w
 told to fund itself. Without that pair, "the funded wallet spends" would be equally true of a
 command that never looked at the wallet at all.
 
+``glyph resume-mint`` is here too, for the key lookup rather than the scan: a new wallet's
+commit, its reveal interrupted, is revealed by ``resume-mint`` from the same wallet file, which
+records no address; another wallet is refused.
+
 Opt-in: ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``. Throwaway container, regtest only.
 
 Run: ``RADIANT_REGTEST=1 pytest -o addopts= -m integration tests/test_fresh_wallet_spends_regtest_e2e.py -rap``
@@ -37,16 +41,15 @@ Run: ``RADIANT_REGTEST=1 pytest -o addopts= -m integration tests/test_fresh_wall
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
-    _pay_to_spk,
-    _RegtestNode,
-    node,
-)
+from test_htlc_regtest_e2e import _IMAGE, _pay_to_spk, _RegtestNode
 
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
@@ -54,6 +57,7 @@ from pyrxd.constants import GENESIS_BLOCK_HASHES
 from pyrxd.hd.wallet import HdWallet
 from pyrxd.network.electrumx import UtxoRecord, script_hash_for_script
 from pyrxd.script.type import P2PKH
+from pyrxd.security.errors import NetworkError
 
 pytestmark = pytest.mark.integration
 
@@ -64,6 +68,27 @@ _FUND = 100 * 100_000_000
 _FALSE_ADVICE = "fund this wallet"
 
 _REGTEST_GENESIS = GENESIS_BLOCK_HASHES["regtest"]
+
+#: This module's own container, named per process: ``_RegtestNode.start`` force-removes its
+#: container by name, so a shared name lets two runs (two sessions, two suites) destroy each
+#: other's node mid-test. ``stop`` removes it when the module is done.
+_CONTAINER = f"pyrxd-regtest-fresh-wallet-{os.getpid()}"
+
+
+@pytest.fixture(scope="module")
+def node():
+    if not os.environ.get("RADIANT_REGTEST"):
+        pytest.skip("RADIANT_REGTEST not set (opt-in for the live regtest e2e)")
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    if subprocess.run(["docker", "image", "inspect", _IMAGE], capture_output=True).returncode != 0:
+        pytest.skip(f"{_IMAGE} image not available")
+    n = _RegtestNode(container=_CONTAINER)
+    n.start()
+    try:
+        yield n
+    finally:
+        n.stop()
 
 
 class _ChainIndex:
@@ -151,29 +176,29 @@ class _ChainIndex:
         return txid
 
 
-def _base(tmp_path: Path) -> list[str]:
+def _base(tmp_path: Path, wallet: str = "wallet.dat") -> list[str]:
     return [
         "--config",
         str(tmp_path / "absent.toml"),
         "--network",
         "regtest",
         "--wallet",
-        str(tmp_path / "wallet.dat"),
+        str(tmp_path / wallet),
         "--json",
         "--yes",
     ]
 
 
-def _new_wallet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
+def _new_wallet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wallet: str = "wallet.dat") -> tuple[str, str]:
     """``pyrxd wallet new``, for real. Returns ``(mnemonic, first receive address)``."""
     for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX", "PYRXD_FEE_RATE", "PYRXD_WALLET_PATH"):
         monkeypatch.delenv(var, raising=False)
-    made = CliRunner().invoke(cli, [*_base(tmp_path), "wallet", "new"])
+    made = CliRunner().invoke(cli, [*_base(tmp_path, wallet), "wallet", "new"])
     assert made.exit_code == 0, (made.output, made.exception)
     doc = json.loads(made.stdout)
     # The precondition #759 is about: the file on disk records no address as used. If
     # `wallet new` ever started saving a scanned wallet, this test would stop testing the case.
-    saved = HdWallet.load(tmp_path / "wallet.dat", doc["mnemonic"])
+    saved = HdWallet.load(tmp_path / wallet, doc["mnemonic"])
     assert not [r for r in saved.addresses.values() if r.used]
     return doc["mnemonic"], doc["address"]
 
@@ -191,9 +216,9 @@ def _fund(rt: _RegtestNode, index: _ChainIndex, address: str) -> str:
     return txid
 
 
-def _run(tmp_path: Path, mnemonic: str, *args: str) -> Any:
+def _run(tmp_path: Path, mnemonic: str, *args: str, wallet: str = "wallet.dat") -> Any:
     """Run a command with the mnemonic typed at the real ``_load_wallet`` prompt."""
-    return CliRunner().invoke(cli, [*_base(tmp_path), *args], input=mnemonic + "\n")
+    return CliRunner().invoke(cli, [*_base(tmp_path, wallet), *args], input=mnemonic + "\n")
 
 
 def _doc(result: Any) -> dict:
@@ -204,7 +229,7 @@ def _doc(result: Any) -> dict:
 # --------------------------------------------------------------------------- pyrxd mark
 
 
-def test_a_new_wallet_funded_at_its_first_address_can_mark(node, tmp_path, monkeypatch) -> None:  # noqa: F811
+def test_a_new_wallet_funded_at_its_first_address_can_mark(node, tmp_path, monkeypatch) -> None:
     mnemonic, address = _new_wallet(tmp_path, monkeypatch)
     index = _wire(node, monkeypatch)
     funding_txid = _fund(node, index, address)
@@ -225,7 +250,7 @@ def test_a_new_wallet_funded_at_its_first_address_can_mark(node, tmp_path, monke
     assert bytes(script_hash_for_script(bytes(P2PKH().lock(address).serialize()))) in index.history_asked
 
 
-def test_an_unfunded_new_wallet_is_still_told_to_fund_itself(node, tmp_path, monkeypatch) -> None:  # noqa: F811
+def test_an_unfunded_new_wallet_is_still_told_to_fund_itself(node, tmp_path, monkeypatch) -> None:
     """The honest refusal: with the scan in place, an EMPTY wallet still gets the advice."""
     mnemonic, _address = _new_wallet(tmp_path, monkeypatch)
     index = _wire(node, monkeypatch)
@@ -249,7 +274,7 @@ def _nft_metadata(tmp_path: Path) -> Path:
     return path
 
 
-def test_a_new_wallet_funded_at_its_first_address_can_mint_an_nft(node, tmp_path, monkeypatch) -> None:  # noqa: F811
+def test_a_new_wallet_funded_at_its_first_address_can_mint_an_nft(node, tmp_path, monkeypatch) -> None:
     mnemonic, address = _new_wallet(tmp_path, monkeypatch)
     index = _wire(node, monkeypatch)
     funding_txid = _fund(node, index, address)
@@ -266,7 +291,7 @@ def test_a_new_wallet_funded_at_its_first_address_can_mint_an_nft(node, tmp_path
     assert (out["commit_txid"], 0) in [(i["txid"], i["vout"]) for i in reveal["vin"]]
 
 
-def test_an_unfunded_new_wallet_is_refused_by_mint_nft(node, tmp_path, monkeypatch) -> None:  # noqa: F811
+def test_an_unfunded_new_wallet_is_refused_by_mint_nft(node, tmp_path, monkeypatch) -> None:
     mnemonic, _address = _new_wallet(tmp_path, monkeypatch)
     index = _wire(node, monkeypatch)
     index.sync()
@@ -278,6 +303,81 @@ def test_an_unfunded_new_wallet_is_refused_by_mint_nft(node, tmp_path, monkeypat
     assert index.broadcasts == []
 
 
-def test_nothing_in_this_file_touched_anything_but_regtest(node) -> None:  # noqa: F811
+# --------------------------------------------------------------------------- glyph resume-mint
+
+
+class _RevealDropped(_ChainIndex):
+    """The chain index, with the connection lost as the reveal is sent.
+
+    The first broadcast (the commit) is relayed and mined. The second (the reveal) raises before
+    it reaches the node, the way a dropped connection does, so the commit is left confirmed and
+    unspent with its pending record on disk: the state ``glyph resume-mint`` exists to finish.
+    """
+
+    def __init__(self, rt: _RegtestNode) -> None:
+        super().__init__(rt)
+        self.dropped: list[bytes] = []
+
+    async def broadcast(self, raw: bytes) -> str:
+        if self.broadcasts:
+            self.dropped.append(bytes(raw))
+            raise NetworkError("simulated: the connection dropped as the reveal was sent")
+        return await super().broadcast(raw)
+
+
+def test_a_new_wallet_resumes_a_mint_whose_reveal_was_interrupted(node, tmp_path, monkeypatch) -> None:
+    """``resume-mint`` finds the commit's key in a wallet whose file records no address.
+
+    ``privkey_for_address`` looked the funding address up in the wallet's recorded addresses
+    only, and a ``wallet new`` file records none: nothing saves the scan that ``mint-nft`` ran.
+    So a new wallet's commit, its reveal interrupted, was refused by ``resume-mint`` with
+    "address ... is not known to this wallet", and the commit's value was stranded until the
+    owner found another way to sign for it. The lookup now derives across the gap window.
+
+    The honest pair first: ANOTHER new wallet, in the same directory and so reading the same
+    pending record, is still refused and broadcasts nothing. Deriving must widen what this
+    wallet can find, not let a wallet sign for an address that is not its own.
+    """
+    mnemonic, address = _new_wallet(tmp_path, monkeypatch)
+    dropping = _RevealDropped(node)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: dropping)
+    funding_txid = _fund(node, dropping, address)
+
+    stopped = _run(tmp_path, mnemonic, "glyph", "mint-nft", str(_nft_metadata(tmp_path)))
+
+    assert stopped.exit_code != 0, stopped.output
+    assert "a server stopped answering after the commit was broadcast" in stopped.output
+    commit_txid = _doc(stopped)["commit_txid"]
+    assert dropping.broadcasts == [commit_txid] and len(dropping.dropped) == 1
+    commit = node.cli("getrawtransaction", commit_txid, "true")
+    assert commit["confirmations"] >= 1
+    assert [(i["txid"], i["vout"]) for i in commit["vin"]] == [(funding_txid, 0)]
+    assert node.cli("gettxout", commit_txid, "0"), "the commit output should be confirmed and unspent"
+    # The case under test: the file still records no address at all, so the resume below has
+    # to find the key for the commit's funding address without a recorded one.
+    assert HdWallet.load(tmp_path / "wallet.dat", mnemonic).addresses == {}
+
+    # The honest refusal: another wallet cannot reveal it, and nothing is broadcast.
+    other_mnemonic, _other = _new_wallet(tmp_path, monkeypatch, wallet="other.dat")
+    index = _wire(node, monkeypatch)
+    index.sync()
+    refused = _run(tmp_path, other_mnemonic, "glyph", "resume-mint", commit_txid, wallet="other.dat")
+    assert refused.exit_code != 0, refused.output
+    assert "this wallet cannot reveal that commit" in refused.output
+    assert index.broadcasts == []
+    assert node.cli("gettxout", commit_txid, "0"), "a refused resume must leave the commit unspent"
+
+    resumed = _run(tmp_path, mnemonic, "glyph", "resume-mint", commit_txid)
+
+    assert resumed.exit_code == 0, (resumed.output, resumed.exception)
+    reveal_txid = _doc(resumed)["reveal_txid"]
+    assert index.broadcasts == [reveal_txid]
+    reveal = node.cli("getrawtransaction", reveal_txid, "true")
+    assert reveal["confirmations"] >= 1
+    assert (commit_txid, 0) in [(i["txid"], i["vout"]) for i in reveal["vin"]]
+    assert not node.cli("gettxout", commit_txid, "0"), "the reveal should have spent the commit"
+
+
+def test_nothing_in_this_file_touched_anything_but_regtest(node) -> None:
     assert node.cli("getblockchaininfo")["chain"] == "regtest"
     assert str(node.cli("getblockhash", "0")) == _REGTEST_GENESIS

@@ -1834,7 +1834,10 @@ class TestCollectSpendable:
         assert triples == []
 
     def test_drops_failed_address_lookups(self):
-        """A per-address failure must not crash the whole collection."""
+        """Non-strict: a per-address failure must not crash the whole collection.
+
+        ``strict=False`` is the mode :meth:`HdWallet.send` uses; the default is strict
+        (``TestAFailedReadIsNotAnAnswer.test_the_default_refuses_a_partial_read``)."""
         from pyrxd.security.errors import NetworkError
 
         w = HdWallet.from_mnemonic(MNEMONIC)
@@ -1857,7 +1860,7 @@ class TestCollectSpendable:
 
         client.get_history = _get_history
         client.get_utxos = _get_utxos
-        triples = asyncio.run(w.collect_spendable(client))
+        triples = asyncio.run(w.collect_spendable(client, strict=False))
         # Only the working address contributed.
         assert len(triples) == 1
 
@@ -1971,6 +1974,11 @@ class TestAFailedReadIsNotAnAnswer:
     fail-closed refusal of a legitimate spend — potentially during a timelock
     race. "Sweep everything" is a completeness claim, and a partial view makes it
     a false one. So: warn on the first, refuse on the second.
+
+    A spend's shortfall message is a completeness claim too: "fund this wallet"
+    says no address holds enough. ``pyrxd mark`` printed it when ``get_utxos``
+    failed for the one funded address (#759 review). So ``collect_spendable`` is
+    strict by DEFAULT, and :meth:`HdWallet.send` — the "enough" case — opts out.
     """
 
     def test_a_partial_read_is_reported_not_swallowed(self, caplog):
@@ -1981,8 +1989,8 @@ class TestAFailedReadIsNotAnAnswer:
             utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=100_000_000)] for i, a in enumerate(addrs)},
         )
         with caplog.at_level("WARNING"):
-            triples = asyncio.run(w.collect_spendable(client))
-        assert len(triples) == 2  # the tolerant default is preserved
+            triples = asyncio.run(w.collect_spendable(client, strict=False))
+        assert len(triples) == 2  # the tolerant mode, which send() uses
         assert any("1 of 3" in r.message for r in caplog.records), (
             "a dropped address must leave a trace — the SDK path had no logging at all, "
             "so the only signal was a balance that quietly came back smaller"
@@ -2014,6 +2022,17 @@ class TestAFailedReadIsNotAnAnswer:
         client = _client_failing_on({addrs[1]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
         with pytest.raises(NetworkError, match="1 of 3"):
             asyncio.run(getattr(w, reader)(client, strict=True))
+
+    def test_the_default_refuses_a_partial_read(self):
+        """No keyword: the spend callers (``mark``, the glyph and swap-book commands, the SDK
+        builders) pass none, so the default is what makes their "fund this wallet" true."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on({addrs[1]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
+        with pytest.raises(NetworkError, match="1 of 3"):
+            asyncio.run(w.collect_spendable(client))
 
     def test_strict_is_satisfied_when_every_read_answers(self):
         w = HdWallet.from_mnemonic(MNEMONIC)

@@ -25,11 +25,11 @@ from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
-from pyrxd.hd.wallet import HdWallet
+from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
 from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
 
@@ -47,12 +47,16 @@ class _Chain:
     """An ElectrumX that knows about UTXOs at given addresses, and nothing else.
 
     ``get_history`` answers for exactly the addresses holding something, the way a real server
-    does: an address with a UTXO has history. ``fail_history`` makes every history read fail.
+    does: an address with a UTXO has history. ``fail_history`` makes every history read fail;
+    ``fail_utxos`` makes every UTXO read fail while history still answers.
     """
 
-    def __init__(self, funded: dict[str, UtxoRecord] | None = None, *, fail_history: bool = False) -> None:
+    def __init__(
+        self, funded: dict[str, UtxoRecord] | None = None, *, fail_history: bool = False, fail_utxos: bool = False
+    ) -> None:
         self.by_hash = {bytes(script_hash_for_address(a)): (a, u) for a, u in (funded or {}).items()}
         self.fail_history = fail_history
+        self.fail_utxos = fail_utxos
         self.broadcasts: list[bytes] = []
 
     async def __aenter__(self) -> _Chain:
@@ -68,6 +72,8 @@ class _Chain:
         return [{"tx_hash": hit[1].tx_hash, "height": 1}] if hit else []
 
     async def get_utxos(self, script_hash):
+        if self.fail_utxos:
+            raise NetworkError("simulated: listunspent failed for this address")
         hit = self.by_hash.get(bytes(script_hash))
         return [hit[1]] if hit else []
 
@@ -121,6 +127,45 @@ class TestCollectSpendableScansFirst:
         chain = _Chain({w.next_receive_address(): _utxo()}, fail_history=True)
         with pytest.raises(NetworkError):
             asyncio.run(w.collect_spendable(chain))
+
+
+class _LaggingChain(_Chain):
+    """A server whose history index lags its UTXO set: it reports no history for anything."""
+
+    async def get_history(self, script_hash):
+        return []
+
+
+class TestAKnownUsedAddressStaysUsed:
+    """``_scan_chain`` never demotes an address the wallet already knows is used.
+
+    It used to overwrite the flag with whatever this server said, and ``collect_spendable``
+    kept a snapshot of the known-used addresses taken before its own scan. That protected one
+    call: the scan cleared the flag, so the NEXT call's snapshot no longer held the address and
+    a lagging server hid its funds. A command that spends twice (a mint's commit, then its
+    reveal) makes exactly that second call.
+    """
+
+    def test_two_calls_in_a_row_both_read_it(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        known = w.derive_address(0, 2)
+        w.addresses["0/2"] = AddressRecord(address=known, change=0, index=2, used=True)
+        chain = _LaggingChain({known: _utxo()})
+        for call in ("first", "second"):
+            triples = asyncio.run(w.collect_spendable(chain))
+            assert [(u.tx_hash, a) for u, a, _k in triples] == [("cc" * 32, known)], call
+        assert w.addresses["0/2"].used
+
+    def test_a_scan_still_does_not_invent_a_used_address(self) -> None:
+        """The honest half: only what the wallet knew is kept. An address it never knew as
+        used, which this server reports no history for, is not read."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        known, unknown = w.derive_address(0, 2), w.derive_address(0, 5)
+        w.addresses["0/2"] = AddressRecord(address=known, change=0, index=2, used=True)
+        chain = _LaggingChain({known: _utxo("aa" * 32), unknown: _utxo("bb" * 32)})
+        for _call in range(2):
+            assert [a for _u, a, _k in asyncio.run(w.collect_spendable(chain))] == [known]
+        assert not w.addresses["0/5"].used
 
 
 # --------------------------------------------------------------------------- the commands
@@ -185,6 +230,20 @@ class TestMarkFromAWalletNobodyScanned:
         assert "could not reach ElectrumX" in result.output
         assert chain.broadcasts == []
 
+    def test_a_utxo_read_that_fails_is_a_network_error_not_advice_to_fund(self, tmp_path, monkeypatch) -> None:
+        """The scan answers, so the funded address is found; then its UTXO read fails. A
+        non-strict collect returned nothing for it, and ``mark`` told the owner to fund the
+        wallet. Collection is strict by default now, so the failure is reported as one."""
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        chain = _Chain({first: _utxo()}, fail_utxos=True)
+        (tmp_path / "f.txt").write_bytes(b"x")
+        result = _run(tmp_path, monkeypatch, chain, mnemonic, "mark", str(tmp_path / "f.txt"))
+        assert result.exit_code == 2, result.output
+        assert _FALSE_ADVICE not in result.output
+        assert "could not reach ElectrumX" in result.output
+        assert "1 of 1 address reads failed" in result.output
+        assert chain.broadcasts == []
+
 
 class TestUtxosFromAWalletNobodyScanned:
     def test_a_funded_new_wallet_lists_its_utxo(self, tmp_path, monkeypatch) -> None:
@@ -199,6 +258,128 @@ class TestUtxosFromAWalletNobodyScanned:
         result = _run(tmp_path, monkeypatch, _Chain(), mnemonic, "utxos")
         assert result.exit_code == 0, (result.output, result.exception)
         assert _doc(result) == []
+
+
+# --------------------------------------------------------------------------- key lookup
+
+
+class TestKeyLookupDerivesInTheGapWindow:
+    """``privkey_for_address`` finds an unrecorded address by deriving, with no network.
+
+    A ``wallet new`` file records no address, and nothing saves a scan, so a lookup that read
+    only the recorded addresses could not find the key for a new wallet's own funding address.
+    ``glyph resume-mint`` then refused to reveal that wallet's commit (proved on regtest in
+    ``test_fresh_wallet_spends_regtest_e2e.py``). The lookup now searches the gap window on
+    both chains, and nothing past it.
+    """
+
+    @pytest.mark.parametrize(("change", "index"), [(0, 7), (1, 3)])
+    def test_an_unrecorded_address_inside_the_window_is_found(self, change: int, index: int) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        assert w.addresses == {}
+        address = w.derive_address(change, index)
+        key = w.privkey_for_address(address)
+        assert key.public_key().address() == address
+        assert key.public_key().hash160() == w.privkey_for(change, index).public_key().hash160()
+        assert w.addresses == {}, "a lookup must not change the wallet"
+
+    @pytest.mark.parametrize("change", [0, 1])
+    def test_an_address_past_the_window_is_still_refused(self, change: int) -> None:
+        """The honest bound: one past the window is not searched, so it is not this wallet's."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        with pytest.raises(ValidationError, match="not known to this wallet"):
+            w.privkey_for_address(w.derive_address(change, _GAP_LIMIT))
+
+    def test_the_window_runs_past_the_highest_known_index(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        w.addresses["0/30"] = AddressRecord(address=w.derive_address(0, 30), change=0, index=30, used=True)
+        last = w.derive_address(0, 30 + _GAP_LIMIT)
+        assert w.privkey_for_address(last).public_key().address() == last
+        with pytest.raises(ValidationError, match="not known to this wallet"):
+            w.privkey_for_address(w.derive_address(0, 31 + _GAP_LIMIT))
+
+    def test_another_wallets_address_is_refused(self) -> None:
+        stranger = HdWallet.from_mnemonic(MNEMONIC, passphrase="another wallet").derive_address(0, 0)
+        with pytest.raises(ValidationError, match="not known to this wallet"):
+            HdWallet.from_mnemonic(MNEMONIC).privkey_for_address(stranger)
+
+
+class _MintChain(_Chain):
+    """``_Chain`` plus the confirmation read the minter polls."""
+
+    async def get_transaction_verbose(self, txid):
+        return {"confirmations": 1}
+
+
+class TestTheMinterRevealsFromAWalletNobodyScanned:
+    """The SDK caller, through its own entry point: ``GlyphMinter.reveal_nft`` after a crash.
+
+    The commit is made by one ``HdWallet``; the reveal by a second one opened from the same
+    mnemonic, as a process restarted after a crash would open it, recording nothing.
+    """
+
+    def _commit(self, tmp_path: Path, funded_at: tuple[int, int]):
+        from pyrxd.glyph.mint import GlyphMinter, JsonFilePendingStore
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+        committer = HdWallet.from_mnemonic(MNEMONIC)
+        chain = _MintChain({committer.derive_address(*funded_at): _utxo()})
+        store = JsonFilePendingStore(tmp_path / "pending")
+        minter = GlyphMinter(chain, committer, store, poll_interval_s=0.01)
+        metadata = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="fresh-wallet-reveal")
+        pending = asyncio.run(minter.commit_nft(metadata))
+        assert pending.funding_address == committer.derive_address(*funded_at)
+        return chain, store, pending
+
+    def test_a_fresh_wallet_from_the_same_mnemonic_reveals(self, tmp_path) -> None:
+        from pyrxd.glyph.mint import GlyphMinter
+
+        chain, store, pending = self._commit(tmp_path, funded_at=(0, 7))
+        restarted = HdWallet.from_mnemonic(MNEMONIC)
+        assert restarted.addresses == {}
+        result = asyncio.run(GlyphMinter(chain, restarted, store, poll_interval_s=0.01).reveal_nft(pending))
+        reveal = Transaction.from_hex(chain.broadcasts[-1].hex())
+        assert result.reveal_txid == reveal.txid()
+        assert [(i.source_txid, i.source_output_index) for i in reveal.inputs] == [(pending.commit_txid, 0)]
+
+    def test_another_wallet_still_cannot_reveal(self, tmp_path) -> None:
+        from pyrxd.glyph.mint import GlyphMinter
+
+        chain, store, pending = self._commit(tmp_path, funded_at=(0, 0))
+        stranger = HdWallet.from_mnemonic(MNEMONIC, passphrase="another wallet")
+        sent = len(chain.broadcasts)
+        with pytest.raises(ValidationError, match="not known to this wallet"):
+            asyncio.run(GlyphMinter(chain, stranger, store, poll_interval_s=0.01).reveal_nft(pending))
+        assert len(chain.broadcasts) == sent
+
+
+class TestMarkSignsWithAnUnrecordedAddress:
+    """``pyrxd mark --signer-address`` crosses the same lookup, from a ``wallet new`` file."""
+
+    def test_a_signer_address_inside_the_window_signs(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        signer = HdWallet.from_mnemonic(mnemonic)
+        (tmp_path / "f.txt").write_bytes(b"x")
+        chain = _Chain({first: _utxo()})
+        result = _run(
+            tmp_path, monkeypatch, chain, mnemonic, "mark", str(tmp_path / "f.txt"),
+            "--signer-address", signer.derive_address(0, 7),
+        )  # fmt: skip
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert _doc(result)["signer_hash160"] == signer.privkey_for(0, 7).public_key().hash160().hex()
+        assert len(chain.broadcasts) == 1
+
+    def test_a_signer_address_past_the_window_is_refused(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first = _new_wallet(tmp_path, monkeypatch)
+        outside = HdWallet.from_mnemonic(mnemonic).derive_address(0, _GAP_LIMIT)
+        (tmp_path / "f.txt").write_bytes(b"x")
+        chain = _Chain({first: _utxo()})
+        result = _run(
+            tmp_path, monkeypatch, chain, mnemonic, "mark", str(tmp_path / "f.txt"), "--signer-address", outside
+        )
+        assert result.exit_code != 0
+        assert f"cannot sign with {outside}" in result.output
+        assert chain.broadcasts == []
 
 
 # --------------------------------------------------------------------------- the funnel
@@ -219,6 +400,32 @@ class TestEverySpendPathCrossesTheScan:
                 if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "collect_spendable":
                     defs.append(path.relative_to(_SRC).as_posix())
         assert defs == ["hd/wallet.py"]
+
+    def test_only_the_named_callers_accept_a_partial_view(self) -> None:
+        """``collect_spendable`` is strict by default, so a caller that turns "nothing found"
+        into "fund this wallet" cannot be handed a partial view by a failed read. Opting out is
+        a judgement, so the set of callers that pass ``strict=False`` is pinned: ``send`` (an
+        amount only needs *enough*) and the read-only ``utxos`` listing. Any change to the set
+        fails here and has to say why."""
+        calls: list[tuple[str, str]] = []
+        opted_out: set[tuple[str, str]] = set()
+
+        def visit(node: ast.AST, where: str, func: str) -> None:
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                func = node.name
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "collect_spendable":
+                calls.append((where, func))
+                for kw in node.keywords:
+                    # Anything but a literal True counts as opting out, so a variable cannot hide one.
+                    if kw.arg == "strict" and not (isinstance(kw.value, ast.Constant) and kw.value.value is True):
+                        opted_out.add((where, func))
+            for child in ast.iter_child_nodes(node):
+                visit(child, where, func)
+
+        for path in sorted(_SRC.rglob("*.py")):
+            visit(ast.parse(path.read_text(encoding="utf-8")), path.relative_to(_SRC).as_posix(), "<module>")
+        assert ("hashmark_tx.py", "build_hashmark_mark") in calls, "the walk found no callers — it is broken"
+        assert opted_out == {("hd/wallet.py", "send"), ("cli/query_cmds.py", "_query")}
 
     def test_there_are_spend_paths_to_protect(self) -> None:
         """Paired with the one above: a scan that found no callers would pass it vacuously."""
