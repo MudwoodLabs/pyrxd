@@ -117,7 +117,7 @@ def _mut_outputs(inspector: GlyphInspector, outputs: list[tuple[int, bytes]]) ->
         parsed = parse_mutable_nft_script(glyph.script)
         if parsed is None:  # pragma: no cover - find_glyphs classified it as mut
             continue
-        # The outpoint form the inspect path uses (`_inspect_core.py:516`), not the repr.
+        # The outpoint form the inspect path uses (the `mut` row of `_classify_script`), not the repr.
         found.append((glyph.vout, f"{glyph.ref.txid}:{glyph.ref.vout}", parsed[1]))
     return found
 

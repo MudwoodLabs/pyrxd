@@ -127,12 +127,12 @@ rejects a valid script or — when the byte it resumes on happens to be a valid
 single-byte opcode — silently resynchronizes, reporting a **phantom** ref and
 dropping the real one. Implementations MUST use the five-opcode set.
 
-pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:1142-1164`) over
-the constant `REF_OPCODES` (`:1075`); the differential test against a port of the
+pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:1144-1166`) over
+the constant `REF_OPCODES` (`:1099`); the differential test against a port of the
 consensus rule is `TestRefWalkerConsensusDifferential` in `tests/test_glyph.py`.
 A script that ends mid-push or mid-ref-operand has ambiguous length;
 implementations MUST refuse it rather than guess (`TruncatedScriptError`,
-`src/pyrxd/glyph/script.py:1100-1106`).
+`src/pyrxd/glyph/script.py:1102-1108`).
 
 ## 3. Identifiers
 
@@ -364,7 +364,7 @@ bidi overrides, zero-width joiners, and combining marks are all reachable throug
 payload_hash = SHA256d(cbor_bytes)          # 32 bytes
 ```
 
-`src/pyrxd/glyph/script.py:243-245`. The `gly` marker is excluded. This is a
+`hash_payload` (`src/pyrxd/glyph/script.py:782-784`). The `gly` marker is excluded. This is a
 **double** SHA-256 — it matches `OP_HASH256`, which is what the commit script
 executes.
 
@@ -376,7 +376,7 @@ reveal txid.
 
 This is not a convention layered on top of the chain; it is what the commit
 covenant enforces. Walking `build_commit_locking_script`
-(`src/pyrxd/glyph/script.py:253-293`) with the reveal's scriptSig on the stack:
+(`src/pyrxd/glyph/script.py:254-294`) with the reveal's scriptSig on the stack:
 
 ```
 stack: [sig, pubkey, "gly", cbor]
@@ -397,7 +397,7 @@ produce an output carrying exactly that ref, at the required ref type. pyrxd
 builds the matching locking script by constructing
 `GlyphRef(commit_txid, commit_vout)` and embedding it
 (`src/pyrxd/glyph/builder.py` `GlyphBuilder.prepare_reveal`), and reads it back with
-`extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:919-930`).
+`extract_ref_from_{nft,ft}_script` (`src/pyrxd/glyph/script.py:921-932`).
 
 **Requirements.**
 
@@ -503,7 +503,7 @@ d8 <ref:36>                OP_PUSHINPUTREFSINGLETON <ref>
 88 ac                      OP_EQUALVERIFY OP_CHECKSIG
 ```
 
-`src/pyrxd/glyph/script.py:171-186`. Total length MUST be 63 bytes; the builder
+`build_nft_locking_script` (`src/pyrxd/glyph/script.py:236-241`). Total length MUST be 63 bytes; the builder
 asserts it. Classifier regex: `^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$`
 (`src/pyrxd/glyph/script.py:146`).
 
@@ -521,9 +521,9 @@ d0 <token_ref:36>                OP_PUSHINPUTREF <ref>         (37 bytes)
 de c0 e9 aa 76 e3 78 e4 a2 69 e6 9d   conservation epilogue    (12 bytes)
 ```
 
-`src/pyrxd/glyph/script.py:189-196`; offset-by-offset assertions at
+`build_ft_locking_script` (`src/pyrxd/glyph/script.py:244-251`); offset-by-offset assertions at
 `tests/test_dmint_module.py:610-624`. Classifier regex at
-`src/pyrxd/glyph/script.py:153`.
+`src/pyrxd/glyph/script.py:154`.
 
 The token quantity carried by an FT output **is** the output's `satoshis` value:
 one photon is one FT unit. There is no separate amount field.
@@ -549,7 +549,7 @@ da                              OP_REFTYPE_OUTPUT
 76 a9 14 <owner_pkh:20> 88 ac   P2PKH tail
 ```
 
-`src/pyrxd/glyph/script.py:253-293`. The FT and NFT variants are byte-identical
+`src/pyrxd/glyph/script.py:254-294`. The FT and NFT variants are byte-identical
 except for the ref-type opcode at **offset 48**: `0x51` for FT, `0x52` for NFT.
 That single byte is pinned against both shapes appearing in one mainnet
 transaction at `tests/test_glyph_dmint.py:227-240`.
@@ -568,8 +568,8 @@ d8 <mutable_ref:36>        OP_PUSHINPUTREFSINGLETON <ref>
 <body:102>                 fixed body
 ```
 
-`src/pyrxd/glyph/script.py:1019-1043`. The 102-byte body is a fixed constant
-(`src/pyrxd/glyph/script.py:977-1001`) derived from Photonic Wallet's
+`src/pyrxd/glyph/script.py:1021-1045`. The 102-byte body is a fixed constant
+(`src/pyrxd/glyph/script.py:979-1003`) derived from Photonic Wallet's
 `parseMutableScript` regex with the `gly` magic bytes substituted, and pinned at
 `tests/test_glyph_v2.py:112-121`.
 
@@ -590,7 +590,7 @@ contract). Index integers use minimal push encoding
 This specification reproduces the body as a constant and does not restate a
 stack-level derivation of it. Note that pyrxd's own size constant is **174**
 bytes, while Photonic Wallet documents 175; pyrxd's value is the one that matches
-the regex and the built script (`src/pyrxd/glyph/script.py:348-351`).
+the regex and the built script (`src/pyrxd/glyph/script.py:1007-1008`).
 
 ### 7.5 CONTAINER
 
@@ -664,7 +664,7 @@ recognises the shape only to report it: `_inspect_script` returns
 `GlyphInspector.find_glyphs` returns a `container-legacy` entry with
 `spendable=False`, `GlyphScanner` logs it and does not hand it back as a token,
 and `build_nft_transfer_tx` refuses it by name
-(`src/pyrxd/glyph/script.py:800-843`).
+(`src/pyrxd/glyph/script.py:802-845`).
 
 ### 7.6 dMint contracts
 
@@ -908,9 +908,9 @@ envelope carries more type information than the chain does.
 | CONTAINER | **not distinguishable** — byte-identical to an NFT by design (§7.5) | envelope only |
 | DAT, BURN, ENCRYPTED, TIMELOCK, AUTHORITY, WAVE | **not distinguishable** — envelope markers only | envelope only |
 
-`src/pyrxd/glyph/_inspect_core.py:1074-1243` is the dispatch order pyrxd uses — NFT, FT,
+`src/pyrxd/glyph/_inspect_core.py:1074-1246` is the dispatch order pyrxd uses — NFT, FT,
 container-legacy, MUT, commit-NFT, commit-FT, in that order — and
-`src/pyrxd/glyph/_inspect_core.py:1420-1484` is the envelope-side classification, which returns
+`src/pyrxd/glyph/_inspect_core.py:1423-1487` is the envelope-side classification, which returns
 the highest-specificity marker present.
 
 (Both pointers were re-derived, not shifted. The previous pair named lines 210-322 and 325-369,
@@ -1398,7 +1398,7 @@ behaviour stay on chain and a reader still has to handle them.
 | Royalty residue | Flooring loss and any uncovered bps are dropped | Routed to the top-level address; `sum(payouts) == due` exactly | Same reason. |
 | Royalty `enforced` flag | Returns *no* outputs when `enforced` is false — making an advisory royalty mean "never paid" | No branch on the flag; passing a royalty is the decision to pay it | The flag is display/policy metadata, not a payment switch (`src/pyrxd/glyph/royalty.py:70-74`). |
 | `dmint.premine` consistency | No bounds or consistency checks at all | Deploy refused if the advertised premine ≠ the emitted premine | A mismatch is a permanently mis-reported supply and it is silent (`src/pyrxd/glyph/builder.py` `_assert_declared_dmint_matches`). |
-| Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:348-351`). |
+| Mutable NFT script size | Documented as 175 bytes | 174 bytes | 174 is what the regex and the built script actually are (`src/pyrxd/glyph/script.py:1007-1008`). |
 | V2 dMint Part A | Older shape prefixed `51 75` (`OP_1 OP_DROP`) | Opens directly at `c0 c8`, matching the post-2026-05-26 canonical redesign | Byte-matched to the current canonical source and validated by golden vector (`src/pyrxd/glyph/dmint/builders.py` `_PART_A`). |
 | V2 dMint deploy target, BLAKE3/K12 | `dMintDiffToTarget`: `MAX_TARGET / difficulty` for every algorithm | The same, since 2026-09-23. Before then pyrxd deployed BLAKE3/K12 with `(2^256 - 1) // difficulty`, wider than the 8 bytes Part B2 reads as a number, so those contracts could never be minted | Part B1 compares the same 8-byte hash window whatever the hash opcode (`src/pyrxd/glyph/dmint/types.py` `target_for_difficulty`; the BLAKE3/K12 mainnet deploys rebuild byte for byte in `tests/test_dmint_deploy_bounds.py`). |
 | V2 dMint numeric deploy parameters | `dMintScript` bounds none of `maxHeight`, `reward`, `targetTime`, `halfLife`, `epochLength` or schedule heights above, and `pushMinimal` emits any width (the Mint form's inputs carry min/max hints) | Refused: a number wider than 8 bytes, a reward above Radiant's money supply, a difficulty whose target is 0, and, in ASERT/LWMA/EPOCH, a target time above 0xFFFFFFFF s. FIXED and SCHEDULE only carry the target time as bytes, so there it is held only to pyrxd's 8-byte encoder limit. In-range bytes are identical | Past those bounds a deploy builds a number the covenant cannot read, a reward no transaction can pay, a target only an all-zero hash meets, or a target spacing no mint can meet (the retarget compares it with the gap between two timestamps, each below 2^31 in any mint the covenant accepts) (`src/pyrxd/glyph/dmint/types.py` `check_v2_numeric_bounds`, `DAA_MODES_READING_TARGET_TIME`). |
@@ -1406,7 +1406,7 @@ behaviour stay on chain and a reader still has to handle them.
 | V2 EPOCH difficulty adjustment | Pre-fix bytecode overflows int64 and bricks the contract at a boundary mint | Divide-first with a 2^48 clamp on both sides of the multiply | Upstream fix (Radiant-Core/Photonic-Wallet#2), which pyrxd byte-matches (`src/pyrxd/glyph/dmint/builders.py` `_build_epoch_daa`). |
 | V2 ASERT / LWMA difficulty adjustment (history) | Integer power-of-2 ASERT stepper (unrolled `OP_2MUL`/`OP_2DIV` after an earlier `OP_LSHIFT`/`OP_RSHIFT` shape that was wrong for the little-endian target); unity-gain LWMA `target × timeDelta / targetTime`, later floored at `timeDelta ≥ 0` (#2). Replaced upstream by the fractional, damped ASERT-v2 (`ed53cd41`, 2026-06-19) and LWMA-v2 (`c90e6506`, 2026-06-20). | Same as current Photonic for every NEW deploy (byte-matched at `becf41a7`, `_build_asert_daa_v2` / `_build_linear_daa_v2`). The retired builders are kept frozen (`_build_asert_daa_legacy`, `_build_linear_daa_legacy`, `_build_linear_daa_legacy_prefloor`) and `detect_contract_daa_bytecode` reads which generation a deployed contract bakes, so the mint builder recomputes the target with the matching formula. | pyrxd resynced on 2026-09-16 after three months on the retired formulas; a covenant's bytecode is immutable, so contracts deployed in between — including the mainnet LWMA deploy `dea3beb9…`, whose on-chain mint `e7b52f16…` the builder recreates byte-for-byte — must keep mining under the formula they bake (`tests/test_dmint_daa_v2_resync.py`). A contract matching no known generation is refused before the PoW grind. |
 | WAVE name location | Bare label in `attrs.name`, domain in `attrs.domain`, qualified name at top-level `name`, plus `v: 2` and `type: "wave_name"` (`createWaveNameMetadata`, `packages/lib/src/wave.ts`). Its `validateWaveName` refuses a label under 3 characters (`packages/lib/src/wave.ts:32`) | The same fields since #728 (`attrs.expires` only when asked). The bytes equal those of mainnet claim `f644794b…`, which the public indexer resolves; that claim is canonical CBOR and was not encoded by Photonic's `cbor-x`, so this is a field-level match with Photonic, not a byte-level one (`tests/test_wave_claim_registers_with_the_indexer.py`). **Through 0.24.0 pyrxd put the qualified name in `attrs.name` and left top-level `name` empty.** RXinDexer's `validate_wave_name` refuses the `.`, so by its source no claim `build_wave_metadata` built from a qualified name was indexed; given a bare label (`"alice"`) it wrote `attrs.name = "alice"`, which registers `alice.rxd` (both checked by running the indexer's own code at `ca8a6a4e`, `tests/test_wave_fee_matches_the_pinned_indexer.py`; no pyrxd-built claim has been checked against a live indexer). Readers still accept that shape and report it verbatim. Every write door now holds a WAVE claim to one rule (`src/pyrxd/glyph/wave_rules.py`): a 3-63 character label of lowercase `a-z`, `0-9` and `-`, no leading or trailing `-`, `--` only after `xn--`, domain exactly `rxd`, a name in `attrs.name`, and no top-level or `app.data` name naming another claim. A top-level-only `name` (older pyrxd) is refused: RXinDexer's LIVE claim path skips it (`electrumx/server/wave_index.py:719-721`), and only a backfill of an empty index would register it. `allow_unregistrable_wave=True` on the reveal paths reveals a commit pyrxd ≤0.24.0 already broadcast; that claim registers only if the indexer's own rule accepts it (the dotted `alice.rxd` does not; a bare `ab` or `Alice` does, and owes the fee) | RXinDexer registers from `attrs.name` and rebuilds from the top-level name on a backfill; pyrxd's shape was checked against neither until #728. The label rule is the intersection of the WAVE protocol (Radiant-Core/WAVE-Protocol `ANNOUNCEMENT.md:65`, 3-63), Photonic, and RXinDexer (whose own minimum, 1, is the outlier). Photonic always writes `attrs.expires` (now + 2 years); pyrxd writes it only when given, since RXinDexer takes the term from the block time. |
-| Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:729-746`, `:1087-1117`). |
+| Delegate base parsing | `parseDelegateBaseScript` matches `/^((d1[0-9a-f]{72}75)+).*/`; the trailing `.*` ignores everything after the ref run, so an authority-gated NFT parses as a base authorising the very authority it is gated on | Walks the opcode stream and refuses a tail that CARRIES a ref (`0xd0`/`0xd8`) | A gated item opens with the same `OP_REQUIREINPUTREF <ref> OP_DROP` pair, so under the regex it is byte-indistinguishable from a genuine base — a provenance forgery, reported as **H15**. A real base holds no token, so refusing a pushed ref costs honest callers nothing, and unlike a pinned P2PKH tail it does not refuse bases paying to other script shapes. An opcode walk rather than a regex so a `0xd0` byte inside pushdata cannot be misread (`src/pyrxd/glyph/script.py:731-748`, `:1111-1141`). |
 | Burn proof verification | `validateBurn` checks the proof's shape and that the ref is ABSENT from the transaction's outputs | `verify_burn` additionally REQUIRES the spent output scripts, and checks one of them carried the ref under `0xd0`/`0xd8` | Absence from the outputs is a condition every unrelated transaction on the chain satisfies, so the weaker check calls a transaction that never held the token a valid burn of it — reported as **M27**. pyrxd makes the spent scripts a required argument rather than an optional one, so there is no call shape that reaches the weak answer (`src/pyrxd/glyph/burn.py:262`). |
 | `by` authority claims | `verifyAuthorityChain` compares the token's `by` field against a candidate authority's ref and reports success on a match; a `hasPermission` helper reads the same `attrs` | `verify_authority_claim` takes relationship VERDICTS, not metadata; pyrxd ships no `has_permission` | `by` is operator-supplied CBOR that anyone can write, so ref-equality distinguishes "claims X" from nothing at all — a forger copying a real issuer's ref passes it. Whether the claim was AUTHORISED is answerable only from the reveal transaction's refs or a resolved delegate burn. Reported as **M26**; the same reasoning removes `has_permission`, which read permissions off the unauthenticated claim (`src/pyrxd/glyph/authority.py:313`). |
 
@@ -1467,12 +1467,14 @@ directions, and unevenly:
   it does mean `decode(encode(x)) != x` for an encrypted envelope. A caller that
   needs the exact bytes a token arrived as reads `GlyphMetadata.source_cbor`.
 
-### 16.4 Commit script ref-type byte is under-validated
+### 16.4 Commit script ref-type byte (resolved in 0.25.0)
 
-`COMMIT_SCRIPT_RE` (`src/pyrxd/glyph/script.py:119`) matches any byte at the
-ref-type position, not only `0x51`/`0x52`. A script with, say, `0x53` there
-classifies as a commit but describes a ref type Radiant does not define. Behaviour
-for such a script is undefined.
+Through 0.24.0, pyrxd's commit template matched any byte at the ref-type
+position, not only `0x51`/`0x52`. A script with, say, `0x53` there classified as a
+commit but described a ref type Radiant does not define. Since 0.25.0
+`COMMIT_SCRIPT_RE` (`src/pyrxd/glyph/script.py:164`) accepts only `OP_1` (FT) and
+`OP_2` (NFT), the two operands pyrxd's builders and Photonic's emit; a script with
+any other byte there is not a commit.
 
 ### 16.5 Carrier values
 

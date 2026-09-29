@@ -289,7 +289,7 @@ def test_the_inspector_names_both_shapes_and_qualifies_the_burn_claim():
     dat = _inspect_script(build_dat_commit_locking_script(HASH, PKH).hex())
     assert dat["type"] == "commit-dat"
     assert dat["payload_hash"] == HASH.hex() and dat["owner_pkh"] == bytes(PKH).hex()
-    assert "creates no token" in dat["note"]
+    assert "demands no token" in dat["note"] and "nor prevents one" in dat["note"]
 
     burn = _inspect_script(build_burn_proof_script(TOKEN, amount=7).hex())
     assert burn["type"] == "op_return-burn"

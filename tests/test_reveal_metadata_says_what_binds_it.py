@@ -15,11 +15,14 @@ the payload shown — and, since the 0.25.0 panel, to WHAT:
 * ``bound`` needs an NFT or FT commit (ref-type operand exactly ``OP_2``/``OP_1``) whose hash
   matches, AND the commit's outpoint among the transaction's OUTPUTS as the ref type that
   commit demands. It names those outputs, and claims nothing about any other.
-* ``bound-no-token`` is a DAT commit: bound as data, describing no output.
+* ``bound-no-token`` is a commit that demands no token (a DAT commit, or the 65-byte hash-lock
+  seen under mainnet DAT reveals): bound as data. It does not prevent a token either, so the
+  reason says whether an output carries the commit's outpoint anyway.
 * ``mismatch`` and ``commit-unsatisfied`` are transactions a node REJECTS — the commit's hash
   check or its ``OP_REFTYPE_OUTPUT`` check fails — so they are bytes that were never mined.
 * ``not-a-commit`` says only that pyrxd does not recognise the spent script as a commit —
-  NOT that nobody committed (a 65-byte mainnet DAT commit is unrecognised and does bind).
+  NOT that nobody committed (a script pyrxd does not recognise may still hash-lock the payload,
+  as the 65-byte mainnet commit did before #751 recognised it).
   ``unchecked`` establishes nothing.
 
 TWO THINGS THE PANEL FOUND, AND WHY THE FIXTURES CHANGED.
@@ -315,7 +318,8 @@ class TestADatCommitBindsData:
         verdict = _bind(cbor, spent, [_P2PKH])
         assert verdict["state"] == "bound-no-token"
         assert verdict["commit"] == "dat"
-        assert "creates no token" in verdict["reason"]
+        assert "the spent DAT commit" in verdict["reason"] and "demands no token" in verdict["reason"]
+        assert "no output carries its outpoint as a ref: this payload describes no output" in verdict["reason"]
 
     def test_a_dat_commit_to_another_payload_is_a_mismatch(self) -> None:
         _, cbor = _envelope("my-data", GlyphProtocol.DAT)
@@ -331,12 +335,18 @@ class TestADatCommitBindsData:
         assert _bind(cbor, spent, [_P2PKH])["state"] == "bound-no-token"
 
     def test_a_dat_commit_is_never_read_as_bound_to_a_token(self) -> None:
-        """A DAT commit mints nothing, so it is exactly what a decoy placed first would spend: its
-        envelope may declare any protocol. Even with an NFT for its outpoint in the outputs, it is
-        not ``bound`` — the commit demanded nothing, so nothing ties the payload to that output."""
+        """A DAT commit demands no token, so it is exactly what a decoy placed first would spend:
+        its envelope may declare any protocol. Even with an NFT for its outpoint in the outputs, it
+        is not ``bound`` — the commit demanded nothing. It does not PREVENT that NFT either, so the
+        reason names the output rather than saying the payload describes none."""
         _, cbor = _envelope("Tether USD", GlyphProtocol.NFT)
         spent = build_dat_commit_locking_script(hash256(cbor), Hex20(os.urandom(20)))
-        assert _bind(cbor, spent, [_nft_out(_OUTPOINT_TXID)])["state"] == "bound-no-token"
+        verdict = _bind(cbor, spent, [_P2PKH, _nft_out(_OUTPOINT_TXID)])
+        assert verdict["state"] == "bound-no-token"
+        assert verdict["reason"].endswith(
+            "It demands no token, nor prevents one: this transaction makes its outpoint a ref at output 1"
+        )
+        assert "describes no output" not in verdict["reason"]
 
     @pytest.mark.parametrize("delegated", [False, True], ids=["bare", "delegate-prefixed"])
     def test_photonics_dat_commit_spelled_from_its_builder_is_recognised(self, delegated: bool) -> None:
@@ -397,12 +407,17 @@ class TestADatCommitBindsData:
         assert (metadata["classification"], metadata["mints"]) == ("dat", False)
         binding = metadata["payload_binding"]
         assert (binding["state"], binding["commit"]) == ("bound-no-token", "dat")
-        assert "creates no token" in binding["reason"]
+        # Named for what it is, not called a DAT commit: the script has no "dat" push.
+        assert binding["reason"].startswith("the spent 65-byte hash-lock committed to exactly this payload.")
+        assert "no output carries its outpoint as a ref: this payload describes no output" in binding["reason"]
 
 
 class TestThe65ByteDatCommit:
     """#751: ``OP_HASH256 <32> OP_EQUALVERIFY <"gly"> OP_EQUALVERIFY <P2PKH>``, recognised from the
-    script's own semantics — it hash-locks the payload and checks no ref — and nothing looser."""
+    script's own semantics — it hash-locks the payload and checks no ref — and nothing looser.
+
+    Nothing in it says DAT: it is filed with the DAT commits for that obligation, and the reveals
+    seen spending it are DAT reveals. The text it produces must not say more."""
 
     @staticmethod
     def _transcribed(h: bytes, pkh: bytes) -> bytes:
@@ -433,10 +448,15 @@ class TestThe65ByteDatCommit:
         assert (verdict["state"], verdict["commit"]) == ("bound-no-token", "dat")
 
     def test_it_is_never_bound_to_a_token(self) -> None:
-        """No ref check, so an NFT for its outpoint in the outputs does not make it ``bound``."""
+        """No ref check, so an NFT for its outpoint in the outputs does not make it ``bound``. The
+        script demands no token; it does not prevent one, and this reveal mints one — so the
+        reason must say so, not that the payload describes no output."""
         _, cbor = _envelope("Tether USD", GlyphProtocol.NFT)
         verdict = _bind(cbor, self._transcribed(hash256(cbor), os.urandom(20)), [_nft_out(_OUTPOINT_TXID)])
         assert verdict["state"] == "bound-no-token"
+        assert verdict["reason"].endswith("nor prevents one: this transaction makes its outpoint a ref at output 0")
+        assert "describes no output" not in verdict["reason"]
+        assert "DAT commit" not in verdict["reason"]
 
     def test_a_65_byte_commit_to_another_payload_is_a_mismatch(self) -> None:
         _, cbor = _envelope("data", GlyphProtocol.DAT)
@@ -449,10 +469,50 @@ class TestThe65ByteDatCommit:
         h, pkh = os.urandom(32), os.urandom(20)
         row = _classify_script(self._transcribed(h, pkh).hex(), network="mainnet")
         assert (row["type"], row["payload_hash"], row["owner_pkh"]) == ("commit-dat", h.hex(), pkh.hex())
-        assert "65-byte" in row["note"]
+        assert "65-byte" in row["note"] and "the script does not say DAT" in row["note"]
+        assert "creates no token" not in row["note"] and "nor prevents one" in row["note"]
+        assert len(row["note"]) <= _HUMAN_STRING_CAP, "the CLI cuts a fetched output's note at the cap"
         # The honest pair: the 70-byte form is still a DAT commit, with its own note.
         seventy = _classify_script(build_dat_commit_locking_script(h, Hex20(pkh)).hex(), network="mainnet")
         assert seventy["type"] == "commit-dat" and "65-byte" not in seventy["note"]
+
+    # Offsets in the 65-byte template: 0 OP_HASH256, 1 push-32, 2-33 h, 34 OP_EQUALVERIFY,
+    # 35 push-3, 36-38 "gly", 39 OP_EQUALVERIFY, 40 OP_DUP, 41 OP_HASH160, 42 push-20, 43-62 pkh,
+    # 63 OP_EQUALVERIFY, 64 OP_CHECKSIG. Each single-byte case asserts the byte it replaces, so a
+    # case cannot drift onto a neighbour and still pass (``equal-after-gly`` once replaced byte 40).
+    _AT = {34: 0x88, 1: 0x20, 0: 0xAA, 39: 0x88, 40: 0x76, 41: 0xA9, 42: 0x14, 63: 0x88, 64: 0xAC}
+
+    @pytest.mark.parametrize(
+        ("at", "byte"),
+        [
+            (34, 0x87),  # OP_EQUAL, not OP_EQUALVERIFY, after the hash
+            (39, 0x87),  # OP_EQUAL, not OP_EQUALVERIFY, after "gly"
+            (0, 0xA8),  # OP_SHA256, not OP_HASH256
+            (1, 0x21),  # a 33-byte push where the 32-byte hash push goes
+            (40, 0x75),  # OP_DROP where the P2PKH's OP_DUP goes
+            (41, 0xA8),  # OP_SHA256 where the P2PKH's OP_HASH160 goes
+            (42, 0x15),  # a 21-byte push where the 20-byte pkh push goes
+            (63, 0x87),  # OP_EQUAL, not OP_EQUALVERIFY, before the signature check
+            (64, 0xAD),  # OP_CHECKSIGVERIFY, not OP_CHECKSIG
+        ],
+        ids=[
+            "equal-after-hash",
+            "equal-after-gly",
+            "sha256",
+            "push-33",
+            "drop-not-dup",
+            "sha256-not-hash160",
+            "push-21",
+            "equal-before-checksig",
+            "checksigverify",
+        ],
+    )
+    def test_a_one_byte_near_miss_is_not_recognised(self, at: int, byte: int) -> None:
+        _, cbor = _envelope("data", GlyphProtocol.DAT)
+        exact = self._transcribed(hash256(cbor), os.urandom(20))
+        assert exact[at] == self._AT[at], f"the premise: byte {at} of the template is {self._AT[at]:#04x}"
+        near = exact[:at] + bytes([byte]) + exact[at + 1 :]
+        self._assert_not_recognised(cbor, near)
 
     @pytest.mark.parametrize(
         "mutate",
@@ -460,17 +520,23 @@ class TestThe65ByteDatCommit:
             lambda s: s[:-1],  # 64 bytes
             lambda s: s + b"\x75",  # 66 bytes: a trailing OP_DROP
             lambda s: s.replace(b"\x03gly", b"\x03glz"),  # another marker
-            lambda s: s[:34] + b"\x87" + s[35:],  # OP_EQUAL, not OP_EQUALVERIFY, after the hash
-            lambda s: s[:40] + b"\x87" + s[41:],  # OP_EQUAL after "gly"
-            lambda s: b"\xa8" + s[1:],  # OP_SHA256, not OP_HASH256
             lambda s: b"\xd0" + GlyphRef(txid="ef" * 32, vout=0).to_bytes() + b"\x75" + s,  # a ref prefix
         ],
-        ids=["64-bytes", "66-bytes", "glz", "equal-after-hash", "equal-after-gly", "sha256", "ref-prefix"],
+        ids=["64-bytes", "66-bytes", "glz", "ref-prefix"],
     )
     def test_a_near_miss_is_not_recognised(self, mutate) -> None:
         _, cbor = _envelope("data", GlyphProtocol.DAT)
-        near = mutate(self._transcribed(hash256(cbor), os.urandom(20)))
+        self._assert_not_recognised(cbor, mutate(self._transcribed(hash256(cbor), os.urandom(20))))
+
+    @staticmethod
+    def _assert_not_recognised(cbor: bytes, near: bytes) -> None:
+        """Through both production readers: the binding, and the script's own classification."""
+        from pyrxd.glyph._inspect_core import _classify_script
+        from pyrxd.glyph.script import parse_dat_gly_only_commit_script
+
+        assert parse_dat_gly_only_commit_script(near) is None
         assert _bind(cbor, near, [_P2PKH])["state"] == "not-a-commit"
+        assert _classify_script(near.hex(), network="mainnet")["type"] != "commit-dat"
 
 
 def test_a_commit_that_committed_to_a_DIFFERENT_payload_reads_mismatch() -> None:
@@ -503,6 +569,24 @@ def test_no_spent_script_reads_unchecked_and_never_bound() -> None:
     assert "not supplied" in verdict["reason"]
 
 
+def _every_no_token_reason(dat: bytes, minted: list[bytes], wide: list[bytes]) -> dict[str, dict]:
+    """``bound-no-token`` from both commit forms, each with no output carrying its outpoint, one
+    that does, the widest ``where``, and no outpoint named: every sentence it can say."""
+    forms = {
+        "70-byte": build_dat_commit_locking_script(hash256(dat), Hex20(os.urandom(20))),
+        "65-byte": TestThe65ByteDatCommit._transcribed(hash256(dat), os.urandom(20)),
+    }
+    out: dict[str, dict] = {}
+    for form, spent in forms.items():
+        out[f"bound-no-token ({form}, no mint)"] = _bind(dat, spent, [_P2PKH])
+        out[f"bound-no-token ({form}, mints)"] = _bind(dat, spent, minted)
+        out[f"bound-no-token ({form}, widest)"] = _bind(dat, spent, wide)
+        out[f"bound-no-token ({form}, no outpoint)"] = _payload_binding(dat, spent, None, [_P2PKH])
+    assert all(v["state"] == "bound-no-token" for v in out.values())
+    assert "and 89,997 more" in out["bound-no-token (65-byte, widest)"]["reason"], "the premise: the widest case"
+    return out
+
+
 def _one_of_each_state() -> dict[str, dict]:
     _, cbor = _envelope("x")
     _, other = _envelope("y")
@@ -520,7 +604,7 @@ def _one_of_each_state() -> dict[str, dict]:
         "not-a-commit": _bind(cbor, _P2PKH, minted),
         "bound": _bind(cbor, _commit_for(cbor), minted),
         "bound (widest)": _bind(ft_cbor, _commit_for(ft_cbor, is_nft=False), wide),
-        "bound-no-token": _bind(dat, build_dat_commit_locking_script(hash256(dat), Hex20(os.urandom(20))), minted),
+        **_every_no_token_reason(dat, minted, wide),
         "mismatch": _bind(cbor, _commit_for(other), minted),
         "commit-unsatisfied": _bind(cbor, _commit_for(cbor), [b"\x6a"]),
         "commit-unsatisfied (normal)": _bind(cbor, _commit_for(cbor), [_ft_out(_OUTPOINT_TXID)]),

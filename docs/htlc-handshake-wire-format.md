@@ -227,8 +227,8 @@ MUST verify, before acting on it (`swap_coordinator.py:1636-1656`):
 
 ## The `terms` object
 
-The canonical wire form of `NegotiatedTerms`, produced by `to_dict` (`swap_state.py:370-395`) and
-consumed by `from_dict` (`:397-415`). All hex is bare lowercase with no `0x` prefix.
+The canonical wire form of `NegotiatedTerms`, produced by `to_dict` (`swap_state.py:463-494`) and
+consumed by `from_dict` (`:496-515`). All hex is bare lowercase with no `0x` prefix.
 
 | Key | Type | Req. | Constraint | Source |
 |---|---|---|---|---|
@@ -478,7 +478,7 @@ The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1214-
 `SAFE` / `WAIT` / `SQUEEZED` and **never claims silently off a shallow reveal**. On a value-bearing
 Radiant swap the coordinator additionally refuses to construct unless the burial is *value-scaled*
 — `ceil(value × factor / reorg_cost_per_block)` — or the operator explicitly opts into a flat
-burial for a dust run (`:1062-1077`). Both inputs are operator-supplied; there is no price or
+burial for a dust run (`:1603-1618`). Both inputs are operator-supplied; there is no price or
 hashrate feed in the stack.
 
 ### Fee policy
@@ -504,9 +504,9 @@ written, not from a prior document. They are ordered by consequence.
 funds the counter leg **first**. The shipped BTC runbook does the opposite: the maker funds the
 Radiant covenant right after publishing the envelope (`scripts/btc_swap_two_host.py:690`), and the
 taker verifies that funding is on chain **and buried** before locking any BTC
-(`:503-533`). The FSM still records the taker's lock as the first transition.
+(`:602-615`). The FSM still records the taker's lock as the first transition.
 
-The harness states its own reason (`:503-506`): *"a hostile maker who never locks RXD can wait for
+The harness states its own reason (`:602-606`): *"a hostile maker who never locks RXD can wait for
 our BTC HTLC and claim it with p → one-sided taker loss."* That is a correct reading of the scripts
 — the BTC claim leaf is `<H> … <makerClaimPk> OP_CHECKSIG` with no precondition that the asset was
 ever locked, and the maker holds both `p` and the claim key from the moment the envelope is
@@ -567,8 +567,8 @@ The two envelope schema strings appear at exactly four sites, all of them **writ
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
-`SWAP_RECORD_SCHEMA_VERSION` (`swap_state.py:39`) versions the *durable record*, and is emitted only
-when the counter leg is ETH (`:530-535`).
+`SWAP_RECORD_SCHEMA_VERSION` (`swap_state.py:42`) versions the *durable record*, and is emitted only
+when the counter leg is ETH (`:723-725`).
 
 Compounding it: `NegotiatedTerms.from_dict` reads named keys and **silently ignores anything else**
 (`swap_state.py:397-415`; verified by `test_from_dict_silently_ignores_unknown_keys`). Combined with
@@ -738,7 +738,7 @@ after the taker has locked strands the taker's counter leg.
 
 The FSM is the pure, exhaustively-tested core: 13 states, 14 edges, in `swap_state.py:61-184`.
 `advance(state, event)` raises on any undefined `(state, event)` pair and on any transition out of
-a terminal state — an undefined edge is a bug, never a no-op (`:208-223`).
+a terminal state — an undefined edge is a bug, never a no-op (`:225-240`).
 
 | From | Event | To | Driven by |
 |---|---|---|---|

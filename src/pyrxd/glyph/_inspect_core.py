@@ -1181,7 +1181,7 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
                 "payload_hash": payload_hash.hex(),
             }
 
-    # DAT commit: no OP_REFTYPE_OUTPUT block, so its reveal mints nothing. It is
+    # DAT commit: no OP_REFTYPE_OUTPUT block, so it demands no token of its reveal. It is
     # checked BEFORE the NFT/FT commit branches only for readability — the three
     # regexes are disjoint, and the test suite pins that they are.
     parsed_dat = parse_dat_commit_script(script)
@@ -1193,14 +1193,16 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
             "type": "commit-dat",
             "payload_hash": dat_hash.hex(),
             "owner_pkh": bytes(dat_pkh).hex(),
-            "note": "a DAT reveal creates no token — the payload in its scriptSig is the whole point",
+            "note": "a DAT commit demands no token of its reveal (nor prevents one) — the payload in the "
+            "reveal's scriptSig is the whole point",
         }
         if _delegate_ref is not None:
             row["delegate_base_ref"] = f"{_delegate_ref.txid}:{_delegate_ref.vout}"
         return row
 
-    # The 65-byte DAT commit mainnet DAT tokens use: no "dat" push, bare only (#751). Read by
-    # what it does — it hash-locks a payload and checks no ref — not by who built it.
+    # The 65-byte hash-lock commit seen under mainnet DAT reveals: no "dat" push, bare only
+    # (#751). Read by what it does — it hash-locks a payload and checks no ref — not by who built
+    # it; filed as `commit-dat` for that, not because the script says DAT (it does not).
     parsed_dat65 = parse_dat_gly_only_commit_script(script)
     if parsed_dat65 is not None:
         dat_hash, dat_pkh = parsed_dat65
@@ -1209,8 +1211,9 @@ def _classify_script(script_hex: str, *, network: str, attest: bool = True, summ
             "type": "commit-dat",
             "payload_hash": dat_hash.hex(),
             "owner_pkh": bytes(dat_pkh).hex(),
-            "note": 'the 65-byte DAT commit form (no "dat" push, which neither pyrxd nor Photonic emits): '
-            "it hash-locks the payload and checks no ref, so a reveal spending it creates no token",
+            # At most _HUMAN_STRING_CAP: the CLI cuts a fetched output's note there.
+            "note": 'a 65-byte hash-lock with no "dat" push (neither pyrxd nor Photonic emits it): it demands '
+            "no token of its reveal, nor prevents one. Read as a DAT commit for that; the script does not say DAT",
         }
 
     if is_commit_nft_script(script_hex):
@@ -1499,23 +1502,25 @@ def _commit_obligation(spent_script: bytes) -> tuple[str, bytes, int | None] | N
     * ``"nft"`` — ``OP_REFTYPE_OUTPUT OP_2 OP_NUMEQUALVERIFY``: the spending transaction must
       create the commit's own outpoint as a SINGLETON ref. ``required_ref_type`` is 2.
     * ``"ft"`` — the same with ``OP_1``: as a NORMAL ref, and not as a singleton. 1.
-    * ``"dat"`` — no ref check at all: a DAT reveal creates nothing. ``None``.
+    * ``"dat"`` — no ref check at all: the reveal is not obliged to create anything (nor
+      prevented from it). ``None``.
 
     The ref-type operand is matched as exactly ``OP_2`` or ``OP_1``
     (:data:`~pyrxd.glyph.script.COMMIT_SCRIPT_RE`). A commit with ``OP_0`` there demands that its
     ref appear in NO output — it mints nothing — and reading one as a commit is how a decoy
     placed first read ``bound``.
 
-    WHICH DAT FORMS. Two. The one the two builders emit, read from their source: Photonic's
+    WHICH ``"dat"`` FORMS. Two. The one the two builders emit, read from their source: Photonic's
     ``datCommitScript`` at ``becf41a7`` (unchanged since it was added in ``36d8d34``, 2024-04-05)
     and pyrxd's :func:`~pyrxd.glyph.script.build_dat_commit_locking_script` both build
     ``OP_HASH256 <h> OP_EQUALVERIFY "dat" OP_EQUALVERIFY "gly" OP_EQUALVERIFY`` + P2PKH, 70 bytes,
-    or 126 behind a delegate prefix. And the 65-byte form mainnet DAT tokens use, with no ``"dat"``
-    push (``77df45a9…1b22:0``), which neither builder emits (#751). That one is recognised from
-    the script's own semantics, not from who built it: ``OP_HASH256 <h> OP_EQUALVERIFY`` forces
-    the spender to push a payload whose hash256 is ``h``, and nothing in it checks a ref, so it is
-    a DAT commit in exactly the sense :func:`_payload_binding` needs — it binds a payload and
-    creates no token. Only the bare 65-byte script is read
+    or 126 behind a delegate prefix. And a 65-byte hash-lock with no ``"dat"`` push, which neither
+    builder emits (#751). That one is read from the script's own semantics, not from who built it:
+    ``OP_HASH256 <h> OP_EQUALVERIFY`` forces the spender to push a payload whose hash256 is ``h``,
+    and nothing in it checks a ref — the one obligation :func:`_payload_binding` reads for the
+    ``"dat"`` kind. The kind is named for that obligation. The script has no ``"dat"`` push, so
+    nothing in it says DAT; the reveals seen spending it are DAT reveals (``77df45a9…1b22:0``,
+    spent by ``e5c67100…be5d``, ``p = [3]``). Only the bare 65-byte script is read
     (:func:`~pyrxd.glyph.script.parse_dat_gly_only_commit_script`).
     """
     from .script import (
@@ -1572,6 +1577,42 @@ def _output_ref_type(output_scripts: Sequence[bytes], wire_ref: bytes) -> tuple[
     return (2 if singleton else 1 if normal else 0), singleton, normal
 
 
+def _where(at: Sequence[int]) -> str:
+    """``output 3``, or ``outputs 0, 1, 2 and 7 more``: up to three indices, then a count."""
+    where = f"output {at[0]}" if len(at) == 1 else f"outputs {', '.join(map(str, at[:3]))}"
+    if len(at) > 3:
+        where += f" and {len(at) - 3:,} more"
+    return where
+
+
+def _no_token_reason(spent_script: bytes, spent_outpoint: str | None, output_scripts: Sequence[bytes]) -> str:
+    """The ``bound-no-token`` reason: a commit that demands no token, and whether one was made anyway.
+
+    The commit binds the payload and checks no ref, so it neither demands nor prevents a token for
+    its outpoint. Which of the two this transaction did is read from its outputs, the same way
+    ``bound`` reads them, so the sentence never says "describes no output" beside an output that
+    carries the commit's outpoint. The 65-byte form is named by its shape, not called a DAT commit:
+    nothing in that script says DAT. Every variant fits ``_HUMAN_STRING_CAP`` whole, the widest
+    ``where`` included, because the page cuts a longer one at its last clause.
+    """
+    from .script import parse_dat_commit_script
+
+    kind = "DAT commit" if parse_dat_commit_script(spent_script) is not None else "65-byte hash-lock"
+    said = f"the spent {kind} committed to exactly this payload. It demands no token"
+    if spent_outpoint is None:
+        return f"{said}; no outpoint is named, so no output was checked for one"
+    prev_txid, _, vout = spent_outpoint.rpartition(":")
+    wire_ref = bytes.fromhex(prev_txid)[::-1] + int(vout).to_bytes(4, "little")
+    _, singleton, normal = _output_ref_type(output_scripts, wire_ref)
+    carried = sorted(set(singleton) | set(normal))
+    if not carried:
+        return (
+            f"{said}, and no output carries its outpoint as a ref: this payload describes no output, "
+            "whatever protocol it declares"
+        )
+    return f"{said}, nor prevents one: this transaction makes its outpoint a ref at {_where(carried)}"
+
+
 def _payload_binding(
     metadata_cbor: bytes | None,
     spent_script: bytes | None,
@@ -1601,9 +1642,12 @@ def _payload_binding(
         reads ``bound`` here, and a node refuses it (``bad-txns-…-reference-operations``, measured
         by the round-2 review of #743).
     ``bound-no-token``
-        The same hash equality against a DAT commit. A DAT commit demands no ref, so the payload
-        is bound as DATA and describes no output here — whatever protocol it declares. It is kept
-        apart from ``bound`` because a DAT commit is a commit that mints nothing, placed first
+        The same hash equality against a commit of the ``"dat"`` kind: one that demands no token
+        of its reveal. The payload is bound as DATA — whatever protocol it declares — and not to
+        any output. Such a commit does not PREVENT a token either: the reveal may create the
+        commit's outpoint as a ref anyway. The reason says which: that no output carries it (so the
+        payload describes no output here), or the outputs that do, which the commit did not demand.
+        It is kept apart from ``bound`` because a commit that demands no token can be placed first
         exactly as a decoy would be.
     ``mismatch``
         The spent commit committed to a different payload. A node rejects that spend: the commit's
@@ -1665,8 +1709,7 @@ def _payload_binding(
         return {
             "state": "bound-no-token",
             "commit": kind,
-            "reason": "the spent DAT commit committed to exactly this payload. A DAT commit creates no "
-            "token, so this payload describes no output of this transaction, whatever protocol it declares",
+            "reason": _no_token_reason(spent_script, spent_outpoint, output_scripts),
         }
     if spent_outpoint is None:
         return {
@@ -1689,9 +1732,7 @@ def _payload_binding(
             "metadata as unattributed",
         }
     at = singleton if required == 2 else normal
-    where = f"output {at[0]}" if len(at) == 1 else f"outputs {', '.join(map(str, at[:3]))}"
-    if len(at) > 3:
-        where += f" and {len(at) - 3:,} more"
+    where = _where(at)
     # Two scalars rather than a list of indices: an FT reveal can carry its ref in every one of
     # 100,000 outputs, and a list that long is what every other list here is cut for. The first
     # three are in the reason, which is what both renderers draw.

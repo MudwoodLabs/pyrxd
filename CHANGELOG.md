@@ -8,13 +8,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **`glyph inspect` recognises the 65-byte DAT commit mainnet DAT tokens use (#751).**
+- **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
   `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted
-  by neither pyrxd nor Photonic. A reveal spending it read `not-a-commit`, which undersold a real
-  commitment: the script forces the spender to push a payload whose hash256 is `h`, and checks no
-  ref. It is now read from those semantics: the reveal's payload binding is `bound-no-token`
-  (or `mismatch` for another payload), and the script itself classifies as `commit-dat`. Only the
-  exact bare 65-byte form is recognised.
+  by neither pyrxd nor Photonic; both DAT reveals sampled in the 0.25.0 review spent this form. A
+  reveal spending it read `not-a-commit`, which undersold a real commitment: the script forces the
+  spender to push a payload whose hash256 is `h`, and checks no ref. It is now read from those
+  semantics: the reveal's payload binding is `bound-no-token` (or `mismatch` for another payload),
+  and the script itself classifies as `commit-dat`. Nothing in the script says DAT. It is filed
+  with the DAT commits because it has the same obligation, and its `note` and binding reason say
+  so. Only the exact bare 65-byte form is recognised.
+
+- **`bound-no-token` no longer says the payload "describes no output" of a reveal that mints.**
+  A commit that demands no token, the 70-byte DAT commit or the 65-byte form, does not prevent
+  one either: its reveal can still create the commit's outpoint as a ref. The reason used to say
+  "A DAT commit creates no token, so this payload describes no output of this transaction",
+  whatever the outputs held. It now says the commit demands no token, and then either that no
+  output carries its outpoint, which is the only case where it says the payload describes no
+  output, or which outputs do. The CLI and the /inspect/ page print this reason. The `commit-dat`
+  note now says "demands no token of its reveal, nor prevents one" instead of "creates no token".
+
+### Documentation
+
+- Doc citations into `glyph/script.py` and `glyph/_inspect_core.py` re-pointed at the code they
+  name. Several in the Glyph protocol spec had already drifted before this change: the 63-byte NFT
+  script, the FT script, the payload hash, the mutable NFT size and `COMMIT_SCRIPT_RE`. The
+  spec's §16.4 said `COMMIT_SCRIPT_RE` matches any ref-type byte, which stopped being true in
+  0.25.0. It now says that.
+- `tests/test_doc_citations_resolve.py` checks two kinds of citation it could not see before. A
+  bare `` `:N` `` is read against the file named before it. A citation written directly after a
+  backticked name that its file defines must overlap that definition. On the docs as they stood,
+  those checks found 13 drifted citations, including some in `docs/htlc-handshake-wire-format.md`,
+  `docs/security-audit-scope.md` and a how-to. All 13 are re-cited. Other line citations in
+  `docs/htlc-handshake-wire-format.md` name no file on their table row, or no symbol, so these
+  checks cannot see them, and they were not re-derived here.
 
 ## [0.25.0] — 2026-09-26
 
