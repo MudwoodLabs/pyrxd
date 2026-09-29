@@ -41,7 +41,7 @@ _SCRIPT = _ROOT / "scripts" / "mutation_test.sh"
 
 #: Packages excluded by rule. The rule IS the reason, so there is nothing per-module to rot.
 _OUT_OF_SCOPE_PREFIXES = (
-    "cli/",  # Click command wiring: argument plumbing and output formatting
+    "cli/",  # Click command wiring: argument plumbing and output formatting — except _MUTATED_CLI
     "agent/",  # long-running daemon, exercised by its own integration tests
     "gravity/watch/",  # watchtower daemons, ditto
     "contrib/",  # sample miner shipped as an example, not a library surface
@@ -67,6 +67,12 @@ _OUT_OF_SCOPE_MODULES = {
     # entry stops being true out loud.
     "network/_guards": "pure re-export of security/json_guards, which is mutated in the network group",
 }
+
+#: The cli/ modules that are mutated ANYWAY, because they print verdicts rather than plumb
+#: arguments (groups `markcli` and `inspectcli` in scripts/mutation_test.sh). The prefix rule above
+#: would let either drop out of its group in silence; `test_the_verdict_printing_cli_stays_mutated`
+#: pins them.
+_MUTATED_CLI = frozenset({"cli/hashmark_cmds", "cli/glyph_inspect"})
 
 #: The backlog, not an exemption list. See the module docstring. MAY SHRINK, MUST NOT GROW.
 _NOT_YET_MUTATED = frozenset(
@@ -244,3 +250,13 @@ def test_a_genuinely_trivial_module_is_not_refused() -> None:
         "module to prove the honest path"
     )
     assert _oversized_trivial_reason("script/unlocking_template", "trivial re-exports") is None
+
+
+def test_the_verdict_printing_cli_stays_mutated() -> None:
+    """`cli/` is out of scope by rule, so nothing above would notice if `cli/hashmark_cmds` or
+    `cli/glyph_inspect` left its group. Both render the verdict a human acts on (`pyrxd mark`/
+    `verify`, `pyrxd glyph inspect`), which is not argument plumbing, so pin them explicitly."""
+    shipped = _shipped_modules()
+    assert shipped >= _MUTATED_CLI, f"renamed or deleted: {sorted(_MUTATED_CLI - shipped)}"
+    missing = sorted(_MUTATED_CLI - _mutated_modules())
+    assert not missing, f"no mutation group mutates {missing} any more; see _MUTATED_CLI"
