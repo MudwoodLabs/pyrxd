@@ -301,12 +301,50 @@ class TestTheEthDeadlineMustLeaveTimeToClaim:
                 _claimable(remaining)
 
     def test_the_budget_is_the_one_the_claim_guard_uses(self) -> None:
-        """One number, not two copies that can drift: the ETH leg re-exports this module's value."""
+        """One number, not two copies that can drift: the ETH leg re-exports this module's value.
+
+        Asserted on the SOURCE of `htlc_leg`, not on the value. An identity check (`is`) cannot
+        see the leg going back to its own `= 96` literal, because CPython caches small ints: a
+        local 96 and the imported 96 are the same object, so the drift this guards against would
+        pass. What must not exist is a module-level assignment of the NAME to anything but the
+        imported definition.
+        """
+        import ast
+        import inspect
+
         from pyrxd.eth_wallet import htlc_leg
         from pyrxd.gravity import eth_rxd_timelock
 
-        assert htlc_leg.CLAIM_INCLUSION_BUDGET_S is eth_rxd_timelock.CLAIM_INCLUSION_BUDGET_S
-        assert eth_rxd_timelock.CLAIM_INCLUSION_BUDGET_S == 96
+        name = "CLAIM_INCLUSION_BUDGET_S"
+        tree = ast.parse(inspect.getsource(htlc_leg))
+        imported_as = {
+            alias.asname or alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "pyrxd.gravity.eth_rxd_timelock"
+            for alias in node.names
+            if alias.name == name
+        }
+        assert imported_as, f"htlc_leg no longer imports {name} from eth_rxd_timelock"
+
+        assigned: list[tuple[int, str]] = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                assigned.append((node.lineno, ast.unparse(value)))
+        # Non-vacuity: the re-export itself IS an assignment, so an empty list means the scan
+        # stopped seeing assignments, not that the module is clean.
+        assert assigned, f"expected htlc_leg's re-export of {name}; the scan found no assignment"
+        bad = [(line, src) for line, src in assigned if src not in imported_as]
+        assert not bad, (
+            f"htlc_leg defines its own {name} ({bad}) instead of re-exporting "
+            "eth_rxd_timelock's: the claim guard and the pre-funding check can drift apart again"
+        )
+        assert htlc_leg.CLAIM_INCLUSION_BUDGET_S == eth_rxd_timelock.CLAIM_INCLUSION_BUDGET_S == 96
 
     def test_a_deadline_far_short_of_the_floor_is_refused(self) -> None:
         """Not only the boundary: `==` would refuse exactly one value and wave the rest through."""
@@ -383,6 +421,77 @@ class TestTheEthDeadlineMustLeaveTimeToClaim:
 
         _claimable(remaining_s, eth_finality_stall_tolerance_s=MAINNET_ETH_FINALITY_STALL_FLOOR_S)
         _claimable(remaining_s, eth_finality_stall_tolerance_s=2 * MAINNET_ETH_FINALITY_STALL_FLOOR_S)
+
+
+class TestTheCoordinatorRefusesTheBoundaryBeforeAnyLock:
+    """The same boundary, through the PRODUCTION entry point: `SwapCoordinator.taker_funds_btc`.
+
+    The class above calls `assert_eth_deadline_is_claimable` directly, so it proves the function
+    and nothing about whether the taker's funding path still reaches it with the policy's margin.
+    Before this class existed, removing the inclusion budget from the floor was caught ONLY by the
+    direct tests; every coordinator test used a deadline 40,000 s out, far from any boundary.
+
+    Margin: the same 768 + 3600 + 300 s to finality as `_margin()`, carried by the coordinator's
+    `MarginPolicy.cross_clock_margin`, so the floor is 4764 s. `t_rxd` is 80 blocks at the
+    fixtures' 300 s dividing interval (24,000 s), which clears `eth_timeout + total_s()` (at most
+    4765 + 7068 s) with room to spare, so the ordering gate cannot be what refuses; only the
+    deadline differs between the two cases.
+    """
+
+    FLOOR = 768 + 3600 + 300 + 96  # finality + stall + rounding + CLAIM_INCLUSION_BUDGET_S
+
+    @staticmethod
+    def _coordinator(remaining_s: int):
+        from tests.test_swap_coordinator import _NOW as COORD_NOW
+        from tests.test_swap_coordinator import (
+            FakeEthLeg,
+            FakeRadiantLeg,
+            FakeSeenStore,
+            _eth_coord_full,
+            _eth_fund_policy,
+            _eth_terms,
+            _final,
+            generate_secret,
+        )
+
+        secret, h = generate_secret()
+        terms = _eth_terms(hashlock=h, eth_timeout_unix_s=COORD_NOW + remaining_s, t_rxd_blocks=80)
+        leg = FakeEthLeg(preimage=secret, verdict=_final())
+        seen = FakeSeenStore()
+        coord = _eth_coord_full(
+            terms=terms,
+            eth_leg=leg,
+            radiant_leg=FakeRadiantLeg(),
+            seen_store=seen,
+            policy=_eth_fund_policy(cross_clock_margin=_margin()),
+        )
+        return coord, terms, leg, seen, h, COORD_NOW
+
+    async def test_a_deadline_AT_the_floor_is_refused_before_any_counter_leg_lock(self) -> None:
+        from pyrxd.gravity.swap_state import SwapState
+
+        coord, terms, leg, seen, h, now = self._coordinator(self.FLOOR)
+        gate = await coord.pre_btc_lock_check(terms, now_unix_s=now)
+        assert not gate.ok
+        assert "leaves too little time to claim" in gate.reason and "claim inclusion 96s" in gate.reason
+
+        with pytest.raises(ValidationError, match=r"pre-BTC-lock gate refused funding: .*claim inclusion 96s"):
+            await coord.taker_funds_btc(terms, now_unix_s=now)
+        assert "fund" not in leg.calls, "the counter leg was funded against a deadline the maker cannot claim"
+        assert coord.record.state is SwapState.NEGOTIATED
+        assert not seen.has_seen(h), "a refused gate must not burn H"
+
+    async def test_one_second_past_the_floor_funds(self) -> None:
+        """The paired honest path: the same wiring one second later must fund, or the refusal
+        above could be any other gate failing."""
+        from pyrxd.gravity.swap_state import SwapState
+
+        coord, terms, leg, _seen, _h, now = self._coordinator(self.FLOOR + 1)
+        gate = await coord.pre_btc_lock_check(terms, now_unix_s=now)
+        assert gate.ok, gate.reason
+        rec = await coord.taker_funds_btc(terms, now_unix_s=now)
+        assert rec.state is SwapState.BTC_LOCKED
+        assert "fund" in leg.calls
 
 
 class TestTheGateSubtractsElapsedDepthExactly:
