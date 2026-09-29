@@ -48,6 +48,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `pyrxd.network.electrumx.script_hash_for_output`. Still open: the gap-limit scan reads P2PKH
   history only, so an address holding a token and no plain output is not marked used and is not
   listed.
+- **`pyrxd address` no longer hands out an address that has been paid plain RXD (#781).** With no
+  `--index`, it printed the first address the wallet file did not mark used. Only the gap-limit
+  scan marks an address used, and no command saves a scan, so on a `pyrxd wallet new` file it
+  printed index 0 every time, including after index 0 was paid. `--change` did the same on the
+  change chain. It now runs `HdWallet.refresh` first, the scan `balance`, `glyph list` and the
+  spend paths run, and prints the first address on the chain whose P2PKH script hash has no
+  history. An address that was paid and then spent from has that history, so it counts as used
+  though it holds nothing. If the scan cannot read an address, `address` exits 2 and prints no
+  address in any output mode. The scan is not saved. `--index N` still derives that index directly
+  and reads nothing from the network. **Not covered:** an address that has only ever received a
+  Glyph token. RXinDexer lists a token output under its script hash with the refs zeroed, not
+  under the owner's P2PKH hash, so the scan sees no history there and `address` can hand that
+  address out again (#787).
 
 - **`glyph inspect` reads the 65-byte hash-lock commit seen under mainnet DAT reveals (#751).**
   `OP_HASH256 <h> OP_EQUALVERIFY "gly" OP_EQUALVERIFY` + P2PKH, with no `"dat"` push, is emitted

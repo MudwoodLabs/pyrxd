@@ -132,9 +132,12 @@ $ pyrxd address
 
 The path on the right is the BIP44 derivation path — chain `512`
 is SLIP-0044's Radiant coin type. Every `pyrxd address` call
-walks the external chain (`/0/i`) to find the first index with
-no on-chain history, so calling it twice in a row will return
-the same address until you actually receive on it. You will be
+asks ElectrumX for the history of the external chain (`/0/i`)
+and prints the first index with no on-chain history, so calling
+it twice in a row will return the same address until you
+actually receive RXD on it. (An address that has only
+received a Glyph token is not yet seen as used; see
+[#787](https://github.com/MudwoodLabs/pyrxd/issues/787).) You will be
 prompted for the mnemonic each time — that is by design;
 `pyrxd` never stores the seed at rest unencrypted.
 

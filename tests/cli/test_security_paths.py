@@ -19,6 +19,7 @@ tests/cli/ — a published, fundless vector, never a hand-written key.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -306,11 +307,16 @@ class TestQueryCommandPaths:
         assert "hunter2" not in result.output
 
     def test_address_next_on_change_chain(self, runner: CliRunner, tmp_path: Path) -> None:
-        _saved_wallet(tmp_path / "wallet.dat")
-        ctx = _ctx(tmp_path / "wallet.dat", output_mode="json")
+        wallet = _saved_wallet(tmp_path / "wallet.dat")
+        # `address` scans before it picks (#781): internal index 0 has history, so the answer is 1.
+        client = _funded_client_for(wallet._derive_address(1, 0))
+        ctx = _ctx(tmp_path / "wallet.dat", client, output_mode="json")
         result = runner.invoke(address_cmd, ["--change"], obj=ctx, input=f"{MNEMONIC}\n")
         assert result.exit_code == 0, result.output
-        assert "'/1/" in result.output  # internal (change) chain path
+        # The whole path, parsed: a substring "'/1/1" would also match /1/10 through /1/19.
+        payload = json.loads(result.output.split("Mnemonic (input hidden): ", 1)[-1])
+        assert payload["path"] == "m/44'/512'/0'/1/1"  # internal (change) chain, past the used index
+        assert payload["address"] == wallet._derive_address(1, 1)
 
     def test_balance_refresh_reports_confirmed(self, runner: CliRunner, tmp_path: Path) -> None:
         wallet = _saved_wallet(tmp_path / "wallet.dat")
