@@ -35,6 +35,10 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # This job uploads hidden paths (include-hidden-files below), and `.git/config` is where
+        # checkout persists the token. Nothing here pushes, so do not persist it at all.
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -61,6 +65,10 @@ jobs:
           path: |
             logs/
             tests/.hypothesis-corpus/
+          # A dot-directory: without this, upload-artifact (>= v4.4) skips it and uploads only
+          # logs/ — which is what run 36417762423's artifact held. The reproducers this step
+          # exists to keep were never in it.
+          include-hidden-files: true
           retention-days: 30
 
   atheris:

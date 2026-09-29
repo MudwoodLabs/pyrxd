@@ -115,7 +115,9 @@ def _mutated_modules() -> set[str]:
     """
     out: set[str] = set()
     for line in _SCRIPT.read_text(encoding="utf-8").split("\n"):
-        m = re.match(r'\s*([a-z]+)\)\s+echo "([^"]*)" ;;', line)
+        # `[a-z0-9_]+`, like every other parser of this script: `[a-z]+` skipped any group whose
+        # name has a digit or underscore, and reported its modules as unmutated.
+        m = re.match(r'\s*([a-z0-9_]+)\)\s+echo "([^"]*)" ;;', line)
         if not m:
             continue
         items = m.group(2).split()

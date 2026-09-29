@@ -70,8 +70,8 @@ def _value_groups() -> set[str]:
     return set(m.group(1).split())
 
 
-def _matrix_groups() -> set[str]:
-    """What the workflow will actually run — obtained by running the generator the workflow runs."""
+def _matrix() -> list[dict[str, str]]:
+    """The workflow's job list — obtained by running the generator the workflow runs."""
     import json
     import subprocess
 
@@ -81,7 +81,12 @@ def _matrix_groups() -> set[str]:
         text=True,
         check=True,
     ).stdout
-    return set(json.loads(out)["group"])
+    return json.loads(out)["include"]
+
+
+def _matrix_groups() -> set[str]:
+    """What the workflow will actually run."""
+    return {e["group"] for e in _matrix()}
 
 
 def test_every_VALUE_group_is_RUN_weekly_by_the_workflow() -> None:
@@ -197,9 +202,44 @@ def test_a_threshold_names_a_group_that_exists() -> None:
     assert r.returncode == 0, f"the generator refuses to emit: {r.stderr.strip()}"
     import json
 
-    for entry in json.loads(r.stdout)["include"]:
+    floored = [e for e in json.loads(r.stdout)["include"] if "min_kill" in e]
+    assert floored, "no job carries a kill floor; ethleg and ethtimelock should"
+    for entry in floored:
         assert entry["group"] in _matrix_groups()
         assert str(entry["min_kill"]).isdigit()
+
+
+def _script_shards() -> dict[str, int]:
+    """`group_shards()` as the script declares it, parsed here independently of the generator."""
+    body = _SCRIPT.read_text()
+    start = body.index("group_shards() {")
+    block = body[start : body.index("\n}\n", start)]
+    return {g: int(n) for g, n in re.findall(r'^\s+([a-z0-9_]+)\)\s+echo "(\d+)" ;;', block, re.M)}
+
+
+def test_every_shard_of_a_sharded_group_is_a_job_and_every_job_name_is_unique() -> None:
+    """A sharded group is N jobs. If the generator emitted fewer, the missing shards' mutants
+    would never run while every job that did run went green. Job names also name the artifacts,
+    and a duplicate would make the second upload fail."""
+    shards = _script_shards()
+    assert shards, "group_shards() lists no group; the parse broke (inspectcore and inspectcli are sharded)"
+    jobs = _matrix()
+    names = [e["name"] for e in jobs]
+    assert len(names) == len(set(names)), f"duplicate job names: {sorted(n for n in names if names.count(n) > 1)}"
+    for group, n in shards.items():
+        got = sorted(int(e["shard"]) for e in jobs if e["group"] == group)
+        assert got == list(range(1, n + 1)), f"{group}: group_shards says {n}, the matrix runs shards {got}"
+    unsharded = [e for e in jobs if e["group"] not in shards]
+    assert unsharded and all("shard" not in e and e["name"] == e["group"] for e in unsharded)
+
+
+def test_the_mutate_step_passes_the_shard_and_names_its_files_by_job() -> None:
+    """The shard index reaches the script only through the step's env, and two shards of one
+    group share `matrix.group` — so a log or artifact named by group would collide."""
+    wf = _WORKFLOW.read_text()
+    assert "MUTATION_SHARD: ${{ matrix.shard }}" in wf
+    assert "matrix.group }}.log" not in wf and "name: mutation-${{ matrix.group }}" not in wf
+    assert 'tee "mutation-${MATRIX_NAME}.log"' in wf
 
 
 def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
@@ -265,6 +305,16 @@ def test_the_how_to_page_LISTS_every_group_a_reader_can_run() -> None:
         28: "twenty-eight",
         29: "twenty-nine",
         30: "thirty",
+        31: "thirty-one",
+        32: "thirty-two",
+        33: "thirty-three",
+        34: "thirty-four",
+        35: "thirty-five",
+        36: "thirty-six",
+        37: "thirty-seven",
+        38: "thirty-eight",
+        39: "thirty-nine",
+        40: "forty",
     }
     want = words.get(len(_value_groups()))
     assert want is not None, f"add a spelling for {len(_value_groups())} to this test"

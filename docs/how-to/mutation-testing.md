@@ -21,19 +21,27 @@ poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/s
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
 poetry run task mutate mint               # glyph/mint.py + transfer.py + client.py — mint/move facade
 poetry run task mutate glyphscript        # glyph/script.py + glyph/payload.py — envelope + locking scripts
-poetry run task mutate verdicts           # authority/burn/relationship/mutable-chain verdicts — the modules that answer "is this true"
+poetry run task mutate verdicts           # authority/burn/relationship verdicts — the modules that answer "is this true"
+poetry run task mutate mutchain           # the mutable-chain walk and its discovery from the chain
+poetry run task mutate waveverdicts       # WAVE identity and HashMark anchor verdicts
 poetry run task mutate btcleg            # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 poetry run task mutate covenants         # consensus-enforced covenant bytes — Gravity, HTLC, RSWP, soulbound
 poetry run task mutate gravitycore       # the Gravity swap machinery — state, trade, maker, fee policy, finality, reorg cost
 poetry run task mutate cryptoprim        # crypto primitives and secret handling — AEAD, KEM, AES-CBC, curve, RNG, types
-poetry run task mutate glyphverify       # glyph verification and classification — creator sigs, royalties, scanner, inspector
+poetry run task mutate glyphverify       # creator signatures, credential binding, royalties
+poetry run task mutate glyphscan         # glyph scanner and glyph types
+poetry run task mutate glyphinspector    # glyph inspector, WAVE parsing, confusables
+poetry run task mutate waverules         # WAVE name rules
+poetry run task mutate inspectcore       # glyph/_inspect_core.py — the classification core (4 shards in CI)
 poetry run task mutate glyphlock         # timelocked glyph content — reveal tx, encryption envelope, fee sizing
-poetry run task mutate wire              # wire encodings and proofs — compactsize, merkle path, consensus walk, HashMark
+poetry run task mutate wire              # wire encodings and proofs — compactsize, merkle path, consensus walk, message
+poetry run task mutate hashmark          # script/hashmark.py — the HashMark encoder/decoder
+poetry run task mutate wiretx            # hashmark_tx.py + swap/rswp/wire.py
 poetry run task mutate hdseed            # BIP39 mnemonics, BIP44 paths, and account discovery
 poetry run task mutate feecore           # the fee models beneath fee_sizing
 poetry run task mutate walletcore        # consensus constants and the partial/resolve swap halves
 poetry run task mutate markcli           # cli/hashmark_cmds.py — what `pyrxd mark`/`verify` print
-poetry run task mutate inspectcli        # cli/glyph_inspect.py — what `pyrxd glyph inspect` prints
+poetry run task mutate inspectcli        # cli/glyph_inspect.py — what `pyrxd glyph inspect` prints (4 shards in CI)
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
@@ -42,7 +50,7 @@ poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg 
 poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the twenty-five value-moving groups
+poetry run task mutate value              # the thirty-three value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
@@ -67,6 +75,10 @@ Useful environment knobs:
 - `MUTATION_REPORT_DIR=dir` — where the per-group Markdown survivor lists land
   (default `.mutation-reports/`, gitignored).
 - `MUTATION_MIN_KILL_PCT=N` — opt-in gate: exit non-zero below N% total kill rate.
+- `MUTATION_SHARD=k` — run only shard `k` (1-based) of a group listed in `group_shards` in the
+  script: every N-th mutant of each module, via `scripts/mutation_shard.py`. The weekly workflow
+  sets it; a local run leaves it unset and gets the whole group. Refused for a group that is not
+  sharded, so a job named for one slice cannot quietly run everything.
 - `MUTATION_RESUME=1` — keep an existing session and pick up where it stopped. `cosmic-ray exec`
   only runs jobs with no result yet, so a group killed at 90% resumes instead of restarting. Use it
   with `MUTATION_SESSION_DIR` and **only when the module has not changed since the session was
@@ -495,7 +507,7 @@ Three places, deliberately, and **not** on the per-push path:
 | Where | What | Why |
 |---|---|---|
 | `task mutate <group>` | on demand, locally | the loop you use while writing killer tests |
-| [`Mutation (scheduled)`](https://github.com/MudwoodLabs/pyrxd/blob/main/.github/workflows/mutation.yml) | weekly, one parallel job per group | keeps the survivor list current without anyone remembering to run it |
+| [`Mutation (scheduled)`](https://github.com/MudwoodLabs/pyrxd/blob/main/.github/workflows/mutation.yml) | weekly, one parallel job per group (or per shard) | keeps the survivor list current without anyone remembering to run it |
 | pre-release | `task mutate value` over the groups touching what shipped | the release checklist's slot for "did the new tests actually assert anything" |
 
 The per-push gate is `ci.yml`, whose required checks must stay fast enough that people do not learn
@@ -509,6 +521,59 @@ One job per group, `fail-fast: false`. Groups **cannot** share a runner: cosmic-
 it. Separate runners give each group its own checkout for free and make the wall clock the slowest
 group rather than the sum. The repo is public, so these are free-tier minutes rather than a draw on
 the private Actions pool.
+
+### Fitting a group in one job (330 minutes)
+
+A job that hits `timeout-minutes: 330` is cancelled and produces no score. Run 36521398529
+(2026-09-29) lost four groups that way: `wire`, `verdicts`, `glyphverify` and `inspectcli`. They
+are now split by module, and the two modules too big for any one job are **sharded**:
+`group_shards` in the script names them, `scripts/mutation_groups.py` emits one matrix job per
+shard, and each job keeps every N-th mutant of the fresh session (`scripts/mutation_shard.py`).
+Every split group keeps its parent's full test list, so no module is tested by less than before.
+
+Minutes per job, from that run's per-module seconds where it reached the module (**M**), and
+otherwise ESTIMATED (**E**) from a `cosmic-ray init` mutant count times a per-mutant rate:
+
+| Job | Modules | Minutes | Basis |
+|---|---|---|---|
+| `wire` | compactsize, merkle_path, script/consensus, script/message | ~118 | M, except message (E) |
+| `hashmark` | script/hashmark | 177 | M (1,084 mutants, 10,648 s) |
+| `wiretx` | hashmark_tx, swap/rswp/wire | ~103 | E: an earlier run's per-mutant rate × 1.7; on the four `wire` modules both runs reached, run 36521398529 was 1.4-1.8× slower per mutant |
+| `verdicts` | glyph/authority, burn, relationships | 149 | M |
+| `mutchain` | glyph/mutable_chain, mutable_chain_discovery | 152 | M |
+| `waveverdicts` | glyph/wave_identity, mark_anchor | ~103 | E: earlier per-mutant rate × 1.1; the five `verdicts` modules both runs reached were 1.10-1.12× slower |
+| `glyphverify` | glyph/creator, credential_binding, royalty | 124 | M |
+| `glyphscan` | glyph/scanner, types | ~164 | E: scanner at its measured 12.7 s/mutant (it grew from 237 to 375 mutants in #784); types at 13.7 s |
+| `glyphinspector` | glyph/inspector, wave, confusables | ~173 | inspector M; wave and confusables E at 13.7 s |
+| `waverules` | glyph/wave_rules | ~172 | E: 755 mutants at 13.7 s |
+| `inspectcore` ×4 | glyph/_inspect_core | ~133 each | E: 2,334 mutants at 13.7 s, over 4 shards |
+| `inspectcli` ×4 | cli/glyph_inspect | ~149 each | E: 1,428 mutants at 25 s, over 4 shards |
+
+The 13.7 s/mutant for the `glyphverify` test list is a SAMPLE, not a sweep: 25 random
+`_inspect_core` mutants averaged 18.9 s on a local box whose clean `glyphverify` suite took 29 s
+against the runner's 21 s, so 18.9 × 21 / 29. It agrees with the 12-13 s the runner measured on
+credential_binding, scanner and inspector. For `inspectcli`, 25 random mutants averaged 30.9 s
+locally; the 15 that survived (and so ran the whole list) averaged 40.7 s against the runner's
+33 s clean suite, so 30.9 × 33 / 40.7 ≈ 25 s. Neither sample hit the per-mutant timeout. As a
+bound rather than an estimate: if every mutant cost a full clean suite, one `inspectcore` shard
+(584 mutants × 21 s) would take ~204 minutes and one `inspectcli` shard (357 × 33 s) ~196. The
+first weekly run of the new
+split replaces every **E** above with a measurement; if any job lands near the timeout, split or
+shard it further rather than raising the timeout.
+
+cosmic-ray runs one mutant at a time (the `local` distributor is serial), so each job uses one of
+the runner's cores; the step prints `nproc` so the count is recorded rather than assumed.
+
+### What each job uploads
+
+Two artifacts per job, both under dot-directories and so both needing `include-hidden-files: true`
+(upload-artifact skips hidden paths by default since v4.4, which is why every artifact before this
+held only the log):
+
+- `mutation-<job>-survivors` — the Markdown survivor list. **Required** when the sweep succeeded:
+  the upload fails the job if it is missing. On a failed sweep it is uploaded if it exists.
+- `mutation-<job>` — the log and the session `.sqlite` files, always, including after a timeout,
+  so the mutants that did run can still be re-queried with `cr-report`.
 
 The lane is **report-only** — no `MUTATION_MIN_KILL_PCT`. A third of the survivors in this scope are
 equivalent mutants (1 045 of 3 122 are annotation-only by the conservative count), so a raw kill-rate
