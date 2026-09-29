@@ -652,6 +652,10 @@ class JsonFilePendingStore(PendingStore):
     partial write. It then re-reads the file and compares before returning, because a
     write that reported success and landed corrupt is indistinguishable from a good one
     until the reveal fails, by which point the commit is already on-chain.
+
+    *directory* is used as given: ``~`` is NOT expanded, so pass
+    ``Path("~/.pyrxd/pending-mints").expanduser()``, not the bare string, or the records land
+    in a directory literally named ``~`` under the current one (#755).
     """
 
     def __init__(self, directory: str | os.PathLike[str]) -> None:
@@ -957,7 +961,7 @@ class GlyphMinter:
 
     Usage::
 
-        store = JsonFilePendingStore("~/.pyrxd/pending-mints")
+        store = JsonFilePendingStore(Path("~/.pyrxd/pending-mints").expanduser())
         minter = GlyphMinter(client, wallet, store)
         result = await minter.mint_nft(metadata)
 

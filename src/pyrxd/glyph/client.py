@@ -289,7 +289,8 @@ class GlyphClient:
 
     Usage::
 
-        client = GlyphClient(electrumx, wallet, store=JsonFilePendingStore("~/.pyrxd/pending"))
+        store = JsonFilePendingStore(Path("~/.pyrxd/pending").expanduser())
+        client = GlyphClient(electrumx, wallet, store=store)
         result = await client.mint_nft(metadata)
         receipt = await client.transfer_ft(ref, 250, recipient_pkh)
 

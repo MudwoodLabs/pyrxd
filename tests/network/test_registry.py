@@ -203,3 +203,60 @@ class TestNetworkProfile:
     def test_rejects_empty_network_name(self) -> None:
         with pytest.raises(ValidationError, match="non-empty"):
             NetworkProfile(network=" ", endpoints=(Endpoint(url="wss://a.example/"),))
+
+
+class TestSourceIdentityFollowUps:
+    """#754: what the 0.25.0 form-2 review left open in ``Endpoint.source``."""
+
+    def test_an_idn_host_and_its_punycode_are_one_source(self) -> None:
+        unicode_host = NetworkProfile.build("mainnet", ["wss://bücher.example/a"]).endpoints[0]
+        punycode = NetworkProfile.build("mainnet", ["wss://xn--bcher-kva.example/b"]).endpoints[0]
+        assert unicode_host.source == punycode.source == "xn--bcher-kva.example"
+
+    def test_an_idn_host_in_capitals_folds_too(self) -> None:
+        assert NetworkProfile.build("mainnet", ["wss://BÜCHER.example/"]).endpoints[0].source == "xn--bcher-kva.example"
+
+    def test_through_the_config_loader_two_spellings_of_one_idn_server_are_one_source(self, tmp_path) -> None:
+        from pyrxd.cli import config as _config
+
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            'network = "mainnet"\nelectrumx_servers = ["wss://bücher.example/a", "wss://xn--bcher-kva.example/b"]\n',
+            encoding="utf-8",
+        )
+        profile = _config.load(cfg).for_network("mainnet").require_profile()
+        assert len(profile.endpoints) == 2  # two URLs, kept for failover
+        assert len({e.source for e in profile.endpoints}) == 1  # but one source
+
+    def test_two_different_ascii_hosts_stay_two_sources(self) -> None:
+        """The honest path: folding must not merge servers that are different."""
+        profile = NetworkProfile.build("mainnet", ["wss://a.example/", "wss://b.example/"])
+        assert [e.source for e in profile.endpoints] == ["a.example", "b.example"]
+
+    def test_two_different_idn_hosts_stay_two_sources(self) -> None:
+        profile = NetworkProfile.build("mainnet", ["wss://bücher.example/", "wss://büchen.example/"])
+        assert len({e.source for e in profile.endpoints}) == 2
+
+    @pytest.mark.parametrize("url", ["wss://[::1", "wss://[::1/", "ws://[127.0.0.1:50022/"])
+    def test_a_malformed_ipv6_url_is_a_validation_error(self, url) -> None:
+        with pytest.raises(ValidationError, match="malformed"):
+            Endpoint(url=url, allow_insecure=True)
+
+    def test_a_malformed_ipv6_url_through_the_config_loader_is_a_validation_error(self, tmp_path) -> None:
+        from pyrxd.cli import config as _config
+
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            'network = "mainnet"\nelectrumx_servers = ["wss://[::1", "wss://b.example/"]\n', encoding="utf-8"
+        )
+        with pytest.raises(ValidationError, match="malformed"):
+            _config.load(cfg).for_network("mainnet").require_profile()
+
+    def test_a_well_formed_ipv6_url_is_accepted(self) -> None:
+        assert Endpoint(url="wss://[::1]:50002/").source == "::1"
+
+    def test_the_loopback_check_fails_closed_on_a_malformed_url(self) -> None:
+        from pyrxd.network.registry import _is_loopback_url
+
+        assert _is_loopback_url("wss://[::1") is False
+        assert _is_loopback_url("wss://[::1]/") is True

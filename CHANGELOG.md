@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An outpoint's output index must be ASCII digits (#746).** `glyph inspect` and the
+  `/inspect/` and `/verify/` pages read `<txid>:1_0` as output 10 and accepted ` 1`, `+1` and
+  non-ASCII digits, through Python's `int()`. They now refuse anything but `0`-`9`.
+- **Form-2 source identity (#754).** An internationalised host and its punycode spelling now
+  count as one source (and one endpoint), so one server behind both URLs cannot corroborate
+  itself. A malformed IPv6 endpoint URL such as `wss://[::1` is refused with a `ValidationError`
+  instead of crashing the config loader with a raw `ValueError`. The `--json` mark anchor gains a
+  `header_bound` key, so a reader can tell whether the height was checked against the endpoint's
+  block header without parsing the caveat.
+- **The `JsonFilePendingStore` examples in the `GlyphMinter` and `GlyphClient` docstrings
+  expand `~` (#755).** Run as written they created a directory literally named `~` under the
+  current one; the constructor does not expand `~`, and its docstring now says so.
+
 ## [0.25.0] — 2026-09-26
 
 ### Changed (breaking)
