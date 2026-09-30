@@ -10,8 +10,9 @@
 //   stdin:  {"txid": hex, "raw_hex": hex, "anchor": {...},   — what the page hands the loop
 //            "python"?: path, "checkpoints"?: [[h, hash], …],  — the real bridge, and the mainnet
 //                      checkpoints its subprocess uses
-//            "bridge"?: "always_asks",                        — instead: a bridge that asks for a
-//                      new header range on every call, forever
+//            "bridge"?: "always_asks" | "repeats",            — instead: a bridge that asks for a
+//                      new header range on every call, forever; or one that asks for the SAME
+//                      request (the merkle branch, key "merkle") on every call, forever
 //            "proof": {…}}                                    — the server's answers (proof_server.mjs)
 //   stdout: {"answer": {...} | null,        — what `proveMarkBlock` resolved to
 //            "server_log": [[method, params], …],
@@ -81,6 +82,15 @@ async function main() {
       calls.push(args);
       const n = calls.length;
       return { needs: { key: `headers:${n}:1`, method: "blockchain.block.headers", params: [n, 1] } };
+    };
+  } else if (spec.bridge === "repeats") {
+    // A bridge that asks again for what it was already given: the loop's duplicate-request guard,
+    // not its cap, is what must end it — after one request.
+    bridge = (...args) => {
+      calls.push(args);
+      return {
+        needs: { key: "merkle", method: "blockchain.transaction.get_merkle", params: [spec.txid, spec.anchor.height] },
+      };
     };
   } else {
     bridge = makeGlueSubprocessBridge(spec.python, GLUE_DIR, calls, {

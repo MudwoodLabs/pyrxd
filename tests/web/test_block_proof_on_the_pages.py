@@ -613,6 +613,29 @@ def test_the_js_loop_stops_at_its_cap_when_the_bridge_keeps_asking(glue) -> None
     assert f"stopped after {cap} block-proof request(s)" in out["answer"]["reason"]
 
 
+@pytest.mark.parametrize("answered", [True, False], ids=["replied", "refused"])
+def test_the_js_loop_never_sends_the_same_request_twice(glue, answered: bool) -> None:
+    """A bridge that asks again for a key it already has — as a reply, or as an error — is asking
+    for something it cannot want. The loop stops after that ONE request, well below its cap, and
+    says so; it does not send it again."""
+    proof = _proof_table(C) if answered else _proof_table(C, merkle={"error": {"code": -32601, "message": "no"}})
+    out = _harness(
+        _PROOF_HARNESS,
+        {
+            "txid": C.txid,
+            "raw_hex": C.raw.hex(),
+            "anchor": page_anchor(glue, C, _server(C)),
+            "bridge": "repeats",
+            "proof": proof,
+        },
+    )
+    assert out["__constants__"]["max_block_proof_requests"] > 1, "the premise: the cap alone would allow more"
+    assert out["server_log"] == [["blockchain.transaction.get_merkle", [C.txid, C.height]]]
+    assert out["bridge_calls"] == 2
+    assert out["answer"]["anchor"] is None
+    assert "stopped after 1 block-proof request(s)" in out["answer"]["reason"]
+
+
 def test_the_cap_is_above_what_the_rule_can_ask_at_the_pages_floor(glue) -> None:
     """The cap only stops a runaway loop; it must never cut off an honest proof. At the page's
     floor the longest walk is MAX_HEADERS_FROM_CHECKPOINT + 1 headers either side of the newest
