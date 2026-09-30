@@ -240,7 +240,7 @@ def _margin_policy(args: argparse.Namespace) -> MarginPolicy:
     # THE SAME REASONING AS THE STALL-TOLERANCE WARNING ABOVE, for the knob that scales every
     # reserve. `_dividing_interval_s` falls back to the NOMINAL interval when no fast tail is set,
     # so an omitted flag does not fail — it silently sizes every reserve against 300s instead of
-    # the 36s p10, measured 8.3x looser. `eth_swap_run.py:193` REFUSES a real-value run without
+    # the 36s p10, measured 8.3x looser. `eth_swap_run.py:206` REFUSES a real-value run without
     # this; refusing here would be wrong, because there is no mainnet path in this file at all.
     #
     # But this harness is what the two-party adversarial run drives, and that run is meant to be

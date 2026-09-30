@@ -42,21 +42,21 @@ re-derive from it.
 | The negotiated-terms object and its JSON wire form | `src/pyrxd/gravity/swap_state.py:279-515` (`NegotiatedTerms`) |
 | The state machine every message drives | `src/pyrxd/gravity/swap_state.py:65-240` (13 states, 14 edges, `advance`) |
 | The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:42, 524-776` (`SwapRecord`) |
-| Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:114-134, 475-514` |
-| Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1763-1953` |
-| Post-asset-lock revalidation (what a taker checks after the maker locks) | `src/pyrxd/gravity/swap_coordinator.py:2508-2575` |
+| Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:123-143, 808-970` |
+| Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1774-1969` |
+| Post-asset-lock revalidation (what a taker checks after the maker locks) | `src/pyrxd/gravity/swap_coordinator.py:2631-2698` |
 | Preimage-length pin, BTC leg | `src/pyrxd/btc_wallet/taproot.py:334-356` (`claim_leaf_script`) |
 | Preimage-length pin, Radiant leg | `src/pyrxd/gravity/artifacts/GravityHtlcCovenantRxd.artifact.json` (`OP_SWAP OP_SIZE 20 OP_EQUALVERIFY OP_SHA256 …`), and `src/pyrxd/gravity/htlc_spend.py:272-275` |
 | Radiant covenant parameter binding | `src/pyrxd/gravity/htlc_covenant.py:202-222, 366-381, 487-516` |
 | BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:387-413` |
 | ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:152-193`, `src/pyrxd/eth_wallet/locator.py:33-104` |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:526-601`, `src/pyrxd/eth_wallet/locator.py:33-121` |
-| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-59, 632-691`, `scripts/eth_swap_two_host.py:585-645` |
+| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-59, 641-700`, `scripts/eth_swap_two_host.py:585-645` |
 | Conformance vectors | `conformance/htlc-handshake-vectors.json`, guarded by `tests/test_htlc_handshake_conformance_vectors.py` |
 
 ## Roles, and the one invariant everything rests on
 
-`swap_coordinator.py:114-134` names the invariant `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`:
+`swap_coordinator.py:123-143` names the invariant `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`:
 
 - The **maker** holds the Radiant asset and wants the counter-chain value (BTC/ETH). The maker
   generates the secret `p`, publishes `H = SHA256(p)`, locks the asset, and **claims the counter
@@ -65,7 +65,7 @@ re-derive from it.
   HTLC, then **claims the asset second** by scraping `p` off the maker's counter-chain claim.
 
 Only the maker ever holds `p`. It is generated as 32 CSPRNG bytes
-(`swap_coordinator.py:976`), wrapped in `SecretBytes`, and is **absent by construction** from every
+(`swap_coordinator.py:985`), wrapped in `SecretBytes`, and is **absent by construction** from every
 serialisable type — `NegotiatedTerms`, `SwapRecord`, and both locators have no field for it
 (`swap_state.py:16-19, 516-517`). The taker recovers `p` from the chain, never from a message.
 
@@ -86,7 +86,7 @@ states it as such (`scripts/btc_swap_two_host.py:42-50`).
 
 Message ordering is strict: a receiver MUST NOT accept message *n+1* before message *n*, and the
 coordinator enforces this by refusing every step that is not valid from the current state
-(`swap_coordinator.py:1356, 1456, 1573, 1636, 1705`).
+(`swap_coordinator.py:2353, 2656, 2971, 3165, 3234`).
 
 ### Envelope framing
 
@@ -98,7 +98,7 @@ Every message is a JSON object carrying a `schema` string:
 
 | Value | Meaning |
 |---|---|
-| `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:800`) |
+| `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:798`) |
 | `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:774`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
@@ -121,7 +121,7 @@ The taker's public key material, so the maker can build the covenant and the tap
 | `taker_btc_refund_xonly_hex` | 64-hex | BTC only | Taker's x-only key for the BTC refund leaf. |
 | `eth_taker_refund_addr` | `0x`+40-hex | ETH only | Taker's address; becomes the contract's immutable `refundee`. |
 
-Source: `scripts/btc_swap_two_host.py:435-439`, `scripts/eth_swap_two_host.py:635`.
+Source: `scripts/btc_swap_two_host.py:548-552`, `scripts/eth_swap_two_host.py:635`.
 
 ### 2. `envelope` (maker → taker)
 
@@ -177,10 +177,10 @@ see **HZ-3** for what it binds and why the derivable funding *address* does not 
 ### 4. Asset lock and revalidation
 
 Not a message: the maker funds the covenant on chain and the taker observes it. The taker MUST call
-the equivalent of `post_asset_lock_revalidate` (`swap_coordinator.py:2592-2660`), which recomputes the
+the equivalent of `post_asset_lock_revalidate` (`swap_coordinator.py:2631-2698`), which recomputes the
 expected covenant scriptPubKey from `terms` and compares it byte-for-byte against the observed one
-(`:1466-1479`). Match ⇒ `BOTH_LOCKED`. Mismatch, **or an inability to recompute it**, ⇒
-`PARAMS_MISMATCH` and the taker refunds the counter leg (`:1468-1473` — the unrecomputable case is
+(`:2660-2676`). Match ⇒ `BOTH_LOCKED`. Mismatch, **or an inability to recompute it**, ⇒
+`PARAMS_MISMATCH` and the taker refunds the counter leg (`:2661-2669` — the unrecomputable case is
 treated as a mismatch, which is the fail-closed direction).
 
 Every negotiated Radiant parameter that is substituted into the covenant bytecode — `hashlock`,
@@ -195,10 +195,10 @@ otherwise identical terms produce a **byte-identical** covenant scriptPubKey —
 demonstrate exactly that, and `test_credential_gating_does_not_change_the_covenant_spk` asserts it.
 
 The credential gate is therefore **off-chain policy, enforced by the party that chooses to run
-it** — the credential rule, `_credential_binding_failure` (`swap_coordinator.py:2662-2702`),
+it** — the credential rule, `_credential_binding_failure` (`swap_coordinator.py:2700-2740`),
 resolves the credential, checks it is genuinely consensus-soulbound, and requires its owner to be
 the swap's pinned payout (`taker_dest_hash`). The taker's pre-fund gate, `pre_btc_lock_check`
-(`swap_coordinator.py:1772-1967`), runs it before funding, and the maker's path runs it again
+(`swap_coordinator.py:1774-1969`), runs it before funding, and the maker's path runs it again
 before `BOTH_LOCKED`, the precondition for revealing `p`. (Earlier revisions of this document
 called the gate `pre_btc_lock_gate`; no function has that name.) It is fail-closed when a
 `credential_ref` is present (an unwired resolver, an unresolvable ref, or an owner mismatch all
@@ -215,16 +215,16 @@ The maker's counter-chain claim, which reveals `p` on chain.
 | `btc_claim_tx_hex` | hex | BTC — the raw claim transaction |
 | `eth_claim_tx_hash` | `0x`-hex | ETH — the claim transaction hash |
 
-Source: `scripts/btc_swap_two_host.py:771`, `scripts/eth_swap_two_host.py:711`.
+Source: `scripts/btc_swap_two_host.py:884`, `scripts/eth_swap_two_host.py:711`.
 
 This message is a **convenience pointer, not a channel**. `p` is public on chain the moment the
 claim confirms; the taker can and should find it by watching the counter chain. A conforming taker
-MUST verify, before acting on it (`swap_coordinator.py:1640-1660`):
+MUST verify, before acting on it (`swap_coordinator.py:3240-3245`):
 
 1. `SHA256(scraped p) == terms.hashlock` — scraping is by hash over all candidate pushes, **never
    by byte offset** (`counter_chain_leg.py:93-95`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
-   (`swap_coordinator.py:1594-1616`); ETH: the transaction targets *this swap's* contract instance
+   (`swap_coordinator.py:3119-3141`); ETH: the transaction targets *this swap's* contract instance
    and emits `Claimed(p)` from it (`eth_leg.py:334-340`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
@@ -249,7 +249,7 @@ The canonical wire form of `NegotiatedTerms`, produced by `NegotiatedTerms.to_di
 | `counter_chain` | `"btc"\|"eth"` | optional | **Default `"btc"`** when absent. | `:292-293, 411` |
 | `value_amount` | int | conditional | Counter-leg amount in the counter chain's own unit. **Omitted when it equals `btc_sats`**; **MUST be present and > 0 on an ETH swap** (wei — the sats sentinel deliberately does not cross the unit boundary). | `:296-314, 389` |
 | `eth_timeout_unix_s` | int | conditional | **Required on an ETH swap**, **forbidden on a BTC swap**. Absolute unix deadline; the contract immutable `timeout`. This is the *real* ETH counter-leg deadline. | `:315-322` |
-| `credential_ref` | hex | optional | Empty or **exactly 36 bytes**. **Off-chain** soulbound-credential gate, checked by `_credential_binding_failure` before funding (the taker) and before `BOTH_LOCKED` (the maker). It does **not** enter the covenant bytecode and is **not** covered by the §4 SPK byte-compare. | `:344-346`; `swap_coordinator.py:2577-2617` |
+| `credential_ref` | hex | optional | Empty or **exactly 36 bytes**. **Off-chain** soulbound-credential gate, checked by `_credential_binding_failure` before funding (the taker) and before `BOTH_LOCKED` (the maker). It does **not** enter the covenant bytecode and is **not** covered by the §4 SPK byte-compare. | `:344-346`; `swap_coordinator.py:2700-2740` |
 
 ### `genesis_ref` — what is actually enforced, and where
 
@@ -305,7 +305,7 @@ A minimal BTC↔RXD `terms` object, from `conformance/htlc-handshake-vectors.jso
 
 ### Hashlock — SHA256, and the preimage is exactly 32 bytes
 
-`H = SHA256(p)`, single SHA256, 32 bytes (`swap_coordinator.py:977`). Note that this is a
+`H = SHA256(p)`, single SHA256, 32 bytes (`swap_coordinator.py:986`). Note that this is a
 *different* hash from the dest hashes in the same object, which are `hash256` (double SHA256) —
 mixing them produces an unspendable covenant.
 
@@ -334,10 +334,10 @@ chains, and on the Radiant side a non-minimal push permanently bricks the covena
 branches — finding F-001, now guarded fail-closed at build time for values in `1..16`
 (`htlc_covenant.py:290-371`, guard 3; the same reasoning on the BTC leaf at `taproot.py:338-343`).
 
-The preimage MUST be fresh per swap and MUST come from a CSPRNG (`swap_coordinator.py:976`). `H`
+The preimage MUST be fresh per swap and MUST come from a CSPRNG (`swap_coordinator.py:985`). `H`
 reuse is separately rejected: the coordinator atomically reserves `H` in a seen-store immediately
 **before** the funding broadcast, and a second funder of the same `H` is refused with nothing
-broadcast (`swap_coordinator.py:1367-1379`).
+broadcast (`swap_coordinator.py:2435-2439`).
 
 ### Timelock deltas — the maker's own leg must outlast the one it claims
 
@@ -392,10 +392,10 @@ the block-denominated form, re-derive against the wall-clock relation.**
 **Margin floor.** There is no protocol-mandated minimum. `margin` is **each party's own policy**,
 not a negotiated field — the taker checks the maker's `terms` against the *taker's* margin and
 refuses on failure (`scripts/btc_swap_two_host.py:567-570`). The shipped default is
-`ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36` (`swap_coordinator.py:157`), which is **labelled ESTIMATED
+`ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36` (`swap_coordinator.py:166`), which is **labelled ESTIMATED
 and is test-only**: a policy constructed with `require_measured=True` refuses to use it
-(`:464-468`). A real-value swap MUST supply a margin measured from real block data
-(`measure_margin_from_btc_block_times`, `:654-754`).
+(`:473-477`). A real-value swap MUST supply a margin measured from real block data
+(`measure_margin_from_btc_block_times`, `:656-756`).
 
 **Two traps.**
 
@@ -426,8 +426,8 @@ separately, in `taker_intro.taker_pkh_hex` and `envelope.maker_pkh_hex`, so each
 the covenant; they are bound only transitively, by recomputing
 `holder_hash(pkh, variant=…, genesis_ref=…)` and comparing it to the dest hash baked into the
 covenant bytecode (`htlc_covenant.py:180`; the same mechanism proves a credential's owner is the
-payout recipient at `swap_coordinator.py:2692-2696`). A pkh that does not reproduce the dest hash
-is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:572-575`).
+payout recipient at `swap_coordinator.py:2730-2734`). A pkh that does not reproduce the dest hash
+is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:641-644`).
 Holder-script layouts, from `htlc_covenant.py:168-177`:
 
 | variant | holder script | bytes |
@@ -442,7 +442,7 @@ Holder-script layouts, from `htlc_covenant.py:168-177`:
 scriptPubKey commits to the taptree, not to the output value; an ETH contract address commits to
 its immutables, not to its balance. So the funding-target check cannot catch a wrong amount, and a
 separate check does: `funded != terms.value_amount ⇒ raise`
-(`swap_coordinator.py:1393-1398`). Both under- and over-funding are rejected; over-funding is a
+(`swap_coordinator.py:2489-2494`). Both under- and over-funding are rejected; over-funding is a
 one-sided taker loss because the claim leaf does not cap value.
 
 **The asset-leg amount is bound differently per variant** — and the three are not equivalent:
@@ -455,10 +455,10 @@ one-sided taker loss because the claim leaf does not cap value.
 
 All three additionally pin `OP_TXOUTPUTCOUNT OP_1` (exactly one output) and the destination hash.
 The leg re-reads the on-chain value rather than trusting a self-report, filtering the covenant UTXO
-set on the expected value and failing closed when nothing matches (`radiant_leg.py:256-259`). When
+set on the expected value and failing closed when nothing matches (`radiant_leg.py:263-266`). When
 **several** outputs match it does **not** refuse: it selects the earliest-confirmed one (unconfirmed
 sorts last; ties break on txid, then index), and once the funded outpoint is recorded, the claim
-pins to it instead of scanning again (`radiant_leg.py:260-305`). Refusing was the weakness this
+pins to it instead of scanning again (`radiant_leg.py:267-312`). Refusing was the weakness this
 replaced. The covenant SPK is a pure function of public terms, so a second payment to it can come
 from anyone who can build one, and a refusal would let that payment block the taker's claim until
 the maker's CSV refund opens. That is a one-sided taker loss. Selecting is safe because every
@@ -478,27 +478,27 @@ The values a second implementation should know about:
 
 | Parameter | Default | Nature | Source |
 |---|---|---|---|
-| `btc_claim_reorg_depth` | 6 blocks | **ESTIMATED**, test-only | `swap_coordinator.py:150, 195-197` |
-| `rxd_claim_burial` | 6 blocks | **ESTIMATED**, test-only | `:144, 198-200` |
-| **reorg-depth hard floor** | **2 blocks** | **not a knob** — rejected below this | `:150, 253-270` |
-| **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `:157, 292-304` |
-| `min_ref_confirmations` | 6 | policy | `:898` |
-| `min_credential_confirmations` | 6 | policy | `:917` |
-| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:504` |
-| `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `:893` |
+| `btc_claim_reorg_depth` | 6 blocks | **ESTIMATED**, test-only | `swap_coordinator.py:300-302` |
+| `rxd_claim_burial` | 6 blocks | **ESTIMATED**, test-only | `:303-305` |
+| **reorg-depth hard floor** | **2 blocks** | **not a knob** — rejected below this | `:204, 456-472` |
+| **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `:229, 501-506` |
+| `min_ref_confirmations` | 6 | policy | `:1444` |
+| `min_credential_confirmations` | 6 | policy | `:1471` |
+| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:573` |
+| `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `swap_coordinator.py:1440` |
 
-The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1225-1380`), returns
+The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1227-1382`), returns
 `SAFE` / `WAIT` / `SQUEEZED` and **never claims silently off a shallow reveal**. On a value-bearing
 Radiant swap the coordinator additionally refuses to construct unless the burial is *value-scaled*
 — `ceil(value × factor / reorg_cost_per_block)` — or the operator explicitly opts into a flat
-burial for a dust run (`:1607-1622`). Both inputs are operator-supplied; there is no price or
+burial for a dust run (`:1616-1631`). Both inputs are operator-supplied; there is no price or
 hashrate feed in the stack.
 
 ### Fee policy
 
 **No fee parameter crosses the wire.** `NegotiatedTerms` has no fee field, and `DeadlineFeePolicy`
 has no `to_dict`/`from_dict` — it is only ever constructor-injected (`fee_policy.py:157-311`;
-`radiant_leg.py:506`; `htlc_spend.py:255, 313`). Fees are node policy, not protocol.
+`radiant_leg.py:575`; `htlc_spend.py:255, 313`). Fees are node policy, not protocol.
 
 This is worth stating explicitly because on Radiant it is unusually consequential: the chain
 supports **neither RBF nor CPFP**, so an under-fee'd time-critical spend is not slow, it is
@@ -515,7 +515,7 @@ written, not from a prior document. They are ordered by consequence.
 
 `swap_state.py:155-165` and the `MAKER_SECRET_TAKER_LOCKS_BTC_FIRST` invariant both say the taker
 funds the counter leg **first**. The shipped BTC runbook does the opposite: the maker funds the
-Radiant covenant right after publishing the envelope (`scripts/btc_swap_two_host.py:699`), and the
+Radiant covenant right after publishing the envelope (`scripts/btc_swap_two_host.py:808`), and the
 taker verifies that funding is on chain **and buried** before locking any BTC
 (`:607-624`). The FSM still records the taker's lock as the first transition.
 
@@ -526,7 +526,7 @@ ever locked, and the maker holds both `p` and the claim key from the moment the 
 published. Consensus permits the claim; the FSM simply has no edge for it (from `BTC_LOCKED` the
 only exits are `BOTH_LOCKED`, `ABORTED`, `PARAMS_MISMATCH` — `swap_state.py:156-160`), and
 `maker_claims_btc` refuses it only for an *honest* maker driving its own coordinator
-(`swap_coordinator.py:1577-1578`). A hostile maker does not use a coordinator.
+(`swap_coordinator.py:2971-2972`). A hostile maker does not use a coordinator.
 
 **Normative:** a taker MUST NOT fund the counter leg until it has confirmed the maker's asset lock
 on chain, at the agreed scriptPubKey, for the agreed value, at a depth the taker chose. The FSM's
@@ -584,7 +584,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:689, 826`; `scripts/eth_swap_two_host.py:633, 838` — the second of
+(`scripts/btc_swap_two_host.py:798, 1316`; `scripts/eth_swap_two_host.py:633, 838` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
@@ -678,7 +678,7 @@ On an ETH swap `t_btc` must still be supplied, must still be a `Timelock`, and `
 still exceed it (`swap_state.py:450, 457-460`) — but the real deadline is the absolute
 `eth_timeout_unix_s`, and the ETH leg **explicitly ignores** the relative timelock the coordinator
 passes to `refund` (`eth_leg.py:316-319`). The pre-fund ordering gate correctly routes ETH swaps to
-a different, cross-clock check (`swap_coordinator.py:1283-1286, 1297-1328`) rather than
+a different, cross-clock check (`swap_coordinator.py:1879-1882, 2256-2324`) rather than
 `assert_timelock_margin`.
 
 **Normative:** on an ETH swap, treat `t_btc` as a required placeholder with no on-chain meaning. Do
@@ -688,8 +688,8 @@ not derive a refund from it, and do not validate the ETH leg against it. Validat
 #### HZ-4b: The `derive==promised` gate is a tautology
 
 Step 4 of the pre-fund gate compares `derive_funding_scriptpubkey(terms)` with
-`promised_funding_scriptpubkey(terms)` (`swap_coordinator.py:1290-1297`), and the docstring calls
-this "maker-**promised** params match the locally re-derived BTC funding SPK" (`:1214`). On both
+`promised_funding_scriptpubkey(terms)` (`swap_coordinator.py:1896-1897`), and the docstring calls
+this "maker-**promised** params match the locally re-derived BTC funding SPK" (`:1791`). On both
 shipped legs the two methods call the same function on the same input:
 
 - BTC — `src/pyrxd/btc_wallet/htlc_leg.py:403` and `:413`, both return `self._htlc(terms).scriptpubkey`; the
@@ -705,7 +705,7 @@ omit the checks that actually bind.
 ### HZ-5: Network identity is carried but never checked
 
 `envelope` carries `btc_network`, `rxd_network` and (ETH) `eth_chain_id`
-(`scripts/btc_swap_two_host.py:804-805`, `scripts/eth_swap_two_host.py:779-780`), but no reader
+(`scripts/btc_swap_two_host.py:802-803`, `scripts/eth_swap_two_host.py:779-780`), but no reader
 compares them to its own configuration — the taker phases read `maker_pkh_hex`,
 `covenant_spk_hex` and the payout fields and nothing else. `terms` carries no network at all, and
 `BtcHtlcLocator.network` defaults to `"bc"` (`taproot.py:628`).
@@ -748,9 +748,9 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 ### HZ-8: The library default accepts a 1-confirmation covenant
 
-`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:504`). The
+`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:573`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
-text warning that real value must set it deep (`scripts/btc_swap_two_host.py:946-951`). A
+text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1462-1469`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it
 after the taker has locked strands the taker's counter leg.
 
@@ -786,13 +786,13 @@ Notes a second implementation needs:
 
 - The reorg gate's `WAIT` verdict is **not** a transition. The record stays `SECRET_REVEALED` and
   the caller retries; no state is stranded because the gate runs before any advance
-  (`swap_coordinator.py:3143-3149`).
+  (`swap_coordinator.py:3266-3272`).
 - `ASSET_REFUNDED_TAKER_ACTS` is reached by a **maker-only** primitive. The covenant's CSV refund
   pays the *maker* in both directions, so a taker that runs it gifts the asset back and destroys
   its only recourse; the coordinator forbids it for a `TAKER`-role instance
-  (`swap_coordinator.py:3406-3411`). **The taker's stall recovery is `mutual_refund`.**
+  (`swap_coordinator.py:3444-3449`). **The taker's stall recovery is `mutual_refund`.**
 - Durable state MUST be persisted before an awaited broadcast and the post-broadcast write
-  shielded from cancellation, or a retry double-funds (`swap_coordinator.py:1183-1196, 1358-1400`).
+  shielded from cancellation, or a retry double-funds (`swap_coordinator.py:2359-2362, 2454-2462`).
 
 ## Known residuals
 
