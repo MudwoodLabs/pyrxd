@@ -2215,6 +2215,18 @@ async def test_the_durable_record_carries_the_override_statement(monkeypatch):
     assert len(written) >= 2 and all(w.get("single_operator_override") == _statement("20000") for w in written)
     assert SwapRecord.from_dict(written[-1]).single_operator_override == _statement("20000")
 
+    # A later gate run WITHOUT the override (a resume, say) keeps the statement: it is history.
+    resumed, _ = _btc_coord(
+        terms,
+        _real_leg(view, network="bc"),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    resumed.record = SwapRecord.from_dict(written[0])
+    await resumed.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    assert resumed.last_maker_funding.single_operator_override is None
+    assert resumed.record.single_operator_override == _statement("20000")
+
     # Without the override the record does not grow the field (its wire form is unchanged).
     coord, _ = _btc_coord(
         terms,

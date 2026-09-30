@@ -2298,9 +2298,12 @@ class SwapCoordinator:
         self.last_maker_funding = result
         # The user override of the single-operator threshold goes into the DURABLE record, so the
         # swap's own record says it was run under it. Carried by every later copy of the record
-        # (they use dataclasses.replace) and written by the intent persist before any lock.
-        if result.single_operator_override != self.record.single_operator_override:
-            self.record = dataclasses.replace(self.record, single_operator_override=result.single_operator_override)
+        # (they use dataclasses.replace) and written by the intent persist before any lock. Never
+        # CLEARED: a later run without the override (a resume) must not erase that an earlier gate
+        # run - possibly the one the lock went through - accepted one operator by user override.
+        override = result.single_operator_override
+        if override is not None and override != self.record.single_operator_override:
+            self.record = dataclasses.replace(self.record, single_operator_override=override)
         return result.outpoint, result.value_photons, result.elapsed_blocks_upper
 
     def _assert_eth_timelock_ordering(
