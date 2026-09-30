@@ -945,7 +945,7 @@ def test_a_maker_refunded_covenant_with_the_counter_leg_locked_says_refund(swap,
     # which a dust-run recovery file comes with, and a scripts/ directory a pip install lacks.
     assert "--phase abort" not in res.output
     assert "two_host" not in res.output
-    assert "pyrxd has no command that refunds the BTC leg" in res.output
+    assert "No pyrxd command can refund the BTC leg from this file" in res.output
     assert "scripts/dust_swap_run.py, which wrote this file" in res.output
     assert "30 BTC blocks after the HTLC funding confirmed" in res.output
     assert "NO timelock" in res.output
@@ -1066,7 +1066,7 @@ def _writer_record(swap, shape: str) -> dict[str, Any]:
             "ETH",
             [
                 "scripts/eth_swap_run.py, which wrote this file, has no phase that refunds only that leg",
-                f"refund() opens at unix time {_FAR_FUTURE_TS} (2096-10-02 07:06:40 UTC; still ahead)",
+                f"refund() opens at unix time {_FAR_FUTURE_TS} (2096-10-02 07:06:40 UTC; still ahead by this machine's clock)",
                 f"`eth_refund_to` = {_ETH_REFUND_TO}",
             ],
         ),
@@ -1075,7 +1075,7 @@ def _writer_record(swap, shape: str) -> dict[str, Any]:
             "ETH",
             [
                 "scripts/eth_swap_grief_run.py, which wrote this file, has no phase that refunds only that leg",
-                f"refund() opens at unix time {_FAR_PAST_TS} (2001-09-09 01:46:40 UTC; already passed)",
+                f"refund() opens at unix time {_FAR_PAST_TS} (2001-09-09 01:46:40 UTC; already passed by this machine's clock; the contract checks block time)",
                 f"`eth_refund_to` = {_ETH_REFUND_TO}",
             ],
         ),
@@ -1096,8 +1096,8 @@ def test_the_counter_leg_refund_advice_is_runnable_or_says_plainly_there_is_none
     assert res.exit_code == 0, res.output
     assert f"Counter-leg ({chain}): NOT_CHECKED" in res.output
     assert "situation  : COVENANT_SPENT" in res.output
-    assert f"pyrxd has no command that refunds the {chain} leg" in res.output
-    assert f"Your {chain} stays locked until refunded" in res.output
+    assert f"No pyrxd command can refund the {chain} leg from this file" in res.output
+    assert f"Your {chain}-side funds stay locked until refunded" in res.output
     for fragment in expected:
         assert fragment in res.output, fragment
     # Never a command that cannot run from this file. (Scoped to the advice line: the

@@ -251,7 +251,7 @@ def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None
     (``envelope.json``, ``taker_funding.json``) and that harness's own local secret file, and this
     parser accepts only the files the OTHER three harnesses write — none of which has a phase that
     refunds only the counter-leg. ``scripts/`` is also absent from a pip install. So the advice is
-    the plain truth instead: pyrxd has no command for it, the leg stays locked until refunded,
+    the plain truth instead: no pyrxd command can do it from this file, the leg stays locked until refunded,
     when its refund opens, and what in THIS file the refund needs.
     """
     chain = facts.counter_chain.upper()
@@ -278,7 +278,11 @@ def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None
         if isinstance(ts, int) and not isinstance(ts, bool):
             now = int(time.time()) if now_unix_s is None else now_unix_s
             iso = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            passed = "already passed" if now >= ts else "still ahead"
+            passed = (
+                "already passed by this machine's clock; the contract checks block time"
+                if now >= ts
+                else "still ahead by this machine's clock"
+            )
             when = f"the HTLC contract's refund() opens at unix time {ts} ({iso}; {passed})"
         else:
             when = "the HTLC contract's refund() opens at its own timeout, which this file does not record"
@@ -288,7 +292,10 @@ def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None
             if facts.eth_refund_to
             else "Refund it with the tool that funded it."
         )
-    return f"pyrxd has no command that refunds the {chain} leg, and {who}. Your {chain} stays locked until refunded; {when}. {how}"
+    return (
+        f"No pyrxd command can refund the {chain} leg from this file, and {who}. Your {chain}-side funds "
+        f"stay locked until refunded; {when}. {how}"
+    )
 
 
 def _covenant_spent(
@@ -309,7 +316,7 @@ def _covenant_spent(
     chain = counter_chain.upper()
     if refund_advice is None:
         refund_advice = (
-            f"pyrxd has no command that refunds the {chain} leg; refund it with the tool that funded it, "
+            f"No pyrxd command can refund the {chain} leg from this file; refund it with the tool that funded it, "
             "once that leg's own timelock has passed."
         )
     no_timelock = (
