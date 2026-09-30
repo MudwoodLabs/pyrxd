@@ -67,6 +67,7 @@ from ..security.errors import (
     ValidationError,
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
+from ..spv.radiant import TxMerkleBranch
 from .electrumx import ElectrumXClient, UtxoRecord, verified_broadcast_txid
 from .registry import Endpoint, NetworkProfile
 
@@ -228,6 +229,9 @@ class FailoverElectrumXClient:
 
     async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
         return await self._run("get_transaction_merkle", lambda c: c.get_transaction_merkle(txid, height))
+
+    async def get_transaction_merkle_branch(self, txid: Txid, height: BlockHeight) -> TxMerkleBranch:
+        return await self._run("get_transaction_merkle_branch", lambda c: c.get_transaction_merkle_branch(txid, height))
 
     async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Photons, Photons]:
         return await self._run("get_balance", lambda c: c.get_balance(script_hash))

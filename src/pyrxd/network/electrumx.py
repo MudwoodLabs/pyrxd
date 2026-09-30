@@ -48,6 +48,7 @@ from ..security.errors import (
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..security.units import ChainHeight, PhotonValue
+from ..spv.radiant import TxMerkleBranch
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
 from .tls_pin import normalize_pin, verify_connection_pin
@@ -574,13 +575,13 @@ class ElectrumXClient:
             )
         return result
 
-    async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
-        """Fetch the Merkle proof for *txid* at block *height*.
+    async def get_transaction_merkle_branch(self, txid: Txid, height: BlockHeight) -> TxMerkleBranch:
+        """Fetch *txid*'s merkle branch in block *height*, as ElectrumX sends it, shape-validated.
 
-        Returns
-        -------
-        MerklePath
-            A parsed Merkle path object.
+        Returns a :class:`~pyrxd.spv.radiant.TxMerkleBranch`: the sibling hashes one per tree
+        level, and the transaction's position. It is NOT checked against any header here — that is
+        the consumer's job, and :mod:`pyrxd.glyph.mark_block` is the one that does it. Raises
+        ``NetworkError`` for a malformed reply or a proof for a different block than requested.
         """
         if not isinstance(txid, Txid):
             txid = Txid(txid)
@@ -598,28 +599,48 @@ class ElectrumXClient:
             block_height = BlockHeight(nonneg_int(result["block_height"]))
             merkle_hashes: list[str] = merkle_branch(result["merkle"])
             pos: int = nonneg_int(result["pos"])
-        except (KeyError, TypeError, ValueError, ValidationError):
+            branch = TxMerkleBranch(
+                block_height=int(block_height),
+                branch=tuple(h.lower() for h in merkle_hashes),
+                pos=pos,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError, ValidationError):
             raise NetworkError("Malformed merkle response from server")
 
         # The proof must be for the block we ASKED about. ElectrumX echoes `block_height`, and
         # without binding it the server chooses which block it proves inclusion in.
-        if int(block_height) != int(height):
+        if branch.block_height != int(height):
             raise NetworkError(
-                f"merkle proof is for block {int(block_height)}, not the requested {int(height)}; fail-closed"
+                f"merkle proof is for block {branch.block_height}, not the requested {int(height)}; fail-closed"
             )
+        return branch
 
-        # Build a MerklePath from the ElectrumX branch format.
-        # ElectrumX returns hashes in display (reversed) order; we pass the
-        # txid as the leaf and build a linear proof path.
+    async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
+        """Fetch the Merkle proof for *txid* at block *height*, as a BUMP :class:`MerklePath`.
+
+        Built from :meth:`get_transaction_merkle_branch`: ONE BUMP level per tree depth — level 0
+        holds the txid leaf at ``pos`` and its sibling at ``pos ^ 1``; level ``i`` holds the one
+        sibling at offset ``(pos >> i) ^ 1``. Through 0.25.1 every sibling was put in level 0, which
+        raised on real mainnet proofs ("Missing hash for index 3 at height 0", "Duplicate offset:
+        1, at height: 0" — measured on two HashMark txids against both shipped servers).
+
+        The returned path is not checked against any header.
+        """
+        if not isinstance(txid, Txid):
+            txid = Txid(txid)
+        tmb = await self.get_transaction_merkle_branch(txid, height)
+        pos = tmb.pos
         path: list[list[Any]] = [[{"offset": pos, "hash_str": str(txid), "txid": True}]]
-        current_pos = pos
-        for _h, sibling_hex in enumerate(merkle_hashes):
-            sibling_offset = current_pos ^ 1
-            path[0].append({"offset": sibling_offset, "hash_str": sibling_hex})
-            current_pos = current_pos >> 1
+        for level, sibling_hex in enumerate(tmb.branch):
+            leaf = {"offset": (pos >> level) ^ 1, "hash_str": sibling_hex}
+            if level == 0:
+                path[0].append(leaf)
+            else:
+                path.append([leaf])
+        path[0].sort(key=lambda e: e["offset"])
 
         try:
-            return MerklePath(int(block_height), path)
+            return MerklePath(tmb.block_height, path)
         except Exception as exc:
             raise NetworkError(f"Could not construct MerklePath: {exc}") from exc
 

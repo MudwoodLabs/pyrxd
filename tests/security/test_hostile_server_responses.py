@@ -157,8 +157,8 @@ def is_acceptable(value: Any) -> bool:
 
     ``2**80`` is excluded wherever the SDK has a *principled* ceiling to check against —
     ``Satoshis.MAX`` (the chain's hard supply bound) for an amount, ``BlockHeight``'s
-    sanity ceiling for a height. It is deliberately NOT excluded for confirmation depths,
-    output indices and Merkle leaf positions: there is no principled ceiling for those,
+    sanity ceiling for a height. It is deliberately NOT excluded for confirmation depths
+    and output indices: there is no principled ceiling for those,
     and inventing one would be a number this suite made up rather than a rule the chain
     imposes. A huge depth is not more of a lie than a merely large one — the defence
     against a lying depth is the quorum reader, not a magnitude check."""
@@ -597,11 +597,19 @@ async def test_electrumx_get_utxos_requires_a_real_txid(shape: str, tx_hash: Any
 
 @pytest.mark.parametrize(("shape", "value"), HOSTILE_SCALARS, ids=[s for s, _ in HOSTILE_SCALARS])
 async def test_electrumx_get_merkle_fails_closed_on_hostile_pos(shape: str, value: Any) -> None:
-    """``blockchain.transaction.get_merkle`` → ``pos``, the leaf index of the proof."""
-    result = with_field({"block_height": 100, "merkle": ["ab" * 32], "pos": 3}, "pos", value)
+    """``blockchain.transaction.get_merkle`` → ``pos``, the leaf index of the proof.
+
+    Unlike the depths and indices :func:`is_acceptable` describes, a leaf position DOES have a
+    principled ceiling: the branch's own depth. ``pos >= 2**depth`` names no leaf of a tree that
+    deep — it aliases a smaller position (``2**depth`` walks the coinbase's branch), which is the
+    audit 2026-05-29 F-04/F-05 bypass ``pyrxd.spv.merkle.build_branch`` already refuses. So
+    ``2**80`` is refused here now, where it used to be accepted.
+    """
+    base = {"block_height": 100, "merkle": ["ab" * 32, "cd" * 32], "pos": 3}
+    result = with_field(base, "pos", value)
     coro = electrum_client(result).get_transaction_merkle(Txid(VALID_TXID), BlockHeight(100))
 
-    if is_uncapped_ok(value):
+    if is_finite_number(value) and 0 <= value < 2 ** len(base["merkle"]):
         assert await coro is not None
         return
     await assert_fail_closed(coro, label=f"ElectrumX.get_transaction_merkle[pos={shape}]")
@@ -684,14 +692,19 @@ async def test_electrumx_get_merkle_refuses_a_proof_for_a_different_block(proved
     not ask. Every other test in this file requests height 100 and is handed 100 back,
     so the echo was never actually checked against the request.
     """
-    result = {"block_height": proved_height, "merkle": ["ab" * 32], "pos": 3}
+    result = {"block_height": proved_height, "merkle": ["ab" * 32, "cd" * 32], "pos": 3}
     with pytest.raises(RxdSdkError, match="not the requested"):
         await electrum_client(result).get_transaction_merkle(Txid(VALID_TXID), BlockHeight(100))
 
 
 async def test_electrumx_get_merkle_still_accepts_a_proof_for_the_requested_block() -> None:
-    """The height binding must not reject the honest answer."""
-    result = {"block_height": 100, "merkle": ["ab" * 32], "pos": 3}
+    """The height binding must not reject the honest answer.
+
+    Two siblings, not one: ``pos`` 3 in a one-level tree is not a leaf position (see
+    :func:`test_electrumx_get_merkle_fails_closed_on_hostile_pos`), and this fixture used to
+    pair them, which only passed because nothing checked the shape.
+    """
+    result = {"block_height": 100, "merkle": ["ab" * 32, "cd" * 32], "pos": 3}
     assert await electrum_client(result).get_transaction_merkle(Txid(VALID_TXID), BlockHeight(100)) is not None
 
 
