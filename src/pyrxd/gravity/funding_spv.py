@@ -618,8 +618,9 @@ def early_elapsed_blocks_upper(
     term ``v`` and ``d = max(1, v)`` step 6 computes ``max(k, (k - d + 1) + blocks_upper(E(d)))`` with
     ``E(d) = (d - 1 + 5) × spacing + early_slack_s`` at most — ``MTP(R)`` is the time of the block
     five below ``R`` (the middle of 11), ``R`` is ``d - 1`` blocks below the newest header. (If more
-    blocks have arrived by then, each counts one block directly and removes a newer header's age from
-    ``E``, which the time term counts at ``surge_factor`` blocks per spacing.) ``v`` is not known
+    blocks have arrived by then, each adds one to the proved part and moves ``R``, and so ``MTP(R)``,
+    one block later — about one spacing off ``E``, which the time term counts at ``surge_factor``
+    blocks per spacing.) ``v`` is not known
     here: the gate's ``C`` lies between :func:`forged_confirmation_cost_floor_photons` and the
     shipped last interval's own price, so this takes the MAXIMUM of that expression over every value
     term the two allow, with ``k = max(6, burial, v)`` as the gate computes it.
