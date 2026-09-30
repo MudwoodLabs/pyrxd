@@ -1,4 +1,5 @@
-"""ONE source identity, everywhere a source is counted — and it is a HOST, not an operator.
+"""ONE source identity, everywhere a source is counted: distinct operators, as declared, or by
+registered domain.
 
 THE DEFECT CLASS. Each quorum in pyrxd grew its own idea of "a different source": the watchtower's
 RXD quorum folded case and a trailing slash, the Esplora helper only lower-cased the host, the ETH
@@ -25,8 +26,12 @@ the only one:
     once. Each planter feeds its site two spellings of ONE host and must count ONE source.
 (c) The honest paths: two genuinely different hosts count as two at every site, and several URLs on
     one host still work as failover.
+(d) The key is an OPERATOR GROUP, not a host, at every site: two subdomains of one registered
+    domain, one shipped operator's two servers, and two domains declared as one operator each count
+    ONE; two registered domains under ``co.uk``, the three shipped operators, two IP addresses, and
+    one domain declared as two operators each count TWO.
 
-What the key does not claim — anything about operators — is stated once, in
+What the key does not claim — that a group is an independent operator — is stated once, in
 :mod:`pyrxd.network.source_identity`.
 """
 
@@ -42,7 +47,7 @@ from collections.abc import Callable
 
 import pytest
 
-from pyrxd.network.source_identity import SameHostFailover, SourceKey, group_by_source, source_key, source_key_of
+from pyrxd.network.source_identity import SameSourceFailover, SourceKey, group_by_source, source_key, source_key_of
 from pyrxd.security.errors import NetworkError, ValidationError
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -160,7 +165,7 @@ async def test_an_ssh_node_and_a_wss_url_on_one_ipv6_machine_are_ONE_source(monk
             return await run._build_rxd_source(args, stack)
 
     for ssh_host in ("2001:db8::1", "user@2001:db8:0:0:0:0:0:1"):
-        with pytest.raises(ValidationError, match="same host"):
+        with pytest.raises(ValidationError, match="same source"):
             await build(ssh_host, "wss://[2001:db8::1]:50022")
     # The honest path: the node on a DIFFERENT v6 machine is a second source.
     src, corroborated = await build("2001:db9::2", "wss://[2001:db8::1]:50022")
@@ -179,9 +184,9 @@ def test_a_quorum_refuses_a_client_that_cannot_name_its_host() -> None:
     class _Labelled:
         source_key = "a"  # a plain str, as a caller might type it
 
-    with pytest.raises(ValidationError, match="does not say which host"):
+    with pytest.raises(ValidationError, match="does not say which source"):
         source_key_of(_Labelled())
-    with pytest.raises(ValidationError, match="does not say which host"):
+    with pytest.raises(ValidationError, match="does not say which source"):
         source_key_of(object())
 
 
@@ -480,7 +485,7 @@ def test_the_scan_can_see_the_pattern_it_forbids() -> None:
 
 
 # ---- planters: build the site from two URLs, return how many SOURCES it counted ----------------
-# A refusal naming "the same host" is the site declining to count one host twice: it returns 1.
+# A refusal naming "the same source" is the site declining to count one source twice: it returns 1.
 # Any other exception propagates, so a planter cannot pass by failing for an unrelated reason —
 # and the honest-path test runs the SAME planter and must see 2.
 
@@ -489,7 +494,7 @@ def _refused_as_one_host(fn: Callable[[], int]) -> int:
     try:
         return fn()
     except ValidationError as exc:
-        if "same host" not in str(exc):
+        if "same source" not in str(exc):
             raise
         return 1
 
@@ -681,7 +686,7 @@ def _plant_eth_swap_run_rpc(a: str, b: str, _mp) -> int:
     try:
         rpc = runner._eth_rpc(args, rpc_url=f"{_https(a)},{_https(b)}", chain_id=1)
     except SystemExit as exc:
-        assert "one host is one source" in str(exc), exc
+        assert "names one source" in str(exc), exc
         return 1
     return len(rpc.sources)
 
@@ -784,6 +789,96 @@ async def test_two_distinct_hosts_still_count_as_TWO_at_every_site(site, monkeyp
     assert await _run(PLANTERS[site], *TWO_HOSTS, monkeypatch) == 2, site
 
 
+# ---- (d) ...and every site counts OPERATOR GROUPS, not hosts --------------------------------------
+# Distinct operators, as declared, or by registered domain (`source_key`). The same planters, fed
+# two HOSTS of one group — which #801's host identity counted as two. `declare` is applied first:
+# `{host: operator}` through the production `declare_operator`, as the config file's `operator = "…"`
+# does. The conftest fixture forgets declarations after each test.
+
+#: Two hosts, ONE group: subdomains of one registered domain (nothing declared, nothing shipped —
+#: the Public Suffix List alone), one shipped operator's two servers, and two DIFFERENT registered
+#: domains declared as one operator.
+ONE_GROUP_CASES = {
+    "subdomains-of-one-registered-domain": ("wss://x.pool.example.org", "wss://y.pool.example.org", {}),
+    "subdomains-under-a-multi-label-suffix": ("wss://a.one.co.uk", "wss://b.one.co.uk", {}),
+    "shipped-operator-two-servers": (
+        "wss://electrumx.radiant4people.com:50022",
+        "wss://electrumx2.radiant4people.com:50022",
+        {},
+    ),
+    "declared-one-operator-across-domains": (
+        "wss://node.alpha.example",
+        "wss://node.beta.example",
+        {"node.alpha.example": "acme", "node.beta.example": "acme"},
+    ),
+}
+
+#: Two hosts, TWO groups: the honest paths the grouping must not collapse.
+TWO_GROUP_CASES = {
+    "two-registered-domains-under-co.uk": ("wss://a.co.uk", "wss://b.co.uk", {}),
+    "shipped-operators-radiantcore-radiant4people": (
+        "wss://electrumx.radiantcore.org",
+        "wss://electrumx.radiant4people.com:50022",
+        {},
+    ),
+    "shipped-operators-radiantcore-bladenet": (
+        "wss://electrumx.radiantcore.org",
+        "wss://radiant2.bladenet.online:50022",
+        {},
+    ),
+    "shipped-operators-radiant4people-bladenet": (
+        "wss://electrumx2.radiant4people.com:50022",
+        "wss://radiant4.bladenet.online:50022",
+        {},
+    ),
+    "two-ip-addresses-in-one-slash-24": ("wss://203.0.113.7", "wss://203.0.113.8", {}),
+    "declared-split-of-one-domain": (
+        "wss://x.shared.example",
+        "wss://y.shared.example",
+        {"x.shared.example": "op-x", "y.shared.example": "op-y"},
+    ),
+}
+
+
+def _declare(declared: dict[str, str]) -> None:
+    from pyrxd.network.source_identity import declare_operator
+
+    for host, operator in declared.items():
+        declare_operator(host, operator)
+
+
+@pytest.mark.parametrize("case", sorted(ONE_GROUP_CASES))
+@pytest.mark.parametrize("site", sorted(PLANTERS))
+async def test_one_operator_group_counts_as_ONE_source_at_every_site(site, case, monkeypatch) -> None:
+    a, b, declared = ONE_GROUP_CASES[case]
+    _declare(declared)
+    assert await _run(PLANTERS[site], a, b, monkeypatch) == 1, (site, case)
+
+
+@pytest.mark.parametrize("case", sorted(TWO_GROUP_CASES))
+@pytest.mark.parametrize("site", sorted(PLANTERS))
+async def test_two_operator_groups_count_as_TWO_at_every_site(site, case, monkeypatch) -> None:
+    """The honest half of (d): three operators are three, ``a.co.uk``/``b.co.uk`` are two, and a
+    declaration that splits one domain is obeyed. A grouping that refused these would refuse valid work."""
+    a, b, declared = TWO_GROUP_CASES[case]
+    _declare(declared)
+    assert await _run(PLANTERS[site], a, b, monkeypatch) == 2, (site, case)
+
+
+def test_the_group_cases_are_what_they_claim() -> None:
+    """The fixtures above are only evidence if they are the shapes named: each ONE case is two
+    different HOSTS (so #801's host identity would have counted two), each TWO case two groups."""
+    from pyrxd.network.source_identity import _canonical_host_of
+
+    for case, (a, b, declared) in ONE_GROUP_CASES.items():
+        assert _canonical_host_of(a) != _canonical_host_of(b), case
+        _declare(declared)
+        assert source_key(a) == source_key(b), case
+    for case, (a, b, declared) in TWO_GROUP_CASES.items():
+        _declare(declared)
+        assert source_key(a) != source_key(b), case
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # (c) Failover with duplicate URLs still works — and counts once
 # ══════════════════════════════════════════════════════════════════════════════
@@ -797,14 +892,14 @@ async def test_watchtower_gives_one_host_ONE_client_that_fails_over_across_its_u
     # Safe (single-source is the cautious posture), but not SILENT: the operator wrote two URLs
     # and must be told they got one source and no corroboration.
     assert "RXD corroboration is OFF" in caplog.text, caplog.text
-    assert "name ONE host ('h.example')" in caplog.text, caplog.text
+    assert "are ONE source (registered domain 'h.example')" in caplog.text, caplog.text
 
 
 async def test_two_distinct_hosts_do_not_warn_that_corroboration_is_off(monkeypatch, caplog) -> None:
     caplog.set_level("WARNING", logger="pyrxd.watchtower")
     _src, corroborated = await _rxd_source_from_run(*TWO_HOSTS, monkeypatch)
     assert corroborated is True
-    assert "corroboration is OFF" not in caplog.text and "name ONE host" not in caplog.text, caplog.text
+    assert "corroboration is OFF" not in caplog.text and "are ONE source" not in caplog.text, caplog.text
 
 
 async def test_same_host_esplora_urls_become_one_failover_reader(monkeypatch) -> None:
@@ -815,7 +910,7 @@ async def test_same_host_esplora_urls_become_one_failover_reader(monkeypatch) ->
     )
     assert len(reader._readers) == 2
     failover = reader._readers[0]
-    assert isinstance(failover, SameHostFailover) and failover.source_key == "h.example"
+    assert isinstance(failover, SameSourceFailover) and failover.source_key == "h.example"
 
     class _Member:
         def __init__(self, fails: bool) -> None:
@@ -827,7 +922,7 @@ async def test_same_host_esplora_urls_become_one_failover_reader(monkeypatch) ->
                 raise NetworkError("this URL is down")
             return 7
 
-    assert await SameHostFailover([_Member(True), _Member(False)]).confirmations("00" * 32) == 7
+    assert await SameSourceFailover([_Member(True), _Member(False)]).confirmations("00" * 32) == 7
 
 
 async def test_same_host_failover_does_not_shop_for_a_better_answer() -> None:
@@ -847,7 +942,7 @@ async def test_same_host_failover_does_not_shop_for_a_better_answer() -> None:
             return 1
 
     with pytest.raises(ValueError, match="the host's answer"):
-        await SameHostFailover([_Refuses(), _Agrees()]).read()
+        await SameSourceFailover([_Refuses(), _Agrees()]).read()
 
 
 def test_failover_group_refuses_members_on_different_hosts() -> None:
@@ -855,8 +950,8 @@ def test_failover_group_refuses_members_on_different_hosts() -> None:
         def __init__(self, url: str) -> None:
             self.source_key = source_key(url)
 
-    with pytest.raises(ValidationError, match="must all be one host"):
-        SameHostFailover([_M("https://a.example"), _M("https://b.example")])
+    with pytest.raises(ValidationError, match="must all be one source"):
+        SameSourceFailover([_M("https://a.example"), _M("https://b.example")])
 
 
 def test_a_profile_may_still_list_one_host_twice_for_failover() -> None:

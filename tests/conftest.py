@@ -102,6 +102,18 @@ except ImportError:
 # bare substring of an identifier.
 
 
+@pytest.fixture(autouse=True)
+def _forget_declared_source_operators():
+    """Operator declarations are process-wide (``pyrxd.network.source_identity.declare_operator``,
+    which a config's ``operator = "…"`` calls). Every test starts and ends with none, so one test's
+    declaration cannot decide how another counts sources, or refuse its different declaration."""
+    from pyrxd.network.source_identity import _forget_declared_operators
+
+    _forget_declared_operators()
+    yield
+    _forget_declared_operators()
+
+
 @pytest.fixture
 def unit_test_mocks(monkeypatch: None):
     """Include Mocks here to execute all commands offline and fast."""

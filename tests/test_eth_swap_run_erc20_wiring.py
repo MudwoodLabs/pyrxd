@@ -191,7 +191,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         """The constraint that makes the quorum matter. A value-bearing token leg on one endpoint
         is the configuration where a lying or lagging provider costs the preimage."""
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        with pytest.raises(SystemExit, match="at least THREE --eth-rpc-url endpoints on"):
+        with pytest.raises(SystemExit, match="at least THREE --eth-rpc-url endpoints of distinct operators"):
             runner._eth_rpc(args, rpc_url="http://127.0.0.1:1", chain_id=1)
 
     def test_a_real_token_leg_REFUSES_TWO_because_the_tolerance_would_be_inert(self, runner) -> None:
@@ -203,7 +203,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         live swap with value already locked in the HTLC.
         """
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        with pytest.raises(SystemExit, match="at least THREE --eth-rpc-url endpoints on"):
+        with pytest.raises(SystemExit, match="at least THREE --eth-rpc-url endpoints of distinct operators"):
             runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.2:1", chain_id=1)
 
     def test_a_real_token_leg_is_SATISFIED_by_three(self, runner) -> None:
@@ -228,7 +228,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         endpoints and armed a real-value leg on one host's word. It counts distinct hosts now,
         and a repeated host is refused outright rather than silently collapsed."""
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        with pytest.raises(SystemExit, match="one host is one source"):
+        with pytest.raises(SystemExit, match="names one source"):
             runner._eth_rpc(args, rpc_url=urls, chain_id=1)
 
     def test_a_TESTNET_token_leg_is_not_forced_into_a_quorum(self, runner) -> None:

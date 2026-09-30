@@ -457,10 +457,10 @@ class ElectrumXClient:
         # Validate all URLs at construction time (fast-fail).
         for url in self._urls:
             self._validate_url(url)
-        # The distinct host this client reads from, for a quorum to count it by. The URLs are raced
-        # (`_connect_first`), so a client over several URLs on ONE host is one failover source; a
-        # client over several hosts cannot say which one answered, and is ``None`` — which a
-        # quorum refuses rather than guess.
+        # The source this client reads from (its operator group, `source_key`), for a quorum to
+        # count it by. The URLs are raced (`_connect_first`), so a client over several URLs of ONE
+        # group is one failover source; a client over several groups cannot say which one
+        # answered, and is ``None`` — which a quorum refuses rather than guess.
         keys = {source_key(url) for url in self._urls}
         self.source_key: SourceKey | None = next(iter(keys)) if len(keys) == 1 else None
 

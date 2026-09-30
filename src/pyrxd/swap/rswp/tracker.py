@@ -25,7 +25,7 @@ only source of truth for classification:
   (unconfirmed) forgery, not a server that lies about ``height``. This tracker is
   a convenience position view, **not** a settlement validator. For
   trust-minimized proof of a fill, SPV-verify the spending tx (Merkle inclusion
-  + header PoW via :mod:`pyrxd.spv`) or cross-check ≥2 servers on distinct hosts before
+  + header PoW via :mod:`pyrxd.spv`) or cross-check ≥2 servers of distinct operators before
   treating FILLED as "paid" (e.g. before releasing an off-chain good). SPV
   inclusion in ``classify`` is a tracked follow-up.
 * Anything that confirmed-spends the offered UTXO but does not match the demand

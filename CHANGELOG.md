@@ -30,10 +30,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
   them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
   (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
-  wraps them in one `SameHostFailover` reader.
+  wraps them in one failover reader (`SameSourceFailover`; see below).
 
 ### Changed (breaking)
 
+- **Sources are counted by OPERATOR, as declared, or by registered domain — not by host.** The key
+  every quorum counts through (`pyrxd.network.source_identity.source_key`) is now an operator
+  group: an operator the config declares (`operator = "…"`, below), else an operator pyrxd ships
+  knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`: radiant4people.com, radiantcore.org and
+  bladenet.online, three different operators per the Radiant maintainer's statement of
+  2026-09-29), else the host's REGISTERED DOMAIN (eTLD+1, by the Public Suffix List, vendored at
+  `src/pyrxd/network/data/` and sha256-pinned), else, for an IP address, that address. So
+  `x.example.com` and `y.example.com` are ONE source while `a.co.uk` and `b.co.uk` stay two. This
+  is breaking for any list whose endpoints share a registered domain: the watchtower's RXD quorum,
+  the BTC Esplora quorums, the ETH RPC quorum, `scripts/eth_swap_run.py`'s endpoint gate,
+  `scripts/swap_run_verify.py`'s cross-check and HashMark §7.6 form 2 now count them once, and the
+  quorums that refused one host twice now refuse one operator twice (`ValidationError` "the same
+  source"). The watchtower still accepts such URLs as one failover source and warns that
+  corroboration is off when that leaves one. `SameHostFailover` (unreleased) is renamed
+  `SameSourceFailover`, and its members may be several hosts of one operator.
+- **Input that names no host is refused.** `source_key` raised nothing for `[bad`, `wss://[::1`,
+  `[::1]x` or `wss://` and made each its own key, so a typo counted as a source. They now raise
+  `ValidationError`, and so does `Endpoint(...)` at construction; so does brackets around anything
+  that is not an IPv6 address. No shipped default is affected.
 - **Quorums refuse two sources on one host, and every source must name its host.**
   `MultiSourceRxdChainSource`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
   `MultiSourceEthRpc` raise `ValidationError` when two sources share a host, and when a source
@@ -49,8 +68,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `scripts/eth_swap_run.py` refuses an `--eth-rpc-url` list that names one host twice, and its
   three-endpoint gate counts distinct hosts.
 
+### Added
+
+- **Declare who runs an ElectrumX server: `operator = "…"`.** An entry of `electrumx_servers` (or
+  `electrumx`), top-level or under `[networks.<name>]`, may be `{ url = "wss://...", operator =
+  "acme" }`. The declaration overrides the registered-domain grouping everywhere sources are
+  counted in the process (it is applied when the CLI builds its endpoint profile), so two domains
+  declared as one operator count once and two hosts of one domain declared as two operators count
+  twice. It is validated at load: an id is 1-64 lower-case letters, digits, `.` or `-`; unknown
+  keys in the table, one host declared as two operators, and a declaration that contradicts a
+  shipped operator are refused. pyrxd believes the declaration; it is only as good as what is
+  written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md` (7c).
+- **`wss://electrumx2.radiant4people.com:50022/` is a shipped mainnet default, for failover.** It is
+  radiant4people's second server, so it is ONE source with `electrumx.radiant4people.com` and never
+  a second vote; it comes last so form 2's endpoint pair reaches radiantcore first. Each shipped
+  endpoint now carries its operator (`registry.SHIPPED_ENDPOINTS`; `DEFAULT_ENDPOINTS` is derived
+  from it, and the watchtower's `DEFAULT_RXD_ELECTRUMX` is `DEFAULT_ENDPOINTS["mainnet"]`). Probed
+  2026-09-29 from one vantage point: radiantcore and both radiant4people servers served the mainnet
+  genesis at tip 468,606. Photonic's other three mainnet servers (bladenet: `radiant2`, `radiantus`
+  and `radiant4.bladenet.online:50022`, Radiant-Core/Photonic-Wallet @ `becf41a`) are not shipped:
+  none answered that day (timeouts, no route, and a failed TLS handshake on radiant2 :443).
+
 ### Changed
 
+- **"Distinct operators (as declared, or by registered domain)".** The prose that #801 changed to
+  "distinct host" now says what is counted, and the operator limit in
+  `pyrxd.network.source_identity` states both halves once: one party can register several domains,
+  and a declared operator is only as good as the declaration. `verify --wave-name`'s ESTABLISHED
+  explanation, `--help` and the form-2 caveat say it rests on two distinct operators as declared or
+  by registered domain, which is not proof that different parties run them. The same module
+  documents one known IDNA deviation: Python's codec (IDNA2003) makes `faß.de` and `fass.de` one
+  key while yarl/aiohttp (IDNA2008) treat them as two hosts — rare, and it can only lower a count.
+  A comment that read `203.113.7` as `203.0.113.7` now says `inet_aton` reads it as `203.113.0.7`.
 - **"Distinct host", never "independent operator".** A URL can show that two servers are on
   different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
   say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`

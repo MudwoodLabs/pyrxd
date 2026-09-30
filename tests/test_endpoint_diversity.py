@@ -22,7 +22,8 @@ def count_distinct_hosts(urls):
 
 def test_source_key_parses_hostname():
     assert source_key("https://mempool.space/api") == "mempool.space"
-    assert source_key("wss://x.example.com:50022") == "x.example.com"
+    # grouped by REGISTERED DOMAIN: x.example.com is one source with every other *.example.com
+    assert source_key("wss://x.example.com:50022") == "example.com"
     assert source_key("HTTPS://Mempool.Space/api") == "mempool.space"
     for blank in ("", None):
         with pytest.raises(ValidationError):

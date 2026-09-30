@@ -994,22 +994,23 @@ def _require_wave_name(name: str | None) -> str | None:
 
 
 def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
-    """Two clients pinned to two configured endpoints on DIFFERENT HOSTS, each labelled by its URL.
+    """Two clients pinned to two configured endpoints of DIFFERENT OPERATORS, each labelled by its URL.
 
-    Form 2 needs two sources on distinct hosts three times over: the walker refuses a tip proof from
-    the server that supplied the candidates, the judge refuses a mark height from the server that
-    supplied the name→glyph binding, and the judge refuses any block height — the mark's or a chain
-    step's — that both endpoints do not report identically. Those rules compare the LABELS by host
-    (:func:`pyrxd.network.source_identity.source_key`, inside the judge and the walker), so a label
-    must name the endpoint that really answers: one endpoint must never carry two labels. With ONE configured endpoint both clients are that endpoint and both labels are
-    equal, so each of those rules degrades with its reason — which
-    is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
-    config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
-    ships two endpoints on distinct hosts, so with no configuration at all these are two different
-    hosts and form 2 is reachable. Distinct hosts, not proven distinct operators: see the
-    operator limit in :mod:`pyrxd.network.source_identity`. (It used to say the default was single-server, which read
-    as though form 2 — and ``verify --wave-name``'s ESTABLISHED — needed opting into. It does not.
-    testnet and regtest ship no endpoint at all.)
+    Form 2 needs two sources three times over: the walker refuses a tip proof from the server that
+    supplied the candidates, the judge refuses a mark height from the server that supplied the
+    name→glyph binding, and the judge refuses any block height — the mark's or a chain step's — that
+    both endpoints do not report identically. Those rules compare the LABELS by source
+    (:func:`pyrxd.network.source_identity.source_key`, inside the judge and the walker: distinct
+    operators, as declared, or by registered domain), so a label must name the endpoint that really
+    answers: one endpoint must never carry two labels. With ONE configured operator both clients are
+    one endpoint and both labels are equal, so each of those rules degrades with its reason — which
+    is the truth of a single-operator configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
+    config naming one operator's servers). That is NOT the shipped mainnet default:
+    ``network/registry.py`` ships endpoints of two operators, so with no configuration at all these
+    are two operators and form 2 is reachable. The grouping is not proof of independence: see the
+    operator limit in :mod:`pyrxd.network.source_identity`. (It used to say the default was
+    single-server, which read as though form 2 — and ``verify --wave-name``'s ESTABLISHED — needed
+    opting into. It does not. testnet and regtest ship no endpoint at all.)
 
     Tests patch this to hand in fakes.
     """
@@ -1021,13 +1022,14 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
 
     profile = ctx.config.require_profile()
     first = profile.endpoints[0]
-    # A SECOND HOST, not merely a second URL. `wss://h/` and `wss://h/x`, or one IP address
-    # spelled two ways, are one machine: taking the next URL made one lying server two "sources"
-    # that corroborated each other (0.25.0 panel, round 3). The first endpoint on a DIFFERENT host
-    # (`Endpoint.source`) is the second; if there is none, this is a single-host configuration
-    # and both halves are the first endpoint under one label — which every source rule refuses.
-    # (The judge and the walker compare by host themselves too, so a caller that skips this
-    # function cannot skip the rule.)
+    # A SECOND OPERATOR, not merely a second URL. `wss://h/` and `wss://h/x`, one IP address
+    # spelled two ways, two hosts of one registered domain, or radiant4people's two servers are one
+    # source: taking the next URL made one lying server two "sources" that corroborated each other
+    # (0.25.0 panel, round 3). The first endpoint of a DIFFERENT source (`Endpoint.source`, which
+    # honours a declared `operator`) is the second; if there is none, this is a single-operator
+    # configuration and both halves are the first endpoint under one label — which every source
+    # rule refuses. (The judge and the walker compare by source themselves too, so a caller that
+    # skips this function cannot skip the rule.)
     second = next((e for e in profile.endpoints[1:] if e.source != first.source), first)
 
     def _one(endpoint: object) -> FailoverElectrumXClient:

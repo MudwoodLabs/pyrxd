@@ -22,15 +22,16 @@ note about it.
 SIX THINGS MUST HOLD, or the verdict degrades to form 1 WITH A REASON:
 
 1. The mark has a block, buried to the caller's bar (``MarkAnchor.usable_for_point_in_time``).
-2. The mark's block and the name→glyph binding came from DIFFERENT sources — distinct HOSTS, by
-   :func:`pyrxd.network.source_identity.source_key`, so ``wss://h/`` and ``wss://h:443/x`` are one
-   source here whatever the caller labelled them. One endpoint that supplies both can move the
+2. The mark's block and the name→glyph binding came from DIFFERENT sources — distinct operators,
+   as declared, or by registered domain (:func:`pyrxd.network.source_identity.source_key`), so
+   ``wss://h/`` and ``wss://h:443/x``, or ``wss://x.d.example`` and ``wss://y.d.example``, are one
+   source here whatever the caller labelled them. One source that supplies both can move the
    answer twice - pick the block, then pick what the name said then.
 3. The name's chain walked completely and its tip is proved (``MutableChainWalk.complete``).
 4. The glyph's OWN mint payload names the label that was asked about. An index that binds a name
    to someone else's glyph is otherwise believed outright.
 5. EVERY BLOCK HEIGHT THE ANSWER COMPARES — the mark's, and each chain step's — was reported
-   identically by at least two sources on DIFFERENT HOSTS (:class:`HeightReport`). The heights decide which
+   identically by at least two DIFFERENT sources (:class:`HeightReport`). The heights decide which
    update was current at the mark's block exactly as much as the binding does: an endpoint that
    reports ONE update a few blocks late, still monotonic, still plausible, moves the answer from
    one target to another. Rule 2 alone never covered that — the step heights came from the
@@ -45,10 +46,10 @@ WHAT TWO AGREEING SOURCES STILL DO NOT BUY. Agreement turns one endpoint's lie i
 disagreement; it is not proof. The mark's height can be checked against each endpoint's OWN block
 header (the CLI does; :attr:`HeightReport.mark_header_bound` records it), the step heights are not,
 and nothing checks proof-of-work or merkle inclusion — so two endpoints that tell the SAME lie still
-move the answer. The residual trust is "two servers on distinct hosts do not collude" — and a
-distinct host is not an independent operator (the operator limit in
-:mod:`pyrxd.network.source_identity`). The form-2 caveat says so, and says exactly which heights
-were header-checked.
+move the answer. The residual trust is "two servers of distinct operators (as declared, or by
+registered domain) do not collude" — and that grouping is not proof of independence (the operator
+limit in :mod:`pyrxd.network.source_identity`). The form-2 caveat says so, and says exactly which
+heights were header-checked.
 """
 
 from __future__ import annotations
@@ -78,7 +79,7 @@ EXPIRY_UNKNOWN = "unknown: renewals are decided by treasury payments this walk d
 class HeightReport:
     """Where ONE endpoint places the mark and each step of the name's chain.
 
-    ``judge_name_at_mark`` needs at least two of these from DIFFERENT hosts, agreeing on every
+    ``judge_name_at_mark`` needs at least two of these from DIFFERENT sources, agreeing on every
     height it compares, before it will say which target was in force at the mark's block. A
     report is the endpoint's word, labelled — the judge does the comparing, so no caller can
     "corroborate" by assertion.
@@ -88,7 +89,7 @@ class HeightReport:
     one that places it and one that does not disagree, and that degrades.
     """
 
-    #: Who said this — the endpoint's URL in the CLI. Compared across reports BY HOST
+    #: Who said this — the endpoint's URL in the CLI. Compared across reports BY SOURCE
     #: (:func:`~pyrxd.network.source_identity.source_key`), never as raw text.
     source: str
     #: The block this endpoint places the mark in.
@@ -114,7 +115,7 @@ class WaveIdentityVerdict:
     #: The glyph this is ABOUT, always. If the name→glyph binding is wrong, this stays true of
     #: the ref and simply says nothing about the name — which is the correct failure.
     ref: str
-    #: How the name→glyph binding was obtained. Compared with the anchor's source by host.
+    #: How the name→glyph binding was obtained. Compared with the anchor's source by source key.
     binding_source: str
     #: Always False: nothing proves on chain that this glyph is the registration IN FORCE for the
     #: name. A form-2 verdict has checked that the glyph's own mint NAMES it (rule 4), which is
@@ -127,7 +128,7 @@ class WaveIdentityVerdict:
     #: Empty iff ``form == 2``.
     degraded_reason: str
     caveat: str
-    #: The sources whose block heights agreed, on a form-2 verdict: one label per DISTINCT HOST.
+    #: The sources whose block heights agreed, on a form-2 verdict: one label per distinct source.
     #: Empty on a degrade.
     height_sources: tuple[str, ...] = ()
 
@@ -169,17 +170,19 @@ def _corroborated_caveat(sources: Sequence[str], *, mark_header_bound: bool) -> 
         f"{' and '.join(repr(s) for s in sources)}, and are NOT verified. {header} Nothing checks "
         "proof-of-work or merkle inclusion, so one endpoint's lie now shows as a disagreement, but "
         "endpoints that agree on the same lie still move the point in time this answer is about. "
-        "Those endpoints are distinct HOSTS, not proven independent operators, so one party running "
-        "both would defeat the agreement"
+        "Those endpoints are distinct operators as declared, or by registered domain — not proven "
+        "independent: one party can register several domains, so one party running both would defeat "
+        "the agreement"
     )
 
 
 def _same_source(a: str, b: str) -> bool:
-    """True when two source labels are ONE source: equal as text, or the same distinct host.
+    """True when two source labels are ONE source: equal as text, or the same source key.
 
     Two EMPTY labels are the same (unattributed, so possibly one endpoint), as they always were;
     otherwise the comparison is :func:`~pyrxd.network.source_identity.source_key` — the identity
-    every source count in pyrxd uses — so ``wss://h/`` and ``wss://h:443/x`` are one source.
+    every source count in pyrxd uses — so ``wss://h/`` and ``wss://h:443/x`` are one source, and so
+    are two hosts of one registered domain.
     """
     a, b = str(a or "").strip(), str(b or "").strip()
     if not a or not b:
@@ -390,14 +393,15 @@ def judge_name_at_mark(
             ),
             anchor=anchor,
         )
-    # ONE HOST, ONE SOURCE, decided HERE rather than by whoever built the labels. `wss://h/` and
-    # `wss://h/x`, or `wss://h` and `wss://h:443`, are one server; the CLI's `_endpoint_pair`
-    # already picks a second host, but a library caller handing in its own labels could not be
-    # trusted to, and counting spellings let one server's word through as two.
-    by_host: dict[str, str] = {}
+    # ONE OPERATOR, ONE SOURCE, decided HERE rather than by whoever built the labels. `wss://h/`
+    # and `wss://h/x`, `wss://h` and `wss://h:443`, or two hosts of one registered domain, are one
+    # source; the CLI's `_endpoint_pair` already picks a second operator, but a library caller
+    # handing in its own labels could not be trusted to, and counting spellings let one server's
+    # word through as two.
+    by_source: dict[str, str] = {}
     for r in height_reports:
-        by_host.setdefault(source_key(r.source), r.source)
-    sources = list(by_host.values())
+        by_source.setdefault(source_key(r.source), r.source)
+    sources = list(by_source.values())
     if len(sources) < 2:
         labels = list(dict.fromkeys(r.source for r in height_reports))
         only = (

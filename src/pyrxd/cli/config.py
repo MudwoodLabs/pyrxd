@@ -9,6 +9,7 @@ Schema:
   electrumx = "wss://..."           # single server (legacy form)
   electrumx_servers = [             # ordered failover list; wins over `electrumx`
     "wss://...", "wss://...",
+    { url = "wss://...", operator = "acme" },   # optional: who runs this server (see below)
   ]
   allow_insecure = false            # permit ws:// (local regtest indexer only)
   spki_pins = ["sha256/BASE64="]    # opt-in TLS pinning; see pyrxd.network.tls_pin
@@ -18,6 +19,26 @@ Schema:
 
   [networks.testnet]
   electrumx = "wss://..."
+
+Declaring who runs a server — ``operator``
+-----------------------------------------
+Any entry of ``electrumx_servers`` (or ``electrumx``) may be a table,
+``{ url = "wss://...", operator = "acme" }``, instead of a bare URL. The operator
+decides which SOURCE that server is wherever two sources must agree — today,
+HashMark §7.6 form 2 (``hashmark verify --wave-name``, ``glyph inspect``'s name
+check), which needs two configured servers of DIFFERENT operators.
+
+Without a declaration, servers are grouped by REGISTERED DOMAIN (the Public Suffix
+List): ``x.example.com`` and ``y.example.com`` are one source, ``a.co.uk`` and
+``b.co.uk`` two, and an IP address is its own. A declaration overrides that: two
+URLs declared ``"acme"`` are one source whatever their domains, and hosts of one
+domain declared as two operators are two sources. pyrxd believes the declaration
+— it is only as good as what you write (the operator limit in
+:mod:`pyrxd.network.source_identity`). It is refused when it is not a valid id
+(1-64 lower-case letters, digits, ``.`` or ``-``), when one host is declared as
+two operators, or when it contradicts an operator pyrxd ships knowledge of
+(:data:`pyrxd.network.registry.KNOWN_OPERATORS`). Shipped defaults carry their
+operators already; there is nothing to declare for them.
 
 Network binding — why the top-level endpoint does NOT follow ``--network``
 --------------------------------------------------------------------------
@@ -67,6 +88,7 @@ from ..network.registry import (
     default_endpoints,
     genesis_hash_for,
 )
+from ..network.source_identity import declare_operator, source_key
 from ..security.errors import ValidationError
 
 # tomllib landed in Python 3.11. pyproject.toml declares ``requires-python = ">=3.10"``
@@ -179,6 +201,9 @@ class Config:
     network: str = "mainnet"
     electrumx: str = ""
     electrumx_servers: tuple[str, ...] = ()
+    #: Declared operators, ``{url: operator}``, for URLs in :attr:`endpoints` (the config's
+    #: ``{ url = ..., operator = ... }`` entries). Bound to ``network`` like the URLs are.
+    endpoint_operators: dict[str, str] = field(default_factory=dict)
     allow_insecure: bool = False
     spki_pins: tuple[str, ...] = ()
     fee_rate: int = DEFAULT_FEE_RATE_PHOTONS_PER_BYTE
@@ -226,7 +251,7 @@ class Config:
         if not isinstance(overrides, dict):
             overrides = {}
 
-        servers = _resolve_servers(self, network, overrides, electrumx_override)
+        servers, operators = _resolve_servers(self, network, overrides, electrumx_override)
         # Top-level `allow_insecure` / `spki_pins` are bound to the top-level
         # network for the same reason the endpoint is: they describe how to talk to
         # THAT server, and inheriting them across networks would silently relax (or
@@ -243,6 +268,7 @@ class Config:
             network=network,
             electrumx=servers[0] if servers else "",
             electrumx_servers=servers,
+            endpoint_operators=operators,
             allow_insecure=allow_insecure,
             spki_pins=spki_pins,
             # The per-network fee_rate goes through the SAME relay-floor guard as the
@@ -266,13 +292,22 @@ class Config:
         gap = self.endpoint_gap or (None if self.endpoints else EndpointGap(self.network, self.source_path))
         if gap is not None:
             raise ValidationError(str(gap))
-        return NetworkProfile.build(
+        operators = {url: op for url, op in self.endpoint_operators.items() if url in self.endpoints}
+        profile = NetworkProfile.build(
             self.network,
             self.endpoints,
             allow_insecure=self.allow_insecure,
             spki_pins=self.spki_pins,
             genesis_hash=genesis_hash_for(self.network),
+            operators=operators,
         )
+        # The declarations reach every source count in the process, not only `Endpoint.source`:
+        # HashMark §7.6 form 2's judge and walker compare the URLs they are handed, and would
+        # otherwise group two declared operators under one domain as one source.
+        for endpoint in profile.endpoints:
+            if endpoint.operator is not None:
+                declare_operator(endpoint.url, endpoint.operator)
+        return profile
 
 
 def _resolve_servers(
@@ -280,19 +315,23 @@ def _resolve_servers(
     network: str,
     overrides: dict[str, Any],
     electrumx_override: str | None,
-) -> tuple[str, ...]:
-    """Endpoint resolution order for *network*. See the module docstring."""
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Endpoint resolution order for *network*, and the operators declared for those endpoints.
+
+    See the module docstring. Operators travel with the list they were declared in: a
+    ``--electrumx`` override or the shipped defaults carry none.
+    """
     if electrumx_override:
-        return (str(electrumx_override),)
+        return (str(electrumx_override),), {}
     if overrides.get("electrumx_servers"):
-        return _as_str_tuple(overrides["electrumx_servers"], f"networks.{network}.electrumx_servers")
+        return _as_endpoint_list(overrides["electrumx_servers"], f"networks.{network}.electrumx_servers")
     if overrides.get("electrumx"):
-        return (str(overrides["electrumx"]),)
+        return _as_endpoint_list([overrides["electrumx"]], f"networks.{network}.electrumx")
     # The top-level endpoint belongs to the top-level network ONLY. This single
     # condition is the network-binding fix.
     if network == cfg.network and cfg.endpoints:
-        return cfg.endpoints
-    return tuple(default_endpoints(network))
+        return cfg.endpoints, {u: op for u, op in cfg.endpoint_operators.items() if u in cfg.endpoints}
+    return tuple(default_endpoints(network)), {}
 
 
 def _validated_network(value: Any, source_path: Path | None, *, source: str) -> str:
@@ -482,13 +521,20 @@ def load(path: Path | None = None) -> Config:
     )
     # No built-in fallback here: an unset endpoint stays unset and is resolved
     # per-network by `for_network`. See the module docstring.
-    electrumx = os.environ.get("PYRXD_ELECTRUMX") or file_data.get("electrumx") or ""
-    servers = _as_str_tuple(file_data.get("electrumx_servers", ()), "electrumx_servers")
+    operators: dict[str, str] = {}
+    electrumx_raw = os.environ.get("PYRXD_ELECTRUMX") or file_data.get("electrumx") or ""
+    if isinstance(electrumx_raw, dict):
+        (electrumx,), operators = _as_endpoint_list([electrumx_raw], "electrumx")
+    else:
+        electrumx = electrumx_raw
+    servers, server_operators = _as_endpoint_list(file_data.get("electrumx_servers", ()), "electrumx_servers")
+    operators.update(server_operators)
     if os.environ.get("PYRXD_ELECTRUMX"):
         # An explicit env endpoint replaces the file's list rather than joining it —
         # a one-off override must not silently keep failing over to servers the
-        # operator was trying to bypass.
+        # operator was trying to bypass. Their declared operators go with them.
         servers = ()
+        operators = {}
     fee_rate_raw = os.environ.get("PYRXD_FEE_RATE") or file_data.get("fee_rate") or _DEFAULTS["fee_rate"]
     wallet_path = os.environ.get("PYRXD_WALLET_PATH") or file_data.get("wallet_path") or _DEFAULTS["wallet_path"]
     # ``or`` short-circuits on a falsy 0 — coin_type 0 (legacy Bitcoin-compatible)
@@ -505,6 +551,7 @@ def load(path: Path | None = None) -> Config:
         network=network,
         electrumx=str(electrumx),
         electrumx_servers=servers,
+        endpoint_operators=operators,
         allow_insecure=bool(file_data.get("allow_insecure", False)),
         spki_pins=_as_str_tuple(file_data.get("spki_pins", ()), "spki_pins"),
         fee_rate=validated_fee_rate(
@@ -531,6 +578,49 @@ def _as_int(value: Any, key: str) -> int:
         return int(value)
     except (ValueError, TypeError) as exc:
         raise ValidationError(f"config value for {key!r} is not an integer: {value!r}") from exc
+
+
+def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    """An endpoint list whose entries are URLs or ``{ url = "...", operator = "..." }`` tables.
+
+    Returns ``(urls, {url: operator})``. A table must carry a non-empty string ``url``, may carry
+    ``operator``, and nothing else — a misspelt ``operater`` silently ignored would leave the
+    user believing a declaration is in force. The operator id itself is validated where it is
+    used (:func:`pyrxd.network.source_identity.source_key`), and here too, so a bad one fails at
+    load rather than at the first network command.
+    """
+    if value is None:
+        return (), {}
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValidationError(f"config value for {key!r} must be a list of URLs or {{ url, operator }} tables")
+    urls: list[str] = []
+    operators: dict[str, str] = {}
+    for item in value:
+        if isinstance(item, str):
+            if item:
+                urls.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValidationError(f"config value for {key!r} must be a list of URLs or {{ url, operator }} tables")
+        extra = sorted(set(item) - {"url", "operator"})
+        if extra:
+            raise ValidationError(f"config entry in {key!r} has unknown key(s) {extra}; allowed: url, operator")
+        url = item.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValidationError(f"config entry in {key!r} needs a non-empty string url")
+        urls.append(url)
+        if "operator" in item:
+            operator = item["operator"]
+            try:
+                source_key(url, operator=operator)
+            except ValidationError as exc:
+                raise ValidationError(f"config entry in {key!r} for {url!r}: {exc}") from exc
+            if url in operators and operators[url] != operator:
+                raise ValidationError(f"config value for {key!r} declares {url!r} as two operators")
+            operators[url] = operator
+    return tuple(urls), operators
 
 
 def _as_str_tuple(value: Any, key: str) -> tuple[str, ...]:

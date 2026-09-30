@@ -118,9 +118,9 @@ The audit should accept or challenge these explicitly — the code's safety argu
   Rationale: a *self-consistent* lie is byte-identical from every source, so a 2nd source — which
   only detects *disagreement* — has bounded value; the load-bearing defenses are the on-chain
   covenant pins (nBits, the REF-uniqueness consensus rule), not read-side quorum. Standing up a
-  2nd RXD source on a distinct host (ideally a different operator — pyrxd can count hosts, not
-  operators) for the leg-side reads is the right hardening **at first non-dust
-  real value**.
+  2nd RXD source under a different operator (pyrxd counts distinct operators as declared, or by
+  registered domain, and cannot see who really runs a server) for the leg-side reads is the right
+  hardening **at first non-dust real value**.
 - **`ASSUME-CAPFEE-ISOLATION`.** `CappedFeeWalletSource`'s structural ceiling is real **only if**
   the operator funds it from a key isolated from the main wallet (the class validates P2PKH +
   wif-control + the cap, but cannot verify key isolation). See `CAPFEE-ISOLATION`.

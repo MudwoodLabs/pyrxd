@@ -1,6 +1,7 @@
-# Verbatim upstream code, held to sha256 digests by the tests: whitespace fixers and formatters
-# must not touch it (tests/vendor/rxindexer/README.md).
-exclude: ^tests/vendor/rxindexer/
+# Verbatim upstream code and data, held to sha256 digests by the tests: whitespace fixers and
+# formatters must not touch it (tests/vendor/rxindexer/README.md; the Public Suffix List's pin is
+# src/pyrxd/network/data/MANIFEST.json, whose sha256 digests detect-secrets would read as secrets).
+exclude: ^(tests/vendor/rxindexer/|src/pyrxd/network/data/)
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0

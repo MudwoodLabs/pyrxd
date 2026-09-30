@@ -390,7 +390,7 @@ def test_malformed_spki_pin_is_rejected(tmp_path: Path) -> None:
 def test_non_list_endpoint_config_is_a_typed_error(tmp_path: Path) -> None:
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text("electrumx_servers = 5\n")
-    with pytest.raises(ValidationError, match="list of strings"):
+    with pytest.raises(ValidationError, match="list of URLs"):
         _config.load(cfg_file)
 
 

@@ -394,7 +394,7 @@ class FailoverElectrumXClient:
         hostile endpoint that both rejects with ``-27`` and echoes the bytes back still passes.
         What it removes is the far cheaper failure — a broken or lazily-hostile server whose
         ``-27`` is not backed by any transaction at all — and it costs one read on a path that
-        has already failed once. Corroboration across sources on DISTINCT HOSTS is the operator's job
+        has already failed once. Corroboration across sources of DISTINCT OPERATORS is the operator's job
         (see :class:`pyrxd.network.bitcoin.MultiSourceBtcFundingReader` for that shape).
         """
         try:

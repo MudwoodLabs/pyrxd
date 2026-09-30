@@ -596,6 +596,42 @@ Both hashes are printed; compare them against
 
 ---
 
+## 7c. `--wave-name` degrades: two configured servers are "one source"
+
+HashMark §7.6 form 2 (`verify --wave-name`, `glyph inspect --wave-name`) needs
+two configured ElectrumX servers of **different operators**. pyrxd counts
+sources as *distinct operators, as declared, or by registered domain*:
+
+- an operator pyrxd ships knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`
+  — radiant4people, radiantcore and bladenet) is one source however many servers
+  it runs, so `electrumx.radiant4people.com` and `electrumx2.radiant4people.com`
+  are one;
+- any other hosts under one registered domain are one source
+  (`x.example.com` and `y.example.com`), while `a.co.uk` and `b.co.uk` are two,
+  because `co.uk` is a public suffix; an IP address is its own source.
+
+If your two servers really are run by different parties under one domain, or
+you want two domains you know to be one operator counted once, say so per
+server in the config file:
+
+```toml
+# ~/.pyrxd/config.toml
+electrumx_servers = [
+  { url = "wss://x.example.com:50022/", operator = "alice" },
+  { url = "wss://y.example.com:50022/", operator = "bob" },
+]
+```
+
+An `operator` is 1-64 lower-case letters, digits, `.` or `-`. Unknown keys in a
+server table, one host declared as two operators, and a declaration that
+contradicts a shipped operator (e.g. `electrumx2.radiant4people.com` as anything
+but `radiant4people`) are refused at load. **pyrxd believes the declaration**: it
+cannot see who runs a server, so declaring two operators that are really one
+makes the check agree with itself. The limit is stated in the
+`pyrxd.network.source_identity` module docstring.
+
+---
+
 ## 8. dMint v2 flags and premine
 
 **`--daa-mode` requires `--v2`**, verbatim:

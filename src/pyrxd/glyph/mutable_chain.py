@@ -288,10 +288,11 @@ def _as_attrs(value: object) -> dict:
 
 
 def _one_source(a: str, b: str) -> bool:
-    """True when two source labels may be ONE source: both unattributed, or the same distinct host.
+    """True when two source labels may be ONE source: both unattributed, or the same source key.
 
-    The host comparison is :func:`pyrxd.network.source_identity.source_key`, the identity every
-    source count in pyrxd uses. A distinct host is not a distinct operator; see that module.
+    The comparison is :func:`pyrxd.network.source_identity.source_key`, the identity every source
+    count in pyrxd uses: distinct operators, as declared, or by registered domain. That grouping is
+    not proof of independence; see that module.
     """
     a, b = str(a or "").strip(), str(b or "").strip()
     if not a or not b:
@@ -335,9 +336,10 @@ async def walk_mutable_chain(
     # it prevents. `judge_name_at_mark` already refuses when the block height and the name->glyph
     # binding share a source; the same rule belongs here, where the discovery hint and the tip
     # proof meet. Unnamed sources are treated as possibly-identical, because they might be.
-    # Named sources are compared by DISTINCT HOST (`source_key`), here, not by the caller: the CLI
-    # canonicalised its labels, but a library caller passing `wss://h/` and `wss://h/x` - one
-    # server - got two "sources" and a complete walk from one endpoint's two lies.
+    # Named sources are compared by SOURCE KEY (`source_key`: operator, as declared, or registered
+    # domain), here, not by the caller: the CLI canonicalised its labels, but a library caller
+    # passing `wss://h/` and `wss://h/x` - one server - got two "sources" and a complete walk from
+    # one endpoint's two lies.
     if _one_source(candidate_source, tip_source):
         source_conflict = (
             f"the candidate set and the tip proof came from the same source "

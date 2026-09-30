@@ -124,6 +124,9 @@ packages = [{include = "pyrxd", from = "src"}]
 include = [
     { path = "src/pyrxd/gravity/artifacts/*.json", format = ["sdist", "wheel"] },
     { path = "src/pyrxd/hd/wordlist/*.txt",        format = ["sdist", "wheel"] },
+    # The vendored Public Suffix List and its sha256 pin: source counting reads both at runtime.
+    { path = "src/pyrxd/network/data/*.dat",       format = ["sdist", "wheel"] },
+    { path = "src/pyrxd/network/data/*.json",      format = ["sdist", "wheel"] },
     { path = "src/pyrxd/py.typed",                 format = ["sdist", "wheel"] },
     { path = "src/pyrxd/contrib/miner/README.md",  format = ["sdist", "wheel"] },
 

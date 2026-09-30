@@ -118,7 +118,7 @@ class ElectrumRxdChainSource:
 
     def __init__(self, client) -> None:
         self._c = client
-        #: The distinct host behind *client* (its own ``source_key``), which is how
+        #: The source behind *client* (its own ``source_key``: its operator group), which is how
         #: :class:`MultiSourceRxdChainSource` counts this source. ``None`` when the client cannot say.
         self.source_key: SourceKey | None = getattr(client, "source_key", None)
 
@@ -144,20 +144,21 @@ class ElectrumRxdChainSource:
 
 
 class MultiSourceRxdChainSource:
-    """Quorum ``RxdChainSource`` over N Radiant readers on DISTINCT HOSTS (the operator's own
+    """Quorum ``RxdChainSource`` over N Radiant readers of DISTINCT OPERATORS (the operator's own
     node + public ElectrumX servers), mirroring :class:`network.bitcoin.MultiSourceBtcFundingReader`.
 
-    ONE HOST, ONE VOTE. Each source names its host (``source_key``, derived from its URL by
-    :func:`pyrxd.network.source_identity.source_key`), and two sources on one host are REFUSED at
-    construction: ``wss://h`` and ``wss://h:443`` are one server, and one server's "not locked"
-    must never be a corroborated absence. Distinct hosts are not proof of distinct operators: see
-    the operator limit in :mod:`pyrxd.network.source_identity`.
+    ONE OPERATOR, ONE VOTE. Each source names its source key (``source_key``, derived from its URL
+    by :func:`pyrxd.network.source_identity.source_key`: operator, as declared, or registered
+    domain), and two sources with one key are REFUSED at construction: ``wss://h`` and
+    ``wss://h:443`` are one server, radiant4people's two servers one operator, and one operator's
+    "not locked" must never be a corroborated absence. The grouping is not proof of independence:
+    see the operator limit in :mod:`pyrxd.network.source_identity`.
 
     A single RXD source is flagged low-corroboration (a wrong read → a false page, never a
-    false broadcast). Composing >= ``quorum`` distinct-host sources lets a lone lagging/lying/down
+    false broadcast). Composing >= ``quorum`` distinct sources lets a lone lagging/lying/down
     source NOT drive a decision; wire this and pass ``rxd_corroborated=True`` to the
     :class:`ChainObserver` to clear the flag. The daemon shell (``pyrxd.gravity.watch.run``)
-    wires this by default over 2 public ElectrumX endpoints on distinct hosts, so a default tower run
+    wires this by default over public ElectrumX endpoints of 2 operators, so a default tower run
     is corroborated; a single-source run is the explicit fallback.
 
     Semantics (conservative; fail-closed toward NOT auto-acting):
@@ -279,7 +280,7 @@ class OutspendBtcClaimSource:
     Multi-source detection (red-team MEDIUM): the maker-claim DETECTION boolean is the trigger that
     arms the whole claim-race assessment, so a SINGLE lagging/lying/MITM'd ``/outspend`` source that
     reports "unspent" silently SUPPRESSES the PAGE_CLAIM — the worst failure for an alert-only tower.
-    Pass several outspend backends on distinct hosts (the same Esplora set used for depth): detection then
+    Pass several outspend backends of distinct operators (the same Esplora set used for depth): detection then
     fails TOWARD paging — if ANY source sees the outpoint spent (with a txid) we treat it as claimed
     (a missed claim is the real harm; a false page is cheap — the operator just verifies, and the
     DEPTH read below is still the conservative quorum-min, so a single lying "spent" cannot fake

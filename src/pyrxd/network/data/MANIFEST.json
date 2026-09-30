@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "A verbatim copy of the Public Suffix List, fetched with",
+    "curl -sS https://publicsuffix.org/list/public_suffix_list.dat (the distribution the file itself",
+    "asks to be pulled from). It is byte-identical to publicsuffix/list at the commit below plus the",
+    "two-line VERSION/COMMIT header publicsuffix.org adds. The digest is the sha256 of the file's bytes;",
+    "pyrxd.network.source_identity refuses to read a file whose bytes do not match it, and",
+    "tests/test_source_operator_groups.py enforces the pin. Licence: MPL-2.0 (the header of the file).",
+    "Do NOT hand-edit the vendored file: a byte changed is a digest that no longer matches. To refresh,",
+    "re-fetch, update commit/fetched/digest together, and re-run the operator-group tests."
+  ],
+  "source": "https://publicsuffix.org/list/public_suffix_list.dat",
+  "repo": "publicsuffix/list",
+  "commit": "a179a48c465e818cfd8d626691cb317985da87fb",
+  "fetched": "2026-09-29",
+  "files": {
+    "public_suffix_list.dat": "257b298daca42f6d8ec964e238c2a55518e14f09d3117917ec8acee6f188503e"
+  }
+}

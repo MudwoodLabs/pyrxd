@@ -2,11 +2,11 @@
 
 Turns chain reads into the :class:`Observations` that :func:`decide` consumes. The
 safety-critical input — the maker's BTC-claim *depth* — must be quorum-agreed
-(conservative ``min`` across sources on distinct hosts, fail-closed below quorum); the
+(conservative ``min`` across sources of distinct operators, fail-closed below quorum); the
 shell backs :class:`BtcClaimSource.confirmations` with
 ``network.bitcoin.MultiSourceBtcFundingReader`` (already built: ``min(depth)``,
 2-of-3, fail-closed). The RXD side is now **multi-source** too:
-:class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 distinct-host
+:class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 distinct-operator
 Radiant readers (the operator's node + public ElectrumX), and the daemon shell wires it by
 default (``pyrxd.gravity.watch.run``, 2-of-2 public ElectrumX) — passing
 ``rxd_corroborated=True`` clears the ``low_corroboration`` flag. A single-source RXD config

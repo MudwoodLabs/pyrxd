@@ -1,52 +1,92 @@
-"""ONE identity for counting sources: the canonical HOST a URL names.
+"""ONE identity for counting sources: the OPERATOR GROUP a URL belongs to.
 
 Every rule in pyrxd that needs "two sources agreed" — the watchtower's RXD quorum, the BTC Esplora
 quorums, the ETH RPC quorum, HashMark §7.6 form 2's judge and chain walker — counts sources through
-:func:`source_key`, and nothing else. It used to be five identities: one site folded case and a
-trailing slash, one only lowercased the host, one compared raw labels, one had no identity at all,
-and :attr:`~pyrxd.network.registry.Endpoint.source` alone canonicalised. So ``wss://h`` and
-``wss://h:443`` were one source in one place and two in another, and one server reached through
-two spellings could corroborate itself wherever the cheap identity was used.
+:func:`source_key`, and nothing else. (It used to be five identities, one per quorum, so one server
+reached through two spellings corroborated itself wherever the cheap identity was used; 0.25.0
+panel.) Two URLs with the same key are ONE source: they may be one another's failover, and they
+never count as two.
 
-WHAT THE KEY MEANS, EXACTLY: two URLs with the same key name the same DISTINCT HOST. Case, a
-trailing dot, the port, the path, the query, userinfo, and the spelling of an IP literal do not
-make a second host. That is all a URL can show.
+WHAT THE KEY IS — distinct operators, as declared, or by registered domain. In this order:
+
+1. A DECLARED operator: ``source_key(url, operator="acme")``, or a :func:`declare_operator` for the
+   URL's host — which is what an ElectrumX endpoint's ``operator = "…"`` in the ``pyrxd`` config file
+   does. Every URL declared ``"acme"`` is one source, whatever its domain.
+2. An operator pyrxd SHIPS knowledge of: :data:`pyrxd.network.registry.KNOWN_OPERATORS`, keyed by
+   registered domain, recorded from the Radiant maintainer's statement of 2026-09-29.
+3. An IP literal: ITSELF, one group per canonical address (every spelling of one address is one).
+4. Any other name: its REGISTERED DOMAIN (eTLD+1) under the Public Suffix List, a sha256-pinned
+   snapshot vendored in ``network/data/``. So ``x.bladenet.online`` and ``y.bladenet.online`` are one
+   source, while ``a.co.uk`` and ``b.co.uk`` stay two, because ``co.uk`` is a public suffix. The
+   list's PRIVATE section is included, as browsers include it: ``a.github.io`` and ``b.github.io``
+   are two, because that section exists to say those names have different owners.
+5. A name with no registered domain (``localhost``, a bare ssh host alias, a name that is itself a
+   public suffix): itself.
+
+Case, a trailing dot, the port, the path, the query, userinfo and the spelling of an IP literal
+never make a second source. The key of a declared or shipped operator prints as ``operator:<id>``,
+so it cannot collide with a domain or an address.
 
 THE OPERATOR LIMIT — stated here, once; every other docstring, help text and doc that needs it
-points here. A distinct host is not an independent operator. Independence is a property of
-OPERATORS, and nothing in a URL shows who runs a server. Two distinct hosts may be one operator,
-may sit behind one CDN, load balancer or RPC aggregator, may read from one upstream node, or may
-present certificates from one mis-issuing CA; a hostname and its IP address, or two DNS names for
-one machine, are distinct hosts here too. Every quorum built on these keys therefore rests on
-DISTINCT HOSTS, and one party running both hosts (or one failure reaching both) defeats it.
-Choosing hosts whose operators and upstreams do not overlap is the operator's job. The prose
-elsewhere says "distinct host" for this reason, and never "independent operator".
+points here. Nothing in a URL shows who runs a server, so the grouping above is the best a client
+can do, and it is not proof of independence:
+
+* ONE PARTY CAN REGISTER SEVERAL DOMAINS. Two registered domains (or a name and an IP address, or
+  two IP addresses) may be one operator, may sit behind one CDN, load balancer or RPC aggregator,
+  may read from one upstream node, or may present certificates from one mis-issuing CA. They count
+  as two here, and one party running both — or one failure reaching both — defeats a quorum built
+  on them.
+* A DECLARED OPERATOR IS ONLY AS GOOD AS THE DECLARATION. ``operator = "…"`` is the configuring
+  user's statement, and pyrxd believes it: declaring two hosts as two operators makes them two
+  sources. A declaration that contradicts an operator pyrxd ships knowledge of is refused (see
+  :func:`declare_operator`); anything else is taken as written.
+
+Choosing sources whose operators and upstreams do not overlap remains the operator's job. The prose
+elsewhere says "distinct operators (as declared, or by registered domain)" for this reason, and
+never "independent".
 
 WHERE A QUORUM HOLDS CLIENT OBJECTS rather than URLs, each client carries its own ``source_key``
 (a :class:`SourceKey`, derived from the URL it was built with) and the quorum refuses two clients
-with one key (:func:`require_distinct_sources`). Several URLs on ONE host are a failover list for
-one source, never several sources — :class:`SameHostFailover` is that shape for readers, and
+with one key (:func:`require_distinct_sources`). Several URLs in ONE group are a failover list for
+one source, never several sources — :class:`SameSourceFailover` is that shape for readers, and
 ``ElectrumXClient([url, url2])`` already races its URLs.
+
+INPUT THAT NAMES NO HOST IS REFUSED. ``[bad``, ``wss://[::1``, ``[::1]x`` and ``wss://`` raise
+:class:`~pyrxd.security.errors.ValidationError`. They used to become a key of their own, which
+made a typo a source.
+
+INTERNATIONALISED NAMES — one known deviation. Hosts are folded to their A-label with Python's
+``idna`` codec, which implements IDNA2003: it maps ``ß`` to ``ss``, so ``faß.de`` and ``fass.de`` are
+ONE key here. yarl and aiohttp (IDNA2008) encode ``faß.de`` as ``xn--fa-hia.de``, a different host.
+It is rare, and it fails CLOSED: two hosts counted as one source can only lower a count, never
+raise one.
 """
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import inspect
 import ipaddress
+import json
 import re
 import socket
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from ..security.errors import NetworkError, ValidationError
 
 __all__ = [
-    "SameHostFailover",
+    "SameSourceFailover",
     "SourceKey",
     "canonical_host",
+    "declare_operator",
+    "describe_source",
     "group_by_source",
     "one_source_label",
+    "registered_domain",
     "require_distinct_sources",
     "source_key",
     "source_key_of",
@@ -54,8 +94,21 @@ __all__ = [
 
 #: An IPv4 literal in any spelling ``inet_aton`` accepts: one to four dot-separated parts, each
 #: decimal, octal (leading ``0``) or hex (``0x``). ``203.0.113.7``, ``0xcb.0.113.7``,
-#: ``0313.0.0161.07``, ``203.113.7`` and ``3405803783`` are all one address.
+#: ``0313.0.0161.07`` and ``3405803783`` are all one address. With fewer than four parts the LAST
+#: part fills the remaining bytes, so ``203.113.7`` is ``203.113.0.7`` — a different address.
 _INET_ATON_FORM = re.compile(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}")
+
+#: The prefix of an operator group's key. A domain always contains a dot or is a single label and
+#: an IP literal is digits, dots and colons, so no domain or address can spell this.
+_OPERATOR_PREFIX = "operator:"
+
+#: A declared operator id: lower-case letters, digits, ``.`` and ``-``, 1–64 characters, starting
+#: and ending with a letter or digit. Strict on purpose — ``Acme`` and ``acme`` silently being two
+#: operators would be a split nobody declared.
+_OPERATOR_ID = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?")
+
+_DATA_DIR = Path(__file__).resolve().parent / "data"
+_PSL_FILE = "public_suffix_list.dat"
 
 
 def canonical_host(host: str) -> str:
@@ -105,37 +158,217 @@ def canonical_host(host: str) -> str:
 
 
 class SourceKey(str):
-    """A DISTINCT-HOST key, as :func:`source_key` produced it.
+    """A SOURCE key — an operator group — as :func:`source_key` produced it.
 
-    A ``str`` so it prints, compares and hashes as the host. It is a separate type so a quorum can
-    insist that the key it counts came from :func:`source_key` — a caller-chosen label such as
-    ``"a"``/``"b"`` for two URLs on one server would otherwise count as two sources.
+    A ``str`` so it prints, compares and hashes as the group (``operator:radiantcore``,
+    ``bladenet.online``, ``203.0.113.7``). It is a separate type so a quorum can insist that the key
+    it counts came from :func:`source_key` — a caller-chosen label such as ``"a"``/``"b"`` for two
+    URLs on one server would otherwise count as two sources.
     """
 
     __slots__ = ()
 
 
-def source_key(url: str) -> SourceKey:
-    """The distinct-host identity of *url*: THE function every source count keys through.
+# ── The Public Suffix List ───────────────────────────────────────────────────────────────────────
+
+
+@functools.cache
+def _public_suffix_rules() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """``(rules, wildcards, exceptions)`` from the vendored list, each as A-label suffixes.
+
+    Refuses a file whose bytes are not the pinned ones (``data/MANIFEST.json``): a list edited so
+    that ``bladenet.online`` became a public suffix would make every ``*.bladenet.online`` host a
+    source of its own, and nothing else would notice.
+    """
+    manifest = json.loads((_DATA_DIR / "MANIFEST.json").read_text(encoding="utf-8"))
+    raw = (_DATA_DIR / _PSL_FILE).read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != manifest["files"][_PSL_FILE]:
+        raise ValidationError(
+            f"the vendored Public Suffix List is not the pinned file (sha256 {digest}, pinned "
+            f"{manifest['files'][_PSL_FILE]}); refusing to group sources by it"
+        )
+    rules: set[str] = set()
+    wildcards: set[str] = set()
+    exceptions: set[str] = set()
+    for line in raw.decode("utf-8").splitlines():
+        rule = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+        if not rule or rule.startswith("//"):
+            continue
+        target = rules
+        if rule.startswith("!"):
+            rule, target = rule[1:], exceptions
+        elif rule.startswith("*."):
+            rule, target = rule[2:], wildcards
+        try:
+            rule = rule.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            # Not expressible as an A-label by Python's codec (IDNA2003). Leaving a rule out makes
+            # its suffix look ONE label shorter, which merges names under it — the closed side.
+            continue
+        target.add(rule)
+    return frozenset(rules), frozenset(wildcards), frozenset(exceptions)
+
+
+def registered_domain(host: str) -> str | None:
+    """The registered domain (eTLD+1) of a canonical host name, or ``None`` when it has none.
+
+    The Public Suffix List algorithm (https://publicsuffix.org/list/): an exception rule wins,
+    else the matching rule with the most labels, else the implicit ``*`` (the last label). The
+    registered domain is that public suffix plus one label. A name that IS a public suffix, or has
+    a single label, has none. *host* is expected from :func:`canonical_host` (lower-case A-labels,
+    no trailing dot); an IP literal is not a domain and is the caller's to exclude.
+    """
+    rules, wildcards, exceptions = _public_suffix_rules()
+    labels = host.split(".")
+    n = len(labels)
+    suffix_len = 1  # the implicit "*" rule
+    for i in range(n):
+        if ".".join(labels[i:]) in exceptions:
+            suffix_len = n - i - 1
+            break
+    else:
+        for i in range(n):  # smallest i = most labels, so the first match is the prevailing rule
+            if ".".join(labels[i:]) in rules or (i + 1 < n and ".".join(labels[i + 1 :]) in wildcards):
+                suffix_len = max(suffix_len, n - i)
+                break
+    if n <= suffix_len:
+        return None
+    return ".".join(labels[n - suffix_len - 1 :])
+
+
+# ── Operators: declared, and shipped ─────────────────────────────────────────────────────────────
+
+#: Operators DECLARED for a canonical host in this process: :func:`declare_operator`.
+_DECLARED: dict[str, str] = {}
+
+
+def _operator_id(operator: object) -> str:
+    if not isinstance(operator, str) or not _OPERATOR_ID.fullmatch(operator.strip()):
+        raise ValidationError(
+            f"operator {operator!r} is not a valid operator id: use 1-64 lower-case letters, digits, "
+            "'.' or '-', starting and ending with a letter or digit (e.g. \"radiantcore\")"
+        )
+    return operator.strip()
+
+
+def _shipped_operator(host: str) -> str | None:
+    """The operator pyrxd ships knowledge of for *host* (by its registered domain), if any."""
+    from .registry import shipped_operator_domains  # deferred: registry imports this module
+
+    domain = registered_domain(host)
+    return shipped_operator_domains().get(domain) if domain else None
+
+
+def _checked_declaration(host: str, operator: object) -> str:
+    """*operator* validated, and refused when it contradicts what pyrxd ships for *host*.
+
+    A contradiction is refused rather than obeyed because the direction it moves is the dangerous
+    one: declaring one of radiant4people's two hosts to be someone else would turn one operator into
+    two sources. Declaring the SAME operator is fine, and so is declaring a host pyrxd knows nothing
+    about — that is the declaration's whole purpose.
+    """
+    op = _operator_id(operator)
+    shipped = _shipped_operator(host)
+    if shipped is not None and shipped != op:
+        raise ValidationError(
+            f"{host!r} is declared as operator {op!r}, but pyrxd records its domain as operator "
+            f"{shipped!r} (pyrxd.network.registry.KNOWN_OPERATORS). A declaration cannot split an "
+            f"operator pyrxd ships; declare {shipped!r}, or leave the operator out"
+        )
+    return op
+
+
+def declare_operator(url: str, operator: str) -> SourceKey:
+    """Declare that *url*'s host is run by *operator*, for every source count in this process.
+
+    This is what the ``pyrxd`` config file's ``operator = "…"`` does (at
+    :meth:`pyrxd.cli.config.Config.require_profile`), and why it reaches HashMark §7.6 form 2's judge
+    and walker, which compare the URLs they were handed. It keys the CANONICAL HOST, so every URL on
+    that host follows it. Re-declaring the same operator is a no-op; a different operator for a host
+    already declared is refused, since one host cannot be two operators. Returns the host's key.
+    """
+    host = _canonical_host_of(url)
+    op = _checked_declaration(host, operator)
+    already = _DECLARED.get(host)
+    if already is not None and already != op:
+        raise ValidationError(
+            f"{host!r} is already declared as operator {already!r}; it cannot also be {op!r}. One host is one operator"
+        )
+    _DECLARED[host] = op
+    return SourceKey(_OPERATOR_PREFIX + op)
+
+
+def _forget_declared_operators() -> None:
+    """Drop every declaration. For tests, which share one process."""
+    _DECLARED.clear()
+
+
+# ── The key ──────────────────────────────────────────────────────────────────────────────────────
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.partition("%")[0])
+    except ValueError:
+        return False
+    return True
+
+
+def _canonical_host_of(url: object) -> str:
+    """The canonical host *url* names, or ``ValidationError`` when it names none."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValidationError("a source is counted by the host of its URL; an empty URL names no host")
+    host = _host_in(url.strip())
+    if not host:
+        raise ValidationError(
+            f"{url.strip()!r} names no host that can be parsed, so it cannot be counted as a source. "
+            "Check the URL (an unclosed '[', text after ']', or an empty authority)"
+        )
+    return canonical_host(host)
+
+
+def source_key(url: str, *, operator: str | None = None) -> SourceKey:
+    """The SOURCE identity of *url*: THE function every source count keys through.
+
+    Distinct operators, as declared, or by registered domain — the rules, in order, are in the
+    module docstring. *operator* declares the operator for this one call (an ``Endpoint`` passes its
+    own); otherwise a :func:`declare_operator` for the host applies.
 
     Accepts a URL (``wss://h:443/x``), a scheme-less ``host[:port][/path]`` (``localhost:8545``,
     ``user@node.example``, an ssh destination), a bare IPv6 literal (``2001:db8::1``,
     ``fe80::1%eth0``), a bracketed one with or without a port (``[2001:db8::1]:50022``), or a
-    bare label. The key is the canonical host (:func:`canonical_host`): port, path, query,
-    userinfo, case and a trailing dot are dropped.
-
-    Text with no parseable host (a malformed URL such as ``wss://[::1``) is its own key, folded to
-    lower case: identical text is one source, and different text cannot be shown to collide.
+    bare label.
 
     Raises:
-        ValidationError: for an empty or non-string *url* — nothing, counted as a source, would be
-            a source nobody can name.
+        ValidationError: for an empty or non-string *url*, for text that names no parseable host
+            (``[bad``, ``wss://[::1``, ``[::1]x``, ``wss://``), and for an invalid or contradicting
+            *operator*.
     """
-    if not isinstance(url, str) or not url.strip():
-        raise ValidationError("a source is counted by the host of its URL; an empty URL names no host")
-    text = url.strip()
-    host = _host_in(text)
-    return SourceKey(canonical_host(host) if host else text.lower())
+    host = _canonical_host_of(url)
+    if operator is not None:
+        return SourceKey(_OPERATOR_PREFIX + _checked_declaration(host, operator))
+    declared = _DECLARED.get(host)
+    if declared is not None:
+        return SourceKey(_OPERATOR_PREFIX + declared)
+    if _is_ip_literal(host):
+        return SourceKey(host)
+    shipped = _shipped_operator(host)
+    if shipped is not None:
+        return SourceKey(_OPERATOR_PREFIX + shipped)
+    return SourceKey(registered_domain(host) or host)
+
+
+def describe_source(key: str) -> str:
+    """How a key reads in a message: ``operator 'x'``, ``IP address '…'``, ``registered domain '…'``."""
+    key = str(key)
+    if key.startswith(_OPERATOR_PREFIX):
+        return f"operator {key[len(_OPERATOR_PREFIX) :]!r}"
+    if _is_ip_literal(key):
+        return f"IP address {key!r}"
+    if "." in key and registered_domain(key) == key:
+        return f"registered domain {key!r}"
+    return f"host {key!r}"
 
 
 def _host_in(text: str) -> str | None:
@@ -164,6 +397,10 @@ def _host_in(text: str) -> str | None:
         address, pct, zone = inside.partition("%")
         if pct and zone.startswith("25"):
             zone = zone[2:]
+        try:  # brackets hold an IPv6 literal and nothing else
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return None
         return f"{address}%{zone}" if pct else address
     if hostport.count(":") >= 2:
         # Two or more colons unbracketed: an IPv6 literal, which cannot carry a port without
@@ -180,36 +417,36 @@ def _host_in(text: str) -> str | None:
 def one_source_label(a: str, b: str) -> str:
     """How to NAME two labels that were judged one source, for a reason string.
 
-    Equal labels print once; two spellings of one host print both and the host, so a reader who
-    configured ``wss://h`` and ``wss://h:443`` sees why they were not two sources.
+    Equal labels print once; two different labels print both and the group they share, so a reader
+    who configured ``wss://x.example`` and ``wss://y.example`` sees why they were not two sources.
     """
     if a.strip() == b.strip():
         return repr(a)
-    return f"{a!r} and {b!r}, which are one host ({str(source_key(a))!r})"
+    return f"{a!r} and {b!r}, which are one source ({describe_source(source_key(a))})"
 
 
 def source_key_of(source: object) -> SourceKey:
     """The ``source_key`` a client object carries, or ``ValidationError`` when it carries none.
 
-    A quorum that holds client OBJECTS cannot see their URLs, so each client says which host it
+    A quorum that holds client OBJECTS cannot see their URLs, so each client says which source it
     reads from. Every shipped reader derives it from its own URL; a client that cannot say is
-    refused rather than guessed at, because a guess is exactly how one host became two sources.
+    refused rather than guessed at, because a guess is exactly how one server became two sources.
     """
     key = getattr(source, "source_key", None)
     if not isinstance(key, SourceKey):
         raise ValidationError(
-            f"{type(source).__name__} does not say which host it reads from: a quorum counts sources "
+            f"{type(source).__name__} does not say which source it reads from: a quorum counts sources "
             "by `source_key`, which must come from pyrxd.network.source_identity.source_key(<its URL>)"
         )
     return key
 
 
 def require_distinct_sources(sources: Sequence[object], *, what: str) -> tuple[SourceKey, ...]:
-    """Each source's key, refusing when two sources are the same host.
+    """Each source's key, refusing when two sources are the same source.
 
-    Refusal, not silent de-duplication: a caller that hands a quorum the same host twice believes
-    it has two sources, and quietly dropping one would leave that belief in place. Several URLs on
-    one host belong in ONE failover source (:class:`SameHostFailover`, or an ``ElectrumXClient``
+    Refusal, not silent de-duplication: a caller that hands a quorum one operator twice believes it
+    has two sources, and quietly dropping one would leave that belief in place. Several URLs in one
+    group belong in ONE failover source (:class:`SameSourceFailover`, or an ``ElectrumXClient``
     given all of them), which counts once.
     """
     keys = tuple(source_key_of(s) for s in sources)
@@ -217,18 +454,19 @@ def require_distinct_sources(sources: Sequence[object], *, what: str) -> tuple[S
     for index, key in enumerate(keys):
         if key in first:
             raise ValidationError(
-                f"{what}: sources #{first[key]} and #{index} are the same host ({str(key)!r}). One "
-                "host is one source however many URLs reach it, so it cannot corroborate itself. "
-                "Give each distinct host once (several URLs on one host form one failover source)."
+                f"{what}: sources #{first[key]} and #{index} are the same source ({describe_source(key)}). "
+                "Sources are counted by distinct operators (as declared, or by registered domain), so one "
+                "cannot corroborate itself. Give each operator once (several URLs of one operator form one "
+                "failover source), or declare the operators if they really differ."
             )
         first[key] = index
     return keys
 
 
 def group_by_source(urls: Iterable[str]) -> list[tuple[SourceKey, list[str]]]:
-    """``[(key, [url, ...]), ...]`` — URLs grouped by distinct host, in first-seen order.
+    """``[(key, [url, ...]), ...]`` — URLs grouped by :func:`source_key`, in first-seen order.
 
-    What a URL-list builder uses to turn a user's list into sources: one source per host, whose
+    What a URL-list builder uses to turn a user's list into sources: one source per group, whose
     URLs are that source's failover list.
     """
     groups: dict[SourceKey, list[str]] = {}
@@ -237,14 +475,17 @@ def group_by_source(urls: Iterable[str]) -> list[tuple[SourceKey, list[str]]]:
     return list(groups.items())
 
 
-#: Errors that mean "this URL did not answer", on which a same-host failover tries the next URL.
+#: Errors that mean "this URL did not answer", on which a same-source failover tries the next URL.
 #: Anything else is an ANSWER (a refusal, a validation failure) and is returned as-is: trying the
-#: next spelling of one host until it says something more convenient is not failover.
+#: next URL of one source until it says something more convenient is not failover.
 _UNREACHABLE = (NetworkError, OSError, TimeoutError)
 
 
-class SameHostFailover:
-    """ONE source reachable at several URLs on ONE host: tried in order, counted once.
+class SameSourceFailover:
+    """ONE source reachable at several URLs with ONE :func:`source_key`: tried in order, counted once.
+
+    The URLs may be several spellings of one host, or several hosts of one operator group (the two
+    radiant4people servers). Either way they are one vote, and failing over between them is allowed.
 
     Proxies the members' async methods: each call goes to the first member, and on to the next
     only when a member is unreachable (:data:`_UNREACHABLE`). Non-async attributes come from the
@@ -254,12 +495,12 @@ class SameHostFailover:
     def __init__(self, members: Sequence[Any]) -> None:
         members = list(members)
         if not members:
-            raise ValidationError("SameHostFailover needs at least one member")
+            raise ValidationError("SameSourceFailover needs at least one member")
         keys = {source_key_of(m) for m in members}
         if len(keys) != 1:
             raise ValidationError(
-                f"SameHostFailover members must all be one host, got {sorted(map(str, keys))}; "
-                "distinct hosts are distinct sources"
+                f"SameSourceFailover members must all be one source, got {sorted(map(str, keys))}; "
+                "distinct sources are counted separately, not failed over between"
             )
         self._members = members
         self.source_key: SourceKey = keys.pop()
