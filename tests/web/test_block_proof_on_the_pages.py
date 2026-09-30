@@ -11,8 +11,9 @@ WHAT IS CHECKED, and against what:
   REAL glue in a subprocess, and the pages' own ``onCheck`` / ``onFetchTxid`` draw the result: the
   CLI's claim sentence must appear on screen verbatim, so a claim retyped in JavaScript fails here.
   MALFORMED replies too (a branch that is a string, a reply that is an array, header hex that is
-  not hex or not the count served, a huge field nothing reads) go through the page's REAL loop and
-  the CLI helper, and must reach the same state and the same reason.
+  not hex or not the count served, a huge field nothing reads, a branch nested 5,000 deep) go
+  through the page's REAL loop and the CLI helper, and must reach the same state and the same
+  reason.
 * EVERY STATE ON SCREEN: VERIFIED at the checkpoint level and at the proof-of-work level, NOT
   VERIFIED with its reason (inclusion only), CONTRADICTED, a failed merkle fetch, and the "still
   checking" line — with no sentence on the screen contradicting another (#806's class).
@@ -624,6 +625,26 @@ def test_a_server_refusing_the_merkle_method_leaves_the_block_with_the_reason(gl
 #: CLI's server serves — the same reply). The JavaScript judges no shape, so every refusal must be
 #: Python's, in the CLI's words; and a field nothing reads, however large, must change nothing.
 _PADDED = {**C.merkle, "padding": "x" * 1_100_000}
+
+
+def _nested(depth: int) -> list:
+    """A list *depth* deep, built without recursion: ``[[[...]]]``."""
+    out: list = []
+    for _ in range(depth - 1):
+        out = [out]
+    return out
+
+
+def _nested_merkle_json(depth: int) -> str:
+    """The merkle reply, as the JSON text a server would send, with its branch *depth* deep. Text,
+    which the stub server splices into its frame as it is: its own ``JSON.stringify`` cannot write
+    a value 5,000 deep, which is the point."""
+    return (
+        f'{{"block_height": {C.merkle["block_height"]}, "merkle": {"[" * depth}{"]" * depth}, '
+        f'"pos": {C.merkle["pos"]}}}'
+    )
+
+
 _MALFORMED: dict[str, tuple[dict, dict, str]] = {
     "merkle_branch_is_a_string": (
         {"merkle": {**C.merkle, "merkle": "deadbeef"}},
@@ -660,6 +681,16 @@ _MALFORMED: dict[str, tuple[dict, dict, str]] = {
         {"blockchain.transaction.get_merkle": lambda p: copy.deepcopy(_PADDED)},
         "VERIFIED",
     ),
+    # A branch nested thousands deep, under the size cap: 5,000 is past what `JSON.stringify` can
+    # walk (Node 22 throws "Maximum call stack size exceeded"), 2,000 is not. Python's refusal both.
+    **{
+        f"merkle_branch_nested_{depth}_deep": (
+            {"merkle": {"result_json": _nested_merkle_json(depth)}},
+            {"blockchain.transaction.get_merkle": lambda p, depth=depth: {**C.merkle, "merkle": _nested(depth)}},
+            "NOT VERIFIED",
+        )
+        for depth in (2_000, 5_000)
+    },
 }
 
 

@@ -118,8 +118,9 @@ decides what to fetch and what it means, through the same Python
 (`pyrxd.glyph.mark_block.verify_with_fetched`) the CLI calls, so the
 claim and the reason it could not verify are the CLI's sentences. A
 malformed reply is refused by the same Python reader, in the same words:
-the page's JavaScript only drops the fields nothing reads and caps each
-reply's size, and a reply over that cap, or a fetch that fails in
+the page's JavaScript only drops the fields nothing reads, empties nesting
+deeper than any reader looks, and caps each reply's size, and a reply over
+that cap, or a fetch that fails in
 transport (a timeout, an error from the server), is reported in the
 page's own words. A block that does not verify stays on screen as the
 server's word, with the reason. A proof that contradicts the height the

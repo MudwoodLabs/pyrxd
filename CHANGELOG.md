@@ -107,8 +107,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where N deep would reach past the 4,032 blocks this pyrxd links from its newest checkpoint,
   the page proves as far as it may and the CLI says it needs a newer pyrxd.
   - A malformed reply is refused by the same Python reader on both, with the same reason. The
-    page's JavaScript judges no reply's shape: it drops the fields nothing reads and caps each
-    reply's size. A reply over that cap, and a fetch that fails in transport (a timeout, or an
+    page's JavaScript judges no reply's shape: it drops the fields nothing reads, empties
+    nesting deeper than any reader looks (so a reply nested thousands deep is still refused by
+    Python, in its words), and caps each reply's size. A reply over that cap, and a fetch that fails in transport (a timeout, or an
     error frame from the server), are the reasons each surface words for itself.
   - VERIFIED shows the verifier's claim in place of the endpoint's-word caveat, the proved depth,
     and the server's confirmation count beside it, labelled as the server's. The pages REQUIRE one

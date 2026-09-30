@@ -1218,8 +1218,9 @@ def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json
     one reply, is CONTRADICTED on both at any depth (``pyrxd.glyph.mark_block``'s docstring).
 
     THE PAGE HANDS OVER ONLY WHAT IS READ. ``proveMarkBlock`` (shared.js) passes each reply's
-    fields that the readers here read, nothing else, and judges no shape: every refusal of a reply
-    as malformed is the reader's, in the CLI's words. The JavaScript writes two reasons of its own
+    fields that the readers here read, nothing else (and, below eight levels, no nesting: no reader
+    here looks past three), and judges no shape: every refusal of a reply as malformed is the
+    reader's, in the CLI's words. The JavaScript writes two reasons of its own
     — a reply over its size cap, and a fetch that failed in transport — and hands them over as
     errors, capped at ``_PROOF_ERROR_CAP`` here.
 

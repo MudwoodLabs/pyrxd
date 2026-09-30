@@ -962,7 +962,8 @@ const BLOCK_PROOF_METHODS = new Set([
 // `*_from_reply`), so EVERY refusal of a reply's shape — a branch that is not a list, a header
 // count that is not the one asked for, hex that is not hex — is Python's, in the words the CLI
 // prints for the same reply. This page judges no shape itself: it only drops fields nothing reads
-// (a server can pad a reply with anything) and caps the size of what is left.
+// (a server can pad a reply with anything), empties nesting deeper than any reader looks
+// (`PROOF_REPLY_MAX_NESTING`), and caps the size of what is left.
 const PROOF_REPLY_FIELDS = {
   "blockchain.transaction.get_merkle": ["block_height", "merkle", "pos"],
   "blockchain.transaction.id_from_pos": ["tx_hash", "merkle"],
@@ -983,9 +984,35 @@ function proofReplyCap(method, params) {
   return MAX_PROOF_BRANCH_REPLY_CHARS;
 }
 
+// How deep a reply is copied. Python's readers look three levels in at most (the reply, a field,
+// a branch entry) and refuse anything that is a container at the third, so a copy that keeps every
+// level to this depth, and empties each container below it, is refused by them in exactly the
+// words the whole reply would be. Without it a reply nested some thousands deep — well under the
+// size cap — makes `JSON.stringify` throw ("Maximum call stack size exceeded"), and that
+// JavaScript message, not Python's, would become the reason on screen.
+const PROOF_REPLY_MAX_NESTING = 8;
+
+function nestingBounded(value, depth) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return depth >= PROOF_REPLY_MAX_NESTING ? [] : value.map((v) => nestingBounded(v, depth + 1));
+  }
+  const out = {};
+  if (depth < PROOF_REPLY_MAX_NESTING) {
+    for (const name of Object.keys(value)) {
+      // defineProperty, not assignment: a key named "__proto__" stays a key.
+      Object.defineProperty(out, name, {
+        value: nestingBounded(value[name], depth + 1), enumerable: true, writable: true, configurable: true,
+      });
+    }
+  }
+  return out;
+}
+
 // The reply as Python will read it: an object keeps only the fields named above, anything else
 // (an array, a string, null) goes as it is for Python to refuse; a missing `result` is null.
-// Throws a "malformed" wire error only for a reply over its size cap.
+// Nesting past `PROOF_REPLY_MAX_NESTING` is emptied (above). Throws a "malformed" wire error only
+// for a reply over its size cap.
 function proofReplyForPython(method, params, result) {
   let kept = result === undefined ? null : result;
   if (kept !== null && typeof kept === "object" && !Array.isArray(kept)) {
@@ -995,6 +1022,7 @@ function proofReplyForPython(method, params, result) {
     }
     kept = fields;
   }
+  kept = nestingBounded(kept, 0);
   const size = JSON.stringify(kept).length;
   const cap = proofReplyCap(method, params);
   if (size > cap) {

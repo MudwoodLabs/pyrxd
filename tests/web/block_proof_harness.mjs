@@ -52,7 +52,12 @@ function makeServer(proof, log) {
         : answer.error
           ? { id: req.id, error: answer.error }
           : { id: req.id, result: answer.result };
-      setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+      // A reply given as JSON text is spliced in as it is: the page parses the frame's text, as
+      // it would a real server's.
+      const data = answer && answer.resultJson !== undefined
+        ? `{"id":${JSON.stringify(req.id)},"result":${answer.resultJson}}`
+        : JSON.stringify(frame);
+      setTimeout(() => this.dispatch("message", { data }), 0);
     }
     close() {}
   };

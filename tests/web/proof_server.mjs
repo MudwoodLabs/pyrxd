@@ -11,6 +11,10 @@
 //   `headers_reply` is given, which is sent verbatim for every range. `null` means "not a proof
 //   request": the caller answers it (or refuses it) itself. A method listed in `hang` gets
 //   `{hang: true}` — the caller never answers it, so the page's own timeout ends the wait.
+//   `merkle` or `coinbase` may be `{"result_json": text}`: the reply's JSON TEXT, answered as
+//   `{resultJson: text}` for the caller to splice into the frame verbatim — for a reply
+//   `JSON.stringify` cannot produce, such as one nested 5,000 deep.
+//   Only `block_proof_harness.mjs` splices it.
 
 export function answerProof(proof, method, params) {
   if (!proof) return null;
@@ -24,6 +28,9 @@ export function answerProof(proof, method, params) {
   const reply = (value) => {
     if (value === undefined) return { error: { code: -32601, message: `unknown method ${method}` } };
     if (value && typeof value === "object" && value.error) return { error: value.error };
+    if (value && typeof value === "object" && typeof value.result_json === "string") {
+      return { resultJson: value.result_json };
+    }
     return { result: value };
   };
   if (method === "blockchain.transaction.get_merkle") return reply(proof.merkle);
