@@ -61,9 +61,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A value-bearing swap needs `MarginPolicy.rxd_block_interval_fast_s`** (the measured p10
   Radiant inter-block interval) before anyone locks: `SwapCoordinator` refuses to CONSTRUCT a
   negotiated swap on a value-bearing Radiant network without it (every role), and
-  `pre_btc_lock_check` step 3b refuses a policy that lost it. The cross-clock timelock reserves
-  divide time spans by it, and without it they fall back to the nominal interval. The taker gate's
-  own elapsed-depth bound does not read it (see Security). A coordinator that runs the taker gate
+  `pre_btc_lock_check` step 3b refuses a policy that lost it. Time spans are converted into Radiant
+  blocks by dividing by it, and without it that falls back to the nominal interval. Where it is read
+  differs by corridor: for an ETH/ERC-20 counter leg, at fund time (the finalization reserve and the
+  projection of where the maker's Radiant refund opens) and at claim time; for BTC, only at claim
+  time (`assess_claim_finality`'s counter-leg reserve), since the BTC fund-time ordering check
+  projects the refund at the nominal interval. The taker gate's own elapsed-depth bound does not
+  read it (see Security). A coordinator that runs the taker gate
   (any role but `SwapRole.MAKER`) is also refused without a value at stake to size the required
   depth from. Every script that builds a coordinator on the mainnet node client takes
   `--rxd-block-interval-fast-s`, refuses at startup without it, and passes it into its policy:

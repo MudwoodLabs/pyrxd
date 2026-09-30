@@ -123,6 +123,15 @@ headers served above the newest checkpoint; the lowest subsidy the walk cap allo
 ``k`` and value term that follow, a chain at the nominal spacing, and a newest header up to
 ``early_slack_s`` old. What it does not cover is stated on that function.
 
+PER CORRIDOR, what bounds a faster-than-nominal chain before the taker locks. In the BTC corridor
+it is this bound alone: the time term at ``surge_factor`` times the nominal rate, and, above dust,
+the depth reports of two distinct operators. The BTC ordering check (step 7,
+``swap_coordinator.assert_timelock_margin``) projects the rest of ``t_rxd`` at the nominal interval
+and step 6 reserves no counter-leg blocks; the measured fast tail reaches BTC only at claim time
+(``assess_claim_finality``). In the ETH/ERC-20 corridor step 7 also projects the rest of ``t_rxd``
+at the measured fast tail (``eth_rxd_timelock``), and step 6 reserves the finalization window in
+fast-tail blocks.
+
 WHAT REMAINS THE SERVER'S WORD, stated rather than implied:
 
 * that the covenant output is still UNSPENT. SPV proves a transaction was mined, never that an

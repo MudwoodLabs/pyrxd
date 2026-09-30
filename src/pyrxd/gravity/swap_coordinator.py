@@ -2081,10 +2081,14 @@ class SwapCoordinator:
         :meth:`pre_btc_lock_check` step 3b, before the chain is read. Four checks:
 
         1. THE MEASURED FAST TAIL (every role). ``MarginPolicy.rxd_block_interval_fast_s`` is what
-           the cross-clock timelock RESERVES divide time spans by (:func:`_dividing_interval_s`); unset,
-           they fall back to the nominal interval and cover about an eighth of the blocks a measured
-           p10 does. Those reserves are sized independently of the taker gate's elapsed-depth
-           estimate, so a value-bearing swap is refused without it.
+           time spans are converted into Radiant blocks by (:func:`_dividing_interval_s`); unset,
+           that falls back to the nominal interval. WHERE IT IS READ differs by corridor. ETH/ERC-20:
+           at fund time, step 6's finalization reserve and step 7's projection of where the maker's
+           refund opens (:meth:`_assert_eth_timelock_ordering`). BTC: NOT at fund time — step 6's
+           counter reserve is 0 and step 7 (:func:`assert_timelock_margin`) projects the refund at
+           the nominal ``rxd_block_interval_s`` — only at claim time, in
+           :func:`assess_claim_finality`'s counter-leg reserve. Either way it is read independently of
+           the taker gate's elapsed-depth bound, so a value-bearing swap is refused without it.
         2. A VALUE AT STAKE (a coordinator that runs the taker gate — any role but
            ``SwapRole.MAKER``). The gate sizes the depth it requires of the maker's funding from it
            and refuses without one at step 5, after the maker has locked.
