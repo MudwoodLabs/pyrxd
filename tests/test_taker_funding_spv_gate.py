@@ -2274,7 +2274,46 @@ async def test_blackholed_depth_sources_cost_one_timeout_not_one_each():
     took = time.monotonic() - t0
     assert got == ((str(view.source_key), 9), (str(_SHIPPED_OPERATORS[1]), 9)), got
     assert timeout <= took < 1.5 * timeout, f"{took:.2f}s for two blackholed sources at {timeout}s each"
-    assert all(h.cancelled == 2 for h in holes), [h.cancelled for h in holes]  # both reads of each
+    # Each source's reads run one after the other, so only the first (the hung one) was pending.
+    assert all(h.cancelled == 1 for h in holes), [h.cancelled for h in holes]
+
+
+async def test_one_fresh_client_is_asked_its_two_reads_on_one_connection():
+    """Re-attack of the concurrent reads: only SOURCES run concurrently. A fresh
+    ``ElectrumXClient`` asked its verbose and tip reads at once opens two sockets, and the reply on
+    the one its reader does not follow is never read — the source then times out and is dropped.
+    Through a real websocket server: both reads are answered, on ONE connection."""
+    import asyncio
+
+    txid = os.urandom(32).hex()
+    connections: list[int] = []
+
+    async def server_side(ws):
+        connections.append(1)
+        async for msg in ws:
+            req = json.loads(msg)
+            if req["method"] == "blockchain.transaction.get":
+                res = {"txid": txid, "confirmations": 9}
+            elif req["method"] == "blockchain.headers.subscribe":
+                res = {"height": 100 + 11, "hex": "00" * 80}
+            else:
+                await ws.send(json.dumps({"id": req["id"], "error": {"code": -32601, "message": "nope"}}))
+                continue
+            await asyncio.sleep(0.05)  # both requests are in flight together
+            await ws.send(json.dumps({"id": req["id"], "result": res}))
+
+    server = await websockets.serve(server_side, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        client = ElectrumXClient([f"ws://127.0.0.1:{port}"], allow_insecure=True)
+        io = RadiantChainIO(_ChainView(pays=b"\x51", value=1, confs=9), depth_sources=(client,), depth_timeout_s=2.0)
+        got = await asyncio.wait_for(io.reported_depths(txid, 100), 10)
+        assert (str(client.source_key), 12) in got, got  # max(9 confirmations, 111 - 100 + 1)
+        assert len(connections) == 1, f"{len(connections)} connections for one client's reads"
+        await client.close()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "5"])

@@ -498,7 +498,11 @@ class RadiantChainIO:
     @staticmethod
     async def _ask_one(index: int, src: Any, txid: str, height: int) -> list[int]:
         """The depths one source reports: its verbose ``confirmations`` and ``tip - height + 1``,
-        whichever it answers (asked together); a read that fails is left out."""
+        whichever it answers; a read that fails is left out.
+
+        The two reads are asked ONE AFTER THE OTHER. Only different sources run concurrently: two
+        concurrent first calls on one fresh ``ElectrumXClient`` would each open a connection, and
+        the reply to the one whose socket lost the race would never be read."""
 
         async def confirmations() -> int | None:
             verbose = getattr(src, "get_transaction_verbose", None)
@@ -523,7 +527,8 @@ class RadiantChainIO:
                 logger.debug("depth source %d gave no tip height", index, exc_info=True)
                 return None
 
-        return [d for d in await asyncio.gather(confirmations(), from_tip()) if d is not None]
+        found = [await confirmations(), await from_tip()]
+        return [d for d in found if d is not None]
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to
