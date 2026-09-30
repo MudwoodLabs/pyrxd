@@ -378,7 +378,7 @@ def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = Non
 
     *verification* is an optional :class:`~pyrxd.glyph.mark_block.BlockVerification` for this
     anchor's block, applied by :func:`with_block_verification` (see there); without one,
-    ``block_verification`` is ``None`` and nothing else changes.
+    ``block_verification`` and ``verified_confirmations`` are ``None`` and nothing else changes.
     """
     # Function-local: `_inspect_core` is a far larger module than this one, and a
     # top-level import would make every consumer of a dataclass pay for the whole
@@ -409,8 +409,9 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
     """*shape* (a :func:`mark_anchor_dict`) with a block verification's outcome applied — a copy.
 
     THE ONLY PLACE ``height_is_verified`` BECOMES TRUE. It is ``True`` exactly when *verification*
-    is VERIFIED and is about the height *shape* reports; the caveat is then the verifier's own
-    claim sentence (what was proved, and what was not). Otherwise ``height_is_verified`` is
+    is VERIFIED, is about the height *shape* reports, and proved a depth that reaches the floor
+    *shape* reports; the caveat is then the verifier's own claim sentence (what was proved, and
+    what was not). Otherwise ``height_is_verified`` is
     ``False`` and the caveat stays the anchor's own endpoint's-word caveat — except when the merkle
     branch was checked and passed but the height was still not verified: then it is
     :data:`INCLUSION_ONLY_CAVEAT`, because :data:`BOUND_CAVEAT`'s "pyrxd checks no ... merkle

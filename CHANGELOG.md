@@ -53,20 +53,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     reason names the checkpoint, and the human report prints the verifier's claim in place of
     the endpoint's-word caveat. **A JSON consumer comparing `checks.block.state == "CONFIRMED"`
     will now see `VERIFIED` for those marks.** Both states hold the verdict.
+  - Under `VERIFIED` the depth is the one pyrxd proved, printed as "at least N confirmation(s)
+    verified", with the endpoint's figure beside it, labelled, only when the two differ. The
+    floor you set is judged against the proved depth, not the endpoint's number: a mark the
+    endpoint reports below the floor, but proved at or past it, is `VERIFIED` with exit 0 (it
+    was `PROVISIONAL`, exit 5).
   - When it does not verify (no checkpoints for the network, as on testnet and regtest; a block
     too far past the newest checkpoint; a server without the merkle method; a fetch that failed
-    or came back malformed), the state stays `CONFIRMED`, the height is still the endpoint's
-    word, and the reason says why verification did not complete. The verdict and exit code are
-    unchanged. If the merkle branch was checked and passed but the height still did not verify,
-    the caveat says so instead of "pyrxd checks no proof-of-work or merkle inclusion".
+    or came back malformed), the state stays `CONFIRMED` (or `PROVISIONAL`, below the floor),
+    the height and depth are still the endpoint's word, and the reason says why verification
+    did not complete. The verdict and exit code are unchanged. If the merkle branch was checked
+    and passed but the height still did not verify, the caveat says so instead of "pyrxd checks
+    no proof-of-work or merkle inclusion".
   - When the server's own proof contradicts the height it reported (a branch that does not lead
     to the header, a header that does not link), `pyrxd verify` exits 2, as it does when the
-    height cannot be bound to a header, with the reason. It does not call the mark invalid.
+    height cannot be bound to a header, with the reason. It does not call the mark invalid. A
+    block hash the endpoint named that is not the header its proof serves at that height is not,
+    by itself, a contradiction: a chain reorganisation between the two replies produces one
+    honestly. The header served is checked on its own; if it verifies, the result is `VERIFIED`
+    for the block proved, with a note that the endpoint had named another.
   - `mark_anchor` in `--json` gains `blockhash` (the block the endpoint named, once the height
-    is bound to its header) and `block_verification` (every field of the outcome, plus `source`,
-    the endpoint asked for the proof); `height_is_verified` is true only for a VERIFIED block.
-    Form-2 anchors (`name_at_mark.anchor`) and the anchor in the pages' JSON carry the same two
-    keys, with `block_verification` null: they are not verified, and their caveats are unchanged.
+    is bound to its header; under `VERIFIED`, the block proved), `verified_confirmations` (the
+    depth proved, under `VERIFIED`; otherwise null — `confirmations` stays the endpoint's
+    figure) and `block_verification` (every field of the outcome, including `named_blockhash`,
+    plus `source`, the endpoint asked for the proof); `height_is_verified` is true only for a
+    VERIFIED block. Form-2 anchors (`name_at_mark.anchor`) and the anchor in the pages' JSON
+    carry the same three keys, with `verified_confirmations` and `block_verification` null: they
+    are not verified, and their caveats are unchanged.
   - A mark whose block, plus the confirmations asked for, reaches more than 4,032 blocks past
     this pyrxd's newest checkpoint cannot be verified by it and reports `CONFIRMED` with that
     reason; newer checkpoints come with newer releases.

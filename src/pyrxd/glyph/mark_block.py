@@ -7,11 +7,14 @@ no independent source (HashMark §2.3.2), so one endpoint's data is enough — t
 checkpoint, not in who served the proof.
 
 CALLERS (tracked in #799). ``pyrxd verify`` calls it, on by default, through
-:func:`pyrxd.cli.glyph_inspect.verify_anchor_block`, which every anchor that command reports
-crosses: VERIFIED prints this module's claim; any other outcome falls back to the endpoint's-word
-wording with the reason; CONTRADICTED exits 2 with its reason, as a binding failure does. The
-``/verify/`` and ``/inspect/`` pages do not call it yet (phase 3), so they still print the
-endpoint's-word caveat, and so do ``glyph inspect`` and form 2's anchors.
+:func:`pyrxd.cli.glyph_inspect.verify_anchor_block`, for ONE anchor: the mark's own (``mark_anchor``
+in its JSON, and the ``block`` check), which crosses it on both of the paths that build it — its
+own lookup and the anchor inherited from a ``--wave-name`` lookup. VERIFIED prints this module's
+claim; any other outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED
+exits 2 with its reason, as a binding failure does. NOT every anchor that command prints: the
+anchors inside a form-2 name verdict (such as ``records[i].name_at_mark.anchor``, with
+``--wave-name``) are not verified and keep the endpoint's-word caveat. Neither do ``glyph
+inspect`` or the ``/verify/`` and ``/inspect/`` pages call it yet (phase 3).
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads
@@ -64,8 +67,8 @@ server served is well-formed and fails a check — its own proof disagrees with 
 hash it named that is not the header it served is not, on its own, a failed check: see
 :func:`verify_mark_block`); ``NOT VERIFIED`` (nothing was proved either way: data missing or
 unreadable, no checkpoint for this network, the chain above the checkpoint too long for this
-pyrxd, or a difficulty below the floor — an honest low-difficulty stretch is not a lie). Neither non-VERIFIED state says the mark is
-invalid; both mean the height remains the endpoint's word.
+pyrxd, or a difficulty below the floor — an honest low-difficulty stretch is not a lie). Neither
+non-VERIFIED state says the mark is invalid; both mean the height remains the endpoint's word.
 """
 
 from __future__ import annotations
