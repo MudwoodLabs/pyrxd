@@ -58,7 +58,7 @@ from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.spv.radiant import radiant_header_work
 from pyrxd.transaction.transaction import Transaction
 from tests import test_taker_asset_funding_gate_adversarial as A
-from tests._funding_chain import build_funding_chain, regtest_genesis_header
+from tests._funding_chain import build_funding_chain, mine, regtest_genesis_header
 from tests.test_swap_coordinator import (
     _NOW,
     FakeBtcLeg,
@@ -902,6 +902,63 @@ def test_the_upper_bound_is_raised_by_the_server_report_and_never_lowered():
     assert verify_maker_funding(c.evidence(reported_confirmations=1), now_unix_s=_NOW, **kw).elapsed_blocks_upper == 3
     r = verify_maker_funding(c.evidence(), now_unix_s=_NOW + 3000, **kw)
     assert (r.proved_depth, r.withheld_allowance_blocks, r.elapsed_blocks_upper) == (3, 10, 13)
+
+
+def _reference_depth_case():
+    """Checkpoints at 0, 2 and 4 (mainnet schedule, floor-bearing bits), then a funding at block 5
+    buried 10 deep whose newest header is six hours old."""
+    base = build_funding_chain(spk=b"\x51", value=1, confs=4, bits=_HARD_BITS, tip_time=_NOW - 10 * 86400).headers
+    chain = RadiantChain(
+        name="mainnet",
+        checkpoints=tuple((h, radiant_block_hash(base[h])) for h in (0, 2, 4)),
+        pow_limit=(1 << 255) - 1,
+        subsidy_halving_interval=210_000,
+        value_bearing=True,
+    )
+    spk = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    real = build_funding_chain(spk=spk, value=1000, confs=10, base=base, bits=_HARD_BITS, tip_time=_NOW - 6 * 3600)
+    kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6, withheld_block_interval_s=_FAST_S)
+    return real, kw
+
+
+def _time(header: bytes) -> int:
+    return int.from_bytes(header[68:72], "little")
+
+
+def test_the_reference_time_comes_from_a_header_at_depth_value_term():
+    """The elapsed-time allowance is measured from the header ``max(1, value term)`` deep below the
+    newest one served — the depth at which changing that header costs ``value term × C``, at least
+    twice the value at stake — not from the newest header. Serving one more header on top moves the
+    reference up by exactly one, so the allowance is still measured from a header that deep."""
+    real, kw = _reference_depth_case()
+    first = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=1, **kw)
+    cost = first.forged_confirmation_cost_photons
+    value = 2 * cost  # value term ceil(2 × 2C ÷ C) = 4
+    r = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    assert r.value_term == 4 and r.value_term * cost >= FORGERY_COST_FACTOR * value
+    assert r.reference_height == r.served_tip - r.value_term + 1 == 11
+    expected = -(-(_NOW - _time(real.headers[11])) // int(_FAST_S))
+    assert r.withheld_allowance_blocks == expected > 600
+    assert r.elapsed_blocks_upper == (11 - real.height + 1) + expected
+
+    hdrs = dict(real.headers)
+    top = max(hdrs)
+    hdrs[top + 1] = mine(radiant_block_hash(hdrs[top]), hashlib.sha256(b"one more").digest(), _NOW, _HARD_BITS)
+    s = verify_maker_funding(real.evidence(headers=hdrs), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    assert s.served_tip == top + 1 and s.proved_depth == r.proved_depth + 1
+    assert s.reference_height == 12, "the reference moved by more than the one header added"
+    assert s.withheld_allowance_blocks == -(-(_NOW - _time(real.headers[12])) // int(_FAST_S)) > 600
+    assert s.elapsed_blocks_upper >= s.proved_depth + 600
+
+
+def test_a_value_term_of_one_references_the_newest_header():
+    """When one forged confirmation already costs twice the value (value term 1) the reference is the
+    newest header served, exactly as on a test network — no honest swap is charged more time."""
+    real, kw = _reference_depth_case()
+    r = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=1000, **kw)
+    assert r.value_term == 1 and r.forged_confirmation_cost_photons >= FORGERY_COST_FACTOR * 1000
+    assert r.reference_height == r.served_tip
+    assert r.withheld_allowance_blocks == -(-(_NOW - _time(real.headers[r.served_tip])) // int(_FAST_S))
 
 
 def test_a_value_bearing_gate_without_a_clock_refuses(monkeypatch):

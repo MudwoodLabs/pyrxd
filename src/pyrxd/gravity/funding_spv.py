@@ -61,25 +61,39 @@ THE UPPER BOUND ON ELAPSED DEPTH. SPV proves a LOWER bound on how deep the fundi
 gates that follow (``pre_btc_lock_check`` steps 6 and 7) need an UPPER bound, because ``t_rxd`` is a
 CSV counted from the covenant's mining and an under-counted depth makes the maker's refund look
 further away than it is. A server can under-count by withholding its newest headers. The bound used
-is ``max(reported, proved + ceil(max(0, now - T_tip) ÷ interval))``: the depth proved to the newest
-header served, plus an allowance for every block that could have been mined since that header's own
-timestamp, at the interval the coordinator uses for converting time to blocks (the fast tail),
-max'd with the server's own verbose ``confirmations``, which can only raise it. A server that stops
-serving at an older header therefore hands the taker an older ``T_tip`` and a larger allowance —
-the withholding shows up as elapsed time. The clock is the caller's (``now_unix_s``); the
-coordinator never reads one. It is REQUIRED on a value-bearing network; on a test network without
-it the allowance is omitted and the result says so.
+is::
+
+    max(proved, (R - H + 1) + ceil(max(0, now - T_R) ÷ interval), reported)
+
+where ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header
+served (the newest counting as 1), and ``T_R`` its timestamp. The blocks from the funding up to
+``R`` are proved; every block after ``R`` is covered by the allowance for all that could have been
+mined since ``T_R``, at the interval the coordinator uses for converting time to blocks (the
+measured fast tail, required on a value-bearing network). The server's own verbose
+``confirmations`` can only raise it. A server that stops serving at an older header hands the taker
+an older ``T_R`` and a larger allowance — the withholding shows up as elapsed time.
+
+WHY THAT DEPTH. Elapsed time is measured from a header deep enough that changing its time costs as
+much as the rule already demands of the depth: a different header at ``R`` means different headers
+above it too, each mined at the floor or above, which prices it at ``value_term × C ≥ 2 × value at
+stake`` — the value term of ``k``. Deeper would charge every honest swap the time of more blocks at
+the fast-tail rate without raising that price past what ``k`` already settles. ``value_term <= k <=
+proved``, so ``R`` is never below the funding block. A test network has no value term, and ``R`` is
+the newest header served.
+
+The clock is the caller's (``now_unix_s``); the coordinator never reads one. It is REQUIRED on a
+value-bearing network; on a test network without it the allowance is omitted and the result says so.
 
 WHAT REMAINS THE SERVER'S WORD, stated rather than implied:
 
 * that the covenant output is still UNSPENT. SPV proves a transaction was mined, never that an
   output has not been spent since; the ``listunspent`` read that locates the outpoint is kept for
   that, and is no longer the evidence of the output's existence, script or value.
-* withholding hidden inside the allowance above: the tip header's timestamp is set by its miner,
+* withholding hidden inside the allowance above: the reference header's timestamp is set by its miner,
   and Radiant Core accepts one up to ``MAX_FUTURE_BLOCK_TIME`` ahead of its adjusted time
   (``tests/vendor/radiant_core/validation.cpp`` line 3936; the constant lives in ``chain.h``, which
-  is not vendored — two hours in the Bitcoin Core lineage), so a server that stops at a header its
-  miner dated ahead can hide the blocks mined in that difference; so can blocks arriving faster
+  is not vendored — two hours in the Bitcoin Core lineage), so a reference header its miner dated
+  ahead can hide the blocks mined in that difference; so can blocks arriving faster
   than the fast-tail interval. No tolerance is added for it: adding the full limit would charge
   every honest swap that many hours of blocks.
 * which chain is Radiant's most-work chain, and whether each nBits is the value Radiant's
@@ -398,10 +412,14 @@ class VerifiedMakerFunding:
     max_header_work: int
     #: The conservative UPPER bound on blocks since the funding was mined, for the timelock gates.
     elapsed_blocks_upper: int
-    #: The clock allowance inside it, or ``None`` when no clock was supplied (test networks only).
+    #: The clock allowance inside it — blocks that could have been mined since the reference header's
+    #: timestamp — or ``None`` when no clock was supplied (test networks only).
     withheld_allowance_blocks: int | None
     reported_confirmations: int | None
     served_tip: int
+    #: The header the clock allowance is measured from: ``max(1, value_term)`` deep below the served
+    #: tip (the tip itself on a test network).
+    reference_height: int
     #: The verifier's own sentence for what it proved.
     claim: str
 
@@ -593,7 +611,14 @@ def verify_maker_funding(
             f"inclusion in block {height} ({v.blockhash}), {proved} deep, linked to checkpoint {newest_h}",
         )
 
-    # 5. The upper bound on elapsed depth, for the timelock gates.
+    # 5. The upper bound on elapsed depth, for the timelock gates. The allowance is measured from the
+    #    REFERENCE header, `max(1, value_term)` deep below the newest header served (the newest counts
+    #    as 1): a different header there means different headers above it too, each at the floor or
+    #    above, so its time costs `value_term × C` to change — the price the rule already sets on the
+    #    depth. `value_term <= k <= proved`, so the reference is never below the funding block. A
+    #    test network has no value term: the reference is the newest header served.
+    ref_depth = max(1, value_term)
+    ref_h = top - ref_depth + 1
     if now_unix_s is None:
         if chain.value_bearing:
             raise refuse(
@@ -605,11 +630,14 @@ def verify_maker_funding(
             )
         allowance: int | None = None
     else:
-        stale_s = max(0, now_unix_s - _header_time(bytes(headers[top])))
+        stale_s = max(0, now_unix_s - _header_time(bytes(headers[ref_h])))
         allowance = math.ceil(stale_s / float(withheld_block_interval_s))
     reported = evidence.reported_confirmations
     reported_i = reported if isinstance(reported, int) and not isinstance(reported, bool) and reported >= 0 else None
-    upper = max(proved + (allowance or 0), reported_i or 0)
+    # Blocks up to and including the reference header are proved; every block after it is inside the
+    # allowance, which counts all that could have been mined since its timestamp. Never below the
+    # proved depth; the server's own count can only raise it.
+    upper = max(proved, (ref_h - height + 1) + (allowance or 0), reported_i or 0)
 
     return VerifiedMakerFunding(
         outpoint=f"{txid}:{vout}",
@@ -629,5 +657,6 @@ def verify_maker_funding(
         withheld_allowance_blocks=allowance,
         reported_confirmations=reported_i,
         served_tip=top,
+        reference_height=ref_h,
         claim=v.claim or "",
     )
