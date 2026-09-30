@@ -42,7 +42,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two HashMark transactions against both default servers ("Missing hash for index 3 at height
   0", "Duplicate offset: 1, at height: 0"). It now builds one level per tree depth. It also now
   refuses a `pos` of `2**depth` or more, since that points to no leaf of a tree that deep and
-  stands in for a smaller position. No pyrxd command called this method.
+  stands in for a smaller position. A block holding a single transaction (empty branch, root
+  equal to the txid, as in real mainnet block 1) raised too; `MerklePath.compute_root` now
+  returns the txid for that one-leaf, offset-0 path. No pyrxd command called this method.
 
 ## [0.25.1] — 2026-09-29
 

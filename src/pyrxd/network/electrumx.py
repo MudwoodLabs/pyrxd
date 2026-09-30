@@ -622,7 +622,9 @@ class ElectrumXClient:
         holds the txid leaf at ``pos`` and its sibling at ``pos ^ 1``; level ``i`` holds the one
         sibling at offset ``(pos >> i) ^ 1``. Through 0.25.1 every sibling was put in level 0, which
         raised on real mainnet proofs ("Missing hash for index 3 at height 0", "Duplicate offset:
-        1, at height: 0" — measured on two HashMark txids against both shipped servers).
+        1, at height: 0" — measured on two HashMark txids against both shipped servers). A
+        single-transaction block (empty branch, ``pos`` 0) gives one level holding the txid alone,
+        whose root is the txid itself (real block 1 of mainnet).
 
         The returned path is not checked against any header.
         """

@@ -138,3 +138,34 @@ async def test_the_failover_client_forwards_the_branch_method() -> None:
     assert got.pos == fx["merkle"]["pos"]
     path = await fo.get_transaction_merkle(Txid(txid), BlockHeight(fx["merkle"]["block_height"]))
     assert path.compute_root(txid) == _header_at(fx, fx["merkle"]["block_height"])[36:68][::-1].hex()
+
+
+# Block 1 of Radiant mainnet holds ONE transaction, its coinbase. Captured 2026-09-30, read-only,
+# from both shipped servers (identical), and the maintainer's node (``getblock <hash> 1``) agreed:
+# one tx, ``2b1bfc07…ac8c``, and a merkle root equal to it.
+_BLOCK1_TXID = "2b1bfc071d1d120b9592bdd45e50484ebba63943f565aebde9cbb6c250f8ac8c"
+_BLOCK1_REPLY = {"block_height": 1, "merkle": [], "pos": 0}
+_BLOCK1_HEADER = bytes.fromhex(
+    "00000020b43f004e6f7a1f7e439ea50c6c2aac60b6ffb376688de28b5dedd865000000008cacf850c2b6cbe9bdae65f5"
+    "4339a6bb4e48505ed4bd92950b121d1d07fc1b2bd933b162ffff001d29e973a3"
+)
+
+
+async def test_a_single_transaction_block_gives_a_path_whose_root_is_the_txid() -> None:
+    """The branch is empty and the root equals the txid. Through this PR's first fix it raised
+    ``Could not construct MerklePath: Missing hash for index 0 at height 0``."""
+    from pyrxd.merkle_path import MerklePath
+
+    assert _BLOCK1_HEADER[36:68][::-1].hex() == _BLOCK1_TXID, "premise: the real header's root is the txid"
+    path = await _client_answering(_BLOCK1_REPLY).get_transaction_merkle(Txid(_BLOCK1_TXID), BlockHeight(1))
+    assert path.compute_root(_BLOCK1_TXID) == _BLOCK1_HEADER[36:68][::-1].hex()
+    assert MerklePath.from_hex(path.to_hex()).compute_root(_BLOCK1_TXID) == _BLOCK1_TXID
+
+
+def test_a_lone_leaf_that_is_not_at_offset_zero_is_still_refused() -> None:
+    """The single-transaction case is offset 0 only; a lone leaf elsewhere is a proof missing its
+    sibling, not a one-transaction block."""
+    from pyrxd.merkle_path import MerklePath
+
+    with pytest.raises(ValueError, match="Missing hash for index 1 at height 0"):
+        MerklePath(1, [[{"offset": 1, "hash_str": _BLOCK1_TXID, "txid": True}]])
