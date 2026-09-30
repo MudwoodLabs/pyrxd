@@ -31,13 +31,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from pyrxd.hash import radiant_block_hash
-from pyrxd.security.errors import SpvVerificationError, ValidationError
+from pyrxd.security.errors import NetworkError, SpvVerificationError, ValidationError
+from pyrxd.security.json_guards import hex_str, merkle_branch, nonneg_int
 from pyrxd.security.types import BlockHeight, Nbits
 
 __all__ = [
+    "MAX_BLOCK_HEADERS_PER_CALL",
     "MAX_MERKLE_DEPTH",
     "RADIANT_HEADER_LEN",
     "TxMerkleBranch",
+    "block_headers_from_reply",
+    "coinbase_branch_from_reply",
+    "merkle_branch_from_reply",
     "radiant_header_prev_hash",
     "radiant_header_target",
     "radiant_header_work",
@@ -50,7 +55,11 @@ RADIANT_HEADER_LEN = 80
 #: it exists so a server cannot hand a verifier an unbounded list to hash.
 MAX_MERKLE_DEPTH = 32
 
+#: ElectrumX's ``blockchain.block.headers`` serves at most this many headers per call.
+MAX_BLOCK_HEADERS_PER_CALL = 2016
+
 _HEX64 = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+_HEX_DIGITS = re.compile(r"\A[0-9a-fA-F]*\Z")
 
 
 def _require_header(header: Any) -> bytes:
@@ -168,3 +177,88 @@ class TxMerkleBranch:
             raise ValidationError(f"merkle branch deeper than {MAX_MERKLE_DEPTH} levels")
         normalised = tuple(s.lower() if isinstance(s, str) else s for s in branch)
         return cls(block_height=height, branch=normalised, pos=pos)
+
+
+# ── ElectrumX replies, read ONCE ─────────────────────────────────────────────────────────────
+#
+# The three RPCs a block proof needs, read here rather than inside ``ElectrumXClient``, because two
+# callers read them: the client (``pyrxd verify``) and the browser pages' ``glue.verify_mark_block``,
+# which cannot import ``pyrxd.network`` under Pyodide. One reader means a malformed reply is refused
+# with the same words on both surfaces, so the reason a reader sees for "not verified" is the same
+# sentence whichever of them asked. Each raises ``NetworkError`` — a fact about the server's reply.
+
+
+def merkle_branch_from_reply(result: Any, height: int) -> TxMerkleBranch:
+    """A ``blockchain.transaction.get_merkle`` reply for block *height*, shape-validated.
+
+    Raises ``NetworkError`` for a malformed reply, or a proof for another block than *height*:
+    ElectrumX echoes ``block_height``, and without binding it the server chooses which block it
+    proves inclusion in. Not checked against any header here.
+    """
+    # ElectrumX returns {"block_height": N, "merkle": [...], "pos": N}
+    if not isinstance(result, dict):
+        raise NetworkError("Unexpected response type for transaction merkle")
+    try:
+        # `merkle` had NO type check: a JSON string passed through as "the branch", and
+        # iterating "deadbeef" yields eight one-character "hashes". `pos` had no sign check
+        # and both int() calls could raise OverflowError on a JSON `Infinity` — a class
+        # absent from the tuple below, so it escaped past every `except NetworkError`.
+        block_height = BlockHeight(nonneg_int(result["block_height"]))
+        merkle_hashes: list[str] = merkle_branch(result["merkle"])
+        pos: int = nonneg_int(result["pos"])
+        branch = TxMerkleBranch(
+            block_height=int(block_height),
+            branch=tuple(h.lower() for h in merkle_hashes),
+            pos=pos,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError, ValidationError):
+        raise NetworkError("Malformed merkle response from server") from None
+    if branch.block_height != int(height):
+        raise NetworkError(
+            f"merkle proof is for block {branch.block_height}, not the requested {int(height)}; fail-closed"
+        )
+    return branch
+
+
+def block_headers_from_reply(result: Any, count: int) -> list[bytes]:
+    """A ``blockchain.block.headers`` reply to a request for *count* headers, as 80-byte headers.
+
+    The server answers ``{"count": n, "hex": ..., "max": ...}``; ``n`` may be SMALLER than asked
+    when the range runs past its tip, and that is honest, so fewer headers come back. Refused, with
+    ``NetworkError``: a reply that is not an object, an echoed ``count`` that is not a non-negative
+    int or is larger than asked, a ``hex`` that is not a string of hex digits exactly ``160 * n``
+    long. What the headers say (linkage, proof-of-work) is not checked here.
+    """
+    if not isinstance(result, dict):
+        raise NetworkError("Unexpected response type for block headers")
+    try:
+        served = nonneg_int(result.get("count"))
+    except (TypeError, ValueError, OverflowError):
+        raise NetworkError("Malformed block headers response: no usable count") from None
+    if served > count:
+        raise NetworkError(f"server returned {served} block headers when {count} were asked for; fail-closed")
+    hex_blob = result.get("hex")
+    if not isinstance(hex_blob, str) or len(hex_blob) != 160 * served or not _HEX_DIGITS.match(hex_blob):
+        raise NetworkError(f"Malformed block headers response: hex is not {served} 80-byte headers")
+    raw = bytes.fromhex(hex_blob)
+    return [raw[i * 80 : (i + 1) * 80] for i in range(served)]
+
+
+def coinbase_branch_from_reply(result: Any) -> dict[str, Any]:
+    """A ``blockchain.transaction.id_from_pos(height, pos, true)`` reply, shape-validated.
+
+    Returns ``{"tx_hash": <64 lowercase hex>, "merkle": [<64 lowercase hex>, ...]}``. Raises
+    ``NetworkError`` for a reply that is not an object, a ``tx_hash`` that is not 32 bytes of hex,
+    or a ``merkle`` that is not a list of at most :data:`MAX_MERKLE_DEPTH` 32-byte hex hashes. Not
+    checked against any header here.
+    """
+    if not isinstance(result, dict):
+        raise NetworkError("Unexpected response type for transaction id_from_pos")
+    try:
+        tx_hash = hex_str(result["tx_hash"], nbytes=32)
+        branch = merkle_branch(result["merkle"])
+    except (KeyError, TypeError, ValueError):
+        raise NetworkError("Malformed id_from_pos response from server") from None
+    if len(branch) > MAX_MERKLE_DEPTH:
+        raise NetworkError(f"id_from_pos merkle branch is deeper than {MAX_MERKLE_DEPTH} levels; fail-closed")
+    return {"tx_hash": tx_hash.lower(), "merkle": [h.lower() for h in branch]}

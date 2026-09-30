@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -49,8 +48,14 @@ from ..security.errors import (
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..security.units import ChainHeight, PhotonValue
-from ..spv.radiant import MAX_MERKLE_DEPTH, TxMerkleBranch
-from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
+from ..spv.radiant import (
+    MAX_BLOCK_HEADERS_PER_CALL,
+    TxMerkleBranch,
+    block_headers_from_reply,
+    coinbase_branch_from_reply,
+    merkle_branch_from_reply,
+)
+from ._guards import finite_int, hex_str, nonneg_int
 from .registry import block_hash_hex
 from .source_identity import SourceKey, source_key
 from .tls_pin import normalize_pin, verify_connection_pin
@@ -59,10 +64,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT: float = 30.0
 
-#: ElectrumX's ``blockchain.block.headers`` serves at most this many headers per call (its ``max``).
-MAX_BLOCK_HEADERS_PER_CALL = 2016
-
-_HEX_DIGITS = re.compile(r"\A[0-9a-fA-F]*\Z")
+# `MAX_BLOCK_HEADERS_PER_CALL` (2016, ElectrumX's `max`) is imported from `pyrxd.spv.radiant`,
+# where the reply reader it bounds lives, and is re-exported here under its old name.
 
 
 @dataclass
@@ -601,32 +604,8 @@ class ElectrumXClient:
         if not isinstance(height, BlockHeight):
             height = BlockHeight(height)
         result = await self._call("blockchain.transaction.get_merkle", [str(txid), int(height)])
-        # ElectrumX returns {"block_height": N, "merkle": [...], "pos": N}
-        if not isinstance(result, dict):
-            raise NetworkError("Unexpected response type for transaction merkle")
-        try:
-            # `merkle` had NO type check: a JSON string passed through as "the branch", and
-            # iterating "deadbeef" yields eight one-character "hashes". `pos` had no sign check
-            # and both int() calls could raise OverflowError on a JSON `Infinity` — a class
-            # absent from the tuple below, so it escaped past every `except NetworkError`.
-            block_height = BlockHeight(nonneg_int(result["block_height"]))
-            merkle_hashes: list[str] = merkle_branch(result["merkle"])
-            pos: int = nonneg_int(result["pos"])
-            branch = TxMerkleBranch(
-                block_height=int(block_height),
-                branch=tuple(h.lower() for h in merkle_hashes),
-                pos=pos,
-            )
-        except (KeyError, TypeError, ValueError, OverflowError, ValidationError):
-            raise NetworkError("Malformed merkle response from server")
-
-        # The proof must be for the block we ASKED about. ElectrumX echoes `block_height`, and
-        # without binding it the server chooses which block it proves inclusion in.
-        if branch.block_height != int(height):
-            raise NetworkError(
-                f"merkle proof is for block {branch.block_height}, not the requested {int(height)}; fail-closed"
-            )
-        return branch
+        # Read by the one reader the browser pages use too, so both refuse a reply in one wording.
+        return merkle_branch_from_reply(result, int(height))
 
     async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
         """Fetch the Merkle proof for *txid* at block *height*, as a BUMP :class:`MerklePath`.
@@ -818,19 +797,7 @@ class ElectrumXClient:
         if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_BLOCK_HEADERS_PER_CALL:
             raise ValidationError(f"count must be an int in 1..{MAX_BLOCK_HEADERS_PER_CALL}")
         result = await self._call("blockchain.block.headers", [int(start), count])
-        if not isinstance(result, dict):
-            raise NetworkError("Unexpected response type for block headers")
-        try:
-            served = nonneg_int(result.get("count"))
-        except (TypeError, ValueError, OverflowError):
-            raise NetworkError("Malformed block headers response: no usable count")
-        if served > count:
-            raise NetworkError(f"server returned {served} block headers when {count} were asked for; fail-closed")
-        hex_blob = result.get("hex")
-        if not isinstance(hex_blob, str) or len(hex_blob) != 160 * served or not _HEX_DIGITS.match(hex_blob):
-            raise NetworkError(f"Malformed block headers response: hex is not {served} 80-byte headers")
-        raw = bytes.fromhex(hex_blob)
-        return [raw[i * 80 : (i + 1) * 80] for i in range(served)]
+        return block_headers_from_reply(result, count)
 
     async def get_transaction_id_from_pos(self, height: BlockHeight, pos: int) -> dict[str, Any]:
         """The txid at position *pos* of block *height*, with its merkle branch, shape-validated.
@@ -848,16 +815,7 @@ class ElectrumXClient:
         if not isinstance(pos, int) or isinstance(pos, bool) or pos < 0:
             raise ValidationError("pos must be a non-negative int")
         result = await self._call("blockchain.transaction.id_from_pos", [int(height), pos, True])
-        if not isinstance(result, dict):
-            raise NetworkError("Unexpected response type for transaction id_from_pos")
-        try:
-            tx_hash = hex_str(result["tx_hash"], nbytes=32)
-            branch = merkle_branch(result["merkle"])
-        except (KeyError, TypeError, ValueError):
-            raise NetworkError("Malformed id_from_pos response from server")
-        if len(branch) > MAX_MERKLE_DEPTH:
-            raise NetworkError(f"id_from_pos merkle branch is deeper than {MAX_MERKLE_DEPTH} levels; fail-closed")
-        return {"tx_hash": tx_hash.lower(), "merkle": [h.lower() for h in branch]}
+        return coinbase_branch_from_reply(result)
 
     async def get_tip_height(self) -> BlockHeight:
         """Return the current chain tip block height.

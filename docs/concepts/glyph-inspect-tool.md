@@ -109,11 +109,29 @@ and answers the four questions `pyrxd verify` answers about a HashMark
 and whether a file you have matches — in plain language, for someone
 who arrived from a link with no context.
 
-One answer differs, for now. `pyrxd verify` verifies the block: the
-transaction's merkle branch against the block's header, and that header's
-hash linkage to a checkpoint shipped with pyrxd. The pages do not do that
-yet (#799), so they report the block height as the server's word, with
-that caveat.
+Both verify the block the same way `pyrxd verify` does: the transaction's
+merkle branch against the block's header, and that header's hash linkage
+to a checkpoint shipped with pyrxd (with proof-of-work above the newest
+one). The page draws the block first, as the server's word with that
+caveat, and then fetches the proof and verifies it: `glue.verify_mark_block`
+decides what to fetch and what it means, through the same Python
+(`pyrxd.glyph.mark_block.verify_with_fetched`) the CLI calls, so the
+claim and the reason it could not verify are the CLI's sentences. A
+malformed reply is refused by the same Python reader, in the same words:
+the page's JavaScript only drops the fields nothing reads, empties nesting
+deeper than any reader looks, and caps each reply's size, and a reply over
+that cap, or a fetch that fails in
+transport (a timeout, an error from the server), is reported in the
+page's own words. A block that does not verify stays on screen as the
+server's word, with the reason. A proof that contradicts the height the
+server reported shows no block number, as `pyrxd verify` reports none.
+The pages link at most 4,032 headers past the newest checkpoint, as the
+CLI does. They require one confirmation (the block itself) and try to
+prove up to six, or as many as the server reports if that is fewer, so a
+server whose tip is short still verifies to the depth it can prove; a
+block at or below a checkpoint is proved as deep as the newest
+checkpoint. The server's confirmation count is shown beside the proved
+depth, labelled as the server's.
 
 It is not a second implementation of anything. Both pages read the one
 wheel, the one `glue.py` and the one manifest built by the docs CI
