@@ -46,15 +46,17 @@ class EthLeg:
         artifact + chain id).
     network:
         Network tag (e.g. ``"sepolia"``, ``"anvil"``, ``"mainnet"``). Read by the coordinator's
-        ``_leg_is_value_bearing`` gate, and gated by ``require_audit_cleared``.
+        ``_leg_is_value_bearing`` gate. Passed to ``require_audit_cleared``, which has been a
+        no-op since 0.9.0, so no tag stops this leg constructing.
     claim_to / refund_to:
         The maker's ETH address (receives ETH on ``claim(p)``) and the taker's ETH address
         (receives ETH on ``refund()``). These live on the leg, not in ``NegotiatedTerms``.
     eth_timeout_unix_s:
         The absolute negotiated ETH refund deadline (the contract immutable ``timeout``).
     audit_cleared:
-        Fail-closed audit gate (same discipline as the BTC leg): a non-test network refuses to
-        run unless an external audit of the ETH bridge has cleared it and this is set True.
+        Accepted for backward compatibility and has no effect, exactly as on the BTC leg: it
+        feeds ``require_audit_cleared``, a no-op since 0.9.0. The ETH bridge is unaudited and
+        this flag does not stop it running on any network.
     """
 
     def __init__(

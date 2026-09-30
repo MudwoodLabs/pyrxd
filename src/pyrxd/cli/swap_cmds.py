@@ -21,10 +21,13 @@ recoverable; extracting it is ``pyrxd swap recover-preimage``.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -63,6 +66,91 @@ class SwapFacts:
     # asset detail (ft/nft)
     asset_genesis_ref: str | None = None
     asset_ft_amount: int | None = None
+    #: The in-tree harness that wrote the file (:func:`recovery_file_writer`), or ``None``
+    #: when its fields match none of them.
+    writer: str | None = None
+    #: The recovery file names the taker's counter-leg refund key (``taker_btc_wif``).
+    has_btc_refund_key: bool = False
+    #: The ETH HTLC's immutable refundee, as the harness recorded it (``eth_refund_to``).
+    eth_refund_to: str | None = None
+
+
+#: The three harnesses whose recovery file this parser accepts, each told apart by a field
+#: only that writer emits. Read from the writers, not assumed: ``scripts/dust_swap_run.py``
+#: (``keys_payload``: ``taker_btc_wif``, ``btc_htlc_address``), ``scripts/eth_swap_run.py``
+#: (``eth_chain_id``) and ``scripts/eth_swap_grief_run.py`` (``"scenario": "grief-S1"``).
+#: The two-host harnesses write ``hashlock_H_hex`` and are refused before this is reached
+#: (:func:`_two_host_refusal`).
+_DUST_SWAP_RUN = "scripts/dust_swap_run.py"
+_ETH_SWAP_RUN = "scripts/eth_swap_run.py"
+_ETH_SWAP_GRIEF_RUN = "scripts/eth_swap_grief_run.py"
+
+
+def recovery_file_writer(d: dict[str, Any]) -> str | None:
+    """Which in-tree harness wrote this recovery document, or ``None`` if none matches."""
+    if d.get("scenario") == "grief-S1":
+        return _ETH_SWAP_GRIEF_RUN
+    if "eth_chain_id" in d:
+        return _ETH_SWAP_RUN
+    if "taker_btc_wif" in d or "btc_htlc_address" in d:
+        return _DUST_SWAP_RUN
+    return None
+
+
+def _in_tree_script(name: str) -> Path | None:
+    """``scripts/<name>`` beside this package when pyrxd runs from a source checkout, else ``None``.
+
+    ``scripts/`` ships in the sdist only (``pyproject.toml``), never in the wheel, so on a pip
+    install this is ``None`` and no text may point at a path that is not there.
+    """
+    candidate = Path(__file__).resolve().parents[3] / "scripts" / name
+    return candidate if candidate.is_file() else None
+
+
+def _two_host_refusal(d: dict[str, Any], path: Path) -> str | None:
+    """The refusal for a two-host harness's LOCAL secret file, naming that harness's own recovery.
+
+    ``btc_swap_two_host.py`` / ``eth_swap_two_host.py`` keep each role's private state in a
+    ``--local-out`` file that carries no ``hashlock_H`` or covenant SPK under the names this
+    parser reads (the maker's has ``hashlock_H_hex``; the taker's has neither — both live in the
+    exchange directory's ``envelope.json``). Refusing with "not a swap recovery file" left a
+    taker holding the one file it has with no pointer to the phase that refunds its leg.
+    """
+    if d.get("role") not in ("maker", "taker"):
+        return None
+    if "taker_btc_refund_wif" in d or "maker_btc_claim_privkey_hex" in d:
+        name, chain = "btc_swap_two_host.py", "BTC"
+    elif "eth_taker_refund_addr" in d:
+        name, chain = "eth_swap_two_host.py", "ETH"
+    else:
+        return None
+    here = _in_tree_script(name)
+    if here is not None:
+        script, where = str(here), f"from the source tree at {here.parents[1]}"
+    else:
+        script = f"scripts/{name}"
+        where = (
+            f"from the source checkout you ran the swap from — scripts/{name} is not part of pyrxd "
+            "as installed here (scripts/ ships only in the source distribution)"
+        )
+    role = d["role"]
+    head = (
+        f"this is the {role.upper()}'s local secret file from scripts/{name}, not a recovery file this "
+        "toolkit reads: the hashlock and covenant SPK it needs live in that harness's envelope.json."
+    )
+    if role == "taker":
+        return (
+            f"{head} To get your own {chain} back once its timelock has passed, run that harness's "
+            f"recovery phase {where}: `python {script} --role taker --phase abort --io DIR "
+            f"--local-out {path}` with the same chain flags you passed to `--phase fund`. DIR is the "
+            "exchange directory and must hold envelope.json and taker_funding.json."
+        )
+    return (
+        f"{head} The maker's recovery phases are in that harness, run {where}: `python {script} "
+        f"--role maker --phase abort --io DIR --local-out {path}` if the taker never funded (DIR holds "
+        "envelope.json and no taker_funding.json), or `--phase refund` once both legs are locked (DIR "
+        "holds taker_funding.json); both spend the covenant, so both need the --fee-* flags."
+    )
 
 
 def parse_recovery_file(path: Path) -> SwapFacts:
@@ -102,12 +190,17 @@ def parse_recovery_file(path: Path) -> SwapFacts:
     hashlock = d.get("hashlock_H")
     spk = d.get("rxd_covenant_spk")
     if not hashlock or not spk:
+        two_host = _two_host_refusal(d, path)
+        if two_host is not None:
+            raise ValueError(two_host)
         raise ValueError("not a swap recovery file (missing hashlock_H / rxd_covenant_spk)")
     t_rxd = d.get("t_rxd_blocks")
     if not isinstance(t_rxd, int):
         raise ValueError("recovery file missing integer t_rxd_blocks")
 
-    is_eth = ("eth_chain" in d) or (d.get("counter_chain") == "eth")
+    # ``eth_timeout_unix_s`` too: ``eth_swap_grief_run.py`` writes no ``eth_chain``, so its ETH
+    # swap used to be classified BTC and its counter-leg read asked for a BTC outpoint.
+    is_eth = ("eth_chain" in d) or ("eth_timeout_unix_s" in d) or (d.get("counter_chain") == "eth")
     return SwapFacts(
         counter_chain="eth" if is_eth else "btc",
         hashlock_hex=str(hashlock),
@@ -130,6 +223,9 @@ def parse_recovery_file(path: Path) -> SwapFacts:
         eth_amount_wei=d.get("eth_amount_wei"),
         asset_genesis_ref=d.get("asset_genesis_ref"),
         asset_ft_amount=d.get("asset_ft_amount"),
+        writer=recovery_file_writer(d),
+        has_btc_refund_key=bool(d.get("taker_btc_wif")),
+        eth_refund_to=d.get("eth_refund_to") if isinstance(d.get("eth_refund_to"), str) else None,
     )
 
 
@@ -141,15 +237,146 @@ def electrumx_script_hash(spk_hex: str) -> str:
     return hashlib.sha256(bytes.fromhex(spk_hex)).digest()[::-1].hex()
 
 
+#: Counter-leg states in which that leg is finished: claimed by the maker (revealing p) or
+#: spent without revealing p (the taker's refund). Only these, together with a spent
+#: covenant, justify "no further action".
+_COUNTER_LEG_RESOLVED = frozenset({"CLAIMED_PREIMAGE_REVEALED", "SPENT_NO_PREIMAGE"})
+
+
+def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None) -> str:
+    """What the TAKER can actually do to refund its own counter-leg, for this recovery file.
+
+    This used to name ``scripts/*_swap_two_host.py --role taker --phase abort`` for every file.
+    That command could not run from here: it needs the two-host exchange directory
+    (``envelope.json``, ``taker_funding.json``) and that harness's own local secret file, and this
+    parser accepts only the files the OTHER three harnesses write — none of which has a phase that
+    refunds only the counter-leg. ``scripts/`` is also absent from a pip install. So the advice is
+    the plain truth instead: no pyrxd command can do it from this file, the leg stays locked until refunded,
+    when its refund opens, and what in THIS file the refund needs.
+    """
+    chain = facts.counter_chain.upper()
+    if facts.writer is not None:
+        who = f"{facts.writer}, which wrote this file, has no phase that refunds only that leg"
+    else:
+        who = "this file matches none of the in-tree harnesses, so pyrxd cannot name the tool that wrote it"
+    if facts.counter_chain == "btc":
+        t_btc = facts.t_btc_blocks
+        if isinstance(t_btc, int) and not isinstance(t_btc, bool):
+            when = (
+                f"its refund branch opens {t_btc} BTC blocks after the HTLC funding confirmed "
+                "(a relative CSV timelock; t_btc_blocks in this file)"
+            )
+        else:
+            when = "its refund branch opens at the HTLC's own CSV timelock (t_btc), which this file does not record"
+        how = (
+            "Spend the HTLC's refund branch with a tool that can; this file holds the refund key as `taker_btc_wif`."
+            if facts.has_btc_refund_key
+            else "Refund it with the tool that funded it."
+        )
+    else:
+        ts = facts.eth_timeout_unix_s
+        if isinstance(ts, int) and not isinstance(ts, bool):
+            now = int(time.time()) if now_unix_s is None else now_unix_s
+            iso = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            passed = (
+                "already passed by this machine's clock; the contract checks block time"
+                if now >= ts
+                else "still ahead by this machine's clock"
+            )
+            when = f"the HTLC contract's refund() opens at unix time {ts} ({iso}; {passed})"
+        else:
+            when = "the HTLC contract's refund() opens at its own timeout, which this file does not record"
+        how = (
+            "Refund it by calling refund() on the HTLC contract, which pyrxd cannot send; the contract pays "
+            f"the refundee fixed at deploy (`eth_refund_to` = {sanitize_terminal(facts.eth_refund_to, max_len=64)})."
+            if facts.eth_refund_to
+            else "Refund it with the tool that funded it."
+        )
+    return (
+        f"No pyrxd command can refund the {chain} leg from this file, and {who}. Your {chain}-side funds "
+        f"stay locked until refunded; {when}. {how}"
+    )
+
+
+def _covenant_spent(
+    counter_chain: str,
+    counter_leg_state: str | None,
+    *,
+    refund_advice: str | None = None,
+    counter_leg_source: str | None = None,
+) -> tuple[str, str]:
+    """A spent covenant says nothing on its own about whether the swap is over.
+
+    The covenant is spent both by the taker's claim and by the maker's CSV refund. After a
+    refund the taker's counter-leg may still be locked — and the BTC HTLC's claim branch has
+    no timelock, so a maker holding ``p`` can sweep it later. "No further action" is only
+    true when the counter-leg is resolved too, and then only on the word of the server that
+    said so, which the text names.
+    """
+    chain = counter_chain.upper()
+    if refund_advice is None:
+        refund_advice = (
+            f"No pyrxd command can refund the {chain} leg from this file; refund it with the tool that funded it, "
+            "once that leg's own timelock has passed."
+        )
+    no_timelock = (
+        " The BTC claim branch has NO timelock: a maker who refunded the covenant can still sweep "
+        "your BTC with p until you refund it."
+        if counter_chain == "btc"
+        else ""
+    )
+    if counter_leg_state in _COUNTER_LEG_RESOLVED:
+        # The host came from the operator's own URL, but the line it lands on is printed raw.
+        source = sanitize_terminal(counter_leg_source, max_len=120) if counter_leg_source else "one server"
+        how_spent = (
+            "spent by a transaction that reveals no preimage (a refund)"
+            if counter_leg_state == "SPENT_NO_PREIMAGE"
+            else "claimed with p"
+        )
+        return (
+            "SETTLED",
+            f"Both legs are spent: the RXD covenant and the {chain} leg. {source} reports the {chain} leg "
+            f"{how_spent} — that is one server's answer, not a verified fact. There is nothing left to claim "
+            "or refund; read the spending transactions to see who received what. No further action once a "
+            "second source agrees.",
+        )
+    if counter_leg_state == "LOCKED":
+        return (
+            "COUNTER_LEG_LOCKED",
+            f"The RXD covenant is SPENT but the {chain} leg is still LOCKED (see Counter-leg below). The "
+            f"covenant is spent by the taker's claim OR the maker's CSV refund. TAKER: if the maker "
+            f"refunded, your {chain} is still locked — refund it now. {refund_advice}{no_timelock} "
+            f"MAKER: if the taker claimed the covenant, claim your {chain} with p before the taker's "
+            "refund opens.",
+        )
+    return (
+        "COVENANT_SPENT",
+        f"The RXD covenant is SPENT — by the taker's claim or the maker's CSV refund; this read cannot "
+        f"tell which, and it does NOT mean the swap is over. TAKER: check your {chain} leg (Counter-leg "
+        f"below; pass the counter-leg locator and endpoint if it was not checked). If it is still "
+        f"unspent, refund it now. {refund_advice}{no_timelock}",
+    )
+
+
 def classify_covenant(
     *,
     covenant_state: str,  # "live" | "spent" | "not_found"
     funding_height: int | None,
     now_height: int | None,
     t_rxd_blocks: int,
+    counter_chain: str = "btc",
+    counter_leg_state: str | None = None,
+    refund_advice: str | None = None,
+    counter_leg_source: str | None = None,
 ) -> tuple[str, str]:
     """Pure classifier → ``(situation, next_action)``. No network. ``funding_height``/``now_height``
-    required only for the ``live`` case. The refund (CSV) opens at ``funding_height + t_rxd_blocks``."""
+    required only for the ``live`` case; ``counter_leg_state`` (a :class:`CounterLegStatus` state)
+    only for the ``spent`` case, where it decides whether the swap is actually over.
+    ``refund_advice`` (:func:`counter_leg_refund_advice`) and ``counter_leg_source`` (the server
+    that answered) only shape the ``spent`` text.
+
+    The block count is :func:`pyrxd.gravity.radiant_leg.blocks_to_claim_deadline` — the leg's own
+    arithmetic, called rather than copied, so the screen shows the figure the claim is sized by."""
     if covenant_state == "not_found":
         return (
             "NOT_FUNDED",
@@ -157,26 +384,30 @@ def classify_covenant(
             "Verify the SPK / --network, or the swap is already settled.",
         )
     if covenant_state == "spent":
-        return (
-            "SETTLED",
-            "Covenant outpoint is SPENT — the swap settled (taker claimed the asset) or was refunded. "
-            "Read the spending tx to see which; no further action.",
+        return _covenant_spent(
+            counter_chain, counter_leg_state, refund_advice=refund_advice, counter_leg_source=counter_leg_source
         )
     # live
     if funding_height is None or now_height is None:
         return ("LOCKED", "Covenant is live (unspent); heights unavailable to compute the refund deadline.")
+    # Lazy: the leg module pulls in the covenant/fee stack, which `swap status` without
+    # --check-chain never needs.
+    from pyrxd.gravity.radiant_leg import blocks_to_claim_deadline
+
     refund_opens = funding_height + t_rxd_blocks
-    blocks_left = refund_opens - now_height
+    blocks_left = blocks_to_claim_deadline(t_rxd_blocks, now_height - funding_height + 1)
     if blocks_left > 0:
         return (
             "LOCKED",
-            f"Asset is locked and the covenant is live. The maker's CSV refund opens at RXD height "
-            f"{refund_opens} ({blocks_left} blocks away). If you are the TAKER and the maker has revealed "
-            "the preimage (claimed their counter-leg), claim the asset now; otherwise keep watching.",
+            f"Asset is locked and the covenant is live. The maker's CSV refund can be mined from RXD height "
+            f"{refund_opens}: {blocks_left} block(s) remain in which only the taker's claim can be mined. "
+            "If you are the TAKER and the maker has revealed the preimage (claimed their counter-leg), "
+            "claim the asset now; otherwise keep watching.",
         )
     return (
         "REFUND_OPEN",
-        f"REFUND WINDOW OPEN — the covenant is live but past t_rxd (height {refund_opens} reached). The "
+        f"REFUND WINDOW OPEN — the covenant is live and at least {t_rxd_blocks} blocks deep, so the maker's CSV "
+        f"refund is valid now (it can be mined from RXD height {refund_opens}). The "
         "maker can CSV-refund the asset now. TAKER: claim IMMEDIATELY if you hold the preimage, or the "
         "maker reclaims it. MAKER: your refund is available.",
     )
@@ -284,23 +515,11 @@ def swap_status_cmd(
             chain = asyncio.run(_read_covenant(ctx, facts.rxd_covenant_spk))
         except Exception as exc:  # surface any read failure as a clean CLI error
             raise click.ClickException(f"--check-chain read failed: {type(exc).__name__}: {exc}") from exc
-        situation, next_action = classify_covenant(
-            covenant_state=chain["covenant_state"],
-            funding_height=chain["funding_height"],
-            now_height=chain["now_height"],
-            t_rxd_blocks=facts.t_rxd_blocks,
-        )
-        chain["situation"] = situation
-        chain["next_action"] = next_action
-        if chain["covenant_state"] == "live" and chain["funding_height"] is not None:
-            chain["refund_opens_height"] = chain["funding_height"] + facts.t_rxd_blocks
-            chain["blocks_to_refund"] = chain["refund_opens_height"] - chain["now_height"]
-        payload["chain"] = chain
-        payload["situation"] = situation  # top-level for quiet mode
-
-        # The counter-leg read is BEST-EFFORT and must never sink the covenant verdict above:
+        # The counter-leg read is BEST-EFFORT and must never sink the covenant verdict below:
         # an unreachable third-party explorer is not a reason to deny an operator the RXD facts
         # they came for, mid-incident. Any failure is reported as an ERROR row, not raised.
+        # It runs FIRST because a SPENT covenant cannot be classified without it: a maker's
+        # refund and a taker's claim look identical from the covenant alone.
         try:
             counter = asyncio.run(
                 read_counter_leg(
@@ -319,6 +538,26 @@ def swap_status_cmd(
                 reason=f"counter-leg read failed: {type(exc).__name__}: {exc}",
             )
         payload["counter_leg"] = counter.to_dict()
+
+        situation, next_action = classify_covenant(
+            covenant_state=chain["covenant_state"],
+            funding_height=chain["funding_height"],
+            now_height=chain["now_height"],
+            t_rxd_blocks=facts.t_rxd_blocks,
+            counter_chain=facts.counter_chain,
+            counter_leg_state=counter.state,
+            refund_advice=counter_leg_refund_advice(facts),
+            counter_leg_source=counter.source,
+        )
+        chain["situation"] = situation
+        chain["next_action"] = next_action
+        if chain["covenant_state"] == "live" and chain["funding_height"] is not None:
+            from pyrxd.gravity.radiant_leg import blocks_to_claim_deadline
+
+            chain["refund_opens_height"] = chain["funding_height"] + facts.t_rxd_blocks
+            chain["blocks_to_refund"] = blocks_to_claim_deadline(facts.t_rxd_blocks, chain["depth"])
+        payload["chain"] = chain
+        payload["situation"] = situation  # top-level for quiet mode
 
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
