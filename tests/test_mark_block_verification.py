@@ -552,10 +552,14 @@ _ANY_JSON = st.recursive(
     max_leaves=12,
 )
 _SPAN = sorted(h for h in C.headers if C.height <= h <= C.top)
+#: Above an injected checkpoint at ``C.start``: every header here is PoW- and floor-checked.
+_WORK_SPAN = sorted(h for h in C.headers if C.start <= h <= C.top)
+#: The 80-byte header's fields, as (offset, length): version, prev hash, merkle root, time, nBits, nonce.
+_HEADER_FIELDS = ((0, 4), (4, 32), (36, 32), (68, 4), (72, 4), (76, 4))
 
 
 @st.composite
-def _mutated(draw: Any) -> dict[str, Any]:
+def _mutated(draw: Any, span: list[int] = _SPAN) -> dict[str, Any]:
     kw: dict[str, Any] = {
         "merkle": dict(C.merkle),
         "coinbase_merkle": dict(C.coinbase),
@@ -573,7 +577,8 @@ def _mutated(draw: Any) -> dict[str, Any]:
         "coinbase_field",
         "header",
         "header",
-        "header",
+        "header_field",
+        "header_field",
         "drop_header",
         "raw_tx",
         "height",
@@ -590,9 +595,18 @@ def _mutated(draw: Any) -> dict[str, Any]:
             kw["coinbase_merkle"] = dict(kw["coinbase_merkle"])
             kw["coinbase_merkle"][draw(st.sampled_from(["tx_hash", "merkle"]))] = draw(_ANY_JSON)
         elif what == "header":
-            kw["headers"][draw(st.sampled_from(_SPAN))] = draw(st.binary(min_size=0, max_size=100) | _ANY_JSON)
+            kw["headers"][draw(st.sampled_from(span))] = draw(st.binary(min_size=0, max_size=100) | _ANY_JSON)
+        elif what == "header_field":
+            # In place, keeping 80 bytes: the only way a mutation reaches the PoW and floor checks,
+            # since a wholesale replacement fails linkage first. nBits is where a malformed value
+            # (a ValidationError from ``Nbits``) must still come back as a state, not a raise.
+            h = draw(st.sampled_from(span))
+            off, n = draw(st.sampled_from(_HEADER_FIELDS))
+            old = kw["headers"].get(h)
+            if isinstance(old, (bytes, bytearray)) and len(old) == 80:
+                kw["headers"][h] = bytes(old[:off]) + draw(st.binary(min_size=n, max_size=n)) + bytes(old[off + n :])
         elif what == "drop_header":
-            kw["headers"].pop(draw(st.sampled_from(_SPAN)), None)
+            kw["headers"].pop(draw(st.sampled_from(span)), None)
         elif what == "raw_tx":
             kw["raw_tx"] = draw(st.binary(max_size=400) | _ANY_JSON)
         elif what == "height":
@@ -615,6 +629,32 @@ def test_mutated_server_data_never_raises_and_never_verifies_another_height(kw: 
         assert v.reason is None and v.claim
     else:
         assert v.reason and v.claim is None
+
+
+@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(_mutated(_WORK_SPAN), st.integers(1, 9))
+def test_mutated_server_data_at_the_work_level_never_raises(kw: dict[str, Any], min_conf: int) -> None:
+    """The same property ABOVE the newest checkpoint, where the proof-of-work and floor walk runs —
+    code the checkpoint-level property above never reaches (its checkpoint is ``C.top``)."""
+    v = C.run(C.cp(C.start), min_confirmations=min_conf, **kw)
+    assert isinstance(v, BlockVerification)
+    assert v.state in (VERIFIED, NOT_VERIFIED, CONTRADICTED)
+    assert not (v.reason or "").startswith(mark_block._INTERNAL), v.reason
+    if v.state == VERIFIED:
+        assert v.height == C.height and v.level == "work"
+        assert v.blockhash == radiant_block_hash(C.headers[C.height])
+        assert v.verified_depth is not None and v.verified_depth >= min_conf
+        assert v.reason is None and v.claim
+    else:
+        assert v.reason and v.claim is None
+
+
+def test_the_work_level_property_starts_from_a_verified_input() -> None:
+    """Non-vacuity: unmutated, the property's input verifies at the work level through every
+    step, so its mutations are what move the result, not a broken base case."""
+    v = C.run(C.cp(C.start), min_confirmations=9)
+    assert v.state == VERIFIED and v.level == "work"
+    assert _step(v, "proof_of_work") == _step(v, "floor") == "passed"
 
 
 @settings(max_examples=200, deadline=None)
