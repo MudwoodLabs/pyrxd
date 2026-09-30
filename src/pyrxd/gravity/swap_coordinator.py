@@ -1797,8 +1797,11 @@ class SwapCoordinator:
              Unfunded / mis-valued / shallow / unreadable => fail-closed.
 
         ``now_unix_s`` is the caller's wall-clock (the ``now_rxd_height`` precedent: the
-        coordinator takes clocks as params, never reads them) — REQUIRED for an ETH swap,
-        ignored for BTC. Async because binding (1) awaits the async indexer adapter (a sync
+        coordinator takes clocks as params, never reads them). REQUIRED for an ETH swap (step 3's
+        cross-clock gate), for any swap whose Radiant leg is on mainnet (step 5 bounds the elapsed
+        depth with it and refuses without it), and whenever the policy carries a reorg-cost
+        measurement (step 0). Only a BTC swap on test networks may omit it; step 5 then omits its
+        clock allowance. Async because binding (1) awaits the async indexer adapter (a sync
         gate would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
         """
         if not isinstance(terms, NegotiatedTerms):
@@ -2295,8 +2298,10 @@ class SwapCoordinator:
         concurrent or repeat funder of the same H is refused before any value moves;
         TOCTOU-1), and the durable record carries the full counter-leg locator.
 
-        ``now_unix_s`` is the caller's wall-clock — REQUIRED for an ETH swap (the cross-clock
-        timelock-ordering gate, audit HIGH-1), ignored for BTC (byte-equivalent).
+        ``now_unix_s`` is the caller's wall-clock, passed to :meth:`pre_btc_lock_check` and to the
+        lock-time re-run of :meth:`taker_verify_asset_funding` — REQUIRED for an ETH swap (the
+        cross-clock timelock-ordering gate, audit HIGH-1) and for any swap whose Radiant leg is on
+        mainnet (the taker gate's elapsed-depth bound); see :meth:`pre_btc_lock_check`.
 
         Atomicity (kieran-python HIGH): ``counter_leg.fund`` broadcasts on-chain, so a
         cancellation between the broadcast and the in-memory state advance would

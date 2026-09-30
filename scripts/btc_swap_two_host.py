@@ -495,20 +495,25 @@ async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
     return rec.counterchain_locator.amount_sats
 
 
-async def _taker_verify_rxd_funding(coord: SwapCoordinator, terms) -> tuple[str, int, int]:
-    """TAKER-side fail-closed gate — now a thin wrapper over the LIBRARY's
-    ``RadiantCovenantLeg.verify_maker_asset_funded``, reached through the coordinator so the
-    depth pin comes from the same margin policy the rest of the swap uses. Returns
-    ``(outpoint, photons, confirmations)``; converts the library's raise into a ``SystemExit``.
+async def _taker_verify_rxd_funding(coord: SwapCoordinator, terms, *, now_unix_s: int) -> tuple[str, int, int]:
+    """TAKER-side fail-closed gate — a thin wrapper over the LIBRARY's taker gate,
+    ``SwapCoordinator.taker_verify_asset_funding``, which PROVES the maker's covenant funding: the
+    script and value from the funding transaction's own bytes, its merkle inclusion, and headers
+    linked to a checkpoint pyrxd ships (regtest's genesis here) at the required depth
+    (``pyrxd.gravity.funding_spv``). The depth pin comes from the same margin policy the rest of the
+    swap uses. Returns ``(outpoint, photons, elapsed_blocks_upper)`` — the third value an UPPER bound
+    on the blocks since the funding, for the timelock checks; converts the library's raise into a
+    ``SystemExit``.
 
     This logic used to live HERE (the ``find_covenant_utxo`` + depth check inline in
     ``taker_phase_fund``), which meant a caller driving ``SwapCoordinator`` directly had no
     taker-side asset check at all — hazard HZ-1, and a one-sided taker loss of the full
     ``btc_sats`` against a maker that locks nothing. It now lives in the library, with exactly one
     implementation, inside ``pre_btc_lock_check``; ``taker_funds_btc`` additionally RE-RUNS it at
-    lock time, so this call cannot be skipped and the verify->lock window is covered too."""
+    lock time, so this call cannot be skipped and the verify->lock window is covered too. (The
+    leg's ``verify_maker_asset_funded`` is a server-reported pre-check, not this gate.)"""
     try:
-        return await coord.taker_verify_asset_funding(terms)
+        return await coord.taker_verify_asset_funding(terms, now_unix_s=now_unix_s)
     except (ValidationError, NetworkError) as exc:
         raise SystemExit(
             "REFUSING to fund BTC: the maker's RXD covenant is not verifiably locked at the agreed value and "
@@ -611,8 +616,12 @@ async def taker_phase_fund(args) -> None:
         # The depth floor is --taker-min-rxd-confs: _radiant_leg threads it into the leg's own
         # min_confirmations, which is what the library gate uses on an estimated policy (a measured
         # policy pins the higher rxd_claim_burial instead — coordinator._asset_funding_depth).
-        fop, fval, confs = await _taker_verify_rxd_funding(coord, terms)
-        print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons), buried {confs} conf(s)")
+        fop, fval, elapsed = await _taker_verify_rxd_funding(coord, terms, now_unix_s=int(time.time()))
+        proof = coord.last_maker_funding
+        print(
+            f"  -> RXD covenant PROVED funded on-chain at {fop} ({fval} photons), "
+            f"{proof.proved_depth if proof else '?'} block(s) deep; elapsed-depth upper bound {elapsed}"
+        )
 
         confirm(
             "taker_funds_btc: fund the BTC HTLC (taker's UTXO; claim pays the maker, refund pays the taker)",

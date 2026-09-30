@@ -1218,8 +1218,11 @@ def _nft_terms(carrier: int = 1000, csv: int = 6) -> NegotiatedTerms:
 
 
 class TestTheFundingGateIsExercisedPerAssetVariant:
-    """`verify_maker_asset_funded` is the HZ-1 gate: the taker MUST NOT fund the counter leg until
-    this confirms the maker's asset is really locked, at the agreed value, buried deep enough.
+    """`verify_maker_asset_funded` is the leg's server-reported pre-check of the maker's funding —
+    the value binding and depth read the HZ-1 rule asks for, on ONE server's word. The taker gate
+    itself PROVES the funding (`SwapCoordinator.taker_verify_asset_funding`, with
+    `pyrxd.gravity.funding_spv`); this read is what the coordinator's post-confirm depth measurement
+    still uses.
 
     It had NO per-variant coverage. Its only real-leg exercise hardcoded the RXD covenant, and the
     coordinator tests use a duck-typed fake that records the call without running it. That is how

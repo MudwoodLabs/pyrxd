@@ -671,13 +671,19 @@ class RadiantCovenantLeg:
     async def verify_maker_asset_funded(
         self, terms: NegotiatedTerms, *, min_confirmations: int | None = None
     ) -> tuple[str, int, int]:
-        """TAKER-side fail-closed gate: is the MAKER's asset really locked, at the agreed value,
-        buried deep enough, before the taker funds the counter leg? Returns
-        ``(outpoint, value_photons, confirmations)``; RAISES on anything else — the taker MUST NOT
-        lock BTC/ETH if this raises. The Radiant twin of
-        :meth:`pyrxd.btc_wallet.htlc_leg.BitcoinTaprootLeg.verify_counterparty_funded`.
+        """A SERVER-REPORTED pre-check and locator of the maker's covenant funding — NOT the taker gate.
 
-        WHY: ``docs/htlc-handshake-wire-format.md`` HZ-1 states it normatively — *"a taker MUST NOT
+        Returns ``(outpoint, value_photons, confirmations)`` as ONE server reports them
+        (``listunspent`` and verbose ``confirmations``: no merkle proof, no header), and RAISES on
+        anything short of the checks below. A server that invents the covenant satisfies it, so
+        passing it proves nothing a lying server cannot fake. The taker gate is
+        :meth:`pyrxd.gravity.swap_coordinator.SwapCoordinator.taker_verify_asset_funding`, which
+        PROVES the funding from :meth:`maker_funding_evidence` with
+        :func:`pyrxd.gravity.funding_spv.verify_maker_funding` and no longer calls this. Its
+        production caller is the coordinator's ``_covenant_elapsed_blocks``, the post-confirm
+        ordering recheck's read of the covenant's depth — a measurement there, not a gate.
+
+        The rule it was written for: ``docs/htlc-handshake-wire-format.md`` HZ-1 — *"a taker MUST NOT
         fund the counter leg until it has confirmed the maker's asset lock on chain, at the agreed
         scriptPubKey, for the agreed value, at a depth the taker chose."* Nothing else in the
         handshake gives the taker that. The BTC claim leaf is ``<H> … <makerClaimPk> OP_CHECKSIG``
