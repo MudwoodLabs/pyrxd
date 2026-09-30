@@ -9,9 +9,12 @@ never count as two.
 
 WHAT THE KEY IS — distinct operators, as declared, or by registered domain. In this order:
 
-1. A DECLARED operator: ``source_key(url, operator="acme")``, or a :func:`declare_operator` for the
-   URL's host — which is what an ElectrumX endpoint's ``operator = "…"`` in the ``pyrxd`` config file
-   does. Every URL declared ``"acme"`` is one source, whatever its domain.
+1. A DECLARED operator: ``source_key(url, operator="acme")``. Every URL declared ``"acme"`` is one
+   source, whatever its domain. A declaration TRAVELS WITH THE URL IT DESCRIBES and nowhere else:
+   an :class:`~pyrxd.network.registry.Endpoint` carries its own ``operator`` (the config file's
+   ``operator = "…"``), and anything that counts a set of URLs is HANDED the declarations for that
+   set (:func:`source_keys`). There is no process-wide registry, so a declaration made for one
+   profile is invisible to another profile, to any quorum, and to a later load.
 2. An operator pyrxd SHIPS knowledge of: :data:`pyrxd.network.registry.KNOWN_OPERATORS`, keyed by
    registered domain, recorded from the Radiant maintainer's statement of 2026-09-29.
 3. An IP literal: ITSELF, one group per canonical address (every spelling of one address is one).
@@ -38,8 +41,9 @@ can do, and it is not proof of independence:
   on them.
 * A DECLARED OPERATOR IS ONLY AS GOOD AS THE DECLARATION. ``operator = "…"`` is the configuring
   user's statement, and pyrxd believes it: declaring two hosts as two operators makes them two
-  sources. A declaration that contradicts an operator pyrxd ships knowledge of is refused (see
-  :func:`declare_operator`); anything else is taken as written.
+  sources. A declaration that contradicts an operator pyrxd ships knowledge of is refused, and so
+  is one host counted as two sources within one set (:func:`require_one_key_per_host`); anything
+  else is taken as written.
 
 Choosing sources whose operators and upstreams do not overlap remains the operator's job. The prose
 elsewhere says "distinct operators (as declared, or by registered domain)" for this reason, and
@@ -71,7 +75,7 @@ import ipaddress
 import json
 import re
 import socket
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -82,14 +86,15 @@ __all__ = [
     "SameSourceFailover",
     "SourceKey",
     "canonical_host",
-    "declare_operator",
     "describe_source",
     "group_by_source",
     "one_source_label",
     "registered_domain",
     "require_distinct_sources",
+    "require_one_key_per_host",
     "source_key",
     "source_key_of",
+    "source_keys",
 ]
 
 #: An IPv4 literal in any spelling ``inet_aton`` accepts: one to four dot-separated parts, each
@@ -164,9 +169,19 @@ class SourceKey(str):
     ``bladenet.online``, ``203.0.113.7``). It is a separate type so a quorum can insist that the key
     it counts came from :func:`source_key` — a caller-chosen label such as ``"a"``/``"b"`` for two
     URLs on one server would otherwise count as two sources.
+
+    ``host`` is the canonical host the key was made from (``None`` for a key built by hand). It is
+    not part of the key's value — two hosts of one operator are one key — but it lets every set of
+    keys refuse ONE host counted as TWO sources (:func:`require_one_key_per_host`), which is what a
+    declaration on one of a host's URLs and not another, or two declarations for one host, produce.
     """
 
-    __slots__ = ()
+    host: str | None
+
+    def __new__(cls, value: str, host: str | None = None) -> SourceKey:
+        key = super().__new__(cls, value)
+        key.host = host
+        return key
 
 
 # ── The Public Suffix List ───────────────────────────────────────────────────────────────────────
@@ -239,9 +254,6 @@ def registered_domain(host: str) -> str | None:
 
 # ── Operators: declared, and shipped ─────────────────────────────────────────────────────────────
 
-#: Operators DECLARED for a canonical host in this process: :func:`declare_operator`.
-_DECLARED: dict[str, str] = {}
-
 
 def _operator_id(operator: object) -> str:
     if not isinstance(operator, str) or not _OPERATOR_ID.fullmatch(operator.strip()):
@@ -279,31 +291,6 @@ def _checked_declaration(host: str, operator: object) -> str:
     return op
 
 
-def declare_operator(url: str, operator: str) -> SourceKey:
-    """Declare that *url*'s host is run by *operator*, for every source count in this process.
-
-    This is what the ``pyrxd`` config file's ``operator = "…"`` does (at
-    :meth:`pyrxd.cli.config.Config.require_profile`), and why it reaches HashMark §7.6 form 2's judge
-    and walker, which compare the URLs they were handed. It keys the CANONICAL HOST, so every URL on
-    that host follows it. Re-declaring the same operator is a no-op; a different operator for a host
-    already declared is refused, since one host cannot be two operators. Returns the host's key.
-    """
-    host = _canonical_host_of(url)
-    op = _checked_declaration(host, operator)
-    already = _DECLARED.get(host)
-    if already is not None and already != op:
-        raise ValidationError(
-            f"{host!r} is already declared as operator {already!r}; it cannot also be {op!r}. One host is one operator"
-        )
-    _DECLARED[host] = op
-    return SourceKey(_OPERATOR_PREFIX + op)
-
-
-def _forget_declared_operators() -> None:
-    """Drop every declaration. For tests, which share one process."""
-    _DECLARED.clear()
-
-
 # ── The key ──────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -333,7 +320,10 @@ def source_key(url: str, *, operator: str | None = None) -> SourceKey:
 
     Distinct operators, as declared, or by registered domain — the rules, in order, are in the
     module docstring. *operator* declares the operator for this one call (an ``Endpoint`` passes its
-    own); otherwise a :func:`declare_operator` for the host applies.
+    own). Nothing else declares one: without *operator* the key is the shipped operator, the IP
+    address, or the registered domain, whatever any other code in the process has declared. A key
+    for ONE URL cannot see that another URL of the same host was keyed differently; a SET of URLs
+    is keyed through :func:`source_keys`, which refuses that.
 
     Accepts a URL (``wss://h:443/x``), a scheme-less ``host[:port][/path]`` (``localhost:8545``,
     ``user@node.example``, an ssh destination), a bare IPv6 literal (``2001:db8::1``,
@@ -347,16 +337,65 @@ def source_key(url: str, *, operator: str | None = None) -> SourceKey:
     """
     host = _canonical_host_of(url)
     if operator is not None:
-        return SourceKey(_OPERATOR_PREFIX + _checked_declaration(host, operator))
-    declared = _DECLARED.get(host)
-    if declared is not None:
-        return SourceKey(_OPERATOR_PREFIX + declared)
+        return SourceKey(_OPERATOR_PREFIX + _checked_declaration(host, operator), host)
     if _is_ip_literal(host):
-        return SourceKey(host)
+        return SourceKey(host, host)
     shipped = _shipped_operator(host)
     if shipped is not None:
-        return SourceKey(_OPERATOR_PREFIX + shipped)
-    return SourceKey(registered_domain(host) or host)
+        return SourceKey(_OPERATOR_PREFIX + shipped, host)
+    return SourceKey(registered_domain(host) or host, host)
+
+
+def require_one_key_per_host(keys: Iterable[SourceKey], *, what: str) -> None:
+    """Refuse a set of keys in which ONE host is TWO sources.
+
+    One host is one operator. A declaration on ``wss://h:1`` and a different one (or none) on
+    ``wss://h:2`` would otherwise make one machine two votes — the single-call
+    :func:`source_key` cannot see the other URL, so the refusal lives here, where a SET is keyed:
+    :func:`source_keys` (every URL list: a profile's, a quorum builder's, form 2's labels) and
+    :func:`require_distinct_sources` (every quorum of client objects) both call it. Keys built by
+    hand carry no host and are not checked here.
+    """
+    seen: dict[str, SourceKey] = {}
+    for key in keys:
+        host = getattr(key, "host", None)
+        if host is None:
+            continue
+        other = seen.setdefault(host, key)
+        if other != key:
+            raise ValidationError(
+                f"{what}: host {host!r} is counted as two sources ({describe_source(other)} and "
+                f"{describe_source(key)}). One host is one operator: give every URL of that host the "
+                "same operator, or none"
+            )
+
+
+def _stripped(url: object) -> Any:
+    """*url* without surrounding whitespace; a non-string is passed on for :func:`source_key` to refuse."""
+    return url.strip() if isinstance(url, str) else url
+
+
+def source_keys(urls: Iterable[str], operators: Mapping[str, str] | None = None) -> dict[str, SourceKey]:
+    """``{url: key}`` for ONE set of URLs, with the declarations made FOR that set, and nothing else.
+
+    *operators* maps a URL (exactly as given) to its declared operator. It is the only way a
+    declaration reaches a count: whoever holds the declarations — a profile's endpoints, the
+    config that listed them — passes them to whatever counts, and a declaration passed for one set
+    is not seen by any other. URLs in *operators* that are not in *urls* are keyed too, so their
+    declarations are checked against the set.
+
+    Raises:
+        ValidationError: for a URL that names no host, an invalid or contradicting operator id, and
+            ONE host keyed as two sources (:func:`require_one_key_per_host`).
+    """
+    declared = {_stripped(u): op for u, op in (operators or {}).items()}
+    keys: dict[str, SourceKey] = {}
+    for url in [*urls, *declared]:
+        text = _stripped(url)
+        key = source_key(text, operator=declared.get(text) if isinstance(text, str) else None)
+        keys.setdefault(text, key)
+    require_one_key_per_host(keys.values(), what="counting sources")
+    return keys
 
 
 def describe_source(key: str) -> str:
@@ -414,15 +453,17 @@ def _host_in(text: str) -> str | None:
     return host or None
 
 
-def one_source_label(a: str, b: str) -> str:
+def one_source_label(a: str, b: str, *, operators: Mapping[str, str] | None = None) -> str:
     """How to NAME two labels that were judged one source, for a reason string.
 
     Equal labels print once; two different labels print both and the group they share, so a reader
     who configured ``wss://x.example`` and ``wss://y.example`` sees why they were not two sources.
+    *operators* are the declarations the labels were judged with (:func:`source_keys`).
     """
     if a.strip() == b.strip():
         return repr(a)
-    return f"{a!r} and {b!r}, which are one source ({describe_source(source_key(a))})"
+    key = source_keys([a], operators)[a.strip()]
+    return f"{a!r} and {b!r}, which are one source ({describe_source(key)})"
 
 
 def source_key_of(source: object) -> SourceKey:
@@ -450,14 +491,16 @@ def require_distinct_sources(sources: Sequence[object], *, what: str) -> tuple[S
     given all of them), which counts once.
     """
     keys = tuple(source_key_of(s) for s in sources)
+    require_one_key_per_host(keys, what=what)
     first: dict[SourceKey, int] = {}
     for index, key in enumerate(keys):
         if key in first:
             raise ValidationError(
                 f"{what}: sources #{first[key]} and #{index} are the same source ({describe_source(key)}). "
-                "Sources are counted by distinct operators (as declared, or by registered domain), so one "
-                "cannot corroborate itself. Give each operator once (several URLs of one operator form one "
-                "failover source), or declare the operators if they really differ."
+                "Sources are counted by registered domain, or by an operator pyrxd ships knowledge of, so "
+                "one cannot corroborate itself. Give each operator once: several URLs of one operator form "
+                "one failover source. Use endpoints of different operators; this count takes no operator "
+                "declaration from the config file (that is for ElectrumX endpoints and HashMark form 2)."
             )
         first[key] = index
     return keys
@@ -469,9 +512,11 @@ def group_by_source(urls: Iterable[str]) -> list[tuple[SourceKey, list[str]]]:
     What a URL-list builder uses to turn a user's list into sources: one source per group, whose
     URLs are that source's failover list.
     """
+    urls = list(urls)
+    keys = source_keys(urls)
     groups: dict[SourceKey, list[str]] = {}
     for url in urls:
-        groups.setdefault(source_key(url), []).append(url)
+        groups.setdefault(keys[_stripped(url)], []).append(url)
     return list(groups.items())
 
 

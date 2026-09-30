@@ -623,12 +623,21 @@ electrumx_servers = [
 ```
 
 An `operator` is 1-64 lower-case letters, digits, `.` or `-`. Unknown keys in a
-server table, one host declared as two operators, and a declaration that
-contradicts a shipped operator (e.g. `electrumx2.radiant4people.com` as anything
-but `radiant4people`) are refused at load. **pyrxd believes the declaration**: it
-cannot see who runs a server, so declaring two operators that are really one
-makes the check agree with itself. The limit is stated in the
+server table, one host counted as two sources (two operators on its URLs, or an
+operator on one and not another), and a declaration that contradicts a shipped
+operator (e.g. `electrumx2.radiant4people.com` as anything but `radiant4people`)
+are refused when the list is read: at load for the top-level
+`electrumx_servers`, and when the network is selected for a
+`[networks.<name>]` list — before any server is contacted. **pyrxd believes the
+declaration**: it cannot see who runs a server, so declaring two operators that
+are really one makes the check agree with itself. The limit is stated in the
 `pyrxd.network.source_identity` module docstring.
+
+A declaration applies to form 2 and to nothing else. The watchtower
+(`--rxd-electrumx-url`), the BTC Esplora quorum and the ETH RPC quorum take no
+operator declaration: they count by registered domain, or by an operator pyrxd
+ships knowledge of. If one of them refuses two URLs as one source, use URLs of
+two different registered domains.
 
 ---
 

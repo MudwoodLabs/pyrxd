@@ -365,6 +365,7 @@ async def walk_discovered_chain(
     tip_source: str,
     max_steps: int = MAX_CHAIN_STEPS,
     max_fetches: int = MAX_DISCOVERY_FETCHES,
+    operators: Mapping[str, str] | None = None,
 ) -> DiscoveredWalk:
     """Discover from one server, prove the tip on another, walk — and ask the tip server too
     where each walked step is, so the step heights have a second source (a distinct operator, as
@@ -373,7 +374,7 @@ async def walk_discovered_chain(
     The two clients MAY be the same endpoint. The walk then reports ``complete=False`` with the
     source-conflict reason, because that is the truth of a single-server configuration: it cannot
     prove the history is whole. Give the two labels different values only when the endpoints
-    really are different.
+    really are different. ``operators`` are the declarations for the two labels, passed to the walk.
     """
     fetch = cached_fetcher(discovery_client)
     discovery = await discover_mutable_chain(
@@ -392,6 +393,7 @@ async def walk_discovered_chain(
         candidate_source=discovery_source,
         tip_source=tip_source,
         max_steps=max_steps,
+        operators=operators,
     )
     from pyrxd.security.errors import NetworkError
 

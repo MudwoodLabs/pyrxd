@@ -37,13 +37,13 @@ caller degrades. Absence of evidence is reported as absence of evidence.
 from __future__ import annotations
 
 import io
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import cbor2
 
 from pyrxd.hash import hash256
-from pyrxd.network.source_identity import one_source_label, source_key
+from pyrxd.network.source_identity import one_source_label, source_keys
 from pyrxd.security.errors import ValidationError
 
 from .inspector import GlyphInspector
@@ -287,17 +287,19 @@ def _as_attrs(value: object) -> dict:
     return {k: v for k, v in value.items() if isinstance(k, str)}
 
 
-def _one_source(a: str, b: str) -> bool:
+def _one_source(a: str, b: str, operators: Mapping[str, str] | None) -> bool:
     """True when two source labels may be ONE source: both unattributed, or the same source key.
 
-    The comparison is :func:`pyrxd.network.source_identity.source_key`, the identity every source
-    count in pyrxd uses: distinct operators, as declared, or by registered domain. That grouping is
-    not proof of independence; see that module.
+    The comparison is :func:`pyrxd.network.source_identity.source_keys`, the identity every source
+    count in pyrxd uses: distinct operators, as declared (*operators*, the declarations the caller
+    holds for these labels, and nothing else), or by registered domain. That grouping is not proof
+    of independence; see that module.
     """
     a, b = str(a or "").strip(), str(b or "").strip()
     if not a or not b:
         return a == b
-    return source_key(a) == source_key(b)
+    keys = source_keys([a, b], operators)
+    return keys[a] == keys[b]
 
 
 async def walk_mutable_chain(
@@ -309,6 +311,7 @@ async def walk_mutable_chain(
     candidate_source: str = "",
     tip_source: str = "",
     max_steps: int = MAX_CHAIN_STEPS,
+    operators: Mapping[str, str] | None = None,
 ) -> MutableChainWalk:
     """Follow a mutable glyph from ``mint_txid`` along its own spend chain.
 
@@ -325,6 +328,9 @@ async def walk_mutable_chain(
     reports ``complete=False``, because an unproved tip cannot be distinguished from a truncated
     history.
 
+    ``operators`` maps a source label (a URL) to its declared operator, as the caller's config
+    declares it; it is the only way a declaration reaches this comparison.
+
     :raises ValidationError: only for a CONTRADICTION - a step whose mutable output carries a
         different ref. Absence degrades; contradiction raises. That split follows
         ``glyph/dmint/chain.py``'s S2 verifier, where a server disagreeing with itself is not a
@@ -340,10 +346,10 @@ async def walk_mutable_chain(
     # domain), here, not by the caller: the CLI canonicalised its labels, but a library caller
     # passing `wss://h/` and `wss://h/x` - one server - got two "sources" and a complete walk from
     # one endpoint's two lies.
-    if _one_source(candidate_source, tip_source):
+    if _one_source(candidate_source, tip_source, operators):
         source_conflict = (
             f"the candidate set and the tip proof came from the same source "
-            f"({one_source_label(candidate_source, tip_source)}); "
+            f"({one_source_label(candidate_source, tip_source, operators=operators)}); "
             "one source that supplies both can omit the later updates AND certify the earlier tip"
             if candidate_source
             else "the candidate set and the tip proof are unattributed, so they may be one source "

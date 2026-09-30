@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 import cbor2
 
 from pyrxd.network._guards import nonneg_int
-from pyrxd.network.source_identity import one_source_label, source_key
+from pyrxd.network.source_identity import one_source_label, source_keys
 from pyrxd.security.errors import ValidationError
 
 from .mark_anchor import MarkAnchor
@@ -176,18 +176,20 @@ def _corroborated_caveat(sources: Sequence[str], *, mark_header_bound: bool) -> 
     )
 
 
-def _same_source(a: str, b: str) -> bool:
+def _same_source(a: str, b: str, operators: Mapping[str, str] | None) -> bool:
     """True when two source labels are ONE source: equal as text, or the same source key.
 
     Two EMPTY labels are the same (unattributed, so possibly one endpoint), as they always were;
-    otherwise the comparison is :func:`~pyrxd.network.source_identity.source_key` — the identity
+    otherwise the comparison is :func:`~pyrxd.network.source_identity.source_keys` — the identity
     every source count in pyrxd uses — so ``wss://h/`` and ``wss://h:443/x`` are one source, and so
-    are two hosts of one registered domain.
+    are two hosts of one registered domain, unless *operators* (the declarations the caller holds
+    for these labels) says otherwise.
     """
     a, b = str(a or "").strip(), str(b or "").strip()
     if not a or not b:
         return a == b
-    return source_key(a) == source_key(b)
+    keys = source_keys([a, b], operators)
+    return keys[a] == keys[b]
 
 
 def _requested_label(name: str) -> str:
@@ -281,6 +283,7 @@ def judge_name_at_mark(
     anchor: MarkAnchor,
     walk: MutableChainWalk,
     height_reports: Sequence[HeightReport],
+    operators: Mapping[str, str] | None = None,
 ) -> WaveIdentityVerdict:
     """Compose an anchor and a completed walk into a form-2 verdict, or degrade to form 1.
 
@@ -292,6 +295,11 @@ def judge_name_at_mark(
     two distinct sources must agree on the mark's height (which must equal ``anchor.height``) and
     on the height of every walked step. A step whose agreed height is unknown cannot be placed
     relative to the mark, so the verdict degrades unless it is already known to fall after it.
+
+    Source labels are compared by source key. ``operators`` maps a label (a URL) to the operator
+    declared for it — the CLI passes its config's declarations
+    (:meth:`pyrxd.cli.config.Config.declared_operators`). It is the only way a declaration reaches
+    this judge: nothing declared elsewhere in the process is seen. ``None`` means none declared.
     """
     if not anchor.usable_for_point_in_time:
         if anchor.height is None:
@@ -303,13 +311,13 @@ def judge_name_at_mark(
             )
         return _degrade(ref=ref, binding_source=binding_source, reason=reason, anchor=anchor)
 
-    if _same_source(binding_source, anchor.source):
+    if _same_source(binding_source, anchor.source, operators):
         return _degrade(
             ref=ref,
             binding_source=binding_source,
             reason=(
                 f"the block height and the name→glyph binding both came from "
-                f"{one_source_label(anchor.source, binding_source)}; "
+                f"{one_source_label(anchor.source, binding_source, operators=operators)}; "
                 "one source that supplies both can choose the block AND what the name said then"
             ),
             anchor=anchor,
@@ -398,14 +406,15 @@ def judge_name_at_mark(
     # source; the CLI's `_endpoint_pair` already picks a second operator, but a library caller
     # handing in its own labels could not be trusted to, and counting spellings let one server's
     # word through as two.
+    keys = source_keys([str(r.source) for r in height_reports], operators)
     by_source: dict[str, str] = {}
     for r in height_reports:
-        by_source.setdefault(source_key(r.source), r.source)
+        by_source.setdefault(keys[str(r.source).strip()], r.source)
     sources = list(by_source.values())
     if len(sources) < 2:
         labels = list(dict.fromkeys(r.source for r in height_reports))
         only = (
-            one_source_label(labels[0], labels[1])
+            one_source_label(labels[0], labels[1], operators=operators)
             if len(labels) > 1
             else repr(labels[0])
             if labels

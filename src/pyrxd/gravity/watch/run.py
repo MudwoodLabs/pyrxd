@@ -227,8 +227,9 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     """Assemble the RXD chain source(s); return ``(source, corroborated)``.
 
     Composes (optionally) the operator's own ssh-tr node + any number of public ElectrumX endpoints,
-    ONE SOURCE PER DISTINCT OPERATOR, as declared, or by registered domain
-    (:func:`pyrxd.network.source_identity.source_key`): several URLs of one operator become one
+    ONE SOURCE PER OPERATOR GROUP — by registered domain, or an operator pyrxd ships knowledge of
+    (:func:`pyrxd.network.source_identity.source_key`; the watchtower takes no operator declaration,
+    and a config file's does not reach it): several URLs of one operator become one
     client that races them (failover), never several sources. The grouping is not proof of
     independence (the operator limit in :mod:`pyrxd.network.source_identity`).
     With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
@@ -255,8 +256,13 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         sources.append(ElectrumRxdChainSource(SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)))
     # Public ElectrumX endpoints (repeatable). Default to the verified set unless this is a node-only run.
     urls = list(args.rxd_electrumx_url or [])
+    # What the URLs ARE, for the messages below: the flags the operator gave, or pyrxd's defaults.
+    # A warning about "--rxd-electrumx-url values" on a run that passed none sent the reader to a
+    # flag they never used.
+    what_urls = "--rxd-electrumx-url values"
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
+        what_urls = "default RXD ElectrumX endpoints (no --rxd-electrumx-url given)"
     # ONE SOURCE PER OPERATOR GROUP, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
     # `wss://h/x` and `wss://h.` are one server, and `wss://x.d.example` and `wss://y.d.example` one
     # registered domain; counted apart, one party's "not locked" became a CORROBORATED absence that
@@ -271,10 +277,11 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     for key, group_urls in groups:
         if len(group_urls) > 1:
             logger.warning(
-                "RXD sources: %d --rxd-electrumx-url values are ONE source (%s): %s. Sources are counted "
-                "by distinct operators (as declared, or by registered domain), so they are one failover "
-                "source, not %d sources",
+                "RXD sources: %d %s are ONE source (%s): %s. Sources are counted by registered domain, "
+                "or by an operator pyrxd ships knowledge of, so they are one failover source, not %d "
+                "sources",
                 len(group_urls),
+                what_urls,
                 describe_source(key),
                 ", ".join(group_urls),
                 len(group_urls),
@@ -287,10 +294,12 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if len(sources) == 1:
         if len(urls) > 1:
             logger.warning(
-                "RXD corroboration is OFF: the %d --rxd-electrumx-url values are all one source (one "
-                "operator, as declared, or one registered domain), so the watchtower runs SINGLE-SOURCE "
-                "(every RXD read is low-corroboration). Add a URL of a different operator to corroborate.",
+                "RXD corroboration is OFF: the %d %s are all one source (one registered domain, or one "
+                "operator pyrxd ships knowledge of), so the watchtower runs SINGLE-SOURCE (every RXD read "
+                "is low-corroboration). Add a --rxd-electrumx-url of a different operator to corroborate; "
+                "the watchtower takes no operator declaration, so that means a different registered domain.",
                 len(urls),
+                what_urls,
             )
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
@@ -683,15 +692,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ALSO include the operator's own ssh-tr node as an RXD source on its own host (combine with "
         "--rxd-electrumx-url for 2-of-3); it counts as one more source beside the public ElectrumX (unless its "
-        "host is one of theirs: sources are distinct operators, as declared, or by registered domain)",
+        "host is one of theirs: sources are counted by registered domain, or an operator pyrxd ships)",
     )
     p.add_argument(
         "--rxd-quorum",
         type=int,
         default=2,
         help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
-        "sources of distinct operators are wired; fail-closed below it). Sources are counted by distinct "
-        "operators, as declared, or by registered domain: several URLs of one count once",
+        "sources of distinct operators are wired; fail-closed below it). Sources are counted by registered "
+        "domain, or by an operator pyrxd ships knowledge of: several URLs of one count once. There is no "
+        "operator declaration here",
     )
     # No defaults: this ships in the public wheel. The previous "tr" / "radiant-mainnet"
     # defaults were one operator's private infrastructure, and a user who passed only

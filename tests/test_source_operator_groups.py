@@ -11,8 +11,10 @@ must count two. This file covers what that guard rests on:
 * the honest paths: three operators are three, radiant4people's two servers one, and the shipped
   defaults still reach corroboration (the watchtower's RXD quorum, and form 2's endpoint pair);
 * every refusal: unparseable input, a malformed operator id, a declaration that contradicts a shipped
-  operator, one host declared as two operators, a malformed config entry;
-* the config field, end to end: ``{ url, operator }`` in a real config file reaches form 2's judge.
+  operator, one host counted as two sources (at every entry point that keys a set), a malformed
+  config entry;
+* the config field, end to end: ``{ url, operator }`` in a real config file reaches form 2's judge —
+  and nothing else: not a BTC quorum, not another profile, not a later load.
 """
 
 from __future__ import annotations
@@ -36,11 +38,11 @@ from pyrxd.network.registry import (
     shipped_operator_domains,
 )
 from pyrxd.network.source_identity import (
-    declare_operator,
     describe_source,
     group_by_source,
     registered_domain,
     source_key,
+    source_keys,
 )
 from pyrxd.security.errors import ValidationError
 
@@ -232,8 +234,22 @@ async def test_the_shipped_defaults_still_reach_rxd_corroboration(monkeypatch, c
         ["wss://electrumx.radiantcore.org/"],
     ]
     assert "corroboration is OFF" not in caplog.text
-    # Two URLs became one source, and the log says so rather than hiding it.
-    assert "are ONE source (operator 'radiant4people')" in caplog.text
+    # Two URLs became one source, and the log says so rather than hiding it — naming what they
+    # are: pyrxd's defaults, not a flag this run never passed.
+    assert "2 default RXD ElectrumX endpoints (no --rxd-electrumx-url given) are ONE source" in caplog.text
+    assert "(operator 'radiant4people')" in caplog.text
+    assert "--rxd-electrumx-url values" not in caplog.text, caplog.text
+
+
+async def test_the_watchtower_names_the_flags_when_the_flags_were_given(monkeypatch, caplog) -> None:
+    """The other branch of the wording above: URLs the operator passed are called the flag's values."""
+    from tests.test_one_source_identity import _rxd_source_from_run
+
+    caplog.set_level("WARNING", logger="pyrxd.watchtower")
+    await _rxd_source_from_run("wss://x.pool.example.org", "wss://y.pool.example.org", monkeypatch)
+    assert "2 --rxd-electrumx-url values are ONE source" in caplog.text, caplog.text
+    assert "the 2 --rxd-electrumx-url values are all one source" in caplog.text, caplog.text
+    assert "default RXD ElectrumX endpoints" not in caplog.text
 
 
 async def test_the_watchtower_warns_when_one_registered_domain_turns_corroboration_off(monkeypatch, caplog) -> None:
@@ -295,13 +311,12 @@ def test_a_malformed_operator_id_is_refused(bad) -> None:
     with pytest.raises(ValidationError, match="not a valid operator id"):
         source_key("wss://node.example", operator=bad)  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="not a valid operator id"):
-        declare_operator("wss://node.example", bad)  # type: ignore[arg-type]
+        source_keys(["wss://node.example"], {"wss://node.example": bad})  # type: ignore[dict-item]
 
 
-def test_declaring_no_operator_is_refused_but_passing_none_means_undeclared() -> None:
-    with pytest.raises(ValidationError, match="not a valid operator id"):
-        declare_operator("wss://node.example", None)  # type: ignore[arg-type]
+def test_passing_no_operator_means_undeclared() -> None:
     assert source_key("wss://node.example", operator=None) == "node.example"
+    assert source_keys(["wss://node.example"]) == {"wss://node.example": "node.example"}
 
 
 def test_a_well_formed_operator_id_is_accepted() -> None:
@@ -311,25 +326,104 @@ def test_a_well_formed_operator_id_is_accepted() -> None:
 
 
 def test_a_declaration_that_splits_a_shipped_operator_is_refused() -> None:
+    url = "wss://electrumx2.radiant4people.com:50022"
     with pytest.raises(ValidationError, match="cannot split an operator pyrxd ships"):
-        declare_operator("wss://electrumx2.radiant4people.com:50022", "someone-else")
+        source_keys([url], {url: "someone-else"})
     with pytest.raises(ValidationError, match="cannot split an operator pyrxd ships"):
-        Endpoint("wss://electrumx2.radiant4people.com:50022/", operator="someone-else")
+        Endpoint(url + "/", operator="someone-else")
 
 
 def test_declaring_the_shipped_operator_or_merging_into_it_is_accepted() -> None:
     """Refusal is for the direction that adds sources. Agreeing with the shipped operator, or
     declaring a host of your own to BE that operator, only removes one."""
-    assert declare_operator("wss://electrumx2.radiant4people.com:50022", "radiant4people") == "operator:radiant4people"
-    declare_operator("wss://r4p-mirror.my-own.example", "radiant4people")
-    assert source_key("wss://r4p-mirror.my-own.example/x") == source_key("wss://electrumx.radiant4people.com:50022")
+    r4p, mirror = "wss://electrumx2.radiant4people.com:50022", "wss://r4p-mirror.my-own.example/x"
+    keys = source_keys([r4p, mirror], {r4p: "radiant4people", mirror: "radiant4people"})
+    assert keys[r4p] == keys[mirror] == source_key("wss://electrumx.radiant4people.com:50022")
 
 
-def test_one_host_cannot_be_declared_two_operators() -> None:
-    declare_operator("wss://node.example:50022", "acme")
-    declare_operator("wss://NODE.example./other", "acme")  # the same declaration again: a no-op
-    with pytest.raises(ValidationError, match="already declared as operator 'acme'"):
-        declare_operator("wss://node.example", "globex")
+# ---- One host, one operator: refused wherever a SET of keys is built -------------------------------
+# A single `source_key(url, operator=)` or `Endpoint` cannot see the host's other URLs, so the rule
+# lives where a set is keyed. Each entry point below used to accept two ports of one host as two
+# operators (0.25.x review of #803: `['operator:a', 'operator:b']`).
+
+_ONE_HOST = ("wss://h.one.example:1/", "wss://h.one.example:2/")
+
+
+def test_one_host_same_operator_on_every_url_is_accepted() -> None:
+    """The honest path: a host's URLs all declared one operator, or all undeclared, key as one."""
+    a, b = _ONE_HOST
+    assert len(set(source_keys([a, b], {a: "acme", b: "acme"}).values())) == 1
+    assert len(set(source_keys([a, b]).values())) == 1
+    assert [e.source for e in NetworkProfile.build("mainnet", [a, b], operators={a: "acme", b: "acme"}).endpoints] == [
+        "operator:acme",
+        "operator:acme",
+    ]
+
+
+@pytest.mark.parametrize(
+    "operators",
+    [{_ONE_HOST[0]: "a", _ONE_HOST[1]: "b"}, {_ONE_HOST[0]: "a"}],
+    ids=["two-operators", "declared-and-undeclared"],
+)
+class TestOneHostIsOneOperatorAtEveryEntryPoint:
+    def test_source_keys(self, operators) -> None:
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            source_keys(_ONE_HOST, operators)
+
+    def test_network_profile_build(self, operators) -> None:
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            NetworkProfile.build("mainnet", list(_ONE_HOST), operators=operators)
+
+    def test_network_profile_from_endpoints(self, operators) -> None:
+        endpoints = tuple(Endpoint(u, operator=operators.get(u)) for u in _ONE_HOST)
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            NetworkProfile(network="mainnet", endpoints=endpoints)
+
+    def test_config_load(self, operators, tmp_path, monkeypatch) -> None:
+        entries = ", ".join(
+            f'{{ url = "{u}", operator = "{operators[u]}" }}' if u in operators else f'"{u}"' for u in _ONE_HOST
+        )
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            _load(tmp_path, monkeypatch, f'network = "mainnet"\nelectrumx_servers = [{entries}]\n')
+
+    def test_config_per_network_list(self, operators, tmp_path, monkeypatch) -> None:
+        entries = ", ".join(
+            f'{{ url = "{u}", operator = "{operators[u]}" }}' if u in operators else f'"{u}"' for u in _ONE_HOST
+        )
+        cfg = _load(
+            tmp_path, monkeypatch, f'network = "mainnet"\n[networks.testnet]\nelectrumx_servers = [{entries}]\n'
+        )
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            cfg.for_network("testnet")
+
+    async def test_form_2_judge_and_walker(self, operators) -> None:
+        from tests.test_one_source_identity import _plant_judge, _plant_walker
+
+        for planter in (_plant_judge, _plant_walker):
+            with pytest.raises(ValidationError, match="counted as two sources"):
+                await planter(*_ONE_HOST, None, operators=operators)
+
+    def test_a_quorum_of_clients_keyed_by_hand(self, operators) -> None:
+        from pyrxd.network.bitcoin import MempoolSpaceFundingReader, MultiSourceBtcFundingReader
+
+        readers = []
+        for url in _ONE_HOST:
+            reader = MempoolSpaceFundingReader(base_url=url.replace("wss://", "https://"))
+            reader.source_key = source_key(url, operator=operators.get(url))
+            readers.append(reader)
+        with pytest.raises(ValidationError, match="counted as two sources"):
+            MultiSourceBtcFundingReader(readers, quorum=1)
+
+
+def test_de_duplication_cannot_hide_one_host_declared_twice() -> None:
+    """``wss://h/`` and ``wss://h:443/`` are one CONNECT key, so the profile keeps only the first; the
+    check runs over every endpoint as given, before that, so the contradiction is not dropped."""
+    with pytest.raises(ValidationError, match="counted as two sources"):
+        NetworkProfile.build(
+            "mainnet",
+            ["wss://h.one.example/", "wss://h.one.example:443/"],
+            operators={"wss://h.one.example/": "a", "wss://h.one.example:443/": "b"},
+        )
 
 
 def test_describe_source_names_the_kind_of_group() -> None:
@@ -365,13 +459,65 @@ def test_a_config_entry_declares_its_operator(tmp_path, monkeypatch) -> None:
     )
     cfg = _load(tmp_path, monkeypatch, body).for_network("mainnet")
     assert cfg.endpoint_operators == {"wss://x.shared.example/": "op-x", "wss://y.shared.example/": "op-y"}
-    # Before the profile is built nothing is declared: the three hosts are one registered domain.
-    assert source_key("wss://x.shared.example/") == source_key("wss://y.shared.example/") == "shared.example"
+    assert cfg.declared_operators() == cfg.endpoint_operators
     profile = cfg.require_profile()
     assert [e.operator for e in profile.endpoints] == ["op-x", "op-y", None]
     assert [e.source for e in profile.endpoints] == ["operator:op-x", "operator:op-y", "shared.example"]
-    # ...and after, the declaration reaches every count in the process, not only `Endpoint.source`.
-    assert source_key("wss://x.shared.example/") == "operator:op-x"
+    # The declaration stays on the endpoint. A key asked for without it is the registered domain.
+    assert source_key("wss://x.shared.example/") == source_key("wss://y.shared.example/") == "shared.example"
+
+
+# ---- A declaration is invisible to everything it was not handed to ---------------------------------
+
+
+_SPLIT = (
+    'network = "mainnet"\nelectrumx_servers = [\n'
+    '  { url = "wss://x.shared.example", operator = "op-x" },\n'
+    '  { url = "wss://y.shared.example", operator = "op-y" },\n]\n'
+)
+
+
+def test_a_config_declaration_does_not_reach_a_btc_quorum(tmp_path, monkeypatch) -> None:
+    """The review's leak (#803): once a config declared ``x``/``y.shared.example`` two operators, a
+    BTC ``from_endpoints`` over those hosts that had been refused was ACCEPTED — an ElectrumX
+    declaration reached the Esplora quorum. It must stay refused."""
+    from pyrxd.network.bitcoin import MultiSourceBtcFundingReader
+
+    urls = ["https://x.shared.example/api", "https://y.shared.example/api"]
+    with pytest.raises(ValidationError, match="only 1 distinct source"):
+        MultiSourceBtcFundingReader.from_endpoints(urls, quorum=2)
+    profile = _load(tmp_path, monkeypatch, _SPLIT).for_network("mainnet").require_profile()
+    assert [e.source for e in profile.endpoints] == ["operator:op-x", "operator:op-y"]  # the declaration held
+    with pytest.raises(ValidationError, match="only 1 distinct source"):
+        MultiSourceBtcFundingReader.from_endpoints(urls, quorum=2)
+
+
+def test_a_reload_without_the_declarations_groups_by_domain_again(tmp_path, monkeypatch) -> None:
+    """Fail-open before: the split outlived the config that made it."""
+    _load(tmp_path, monkeypatch, _SPLIT).for_network("mainnet").require_profile()
+    plain = 'network = "mainnet"\nelectrumx_servers = ["wss://x.shared.example", "wss://y.shared.example"]\n'
+    cfg = _load(tmp_path, monkeypatch, plain).for_network("mainnet")
+    assert cfg.declared_operators() == {}
+    assert [e.source for e in cfg.require_profile().endpoints] == ["shared.example", "shared.example"]
+    assert source_key("wss://x.shared.example") == source_key("wss://y.shared.example") == "shared.example"
+
+
+async def test_two_profiles_in_one_process_stay_independent(tmp_path, monkeypatch) -> None:
+    """One profile declares the split; another lists the same hosts undeclared. Each counts by its
+    own declarations, in either order, and form 2's judge follows whichever it is handed."""
+    from tests.test_one_source_identity import _plant_judge
+
+    a, b = "wss://x.shared.example", "wss://y.shared.example"
+    split = NetworkProfile.build("mainnet", [a, b], operators={a: "op-x", b: "op-y"})
+    plain = NetworkProfile.build("mainnet", [a, b])
+    again = NetworkProfile.build("mainnet", [a, b], operators={a: "op-x", b: "op-y"})
+    assert (
+        [e.source for e in split.endpoints] == [e.source for e in again.endpoints] == ["operator:op-x", "operator:op-y"]
+    )
+    assert [e.source for e in plain.endpoints] == ["shared.example", "shared.example"]
+    declared = {e.url: e.operator for e in split.endpoints}
+    assert await _plant_judge(a, b, None, operators=declared) == 2
+    assert await _plant_judge(a, b, None) == 1
 
 
 def test_a_per_network_entry_and_a_single_electrumx_table_declare_too(tmp_path, monkeypatch) -> None:
@@ -406,6 +552,10 @@ def test_an_env_endpoint_drops_the_files_declarations(tmp_path, monkeypatch) -> 
         ('{ operator = "acme" }', "needs a non-empty string url"),
         ('{ url = "wss://x.example/", operator = "Acme" }', "not a valid operator id"),
         ('{ url = "wss://electrumx.radiantcore.org/", operator = "acme" }', "cannot split an operator"),
+        (
+            '{ url = "wss://h.example:1/", operator = "a" }, { url = "wss://h.example:2/", operator = "b" }',
+            "counted as two sources",
+        ),
         ("5", "list of URLs"),
     ],
 )
@@ -481,3 +631,16 @@ class TestADeclaredSplitReachesFormTwo:
         nam, built = self._attach(monkeypatch, tmp_path, body, self._servers())
         assert set(built) == {"wss://x.alpha.example/"}, built
         assert nam["form"] == 1, nam
+
+
+def test_a_quorum_refusal_says_what_can_be_done_where_nothing_can_be_declared() -> None:
+    """A quorum of client objects (BTC, ETH, the watchtower's RXD) takes no operator declaration, so
+    its refusal must not tell the user to declare one: it names the route that exists."""
+    from pyrxd.network.bitcoin import MempoolSpaceFundingReader, MultiSourceBtcFundingReader
+
+    readers = [MempoolSpaceFundingReader(base_url=u) for u in ("https://x.shared.example", "https://y.shared.example")]
+    with pytest.raises(ValidationError, match="same source") as info:
+        MultiSourceBtcFundingReader(readers, quorum=1)
+    message = str(info.value)
+    assert "declare the operators" not in message, message
+    assert "takes no operator declaration" in message and "different operators" in message, message

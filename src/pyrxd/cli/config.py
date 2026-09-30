@@ -35,10 +35,17 @@ URLs declared ``"acme"`` are one source whatever their domains, and hosts of one
 domain declared as two operators are two sources. pyrxd believes the declaration
 — it is only as good as what you write (the operator limit in
 :mod:`pyrxd.network.source_identity`). It is refused when it is not a valid id
-(1-64 lower-case letters, digits, ``.`` or ``-``), when one host is declared as
-two operators, or when it contradicts an operator pyrxd ships knowledge of
-(:data:`pyrxd.network.registry.KNOWN_OPERATORS`). Shipped defaults carry their
-operators already; there is nothing to declare for them.
+(1-64 lower-case letters, digits, ``.`` or ``-``), when one host is counted as
+two sources (two operators, or an operator on one of its URLs and not another),
+or when it contradicts an operator pyrxd ships knowledge of
+(:data:`pyrxd.network.registry.KNOWN_OPERATORS`) — when the list is read: at
+load for the top-level list, and when ``[networks.<name>]`` is selected for
+its own. Shipped defaults carry their operators already; there is nothing to
+declare for them.
+
+A declaration applies to that server, in the profile built from this config,
+and nowhere else in the process: the watchtower's quorums and the BTC and ETH
+quorums do not read it, and a later load without it groups by domain again.
 
 Network binding — why the top-level endpoint does NOT follow ``--network``
 --------------------------------------------------------------------------
@@ -88,7 +95,7 @@ from ..network.registry import (
     default_endpoints,
     genesis_hash_for,
 )
-from ..network.source_identity import declare_operator, source_key
+from ..network.source_identity import source_key, source_keys
 from ..security.errors import ValidationError
 
 # tomllib landed in Python 3.11. pyproject.toml declares ``requires-python = ">=3.10"``
@@ -292,22 +299,26 @@ class Config:
         gap = self.endpoint_gap or (None if self.endpoints else EndpointGap(self.network, self.source_path))
         if gap is not None:
             raise ValidationError(str(gap))
-        operators = {url: op for url, op in self.endpoint_operators.items() if url in self.endpoints}
-        profile = NetworkProfile.build(
+        # The declarations go on the endpoints they describe and nowhere else. Nothing here is
+        # process-wide: form 2's judge and walker are handed them explicitly
+        # (`declared_operators`), and no other count can see them.
+        return NetworkProfile.build(
             self.network,
             self.endpoints,
             allow_insecure=self.allow_insecure,
             spki_pins=self.spki_pins,
             genesis_hash=genesis_hash_for(self.network),
-            operators=operators,
+            operators={url: op for url, op in self.endpoint_operators.items() if url in self.endpoints},
         )
-        # The declarations reach every source count in the process, not only `Endpoint.source`:
-        # HashMark §7.6 form 2's judge and walker compare the URLs they are handed, and would
-        # otherwise group two declared operators under one domain as one source.
-        for endpoint in profile.endpoints:
-            if endpoint.operator is not None:
-                declare_operator(endpoint.url, endpoint.operator)
-        return profile
+
+    def declared_operators(self) -> dict[str, str]:
+        """``{url: operator}`` declared for this config's resolved endpoints, URLs as an
+        :class:`~pyrxd.network.registry.Endpoint` spells them (stripped).
+
+        What a caller that counts these endpoints' SOURCES by URL — HashMark §7.6 form 2's judge
+        and walker — must be handed, since a declaration reaches no count it is not passed to.
+        """
+        return {url.strip(): op for url, op in self.endpoint_operators.items() if url in self.endpoints}
 
 
 def _resolve_servers(
@@ -585,9 +596,12 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
 
     Returns ``(urls, {url: operator})``. A table must carry a non-empty string ``url``, may carry
     ``operator``, and nothing else — a misspelt ``operater`` silently ignored would leave the
-    user believing a declaration is in force. The operator id itself is validated where it is
-    used (:func:`pyrxd.network.source_identity.source_key`), and here too, so a bad one fails at
-    load rather than at the first network command.
+    user believing a declaration is in force. Every refusal a declaration can meet is made HERE,
+    when the list is read — at :func:`load` for the top-level list, and when
+    :meth:`Config.for_network` selects a ``[networks.<name>]`` list — rather than at the first
+    network command: a malformed id, one contradicting a shipped operator, and one host counted as
+    two sources (:func:`pyrxd.network.source_identity.source_keys`). The profile checks the last
+    again, for library callers that never read a config.
     """
     if value is None:
         return (), {}
@@ -620,6 +634,14 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
             if url in operators and operators[url] != operator:
                 raise ValidationError(f"config value for {key!r} declares {url!r} as two operators")
             operators[url] = operator
+    if operators:
+        # Only a list that DECLARES can contradict itself. A plain list is not keyed here, so a
+        # config an offline command reads is not refused for an endpoint it never contacts; its
+        # URLs are checked when the profile is built, as before.
+        try:
+            source_keys(urls, operators)
+        except ValidationError as exc:
+            raise ValidationError(f"config value for {key!r}: {exc}") from exc
     return tuple(urls), operators
 
 

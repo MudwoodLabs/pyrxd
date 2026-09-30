@@ -70,7 +70,7 @@ from urllib.parse import urlsplit
 
 from ..constants import GENESIS_BLOCK_HASHES, genesis_hash_for
 from ..security.errors import ValidationError
-from .source_identity import _canonical_host_of, canonical_host, registered_domain, source_key
+from .source_identity import _canonical_host_of, canonical_host, registered_domain, require_one_key_per_host, source_key
 from .tls_pin import normalize_pin
 
 __all__ = [
@@ -308,8 +308,9 @@ class Endpoint:
         (``wss://h/x``), another port, the same IP address spelled another way, another host
         under one registered domain, or a host of an operator pyrxd knows (the two radiant4people
         servers) — are ONE source: a single lying operator reached through two such URLs must not
-        corroborate itself (0.25.0 panel, round 3). A declared :attr:`operator` decides it
-        instead. Nothing is refused by this — a profile may still list both for failover; they
+        corroborate itself (0.25.0 panel, round 3). This endpoint's own declared
+        :attr:`operator` decides it instead; no other endpoint's declaration, and nothing
+        process-wide, does. Nothing is refused by this — a profile may still list both for failover; they
         simply do not count as two when HashMark §7.6 form 2 needs two.
 
         It is the same key every other source count in pyrxd uses — distinct operators, as
@@ -426,11 +427,19 @@ class NetworkProfile:
         object.__setattr__(self, "network", self.network.strip())
         if not self.endpoints:
             raise ValidationError(f"network {self.network!r} has no ElectrumX endpoint configured")
-        deduped: list[Endpoint] = []
-        seen: set[str] = set()
         for endpoint in self.endpoints:
             if not isinstance(endpoint, Endpoint):
                 raise ValidationError(f"profile endpoints must be Endpoint, got {type(endpoint).__name__}")
+        # ONE HOST, ONE OPERATOR, over every endpoint as given — before de-duplication, which would
+        # otherwise keep whichever of `wss://h/` (operator a) and `wss://h:443/` (operator b) came
+        # first and hide the contradiction. Each `Endpoint.source` alone cannot see the others, so
+        # `wss://h:1/` as "a" and `wss://h:2/` as "b" were two sources on one machine.
+        require_one_key_per_host(
+            (endpoint.source for endpoint in self.endpoints), what=f"network {self.network!r} profile"
+        )
+        deduped: list[Endpoint] = []
+        seen: set[str] = set()
+        for endpoint in self.endpoints:
             if endpoint.key in seen:
                 continue
             seen.add(endpoint.key)
@@ -468,7 +477,8 @@ class NetworkProfile:
         custom chain). Leaving it ``None`` looks the network up in
         :data:`GENESIS_BLOCK_HASHES`, so ``build("mainnet", [...])`` is chain-bound
         with no extra ceremony. *operators* maps a URL (exactly as given in *urls*) to
-        its declared operator (:attr:`Endpoint.operator`).
+        its declared operator (:attr:`Endpoint.operator`). The declaration stays on that
+        endpoint: it decides :attr:`Endpoint.source` and nothing else in the process.
         """
         declared = dict(operators or {})
         unknown = sorted(set(declared) - set(urls))

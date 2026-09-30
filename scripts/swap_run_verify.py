@@ -319,7 +319,8 @@ def assert_no_secrets(doc: object, *, what: str) -> None:
 
 def _host_of(url: str) -> str:
     """The source key of a URL: :func:`pyrxd.network.source_identity.source_key`, the one identity every
-    source count in pyrxd uses — distinct operators, as declared, or by registered domain. Scheme-less
+    source count in pyrxd uses — by registered domain, or an operator pyrxd ships knowledge of (this
+    script takes no operator declaration). Scheme-less
     forms (``localhost:8545``) parse, and the port, path, case and a trailing dot are dropped, so
     ``localhost:8545``/``localhost:8546``, ``h``/``h.`` and ``x.d.example``/``y.d.example`` are one
     source — counting them as two would be a fake quorum (review LOW)."""
@@ -343,7 +344,7 @@ def _dedup_by_host(urls: list[str]) -> list[str]:
 def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tuple[str, ...]) -> None:
     """The verifier's corroboration sources MUST be sources neither party used (else the re-fetch is not independent).
 
-    Identity is :func:`_host_of` (the shared source key: operator, as declared, or registered domain), which is
+    Identity is :func:`_host_of` (the shared source key: shipped operator, or registered domain), which is
     subject to the operator limit in :mod:`pyrxd.network.source_identity`: a party that runs a second domain
     the verifier happens to pick passes.
 

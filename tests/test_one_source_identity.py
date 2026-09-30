@@ -27,9 +27,13 @@ the only one:
 (c) The honest paths: two genuinely different hosts count as two at every site, and several URLs on
     one host still work as failover.
 (d) The key is an OPERATOR GROUP, not a host, at every site: two subdomains of one registered
-    domain, one shipped operator's two servers, and two domains declared as one operator each count
-    ONE; two registered domains under ``co.uk``, the three shipped operators, two IP addresses, and
-    one domain declared as two operators each count TWO.
+    domain and one shipped operator's two servers each count ONE; two registered domains under
+    ``co.uk``, the three shipped operators and two IP addresses each count TWO.
+(e) A DECLARED operator reaches only the counts it is handed to. The sites that take declarations
+    are derived (an ``operators`` parameter) and pinned; there, two domains declared one operator
+    count ONE and one domain declared two operators counts TWO. Every other site is run AFTER the
+    same declaration was made on a profile in the same process, and must count by domain as though
+    it had never been made — the leak a process-wide registry had.
 
 What the key does not claim — that a group is an independent operator — is stated once, in
 :mod:`pyrxd.network.source_identity`.
@@ -697,7 +701,7 @@ def _plant_verify_eth_fetcher(a: str, b: str, _mp) -> int:
     return _script("swap_run_verify")._MultiEthFetcher([_https(a), _https(b)], 1).source_count
 
 
-async def _plant_judge(a: str, b: str, _mp) -> int:
+async def _plant_judge(a: str, b: str, _mp, operators=None) -> int:
     from pyrxd.glyph.wave_identity import HeightReport, judge_name_at_mark
     from tests.test_wave_identity_form2 import _HEIGHTS, NAME, _anchor, _walk
 
@@ -705,7 +709,13 @@ async def _plant_judge(a: str, b: str, _mp) -> int:
     anchor = _anchor(458605, source=a)
     reports = [HeightReport(source=s, mark_height=anchor.height, step_heights=_HEIGHTS) for s in (a, b)]
     verdict = judge_name_at_mark(
-        ref=walk.ref, name=NAME, binding_source="index-B", anchor=anchor, walk=walk, height_reports=reports
+        ref=walk.ref,
+        name=NAME,
+        binding_source="index-B",
+        anchor=anchor,
+        walk=walk,
+        height_reports=reports,
+        operators=operators,
     )
     if verdict.form == 2:
         return len(verdict.height_sources)
@@ -713,7 +723,7 @@ async def _plant_judge(a: str, b: str, _mp) -> int:
     return 1
 
 
-async def _plant_walker(a: str, b: str, _mp) -> int:
+async def _plant_walker(a: str, b: str, _mp, operators=None) -> int:
     from pyrxd.glyph.mutable_chain import walk_mutable_chain
     from tests.test_wave_identity_form2 import _RAW, MINT, _fetch, _unspent
 
@@ -724,6 +734,7 @@ async def _plant_walker(a: str, b: str, _mp) -> int:
         is_unspent=_unspent,
         candidate_source=a,
         tip_source=b,
+        operators=operators,
     )
     if walk.complete:
         return 2
@@ -770,8 +781,8 @@ def test_every_counting_site_has_a_planter_and_every_planter_a_site() -> None:
     assert not orphans, f"planters for sites that no longer exist (or no longer count): {sorted(orphans)}"
 
 
-async def _run(planter: Callable, a: str, b: str, mp) -> int:
-    result = planter(a, b, mp)
+async def _run(planter: Callable, a: str, b: str, mp, operators=None) -> int:
+    result = planter(a, b, mp) if operators is None else planter(a, b, mp, operators=operators)
     if hasattr(result, "__await__"):
         result = await result
     return result
@@ -790,79 +801,51 @@ async def test_two_distinct_hosts_still_count_as_TWO_at_every_site(site, monkeyp
 
 
 # ---- (d) ...and every site counts OPERATOR GROUPS, not hosts --------------------------------------
-# Distinct operators, as declared, or by registered domain (`source_key`). The same planters, fed
-# two HOSTS of one group — which #801's host identity counted as two. `declare` is applied first:
-# `{host: operator}` through the production `declare_operator`, as the config file's `operator = "…"`
-# does. The conftest fixture forgets declarations after each test.
+# Distinct operators, by registered domain or an operator pyrxd ships (`source_key`). The same
+# planters, fed two HOSTS of one group — which #801's host identity counted as two.
 
-#: Two hosts, ONE group: subdomains of one registered domain (nothing declared, nothing shipped —
-#: the Public Suffix List alone), one shipped operator's two servers, and two DIFFERENT registered
-#: domains declared as one operator.
+#: Two hosts, ONE group: subdomains of one registered domain (nothing shipped — the Public Suffix
+#: List alone), and one shipped operator's two servers.
 ONE_GROUP_CASES = {
-    "subdomains-of-one-registered-domain": ("wss://x.pool.example.org", "wss://y.pool.example.org", {}),
-    "subdomains-under-a-multi-label-suffix": ("wss://a.one.co.uk", "wss://b.one.co.uk", {}),
+    "subdomains-of-one-registered-domain": ("wss://x.pool.example.org", "wss://y.pool.example.org"),
+    "subdomains-under-a-multi-label-suffix": ("wss://a.one.co.uk", "wss://b.one.co.uk"),
     "shipped-operator-two-servers": (
         "wss://electrumx.radiant4people.com:50022",
         "wss://electrumx2.radiant4people.com:50022",
-        {},
-    ),
-    "declared-one-operator-across-domains": (
-        "wss://node.alpha.example",
-        "wss://node.beta.example",
-        {"node.alpha.example": "acme", "node.beta.example": "acme"},
     ),
 }
 
 #: Two hosts, TWO groups: the honest paths the grouping must not collapse.
 TWO_GROUP_CASES = {
-    "two-registered-domains-under-co.uk": ("wss://a.co.uk", "wss://b.co.uk", {}),
+    "two-registered-domains-under-co.uk": ("wss://a.co.uk", "wss://b.co.uk"),
     "shipped-operators-radiantcore-radiant4people": (
         "wss://electrumx.radiantcore.org",
         "wss://electrumx.radiant4people.com:50022",
-        {},
     ),
     "shipped-operators-radiantcore-bladenet": (
         "wss://electrumx.radiantcore.org",
         "wss://radiant2.bladenet.online:50022",
-        {},
     ),
     "shipped-operators-radiant4people-bladenet": (
         "wss://electrumx2.radiant4people.com:50022",
         "wss://radiant4.bladenet.online:50022",
-        {},
     ),
-    "two-ip-addresses-in-one-slash-24": ("wss://203.0.113.7", "wss://203.0.113.8", {}),
-    "declared-split-of-one-domain": (
-        "wss://x.shared.example",
-        "wss://y.shared.example",
-        {"x.shared.example": "op-x", "y.shared.example": "op-y"},
-    ),
+    "two-ip-addresses-in-one-slash-24": ("wss://203.0.113.7", "wss://203.0.113.8"),
 }
-
-
-def _declare(declared: dict[str, str]) -> None:
-    from pyrxd.network.source_identity import declare_operator
-
-    for host, operator in declared.items():
-        declare_operator(host, operator)
 
 
 @pytest.mark.parametrize("case", sorted(ONE_GROUP_CASES))
 @pytest.mark.parametrize("site", sorted(PLANTERS))
 async def test_one_operator_group_counts_as_ONE_source_at_every_site(site, case, monkeypatch) -> None:
-    a, b, declared = ONE_GROUP_CASES[case]
-    _declare(declared)
-    assert await _run(PLANTERS[site], a, b, monkeypatch) == 1, (site, case)
+    assert await _run(PLANTERS[site], *ONE_GROUP_CASES[case], monkeypatch) == 1, (site, case)
 
 
 @pytest.mark.parametrize("case", sorted(TWO_GROUP_CASES))
 @pytest.mark.parametrize("site", sorted(PLANTERS))
 async def test_two_operator_groups_count_as_TWO_at_every_site(site, case, monkeypatch) -> None:
-    """The honest half of (d): three operators are three, ``a.co.uk``/``b.co.uk`` are two, and a
-    declaration that splits one domain is obeyed. A grouping that refused these would refuse valid work."""
-    a, b, declared = TWO_GROUP_CASES[case]
-    _declare(declared)
-    assert await _run(PLANTERS[site], a, b, monkeypatch) == 2, (site, case)
+    """The honest half of (d): three operators are three, ``a.co.uk``/``b.co.uk`` are two. A
+    grouping that refused these would refuse valid work."""
+    assert await _run(PLANTERS[site], *TWO_GROUP_CASES[case], monkeypatch) == 2, (site, case)
 
 
 def test_the_group_cases_are_what_they_claim() -> None:
@@ -870,13 +853,66 @@ def test_the_group_cases_are_what_they_claim() -> None:
     different HOSTS (so #801's host identity would have counted two), each TWO case two groups."""
     from pyrxd.network.source_identity import _canonical_host_of
 
-    for case, (a, b, declared) in ONE_GROUP_CASES.items():
+    for case, (a, b) in ONE_GROUP_CASES.items():
         assert _canonical_host_of(a) != _canonical_host_of(b), case
-        _declare(declared)
         assert source_key(a) == source_key(b), case
-    for case, (a, b, declared) in TWO_GROUP_CASES.items():
-        _declare(declared)
+    for case, (a, b) in TWO_GROUP_CASES.items():
         assert source_key(a) != source_key(b), case
+
+
+# ---- (e) A declaration reaches ONLY the counts it is handed to ------------------------------------
+# `(a, b, {url: operator}, count where declared, count by domain)`. Each case moves the count, so
+# a site that ignores a declaration it was handed fails, and so does a site that sees one it was not.
+DECLARED_CASES = {
+    "two-domains-declared-one-operator": (
+        "wss://node.alpha.example",
+        "wss://node.beta.example",
+        {"wss://node.alpha.example": "acme", "wss://node.beta.example": "acme"},
+        1,
+        2,
+    ),
+    "one-domain-declared-two-operators": (
+        "wss://x.shared.example",
+        "wss://y.shared.example",
+        {"wss://x.shared.example": "op-x", "wss://y.shared.example": "op-y"},
+        2,
+        1,
+    ),
+}
+
+#: The sites a declaration can reach: HashMark §7.6 form 2's judge and walker, which the CLI hands
+#: its config's declarations. PINNED, not only derived: a quorum that starts taking declarations
+#: moves what a config's `operator = "…"` can split, and must be looked at, not inherited.
+_DECLARING_SITES = frozenset(
+    {"pyrxd.glyph.wave_identity:judge_name_at_mark", "pyrxd.glyph.mutable_chain:walk_mutable_chain"}
+)
+
+
+def _takes_declarations(fn: ast.AST) -> bool:
+    a = fn.args
+    return "operators" in {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+
+
+def test_the_declaring_sites_are_derived_and_pinned() -> None:
+    sites = _all_sites()
+    derived = {site for site, fn in sites.items() if _takes_declarations(fn)}
+    assert derived == _DECLARING_SITES, sorted(derived)
+
+
+@pytest.mark.parametrize("case", sorted(DECLARED_CASES))
+@pytest.mark.parametrize("site", sorted(PLANTERS))
+async def test_a_declaration_reaches_only_the_sites_it_is_handed_to(site, case, monkeypatch) -> None:
+    from pyrxd.network.registry import NetworkProfile
+
+    a, b, operators, declared_count, domain_count = DECLARED_CASES[case]
+    if site in _DECLARING_SITES:
+        assert await _run(PLANTERS[site], a, b, monkeypatch, operators=operators) == declared_count, (site, case)
+        # ...and without the declaration handed in, the same site counts by domain.
+        assert await _run(PLANTERS[site], a, b, monkeypatch) == domain_count, (site, case)
+        return
+    # The leak: a profile declared these operators, in this process. No other count may see it.
+    NetworkProfile.build("mainnet", [a, b], operators=operators)
+    assert await _run(PLANTERS[site], a, b, monkeypatch) == domain_count, (site, case)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

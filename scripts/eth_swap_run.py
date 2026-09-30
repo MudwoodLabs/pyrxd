@@ -894,8 +894,9 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
         key, group = repeated[0]
         raise SystemExit(
             f"--eth-rpc-url names one source ({describe_source(key)}) {len(group)} times: {', '.join(group)}. "
-            "Sources are counted by distinct operators (as declared, or by registered domain), so it cannot "
-            "corroborate itself. List each operator once."
+            "Sources are counted by registered domain (or an operator pyrxd ships knowledge of), so it cannot "
+            "corroborate itself, and this script takes no operator declaration. List each operator once, as "
+            "URLs of different registered domains."
         )
     if _token_leg_is_real(args) and len(urls) < 3:
         # THREE, not two, and the reason is arithmetic rather than taste. `min_agreeing` defaults

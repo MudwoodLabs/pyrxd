@@ -36,7 +36,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Sources are counted by OPERATOR, as declared, or by registered domain — not by host.** The key
   every quorum counts through (`pyrxd.network.source_identity.source_key`) is now an operator
-  group: an operator the config declares (`operator = "…"`, below), else an operator pyrxd ships
+  group: an operator declared for that URL (`operator = "…"`, below — it reaches HashMark form 2
+  only), else an operator pyrxd ships
   knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`: radiant4people.com, radiantcore.org and
   bladenet.online, three different operators per the Radiant maintainer's statement of
   2026-09-29), else the host's REGISTERED DOMAIN (eTLD+1, by the Public Suffix List, vendored at
@@ -72,13 +73,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Declare who runs an ElectrumX server: `operator = "…"`.** An entry of `electrumx_servers` (or
   `electrumx`), top-level or under `[networks.<name>]`, may be `{ url = "wss://...", operator =
-  "acme" }`. The declaration overrides the registered-domain grouping everywhere sources are
-  counted in the process (it is applied when the CLI builds its endpoint profile), so two domains
-  declared as one operator count once and two hosts of one domain declared as two operators count
-  twice. It is validated at load: an id is 1-64 lower-case letters, digits, `.` or `-`; unknown
-  keys in the table, one host declared as two operators, and a declaration that contradicts a
-  shipped operator are refused. pyrxd believes the declaration; it is only as good as what is
-  written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md` (7c).
+  "acme" }`. The declaration overrides the registered-domain grouping for THAT endpoint
+  (`Endpoint.source`) and for HashMark §7.6 form 2's judge and walker, which the CLI hands the
+  config's declarations explicitly (`Config.declared_operators()`); so two domains declared as one
+  operator count once and two hosts of one domain declared as two operators count twice. Nothing
+  else sees it: there is no process-wide registry, so the watchtower, BTC and ETH quorums, another
+  profile, and a later load without the declaration all group by domain. Library callers pass
+  declarations the same way, as `operators=` to `NetworkProfile.build`, `judge_name_at_mark`,
+  `walk_mutable_chain` and `source_keys`. Refused when the list is read — at `load()` for the
+  top-level list, and when `for_network()` selects a `[networks.<name>]` list: an id that is not
+  1-64 lower-case letters, digits, `.` or `-`; unknown keys in the table; one host counted as two
+  sources (two operators on its URLs, or an operator on one and not another); and a declaration
+  that contradicts a shipped operator. A profile, form 2's labels and a quorum of client objects
+  refuse one host counted as two sources too. pyrxd believes the declaration; it is only as good as
+  what is written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md`
+  (7c).
 - **`wss://electrumx2.radiant4people.com:50022/` is a shipped mainnet default, for failover.** It is
   radiant4people's second server, so it is ONE source with `electrumx.radiant4people.com` and never
   a second vote; it comes last so form 2's endpoint pair reaches radiantcore first. Each shipped

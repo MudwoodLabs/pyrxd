@@ -1591,8 +1591,9 @@ class MultiSourceBtcFundingReader:
     ) -> MultiSourceBtcFundingReader:
         """Build the reader from Esplora base URLs, requiring at least ``quorum`` DISTINCT sources.
 
-        URLs are grouped by :func:`~pyrxd.network.source_identity.source_key` (distinct operators,
-        as declared, or by registered domain), and each group becomes ONE reader — several URLs of
+        URLs are grouped by :func:`~pyrxd.network.source_identity.source_key` (by registered
+        domain, or an operator pyrxd ships knowledge of; no declaration reaches this count), and
+        each group becomes ONE reader — several URLs of
         one group are that reader's failover list
         (:class:`~pyrxd.network.source_identity.SameSourceFailover`), never several votes.
 
@@ -1613,7 +1614,7 @@ class MultiSourceBtcFundingReader:
             if not allow_insufficient_diversity:
                 raise ValidationError(
                     f"BTC funding quorum: {len(urls)} endpoint(s) resolve to only {distinct} distinct "
-                    f"source(s) (operators, as declared, or registered domains), short of quorum={quorum}. "
+                    f"source(s) (registered domains, or operators pyrxd ships knowledge of), short of quorum={quorum}. "
                     f"A quorum of one operator's endpoints is false corroboration (one hostile/buggy "
                     f"operator satisfies it), so this fails closed. "
                     f"Configure >= {quorum} DISTINCT operators, or pass allow_insufficient_diversity=True "

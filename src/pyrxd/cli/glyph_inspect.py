@@ -1000,8 +1000,9 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     supplied the candidates, the judge refuses a mark height from the server that supplied the
     name→glyph binding, and the judge refuses any block height — the mark's or a chain step's — that
     both endpoints do not report identically. Those rules compare the LABELS by source
-    (:func:`pyrxd.network.source_identity.source_key`, inside the judge and the walker: distinct
-    operators, as declared, or by registered domain), so a label must name the endpoint that really
+    (:func:`pyrxd.network.source_identity.source_keys`, inside the judge and the walker: distinct
+    operators, as the config declares them — :meth:`~pyrxd.cli.config.Config.declared_operators`,
+    handed to both — or by registered domain), so a label must name the endpoint that really
     answers: one endpoint must never carry two labels. With ONE configured operator both clients are
     one endpoint and both labels are equal, so each of those rules degrades with its reason — which
     is the truth of a single-operator configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
@@ -1038,6 +1039,18 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
         )
 
     return _one(first), first.url, _one(second), second.url
+
+
+def _declared_operators(ctx: CliContext) -> dict[str, str]:
+    """``{url: operator}`` the config declares for the endpoints :func:`_endpoint_pair` labels.
+
+    Empty with a ``client_factory`` (its label is not a configured URL) and for a context that
+    carries no config — nothing is declared there. Never read from anywhere process-wide.
+    """
+    if ctx.client_factory is not None:
+        return {}
+    config = getattr(ctx, "config", None)
+    return config.declared_operators() if config is not None else {}
 
 
 def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confirmations: int) -> None:
@@ -1141,6 +1154,9 @@ async def _name_at_mark(
     san = _sanitize_display_string
     shown = san(name)
     client_a, label_a, client_b, label_b = _endpoint_pair(ctx)
+    # The config's `operator = "…"` declarations, handed to the walker and the judge that compare
+    # these labels: nothing process-wide carries them, so a count not passed them cannot see them.
+    operators = _declared_operators(ctx)
 
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(client_a)  # type: ignore[arg-type]
@@ -1200,6 +1216,7 @@ async def _name_at_mark(
             tip_client=client_b,
             discovery_source=label_a,
             tip_source=label_b,
+            operators=operators,
         )
 
         # 4. THE MARK'S BLOCK, A SECOND TIME, from the endpoint that did NOT supply the anchor. The
@@ -1257,6 +1274,7 @@ async def _name_at_mark(
         anchor=anchor,
         walk=walk,
         height_reports=reports,
+        operators=operators,
     )
     network = Network(ctx.network) if ctx.network in {n.value for n in Network} else Network.TESTNET
     signer_address = base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[network] + signer_hash160)
