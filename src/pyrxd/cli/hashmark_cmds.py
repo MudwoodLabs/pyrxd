@@ -1199,17 +1199,13 @@ def _with_verified_block(
 def _refuse_contradicted(height: Any, label: Any, reason: Any) -> NoReturn:
     """Exit 2 for a block proof that contradicts the height its endpoint reported — whichever
     lookup made the verification."""
-    where = label or "the endpoint"
+    from ..glyph.mark_block import NOTHING_AGAINST_THE_MARK, contradicted_sentence
+
+    # Both sentences are the pages' too (`glue.verify_mark_block`), from one definition.
     raise NetworkBoundaryError(
         "could not establish which block the mark is in",
-        cause=_sanitize_display_string(
-            f"the block proof {where} served contradicts the height reported for the mark (block {height}): {reason}"
-        ),
-        fix=(
-            "this says nothing against the mark itself, only that the server's own proof does not "
-            "support the height it reported — re-run in a moment, or ask another server with "
-            "--electrumx URL"
-        ),
+        cause=_sanitize_display_string(contradicted_sentence(height, label, reason)),
+        fix=f"{NOTHING_AGAINST_THE_MARK} — re-run in a moment, or ask another server with --electrumx URL",
     )
 
 

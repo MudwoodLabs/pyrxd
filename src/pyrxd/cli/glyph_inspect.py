@@ -27,7 +27,7 @@ import copy
 import logging
 import textwrap
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -842,59 +842,49 @@ async def verify_anchor_block(
     """
     from contextlib import AsyncExitStack
 
-    from ..glyph.mark_block import NOT_VERIFIED, BlockVerification, plan_block_verification, verify_mark_block
+    from ..glyph.mark_block import BlockFetch, BlockVerification, verify_with_fetched
 
-    def outcome(merkle=None, coinbase=None, headers=None) -> BlockVerification:
-        return verify_mark_block(
+    fetched: dict[str, object] = {}
+    failed: dict[str, str] = {}
+
+    def step(label: str | None) -> BlockVerification | BlockFetch:
+        # The SAME sequence and decision the browser pages run (`glue.verify_mark_block`): the
+        # order of the requests, what "could not be fetched" means, and every sentence.
+        return verify_with_fetched(
             txid=txid,
             raw_tx=raw_tx,
             height=height,
-            merkle=merkle,
-            coinbase_merkle=coinbase,
-            headers=headers or {},
-            min_confirmations=min_confirmations,
             blockhash=blockhash,
+            min_confirmations=min_confirmations,
+            source=label,
+            fetched=fetched,
+            failed=failed,
             network=network,
         )
 
-    plan = plan_block_verification(height=height, min_confirmations=min_confirmations, network=network)
-    if plan.reason is not None or not txid:
-        return outcome(), None  # the verifier states the reason; nothing to fetch
+    first = step(None)
+    if isinstance(first, BlockVerification):
+        return first, None  # the verifier states the reason; nothing to fetch, no connection opened
 
     client, label = endpoint()
-
-    def unavailable(what: str, exc: BaseException) -> tuple[BlockVerification, str]:
-        detail = _sanitize_display_string(str(exc)) or type(exc).__name__
-        return (
-            BlockVerification(
-                state=NOT_VERIFIED,
-                claim=None,
-                reason=f"{what} could not be fetched from {_sanitize_display_string(label)}: {detail}",
-                height=height if isinstance(height, int) else None,
-            ),
-            label,
-        )
-
+    # The client's own methods, so every reply crosses the readers the pages use too
+    # (`pyrxd.spv.radiant.*_from_reply`). `id_from_pos`'s third parameter (verbose) is the client's.
+    calls: dict[str, Callable[..., Any]] = {
+        "blockchain.transaction.get_merkle": client.get_transaction_merkle_branch,  # type: ignore[attr-defined]
+        "blockchain.transaction.id_from_pos": lambda h, pos, _verbose: client.get_transaction_id_from_pos(h, pos),  # type: ignore[attr-defined]
+        "blockchain.block.headers": client.get_block_headers,  # type: ignore[attr-defined]
+    }
     async with AsyncExitStack() as stack:
         if not client_is_open:
             await stack.enter_async_context(client)  # type: ignore[arg-type]
-        try:
-            merkle = await client.get_transaction_merkle_branch(txid, height)  # type: ignore[attr-defined]
-        except Exception as exc:
-            return unavailable("the transaction's merkle branch", exc)
-        try:
-            coinbase = await client.get_transaction_id_from_pos(height, 0)  # type: ignore[attr-defined]
-        except Exception as exc:
-            return unavailable("the block's coinbase merkle branch", exc)
-        headers: dict[int, bytes] = {}
-        for start, count in plan.header_ranges:
+        while True:
+            need = step(label)
+            if isinstance(need, BlockVerification):
+                return need, label
             try:
-                got = await client.get_block_headers(start, count)  # type: ignore[attr-defined]
+                fetched[need.key] = await calls[need.method](*need.params)
             except Exception as exc:
-                return unavailable(f"the block headers {start}-{start + count - 1}", exc)
-            for i, header in enumerate(got):
-                headers.setdefault(start + i, header)
-    return outcome(merkle, coinbase, headers), label
+                failed[need.key] = str(exc) or type(exc).__name__
 
 
 def block_verification_could_not_run(exc: BaseException, height: object) -> BlockVerification:

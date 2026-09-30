@@ -926,7 +926,7 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: 
     """
     import json
 
-    from pyrxd.glyph.mark_anchor import AnchorBindingError, mark_anchor_dict, resolve_mark_anchor
+    from pyrxd.glyph.mark_anchor import AnchorBindingError, resolve_mark_anchor
     from pyrxd.security.errors import NetworkError
 
     if not isinstance(verbose_json, str):
@@ -1004,11 +1004,37 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: 
     if missing:
         return _needs_header(missing[0])
 
+    return _anchor_answer(anchor)
+
+
+def _sanitize_untruncated(value):
+    """Every string in *value* through the display sanitiser, NOT the length cap; tuples as lists."""
+    if isinstance(value, str):
+        return _inspect.sanitize_display_string(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_untruncated(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_untruncated(v) for v in value]
+    return value
+
+
+def _anchor_answer(anchor, verification=None, verified_by: str | None = None) -> dict:
+    """What the page renders for a resolved anchor — ``mark_anchor_dict``'s shape, and nothing else.
+
+    One function for the answer before the block is verified (:func:`mark_anchor`) and after
+    (:func:`verify_mark_block`), so the second can only ADD what the verification changes: the
+    caveat (the verifier's claim, or the inclusion-only caveat), ``height_is_verified``,
+    ``verified_confirmations``, ``block_verification`` and, for a block replaced between the
+    anchor's reply and the proof's, ``blockhash`` — all decided by
+    :func:`pyrxd.glyph.mark_anchor.with_block_verification`, the function ``pyrxd verify`` uses.
+    """
+    from pyrxd.glyph.mark_anchor import mark_anchor_dict
+
     # THE SHAPE IS `mark_anchor_dict`'s, not this module's. It was factored out so a
     # height never reaches a screen without the caveat that it is one endpoint's
     # unverified claim, and a page assembling its own dict of the same fields would be
     # the second display shape that helper exists to prevent.
-    shape = mark_anchor_dict(anchor)
+    shape = mark_anchor_dict(anchor, verification, verified_by=verified_by)
 
     # THREE KEYS DROPPED, DELIBERATELY, and this is the only place it happens.
     #
@@ -1026,6 +1052,11 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: 
     for dropped in ("provisional", "deep_enough", "min_confirmations"):
         shape.pop(dropped, None)
     shape["caveat"] = _inspect.sanitize_display_string(str(shape.get("caveat") or ""))
+    # The verification's own sentences (claim, reason) are longer than the 200-character display
+    # cap and must not be cut — a claim that stops halfway still reads as complete — so they are
+    # sanitised, never truncated. Every string in them is pyrxd's, or a server's error text the
+    # page capped before handing it over.
+    shape["block_verification"] = _sanitize_untruncated(shape.get("block_verification"))
     return {
         "resolved": True,
         "txid": anchor.txid,
@@ -1033,11 +1064,264 @@ def mark_anchor(txid: str, verbose_json: str, tip_height: object, headers_json: 
         # Beside the caveat so a test, and a reader of the JSON drawer, can see the height was
         # bound without parsing a sentence. Always True here: an unbound height is never returned.
         "header_bound": anchor.header_bound,
+        # Shown under the block in EVERY state — drawn, being checked, verified or not — so it
+        # says only what holds in all of them: how deep the page tries to prove, that a count it
+        # proved is labelled as verified, and that any other count is the server's word.
         "no_depth_policy": (
-            "This page sets no confirmation-depth requirement: the count above is the fact, "
-            "and how much burial is enough depends on what this mark is worth to you"
+            "This page sets no confirmation-depth requirement. It tries to prove the depth itself "
+            f"— up to {_PROOF_TARGET_DEPTH} confirmations above pyrxd's newest checkpoint (fewer if "
+            "the server reports fewer), or, for a block at or below a checkpoint, every block up to "
+            "the newest one — and labels a count it proved as verified; any other count is the "
+            "server's word. How much burial is enough depends on what this mark is worth to you"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# The mark's block, VERIFIED — the same check `pyrxd verify` runs (#799 phase 3).
+# ---------------------------------------------------------------------------
+
+#: Cap on the anchor JSON the page hands back. It is the dict :func:`mark_anchor` returned, a few
+#: hundred characters of numbers and one caveat; anything near this is not that dict.
+_MAX_ANCHOR_JSON_CHARS = 16_000
+
+#: Cap on the fetched-proof JSON. The most a plan asks for is the longest walk to a checkpoint —
+#: ``MAX_HEADERS_FROM_CHECKPOINT + 1`` headers, 160 hex characters each; the page's target depth
+#: never lengthens it, as the fetch stops that far past the newest checkpoint — plus two merkle
+#: replies; this leaves headroom for the JSON around them and the errors.
+#: ``tests/web/test_block_proof_on_the_pages.py`` checks it covers the worst plan.
+_MAX_PROOF_JSON_CHARS = 1_000_000
+
+#: How much of a page-reported fetch error crosses into a reason.
+_PROOF_ERROR_CAP = 160
+
+#: How deep the pages TRY to prove the mark's block: ``min(the server's reported confirmations,
+#: this)``. NOT a requirement — the page still requires only ``_ANCHOR_FLOOR`` — so a server whose
+#: tip is short, or which serves fewer headers than it reports, still VERIFIES to the depth it can
+#: prove (``target_confirmations`` in :mod:`pyrxd.glyph.mark_block`). Above the newest checkpoint,
+#: each header proved on top of the block is one more that a server lying about the height would
+#: have had to mine, and five more headers are a handful to fetch and hash.
+_PROOF_TARGET_DEPTH = 6
+
+_HEX64_CHARS = frozenset("0123456789abcdef")
+
+
+def _proof_readers() -> dict:
+    """The reply reader for each method — the ones ``ElectrumXClient`` uses, so a malformed reply
+    is refused here in the words ``pyrxd verify`` uses for it."""
+    from pyrxd.spv.radiant import block_headers_from_reply, coinbase_branch_from_reply, merkle_branch_from_reply
+
+    return {
+        "blockchain.transaction.get_merkle": lambda reply, params: merkle_branch_from_reply(reply, params[1]),
+        "blockchain.transaction.id_from_pos": lambda reply, params: coinbase_branch_from_reply(reply),
+        "blockchain.block.headers": lambda reply, params: block_headers_from_reply(reply, params[1]),
+    }
+
+
+def _page_anchor(txid: str, anchor_json: object):
+    """The :class:`~pyrxd.glyph.mark_anchor.MarkAnchor` the page's earlier answer describes, or why not.
+
+    REBUILT FROM ITS NUMBERS, NOT TRUSTED AS TEXT. The page hands back the dict
+    :func:`mark_anchor` returned; only the txid, the height, the endpoint's confirmation count and
+    the block hash it was bound to are read from it, each checked. The caveat and the source are
+    this module's own constants again, so nothing the page carried in a sentence is repeated.
+    """
+    import json
+
+    from pyrxd.glyph.mark_anchor import BOUND_CAVEAT, MarkAnchor
+
+    if not isinstance(anchor_json, str) or len(anchor_json) > _MAX_ANCHOR_JSON_CHARS:
+        return "the block this page placed the mark in could not be read back"
+    try:
+        given = json.loads(anchor_json)
+    except ValueError:
+        return "the block this page placed the mark in could not be read back"
+    if not isinstance(given, dict) or given.get("resolved") is not True or given.get("header_bound") is not True:
+        return "the mark's block was not established, so there is no block to verify"
+    height, confs, blockhash = given.get("height"), given.get("confirmations"), given.get("blockhash")
+    whole = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0  # noqa: E731
+    if given.get("txid") != txid or not whole(height) or not whole(confs) or confs < 1:
+        return "the block this page placed the mark in could not be read back"
+    if not (isinstance(blockhash, str) and len(blockhash) == 64 and set(blockhash) <= _HEX64_CHARS):
+        return "the block this page placed the mark in could not be read back"
+    return MarkAnchor(
+        txid=txid,
+        height=height,
+        confirmations=confs,
+        min_confirmations=_ANCHOR_FLOOR,
+        source=_ANCHOR_SOURCE,
+        caveat=BOUND_CAVEAT,
+        header_bound=True,
+        blockhash=blockhash,
+    )
+
+
+def _page_fetched(fetched_json: object, steps) -> tuple[dict, dict] | str:
+    """``(fetched, failed)`` for :func:`pyrxd.glyph.mark_block.verify_with_fetched`, from the page's JSON.
+
+    ``{"replies": {key: raw reply}, "errors": {key: message}}``. Only the keys of the requests the
+    plan makes are read, each through the reader ``pyrxd verify``'s client uses; a reply that reader
+    refuses becomes a FAILED fetch with its message, exactly as it does in the CLI, never data.
+    """
+    import json
+
+    from pyrxd.security.errors import NetworkError
+
+    if fetched_json is None:
+        return {}, {}
+    if not isinstance(fetched_json, str) or len(fetched_json) > _MAX_PROOF_JSON_CHARS:
+        return "the block proof this page fetched was not in a shape it reads"
+    try:
+        given = json.loads(fetched_json)
+    except ValueError:
+        return "the block proof this page fetched was not in a shape it reads"
+    if not isinstance(given, dict):
+        return "the block proof this page fetched was not in a shape it reads"
+    replies, errors = given.get("replies", {}), given.get("errors", {})
+    if not isinstance(replies, dict) or not isinstance(errors, dict):
+        return "the block proof this page fetched was not in a shape it reads"
+    readers = _proof_readers()
+    fetched: dict = {}
+    failed: dict = {}
+    for step in steps:
+        if step.key in errors:
+            failed[step.key] = _truncate(_inspect.sanitize_display_string(str(errors[step.key])), cap=_PROOF_ERROR_CAP)
+        elif step.key in replies:
+            try:
+                fetched[step.key] = readers[step.method](replies[step.key], step.params)
+            except NetworkError as exc:
+                failed[step.key] = _safe_error(exc)
+    return fetched, failed
+
+
+def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json: object = None) -> dict:
+    """Verify the block :func:`mark_anchor` placed the mark in — the check ``pyrxd verify`` runs.
+
+    SAME RULE, SAME ORDER, SAME SENTENCES. The request sequence and the decision are
+    :func:`pyrxd.glyph.mark_block.verify_with_fetched`, which ``pyrxd verify`` calls too
+    (``pyrxd.cli.glyph_inspect.verify_anchor_block``); each reply crosses the reader the CLI's
+    client uses; the display shape is :func:`~pyrxd.glyph.mark_anchor.with_block_verification`'s.
+    So for the same server answers the page and ``pyrxd verify --min-confirmations N`` — N the
+    depth the page aims for, ``min(the server's count, _PROOF_TARGET_DEPTH)`` — give the same state,
+    claim, reason and proved depth, except where the page's REQUIRING only ``_ANCHOR_FLOOR``
+    matters, and only there:
+
+    * a header between the mark's block and N deep that was not served (the server's chain is
+      shorter), that carries less work than the floor, or that does not link to the header below
+      it when the two came in separate requests: the page VERIFIES to the depth below it, with
+      ``short_of_target`` saying why, where the CLI at N is NOT VERIFIED (CONTRADICTED, for the
+      unlinked pair);
+    * N deep reaching past ``MAX_HEADERS_FROM_CHECKPOINT`` above the newest checkpoint: the page
+      proves as far as it may, where the CLI at N says it needs a newer pyrxd.
+
+    A header SERVED that fails its own proof-of-work, or fails to link to the one below it within
+    one reply, is CONTRADICTED on both at any depth (``pyrxd.glyph.mark_block``'s docstring).
+
+    THE PAGE HANDS OVER ONLY WHAT IS READ. ``proveMarkBlock`` (shared.js) passes each reply's
+    fields that the readers here read, nothing else (and, below eight levels, no nesting: no reader
+    here looks past three), and judges no shape: every refusal of a reply as malformed is the
+    reader's, in the CLI's words. The JavaScript writes two reasons of its own
+    — a reply over its size cap, and a fetch that failed in transport — and hands them over as
+    errors, capped at ``_PROOF_ERROR_CAP`` here.
+
+    A LOOP ACROSS THE BRIDGE, like :func:`mark_anchor`'s. This module cannot fetch, so it answers
+    ``{"needs": {"key", "method", "params"}}`` — the next ElectrumX request the verifier needs, in
+    its order: the transaction's merkle branch, the block's coinbase branch, then each header range
+    the plan names (at most 2016 headers each). The page sends exactly that request, puts the reply
+    (or its error) in *fetched_json* (``{"replies": {key: reply}, "errors": {key: message}}``) and
+    calls again. When nothing more is needed it answers ``{"needs": None, "anchor": {...}}``: the
+    anchor as :func:`mark_anchor` gave it, with the verification applied. Synchronous throughout —
+    the verifier never awaits.
+
+    *raw_hex* is the transaction the page already fetched and hash-checked
+    (``fetchRawTxFromElectrumx``); it is not fetched again. *anchor_json* is :func:`mark_anchor`'s
+    answer, as JSON; only its numbers are read back (:func:`_page_anchor`).
+
+    CONTRADICTED (the server's own branch, header or linkage disagrees with the height it
+    reported) answers ``{"needs": None, "anchor": {"resolved": False, "reason": ...}}``: no block
+    number, as ``pyrxd verify`` reports none and exits 2 — and the reason says it is nothing
+    against the mark. Any other failure keeps the anchor, NOT VERIFIED, with its reason.
+
+    Never raises. Anything it cannot use becomes ``{"needs": None, "anchor": None, "reason": ...}``
+    and the page keeps the answer it already drew.
+    """
+    from pyrxd.glyph.mark_block import (
+        CONTRADICTED,
+        NOTHING_AGAINST_THE_MARK,
+        BlockVerification,
+        block_fetches,
+        contradicted_sentence,
+        plan_block_verification,
+        verify_with_fetched,
+    )
+
+    try:
+        if not (isinstance(txid, str) and len(txid) == 64 and set(txid) <= _HEX64_CHARS):
+            return {"needs": None, "anchor": None, "reason": "no usable transaction number to verify the block of"}
+        anchor = _page_anchor(txid, anchor_json)
+        if isinstance(anchor, str):
+            return {"needs": None, "anchor": None, "reason": anchor}
+        raw_tx = None
+        if (
+            isinstance(raw_hex, str)
+            and 0 < len(raw_hex) <= _MAX_RAW_HEX_CHARS
+            and len(raw_hex) % 2 == 0
+            and all(c in "0123456789abcdefABCDEF" for c in raw_hex)
+        ):
+            raw_tx = bytes.fromhex(raw_hex)
+        # Required: the page's floor. Aimed for: the server's own count, at most six.
+        target = min(anchor.confirmations, _PROOF_TARGET_DEPTH)
+        plan = plan_block_verification(
+            height=anchor.height,
+            min_confirmations=_ANCHOR_FLOOR,
+            target_confirmations=target,
+            network=_PAGE_NETWORK,
+        )
+        fetched = _page_fetched(fetched_json, block_fetches(plan, txid))
+        if isinstance(fetched, str):
+            return {"needs": None, "anchor": None, "reason": fetched}
+        outcome = verify_with_fetched(
+            txid=txid,
+            raw_tx=raw_tx,
+            height=anchor.height,
+            blockhash=anchor.blockhash,
+            min_confirmations=_ANCHOR_FLOOR,
+            target_confirmations=target,
+            source=_ANCHOR_SOURCE,
+            fetched=fetched[0],
+            failed=fetched[1],
+            network=_PAGE_NETWORK,
+        )
+        if not isinstance(outcome, BlockVerification):
+            return {"needs": {"key": outcome.key, "method": outcome.method, "params": list(outcome.params)}}
+        if outcome.state == CONTRADICTED:
+            from dataclasses import asdict
+
+            detail = asdict(outcome)
+            detail["source"] = _ANCHOR_SOURCE
+            return {
+                "needs": None,
+                "anchor": {
+                    "resolved": False,
+                    "reason": _inspect.sanitize_display_string(
+                        f"{contradicted_sentence(anchor.height, _ANCHOR_SOURCE, outcome.reason)}; "
+                        f"{NOTHING_AGAINST_THE_MARK}. Trying again in a moment may work"
+                    ),
+                    "block_verification": _sanitize_untruncated(detail),
+                },
+            }
+        # `block_verification.source` names the endpoint whose data was checked — none, as in the
+        # CLI, when the plan said nothing could verify and nothing was fetched.
+        asked = bool(fetched[0] or fetched[1])
+        return {"needs": None, "anchor": _anchor_answer(anchor, outcome, _ANCHOR_SOURCE if asked else None)}
+    except Exception as exc:  # the never-raises contract; the verifier itself is total
+        return {
+            "needs": None,
+            "anchor": None,
+            "reason": _truncate(
+                _inspect.sanitize_display_string(f"the block could not be verified here: {_safe_error(exc)}")
+            ),
+        }
 
 
 def _recovered_key_bytes(result: object) -> bytes:

@@ -14,8 +14,10 @@ the name judgement reads its depth and hands that same anchor, verified, to the 
 (``records[i].name_at_mark.anchor`` is that anchor). VERIFIED prints this module's claim; any other
 outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED exits 2 with its
 reason, as a binding failure does. What form 2 reads from its SECOND endpoint (the mark's height
-again, and every chain step's) is not verified, and neither ``glyph inspect`` nor the ``/verify/``
-and ``/inspect/`` pages call it yet (phase 3). The swap taker gate calls it too, through
+again, and every chain step's) is not verified, and ``glyph inspect`` does not call it. The
+``/verify/`` and ``/inspect/`` pages do, for their one anchor, through ``glue.verify_mark_block``,
+which drives :func:`verify_with_fetched` — the sequence and decision the CLI's helper uses too.
+The swap taker gate calls :func:`verify_mark_block` too, through
 :func:`pyrxd.gravity.funding_spv.verify_maker_funding`, with a larger header cap.
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
@@ -52,6 +54,28 @@ fetched or checked.
   header, so the required ``min_confirmations`` MUST scale with the value at risk, and the refusal
   must say what it required. The swap taker gate (:mod:`pyrxd.gravity.funding_spv`) does both.
   The default of this module is the mark path's, where a wrong answer misleads but moves nothing.
+
+REQUIRED DEPTH AND TARGET DEPTH ARE TWO NUMBERS. ``min_confirmations`` is REQUIRED: a proof that
+cannot reach it is NOT VERIFIED. ``target_confirmations`` (optional, never below the required
+depth in effect) is how deep to TRY: the headers up to it are fetched and checked like the rest,
+and ``verified_depth`` (with the claim's header count) is the depth actually proved. Past the
+required depth, what a header does decides by CAUSE:
+
+* one SERVED that fails its own proof-of-work (hashes above the target its own nBits states) is
+  a lie at any depth: CONTRADICTED, exactly as it is within the required depth;
+* one whose previous-block field does not name the header below it, when both came in ONE
+  ``blockchain.block.headers`` reply, is a lie too (one reply is one chain): CONTRADICTED;
+* one that was not served (the server's chain is shorter), is not an 80-byte header, carries less
+  work than the floor (an honest difficulty drop can do that), or does not link to the header
+  below it when the two came in SEPARATE requests (a reorganisation between them can do that)
+  only ENDS the proved run below it, and ``short_of_target`` says which. Which request each header
+  came in is read from the plan's ranges (:func:`plan_block_verification`), which is how
+  :func:`verify_with_fetched` fetches them; a caller handing :func:`verify_mark_block` headers it
+  fetched some other way is judged as if it had fetched those ranges.
+
+``pyrxd verify`` passes no target, so its required depth is the only one; the browser pages
+require 1 and aim for more, so a server whose tip is short still VERIFIES to the depth it can
+prove.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
@@ -98,12 +122,18 @@ __all__ = [
     "FLOOR_WORK_DIVISOR",
     "MAX_HEADERS_FROM_CHECKPOINT",
     "MAX_HEADERS_PER_REQUEST",
+    "NOTHING_AGAINST_THE_MARK",
     "NOT_VERIFIED",
     "VERIFIED",
+    "BlockFetch",
     "BlockFetchPlan",
     "BlockVerification",
+    "block_fetches",
+    "contradicted_sentence",
+    "could_not_fetch",
     "plan_block_verification",
     "verify_mark_block",
+    "verify_with_fetched",
 ]
 
 VERIFIED = "VERIFIED"
@@ -186,8 +216,14 @@ class BlockVerification:
     verified_depth: int | None = None
     #: ``((step, "passed" | "failed" | "not run"), ...)`` in the order they run; the ``blockhash``
     #: step is ``"passed"``, ``"differs"`` (see ``named_blockhash``) or ``"not run"``, never
-    #: ``"failed"``.
+    #: ``"failed"``. ``linkage``, ``proof_of_work`` and ``floor`` describe the headers IN the proved
+    #: run; a header past the required depth that ended it is in ``short_of_target``, never here.
     steps: tuple[tuple[str, str], ...] = ()
+    #: Why the proved run stopped below ``target_confirmations``, when a header past the REQUIRED
+    #: depth ended it without being a lie: not served, not an 80-byte header, below the floor, or
+    #: not linking to the header below it across two separate requests. ``None`` when nothing past
+    #: the required depth ended the run — always, with no target (``pyrxd verify``).
+    short_of_target: str | None = None
 
 
 _STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
@@ -246,14 +282,41 @@ def _chunks(start: int, stop_inclusive: int) -> list[tuple[int, int]]:
     return out
 
 
+def _require_target(target_confirmations: Any) -> int | None:
+    if target_confirmations is None:
+        return None
+    if not isinstance(target_confirmations, int) or isinstance(target_confirmations, bool) or target_confirmations < 1:
+        raise ValidationError("target_confirmations must be None or an int >= 1 (the block itself counts as 1)")
+    return target_confirmations
+
+
+def _top(
+    height: int, min_confirmations: int, target: int | None, newest_h: int, cap: int = MAX_HEADERS_FROM_CHECKPOINT
+) -> int:
+    """The highest block to fetch and check: the REQUIRED top (``height + min_confirmations - 1``),
+    raised toward the target's — but never past *cap* (default :data:`MAX_HEADERS_FROM_CHECKPOINT`)
+    above the newest checkpoint, so an optional target can never turn a verifiable block into
+    "needs a newer pyrxd". With no target (the CLI) it is the required top, exactly as before
+    targets existed."""
+    required = height + min_confirmations - 1
+    if target is None or target <= min_confirmations:
+        return required
+    return max(required, min(height + target - 1, newest_h + cap))
+
+
 def _plan(
-    height: Any, min_confirmations: int, table: tuple[tuple[int, str], ...], cap: int = MAX_HEADERS_FROM_CHECKPOINT
+    height: Any,
+    min_confirmations: int,
+    table: tuple[tuple[int, str], ...],
+    target: int | None = None,
+    cap: int = MAX_HEADERS_FROM_CHECKPOINT,
 ) -> BlockFetchPlan:
     if not _is_height(height):
         return BlockFetchPlan(None, (), None, f"no usable block height to verify (got {type(height).__name__})")
     if not table:
         return BlockFetchPlan(height, (), None, "this pyrxd ships no checkpoints for this network")
     newest_h = table[-1][0]
+    # The REQUIRED top decides "needs a newer pyrxd"; the fetch then reaches toward the target.
     top = height + min_confirmations - 1
     ranges: list[tuple[int, int]] = []
     if height <= newest_h:
@@ -265,15 +328,16 @@ def _plan(
         ranges += _chunks(height, above_h)
     else:
         level = "work"
+    if top - newest_h > cap:
+        return BlockFetchPlan(
+            height,
+            (),
+            None,
+            f"block {top} is {top - newest_h} blocks past this pyrxd's newest checkpoint ({newest_h}); "
+            f"it links at most {cap} — needs a newer pyrxd",
+        )
+    top = _top(height, min_confirmations, target, newest_h, cap)
     if top > newest_h:
-        if top - newest_h > cap:
-            return BlockFetchPlan(
-                height,
-                (),
-                None,
-                f"block {top} is {top - newest_h} blocks past this pyrxd's newest checkpoint ({newest_h}); "
-                f"it links at most {cap} — needs a newer pyrxd",
-            )
         ranges += _chunks(newest_h, top)
     return BlockFetchPlan(height, tuple(ranges), level, None)
 
@@ -282,6 +346,7 @@ def plan_block_verification(
     *,
     height: Any,
     min_confirmations: int,
+    target_confirmations: int | None = None,
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
     max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
@@ -289,13 +354,16 @@ def plan_block_verification(
     """Which headers to fetch to verify the block at *height* — decided here, not by the caller.
 
     Total over *height* (it is the endpoint's claim). ``checkpoints`` defaults to the shipped table
-    for *network*; tests pass their own. ``max_headers_from_checkpoint`` bounds the walk (see
-    :data:`MAX_HEADERS_FROM_CHECKPOINT`, its default).
+    for *network*; tests pass their own. ``target_confirmations``: how deep to try beyond the
+    REQUIRED ``min_confirmations`` (see the module docstring); ``None`` asks for the required depth
+    only. ``max_headers_from_checkpoint`` bounds the walk (see :data:`MAX_HEADERS_FROM_CHECKPOINT`,
+    its default).
     """
     return _plan(
         height,
         _require_min_confirmations(min_confirmations),
         _table(network, checkpoints),
+        _require_target(target_confirmations),
         _require_cap(max_headers_from_checkpoint),
     )
 
@@ -307,6 +375,11 @@ def _header(headers: Mapping[Any, Any], h: int) -> bytes:
     if not isinstance(got, (bytes, bytearray)) or len(got) != 80:
         raise _Stop(NOT_VERIFIED, f"the reply for the header at height {h} is not an 80-byte header")
     return bytes(got)
+
+
+def _hashes_to(header: Any, want: str) -> bool:
+    """Whether *header* is an 80-byte header whose hash is *want*."""
+    return isinstance(header, (bytes, bytearray)) and len(header) == 80 and radiant_block_hash(bytes(header)) == want
 
 
 def _coinbase_branch(reply: Any, height: int) -> tuple[str, tuple[str, ...]]:
@@ -337,6 +410,7 @@ def verify_mark_block(
     blockhash: Any = None,
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
+    target_confirmations: int | None = None,
     max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
     pow_limit: int | None = None,
 ) -> BlockVerification:
@@ -355,6 +429,9 @@ def verify_mark_block(
     the endpoint had named another. If that header fails a check, the state is whatever the check
     says, and the reason notes the different name too.
 
+    *min_confirmations* is REQUIRED; *target_confirmations* is how deep to try past it, and never
+    turns a proof that reached the required depth into anything but VERIFIED (module docstring).
+
     ``max_headers_from_checkpoint`` bounds the walk (default :data:`MAX_HEADERS_FROM_CHECKPOINT`);
     ``pow_limit``, when given, is the network's proof-of-work limit, and each header's nBits is then
     decoded by Radiant Core's rule and refused above it (see
@@ -365,6 +442,7 @@ def verify_mark_block(
     """
     table = _table(network, checkpoints)
     min_conf = _require_min_confirmations(min_confirmations)
+    target = _require_target(target_confirmations)
     cap = _require_cap(max_headers_from_checkpoint)
     if pow_limit is not None and (
         not isinstance(pow_limit, int) or isinstance(pow_limit, bool) or not 0 < pow_limit < (1 << 256)
@@ -387,6 +465,7 @@ def verify_mark_block(
             coinbase_merkle=coinbase_merkle,
             headers=headers,
             min_conf=min_conf,
+            target=target,
             blockhash=blockhash,
             table=table,
             steps=steps,
@@ -413,6 +492,7 @@ def _verify(
     coinbase_merkle: Any,
     headers: Any,
     min_conf: int,
+    target: int | None,
     blockhash: Any,
     table: tuple[tuple[int, str], ...],
     steps: dict[str, str],
@@ -421,7 +501,7 @@ def _verify(
     pow_limit: int | None = None,
 ) -> str:
     """Run every check; return the VERIFIED claim, or raise :class:`_Stop` with the outcome."""
-    plan = _plan(height, min_conf, table, cap)
+    plan = _plan(height, min_conf, table, target, cap)
     if plan.reason is not None:
         raise _Stop(NOT_VERIFIED, plan.reason)
     facts["level"] = plan.level
@@ -499,7 +579,8 @@ def _verify(
     # 3. linkage to a checkpoint.
     heights = [h for h, _ in table]
     newest_h, newest_hash = table[-1]
-    top = height + min_conf - 1
+    required_top = height + min_conf - 1
+    top = _top(height, min_conf, target, newest_h, cap)
     linked: set[int] = set()
 
     def link(lo: int, hi: int) -> None:
@@ -530,20 +611,42 @@ def _verify(
     else:
         facts.update(checkpoint_height=newest_h, checkpoint_hash=newest_hash)
 
-    # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor.
-    if top > newest_h:
+    # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor. Past
+    # the REQUIRED depth, a header decides by cause (module docstring): a failed proof-of-work, or
+    # a failed link within one reply, is CONTRADICTED as it is below; anything else ends the proved
+    # run there, recorded in `short_of_target`. When only the TARGET reaches above the checkpoint
+    # (a block just below it), this runs only from the checkpoint's own header, and records these
+    # steps only if it linked a header above it.
+    required_above = required_top > newest_h
+    if top > newest_h and (required_above or _hashes_to(headers.get(newest_h), newest_hash)):
         anchor(newest_h, newest_hash)
         floor = radiant_header_work(_header(headers, newest_h), pow_limit=pow_limit) // FLOOR_WORK_DIVISOR
-        facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
+        if required_above:
+            # Known before any header is checked, so reported on a failing proof too (as in #804).
+            facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
         below = newest_hash
         linked.add(newest_h)
         reached = newest_h
+        # A header that starts a request did not come in the same reply as the one below it.
+        request_starts = {start for start, _count in plan.header_ranges}
         for h in range(newest_h + 1, top + 1):
+            past = h > required_top  # past the REQUIRED depth: only aimed for
             got = headers.get(h)
             if got is None and h > height:
-                break  # burial shortfall, judged below
+                if past:
+                    facts["short_of_target"] = f"the header at {h} was not served"
+                break  # within the required depth: a burial shortfall, judged below
+            if past and not (isinstance(got, (bytes, bytearray)) and len(got) == 80):
+                facts["short_of_target"] = f"the reply for the header at {h} is not an 80-byte header"
+                break
             hdr = _header(headers, h)
             if radiant_header_prev_hash(hdr) != below:
+                if past and h in request_starts:
+                    facts["short_of_target"] = (
+                        f"the header at {h} does not link to the header at {h - 1}, which came in a separate "
+                        f"request (a chain reorganisation between the two can do that)"
+                    )
+                    break
                 steps["linkage"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} does not link to the header served at {h - 1}")
             try:
@@ -551,24 +654,34 @@ def _verify(
             except (SpvVerificationError, ValidationError) as exc:
                 steps["proof_of_work"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} fails its own proof-of-work: {exc}") from None
-            steps["proof_of_work"] = "passed"  # so far: every header up to this one
             if radiant_header_work(hdr, pow_limit=pow_limit) < floor:
+                if past:
+                    # Not in the proved run, so no step records it: the run ends below it.
+                    facts["short_of_target"] = (
+                        f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
+                        f"checkpoint {newest_h}'s)"
+                    )
+                    break
+                steps["proof_of_work"] = "passed"  # every header up to this one, this one included
                 steps["floor"] = "failed"
                 raise _Stop(
                     NOT_VERIFIED,
                     f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
                     f"checkpoint {newest_h}'s); its difficulty may be honest, but it does not verify here",
                 )
+            steps["proof_of_work"] = "passed"  # so far: every header up to this one
             linked.add(h)
             reached = h
-        steps["linkage"] = "passed"
-        steps["proof_of_work"] = "passed"
-        steps["floor"] = "passed"
-        facts["linked_headers"] = len(linked)
-        depth = reached - height + 1
-        if plan.level == "checkpoint":
-            depth = max(depth, newest_h - height + 1)
-        facts["verified_depth"] = depth
+        if required_above or reached > newest_h:
+            facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
+            steps["linkage"] = "passed"
+            steps["proof_of_work"] = "passed"
+            steps["floor"] = "passed"
+            facts["linked_headers"] = len(linked)
+            depth = reached - height + 1
+            if plan.level == "checkpoint":
+                depth = max(depth, newest_h - height + 1)
+            facts["verified_depth"] = depth
 
     # 5. burial.
     if facts["verified_depth"] < min_conf:
@@ -605,3 +718,159 @@ def _verify(
             f"replies would leave it."
         )
     return claim
+
+
+# ── ONE FETCH ORDER, ONE SET OF SENTENCES, for every surface ────────────────────────────────────
+#
+# ``pyrxd verify`` fetches with an async client; the browser pages fetch with a WebSocket in
+# JavaScript and hand the answers to a SYNCHRONOUS Python bridge. Both walk the same sequence
+# (:func:`block_fetches`) and decide through the same function (:func:`verify_with_fetched`), so
+# the order, what counts as "could not be fetched", and every sentence a reader sees come from
+# here once — the CLI and the pages cannot word the same outcome two ways.
+
+#: What each fetch is called in a "could not be fetched" reason.
+MERKLE_FETCH = "the transaction's merkle branch"
+COINBASE_FETCH = "the block's coinbase merkle branch"
+
+
+def _headers_fetch(start: int, count: int) -> str:
+    return f"the block headers {start}-{start + count - 1}"
+
+
+@dataclass(frozen=True)
+class BlockFetch:
+    """One ElectrumX request :func:`verify_with_fetched` still needs, and how to name it.
+
+    ``key`` is ``"merkle"``, ``"coinbase"`` or ``"headers:<start>:<count>"``: the name the answer
+    is handed back under. ``method`` and ``params`` are the JSON-RPC call, exactly — the caller
+    only sends it. ``what`` names it in a reason.
+    """
+
+    key: str
+    method: str
+    params: tuple[Any, ...]
+    what: str
+
+
+def block_fetches(plan: BlockFetchPlan, txid: str) -> tuple[BlockFetch, ...]:
+    """Every request *plan* needs, in the order they are made: the transaction's merkle branch,
+    the block's coinbase branch (which pins the tree's depth), then each header range in the
+    plan's order. Empty when the plan has a reason (nothing fetched could verify)."""
+    if plan.reason is not None or plan.height is None:
+        return ()
+    h = plan.height
+    out = [
+        BlockFetch("merkle", "blockchain.transaction.get_merkle", (txid, h), MERKLE_FETCH),
+        BlockFetch("coinbase", "blockchain.transaction.id_from_pos", (h, 0, True), COINBASE_FETCH),
+    ]
+    for start, count in plan.header_ranges:
+        out.append(
+            BlockFetch(
+                f"headers:{start}:{count}", "blockchain.block.headers", (start, count), _headers_fetch(start, count)
+            )
+        )
+    return tuple(out)
+
+
+def could_not_fetch(what: str, *, source: Any, detail: Any, height: Any) -> BlockVerification:
+    """NOT VERIFIED because *what* could not be fetched from *source* — a server that lacks the
+    method, a request that timed out, a reply refused as malformed. Never a finding against the
+    mark: the height falls back to the endpoint's word, with this reason. *source* and *detail*
+    are sanitised here, for every surface."""
+    from ._inspect_core import _sanitize_display_string  # lazy: this module stays import-light
+
+    return BlockVerification(
+        state=NOT_VERIFIED,
+        claim=None,
+        reason=f"{what} could not be fetched from {_sanitize_display_string(str(source))}: "
+        f"{_sanitize_display_string(str(detail))}",
+        height=height if _is_height(height) else None,
+    )
+
+
+def verify_with_fetched(
+    *,
+    txid: Any,
+    raw_tx: Any,
+    height: Any,
+    blockhash: Any,
+    min_confirmations: int,
+    source: Any,
+    fetched: Mapping[str, Any],
+    failed: Mapping[str, Any],
+    network: str = "mainnet",
+    checkpoints: Sequence[tuple[int, str]] | None = None,
+    target_confirmations: int | None = None,
+) -> BlockVerification | BlockFetch:
+    """The next :class:`BlockFetch` still needed, or the outcome once nothing is.
+
+    SYNCHRONOUS AND NEVER SUSPENDS: the browser bridge calls it without an event loop, once per
+    answer, and the CLI calls it in a loop around its own awaited fetches.
+
+    *fetched* maps a :attr:`BlockFetch.key` to the PARSED answer — a
+    :class:`~pyrxd.spv.radiant.TxMerkleBranch` for ``merkle``, the dict
+    :func:`~pyrxd.spv.radiant.coinbase_branch_from_reply` returns for ``coinbase``, the list of
+    80-byte headers :func:`~pyrxd.spv.radiant.block_headers_from_reply` returns for a range.
+    *failed* maps a key to why that fetch failed. The requests are walked in
+    :func:`block_fetches` order and the FIRST that failed ends it: :func:`could_not_fetch`, naming
+    *source*. When the plan says nothing can verify (no checkpoints, too far past the newest one),
+    or there is no txid, nothing is asked for and the verifier states the reason.
+
+    *min_confirmations* is required and *target_confirmations* only aimed for, as in
+    :func:`verify_mark_block`; ``pyrxd verify`` passes no target, the pages pass one.
+    """
+
+    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None) -> BlockVerification:
+        return verify_mark_block(
+            txid=txid,
+            raw_tx=raw_tx,
+            height=height,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers or {},
+            min_confirmations=min_confirmations,
+            blockhash=blockhash,
+            network=network,
+            checkpoints=checkpoints,
+            target_confirmations=target_confirmations,
+        )
+
+    plan = plan_block_verification(
+        height=height,
+        min_confirmations=min_confirmations,
+        target_confirmations=target_confirmations,
+        network=network,
+        checkpoints=checkpoints,
+    )
+    if plan.reason is not None or not txid:
+        return outcome()
+    merkle = coinbase = None
+    headers: dict[int, bytes] = {}
+    for step in block_fetches(plan, str(txid)):
+        if step.key in failed:
+            return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
+        if step.key not in fetched:
+            return step
+        got = fetched[step.key]
+        if step.key == "merkle":
+            merkle = got
+        elif step.key == "coinbase":
+            coinbase = got
+        else:
+            start = step.params[0]
+            for i, header in enumerate(got or ()):
+                headers.setdefault(start + i, header)
+    return outcome(merkle, coinbase, headers)
+
+
+#: Said beside every CONTRADICTED outcome, on every surface: an honest mark served by a confused or
+#: lying server gets one too.
+NOTHING_AGAINST_THE_MARK = (
+    "this says nothing against the mark itself, only that the server's own proof does not support "
+    "the height it reported"
+)
+
+
+def contradicted_sentence(height: Any, source: Any, reason: Any) -> str:
+    """Why no block is reported for a CONTRADICTED outcome — one sentence for the CLI and the pages."""
+    return f"the block proof {source or 'the endpoint'} served contradicts the height reported for the mark (block {height}): {reason}"

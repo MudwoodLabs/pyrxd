@@ -403,11 +403,16 @@ class TestThePanelAndTheCliShareOneAnchorShape:
         try:
             import glue as module
 
-            source = _i.getsource(module.mark_anchor)
+            sources = {name: _i.getsource(getattr(module, name)) for name in ("mark_anchor", "verify_mark_block")}
+            helper = _i.getsource(module._anchor_answer)
         finally:
             sys.path.remove(str(_GLUE_DIR))
             sys.modules.pop("glue", None)
-        assert "mark_anchor_dict(anchor)" in source, (
+        # Both answers the page draws a block from — before the block is verified and after — go
+        # through ONE helper, and that helper through `mark_anchor_dict`.
+        for name, source in sources.items():
+            assert "_anchor_answer(anchor" in source, f"glue.{name} builds its own anchor dict"
+        assert "mark_anchor_dict(anchor, verification" in helper, (
             "the browser bridge builds its own anchor dict again — that is the second "
             "display shape mark_anchor_dict exists to prevent"
         )

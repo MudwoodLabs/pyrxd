@@ -43,14 +43,26 @@
 //                      serves (any other height is refused), the tip, the depth
 //            "interleave"?: "clear" | {"classify": {"text", "result"}}, — what the reader does
 //                      while the fetch is still waiting on the server
-//            "interleave_on_request"?: n} — do it when the server receives its n-th request
+//            "interleave_on_request"?: n, — do it when the server receives its n-th request
 //                      (every method counted), instead of during the first fetch
+//            "verify_python"?: path, "checkpoints"?: [[h, hash], …], "proof"?: {…},
+//                      — the block PROOF the page runs after drawing: the REAL
+//                      glue.verify_mark_block as `pyVerifyMarkBlock` (absent: none, as before),
+//                      the mainnet checkpoints that subprocess uses, and the proof requests'
+//                      answers (proof_server.mjs)
+//            "choose_file"?: {"on_request": n, "hex": bytes}}
+//                      — the reader chooses a file in the card's file check when the server
+//                      receives its n-th request: its `change` listener runs, with the REAL
+//                      glue.file_check_plan and glue.judge_file_digest (run by verify_python) and
+//                      Node's real digest. The run waits for that comparison as well as the fetch.
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
 //            "glue_calls": [[arg, …], …],   — every call to the classifier bridge, verbatim
 //            "binding_calls": [[arg, …], …], — every call to the binding bridge, verbatim
 //            "anchor_calls": [[arg, …], …],  — every call to the block-lookup bridge, verbatim
+//            "verify_calls": [[arg, …], …],  — every call to the block-proof bridge, verbatim
 //            "server_log": [[method, params], …], — every request the server received, in order
 //            "rendered": "…",               — the result block's text, one node per line
+//            "files_chosen": n,             — how many file-check inputs the choice reached
 //            "status": "…",                 — the fetch-row status text when it finished
 //            "__constants__": {"max_rows_shown": n}}
 
@@ -60,6 +72,7 @@ import { fileURLToPath } from "node:url";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
 import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
+import { answerProof } from "./proof_server.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
@@ -100,8 +113,27 @@ class StubElement {
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
   }
-  addEventListener() {}
+  // Listeners are KEPT, so a case can fire one (`choose_file`): the page's own handler then runs.
+  addEventListener(type, cb) {
+    (this.listeners ||= {});
+    (this.listeners[type] ||= []).push(cb);
+  }
+  dispatch(type) {
+    return ((this.listeners && this.listeners[type]) || []).map((cb) => cb({ type, target: this }));
+  }
   focus() {}
+}
+
+// Every element under `node` (itself included) whose class list holds `name`, in document order.
+function byClass(node, name) {
+  const out = [];
+  const walk = (n) => {
+    if (!(n instanceof StubElement)) return;
+    if (String(n.className || "").split(/\s+/).includes(name)) out.push(n);
+    for (const child of n.childNodes) walk(child);
+  };
+  walk(node);
+  return out;
 }
 
 function renderedLines(node) {
@@ -150,6 +182,13 @@ function makeServer(table, requested, hooks) {
       hooks.count += 1;
       hooks.log.push([req.method, req.params]);
       if (hooks.onRequest) hooks.onRequest(hooks.count, req);
+      const proof = answerProof(hooks.proof, req.method, req.params);
+      if (proof && proof.hang) return;
+      if (proof) {
+        const frame = proof.error ? { id: req.id, error: proof.error } : { id: req.id, result: proof.result };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
       if (req.method === "blockchain.headers.subscribe") {
         const frame = { id: req.id, result: { height: hooks.tip, hex: "" } };
         setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
@@ -207,6 +246,7 @@ async function main() {
   const glueCalls = [];
   const bindingCalls = [];
   const anchorCalls = [];
+  const verifyCalls = [];
   const hooks = {
     count: 0,
     log: [],
@@ -215,6 +255,7 @@ async function main() {
     tip: spec.tip ?? 460572,
     blockhash: spec.blockhash,
     headers: spec.headers || {},
+    proof: spec.proof,
   };
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -275,10 +316,40 @@ async function main() {
   sandbox.__anchor_recorder__ = spec.anchor_python
     ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, anchorCalls)
     : recorder(anchorCalls, spec.anchor_returns || [], "anchor result");
+  sandbox.__verify_bridge__ = spec.verify_python
+    ? makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, verifyCalls, {
+      fn: "verify_mark_block",
+      checkpoints: spec.checkpoints,
+    })
+    : null;
   vm.runInContext(
-    "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__;",
+    "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__; " +
+    "pyVerifyMarkBlock = __verify_bridge__;",
     sandbox,
   );
+  // The file check's two bridges, the REAL glue's, only when a case chooses a file.
+  if (spec.choose_file) {
+    sandbox.__file_plan__ = makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, [], { fn: "file_check_plan" });
+    sandbox.__file_judge__ = makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, [], { fn: "judge_file_digest" });
+    vm.runInContext("pyFileCheckPlan = __file_plan__; pyJudgeFileDigest = __file_judge__;", sandbox);
+  }
+  // `choose_file`: the reader picks a file in every file check on the card, when the server
+  // receives its n-th request. The handlers' promises are kept, and awaited before the render.
+  const fileChecks = [];
+  let filesChosen = 0;
+  const chooseFile = () => {
+    const bytes = Buffer.from(spec.choose_file.hex, "hex");
+    const file = {
+      name: "chosen.bin",
+      size: bytes.length,
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length),
+    };
+    for (const input of byClass(vm.runInContext("RESULT_BLOCK", sandbox), "filecheck-input")) {
+      input.files = [file];
+      filesChosen += 1;
+      fileChecks.push(...input.dispatch("change"));
+    }
+  };
 
   const fetchBtn = new StubElement("button");
   const status = new StubElement("span");
@@ -304,20 +375,27 @@ async function main() {
     }
   };
   let acted = false;
-  if (spec.interleave && spec.interleave_on_request !== undefined) {
-    hooks.onRequest = (n) => {
-      if (n === spec.interleave_on_request) {
-        acted = true;
-        act();
-      }
-    };
-  }
+  let chose = false;
+  hooks.onRequest = (n) => {
+    if (spec.interleave && spec.interleave_on_request !== undefined && n === spec.interleave_on_request) {
+      acted = true;
+      act();
+    }
+    if (spec.choose_file && n === spec.choose_file.on_request) {
+      chose = true;
+      chooseFile();
+    }
+  };
   const pending = sandbox.onFetchTxid(spec.txid, fetchBtn, status);
   if (spec.interleave && spec.interleave_on_request === undefined) {
     acted = true;
     act();
   }
   await pending;
+  await Promise.all(fileChecks);
+  if (spec.choose_file && !chose) {
+    throw new Error(`the file was never chosen: the server saw ${hooks.count} request(s), not ${spec.choose_file.on_request}`);
+  }
   if (spec.interleave && !acted) {
     // A case that asked to interrupt at a request the page never made proves nothing.
     throw new Error(`the interleave never ran: the server saw ${hooks.count} request(s), not ${spec.interleave_on_request}`);
@@ -332,8 +410,10 @@ async function main() {
     glue_calls: glueCalls,
     binding_calls: bindingCalls,
     anchor_calls: anchorCalls,
+    verify_calls: verifyCalls,
     server_log: hooks.log,
     rendered: renderedLines(resultBlock),
+    files_chosen: filesChosen,
     status: status.textContent,
     __constants__: constants,
   }));

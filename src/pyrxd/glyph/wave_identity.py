@@ -65,7 +65,7 @@ from pyrxd.network._guards import nonneg_int
 from pyrxd.network.source_identity import one_source_label, source_keys
 from pyrxd.security.errors import ValidationError
 
-from .mark_anchor import MarkAnchor
+from .mark_anchor import INCLUSION_ONLY_CAVEAT, MarkAnchor
 from .mutable_chain import MutableChainWalk, fold_chain
 from .wave_rules import WAVE_ROOT_DOMAIN, _indexer_name_problem, _is_wave_marked, indexed_wave_name
 
@@ -153,19 +153,61 @@ def _degrade(*, ref: str, binding_source: str, reason: str, anchor: MarkAnchor) 
     )
 
 
-def _corroborated_caveat(sources: Sequence[str], *, mark_header_bound: bool) -> str:
+def _corroborated_caveat(
+    sources: Sequence[str],
+    *,
+    mark_header_bound: bool,
+    mark_verified: bool = False,
+    mark_inclusion_only: bool = False,
+) -> str:
     """The form-2 caveat: what the agreement covers, which heights a header checked, what nothing did.
 
     TRUE BY CONSTRUCTION, not by assumption. It said "pyrxd has no Radiant header ... check" on the
     same screen as a bound anchor's caveat saying the header WAS checked (0.25.0 panel, round 3).
     Whether the mark was header-checked comes from the reports themselves; the step heights never
-    are; and proof-of-work and merkle inclusion are checked by nothing.
+    are; and proof-of-work and merkle inclusion are checked by nothing — EXCEPT for the mark's own
+    block when ``mark_verified``: the anchor carries a depth pyrxd proved
+    (:attr:`~pyrxd.glyph.mark_anchor.MarkAnchor.verified_confirmations`, set only from a VERIFIED
+    block verification of this height, the same predicate that makes the ``block`` line print
+    VERIFIED). Then the sentence about the MARK's height says it was proved, and how, because "NOT
+    verified ... nothing checks merkle inclusion" beside ``block: VERIFIED ... merkle inclusion
+    proved`` was two elements of one screen disagreeing about one quantity (#806). The sentences
+    about the chain STEPS' heights are unchanged either way: those are still the endpoints' word.
+
+    And ``mark_inclusion_only``: the mark's block was NOT verified, but its merkle branch was
+    checked and passed (headers served short, a difficulty below the floor). The block line then
+    carries :data:`~pyrxd.glyph.mark_anchor.INCLUSION_ONLY_CAVEAT`, so the sentence about the mark's
+    height here IS that constant, not a retyped one, and "nothing checks ... merkle inclusion" is
+    said of the chain steps alone — it was false of the mark (#806, the inclusion-only case).
     """
+    if mark_verified:
+        return (
+            f"block heights — the mark's and every chain step's — were reported identically by "
+            f"{' and '.join(repr(s) for s in sources)}. The mark's height is also VERIFIED by pyrxd: the "
+            "mark's merkle branch leads to that block's header, which is linked hash by hash to a "
+            "checkpoint pyrxd ships (the mark's block verification says how). The chain steps' heights "
+            "are NOT verified: none was checked against a block header, and nothing checks their "
+            "proof-of-work or merkle inclusion, so one endpoint's lie about a step's height now shows as "
+            "a disagreement, but endpoints that agree on the same lie still change which update this "
+            "answer finds in force at the mark's block. Those endpoints are distinct operators as "
+            "declared, or by registered domain — not proven independent: one party can register "
+            "several domains, so one party running both would defeat the agreement"
+        )
     header = (
         "The mark's height was also checked against each endpoint's own block header; the step heights were not."
         if mark_header_bound
         else "No height here was checked against a block header."
     )
+    if mark_inclusion_only:
+        return (
+            f"block heights — the mark's and every chain step's — were reported identically by "
+            f"{' and '.join(repr(s) for s in sources)}, and are NOT verified. {header} The mark's own "
+            f"block: {INCLUSION_ONLY_CAVEAT}. Nothing checks the chain steps' proof-of-work or merkle "
+            "inclusion, so one endpoint's lie now shows as a disagreement, but endpoints that agree on "
+            "the same lie still move the point in time this answer is about. Those endpoints are "
+            "distinct operators as declared, or by registered domain — not proven independent: one "
+            "party can register several domains, so one party running both would defeat the agreement"
+        )
     return (
         f"block heights — the mark's and every chain step's — were reported identically by "
         f"{' and '.join(repr(s) for s in sources)}, and are NOT verified. {header} Nothing checks "
@@ -585,7 +627,17 @@ def judge_name_at_mark(
         provisional=False,
         expiry=EXPIRY_UNKNOWN,
         degraded_reason="",
-        caveat=_corroborated_caveat(sources, mark_header_bound=all(r.mark_header_bound for r in height_reports)),
+        caveat=_corroborated_caveat(
+            sources,
+            mark_header_bound=all(r.mark_header_bound for r in height_reports),
+            # The one predicate: set only by `with_proven_depth` from a VERIFIED proof of this
+            # height that reached the floor — exactly when the `block` line prints VERIFIED.
+            mark_verified=anchor.verified_confirmations is not None,
+            # `with_proven_depth` gives the anchor INCLUSION_ONLY_CAVEAT exactly when the proof's
+            # merkle step passed and the height did not verify — the rule `with_block_verification`
+            # gives the `block` line the same caveat by.
+            mark_inclusion_only=anchor.verified_confirmations is None and anchor.caveat == INCLUSION_ONLY_CAVEAT,
+        ),
         height_sources=tuple(sources),
     )
 

@@ -39,6 +39,15 @@
 //               `check` may also carry `blockhash` and `headers` ({height: hex}) for the block
 //               lookup, `anchor_python` (an interpreter: the REAL glue.mark_anchor answers the
 //               block lookup instead of `anchor_returns`) and `interleave_clear_on_request` (n).
+//               For the BLOCK PROOF the page runs after drawing: `verify_python` (an interpreter:
+//               the REAL glue.verify_mark_block is bound as `bridges.verifyMarkBlock`; absent, no
+//               proof bridge is bound and the page draws the server's word alone, as before),
+//               `checkpoints` ([[height, hash], …], replacing the shipped mainnet table in that
+//               subprocess) and `proof` (the proof requests' answers — see proof_server.mjs).
+//               The output then also carries `calls.verify`.
+//               A `result` case may carry `view_anchor_pending: true`: the page's own "still
+//               checking" marker is set on its anchor before it is drawn, as `lookUpTransaction`
+//               sets it while the proof runs.
 //   stdout:     JSON — {"name": {"text": "…", "classes": [...], "statuses": [...],
 //                                "panels": [...], "file_inputs": n, "judged": [...]}}
 //               `text` is one text node per line, so the Python side can assert on
@@ -56,6 +65,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
+import { answerProof } from "./proof_server.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
@@ -316,7 +326,11 @@ function tableServer(table, requested, onRequest) {
       requested.push([req.method, req.params]);
       if (onRequest) onRequest(requested.length, req);
       let frame;
-      if (req.method === "blockchain.headers.subscribe") {
+      const proof = answerProof(table.proof, req.method, req.params);
+      if (proof && proof.hang) return;
+      if (proof) {
+        frame = proof.error ? { id: req.id, error: proof.error } : { id: req.id, result: proof.result };
+      } else if (req.method === "blockchain.headers.subscribe") {
         frame = { id: req.id, result: { height: table.tip, hex: "" } };
       } else if (req.method === "blockchain.block.header") {
         // Served verbatim from the table, whatever it holds; any other height is refused the way
@@ -347,7 +361,7 @@ function tableServer(table, requested, onRequest) {
 // what it handed each bridge, and what it drew.
 async function driveCheck(renderer, spec) {
   const requested = [];
-  const calls = { run: [], fetch: [], anchor: [] };
+  const calls = { run: [], fetch: [], anchor: [], verify: [] };
   const recorder = (bucket, returns) => (...args) => {
     calls[bucket].push(args);
     const canned = (returns || [])[calls[bucket].length - 1];
@@ -372,6 +386,7 @@ async function driveCheck(renderer, spec) {
       tip: spec.tip ?? 460572,
       blockhash: spec.blockhash,
       headers: spec.headers || {},
+      proof: spec.proof,
     },
     requested,
     onRequest,
@@ -382,8 +397,17 @@ async function driveCheck(renderer, spec) {
   renderer.__anchor__ = spec.anchor_python
     ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, calls.anchor)
     : recorder("anchor", spec.anchor_returns);
+  // `verify_python`: the REAL glue.verify_mark_block is the page's proof bridge. Absent, none is
+  // bound — the page then draws the server's word alone, exactly as it did before the proof.
+  renderer.__verify__ = spec.verify_python
+    ? makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, calls.verify, {
+      fn: "verify_mark_block",
+      checkpoints: spec.checkpoints,
+    })
+    : undefined;
   vm.runInContext(
-    "pyRun = __run__; pyFetch = __fetch__; bridges = { markAnchor: __anchor__ }; " +
+    "pyRun = __run__; pyFetch = __fetch__; " +
+    "bridges = { markAnchor: __anchor__, ...(__verify__ ? { verifyMarkBlock: __verify__ } : {}) }; " +
     `INPUT_BOX.value = ${JSON.stringify(spec.text)};`,
     renderer,
   );
@@ -437,6 +461,9 @@ async function main() {
       if (spec.wire_error.kind !== undefined) err.kind = spec.wire_error.kind;
       node = renderer.renderReport(renderer.lookupFailure(err));
     } else if (spec && spec.result) {
+      if (spec.view_anchor_pending && spec.result.payload && spec.result.payload.mark_anchor) {
+        spec.result.payload.mark_anchor.block_proof_pending = true;
+      }
       node = renderer.renderReport(spec.result);
     } else {
       throw new Error(`case ${JSON.stringify(name)} has neither "result" nor "wire_error" — nothing to render`);

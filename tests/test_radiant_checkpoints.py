@@ -61,10 +61,12 @@ def test_the_table_was_confirmed_by_the_maintainers_node() -> None:
     A later ``--write`` WITHOUT the node flips both of these back, and this test fails."""
     assert cp.NODE_CONFIRMED == {"mainnet": True}
     doc = " ".join((cp.__doc__ or "").split())
-    assert "maintainer was a third, REQUIRED source: on 2026-09-30" in doc
+    ordinal = {2: "third", 3: "fourth"}[len(cp.SOURCES["mainnet"])]
+    assert f"maintainer was a {ordinal}, REQUIRED source: on 2026-09-30" in doc
     assert "``radiant-cli getblockhash <height>`` for every entry" in doc
     assert "NO node" not in doc
-    assert len(cp.SOURCES["mainnet"]) == 2, "SOURCES lists the ElectrumX servers; the node is not one"
+    assert cp.SOURCES["mainnet"], "SOURCES lists the ElectrumX servers that agreed"
+    assert all(u.startswith("wss://") for u in cp.SOURCES["mainnet"]), "the node is not one of SOURCES"
 
 
 def test_a_table_written_without_a_node_says_so() -> None:
@@ -135,8 +137,9 @@ def test_the_rendered_prose_counts_the_servers_it_lists() -> None:
         MAINNET[:1], servers=three, node_cli="x", pinned_at_tip=5000, min_depth=1000, generated_utc="2026-01-01"
     )
     flat = " ".join(with_node.split())
-    assert "all 3 servers agreed on every entry" in flat
-    assert "it agreed with all 3 servers on every one" in flat
+    assert "all three servers agreed on every entry" in flat
+    assert "it agreed with all three servers on every one" in flat
+    assert "was a fourth, REQUIRED source" in flat
     assert "any of the four would have refused" in flat
     assert "both servers" not in flat and "of the three" not in flat
     no_node = " ".join(

@@ -37,9 +37,10 @@ linkage to a checkpoint pyrxd ships (and proof-of-work above the newest one). Th
 run it. ``pyrxd verify`` runs it on the anchor it reports and hands the outcome to
 :func:`with_block_verification`, which is the only way a display dict's ``height_is_verified``
 becomes ``True`` — and, with ``--wave-name``, runs it in the form-2 lookup that fetched that
-anchor, before the name judgement reads its depth (:func:`with_proven_depth`). Every other anchor —
-the second endpoint's in form 2, ``glyph inspect``'s, the pages' (for now) — is still a single
-endpoint's claim and carries the caveat below.
+anchor, before the name judgement reads its depth (:func:`with_proven_depth`). The browser pages
+verify their anchor too, through the same :func:`with_block_verification`. Every other anchor —
+the second endpoint's in form 2, ``glyph inspect``'s — is still a single endpoint's claim and
+carries the caveat below.
 
 WHAT IT IS. ``get_transaction_verbose`` binds the echoed txid, so an endpoint cannot answer about a
 DIFFERENT transaction — that much is checked. Beyond it, an endpoint that lies about the height
@@ -420,13 +421,24 @@ def with_proven_depth(anchor: MarkAnchor, verification: Any) -> MarkAnchor:
     For a caller that judges the anchor's depth (``provisional``, ``usable_for_point_in_time``)
     after verifying its block: a VERIFIED block is judged by the depth proved, anything else by
     the endpoint's figure, exactly as the display dict's are (:func:`with_block_verification`).
-    Nothing else changes — the height, the endpoint's ``confirmations``, the caveat and ``source``
-    are still the endpoint's report; the display of the proof is :func:`mark_anchor_dict`'s job.
+
+    THE CAVEAT FOLLOWS THE SAME RULE, because a form-2 verdict that degrades hands the anchor's
+    caveat on as its own: it is the verifier's claim when the depth was proved, and
+    :data:`INCLUSION_ONLY_CAVEAT` when the merkle branch passed and the height still did not
+    verify — the caveat :func:`with_block_verification` gives the display dict — so neither says
+    "pyrxd checks no ... merkle inclusion" beside a block line saying it did (#806). Nothing else
+    changes: the height, the endpoint's ``confirmations`` and ``source`` are still the endpoint's
+    report, and ``height_is_verified`` stays False (it is a property of the display dict).
     """
     from dataclasses import replace
 
     depth = proven_depth(verification, height=anchor.height, min_confirmations=anchor.min_confirmations)
-    return replace(anchor, verified_confirmations=depth)
+    caveat = anchor.caveat
+    if depth is not None:
+        caveat = verification.claim
+    elif verification is not None and dict(getattr(verification, "steps", ()) or ()).get("merkle") == "passed":
+        caveat = INCLUSION_ONLY_CAVEAT
+    return replace(anchor, verified_confirmations=depth, caveat=caveat)
 
 
 def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = None) -> dict:

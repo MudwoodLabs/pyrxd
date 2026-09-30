@@ -472,14 +472,21 @@ class TestAReaderWhoMovedOnStopsTheCandidateFetches:
         That reason holds only while nothing in `onFetchTxid` awaits them, so it is pinned: the
         awaits are exactly the three network waits, each checked by a test above or in
         `test_inspect_fetch_flow.py::TestEveryLaterWaitIsGuardedToo`. A new await fails here, and
-        needs a `superseded()` check after it and a test that interrupts there."""
+        needs a `superseded()` check after it and a test that interrupts there. The fourth,
+        `proveMarkBlock`, verifies the block after the card is drawn: its wait is interrupted in
+        `test_block_proof_on_the_pages.py::test_inspect_a_reader_who_moves_on_during_the_proof_gets_no_redraw`."""
         import re
 
         source = (_REPO_ROOT / "docs" / "inspect_static" / "inspect" / "inspect.js").read_text(encoding="utf-8")
         start = source.index("async function onFetchTxid(")
         body = source[start : source.index("\n}\n", start)]
         awaited = re.findall(r"await\s+([A-Za-z_$][\w$]*)\s*\(", body)
-        assert sorted(awaited) == ["fetchRawTxFromElectrumx", "fetchRawTxFromElectrumx", "resolveMarkAnchor"], awaited
+        assert sorted(awaited) == [
+            "fetchRawTxFromElectrumx",
+            "fetchRawTxFromElectrumx",
+            "proveMarkBlock",
+            "resolveMarkAnchor",
+        ], awaited
         for bridge in ("pyGlueFetch", "pySpentBinding"):
             assert f"{bridge}(" in body, f"the premise: onFetchTxid calls {bridge}"
             assert not re.search(rf"await\s+(fromPy\s*\(\s*)?{bridge}\b", body), f"{bridge} is awaited now"

@@ -176,8 +176,9 @@ async function onCheck() {
   }
   const token = ++inFlight;
   CHECK_BTN.disabled = true;
+  let result = null;
   try {
-    const result = await lookUp(text, token);
+    result = await lookUp(text, token);
     if (token !== inFlight) return;
     renderResult(result);
     updateUrlForInput(text);
@@ -187,6 +188,58 @@ async function onCheck() {
       setFormStatus("");
     }
   }
+  // AFTER the answer is drawn, and never before it: verifying the block costs more round trips
+  // and, at the end, Python hashing on this thread, and the block the server reported is already on
+  // screen with its caveat. `blockProof` is kept so a caller (the render harness) can wait for it.
+  blockProof = verifyTheBlock(result, token);
+  await blockProof;
+}
+
+// The block proof in flight, if any — `onCheck` starts it once the answer is drawn.
+let blockProof = null;
+
+// What the block proof needs that the drawn answer does not carry: the transaction's number and
+// the bytes the page already fetched and hash-checked. Keyed by the result it belongs to, so a
+// proof can only ever be run for the answer it was fetched with.
+const PROOF_INPUTS = new WeakMap();
+
+// Verify the mark's block, then redraw only the "When was it published?" answers — every mark
+// panel shares the transaction's one block — so a file the reader is already comparing, lower
+// down, is left alone. A reader who has moved on (`token`) gets nothing redrawn.
+async function verifyTheBlock(result, token) {
+  const input = result ? PROOF_INPUTS.get(result) : null;
+  if (!input) return;
+  const anchor = result.payload.mark_anchor;
+  const answer = await proveMarkBlock(
+    bridges && bridges.verifyMarkBlock, input.txid, input.rawHex, anchor, () => token !== inFlight,
+  );
+  if (token !== inFlight) return;
+  let settled;
+  if (answer && answer.anchor) {
+    settled = answer.anchor;
+  } else {
+    // Nothing to replace the drawn block with: keep it, and say why it was not verified.
+    settled = Object.assign({}, anchor);
+    delete settled.block_proof_pending;
+    if (answer && answer.reason) settled.block_proof_problem = answer.reason;
+  }
+  result.payload.mark_anchor = settled;
+  for (const sec of collectByClass(RESULT_BLOCK, "qa-when")) {
+    sec.replaceChildren(...answerWhen(settled, anchorReasonFor(result)).childNodes);
+  }
+}
+
+// Every element under `node` whose class list holds `name`, in document order. Walks
+// `childNodes` rather than asking `querySelectorAll`, so it reads a stub DOM the same way.
+function collectByClass(node, name) {
+  const out = [];
+  const walk = (n) => {
+    const cls = typeof n.className === "string" ? n.className : "";
+    if (cls.split(/\s+/).includes(name)) out.push(n);
+    for (const child of n.childNodes || []) walk(child);
+  };
+  walk(node);
+  return out;
 }
 
 // Turn what was typed into a classification, with the block attached when there is
@@ -293,6 +346,13 @@ async function lookUpTransaction(txid, token, named) {
     const anchor = await resolveMarkAnchor(bridges.markAnchor, txid, () => token !== inFlight);
     if (token !== inFlight) return null;
     result.payload.mark_anchor = anchor;
+    // A block to verify, and the runtime to verify it with: drawn now as the server's word, marked
+    // as being checked, and verified once it is on screen (`verifyTheBlock`).
+    if (anchor && anchor.resolved && anchor.height !== null && anchor.height !== undefined &&
+        bridges && bridges.verifyMarkBlock) {
+      anchor.block_proof_pending = true;
+      PROOF_INPUTS.set(result, { txid, rawHex });
+    }
   }
   return result;
 }
@@ -1226,6 +1286,8 @@ function depthInWords(confirmations) {
 // Those are three different facts and only one of them is benign.
 function answerWhen(anchor, anchorReason) {
   const sec = question("When was it published?");
+  // Found again by `verifyTheBlock`, which redraws this answer once the block is verified.
+  sec.className = "qa qa-when";
 
   if (!anchor) {
     sec.appendChild(para(`Not established — ${safeText(anchorReason)}.`));
@@ -1237,6 +1299,8 @@ function answerWhen(anchor, anchorReason) {
     return sec;
   }
   if (!anchor.resolved) {
+    // Also where a block proof that CONTRADICTS the height lands: `glue.verify_mark_block` then
+    // answers with no block number and the reason, as `pyrxd verify` refuses to report one.
     sec.appendChild(para(`Not established — ${safeText(anchor.reason || "no reason was given")}.`));
     sec.appendChild(para(
       "The record was read; its block was not. That is a fact about the lookup, not " +
@@ -1254,39 +1318,89 @@ function answerWhen(anchor, anchorReason) {
     return sec;
   }
 
+  // VERIFIED: the height rests on a checkpoint pyrxd ships, not on the server. Only when the
+  // Python side says so (`height_is_verified`, set by `with_block_verification` for a VERIFIED
+  // outcome alone) AND carries the outcome it came from — the same two things `pyrxd verify`
+  // reads before it prints VERIFIED. Inclusion alone never gets here.
+  const bv = anchor.block_verification && typeof anchor.block_verification === "object"
+    ? anchor.block_verification
+    : null;
+  const verified = anchor.height_is_verified === true && bv !== null && bv.state === "VERIFIED";
+
   // safeText ON THE NUMBERS TOO. They are ints by the time `resolve_mark_anchor` is
   // done with them — `nonneg_int` refuses anything else and the height is one of the
   // candidate heights it computed from them — so this is not closing a live hole. It closes the LAST place on this
   // page where a payload value reaches a sentence without passing the sanitiser,
   // which is what keeps "every string is sanitised" a property of the file rather
   // than a fact about today's callers.
-  sec.appendChild(para(
-    // "KNEW THE FINGERPRINT", not "knew the file". A signed record can be copied into
-    // anyone's transaction and a v1 record can carry any fingerprint its publisher was
-    // given, so the block shows the fingerprint was known by then — not that whoever
-    // published this transaction ever had the file.
-    `In block ${safeText(anchor.height)}, ${depthInWords(anchor.confirmations)}. So the ` +
-    "fingerprint above existed no later than that block — whoever published it knew that " +
-    "fingerprint by then, which is not the same as having had the file.",
-  ));
+  //
+  // "KNEW THE FINGERPRINT", not "knew the file". A signed record can be copied into
+  // anyone's transaction and a v1 record can carry any fingerprint its publisher was
+  // given, so the block shows the fingerprint was known by then — not that whoever
+  // published this transaction ever had the file.
+  const knew =
+    "So the fingerprint above existed no later than that block — whoever published it knew that " +
+    "fingerprint by then, which is not the same as having had the file.";
   const dl = el("dl", { class: "facts" });
   dl.appendChild(fact("block", anchor.height));
-  dl.appendChild(fact("confirmations", anchor.confirmations));
-  sec.appendChild(dl);
-  // THE CAVEAT TRAVELS WITH THE NUMBER. `mark_anchor_dict` carries it precisely so a
-  // height cannot reach a screen without it. A height reaches this line only when it is
-  // BOUND — the server's own header at it hashes to the block the server's node names — and
-  // the caveat says exactly that and no more: checked against the endpoint itself, with
-  // nothing checking proof-of-work or merkle inclusion, so it is still one server's claim.
-  // An unbound height never gets here: it is the `!anchor.resolved` branch above.
-  sec.appendChild(para(
-    `About that block number: ${safeText(anchor.caveat)}. It was reported by ${safeText(anchor.source)}.`,
-    "answer-body muted",
-  ));
+  if (verified) {
+    // THE PROVED DEPTH, and the server's figure beside it only as the server's — as `pyrxd verify`
+    // prints them. The proved depth is a lower bound; the server's number is only a claim.
+    const proved = anchor.verified_confirmations;
+    const differs = proved !== anchor.confirmations;
+    sec.appendChild(para(
+      `In block ${safeText(anchor.height)}, ${provedDepthInWords(proved)}` +
+      (differs ? ` (the server reports ${safeText(anchor.confirmations)})` : "") +
+      `. ${knew}`,
+    ));
+    dl.appendChild(fact("confirmations verified here", `at least ${safeText(proved)}`));
+    if (differs) dl.appendChild(fact("confirmations the server reports", anchor.confirmations));
+    sec.appendChild(dl);
+    // THE CLAIM IS PYTHON'S, WHOLE: `anchor.caveat` is the verifier's own sentence
+    // (`with_block_verification` puts it there), saying what was proved and what was not. It
+    // replaces the endpoint's-word caveat, which would contradict it on this screen.
+    sec.appendChild(para(`Verified here: ${safeText(anchor.caveat)}`, "answer-body verified"));
+    sec.appendChild(para(`The proof was fetched from ${safeText(bv.source || anchor.source)}.`, "answer-body muted"));
+  } else {
+    sec.appendChild(para(`In block ${safeText(anchor.height)}, ${depthInWords(anchor.confirmations)}. ${knew}`));
+    dl.appendChild(fact("confirmations", anchor.confirmations));
+    sec.appendChild(dl);
+    // THE CAVEAT TRAVELS WITH THE NUMBER. `mark_anchor_dict` carries it precisely so a
+    // height cannot reach a screen without it. A height reaches this line only when it is
+    // BOUND — the server's own header at it hashes to the block the server's node names — and
+    // the caveat says exactly what was checked: against the endpoint itself, or, when the block
+    // proof ran and its merkle branch passed without the height verifying, that inclusion alone
+    // fixes no height (`INCLUSION_ONLY_CAVEAT`). Either way it is still one server's claim.
+    // An unbound height never gets here: it is the `!anchor.resolved` branch above.
+    sec.appendChild(para(
+      `About that block number: ${safeText(anchor.caveat)}. It was reported by ${safeText(anchor.source)}.`,
+      "answer-body muted",
+    ));
+    // WHY NOT BETTER, in Python's words (`reason`), or the page's own when the proof never
+    // reached Python's verdict (`block_proof_problem`). While it runs, say that it is running.
+    const why = (bv && bv.reason) || anchor.block_proof_problem;
+    if (why) {
+      sec.appendChild(para(`Not verified here: ${safeText(why)}.`, "answer-body muted"));
+    } else if (anchor.block_proof_pending) {
+      sec.appendChild(para(
+        "Checking this block against the checkpoints pyrxd ships…",
+        "answer-body muted block-proof-pending",
+      ));
+    }
+  }
   if (anchor.no_depth_policy) {
     sec.appendChild(para(`${safeText(anchor.no_depth_policy)}.`, "answer-body muted"));
   }
   return sec;
+}
+
+// The PROVED depth in words, worded as `pyrxd verify` words it ("at least N confirmation(s)
+// verified"): a lower bound, and the mark's own block counts as the first.
+function provedDepthInWords(proved) {
+  const n = Number(proved);
+  if (!Number.isInteger(n) || n < 1) return `with at least ${safeText(proved)} confirmation(s) verified here`;
+  if (n === 1) return "with at least 1 confirmation verified here: the block itself";
+  return `with at least ${n} confirmations verified here: the block itself and ${n - 1} built on top of it`;
 }
 
 // ── 4. the file ─────────────────────────────────────────────────────────
