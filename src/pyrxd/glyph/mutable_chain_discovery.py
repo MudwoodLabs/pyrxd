@@ -39,7 +39,7 @@ change that: a scripthash history is still one server's claim about which transa
 :func:`walk_discovered_chain` therefore takes a DISCOVERY client and a TIP client and labels them.
 Handing it the same endpoint twice is allowed and degrades honestly — which is what a single-server
 configuration (``--electrumx URL``, or a config naming one server) should do. The shipped mainnet
-default is NOT single-server: ``network/registry.py`` ships two endpoints on distinct hosts.
+default is NOT single-server: ``network/registry.py`` ships endpoints of two operators.
 
 WHAT IS AND IS NOT A SERVER CLAIM HERE. Every transaction is fetched txid-bound (the bytes must hash
 to the txid asked for), so the CONTENT of a transaction cannot be forged by either server. What a
@@ -365,15 +365,16 @@ async def walk_discovered_chain(
     tip_source: str,
     max_steps: int = MAX_CHAIN_STEPS,
     max_fetches: int = MAX_DISCOVERY_FETCHES,
+    operators: Mapping[str, str] | None = None,
 ) -> DiscoveredWalk:
     """Discover from one server, prove the tip on another, walk — and ask the tip server too
-    where each walked step is, so the step heights have a second source (a distinct host when the
-    two clients are).
+    where each walked step is, so the step heights have a second source (a distinct operator, as
+    declared, or by registered domain, when the two clients are).
 
     The two clients MAY be the same endpoint. The walk then reports ``complete=False`` with the
     source-conflict reason, because that is the truth of a single-server configuration: it cannot
     prove the history is whole. Give the two labels different values only when the endpoints
-    really are different.
+    really are different. ``operators`` are the declarations for the two labels, passed to the walk.
     """
     fetch = cached_fetcher(discovery_client)
     discovery = await discover_mutable_chain(
@@ -392,6 +393,7 @@ async def walk_discovered_chain(
         candidate_source=discovery_source,
         tip_source=tip_source,
         max_steps=max_steps,
+        operators=operators,
     )
     from pyrxd.security.errors import NetworkError
 

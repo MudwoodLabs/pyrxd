@@ -45,6 +45,7 @@ from pyrxd.glyph.mutable_chain import ChainStep, MutableChainWalk
 from pyrxd.hashmark_tx import plan_hashmark
 from pyrxd.keys import PrivateKey
 from pyrxd.network.registry import default_endpoints
+from pyrxd.network.source_identity import source_key
 from pyrxd.script.hashmark import HashMarkOutcome, decode_hashmark
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction import Transaction
@@ -306,8 +307,10 @@ class TestTheShippedDefaultConfig:
         cfg = cfg_mod.load(tmp_path / "no-such.toml").for_network("mainnet")
         ctx = CliContext(config=cfg, output_mode="human", wallet_path=tmp_path / "w", network="mainnet")
         _a, label_a, _b, label_b = glyph_inspect._endpoint_pair(ctx)
-        assert (label_a, label_b) == default_endpoints("mainnet")
-        assert label_a != label_b
+        # The first shipped endpoint, and the first of a DIFFERENT operator — not radiant4people's
+        # second server, which is the same source as the first (#801 follow-up: operator groups).
+        assert (label_a, label_b) == default_endpoints("mainnet")[:2]
+        assert source_key(label_a) != source_key(label_b)
 
     def test_the_threat_model_names_the_endpoints_the_registry_ships(self) -> None:
         """The seventh copy of the single-endpoint claim was in docs/threat-model.md. The hosts are
@@ -318,7 +321,7 @@ class TestTheShippedDefaultConfig:
         doc = (Path(__file__).resolve().parents[1] / "docs" / "threat-model.md").read_text(encoding="utf-8")
         flat = " ".join(doc.split())
         hosts = [urlparse(u).hostname for u in default_endpoints("mainnet")]
-        assert len(hosts) == 2 and all(hosts), hosts
+        assert len(hosts) == len(default_endpoints("mainnet")) >= 2 and all(hosts), hosts
         for host in hosts:
             assert host in flat, f"threat-model.md does not name the shipped endpoint {host}"
         assert "uses one public ElectrumX server" not in flat
@@ -329,7 +332,9 @@ class TestTheShippedDefaultConfig:
             monkeypatch.delenv(var, raising=False)
         replay = _signed(_content(world, "victim"), world["victim"], label="VictimCorp press kit")
         txid, raw = _tx(_v1(hashlib.sha256(_content(world, "attacker")).digest()), replay)
-        a_url, b_url = default_endpoints("mainnet")
+        # The first two shipped servers are the two operators `_endpoint_pair` picks; the third is
+        # radiant4people's failover server and is never a second source.
+        a_url, b_url = default_endpoints("mainnet")[:2]
         # The second shipped server runs the indexer, the first does not — as measured.
         a = _Server({txid: raw}, indexer=False)
         b = _Server({txid: raw}, indexer=True, target=world["victim_addr"], mint=a.mint)

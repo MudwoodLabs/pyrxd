@@ -83,7 +83,8 @@ from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.network.source_identity import group_by_source
+from pyrxd.network.registry import default_endpoints
+from pyrxd.network.source_identity import describe_source, group_by_source
 from pyrxd.security.errors import RxdSdkError, ValidationError
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -199,12 +200,12 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     A wrong/mainnet base on a signet run reads the wrong chain → the funding is never found → the maturity
     gate stays WATCH (fail-closed, never a wrongful broadcast)."""
     if network == "bc":
-        # Mainnet: the three default distinct-host endpoints (2-of-3). from_endpoints fails closed if the
-        # endpoints ever resolve to < quorum distinct hosts — no silent single-source above-dust arming.
+        # Mainnet: the three default endpoints, three registered domains (2-of-3). from_endpoints fails
+        # closed if they ever resolve to < quorum distinct sources — no silent single-source above-dust arming.
         return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
     # Non-mainnet (signet/testnet) is a NO-REAL-VALUE test network and is typically 1-of-1, so it
-    # explicitly accepts insufficient host diversity (allow_insufficient_diversity) and clamps the
-    # effective quorum to the distinct-host count with a loud warning — the mainnet fail-closed above is
+    # explicitly accepts insufficient source diversity (allow_insufficient_diversity) and clamps the
+    # effective quorum to the distinct-source count with a loud warning — the mainnet fail-closed above is
     # the one that guards real value.
     api_urls = [u.rstrip("/") + "/api" for u in esploras]
     return MultiSourceBtcFundingReader.from_endpoints(
@@ -212,24 +213,25 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     )
 
 
-#: Default public Radiant ElectrumX endpoints on DISTINCT HOSTS, verified live 2026-06-08 (the same
-#: pair as ``pyrxd.network.registry.DEFAULT_ENDPOINTS["mainnet"]``, whose note records what is and
-#: is not known about who runs them). Used when --rxd-electrumx-url is not given on an electrumx
-#: run, so the recommended 2-of-2 (or 2-of-3 with --rxd-include-node) corroboration is turnkey —
-#: mirrors the BTC reader's DEFAULT_MAINNET_ENDPOINTS. Pass --rxd-electrumx-url explicitly to override.
-DEFAULT_RXD_ELECTRUMX = (
-    "wss://electrumx.radiant4people.com:50022",
-    "wss://electrumx.radiantcore.org",
-)
+#: Default public Radiant ElectrumX endpoints: ``pyrxd.network.registry.DEFAULT_ENDPOINTS["mainnet"]``
+#: itself (derived, so the two lists cannot drift), whose note records the operators, the source
+#: of that statement, and the liveness probe. Two operators, three servers: the two radiant4people
+#: servers are ONE source (one client that fails over between them). Used when --rxd-electrumx-url
+#: is not given on an electrumx run, so the recommended 2-of-2 (or 2-of-3 with --rxd-include-node)
+#: corroboration is turnkey — mirrors the BTC reader's DEFAULT_MAINNET_ENDPOINTS. Pass
+#: --rxd-electrumx-url explicitly to override.
+DEFAULT_RXD_ELECTRUMX = default_endpoints("mainnet")
 
 
 async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> tuple[RxdChainSource, bool]:
     """Assemble the RXD chain source(s); return ``(source, corroborated)``.
 
     Composes (optionally) the operator's own ssh-tr node + any number of public ElectrumX endpoints,
-    ONE SOURCE PER DISTINCT HOST (:func:`pyrxd.network.source_identity.source_key`): several URLs on
-    one host become one client that races them (failover), never several sources. Distinct hosts are
-    not proof of distinct operators (the operator limit in :mod:`pyrxd.network.source_identity`).
+    ONE SOURCE PER OPERATOR GROUP — by registered domain, or an operator pyrxd ships knowledge of
+    (:func:`pyrxd.network.source_identity.source_key`; the watchtower takes no operator declaration,
+    and a config file's does not reach it): several URLs of one operator become one
+    client that races them (failover), never several sources. The grouping is not proof of
+    independence (the operator limit in :mod:`pyrxd.network.source_identity`).
     With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
     :class:`MultiSourceRxdChainSource` and ``corroborated=True`` (clears the single-source
     ``low_corroboration`` flag — the recurring v2 blocker); a single source stays ``corroborated=False``
@@ -254,27 +256,41 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         sources.append(ElectrumRxdChainSource(SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)))
     # Public ElectrumX endpoints (repeatable). Default to the verified set unless this is a node-only run.
     urls = list(args.rxd_electrumx_url or [])
+    # What the URLs ARE, for the messages below: the flags the operator gave, or pyrxd's defaults.
+    # A warning about "--rxd-electrumx-url values" on a run that passed none sent the reader to a
+    # flag they never used.
+    what_urls = "--rxd-electrumx-url values"
+    using_defaults = False
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
-    # ONE SOURCE PER HOST, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
-    # `wss://h/x` and `wss://h.` are one server; keyed on the URL text they were four sources, and
-    # one server's "not locked" became a CORROBORATED absence that permits an autonomous refund.
-    # A host's URLs go to ONE client, which races them — failover, counted once.
+        what_urls = "default RXD ElectrumX endpoints (no --rxd-electrumx-url given)"
+        using_defaults = True
+    # ONE SOURCE PER OPERATOR GROUP, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
+    # `wss://h/x` and `wss://h.` are one server, and `wss://x.d.example` and `wss://y.d.example` one
+    # registered domain; counted apart, one party's "not locked" became a CORROBORATED absence that
+    # permits an autonomous refund. A group's URLs go to ONE client, which races them — failover,
+    # counted once.
     groups = group_by_source(u.strip() for u in urls)
-    for _host, host_urls in groups:
-        client = await stack.enter_async_context(ElectrumXClient(host_urls, allow_insecure=args.allow_insecure))
+    for _key, group_urls in groups:
+        client = await stack.enter_async_context(ElectrumXClient(group_urls, allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
-    # Say so when the list the operator wrote is not the quorum they meant: several URLs on one host
-    # collapse to one source, and if that leaves one source, corroboration is OFF.
-    for host, host_urls in groups:
-        if len(host_urls) > 1:
-            logger.warning(
-                "RXD sources: %d --rxd-electrumx-url values name ONE host (%r): %s. One host is one "
-                "source however many URLs reach it, so they are one failover source, not %d sources",
-                len(host_urls),
-                str(host),
-                ", ".join(host_urls),
-                len(host_urls),
+    # Say so when the list the operator wrote is not the quorum they meant: several URLs of one
+    # operator collapse to one source, and if that leaves one source, corroboration is OFF. The
+    # shipped defaults collapse BY DESIGN (radiant4people's second server is its failover, and a
+    # second operator is still there), so for them this is INFO: a WARNING on every default run is
+    # one the operator learns to ignore, and then it says nothing when their own list collapses.
+    for key, group_urls in groups:
+        if len(group_urls) > 1:
+            logger.log(
+                logging.INFO if using_defaults else logging.WARNING,
+                "RXD sources: %d %s are ONE source (%s): %s. Sources are counted by operator (one "
+                "pyrxd ships knowledge of, else the registered domain; every loopback spelling is this "
+                "machine), so they are one failover source, not %d sources",
+                len(group_urls),
+                what_urls,
+                describe_source(key),
+                ", ".join(group_urls),
+                len(group_urls),
             )
     if not sources:
         raise ValidationError(
@@ -284,15 +300,17 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if len(sources) == 1:
         if len(urls) > 1:
             logger.warning(
-                "RXD corroboration is OFF: the %d --rxd-electrumx-url values are all on one host, so the "
-                "watchtower runs SINGLE-SOURCE (every RXD read is low-corroboration). Add a URL on a "
-                "distinct host to corroborate.",
+                "RXD corroboration is OFF: the %d %s are all one source (one registered domain, one "
+                "operator pyrxd ships knowledge of, or this machine's loopback), so the watchtower runs SINGLE-SOURCE (every RXD read "
+                "is low-corroboration). Add a --rxd-electrumx-url of a different operator to corroborate; "
+                "the watchtower takes no operator declaration, so that means a different registered domain.",
                 len(urls),
+                what_urls,
             )
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
         raise ValidationError(
-            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} RXD source(s) on distinct hosts wired; "
+            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} RXD source(s) of distinct operators wired; "
             "add --rxd-electrumx-url / --rxd-include-node, or lower --rxd-quorum"
         )
     # corroborated only when the quorum is a real majority-style check (>= 2); quorum=1 trusts any one.
@@ -679,14 +697,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rxd-include-node",
         action="store_true",
         help="ALSO include the operator's own ssh-tr node as an RXD source on its own host (combine with "
-        "--rxd-electrumx-url for 2-of-3); it counts as one more distinct host beside the public ElectrumX",
+        "--rxd-electrumx-url for 2-of-3); it counts as one more source beside the public ElectrumX (unless its "
+        "host is one of theirs: sources are counted by registered domain, or an operator pyrxd ships)",
     )
     p.add_argument(
         "--rxd-quorum",
         type=int,
         default=2,
         help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
-        "sources on distinct hosts are wired; fail-closed below it). Several URLs on one host count once",
+        "sources of distinct operators are wired; fail-closed below it). Sources are counted by registered "
+        "domain, or by an operator pyrxd ships knowledge of: several URLs of one count once. There is no "
+        "operator declaration here",
     )
     # No defaults: this ships in the public wheel. The previous "tr" / "radiant-mainnet"
     # defaults were one operator's private infrastructure, and a user who passed only
@@ -975,7 +996,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
     # Esplora set for multi-source claim DETECTION (exact repeats dropped, order preserved). Default a
     # free second source so corroboration is ON out of the box (red-team MEDIUM). Detection is
     # any-of, so a repeated host costs nothing there; the funding QUORUM built from this list counts
-    # by host (`MultiSourceBtcFundingReader.from_endpoints` -> `source_key`), not by this dedupe.
+    # by source (`MultiSourceBtcFundingReader.from_endpoints` -> `source_key`), not by this dedupe.
     esploras = [args.mempool_base_url, *(args.esplora_url or [])]
     # blockstream.info is a MAINNET endpoint — only auto-add it on mainnet (a signet/testnet run must
     # point --mempool-base-url at that network's Esplora, e.g. https://mempool.space/signet).

@@ -52,29 +52,40 @@ Only endpoints confirmed reachable are shipped. ``testnet`` and ``regtest`` ship
 **none**: no public Radiant testnet ElectrumX server was confirmed, and regtest is
 by definition a local, per-developer chain. That is honest rather than convenient
 — a guessed endpoint is exactly the failure mode this module exists to remove.
+
+Each shipped endpoint carries its OPERATOR (:class:`ShippedEndpoint`), and
+:data:`KNOWN_OPERATORS` records which registered domain each operator runs. Source
+counting (:func:`pyrxd.network.source_identity.source_key`) uses them, so two
+servers of one operator are one source however many there are.
 """
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from ..constants import GENESIS_BLOCK_HASHES, genesis_hash_for
 from ..security.errors import ValidationError
-from .source_identity import canonical_host, source_key
+from .source_identity import _canonical_host_of, canonical_host, registered_domain, require_one_key_per_host, source_key
 from .tls_pin import normalize_pin
 
 __all__ = [
     "DEFAULT_ENDPOINTS",
     "GENESIS_BLOCK_HASHES",
     "KNOWN_NETWORKS",
+    "KNOWN_OPERATORS",
+    "SHIPPED_ENDPOINTS",
     "Endpoint",
     "NetworkProfile",
+    "ShippedEndpoint",
     "block_hash_hex",
     "default_endpoints",
     "genesis_hash_for",
+    "shipped_operator_domains",
 ]
 
 #: Networks the CLI/config layer understands. Mirrors ``--network``'s choices.
@@ -83,26 +94,89 @@ KNOWN_NETWORKS: tuple[str, ...] = ("mainnet", "testnet", "regtest")
 #: Expected genesis block hash per network, in display (reversed) byte order —
 #: the form ``getblockhash 0`` prints. See the module docstring for provenance.
 
-#: Shipped ElectrumX endpoints per network, in preference order.
+#: Which OPERATOR runs each registered domain pyrxd knows about, keyed by registered domain
+#: (eTLD+1). Source counting treats every host under one of these domains as that operator
+#: (:func:`pyrxd.network.source_identity.source_key`).
 #:
-#: mainnet: two public servers on DISTINCT HOSTS, both confirmed live on
-#: 2026-08-10 — same tip height, and both served the mainnet genesis header
-#: above. On 2026-09-29 their names resolved to different IP addresses under
-#: different DNS providers: separate infrastructure, which is NOT proof of
-#: separate operators (nothing a client can observe is). This is the same pair the watchtower
-#: ships as ``pyrxd.gravity.watch.run.DEFAULT_RXD_ELECTRUMX``.
+#: SOURCE: the Radiant maintainer's statement of 2026-09-29 that radiant4people.com,
+#: radiantcore.org and bladenet.online are three DIFFERENT operators. That is a statement, not
+#: something a client can observe; the limit is in :mod:`pyrxd.network.source_identity`.
+KNOWN_OPERATORS: Mapping[str, str] = {
+    "radiant4people.com": "radiant4people",
+    "radiantcore.org": "radiantcore",
+    "bladenet.online": "bladenet",
+}
+
+
+@dataclass(frozen=True)
+class ShippedEndpoint:
+    """A default endpoint and the operator that runs it (one of :data:`KNOWN_OPERATORS`)."""
+
+    url: str
+    operator: str
+
+
+#: Shipped ElectrumX endpoints per network, in preference order, each with its operator.
+#:
+#: mainnet: two operators, three servers. Operators per the maintainer's statement of 2026-09-29
+#: (:data:`KNOWN_OPERATORS`). Liveness, measured 2026-09-29 (~03:02 UTC on 09-30) from one vantage
+#: point: all three answered ``blockchain.block.header`` 0 with the mainnet genesis above and
+#: reported tip 468,606. ``electrumx2.radiant4people.com`` is radiant4people's SECOND server and
+#: is here for FAILOVER, not corroboration: it is the same operator as the first entry, so it is
+#: one source with it. It comes last so that a two-endpoint pick (HashMark §7.6 form 2) reaches a
+#: second operator first.
+#:
+#: NOT shipped, deliberately: bladenet. Photonic's ``packages/app/src/config.json``
+#: ``defaultConfig.servers.mainnet`` (Radiant-Core/Photonic-Wallet @ ``becf41a``) lists
+#: ``wss://radiant2.bladenet.online:50022``, ``wss://radiantus.bladenet.online:50022`` and
+#: ``wss://radiant4.bladenet.online:50022`` beside the three above, but none answered on
+#: 2026-09-29 from here: radiant2 :50022 timed out and its :443 accepted TCP but failed the TLS
+#: handshake (alert 80, no certificate); radiantus had no route to host on :50022 or :443;
+#: radiant4 timed out on both. A dead default only slows failover. They are listed in
+#: :data:`KNOWN_OPERATORS`, so a user who configures one gets it counted as bladenet.
 #:
 #: testnet/regtest: EMPTY, on purpose. Shipping a mainnet URL under a non-mainnet
 #: key is the bug this module exists to prevent, and inventing a plausible-looking
 #: testnet host would be worse than admitting there isn't one.
-DEFAULT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
+SHIPPED_ENDPOINTS: Mapping[str, tuple[ShippedEndpoint, ...]] = {
     "mainnet": (
-        "wss://electrumx.radiant4people.com:50022/",
-        "wss://electrumx.radiantcore.org/",
+        ShippedEndpoint("wss://electrumx.radiant4people.com:50022/", operator="radiant4people"),
+        ShippedEndpoint("wss://electrumx.radiantcore.org/", operator="radiantcore"),
+        ShippedEndpoint("wss://electrumx2.radiant4people.com:50022/", operator="radiant4people"),
     ),
     "testnet": (),
     "regtest": (),
 }
+
+#: The URLs of :data:`SHIPPED_ENDPOINTS`, per network, in the same order. Derived, so the two
+#: cannot drift.
+DEFAULT_ENDPOINTS: Mapping[str, tuple[str, ...]] = {
+    network: tuple(e.url for e in endpoints) for network, endpoints in SHIPPED_ENDPOINTS.items()
+}
+
+
+@functools.cache
+def shipped_operator_domains() -> Mapping[str, str]:
+    """:data:`KNOWN_OPERATORS`, checked against the Public Suffix List and the shipped endpoints.
+
+    Each key must BE a registered domain (a key that is a public suffix, or has a subdomain, would
+    silently match more or fewer hosts than the statement covers), and each shipped endpoint's
+    declared operator must be the one its domain is recorded under. Checked here, at first use,
+    rather than at import, so importing pyrxd does not read the list.
+    """
+    for domain in KNOWN_OPERATORS:
+        if registered_domain(canonical_host(domain)) != domain:
+            raise ValidationError(f"KNOWN_OPERATORS key {domain!r} is not a registered domain")
+    for network, endpoints in SHIPPED_ENDPOINTS.items():
+        for endpoint in endpoints:
+            host = _canonical_host_of(endpoint.url)
+            recorded = KNOWN_OPERATORS.get(registered_domain(host) or "")
+            if recorded != endpoint.operator:
+                raise ValidationError(
+                    f"shipped {network} endpoint {endpoint.url!r} declares operator {endpoint.operator!r}, "
+                    f"but KNOWN_OPERATORS records its domain as {recorded!r}"
+                )
+    return MappingProxyType(dict(KNOWN_OPERATORS))
 
 
 def block_hash_hex(header: bytes) -> str:
@@ -154,11 +228,16 @@ class Endpoint:
         Optional TLS SubjectPublicKeyInfo pins (``sha256/<base64>``). Empty
         (the default) means pinning is OFF for this endpoint. See
         :mod:`pyrxd.network.tls_pin` for why that is the default.
+    operator:
+        Optional declared operator id (the config file's ``operator = "…"``). It
+        decides which SOURCE this endpoint is (:attr:`source`), overriding the
+        grouping by registered domain. ``None`` (the default) means "not declared".
     """
 
     url: str
     allow_insecure: bool = False
     spki_pins: tuple[str, ...] = ()
+    operator: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.url, str) or not self.url.strip():
@@ -178,6 +257,11 @@ class Endpoint:
         if self.spki_pins and url.startswith("ws://"):
             raise ValidationError("TLS SPKI pinning is meaningless on a plaintext ws:// endpoint")
         object.__setattr__(self, "spki_pins", _normalize_pins(self.spki_pins))
+        if self.operator is not None:
+            object.__setattr__(self, "operator", str(self.operator).strip())
+        # Refused HERE, at wiring time, rather than when a quorum first counts it: a URL that names
+        # no host (``wss://``), or an operator id that is malformed or contradicts one pyrxd ships.
+        source_key(url, operator=self.operator)
 
     @property
     def key(self) -> str:
@@ -218,20 +302,22 @@ class Endpoint:
 
     @property
     def source(self) -> str:
-        """Which DISTINCT HOST this endpoint is, for counting sources: :func:`~pyrxd.network.source_identity.source_key`.
+        """Which SOURCE this endpoint is, for counting sources: :func:`~pyrxd.network.source_identity.source_key`.
 
-        Coarser than :attr:`key` on purpose. Two endpoints on one host — another path
-        (``wss://h/x``), a query (``wss://h/?b``), another port, or the same IP address spelled
-        another way — are one machine, so they are ONE source: a single lying server reached
-        through two such URLs must not corroborate itself (0.25.0 panel, round 3). Nothing is
-        refused by this — a profile may still list both for failover; they simply do not count as
-        two when HashMark §7.6 form 2 needs two.
+        Coarser than :attr:`key` on purpose. Two endpoints of one operator — another path
+        (``wss://h/x``), another port, the same IP address spelled another way, another host
+        under one registered domain, or a host of an operator pyrxd knows (the two radiant4people
+        servers) — are ONE source: a single lying operator reached through two such URLs must not
+        corroborate itself (0.25.0 panel, round 3). This endpoint's own declared
+        :attr:`operator` decides it instead; no other endpoint's declaration, and nothing
+        process-wide, does. Nothing is refused by this — a profile may still list both for failover; they
+        simply do not count as two when HashMark §7.6 form 2 needs two.
 
-        It is the same key every other source count in pyrxd uses, with the same limit: a distinct
-        host is not an independent operator (the operator limit in
+        It is the same key every other source count in pyrxd uses — distinct operators, as
+        declared, or by registered domain — with the same limit (the operator limit in
         :mod:`pyrxd.network.source_identity`).
         """
-        return source_key(self.url)
+        return source_key(self.url, operator=self.operator)
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -341,11 +427,19 @@ class NetworkProfile:
         object.__setattr__(self, "network", self.network.strip())
         if not self.endpoints:
             raise ValidationError(f"network {self.network!r} has no ElectrumX endpoint configured")
-        deduped: list[Endpoint] = []
-        seen: set[str] = set()
         for endpoint in self.endpoints:
             if not isinstance(endpoint, Endpoint):
                 raise ValidationError(f"profile endpoints must be Endpoint, got {type(endpoint).__name__}")
+        # ONE HOST, ONE OPERATOR, over every endpoint as given — before de-duplication, which would
+        # otherwise keep whichever of `wss://h/` (operator a) and `wss://h:443/` (operator b) came
+        # first and hide the contradiction. Each `Endpoint.source` alone cannot see the others, so
+        # `wss://h:1/` as "a" and `wss://h:2/` as "b" were two sources on one machine.
+        require_one_key_per_host(
+            (endpoint.source for endpoint in self.endpoints), what=f"network {self.network!r} profile"
+        )
+        deduped: list[Endpoint] = []
+        seen: set[str] = set()
+        for endpoint in self.endpoints:
             if endpoint.key in seen:
                 continue
             seen.add(endpoint.key)
@@ -375,15 +469,25 @@ class NetworkProfile:
         allow_insecure: bool = False,
         spki_pins: Sequence[str] = (),
         genesis_hash: str | None = None,
+        operators: Mapping[str, str] | None = None,
     ) -> NetworkProfile:
         """Build a profile from plain URLs, defaulting the genesis hash from the registry.
 
         Pass ``genesis_hash`` explicitly only to override the shipped constant (a
         custom chain). Leaving it ``None`` looks the network up in
         :data:`GENESIS_BLOCK_HASHES`, so ``build("mainnet", [...])`` is chain-bound
-        with no extra ceremony.
+        with no extra ceremony. *operators* maps a URL (exactly as given in *urls*) to
+        its declared operator (:attr:`Endpoint.operator`). The declaration stays on that
+        endpoint: it decides :attr:`Endpoint.source` and nothing else in the process.
         """
-        endpoints = tuple(Endpoint(url=url, allow_insecure=allow_insecure, spki_pins=tuple(spki_pins)) for url in urls)
+        declared = dict(operators or {})
+        unknown = sorted(set(declared) - set(urls))
+        if unknown:
+            raise ValidationError(f"operators given for URLs that are not in the profile: {unknown}")
+        endpoints = tuple(
+            Endpoint(url=url, allow_insecure=allow_insecure, spki_pins=tuple(spki_pins), operator=declared.get(url))
+            for url in urls
+        )
         return cls(
             network=network,
             endpoints=endpoints,

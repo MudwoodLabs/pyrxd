@@ -45,8 +45,9 @@ class EthRpc:
             raise ValidationError("rpc_url must be a non-empty string")
         if not isinstance(expected_chain_id, int) or expected_chain_id <= 0:
             raise ValidationError("expected_chain_id must be a positive int")
-        #: The distinct host this endpoint is, for :class:`~pyrxd.eth_wallet.multi_rpc.MultiSourceEthRpc`
-        #: to count it by. Derived before web3 is touched, so an unparseable URL fails here.
+        #: The source this endpoint is (its operator group, :func:`~pyrxd.network.source_identity.source_key`),
+        #: for :class:`~pyrxd.eth_wallet.multi_rpc.MultiSourceEthRpc` to count it by. Derived before
+        #: web3 is touched, so an unparseable URL fails here.
         self.source_key = source_key(rpc_url)
         web3 = _require_web3()
         self._w3 = web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(rpc_url))

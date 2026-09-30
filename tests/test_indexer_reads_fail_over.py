@@ -55,7 +55,9 @@ _MAINNET_GENESIS_HEADER_HEX = (
     "7980b72a"
 )
 
-PLAIN_URL, INDEXER_URL = DEFAULT_ENDPOINTS["mainnet"]  # the shipped order: plain ElectrumX first
+# The shipped order: plain ElectrumX first, the indexer second. The third default,
+# electrumx2.radiant4people.com, is radiant4people's failover server and plays no part here.
+PLAIN_URL, INDEXER_URL = DEFAULT_ENDPOINTS["mainnet"][:2]
 
 # Every method RxinDexerClient calls, each reviewed as a read against upstream
 # Radiant-Core/RXinDexer @ ca8a6a4e (2026-09-24). In `electrumx/server/glyph_api.py` each handler

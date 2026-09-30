@@ -596,6 +596,57 @@ Both hashes are printed; compare them against
 
 ---
 
+## 7c. `--wave-name` degrades: two configured servers are "one source"
+
+HashMark §7.6 form 2 (`verify --wave-name`, `glyph inspect --wave-name`) needs
+two configured ElectrumX servers of **different operators**. pyrxd counts
+sources as *distinct operators, as declared, or by registered domain*:
+
+- an operator pyrxd ships knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`
+  — radiant4people, radiantcore and bladenet) is one source however many servers
+  it runs, so `electrumx.radiant4people.com` and `electrumx2.radiant4people.com`
+  are one;
+- any other hosts under one registered domain are one source
+  (`x.example.com` and `y.example.com`), while `a.co.uk` and `b.co.uk` are two,
+  because `co.uk` is a public suffix; an IP address is its own source;
+- every spelling of this machine (`localhost`, `127.0.0.1` or anything else in
+  `127.0.0.0/8`, `::1`) is ONE source.
+
+If your two servers really are run by different parties under one domain, or
+you want two domains you know to be one operator counted once, say so per
+server in the config file:
+
+```toml
+# ~/.pyrxd/config.toml
+electrumx_servers = [
+  { url = "wss://x.example.com:50022/", operator = "alice" },
+  { url = "wss://y.example.com:50022/", operator = "bob" },
+]
+```
+
+An `operator` is 1-64 lower-case letters, digits, `.` or `-`. Unknown keys in a
+server table, one host counted as two sources (two operators on its URLs, or an
+operator on one and not another), and a declaration that contradicts a shipped
+operator (e.g. `electrumx2.radiant4people.com` as anything but `radiant4people`)
+are refused, and so is a declared server next to an UNDECLARED server of the same
+registered domain (declare `rpc.acme.io` and leave `backup.acme.io` bare, and the
+two would count as two sources where without the declaration they are one — a
+declaration may merge sources, and may split a domain only when every server of
+that domain in the list is declared). All are refused when the list is read: at load for the top-level
+`electrumx_servers`, and when the network is selected for a
+`[networks.<name>]` list — before any server is contacted. **pyrxd believes the
+declaration**: it cannot see who runs a server, so declaring two operators that
+are really one makes the check agree with itself. The limit is stated in the
+`pyrxd.network.source_identity` module docstring.
+
+A declaration applies to form 2 and to nothing else. The watchtower
+(`--rxd-electrumx-url`), the BTC Esplora quorum and the ETH RPC quorum take no
+operator declaration: they count by registered domain, or by an operator pyrxd
+ships knowledge of. If one of them refuses two URLs as one source, use URLs of
+two different registered domains.
+
+---
+
 ## 8. dMint v2 flags and premine
 
 **`--daa-mode` requires `--v2`**, verbatim:
