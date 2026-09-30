@@ -233,7 +233,11 @@ class ElapsedBoundPolicy:
     """The policy inputs of the elapsed-depth upper bound — defaults for maintainer sign-off.
 
     * ``surge_factor`` — the block rate the bound allows for, as a multiple of the nominal spacing:
-      ``λ = surge_factor ÷ nPowTargetSpacing``. Default 2.0.
+      ``λ = surge_factor ÷ nPowTargetSpacing``. Default 3.0: a backtest of this bound over every
+      mainnet header from height 14,088 to 468,799 (every reference height, up to 3,000 blocks after
+      it, at ``ε`` 1e-3 and 1e-12) found no block count it fell short of; at 2.0 it fell short in a
+      sustained run of fast blocks near height 98,705. The heights below 14,088 are the chain's
+      launch, when blocks ran far faster than nominal while difficulty caught up.
     * ``loss_budget_photons``, ``epsilon_min``, ``epsilon_max`` — the confidence:
       ``ε = clamp(loss_budget ÷ value_at_stake, epsilon_min, epsilon_max)``, so an honest swap's
       expected over-run cost is at most about the budget. Defaults 1 RXD, 1e-12, 1e-3. With no value
@@ -246,7 +250,7 @@ class ElapsedBoundPolicy:
       carry before that check stops being at least as strict as step 6. Default 2.0.
     """
 
-    surge_factor: float = 2.0
+    surge_factor: float = 3.0
     loss_budget_photons: int = PHOTONS_PER_RXD
     epsilon_min: float = 1e-12
     epsilon_max: float = 1e-3

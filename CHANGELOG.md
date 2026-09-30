@@ -73,9 +73,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `eth_swap_grief_run.py`'s default `--t-rxd-blocks 3` cannot hold the depth the gate requires and
   is refused at construction.
 - **`CoordinatorConfig.funding_bound`** (`pyrxd.gravity.funding_spv.ElapsedBoundPolicy`) carries the
-  taker gate's elapsed-depth bound policy: `surge_factor` 2.0, `loss_budget_photons` 1 RXD with
+  taker gate's elapsed-depth bound policy: `surge_factor` 3.0 (the maintainer's decision; a backtest
+  over every mainnet header from height 14,088, after the chain's launch, found the bound short of
+  no block count at 3.0, and short near height 98,705 at 2.0), `loss_budget_photons` 1 RXD with
   `epsilon` clamped to 1e-12..1e-3, and, for the negotiation-time check only, `early_slack_s` 3600
-  and `early_work_margin` 2.0. These defaults await the maintainer's sign-off.
+  and `early_work_margin` 2.0. The defaults other than `surge_factor` await the maintainer's
+  sign-off.
 - **`src/pyrxd/spv/radiant_checkpoints.py` ships the last checkpoint interval's work**:
   `LAST_INTERVAL_MAX_WORK` (and its height, `LAST_INTERVAL_MAX_WORK_HEIGHT`) and
   `NEWEST_CHECKPOINT_WORK`. `scripts/refresh_radiant_checkpoints.py` fetches every header of that

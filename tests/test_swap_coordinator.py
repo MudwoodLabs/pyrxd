@@ -2948,9 +2948,10 @@ def test_non_value_bearing_eth_estimated_unaffected():
 
 def test_value_bearing_btc_estimated_unaffected():
     # The guard is ETH-specific; a value-bearing BTC swap on an estimated policy still constructs.
-    # (t_btc 4: room for the taker gate's elapsed-depth bound on a mainnet leg; see _burial_coord.)
+    # (t_btc 4, t_rxd 200: room for the taker gate's elapsed-depth bound on a mainnet leg; see
+    # _burial_coord.)
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4)),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4, t_rxd_blocks=200)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
@@ -2970,11 +2971,11 @@ def test_value_bearing_btc_estimated_unaffected():
 
 
 def _burial_coord(margin_policy):
-    # t_btc 4 leaves the taker gate's negotiation-time check room for the elapsed-depth bound it
-    # models on a mainnet leg (59 blocks for a small value: k = 6 and the newest header up to an hour
-    # old); these tests are about burial.
+    # t_btc 4 and t_rxd 200 leave the taker gate's negotiation-time check room for the elapsed-depth
+    # bound it models on a mainnet leg (80 blocks for a small value: k = 6, the newest header up to
+    # an hour old, blocks counted at 3× the nominal rate); these tests are about burial.
     return SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4)),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4, t_rxd_blocks=200)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),

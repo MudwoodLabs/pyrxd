@@ -495,7 +495,7 @@ async def test_the_time_term_is_the_poisson_quantile_from_the_median_time_past(m
     assert r.elapsed_s == _NOW - r.reference_time
     assert r.value_term > 1 and r.reference_height < r.served_tip, "the reference is value_term deep"
     assert r.epsilon == pytest.approx(1 / 10_000)
-    assert r.time_blocks == poisson_upper_quantile(2.0 * r.elapsed_s / 300, r.epsilon)
+    assert r.time_blocks == poisson_upper_quantile(3.0 * r.elapsed_s / 300, r.epsilon)
     assert r.elapsed_blocks_upper == (r.reference_height - r.height + 1) + r.time_blocks
     assert r.bound_term == "time" and "the time term set the bound" in r.bound_note
 
@@ -799,7 +799,7 @@ def test_the_poisson_quantile_is_monotone_and_zero_at_zero():
 def test_the_confidence_scales_with_the_value_and_the_policy_refuses_what_is_not_an_upper_bound():
     p = ElapsedBoundPolicy()
     assert (p.surge_factor, p.loss_budget_photons, p.early_slack_s, p.early_work_margin) == (
-        2.0,
+        3.0,
         PHOTONS_PER_RXD,
         3600,
         2.0,
@@ -808,7 +808,7 @@ def test_the_confidence_scales_with_the_value_and_the_policy_refuses_what_is_not
     assert p.epsilon(1_000 * PHOTONS_PER_RXD) == pytest.approx(1e-3)
     assert p.epsilon(100_000 * PHOTONS_PER_RXD) == pytest.approx(1e-5)
     assert p.epsilon(10**30) == 1e-12
-    assert p.blocks_upper(3600, spacing_s=300, value_at_stake_photons=None) == poisson_upper_quantile(24.0, 1e-3)
+    assert p.blocks_upper(3600, spacing_s=300, value_at_stake_photons=None) == poisson_upper_quantile(36.0, 1e-3)
     for bad in (
         dict(surge_factor=0.5),
         dict(surge_factor=float("nan")),
@@ -839,7 +839,7 @@ def test_a_test_network_bound_uses_the_loosest_confidence_and_no_value_term():
     )
     assert r.reference_height == r.served_tip and r.epsilon == 1e-3
     assert r.elapsed_s == 1200 + 5 * 300
-    assert r.time_blocks == poisson_upper_quantile(2.0 * r.elapsed_s / 300, 1e-3)
+    assert r.time_blocks == poisson_upper_quantile(3.0 * r.elapsed_s / 300, 1e-3)
     assert r.elapsed_blocks_upper == max(r.proved_depth, r.proved_depth + r.time_blocks)
     no_clock = verify_maker_funding(
         c.evidence(),
@@ -1220,10 +1220,10 @@ async def test_each_coordinator_entry_point_that_funds_refuses_an_unproved_fundi
 
 async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _wide_terms(400)
+    terms = _wide_terms(450)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     # 3.5 × this chain's C: a value term of 7 or more, which proved depth 6 cannot meet, while the
-    # negotiation-time check (which models k up to 14) still finds room in t_rxd 400.
+    # negotiation-time check (which models k up to 14) still finds room in t_rxd 450.
     value = 10_937_50 * PHOTONS_PER_RXD // 100
     policy = _vb_policy(value_at_risk_photons=value)
     coord, btc_view = _btc_coord(terms, _real_leg(view, network="bc"), policy=policy, accept_nondurable_seen=True)
@@ -1562,7 +1562,7 @@ async def test_step_7_judges_the_timelocks_on_the_elapsed_UPPER_bound():
     assert "REMAINING window" in gate.reason
     proof = stale.last_maker_funding
     assert proof.proved_depth == 1 and proof.elapsed_s == 9000
-    assert proof.elapsed_blocks_upper == 1 + poisson_upper_quantile(60.0, proof.epsilon)
+    assert proof.elapsed_blocks_upper == 1 + poisson_upper_quantile(90.0, proof.epsilon)
 
     fresh = _coordinator(terms=terms, radiant_leg=_StaleTipLeg(tip_time=_NOW))
     assert (await fresh.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
@@ -1590,7 +1590,7 @@ def test_the_upper_bound_is_raised_by_a_report_and_never_lowered():
     assert low.elapsed_blocks_upper == honest.elapsed_blocks_upper
     later = verify_maker_funding(c.evidence(), now_unix_s=_NOW + 3000, **kw)
     assert later.elapsed_s == honest.elapsed_s + 3000
-    assert later.elapsed_blocks_upper == 3 + poisson_upper_quantile(2.0 * later.elapsed_s / 300, 1e-3)
+    assert later.elapsed_blocks_upper == 3 + poisson_upper_quantile(3.0 * later.elapsed_s / 300, 1e-3)
 
 
 def test_the_report_term_is_the_max_over_operators_and_a_lower_one_never_lowers_it():
@@ -1718,7 +1718,7 @@ def test_the_reference_time_comes_from_a_header_at_depth_value_term():
     assert r.value_term == 4 and r.value_term * cost >= FORGERY_COST_FACTOR * value
     assert r.reference_height == r.served_tip - r.value_term + 1 == 11
     assert r.reference_time == _mtp_at(real.headers, 11)
-    expected = poisson_upper_quantile(2.0 * (_NOW - r.reference_time) / 300, r.epsilon)
+    expected = poisson_upper_quantile(3.0 * (_NOW - r.reference_time) / 300, r.epsilon)
     assert r.time_blocks == expected
     assert r.elapsed_blocks_upper == (11 - real.height + 1) + expected
 
