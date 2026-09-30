@@ -63,7 +63,7 @@ CSV counted from the covenant's mining and an under-counted depth makes the make
 further away than it is. A server can under-count by withholding its newest headers. The bound used
 is::
 
-    max(proved, (R - H + 1) + ceil(max(0, now - T_R) ÷ interval), reported)
+    max(proved, (R - H + 1) + ceil(max(0, now - T_R) ÷ interval) + F, reported)
 
 where ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header
 served (the newest counting as 1), and ``T_R`` its timestamp. The blocks from the funding up to
@@ -72,6 +72,17 @@ mined since ``T_R``, at the interval the coordinator uses for converting time to
 measured fast tail, required on a value-bearing network). The server's own verbose
 ``confirmations`` can only raise it. A server that stops serving at an older header hands the taker
 an older ``T_R`` and a larger allowance — the withholding shows up as elapsed time.
+
+``F`` is the FUTURE-TIME ALLOWANCE (maintainer decision, 2026-09-30): Radiant Core accepts a block
+whose timestamp is up to ``MAX_FUTURE_BLOCK_TIME`` (two hours; ``tests/vendor/radiant_core/chain.h``
+line 27, enforced at ``validation.cpp`` line 3936) ahead of the node's adjusted time. The bound
+allows for header timestamps up to that limit by adding that span in blocks at the nominal target
+spacing (``nPowTargetSpacing``, 300 s, ``chainparams.cpp`` line 117): ``F = ceil(7200 ÷ 300) = 24``
+blocks, on a value-bearing network for every swap; 0 on a test network.
+
+The coordinator's negotiation-time check (``SwapCoordinator._funding_proof_room_failure``) applies
+this same bound, through :func:`honest_elapsed_blocks_upper`, to the smallest ``k`` the gate can
+require, so a swap whose ``t_rxd`` cannot hold it is refused before anyone locks.
 
 WHY THAT DEPTH. Elapsed time is measured from a header deep enough that changing its time costs as
 much as the rule already demands of the depth: a different header at ``R`` means different headers
@@ -89,13 +100,9 @@ WHAT REMAINS THE SERVER'S WORD, stated rather than implied:
 * that the covenant output is still UNSPENT. SPV proves a transaction was mined, never that an
   output has not been spent since; the ``listunspent`` read that locates the outpoint is kept for
   that, and is no longer the evidence of the output's existence, script or value.
-* withholding hidden inside the allowance above: the reference header's timestamp is set by its miner,
-  and Radiant Core accepts one up to ``MAX_FUTURE_BLOCK_TIME`` ahead of its adjusted time
-  (``tests/vendor/radiant_core/validation.cpp`` line 3936; the constant lives in ``chain.h``, which
-  is not vendored — two hours in the Bitcoin Core lineage), so a reference header its miner dated
-  ahead can hide the blocks mined in that difference; so can blocks arriving faster
-  than the fast-tail interval. No tolerance is added for it: adding the full limit would charge
-  every honest swap that many hours of blocks.
+* the reference header's timestamp beyond what ``F`` allows for: ``F`` converts the future-time
+  limit at the nominal spacing, not at the fast tail; and blocks arriving faster than the fast-tail
+  interval are counted at that interval.
 * which chain is Radiant's most-work chain, and whether each nBits is the value Radiant's
   difficulty rules require: neither is checked (see :mod:`pyrxd.glyph.mark_block`); the floor and
   ``k`` bound what a forgery costs instead.
@@ -130,7 +137,9 @@ from pyrxd.transaction.transaction import Transaction
 
 __all__ = [
     "FORGERY_COST_FACTOR",
+    "FUTURE_TIME_ALLOWANCE_BLOCKS",
     "LOCAL_DEVNET_CHAIN_IDS",
+    "MAX_FUTURE_BLOCK_TIME_S",
     "MAX_HEADERS_FROM_CHECKPOINT_SDK",
     "MIN_FUNDING_CONFIRMATIONS",
     "MakerFundingEvidence",
@@ -138,8 +147,11 @@ __all__ = [
     "RadiantChain",
     "VerifiedMakerFunding",
     "block_subsidy_photons",
+    "elapsed_blocks_upper_bound",
     "forged_confirmation_cost_ceiling_photons",
     "funding_header_ranges",
+    "future_time_allowance_blocks",
+    "honest_elapsed_blocks_upper",
     "radiant_chain_for_leg",
     "required_funding_confirmations",
     "verify_maker_funding",
@@ -160,6 +172,19 @@ FORGERY_COST_FACTOR = 2
 MAX_HEADERS_FROM_CHECKPOINT_SDK = 20_160
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#: Radiant Core's ``MAX_FUTURE_BLOCK_TIME``, in seconds: how far ahead of a node's adjusted time a
+#: block's timestamp may be and still be accepted (``tests/vendor/radiant_core/chain.h`` line 27,
+#: ``2 * 60 * 60``; enforced at ``validation.cpp`` line 3936). A test re-reads it from the vendored file.
+MAX_FUTURE_BLOCK_TIME_S = 2 * 60 * 60
+
+#: Radiant's nominal block spacing, ``consensus.nPowTargetSpacing`` (``chainparams.cpp`` line 117,
+#: ``5 * 60``), in seconds.
+TARGET_BLOCK_SPACING_S = 5 * 60
+
+#: ``F``: the future-time allowance the elapsed-depth bound adds on a value-bearing network —
+#: ``MAX_FUTURE_BLOCK_TIME`` in blocks at the nominal spacing (maintainer decision, 2026-09-30).
+FUTURE_TIME_ALLOWANCE_BLOCKS = -(-MAX_FUTURE_BLOCK_TIME_S // TARGET_BLOCK_SPACING_S)
 
 #: ``GetBlockSubsidy``'s starting reward, ``50000 * COIN`` (``tests/vendor/radiant_core/validation.cpp``
 #: line 1115), in photons.
@@ -330,6 +355,62 @@ def required_funding_confirmations(
     return max(MIN_FUNDING_CONFIRMATIONS, burial_blocks, value_term), value_term
 
 
+def future_time_allowance_blocks(chain: RadiantChain) -> int:
+    """``F`` for *chain*: :data:`FUTURE_TIME_ALLOWANCE_BLOCKS` on a value-bearing network, else 0."""
+    return FUTURE_TIME_ALLOWANCE_BLOCKS if chain.value_bearing else 0
+
+
+def _allowance_blocks(stale_s: float, withheld_block_interval_s: float) -> int:
+    """Blocks that could have been mined in *stale_s* seconds, at the dividing interval."""
+    return math.ceil(max(0.0, float(stale_s)) / float(withheld_block_interval_s))
+
+
+def elapsed_blocks_upper_bound(
+    *,
+    proved: int,
+    through_reference: int,
+    allowance: int | None,
+    future_allowance: int,
+    reported: int | None = None,
+) -> int:
+    """THE upper bound on blocks since the funding (module docstring) — one formula, used by
+    :func:`verify_maker_funding` and, through :func:`honest_elapsed_blocks_upper`, by the
+    coordinator's negotiation-time check, so the two cannot drift apart.
+
+    ``max(proved, through_reference + allowance + future_allowance, reported)``, where
+    *through_reference* is ``R - H + 1`` (the proved blocks up to the reference header).
+    """
+    return max(proved, through_reference + (allowance or 0) + future_allowance, reported or 0)
+
+
+def honest_elapsed_blocks_upper(
+    *,
+    chain: RadiantChain,
+    required_confirmations: int,
+    value_term: int,
+    nominal_block_interval_s: float,
+    withheld_block_interval_s: float,
+) -> int:
+    """The bound :func:`verify_maker_funding` computes for a funding proved exactly
+    *required_confirmations* (``k``) deep on an HONEST chain: blocks arriving at the nominal
+    interval, and the newest header just mined — so the reference header, ``max(1, value_term)``
+    deep, is ``(max(1, value_term) - 1) × nominal`` seconds old, and the future-time allowance is
+    added as it always is.
+
+    For the negotiation-time check, which knows no header: with the smallest ``k`` and value term
+    the gate can require (from the ceiling on ``C``), this is the smallest bound step 6 will judge
+    on such a chain — it only grows with ``k``, with the value term (the fast tail is never slower
+    than the nominal), and with a staler tip.
+    """
+    ref_depth = max(1, value_term)
+    return elapsed_blocks_upper_bound(
+        proved=required_confirmations,
+        through_reference=required_confirmations - ref_depth + 1,
+        allowance=_allowance_blocks((ref_depth - 1) * float(nominal_block_interval_s), withheld_block_interval_s),
+        future_allowance=future_time_allowance_blocks(chain),
+    )
+
+
 def _merged_ranges(spans: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
     """Inclusive ``(lo, hi)`` spans, merged, as ``(start, count)`` chunks of at most 2016."""
     out: list[tuple[int, int]] = []
@@ -440,6 +521,9 @@ class VerifiedMakerFunding:
     #: The clock allowance inside it — blocks that could have been mined since the reference header's
     #: timestamp — or ``None`` when no clock was supplied (test networks only).
     withheld_allowance_blocks: int | None
+    #: ``F``, the future-time allowance inside it (:data:`FUTURE_TIME_ALLOWANCE_BLOCKS`; 0 on a test
+    #: network).
+    future_allowance_blocks: int
     reported_confirmations: int | None
     served_tip: int
     #: The header the clock allowance is measured from: ``max(1, value_term)`` deep below the served
@@ -678,13 +762,20 @@ def verify_maker_funding(
         allowance: int | None = None
     else:
         stale_s = max(0, now_unix_s - _header_time(bytes(headers[ref_h])))
-        allowance = math.ceil(stale_s / float(withheld_block_interval_s))
+        allowance = _allowance_blocks(stale_s, withheld_block_interval_s)
     reported = evidence.reported_confirmations
     reported_i = reported if isinstance(reported, int) and not isinstance(reported, bool) and reported >= 0 else None
     # Blocks up to and including the reference header are proved; every block after it is inside the
-    # allowance, which counts all that could have been mined since its timestamp. Never below the
-    # proved depth; the server's own count can only raise it.
-    upper = max(proved, (ref_h - height + 1) + (allowance or 0), reported_i or 0)
+    # allowance, which counts all that could have been mined since its timestamp, and the future-time
+    # allowance F. Never below the proved depth; the server's own count can only raise it.
+    future = future_time_allowance_blocks(chain)
+    upper = elapsed_blocks_upper_bound(
+        proved=proved,
+        through_reference=ref_h - height + 1,
+        allowance=allowance,
+        future_allowance=future,
+        reported=reported_i,
+    )
 
     return VerifiedMakerFunding(
         outpoint=f"{txid}:{vout}",
@@ -702,6 +793,7 @@ def verify_maker_funding(
         max_header_work=max_work,
         elapsed_blocks_upper=upper,
         withheld_allowance_blocks=allowance,
+        future_allowance_blocks=future,
         reported_confirmations=reported_i,
         served_tip=top,
         reference_height=ref_h,

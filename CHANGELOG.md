@@ -267,16 +267,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
   - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
     blocks since funding: the depth proved up to a reference header, plus one block per measured
-    fast-tail interval since that header's timestamp, or the server's own count if higher. The
+    fast-tail interval since that header's timestamp, plus — on mainnet, for every swap — a
+    future-time allowance of 24 blocks, or the server's own count if higher. The allowance is
+    Radiant Core's `MAX_FUTURE_BLOCK_TIME` (two hours, `src/chain.h`, now vendored at the pinned
+    tag and re-read by a test) at the nominal 300 s spacing: the bound allows for header
+    timestamps up to the future-time limit. The
     reference header is `max(1, value term)` deep below the newest header served, so changing its
     time costs as much as the value term of `k` already demands of the depth (on regtest it is the
     newest header). Blocks a server withholds above it count as elapsed time. A mainnet swap
     therefore needs `now_unix_s` on this path too; `scripts/dust_swap_run.py` passes it.
 
   What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
-  non-spend; the `listunspent` read that locates it is kept for that), and blocks a withholding
-  server can hide inside the allowance above — after a reference header its miner dated ahead of
-  time, or arriving faster than the fast tail. Neither the most-work chain nor each header's nBits is
+  non-spend; the `listunspent` read that locates it is kept for that), and the elapsed-depth
+  bound's residual: a reference header's timestamp beyond what the future-time allowance covers
+  (it converts the limit at the nominal spacing), and blocks arriving faster than the fast tail.
+  Neither the most-work chain nor each header's nBits is
   checked; the checkpoint table is only as good as its sources. `GravityTrade` is not gated.
 
 - **Every source count keys on ONE host identity, so one server can no longer corroborate

@@ -206,6 +206,18 @@ def _ab_terms(t_rxd_blocks: int = 400) -> NegotiatedTerms:
     return A._terms(maker_kp=maker_kp, taker_kp=taker_kp, t_rxd_blocks=t_rxd_blocks)
 
 
+def _vb_terms(t_rxd_blocks: int = 400) -> NegotiatedTerms:
+    """:func:`_ab_terms` with room for a value-bearing gate's elapsed-depth bound. Those terms leave
+    ``t_btc`` 4 BTC blocks (8 Radiant blocks of wall clock) inside the margin — a window no
+    value-bearing funding fits, since the bound carries the future-time allowance
+    (:data:`~pyrxd.gravity.funding_spv.FUTURE_TIME_ALLOWANCE_BLOCKS`, 24) on top of the proved depth.
+    ``t_btc`` is the taker's own leg, so shortening it changes nothing the covenant commits to."""
+    import dataclasses
+
+    terms = _ab_terms(t_rxd_blocks)
+    return dataclasses.replace(terms, t_btc=type(terms.t_btc)(max(1, t_rxd_blocks // 2 - 36 - 40), terms.t_btc.unit))
+
+
 # --------------------------------------------------------------------------- (a) the lying server
 
 
@@ -359,7 +371,7 @@ async def test_honest_regtest_funding_verifies_and_the_lock_proceeds():
 
 async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     coord, _btc_view = _btc_coord(
         terms,
@@ -565,6 +577,54 @@ def test_chain_constants_are_derived_from_the_vendored_radiant_core_sources():
     subsidy = re.search(r"GetBlockSubsidy\(int nHeight.*?nSubsidy = (\d+) \* COIN;", validation, re.S)
     assert int(subsidy.group(1)) * PHOTONS_PER_RXD == funding_spv.INITIAL_SUBSIDY_PHOTONS
     assert radiant_block_hash(regtest_genesis_header()) == funding_spv.REGTEST_CHAIN.checkpoints[0][1]
+
+
+def test_the_future_time_allowance_is_derived_from_the_vendored_radiant_core_sources():
+    """``MAX_FUTURE_BLOCK_TIME`` is READ from the vendored ``chain.h`` and the nominal spacing from
+    mainnet's ``nPowTargetSpacing`` in ``chainparams.cpp`` — both at the pinned tag — and ``F`` is
+    their ratio rounded up. The consensus check that uses the limit is found in ``validation.cpp``."""
+    import re
+
+    vendor = ROOT / "tests" / "vendor" / "radiant_core"
+    chain_h = (vendor / "chain.h").read_text()
+    params = (vendor / "chainparams.cpp").read_text()
+    validation = (vendor / "validation.cpp").read_text()
+
+    def product(expr: str) -> int:
+        out = 1
+        for factor in expr.split("*"):
+            out *= int(factor.strip())
+        return out
+
+    limit = product(re.search(r"MAX_FUTURE_BLOCK_TIME = ([0-9 *]+);", chain_h).group(1))
+    main = params[params.index("class CMainParams ") : params.index("class CTestNetParams ")]
+    spacing = product(re.search(r"nPowTargetSpacing = ([0-9 *]+);", main).group(1))
+    assert "block.GetBlockTime() > nAdjustedTime + MAX_FUTURE_BLOCK_TIME" in validation
+    assert (limit, spacing) == (funding_spv.MAX_FUTURE_BLOCK_TIME_S, funding_spv.TARGET_BLOCK_SPACING_S)
+    assert funding_spv.FUTURE_TIME_ALLOWANCE_BLOCKS == -(-limit // spacing) == 24
+    assert funding_spv.future_time_allowance_blocks(funding_spv.MAINNET_CHAIN) == 24
+    assert funding_spv.future_time_allowance_blocks(funding_spv.REGTEST_CHAIN) == 0
+
+
+def test_a_test_network_bound_carries_no_future_time_allowance():
+    """F applies on a value-bearing network only: regtest's bound is the proved depth plus the clock
+    allowance, as before."""
+    spk = b"\x76\xa9" + bytes(32)
+    c = build_funding_chain(spk=spk, value=1000, confs=6)
+    r = verify_maker_funding(
+        c.evidence(),
+        chain=funding_spv.REGTEST_CHAIN,
+        expected_spk=spk,
+        expected_value=1000,
+        value_at_stake_photons=None,
+        burial_blocks=6,
+        now_unix_s=_NOW,
+        withheld_block_interval_s=300.0,
+    )
+    assert r.future_allowance_blocks == 0
+    assert r.elapsed_blocks_upper == max(
+        r.proved_depth, (r.reference_height - c.height + 1) + r.withheld_allowance_blocks
+    )
 
 
 @pytest.mark.parametrize(
@@ -1105,7 +1165,8 @@ def test_the_reference_time_comes_from_a_header_at_depth_value_term():
     assert r.reference_height == r.served_tip - r.value_term + 1 == 11
     expected = -(-(_NOW - _time(real.headers[11])) // int(_FAST_S))
     assert r.withheld_allowance_blocks == expected > 600
-    assert r.elapsed_blocks_upper == (11 - real.height + 1) + expected
+    assert r.future_allowance_blocks == funding_spv.FUTURE_TIME_ALLOWANCE_BLOCKS == 24
+    assert r.elapsed_blocks_upper == (11 - real.height + 1) + expected + 24
 
     hdrs = dict(real.headers)
     top = max(hdrs)

@@ -51,6 +51,7 @@ files**, not by trusting a Python transcription of them:
 | DER signature size bounds and the flags gating strict-DER / low-S | `IsValidDERSignatureEncoding` and its callers in `sigencoding.cpp` |
 | the per-script stack-memory and opcode-cost budgets | `MAX_SCRIPT_STACK_MEMORY_USAGE` / `MAX_SCRIPT_OPCODE_COST` in `consensus.h` |
 | the order refs are hashed into `hashOutputHashes` | `base_blob::Compare` and `operator<` in `uint256.h` |
+| `MAX_FUTURE_BLOCK_TIME` (the swap taker gate's future-time allowance) | `chain.h` |
 
 A hand-maintained Python table of the same facts would reintroduce exactly the transcription step
 that produced the bugs.
