@@ -378,19 +378,26 @@ async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monke
 async def test_a_value_bearing_gate_without_a_measured_fast_tail_refuses_before_fetching(monkeypatch):
     """The allowance for blocks mined since the reference header divides elapsed time by an interval;
     on a value-bearing network that must be the MEASURED fast tail, never the nominal fallback. With
-    none set the gate refuses, and nothing is fetched."""
+    none set the coordinator refuses to CONSTRUCT for a negotiated swap (before anyone locks); and
+    the gate itself — step 3b and step 5 — still refuses on its own, and nothing is fetched."""
+    import dataclasses
+
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _ab_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
-    coord, btc_view = _btc_coord(
-        terms,
-        _real_leg(view, network="bc"),
-        policy=MarginPolicy.estimated(accept_flat_burial=True),
-        accept_nondurable_seen=True,
-    )
+    no_tail = MarginPolicy.estimated(accept_flat_burial=True)
+    with pytest.raises(
+        ValidationError, match=r"refused before anyone locks.*needs MarginPolicy\.rxd_block_interval_fast_s"
+    ):
+        _btc_coord(terms, _real_leg(view, network="bc"), policy=no_tail, accept_nondurable_seen=True)
+    # Defence in depth: a coordinator whose policy lost the fast tail after construction.
+    coord, btc_view = _btc_coord(terms, _real_leg(view, network="bc"), policy=_vb_policy(), accept_nondurable_seen=True)
+    coord.config = dataclasses.replace(coord.config, margin_policy=no_tail)
     gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
     assert gate.ok is False
     assert "needs MarginPolicy.rxd_block_interval_fast_s" in gate.reason, gate.reason
+    with pytest.raises(MakerFundingNotVerified, match=r"needs MarginPolicy\.rxd_block_interval_fast_s"):
+        await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
     assert view.reads == [], "the gate fetched evidence it could not judge"
     assert btc_view.broadcasts == []
 

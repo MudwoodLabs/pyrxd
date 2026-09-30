@@ -2076,10 +2076,14 @@ class SwapCoordinator:
         exactly that deep. Failing here means failing there, whatever the chain turns out to hold;
         passing here decides nothing — step 6 and 7 on the proved bound stay authoritative.
 
-        None — no check — on a test network, where there is no value term; when the value is unknown
-        or the configuration has no Radiant chain, which the gate itself refuses; and where the
-        negotiated terms already fail step 3's own ordering check, which owns that refusal. The ETH
-        ordering needs a clock, so for an ETH counter leg only the step-6 floor runs here.
+        On a value-bearing network, two inputs the gate REQUIRES are checked here too, because the
+        gate refuses without them only at step 5 — after the maker has locked: the measured fast tail
+        (``MarginPolicy.rxd_block_interval_fast_s``) and a value at stake to size ``k`` from.
+
+        None — no check — on a test network, where there is no value term; when the configuration
+        has no Radiant chain, which the gate itself refuses; and where the negotiated terms already
+        fail step 3's own ordering check, which owns that refusal. The ETH ordering needs a clock,
+        so for an ETH counter leg only the step-6 floor runs here.
         """
         try:
             chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
@@ -2087,11 +2091,25 @@ class SwapCoordinator:
             return None
         if not chain.value_bearing:
             return None
-        value = self._funding_value_at_stake_photons(terms)
-        ceiling = forged_confirmation_cost_ceiling_photons(chain)
-        if value is None or value <= 0 or ceiling <= 0:
-            return None
         mp = self.config.margin_policy
+        before = (
+            f"this swap can never pass the taker gate, so it is refused before anyone locks: on Radiant {chain.name} "
+        )
+        if mp.rxd_block_interval_fast_s is None:
+            return before + (
+                "the gate needs MarginPolicy.rxd_block_interval_fast_s, the MEASURED fast-tail (p10) Radiant "
+                "inter-block interval in seconds, to bound the blocks since the maker's funding, and refuses "
+                "without it. Measure it for this run and set it (MarginPolicy.measured(rxd_block_interval_fast_s=...))"
+            )
+        value = self._funding_value_at_stake_photons(terms)
+        if value is None or value <= 0:
+            return before + (
+                "no value at stake is available to size the confirmations the gate requires of the maker's "
+                "funding; set MarginPolicy.value_at_risk_photons to the swap's value in photons"
+            )
+        ceiling = forged_confirmation_cost_ceiling_photons(chain)
+        if ceiling <= 0:
+            return None
         burial = self._funding_burial_blocks(chain, value)
         k_min, value_term = required_funding_confirmations(
             value_bearing=True,

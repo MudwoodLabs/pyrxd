@@ -65,11 +65,21 @@ def _margin(args) -> CrossClockMargin:
 
 
 def _policy(args) -> MarginPolicy:
+    # The Radiant leg is MAINNET (SshTrRadiantClient.NETWORK), so the taker gate requires the
+    # measured fast tail and the coordinator refuses to construct without it. Refuse here first,
+    # with the flag's name, rather than fake a value.
+    if not args.rxd_block_interval_fast_s:
+        raise SystemExit(
+            "this run locks MAINNET RXD, so it needs --rxd-block-interval-fast-s (the MEASURED p10 Radiant "
+            "inter-block, seconds): the taker gate bounds the blocks since the maker's funding by dividing "
+            "elapsed time by it, and refuses without it. Measure it against a mainnet node for THIS run."
+        )
     return MarginPolicy(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),
         block_interval_s=args.btc_block_interval_s,
         is_measured=False,
         rxd_block_interval_s=args.rxd_block_interval_s,
+        rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_margin(args),
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
@@ -84,6 +94,7 @@ async def run(args) -> None:
     for req in ("eth_rpc_url", "eth_key_hex", "eth_claim_to", "eth_refund_to"):
         if not getattr(args, req):
             raise SystemExit(f"requires --{req.replace('_', '-')}")
+    policy = _policy(args)  # refuses at startup, before any key or covenant is made
     rxd_network = SshTrRadiantClient.NETWORK
     print(f"=== ETH↔RXD GRIEFING run (S1) — ETH=sepolia, RXD={rxd_network} mainnet ===")
     print("    maker STALLS; the honest taker recovers via mutual_refund (no one-sided loss).")
@@ -153,7 +164,7 @@ async def run(args) -> None:
         # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
         # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
         config=CoordinatorConfig(
-            margin_policy=_policy(args),
+            margin_policy=policy,
             accept_nondurable_seen=True,
             accept_estimated_eth_margins=True,
             fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
@@ -251,6 +262,12 @@ def _args():
     ap.add_argument("--margin-blocks", type=int, default=2)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=120.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help="MEASURED p10 Radiant inter-block (seconds). Required: the Radiant leg is mainnet.",
+    )
     ap.add_argument("--eth-finalization-window-s", type=int, default=768)  # hard floor (2 epochs)
     ap.add_argument("--rxd-claim-burial-s", type=int, default=60)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=60)

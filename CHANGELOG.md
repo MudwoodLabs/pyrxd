@@ -60,9 +60,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SwapCoordinator.last_maker_funding`.
 - **A mainnet swap's taker gate requires `MarginPolicy.rxd_block_interval_fast_s`** (the measured
   p10 Radiant inter-block interval) and refuses without it, before fetching anything; it no longer
-  falls back to the nominal interval there. `scripts/dust_swap_run.py` and
-  `scripts/dust_swap_resume.py` take `--rxd-block-interval-fast-s` and refuse at startup without
-  it — their measured policy raised on its absence before, so the runner never reached the gate.
+  falls back to the nominal interval there. Because the gate runs only after the maker has locked,
+  `SwapCoordinator` now also refuses to CONSTRUCT a negotiated swap on a value-bearing Radiant
+  network without it, or without a value at stake to size the required depth from. Every script
+  that builds a coordinator on the mainnet node client takes `--rxd-block-interval-fast-s`, refuses
+  at startup without it, and passes it into its policy: `scripts/dust_swap_run.py` and
+  `scripts/dust_swap_resume.py` (their measured policy already required it), and
+  `scripts/eth_swap_run.py --stage sepolia-dust` and `scripts/eth_swap_grief_run.py`, whose
+  estimated policies did not carry it — before this, they constructed, locked mainnet RXD, and
+  were then refused by the taker gate. `eth_swap_grief_run.py`'s default `--t-rxd-blocks 3` cannot
+  hold the depth the gate requires and is refused at construction.
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.
