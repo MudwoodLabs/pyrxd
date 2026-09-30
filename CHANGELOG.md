@@ -36,6 +36,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in `pyrxd.spv.radiant`, beside the Bitcoin one, which is unchanged.
   `ElectrumXClient.get_transaction_merkle_branch` returns a transaction's validated merkle branch.
 
+### Deprecated
+
+- **`GravityTrade` (the SPV-oracle swap) now warns loudly that it is UNGATED.** Constructing it
+  emits a `DeprecationWarning` and logs a WARNING: nothing verifies the maker's covenant exists on
+  chain before the taker pays BTC, and one lying server can get the taker to pay in full for a
+  covenant that does not exist. Use the HTLC
+  swap (`SwapCoordinator`) instead; see
+  `docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md`.
+
 ### Fixed
 
 - **`ElectrumXClient.get_transaction_merkle` raised on real proofs.** It put every sibling hash
