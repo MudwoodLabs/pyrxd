@@ -30,10 +30,14 @@ paragraph above as "nothing short of full SPV is worth doing":
 
 This module builds neither: an anchor is ONE endpoint's word, and it ships the caveat. The second
 step IS taken one level up, for HashMark §7.6 form 2 only — ``judge_name_at_mark`` refuses unless a
-second endpoint places the mark in the same block (and agrees on every chain step's height). An
-anchor used anywhere else — ``pyrxd verify``'s block line, for one — is still a single endpoint's
-claim. The honest ordering is: caveat now, the two steps above as real improvements, a Radiant SPV
-client for a claim that does not need a caveat at all.
+second endpoint places the mark in the same block (and agrees on every chain step's height).
+
+THE BLOCK VERIFICATION THAT DOES EXIST is :mod:`pyrxd.glyph.mark_block`: merkle inclusion, then hash
+linkage to a checkpoint pyrxd ships (and proof-of-work above the newest one). This module does not
+run it. ``pyrxd verify`` runs it on the anchor it reports and hands the outcome to
+:func:`with_block_verification`, which is the only way a display dict's ``height_is_verified``
+becomes ``True``. Every other anchor — form 2's, ``glyph inspect``'s, the pages' (for now) — is
+still a single endpoint's claim and carries the caveat below.
 
 WHAT IT IS. ``get_transaction_verbose`` binds the echoed txid, so an endpoint cannot answer about a
 DIFFERENT transaction — that much is checked. Beyond it, an endpoint that lies about the height
@@ -50,8 +54,9 @@ ship depth defaults". Neither does this.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.json_guards import nonneg_int
@@ -76,6 +81,18 @@ BOUND_CAVEAT = (
     "that height hashes to the block it says holds the transaction), NOT verified: pyrxd checks no "
     "proof-of-work or merkle inclusion, so an endpoint that lies about the height moves the point "
     "in time this answer is about"
+)
+
+#: The caveat for an anchor whose block verification (:mod:`pyrxd.glyph.mark_block`) RAN, found the
+#: transaction's merkle branch leads to the header served at that height, and then did not reach
+#: VERIFIED. :data:`BOUND_CAVEAT`'s "pyrxd checks no ... merkle inclusion" is not true of it, so it
+#: would be a false sentence; this one says what was checked and why it does not fix the height.
+#: Set by :func:`with_block_verification` only; the reason travels beside it.
+INCLUSION_ONLY_CAVEAT = (
+    "height reported by the endpoint and NOT verified: the transaction's merkle branch leads to the "
+    "header served at that height, but the checks that would tie that header to a checkpoint pyrxd "
+    "ships did not all pass (the reason is given with it), and inclusion alone fixes no height, so an "
+    "endpoint that lies about the height moves the point in time this answer is about"
 )
 
 #: How far either side of ``tip - confirmations + 1`` a binding looks for the transaction's block.
@@ -142,13 +159,19 @@ class MarkAnchor:
     #: one hostile endpoint cannot move both answers.
     source: str
     caveat: str = UNVERIFIED_CAVEAT
-    #: Always ``False``. There is no Radiant SPV in this codebase; see the module docstring.
+    #: Always ``False`` here: a :class:`MarkAnchor` is an endpoint's word. The DISPLAY dict's
+    #: ``height_is_verified`` can become ``True`` only through :func:`with_block_verification`,
+    #: given a VERIFIED outcome of :func:`pyrxd.glyph.mark_block.verify_mark_block`.
     height_is_verified: bool = False
     #: ``True`` when ``height`` was bound to the endpoint's own header (the header at ``height``
     #: hashes to the block the endpoint named). A check of the endpoint against ITSELF — which is
     #: why ``height_is_verified`` stays False. Carried so a verdict built on the height can say
     #: truthfully whether the height was header-checked, rather than assuming either way.
     header_bound: bool = False
+    #: The block hash the endpoint named for the transaction (verbose ``blockhash``), lowercase
+    #: display hex — set only when ``header_bound``, i.e. when the header at ``height`` hashed to
+    #: it. ``None`` otherwise: an unbound hash would be a second unchecked claim.
+    blockhash: str | None = None
 
     @property
     def provisional(self) -> bool:
@@ -258,6 +281,8 @@ async def resolve_mark_anchor(
             source=source,
             caveat=BOUND_CAVEAT,
             header_bound=True,
+            # `_bind_to_block` returned, so this is a 64-hex string the header at `height` hashes to.
+            blockhash=str(info.get("blockhash")).lower(),
         )
 
     return MarkAnchor(
@@ -343,13 +368,17 @@ async def _bind_to_block(
     )
 
 
-def mark_anchor_dict(anchor) -> dict:
+def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = None) -> dict:
     """The display shape of a :class:`~pyrxd.glyph.mark_anchor.MarkAnchor`.
 
-    ``caveat`` and ``height_is_verified`` are carried, never dropped: the height is one
-    endpoint's claim — at most checked against that endpoint's own header — and nothing checks
-    proof-of-work or merkle inclusion. A consumer that shows the number and not the caveat has
-    published the unqualified sentence this module exists to prevent.
+    ``caveat`` and ``height_is_verified`` are carried, never dropped: without a VERIFIED
+    *verification* the height is one endpoint's claim — at most checked against that endpoint's own
+    header. A consumer that shows the number and not the caveat has published the unqualified
+    sentence this module exists to prevent.
+
+    *verification* is an optional :class:`~pyrxd.glyph.mark_block.BlockVerification` for this
+    anchor's block, applied by :func:`with_block_verification` (see there); without one,
+    ``block_verification`` is ``None`` and nothing else changes.
     """
     # Function-local: `_inspect_core` is a far larger module than this one, and a
     # top-level import would make every consumer of a dataclass pay for the whole
@@ -357,7 +386,7 @@ def mark_anchor_dict(anchor) -> dict:
     # `tests/web/test_mark_anchor_bridge.py` measures.
     from ._inspect_core import _sanitize_display_string
 
-    return {
+    shape = {
         "height": anchor.height,
         "confirmations": anchor.confirmations,
         "min_confirmations": anchor.min_confirmations,
@@ -368,12 +397,63 @@ def mark_anchor_dict(anchor) -> dict:
         # Whether the height was checked against the endpoint's own block header. Carried as a
         # key so a JSON reader need not parse the caveat to learn it (#754).
         "header_bound": anchor.header_bound,
+        "blockhash": anchor.blockhash,
         "caveat": anchor.caveat,
     }
+    return with_block_verification(shape, verification, verified_by=verified_by)
+
+
+def with_block_verification(shape: Mapping[str, Any], verification: Any, *, verified_by: str | None = None) -> dict:
+    """*shape* (a :func:`mark_anchor_dict`) with a block verification's outcome applied — a copy.
+
+    THE ONLY PLACE ``height_is_verified`` BECOMES TRUE. It is ``True`` exactly when *verification*
+    is VERIFIED and is about the height *shape* reports; the caveat is then the verifier's own
+    claim sentence (what was proved, and what was not). Otherwise ``height_is_verified`` is
+    ``False`` and the caveat stays the anchor's own endpoint's-word caveat — except when the merkle
+    branch was checked and passed but the height was still not verified: then it is
+    :data:`INCLUSION_ONLY_CAVEAT`, because :data:`BOUND_CAVEAT`'s "pyrxd checks no ... merkle
+    inclusion" would be false. Inclusion alone never makes the height verified.
+
+    ``block_verification`` carries the whole outcome (every :class:`BlockVerification` field) plus
+    ``source``, the endpoint whose data was checked (*verified_by*); ``None`` when *verification* is.
+    When VERIFIED, ``blockhash`` is the verified header's hash.
+    """
+    out = dict(shape)
+    if out.get("block_verification") is not None:
+        # Applied before: the caveat is the earlier outcome's, so start again from the endpoint's.
+        out["caveat"] = BOUND_CAVEAT if out.get("header_bound") else UNVERIFIED_CAVEAT
+    out["height_is_verified"] = False
+    if verification is None:
+        out["block_verification"] = None
+        return out
+
+    from dataclasses import asdict
+
+    from .mark_block import VERIFIED  # lazy: the page imports this module and must stay light
+
+    detail = asdict(verification)
+    detail["source"] = verified_by
+    out["block_verification"] = detail
+    height = out.get("height")
+    verified = (
+        verification.state == VERIFIED
+        and isinstance(verification.claim, str)
+        and height is not None
+        and verification.height == height
+    )
+    out["height_is_verified"] = verified
+    if verified:
+        out["caveat"] = verification.claim
+        # The verified header's hash (equal to the endpoint's named block when it named one).
+        out["blockhash"] = verification.blockhash
+    elif dict(verification.steps).get("merkle") == "passed":
+        out["caveat"] = INCLUSION_ONLY_CAVEAT
+    return out
 
 
 __all__ = [
     "BOUND_CAVEAT",
+    "INCLUSION_ONLY_CAVEAT",
     "MAX_INDEX_LAG_BLOCKS",
     "MIN_CONFIRMATIONS_MEANING",
     "UNVERIFIED_CAVEAT",
@@ -381,4 +461,5 @@ __all__ = [
     "MarkAnchor",
     "mark_anchor_dict",
     "resolve_mark_anchor",
+    "with_block_verification",
 ]

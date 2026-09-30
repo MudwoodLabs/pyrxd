@@ -109,6 +109,12 @@ and answers the four questions `pyrxd verify` answers about a HashMark
 and whether a file you have matches — in plain language, for someone
 who arrived from a link with no context.
 
+One answer differs, for now. `pyrxd verify` verifies the block: the
+transaction's merkle branch against the block's header, and that header's
+hash linkage to a checkpoint shipped with pyrxd. The pages do not do that
+yet (#799), so they report the block height as the server's word, with
+that caveat.
+
 It is not a second implementation of anything. Both pages read the one
 wheel, the one `glue.py` and the one manifest built by the docs CI
 step, and every verdict on both comes out of the same Python. The

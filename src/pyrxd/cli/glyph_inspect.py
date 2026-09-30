@@ -26,7 +26,7 @@ import asyncio
 import copy
 import logging
 import textwrap
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import click
@@ -58,6 +58,7 @@ from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
 if TYPE_CHECKING:
+    from ..glyph.mark_block import BlockVerification
     from ..network.electrumx import ElectrumXClient
 
 _log = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ __all__ = [
     "mark_anchor_dict",
     "mark_anchor_lines",
     "resolve_anchor_from",
+    "verify_anchor_block",
 ]
 
 
@@ -206,7 +208,12 @@ def _classify_raw_tx(
 
 
 async def _inspect_txid_inner(
-    client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None, network: str = "mainnet"
+    client: ElectrumXClient,
+    txid_hex: str,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    raw_out: list[bytes] | None = None,
 ) -> dict:
     """Fetch *txid_hex* via *client* and classify every output.
 
@@ -218,6 +225,10 @@ async def _inspect_txid_inner(
 
     :param only_vout: if not None, restrict the outputs list to a single
         vout — used by the ``--resolve`` outpoint flow.
+    :param raw_out: if given, the transaction's raw bytes are appended to it once
+        ``get_transaction`` (which checks they hash to *txid_hex*) and the classifier
+        (which checks it again) have both accepted them — for ``pyrxd verify``, whose block
+        verification uses these bytes instead of fetching them again.
     """
     # Validate the txid locally before any network call so a malformed
     # input never reaches the server.
@@ -228,6 +239,8 @@ async def _inspect_txid_inner(
 
     raw = await client.get_transaction(txid)
     payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+    if raw_out is not None:
+        raw_out.append(bytes(raw))
 
     # DELEGATED CLAIMS. A token may authorise its `in`/`by` through a delegate
     # rather than by spending the parent here, and `_classify_raw_tx` cannot see
@@ -792,6 +805,88 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     )
 
 
+async def verify_anchor_block(
+    endpoint: Callable[[], tuple[object, str]],
+    *,
+    txid: str | None,
+    height: object,
+    blockhash: object,
+    raw_tx: bytes | None,
+    network: str,
+    min_confirmations: int,
+) -> tuple[BlockVerification, str | None]:
+    """Verify the block an anchor names — ``(outcome, label of the endpoint whose data was checked)``.
+
+    THE ONE CLI DOOR TO :func:`~pyrxd.glyph.mark_block.verify_mark_block`. It follows
+    :func:`~pyrxd.glyph.mark_block.plan_block_verification` — the verifier, not this function,
+    decides which headers to fetch — and only then calls *endpoint* for a client, so a run that
+    cannot verify (no checkpoints for this network, a block too far past the newest one) opens
+    no connection and says why. Then it fetches the transaction's merkle branch, the block's
+    coinbase branch (which pins the tree's depth) and the planned header ranges, and hands them
+    to the verifier with *raw_tx*: the bytes the caller already fetched and hash-checked, never
+    fetched again here.
+
+    ANY endpoint may answer: merkle verification needs no independent source (HashMark §2.3.2),
+    because the trust sits in the checkpoint pyrxd ships, not in who served the proof.
+
+    NEVER RAISES for anything a server does. A failed or refused fetch (a server without
+    ``blockchain.transaction.get_merkle``, a header range that times out, a malformed reply) is
+    ``NOT VERIFIED`` with the reason: verification that could not run is not a finding against the
+    mark, and must not refuse one.
+    """
+    from ..glyph.mark_block import NOT_VERIFIED, BlockVerification, plan_block_verification, verify_mark_block
+
+    def outcome(merkle=None, coinbase=None, headers=None) -> BlockVerification:
+        return verify_mark_block(
+            txid=txid,
+            raw_tx=raw_tx,
+            height=height,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers or {},
+            min_confirmations=min_confirmations,
+            blockhash=blockhash,
+            network=network,
+        )
+
+    plan = plan_block_verification(height=height, min_confirmations=min_confirmations, network=network)
+    if plan.reason is not None or not txid:
+        return outcome(), None  # the verifier states the reason; nothing to fetch
+
+    client, label = endpoint()
+
+    def unavailable(what: str, exc: BaseException) -> tuple[BlockVerification, str]:
+        detail = _sanitize_display_string(str(exc)) or type(exc).__name__
+        return (
+            BlockVerification(
+                state=NOT_VERIFIED,
+                claim=None,
+                reason=f"{what} could not be fetched from {_sanitize_display_string(label)}: {detail}",
+                height=height if isinstance(height, int) else None,
+            ),
+            label,
+        )
+
+    async with client:  # type: ignore[attr-defined]
+        try:
+            merkle = await client.get_transaction_merkle_branch(txid, height)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return unavailable("the transaction's merkle branch", exc)
+        try:
+            coinbase = await client.get_transaction_id_from_pos(height, 0)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return unavailable("the block's coinbase merkle branch", exc)
+        headers: dict[int, bytes] = {}
+        for start, count in plan.header_ranges:
+            try:
+                got = await client.get_block_headers(start, count)  # type: ignore[attr-defined]
+            except Exception as exc:
+                return unavailable(f"the block headers {start}-{start + count - 1}", exc)
+            for i, header in enumerate(got):
+                headers.setdefault(start + i, header)
+    return outcome(merkle, coinbase, headers), label
+
+
 # `mark_anchor_dict` moved to `pyrxd.glyph.mark_anchor`, beside the dataclass it
 # describes, and is re-exported above so every caller here is unchanged.
 #
@@ -806,9 +901,14 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
 def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> list[str]:
     """A block, its depth against the floor the caller set, and what the number is worth.
 
-    Never prints a bare height. ``height_is_verified`` is ``False`` for every anchor this
-    codebase can build, so the caveat is unconditional rather than conditional on a flag
-    that is always the same — a conditional would read as though the other branch existed.
+    Never prints a bare height: the ``caveat`` is printed under every height. What it says
+    depends on the anchor. When ``pyrxd verify`` verified the block
+    (:func:`~pyrxd.glyph.mark_anchor.with_block_verification`: ``height_is_verified`` is true, and
+    only for a VERIFIED outcome), the caveat IS the verifier's claim, printed under
+    ``VERIFIED:``. Otherwise it is the endpoint's-word caveat, and when a verification ran and did
+    not reach VERIFIED, the reason is printed under it — so a reader sees both that the height is
+    the endpoint's word and why pyrxd could not do better. An anchor no verification ran on (form
+    2's, ``glyph inspect``'s) prints exactly as it always did.
     """
     if not a:
         return []
@@ -829,9 +929,21 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     # as complete. Sanitised anyway, so a future caveat from elsewhere cannot carry control
     # bytes, and bounded by line count rather than by cutting the sentence.
     caveat = _sanitize_display_string(str(a.get("caveat") or ""))
-    for chunk in textwrap.wrap(caveat, width=92)[:6]:
+    bv = a.get("block_verification")
+    bv = bv if isinstance(bv, Mapping) else None
+    verified = bool(a.get("height_is_verified")) and bv is not None
+    if verified:
+        caveat = f"VERIFIED: {caveat}"
+    # The longest claim (the proof-of-work level) wraps to 8 lines at this width; 10 leaves room.
+    for chunk in textwrap.wrap(caveat, width=92)[:10]:
         lines.append(f"{indent}              {chunk}")
+    if bv is not None and not verified and bv.get("reason"):
+        why = _sanitize_display_string(f"not verified: {bv.get('reason')}")
+        for chunk in textwrap.wrap(why, width=92)[:6]:
+            lines.append(f"{indent}              {chunk}")
     lines.append(f"{indent}              (source: {_truncate_for_human(str(a.get('source') or ''))})")
+    if bv is not None and bv.get("source"):
+        lines.append(f"{indent}              (block proof asked of: {_truncate_for_human(str(bv.get('source')))})")
     return lines
 
 
@@ -1890,19 +2002,20 @@ def inspect_cmd(
         click.echo(_render_inspect_human(payload))
 
 
-def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
+def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str, raw_out: list[bytes] | None = None) -> dict:
     """Spin up an ElectrumX client, run _inspect_txid_inner, surface errors.
 
     Wraps NetworkError → NetworkBoundaryError (exit code 2) so a
     user can distinguish "wrong input" (UserError, exit 1) from
-    "network is down" (exit 2).
+    "network is down" (exit 2). ``raw_out`` is passed through to
+    :func:`_inspect_txid_inner` (the ``txid`` form only).
     """
 
     async def _do() -> dict:
         client = ctx.make_client()
         async with client:
             if form == "txid":
-                return await _inspect_txid_inner(client, value, network=ctx.network)
+                return await _inspect_txid_inner(client, value, network=ctx.network, raw_out=raw_out)
             # form == "outpoint" + resolve: parse, fetch the source, classify
             # only the named vout.
             outpoint_payload = _inspect_outpoint(value)

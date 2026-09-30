@@ -140,6 +140,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AnchorBindingError": ("pyrxd.glyph.mark_anchor", "AnchorBindingError"),
     "MAX_INDEX_LAG_BLOCKS": ("pyrxd.glyph.mark_anchor", "MAX_INDEX_LAG_BLOCKS"),
     "MIN_CONFIRMATIONS_MEANING": ("pyrxd.glyph.mark_anchor", "MIN_CONFIRMATIONS_MEANING"),
+    # How `pyrxd verify` applies a block verification to an anchor's display shape (the only way
+    # `height_is_verified` becomes true), and the caveat it leaves when inclusion alone was checked.
+    "with_block_verification": ("pyrxd.glyph.mark_anchor", "with_block_verification"),
+    "INCLUSION_ONLY_CAVEAT": ("pyrxd.glyph.mark_anchor", "INCLUSION_ONLY_CAVEAT"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),

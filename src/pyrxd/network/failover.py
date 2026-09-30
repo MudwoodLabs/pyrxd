@@ -245,6 +245,12 @@ class FailoverElectrumXClient:
     async def get_block_header(self, height: BlockHeight) -> bytes:
         return await self._run("get_block_header", lambda c: c.get_block_header(height))
 
+    async def get_block_headers(self, start: BlockHeight, count: int) -> list[bytes]:
+        return await self._run("get_block_headers", lambda c: c.get_block_headers(start, count))
+
+    async def get_transaction_id_from_pos(self, height: BlockHeight, pos: int) -> dict[str, Any]:
+        return await self._run("get_transaction_id_from_pos", lambda c: c.get_transaction_id_from_pos(height, pos))
+
     async def get_tip_height(self) -> BlockHeight:
         return await self._run("get_tip_height", lambda c: c.get_tip_height())
 

@@ -770,5 +770,5 @@ def test_the_block_is_inherited_from_the_verdicts_own_record_first() -> None:
     first = {"name_at_mark": {"resolved": True, "anchor": {"height": 1, "source": "wss://b"}}}
     witness = {"name_at_mark": {"resolved": True, "anchor": {"height": 2, "source": "wss://a"}}}
     payload = {"txid": "cd" * 32, "outputs": [{"vout": 0, "hashmark": first}, {"vout": 1, "hashmark": witness}]}
-    assert hashmark_cmds._verify_anchor(object(), payload, min_confirmations=6, prefer=witness)["height"] == 2
-    assert hashmark_cmds._verify_anchor(object(), payload, min_confirmations=6)["height"] == 1, "unchanged default"
+    assert hashmark_cmds._anchor_of(object(), payload, min_confirmations=6, prefer=witness)["height"] == 2
+    assert hashmark_cmds._anchor_of(object(), payload, min_confirmations=6)["height"] == 1, "unchanged default"

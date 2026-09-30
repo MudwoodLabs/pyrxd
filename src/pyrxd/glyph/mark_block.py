@@ -6,12 +6,12 @@ pyrxd ships: the checkpoint table in :mod:`pyrxd.spv.radiant_checkpoints`. Merkl
 no independent source (HashMark §2.3.2), so one endpoint's data is enough — the trust sits in the
 checkpoint, not in who served the proof.
 
-STATUS: no production caller yet (tracked in #799). The ``pyrxd verify`` wiring is phase 2 and the
-``/verify/`` and ``/inspect/`` pages are phase 3 of the plan this was built from; until then only
-the tests call :func:`verify_mark_block`, and every surface still prints the endpoint's-word
-caveat. Decided for phase 2 (maintainer, 2026-09-29): on by default in ``pyrxd verify``, falling
-back to today's wording when not VERIFIED, and CONTRADICTED exits 2 with its reason, as a binding
-failure does today.
+CALLERS (tracked in #799). ``pyrxd verify`` calls it, on by default, through
+:func:`pyrxd.cli.glyph_inspect.verify_anchor_block`, which every anchor that command reports
+crosses: VERIFIED prints this module's claim; any other outcome falls back to the endpoint's-word
+wording with the reason; CONTRADICTED exits 2 with its reason, as a binding failure does. The
+``/verify/`` and ``/inspect/`` pages do not call it yet (phase 3), so they still print the
+endpoint's-word caveat, and so do ``glyph inspect`` and form 2's anchors.
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads

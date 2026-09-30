@@ -213,7 +213,13 @@ _RPC_FAMILY = "blockchain.transaction"
 _FUNNEL = ("network/electrumx.py", "ElectrumXClient.broadcast")
 #: The other ``blockchain.transaction.*`` RPCs pyrxd sends. Pinned both ways below: a new one
 #: must be added here on purpose, and one that is gone must leave.
-_OTHER_TRANSACTION_RPCS = {"blockchain.transaction.get", "blockchain.transaction.get_merkle"}
+_OTHER_TRANSACTION_RPCS = {
+    "blockchain.transaction.get",
+    "blockchain.transaction.get_merkle",
+    # A read: a block's txid and merkle branch at a position (the coinbase's pins a block's tree
+    # depth for `pyrxd verify`'s block verification). Sends nothing.
+    "blockchain.transaction.id_from_pos",
+}
 #: Functions that fetch an attribute by a name given as a value.
 _BY_NAME = {
     "getattr",
