@@ -957,45 +957,54 @@ const BLOCK_PROOF_METHODS = new Set([
   "blockchain.block.headers",
 ]);
 
-const HEX64_RE = /^[0-9a-fA-F]{64}$/;
+// WHAT OF A PROOF REPLY CROSSES INTO PYTHON: the fields `glue.verify_mark_block` reads, and nothing
+// else. Python reads them with the readers `pyrxd verify`'s client uses (`pyrxd.spv.radiant`
+// `*_from_reply`), so EVERY refusal of a reply's shape — a branch that is not a list, a header
+// count that is not the one asked for, hex that is not hex — is Python's, in the words the CLI
+// prints for the same reply. This page judges no shape itself: it only drops fields nothing reads
+// (a server can pad a reply with anything) and caps the size of what is left.
+const PROOF_REPLY_FIELDS = {
+  "blockchain.transaction.get_merkle": ["block_height", "merkle", "pos"],
+  "blockchain.transaction.id_from_pos": ["tx_hash", "merkle"],
+  "blockchain.block.headers": ["count", "hex"],
+};
 
-// A merkle branch as ElectrumX sends one: at most 32 levels of 32-byte hex hashes.
-function isMerkleList(value) {
-  return Array.isArray(value) && value.length <= 32 && value.every((h) => typeof h === "string" && HEX64_RE.test(h));
+// The size cap on one reply, after the unread fields are dropped: a merkle or coinbase branch is
+// at most 32 hashes of 64 characters (about 2,200 characters of JSON), and a header range at most
+// 160 hex characters per header ASKED FOR. Each leaves room for the JSON around it. Together they
+// bound what `proveMarkBlock` hands Python under glue's own cap (`_MAX_PROOF_JSON_CHARS`), for the
+// longest plan, which `tests/web/test_block_proof_on_the_pages.py` checks. A reply over its cap is
+// the ONE refusal written here, and it is about size, not shape.
+const MAX_PROOF_BRANCH_REPLY_CHARS = 16_384;
+const PROOF_REPLY_SLACK_CHARS = 1024;
+
+function proofReplyCap(method, params) {
+  if (method === "blockchain.block.headers") return BLOCK_HEADER_HEX_LEN * params[1] + PROOF_REPLY_SLACK_CHARS;
+  return MAX_PROOF_BRANCH_REPLY_CHARS;
 }
 
-// EVERY PROOF REPLY IS UNTRUSTED SERVER INPUT, bounded here before it is handed on: its shape, and
-// for headers the one length that matters (160 hex characters per header, no more than were asked
-// for, at most 2016). Python reads each again, with the readers `pyrxd verify`'s client uses, so a
-// reply refused there is refused in the CLI's words; this is the page's own guard on what it holds.
-function checkProofReply(method, params, result) {
-  const isObject = result !== null && typeof result === "object" && !Array.isArray(result);
-  if (!isObject) throw wireError("malformed", "the server's proof answer is not an object");
-  if (method === "blockchain.transaction.get_merkle") {
-    if (!Number.isInteger(result.block_height) || result.block_height < 0) {
-      throw wireError("malformed", "the server's merkle answer has no usable block height");
+// The reply as Python will read it: an object keeps only the fields named above, anything else
+// (an array, a string, null) goes as it is for Python to refuse; a missing `result` is null.
+// Throws a "malformed" wire error only for a reply over its size cap.
+function proofReplyForPython(method, params, result) {
+  let kept = result === undefined ? null : result;
+  if (kept !== null && typeof kept === "object" && !Array.isArray(kept)) {
+    const fields = {};
+    for (const name of PROOF_REPLY_FIELDS[method]) {
+      if (Object.prototype.hasOwnProperty.call(kept, name)) fields[name] = kept[name];
     }
-    if (!isMerkleList(result.merkle)) throw wireError("malformed", "the server's merkle branch is not a list of hashes");
-    if (!Number.isInteger(result.pos) || result.pos < 0) {
-      throw wireError("malformed", "the server's merkle answer has no usable position");
-    }
-    return;
+    kept = fields;
   }
-  if (method === "blockchain.transaction.id_from_pos") {
-    if (typeof result.tx_hash !== "string" || !HEX64_RE.test(result.tx_hash)) {
-      throw wireError("malformed", "the server's coinbase answer has no usable transaction hash");
-    }
-    if (!isMerkleList(result.merkle)) throw wireError("malformed", "the server's coinbase branch is not a list of hashes");
-    return;
+  const size = JSON.stringify(kept).length;
+  const cap = proofReplyCap(method, params);
+  if (size > cap) {
+    throw wireError(
+      "malformed",
+      `the server's reply is ${size.toLocaleString("en-US")} characters, over the ` +
+      `${cap.toLocaleString("en-US")} this page accepts for it`,
+    );
   }
-  // blockchain.block.headers
-  const asked = params[1];
-  if (!Number.isInteger(result.count) || result.count < 0 || result.count > asked || result.count > MAX_HEADERS_PER_REQUEST) {
-    throw wireError("malformed", `the server returned a header count that is not 0 to ${asked}`);
-  }
-  if (typeof result.hex !== "string" || result.hex.length !== BLOCK_HEADER_HEX_LEN * result.count || !/^[0-9a-fA-F]*$/.test(result.hex)) {
-    throw wireError("malformed", `the server's headers are not ${result.count} 80-byte headers`);
-  }
+  return kept;
 }
 
 // One proof request, by LITERAL method name: every request either page sends names its method in
@@ -1054,8 +1063,7 @@ async function proveMarkBlock(verifyBridge, txid, rawHex, anchor, superseded) {
       }
       try {
         const result = await sendProofRequest(method, params);
-        checkProofReply(method, params, result);
-        fetched.replies[key] = result;
+        fetched.replies[key] = proofReplyForPython(method, params, result);
       } catch (err) {
         fetched.errors[key] = stripControlChars(String((err && err.message) || err)).slice(0, 160);
       }

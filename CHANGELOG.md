@@ -97,8 +97,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them with the transaction it already fetched and hash-checked. The fetch order, the decision
   and every sentence come from the same Python the CLI uses
   (`pyrxd.glyph.mark_block.verify_with_fetched`, and the reply readers now in
-  `pyrxd.spv.radiant`), so for the same server answers the page and `pyrxd verify` give the same
-  state, claim, reason and proved depth.
+  `pyrxd.spv.radiant`), so for the same server answers the page and `pyrxd verify
+  --min-confirmations N`, where N is the depth the page aims for, give the same state, claim,
+  reason and proved depth.
+  - A malformed reply is refused by the same Python reader on both, with the same reason. The
+    page's JavaScript judges no reply's shape: it drops the fields nothing reads and caps each
+    reply's size. A reply over that cap, and a fetch that fails in transport (a timeout, or an
+    error frame from the server), are the reasons each surface words for itself.
   - VERIFIED shows the verifier's claim in place of the endpoint's-word caveat, the proved depth,
     and the server's confirmation count beside it, labelled as the server's. The pages' floor is
     one confirmation, so above the newest checkpoint they prove the block itself; at or below it,

@@ -116,8 +116,12 @@ one). The page draws the block first, as the server's word with that
 caveat, and then fetches the proof and verifies it: `glue.verify_mark_block`
 decides what to fetch and what it means, through the same Python
 (`pyrxd.glyph.mark_block.verify_with_fetched`) the CLI calls, so the
-claim, the reason it could not verify, and the depth proved are the
-CLI's sentences. A block that does not verify stays on screen as the
+claim and the reason it could not verify are the CLI's sentences. A
+malformed reply is refused by the same Python reader, in the same words:
+the page's JavaScript only drops the fields nothing reads and caps each
+reply's size, and a reply over that cap, or a fetch that fails in
+transport (a timeout, an error from the server), is reported in the
+page's own words. A block that does not verify stays on screen as the
 server's word, with the reason. A proof that contradicts the height the
 server reported shows no block number, as `pyrxd verify` reports none.
 The pages link at most 4,032 headers past the newest checkpoint, as the

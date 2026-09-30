@@ -10,6 +10,9 @@ WHAT IS CHECKED, and against what:
   display dict. Then the page's own JavaScript loop (``proveMarkBlock`` in ``shared.js``) drives the
   REAL glue in a subprocess, and the pages' own ``onCheck`` / ``onFetchTxid`` draw the result: the
   CLI's claim sentence must appear on screen verbatim, so a claim retyped in JavaScript fails here.
+  MALFORMED replies too (a branch that is a string, a reply that is an array, header hex that is
+  not hex or not the count served, a huge field nothing reads) go through the page's REAL loop and
+  the CLI helper, and must reach the same state and the same reason.
 * EVERY STATE ON SCREEN: VERIFIED at the checkpoint level and at the proof-of-work level, NOT
   VERIFIED with its reason (inclusion only), CONTRADICTED, a failed merkle fetch, and the "still
   checking" line — with no sentence on the screen contradicting another (#806's class).
@@ -509,13 +512,86 @@ def test_a_server_refusing_the_merkle_method_leaves_the_block_with_the_reason(gl
     assert len(out["server_log"]) == 1, "nothing is fetched after the first failure"
 
 
-def test_the_js_shape_check_refuses_headers_that_are_not_the_count_served(glue) -> None:
-    """A header range whose hex is not 160 x count is refused in JavaScript, before Python — and
-    the refusal becomes the reason, never a header."""
-    out = _js_proof(glue, C, C.tip, _proof_table(C, headers_reply={"count": 2, "hex": "00" * 80, "max": 2016}))
+#: MALFORMED REPLIES, each through the page's REAL JavaScript loop (`proveMarkBlock`) and the real
+#: glue, and through the CLI helper over a real client: (what the page's table serves, what the
+#: CLI's server serves — the same reply). The JavaScript judges no shape, so every refusal must be
+#: Python's, in the CLI's words; and a field nothing reads, however large, must change nothing.
+_PADDED = {**C.merkle, "padding": "x" * 1_100_000}
+_MALFORMED: dict[str, tuple[dict, dict, str]] = {
+    "merkle_branch_is_a_string": (
+        {"merkle": {**C.merkle, "merkle": "deadbeef"}},
+        {"blockchain.transaction.get_merkle": lambda p: {**C.merkle, "merkle": "deadbeef"}},
+        "NOT VERIFIED",
+    ),
+    "merkle_reply_is_an_array": (
+        {"merkle": [C.merkle]},
+        {"blockchain.transaction.get_merkle": lambda p: [copy.deepcopy(C.merkle)]},
+        "NOT VERIFIED",
+    ),
+    "coinbase_reply_is_an_array": (
+        {"coinbase": [C.coinbase]},
+        {"blockchain.transaction.id_from_pos": lambda p: [copy.deepcopy(C.coinbase)]},
+        "NOT VERIFIED",
+    ),
+    "merkle_reply_has_no_pos": (
+        {"merkle": {k: v for k, v in C.merkle.items() if k != "pos"}},
+        {"blockchain.transaction.get_merkle": lambda p: {k: v for k, v in C.merkle.items() if k != "pos"}},
+        "NOT VERIFIED",
+    ),
+    "header_hex_is_not_hex": (
+        {"headers_reply": {"count": 2, "hex": "zz" * 160, "max": 2016}},
+        {"blockchain.block.headers": lambda p: {"count": 2, "hex": "zz" * 160, "max": 2016}},
+        "NOT VERIFIED",
+    ),
+    "header_hex_is_not_the_count_served": (
+        {"headers_reply": {"count": 2, "hex": "00" * 80, "max": 2016}},
+        {"blockchain.block.headers": lambda p: {"count": 2, "hex": "00" * 80, "max": 2016}},
+        "NOT VERIFIED",
+    ),
+    "an_oversized_field_nothing_reads": (
+        {"merkle": _PADDED},
+        {"blockchain.transaction.get_merkle": lambda p: copy.deepcopy(_PADDED)},
+        "VERIFIED",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_MALFORMED), ids=list(_MALFORMED))
+def test_a_malformed_reply_gets_the_same_state_and_reason_on_the_page_and_the_cli(glue, monkeypatch, case) -> None:
+    table_over, server_over, state = _MALFORMED[case]
+    out = _js_proof(glue, C, C.tip, _proof_table(C, **copy.deepcopy(table_over)))
+    got = out["answer"]["anchor"]
+    assert got is not None, out["answer"]
+    monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(C, C.tip))
+    anchor = page_anchor(glue, C, _server(C))
+    cli, _ = cli_proof(
+        C,
+        _server(C, **server_over),
+        anchor,
+        label=glue._ANCHOR_SOURCE,
+        min_confirmations=page_target(glue, anchor),
+    )
+    assert cli.state == state, cli.reason
+    bv = dict(got["block_verification"])
+    bv.pop("source")
+    assert bv == _cli_verification(cli), "the page and the CLI disagree"
+    assert (got["block_verification"]["state"], got["block_verification"]["reason"]) == (cli.state, cli.reason)
+    if state != "VERIFIED":
+        # Python's reader wrote it, as `could_not_fetch` words it — not a JavaScript sentence.
+        assert " could not be fetched from " in cli.reason, cli.reason
+        assert ("Malformed" in cli.reason) or ("Unexpected response type" in cli.reason), cli.reason
+
+
+def test_a_reply_over_the_pages_size_cap_is_refused_before_python_and_says_so(glue) -> None:
+    """The one refusal the page writes itself is about SIZE, after the unread fields are dropped: a
+    merkle branch of 600 hashes is larger than any honest one. It is a failed fetch with the page's
+    reason — never a header, and never Python's "not in a shape it reads"."""
+    huge = {**C.merkle, "merkle": ["ab" * 32] * 600}
+    out = _js_proof(glue, C, C.tip, _proof_table(C, merkle=huge))
     bv = out["answer"]["anchor"]["block_verification"]
     assert bv["state"] == "NOT VERIFIED"
-    assert "could not be fetched" in bv["reason"] and "are not 2 80-byte headers" in bv["reason"]
+    assert bv["reason"].startswith(f"the transaction's merkle branch could not be fetched from {glue._ANCHOR_SOURCE}: ")
+    assert "over the 16,384 this page accepts for it" in bv["reason"]
 
 
 def test_the_js_loop_stops_at_its_cap_when_the_bridge_keeps_asking(glue) -> None:
@@ -575,20 +651,37 @@ def test_the_cap_is_above_what_the_rule_can_ask_at_the_pages_floor(glue) -> None
     assert seen <= worst <= cap
 
 
+def _js_constant(name: str) -> int:
+    import re
+
+    shared = (_GLUE_DIR / "shared.js").read_text(encoding="utf-8")
+    match = re.search(rf"const {name} = ([\d_]+);", shared)
+    assert match, f"shared.js no longer declares {name} — this scan is broken"
+    return int(match.group(1).replace("_", ""))
+
+
 def test_the_proof_json_cap_holds_the_worst_plan(glue) -> None:
-    """``_MAX_PROOF_JSON_CHARS`` bounds what the page may hand across. The most a plan at the page's
-    floor asks for, with the largest honest replies, must fit under it."""
-    worst_headers = MAX_HEADERS_FROM_CHECKPOINT + 1
-    merkle = {"block_height": 1, "merkle": ["ab" * 32] * 32, "pos": 1}
-    coinbase = {"tx_hash": "ab" * 32, "merkle": ["ab" * 32] * 32}
-    replies = {"merkle": merkle, "coinbase": coinbase}
-    left, start = worst_headers, 0
-    while left:
-        n = min(left, MAX_HEADERS_PER_REQUEST)
-        replies[f"headers:{start}:{n}"] = {"count": n, "hex": "00" * 80 * n, "max": 2016}
-        start, left = start + n, left - n
-    errors = {f"key-{i}": "e" * 160 for i in range(4)}
-    assert len(json.dumps({"replies": replies, "errors": errors})) < glue._MAX_PROOF_JSON_CHARS
+    """``_MAX_PROOF_JSON_CHARS`` bounds what the page may hand across, and the page's per-reply
+    caps (``proofReplyCap`` in shared.js) bound each reply it hands. For the longest plan the page
+    can make, every reply AT its cap, plus an error for every key, must still fit — so a reply the
+    page accepted can never trip glue's "not in a shape it reads" instead of Python's own reason."""
+    branch_cap = _js_constant("MAX_PROOF_BRANCH_REPLY_CHARS")
+    slack = _js_constant("PROOF_REPLY_SLACK_CHARS")
+    newest = radiant_checkpoints.CHECKPOINTS["mainnet"][-1][0]
+    plans = [
+        plan_block_verification(
+            height=h, min_confirmations=glue._ANCHOR_FLOOR, target_confirmations=glue._PROOF_TARGET_DEPTH
+        )
+        for h in (newest + MAX_HEADERS_FROM_CHECKPOINT, newest - 1, newest + 1)
+    ]
+    plans = [p for p in plans if p.reason is None]
+    assert plans, "non-vacuity: no plan to measure"
+    for plan in plans:
+        at_cap = {"merkle": "x" * (branch_cap - 2), "coinbase": "x" * (branch_cap - 2)}
+        for s, n in plan.header_ranges:
+            at_cap[f"headers:{s}:{n}"] = "x" * (160 * n + slack - 2)
+        errors = {key: "e" * 160 for key in at_cap}
+        assert len(json.dumps({"replies": at_cap, "errors": errors})) < glue._MAX_PROOF_JSON_CHARS
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════

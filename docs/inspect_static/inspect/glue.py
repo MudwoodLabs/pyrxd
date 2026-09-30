@@ -1195,8 +1195,16 @@ def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json
     :func:`pyrxd.glyph.mark_block.verify_with_fetched`, which ``pyrxd verify`` calls too
     (``pyrxd.cli.glyph_inspect.verify_anchor_block``); each reply crosses the reader the CLI's
     client uses; the display shape is :func:`~pyrxd.glyph.mark_anchor.with_block_verification`'s.
-    So the page and the CLI give the same state, claim, reason and proved depth for the same
-    server answers, and no sentence of it is written in JavaScript.
+    So for the same server answers the page and ``pyrxd verify --min-confirmations N`` — N the
+    depth the page aims for, ``min(the server's count, _PROOF_TARGET_DEPTH)`` — give the same state,
+    claim, reason and proved depth. The page REQUIRES only ``_ANCHOR_FLOOR``, so where fewer than N
+    are served it still VERIFIES to the depth it proved, where the CLI at N would not.
+
+    THE PAGE HANDS OVER ONLY WHAT IS READ. ``proveMarkBlock`` (shared.js) passes each reply's
+    fields that the readers here read, nothing else, and judges no shape: every refusal of a reply
+    as malformed is the reader's, in the CLI's words. The JavaScript writes two reasons of its own
+    — a reply over its size cap, and a fetch that failed in transport — and hands them over as
+    errors, capped at ``_PROOF_ERROR_CAP`` here.
 
     A LOOP ACROSS THE BRIDGE, like :func:`mark_anchor`'s. This module cannot fetch, so it answers
     ``{"needs": {"key", "method", "params"}}`` — the next ElectrumX request the verifier needs, in
