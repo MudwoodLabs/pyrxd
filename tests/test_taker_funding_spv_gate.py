@@ -2019,3 +2019,45 @@ async def test_a_client_over_several_operators_is_asked_once_per_operator(monkey
     got = await RadiantChainIO(client).reported_depths("ab" * 32, 100)
     assert got == tuple(depth_of.items())
     assert sorted(closed) == sorted(tuple(v) for v in _SHIPPED_BY_OPERATOR.values())
+
+
+def _exact_log_tail(mean: float, n: int):
+    """``log P(Poisson(mean) > n)`` by a 60-digit summation of the pmf from 0, as a ``Decimal``."""
+    from decimal import MAX_EMAX, MIN_EMIN, Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec, ctx.Emax, ctx.Emin = 60, MAX_EMAX, MIN_EMIN
+        m = Decimal(repr(mean))
+        term = (-m).exp()
+        cdf = term
+        for j in range(1, n + 1):
+            term = term * m / j
+            cdf += term
+        # The upper part directly, so a tail far below 1 keeps all 60 digits.
+        tail, j = Decimal(0), n + 1
+        term = term * m / j if n >= 0 else term
+        while True:
+            tail += term
+            j += 1
+            term = term * m / j
+            if j > m and term < tail * Decimal(10) ** -40:
+                return (tail + term).ln()
+
+
+@pytest.mark.parametrize("mean", [0.5, 30.0, 3_000.0, 100_000.0])
+def test_the_log_tail_error_stays_far_inside_the_quantile_margin(mean):
+    """``_log_poisson_tail`` against an exact 60-digit log-tail, below, at and far above the mean:
+    its floating-point error is under a hundredth of ``_QUANTILE_LOG_MARGIN``, the margin that makes
+    :func:`poisson_upper_quantile` conservative.
+
+    NOT PINNED, by measurement: the geometric remainder the function adds once the terms fall below
+    1e-17 of the sum. Against a 60-digit tail it moves the result by at most 4e-15 (at a mean of
+    1e7), seven orders below the function's own rounding error there (3.3e-8), so no comparison with
+    an exact tail can see it; dropping it was a plant that survived, and still does."""
+    import math
+
+    sd = math.sqrt(mean)
+    for n in sorted({max(-1, int(mean - 3 * sd)), int(mean), int(mean + 3 * sd), int(mean + 20 * sd + 10)}):
+        exact = float(_exact_log_tail(mean, n))
+        got = funding_spv._log_poisson_tail(mean, n)
+        assert abs(got - exact) <= funding_spv._QUANTILE_LOG_MARGIN / 100, (mean, n, got, exact)

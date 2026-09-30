@@ -238,8 +238,9 @@ TARGET_BLOCK_SPACING_S = 5 * 60
 INITIAL_SUBSIDY_PHOTONS = 50_000 * PHOTONS_PER_RXD
 
 #: How far below the true quantile's threshold :func:`poisson_upper_quantile` requires its computed
-#: log-tail to fall. Its floating-point error is far smaller (under 1e-8 at a mean of 1e5); the margin
-#: turns it into a result that is never below the exact quantile, and at most one above it.
+#: log-tail to fall. Its floating-point error is far smaller (measured against a 60-digit tail: under
+#: 1e-9 up to a mean of 3e5, 3.3e-8 at the 1e7 limit below); the margin turns it into a result that
+#: is never below the exact quantile, and at most one above it.
 _QUANTILE_LOG_MARGIN = 1e-6
 
 #: Above this mean the quantile is the closed-form Bernstein bound (never below the exact quantile)
@@ -340,12 +341,16 @@ DEFAULT_ELAPSED_BOUND_POLICY = ElapsedBoundPolicy()
 
 
 def _log_poisson_tail(mean: float, n: int) -> float:
-    """``log P(X > n)`` for ``X ~ Poisson(mean)``, ``mean > 0``, ``n >= -1`` — an over-estimate.
+    """``log P(X > n)`` for ``X ~ Poisson(mean)``, ``mean > 0``, ``n >= -1``.
 
     Sums the pmf from ``n + 1`` upward in scaled form (each term the previous times ``mean ÷ j``),
-    starting from ``log pmf(n + 1)`` by ``lgamma``; once the terms are decreasing and negligible, the
-    rest is bounded above by a geometric series and ADDED, so the result is never below the true tail
-    by more than floating-point error (which the caller's margin absorbs).
+    starting from ``log pmf(n + 1)`` by ``lgamma``; once the terms are decreasing and below 1e-17 of
+    the sum, the rest is bounded above by a geometric series and added. That remainder is below
+    double precision: measured against a 60-digit tail, it moves the result by at most 4e-15 (at a
+    mean of 1e7), while the result's own floating-point error reaches 3.3e-8 there (from ``lgamma``
+    and ``j · log(mean)`` at that size). So the result can be BELOW the true log-tail by that error,
+    and it is the caller's :data:`_QUANTILE_LOG_MARGIN` (1e-6) that makes the quantile conservative;
+    a test pins that the error stays far inside it.
     """
     j = n + 1
     log_first = -mean + j * math.log(mean) - math.lgamma(j + 1)
