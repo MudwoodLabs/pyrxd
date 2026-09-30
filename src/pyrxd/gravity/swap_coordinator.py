@@ -74,6 +74,8 @@ from .funding_spv import (
     VerifiedMakerFunding,
     forged_confirmation_cost_ceiling_photons,
     funding_header_ranges,
+    future_time_allowance_blocks,
+    honest_elapsed_blocks_upper,
     radiant_chain_for_leg,
     required_funding_confirmations,
     verify_maker_funding,
@@ -2068,13 +2070,19 @@ class SwapCoordinator:
         """Why *terms* can never pass the taker gate's timelock steps, or None — decided BEFORE ANYONE LOCKS.
 
         The taker gate requires the maker's funding ``k`` deep (step 5) and then judges ``t_rxd``
-        minus the elapsed depth, which is at least ``k`` (steps 6 and 7). ``k`` grows with the
-        value, so a large swap on a short ``t_rxd`` is refused there — after the maker's covenant is
-        already on chain. This computes the SMALLEST ``k`` the gate can require, from pyrxd's
-        own data only (:func:`~pyrxd.gravity.funding_spv.forged_confirmation_cost_ceiling_photons`,
-        an upper bound on ``C``; no server input), and runs steps 6 and 7 as if the funding were
-        exactly that deep. Failing here means failing there, whatever the chain turns out to hold;
-        passing here decides nothing — step 6 and 7 on the proved bound stay authoritative.
+        minus the elapsed-depth UPPER bound (steps 6 and 7) — which is at least ``k``, and in the
+        value-term regime much more: the blocks after the reference header ``value_term`` deep are
+        counted at the fast tail, and the future-time allowance is added. So a large swap on a short
+        ``t_rxd`` is refused there — after the maker's covenant is already on chain. This computes
+        the SMALLEST ``k`` and value term the gate can require, from pyrxd's own data only
+        (:func:`~pyrxd.gravity.funding_spv.forged_confirmation_cost_ceiling_photons`, an upper bound
+        on ``C``; no server input), then the bound step 6 computes for a funding exactly that deep
+        on an honest chain — blocks at the nominal interval, the newest just mined — through the SAME
+        formula (:func:`~pyrxd.gravity.funding_spv.honest_elapsed_blocks_upper`), and runs steps 6
+        and 7 on it. Failing here means failing there on such a chain; a chain whose blocks happened
+        to come faster than nominal could give step 6 a smaller bound, but a swap that needs that is
+        not negotiated to hold. Passing here decides nothing — steps 6 and 7 on the proved bound stay
+        authoritative.
 
         On a value-bearing network, two inputs the gate REQUIRES are checked here too, because the
         gate refuses without them only at step 5 — after the maker has locked: the measured fast tail
@@ -2117,11 +2125,19 @@ class SwapCoordinator:
             value_at_stake_photons=value,
             forged_confirmation_cost_photons=ceiling,
         )
+        # The bound step 6 will judge for a funding exactly k_min deep, by the gate's own formula.
+        elapsed = honest_elapsed_blocks_upper(
+            chain=chain,
+            required_confirmations=k_min,
+            value_term=value_term,
+            nominal_block_interval_s=float(mp.rxd_block_interval_s),
+            withheld_block_interval_s=float(mp.rxd_block_interval_fast_s),
+        )
         why = None
-        if self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=k_min) is not None:
+        if self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=elapsed) is not None:
             why = (
-                f"the {int(terms.t_rxd.value) - k_min} blocks of it left at that depth are fewer than a safe "
-                "claim needs (pre_btc_lock_check step 6)"
+                f"the {int(terms.t_rxd.value) - elapsed} blocks of it left once {elapsed} have elapsed are fewer "
+                "than a safe claim needs (pre_btc_lock_check step 6)"
             )
         elif terms.counter_chain == "btc":
             try:
@@ -2129,17 +2145,21 @@ class SwapCoordinator:
             except ValidationError:
                 return None
             try:
-                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp, elapsed_blocks=k_min)
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp, elapsed_blocks=elapsed)
             except ValidationError as exc:
-                why = f"at that depth the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
+                why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
         if why is None:
             return None
         return (
             f"this swap can never pass the taker gate, so it is refused before anyone locks: on Radiant "
             f"{chain.name} the maker's funding must be proved at least {k_min} blocks deep "
             f"(k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) = "
-            f"{value_term}), with C at most {ceiling} photons by pyrxd's shipped checkpoints), and "
-            f"t_rxd is {int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer t_rxd or a smaller value"
+            f"{value_term}), with C at most {ceiling} photons by pyrxd's shipped checkpoints); at that depth "
+            f"the gate's upper bound on the blocks elapsed since the funding is at least {elapsed} on a chain "
+            f"at the nominal {float(mp.rxd_block_interval_s):g}s interval (the reference header "
+            f"{max(1, value_term)} deep counted at the {float(mp.rxd_block_interval_fast_s):g}s fast tail, plus "
+            f"the {future_time_allowance_blocks(chain)}-block future-time allowance); and t_rxd is "
+            f"{int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer t_rxd or a smaller value"
         )
 
     async def taker_verify_asset_funding(

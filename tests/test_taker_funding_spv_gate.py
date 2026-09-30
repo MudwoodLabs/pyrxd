@@ -271,7 +271,7 @@ async def test_a_complete_self_consistent_forged_proof_is_refused_on_the_value_b
     value, a merkle branch that really leads to its header, and a whole chain of headers for every
     range asked. It cannot serve headers that hash to pyrxd's shipped mainnet checkpoints, so the
     proof is CONTRADICTED and the lock refused."""
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     spk = _covenant(terms)
     # A whole chain from the height of the second-newest shipped checkpoint to 16 blocks past the
     # newest, every header meeting its own target, the funding 5 blocks past the newest checkpoint.
@@ -395,7 +395,7 @@ async def test_a_value_bearing_gate_without_a_measured_fast_tail_refuses_before_
     import dataclasses
 
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     no_tail = MarginPolicy.estimated(accept_flat_burial=True)
     with pytest.raises(
@@ -418,7 +418,7 @@ async def test_the_allowance_divides_by_the_measured_fast_tail_not_the_nominal_i
     """One hour since the reference header, a 36 s fast tail and a 300 s nominal: the allowance is
     100 blocks, not 12. Swapping the nominal interval in at the gate fails here."""
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     view = _ChainView(
         pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW - 3600
     )
@@ -994,7 +994,7 @@ async def test_each_coordinator_entry_point_that_funds_refuses_an_unproved_fundi
 
 async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     # 3.5 × this chain's C: a value term of 7 or more, which proved depth 6 cannot meet, while the
     # negotiation-time check (k at least 7) still finds room in t_rxd 400.
@@ -1036,23 +1036,157 @@ def test_a_swap_whose_t_rxd_cannot_hold_k_is_refused_when_the_coordinator_is_bui
     assert view.reads == []
 
 
+def test_the_early_check_charges_the_reference_depth_the_gate_will_charge(monkeypatch):
+    """The reviewer's probe. Value term = k = 100, t_rxd 600, t_btc 100: the early check used to run
+    steps 6 and 7 at an elapsed depth of k (100) and pass, while step 6 on an HONEST chain (300 s
+    blocks, fresh tip) then computed ~826 — the reference header 100 deep, the 99 blocks above it
+    counted at the 36 s fast tail — and refused after the maker's lock. The early check now applies
+    the gate's own bound, so it refuses at construction, before anyone locks."""
+    import dataclasses
+
+    from pyrxd.btc_wallet import taproot as t
+
+    base, chain = _value_bearing_chain(monkeypatch)
+    ceiling = funding_spv.forged_confirmation_cost_ceiling_photons(chain)
+    terms = dataclasses.replace(
+        _ab_terms(600), t_btc=t.Timelock(100, t.TimeUnit.BLOCKS), t_rxd=t.Timelock(600, t.TimeUnit.BLOCKS)
+    )
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS)
+    model = funding_spv.honest_elapsed_blocks_upper(
+        chain=chain,
+        required_confirmations=100,
+        value_term=100,
+        nominal_block_interval_s=300.0,
+        withheld_block_interval_s=_FAST_S,
+    )
+    assert model == 1 + 825 + 24 == 850
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*at least 850"):
+        _btc_coord(
+            terms,
+            _real_leg(view, network="bc"),
+            policy=_vb_policy(value_at_risk_photons=50 * ceiling),
+            accept_nondurable_seen=True,
+        )
+
+
+def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
+    """For an ETH counter leg only the step-6 floor runs early (the ordering needs a clock), so the
+    floor alone must see the bound. Value term 100: t_rxd 600 leaves 500 blocks at depth k — enough
+    for a safe claim — but none once the gate's bound (850) has elapsed. Refused at construction."""
+    import dataclasses
+
+    from pyrxd.btc_wallet import taproot as t
+
+    base, chain = _value_bearing_chain(monkeypatch)
+    ceiling = funding_spv.forged_confirmation_cost_ceiling_photons(chain)
+    p = os.urandom(32)
+    terms = dataclasses.replace(
+        _eth_terms(hashlock=hashlib.sha256(p).digest()),
+        t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(600, t.TimeUnit.BLOCKS),
+        radiant_amount=1000,
+    )
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS)
+    eth = FakeEthLeg(preimage=p, verdict=_final())
+    eth.network, eth.chain_id = "sepolia", 11155111
+
+    def build(value):
+        return SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            counter_leg=eth,
+            radiant_leg=_real_leg(view, network="bc"),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(
+                margin_policy=_vb_policy(value_at_risk_photons=value, eth_finalization_window_s=768),
+                maker_stall_safety_window_blocks=6,
+                accept_estimated_eth_margins=True,
+                accept_nondurable_seen=True,
+            ),
+        )
+
+    assert build(1000) is not None  # a small value: k = 6, bound 30 — room to spare
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*at least 850.*step 6"):
+        build(50 * ceiling)
+
+
+async def test_the_early_check_and_step_6_agree_to_the_block_on_an_honest_chain(monkeypatch):
+    """The early check and step 6 use ONE bound. On an honest chain — blocks every 300 s, the newest
+    just mined, the funding exactly k deep — the gate computes exactly the bound the early check
+    modelled, future-time allowance included. So at the smallest t_rxd the early check accepts, the
+    gate passes; one block shorter is refused at construction, never after the lock.
+
+    Value term 10 (value 5 C; on this chain every header carries the checkpoint's work, so C is the
+    ceiling): k = 10, and the bound is 1 + ceil(9 × 300 ÷ 36) + 24 = 100."""
+    import dataclasses
+
+    from pyrxd.btc_wallet import taproot as t
+
+    base, chain = _value_bearing_chain(monkeypatch)
+    ceiling = funding_spv.forged_confirmation_cost_ceiling_photons(chain)
+    policy = _vb_policy(value_at_risk_photons=5 * ceiling)
+
+    def terms_at(t_rxd: int):
+        return dataclasses.replace(
+            _ab_terms(t_rxd), t_btc=t.Timelock(10, t.TimeUnit.BLOCKS), t_rxd=t.Timelock(t_rxd, t.TimeUnit.BLOCKS)
+        )
+
+    def build(terms, **chain_kw):
+        view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, base=base, bits=_HARD_BITS, **chain_kw)
+        return (*_btc_coord(terms, _real_leg(view, network="bc"), policy=policy, accept_nondurable_seen=True), view)
+
+    probe, _b, _v = build(terms_at(2000), confs=10)
+    # The smallest t_rxd the early check accepts, among those that pass step 3's negotiated ordering.
+    boundary = next(
+        n
+        for n in range(90, 2000)
+        if _step3_passes(terms_at(n), policy) and probe._funding_proof_room_failure(terms_at(n)) is None
+    )
+    short = terms_at(boundary - 1)
+    assert _step3_passes(short, policy), "the block-short case must fail on the bound, not on step 3"
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*at least 100 "):
+        build(short, confs=10)
+
+    # build_funding_chain spaces headers 300 s apart (its default), the tip stamped exactly _NOW.
+    at = terms_at(boundary)  # built once: each call draws fresh keys, hence a different covenant
+    coord, btc_view, _view = build(at, confs=10, tip_time=_NOW)
+    gate = await coord.pre_btc_lock_check(at, now_unix_s=_NOW)
+    assert gate.ok is True, gate.reason
+    proof = coord.last_maker_funding
+    assert (proof.required_confirmations, proof.value_term, proof.proved_depth) == (10, 10, 10)
+    assert proof.future_allowance_blocks == funding_spv.FUTURE_TIME_ALLOWANCE_BLOCKS == 24
+    assert proof.elapsed_blocks_upper == 100 == 1 + proof.withheld_allowance_blocks + 24
+    assert btc_view.broadcasts == []
+
+
+def _step3_passes(terms, policy) -> bool:
+    from pyrxd.gravity.swap_coordinator import assert_timelock_margin
+
+    try:
+        assert_timelock_margin(terms.t_btc, terms.t_rxd, policy)
+    except ValidationError:
+        return False
+    return True
+
+
 async def test_pre_btc_lock_check_runs_the_same_check_on_the_terms_it_is_handed(monkeypatch):
-    """The record's terms leave room; the terms handed to ``pre_btc_lock_check`` (t_rxd 700) clear the
-    negotiated ordering at step 3 but not once the funding is 640 deep. Refused at step 3b, before
-    the chain is read."""
+    """The record's terms leave room; the terms handed to ``pre_btc_lock_check`` (t_rxd 5500) clear the
+    negotiated ordering at step 3, and step 6's floor, but not the ordering once the elapsed-depth
+    bound for a funding 640 deep (5350 blocks on an honest chain) is spent. Refused at step 3b,
+    before the chain is read."""
     import dataclasses
 
     from pyrxd.btc_wallet import taproot as t
 
     base, _chain = _value_bearing_chain(monkeypatch)
     roomy = dataclasses.replace(
-        _ab_terms(5000), t_btc=t.Timelock(100, t.TimeUnit.BLOCKS), t_rxd=t.Timelock(5000, t.TimeUnit.BLOCKS)
+        _ab_terms(7000), t_btc=t.Timelock(100, t.TimeUnit.BLOCKS), t_rxd=t.Timelock(7000, t.TimeUnit.BLOCKS)
     )
     view = _ChainView(pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     coord, btc_view = _btc_coord(
         roomy, _real_leg(view, network="bc"), policy=_vb_policy(value_at_risk_photons=_BIG), accept_nondurable_seen=True
     )
-    tight = dataclasses.replace(roomy, t_rxd=t.Timelock(700, t.TimeUnit.BLOCKS))
+    tight = dataclasses.replace(roomy, t_rxd=t.Timelock(5500, t.TimeUnit.BLOCKS))
     gate = await coord.pre_btc_lock_check(tight, now_unix_s=_NOW)
     assert gate.ok is False
     assert "refused before anyone locks" in gate.reason and "step 7" in gate.reason, gate.reason
@@ -1064,7 +1198,7 @@ async def test_the_proved_bound_at_step_6_stays_authoritative(monkeypatch):
     newest header is six hours old, so the elapsed-depth upper bound is hundreds of blocks and step 6
     refuses on the proof. Passing the early check decides nothing."""
     base, _chain = _value_bearing_chain(monkeypatch)
-    terms = _ab_terms(400)
+    terms = _vb_terms(400)
     view = _ChainView(
         pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW - 6 * 3600
     )

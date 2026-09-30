@@ -261,8 +261,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
     `pre_btc_lock_check` step 3b, before the chain is read. It sizes the smallest possible `k` from
     pyrxd's shipped checkpoints alone (`C` at most the newest checkpoint's subsidy ÷ 16,
-    `funding_spv.forged_confirmation_cost_ceiling_photons`) and runs steps 6 and 7 at that depth;
-    failing there means the gate would refuse. Steps 6 and 7 on the proved bound stay authoritative;
+    `funding_spv.forged_confirmation_cost_ceiling_photons`), then the elapsed-depth bound the gate
+    computes for a funding that deep on a chain whose blocks arrive at the nominal interval — the
+    blocks above the reference header counted at the fast tail, and the future-time allowance —
+    through the same function (`funding_spv.honest_elapsed_blocks_upper`), and runs steps 6 and 7
+    on it; failing there means the gate would refuse on such a chain. Steps 6 and 7 on the proved
+    bound stay authoritative;
   - the gate links at most 20,160 headers above the newest checkpoint (the pages and
     `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
   - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
