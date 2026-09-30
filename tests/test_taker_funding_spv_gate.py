@@ -462,6 +462,8 @@ def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
     r = verify_maker_funding(ev, value_at_stake_photons=value, **common)
     assert r.proved_depth == 9 and r.required_confirmations == 6
     assert r.forged_confirmation_cost_photons == cost and r.max_header_work == max_work
+    # The negotiation-time ceiling on C, from the checkpoint table alone, bounds the real C from above.
+    assert cost <= funding_spv.forged_confirmation_cost_ceiling_photons(chain)
     # Nine proved blocks cover a value up to 4.5 C; one photon over that needs ten.
     with pytest.raises(MakerFundingNotVerified, match=r"proved only 9 block\(s\) deep; wait for 1 more"):
         verify_maker_funding(ev, value_at_stake_photons=9 * cost // 2 + 1, **common)
