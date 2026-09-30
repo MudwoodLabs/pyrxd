@@ -20,6 +20,14 @@ What is real here:
 Moves no real value: anvil is a local fork with public deterministic keys, Radiant is a
 self-managed regtest container, and the tokens are conjured ON THE FORK (see `_seed_token`).
 
+THE FORK RUNS UNDER A DEVNET CHAIN ID (31337), not the forked chain's. The taker gate judges the
+counter leg by the chain id it signs for, and refuses a regtest Radiant leg beside a chain id that
+moves real value — a mainnet id (1, 8453) is exactly that, fork or not. So anvil serves the forked
+state under 31337, and the tokens the suite uses are the forked chain's pinned tokens re-pinned to
+31337 HERE, test-side (`_on_devnet`): same address, same decimals, same freeze function — the fork
+carries the very contract at that address, and `assert_token_matches_chain` still reads its
+decimals live. Production's token registry is unchanged.
+
 Run it::
 
     XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \\
@@ -48,6 +56,7 @@ regtest suite — serialise them.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -70,6 +79,7 @@ from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.funding_spv import LOCAL_DEVNET_CHAIN_IDS
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
@@ -97,12 +107,23 @@ _RXD_IMAGE = RegtestNode.IMAGE
 #: Base USDT is the has_blacklist=False branch of the pre-reveal gate — a different path from L1
 #: USDT, and the one a Base mainnet run actually takes.
 _FORK_CHAIN_ID = int(os.environ.get("PYRXD_ETH_FORK_CHAIN_ID", "1"))
-_USDC = token_for("USDC", _FORK_CHAIN_ID)
+#: The chain id anvil serves the fork under, and every leg signs for: a local development chain,
+#: which the taker gate reads as moving no value (see the module docstring).
+_DEVNET_CHAIN_ID = 31337
+assert _DEVNET_CHAIN_ID in LOCAL_DEVNET_CHAIN_IDS
+
+
+def _on_devnet(token):
+    """The forked chain's pinned *token*, pinned to :data:`_DEVNET_CHAIN_ID` instead — test-side."""
+    return dataclasses.replace(token, chain_id=_DEVNET_CHAIN_ID)
+
+
+_USDC = _on_devnet(token_for("USDC", _FORK_CHAIN_ID))
 #: Both are run against the REAL mainnet contracts on a fork, because the USDT delta is runtime
 #: behaviour a fake cannot prove: Tether's `transfer` returns NO bool (it is not ERC-20 compliant),
 #: and its freeze predicate is `isBlackListed`, not `isBlacklisted`. Unit tests pin the name; only
 #: the real bytecode proves the leg survives the missing return value.
-_TOKENS = {"USDC": _USDC, "USDT": token_for("USDT", _FORK_CHAIN_ID)}
+_TOKENS = {"USDC": _USDC, "USDT": _on_devnet(token_for("USDT", _FORK_CHAIN_ID))}
 
 #: Function selectors used only to seed the fork with tokens. See `_seed_token`.
 _SEL_L2_BRIDGE = "0xae1f6aaf"  # l2Bridge()
@@ -251,7 +272,7 @@ def env(request, tmp_path_factory):
             "--port",
             str(port),
             "--chain-id",
-            str(_FORK_CHAIN_ID),
+            str(_DEVNET_CHAIN_ID),
             "--slots-in-an-epoch",
             "1",
             "--silent",
@@ -406,13 +427,13 @@ def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=
         token_address=(token or _USDC).address,
     )
 
-    rpc = EthRpc(url, expected_chain_id=_FORK_CHAIN_ID)
+    rpc = EthRpc(url, expected_chain_id=_DEVNET_CHAIN_ID)
     artifact = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
     contract_leg = Erc20HtlcLeg(
         token=token or _USDC,
         rpc=rpc,
         signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)),
-        chain_id=_FORK_CHAIN_ID,
+        chain_id=_DEVNET_CHAIN_ID,
         artifact=artifact,
     )
     eth_leg = _RecordingEthLeg(
