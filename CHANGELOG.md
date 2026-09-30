@@ -205,6 +205,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
     moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
     that is a known testnet or a local development chain (31337);
+  - a swap whose `t_rxd` cannot hold the depth the gate will require is refused BEFORE ANYONE
+    LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
+    `pre_btc_lock_check` step 3b, before the chain is read. It sizes the smallest possible `k` from
+    pyrxd's shipped checkpoints alone (`C` at most the newest checkpoint's subsidy ÷ 16,
+    `funding_spv.forged_confirmation_cost_ceiling_photons`) and runs steps 6 and 7 at that depth;
+    failing there means the gate would refuse. Steps 6 and 7 on the proved bound stay authoritative;
   - the gate links at most 20,160 headers above the newest checkpoint (the pages and
     `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
   - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the

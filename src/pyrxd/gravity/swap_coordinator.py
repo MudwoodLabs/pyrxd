@@ -70,9 +70,12 @@ from .finality import CounterClaimFinality, CounterClaimState
 from .funding_spv import (
     MIN_FUNDING_CONFIRMATIONS,
     MakerFundingNotVerified,
+    RadiantChain,
     VerifiedMakerFunding,
+    forged_confirmation_cost_ceiling_photons,
     funding_header_ranges,
     radiant_chain_for_leg,
+    required_funding_confirmations,
     verify_maker_funding,
 )
 from .ref_authenticity import verify_ref_authenticity
@@ -1728,6 +1731,15 @@ class SwapCoordinator:
         self._credential_resolver = credential_resolver
         #: What the taker gate last PROVED about the maker's funding (k, C, depths), or None.
         self.last_maker_funding: VerifiedMakerFunding | None = None
+        # THE NEGOTIATION-TIME CHECK (before anyone locks). A swap whose t_rxd cannot hold the
+        # confirmations the taker gate will require (plus the margins steps 6 and 7 add) is refused
+        # at step 6 — after the maker has already locked its covenant. The terms, the value and the
+        # policy are all known here, so refuse it now. Only for a NEGOTIATED record: a coordinator
+        # built to recover an in-flight swap must construct whatever its terms were.
+        if record.state is SwapState.NEGOTIATED:
+            room = self._funding_proof_room_failure(record.terms)
+            if room is not None:
+                raise ValidationError(room)
 
     @property
     def btc_leg(self):
@@ -1866,6 +1878,13 @@ class SwapCoordinator:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
+
+        # 3b. The same timelocks against the SMALLEST depth the taker gate can require of the maker's
+        #     funding (see `_funding_proof_room_failure`) — before the chain is read. The constructor
+        #     ran it on the record's terms; these are the terms this call was handed.
+        room = self._funding_proof_room_failure(terms)
+        if room is not None:
+            return PreBtcLockGate(ok=False, reason=room)
 
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
@@ -2027,6 +2046,81 @@ class SwapCoordinator:
             candidates.append(int(implied))
         return max(candidates) if candidates else None
 
+    def _funding_burial_blocks(self, chain: RadiantChain, value_at_stake: int | None) -> int:
+        """The ``burial`` term of the taker gate's ``k`` — the swap's existing reorg burial.
+
+        On a value-bearing network that is the configured depth raised by the VALUE-SCALED burial —
+        a reorg that removes the maker's funding after the taker locks is the same economic attack as
+        one that removes the taker's claim, so it is priced the same way. A test network has no value
+        to scale by, so its configured depth stands.
+        """
+        depth = self._asset_funding_depth()
+        if depth is None:
+            depth = int(getattr(self.radiant_leg, "min_confirmations", 1))
+        if not chain.value_bearing:
+            return depth
+        return max(depth, _value_scaled_burial_blocks(self.config.margin_policy, value_at_stake))
+
+    def _funding_proof_room_failure(self, terms: NegotiatedTerms) -> str | None:
+        """Why *terms* can never pass the taker gate's timelock steps, or None — decided BEFORE ANYONE LOCKS.
+
+        The taker gate requires the maker's funding ``k`` deep (step 5) and then judges ``t_rxd``
+        minus the elapsed depth, which is at least ``k`` (steps 6 and 7). ``k`` grows with the
+        value, so a large swap on a short ``t_rxd`` is refused there — after the maker's covenant is
+        already on chain. This computes the SMALLEST ``k`` the gate can require, from pyrxd's
+        own data only (:func:`~pyrxd.gravity.funding_spv.forged_confirmation_cost_ceiling_photons`,
+        an upper bound on ``C``; no server input), and runs steps 6 and 7 as if the funding were
+        exactly that deep. Failing here means failing there, whatever the chain turns out to hold;
+        passing here decides nothing — step 6 and 7 on the proved bound stay authoritative.
+
+        None — no check — on a test network, where there is no value term; when the value is unknown
+        or the configuration has no Radiant chain, which the gate itself refuses; and where the
+        negotiated terms already fail step 3's own ordering check, which owns that refusal. The ETH
+        ordering needs a clock, so for an ETH counter leg only the step-6 floor runs here.
+        """
+        try:
+            chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
+        except MakerFundingNotVerified:
+            return None
+        if not chain.value_bearing:
+            return None
+        value = self._funding_value_at_stake_photons(terms)
+        ceiling = forged_confirmation_cost_ceiling_photons(chain)
+        if value is None or value <= 0 or ceiling <= 0:
+            return None
+        mp = self.config.margin_policy
+        burial = self._funding_burial_blocks(chain, value)
+        k_min, value_term = required_funding_confirmations(
+            value_bearing=True,
+            burial_blocks=burial,
+            value_at_stake_photons=value,
+            forged_confirmation_cost_photons=ceiling,
+        )
+        why = None
+        if self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=k_min) is not None:
+            why = (
+                f"the {int(terms.t_rxd.value) - k_min} blocks of it left at that depth are fewer than a safe "
+                "claim needs (pre_btc_lock_check step 6)"
+            )
+        elif terms.counter_chain == "btc":
+            try:
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp)
+            except ValidationError:
+                return None
+            try:
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp, elapsed_blocks=k_min)
+            except ValidationError as exc:
+                why = f"at that depth the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
+        if why is None:
+            return None
+        return (
+            f"this swap can never pass the taker gate, so it is refused before anyone locks: on Radiant "
+            f"{chain.name} the maker's funding must be proved at least {k_min} blocks deep "
+            f"(k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) = "
+            f"{value_term}), with C at most {ceiling} photons by pyrxd's shipped checkpoints), and "
+            f"t_rxd is {int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer t_rxd or a smaller value"
+        )
+
     async def taker_verify_asset_funding(
         self, terms: NegotiatedTerms, *, now_unix_s: int | None = None
     ) -> tuple[str, int, int]:
@@ -2096,15 +2190,7 @@ class SwapCoordinator:
             withheld_interval_s = _dividing_interval_s(mp)
         expected_spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms))
         value_at_stake = self._funding_value_at_stake_photons(terms)
-        depth = self._asset_funding_depth()
-        if depth is None:
-            depth = int(getattr(self.radiant_leg, "min_confirmations", 1))
-        # The swap's existing reorg burial. On a value-bearing network that is the configured depth
-        # raised by the VALUE-SCALED burial — a reorg that removes the maker's funding after the
-        # taker locks is the same economic attack as one that removes the taker's claim, so it is
-        # priced the same way. A test network has no value to scale by, so its configured depth
-        # stands, exactly as before this gate.
-        burial = max(depth, _value_scaled_burial_blocks(mp, value_at_stake)) if chain.value_bearing else depth
+        burial = self._funding_burial_blocks(chain, value_at_stake)
         # The depth known BEFORE the headers are read (the value term needs them): lets the leg
         # refuse a funding its own server calls shallower without fetching thousands of headers.
         known_floor = max(burial, MIN_FUNDING_CONFIRMATIONS) if chain.value_bearing else max(burial, 1)

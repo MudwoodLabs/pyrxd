@@ -368,9 +368,12 @@ def test_the_btc_derivation_leaves_no_headroom_for_a_post_confirm_rerun(
 def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
     """The membership half of the same exemption: `assert_timelock_margin`'s production call sites.
 
-    Both live inside `pre_btc_lock_check`. A third would be the post-confirm rerun the test above
-    measured as refusing honest terms — so this fails and points at that measurement rather than
-    letting the rerun land on the strength of the symmetry argument alone.
+    Two live inside `pre_btc_lock_check`; two inside `_funding_proof_room_failure`, the
+    negotiation-time check, which is itself called only from the constructor (for a NEGOTIATED
+    record) and from `pre_btc_lock_check` — pre-fund, both, and pinned below. Anything else would be
+    the post-confirm rerun the test above measured as refusing honest terms — so this fails and
+    points at that measurement rather than letting the rerun land on the strength of the symmetry
+    argument alone.
     """
     src = Path(sc.__file__).read_text()
     tree = ast.parse(src)
@@ -381,9 +384,17 @@ def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
                 if isinstance(sub, ast.Call) and ast.unparse(sub.func).endswith("assert_timelock_margin"):
                     enclosing.setdefault(sub.lineno, node.name)
     assert enclosing, "no assert_timelock_margin call found in the coordinator — the scan has broken"
-    assert sorted(set(enclosing.values())) == ["pre_btc_lock_check"], (
+    assert sorted(set(enclosing.values())) == ["_funding_proof_room_failure", "pre_btc_lock_check"], (
         f"assert_timelock_margin is now called from {sorted(set(enclosing.values()))}. If that is a "
         "post-confirm rerun, read the measurement on _assert_btc_counter_funding_verified first: "
         "both shapes of it refuse honest, production-derived terms."
     )
-    assert len(enclosing) == 2, f"expected the two pre-fund call sites, found {len(enclosing)}"
+    assert len(enclosing) == 4, f"expected the four pre-fund call sites, found {len(enclosing)}"
+    room_callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "self._funding_proof_room_failure"
+    }
+    assert room_callers == {"__init__", "pre_btc_lock_check"}, room_callers

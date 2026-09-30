@@ -875,7 +875,9 @@ async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _ab_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
-    value = 1_000_000 * PHOTONS_PER_RXD
+    # 3.5 × this chain's C: a value term of 7 or more, which proved depth 6 cannot meet, while the
+    # negotiation-time check (k at least 7) still finds room in t_rxd 400.
+    value = 10_937_50 * PHOTONS_PER_RXD // 100
     policy = _vb_policy(value_at_risk_photons=value)
     coord, btc_view = _btc_coord(terms, _real_leg(view, network="bc"), policy=policy, accept_nondurable_seen=True)
     gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
@@ -886,6 +888,72 @@ async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     k = int(reason.split("k = ")[1].split(" ")[0])
     assert k > 6, "the value term, not the floor, set k"
     assert btc_view.broadcasts == []
+
+
+# --------------------------------------------------------------------------- (e2) before anyone locks
+
+_BIG = 1_000_000 * PHOTONS_PER_RXD  # k at least 640 on the synthetic chain (C at most 3,125 RXD)
+
+
+def test_a_swap_whose_t_rxd_cannot_hold_k_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """A value this large needs the maker's funding at least 640 deep, and t_rxd is 400 blocks. That
+    is refused at negotiation — constructing the coordinator — before the maker locks anything and
+    before any chain read, with C bounded from the shipped checkpoints alone."""
+    base, chain = _value_bearing_chain(monkeypatch)
+    terms = _ab_terms(400)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    with pytest.raises(ValidationError, match="refused before anyone locks") as exc:
+        _btc_coord(
+            terms,
+            _real_leg(view, network="bc"),
+            policy=_vb_policy(value_at_risk_photons=_BIG),
+            accept_nondurable_seen=True,
+        )
+    ceiling = funding_spv.forged_confirmation_cost_ceiling_photons(chain)
+    assert ceiling == block_subsidy_photons(chain.checkpoints[-1][0], chain) // 16
+    assert "at least 640 blocks deep" in str(exc.value) and f"C at most {ceiling} photons" in str(exc.value)
+    assert view.reads == []
+
+
+async def test_pre_btc_lock_check_runs_the_same_check_on_the_terms_it_is_handed(monkeypatch):
+    """The record's terms leave room; the terms handed to ``pre_btc_lock_check`` (t_rxd 700) clear the
+    negotiated ordering at step 3 but not once the funding is 640 deep. Refused at step 3b, before
+    the chain is read."""
+    import dataclasses
+
+    from pyrxd.btc_wallet import taproot as t
+
+    base, _chain = _value_bearing_chain(monkeypatch)
+    roomy = dataclasses.replace(
+        _ab_terms(5000), t_btc=t.Timelock(100, t.TimeUnit.BLOCKS), t_rxd=t.Timelock(5000, t.TimeUnit.BLOCKS)
+    )
+    view = _ChainView(pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    coord, btc_view = _btc_coord(
+        roomy, _real_leg(view, network="bc"), policy=_vb_policy(value_at_risk_photons=_BIG), accept_nondurable_seen=True
+    )
+    tight = dataclasses.replace(roomy, t_rxd=t.Timelock(700, t.TimeUnit.BLOCKS))
+    gate = await coord.pre_btc_lock_check(tight, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert "refused before anyone locks" in gate.reason and "step 7" in gate.reason, gate.reason
+    assert view.reads == [] and btc_view.broadcasts == []
+
+
+async def test_the_proved_bound_at_step_6_stays_authoritative(monkeypatch):
+    """The negotiation-time check passes (a small value: k is the floor of 6), but the funding's
+    newest header is six hours old, so the elapsed-depth upper bound is hundreds of blocks and step 6
+    refuses on the proof. Passing the early check decides nothing."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _ab_terms(400)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW - 6 * 3600
+    )
+    coord, btc_view = _btc_coord(terms, _real_leg(view, network="bc"), policy=_vb_policy(), accept_nondurable_seen=True)
+    assert coord._funding_proof_room_failure(terms) is None
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert "can NEVER reach a safe claim" in gate.reason, gate.reason
+    assert coord.last_maker_funding.elapsed_blocks_upper > 400
+    assert "headers" in view.reads and btc_view.broadcasts == []
 
 
 # --------------------------------------------------------------------------- (f) the upper bound

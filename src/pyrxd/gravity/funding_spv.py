@@ -138,6 +138,7 @@ __all__ = [
     "RadiantChain",
     "VerifiedMakerFunding",
     "block_subsidy_photons",
+    "forged_confirmation_cost_ceiling_photons",
     "funding_header_ranges",
     "radiant_chain_for_leg",
     "required_funding_confirmations",
@@ -283,6 +284,21 @@ def block_subsidy_photons(height: int, chain: RadiantChain) -> int:
     if halvings >= 64:
         return 0
     return INITIAL_SUBSIDY_PHOTONS >> halvings
+
+
+def forged_confirmation_cost_ceiling_photons(chain: RadiantChain) -> int:
+    """The most ``C`` can be for a funding made from now on, from the SHIPPED checkpoint table alone.
+
+    For the negotiation-time check, which runs before any funding or header exists. Two facts make it
+    an upper bound on the ``C`` :func:`verify_maker_funding` will compute: ``max_header_work``
+    includes the newest checkpoint's own header, whose work ÷ :data:`FLOOR_WORK_DIVISOR` is
+    ``floor_work``, so ``floor_work ÷ max_header_work <= 1/16``; and the subsidy never rises with
+    height, while a funding made for terms agreed now is mined above every shipped checkpoint (each is
+    at least a thousand blocks below the tip it was generated at). A ``k`` sized from this is
+    therefore never larger than the ``k`` the gate will require — so a check built on it refuses only
+    what the gate would refuse.
+    """
+    return block_subsidy_photons(chain.checkpoints[-1][0], chain) // FLOOR_WORK_DIVISOR
 
 
 def required_funding_confirmations(
