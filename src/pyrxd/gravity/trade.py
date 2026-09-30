@@ -6,8 +6,8 @@
     evidence it reads is the broadcast acknowledgement of the claim tx from a
     single server (see ``_broadcast_radiant``); nothing independently verifies
     that the maker's covenant exists on chain before the taker pays. A single
-    lying server can take the taker's full BTC payment for a covenant that was
-    never actually broadcast or mined. See
+    lying server can get the taker to pay the full BTC amount for a covenant that
+    was never actually broadcast or mined. See
     ``docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md``.
     Use the HTLC swap (:class:`~pyrxd.gravity.swap_coordinator.SwapCoordinator`)
     instead.
@@ -146,8 +146,8 @@ class GravityTrade:
         Deprecated and **UNGATED**: nothing verifies that the maker's covenant
         exists on chain before you pay. Between ``claim()`` and the taker's BTC
         payment, the only Radiant-side evidence read is the claim tx's broadcast
-        acknowledgement from a single server — one lying server can take the
-        full BTC payment for a covenant that does not exist. Use the HTLC swap
+        acknowledgement from a single server — one lying server can get you to pay
+        the full BTC amount for a covenant that does not exist. Use the HTLC swap
         (:class:`~pyrxd.gravity.swap_coordinator.SwapCoordinator`) instead.
         Constructing this class emits a ``DeprecationWarning``.
 
@@ -196,7 +196,8 @@ class GravityTrade:
     _DEPRECATION_MESSAGE = (
         "GravityTrade is deprecated and UNGATED: nothing verifies that the "
         "maker's covenant exists on chain before you pay; one lying server can "
-        "take the full payment. Use the HTLC swap (SwapCoordinator) instead."
+        "get you to pay in full for a covenant that does not exist. Use the HTLC "
+        "swap (SwapCoordinator) instead."
     )
 
     def __init__(
