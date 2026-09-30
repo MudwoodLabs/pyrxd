@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -589,7 +590,7 @@ def test_online_btc_recovery_reports_an_unspent_htlc(swap, monkeypatch, no_real_
     monkeypatch.setattr(swap_recovery_cmds, "fetch_btc_claim_bytes", AsyncMock(return_value=(False, None, None)))
     res = _recover(swap, "--btc-funding-outpoint", f"{OUR_FUNDING.txid}:1")
     assert res.exit_code == 1
-    assert "is UNSPENT" in res.output
+    assert "UNSPENT" in res.output
 
 
 def test_online_btc_recovery_refuses_unverifiable_bytes(swap, monkeypatch, no_real_http) -> None:
@@ -779,3 +780,207 @@ def test_the_runnable_remedy_survives_even_a_hard_truncation(swap, tmp_path: Pat
     message = str(exc.value)
     assert "install -m 600" in sanitize_terminal(message, max_len=200)
     assert message.index("install -m 600") < message.index("cannot succeed")
+
+
+# --------------------------------------------------------------------------- the counter-leg verdict must be TRUE
+#
+# Everything below runs the REAL commands, the REAL counter-leg readers and the REAL
+# Esplora GET helpers (`mempool_space_outspend` / `mempool_space_tx_hex`). Only the
+# network is fake: an aiohttp-shaped session answering canned JSON, and the ElectrumX
+# client the covenant read goes through.
+
+_ESPLORA = "https://esplora.example/api/key-DO-NOT-PRINT"
+
+
+class _EsploraResponse:
+    def __init__(self, body: Any, status: int = 200) -> None:
+        self._body = body
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return None
+
+    def raise_for_status(self) -> None:
+        if self.status >= 400:
+            raise OSError(f"HTTP {self.status}")
+
+    async def json(self):
+        return self._body
+
+    async def text(self):
+        return self._body if isinstance(self._body, str) else json.dumps(self._body)
+
+
+class _FakeEsplora:
+    """An aiohttp-shaped session over canned Esplora answers. GET only — nothing else exists."""
+
+    def __init__(self, outspend: Any, tx_hex: dict[str, str] | None = None) -> None:
+        self._outspend = outspend
+        self._tx_hex = tx_hex or {}
+        self.urls: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return None
+
+    def get(self, url: str, timeout: Any = None) -> _EsploraResponse:
+        self.urls.append(url)
+        if "/outspend/" in url:
+            return _EsploraResponse(self._outspend)
+        txid = url.rsplit("/", 2)[-2]
+        if url.endswith("/hex") and txid in self._tx_hex:
+            return _EsploraResponse(self._tx_hex[txid])
+        return _EsploraResponse("", status=404)
+
+
+def _serve(monkeypatch, session: _FakeEsplora) -> _FakeEsplora:
+    """Route BOTH commands' HTTP through *session* (each module holds its own reference)."""
+    from pyrxd.cli import swap_recovery
+
+    monkeypatch.setattr(swap_recovery, "open_http_session", AsyncMock(return_value=session))
+    monkeypatch.setattr(swap_recovery_cmds, "open_http_session", AsyncMock(return_value=session))
+    return session
+
+
+class _SpentCovenantClient(_NoBroadcastClient):
+    """ElectrumX for a covenant that WAS funded and is now spent: no UTXO, some history."""
+
+    def __init__(self, cov_sh: str, tip: int) -> None:
+        super().__init__({}, tip=tip)
+        self._cov_sh = cov_sh
+
+    async def get_history(self, sh):
+        return [{"tx_hash": "ef" * 32, "height": 100}] if sh == self._cov_sh else []
+
+
+_OUTPOINT = f"{OUR_FUNDING.txid}:{OUR_FUNDING.vout}"
+
+#: An explorer that says SPENT but does not say by what. Each one used to read as UNSPENT.
+_SPENT_SPENDER_UNKNOWN = [
+    pytest.param({"spent": True}, id="spender-missing"),
+    pytest.param({"spent": True, "txid": "zz" * 32}, id="spender-not-hex"),
+    pytest.param({"spent": True, "txid": "ab" * 31}, id="spender-short"),
+    pytest.param({"spent": True, "txid": None}, id="spender-null"),
+]
+
+
+def _checked_status(swap, *extra, client=None, output_mode: str = "human"):
+    return _status(
+        swap,
+        "--btc-funding-outpoint",
+        _OUTPOINT,
+        "--btc-api-url",
+        _ESPLORA,
+        *extra,
+        client=client,
+        output_mode=output_mode,
+    )
+
+
+@pytest.mark.parametrize("outspend", _SPENT_SPENDER_UNKNOWN)
+def test_status_spent_with_an_unknown_spender_is_an_error_never_unspent(swap, monkeypatch, outspend) -> None:
+    esplora = _serve(monkeypatch, _FakeEsplora(outspend))
+    res = _checked_status(swap)
+    assert res.exit_code == 0, res.output
+    assert "Counter-leg (BTC): ERROR" in res.output
+    assert "Counter-leg (BTC): LOCKED" not in res.output
+    assert "UNSPENT" not in res.output
+    assert "has not claimed" not in res.output
+    assert "SPENT but gave no well-formed spending txid" in res.output
+    # No spender, so nothing was fetched by txid — the refusal is not a fetch failure.
+    assert not any(u.endswith("/hex") for u in esplora.urls)
+
+
+@pytest.mark.parametrize("outspend", _SPENT_SPENDER_UNKNOWN)
+def test_recover_preimage_spent_with_an_unknown_spender_is_an_error_never_unspent(swap, monkeypatch, outspend) -> None:
+    _serve(monkeypatch, _FakeEsplora(outspend))
+    res = _recover(swap, "--btc-funding-outpoint", _OUTPOINT, "--btc-api-url", _ESPLORA)
+    assert res.exit_code == 2, res.output  # NetworkBoundaryError: inconclusive, not "not revealed"
+    assert "inconclusive" in res.output
+    assert "UNSPENT" not in res.output
+    assert "no preimage has been revealed yet" not in res.output
+    assert P.hex() not in res.output
+
+
+def test_an_honest_unspent_answer_still_reads_unspent_and_names_its_one_source(swap, monkeypatch) -> None:
+    _serve(monkeypatch, _FakeEsplora({"spent": False}))
+    res = _checked_status(swap)
+    assert res.exit_code == 0, res.output
+    assert "Counter-leg (BTC): LOCKED" in res.output
+    assert "esplora.example reports the BTC funding outpoint" in res.output
+    assert "UNSPENT" in res.output
+    assert "one server's answer" in res.output
+    assert "DO-NOT-PRINT" not in res.output  # the host only, never a path that may carry a key
+
+    rec = _recover(swap, "--btc-funding-outpoint", _OUTPOINT, "--btc-api-url", _ESPLORA)
+    assert rec.exit_code == 1, rec.output
+    assert "no preimage has been revealed yet" in rec.output
+    assert "esplora.example reports" in rec.output
+    assert "UNSPENT" in rec.output
+    assert "DO-NOT-PRINT" not in rec.output
+
+
+def test_a_maker_refunded_covenant_with_the_counter_leg_locked_says_refund(swap, monkeypatch) -> None:
+    """The covenant is spent (the maker's CSV refund) and the taker's BTC is still in the HTLC.
+
+    This used to print SETTLED "... no further action" directly above a Counter-leg row
+    reading LOCKED — and the BTC claim branch has no timelock, so a maker holding p can
+    sweep that BTC whenever it likes."""
+    _serve(monkeypatch, _FakeEsplora({"spent": False}))
+    client = _SpentCovenantClient(swap["cov_sh"], tip=130)
+    res = _checked_status(swap, client=client)
+    assert res.exit_code == 0, res.output
+    assert "covenant SPENT" in res.output
+    assert "Counter-leg (BTC): LOCKED" in res.output
+    assert "no further action" not in res.output.lower()
+    assert "SETTLED" not in res.output
+    assert "refund it now" in res.output
+    assert "python scripts/btc_swap_two_host.py --role taker --phase abort" in res.output
+    assert "NO timelock" in res.output
+
+    js = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130), output_mode="json")
+    assert json.loads(js.output)["situation"] == "COUNTER_LEG_LOCKED"
+
+
+def test_a_spent_covenant_with_the_counter_leg_unchecked_does_not_claim_settled(swap) -> None:
+    res = _status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))  # no counter-leg locator
+    assert res.exit_code == 0, res.output
+    assert "Counter-leg (BTC): NOT_CHECKED" in res.output
+    assert "no further action" not in res.output.lower()
+    assert "SETTLED" not in res.output
+    assert "does NOT mean the swap is over" in res.output
+
+
+def test_both_legs_spent_still_reads_settled(swap, monkeypatch) -> None:
+    raw = _claim_tx()
+    spender = btc_txid_from_raw(raw)
+    _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
+    res = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))
+    assert res.exit_code == 0, res.output
+    assert "Counter-leg (BTC): CLAIMED_PREIMAGE_REVEALED" in res.output
+    assert "situation  : SETTLED" in res.output
+    assert "No further action" in res.output
+    assert P.hex() not in res.output  # status still never prints p
+
+
+def test_the_status_block_count_is_the_legs_own_figure(swap) -> None:
+    """``claim_asset`` sizes its fee against ``t_rxd - confirmations``; the status screen
+    used to print ``funding_height + t_rxd - tip``, one block more than that."""
+    from pyrxd.gravity.radiant_leg import blocks_to_claim_deadline
+
+    res = _status(swap, client=_client(swap, confirmations=5), output_mode="json")
+    assert res.exit_code == 0, res.output
+    chain = json.loads(res.output)["chain"]
+    assert chain["depth"] == 5
+    # The known answer, from the fixture: t_rxd 20, 5 confirmations deep.
+    assert chain["blocks_to_refund"] == 15
+    assert chain["blocks_to_refund"] == blocks_to_claim_deadline(20, chain["depth"])
+
+    human = _status(swap, client=_client(swap, confirmations=5))
+    assert "15 block(s) remain" in human.output
+    assert "16 block" not in human.output

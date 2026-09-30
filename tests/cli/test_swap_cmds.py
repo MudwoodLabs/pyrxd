@@ -102,16 +102,46 @@ def test_classify_not_found():
     assert sit == "NOT_FUNDED"
 
 
-def test_classify_spent():
-    sit, _ = classify_covenant(covenant_state="spent", funding_height=None, now_height=None, t_rxd_blocks=20)
-    assert sit == "SETTLED"
+def test_classify_spent_alone_is_not_settled():
+    # A spent covenant is the taker's claim OR the maker's refund; alone it cannot say "over".
+    sit, action = classify_covenant(covenant_state="spent", funding_height=None, now_height=None, t_rxd_blocks=20)
+    assert sit == "COVENANT_SPENT"
+    assert "no further action" not in action.lower()
+
+
+@pytest.mark.parametrize(
+    ("counter", "expected"),
+    [
+        ("CLAIMED_PREIMAGE_REVEALED", "SETTLED"),
+        ("SPENT_NO_PREIMAGE", "SETTLED"),
+        ("LOCKED", "COUNTER_LEG_LOCKED"),
+        ("NOT_CHECKED", "COVENANT_SPENT"),
+        ("ERROR", "COVENANT_SPENT"),
+    ],
+)
+def test_classify_spent_is_settled_only_when_the_counter_leg_is_resolved(counter, expected):
+    sit, action = classify_covenant(
+        covenant_state="spent", funding_height=None, now_height=None, t_rxd_blocks=20, counter_leg_state=counter
+    )
+    assert sit == expected
+    assert ("No further action" in action) is (expected == "SETTLED")
 
 
 def test_classify_live_locked():
-    # funded@100, now 105, t_rxd 20 → refund opens at 120, 15 blocks away → LOCKED
+    # funded@100, now 105 (6 confirmations), t_rxd 20 → the refund can be mined from 120, and
+    # blocks 106..119 — 14 of them — are the ones in which only the claim can be mined.
     sit, action = classify_covenant(covenant_state="live", funding_height=100, now_height=105, t_rxd_blocks=20)
     assert sit == "LOCKED"
-    assert "120" in action and "15 blocks" in action
+    assert "120" in action and "14 block(s)" in action
+
+
+def test_classify_refund_open_at_the_legs_maturity_not_one_block_later():
+    # 20 confirmations deep (tip 119) is exactly when refund_asset stops refusing: the maker
+    # can broadcast the refund now. This read LOCKED "1 blocks away" before.
+    sit, _ = classify_covenant(covenant_state="live", funding_height=100, now_height=119, t_rxd_blocks=20)
+    assert sit == "REFUND_OPEN"
+    sit, _ = classify_covenant(covenant_state="live", funding_height=100, now_height=118, t_rxd_blocks=20)
+    assert sit == "LOCKED"
 
 
 def test_classify_live_refund_open():

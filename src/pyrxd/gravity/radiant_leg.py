@@ -28,9 +28,12 @@ Design notes (T7 plan D5/D6, reviewed)
   committed to (a wrong-key/wrong-party guard).
 * ``carrier_value`` (the funded covenant output value) is read from the on-chain
   UTXO, never self-reported.
-* **AUDIT GATE:** reuses :func:`pyrxd.btc_wallet.htlc_leg.require_audit_cleared` —
-  the leg refuses to construct for a value-bearing network without the explicit
-  opt-in (the always-succeeding fakes hide the one-sided-loss surface).
+* **AUDIT GATE (non-blocking since 0.9.0):** the constructor still calls
+  :func:`pyrxd.btc_wallet.htlc_leg.require_audit_cleared`, but that function has been
+  a no-op since 0.9.0, when the maintainer chose to match Radiant's own posture rather
+  than hard-block mainnet use. The leg constructs on ANY network, with or without
+  ``audit_cleared``. The stack is unaudited; what still keys on the network tag is the
+  coordinator's value-bearing setup checks (see ``_leg_is_value_bearing``).
 * ``SeenStore`` is an in-memory ``set`` for this milestone (a SQLite durable store
   is deferred to the audit-gated track; a blocking ``sqlite3`` call would stall the
   async loop). The duck-typed ``has_seen``/``mark_seen`` shape lets a durable store
@@ -75,9 +78,27 @@ __all__ = [
     "RadiantCovenantLeg",
     "RxinDexerRefAdapter",
     "SeenStore",
+    "blocks_to_claim_deadline",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def blocks_to_claim_deadline(t_rxd_blocks: int, confirmations: int) -> int:
+    """Radiant blocks left in which ONLY the taker's claim can be mined.
+
+    The covenant's refund branch is a BIP68 relative lock of ``t_rxd`` blocks, valid once the
+    covenant is ``t_rxd`` confirmations deep (the maturity :meth:`RadiantCovenantLeg.refund_asset`
+    checks). So ``t_rxd - confirmations`` more blocks can be mined before the maker's refund
+    can be too; at 0 the refund is valid now. Clamped at 0: a deadline already passed is 0,
+    never negative.
+
+    ONE definition on purpose. :meth:`RadiantCovenantLeg.claim_asset` sizes the claim fee
+    against it and ``pyrxd swap status`` prints it; the status screen used to compute its own
+    ``funding_height + t_rxd - tip``, which is this figure plus one — a block of margin the
+    taker did not have.
+    """
+    return max(0, t_rxd_blocks - confirmations)
 
 
 # --------------------------------------------------------------------------- SeenStore
@@ -449,7 +470,8 @@ class RadiantCovenantLeg:
     Parameters
     ----------
     network:
-        Radiant network tag (regtest test chains bypass the audit gate).
+        Radiant network tag. The coordinator reads it to decide whether the swap is
+        value-bearing; the leg itself constructs on any tag.
     taker_pkh / maker_pkh:
         The taker (claim) and maker (refund) Radiant holder pubkey-hashes. The
         covenant binds ``hash256(holder(pkh))``; these must reproduce the terms'
@@ -462,8 +484,8 @@ class RadiantCovenantLeg:
     min_confirmations:
         Confirmations required before the funded covenant value is trusted.
     audit_cleared:
-        Explicit opt-in for a value-bearing ``network`` (see
-        :func:`pyrxd.btc_wallet.htlc_leg.require_audit_cleared`).
+        Accepted for backward compatibility and has no effect: it feeds
+        :func:`pyrxd.btc_wallet.htlc_leg.require_audit_cleared`, a no-op since 0.9.0.
     fee_policy:
         The :class:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy` the pre-broadcast
         affordability gate enforces. Defaults to the reference node's advertised
@@ -766,7 +788,7 @@ class RadiantCovenantLeg:
         # The covenant CSV is a BIP68 BLOCK count (_build_covenant refuses any other
         # unit), so this subtraction is in Radiant blocks. Clamped at 0: a deadline
         # already passed takes the maximum urgency premium, never a negative one.
-        blocks_to_deadline = max(0, record.terms.t_rxd.value - confs)
+        blocks_to_deadline = blocks_to_claim_deadline(record.terms.t_rxd.value, confs)
         fee = self.fee_source.next_fee_input()
         with self._unspent_on_failure(fee):
             tx = build_htlc_claim_tx(

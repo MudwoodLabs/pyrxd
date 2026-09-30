@@ -104,6 +104,7 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
+from pyrxd.network.registry import url_host
 
 # ``_looks_like_mnemonic`` is private to ``security.errors`` but is THE definition of
 # "this string is a seed phrase" in this SDK, and the gate below must agree with the
@@ -133,6 +134,7 @@ __all__ = [
     "build_cold_refund",
     "covenant_pkhs",
     "electrumx_script_hash",
+    "endpoint_source_label",
     "eth_rpc_read",
     "fee_scriptpubkey",
     "fetch_btc_claim_bytes",
@@ -149,6 +151,7 @@ __all__ = [
     "recover_preimage_from_btc_claim",
     "recover_preimage_from_eth_claim",
     "select_fee_utxo",
+    "spent_spender_unknown_reason",
 ]
 
 
@@ -850,10 +853,36 @@ def not_checked(chain: str, reason: str) -> CounterLegStatus:
     return CounterLegStatus(chain=chain, state="NOT_CHECKED", reason=reason)
 
 
+def endpoint_source_label(url: str) -> str:
+    """Name the ONE server an answer came from, for operator-facing text.
+
+    The canonical host (:func:`pyrxd.network.registry.url_host`, the same spelling
+    :attr:`~pyrxd.network.registry.Endpoint.source` counts sources by), never the full
+    URL: an RPC URL routinely carries an API key in its path or query.
+    """
+    try:
+        host = url_host(url)
+    except ValueError:
+        host = ""
+    return host or "an endpoint whose URL has no parseable host"
+
+
 async def fetch_btc_claim_bytes(
     session: Any, base_url: str, funding_outpoint: BtcOutpoint, *, timeout_s: float = 15.0
 ) -> tuple[bool, str | None, bytes | None]:
     """Esplora GET pair: ``(spent, spender_txid, raw_bytes)`` for a funding outpoint.
+
+    Three shapes, and callers must tell all three apart:
+
+    * ``(False, None, None)`` — the server says UNSPENT.
+    * ``(True, None, None)`` — the server says SPENT but gave no well-formed spending
+      txid. The spend exists and cannot be fetched or verified. This is NOT unspent: it
+      used to be returned as ``(False, None, None)``, so an explorer answering
+      ``{"spent": true}`` with the txid missing or malformed made both ``swap status``
+      and ``recover-preimage`` report the counterparty had not claimed — the one
+      answer that tells a taker to keep waiting while ``p`` may already be public.
+    * ``(True, txid, raw_or_None)`` — spent by ``txid``; ``raw`` is ``None`` when the
+      bytes are not retrievable yet.
 
     Reuses the watchtower's proven keyless read helpers rather than re-implementing
     them. They are imported lazily: ``pyrxd.gravity.watch``'s package ``__init__``
@@ -866,10 +895,22 @@ async def fetch_btc_claim_bytes(
     spent, spender = await mempool_space_outspend(
         session, base_url, funding_outpoint.txid, funding_outpoint.vout, timeout_s=timeout_s
     )
-    if not spent or not spender:
+    if not spent:
         return False, None, None
+    if not spender:
+        return True, None, None
     raw = await mempool_space_tx_hex(session, base_url, spender, timeout_s=timeout_s)
     return True, spender, raw
+
+
+def spent_spender_unknown_reason(source: str, funding_outpoint: BtcOutpoint) -> str:
+    """The operator text for ``(True, None, None)`` — shared so both commands say the same thing."""
+    return (
+        f"{source} reports the BTC funding outpoint {funding_outpoint.txid}:{funding_outpoint.vout} "
+        "SPENT but gave no well-formed spending txid, so the spend cannot be fetched or verified. "
+        "This is NOT 'unspent': the counterparty may already have claimed and revealed p. Check the "
+        "outpoint on another explorer or your own node now."
+    )
 
 
 async def read_btc_counter_leg(
@@ -877,14 +918,20 @@ async def read_btc_counter_leg(
 ) -> CounterLegStatus:
     """Classify the BTC counter-leg through the SAME provenance-checked path as recovery."""
     spent, spender, raw = await fetch_btc_claim_bytes(session, base_url, funding_outpoint, timeout_s=timeout_s)
+    source = endpoint_source_label(base_url)
     if not spent:
         return CounterLegStatus(
             chain="btc",
             state="LOCKED",
             reason=(
-                f"BTC funding outpoint {funding_outpoint.txid}:{funding_outpoint.vout} is UNSPENT — "
-                "the counterparty has not claimed, so no preimage has been revealed."
+                f"{source} reports the BTC funding outpoint {funding_outpoint.txid}:{funding_outpoint.vout} "
+                "UNSPENT — the counterparty has not claimed, so no preimage has been revealed. That is one "
+                "server's answer, not a verified fact."
             ),
+        )
+    if spender is None:
+        return CounterLegStatus(
+            chain="btc", state="ERROR", reason=spent_spender_unknown_reason(source, funding_outpoint)
         )
     if not raw:
         return CounterLegStatus(
@@ -982,8 +1029,9 @@ async def read_eth_counter_leg(
             chain="eth",
             state="LOCKED",
             reason=(
-                f"the HTLC contract {contract_address} has emitted no retrievable claim activity — "
-                "no preimage has been revealed."
+                f"{endpoint_source_label(rpc_url)} reports no retrievable claim activity from the HTLC "
+                f"contract {contract_address} — no preimage has been revealed. That is one server's "
+                "answer, not a verified fact."
             ),
         )
     tx_hash = tx.get("hash") if isinstance(tx.get("hash"), str) else None

@@ -51,6 +51,7 @@ from .swap_recovery import (
     build_cold_claim,
     build_cold_refund,
     covenant_pkhs,
+    endpoint_source_label,
     fetch_btc_claim_bytes,
     fetch_eth_claim_artifacts,
     open_http_session,
@@ -62,6 +63,7 @@ from .swap_recovery import (
     recover_preimage_from_btc_claim,
     recover_preimage_from_eth_claim,
     select_fee_utxo,
+    spent_spender_unknown_reason,
 )
 
 DEFAULT_BTC_API_URL = "https://mempool.space"
@@ -206,15 +208,27 @@ async def _recover(
         session = await open_http_session()
         async with session:
             spent, spender, raw = await fetch_btc_claim_bytes(session, btc_api_url, outpoint, timeout_s=timeout_s)
+        source = endpoint_source_label(btc_api_url)
         if not spent:
             raise PreimageNotRevealed(
-                f"BTC funding outpoint {outpoint.txid}:{outpoint.vout} is UNSPENT — the counterparty has "
-                "not claimed, so there is no preimage to recover yet."
+                f"{source} reports the BTC funding outpoint {outpoint.txid}:{outpoint.vout} UNSPENT — the "
+                "counterparty has not claimed, so there is no preimage to recover yet. That is one "
+                "server's answer, not a verified fact."
+            )
+        if spender is None:
+            # Spent, spender unknown: an ERROR, never "unspent". Before this branch existed the
+            # fetch folded it into the unspent case above, and "no preimage yet — keep watching"
+            # is exactly the wrong advice when p may already be public.
+            raise NetworkBoundaryError(
+                "the counter-chain read is inconclusive — no preimage was taken",
+                cause=sanitize_terminal(spent_spender_unknown_reason(source, outpoint), max_len=400),
+                fix="re-run with another --btc-api-url, or fetch the spending tx from your own node and "
+                "pass it with --claim-tx-hex — nothing was broadcast",
             )
         if not raw:
             raise ProvenanceRefused(
                 f"the outpoint is spent by {spender}, but its raw bytes are not retrievable from "
-                f"{btc_api_url} yet. Refusing to proceed on an unverifiable transaction."
+                f"{source} yet. Refusing to proceed on an unverifiable transaction."
             )
         return recover_preimage_from_btc_claim(raw, hashlock=hashlock, funding_outpoint=outpoint, reported_txid=spender)
 
@@ -232,7 +246,8 @@ async def _recover(
         )
     if tx is None:
         raise PreimageNotRevealed(
-            f"the HTLC contract {eth_contract} shows no retrievable claim activity — no preimage yet."
+            f"{endpoint_source_label(eth_rpc_url)} reports no retrievable claim activity from the HTLC "
+            f"contract {eth_contract} — no preimage yet. That is one server's answer, not a verified fact."
         )
     return recover_preimage_from_eth_claim(hashlock=hashlock, contract_address=eth_contract, claim_tx=tx, logs=logs)
 

@@ -76,6 +76,7 @@ __all__ = [
     "block_hash_hex",
     "default_endpoints",
     "genesis_hash_for",
+    "url_host",
 ]
 
 #: Networks the CLI/config layer understands. Mirrors ``--network``'s choices.
@@ -175,6 +176,20 @@ def _canonical_host(host: str) -> str:
         except UnicodeError:
             return host
     return host
+
+
+def url_host(url: str) -> str:
+    """The canonical host of *url* — the one spelling pyrxd names a SOURCE by.
+
+    :attr:`Endpoint.source` is this function, so a message that names "the server that said
+    so" and the source counter that decides whether two servers are independent agree on
+    what one server is. Only the host: never the path, query or userinfo, where an RPC URL
+    commonly carries an API key. ``""`` when the URL has no host.
+
+    Raises:
+        ValueError: *url* cannot be split (e.g. an unclosed IPv6 bracket).
+    """
+    return _canonical_host(urlsplit(url).hostname or "")
 
 
 def _normalize_pins(pins: Iterable[str]) -> tuple[str, ...]:
@@ -278,7 +293,7 @@ class Endpoint:
         are different sources here, and that limit is stated rather than papered over.
         """
         try:
-            return _canonical_host(urlsplit(self.url).hostname or "")
+            return url_host(self.url)
         except ValueError:
             return self.url.lower()
 

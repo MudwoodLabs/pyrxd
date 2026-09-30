@@ -48,8 +48,8 @@ re-derive from it.
 | Preimage-length pin, BTC leg | `src/pyrxd/btc_wallet/taproot.py:334-356` (`claim_leaf_script`) |
 | Preimage-length pin, Radiant leg | `src/pyrxd/gravity/artifacts/GravityHtlcCovenantRxd.artifact.json` (`OP_SWAP OP_SIZE 20 OP_EQUALVERIFY OP_SHA256 …`), and `src/pyrxd/gravity/htlc_spend.py:272-275` |
 | Radiant covenant parameter binding | `src/pyrxd/gravity/htlc_covenant.py:202-222, 366-381, 487-516` |
-| BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:336-362` |
-| ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:150-191`, `src/pyrxd/eth_wallet/locator.py:33-104` |
+| BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:340-366` |
+| ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:152-193`, `src/pyrxd/eth_wallet/locator.py:33-104` |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:526-601`, `src/pyrxd/eth_wallet/locator.py:33-121` |
 | The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-59, 632-691`, `scripts/eth_swap_two_host.py:585-645` |
 | Conformance vectors | `conformance/htlc-handshake-vectors.json`, guarded by `tests/test_htlc_handshake_conformance_vectors.py` |
@@ -225,7 +225,7 @@ MUST verify, before acting on it (`swap_coordinator.py:1636-1656`):
    by byte offset** (`counter_chain_leg.py:93-95`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
    (`swap_coordinator.py:1590-1612`); ETH: the transaction targets *this swap's* contract instance
-   and emits `Claimed(p)` from it (`eth_leg.py:214-220`). Without this, a claim transaction from a
+   and emits `Claimed(p)` from it (`eth_leg.py:216-222`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
 ## The `terms` object
@@ -419,7 +419,7 @@ differences matter:
 | Radiant refund (pays the maker) | `terms.maker_dest_hash` | **Consensus-bound**, same mechanism. |
 | BTC claim (pays the maker) | `envelope.btc_maker_payout_spk_hex` | **Not bound** — see **HZ-6**. |
 | BTC refund (pays the taker) | not on the wire at all | Taker-local. Safe: it is the taker's own money returning. |
-| ETH claim / refund | `envelope.eth_maker_claim_addr` / `eth_taker_refund_addr` | **Contract immutables**; verified on chain by the maker before it locks (`eth_leg.py:170-191`). |
+| ETH claim / refund | `envelope.eth_maker_claim_addr` / `eth_taker_refund_addr` | **Contract immutables**; verified on chain by the maker before it locks (`eth_leg.py:172-193`). |
 
 The pkhs themselves are **not** in `terms` — only `hash256(holder(pkh))` is. The raw pkhs travel
 separately, in `taker_intro.taker_pkh_hex` and `envelope.maker_pkh_hex`, so each side can rebuild
@@ -427,7 +427,7 @@ the covenant; they are bound only transitively, by recomputing
 `holder_hash(pkh, variant=…, genesis_ref=…)` and comparing it to the dest hash baked into the
 covenant bytecode (`htlc_covenant.py:180`; the same mechanism proves a credential's owner is the
 payout recipient at `swap_coordinator.py:2498-2502`). A pkh that does not reproduce the dest hash
-is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:468-471`).
+is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:490-493`).
 Holder-script layouts, from `htlc_covenant.py:168-177`:
 
 | variant | holder script | bytes |
@@ -455,7 +455,7 @@ one-sided taker loss because the claim leaf does not cap value.
 
 All three additionally pin `OP_TXOUTPUTCOUNT OP_1` (exactly one output) and the destination hash.
 The leg re-reads the on-chain value rather than trusting a self-report, filtering the covenant UTXO
-set on the expected value and failing closed on an ambiguous set (`radiant_leg.py:199-206`).
+set on the expected value and failing closed on an ambiguous set (`radiant_leg.py:220-227`).
 
 ### Finality and confirmation-depth parameters
 
@@ -474,7 +474,7 @@ The values a second implementation should know about:
 | **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `:157, 292-304` |
 | `min_ref_confirmations` | 6 | policy | `:898` |
 | `min_credential_confirmations` | 6 | policy | `:917` |
-| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:478` |
+| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:500` |
 | `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `:893` |
 
 The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1214-1369`), returns
@@ -488,7 +488,7 @@ hashrate feed in the stack.
 
 **No fee parameter crosses the wire.** `NegotiatedTerms` has no fee field, and `DeadlineFeePolicy`
 has no `to_dict`/`from_dict` — it is only ever constructor-injected (`fee_policy.py:157-311`;
-`radiant_leg.py:402`; `htlc_spend.py:255, 313`). Fees are node policy, not protocol.
+`radiant_leg.py:423`; `htlc_spend.py:255, 313`). Fees are node policy, not protocol.
 
 This is worth stating explicitly because on Radiant it is unusually consequential: the chain
 supports **neither RBF nor CPFP**, so an under-fee'd time-critical spend is not slow, it is
@@ -659,7 +659,7 @@ that the funding is therefore bound — the address is bound; the **value** is n
 On an ETH swap `t_btc` must still be supplied, must still be a `Timelock`, and `t_rxd` must
 still exceed it (`swap_state.py:450, 457-460`) — but the real deadline is the absolute
 `eth_timeout_unix_s`, and the ETH leg **explicitly ignores** the relative timelock the coordinator
-passes to `refund` (`eth_leg.py:314-317`). The pre-fund ordering gate correctly routes ETH swaps to
+passes to `refund` (`eth_leg.py:316-319`). The pre-fund ordering gate correctly routes ETH swaps to
 a different, cross-clock check (`swap_coordinator.py:1279-1282, 1297-1328`) rather than
 `assert_timelock_margin`.
 
@@ -674,9 +674,9 @@ Step 4 of the pre-fund gate compares `derive_funding_scriptpubkey(terms)` with
 this "maker-**promised** params match the locally re-derived BTC funding SPK" (`:1210`). On both
 shipped legs the two methods call the same function on the same input:
 
-- BTC — `src/pyrxd/btc_wallet/htlc_leg.py:350-362`, both return `self._htlc(terms).scriptpubkey`; the docstring at
+- BTC — `src/pyrxd/btc_wallet/htlc_leg.py:354-366`, both return `self._htlc(terms).scriptpubkey`; the docstring at
   `:356-360` says so plainly ("there is no separate maker-side derivation").
-- ETH — `eth_leg.py:97-105`, both return `self._commitment(terms)`, computed from the leg's *own*
+- ETH — `eth_leg.py:99-107`, both return `self._commitment(terms)`, computed from the leg's *own*
   local `claim_to`/`refund_to`/`timeout`.
 
 There is no independently-transmitted "promised scriptPubKey" anywhere in the handshake. The check
@@ -710,7 +710,7 @@ restriction, so the maker may send its claimed BTC anywhere. The field exists so
 construct its leg object; it is not a promise.
 
 The ETH equivalents are the opposite: `claimant` and `refundee` are contract immutables, and the
-maker verifies them on chain against its *own* expectation before locking (`eth_leg.py:150-191`).
+maker verifies them on chain against its *own* expectation before locking (`eth_leg.py:152-193`).
 
 **Normative:** do not treat `btc_maker_payout_spk_hex` as binding, and do not build a safety
 argument on it.
@@ -729,7 +729,7 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 ### HZ-8: The library default accepts a 1-confirmation covenant
 
-`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:478`). The
+`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:500`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
 text warning that real value must set it deep (`scripts/btc_swap_two_host.py:937-942`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it

@@ -375,8 +375,9 @@ Litecoin** via the chain knobs —
 `BTC_FAMILY_CHAIN=ltc BTC_REGTEST=1 pytest tests/test_btc_htlc_regtest_e2e.py -m integration`
 and `XCHAIN_BTC_FAMILY=ltc XCHAIN_REGTEST=1 pytest tests/test_xchain_swap_regtest_e2e.py -m
 integration` (the node image builds from `docker/litecoin-regtest.Dockerfile`, wrapping the
-official release binary). Mainnet `"ltc"`, like every value-bearing network, requires the
-explicit opt-in.
+official release binary). Mainnet `"ltc"`, like every value-bearing network, gets the
+coordinator's value-bearing setup checks. It needs no audit opt-in: `require_audit_cleared`
+has been a no-op since 0.9.0.
 
 ### A new chain family — the deliberate path
 
