@@ -89,11 +89,14 @@ class FundingPolicy:
 
 logger = logging.getLogger(__name__)
 
-# Networks that NEVER require the audit opt-in — isolated test chains that cannot
-# move real value. Everything else (mainnet "bc"/"ltc", and any value-bearing network)
-# requires an explicit audit-cleared opt-in. "rltc"/"tltc" are Litecoin's regtest/
-# testnet HRPs (the Bitcoin-family Taproot-HTLC leg is chain-agnostic; see
-# pyrxd.btc_wallet.chains).
+# Isolated test chains that cannot move real value. Everything else (mainnet "bc"/"ltc",
+# and any value-bearing network) is what the coordinator's ``_leg_is_value_bearing`` and
+# the watchtower executors treat as value-bearing. Membership does NOT decide whether a
+# leg constructs: ``require_audit_cleared`` has been a no-op since 0.9.0, so no leg needs
+# an audit opt-in on any network. (The watchtower's ``run.py`` still requires its own
+# ``--audit-cleared`` flag to arm autonomy outside this set.) "rltc"/"tltc" are
+# Litecoin's regtest/testnet HRPs (the Bitcoin-family Taproot-HTLC leg is chain-agnostic;
+# see pyrxd.btc_wallet.chains).
 AUDIT_CLEARED_NETWORKS: frozenset[str] = frozenset({"bcrt", "regtest", "tb", "signet", "rltc", "tltc"})
 
 # Broadcast responses that mean "the node already has this tx" — idempotent
@@ -256,8 +259,9 @@ class BitcoinTaprootLeg:
     min_confirmations:
         Confirmations required before the on-chain funded amount is trusted.
     audit_cleared:
-        Explicit opt-in for a value-bearing ``network`` (see
-        :func:`require_audit_cleared`). Ignored for isolated test chains.
+        Accepted for backward compatibility and has no effect: it feeds
+        :func:`require_audit_cleared`, a no-op since 0.9.0. The leg constructs on any
+        ``network`` with or without it.
     """
 
     _POLICY_SENTINEL: object = object()

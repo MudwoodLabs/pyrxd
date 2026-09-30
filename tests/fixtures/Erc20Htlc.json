@@ -281,5 +281,13 @@
         "length": 32
       }
     ]
+  },
+  "immutable_names": {
+    "40792": "hashlock",
+    "40794": "claimant",
+    "40796": "refundee",
+    "40799": "timeout",
+    "40802": "token",
+    "40805": "amount"
   }
 }

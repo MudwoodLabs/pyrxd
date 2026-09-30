@@ -39,7 +39,7 @@ change that: a scripthash history is still one server's claim about which transa
 :func:`walk_discovered_chain` therefore takes a DISCOVERY client and a TIP client and labels them.
 Handing it the same endpoint twice is allowed and degrades honestly — which is what a single-server
 configuration (``--electrumx URL``, or a config naming one server) should do. The shipped mainnet
-default is NOT single-server: ``network/registry.py`` ships two independent endpoints.
+default is NOT single-server: ``network/registry.py`` ships two endpoints on distinct hosts.
 
 WHAT IS AND IS NOT A SERVER CLAIM HERE. Every transaction is fetched txid-bound (the bytes must hash
 to the txid asked for), so the CONTENT of a transaction cannot be forged by either server. What a
@@ -367,7 +367,8 @@ async def walk_discovered_chain(
     max_fetches: int = MAX_DISCOVERY_FETCHES,
 ) -> DiscoveredWalk:
     """Discover from one server, prove the tip on another, walk — and ask the tip server too
-    where each walked step is, so the step heights have a second, independent source.
+    where each walked step is, so the step heights have a second source (a distinct host when the
+    two clients are).
 
     The two clients MAY be the same endpoint. The walk then reports ``complete=False`` with the
     source-conflict reason, because that is the truth of a single-server configuration: it cannot

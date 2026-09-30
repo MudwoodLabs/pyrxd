@@ -111,7 +111,7 @@ class _Rpc:
 
 def _verifying(rpc) -> Erc20HtlcLeg:
     leg = _leg(rpc)
-    leg._runtime_code_matches = lambda code: True  # the artifact compare has its own tests
+    leg._expected_runtime = lambda loc: b"\x60\x00"  # the artifact compare has its own tests
     return leg
 
 
@@ -431,7 +431,7 @@ def _push(rpc, *, resuming, amount=100, push_nonce=None, push_tx_hash=None, on_p
 
     key = PrivateKeyMaterial(os.urandom(32))
     leg = Erc20HtlcLeg(token=_USDC, rpc=rpc, signing_key=key, chain_id=1, artifact=_ART)
-    leg._runtime_code_matches = lambda code: True  # the artifact compare has its own tests
+    leg._expected_runtime = lambda loc: b"\x60\x00"  # the artifact compare has its own tests
     rpc.deployer, rpc.amount = derive_address(key), amount
     sent: list = []
 

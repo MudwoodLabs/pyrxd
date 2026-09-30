@@ -25,6 +25,7 @@ from pyrxd.network.bitcoin import (
 )
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
+from tests._source_hosts import distinct_host
 
 # A real, parseable legacy tx (>64 bytes for RawTx) + its locally-derived txid, so
 # get_raw_tx's F-004 binding (returned bytes must hash to the requested txid) holds.
@@ -540,6 +541,7 @@ class TestMultiSourceAdditional:
         self, height=840000, block_hash="aa" * 32, raw_hex="bb" * 65, script_type="p2pkh", tx_block_height=800000
     ):
         s = MagicMock()
+        s.source_key = distinct_host()
         s.get_tip_height = AsyncMock(return_value=BlockHeight(height))
         s.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex(block_hash)))
         s.get_block_header_hex = AsyncMock(return_value=bytes.fromhex("cc" * 80))

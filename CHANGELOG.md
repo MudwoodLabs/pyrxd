@@ -45,6 +45,140 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stands in for a smaller position. A block holding a single transaction (empty branch, root
   equal to the txid, as in real mainnet block 1) raised too; `MerklePath.compute_root` now
   returns the txid for that one-leaf, offset-0 path. No pyrxd command called this method.
+### Fixed
+
+- **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
+  Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
+  the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and
+  `recover-preimage` said no preimage had been revealed, while the counterparty may already have
+  claimed and published `p`. That answer is now its own state: `status` shows the counter-leg as
+  `ERROR`, and `recover-preimage` exits 2 as an inconclusive read. The UNSPENT and LOCKED texts
+  (BTC and ETH) now name the one server that gave the answer, by host only.
+- **`swap status` no longer says "no further action" for a spent covenant unless the counter-leg
+  is spent too.** A covenant is spent by the taker's claim and by the maker's CSV refund alike.
+  After a refund the taker's BTC or ETH may still be locked, and the BTC claim branch has no
+  timelock, so the maker can still sweep it. The screen could print `SETTLED … no further action`
+  above a counter-leg row reading `LOCKED`. The situation is now `SETTLED` only when both legs are
+  spent, `COUNTER_LEG_LOCKED` when the counter-leg is still locked, and `COVENANT_SPENT` when the
+  counter-leg was not checked. `SETTLED` names the one server whose answer it rests on, as the
+  `LOCKED` counter-leg text already did.
+- **`swap status` no longer tells a taker to run a refund command it cannot run.** The advice
+  named `scripts/*_swap_two_host.py --role taker --phase abort`, which needs that harness's
+  `envelope.json`, `taker_funding.json` and its own secret file; `status` reads only the files
+  `dust_swap_run.py`, `eth_swap_run.py` and `eth_swap_grief_run.py` write, and a pip install has
+  no `scripts/` at all. It now says plainly that pyrxd has no command that refunds the counter-leg,
+  names the harness that wrote the file, says when the leg's refund opens (`t_btc_blocks` after the
+  BTC funding confirmed, or the ETH contract's timeout), and names what in the file the refund
+  needs (`taker_btc_wif`, or the `eth_refund_to` refundee). A two-host `--local-out` file is refused
+  with that harness's own recovery command and the files it needs.
+- **`swap status` read an `eth_swap_grief_run.py` recovery file as a BTC swap.** That writer
+  records no `eth_chain`, so the counter-leg read asked for a BTC funding outpoint. An
+  `eth_timeout_unix_s` field now marks the file as ETH too.
+- **The handshake spec said the Radiant leg fails closed on an ambiguous covenant UTXO set.** It
+  selects the earliest-confirmed match instead, deliberately: a refusal could be triggered by any
+  payment to the public covenant SPK and would block the taker's claim until the maker's refund
+  opens. `docs/htlc-handshake-wire-format.md` and `verify_maker_asset_funded`'s docstring now
+  describe the selection, and the spec's stale line citations into the three legs are repaired.
+- **`swap status` counted one block too many before the maker's refund.** It printed
+  `funding_height + t_rxd - tip`, one more than the `t_rxd - confirmations` that
+  `RadiantCovenantLeg.claim_asset` sizes its fee against, and it reported `LOCKED` at the depth
+  where the refund is already valid. Both now come from the leg's own
+  `blocks_to_claim_deadline`, and `REFUND_OPEN` starts at the same depth where `refund_asset` and
+  `swap build-refund` accept the refund.
+- **Docstrings and docs no longer say `require_audit_cleared` blocks anything.** It has been a
+  no-op since 0.9.0. The Radiant, BTC and ETH legs, both chain registries, the SPV sole-authority
+  builder, the watchtower README, `docs/concepts/architecture.md`,
+  `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
+  network needed an opt-in to construct. None does. The gate stays a no-op.
+### Security
+
+- **Every source count keys on ONE host identity, so one server can no longer corroborate
+  itself.** Each quorum had its own idea of "a different source", and the cheap ones counted
+  spellings. The watchtower's RXD quorum folded only case and a trailing slash, so `wss://h`,
+  `wss://h:443`, `wss://h/x` and `wss://h.` were four sources: one server behind two URLs gave
+  `corroborated=True`, and its "not locked" answer became a corroborated absence that can permit
+  an autonomous refund. `MultiSourceEthRpc([r, r])` was accepted as a 2-of-2 quorum, and
+  `scripts/eth_swap_run.py` counted one URL typed three times as the "THREE" endpoints a
+  real-value token leg requires. The Esplora host helper (`endpoint_host`) only lower-cased, so
+  `mempool.space` and `mempool.space.`, or `127.0.0.1` and `2130706433`, were two hosts.
+  `MultiSourceBtcDataSource` checked no host at all, and `MultiSourceBtcFundingReader` checked
+  host diversity only in `from_endpoints`, then built one voting reader per URL, so
+  `[h/a, h/b, g]` at quorum 2 let host `h` agree with itself. HashMark §7.6 form 2's public
+  `judge_name_at_mark` and `walk_mutable_chain` compared raw labels, so only the CLI, which picked
+  a second host itself, was protected. Every one of these now counts through
+  `pyrxd.network.source_identity.source_key`, the canonical host (`Endpoint.source` already used
+  that logic), and the judge and the walker compare by host inside themselves. An unbracketed IPv6
+  literal, as an ssh destination is written (`--ssh-host 2001:db8::1`), is read as that address:
+  parsed as a URL it was host `2001`, i.e. `0.0.7.209`, so the node over ssh and
+  `wss://[2001:db8::1]:50022` on the same machine were two sources, and any two bare IPv6 hosts
+  were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
+  them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
+  (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
+  wraps them in one `SameHostFailover` reader.
+
+### Changed (breaking)
+
+- **Quorums refuse two sources on one host, and every source must name its host.**
+  `MultiSourceRxdChainSource`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
+  `MultiSourceEthRpc` raise `ValidationError` when two sources share a host, and when a source
+  carries no `source_key` built by `pyrxd.network.source_identity.source_key`. Every shipped
+  reader derives one from its own URL: `EthRpc`, `ElectrumXClient` (when all its URLs are one
+  host), `ElectrumRxdChainSource`, `SshTrRxdReader`, `MempoolSpaceSource`, `BlockstreamSource`,
+  `BitcoinCoreRpcSource`, `MempoolSpaceFundingReader`, and `BitcoinCoreFundingReader` when its
+  `rpc` is a bound method of a client that has one. A custom source sets
+  `source_key = source_key(<its URL>)`. `pyrxd.network.bitcoin.endpoint_host` and
+  `count_distinct_hosts` are removed: they were the Esplora quorum's second identity, and nothing
+  shipped calls them now. Use `source_key` and `group_by_source` from
+  `pyrxd.network.source_identity`, which refuse a blank URL rather than counting it as a host.
+  `scripts/eth_swap_run.py` refuses an `--eth-rpc-url` list that names one host twice, and its
+  three-endpoint gate counts distinct hosts.
+
+### Changed
+
+- **"Distinct host", never "independent operator".** A URL can show that two servers are on
+  different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
+  say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`
+  module docstring ("the operator limit"), which the other places point to. The
+  `registry.py` note on the two shipped ElectrumX servers no longer says "distinct operators": on
+  2026-09-29 they resolved to different IP addresses under different DNS providers, which is
+  separate infrastructure and not proof of separate operators. `verify --wave-name` keeps the
+  verdict name ESTABLISHED, and its explanation, `--help` and the form-2 caveat now say that it
+  rests on two distinct hosts and that one party running both would defeat it.
+  `docs/threat-model.md` no longer says form 2 is the only place the default pair is counted as
+  two sources (the watchtower's RXD quorum counts it too), and no longer says multi-source
+  ElectrumX is unimplemented.
+- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
+  proven on a local Anvil chain. Affects v0.6.0 through v0.25.1; upgrade before running an ETH or
+  ERC-20 swap.** The affected surface is a MAKER verifying a counterparty-deployed ETH or ERC-20
+  HTLC (`EthHtlcContractLeg.verify_funded`, and `Erc20HtlcLeg.verify_funded`, which inherits it,
+  since that leg shipped in v0.21.0). The masked compare arrived with #155, was first released in
+  v0.6.0, and is in every release through v0.25.1. It compared the deployed runtime to the
+  committed artifact with a *value-masked* compare that wildcarded every committed-zero byte — a
+  superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
+  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
+  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
+  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
+  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` sent
+  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
+  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
+  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
+  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
+  wildcarded, so a forged immutable copy or any modified logic byte is rejected. The token leg
+  extends it to its `token`/`amount` immutables.
+
+### Changed (breaking)
+
+- **The injected ETH/ERC-20 HTLC artifact must now carry `immutableReferences` and
+  `immutable_names`, and a leg built from one that does not is refused at CONSTRUCTION.** The exact
+  compare cannot be built without them. Checking only inside `verify_funded` let a leg deploy and
+  fund its own contract first (native `fund` sends the value with the deploy), leaving the ETH
+  locked until the refund timeout. An empty map, an unnamed reference id, a name for an id the
+  build does not have, or a slot outside the runtime is refused the same way. A plain Foundry
+  build output does not qualify; `load_artifact`'s docstring says how to produce one that does.
+  Regression cover: an Anvil forged-copy test for each of `EthHtlc` and the real `Erc20Htlc` (the
+  latter forging every copy of every immutable in turn), an Anvil test that checks each
+  `immutable_names` entry by executing its getter, a default-suite test that derives the same map
+  from the bytecode without reading it, and construction-refusal tests with their honest paths.
 
 ## [0.25.1] — 2026-09-29
 

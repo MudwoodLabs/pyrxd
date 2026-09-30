@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import cbor2
 
 from pyrxd.hash import hash256
+from pyrxd.network.source_identity import one_source_label, source_key
 from pyrxd.security.errors import ValidationError
 
 from .inspector import GlyphInspector
@@ -286,6 +287,18 @@ def _as_attrs(value: object) -> dict:
     return {k: v for k, v in value.items() if isinstance(k, str)}
 
 
+def _one_source(a: str, b: str) -> bool:
+    """True when two source labels may be ONE source: both unattributed, or the same distinct host.
+
+    The host comparison is :func:`pyrxd.network.source_identity.source_key`, the identity every
+    source count in pyrxd uses. A distinct host is not a distinct operator; see that module.
+    """
+    a, b = str(a or "").strip(), str(b or "").strip()
+    if not a or not b:
+        return a == b
+    return source_key(a) == source_key(b)
+
+
 async def walk_mutable_chain(
     *,
     mint_txid: str,
@@ -322,9 +335,13 @@ async def walk_mutable_chain(
     # it prevents. `judge_name_at_mark` already refuses when the block height and the name->glyph
     # binding share a source; the same rule belongs here, where the discovery hint and the tip
     # proof meet. Unnamed sources are treated as possibly-identical, because they might be.
-    if candidate_source == tip_source:
+    # Named sources are compared by DISTINCT HOST (`source_key`), here, not by the caller: the CLI
+    # canonicalised its labels, but a library caller passing `wss://h/` and `wss://h/x` - one
+    # server - got two "sources" and a complete walk from one endpoint's two lies.
+    if _one_source(candidate_source, tip_source):
         source_conflict = (
-            f"the candidate set and the tip proof came from the same source ({candidate_source!r}); "
+            f"the candidate set and the tip proof came from the same source "
+            f"({one_source_label(candidate_source, tip_source)}); "
             "one source that supplies both can omit the later updates AND certify the earlier tip"
             if candidate_source
             else "the candidate set and the tip proof are unattributed, so they may be one source "

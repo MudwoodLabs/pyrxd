@@ -36,6 +36,7 @@ import re
 import shlex
 import subprocess  # nosec B404  # read-only; every call site below is a fixed, shlex-quoted argv
 
+from ...network.source_identity import SourceKey, source_key
 from ...security.errors import ValidationError
 
 __all__ = ["SshTrRxdReader"]
@@ -87,6 +88,10 @@ class SshTrRxdReader:
         self._ssh_host = _validate_argv_token(ssh_host, "ssh_host")
         self._container = _validate_argv_token(container, "container")
         self._timeout = ssh_timeout_s
+        #: The node's host as a quorum counts it: the ssh destination, through the one identity
+        #: function. An ssh alias and a public hostname for the same machine still count as two
+        #: hosts — a URL, or an ssh destination, cannot show otherwise.
+        self.source_key: SourceKey = source_key(self._ssh_host)
 
     def _cli_argv(self, *cli_args: str) -> list[str]:
         inner = ["docker", "exec", self._container, "radiant-cli", *cli_args]

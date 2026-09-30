@@ -23,9 +23,10 @@ paragraph above as "nothing short of full SPV is worth doing":
   * CHECKING THE HEADER'S OWN PROOF-OF-WORK (does it hash below its stated target) makes fabricating
     a header cost real work instead of nothing. It still does not prove the header is on the
     most-work chain, which is what a reorg-depth argument needs.
-  * COMPARING HEIGHTS FROM INDEPENDENT ENDPOINTS turns one lie into a detectable disagreement. That
-    is a weaker claim than consensus, and it is the same independence argument ``source`` exists to
-    make checkable one level up.
+  * COMPARING HEIGHTS FROM ENDPOINTS ON DISTINCT HOSTS turns one lie into a detectable disagreement.
+    That is a weaker claim than consensus, and weaker again than independence: two hosts can be one
+    operator, which nothing here can see. ``source`` exists to make the distinct-host part
+    checkable one level up.
 
 This module builds neither: an anchor is ONE endpoint's word, and it ships the caveat. The second
 step IS taken one level up, for HashMark §7.6 form 2 only — ``judge_name_at_mark`` refuses unless a

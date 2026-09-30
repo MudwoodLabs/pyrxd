@@ -198,5 +198,11 @@
         "length": 32
       }
     ]
+  },
+  "immutable_names": {
+    "4": "hashlock",
+    "6": "claimant",
+    "8": "refundee",
+    "10": "timeout"
   }
 }

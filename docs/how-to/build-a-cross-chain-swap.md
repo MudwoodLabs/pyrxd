@@ -302,6 +302,8 @@ from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 base = KNOWN_EVM_CHAINS["base-sepolia"]          # or "base" (mainnet; opt-in required)
 
 rpc = EthRpc("https://sepolia.base.org", expected_chain_id=base.chain_id)
+# ARTIFACT must carry `immutableReferences` and `immutable_names`, or the constructor refuses it;
+# a plain Foundry build output does not. See `load_artifact`'s docstring.
 contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=base.chain_id, artifact=ARTIFACT)
 eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)  # mainnet needs an opt-in
 
@@ -375,8 +377,9 @@ Litecoin** via the chain knobs —
 `BTC_FAMILY_CHAIN=ltc BTC_REGTEST=1 pytest tests/test_btc_htlc_regtest_e2e.py -m integration`
 and `XCHAIN_BTC_FAMILY=ltc XCHAIN_REGTEST=1 pytest tests/test_xchain_swap_regtest_e2e.py -m
 integration` (the node image builds from `docker/litecoin-regtest.Dockerfile`, wrapping the
-official release binary). Mainnet `"ltc"`, like every value-bearing network, requires the
-explicit opt-in.
+official release binary). Mainnet `"ltc"`, like every value-bearing network, gets the
+coordinator's value-bearing setup checks. It needs no audit opt-in: `require_audit_cleared`
+has been a no-op since 0.9.0.
 
 ### A new chain family — the deliberate path
 

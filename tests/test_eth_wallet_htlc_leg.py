@@ -43,10 +43,14 @@ from pyrxd.security.secrets import PrivateKeyMaterial
 pytest.importorskip("web3")
 pytest.importorskip("eth_account")
 
+#: The smallest immutable layout the leg's constructor accepts (one 32-byte slot). These tests are
+#: about other things; the layout checks themselves live in test_eth_leg.py.
 _ART = {
     "abi": [{"type": "function", "name": "claim", "inputs": [{"type": "bytes32"}]}],
     "bytecode": "0x00",
-    "runtime_bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
 }
 _CONTRACT = "0x" + "11" * 20
 #: Odd, with low bits set: the messages below state computed gaps ("96s before", "97s stale"), and
@@ -367,7 +371,7 @@ class _FundedRpc:
 
 def _verifying_leg(rpc) -> EthHtlcContractLeg:
     leg = _leg(rpc)
-    leg._runtime_code_matches = lambda code: True  # the artifact compare has its own tests
+    leg._expected_runtime = lambda loc: b"\x60\x00"  # the artifact compare has its own tests
     return leg
 
 
@@ -630,12 +634,38 @@ async def test_a_delegated_claimant_does_not_excuse_a_contract_refundee():
         )
 
 
-def test_the_runtime_compare_refuses_a_HIGHER_byte_as_well_as_a_lower_one():
-    art = {"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x6060"}
+def test_expected_runtime_is_exact_and_substitutes_every_immutable_offset():
+    """The slot-accurate compare builds the expected runtime by substituting the negotiated value
+    into EVERY immutableReferences offset and requiring EXACT equality — no byte is wildcarded, so
+    a forged immutable copy or a modified logic byte (even a committed-zero one) is caught. Uses a
+    synthetic 2-copy artifact so the two-copy forgery is expressible without Anvil."""
+    # Synthetic runtime: 96 bytes. immutable `claimant` (ref id "6") at offsets 0 and 64 (two
+    # copies, as Solidity splices); byte at offset 40 is a non-zero LOGIC byte between them.
+    runtime = bytearray(96)
+    runtime[40] = 0xFE
+    art = {
+        "abi": [],
+        "bytecode": "0x00",
+        "runtime_bytecode": "0x" + bytes(runtime).hex(),
+        "immutableReferences": {"6": [{"start": 0, "length": 32}, {"start": 64, "length": 32}]},
+        "immutable_names": {"6": "claimant"},
+    }
     leg = EthHtlcContractLeg(rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=art)
-    assert leg._runtime_code_matches(bytes.fromhex("6060"))
-    assert not leg._runtime_code_matches(bytes.fromhex("6061"))
-    assert not leg._runtime_code_matches(bytes.fromhex("605f"))
+    loc = _locator()  # claimant == 0x33..33
+    expected = leg._expected_runtime(loc)
+    word = b"\x00" * 12 + bytes.fromhex("33" * 20)
+    assert expected[0:32] == word and expected[64:96] == word  # BOTH copies substituted
+    assert expected[40] == 0xFE  # the logic byte is preserved exactly
+    # Forging ONLY the second (claim/refund) copy is rejected — the getter would read the first.
+    forged = bytearray(expected)
+    forged[64:96] = b"\x00" * 12 + bytes.fromhex("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+    assert bytes(forged) != expected
+    # A flipped logic byte is rejected too (the old mask ignored higher/lower committed-zero bytes).
+    lower = bytearray(expected)
+    lower[40] = 0x5F
+    higher = bytearray(expected)
+    higher[40] = 0xFF
+    assert bytes(lower) != expected and bytes(higher) != expected
 
 
 def test_a_23_byte_code_with_a_higher_prefix_is_not_a_delegation():

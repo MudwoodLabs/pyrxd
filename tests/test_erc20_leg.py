@@ -79,7 +79,15 @@ class TestItReusesTheAuditedNativePathRatherThanReimplementingIt:
             and callable(getattr(EthHtlcContractLeg, name, None))
             and getattr(Erc20HtlcLeg, name, None) is not getattr(EthHtlcContractLeg, name, None)
         }
-        assert overridden == {"fund", "verify_funded", "claim"}, f"unexpected divergence: {overridden}"
+        # `_immutable_values` is overridden to add the token leg's `token`/`amount` immutables, so
+        # the inherited slot-exact `_expected_runtime` substitutes a value into every one of the
+        # 6-immutable Erc20Htlc's offsets (the native leg supplies only the base four).
+        assert overridden == {
+            "fund",
+            "verify_funded",
+            "claim",
+            "_immutable_values",
+        }, f"unexpected divergence: {overridden}"
 
     def test_it_still_satisfies_the_counter_chain_port(self) -> None:
         from pyrxd.gravity.counter_chain_leg import CounterChainLeg

@@ -266,7 +266,7 @@ The SPV primitive is the highest-risk client-side layer — a forged proof relea
 
 - [ ] Build a `CovenantParams(expected_nbits=…)`, then feed `SpvProofBuilder.build()` a header whose nBits (bytes 72:76) differs from the committed value. Confirm "does not match the committed" — and that it fires *before* the PoW check.
 - [ ] Confirm `build_gravity_offer(..., reject_low_difficulty=True)` rejects a difficulty-1-class `expected_nbits` (`ffff001d`), and rejects a low-mantissa exp-0x1c target once `min_difficulty_nbits` is supplied.
-- [ ] Confirm `require_spv_sole_authority_cleared("mainnet", audit_cleared=False)` raises, and `SpvProofBuilder.for_sole_authority(..., network="mainnet")` raises without the opt-in.
+- [ ] Confirm `require_spv_sole_authority_cleared("mainnet", audit_cleared=False)` returns `None` and `SpvProofBuilder.for_sole_authority(..., network="mainnet")` constructs without the opt-in: the gate has been advisory since 0.9.0, so nothing in code stops a covenant-less sole-authority use on mainnet. Review every such caller as if unguarded.
 
 ### 10.2 Merkle / coinbase (pitfalls §3, §6, §7)
 

@@ -10,16 +10,23 @@ import logging
 
 import pytest
 
-from pyrxd.network.bitcoin import MultiSourceBtcFundingReader, count_distinct_hosts, endpoint_host
+from pyrxd.network.bitcoin import MultiSourceBtcFundingReader
+from pyrxd.network.source_identity import group_by_source, source_key
 from pyrxd.security.errors import ValidationError
 
 
-def test_endpoint_host_parses_hostname():
-    assert endpoint_host("https://mempool.space/api") == "mempool.space"
-    assert endpoint_host("wss://x.example.com:50022") == "x.example.com"
-    assert endpoint_host("HTTPS://Mempool.Space/api") == "mempool.space"
-    assert endpoint_host("") is None
-    assert endpoint_host(None) is None  # type: ignore[arg-type]
+def count_distinct_hosts(urls):
+    """How many distinct hosts the funding quorum sees in *urls* — the grouping `from_endpoints` uses."""
+    return len(group_by_source(urls))
+
+
+def test_source_key_parses_hostname():
+    assert source_key("https://mempool.space/api") == "mempool.space"
+    assert source_key("wss://x.example.com:50022") == "x.example.com"
+    assert source_key("HTTPS://Mempool.Space/api") == "mempool.space"
+    for blank in ("", None):
+        with pytest.raises(ValidationError):
+            source_key(blank)  # type: ignore[arg-type]
 
 
 def test_count_distinct_hosts():
@@ -27,8 +34,13 @@ def test_count_distinct_hosts():
     assert count_distinct_hosts(["https://mempool.space/api", "https://mempool.space/signet/api"]) == 1
     # genuinely independent hosts → TWO
     assert count_distinct_hosts(["https://mempool.space/api", "https://blockstream.info/api"]) == 2
-    # unparseable tokens count as one distinct source each (we can't prove they collide)
-    assert count_distinct_hosts(["", "   "]) == 2
+    # the same host spelled with a default port or a trailing dot is ONE host (it used to be two)
+    assert count_distinct_hosts(["https://mempool.space/api", "https://mempool.space:443/api"]) == 1
+    assert count_distinct_hosts(["https://mempool.space/api", "https://mempool.space./api"]) == 1
+    assert count_distinct_hosts(["https://127.0.0.1/api", "https://2130706433/api"]) == 1
+    # a blank URL names no host; it used to count as a distinct source of its own
+    with pytest.raises(ValidationError):
+        count_distinct_hosts(["", "   "])
 
 
 def test_default_mainnet_endpoints_are_independent():
