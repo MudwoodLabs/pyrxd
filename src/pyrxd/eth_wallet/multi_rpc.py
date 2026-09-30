@@ -105,11 +105,8 @@ class MultiSourceEthRpc:
     refused: ``MultiSourceEthRpc([r, r])`` used to be a 2-of-2 quorum of one endpoint agreeing
     with itself, and so did ``https://h/v2/KEY1`` beside ``https://h:443/v2/KEY2``.
 
-    What a host key cannot see, and this class therefore cannot either: two hosts run by one
-    provider, an RPC aggregator or load balancer fronting other providers' nodes, or two providers
-    reading from one upstream node. Those share one failure and one operator while counting as two
-    distinct hosts. Choosing providers that do not share an operator or an upstream is the
-    operator's job.
+    What a host key cannot see — who runs each host — this class cannot see either: see the
+    operator limit in :mod:`pyrxd.network.source_identity`.
 
     :param sources: two or more ``EthRpc`` instances on distinct hosts, each pinned to the same
         chain id.

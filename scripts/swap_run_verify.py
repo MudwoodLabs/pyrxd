@@ -342,8 +342,8 @@ def _dedup_by_host(urls: list[str]) -> list[str]:
 def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tuple[str, ...]) -> None:
     """The verifier's corroboration sources MUST be hosts neither party used (else the re-fetch is not a distinct host).
 
-    Host identity is :func:`_host_of` (the shared distinct-host key). A distinct host is not proof of a distinct
-    operator: a party that runs a second host the verifier happens to pick passes this check.
+    Host identity is :func:`_host_of` (the shared distinct-host key), which is subject to the operator limit in
+    :mod:`pyrxd.network.source_identity`: a party that runs a second host the verifier happens to pick passes.
 
     NB: `party_endpoints` is manifest-supplied (party-declared), so an adversary who runs the "third-party"
     source can simply omit it here and this hostname check passes. This guard is therefore ADVISORY — the

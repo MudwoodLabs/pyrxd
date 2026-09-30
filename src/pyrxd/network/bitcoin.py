@@ -1553,8 +1553,8 @@ class MultiSourceBtcFundingReader:
     failing source is simply dropped from the quorum (never fails the whole read).
     """
 
-    #: Default mainnet Esplora endpoints: three DISTINCT HOSTS. That is what a URL can show; whether
-    #: their operators are independent of each other is not, and is not claimed.
+    #: Default mainnet Esplora endpoints: three DISTINCT HOSTS, not proven independent operators
+    #: (the operator limit in :mod:`pyrxd.network.source_identity`).
     DEFAULT_MAINNET_ENDPOINTS = (
         "https://mempool.space/api",
         "https://blockstream.info/api",

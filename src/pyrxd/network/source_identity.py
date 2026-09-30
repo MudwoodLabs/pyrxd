@@ -12,11 +12,14 @@ WHAT THE KEY MEANS, EXACTLY: two URLs with the same key name the same DISTINCT H
 trailing dot, the port, the path, the query, userinfo, and the spelling of an IP literal do not
 make a second host. That is all a URL can show.
 
-WHAT IT CANNOT MEAN: independence. Independence is a property of OPERATORS, and nothing in a URL
-shows who runs a server. Two distinct hosts may be one operator, may sit behind one CDN, may read
-from one upstream node, or may present certificates from one mis-issuing CA; a hostname and its IP
-address, or two DNS names for one machine, are distinct hosts here too. Every quorum built on these
-keys therefore rests on DISTINCT HOSTS, and one party running both hosts defeats it. The prose
+THE OPERATOR LIMIT — stated here, once; every other docstring, help text and doc that needs it
+points here. A distinct host is not an independent operator. Independence is a property of
+OPERATORS, and nothing in a URL shows who runs a server. Two distinct hosts may be one operator,
+may sit behind one CDN, load balancer or RPC aggregator, may read from one upstream node, or may
+present certificates from one mis-issuing CA; a hostname and its IP address, or two DNS names for
+one machine, are distinct hosts here too. Every quorum built on these keys therefore rests on
+DISTINCT HOSTS, and one party running both hosts (or one failure reaching both) defeats it.
+Choosing hosts whose operators and upstreams do not overlap is the operator's job. The prose
 elsewhere says "distinct host" for this reason, and never "independent operator".
 
 WHERE A QUORUM HOLDS CLIENT OBJECTS rather than URLs, each client carries its own ``source_key``
@@ -65,8 +68,11 @@ def canonical_host(host: str) -> str:
     two NAMES reach one machine is not visible in a URL, and nothing here claims to see it.
     An internationalised name is folded to its punycode A-label, the spelling that is connected to.
 
-    Not folded, because the URL does not show them to be one host: an IPv6 zone id spelled
-    ``%eth0`` and ``%25eth0`` (link-local addresses only), and a NAT64 (``64:ff9b::/96``) or
+    An IPv6 zone id is kept (lower-cased): ``fe80::1%eth0`` and ``fe80::1%eth1`` are different
+    interfaces. Its RFC 6874 URL spelling ``%25eth0`` is decoded by :func:`source_key` before it
+    gets here, so ``[fe80::1%25eth0]`` and a bare ``fe80::1%eth0`` are one key.
+
+    Not folded, because the URL does not show them to be one host: a NAT64 (``64:ff9b::/96``) or
     IPv4-compatible IPv6 address next to the IPv4 address it embeds. Whether those reach one
     machine depends on the network, the same limit as a hostname next to its IP address.
     """
@@ -113,8 +119,10 @@ def source_key(url: str) -> SourceKey:
     """The distinct-host identity of *url*: THE function every source count keys through.
 
     Accepts a URL (``wss://h:443/x``), a scheme-less ``host[:port][/path]`` (``localhost:8545``,
-    ``user@node.example``), or a bare label. The key is the canonical host
-    (:func:`canonical_host`): port, path, query, userinfo, case and a trailing dot are dropped.
+    ``user@node.example``, an ssh destination), a bare IPv6 literal (``2001:db8::1``,
+    ``fe80::1%eth0``), a bracketed one with or without a port (``[2001:db8::1]:50022``), or a
+    bare label. The key is the canonical host (:func:`canonical_host`): port, path, query,
+    userinfo, case and a trailing dot are dropped.
 
     Text with no parseable host (a malformed URL such as ``wss://[::1``) is its own key, folded to
     lower case: identical text is one source, and different text cannot be shown to collide.
@@ -126,11 +134,47 @@ def source_key(url: str) -> SourceKey:
     if not isinstance(url, str) or not url.strip():
         raise ValidationError("a source is counted by the host of its URL; an empty URL names no host")
     text = url.strip()
-    try:
-        host = urlsplit(text if "://" in text else "//" + text.lstrip("/")).hostname or ""
-    except ValueError:  # e.g. an unclosed IPv6 bracket (#754)
-        host = ""
+    host = _host_in(text)
     return SourceKey(canonical_host(host) if host else text.lower())
+
+
+def _host_in(text: str) -> str | None:
+    """The host *text* names, or ``None`` when no host can be parsed out of it.
+
+    The authority is split by hand rather than by ``urlsplit(...).hostname``, which reads an
+    UNBRACKETED IPv6 literal as ``host:port``: ``2001:db8::1`` became host ``"2001"``, which
+    ``inet_aton`` then read as ``0.0.7.209``. So an ssh destination ``2001:db8::1`` and
+    ``wss://[2001:db8::1]:50022`` — one machine — counted as two sources, and ``2001:db8::1``
+    next to ``2001:db9::2`` — two machines — was refused as one.
+    """
+    if "://" in text:
+        try:
+            authority = urlsplit(text).netloc
+        except ValueError:  # e.g. an unclosed IPv6 bracket (#754)
+            return None
+    else:
+        authority = re.split(r"[/?#]", text.lstrip("/"), maxsplit=1)[0]
+    hostport = authority.rpartition("@")[2]  # drop userinfo (``user@host``, ``user:pw@host``)
+    if hostport.startswith("["):  # ``[v6]`` or ``[v6]:port``
+        close = hostport.find("]")
+        if close == -1 or hostport[close + 1 :][:1] not in ("", ":"):
+            return None
+        inside = hostport[1:close]
+        # RFC 6874: inside a URL's brackets the zone delimiter is percent-encoded, ``%25eth0``.
+        address, pct, zone = inside.partition("%")
+        if pct and zone.startswith("25"):
+            zone = zone[2:]
+        return f"{address}%{zone}" if pct else address
+    if hostport.count(":") >= 2:
+        # Two or more colons unbracketed: an IPv6 literal, which cannot carry a port without
+        # brackets, so the whole of it is the address (a zone id may follow ``%``).
+        try:
+            ipaddress.IPv6Address(hostport)
+        except ValueError:
+            return None
+        return hostport
+    host = hostport.partition(":")[0]  # ``host`` or ``host:port``
+    return host or None
 
 
 def one_source_label(a: str, b: str) -> str:

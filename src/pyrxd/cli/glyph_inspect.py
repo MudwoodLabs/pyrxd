@@ -1006,8 +1006,8 @@ def _endpoint_pair(ctx: CliContext) -> tuple[object, str, object, str]:
     is the truth of a single-server configuration (``--electrumx URL``, ``PYRXD_ELECTRUMX``, or a
     config naming one server). That is NOT the shipped mainnet default: ``network/registry.py``
     ships two endpoints on distinct hosts, so with no configuration at all these are two different
-    hosts and form 2 is reachable. Distinct hosts, not proven distinct operators: that limit is
-    stated in :mod:`pyrxd.network.source_identity` and in every form-2 caveat. (It used to say the default was single-server, which read
+    hosts and form 2 is reachable. Distinct hosts, not proven distinct operators: see the
+    operator limit in :mod:`pyrxd.network.source_identity`. (It used to say the default was single-server, which read
     as though form 2 — and ``verify --wave-name``'s ESTABLISHED — needed opting into. It does not.
     testnet and regtest ship no endpoint at all.)
 

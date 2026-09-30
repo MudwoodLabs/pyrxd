@@ -46,9 +46,9 @@ disagreement; it is not proof. The mark's height can be checked against each end
 header (the CLI does; :attr:`HeightReport.mark_header_bound` records it), the step heights are not,
 and nothing checks proof-of-work or merkle inclusion — so two endpoints that tell the SAME lie still
 move the answer. The residual trust is "two servers on distinct hosts do not collude" — and a
-distinct host is not an independent operator: one party running both hosts, a CDN or upstream node
-they share, or one CA mis-issuing both certificates defeats it, and none of that is visible in a
-URL. The form-2 caveat says so, and says exactly which heights were header-checked.
+distinct host is not an independent operator (the operator limit in
+:mod:`pyrxd.network.source_identity`). The form-2 caveat says so, and says exactly which heights
+were header-checked.
 """
 
 from __future__ import annotations
@@ -169,8 +169,8 @@ def _corroborated_caveat(sources: Sequence[str], *, mark_header_bound: bool) -> 
         f"{' and '.join(repr(s) for s in sources)}, and are NOT verified. {header} Nothing checks "
         "proof-of-work or merkle inclusion, so one endpoint's lie now shows as a disagreement, but "
         "endpoints that agree on the same lie still move the point in time this answer is about. "
-        "Those endpoints are distinct HOSTS, not proven independent operators: one party running "
-        "both, or a CDN or upstream node they share, would defeat the agreement"
+        "Those endpoints are distinct HOSTS, not proven independent operators, so one party running "
+        "both would defeat the agreement"
     )
 
 

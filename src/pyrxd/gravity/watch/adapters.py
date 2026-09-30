@@ -150,9 +150,8 @@ class MultiSourceRxdChainSource:
     ONE HOST, ONE VOTE. Each source names its host (``source_key``, derived from its URL by
     :func:`pyrxd.network.source_identity.source_key`), and two sources on one host are REFUSED at
     construction: ``wss://h`` and ``wss://h:443`` are one server, and one server's "not locked"
-    must never be a corroborated absence. Distinct hosts are not proof of distinct operators — one
-    party running both, a shared upstream node, or a shared CDN defeats the quorum, and nothing a
-    client can observe rules that out.
+    must never be a corroborated absence. Distinct hosts are not proof of distinct operators: see
+    the operator limit in :mod:`pyrxd.network.source_identity`.
 
     A single RXD source is flagged low-corroboration (a wrong read → a false page, never a
     false broadcast). Composing >= ``quorum`` distinct-host sources lets a lone lagging/lying/down

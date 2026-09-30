@@ -229,7 +229,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     Composes (optionally) the operator's own ssh-tr node + any number of public ElectrumX endpoints,
     ONE SOURCE PER DISTINCT HOST (:func:`pyrxd.network.source_identity.source_key`): several URLs on
     one host become one client that races them (failover), never several sources. Distinct hosts are
-    not proof of distinct operators; one party running two of them defeats the quorum.
+    not proof of distinct operators (the operator limit in :mod:`pyrxd.network.source_identity`).
     With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
     :class:`MultiSourceRxdChainSource` and ``corroborated=True`` (clears the single-source
     ``low_corroboration`` flag — the recurring v2 blocker); a single source stays ``corroborated=False``
@@ -260,15 +260,35 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     # `wss://h/x` and `wss://h.` are one server; keyed on the URL text they were four sources, and
     # one server's "not locked" became a CORROBORATED absence that permits an autonomous refund.
     # A host's URLs go to ONE client, which races them — failover, counted once.
-    for _host, host_urls in group_by_source(u.strip() for u in urls):
+    groups = group_by_source(u.strip() for u in urls)
+    for _host, host_urls in groups:
         client = await stack.enter_async_context(ElectrumXClient(host_urls, allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
+    # Say so when the list the operator wrote is not the quorum they meant: several URLs on one host
+    # collapse to one source, and if that leaves one source, corroboration is OFF.
+    for host, host_urls in groups:
+        if len(host_urls) > 1:
+            logger.warning(
+                "RXD sources: %d --rxd-electrumx-url values name ONE host (%r): %s. One host is one "
+                "source however many URLs reach it, so they are one failover source, not %d sources",
+                len(host_urls),
+                str(host),
+                ", ".join(host_urls),
+                len(host_urls),
+            )
     if not sources:
         raise ValidationError(
             "no RXD source configured — pass --rxd-electrumx-url (repeatable) and/or --rxd-include-node "
             "(or --rxd-backend ssh-tr)"
         )
     if len(sources) == 1:
+        if len(urls) > 1:
+            logger.warning(
+                "RXD corroboration is OFF: the %d --rxd-electrumx-url values are all on one host, so the "
+                "watchtower runs SINGLE-SOURCE (every RXD read is low-corroboration). Add a URL on a "
+                "distinct host to corroborate.",
+                len(urls),
+            )
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
         raise ValidationError(

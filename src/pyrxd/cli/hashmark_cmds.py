@@ -860,7 +860,7 @@ def _name_check(record: dict, *, asked: bool) -> tuple[str, str]:
     if nam.get("form") == 2 and nam.get("signer_is_target_at_height") is True:
         return "ESTABLISHED", (
             f"{nam.get('name')} pointed at the signing key at block {nam.get('height')}, per two ElectrumX "
-            "servers on distinct hosts — not proven independent: one party running both could make them agree"
+            "servers on distinct hosts, which does not prove they have different operators"
         )
     if nam.get("form") == 2:
         return (
@@ -1417,8 +1417,7 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     help="HashMark 7.6 form 2: did NAME (e.g. company.rxd) point at the signing key AT THE BLOCK "
     "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers on DISTINCT HOSTS that report "
     "the same block heights; with one host, or if they disagree, it degrades to form 1, says why, "
-    "and the verdict does NOT hold. Distinct hosts are not proof of distinct operators: one party "
-    "running both servers could make them agree.",
+    "and the verdict does NOT hold. Distinct hosts are not proof of distinct operators.",
 )
 @click.option(
     "--verify-wave",
@@ -1464,8 +1463,8 @@ def verify_cmd(
     \b
     ESTABLISHED RESTS ON TWO DISTINCT HOSTS, not on proof. It means two configured ElectrumX
     servers on different hosts reported the same block heights for the mark and the name's
-    history. Nothing checks who runs them: one party running both, a CDN or upstream node they
-    share, or one mis-issued certificate would let a lie through as agreement.
+    history. Nothing checks who runs them, so one party running both could pass a lie off as
+    agreement.
 
     \b
     THE VERDICT IS ABOUT ONE RECORD. A transaction can carry several HashMark outputs, and the

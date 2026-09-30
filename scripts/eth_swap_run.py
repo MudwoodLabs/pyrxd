@@ -881,9 +881,8 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
     to pass the three-endpoint gate on its own. Repeating a host is refused outright rather than
     silently collapsed, so the operator sees that the list they wrote is not the quorum they meant.
 
-    What a host count cannot check is independence, which is the operator's job: three hosts at one
-    provider, an RPC aggregator fronting other providers' nodes, or providers reading one upstream
-    node share one operator or one outage while counting as three distinct hosts.
+    What a host count cannot check is who runs each host: see the operator limit in
+    :mod:`pyrxd.network.source_identity`.
     """
     urls = [u.strip() for u in str(rpc_url).split(",") if u.strip()]
     if not urls:
@@ -908,8 +907,7 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
             "min_agreeing is 2 and a single 429 stalls the swap mid-flight. Working L1 endpoints "
             "measured 2026-08-26: ethereum-rpc.publicnode.com, eth-mainnet.public.blastapi.io, "
             "eth.api.onfinality.io/public, eth.drpc.org, rpc.mevblocker.io. Prefer providers that do "
-            "not share an operator or an upstream node: distinct hosts at one provider share a "
-            "single failure, and pyrxd can count hosts but cannot see who runs them."
+            "not share an operator: pyrxd counts hosts and cannot see who runs them."
         )
     if len(urls) == 1:
         if _token_leg_is_real(args):
@@ -917,7 +915,7 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
                 "a real-value token counter leg requires --eth-rpc-url endpoints on distinct hosts "
                 "(comma-separated), so no irreversible step rests on one endpoint's word. Working L1 "
                 "endpoints measured 2026-08-26: ethereum-rpc.publicnode.com. Prefer providers that "
-                "do not share an operator — several URLs from one provider share a single failure."
+                "do not share an operator."
             )
         return EthRpc(urls[0], expected_chain_id=chain_id)
     return MultiSourceEthRpc([EthRpc(u, expected_chain_id=chain_id) for u in urls])
@@ -1514,8 +1512,8 @@ def _args() -> argparse.Namespace:
         help=(
             "EVM endpoint. Comma-separated for a QUORUM, which a real token counter leg requires: "
             "safety-critical reads then need agreement instead of one endpoint's word. Use "
-            "providers on distinct hosts that do not share an operator — several URLs from one provider "
-            "share a single failure, and repeating a host is refused."
+            "providers on distinct hosts that do not share an operator (repeating a host is refused; "
+            "pyrxd counts hosts and cannot see who runs them)."
         ),
     )
     add_eth_key_arguments(ap)

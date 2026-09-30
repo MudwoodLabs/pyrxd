@@ -23,10 +23,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `judge_name_at_mark` and `walk_mutable_chain` compared raw labels, so only the CLI, which picked
   a second host itself, was protected. Every one of these now counts through
   `pyrxd.network.source_identity.source_key`, the canonical host (`Endpoint.source` already used
-  that logic), and the judge and the walker compare by host inside themselves. Several URLs on one
-  host remain a failover list for ONE source: the watchtower hands them to one `ElectrumXClient`,
-  which races them, and `MultiSourceBtcFundingReader.from_endpoints` wraps them in one
-  `SameHostFailover` reader.
+  that logic), and the judge and the walker compare by host inside themselves. An unbracketed IPv6
+  literal, as an ssh destination is written (`--ssh-host 2001:db8::1`), is read as that address:
+  parsed as a URL it was host `2001`, i.e. `0.0.7.209`, so the node over ssh and
+  `wss://[2001:db8::1]:50022` on the same machine were two sources, and any two bare IPv6 hosts
+  were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
+  them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
+  (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
+  wraps them in one `SameHostFailover` reader.
 
 ### Changed (breaking)
 
@@ -49,8 +53,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **"Distinct host", never "independent operator".** A URL can show that two servers are on
   different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
-  say "distinct host" and state the limit once: one operator running both hosts, a CDN or upstream
-  node they share, or one CA mis-issuing both certificates defeats any quorum here. The
+  say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`
+  module docstring ("the operator limit"), which the other places point to. The
   `registry.py` note on the two shipped ElectrumX servers no longer says "distinct operators": on
   2026-09-29 they resolved to different IP addresses under different DNS providers, which is
   separate infrastructure and not proof of separate operators. `verify --wave-name` keeps the

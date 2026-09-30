@@ -227,10 +227,9 @@ class Endpoint:
         refused by this — a profile may still list both for failover; they simply do not count as
         two when HashMark §7.6 form 2 needs two.
 
-        A distinct host is not an independent operator. One party can run two hosts, two hosts can
-        share a CDN or an upstream node, and a hostname and its IP address are two hosts here; the
-        URL shows none of that, and this does not claim to see it. It is the same key every other
-        source count in pyrxd uses (:mod:`pyrxd.network.source_identity`).
+        It is the same key every other source count in pyrxd uses, with the same limit: a distinct
+        host is not an independent operator (the operator limit in
+        :mod:`pyrxd.network.source_identity`).
         """
         return source_key(self.url)
 

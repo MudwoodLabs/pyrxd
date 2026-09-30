@@ -254,7 +254,7 @@ CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
 
 #: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
 #: primary's view of a mined transaction, and how often it re-asks. Only a multi-source RPC waits
-#: at all. Independent providers on a healthy chain converge within a block or two, so this is
+#: at all. Distinct hosts on a healthy chain converge within a block or two, so this is
 #: sized for a slow endpoint rather than for a chain halt: past it, "we could not get a quorum" is
 #: the honest answer and the claim is reported UNCONFIRMED, not failed and not succeeded.
 CLAIM_RECEIPT_QUORUM_WAIT_S: float = 60.0
