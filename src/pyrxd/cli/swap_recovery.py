@@ -831,6 +831,10 @@ class CounterLegStatus:
     reason: str
     claim_txid: str | None = None
     preimage_available: bool = False
+    #: The ONE server the state came from, by host (:func:`endpoint_source_label`), or
+    #: ``None`` when nothing was read. ``swap status`` names it wherever a verdict rests on
+    #: that server's word — a SETTLED swap included, not only a LOCKED one.
+    source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -839,6 +843,7 @@ class CounterLegStatus:
             "reason": self.reason,
             "claim_txid": self.claim_txid,
             "preimage_available": self.preimage_available,
+            "source": self.source,
         }
 
 
@@ -923,6 +928,7 @@ async def read_btc_counter_leg(
         return CounterLegStatus(
             chain="btc",
             state="LOCKED",
+            source=source,
             reason=(
                 f"{source} reports the BTC funding outpoint {funding_outpoint.txid}:{funding_outpoint.vout} "
                 "UNSPENT — the counterparty has not claimed, so no preimage has been revealed. That is one "
@@ -931,7 +937,7 @@ async def read_btc_counter_leg(
         )
     if spender is None:
         return CounterLegStatus(
-            chain="btc", state="ERROR", reason=spent_spender_unknown_reason(source, funding_outpoint)
+            chain="btc", state="ERROR", reason=spent_spender_unknown_reason(source, funding_outpoint), source=source
         )
     if not raw:
         return CounterLegStatus(
@@ -939,15 +945,18 @@ async def read_btc_counter_leg(
             state="ERROR",
             reason=f"outpoint is spent by {spender} but its raw bytes are not retrievable yet (unindexed?)",
             claim_txid=spender,
+            source=source,
         )
     try:
         rec = recover_preimage_from_btc_claim(
             raw, hashlock=hashlock, funding_outpoint=funding_outpoint, reported_txid=spender
         )
     except PreimageNotRevealed as exc:
-        return CounterLegStatus(chain="btc", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=spender)
+        return CounterLegStatus(
+            chain="btc", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=spender, source=source
+        )
     except ProvenanceRefused as exc:
-        return CounterLegStatus(chain="btc", state="ERROR", reason=str(exc), claim_txid=spender)
+        return CounterLegStatus(chain="btc", state="ERROR", reason=str(exc), claim_txid=spender, source=source)
     return CounterLegStatus(
         chain="btc",
         state="CLAIMED_PREIMAGE_REVEALED",
@@ -958,6 +967,7 @@ async def read_btc_counter_leg(
         ),
         claim_txid=rec.claim_txid,
         preimage_available=True,
+        source=source,
     )
 
 
@@ -1024,12 +1034,14 @@ async def read_eth_counter_leg(
 ) -> CounterLegStatus:
     """Classify the ETH counter-leg through the SAME provenance-checked path as recovery."""
     tx, logs = await fetch_eth_claim_artifacts(session, rpc_url, contract_address=contract_address, timeout_s=timeout_s)
+    source = endpoint_source_label(rpc_url)
     if tx is None:
         return CounterLegStatus(
             chain="eth",
             state="LOCKED",
+            source=source,
             reason=(
-                f"{endpoint_source_label(rpc_url)} reports no retrievable claim activity from the HTLC "
+                f"{source} reports no retrievable claim activity from the HTLC "
                 f"contract {contract_address} — no preimage has been revealed. That is one server's "
                 "answer, not a verified fact."
             ),
@@ -1040,9 +1052,11 @@ async def read_eth_counter_leg(
             hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs
         )
     except PreimageNotRevealed as exc:
-        return CounterLegStatus(chain="eth", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=tx_hash)
+        return CounterLegStatus(
+            chain="eth", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=tx_hash, source=source
+        )
     except ProvenanceRefused as exc:
-        return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), claim_txid=tx_hash)
+        return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), claim_txid=tx_hash, source=source)
     return CounterLegStatus(
         chain="eth",
         state="CLAIMED_PREIMAGE_REVEALED",
@@ -1053,6 +1067,7 @@ async def read_eth_counter_leg(
         ),
         claim_txid=rec.claim_txid,
         preimage_available=True,
+        source=source,
     )
 
 

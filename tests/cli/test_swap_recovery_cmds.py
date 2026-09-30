@@ -940,7 +940,14 @@ def test_a_maker_refunded_covenant_with_the_counter_leg_locked_says_refund(swap,
     assert "no further action" not in res.output.lower()
     assert "SETTLED" not in res.output
     assert "refund it now" in res.output
-    assert "python scripts/btc_swap_two_host.py --role taker --phase abort" in res.output
+    # It used to name `scripts/btc_swap_two_host.py --role taker --phase abort` here: a command
+    # that needs that harness's envelope.json + taker_funding.json + its own secret file, none of
+    # which a dust-run recovery file comes with, and a scripts/ directory a pip install lacks.
+    assert "--phase abort" not in res.output
+    assert "two_host" not in res.output
+    assert "pyrxd has no command that refunds the BTC leg" in res.output
+    assert "scripts/dust_swap_run.py, which wrote this file" in res.output
+    assert "30 BTC blocks after the HTLC funding confirmed" in res.output
     assert "NO timelock" in res.output
 
     js = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130), output_mode="json")
@@ -965,7 +972,231 @@ def test_both_legs_spent_still_reads_settled(swap, monkeypatch) -> None:
     assert "Counter-leg (BTC): CLAIMED_PREIMAGE_REVEALED" in res.output
     assert "situation  : SETTLED" in res.output
     assert "No further action" in res.output
+    # SETTLED rests on the explorer's word that the leg is spent; the text says whose, as LOCKED does.
+    assert "esplora.example reports the BTC leg claimed with p" in res.output
+    assert "one server's answer" in res.output
+    assert "DO-NOT-PRINT" not in res.output
     assert P.hex() not in res.output  # status still never prints p
+
+
+def test_a_settled_swap_on_a_refunded_counter_leg_names_the_one_server_that_said_so(swap, monkeypatch) -> None:
+    raw = _refund_tx()
+    spender = btc_txid_from_raw(raw)
+    _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
+    res = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))
+    assert res.exit_code == 0, res.output
+    assert "Counter-leg (BTC): SPENT_NO_PREIMAGE" in res.output
+    assert "situation  : SETTLED" in res.output
+    assert "esplora.example reports the BTC leg spent by a transaction that reveals no preimage" in res.output
+    assert "one server's answer, not a verified fact" in res.output
+    assert "DO-NOT-PRINT" not in res.output
+
+    js = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130), output_mode="json")
+    doc = json.loads(js.output)
+    assert doc["counter_leg"]["source"] == "esplora.example"
+    assert "esplora.example reports" in doc["chain"]["next_action"]
+
+
+# --------------------------------------------------------------------------- refund advice, per writer
+#
+# Each recovery-file shape `swap status` accepts, as its writer emits it (fields read from the
+# scripts, not invented), driven through the real CLI to the COVENANT_SPENT advice. None of these
+# writers has a phase that refunds only the counter-leg, so none may be told to run one.
+
+_ETH_REFUND_TO = "0x" + "ab" * 20
+_FAR_PAST_TS = 1_000_000_000  # 2001
+_FAR_FUTURE_TS = 4_000_000_000  # 2096
+
+
+def _writer_record(swap, shape: str) -> dict[str, Any]:
+    base = {
+        "hashlock_H": H.hex(),
+        "rxd_covenant_spk": swap["cov"].funded_spk.hex(),
+        "t_rxd_blocks": 20,
+        "rxd_network": "bc",
+        "taker_rxd_wif": swap["taker"].wif(),
+    }
+    if shape == "dust_swap_run":
+        return {
+            **base,
+            "stage": "dust",
+            "btc_network": "bc",
+            "taker_btc_wif": PrivateKey().wif(),
+            "btc_refund_payout_spk": "0014" + "22" * 20,
+            "t_btc_blocks": 30,
+            "btc_htlc_address": "bc1qexample",
+        }
+    if shape == "eth_swap_run":
+        return {
+            **base,
+            "stage": "sepolia-dust",
+            "eth_chain": "sepolia",
+            "eth_chain_id": 11155111,
+            "eth_refund_to": _ETH_REFUND_TO,
+            "eth_timeout_unix_s": _FAR_FUTURE_TS,
+        }
+    if shape == "eth_swap_grief_run":
+        # The grief run writes NO `eth_chain`; its ETH swap used to be classified BTC.
+        return {
+            **base,
+            "scenario": "grief-S1",
+            "eth_refund_to": _ETH_REFUND_TO,
+            "eth_timeout_unix_s": _FAR_PAST_TS,
+            "eth_amount_wei": 10**14,
+        }
+    assert shape == "unknown"
+    return base
+
+
+@pytest.mark.parametrize(
+    ("shape", "chain", "expected"),
+    [
+        (
+            "dust_swap_run",
+            "BTC",
+            [
+                "scripts/dust_swap_run.py, which wrote this file, has no phase that refunds only that leg",
+                "opens 30 BTC blocks after the HTLC funding confirmed",
+                "this file holds the refund key as `taker_btc_wif`",
+                "NO timelock",
+            ],
+        ),
+        (
+            "eth_swap_run",
+            "ETH",
+            [
+                "scripts/eth_swap_run.py, which wrote this file, has no phase that refunds only that leg",
+                f"refund() opens at unix time {_FAR_FUTURE_TS} (2096-10-02 07:06:40 UTC; still ahead)",
+                f"`eth_refund_to` = {_ETH_REFUND_TO}",
+            ],
+        ),
+        (
+            "eth_swap_grief_run",
+            "ETH",
+            [
+                "scripts/eth_swap_grief_run.py, which wrote this file, has no phase that refunds only that leg",
+                f"refund() opens at unix time {_FAR_PAST_TS} (2001-09-09 01:46:40 UTC; already passed)",
+                f"`eth_refund_to` = {_ETH_REFUND_TO}",
+            ],
+        ),
+        (
+            "unknown",
+            "BTC",
+            [
+                "this file matches none of the in-tree harnesses, so pyrxd cannot name the tool that wrote it",
+                "which this file does not record",
+                "Refund it with the tool that funded it.",
+            ],
+        ),
+    ],
+)
+def test_the_counter_leg_refund_advice_is_runnable_or_says_plainly_there_is_none(swap, shape, chain, expected) -> None:
+    swap["keys"].write_text(json.dumps(_writer_record(swap, shape)))
+    res = _status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))
+    assert res.exit_code == 0, res.output
+    assert f"Counter-leg ({chain}): NOT_CHECKED" in res.output
+    assert "situation  : COVENANT_SPENT" in res.output
+    assert f"pyrxd has no command that refunds the {chain} leg" in res.output
+    assert f"Your {chain} stays locked until refunded" in res.output
+    for fragment in expected:
+        assert fragment in res.output, fragment
+    # Never a command that cannot run from this file. (Scoped to the advice line: the
+    # NOT_CHECKED reason below it mentions eth_swap_two_host.py as history, not as advice.)
+    (action,) = [ln for ln in res.output.splitlines() if ln.startswith("  next action:")]
+    assert "--phase" not in action
+    assert "two_host" not in action
+
+
+def _two_host_local_file(tmp_path: Path, harness: str, role: str) -> Path:
+    """A two-host ``--local-out`` file, with the fields that harness's intro/envelope phase writes."""
+    if harness == "btc" and role == "taker":
+        doc = {
+            "role": "taker",
+            "taker_rxd_wif": PrivateKey().wif(),
+            "taker_pkh_hex": "11" * 20,
+            "taker_btc_refund_wif": PrivateKey().wif(),
+            "taker_btc_refund_xonly_hex": "22" * 32,
+        }
+    elif harness == "btc":
+        doc = {
+            "role": "maker",
+            "hashlock_H_hex": H.hex(),
+            "maker_rxd_wif": PrivateKey().wif(),
+            "maker_pkh_hex": "11" * 20,
+            "taker_pkh_hex": "33" * 20,
+            "maker_btc_claim_privkey_hex": os.urandom(32).hex(),
+            "btc_claim_xonly_hex": "44" * 32,
+            "taker_btc_refund_xonly_hex": "22" * 32,
+            "covenant_spk_hex": "c4" * 40,
+        }
+    elif role == "taker":
+        doc = {
+            "role": "taker",
+            "taker_rxd_wif": PrivateKey().wif(),
+            "taker_pkh_hex": "11" * 20,
+            "eth_key_hex": os.urandom(32).hex(),
+            "eth_taker_refund_addr": _ETH_REFUND_TO,
+        }
+    else:
+        doc = {
+            "role": "maker",
+            "hashlock_H_hex": H.hex(),
+            "maker_rxd_wif": PrivateKey().wif(),
+            "maker_pkh_hex": "11" * 20,
+            "taker_pkh_hex": "33" * 20,
+            "eth_key_hex": os.urandom(32).hex(),
+            "eth_maker_claim_addr": "0x" + "cd" * 20,
+            "eth_taker_refund_addr": _ETH_REFUND_TO,
+            "eth_timeout_unix_s": _FAR_FUTURE_TS,
+            "covenant_spk_hex": "c4" * 40,
+        }
+    path = tmp_path / f".{harness}_{role}_local.json"
+    path.write_text(json.dumps(doc))
+    path.chmod(0o600)
+    return path
+
+
+def _status_of(path: Path):
+    return _invoke(["status", "--swap-file", str(path)], _ctx())
+
+
+@pytest.mark.parametrize("harness", ["btc", "eth"])
+def test_a_two_host_taker_file_is_pointed_at_that_harnesss_own_abort_phase(tmp_path, harness) -> None:
+    path = _two_host_local_file(tmp_path, harness, "taker")
+    res = _status_of(path)
+    assert res.exit_code != 0
+    out = " ".join(res.output.split())  # click wraps nothing, but be robust to it
+    script = f"{harness}_swap_two_host.py"
+    assert f"TAKER's local secret file from scripts/{script}" in out
+    assert "--role taker --phase abort --io DIR" in out
+    assert f"--local-out {path}" in out
+    assert "must hold envelope.json and taker_funding.json" in out
+    # Run from this checkout the script is really there, and the command names it by that path.
+    here = swap_cmds._in_tree_script(script)
+    assert here is not None and here.is_file()
+    assert f"python {here} --role taker --phase abort" in out
+
+
+@pytest.mark.parametrize("harness", ["btc", "eth"])
+def test_a_two_host_maker_file_is_pointed_at_the_makers_recovery_phases(tmp_path, harness) -> None:
+    res = _status_of(_two_host_local_file(tmp_path, harness, "maker"))
+    assert res.exit_code != 0
+    out = " ".join(res.output.split())
+    assert f"MAKER's local secret file from scripts/{harness}_swap_two_host.py" in out
+    assert "--role maker --phase abort" in out
+    assert "--phase refund" in out
+    assert "--role taker" not in out
+
+
+def test_on_a_pip_install_the_two_host_advice_says_where_the_script_is_not(tmp_path, monkeypatch) -> None:
+    """``scripts/`` ships in the sdist only. Without it, never present the path as runnable HERE."""
+    monkeypatch.setattr(swap_cmds, "_in_tree_script", lambda name: None)
+    res = _status_of(_two_host_local_file(tmp_path, "btc", "taker"))
+    assert res.exit_code != 0
+    out = " ".join(res.output.split())
+    assert "not part of pyrxd as installed here" in out
+    assert "from the source checkout you ran the swap from" in out
+    assert "from the source tree at" not in out
 
 
 def test_the_status_block_count_is_the_legs_own_figure(swap) -> None:
