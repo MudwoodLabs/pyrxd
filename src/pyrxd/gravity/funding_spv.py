@@ -681,7 +681,16 @@ def early_elapsed_blocks_upper(
     the floor used here, and its ``k`` and bound grow in proportion); a funding mined below the
     newest checkpoint (a covenant for terms agreed now is mined above it); and a chain whose blocks
     come slower than the nominal spacing by more than ``early_slack_s`` absorbs. In each case step 6
-    still decides, on the proved bound.
+    still decides, on the proved bound, before the taker locks.
+
+    HOW OFTEN THE SLOW-CHAIN CASE OCCURRED, measured 2026-09-30 at the defaults (``surge_factor``
+    3.0, ``early_slack_s`` 3600) with burial 6, on every mainnet funding height from 400,000 whose
+    ``k``-th block exists (tip 468,799), the taker checking when the funding reaches ``k`` deep, just
+    before the next block: this bound was below step 6's in 98 of 68,793 fundings at 100 RXD, 95 of
+    68,791 at 1,000 RXD and 106 of 68,721 at 10,000 RXD (none at 100,000 RXD), by at most 376
+    blocks. Each was in a stretch where blocks came slower than this model assumes; the range holds
+    7 inter-block gaps longer than an hour (the longest 27,752 s). Such a swap is refused at step 6
+    after the maker locked, never locked against.
     """
     last_max, cp_work = _shipped_work(chain)
     newest_h = chain.checkpoints[-1][0]
