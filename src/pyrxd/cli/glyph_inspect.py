@@ -26,7 +26,7 @@ import asyncio
 import copy
 import logging
 import textwrap
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import click
@@ -58,6 +58,7 @@ from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
 if TYPE_CHECKING:
+    from ..glyph.mark_block import BlockVerification
     from ..network.electrumx import ElectrumXClient
 
 _log = logging.getLogger(__name__)
@@ -66,11 +67,13 @@ _log = logging.getLogger(__name__)
 _MAX_DELEGATE_BASES = 25
 
 __all__ = [
+    "block_verification_could_not_run",
     "hashmark_records",
     "inspect_cmd",
     "mark_anchor_dict",
     "mark_anchor_lines",
     "resolve_anchor_from",
+    "verify_anchor_block",
 ]
 
 
@@ -206,7 +209,12 @@ def _classify_raw_tx(
 
 
 async def _inspect_txid_inner(
-    client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None, network: str = "mainnet"
+    client: ElectrumXClient,
+    txid_hex: str,
+    *,
+    only_vout: int | None = None,
+    network: str = "mainnet",
+    raw_out: list[bytes] | None = None,
 ) -> dict:
     """Fetch *txid_hex* via *client* and classify every output.
 
@@ -218,6 +226,10 @@ async def _inspect_txid_inner(
 
     :param only_vout: if not None, restrict the outputs list to a single
         vout — used by the ``--resolve`` outpoint flow.
+    :param raw_out: if given, the transaction's raw bytes are appended to it once
+        ``get_transaction`` (which checks they hash to *txid_hex*) and the classifier
+        (which checks it again) have both accepted them — for ``pyrxd verify``, whose block
+        verification uses these bytes instead of fetching them again.
     """
     # Validate the txid locally before any network call so a malformed
     # input never reaches the server.
@@ -228,6 +240,8 @@ async def _inspect_txid_inner(
 
     raw = await client.get_transaction(txid)
     payload = _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout, network=network)
+    if raw_out is not None:
+        raw_out.append(bytes(raw))
 
     # DELEGATED CLAIMS. A token may authorise its `in`/`by` through a delegate
     # rather than by spending the parent here, and `_classify_raw_tx` cannot see
@@ -792,6 +806,111 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
     )
 
 
+async def verify_anchor_block(
+    endpoint: Callable[[], tuple[object, str]],
+    *,
+    txid: str | None,
+    height: object,
+    blockhash: object,
+    raw_tx: bytes | None,
+    network: str,
+    min_confirmations: int,
+    client_is_open: bool = False,
+) -> tuple[BlockVerification, str | None]:
+    """Verify the block an anchor names — ``(outcome, label of the endpoint whose data was checked)``.
+
+    THE ONE CLI DOOR TO :func:`~pyrxd.glyph.mark_block.verify_mark_block`. It follows
+    :func:`~pyrxd.glyph.mark_block.plan_block_verification` — the verifier, not this function,
+    decides which headers to fetch — and only then calls *endpoint* for a client, so a run that
+    cannot verify (no checkpoints for this network, a block too far past the newest one) opens
+    no connection and says why. Then it fetches the transaction's merkle branch, the block's
+    coinbase branch (which pins the tree's depth) and the planned header ranges, and hands them
+    to the verifier with *raw_tx*: the bytes the caller already fetched and hash-checked, never
+    fetched again here.
+
+    ANY endpoint may answer: merkle verification needs no independent source (HashMark §2.3.2),
+    because the trust sits in the checkpoint pyrxd ships, not in who served the proof.
+
+    NEVER RAISES for anything a server does. A failed or refused fetch (a server without
+    ``blockchain.transaction.get_merkle``, a header range that times out, a malformed reply) is
+    ``NOT VERIFIED`` with the reason: verification that could not run is not a finding against the
+    mark, and must not refuse one.
+
+    ``client_is_open``: the client *endpoint* returns is already connected, inside a caller's own
+    ``async with`` (the form-2 name lookup, which verifies the anchor it just fetched with the
+    client that fetched it), so it is used as it is and not closed here.
+    """
+    from contextlib import AsyncExitStack
+
+    from ..glyph.mark_block import NOT_VERIFIED, BlockVerification, plan_block_verification, verify_mark_block
+
+    def outcome(merkle=None, coinbase=None, headers=None) -> BlockVerification:
+        return verify_mark_block(
+            txid=txid,
+            raw_tx=raw_tx,
+            height=height,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers or {},
+            min_confirmations=min_confirmations,
+            blockhash=blockhash,
+            network=network,
+        )
+
+    plan = plan_block_verification(height=height, min_confirmations=min_confirmations, network=network)
+    if plan.reason is not None or not txid:
+        return outcome(), None  # the verifier states the reason; nothing to fetch
+
+    client, label = endpoint()
+
+    def unavailable(what: str, exc: BaseException) -> tuple[BlockVerification, str]:
+        detail = _sanitize_display_string(str(exc)) or type(exc).__name__
+        return (
+            BlockVerification(
+                state=NOT_VERIFIED,
+                claim=None,
+                reason=f"{what} could not be fetched from {_sanitize_display_string(label)}: {detail}",
+                height=height if isinstance(height, int) else None,
+            ),
+            label,
+        )
+
+    async with AsyncExitStack() as stack:
+        if not client_is_open:
+            await stack.enter_async_context(client)  # type: ignore[arg-type]
+        try:
+            merkle = await client.get_transaction_merkle_branch(txid, height)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return unavailable("the transaction's merkle branch", exc)
+        try:
+            coinbase = await client.get_transaction_id_from_pos(height, 0)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return unavailable("the block's coinbase merkle branch", exc)
+        headers: dict[int, bytes] = {}
+        for start, count in plan.header_ranges:
+            try:
+                got = await client.get_block_headers(start, count)  # type: ignore[attr-defined]
+            except Exception as exc:
+                return unavailable(f"the block headers {start}-{start + count - 1}", exc)
+            for i, header in enumerate(got):
+                headers.setdefault(start + i, header)
+    return outcome(merkle, coinbase, headers), label
+
+
+def block_verification_could_not_run(exc: BaseException, height: object) -> BlockVerification:
+    """NOT VERIFIED for a verification that raised — pyrxd's own failure, since
+    :func:`verify_anchor_block` is total over anything a server does. Never a refusal of the mark:
+    the block falls back to the endpoint's word, with this reason."""
+    from ..glyph.mark_block import NOT_VERIFIED, BlockVerification
+
+    return BlockVerification(
+        state=NOT_VERIFIED,
+        claim=None,
+        reason=_sanitize_display_string(f"block verification could not run ({type(exc).__name__}: {exc})"),
+        height=height if isinstance(height, int) else None,
+    )
+
+
 # `mark_anchor_dict` moved to `pyrxd.glyph.mark_anchor`, beside the dataclass it
 # describes, and is re-exported above so every caller here is unchanged.
 #
@@ -806,9 +925,19 @@ async def resolve_anchor_from(client: object, label: str, *, mark_txid: str | No
 def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> list[str]:
     """A block, its depth against the floor the caller set, and what the number is worth.
 
-    Never prints a bare height. ``height_is_verified`` is ``False`` for every anchor this
-    codebase can build, so the caveat is unconditional rather than conditional on a flag
-    that is always the same — a conditional would read as though the other branch existed.
+    Never prints a bare height: the ``caveat`` is printed under every height. What it says
+    depends on the anchor. When ``pyrxd verify`` verified the block
+    (:func:`~pyrxd.glyph.mark_anchor.with_block_verification`: ``height_is_verified`` is true, and
+    only for a VERIFIED outcome), the caveat IS the verifier's claim, printed under
+    ``VERIFIED:``. Otherwise it is the endpoint's-word caveat, and when a verification ran and did
+    not reach VERIFIED, the reason is printed under it — so a reader sees both that the height is
+    the endpoint's word and why pyrxd could not do better. An anchor no verification ran on (form
+    2's, ``glyph inspect``'s) prints exactly as it always did.
+
+    The depth follows the same rule. VERIFIED prints the PROVED depth (``verified_confirmations``)
+    as "at least N confirmation(s) verified", judged against the floor, and the endpoint's figure
+    beside it, labelled, only when the two differ; otherwise the depth is the endpoint's
+    ``confirmations``, as before.
     """
     if not a:
         return []
@@ -818,7 +947,17 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
             f"(unconfirmed, or the endpoint reports no depth)",
             f"{indent}              a mark in the mempool fixes no time; nothing below is anchored",
         ]
-    depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
+    bv = a.get("block_verification")
+    bv = bv if isinstance(bv, Mapping) else None
+    verified = bool(a.get("height_is_verified")) and bv is not None
+    if verified:
+        # The PROVED depth, which the floor was judged against; the endpoint's number beside it,
+        # labelled, when it differs (it is only a claim, and may be larger or smaller).
+        depth = f"at least {a.get('verified_confirmations')} confirmation(s) verified, floor {a['min_confirmations']}"
+        if a.get("verified_confirmations") != a.get("confirmations"):
+            depth += f"; the endpoint reports {a['confirmations']}"
+    else:
+        depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
     verdict = "PROVISIONAL — below the floor you set" if a.get("provisional") else "at or past the floor you set"
     lines = [f"{indent}block:        {a['height']}  ({depth}) — {verdict}"]
     # WRAPPED, NOT TRUNCATED. `_truncate_for_human` caps at 200 characters and this caveat is
@@ -829,9 +968,19 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     # as complete. Sanitised anyway, so a future caveat from elsewhere cannot carry control
     # bytes, and bounded by line count rather than by cutting the sentence.
     caveat = _sanitize_display_string(str(a.get("caveat") or ""))
-    for chunk in textwrap.wrap(caveat, width=92)[:6]:
+    if verified:
+        caveat = f"VERIFIED: {caveat}"
+    # The longest claim (the proof-of-work level, with the sentence saying the endpoint had named a
+    # different block) wraps to 11 lines at this width; 14 leaves room. A cut claim reads as whole.
+    for chunk in textwrap.wrap(caveat, width=92)[:14]:
         lines.append(f"{indent}              {chunk}")
+    if bv is not None and not verified and bv.get("reason"):
+        why = _sanitize_display_string(f"not verified: {bv.get('reason')}")
+        for chunk in textwrap.wrap(why, width=92)[:6]:
+            lines.append(f"{indent}              {chunk}")
     lines.append(f"{indent}              (source: {_truncate_for_human(str(a.get('source') or ''))})")
+    if bv is not None and bv.get("source"):
+        lines.append(f"{indent}              (block proof asked of: {_truncate_for_human(str(bv.get('source')))})")
     return lines
 
 
@@ -889,10 +1038,12 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
     name = nam.get("name", "?")
     if not nam.get("resolved"):
         return [f"{indent}at the mark's block — {name}: not established ({nam.get('reason')})"]
+    depth = _name_depth_lines(nam, indent)
     if nam.get("form") != 2:
         return [
             f"{indent}at the mark's block — {name}: not established ({nam.get('degraded_reason')})",
             f"{indent}  (form 1 only: nothing beyond the present-tense lookup can be said)",
+            *depth,
         ]
     chain = nam.get("chain") or {}
     same = nam.get("signer_is_target_at_height")
@@ -914,6 +1065,7 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
     ]
     if nam.get("provisional"):
         lines.append(f"{indent}  PROVISIONAL: the mark is below the confirmation floor you set")
+    lines.extend(depth)
     # EXPIRY IS A STATE, AND IT IS PRINTED. `expiry` has only ever been "unknown" — renewals are
     # decided by treasury payments the walk does not observe — and it reached --json but no
     # terminal, so a reader of "pointed at X at block N" had no way to learn the name might have
@@ -925,6 +1077,26 @@ def _name_at_mark_lines(nam: dict | None, indent: str = "  ") -> list[str]:
         f"{name}, but which registration of it is in force is not verified on chain)"
     )
     return lines
+
+
+def _name_depth_lines(nam: Mapping[str, object], indent: str) -> list[str]:
+    """WHOSE DEPTH the name judgement used, when it is not the endpoint's figure.
+
+    Under ``pyrxd verify`` a VERIFIED block is judged by the depth proved, and when the endpoint
+    reports another number the name line must not leave a reader to assume it was the endpoint's
+    (the ``block`` line beside it prints both). Nothing is printed otherwise: then the depth
+    judged IS the endpoint's, as it always was.
+    """
+    a = nam.get("anchor")
+    if not isinstance(a, Mapping) or not a.get("height_is_verified"):
+        return []
+    proved, reported = a.get("verified_confirmations"), a.get("confirmations")
+    if proved == reported:
+        return []
+    return [
+        f"{indent}  (the mark's depth, judged against the floor: at least {proved} confirmation(s) "
+        f"verified; the endpoint reports {reported})"
+    ]
 
 
 def _require_min_confirmations(
@@ -1053,8 +1225,20 @@ def _declared_operators(ctx: CliContext) -> dict[str, str]:
     return config.declared_operators() if config is not None else {}
 
 
-def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confirmations: int) -> None:
+def _attach_name_at_mark(
+    ctx: CliContext,
+    payload: dict,
+    *,
+    name: str,
+    min_confirmations: int,
+    verify_block: bool = False,
+    mark_raw_tx: bytes | None = None,
+) -> None:
     """Attach a §7.6 form-2 verdict (or its degrade) to every VERIFIED HashMark record.
+
+    ``verify_block`` (``pyrxd verify``): verify the mark's block, with ``mark_raw_tx`` (the bytes
+    the caller fetched and hash-checked), before the name judgement reads its depth — see
+    :func:`_name_at_mark`. ``glyph inspect`` does not ask, and its anchors are the endpoint's word.
 
     Same two shapes as :func:`_attach_wave_identity` — a pasted script carries one record at the
     top level, a fetched transaction one per output — and the same contract: errors are attached
@@ -1081,7 +1265,15 @@ def _attach_name_at_mark(ctx: CliContext, payload: dict, *, name: str, min_confi
         if signer is not None and signer in by_signer:
             hm["name_at_mark"] = copy.deepcopy(by_signer[signer])
             continue
-        _judge_one_name_at_mark(ctx, hm, mark_txid=mark_txid, name=name, min_confirmations=min_confirmations)
+        _judge_one_name_at_mark(
+            ctx,
+            hm,
+            mark_txid=mark_txid,
+            name=name,
+            min_confirmations=min_confirmations,
+            verify_block=verify_block,
+            mark_raw_tx=mark_raw_tx,
+        )
         if signer is not None and "name_at_mark" in hm:
             by_signer[signer] = copy.deepcopy(hm["name_at_mark"])
 
@@ -1099,7 +1291,14 @@ def _verified_signer(hm: dict | None) -> str | None:
 
 
 def _judge_one_name_at_mark(
-    ctx: CliContext, hm: dict, *, mark_txid: str | None, name: str, min_confirmations: int
+    ctx: CliContext,
+    hm: dict,
+    *,
+    mark_txid: str | None,
+    name: str,
+    min_confirmations: int,
+    verify_block: bool = False,
+    mark_raw_tx: bytes | None = None,
 ) -> None:
     if not hm:
         return
@@ -1124,6 +1323,8 @@ def _judge_one_name_at_mark(
                 mark_txid=mark_txid,
                 min_confirmations=min_confirmations,
                 signer_hash160=bytes.fromhex(att["recovered_hash160"]),
+                # Only when asked, so a caller that does not verify passes exactly what it did.
+                **({"verify_block": True, "mark_raw_tx": mark_raw_tx} if verify_block else {}),
             )
         )
     except Exception as exc:
@@ -1136,16 +1337,34 @@ def _judge_one_name_at_mark(
 
 
 async def _name_at_mark(
-    ctx: CliContext, *, name: str, mark_txid: str | None, min_confirmations: int, signer_hash160: bytes
+    ctx: CliContext,
+    *,
+    name: str,
+    mark_txid: str | None,
+    min_confirmations: int,
+    signer_hash160: bytes,
+    verify_block: bool = False,
+    mark_raw_tx: bytes | None = None,
 ) -> dict:
     """Binding from one endpoint, the mark's block from the other; candidates from one, tip proof
     from the other; and EVERY block height — the mark's and each chain step's — from both. Then
     the pure judge. Every source is labelled by URL so the rules that refuse a shared or a
-    disagreeing source can see when it IS shared, or does disagree."""
+    disagreeing source can see when it IS shared, or does disagree.
+
+    ``verify_block`` (``pyrxd verify``): the anchor's block is verified
+    (:func:`verify_anchor_block`, with ``mark_raw_tx``) as soon as the anchor is fetched, BEFORE
+    anything reads its depth — the second endpoint's lookup, which runs only for a deep-enough
+    mark, and the judge. A VERIFIED block is then judged by the depth proved, as the ``block``
+    check judges it (:func:`~pyrxd.glyph.mark_anchor.with_proven_depth`, one predicate for both);
+    any other outcome leaves the endpoint's figure, exactly as before. The returned ``anchor``
+    carries that same verification, and ``pyrxd verify`` reports it rather than verifying the
+    block a second time — so the name check, the block check and the JSON read one outcome. Only
+    the mark's own block: the chain steps' heights are still the two endpoints' word."""
     from contextlib import AsyncExitStack
 
     from ..base58 import base58check_encode
     from ..constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+    from ..glyph.mark_anchor import with_proven_depth
     from ..glyph.mutable_chain_discovery import walk_discovered_chain
     from ..glyph.wave import WaveNameNotFound, WaveResolver
     from ..glyph.wave_identity import HeightReport, _requested_label, judge_name_at_mark
@@ -1207,6 +1426,29 @@ async def _name_at_mark(
         anchor = await resolve_anchor_from(
             anchor_client, anchor_label, mark_txid=mark_txid, min_confirmations=min_confirmations
         )
+
+        # 2b. THE ANCHOR'S BLOCK, VERIFIED, when the caller asked — before step 4 and the judge read
+        #     its depth. Asked of the endpoint that gave the anchor, on its open connection: any
+        #     endpoint may serve the proof (the trust is in the checkpoint), and this one names the
+        #     block the proof is compared with. The proof can only move the depth from the
+        #     endpoint's word to proved (never below the floor); the height is the anchor's.
+        verification: BlockVerification | None = None
+        proof_label: str | None = None
+        if verify_block:
+            try:
+                verification, proof_label = await verify_anchor_block(
+                    lambda: (anchor_client, anchor_label),
+                    txid=mark_txid,
+                    height=anchor.height,
+                    blockhash=anchor.blockhash,
+                    raw_tx=mark_raw_tx,
+                    network=ctx.network,
+                    min_confirmations=min_confirmations,
+                    client_is_open=True,
+                )
+            except Exception as exc:  # total over server data; this is pyrxd's own failure
+                verification = block_verification_could_not_run(exc, anchor.height)
+            anchor = with_proven_depth(anchor, verification)
 
         # 3. THE CHAIN: discovered on A, tip proved on B — and B asked, independently, where each
         #    walked step is (`found.tip_heights`). A's step heights alone decided the answer before.
@@ -1311,7 +1553,9 @@ async def _name_at_mark(
         # Handing the resulting anchor out means the second surface inherits it instead of
         # re-deriving it from a server it picked on its own — where a hostile endpoint that
         # had already supplied the binding could move the block as well.
-        "anchor": mark_anchor_dict(anchor),
+        #
+        # Under `verify_block` it carries the block verification the judge's depth came from.
+        "anchor": mark_anchor_dict(anchor, verification, verified_by=proof_label),
         "chain": {
             "steps": len(walk.steps),
             "complete": walk.complete,
@@ -1890,19 +2134,20 @@ def inspect_cmd(
         click.echo(_render_inspect_human(payload))
 
 
-def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
+def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str, raw_out: list[bytes] | None = None) -> dict:
     """Spin up an ElectrumX client, run _inspect_txid_inner, surface errors.
 
     Wraps NetworkError → NetworkBoundaryError (exit code 2) so a
     user can distinguish "wrong input" (UserError, exit 1) from
-    "network is down" (exit 2).
+    "network is down" (exit 2). ``raw_out`` is passed through to
+    :func:`_inspect_txid_inner` (the ``txid`` form only).
     """
 
     async def _do() -> dict:
         client = ctx.make_client()
         async with client:
             if form == "txid":
-                return await _inspect_txid_inner(client, value, network=ctx.network)
+                return await _inspect_txid_inner(client, value, network=ctx.network, raw_out=raw_out)
             # form == "outpoint" + resolve: parse, fetch the source, classify
             # only the named vout.
             outpoint_payload = _inspect_outpoint(value)

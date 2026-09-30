@@ -236,7 +236,8 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
 ```
 0   success
 1   user-error (bad input, file not found, insufficient funds, missing --yes in JSON mode)
-2   network error (couldn't reach ElectrumX, broadcast rejected)
+2   network error (couldn't reach ElectrumX, broadcast rejected; in `pyrxd verify`, also a
+    server whose own block proof contradicts the height it reported for the mark)
 3   wallet decryption failed
 4   unexpected error (bug — should not happen)
 5   a verdict that does not hold (`pyrxd verify`): no single HashMark record in the

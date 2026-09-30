@@ -8,9 +8,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **`pyrxd.glyph.mark_block.verify_mark_block`, which checks the block a HashMark is in. No
-  command calls it yet.** `pyrxd verify` and the `/verify/` and `/inspect/` pages still report
-  the height as the endpoint's word. Connecting them is the next step (#799). The verifier checks that
+- **`pyrxd.glyph.mark_block.verify_mark_block`, which checks the block a HashMark is in.**
+  `pyrxd verify` calls it (see Changed below); the `/verify/` and `/inspect/` pages do not yet,
+  and still report the height as the endpoint's word (#799, phase 3). The verifier checks that
   the transaction's merkle branch leads to the merkle root of the header served for its height,
   and that the branch is as deep as the block's tree, which the coinbase's own branch (checked
   against the same root) states. Radiant allows 64-byte transactions, so without that pin a
@@ -35,6 +35,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the script refuses to write if any source disagrees. The Radiant header proof-of-work check is
   in `pyrxd.spv.radiant`, beside the Bitcoin one, which is unchanged.
   `ElectrumXClient.get_transaction_merkle_branch` returns a transaction's validated merkle branch.
+- **`ElectrumXClient.get_block_headers(start, count)` and
+  `ElectrumXClient.get_transaction_id_from_pos(height, pos)`**, also forwarded by
+  `FailoverElectrumXClient`. The first returns up to 2016 consecutive 80-byte headers
+  (`blockchain.block.headers`) and refuses a reply whose echoed count is larger than asked or
+  whose hex is not exactly that many headers; fewer headers than asked (a range past the
+  server's tip) is returned as it is. The second returns a txid and its merkle branch
+  (`blockchain.transaction.id_from_pos`, with the branch), shape-checked. Neither checks what the
+  data says; `verify_mark_block` does.
+
+### Changed
+
+- **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
+  merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
+  from one configured endpoint, and checks them with the raw transaction it already fetched.
+  - When the block verifies, `checks.block.state` is **`VERIFIED`** (it was `CONFIRMED`), the
+    reason names the checkpoint, and the human report prints the verifier's claim in place of
+    the endpoint's-word caveat. **A JSON consumer comparing `checks.block.state == "CONFIRMED"`
+    will now see `VERIFIED` for those marks.** Both states hold the verdict.
+  - Under `VERIFIED` the depth is the one pyrxd proved, printed as "at least N confirmation(s)
+    verified", with the endpoint's figure beside it, labelled, only when the two differ. The
+    floor you set is judged against the proved depth, not the endpoint's number: a mark the
+    endpoint reports below the floor, but proved at or past it, is `VERIFIED`, and its depth no
+    longer fails the verdict (it was `PROVISIONAL`, exit 5). That holds for the `name` check
+    too: with `--wave-name`, form 2's depth test reads the same proved depth, so the exit is 0
+    unless another check fails.
+  - When it does not verify (no checkpoints for the network, as on testnet and regtest; a block
+    too far past the newest checkpoint; a server without the merkle method; a fetch that failed
+    or came back malformed), the state stays `CONFIRMED` (or `PROVISIONAL`, below the floor),
+    the height and depth are still the endpoint's word, and the reason says why verification
+    did not complete. The verdict and exit code are unchanged. If the merkle branch was checked
+    and passed but the height still did not verify, the caveat says so instead of "pyrxd checks
+    no proof-of-work or merkle inclusion".
+  - When the server's own proof contradicts the height it reported (a branch that does not lead
+    to the header, a header that does not link), `pyrxd verify` exits 2, as it does when the
+    height cannot be bound to a header, with the reason. It does not call the mark invalid. A
+    block hash the endpoint named that is not the header its proof serves at that height is not,
+    by itself, a contradiction: a chain reorganisation between the two replies produces one
+    honestly. The header served is checked on its own; if it verifies, the result is `VERIFIED`
+    for the block proved, with a note that the endpoint had named another.
+  - `mark_anchor` in `--json` gains `blockhash` (the block the endpoint named, once the height
+    is bound to its header; under `VERIFIED`, the block proved), `verified_confirmations` (the
+    depth proved, under `VERIFIED`; otherwise null — `confirmations` stays the endpoint's
+    figure) and `block_verification` (every field of the outcome, including `named_blockhash`,
+    plus `source`, the endpoint asked for the proof). `header_bound` keeps its meaning — the
+    endpoint's height was checked against the endpoint's own header — and that header is the
+    block the endpoint named: `block_verification.named_blockhash` when it is set (the block
+    proved is a different one, which is then `blockhash`), otherwise `blockhash`.
+    `height_is_verified` is true only for a VERIFIED block. With `--wave-name`, `records[i].name_at_mark.anchor` is the same anchor,
+    with the same verification: the block is verified once, in the name lookup, before the name
+    judgement reads its depth, so a mark proved at or past the floor is not judged "too shallow"
+    for the name on the endpoint's lower figure, and the name's detail says whose depth it used
+    when the two differ. The name's chain-step heights are still the two endpoints' word.
+    `glyph inspect --wave-name` and the pages' JSON carry the same three keys, with
+    `verified_confirmations` and `block_verification` null: they are not verified, and their
+    caveats are unchanged.
+  - A mark whose block, plus the confirmations asked for, reaches more than 4,032 blocks past
+    this pyrxd's newest checkpoint cannot be verified by it and reports `CONFIRMED` with that
+    reason; newer checkpoints come with newer releases.
 
 ### Deprecated
 

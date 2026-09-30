@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
@@ -879,15 +879,47 @@ def _block_check(anchor: dict | None) -> tuple[str, str]:
 
     Both are refusals here rather than footnotes: the whole claim is "no later than the block
     that confirms it", so without a block deep enough to stand on there is no claim to hold.
+
+    VERIFIED only when the anchor's own ``height_is_verified`` says so, which
+    :func:`~pyrxd.glyph.mark_anchor.with_block_verification` sets for a VERIFIED outcome alone —
+    the same field the detail lines read, so the summary and the detail cannot disagree. Under
+    VERIFIED the depth is the PROVED one (``verified_confirmations``), and the floor was judged
+    against it: an endpoint's number is only a claim, larger or smaller, and is printed beside it
+    when it differs, labelled as the endpoint's. Any other outcome is the endpoint's word —
+    CONFIRMED, or PROVISIONAL below the floor — with the reason verification did not reach
+    VERIFIED. Neither fails the verdict on that account: verification that could not run is not a
+    finding against the mark. (A CONTRADICTED outcome never gets here: :func:`_verify_anchor`
+    refuses it.)
     """
     if not anchor or anchor.get("height") is None:
         return "NO BLOCK", "this transaction is not in a block; a mark in the mempool fixes no time"
+    bv = anchor.get("block_verification")
+    bv = bv if isinstance(bv, dict) else None
+    if bv is not None and anchor.get("height_is_verified"):
+        # `with_block_verification` sets it only when the proved depth reaches the floor.
+        where = f"block {anchor['height']}, at least {anchor.get('verified_confirmations')} confirmation(s) verified"
+        if anchor.get("verified_confirmations") != anchor.get("confirmations"):
+            where += f" (the endpoint reports {anchor.get('confirmations')})"
+        # Before the "how", which the detail lines state in full: the human summary is cut at 200
+        # characters, and this is the part a reader must not lose.
+        if dict(bv.get("steps") or ()).get("blockhash") == "differs":
+            where += f"; the endpoint had named a different block, the block proved is {anchor.get('blockhash')}"
+        if bv.get("level") == "checkpoint":
+            how = f"linked hash by hash to pyrxd checkpoint {bv.get('checkpoint_height')}"
+        else:
+            how = (
+                f"linked to pyrxd checkpoint {bv.get('checkpoint_height')} through headers each carrying "
+                f"proof-of-work of at least 2^{bv.get('floor_work_log2')}"
+            )
+        return "VERIFIED", f"{where}; merkle inclusion proved, {how}"
+    unverified = f" (endpoint's word; not verified: {bv.get('reason')})" if bv is not None else ""
     if anchor.get("provisional"):
         return (
             "PROVISIONAL",
-            f"{anchor['confirmations']} confirmation(s) against the floor of {anchor['min_confirmations']} you set",
+            f"{anchor['confirmations']} confirmation(s) against the floor of {anchor['min_confirmations']} you set"
+            f"{unverified}",
         )
-    return "CONFIRMED", f"block {anchor['height']}, {anchor['confirmations']} confirmation(s)"
+    return "CONFIRMED", f"block {anchor['height']}, {anchor['confirmations']} confirmation(s){unverified}"
 
 
 def _digest_match_lines(dm: dict | None, indent: str = "  ") -> list[str]:
@@ -1080,7 +1112,108 @@ def _tx_refusal(per_record: list[tuple[Any, dict, dict]]) -> tuple[Any, dict] | 
     return None
 
 
-def _verify_anchor(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer: dict | None = None) -> dict:
+def _verify_anchor(
+    ctx: CliContext,
+    payload: dict,
+    *,
+    min_confirmations: int,
+    raw_tx: bytes | None,
+    prefer: dict | None = None,
+) -> dict:
+    """The mark's block, VERIFIED where pyrxd can: every anchor this returns crosses
+    :func:`_with_verified_block`, whichever branch below produced it. (An anchor inherited from a
+    ``--wave-name`` lookup arrives verified already — the verification the name judgement's depth
+    came from — and is reported with that outcome rather than verified twice.)
+
+    ``raw_tx`` is the transaction the verify path already fetched and hash-checked; the block
+    verification uses those bytes rather than fetching them again. Required, with no default, so
+    no caller can skip it by omission (``None`` says "not available", and verification then
+    reports NOT VERIFIED with that reason).
+    """
+    anchor = _anchor_of(ctx, payload, min_confirmations=min_confirmations, prefer=prefer)
+    return _with_verified_block(
+        ctx, anchor, txid=payload.get("txid"), raw_tx=raw_tx, min_confirmations=min_confirmations
+    )
+
+
+def _with_verified_block(
+    ctx: CliContext, anchor: dict, *, txid: Any, raw_tx: bytes | None, min_confirmations: int
+) -> dict:
+    """*anchor* with its block verified (:func:`~pyrxd.cli.glyph_inspect.verify_anchor_block`).
+
+    ONE VERIFICATION PER ANCHOR. An anchor inherited from a ``--wave-name`` lookup already carries
+    the verification that lookup made (``block_verification``), and the name judgement's depth came
+    from it (:func:`~pyrxd.cli.glyph_inspect._name_at_mark`). That outcome is reported as it is —
+    never verified again here, where a second fetch could come out differently (a block arriving
+    between the two) and leave the ``name`` and ``block`` checks judging the mark's depth from two
+    different proofs. It crosses the same CONTRADICTED refusal below. An anchor with none (its own
+    lookup, or a name lookup that did not verify) is verified here.
+
+    ON BY DEFAULT, and it never refuses a valid mark: anything that stops verification from
+    running — a server without the merkle method, a header range that times out, a network pyrxd
+    ships no checkpoints for, even an error of pyrxd's own — is NOT VERIFIED with the reason, and
+    the block check falls back to today's CONFIRMED on the endpoint's word.
+
+    CONTRADICTED IS REFUSED, exit 2, as a binding failure is: the endpoint's own proof (a merkle
+    branch, a header, a linkage) disagrees with the height it reported. That is not a finding
+    against the mark — an honest mark served by a confused or lying server gets it too — so the
+    error says only that the height could not be established, and why.
+    """
+    from ..glyph.mark_anchor import with_block_verification
+    from ..glyph.mark_block import CONTRADICTED
+
+    height = anchor.get("height")
+
+    made = anchor.get("block_verification")
+    if isinstance(made, dict):
+        if made.get("state") == CONTRADICTED:
+            _refuse_contradicted(height, made.get("source"), made.get("reason"))
+        return anchor
+
+    def endpoint() -> tuple[object, str]:
+        # ONE endpoint pinned to one URL, the same seam `_anchor_of` asks — so the label names
+        # whoever really served the proof. Any endpoint may serve it (the trust is in the
+        # checkpoint); the label is recorded, not relied on.
+        client_a, label_a, _client_b, _label_b = _inspect._endpoint_pair(ctx)
+        return client_a, label_a
+
+    try:
+        verification, label = asyncio.run(
+            _inspect.verify_anchor_block(
+                endpoint,
+                txid=txid,
+                height=height,
+                blockhash=anchor.get("blockhash"),
+                raw_tx=raw_tx,
+                network=ctx.network,
+                min_confirmations=min_confirmations,
+            )
+        )
+    except Exception as exc:  # the helper is total over server data; this is pyrxd's own failure
+        verification, label = _inspect.block_verification_could_not_run(exc, height), None
+    if verification.state == CONTRADICTED:
+        _refuse_contradicted(height, label, verification.reason)
+    return with_block_verification(anchor, verification, verified_by=label)
+
+
+def _refuse_contradicted(height: Any, label: Any, reason: Any) -> NoReturn:
+    """Exit 2 for a block proof that contradicts the height its endpoint reported — whichever
+    lookup made the verification."""
+    where = label or "the endpoint"
+    raise NetworkBoundaryError(
+        "could not establish which block the mark is in",
+        cause=_sanitize_display_string(
+            f"the block proof {where} served contradicts the height reported for the mark (block {height}): {reason}"
+        ),
+        fix=(
+            "this says nothing against the mark itself, only that the server's own proof does not "
+            "support the height it reported — re-run in a moment, or ask another server with "
+            "--electrumx URL"
+        ),
+    )
+
+
+def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer: dict | None = None) -> dict:
     """The mark's block — from the name lookup's own anchor when there was one, else our own.
 
     A HOSTILE SOURCE MUST NOT MOVE BOTH THE NAME BINDING AND THE BLOCK. That rule is enforced
@@ -1461,7 +1594,7 @@ def verify_cmd(
       signature  VERIFIED / DOES NOT VERIFY / RECORD DOES NOT DECODE / NOT CHECKED / NO SIGNATURE
       file       MATCHES / DOES NOT MATCH / CANNOT COMPARE / NOT CHECKED
       name       ESTABLISHED / NOT THE SIGNER / NOT ESTABLISHED / NOT CHECKED
-      block      CONFIRMED / PROVISIONAL / NO BLOCK
+      block      VERIFIED / CONFIRMED / PROVISIONAL / NO BLOCK
 
     \b
     ESTABLISHED RESTS ON TWO DISTINCT OPERATORS, not on proof. It means two configured
@@ -1487,7 +1620,19 @@ def verify_cmd(
     CHECKED — nothing was asked of it, so nothing failed.
 
     \b
-    Exit codes: 0 the verdict holds, 5 it does not, 1 bad input, 2 network.
+    THE BLOCK IS VERIFIED WHERE PYRXD CAN, on by default. VERIFIED means pyrxd itself checked
+    that the transaction's merkle branch leads to that block's header, and that the header is
+    linked hash by hash to a checkpoint shipped with pyrxd (above the newest checkpoint, through
+    headers that each meet their own proof-of-work target and a work floor). CONFIRMED means that
+    could not be done — no checkpoints for this network, a block too far past the newest one, a
+    server without the merkle method, a fetch that failed — and the height is the endpoint's word;
+    the reason is printed. Both hold the verdict. When the server's own proof CONTRADICTS the
+    height it reported, the height cannot be established: exit 2, as for any network failure.
+    That is not a finding against the mark.
+
+    \b
+    Exit codes: 0 the verdict holds, 5 it does not, 1 bad input, 2 network (including a server
+    whose block proof contradicts the height it reported).
     NOT CHECKED never fails the verdict. Here it means you did not ask that question (no --file
     or --digest, no --wave-name), or the record is a version or hash this build cannot read, so
     no signature in it could be checked. Neither is a finding against the record, and failing
@@ -1525,7 +1670,10 @@ def verify_cmd(
     rerun = named["input"] if named is not None else wanted
     _require_min_confirmations(min_confirmations, needed_by="pyrxd verify", command=f"pyrxd verify {rerun}")
 
-    payload = _run_fetch_inspect(ctx, form="txid", value=wanted)
+    # The raw bytes `_inspect_txid_inner` fetched and hash-checked, kept for the block verification
+    # below so it verifies THOSE bytes rather than fetching the transaction a second time.
+    raw_out: list[bytes] = []
+    payload = _run_fetch_inspect(ctx, form="txid", value=wanted, raw_out=raw_out)
     if named is not None:
         # FIRST, before anything is said about what the transaction carries: an output it does not
         # have is bad input, whether or not there is a mark in it.
@@ -1578,7 +1726,16 @@ def verify_cmd(
     if verify_wave:
         _attach_wave_identity(ctx, payload)
     if name_asked:
-        _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
+        # `verify_block`: the name judgement reads the mark's depth from the block verification,
+        # made once, in the lookup that fetched the anchor; `_verify_anchor` reports that outcome.
+        _attach_name_at_mark(
+            ctx,
+            payload,
+            name=wave_name,  # type: ignore[arg-type]
+            min_confirmations=min_confirmations,  # type: ignore[arg-type]
+            verify_block=True,
+            mark_raw_tx=raw_out[0] if raw_out else None,
+        )
 
     expected, absent_reason = _digest_expectation(records, file_path=file_path, digest_hex=digest_hex)
     source = "--digest" if digest_hex is not None else (str(file_path) if file_path is not None else "")
@@ -1599,7 +1756,13 @@ def verify_cmd(
     w_vout, w_hm, w_checks = _choose_witness(per_record)
     refusal = _tx_refusal(per_record)
 
-    anchor = _verify_anchor(ctx, payload, min_confirmations=min_confirmations, prefer=w_hm)  # type: ignore[arg-type]
+    anchor = _verify_anchor(
+        ctx,
+        payload,
+        min_confirmations=min_confirmations,  # type: ignore[arg-type]
+        raw_tx=raw_out[0] if raw_out else None,
+        prefer=w_hm,
+    )
 
     checks = {
         "signature": refusal[1] if refusal else w_checks["signature"],

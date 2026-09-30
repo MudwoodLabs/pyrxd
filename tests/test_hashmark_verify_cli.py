@@ -631,7 +631,7 @@ class TestFormTwoThroughTheCommand:
                 }
             ],
         }
-        anchor = hashmark_cmds._verify_anchor(ctx, payload, min_confirmations=6)
+        anchor = hashmark_cmds._anchor_of(ctx, payload, min_confirmations=6)
         assert anchor == {"height": 12345, "confirmations": 9, "source": "wss://not-the-binding"}
 
 

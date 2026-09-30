@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -48,7 +49,7 @@ from ..security.errors import (
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..security.units import ChainHeight, PhotonValue
-from ..spv.radiant import TxMerkleBranch
+from ..spv.radiant import MAX_MERKLE_DEPTH, TxMerkleBranch
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
 from .source_identity import SourceKey, source_key
@@ -57,6 +58,11 @@ from .tls_pin import normalize_pin, verify_connection_pin
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT: float = 30.0
+
+#: ElectrumX's ``blockchain.block.headers`` serves at most this many headers per call (its ``max``).
+MAX_BLOCK_HEADERS_PER_CALL = 2016
+
+_HEX_DIGITS = re.compile(r"\A[0-9a-fA-F]*\Z")
 
 
 @dataclass
@@ -791,6 +797,67 @@ class ElectrumXClient:
         if len(header_bytes) != 80:
             raise NetworkError(f"Block header must be 80 bytes, got {len(header_bytes)}")
         return header_bytes
+
+    async def get_block_headers(self, start: BlockHeight, count: int) -> list[bytes]:
+        """Return up to *count* consecutive raw 80-byte headers from height *start*.
+
+        ``blockchain.block.headers``, which serves at most :data:`MAX_BLOCK_HEADERS_PER_CALL`
+        (2016) per call. The server answers ``{"count": n, "hex": ..., "max": ...}``; ``n`` may be
+        SMALLER than asked when the range runs past its tip, and that is honest, so fewer headers
+        come back. What is refused, with ``NetworkError``: a reply that is not an object, an
+        echoed ``count`` that is not a non-negative int or is larger than asked, a ``hex`` that is
+        not a string of hex digits exactly ``160 * n`` long. Each returned header is exactly 80
+        bytes. Nothing here checks what the headers say (linkage, proof-of-work): that is the
+        consumer's job, and :mod:`pyrxd.glyph.mark_block` is the one that does it.
+
+        :raises ValidationError: for a *count* outside ``1..2016`` or a bad *start* — a caller's
+            error, refused before anything is sent.
+        """
+        if not isinstance(start, BlockHeight):
+            start = BlockHeight(start)
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_BLOCK_HEADERS_PER_CALL:
+            raise ValidationError(f"count must be an int in 1..{MAX_BLOCK_HEADERS_PER_CALL}")
+        result = await self._call("blockchain.block.headers", [int(start), count])
+        if not isinstance(result, dict):
+            raise NetworkError("Unexpected response type for block headers")
+        try:
+            served = nonneg_int(result.get("count"))
+        except (TypeError, ValueError, OverflowError):
+            raise NetworkError("Malformed block headers response: no usable count")
+        if served > count:
+            raise NetworkError(f"server returned {served} block headers when {count} were asked for; fail-closed")
+        hex_blob = result.get("hex")
+        if not isinstance(hex_blob, str) or len(hex_blob) != 160 * served or not _HEX_DIGITS.match(hex_blob):
+            raise NetworkError(f"Malformed block headers response: hex is not {served} 80-byte headers")
+        raw = bytes.fromhex(hex_blob)
+        return [raw[i * 80 : (i + 1) * 80] for i in range(served)]
+
+    async def get_transaction_id_from_pos(self, height: BlockHeight, pos: int) -> dict[str, Any]:
+        """The txid at position *pos* of block *height*, with its merkle branch, shape-validated.
+
+        ``blockchain.transaction.id_from_pos(height, pos, true)``. Returns
+        ``{"tx_hash": <64 lowercase hex>, "merkle": [<64 lowercase hex>, ...]}`` — the shape
+        :func:`pyrxd.glyph.mark_block.verify_mark_block` takes as ``coinbase_merkle`` when *pos* is
+        0. Raises ``NetworkError`` for a reply that is not an object, a ``tx_hash`` that is not 32
+        bytes of hex, or a ``merkle`` that is not a list of at most
+        :data:`~pyrxd.spv.radiant.MAX_MERKLE_DEPTH` 32-byte hex hashes. Not checked against any
+        header here.
+        """
+        if not isinstance(height, BlockHeight):
+            height = BlockHeight(height)
+        if not isinstance(pos, int) or isinstance(pos, bool) or pos < 0:
+            raise ValidationError("pos must be a non-negative int")
+        result = await self._call("blockchain.transaction.id_from_pos", [int(height), pos, True])
+        if not isinstance(result, dict):
+            raise NetworkError("Unexpected response type for transaction id_from_pos")
+        try:
+            tx_hash = hex_str(result["tx_hash"], nbytes=32)
+            branch = merkle_branch(result["merkle"])
+        except (KeyError, TypeError, ValueError):
+            raise NetworkError("Malformed id_from_pos response from server")
+        if len(branch) > MAX_MERKLE_DEPTH:
+            raise NetworkError(f"id_from_pos merkle branch is deeper than {MAX_MERKLE_DEPTH} levels; fail-closed")
+        return {"tx_hash": tx_hash.lower(), "merkle": [h.lower() for h in branch]}
 
     async def get_tip_height(self) -> BlockHeight:
         """Return the current chain tip block height.
