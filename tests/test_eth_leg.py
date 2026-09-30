@@ -8,6 +8,7 @@ scrape_secret) are tested for real.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 
 import pytest
@@ -19,7 +20,15 @@ from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-_ART = {"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x00"}
+#: The smallest immutable layout the leg's constructor accepts (one 32-byte slot). These tests are
+#: about other things; the layout checks themselves live in test_eth_leg.py.
+_ART = {
+    "abi": [],
+    "bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
+}
 _MAKER = "0x" + "11" * 20
 _TAKER = "0x" + "22" * 20
 _TIMEOUT = 1779710245
@@ -595,7 +604,7 @@ async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
     )
     rpc = _RecordingRpc(loc, loc.amount_wei)
     leg = EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=11155111, artifact=_ART)
-    leg._runtime_code_matches = lambda code: True  # bypass artifact-bytecode match; we test the PINNING
+    leg._expected_runtime = lambda loc: b"\x60\x00"  # bypass artifact-bytecode match; we test the PINNING
 
     await leg.verify_funded(loc, expected_amount_wei=loc.amount_wei, block_identifier="finalized")
 
@@ -634,24 +643,157 @@ async def test_the_recording_fake_can_actually_answer_the_head_timestamp():
     assert await rpc.latest_block_timestamp_min() == _HEAD_TS
 
 
-def test_runtime_code_mask_gap_documented_and_empty_code_fails_closed():
-    """Pin the EXACT shape of the _runtime_code_matches masking gap (audit eth_leg_web3 LOW /
-    MEDIUM-1 residual): every committed-ZERO byte is masked — a superset of the immutable slots —
-    so a contract whose logic differs ONLY at committed-zero positions passes this gate. That is
-    why the gate alone cannot prove "no modified logic" and the 'finalized' verify pin is the live
-    backstop (staged for real in test_eth_leg_anvil_integration.py's reorg test). Also pins the
-    fail-closed cases the backstop relies on: empty code (a reorged-out deploy read at the
-    finalized checkpoint) and any non-zero-position or length deviation must be rejected."""
-    # offsets:                0     1     2     3     4
-    runtime = bytes.fromhex("600060ff00")  # committed zeros at offsets 1 and 4
-    art = {"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x" + runtime.hex()}
-    leg = EthHtlcContractLeg(rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=art)
+import pathlib as _pathlib
 
-    assert leg._runtime_code_matches(runtime)  # exact match passes
-    # THE GAP: a byte swapped in at a committed-zero position is NOT verified (masked superset).
-    assert leg._runtime_code_matches(bytes.fromhex("604260ff00"))
-    assert leg._runtime_code_matches(bytes.fromhex("600060ff42"))
-    # Fail-closed: non-zero-position deviation, length mismatch, and the reorged-out empty read.
-    assert not leg._runtime_code_matches(bytes.fromhex("600060fe00"))
-    assert not leg._runtime_code_matches(runtime + b"\x00")
-    assert not leg._runtime_code_matches(b"")
+_REAL_ART = json.loads((_pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+
+
+def _real_locator():
+    from web3 import Web3
+
+    return EthHtlcLocator(
+        chain_id=31337,
+        contract_address=Web3.to_checksum_address("0x" + "33" * 20),
+        deploy_tx_hash="0x" + "de" * 32,
+        hashlock="0x" + "ab" * 32,
+        claimant=Web3.to_checksum_address("0x" + "11" * 20),
+        refundee=Web3.to_checksum_address("0x" + "22" * 20),
+        timeout=4_000_000_000,
+        amount_wei=10**15,
+    )
+
+
+def test_expected_runtime_rejects_a_forged_immutable_copy_the_getters_cannot_see():
+    """FUND-SAFETY regression (proven on Anvil): the old value-masked compare wildcarded every
+    committed-zero byte — a superset of the immutable slots — and, worse, verified no relationship
+    BETWEEN the 2–3 runtime copies Solidity splices per immutable. A getter reads one copy while
+    ``claim()``/``refund()`` read another, so a hostile deployer could set the getter copy of
+    ``claimant`` to the negotiated maker (passing verify_funded's getter bind) and the ``claim()``
+    copy to an attacker — draining the ETH on claim. This pins the slot-accurate fix: the expected
+    runtime substitutes the negotiated value into EVERY immutableReferences offset and requires
+    EXACT equality, so forging ANY single copy is caught with no Anvil needed."""
+    pytest.importorskip("web3")
+    leg = EthHtlcContractLeg(
+        rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=_REAL_ART
+    )
+    loc = _real_locator()
+    expected = leg._expected_runtime(loc)
+    # Every immutableReferences offset carries the negotiated value (no zero placeholder survives).
+    for refs in _REAL_ART["immutableReferences"].values():
+        for r in refs:
+            assert expected[r["start"] : r["start"] + 32] != b"\x00" * 32
+    # THE ATTACK: forge ONLY the claim()-copy of `claimant` (id 6 has copies at 1224 and 1418; the
+    # getter reads 1418, claim() reads 1224). The forged runtime keeps the getter copy honest, so
+    # every getter bind in verify_funded still passes — the exact compare is what rejects it.
+    attacker = bytes.fromhex("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+    forged = bytearray(expected)
+    forged[1224 : 1224 + 32] = b"\x00" * 12 + attacker
+    assert bytes(forged) != expected  # the compare verify_funded now runs rejects this
+    # And a byte flipped anywhere in the LOGIC (a committed-zero position the old mask ignored) is
+    # likewise rejected: find a non-immutable zero byte and flip it.
+    imm_windows = {
+        i
+        for refs in _REAL_ART["immutableReferences"].values()
+        for r in refs
+        for i in range(r["start"], r["start"] + 32)
+    }
+    zero_logic = next(i for i, b in enumerate(expected) if b == 0 and i not in imm_windows)
+    tampered = bytearray(expected)
+    tampered[zero_logic] = 0x42
+    assert bytes(tampered) != expected
+
+
+_ERC20_ART = json.loads((_pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+
+
+class _TripwireRpc:
+    """Records ANY use. A leg that is refused at construction must not have touched the network —
+    no deploy, no balance read, nothing — because the funder's own ``fund`` sends value with the
+    deploy, before ``verify_funded`` (where the layout used to be checked) ever runs."""
+
+    def __init__(self):
+        object.__setattr__(self, "touched", [])
+
+    def __getattr__(self, name):
+        self.touched.append(name)
+        raise AssertionError(f"a refused leg used rpc.{name}")
+
+
+def _build(kind: str, artifact: dict, rpc) -> object:
+    if kind == "native":
+        return EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=artifact)
+    from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+    from pyrxd.eth_wallet.tokens import token_for
+
+    return Erc20HtlcLeg(
+        token=token_for("USDC", 1), rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=artifact
+    )
+
+
+@pytest.mark.parametrize("kind,art", [("native", _REAL_ART), ("erc20", _ERC20_ART)])
+@pytest.mark.parametrize("key", ["immutableReferences", "immutable_names"])
+def test_an_artifact_without_its_immutable_layout_is_refused_at_CONSTRUCTION(kind, art, key):
+    """FAIL BEFORE VALUE MOVES. The exact runtime compare cannot be built without
+    ``immutableReferences`` and ``immutable_names``. When only ``verify_funded`` checked for them, a
+    leg built from such an artifact deployed and FUNDED (0.001 ETH in the reviewer's proof) before
+    refusing, and through ``EthLeg.fund`` the ETH then sat locked until the refund timeout. Now the
+    constructor refuses, so there is no leg to fund with."""
+    rpc = _TripwireRpc()
+    stripped = {k: v for k, v in art.items() if k != key}
+    with pytest.raises(ValidationError, match=f"missing required keys: \\['{key}'\\]"):
+        _build(kind, stripped, rpc)
+    assert rpc.touched == [], f"a refused leg touched the network: {rpc.touched}"
+
+
+@pytest.mark.parametrize("kind,art", [("native", _REAL_ART), ("erc20", _ERC20_ART)])
+def test_the_real_artifacts_are_ACCEPTED_at_construction(kind, art):
+    """The honest path for the refusals above and below: both committed artifacts construct, with
+    the network untouched."""
+    rpc = _TripwireRpc()
+    _build(kind, art, rpc)
+    assert rpc.touched == []
+
+
+def _mutated(**changes) -> dict:
+    art = json.loads(json.dumps(_REAL_ART))
+    for k, v in changes.items():
+        art[k] = v
+    return art
+
+
+_FIRST_ID = next(iter(_REAL_ART["immutableReferences"]))
+
+
+@pytest.mark.parametrize(
+    "art,match",
+    [
+        (_mutated(immutableReferences={}), "immutableReferences' must be a non-empty"),
+        (_mutated(immutable_names={}), "immutable_names' must be a non-empty"),
+        (
+            _mutated(immutable_names={k: v for k, v in _REAL_ART["immutable_names"].items() if k != _FIRST_ID}),
+            "unnamed: \\['" + _FIRST_ID + "'\\]",
+        ),
+        (_mutated(immutable_names={**_REAL_ART["immutable_names"], "999999": "claimant"}), "not in this build"),
+        (
+            _mutated(
+                immutableReferences={
+                    **_REAL_ART["immutableReferences"],
+                    _FIRST_ID: [{"start": len(bytes.fromhex(_REAL_ART["runtime_bytecode"][2:])) - 31, "length": 32}],
+                }
+            ),
+            "lies outside",
+        ),
+        (
+            _mutated(immutableReferences={**_REAL_ART["immutableReferences"], _FIRST_ID: [{"start": 0, "length": 20}]}),
+            "malformed slot",
+        ),
+        (_mutated(immutableReferences={**_REAL_ART["immutableReferences"], _FIRST_ID: []}), "has no slots"),
+    ],
+)
+def test_an_unusable_immutable_layout_is_refused_at_construction(art, match):
+    """Presence is not enough: each of these would pass a key check and then fail only inside
+    ``verify_funded``, after the funder's deploy had already carried the value."""
+    rpc = _TripwireRpc()
+    with pytest.raises(ValidationError, match=match):
+        _build("native", art, rpc)
+    assert rpc.touched == []

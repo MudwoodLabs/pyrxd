@@ -162,10 +162,16 @@ class TestTheErc20HtlcArtifactMatchesWhatTheLegNeeds:
         return json.loads((Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
 
     def test_it_has_the_keys_load_artifact_requires(self) -> None:
+        # The key set is the leg's OWN constant, not a copy of it: a hand-kept tuple here missed
+        # the immutable layout keys when they became required.
+        from pyrxd.eth_wallet.htlc_leg import _REQUIRED_ARTIFACT_KEYS, _validate_artifact
+
         art = self._artifact()
-        for key in ("abi", "bytecode", "runtime_bytecode"):
+        assert {"immutableReferences", "immutable_names"} <= set(_REQUIRED_ARTIFACT_KEYS)
+        for key in _REQUIRED_ARTIFACT_KEYS:
             assert key in art, key
             assert art[key], f"{key} is empty"
+        _validate_artifact(art)  # the constructor's own check, layout included
 
     def test_the_claimed_event_keeps_the_preimage_UNINDEXED(self) -> None:
         """THE load-bearing pin. `eth_wallet/secret.py` recovers the secret by scanning the log

@@ -6,6 +6,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
+  proven on a local Anvil chain. Affects v0.6.0 through v0.25.1; upgrade before running an ETH or
+  ERC-20 swap.** The affected surface is a MAKER verifying a counterparty-deployed ETH or ERC-20
+  HTLC (`EthHtlcContractLeg.verify_funded`, and `Erc20HtlcLeg.verify_funded`, which inherits it,
+  since that leg shipped in v0.21.0). The masked compare arrived with #155, was first released in
+  v0.6.0, and is in every release through v0.25.1. It compared the deployed runtime to the
+  committed artifact with a *value-masked* compare that wildcarded every committed-zero byte — a
+  superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
+  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
+  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
+  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
+  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` sent
+  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
+  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
+  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
+  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
+  wildcarded, so a forged immutable copy or any modified logic byte is rejected. The token leg
+  extends it to its `token`/`amount` immutables.
+
+### Changed (breaking)
+
+- **The injected ETH/ERC-20 HTLC artifact must now carry `immutableReferences` and
+  `immutable_names`, and a leg built from one that does not is refused at CONSTRUCTION.** The exact
+  compare cannot be built without them. Checking only inside `verify_funded` let a leg deploy and
+  fund its own contract first (native `fund` sends the value with the deploy), leaving the ETH
+  locked until the refund timeout. An empty map, an unnamed reference id, a name for an id the
+  build does not have, or a slot outside the runtime is refused the same way. A plain Foundry
+  build output does not qualify; `load_artifact`'s docstring says how to produce one that does.
+  Regression cover: an Anvil forged-copy test for each of `EthHtlc` and the real `Erc20Htlc` (the
+  latter forging every copy of every immutable in turn), an Anvil test that checks each
+  `immutable_names` entry by executing its getter, a default-suite test that derives the same map
+  from the bytecode without reading it, and construction-refusal tests with their honest paths.
+
 ## [0.25.1] — 2026-09-29
 
 ### Changed (breaking)
