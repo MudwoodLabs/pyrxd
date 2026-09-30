@@ -375,7 +375,7 @@ def _parse_args(argv):
         default=0.0,
         help=(
             "REQUIRED: the MEASURED p10 Radiant inter-block interval (seconds). The measured policy "
-            "and the swap taker gate divide by it; measure it against a mainnet node for this run."
+            "requires it (the timelock reserves divide by it); measure it against a mainnet node for this run."
         ),
     )
     ap.add_argument("--poll-interval-s", type=float, default=30.0)

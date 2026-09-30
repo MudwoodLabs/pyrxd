@@ -60,49 +60,71 @@ own node — never to proceed.
 THE UPPER BOUND ON ELAPSED DEPTH. SPV proves a LOWER bound on how deep the funding is. The timelock
 gates that follow (``pre_btc_lock_check`` steps 6 and 7) need an UPPER bound, because ``t_rxd`` is a
 CSV counted from the covenant's mining and an under-counted depth makes the maker's refund look
-further away than it is. A server can under-count by withholding its newest headers. The bound used
-is::
+further away than it is. A server can under-count by serving fewer headers than exist. The bound
+used is::
 
-    max(proved, (R - H + 1) + ceil(max(0, now - T_R) ÷ interval) + F, reported)
+    max(proved, (R - H + 1) + blocks_upper(E), reported)
+    E = max(0, now - MTP(R))
+    blocks_upper(E) = the smallest n with P(Poisson(λ·E) > n) <= ε,   λ = surge_factor ÷ spacing
 
-where ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header
-served (the newest counting as 1), and ``T_R`` its timestamp. The blocks from the funding up to
-``R`` are proved; every block after ``R`` is covered by the allowance for all that could have been
-mined since ``T_R``, at the interval the coordinator uses for converting time to blocks (the
-measured fast tail, required on a value-bearing network). The server's own verbose
-``confirmations`` can only raise it. A server that stops serving at an older header hands the taker
-an older ``T_R`` and a larger allowance — the withholding shows up as elapsed time.
+* ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header served
+  (the newest counting as 1). The blocks from the funding up to ``R`` are proved.
+* ``MTP(R)`` is the reference time: the MEDIAN TIME PAST at ``R`` — the median of the timestamps of
+  the :data:`MEDIAN_TIME_SPAN` (11) headers ending at ``R``, exactly as Radiant Core's
+  ``CBlockIndex::GetMedianTimePast`` computes it (``tests/vendor/radiant_core/chain.h`` lines
+  195-209; consensus requires each block's time to exceed it, ``validation.cpp`` line 3930). All 11
+  headers are ones this gate has verified: ``R`` is linked to a checkpoint (and, above the newest
+  checkpoint, proof-of-work checked), and each header below it in the window is linked to ``R`` by
+  its hash.
+* ``blocks_upper(E)`` counts the blocks after ``R`` statistically: blocks arrive as a Poisson
+  process, and at a rate of ``surge_factor`` times the nominal (``nPowTargetSpacing``, 300 s,
+  ``chainparams.cpp`` line 117) the number in ``E`` seconds exceeds ``blocks_upper(E)`` with
+  probability at most ``ε`` (:func:`poisson_upper_quantile`, computed conservatively).
+  ``ε = clamp(loss_budget ÷ value_at_stake, 1e-12, 1e-3)``: the confidence scales with the value,
+  so the expected cost of an honest over-run stays at or below about the loss budget (1 RXD by
+  default). The defaults are policy (:class:`ElapsedBoundPolicy`), listed for maintainer sign-off.
+* ``reported`` is the largest depth any configured source reports for the funding — its verbose
+  ``confirmations`` or ``tip - H + 1`` — grouped by operator (:func:`pyrxd.network.source_identity.source_key`).
+  A report can only RAISE the bound; a source reporting less never lowers it. With one operator
+  configured, the time term is what stands against a source that stops serving early, and the
+  result says so.
 
-``F`` is the FUTURE-TIME ALLOWANCE (maintainer decision, 2026-09-30): Radiant Core accepts a block
-whose timestamp is up to ``MAX_FUTURE_BLOCK_TIME`` (two hours; ``tests/vendor/radiant_core/chain.h``
-line 27, enforced at ``validation.cpp`` line 3936) ahead of the node's adjusted time. The bound
-allows for header timestamps up to that limit by adding that span in blocks at the nominal target
-spacing (``nPowTargetSpacing``, 300 s, ``chainparams.cpp`` line 117): ``F = ceil(7200 ÷ 300) = 24``
-blocks, on a value-bearing network for every swap; 0 on a test network.
+The result names the term that set the bound (``bound_term``). A server that stops serving at an
+older header hands the taker an older ``MTP(R)`` and a larger ``E``: fewer headers served shows up as
+elapsed time.
 
-The coordinator's negotiation-time check (``SwapCoordinator._funding_proof_room_failure``) applies
-this same bound, through :func:`honest_elapsed_blocks_upper`, to the smallest ``k`` the gate can
-require, so a swap whose ``t_rxd`` cannot hold it is refused before anyone locks.
+WHY THE MEDIAN. It is the time Radiant Core itself orders blocks by, and one header's timestamp moves
+it by at most one position in the sorted window: on a chain at the nominal spacing, one block
+interval. No lag term is added: on such a chain ``MTP(R)`` is the time of the block five below
+``R``, so ``E`` already counts about five intervals more than have passed since ``R`` was mined.
 
-WHY THAT DEPTH. Elapsed time is measured from a header deep enough that changing its time costs as
-much as the rule already demands of the depth: a different header at ``R`` means different headers
-above it too, each mined at the floor or above, which prices it at ``value_term × C ≥ 2 × value at
-stake`` — the value term of ``k``. Deeper would charge every honest swap the time of more blocks at
-the fast-tail rate without raising that price past what ``k`` already settles. ``value_term <= k <=
-proved``, so ``R`` is never below the funding block. A test network has no value term, and ``R`` is
-the newest header served.
+WHY THAT DEPTH. The reference is taken deep enough that changing any header in its window costs as
+much as the rule already demands of the depth: a different header at or below ``R`` means different
+headers above it too, each mined at the floor or above, which prices it at ``value_term × C ≥ 2 ×
+value at stake`` — the value term of ``k``. Deeper would charge every honest swap the time of more
+blocks without raising that price past what ``k`` already settles. ``value_term <= k <= proved``, so
+``R`` is never below the funding block. A test network has no value term, and ``R`` is the newest
+header served.
 
 The clock is the caller's (``now_unix_s``); the coordinator never reads one. It is REQUIRED on a
-value-bearing network; on a test network without it the allowance is omitted and the result says so.
+value-bearing network; on a test network without it the time term is omitted and the result says so.
+
+THE NEGOTIATION-TIME CHECK. :func:`early_elapsed_blocks_upper` models the same bound for the
+coordinator before anyone locks (``SwapCoordinator._funding_proof_room_failure``), and is built to be
+AT LEAST AS LARGE as what step 6 computes on an honest chain, so that a swap it accepts is not
+refused after the maker locks: it takes ``C`` no larger than the gate can compute (the shipped last
+checkpoint interval's work, ``LAST_INTERVAL_MAX_WORK``, times ``early_work_margin`` for harder
+headers served above the newest checkpoint; the lowest subsidy the walk cap allows), the largest
+``k`` and value term that follow, a chain at the nominal spacing, and a newest header up to
+``early_slack_s`` old. What it does not cover is stated on that function.
 
 WHAT REMAINS THE SERVER'S WORD, stated rather than implied:
 
 * that the covenant output is still UNSPENT. SPV proves a transaction was mined, never that an
   output has not been spent since; the ``listunspent`` read that locates the outpoint is kept for
   that, and is no longer the evidence of the output's existence, script or value.
-* the reference header's timestamp beyond what ``F`` allows for: ``F`` converts the future-time
-  limit at the nominal spacing, not at the fast tail; and blocks arriving faster than the fast-tail
-  interval are counted at that interval.
+* the elapsed-depth bound is a statistical upper bound at confidence ``1 - ε`` for block rates up to
+  ``surge_factor`` times the nominal, measured from the median time past at ``R``; it is not a proof.
 * which chain is Radiant's most-work chain, and whether each nBits is the value Radiant's
   difficulty rules require: neither is checked (see :mod:`pyrxd.glyph.mark_block`); the floor and
   ``k`` bound what a forgery costs instead.
@@ -115,6 +137,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
@@ -132,26 +155,28 @@ from pyrxd.hash import hash256, radiant_block_hash
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import BlockHeight
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work
-from pyrxd.spv.radiant_checkpoints import CHECKPOINTS
+from pyrxd.spv.radiant_checkpoints import CHECKPOINTS, LAST_INTERVAL_MAX_WORK, NEWEST_CHECKPOINT_WORK
 from pyrxd.transaction.transaction import Transaction
 
 __all__ = [
     "FORGERY_COST_FACTOR",
-    "FUTURE_TIME_ALLOWANCE_BLOCKS",
     "LOCAL_DEVNET_CHAIN_IDS",
-    "MAX_FUTURE_BLOCK_TIME_S",
     "MAX_HEADERS_FROM_CHECKPOINT_SDK",
+    "MEDIAN_TIME_SPAN",
     "MIN_FUNDING_CONFIRMATIONS",
+    "EarlyElapsedBound",
+    "ElapsedBoundPolicy",
     "MakerFundingEvidence",
     "MakerFundingNotVerified",
     "RadiantChain",
     "VerifiedMakerFunding",
     "block_subsidy_photons",
+    "early_elapsed_blocks_upper",
     "elapsed_blocks_upper_bound",
-    "forged_confirmation_cost_ceiling_photons",
+    "forged_confirmation_cost_floor_photons",
     "funding_header_ranges",
-    "future_time_allowance_blocks",
-    "honest_elapsed_blocks_upper",
+    "median_time_past",
+    "poisson_upper_quantile",
     "radiant_chain_for_leg",
     "required_funding_confirmations",
     "verify_maker_funding",
@@ -173,22 +198,26 @@ MAX_HEADERS_FROM_CHECKPOINT_SDK = 20_160
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
-#: Radiant Core's ``MAX_FUTURE_BLOCK_TIME``, in seconds: how far ahead of a node's adjusted time a
-#: block's timestamp may be and still be accepted (``tests/vendor/radiant_core/chain.h`` line 27,
-#: ``2 * 60 * 60``; enforced at ``validation.cpp`` line 3936). A test re-reads it from the vendored file.
-MAX_FUTURE_BLOCK_TIME_S = 2 * 60 * 60
+#: Radiant Core's ``CBlockIndex::nMedianTimeSpan`` (``tests/vendor/radiant_core/chain.h`` line 195):
+#: how many headers, ending at a block, its median time past is taken over. A test re-reads it.
+MEDIAN_TIME_SPAN = 11
 
 #: Radiant's nominal block spacing, ``consensus.nPowTargetSpacing`` (``chainparams.cpp`` line 117,
-#: ``5 * 60``), in seconds.
+#: ``5 * 60``, the same on every network), in seconds. A test re-reads it.
 TARGET_BLOCK_SPACING_S = 5 * 60
-
-#: ``F``: the future-time allowance the elapsed-depth bound adds on a value-bearing network —
-#: ``MAX_FUTURE_BLOCK_TIME`` in blocks at the nominal spacing (maintainer decision, 2026-09-30).
-FUTURE_TIME_ALLOWANCE_BLOCKS = -(-MAX_FUTURE_BLOCK_TIME_S // TARGET_BLOCK_SPACING_S)
 
 #: ``GetBlockSubsidy``'s starting reward, ``50000 * COIN`` (``tests/vendor/radiant_core/validation.cpp``
 #: line 1115), in photons.
 INITIAL_SUBSIDY_PHOTONS = 50_000 * PHOTONS_PER_RXD
+
+#: How far below the true quantile's threshold :func:`poisson_upper_quantile` requires its computed
+#: log-tail to fall. Its floating-point error is far smaller (under 1e-8 at a mean of 1e5); the margin
+#: turns it into a result that is never below the exact quantile, and at most one above it.
+_QUANTILE_LOG_MARGIN = 1e-6
+
+#: Above this mean the quantile is the closed-form Bernstein bound (never below the exact quantile)
+#: instead of a summation.
+_QUANTILE_EXACT_LIMIT = 1e7
 
 
 class MakerFundingNotVerified(ValidationError):
@@ -197,6 +226,132 @@ class MakerFundingNotVerified(ValidationError):
     A :class:`~pyrxd.security.errors.ValidationError`, so every existing fail-closed handler on the
     lock path refuses on it. The message names what was required and what was proved.
     """
+
+
+@dataclass(frozen=True)
+class ElapsedBoundPolicy:
+    """The policy inputs of the elapsed-depth upper bound — defaults for maintainer sign-off.
+
+    * ``surge_factor`` — the block rate the bound allows for, as a multiple of the nominal spacing:
+      ``λ = surge_factor ÷ nPowTargetSpacing``. Default 2.0.
+    * ``loss_budget_photons``, ``epsilon_min``, ``epsilon_max`` — the confidence:
+      ``ε = clamp(loss_budget ÷ value_at_stake, epsilon_min, epsilon_max)``, so an honest swap's
+      expected over-run cost is at most about the budget. Defaults 1 RXD, 1e-12, 1e-3. With no value
+      (a test network) ``ε`` is ``epsilon_max``.
+    * ``early_slack_s`` — the negotiation-time check only: how old the newest header may be when the
+      taker reaches step 6, in seconds (the gap between the covenant reaching ``k`` and the taker
+      locking). Default 3600. The at-lock check uses the actual clock instead.
+    * ``early_work_margin`` — the negotiation-time check only: how much more work than the shipped
+      last checkpoint interval's hardest header a header served above the newest checkpoint may
+      carry before that check stops being at least as strict as step 6. Default 2.0.
+    """
+
+    surge_factor: float = 2.0
+    loss_budget_photons: int = PHOTONS_PER_RXD
+    epsilon_min: float = 1e-12
+    epsilon_max: float = 1e-3
+    early_slack_s: int = 3600
+    early_work_margin: float = 2.0
+
+    def __post_init__(self) -> None:
+        def num(v: Any) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+        if not num(self.surge_factor) or self.surge_factor < 1:
+            raise ValidationError("ElapsedBoundPolicy.surge_factor must be a finite number >= 1")
+        lb = self.loss_budget_photons
+        if not isinstance(lb, int) or isinstance(lb, bool) or lb <= 0:
+            raise ValidationError("ElapsedBoundPolicy.loss_budget_photons must be a positive int")
+        if not (num(self.epsilon_min) and num(self.epsilon_max) and 0 < self.epsilon_min <= self.epsilon_max < 0.5):
+            raise ValidationError("ElapsedBoundPolicy needs 0 < epsilon_min <= epsilon_max < 0.5")
+        es = self.early_slack_s
+        if not isinstance(es, int) or isinstance(es, bool) or es < 0:
+            raise ValidationError("ElapsedBoundPolicy.early_slack_s must be a non-negative int")
+        if not num(self.early_work_margin) or self.early_work_margin < 1:
+            raise ValidationError("ElapsedBoundPolicy.early_work_margin must be a finite number >= 1")
+
+    def epsilon(self, value_at_stake_photons: int | None) -> float:
+        """``ε`` for a swap of this value: ``clamp(loss_budget ÷ value, epsilon_min, epsilon_max)``."""
+        if value_at_stake_photons is None or value_at_stake_photons <= 0:
+            return self.epsilon_max
+        return min(self.epsilon_max, max(self.epsilon_min, self.loss_budget_photons / value_at_stake_photons))
+
+    def blocks_upper(self, elapsed_s: int, *, spacing_s: int, value_at_stake_photons: int | None) -> int:
+        """``blocks_upper(E)``: the statistical upper bound on blocks mined in *elapsed_s* seconds."""
+        if not isinstance(elapsed_s, int) or isinstance(elapsed_s, bool) or elapsed_s < 0:
+            raise ValidationError("elapsed_s must be a non-negative int")
+        mean = float(self.surge_factor) * elapsed_s / float(spacing_s)
+        return poisson_upper_quantile(mean, self.epsilon(value_at_stake_photons))
+
+
+#: The defaults, as listed for maintainer sign-off.
+DEFAULT_ELAPSED_BOUND_POLICY = ElapsedBoundPolicy()
+
+
+def _log_poisson_tail(mean: float, n: int) -> float:
+    """``log P(X > n)`` for ``X ~ Poisson(mean)``, ``mean > 0``, ``n >= -1`` — an over-estimate.
+
+    Sums the pmf from ``n + 1`` upward in scaled form (each term the previous times ``mean ÷ j``),
+    starting from ``log pmf(n + 1)`` by ``lgamma``; once the terms are decreasing and negligible, the
+    rest is bounded above by a geometric series and ADDED, so the result is never below the true tail
+    by more than floating-point error (which the caller's margin absorbs).
+    """
+    j = n + 1
+    log_first = -mean + j * math.log(mean) - math.lgamma(j + 1)
+    total = 1.0
+    term = 1.0
+    i = j
+    while True:
+        i += 1
+        term *= mean / i
+        total += term
+        ratio = mean / (i + 1)
+        if ratio < 1.0 and term <= total * 1e-17:
+            total += term * ratio / (1.0 - ratio)
+            break
+    return log_first + math.log(total)
+
+
+def poisson_upper_quantile(mean: float, epsilon: float) -> int:
+    """The smallest ``n`` with ``P(Poisson(mean) > n) <= epsilon`` — never below the exact value.
+
+    Exact up to floating-point error for ``mean`` up to :data:`_QUANTILE_EXACT_LIMIT` (a bisection on
+    :func:`_log_poisson_tail`, accepting ``n`` only when the computed log-tail is at least
+    :data:`_QUANTILE_LOG_MARGIN` below ``log epsilon``): the result is the exact quantile or one more.
+    Above that limit it is the Bernstein bound ``ceil(mean + t)``, ``t = L/3 + sqrt(L²/9 + 2·L·mean)``,
+    ``L = -log epsilon``, which is never below the exact quantile. A test compares both against an
+    independent 60-digit summation over a grid of means and ``epsilon`` values.
+    """
+    if not (isinstance(mean, (int, float)) and not isinstance(mean, bool) and math.isfinite(mean) and mean >= 0):
+        raise ValidationError("mean must be a finite number >= 0")
+    if not (isinstance(epsilon, float) and 0 < epsilon < 1):
+        raise ValidationError("epsilon must be a float in (0, 1)")
+    if mean == 0:
+        return 0
+    big_l = -math.log(epsilon)
+    hi = math.ceil(mean + big_l / 3 + math.sqrt(big_l * big_l / 9 + 2 * big_l * mean))
+    if mean > _QUANTILE_EXACT_LIMIT:
+        return hi
+    target = math.log(epsilon) - _QUANTILE_LOG_MARGIN
+    # Invariant: tail(lo) is above the target (lo = -1: the whole distribution); tail(hi) is not.
+    lo = -1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _log_poisson_tail(float(mean), mid) <= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def median_time_past(times: Sequence[int]) -> int:
+    """Radiant Core's ``GetMedianTimePast`` over *times*, the timestamps of up to
+    :data:`MEDIAN_TIME_SPAN` consecutive headers: sort them and take the element at index
+    ``len // 2`` (``chain.h`` lines 197-209)."""
+    if not times or len(times) > MEDIAN_TIME_SPAN:
+        raise ValidationError(f"median time past needs 1..{MEDIAN_TIME_SPAN} timestamps")
+    ordered = sorted(int(t) for t in times)
+    return ordered[len(ordered) // 2]
 
 
 @dataclass(frozen=True)
@@ -212,16 +367,27 @@ class RadiantChain:
     subsidy_halving_interval: int
     #: Whether a swap on it moves real value (then the value term and the clock are required).
     value_bearing: bool
+    #: ``consensus.nPowTargetSpacing``, seconds.
+    target_spacing_s: int = TARGET_BLOCK_SPACING_S
+    #: The most header work between the two newest checkpoints (both included), as shipped with the
+    #: table (:data:`pyrxd.spv.radiant_checkpoints.LAST_INTERVAL_MAX_WORK`); ``None`` where none is
+    #: shipped. The negotiation-time check prices ``C`` from it.
+    last_interval_max_work: int | None = None
+    #: The newest checkpoint header's own work, as shipped; ``None`` where none is shipped.
+    newest_checkpoint_work: int | None = None
 
 
-#: Radiant mainnet: the shipped checkpoint table; ``powLimit`` ``00000000ff…ff`` and halving interval
-#: 210,000 (``tests/vendor/radiant_core/chainparams.cpp`` lines 113-114 and 96).
+#: Radiant mainnet: the shipped checkpoint table and the last interval's work shipped with it;
+#: ``powLimit`` ``00000000ff…ff`` and halving interval 210,000
+#: (``tests/vendor/radiant_core/chainparams.cpp`` lines 113-114 and 96).
 MAINNET_CHAIN = RadiantChain(
     name="mainnet",
     checkpoints=CHECKPOINTS["mainnet"],
     pow_limit=(1 << 224) - 1,
     subsidy_halving_interval=210_000,
     value_bearing=True,
+    last_interval_max_work=LAST_INTERVAL_MAX_WORK["mainnet"],
+    newest_checkpoint_work=NEWEST_CHECKPOINT_WORK["mainnet"],
 )
 
 #: Radiant regtest: no shipped table, so its genesis (``chainparams.cpp`` line 509, and
@@ -311,19 +477,38 @@ def block_subsidy_photons(height: int, chain: RadiantChain) -> int:
     return INITIAL_SUBSIDY_PHOTONS >> halvings
 
 
-def forged_confirmation_cost_ceiling_photons(chain: RadiantChain) -> int:
-    """The most ``C`` can be for a funding made from now on, from the SHIPPED checkpoint table alone.
+def _shipped_work(chain: RadiantChain) -> tuple[int, int]:
+    if chain.last_interval_max_work is None or chain.newest_checkpoint_work is None:
+        raise MakerFundingNotVerified(
+            f"pyrxd ships no last-checkpoint-interval work for Radiant {chain.name}, so the cost of a forged "
+            "confirmation cannot be bounded before the chain is read"
+        )
+    return int(chain.last_interval_max_work), int(chain.newest_checkpoint_work)
 
-    For the negotiation-time check, which runs before any funding or header exists. Two facts make it
-    an upper bound on the ``C`` :func:`verify_maker_funding` will compute: ``max_header_work``
-    includes the newest checkpoint's own header, whose work ÷ :data:`FLOOR_WORK_DIVISOR` is
-    ``floor_work``, so ``floor_work ÷ max_header_work <= 1/16``; and the subsidy never rises with
-    height, while a funding made for terms agreed now is mined above every shipped checkpoint (each is
-    at least a thousand blocks below the tip it was generated at). A ``k`` sized from this is
-    therefore never larger than the ``k`` the gate will require — so a check built on it refuses only
-    what the gate would refuse.
+
+def forged_confirmation_cost_floor_photons(
+    chain: RadiantChain,
+    policy: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY,
+    *,
+    cap: int = MAX_HEADERS_FROM_CHECKPOINT_SDK,
+) -> int:
+    """The LEAST ``C`` :func:`verify_maker_funding` can compute for a funding made from now on, from
+    the SHIPPED table alone — for the negotiation-time check, which runs before any header exists.
+
+    ``subsidy(newest checkpoint + cap) × floor_work ÷ ceil(early_work_margin × LAST_INTERVAL_MAX_WORK)``.
+    Each factor is on the conservative side of the gate's own: the funding height is at most
+    ``cap`` above the newest checkpoint (the gate refuses beyond it) and the subsidy never rises with
+    height; ``floor_work`` is the same shipped checkpoint work ÷ 16; and the gate's
+    ``max_header_work`` is the last interval's maximum — shipped exactly — or a header served above
+    the newest checkpoint, which this assumes carries at most ``early_work_margin`` times that. A
+    served header harder than that makes the gate's ``C`` smaller than this; see
+    :func:`early_elapsed_blocks_upper` for what that leaves uncovered.
     """
-    return block_subsidy_photons(chain.checkpoints[-1][0], chain) // FLOOR_WORK_DIVISOR
+    last_max, cp_work = _shipped_work(chain)
+    newest_h = chain.checkpoints[-1][0]
+    subsidy = block_subsidy_photons(newest_h + cap, chain)
+    worst = math.ceil(Fraction(policy.early_work_margin) * last_max)
+    return subsidy * (cp_work // FLOOR_WORK_DIVISOR) // worst
 
 
 def required_funding_confirmations(
@@ -355,59 +540,145 @@ def required_funding_confirmations(
     return max(MIN_FUNDING_CONFIRMATIONS, burial_blocks, value_term), value_term
 
 
-def future_time_allowance_blocks(chain: RadiantChain) -> int:
-    """``F`` for *chain*: :data:`FUTURE_TIME_ALLOWANCE_BLOCKS` on a value-bearing network, else 0."""
-    return FUTURE_TIME_ALLOWANCE_BLOCKS if chain.value_bearing else 0
-
-
-def _allowance_blocks(stale_s: float, withheld_block_interval_s: float) -> int:
-    """Blocks that could have been mined in *stale_s* seconds, at the dividing interval."""
-    return math.ceil(max(0.0, float(stale_s)) / float(withheld_block_interval_s))
+#: The bound's terms, in the order a tie is attributed.
+_TERMS = ("time", "reported", "proved")
 
 
 def elapsed_blocks_upper_bound(
     *,
     proved: int,
     through_reference: int,
-    allowance: int | None,
-    future_allowance: int,
+    time_blocks: int | None,
     reported: int | None = None,
-) -> int:
-    """THE upper bound on blocks since the funding (module docstring) — one formula, used by
-    :func:`verify_maker_funding` and, through :func:`honest_elapsed_blocks_upper`, by the
-    coordinator's negotiation-time check, so the two cannot drift apart.
+) -> tuple[int, str]:
+    """THE upper bound on blocks since the funding (module docstring), and which term set it —
+    ``(max(proved, through_reference + time_blocks, reported), "time" | "reported" | "proved")``.
 
-    ``max(proved, through_reference + allowance + future_allowance, reported)``, where
-    *through_reference* is ``R - H + 1`` (the proved blocks up to the reference header).
+    *through_reference* is ``R - H + 1`` (the proved blocks up to the reference header) and
+    *time_blocks* ``blocks_upper(E)``; ``None`` for a term that is absent (no clock on a test
+    network, no report). Used by :func:`verify_maker_funding` and, through
+    :func:`early_elapsed_blocks_upper`, by the coordinator's negotiation-time check.
     """
-    return max(proved, through_reference + (allowance or 0) + future_allowance, reported or 0)
+    values = {
+        "time": None if time_blocks is None else through_reference + time_blocks,
+        "reported": reported,
+        "proved": proved,
+    }
+    best = max(v for v in values.values() if v is not None)
+    return best, next(t for t in _TERMS if values[t] == best)
 
 
-def honest_elapsed_blocks_upper(
+def _quantile_scan(mean: float, epsilon: float, start: int) -> int:
+    """:func:`poisson_upper_quantile`, scanning up from *start* — a value known not to exceed it
+    (the quantile of a smaller mean at the same ``epsilon``). Never below the bisection's answer."""
+    if mean == 0:
+        return 0
+    target = math.log(epsilon) - _QUANTILE_LOG_MARGIN
+    if mean > _QUANTILE_EXACT_LIMIT:
+        return poisson_upper_quantile(mean, epsilon)
+    n = max(0, start)
+    while _log_poisson_tail(float(mean), n) > target:
+        n += 1
+    return n
+
+
+@dataclass(frozen=True)
+class EarlyElapsedBound:
+    """What the negotiation-time check models for step 6, and the inputs it took."""
+
+    #: The largest ``k`` and value term the gate can require (with ``C`` at its floor).
+    required_confirmations: int
+    value_term: int
+    #: :func:`forged_confirmation_cost_floor_photons`.
+    cost_floor_photons: int
+    burial_blocks: int
+    epsilon: float
+    #: The bound modelled for step 6 — at least what step 6 computes on an honest chain (see
+    #: :func:`early_elapsed_blocks_upper`).
+    elapsed_blocks_upper: int
+    #: The reference depth, and the ``E`` in seconds, at which that maximum was reached.
+    reference_depth: int
+    elapsed_s: int
+
+
+def early_elapsed_blocks_upper(
     *,
     chain: RadiantChain,
-    required_confirmations: int,
-    value_term: int,
-    nominal_block_interval_s: float,
-    withheld_block_interval_s: float,
-) -> int:
-    """The bound :func:`verify_maker_funding` computes for a funding proved exactly
-    *required_confirmations* (``k``) deep on an HONEST chain: blocks arriving at the nominal
-    interval, and the newest header just mined — so the reference header, ``max(1, value_term)``
-    deep, is ``(max(1, value_term) - 1) × nominal`` seconds old, and the future-time allowance is
-    added as it always is.
+    value_at_stake_photons: int | None,
+    burial_blocks: int,
+    policy: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY,
+    cap: int = MAX_HEADERS_FROM_CHECKPOINT_SDK,
+) -> EarlyElapsedBound:
+    """The elapsed-depth bound step 6 will judge, modelled BEFORE ANYONE LOCKS — at least as large as
+    what :func:`verify_maker_funding` computes on an honest chain, so a swap whose ``t_rxd`` holds
+    this is not refused at step 6 after the maker's covenant is on chain.
 
-    For the negotiation-time check, which knows no header: with the smallest ``k`` and value term
-    the gate can require (from the ceiling on ``C``), this is the smallest bound step 6 will judge
-    on such a chain — it only grows with ``k``, with the value term (the fast tail is never slower
-    than the nominal), and with a staler tip.
+    The model of "an honest chain": blocks at the nominal spacing, the funding proved exactly ``k``
+    deep, and the newest header at most ``early_slack_s`` old when step 6 runs. Then with a value
+    term ``v`` and ``d = max(1, v)`` step 6 computes ``max(k, (k - d + 1) + blocks_upper(E(d)))`` with
+    ``E(d) = (d - 1 + 5) × spacing + early_slack_s`` at most — ``MTP(R)`` is the time of the block
+    five below ``R`` (the middle of 11), ``R`` is ``d - 1`` blocks below the newest header. (If more
+    blocks have arrived by then, each counts one block directly and removes a newer header's age from
+    ``E``, which the time term counts at ``surge_factor`` blocks per spacing.) ``v`` is not known
+    here: the gate's ``C`` lies between :func:`forged_confirmation_cost_floor_photons` and the
+    shipped last interval's own price, so this takes the MAXIMUM of that expression over every value
+    term the two allow, with ``k = max(6, burial, v)`` as the gate computes it.
+
+    NOT COVERED, stated: a header served above the newest checkpoint carrying more than
+    ``early_work_margin`` times the shipped last interval's hardest (the gate's ``C`` then falls below
+    the floor used here, and its ``k`` and bound grow in proportion); a funding mined below the
+    newest checkpoint (a covenant for terms agreed now is mined above it); and a chain whose blocks
+    come slower than the nominal spacing by more than ``early_slack_s`` absorbs. In each case step 6
+    still decides, on the proved bound.
     """
-    ref_depth = max(1, value_term)
-    return elapsed_blocks_upper_bound(
-        proved=required_confirmations,
-        through_reference=required_confirmations - ref_depth + 1,
-        allowance=_allowance_blocks((ref_depth - 1) * float(nominal_block_interval_s), withheld_block_interval_s),
-        future_allowance=future_time_allowance_blocks(chain),
+    last_max, cp_work = _shipped_work(chain)
+    newest_h = chain.checkpoints[-1][0]
+    floor = cp_work // FLOOR_WORK_DIVISOR
+    c_lo = forged_confirmation_cost_floor_photons(chain, policy, cap=cap)
+    k_hi, v_hi = required_funding_confirmations(
+        value_bearing=chain.value_bearing,
+        burial_blocks=burial_blocks,
+        value_at_stake_photons=value_at_stake_photons,
+        forged_confirmation_cost_photons=c_lo,
+    )
+    c_hi = block_subsidy_photons(newest_h, chain) * floor // last_max
+    _, v_lo = required_funding_confirmations(
+        value_bearing=chain.value_bearing,
+        burial_blocks=burial_blocks,
+        value_at_stake_photons=value_at_stake_photons,
+        forged_confirmation_cost_photons=max(c_hi, c_lo),
+    )
+    k0 = max(MIN_FUNDING_CONFIRMATIONS, burial_blocks) if chain.value_bearing else max(1, burial_blocks)
+    eps = policy.epsilon(value_at_stake_photons)
+    lag = (MEDIAN_TIME_SPAN - 1) // 2
+    spacing = int(chain.target_spacing_s)
+
+    def elapsed_s(d: int) -> int:
+        return (d - 1 + lag) * spacing + int(policy.early_slack_s)
+
+    def mean(d: int) -> float:
+        return float(policy.surge_factor) * elapsed_s(d) / spacing
+
+    best, best_d = k_hi, max(1, v_hi)
+    if v_hi > k0:  # k = v = d: the bound 1 + blocks_upper(E(d)) grows with d, so its largest is at v_hi
+        cand = 1 + poisson_upper_quantile(mean(v_hi), eps)
+        if cand > best:
+            best, best_d = cand, v_hi
+    q = 0
+    for d in range(max(1, v_lo), max(1, min(v_hi, k0)) + 1):  # k = k0 >= d
+        q = _quantile_scan(mean(d), eps, q)
+        cand = k0 - d + 1 + q
+        if cand > best:
+            best, best_d = cand, d
+    return EarlyElapsedBound(
+        required_confirmations=k_hi,
+        value_term=v_hi,
+        cost_floor_photons=c_lo,
+        burial_blocks=burial_blocks,
+        epsilon=eps,
+        elapsed_blocks_upper=best,
+        reference_depth=best_d,
+        elapsed_s=elapsed_s(best_d),
     )
 
 
@@ -447,6 +718,9 @@ def funding_header_ranges(
     funding block and the served tip, which the three spans above leave a gap in once the funding
     is two or more checkpoint intervals down. Past ``cap`` the gap is not fetched, and a reference
     header that falls in it refuses there, naming it.
+
+    Every span starts :data:`MEDIAN_TIME_SPAN` ``- 1`` headers lower than it otherwise would, so the
+    window the reference header's median time past is taken over is fetched with it.
     """
     table = chain.checkpoints
     newest_h = table[-1][0]
@@ -467,11 +741,13 @@ def funding_header_ranges(
     )
     if plan.reason is not None:
         raise MakerFundingNotVerified(f"the funding block cannot be verified: {plan.reason}")
+    below = MEDIAN_TIME_SPAN - 1
     spans = [(start, start + count - 1) for start, count in plan.header_ranges]
+    spans.append((max(0, height - below), height))
     if height <= newest_h and newest_h - height <= cap:
         spans.append((height, newest_h))
     if len(table) >= 2:
-        spans.append((table[-2][0], newest_h))
+        spans.append((max(0, table[-2][0] - below), newest_h))
     spans.append((newest_h, top))
     return _merged_ranges(spans)
 
@@ -491,9 +767,10 @@ class MakerFundingEvidence:
     coinbase_merkle: Any
     #: ``height -> raw 80-byte header`` for :func:`funding_header_ranges`' ranges, as served.
     headers: Mapping[int, bytes]
-    #: The server's verbose ``confirmations`` for the funding tx: used only to RAISE the elapsed
-    #: upper bound, never as proof of depth. ``None`` when it did not answer.
-    reported_confirmations: int | None = None
+    #: ``((source, depth), ...)``: the depth each configured source REPORTS for the funding (its
+    #: verbose ``confirmations``, or its tip height minus the funding height plus one), keyed by the
+    #: source's operator group. Used only to RAISE the elapsed upper bound, never as proof of depth.
+    reported_depths: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -516,19 +793,30 @@ class VerifiedMakerFunding:
     subsidy_photons: int
     floor_work: int
     max_header_work: int
-    #: The conservative UPPER bound on blocks since the funding was mined, for the timelock gates.
+    #: The most work in the last checkpoint interval, as linked in this run (``None`` with one
+    #: checkpoint). The shipped table records the same number for the negotiation-time check.
+    last_interval_max_work: int | None
+    #: The conservative UPPER bound on blocks since the funding was mined, for the timelock gates,
+    #: and the term that set it: ``"time"``, ``"reported"`` or ``"proved"``.
     elapsed_blocks_upper: int
-    #: The clock allowance inside it — blocks that could have been mined since the reference header's
-    #: timestamp — or ``None`` when no clock was supplied (test networks only).
-    withheld_allowance_blocks: int | None
-    #: ``F``, the future-time allowance inside it (:data:`FUTURE_TIME_ALLOWANCE_BLOCKS`; 0 on a test
-    #: network).
-    future_allowance_blocks: int
-    reported_confirmations: int | None
-    served_tip: int
-    #: The header the clock allowance is measured from: ``max(1, value_term)`` deep below the served
-    #: tip (the tip itself on a test network).
+    bound_term: str
+    #: The header the time term is measured from: ``max(1, value_term)`` deep below the served tip
+    #: (the tip itself on a test network), and the median time past at it.
     reference_height: int
+    reference_time: int
+    #: ``E = max(0, now - reference_time)`` and ``blocks_upper(E)``; ``None`` when no clock was
+    #: supplied (test networks only).
+    elapsed_s: int | None
+    time_blocks: int | None
+    #: The confidence and block rate the time term used.
+    epsilon: float
+    surge_factor: float
+    #: The largest depth each operator group reported, and the largest of them (``None``: no report).
+    reported_by_operator: tuple[tuple[str, int], ...]
+    reported_depth: int | None
+    served_tip: int
+    #: One sentence: which term set the bound, and what stood behind it.
+    bound_note: str
     #: The verifier's own sentence for what it proved.
     claim: str
 
@@ -550,6 +838,19 @@ def _header_time(header: bytes) -> int:
     return int.from_bytes(header[68:72], "little")
 
 
+def _reported_by_operator(reported: Any) -> tuple[tuple[str, int], ...]:
+    """The largest depth per operator group, from ``((source, depth), ...)``; unusable entries dropped."""
+    best: dict[str, int] = {}
+    for item in reported if isinstance(reported, (tuple, list)) else ():
+        if not (isinstance(item, (tuple, list)) and len(item) == 2):
+            continue
+        key, depth = item
+        if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
+            continue
+        best[str(key)] = max(best.get(str(key), 0), depth)
+    return tuple(sorted(best.items()))
+
+
 def verify_maker_funding(
     evidence: MakerFundingEvidence,
     *,
@@ -559,7 +860,7 @@ def verify_maker_funding(
     value_at_stake_photons: int | None,
     burial_blocks: int,
     now_unix_s: int | None,
-    withheld_block_interval_s: float,
+    bound_policy: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY,
     cap: int = MAX_HEADERS_FROM_CHECKPOINT_SDK,
 ) -> VerifiedMakerFunding:
     """Prove *evidence* pays *expected_spk* / *expected_value* at the required depth, or RAISE.
@@ -570,8 +871,8 @@ def verify_maker_funding(
     """
     if not isinstance(evidence, MakerFundingEvidence):
         raise MakerFundingNotVerified("the Radiant leg returned no funding evidence")
-    if not (isinstance(withheld_block_interval_s, (int, float)) and withheld_block_interval_s > 0):
-        raise ValidationError("withheld_block_interval_s must be a positive number")
+    if not isinstance(bound_policy, ElapsedBoundPolicy):
+        raise ValidationError("bound_policy must be an ElapsedBoundPolicy")
     if now_unix_s is not None and (not isinstance(now_unix_s, int) or isinstance(now_unix_s, bool)):
         raise ValidationError("now_unix_s must be an int or None")
     rule = _rule(chain.value_bearing)
@@ -657,6 +958,7 @@ def verify_maker_funding(
     if height <= newest_h:
         cp_above = next(h for h, _ in table if h >= height)
         verified_heights.update(range(height, cp_above + 1))
+    interval_max: int | None = None
     try:
         if len(table) >= 2:
             prev_h, prev_hash = table[-2]
@@ -671,6 +973,9 @@ def verify_maker_funding(
             if below != newest_hash:
                 raise KeyError(newest_h)
             verified_heights.update(range(prev_h, newest_h + 1))
+            interval_max = max(
+                radiant_header_work(bytes(headers[h]), pow_limit=chain.pow_limit) for h in range(prev_h, newest_h + 1)
+            )
         max_work = max(radiant_header_work(bytes(headers[h]), pow_limit=chain.pow_limit) for h in verified_heights)
         floor_work = radiant_header_work(bytes(headers[newest_h]), pow_limit=chain.pow_limit) // FLOOR_WORK_DIVISOR
     except (KeyError, TypeError, ValueError, ValidationError):
@@ -720,19 +1025,22 @@ def verify_maker_funding(
             f"inclusion in block {height} ({v.blockhash}), {proved} deep, linked to checkpoint {newest_h}",
         )
 
-    # 5. The upper bound on elapsed depth, for the timelock gates. The allowance is measured from the
-    #    REFERENCE header, `max(1, value_term)` deep below the newest header served (the newest counts
-    #    as 1): a different header there means different headers above it too, each at the floor or
-    #    above, so its time costs `value_term × C` to change — the price the rule already sets on the
-    #    depth. `value_term <= k <= proved`, so the reference is never below the funding block. A
-    #    test network has no value term: the reference is the newest header served.
+    # 5. The upper bound on elapsed depth, for the timelock gates. The time term is measured from the
+    #    MEDIAN TIME PAST at the REFERENCE header, `max(1, value_term)` deep below the newest header
+    #    served (the newest counts as 1): a different header at or below it means different headers
+    #    above it too, each at the floor or above, so its window costs `value_term × C` to change —
+    #    the price the rule already sets on the depth. `value_term <= k <= proved`, so the reference
+    #    is never below the funding block. A test network has no value term: the reference is the
+    #    newest header served.
     ref_depth = max(1, value_term)
     ref_h = top - ref_depth + 1
-    if ref_h not in verified_heights:
-        # Below the last checkpoint interval and above the funding block's own checkpoint: nothing
-        # above linked it yet. Link it to the checkpoint at or above it before reading its time.
-        cp_ref_h, cp_ref_hash = next((h, b) for h, b in table if h >= ref_h)
-        try:
+    window_lo = max(0, ref_h - (MEDIAN_TIME_SPAN - 1))
+    cp_ref_h = newest_h
+    try:
+        if ref_h not in verified_heights:
+            # Below the last checkpoint interval and above the funding block's own checkpoint: nothing
+            # above linked it yet. Link it to the checkpoint at or above it before reading its time.
+            cp_ref_h, cp_ref_hash = next((h, b) for h, b in table if h >= ref_h)
             below = radiant_block_hash(bytes(headers[ref_h]))
             for h in range(ref_h + 1, cp_ref_h + 1):
                 hdr = bytes(headers[h])
@@ -741,41 +1049,76 @@ def verify_maker_funding(
                 below = radiant_block_hash(hdr)
             if below != cp_ref_hash:
                 raise KeyError(cp_ref_h)
-        except (KeyError, TypeError, ValueError, ValidationError):
+    except (KeyError, TypeError, ValueError, ValidationError):
+        raise refuse(
+            f"the reference header the elapsed-depth bound is measured from (block {ref_h}, {ref_depth} "
+            f"deep counting the newest header served as 1) was not served linked to checkpoint {cp_ref_h}, "
+            "so the blocks since the funding cannot be bounded from above",
+            why,
+            f"the funding in block {height}, {proved} deep",
+        ) from None
+    # The median-time-past window below it: each header linked to the one above by its hash, so the
+    # whole window is as fixed as the reference header itself.
+    want = radiant_header_prev_hash(bytes(headers[ref_h]))
+    for h in range(ref_h - 1, window_lo - 1, -1):
+        below_hdr = headers.get(h)
+        if not isinstance(below_hdr, (bytes, bytearray)) or radiant_block_hash(bytes(below_hdr)) != want:
             raise refuse(
-                f"the reference header the elapsed-depth bound is measured from (block {ref_h}, {ref_depth} "
-                f"deep counting the newest header served as 1) was not served linked to checkpoint {cp_ref_h}, "
-                "so the "
-                "blocks since the funding cannot be bounded from above",
+                f"header {h}, in the {MEDIAN_TIME_SPAN}-header window the reference time is the median of "
+                f"(blocks {window_lo} to {ref_h}), was not served linked to the reference header {ref_h}, so "
+                "the blocks since the funding cannot be bounded from above",
                 why,
                 f"the funding in block {height}, {proved} deep",
-            ) from None
+            )
+        want = radiant_header_prev_hash(bytes(below_hdr))
+    mtp = median_time_past([_header_time(bytes(headers[h])) for h in range(window_lo, ref_h + 1)])
+    eps = bound_policy.epsilon(value_at_stake_photons)
     if now_unix_s is None:
         if chain.value_bearing:
             raise refuse(
-                "no wall clock (now_unix_s) was supplied, so the blocks a server may have withheld above "
-                "the newest header it served cannot be bounded, and the timelock checks would judge a CSV "
-                "window that may already be shorter",
+                "no wall clock (now_unix_s) was supplied, so the blocks mined since the reference header "
+                "cannot be bounded, and the timelock checks would judge a CSV window that may already be "
+                "shorter",
                 "now_unix_s",
                 f"the funding in block {height}, at least {proved} deep",
             )
-        allowance: int | None = None
+        elapsed_s: int | None = None
+        time_blocks: int | None = None
     else:
-        stale_s = max(0, now_unix_s - _header_time(bytes(headers[ref_h])))
-        allowance = _allowance_blocks(stale_s, withheld_block_interval_s)
-    reported = evidence.reported_confirmations
-    reported_i = reported if isinstance(reported, int) and not isinstance(reported, bool) and reported >= 0 else None
+        elapsed_s = max(0, now_unix_s - mtp)
+        time_blocks = bound_policy.blocks_upper(
+            elapsed_s, spacing_s=int(chain.target_spacing_s), value_at_stake_photons=value_at_stake_photons
+        )
+    by_operator = _reported_by_operator(evidence.reported_depths)
+    reported = max((d for _k, d in by_operator), default=None)
     # Blocks up to and including the reference header are proved; every block after it is inside the
-    # allowance, which counts all that could have been mined since its timestamp, and the future-time
-    # allowance F. Never below the proved depth; the server's own count can only raise it.
-    future = future_time_allowance_blocks(chain)
-    upper = elapsed_blocks_upper_bound(
+    # time term. Never below the proved depth; a source's own count can only raise it.
+    upper, term = elapsed_blocks_upper_bound(
         proved=proved,
         through_reference=ref_h - height + 1,
-        allowance=allowance,
-        future_allowance=future,
-        reported=reported_i,
+        time_blocks=time_blocks,
+        reported=reported,
     )
+    ops = len(by_operator)
+    if time_blocks is None:
+        time_part = "no clock was supplied (test network), so there is no time term"
+    else:
+        time_part = (
+            f"time term {ref_h - height + 1} proved to block {ref_h} + {time_blocks} for the {elapsed_s} s since "
+            f"the median time past at it ({mtp}), at ε = {eps:.3g} and {bound_policy.surge_factor:g}× the "
+            f"{int(chain.target_spacing_s)} s nominal rate"
+        )
+    report_part = (
+        "no source reported a depth"
+        if not by_operator
+        else f"reports from {ops} operator{'s' if ops != 1 else ''} ({', '.join(f'{k} {d}' for k, d in by_operator)})"
+    )
+    one_op = (
+        "; with one operator configured, the time term is what stands against a source that stops serving early"
+        if ops <= 1 and time_blocks is not None
+        else ""
+    )
+    note = f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}"
 
     return VerifiedMakerFunding(
         outpoint=f"{txid}:{vout}",
@@ -791,11 +1134,18 @@ def verify_maker_funding(
         subsidy_photons=subsidy,
         floor_work=floor_work,
         max_header_work=max_work,
+        last_interval_max_work=interval_max,
         elapsed_blocks_upper=upper,
-        withheld_allowance_blocks=allowance,
-        future_allowance_blocks=future,
-        reported_confirmations=reported_i,
-        served_tip=top,
+        bound_term=term,
         reference_height=ref_h,
+        reference_time=mtp,
+        elapsed_s=elapsed_s,
+        time_blocks=time_blocks,
+        epsilon=eps,
+        surge_factor=float(bound_policy.surge_factor),
+        reported_by_operator=by_operator,
+        reported_depth=reported,
+        served_tip=top,
+        bound_note=note,
         claim=v.claim or "",
     )

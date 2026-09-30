@@ -65,14 +65,14 @@ def _margin(args) -> CrossClockMargin:
 
 
 def _policy(args) -> MarginPolicy:
-    # The Radiant leg is MAINNET (SshTrRadiantClient.NETWORK), so the taker gate requires the
-    # measured fast tail and the coordinator refuses to construct without it. Refuse here first,
-    # with the flag's name, rather than fake a value.
+    # The Radiant leg is MAINNET (SshTrRadiantClient.NETWORK), so the coordinator refuses to
+    # construct without the measured fast tail: the timelock reserves divide time spans by it.
+    # Refuse here first, with the flag's name, rather than fake a value.
     if not args.rxd_block_interval_fast_s:
         raise SystemExit(
             "this run locks MAINNET RXD, so it needs --rxd-block-interval-fast-s (the MEASURED p10 Radiant "
-            "inter-block, seconds): the taker gate bounds the blocks since the maker's funding by dividing "
-            "elapsed time by it, and refuses without it. Measure it against a mainnet node for THIS run."
+            "inter-block, seconds): the timelock reserves convert time spans into Radiant blocks by dividing "
+            "by it, and the coordinator refuses without it. Measure it against a mainnet node for THIS run."
         )
     return MarginPolicy(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),

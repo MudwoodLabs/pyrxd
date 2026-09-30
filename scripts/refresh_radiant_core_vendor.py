@@ -93,9 +93,9 @@ FILES = {
     # gate (pyrxd.gravity.funding_spv) prices a forged confirmation from the block subsidy and
     # links regtest headers to regtest's genesis, so both need the chain's own numbers.
     "chainparams.cpp": "src/chainparams.cpp",
-    # MAX_FUTURE_BLOCK_TIME — how far past a node's adjusted time a block's timestamp may be and
-    # still be accepted (validation.cpp uses it and declares it nowhere). The swap taker gate's
-    # elapsed-depth bound adds that span, in blocks, so the value must be readable here.
+    # nMedianTimeSpan and CBlockIndex::GetMedianTimePast — the median time past a block is ordered
+    # after (validation.cpp uses it and declares it nowhere). The swap taker gate's elapsed-depth
+    # bound measures its time term from it, so the rule must be readable here.
     "chain.h": "src/chain.h",
 }
 

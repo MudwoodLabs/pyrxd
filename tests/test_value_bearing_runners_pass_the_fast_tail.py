@@ -1,13 +1,11 @@
-"""A mainnet swap's taker gate needs the MEASURED Radiant fast tail — and that is decided BEFORE
-anyone locks.
+"""A mainnet swap needs the MEASURED Radiant fast tail — and that is decided BEFORE anyone locks.
 
-The gate (``SwapCoordinator.taker_verify_asset_funding``) divides elapsed time by
-``MarginPolicy.rxd_block_interval_fast_s`` on a value-bearing network and refuses without it. It
-runs at ``pre_btc_lock_check`` step 5 and again inside ``taker_funds_btc`` — after the maker has
-locked its Radiant covenant. ``scripts/eth_swap_run.py``'s sepolia-dust stage and
+The cross-clock timelock reserves convert time spans into Radiant blocks by dividing by
+``MarginPolicy.rxd_block_interval_fast_s`` (``swap_coordinator._dividing_interval_s``); unset, they
+fall back to the nominal interval and cover about an eighth of the blocks a measured p10 does. So a
+value-bearing coordinator refuses without it. ``scripts/eth_swap_run.py``'s sepolia-dust stage and
 ``scripts/eth_swap_grief_run.py`` built a policy with no fast tail while their Radiant leg was
-mainnet, so the coordinator constructed, the maker locked mainnet RXD, and the taker's gate then
-refused. Pinned here:
+mainnet. Pinned here:
 
 * the coordinator REFUSES TO CONSTRUCT on a value-bearing network without the fast tail (the
   negotiation-time check), so no runner can reach a lock without it;
@@ -76,7 +74,7 @@ def _eth_coord_on_mainnet_radiant(monkeypatch, policy):
     p = os.urandom(32)
     terms = dataclasses.replace(
         _eth_terms(hashlock=hashlib.sha256(p).digest()),
-        t_rxd=bt.Timelock(60, bt.TimeUnit.BLOCKS),
+        t_rxd=bt.Timelock(120, bt.TimeUnit.BLOCKS),
         radiant_amount=1000,
     )
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
@@ -101,8 +99,8 @@ def _eth_coord_on_mainnet_radiant(monkeypatch, policy):
 def test_a_mainnet_radiant_coordinator_without_the_fast_tail_refuses_to_construct(eth_run, monkeypatch):
     """The reviewer's probe, turned round. The sepolia-dust stage's policy exactly as it was built
     before the fix (the stage's own ``_policy``, less the fast tail it now carries) used to
-    CONSTRUCT a coordinator whose Radiant leg is mainnet; the maker then locked, and the taker gate
-    refused. It now refuses at construction, before anyone locks — and the same policy WITH the
+    CONSTRUCT a coordinator whose Radiant leg is mainnet, its reserves sized at the nominal
+    interval. It now refuses at construction, before anyone locks — and the same policy WITH the
     fast tail constructs."""
     with_tail = eth_run._policy(_sepolia_dust_args(eth_run, monkeypatch, "--rxd-block-interval-fast-s", "36"))
     before_fix = type(with_tail)(**{**with_tail.__dict__, "rxd_block_interval_fast_s": None})
@@ -235,8 +233,8 @@ def test_every_mainnet_coordinator_script_hands_its_coordinator_a_policy_with_th
                 kws = {kw.arg for kw in ret.keywords}
                 assert "rxd_block_interval_fast_s" in kws, (
                     f"{name}: {builder} (line {ret.lineno}) builds the coordinator's policy without "
-                    "rxd_block_interval_fast_s; its Radiant leg is mainnet, so the taker gate refuses "
-                    "without it — after the maker has locked"
+                    "rxd_block_interval_fast_s; its Radiant leg is mainnet, and the coordinator refuses "
+                    "without it (the timelock reserves divide by it)"
                 )
                 checked += 1
     assert checked >= len(scripts)

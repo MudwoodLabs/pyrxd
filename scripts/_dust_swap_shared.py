@@ -361,14 +361,14 @@ async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
 
     The Radiant fast tail is NOT measured here: it comes from ``--rxd-block-interval-fast-s``, and
     without it this refuses before any network read. A measured policy requires it, and the swap
-    taker gate divides by it on mainnet; there is no value to fall back to that would not
+    timelock reserves divide by it; there is no value to fall back to that would not
     under-count blocks.
     """
     fast = getattr(args, "rxd_block_interval_fast_s", None)
     if not isinstance(fast, (int, float)) or isinstance(fast, bool) or fast <= 0:
         raise SystemExit(
             "--rxd-block-interval-fast-s is required: the MEASURED p10 Radiant inter-block interval "
-            "(seconds). The measured margin policy and the swap taker gate both divide by it, and the "
+            "(seconds). The measured margin policy requires it (the timelock reserves divide by it), and the "
             "nominal interval would under-count blocks. Measure it against a mainnet node for this run."
         )
     src = MempoolSpaceSource(base_url=_MAINNET_BTC_API)

@@ -58,18 +58,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`scripts/radiant_mainnet_chainio.py:mainnet_proof_client`). The third value
   `taker_verify_asset_funding` returns is now that elapsed-depth upper bound; what was proved is on
   `SwapCoordinator.last_maker_funding`.
-- **A mainnet swap's taker gate requires `MarginPolicy.rxd_block_interval_fast_s`** (the measured
-  p10 Radiant inter-block interval) and refuses without it, before fetching anything; it no longer
-  falls back to the nominal interval there. Because the gate runs only after the maker has locked,
-  `SwapCoordinator` now also refuses to CONSTRUCT a negotiated swap on a value-bearing Radiant
-  network without it, or without a value at stake to size the required depth from. Every script
-  that builds a coordinator on the mainnet node client takes `--rxd-block-interval-fast-s`, refuses
-  at startup without it, and passes it into its policy: `scripts/dust_swap_run.py` and
-  `scripts/dust_swap_resume.py` (their measured policy already required it), and
-  `scripts/eth_swap_run.py --stage sepolia-dust` and `scripts/eth_swap_grief_run.py`, whose
-  estimated policies did not carry it — before this, they constructed, locked mainnet RXD, and
-  were then refused by the taker gate. `eth_swap_grief_run.py`'s default `--t-rxd-blocks 3` cannot
-  hold the depth the gate requires and is refused at construction.
+- **A value-bearing swap needs `MarginPolicy.rxd_block_interval_fast_s`** (the measured p10
+  Radiant inter-block interval) before anyone locks: `SwapCoordinator` refuses to CONSTRUCT a
+  negotiated swap on a value-bearing Radiant network without it (every role), and
+  `pre_btc_lock_check` step 3b refuses a policy that lost it. The cross-clock timelock reserves
+  divide time spans by it, and without it they fall back to the nominal interval. The taker gate's
+  own elapsed-depth bound does not read it (see Security). A coordinator that runs the taker gate
+  (any role but `SwapRole.MAKER`) is also refused without a value at stake to size the required
+  depth from. Every script that builds a coordinator on the mainnet node client takes
+  `--rxd-block-interval-fast-s`, refuses at startup without it, and passes it into its policy:
+  `scripts/dust_swap_run.py` and `scripts/dust_swap_resume.py` (their measured policy already
+  required it), and `scripts/eth_swap_run.py --stage sepolia-dust` and
+  `scripts/eth_swap_grief_run.py`, whose estimated policies did not carry it.
+  `eth_swap_grief_run.py`'s default `--t-rxd-blocks 3` cannot hold the depth the gate requires and
+  is refused at construction.
+- **`CoordinatorConfig.funding_bound`** (`pyrxd.gravity.funding_spv.ElapsedBoundPolicy`) carries the
+  taker gate's elapsed-depth bound policy: `surge_factor` 2.0, `loss_budget_photons` 1 RXD with
+  `epsilon` clamped to 1e-12..1e-3, and, for the negotiation-time check only, `early_slack_s` 3600
+  and `early_work_margin` 2.0. These defaults await the maintainer's sign-off.
+- **`src/pyrxd/spv/radiant_checkpoints.py` ships the last checkpoint interval's work**:
+  `LAST_INTERVAL_MAX_WORK` (and its height, `LAST_INTERVAL_MAX_WORK_HEIGHT`) and
+  `NEWEST_CHECKPOINT_WORK`. `scripts/refresh_radiant_checkpoints.py` fetches every header of that
+  interval from every source (the servers, and the node with `--node-cli`), refuses unless they are
+  byte-identical and link between the two checkpoints, and records the numbers; `--check`
+  re-verifies them. Regenerated 2026-09-30 with the maintainer's node: 465,696..467,712, the hardest
+  header at 465,703 (3.02 times the newest checkpoint's work).
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.
@@ -257,36 +270,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
     moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
     that is a known testnet or a local development chain (31337);
-  - a swap whose `t_rxd` cannot hold the depth the gate will require is refused BEFORE ANYONE
+  - a swap whose `t_rxd` cannot hold the bound the gate will judge is refused BEFORE ANYONE
     LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
-    `pre_btc_lock_check` step 3b, before the chain is read. It sizes the smallest possible `k` from
-    pyrxd's shipped checkpoints alone (`C` at most the newest checkpoint's subsidy ÷ 16,
-    `funding_spv.forged_confirmation_cost_ceiling_photons`), then the elapsed-depth bound the gate
-    computes for a funding that deep on a chain whose blocks arrive at the nominal interval — the
-    blocks above the reference header counted at the fast tail, and the future-time allowance —
-    through the same function (`funding_spv.honest_elapsed_blocks_upper`), and runs steps 6 and 7
-    on it; failing there means the gate would refuse on such a chain. Steps 6 and 7 on the proved
-    bound stay authoritative;
+    `pre_btc_lock_check` step 3b, before the chain is read. `funding_spv.early_elapsed_blocks_upper`
+    models step 6's bound to be at least what step 6 computes on an honest chain: `C` at its lowest
+    (`funding_spv.forged_confirmation_cost_floor_photons`: the shipped last interval's hardest
+    header times `early_work_margin`, and the lowest subsidy the walk cap allows), the largest `k`
+    and value term that follow, blocks at the nominal spacing, and the newest header up to
+    `early_slack_s` old. What it does not cover is stated on that function (a header served above
+    the newest checkpoint harder than the margin allows, which a test pins); steps 6 and 7 on the
+    proved bound stay authoritative;
   - the gate links at most 20,160 headers above the newest checkpoint (the pages and
     `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
   - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
-    blocks since funding: the depth proved up to a reference header, plus one block per measured
-    fast-tail interval since that header's timestamp, plus — on mainnet, for every swap — a
-    future-time allowance of 24 blocks, or the server's own count if higher. The allowance is
-    Radiant Core's `MAX_FUTURE_BLOCK_TIME` (two hours, `src/chain.h`, now vendored at the pinned
-    tag and re-read by a test) at the nominal 300 s spacing: the bound allows for header
-    timestamps up to the future-time limit. The
-    reference header is `max(1, value term)` deep below the newest header served, so changing its
-    time costs as much as the value term of `k` already demands of the depth (on regtest it is the
-    newest header). Blocks a server withholds above it count as elapsed time. A mainnet swap
-    therefore needs `now_unix_s` on this path too; `scripts/dust_swap_run.py` passes it.
+    blocks since funding: `max(proved, (R - H + 1) + blocks_upper(E), reported)`. `R` is the
+    reference header, `max(1, value term)` deep below the newest header served, so changing any
+    header of its window costs as much as the value term of `k` already demands of the depth (on
+    regtest it is the newest header). `E = now - MTP(R)`, the median time past at `R` — the median
+    of the 11 header timestamps ending there, as Radiant Core computes it (`chain.h`, now vendored
+    at the pinned tag and re-read by a test) — over headers the gate has verified. `blocks_upper(E)`
+    is a statistical upper bound: the smallest `n` with `P(Poisson(λ·E) > n) <= ε`, at `λ` =
+    `surge_factor` over the nominal 300 s spacing and a confidence `ε = clamp(1 RXD ÷ value, 1e-12,
+    1e-3)` scaled by the value (`funding_spv.poisson_upper_quantile`, never below the exact
+    quantile). `reported` is the largest depth any configured source reports, grouped by operator
+    (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
+    term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
+    `scripts/dust_swap_run.py` passes it.
 
   What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
-  non-spend; the `listunspent` read that locates it is kept for that), and the elapsed-depth
-  bound's residual: a reference header's timestamp beyond what the future-time allowance covers
-  (it converts the limit at the nominal spacing), and blocks arriving faster than the fast tail.
-  Neither the most-work chain nor each header's nBits is
-  checked; the checkpoint table is only as good as its sources. `GravityTrade` is not gated.
+  non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a
+  statistical upper bound, at the confidence and block rate above, not a proof. Neither the
+  most-work chain nor each header's nBits is checked; the checkpoint table is only as good as its
+  sources. `GravityTrade` is not gated.
 
 - **Every source count keys on ONE host identity, so one server can no longer corroborate
   itself.** Each quorum had its own idea of "a different source", and the cheap ones counted

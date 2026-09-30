@@ -68,16 +68,15 @@ from .eth_rxd_timelock import (
 )
 from .finality import CounterClaimFinality, CounterClaimState
 from .funding_spv import (
+    DEFAULT_ELAPSED_BOUND_POLICY,
     MIN_FUNDING_CONFIRMATIONS,
+    ElapsedBoundPolicy,
     MakerFundingNotVerified,
     RadiantChain,
     VerifiedMakerFunding,
-    forged_confirmation_cost_ceiling_photons,
+    early_elapsed_blocks_upper,
     funding_header_ranges,
-    future_time_allowance_blocks,
-    honest_elapsed_blocks_upper,
     radiant_chain_for_leg,
-    required_funding_confirmations,
     verify_maker_funding,
 )
 from .ref_authenticity import verify_ref_authenticity
@@ -1475,10 +1474,16 @@ class CoordinatorConfig:
     # guards (e.g. the taker-stranding asset-only refund) fail closed in code, not
     # merely in a docstring.
     role: SwapRole | None = None
+    # The taker gate's elapsed-depth bound policy (surge factor, confidence, the negotiation-time
+    # check's slack and work margin): :class:`pyrxd.gravity.funding_spv.ElapsedBoundPolicy`. The
+    # defaults are the ones listed for maintainer sign-off.
+    funding_bound: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin_policy, MarginPolicy):
             raise ValidationError("margin_policy must be a MarginPolicy")
+        if not isinstance(self.funding_bound, ElapsedBoundPolicy):
+            raise ValidationError("funding_bound must be an ElapsedBoundPolicy")
         w = self.maker_stall_safety_window_blocks
         if not isinstance(w, int) or isinstance(w, bool) or w < 0:
             raise ValidationError("maker_stall_safety_window_blocks must be a non-negative int")
@@ -1734,10 +1739,12 @@ class SwapCoordinator:
         #: What the taker gate last PROVED about the maker's funding (k, C, depths), or None.
         self.last_maker_funding: VerifiedMakerFunding | None = None
         # THE NEGOTIATION-TIME CHECK (before anyone locks). A swap whose t_rxd cannot hold the
-        # confirmations the taker gate will require (plus the margins steps 6 and 7 add) is refused
-        # at step 6 — after the maker has already locked its covenant. The terms, the value and the
-        # policy are all known here, so refuse it now. Only for a NEGOTIATED record: a coordinator
-        # built to recover an in-flight swap must construct whatever its terms were.
+        # elapsed-depth bound the taker gate will judge (plus the margins steps 6 and 7 add) is
+        # refused at step 6 — after the maker has already locked its covenant; and a value-bearing
+        # policy without the measured fast tail sizes every timelock reserve at the nominal interval.
+        # The terms, the value and the policy are all known here, so refuse now. Only for a
+        # NEGOTIATED record: a coordinator built to recover an in-flight swap must construct whatever
+        # its terms were.
         if record.state is SwapState.NEGOTIATED:
             room = self._funding_proof_room_failure(record.terms)
             if room is not None:
@@ -1802,8 +1809,8 @@ class SwapCoordinator:
         coordinator takes clocks as params, never reads them). REQUIRED for an ETH swap (step 3's
         cross-clock gate), for any swap whose Radiant leg is on mainnet (step 5 bounds the elapsed
         depth with it and refuses without it), and whenever the policy carries a reorg-cost
-        measurement (step 0). Only a BTC swap on test networks may omit it; step 5 then omits its
-        clock allowance. Async because binding (1) awaits the async indexer adapter (a sync
+        measurement (step 0). Only a BTC swap on test networks may omit it; step 5 then omits the
+        time term of its bound. Async because binding (1) awaits the async indexer adapter (a sync
         gate would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
         """
         if not isinstance(terms, NegotiatedTerms):
@@ -2067,26 +2074,29 @@ class SwapCoordinator:
         return max(depth, _value_scaled_burial_blocks(self.config.margin_policy, value_at_stake))
 
     def _funding_proof_room_failure(self, terms: NegotiatedTerms) -> str | None:
-        """Why *terms* can never pass the taker gate's timelock steps, or None — decided BEFORE ANYONE LOCKS.
+        """Why *terms* are refused BEFORE ANYONE LOCKS on a value-bearing Radiant network, or None.
 
-        The taker gate requires the maker's funding ``k`` deep (step 5) and then judges ``t_rxd``
-        minus the elapsed-depth UPPER bound (steps 6 and 7) — which is at least ``k``, and in the
-        value-term regime much more: the blocks after the reference header ``value_term`` deep are
-        counted at the fast tail, and the future-time allowance is added. So a large swap on a short
-        ``t_rxd`` is refused there — after the maker's covenant is already on chain. This computes
-        the SMALLEST ``k`` and value term the gate can require, from pyrxd's own data only
-        (:func:`~pyrxd.gravity.funding_spv.forged_confirmation_cost_ceiling_photons`, an upper bound
-        on ``C``; no server input), then the bound step 6 computes for a funding exactly that deep
-        on an honest chain — blocks at the nominal interval, the newest just mined — through the SAME
-        formula (:func:`~pyrxd.gravity.funding_spv.honest_elapsed_blocks_upper`), and runs steps 6
-        and 7 on it. Failing here means failing there on such a chain; a chain whose blocks happened
-        to come faster than nominal could give step 6 a smaller bound, but a swap that needs that is
-        not negotiated to hold. Passing here decides nothing — steps 6 and 7 on the proved bound stay
-        authoritative.
+        Run when the coordinator is built for a NEGOTIATED record and again at
+        :meth:`pre_btc_lock_check` step 3b, before the chain is read. Three checks:
 
-        On a value-bearing network, two inputs the gate REQUIRES are checked here too, because the
-        gate refuses without them only at step 5 — after the maker has locked: the measured fast tail
-        (``MarginPolicy.rxd_block_interval_fast_s``) and a value at stake to size ``k`` from.
+        1. THE MEASURED FAST TAIL (every role). ``MarginPolicy.rxd_block_interval_fast_s`` is what
+           the cross-clock timelock RESERVES divide time spans by (:func:`_dividing_interval_s`); unset,
+           they fall back to the nominal interval and cover about an eighth of the blocks a measured
+           p10 does. Those reserves are sized independently of the taker gate's elapsed-depth
+           estimate, so a value-bearing swap is refused without it.
+        2. A VALUE AT STAKE (a coordinator that runs the taker gate — any role but
+           ``SwapRole.MAKER``). The gate sizes the depth it requires of the maker's funding from it
+           and refuses without one at step 5, after the maker has locked.
+        3. ROOM IN ``t_rxd``. Step 6 subtracts the gate's elapsed-depth UPPER bound from ``t_rxd``, and
+           step 7 re-runs the timelock ordering against what remains. This models that bound with
+           :func:`~pyrxd.gravity.funding_spv.early_elapsed_blocks_upper` — built from pyrxd's shipped
+           checkpoint data only, to be AT LEAST what step 6 computes on an honest chain (blocks at the
+           nominal spacing, the newest header up to ``funding_bound.early_slack_s`` old, no header
+           above the newest checkpoint harder than ``funding_bound.early_work_margin`` times the
+           shipped last interval's hardest) — and runs steps 6 and 7 on it with this coordinator's
+           policy. So a swap this accepts is not refused at step 6 on such a chain; what the model
+           does not cover is listed on that function, and step 6 on the proved bound stays
+           authoritative.
 
         None — no check — on a test network, where there is no value term; when the configuration
         has no Radiant chain, which the gate itself refuses; and where the negotiated terms already
@@ -2100,39 +2110,34 @@ class SwapCoordinator:
         if not chain.value_bearing:
             return None
         mp = self.config.margin_policy
-        before = (
-            f"this swap can never pass the taker gate, so it is refused before anyone locks: on Radiant {chain.name} "
-        )
+        before = f"refused before anyone locks, on Radiant {chain.name}: "
         if mp.rxd_block_interval_fast_s is None:
             return before + (
-                "the gate needs MarginPolicy.rxd_block_interval_fast_s, the MEASURED fast-tail (p10) Radiant "
-                "inter-block interval in seconds, to bound the blocks since the maker's funding, and refuses "
-                "without it. Measure it for this run and set it (MarginPolicy.measured(rxd_block_interval_fast_s=...))"
+                "a value-bearing swap needs MarginPolicy.rxd_block_interval_fast_s, the MEASURED fast-tail (p10) "
+                "Radiant inter-block interval in seconds. The timelock reserves convert time spans into Radiant "
+                f"blocks by dividing by it, and the nominal {mp.rxd_block_interval_s:g}s they fall back to counts "
+                "far fewer blocks than a measured p10. Measure it for this run and set it "
+                "(MarginPolicy.measured(rxd_block_interval_fast_s=...))"
             )
+        runs_taker_gate = self.config.role is not SwapRole.MAKER
         value = self._funding_value_at_stake_photons(terms)
         if value is None or value <= 0:
+            if not runs_taker_gate:
+                return None
             return before + (
-                "no value at stake is available to size the confirmations the gate requires of the maker's "
-                "funding; set MarginPolicy.value_at_risk_photons to the swap's value in photons"
+                "the taker gate this coordinator runs needs a value at stake to size the confirmations it "
+                "requires of the maker's funding, and refuses without one at step 5 — after the maker has "
+                "locked; set MarginPolicy.value_at_risk_photons to the swap's value in photons (a coordinator "
+                "that drives only the maker side, config.role=SwapRole.MAKER, is not refused for this)"
             )
-        ceiling = forged_confirmation_cost_ceiling_photons(chain)
-        if ceiling <= 0:
-            return None
         burial = self._funding_burial_blocks(chain, value)
-        k_min, value_term = required_funding_confirmations(
-            value_bearing=True,
-            burial_blocks=burial,
-            value_at_stake_photons=value,
-            forged_confirmation_cost_photons=ceiling,
-        )
-        # The bound step 6 will judge for a funding exactly k_min deep, by the gate's own formula.
-        elapsed = honest_elapsed_blocks_upper(
-            chain=chain,
-            required_confirmations=k_min,
-            value_term=value_term,
-            nominal_block_interval_s=float(mp.rxd_block_interval_s),
-            withheld_block_interval_s=float(mp.rxd_block_interval_fast_s),
-        )
+        try:
+            early = early_elapsed_blocks_upper(
+                chain=chain, value_at_stake_photons=value, burial_blocks=burial, policy=self.config.funding_bound
+            )
+        except MakerFundingNotVerified as exc:
+            return before + f"the taker gate's elapsed-depth bound cannot be modelled: {exc}"
+        elapsed = early.elapsed_blocks_upper
         why = None
         if self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=elapsed) is not None:
             why = (
@@ -2150,16 +2155,16 @@ class SwapCoordinator:
                 why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
         if why is None:
             return None
-        return (
-            f"this swap can never pass the taker gate, so it is refused before anyone locks: on Radiant "
-            f"{chain.name} the maker's funding must be proved at least {k_min} blocks deep "
-            f"(k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) = "
-            f"{value_term}), with C at most {ceiling} photons by pyrxd's shipped checkpoints); at that depth "
-            f"the gate's upper bound on the blocks elapsed since the funding is at least {elapsed} on a chain "
-            f"at the nominal {float(mp.rxd_block_interval_s):g}s interval (the reference header "
-            f"{max(1, value_term)} deep counted at the {float(mp.rxd_block_interval_fast_s):g}s fast tail, plus "
-            f"the {future_time_allowance_blocks(chain)}-block future-time allowance); and t_rxd is "
-            f"{int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer t_rxd or a smaller value"
+        fb = self.config.funding_bound
+        return before + (
+            f"with this coordinator's policy the taker gate can require the maker's funding up to {early.required_confirmations} "
+            f"blocks deep (k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) "
+            f"= {early.value_term}), with C at least {early.cost_floor_photons} photons by pyrxd's shipped checkpoints); "
+            f"its upper bound on the blocks elapsed since the funding can then be {elapsed} on an honest chain "
+            f"(blocks every {int(chain.target_spacing_s)} s, the newest up to {fb.early_slack_s} s old; the blocks after "
+            f"the reference header {early.reference_depth} deep counted at {fb.surge_factor:g}× that rate, "
+            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer "
+            "t_rxd or a smaller value"
         )
 
     async def taker_verify_asset_funding(
@@ -2200,8 +2205,9 @@ class SwapCoordinator:
         no path that proceeds on the server's word.
 
         What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show
-        a non-spend), and the elapsed-depth bound's residual described in
-        :mod:`pyrxd.gravity.funding_spv`.
+        a non-spend). The elapsed-depth upper bound is statistical — a confidence scaled by the value,
+        at ``funding_bound.surge_factor`` times the nominal block rate — as
+        :mod:`pyrxd.gravity.funding_spv` states.
         """
         fetch = getattr(self.radiant_leg, "maker_funding_evidence", None)
         if not callable(fetch):
@@ -2211,24 +2217,6 @@ class SwapCoordinator:
                 "RadiantCovenantLeg, or a leg exposing that read."
             )
         chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
-        mp = self.config.margin_policy
-        # The interval the elapsed-depth allowance DIVIDES a time span by. On a value-bearing network
-        # it must be the MEASURED fast tail: `_dividing_interval_s` falls back to the nominal
-        # interval when none is set, and dividing by a nominal 300 s where the measured p10 is ~36 s
-        # counts about an eighth of the blocks — an under-count, the direction steps 6 and 7 cannot
-        # afford. So its absence refuses here, before anything is fetched.
-        if chain.value_bearing:
-            if mp.rxd_block_interval_fast_s is None:
-                raise MakerFundingNotVerified(
-                    "a swap on a value-bearing network needs MarginPolicy.rxd_block_interval_fast_s, the MEASURED "
-                    "fast-tail (p10) Radiant inter-block interval in seconds: the upper bound on the blocks since "
-                    "the maker's funding converts elapsed time into blocks by dividing by it, and the nominal "
-                    f"{mp.rxd_block_interval_s:g}s would count fewer. Measure it for this run and set it "
-                    "(MarginPolicy.measured(rxd_block_interval_fast_s=...))"
-                )
-            withheld_interval_s = float(mp.rxd_block_interval_fast_s)
-        else:
-            withheld_interval_s = _dividing_interval_s(mp)
         expected_spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms))
         value_at_stake = self._funding_value_at_stake_photons(terms)
         burial = self._funding_burial_blocks(chain, value_at_stake)
@@ -2248,7 +2236,7 @@ class SwapCoordinator:
             value_at_stake_photons=value_at_stake,
             burial_blocks=burial,
             now_unix_s=now_unix_s,
-            withheld_block_interval_s=withheld_interval_s,
+            bound_policy=self.config.funding_bound,
         )
         self.last_maker_funding = result
         return result.outpoint, result.value_photons, result.elapsed_blocks_upper

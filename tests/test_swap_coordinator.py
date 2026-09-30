@@ -2922,8 +2922,8 @@ def test_value_bearing_eth_estimated_policy_refused():
 
 def _with_fast_tail(policy, fast_s: float = 300.0, **over):
     """*policy* carrying a fast tail, which a mainnet Radiant leg's coordinator requires to construct
-    (the taker gate divides by it). 300 s — the nominal — so the arithmetic these guard tests pin is
-    unchanged; they are about other guards, not the fast tail. *over* sets other fields (a
+    (the timelock reserves divide by it). 300 s — the nominal — so the arithmetic these guard tests pin
+    is unchanged; they are about other guards, not the fast tail. *over* sets other fields (a
     ``value_at_risk_photons`` for an ``ft`` swap, which the taker gate also requires)."""
     return type(policy)(**{**policy.__dict__, "rxd_block_interval_fast_s": fast_s, **over})
 
@@ -2948,9 +2948,9 @@ def test_non_value_bearing_eth_estimated_unaffected():
 
 def test_value_bearing_btc_estimated_unaffected():
     # The guard is ETH-specific; a value-bearing BTC swap on an estimated policy still constructs.
-    # (t_btc 10: room for the taker gate's elapsed-depth bound on a mainnet leg; see _burial_coord.)
+    # (t_btc 4: room for the taker gate's elapsed-depth bound on a mainnet leg; see _burial_coord.)
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=10)),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
@@ -2970,10 +2970,11 @@ def test_value_bearing_btc_estimated_unaffected():
 
 
 def _burial_coord(margin_policy):
-    # t_btc 10 leaves the taker gate's negotiation-time check room for the elapsed-depth bound on a
-    # mainnet leg (at least 6 + the 24-block future-time allowance); these tests are about burial.
+    # t_btc 4 leaves the taker gate's negotiation-time check room for the elapsed-depth bound it
+    # models on a mainnet leg (59 blocks for a small value: k = 6 and the newest header up to an hour
+    # old); these tests are about burial.
     return SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=10)),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
@@ -3168,7 +3169,7 @@ def test_a_mainnet_swap_with_no_value_to_size_the_funding_depth_is_refused_at_co
     """An ft swap has no in-protocol value; with no value_at_risk_photons the taker gate cannot size
     the depth it requires of the maker's funding and refuses — at step 5, after the maker locked.
     So the negotiation-time check refuses it first."""
-    with pytest.raises(ValidationError, match=r"refused before anyone locks.*no value at stake"):
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*needs a value at stake"):
         _burial_coord(_with_fast_tail(MarginPolicy.estimated(accept_flat_burial=True)))
 
 

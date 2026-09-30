@@ -179,14 +179,20 @@ class RadiantChainIO:
     funding from (:meth:`funding_evidence`); by default ``client`` does. Any server will do for
     those: the proof rests on the checkpoints pyrxd ships, not on who served it — so a transport
     that cannot serve them (the operator scripts' node-over-ssh shim) pairs with an ElectrumX client.
+
+    ``depth_sources`` are further Radiant readers (each with ``get_transaction_verbose`` and/or
+    ``get_tip_height``) whose REPORTED depth of the funding the gate's elapsed-depth upper bound may
+    be raised by, beside ``client``'s and ``proof_client``'s. A report never lowers the bound, so a
+    source reporting less costs nothing; each is grouped by its ``source_key`` (its operator).
     """
 
-    def __init__(self, client: Any, *, proof_client: Any = None) -> None:
+    def __init__(self, client: Any, *, proof_client: Any = None, depth_sources: tuple[Any, ...] = ()) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
         self._client = client
         self._proof_client = client if proof_client is None else proof_client
+        self._depth_sources = tuple(depth_sources)
 
     async def broadcast(self, raw_tx: bytes) -> str:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
@@ -318,9 +324,10 @@ class RadiantChainIO:
 
         The funding transaction's raw bytes, its merkle branch in block *height*, that block's
         coinbase branch (which pins the tree's depth), the header ranges the coordinator planned
-        (:func:`pyrxd.gravity.funding_spv.funding_header_ranges`), and the server's verbose
-        ``confirmations``. :func:`pyrxd.gravity.funding_spv.verify_maker_funding` decides what they
-        prove; a reply this cannot fetch raises ``NetworkError``, and the gate refuses on it.
+        (:func:`pyrxd.gravity.funding_spv.funding_header_ranges`), and the depth each configured
+        source reports (:meth:`reported_depths`). :func:`pyrxd.gravity.funding_spv.verify_maker_funding`
+        decides what they prove; a reply this cannot fetch raises ``NetworkError``, and the gate
+        refuses on it.
 
         Header ranges are fetched in ascending order and fetching stops at the first SHORT reply: a
         server answers fewer headers past its tip, so everything above that is beyond its chain.
@@ -358,10 +365,6 @@ class RadiantChainIO:
             raise NetworkError(
                 f"could not fetch the proof of the maker's funding: {type(exc).__name__}: {exc}"
             ) from exc
-        try:
-            reported: int | None = int(await self.confirmations(txid))
-        except Exception:
-            reported = None  # only ever RAISES the elapsed bound; the proof does not depend on it
         return MakerFundingEvidence(
             txid=txid.lower(),
             vout=int(vout_s),
@@ -370,8 +373,48 @@ class RadiantChainIO:
             merkle=merkle,
             coinbase_merkle=coinbase,
             headers=headers,
-            reported_confirmations=reported,
+            reported_depths=await self.reported_depths(txid, int(height)),
         )
+
+    async def reported_depths(self, txid: str, height: int) -> tuple[tuple[str, int], ...]:
+        """``((operator, depth), ...)``: the depth of *txid* (mined at *height*) each configured
+        source REPORTS — ``client``, ``proof_client`` and every ``depth_sources`` reader, each once.
+
+        A source's depth is the larger of its verbose ``confirmations`` and its ``tip - height + 1``,
+        whichever it answers; a source that answers neither is left out. Each is labelled by its
+        ``source_key`` (its operator group, :func:`pyrxd.network.source_identity.source_key`), or
+        ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
+        These only ever RAISE the gate's elapsed upper bound; the proof does not depend on them.
+        """
+        seen: list[Any] = []
+        for src in (self._client, self._proof_client, *self._depth_sources):
+            if not any(src is s for s in seen):
+                seen.append(src)
+        out: list[tuple[str, int]] = []
+        for index, src in enumerate(seen):
+            depths: list[int] = []
+            verbose = getattr(src, "get_transaction_verbose", None)
+            if callable(verbose):
+                try:
+                    info = await verbose(txid)
+                    confs = finite_int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+                    if confs > 0:
+                        depths.append(confs)
+                except Exception:
+                    logger.debug("depth source %d gave no confirmations", index, exc_info=True)
+            tip = getattr(src, "get_tip_height", None)
+            if callable(tip):
+                try:
+                    t = finite_int(await tip())
+                    if t >= height:
+                        depths.append(t - height + 1)
+                except Exception:
+                    logger.debug("depth source %d gave no tip height", index, exc_info=True)
+            if depths:
+                key = getattr(src, "source_key", None)
+                label = str(key) if key else f"unidentified source #{index} ({type(src).__name__})"
+                out.append((label, max(depths)))
+        return tuple(out)
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to

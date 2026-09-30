@@ -177,14 +177,14 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
         accept_flat_burial=True,
     )
     if not _token_leg_is_real(args):
-        # The Radiant leg is MAINNET on this stage whatever the EVM leg is, so the taker gate
-        # requires the measured fast tail, and the coordinator refuses to construct without it.
+        # The Radiant leg is MAINNET on this stage whatever the EVM leg is, so the coordinator refuses
+        # to construct without the measured fast tail: the timelock reserves divide time spans by it.
         # Refuse here first, with the flag's name, rather than fake a value.
         if not args.rxd_block_interval_fast_s:
             raise SystemExit(
                 "stage=sepolia-dust locks MAINNET RXD, so it needs --rxd-block-interval-fast-s (the "
-                "MEASURED p10 Radiant inter-block, seconds): the taker gate bounds the blocks since the "
-                "maker's funding by dividing elapsed time by it, and refuses without it. Measure it "
+                "MEASURED p10 Radiant inter-block, seconds): the timelock reserves convert time spans into "
+                "Radiant blocks by dividing by it, and the coordinator refuses without it. Measure it "
                 "against a mainnet node for THIS run."
             )
         if int(args.t_rxd_blocks) == 0:
@@ -1611,7 +1611,7 @@ def _args() -> argparse.Namespace:
         default=0.0,
         help=(
             "MEASURED p10 Radiant inter-block (seconds). Required on stage=sepolia-dust (its Radiant "
-            "leg is mainnet, and the taker gate divides by it). Reserves DIVIDE by this, so a "
+            "leg is mainnet, and the coordinator requires it there). Reserves DIVIDE by this, so a "
             "stale-high value under-counts blocks; measure it per run rather than inheriting a number."
         ),
     )

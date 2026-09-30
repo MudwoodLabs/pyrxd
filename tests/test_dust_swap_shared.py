@@ -202,9 +202,9 @@ class TestMergeIntoMode600:
 
 class TestMeasuredMarginNeedsTheRadiantFastTail:
     """The dust runner's measured policy is ``require_measured``, which refuses without a measured
-    Radiant fast tail, and the swap taker gate divides by that same number on mainnet. Before
-    ``--rxd-block-interval-fast-s`` existed the builder raised inside ``MarginPolicy`` and the run
-    never reached the gate; now the flag is required and its absence refuses before any read."""
+    Radiant fast tail (the timelock reserves divide by it). Before ``--rxd-block-interval-fast-s``
+    existed the builder raised inside ``MarginPolicy`` and the run never reached a lock; now the flag
+    is required and its absence refuses before any read."""
 
     @staticmethod
     def _args(**over):
@@ -253,7 +253,7 @@ class TestMeasuredMarginNeedsTheRadiantFastTail:
             asyncio.run(measured_margin_from_mainnet(self._args()))
         assert opened == [], "it read the network before refusing"
 
-    def test_with_the_flag_the_policy_carries_it_and_satisfies_the_taker_gate(self, monkeypatch) -> None:
+    def test_with_the_flag_the_policy_carries_it(self, monkeypatch) -> None:
         import asyncio
 
         from _dust_swap_shared import measured_margin_from_mainnet

@@ -14,9 +14,12 @@ block holds a unique coinbase; the funding block also holds the funding transact
 pays the covenant scriptPubKey the caller names.
 
 NOT A FICTION IN THE WAYS THAT MATTER: the gate runs its real code on these bytes. What IS chosen
-by the fixture, and says so: timestamps. By default the newest header is stamped ``tip_time``
-(an arbitrary far-future second unless given), which makes the gate's clock allowance for withheld
-blocks zero for any test clock — tests of that allowance pass ``tip_time`` explicitly.
+by the fixture, and says so: timestamps, ``spacing_s`` (300 s by default) apart. By default the
+newest header is stamped ``tip_time`` (an arbitrary far-future second unless given), which puts the
+median time past of any window of them in the future and so makes the gate's time term zero for any
+test clock — tests of that term pass ``tip_time`` explicitly. A chain built on a ``base`` keeps the
+base's own timestamps, so a base meant to sit below a chain stamped near a test clock is built with
+an earlier ``tip_time`` too.
 """
 
 from __future__ import annotations
@@ -110,7 +113,8 @@ class FundingChain:
             merkle=dict(self.merkle),
             coinbase_merkle=dict(self.coinbase_merkle),
             headers=headers,
-            reported_confirmations=reported_confirmations,
+            # One source reporting, as a single server's verbose ``confirmations`` would.
+            reported_depths=() if reported_confirmations is None else (("server", int(reported_confirmations)),),
         )
         kw.update(over)
         return MakerFundingEvidence(**kw)
@@ -126,9 +130,12 @@ def build_funding_chain(
     bits: int = REGTEST_BITS,
     tip_time: int = FAR_FUTURE,
     spacing_s: int = 300,
+    bits_at: dict[int, int] | None = None,
+    time_at: dict[int, int] | None = None,
 ) -> FundingChain:
     """A chain on *base* (default: regtest genesis) whose block at *funding_height* holds a funding
-    tx paying ``(value, spk)`` at output 0, buried *confs* deep (the funding block counts as 1)."""
+    tx paying ``(value, spk)`` at output 0, buried *confs* deep (the funding block counts as 1).
+    *bits_at* / *time_at* override the difficulty / timestamp of chosen heights."""
     headers = dict(base) if base is not None else {0: regtest_genesis_header()}
     start = max(headers) + 1
     height = funding_height if funding_height is not None else start
@@ -147,7 +154,8 @@ def build_funding_chain(
         else:
             root = bytes.fromhex(cb_txid)[::-1]
         prev = radiant_block_hash(headers[h - 1])
-        headers[h] = mine(prev, root, first_t + spacing_s * (h - start), bits)
+        t_h = (time_at or {}).get(h, first_t + spacing_s * (h - start))
+        headers[h] = mine(prev, root, t_h, (bits_at or {}).get(h, bits))
     return FundingChain(
         headers=headers,
         txid=fund_txid,
