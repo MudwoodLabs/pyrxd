@@ -1,9 +1,10 @@
 """``pyrxd.glyph.mark_block``: verifying a HashMark's block from real data, and refusing lies.
 
-REAL DATA. Both marks are real mainnet transactions — Craig's at block 460,572
-(``a1a86ab4…5916``) and pyrxd's at 468,521 (``aa66b046…c86e``) — with the merkle replies, raw
-transactions and 17 linked headers around each, saved verbatim from both shipped ElectrumX servers
-(which returned identical data): ``tests/fixtures/mark_block_fixtures_2026-09-30.json``.
+REAL DATA. Both marks are real mainnet transactions: one written by the reference TypeScript
+implementation at block 460,572 (``a1a86ab4…5916``), and pyrxd's own at 468,521
+(``aa66b046…c86e``). The merkle replies, raw transactions and 17 linked headers around each were
+saved verbatim from both shipped ElectrumX servers, which returned identical data:
+``tests/fixtures/mark_block_fixtures_2026-09-30.json``.
 
 TEST CHECKPOINTS. Most tests inject a checkpoint table through ``checkpoints=`` built from a
 fixture header's own hash, so they exercise both levels on 17 headers rather than on the ~1,100
@@ -52,7 +53,7 @@ from pyrxd.spv.radiant_checkpoints import CHECKPOINTS
 ROOT = Path(__file__).resolve().parent.parent
 _FIX = json.loads((ROOT / "tests/fixtures/mark_block_fixtures_2026-09-30.json").read_text(encoding="utf-8"))["fixtures"]
 
-CRAIG = "a1a86ab4503901af4df3d092fcf668b07c03c5cd89240fe918ae70e02e045916"
+REFERENCE = "a1a86ab4503901af4df3d092fcf668b07c03c5cd89240fe918ae70e02e045916"
 PYRXD = "aa66b04662aa5514ed7d0027ff3cbd608d73f3e2b92d4129d810eb576bc0c86e"
 
 
@@ -92,9 +93,9 @@ class Mark:
         return verify_mark_block(**kw)
 
 
-MARKS = {"craig_460572": Mark(CRAIG), "pyrxd_468521": Mark(PYRXD)}
+MARKS = {"reference_460572": Mark(REFERENCE), "pyrxd_468521": Mark(PYRXD)}
 BOTH = pytest.mark.parametrize("m", list(MARKS.values()), ids=list(MARKS))
-C = MARKS["craig_460572"]
+C = MARKS["reference_460572"]
 
 
 def _step(v: BlockVerification, name: str) -> str:
@@ -105,7 +106,7 @@ def _step(v: BlockVerification, name: str) -> str:
 
 
 def test_both_real_marks_are_here() -> None:
-    assert (MARKS["craig_460572"].height, MARKS["pyrxd_468521"].height) == (460572, 468521)
+    assert (MARKS["reference_460572"].height, MARKS["pyrxd_468521"].height) == (460572, 468521)
     for m in MARKS.values():
         assert m.top - m.height == 8 and m.height - m.start == 8
 
