@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -788,7 +789,9 @@ def test_a_declaring_config_without_a_split_loads_and_an_offline_inspect_runs(tm
     bad.write_text(_ACME_SPLIT_BY_OMISSION)
     result = CliRunner().invoke(cli, ["--config", str(bad), "glyph", "inspect", contract])
     assert result.exit_code != 0, result.output
-    assert isinstance(result.exception, ValidationError) and "backup.acme.io" in str(result.exception)
+    assert isinstance(result.exception, ValidationError), result.output
+    message = str(result.exception)
+    assert re.search(r"'backup\.acme\.io', of the same registered domain 'acme\.io', is not declared", message), message
 
 
 def test_the_shipped_defaults_are_still_two_operators() -> None:
