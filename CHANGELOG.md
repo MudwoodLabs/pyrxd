@@ -11,9 +11,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`pyrxd.glyph.mark_block.verify_mark_block`, which checks the block a HashMark is in. No
   command calls it yet.** `pyrxd verify` and the `/verify/` and `/inspect/` pages still report
   the height as the endpoint's word. Connecting them is the next step (#799). The verifier checks that
-  the transaction's merkle branch leads to the merkle root of the header served for its height.
-  It then links that header, hash by hash (Radiant's double SHA-512/256), to a checkpoint that
-  pyrxd ships.
+  the transaction's merkle branch leads to the merkle root of the header served for its height,
+  and that the branch is as deep as the block's tree, which the coinbase's own branch (checked
+  against the same root) states. Radiant allows 64-byte transactions, so without that pin a
+  branch one level too deep could prove a transaction the block does not contain. It then links
+  that header, hash by hash (Radiant's double SHA-512/256), to a checkpoint that pyrxd ships.
   - **At or below the newest checkpoint**, the header must link to the next checkpoint above
     it. The height then rests on that checkpoint, not on the server.
   - **Above the newest checkpoint**, it links through at most 4,032 headers. Each must meet the

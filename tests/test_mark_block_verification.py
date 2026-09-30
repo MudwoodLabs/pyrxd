@@ -2,8 +2,9 @@
 
 REAL DATA. Both marks are real mainnet transactions: one written by the reference TypeScript
 implementation at block 460,572 (``a1a86ab4…5916``), and pyrxd's own at 468,521
-(``aa66b046…c86e``). The merkle replies, raw transactions and 17 linked headers around each were
-saved verbatim from both shipped ElectrumX servers, which returned identical data:
+(``aa66b046…c86e``). The merkle replies, raw transactions and 17 linked headers around each, and
+each block's coinbase branch (``id_from_pos(height, 0, true)``), were saved verbatim from both
+shipped ElectrumX servers, which returned identical data:
 ``tests/fixtures/mark_block_fixtures_2026-09-30.json``.
 
 TEST CHECKPOINTS. Most tests inject a checkpoint table through ``checkpoints=`` built from a
@@ -69,6 +70,7 @@ class Mark:
         self.txid = txid
         self.raw_tx = bytes.fromhex(fx["raw_tx"])
         self.merkle = dict(fx["merkle"])
+        self.coinbase = dict(fx["coinbase_merkle"])
         self.height = fx["merkle"]["block_height"]
         raw = bytes.fromhex(fx["headers_hex"])
         self.start = fx["headers_start"]
@@ -84,6 +86,7 @@ class Mark:
             "raw_tx": self.raw_tx,
             "height": self.height,
             "merkle": self.merkle,
+            "coinbase_merkle": self.coinbase,
             "headers": self.headers,
             "min_confirmations": 1,
             "blockhash": radiant_block_hash(self.headers[self.height]),
@@ -181,11 +184,13 @@ def test_an_odd_level_duplicate_sibling_is_accepted() -> None:
     header = b"\x00\x00\x00\x20" + b"\x11" * 32 + root + b"\x00" * 4 + bytes.fromhex("31aa001a") + b"\x00" * 4
     merkle = {"block_height": 1000, "merkle": [l0[2][::-1].hex(), left[::-1].hex()], "pos": 2}
     assert merkle["merkle"][0] == C.txid, "the sibling is the mark itself"
+    coinbase = {"tx_hash": l0[0][::-1].hex(), "merkle": [l0[1][::-1].hex(), right[::-1].hex()]}
     v = verify_mark_block(
         txid=C.txid,
         raw_tx=mark,
         height=1000,
         merkle=merkle,
+        coinbase_merkle=coinbase,
         headers={1000: header},
         min_confirmations=1,
         checkpoints=[(1000, radiant_block_hash(header))],
@@ -232,10 +237,9 @@ def test_a_chain_that_does_not_reach_the_checkpoint_hash_is_contradicted() -> No
     [
         lambda r: {**r, "merkle": [r["merkle"][0][:-2] + "00", *r["merkle"][1:]]},
         lambda r: {**r, "pos": 5},
-        lambda r: {**r, "merkle": r["merkle"][:-1], "pos": r["pos"] % 8},
         lambda r: {**r, "merkle": list(reversed(r["merkle"]))},
     ],
-    ids=["flipped_sibling", "pos_4_to_5", "truncated_branch", "reordered_branch"],
+    ids=["flipped_sibling", "pos_4_to_5", "reordered_branch"],
 )
 def test_a_wrong_merkle_branch_is_contradicted(mutate: Any) -> None:
     v = C.run(C.cp(C.top), merkle=mutate(C.merkle))
@@ -287,7 +291,10 @@ _MINED_HEADER = bytes.fromhex(
 def _forged(**over: Any) -> BlockVerification:
     headers = {460580: C.headers[460580], 460581: over.pop("header", _MINED_HEADER)}
     merkle = {"block_height": 460581, "merkle": [_d256(_MINED_COINBASE)[::-1].hex()], "pos": 1}
-    return C.run(C.cp(460580), height=460581, merkle=merkle, headers=headers, blockhash=None, **over)
+    coinbase = {"tx_hash": _d256(_MINED_COINBASE)[::-1].hex(), "merkle": [C.txid]}
+    return C.run(
+        C.cp(460580), height=460581, merkle=merkle, coinbase_merkle=coinbase, headers=headers, blockhash=None, **over
+    )
 
 
 def test_the_mined_forgery_is_real_proof_of_work_on_the_real_chain() -> None:
@@ -310,6 +317,124 @@ def test_the_same_forgery_unmined_is_contradicted() -> None:
     h = bytearray(_MINED_HEADER)
     h[76] ^= 0x01
     assert _forged(header=bytes(h)).state == CONTRADICTED
+
+
+# ── the tree's depth, pinned by the coinbase's branch ──────────────────────────────────────────
+
+
+def _hx(b: bytes) -> str:
+    return b[::-1].hex()
+
+
+def _unmined_header(root: bytes) -> bytes:
+    return b"\x00\x00\x00\x20" + b"\x11" * 32 + root + b"\x00" * 4 + bytes.fromhex("31aa001a") + b"\x00" * 4
+
+
+@BOTH
+def test_the_real_coinbase_branch_states_the_real_depth(m: Mark) -> None:
+    """Known answers from outside the servers: the maintainer's node reported 12 and 22 txs in
+    these blocks (``getblock``), so their trees are 4 and 5 levels deep."""
+    assert len(m.coinbase["merkle"]) == len(m.merkle["merkle"]) == {460572: 4, 468521: 5}[m.height]
+    assert _step(m.run(m.cp(m.top)), "tree_depth") == "passed"
+
+
+def _block_with_a_64_byte_tx() -> tuple[bytes, dict[str, Any], dict[str, Any], bytes]:
+    """A four-transaction block whose third transaction is 64 bytes: 32 arbitrary bytes, then the
+    mark's txid. Those 64 bytes are also an inner node's two children, so the mark "sits" one
+    level BELOW the 64-byte transaction, at position 5 of a tree one level deeper than the block's.
+    (A real attack must also make the 64 bytes parse as a transaction; the merkle arithmetic is
+    the same.) Returns the header, the forged mark branch, the honest coinbase branch, and t64."""
+    cb, t1, t3 = b"\x01" * 100, b"\x02" * 100, b"\x03" * 100
+    t64 = b"\x07" * 32 + _d256(C.raw_tx)
+    l0 = [_d256(cb), _d256(t1), _d256(t64), _d256(t3)]
+    n01, n23 = _d256(l0[0] + l0[1]), _d256(l0[2] + l0[3])
+    header = _unmined_header(_d256(n01 + n23))
+    forged = {"block_height": 1000, "merkle": [_hx(t64[:32]), _hx(l0[3]), _hx(n01)], "pos": 5}
+    coinbase = {"tx_hash": _hx(l0[0]), "merkle": [_hx(l0[1]), _hx(n23)]}
+    return header, forged, coinbase, t64
+
+
+def test_a_branch_one_level_too_deep_through_a_64_byte_tx_is_contradicted() -> None:
+    """CVE-2017-12842's shape. The forged branch reaches the real root (premise, below), so only
+    the depth pin refuses it: the coinbase's branch says the tree is 2 deep, the mark's is 3."""
+    from pyrxd.spv.merkle import build_branch, verify_tx_in_block
+
+    header, forged, coinbase, t64 = _block_with_a_64_byte_tx()
+    assert len(t64) == 64
+    # Premise: the inclusion check alone ACCEPTS the forgery. Without this the test below could
+    # pass for the wrong reason (a branch that simply does not reach the root).
+    verify_tx_in_block(C.raw_tx, C.txid, build_branch(forged["merkle"], 5), 5, header)
+
+    v = C.run(
+        [(1000, radiant_block_hash(header))],
+        height=1000,
+        merkle=forged,
+        coinbase_merkle=coinbase,
+        headers={1000: header},
+        blockhash=None,
+    )
+    assert v.state == CONTRADICTED, v.reason
+    assert _step(v, "tree_depth") == "failed"
+    assert "3 level(s) deep, but block 1000's tree is 2 deep" in (v.reason or "")
+
+
+def test_a_real_branch_one_level_too_short_is_contradicted() -> None:
+    """The mark's real branch with its top level cut off (and ``pos`` cut to fit): the coinbase
+    says the tree is 4 deep."""
+    v = C.run(C.cp(C.top), merkle={**C.merkle, "merkle": C.merkle["merkle"][:-1], "pos": C.merkle["pos"] % 8})
+    assert v.state == CONTRADICTED and _step(v, "tree_depth") == "failed"
+    assert "3 level(s) deep, but block 460572's tree is 4 deep" in (v.reason or "")
+
+
+def test_a_coinbase_branch_one_level_short_that_still_reaches_the_root_is_contradicted() -> None:
+    """A server naming an inner node as "the coinbase" gets a shorter branch that DOES reach the
+    root; the honest mark's branch then disagrees with it about the depth."""
+    cb = C.coinbase
+    inner = _d256(bytes.fromhex(cb["tx_hash"])[::-1] + bytes.fromhex(cb["merkle"][0])[::-1])
+    v = C.run(C.cp(C.top), coinbase_merkle={"tx_hash": _hx(inner), "merkle": cb["merkle"][1:]})
+    assert v.state == CONTRADICTED and _step(v, "tree_depth") == "failed"
+    assert "4 level(s) deep, but block 460572's tree is 3 deep" in (v.reason or "")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: {**c, "merkle": [*c["merkle"], "ab" * 32]},
+        lambda c: {**c, "merkle": c["merkle"][:-1]},
+        lambda c: {**c, "merkle": [c["merkle"][0][:-2] + "00", *c["merkle"][1:]]},
+        lambda c: {**c, "tx_hash": C.txid},
+    ],
+    ids=["one_level_longer", "one_level_shorter", "flipped_sibling", "not_the_coinbase"],
+)
+def test_a_coinbase_branch_that_misses_the_root_is_contradicted(mutate: Any) -> None:
+    v = C.run(C.cp(C.top), coinbase_merkle=mutate(C.coinbase))
+    assert v.state == CONTRADICTED and _step(v, "tree_depth") == "failed"
+    assert "coinbase's merkle branch does not lead to block 460572's merkle root" in (v.reason or "")
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason"),
+    [
+        (None, "no coinbase merkle branch"),
+        ("deadbeef", "not an object"),
+        ({}, "no usable tx_hash"),
+        ({"tx_hash": "zz" * 32, "merkle": []}, "no usable tx_hash"),
+        ({"tx_hash": "ab" * 32}, "malformed"),
+        ({"tx_hash": "ab" * 32, "merkle": "deadbeef"}, "malformed"),
+        ({"tx_hash": "ab" * 32, "merkle": ["ab"]}, "malformed"),
+        ({"tx_hash": "ab" * 32, "merkle": ["ab" * 32] * 33}, "deeper than 32"),
+    ],
+    ids=["none", "string", "empty", "bad_hash", "no_merkle", "merkle_string", "short_sibling", "too_deep"],
+)
+def test_an_unreadable_coinbase_branch_is_not_verified(reply: Any, reason: str) -> None:
+    v = C.run(C.cp(C.top), coinbase_merkle=reply)
+    assert v.state == NOT_VERIFIED and reason in (v.reason or ""), v.reason
+
+
+def test_the_coinbase_branch_has_no_default() -> None:
+    """Required, so a phase-2 caller cannot forget it and silently skip the depth pin."""
+    param = inspect.signature(verify_mark_block).parameters["coinbase_merkle"]
+    assert param.default is inspect.Parameter.empty
 
 
 # ── nothing proved either way ────────────────────────────────────────────────────────────────
@@ -433,6 +558,7 @@ _SPAN = sorted(h for h in C.headers if C.height <= h <= C.top)
 def _mutated(draw: Any) -> dict[str, Any]:
     kw: dict[str, Any] = {
         "merkle": dict(C.merkle),
+        "coinbase_merkle": dict(C.coinbase),
         "headers": dict(C.headers),
         "raw_tx": C.raw_tx,
         "height": C.height,
@@ -441,7 +567,18 @@ def _mutated(draw: Any) -> dict[str, Any]:
     # One or two mutations, headers weighted up: with more, nearly every case stopped at the first
     # (merkle) check and the header-walking code was rarely reached. The bit-flip property below
     # covers the linkage walk exhaustively over its own axis.
-    kinds = ["merkle_field", "merkle", "header", "header", "header", "drop_header", "raw_tx", "height", "blockhash"]
+    kinds = [
+        "merkle_field",
+        "merkle",
+        "coinbase_field",
+        "header",
+        "header",
+        "header",
+        "drop_header",
+        "raw_tx",
+        "height",
+        "blockhash",
+    ]
     for _ in range(draw(st.integers(1, 2))):
         what = draw(st.sampled_from(kinds))
         if what == "merkle_field":
@@ -449,6 +586,9 @@ def _mutated(draw: Any) -> dict[str, Any]:
             kw["merkle"][draw(st.sampled_from(["block_height", "merkle", "pos"]))] = draw(_ANY_JSON)
         elif what == "merkle":
             kw["merkle"] = draw(_ANY_JSON)
+        elif what == "coinbase_field":
+            kw["coinbase_merkle"] = dict(kw["coinbase_merkle"])
+            kw["coinbase_merkle"][draw(st.sampled_from(["tx_hash", "merkle"]))] = draw(_ANY_JSON)
         elif what == "header":
             kw["headers"][draw(st.sampled_from(_SPAN))] = draw(st.binary(min_size=0, max_size=100) | _ANY_JSON)
         elif what == "drop_header":

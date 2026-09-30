@@ -15,7 +15,15 @@ failure does today.
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads
-to the merkle root in the header served for its height.
+to the merkle root in the header served for its height — and that the branch is exactly as deep
+as the block's tree, which the COINBASE's branch (position 0, checked against the same root)
+states. Radiant accepts 64-byte transactions (``MIN_TX_SIZE = 32``,
+``tests/vendor/radiant_core/consensus.h:19``), and the bytes of one can double as an inner node's
+two children, so a branch one level longer than the tree can "prove" a transaction the block does
+not contain (CVE-2017-12842); the more-than-64-bytes rule closes only the shorter direction.
+Pinning the depth to the coinbase's closes the longer one too, unless the block's coinbase is
+itself 64 bytes, which only that block's miner can arrange: the coinbase's raw bytes are not
+fetched or checked.
 
 * **checkpoint** — the height ``H`` is at or below the newest checkpoint. The header at ``H`` is
   linked hash by hash (each header's previous-block field equals the double-SHA-512/256 hash of the
@@ -70,7 +78,7 @@ from typing import Any
 from pyrxd.hash import radiant_block_hash
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import BlockHeight
-from pyrxd.spv.merkle import build_branch, verify_tx_in_block
+from pyrxd.spv.merkle import build_branch, compute_root, extract_merkle_root, verify_tx_in_block
 from pyrxd.spv.radiant import (
     TxMerkleBranch,
     radiant_header_prev_hash,
@@ -124,8 +132,9 @@ class BlockFetchPlan:
     """What a caller must fetch before :func:`verify_mark_block` can reach VERIFIED.
 
     ``header_ranges`` are ``(start_height, count)`` pairs, each ``count <= MAX_HEADERS_PER_REQUEST``
-    (a ``blockchain.block.headers`` call each), plus the merkle branch for the mark's txid at
-    ``height``. When ``reason`` is set, nothing fetched can verify this block and the ranges are
+    (a ``blockchain.block.headers`` call each), plus two merkle branches in the block at ``height``:
+    the mark's (``blockchain.transaction.get_merkle``) and the coinbase's
+    (``blockchain.transaction.id_from_pos(height, 0, true)``), which pins the tree's depth. When ``reason`` is set, nothing fetched can verify this block and the ranges are
     empty: say why instead of fetching.
     """
 
@@ -163,7 +172,7 @@ class BlockVerification:
     steps: tuple[tuple[str, str], ...] = ()
 
 
-_STEPS = ("merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
+_STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
 
 
 class _Stop(Exception):
@@ -269,12 +278,29 @@ def _header(headers: Mapping[Any, Any], h: int) -> bytes:
     return bytes(got)
 
 
+def _coinbase_branch(reply: Any, height: int) -> tuple[str, tuple[str, ...]]:
+    """``(coinbase txid, branch)`` from an ``id_from_pos(height, 0, true)`` reply, shape-checked only."""
+    if reply is None:
+        raise _Stop(NOT_VERIFIED, "no coinbase merkle branch was supplied, so the tree's depth is unknown")
+    if not isinstance(reply, Mapping):
+        raise _Stop(NOT_VERIFIED, "the coinbase merkle reply is malformed: not an object")
+    tx_hash, branch = reply.get("tx_hash"), reply.get("merkle")
+    if not isinstance(tx_hash, str) or not _HEX64.match(tx_hash.lower()):
+        raise _Stop(NOT_VERIFIED, "the coinbase merkle reply is malformed: no usable tx_hash")
+    try:
+        parsed = TxMerkleBranch.from_electrumx({"block_height": height, "merkle": branch, "pos": 0})
+    except ValidationError as exc:
+        raise _Stop(NOT_VERIFIED, f"the coinbase merkle reply is malformed: {exc}") from None
+    return tx_hash.lower(), parsed.branch
+
+
 def verify_mark_block(
     *,
     txid: Any,
     raw_tx: Any,
     height: Any,
     merkle: TxMerkleBranch | Mapping[str, Any] | None,
+    coinbase_merkle: Mapping[str, Any] | None,
     headers: Mapping[int, bytes],
     min_confirmations: int,
     blockhash: Any = None,
@@ -284,7 +310,10 @@ def verify_mark_block(
     """Verify that *txid* is in the block at *height*, anchored to a shipped checkpoint.
 
     *raw_tx* is the transaction's bytes; *merkle* is a :class:`~pyrxd.spv.radiant.TxMerkleBranch`
-    or the raw ``blockchain.transaction.get_merkle`` dict; *headers* maps height to raw 80-byte
+    or the raw ``blockchain.transaction.get_merkle`` dict; *coinbase_merkle* is the raw
+    ``blockchain.transaction.id_from_pos(height, 0, true)`` dict (``tx_hash`` and ``merkle``) for
+    the same block, which pins the tree's depth — it has no default, so no caller can skip it;
+    *headers* maps height to raw 80-byte
     header, covering :func:`plan_block_verification`'s ranges; *blockhash*, when given, is the
     block hash the endpoint named for the transaction (verbose ``blockhash``) and must match.
 
@@ -306,6 +335,7 @@ def verify_mark_block(
             raw_tx=raw_tx,
             height=height,
             merkle=merkle,
+            coinbase_merkle=coinbase_merkle,
             headers=headers,
             min_conf=min_conf,
             blockhash=blockhash,
@@ -326,6 +356,7 @@ def _verify(
     raw_tx: Any,
     height: Any,
     merkle: Any,
+    coinbase_merkle: Any,
     headers: Any,
     min_conf: int,
     blockhash: Any,
@@ -360,12 +391,34 @@ def _verify(
     if not isinstance(raw_tx, (bytes, bytearray)):
         raise _Stop(NOT_VERIFIED, "no raw transaction bytes were supplied")
     header_h = _header(headers, height)
+
+    # 1a. the tree's depth, from the coinbase's branch in the same block (see the module docstring).
+    cb_txid, cb_branch = _coinbase_branch(coinbase_merkle, height)
+    if compute_root(cb_txid, build_branch(list(cb_branch), 0)) != extract_merkle_root(header_h):
+        steps["tree_depth"] = "failed"
+        raise _Stop(CONTRADICTED, f"the coinbase's merkle branch does not lead to block {height}'s merkle root")
+    if len(merkle.branch) != len(cb_branch):
+        steps["tree_depth"] = "failed"
+        raise _Stop(
+            CONTRADICTED,
+            f"the transaction's merkle branch is {len(merkle.branch)} level(s) deep, but block {height}'s "
+            f"tree is {len(cb_branch)} deep (its coinbase's branch)",
+        )
+    steps["tree_depth"] = "passed"
+
     # NOT refused here: a sibling equal to the running hash. ElectrumX's honest branch for the last
     # transaction of an odd-width level duplicates it (the merkle duplicate-last rule), so refusing
     # it would refuse real marks. CVE-2012-2459 cannot prove a transaction that is absent here:
     # the root is pinned by a header that must also link to a checkpoint.
     try:
-        verify_tx_in_block(bytes(raw_tx), txid, build_branch(list(merkle.branch), merkle.pos), merkle.pos, header_h)
+        verify_tx_in_block(
+            bytes(raw_tx),
+            txid,
+            build_branch(list(merkle.branch), merkle.pos),
+            merkle.pos,
+            header_h,
+            expected_depth=len(cb_branch),
+        )
     except SpvVerificationError as exc:
         steps["merkle"] = "failed"
         raise _Stop(CONTRADICTED, f"merkle inclusion failed: {exc}") from None
