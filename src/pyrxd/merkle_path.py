@@ -202,7 +202,7 @@ class MerklePath:
         # and the merkle root IS the txid. The BUMP holds that leaf alone at offset 0 of level 0,
         # and walking it would look for a sibling that does not exist. Only offset 0 qualifies:
         # a lone leaf anywhere else is an incomplete proof and still raises below.
-        if len(self.path) == 1 and len(self.path[0]) == 1 and index == 0:
+        if len(self.path) == 1 and len(self.path[0]) == 1 and index == 0 and isinstance(txid, str):
             return txid
 
         # Calculate the root using the index as a way to determine which direction to concatenate.
