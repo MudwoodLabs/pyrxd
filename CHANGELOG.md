@@ -96,7 +96,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **`ElectrumXClient.per_source_clients()`** returns one new client per group. A client over
   several operators' URLs races them, so one reply from it cannot say which operator sent it;
   `RadiantChainIO` asks such a client once per operator for a funding's depth, on clients it closes
-  afterwards. **`RadiantChainIO.configured_depth_operators()`** (and
+  afterwards. It asks its depth sources concurrently, each under `depth_timeout_s` (new, default
+  20 s); a source that does not answer in time is dropped as a failing one is, so an unresponsive
+  operator costs the call one timeout rather than one per source in turn. **`RadiantChainIO.configured_depth_operators()`** (and
   `RadiantCovenantLeg.configured_depth_operators()`) names the operator groups a configuration asks,
   derived from each source's `source_key`. The mainnet node client in
   `scripts/radiant_mainnet_chainio.py` now carries a `source_key` (its ssh destination), so the

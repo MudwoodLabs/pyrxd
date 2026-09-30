@@ -42,8 +42,10 @@ Design notes (T7 plan D5/D6, reviewed)
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
@@ -164,6 +166,11 @@ class RadiantBroadcaster(Protocol):
         ...
 
 
+#: How long :meth:`RadiantChainIO.reported_depths` waits for any one depth source before dropping
+#: it. The sources are asked concurrently, so this bounds the whole call, not each source in turn.
+DEPTH_SOURCE_TIMEOUT_S = 20.0
+
+
 class RadiantChainIO:
     """Thin chain helper over an ``ElectrumXClient``-like object.
 
@@ -189,16 +196,33 @@ class RadiantChainIO:
     says which this configuration asks. A client over the URLs of several operators — an
     ``ElectrumXClient`` given pyrxd's shipped mainnet endpoints, which races them — is asked once
     PER OPERATOR (``ElectrumXClient.per_source_clients``), since one reply from it cannot say which
-    operator sent it.
+    operator sent it. The sources are asked CONCURRENTLY, each under ``depth_timeout_s`` (default
+    :data:`DEPTH_SOURCE_TIMEOUT_S`): a source that does not answer in time is dropped, as one that
+    fails is, and costs the call one timeout, not one per unresponsive source.
     """
 
-    def __init__(self, client: Any, *, proof_client: Any = None, depth_sources: tuple[Any, ...] = ()) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        proof_client: Any = None,
+        depth_sources: tuple[Any, ...] = (),
+        depth_timeout_s: float = DEPTH_SOURCE_TIMEOUT_S,
+    ) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
+        if (
+            not isinstance(depth_timeout_s, (int, float))
+            or isinstance(depth_timeout_s, bool)
+            or not math.isfinite(depth_timeout_s)
+            or depth_timeout_s <= 0
+        ):
+            raise ValidationError("RadiantChainIO depth_timeout_s must be a finite number > 0")
         self._client = client
         self._proof_client = client if proof_client is None else proof_client
         self._depth_sources = tuple(depth_sources)
+        self._depth_timeout_s = float(depth_timeout_s)
 
     async def broadcast(self, raw_tx: bytes) -> str:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
@@ -432,6 +456,10 @@ class RadiantChainIO:
         ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
         These RAISE the gate's elapsed upper bound, and above dust the gate counts the operators
         among them; the proof does not depend on them.
+
+        The sources are asked CONCURRENTLY, each under ``depth_timeout_s``; one that times out or
+        fails is left out exactly as one that answers neither. So an unresponsive operator costs the
+        call one timeout, not one per source in turn.
         """
         asked: list[tuple[int, Any]] = []
         made: list[Any] = []
@@ -450,31 +478,52 @@ class RadiantChainIO:
                     await part.close()
 
     async def _ask_depths(self, asked: list[tuple[int, Any]], txid: str, height: int) -> tuple[tuple[str, int], ...]:
-        out: list[tuple[str, int]] = []
-        for index, src in asked:
-            depths: list[int] = []
+        async def one(index: int, src: Any) -> tuple[str, int] | None:
+            try:
+                depths = await asyncio.wait_for(self._ask_one(index, src, txid, height), self._depth_timeout_s)
+            except asyncio.TimeoutError:
+                logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
+                return None
+            if not depths:
+                return None
+            key = getattr(src, "source_key", None)
+            label = str(key) if key else self._unidentified_label(index, src)
+            return (label, max(depths))
+
+        # Concurrently: one unresponsive operator costs one timeout, not one per source in turn.
+        # `gather` keeps the order they were asked in.
+        answers = await asyncio.gather(*(one(index, src) for index, src in asked))
+        return tuple(a for a in answers if a is not None)
+
+    @staticmethod
+    async def _ask_one(index: int, src: Any, txid: str, height: int) -> list[int]:
+        """The depths one source reports: its verbose ``confirmations`` and ``tip - height + 1``,
+        whichever it answers (asked together); a read that fails is left out."""
+
+        async def confirmations() -> int | None:
             verbose = getattr(src, "get_transaction_verbose", None)
-            if callable(verbose):
-                try:
-                    info = await verbose(txid)
-                    confs = finite_int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
-                    if confs > 0:
-                        depths.append(confs)
-                except Exception:
-                    logger.debug("depth source %d gave no confirmations", index, exc_info=True)
+            if not callable(verbose):
+                return None
+            try:
+                info = await verbose(txid)
+                confs = finite_int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+                return confs if confs > 0 else None
+            except Exception:
+                logger.debug("depth source %d gave no confirmations", index, exc_info=True)
+                return None
+
+        async def from_tip() -> int | None:
             tip = getattr(src, "get_tip_height", None)
-            if callable(tip):
-                try:
-                    t = finite_int(await tip())
-                    if t >= height:
-                        depths.append(t - height + 1)
-                except Exception:
-                    logger.debug("depth source %d gave no tip height", index, exc_info=True)
-            if depths:
-                key = getattr(src, "source_key", None)
-                label = str(key) if key else self._unidentified_label(index, src)
-                out.append((label, max(depths)))
-        return tuple(out)
+            if not callable(tip):
+                return None
+            try:
+                t = finite_int(await tip())
+                return t - height + 1 if t >= height else None
+            except Exception:
+                logger.debug("depth source %d gave no tip height", index, exc_info=True)
+                return None
+
+        return [d for d in await asyncio.gather(confirmations(), from_tip()) if d is not None]
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to

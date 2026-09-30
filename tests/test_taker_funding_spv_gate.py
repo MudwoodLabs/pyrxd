@@ -2218,3 +2218,59 @@ async def test_the_durable_record_carries_the_override_statement(monkeypatch):
     coord._persist = persist
     assert (await coord.taker_funds_btc(terms, now_unix_s=_NOW)).state is SwapState.BTC_LOCKED
     assert written and all("single_operator_override" not in w for w in written)
+
+
+# --------------------------------------------------------------------------- concurrent depth reads
+
+
+class _Blackholed:
+    """A depth source that never answers (a dropped route: the read just hangs)."""
+
+    def __init__(self, key):
+        self.source_key = key
+        self.cancelled = 0
+
+    async def _hang(self, *_a):
+        import asyncio
+
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+
+    async def get_transaction_verbose(self, txid):
+        return await self._hang()
+
+    async def get_tip_height(self):
+        return await self._hang()
+
+
+async def test_blackholed_depth_sources_cost_one_timeout_not_one_each():
+    """The reviewer's case: each unresponsive operator added a full timeout to the call, one after
+    another. Now the sources are asked concurrently, each under ``depth_timeout_s``: two blackholed
+    sources beside one that answers finish in about ONE timeout, the silent ones are dropped exactly
+    as a failing source is, and their pending reads are cancelled."""
+    import asyncio
+    import time
+
+    view = _ChainView(pays=b"\x51", value=1, confs=9)
+    holes = (_Blackholed("operator:hole-a"), _Blackholed("operator:hole-b"))
+    timeout = 0.4
+    io = RadiantChainIO(view, depth_sources=(*holes, _DepthReader(view)), depth_timeout_s=timeout)
+    t0 = time.monotonic()
+    try:  # bounded here too, so a regression that drops the per-source timeout fails, not hangs
+        got = await asyncio.wait_for(io.reported_depths(view.chain.txid, view.chain.height), 10 * timeout)
+    except asyncio.TimeoutError:
+        pytest.fail(f"reported_depths did not return within {10 * timeout}s: a blackholed source was awaited unbounded")
+    took = time.monotonic() - t0
+    assert got == ((str(view.source_key), 9), (str(_SHIPPED_OPERATORS[1]), 9)), got
+    assert timeout <= took < 1.5 * timeout, f"{took:.2f}s for two blackholed sources at {timeout}s each"
+    assert all(h.cancelled == 2 for h in holes), [h.cancelled for h in holes]  # both reads of each
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "5"])
+def test_the_depth_timeout_must_be_a_positive_finite_number(bad):
+    view = _ChainView(pays=b"\x51", value=1, confs=9)
+    with pytest.raises(ValidationError, match="depth_timeout_s"):
+        RadiantChainIO(view, depth_timeout_s=bad)
