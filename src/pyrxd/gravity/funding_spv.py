@@ -359,6 +359,13 @@ def funding_header_ranges(
     newest checkpoint up to ``cap`` headers above it. A server answers FEWER headers past its tip,
     and that is where its chain ends for this gate. Raises :class:`MakerFundingNotVerified` for a
     height nothing fetched could prove.
+
+    A funding at or below the newest checkpoint gets the WHOLE span from its block up to the newest
+    checkpoint, when that span is at most ``cap`` headers: the reference header the elapsed-depth
+    bound is measured from (:func:`verify_maker_funding`, step 5) can lie anywhere between the
+    funding block and the served tip, which the three spans above leave a gap in once the funding
+    is two or more checkpoint intervals down. Past ``cap`` the gap is not fetched, and a reference
+    header that falls in it refuses there, naming it.
     """
     table = chain.checkpoints
     newest_h = table[-1][0]
@@ -380,6 +387,8 @@ def funding_header_ranges(
     if plan.reason is not None:
         raise MakerFundingNotVerified(f"the funding block cannot be verified: {plan.reason}")
     spans = [(start, start + count - 1) for start, count in plan.header_ranges]
+    if height <= newest_h and newest_h - height <= cap:
+        spans.append((height, newest_h))
     if len(table) >= 2:
         spans.append((table[-2][0], newest_h))
     spans.append((newest_h, top))
@@ -635,6 +644,28 @@ def verify_maker_funding(
     #    test network has no value term: the reference is the newest header served.
     ref_depth = max(1, value_term)
     ref_h = top - ref_depth + 1
+    if ref_h not in verified_heights:
+        # Below the last checkpoint interval and above the funding block's own checkpoint: nothing
+        # above linked it yet. Link it to the checkpoint at or above it before reading its time.
+        cp_ref_h, cp_ref_hash = next((h, b) for h, b in table if h >= ref_h)
+        try:
+            below = radiant_block_hash(bytes(headers[ref_h]))
+            for h in range(ref_h + 1, cp_ref_h + 1):
+                hdr = bytes(headers[h])
+                if radiant_header_prev_hash(hdr) != below:
+                    raise KeyError(h)
+                below = radiant_block_hash(hdr)
+            if below != cp_ref_hash:
+                raise KeyError(cp_ref_h)
+        except (KeyError, TypeError, ValueError, ValidationError):
+            raise refuse(
+                f"the reference header the elapsed-depth bound is measured from (block {ref_h}, {ref_depth} "
+                f"deep counting the newest header served as 1) was not served linked to checkpoint {cp_ref_h}, "
+                "so the "
+                "blocks since the funding cannot be bounded from above",
+                why,
+                f"the funding in block {height}, {proved} deep",
+            ) from None
     if now_unix_s is None:
         if chain.value_bearing:
             raise refuse(

@@ -420,6 +420,58 @@ async def test_the_allowance_divides_by_the_measured_fast_tail_not_the_nominal_i
     assert proof.elapsed_blocks_upper >= proof.proved_depth + 100 - 1
 
 
+def _gap_case(**over):
+    """Checkpoints 0/4/6/8; the funding at block 1, 10 deep (served tip 10). The reference header for
+    a value term of 6 is block 5 — between the funding's own checkpoint (4) and the last checkpoint
+    interval (6..8), the range the three planned spans used to leave out."""
+    spk = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    real = build_funding_chain(spk=spk, value=1000, confs=10, bits=_HARD_BITS, tip_time=_NOW)
+    chain = RadiantChain(
+        name="mainnet",
+        checkpoints=tuple((h, radiant_block_hash(real.headers[h])) for h in (0, 4, 6, 8)),
+        pow_limit=(1 << 255) - 1,
+        subsidy_halving_interval=210_000,
+        value_bearing=True,
+    )
+    kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6, withheld_block_interval_s=36.0)
+    kw.update(over)
+    cap = kw.get("cap", MAX_HEADERS_FROM_CHECKPOINT_SDK)
+    fetched = {h for s, n in funding_header_ranges(chain, real.height, cap=cap) for h in range(s, s + n)}
+    ev = real.evidence(headers={h: b for h, b in real.headers.items() if h in fetched})
+    cost = verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=1, **kw).forged_confirmation_cost_photons
+    return ev, kw, cost, fetched
+
+
+def test_a_reference_header_below_the_last_checkpoint_interval_is_fetched_and_linked():
+    """The reviewer's probe (``KeyError(5)``): the value term puts the reference header at block 5,
+    which the planned ranges did not fetch. They now plan the whole span from the funding block up
+    to the newest checkpoint, and the gate links block 5 to checkpoint 6 before reading its time."""
+    ev, kw, cost, fetched = _gap_case()
+    assert 5 in fetched
+    r = verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=3 * cost, **kw)
+    assert (r.value_term, r.served_tip, r.reference_height) == (6, 10, 5)
+
+
+def test_a_reference_header_the_plan_cannot_reach_refuses_by_name_never_a_bare_key_error():
+    """With a walk cap smaller than the funding's distance below the newest checkpoint the gap is not
+    fetched; the refusal is a MakerFundingNotVerified that names the reference header."""
+    ev, kw, cost, fetched = _gap_case(cap=4)
+    assert 5 not in fetched
+    with pytest.raises(MakerFundingNotVerified, match=r"reference header .*block 5.*checkpoint 6"):
+        verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=3 * cost, **kw)
+
+
+def test_a_reference_header_that_does_not_link_to_its_checkpoint_is_refused():
+    """Served, but not the chain's: a header at the reference height that does not link to the
+    checkpoint above it is refused, so its timestamp is never read."""
+    ev, kw, cost, _fetched = _gap_case()
+    forged = dict(ev.headers)
+    forged[5] = mine("00" * 32, b"\x00" * 32, _NOW, _HARD_BITS)
+    ev = type(ev)(**{**ev.__dict__, "headers": forged})
+    with pytest.raises(MakerFundingNotVerified, match=r"reference header .*block 5"):
+        verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=3 * cost, **kw)
+
+
 def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
     """REAL data: the recorded mainnet block 460,572 transaction, its merkle and coinbase branches
     and headers 460,564..460,580 (``tests/fixtures/mark_block_fixtures_2026-09-30.json``), judged
