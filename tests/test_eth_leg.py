@@ -20,7 +20,15 @@ from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-_ART = {"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x00"}
+#: The smallest immutable layout the leg's constructor accepts (one 32-byte slot). These tests are
+#: about other things; the layout checks themselves live in test_eth_leg.py.
+_ART = {
+    "abi": [],
+    "bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
+}
 _MAKER = "0x" + "11" * 20
 _TAKER = "0x" + "22" * 20
 _TIMEOUT = 1779710245
@@ -695,18 +703,97 @@ def test_expected_runtime_rejects_a_forged_immutable_copy_the_getters_cannot_see
     assert bytes(tampered) != expected
 
 
-def test_expected_runtime_fails_closed_without_immutable_metadata():
-    """An artifact that cannot describe its immutable layout must FAIL CLOSED, not silently fall
-    back to a value-masked compare — the fallback is exactly the hole the fix closes."""
-    pytest.importorskip("web3")
-    loc = _real_locator()
-    no_refs = {k: v for k, v in _REAL_ART.items() if k != "immutableReferences"}
-    leg1 = EthHtlcContractLeg(rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=no_refs)
-    with pytest.raises(ValidationError, match="immutableReferences"):
-        leg1._expected_runtime(loc)
-    no_names = {k: v for k, v in _REAL_ART.items() if k != "immutable_names"}
-    leg2 = EthHtlcContractLeg(
-        rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=no_names
+_ERC20_ART = json.loads((_pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+
+
+class _TripwireRpc:
+    """Records ANY use. A leg that is refused at construction must not have touched the network —
+    no deploy, no balance read, nothing — because the funder's own ``fund`` sends value with the
+    deploy, before ``verify_funded`` (where the layout used to be checked) ever runs."""
+
+    def __init__(self):
+        object.__setattr__(self, "touched", [])
+
+    def __getattr__(self, name):
+        self.touched.append(name)
+        raise AssertionError(f"a refused leg used rpc.{name}")
+
+
+def _build(kind: str, artifact: dict, rpc) -> object:
+    if kind == "native":
+        return EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=artifact)
+    from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+    from pyrxd.eth_wallet.tokens import token_for
+
+    return Erc20HtlcLeg(
+        token=token_for("USDC", 1), rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=artifact
     )
-    with pytest.raises(ValidationError, match="immutable_names"):
-        leg2._expected_runtime(loc)
+
+
+@pytest.mark.parametrize("kind,art", [("native", _REAL_ART), ("erc20", _ERC20_ART)])
+@pytest.mark.parametrize("key", ["immutableReferences", "immutable_names"])
+def test_an_artifact_without_its_immutable_layout_is_refused_at_CONSTRUCTION(kind, art, key):
+    """FAIL BEFORE VALUE MOVES. The exact runtime compare cannot be built without
+    ``immutableReferences`` and ``immutable_names``. When only ``verify_funded`` checked for them, a
+    leg built from such an artifact deployed and FUNDED (0.001 ETH in the reviewer's proof) before
+    refusing, and through ``EthLeg.fund`` the ETH then sat locked until the refund timeout. Now the
+    constructor refuses, so there is no leg to fund with."""
+    rpc = _TripwireRpc()
+    stripped = {k: v for k, v in art.items() if k != key}
+    with pytest.raises(ValidationError, match=f"missing required keys: \\['{key}'\\]"):
+        _build(kind, stripped, rpc)
+    assert rpc.touched == [], f"a refused leg touched the network: {rpc.touched}"
+
+
+@pytest.mark.parametrize("kind,art", [("native", _REAL_ART), ("erc20", _ERC20_ART)])
+def test_the_real_artifacts_are_ACCEPTED_at_construction(kind, art):
+    """The honest path for the refusals above and below: both committed artifacts construct, with
+    the network untouched."""
+    rpc = _TripwireRpc()
+    _build(kind, art, rpc)
+    assert rpc.touched == []
+
+
+def _mutated(**changes) -> dict:
+    art = json.loads(json.dumps(_REAL_ART))
+    for k, v in changes.items():
+        art[k] = v
+    return art
+
+
+_FIRST_ID = next(iter(_REAL_ART["immutableReferences"]))
+
+
+@pytest.mark.parametrize(
+    "art,match",
+    [
+        (_mutated(immutableReferences={}), "immutableReferences' must be a non-empty"),
+        (_mutated(immutable_names={}), "immutable_names' must be a non-empty"),
+        (
+            _mutated(immutable_names={k: v for k, v in _REAL_ART["immutable_names"].items() if k != _FIRST_ID}),
+            "unnamed: \\['" + _FIRST_ID + "'\\]",
+        ),
+        (_mutated(immutable_names={**_REAL_ART["immutable_names"], "999999": "claimant"}), "not in this build"),
+        (
+            _mutated(
+                immutableReferences={
+                    **_REAL_ART["immutableReferences"],
+                    _FIRST_ID: [{"start": len(bytes.fromhex(_REAL_ART["runtime_bytecode"][2:])) - 31, "length": 32}],
+                }
+            ),
+            "lies outside",
+        ),
+        (
+            _mutated(immutableReferences={**_REAL_ART["immutableReferences"], _FIRST_ID: [{"start": 0, "length": 20}]}),
+            "malformed slot",
+        ),
+        (_mutated(immutableReferences={**_REAL_ART["immutableReferences"], _FIRST_ID: []}), "has no slots"),
+    ],
+)
+def test_an_unusable_immutable_layout_is_refused_at_construction(art, match):
+    """Presence is not enough: each of these would pass a key check and then fail only inside
+    ``verify_funded``, after the funder's deploy had already carried the value."""
+    rpc = _TripwireRpc()
+    with pytest.raises(ValidationError, match=match):
+        _build("native", art, rpc)
+    assert rpc.touched == []

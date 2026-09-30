@@ -60,7 +60,12 @@ from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
 
-_REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
+#: ``immutableReferences`` and ``immutable_names`` are REQUIRED AT CONSTRUCTION, not merely at verify
+#: time. The exact runtime compare in :meth:`EthHtlcContractLeg._expected_runtime` cannot be built
+#: without them, and a leg that only discovered that in ``verify_funded`` had already deployed and
+#: FUNDED its own contract (native ``fund`` sends the value with the deploy), leaving the ETH locked
+#: until the refund timeout. Refusing here means no value moves on an artifact that cannot verify.
+_REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode", "immutableReferences", "immutable_names")
 # Claim-artifact size caps (red-team LOW DoS): a legit claim(bytes32) calldata + Claimed(bytes32)
 # log are ~tens of bytes; cap each blob + the aggregate well above that, fail closed past it so a
 # malicious RPC cannot feed recover_secret's O(n) scan an unbounded blob.
@@ -192,13 +197,29 @@ def _agree_receipt_facts(answers: list[Any]) -> Any:
 
 
 def load_artifact(path: str | os.PathLike) -> dict:
-    """Load an EthHtlc artifact (ABI + bytecode + runtime_bytecode) from ``path``.
+    """Load an EthHtlc artifact from ``path`` (see below for the keys it must carry).
 
-    The contract artifact is owned by the DEPLOYING application (its audited Foundry
-    build output), NOT shipped inside the pyrxd wheel — it is INJECTED
+    The contract artifact is owned by the DEPLOYING application (built from its audited
+    contract source), NOT shipped inside the pyrxd wheel — it is INJECTED
     into :class:`EthHtlcContractLeg` via its constructor so the wheel carries no contract
     bytecode and the audited artifact stays beside its contract source. This helper is a
     convenience for callers that have the artifact on disk; pass the resulting dict in.
+
+    **A plain Foundry ``out/<C>.sol/<C>.json`` does NOT qualify**, and the leg's constructor
+    refuses it. Foundry nests the code under ``bytecode.object`` / ``deployedBytecode.object``,
+    keeps ``immutableReferences`` under ``deployedBytecode``, and has no ``immutable_names`` at
+    all. The artifact must be a flat dict with:
+
+    * ``abi``, ``bytecode`` (creation code) and ``runtime_bytecode`` (deployed code), ``0x`` hex;
+    * ``immutableReferences`` — the compiler's ``deployedBytecode.immutableReferences``, copied
+      unchanged: ``{reference-id: [{"start": int, "length": 32}, ...]}``;
+    * ``immutable_names`` — ``{reference-id: name}`` naming the constructor term each id holds
+      (``hashlock``/``claimant``/``refundee``/``timeout``, plus ``token``/``amount`` for
+      ``Erc20Htlc``). A reference id is the AST node id of the immutable's
+      ``VariableDeclaration``, so build with ``forge build --ast`` and read, from the artifact's
+      ``ast``, each ``VariableDeclaration`` whose ``mutability`` is ``"immutable"``: its ``id``
+      is the key and its ``name`` the value. Ids are specific to one compilation, so derive the
+      map from the SAME build that produced ``immutableReferences``, never by hand.
     """
     with open(path) as f:
         return json.load(f)
@@ -209,8 +230,55 @@ def _validate_artifact(artifact: dict) -> dict:
         raise ValidationError("artifact must be a dict (ABI + bytecode + runtime_bytecode)")
     missing = [k for k in _REQUIRED_ARTIFACT_KEYS if k not in artifact]
     if missing:
-        raise ValidationError(f"artifact missing required keys: {missing}")
+        raise ValidationError(
+            f"artifact missing required keys: {missing}. A plain Foundry build output does not "
+            "qualify; see load_artifact for the keys and how to produce immutable_names."
+        )
+    _validate_immutable_layout(artifact)
     return artifact
+
+
+def _validate_immutable_layout(artifact: dict) -> None:
+    """Refuse, at CONSTRUCTION, an immutable layout the exact runtime compare could not use.
+
+    Presence alone is not enough: an empty ``immutableReferences``, a reference id with no name, a
+    name for an id the build does not have, or an offset outside the runtime would each surface
+    only in ``verify_funded`` — after the funder's own ``fund`` had deployed and funded. These are
+    properties of the artifact alone, so they are checked before any value can move. Whether the
+    NAMES match what a particular leg can supply values for is still checked in
+    ``_expected_runtime``, which also re-checks everything here.
+    """
+    refs = artifact["immutableReferences"]
+    names = artifact["immutable_names"]
+    if not isinstance(refs, dict) or not refs:
+        raise ValidationError("artifact 'immutableReferences' must be a non-empty {reference-id: [slot, ...]} dict")
+    if not isinstance(names, dict) or not names:
+        raise ValidationError("artifact 'immutable_names' must be a non-empty {reference-id: name} dict")
+    ref_ids = {str(k) for k in refs}
+    name_ids = {str(k) for k in names}
+    if ref_ids != name_ids:
+        raise ValidationError(
+            f"artifact 'immutable_names' does not cover exactly the 'immutableReferences' ids "
+            f"(unnamed: {sorted(ref_ids - name_ids)}, not in this build: {sorted(name_ids - ref_ids)}). "
+            "Reference ids are specific to one compilation; derive the map from the same build."
+        )
+    runtime_hex = artifact["runtime_bytecode"]
+    try:
+        runtime_len = len(bytes.fromhex(str(runtime_hex).removeprefix("0x")))
+    except ValueError as exc:
+        raise ValidationError("artifact 'runtime_bytecode' is not hex") from exc
+    for ref_id, slots in refs.items():
+        if not isinstance(slots, list) or not slots:
+            raise ValidationError(f"immutableReferences id {ref_id!r} has no slots")
+        for slot in slots:
+            start = slot.get("start") if isinstance(slot, dict) else None
+            length = slot.get("length") if isinstance(slot, dict) else None
+            if not isinstance(start, int) or isinstance(start, bool) or start < 0 or length != 32:
+                raise ValidationError(f"immutableReferences id {ref_id!r} has a malformed slot {slot!r}")
+            if start + 32 > runtime_len:
+                raise ValidationError(
+                    f"immutableReferences id {ref_id!r} slot at {start} lies outside the {runtime_len}-byte runtime"
+                )
 
 
 def _require_web3() -> Any:
@@ -307,10 +375,13 @@ class EthHtlcContractLeg:
     chain_id:
         EIP-155 chain id; must match ``rpc``'s endpoint (asserted at use).
     artifact:
-        The EthHtlc contract artifact dict (``abi`` + ``bytecode`` + ``runtime_bytecode``),
-        owned and INJECTED by the deploying application (its audited Foundry build output).
-        Use :func:`load_artifact` to read it from disk. pyrxd ships no contract bytecode of
-        its own.
+        The EthHtlc contract artifact dict (``abi`` + ``bytecode`` + ``runtime_bytecode`` +
+        ``immutableReferences`` + ``immutable_names``), owned and INJECTED by the deploying
+        application. Use :func:`load_artifact` to read it from disk. pyrxd ships no contract
+        bytecode of its own. A plain Foundry build output does NOT qualify (it nests the code,
+        and has no ``immutable_names``); :func:`load_artifact` says how to produce one that does.
+        An artifact without the immutable layout is refused HERE, at construction, because the
+        exact runtime check in :meth:`verify_funded` needs it and ``fund`` moves value first.
     """
 
     def __init__(

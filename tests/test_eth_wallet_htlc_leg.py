@@ -43,10 +43,14 @@ from pyrxd.security.secrets import PrivateKeyMaterial
 pytest.importorskip("web3")
 pytest.importorskip("eth_account")
 
+#: The smallest immutable layout the leg's constructor accepts (one 32-byte slot). These tests are
+#: about other things; the layout checks themselves live in test_eth_leg.py.
 _ART = {
     "abi": [{"type": "function", "name": "claim", "inputs": [{"type": "bytes32"}]}],
     "bytecode": "0x00",
-    "runtime_bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
 }
 _CONTRACT = "0x" + "11" * 20
 #: Odd, with low bits set: the messages below state computed gaps ("96s before", "97s stale"), and

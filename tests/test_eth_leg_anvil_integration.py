@@ -404,3 +404,127 @@ async def test_wrong_chain_id_refused(anvil_url_base_sepolia):
             )
     finally:
         await rpc.close()
+
+
+# ---------------------------------------------------------------------------
+# Erc20Htlc: the REAL contract through the exact runtime compare, and the immutable_names map
+# checked by EXECUTING each getter.
+# ---------------------------------------------------------------------------
+
+_ERC20_ARTIFACT = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+
+#: A hand-assembled STUB token, placed with anvil_setCode: ``decimals()`` (0x313ce567) returns 6 and
+#: every other call returns 10**12, so ``balanceOf`` reports any address as holding 10**12 base
+#: units. It exists only so the token leg's decimals and balance reads have something to answer
+#: them. It is NOT a model of a real token: no transfer moves anything and there is no freeze list.
+#: What these tests are about is the HTLC's runtime; the real USDC path is the fork suite's job.
+#:
+#:   PUSH0 CALLDATALOAD PUSH1 0xe0 SHR PUSH4 0x313ce567 EQ PUSH1 0x1a JUMPI
+#:   PUSH5 10**12 PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+#:   0x1a: JUMPDEST PUSH1 6 PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+_STUB_TOKEN_RUNTIME = "0x5f3560e01c63313ce56714601a5764e8d4a510005f5260205ff35b60065f5260205ff3"
+_STUB_TOKEN_ADDR = "0x" + "70ce" * 10
+_ERC20_AMOUNT = 12_345_678  # base units; non-round so an encoding slip cannot hide in zeros
+
+
+async def _stub_token(rpc):
+    from eth_utils import to_checksum_address
+
+    from pyrxd.eth_wallet.tokens import Erc20Token
+
+    await rpc.w3.provider.make_request("anvil_setCode", [to_checksum_address(_STUB_TOKEN_ADDR), _STUB_TOKEN_RUNTIME])
+    return Erc20Token("STUB", _STUB_TOKEN_ADDR, 6, _CHAIN_ID, has_blacklist=False)
+
+
+def _erc20_legs(rpc, token):
+    from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+
+    def leg(key):
+        return Erc20HtlcLeg(
+            token=token,
+            rpc=rpc,
+            signing_key=PrivateKeyMaterial(bytes.fromhex(key)),
+            chain_id=_CHAIN_ID,
+            artifact=_ERC20_ARTIFACT,
+        )
+
+    return leg(_KEY_TAKER), leg(_KEY_MAKER)
+
+
+async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused(anvil_url):
+    """The token leg's counterpart of the forged-copy test above, against the REAL ``Erc20Htlc``.
+
+    (a) The honest path: the taker's ``fund`` deploys the real contract and the maker's
+    ``verify_funded`` accepts it, with the on-chain runtime EXACTLY equal to ``_expected_runtime``.
+    That equality is the only thing that proves the token leg's own encodings — ``token`` as a
+    right-aligned address word, ``amount`` as a big-endian uint — are the bytes the compiler
+    splices; no unit test can, because every unit fake splices with the same encoder.
+
+    (b) Every single copy of every immutable is bound: forge ONE copy at a time (the last byte of
+    its word flipped) at a fresh address and the maker's real ``verify_funded`` refuses it. Each
+    immutable has 2 or 3 copies and a getter reads only one, so this is the whole class the old
+    value-masked compare missed, not only the ``claimant`` instance that was demonstrated."""
+    import dataclasses
+
+    from eth_utils import to_checksum_address
+
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        token = await _stub_token(rpc)
+        taker, maker = _erc20_legs(rpc, token)
+        _p, h = _secret()
+        timeout = await _now_plus(rpc, 3600)
+        loc = await taker.fund(
+            hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_ERC20_AMOUNT
+        )
+        await maker.verify_funded(loc, expected_amount_wei=_ERC20_AMOUNT)
+        honest = bytes(await rpc.get_code(loc.contract_address))
+        assert honest == maker._expected_runtime(loc)
+
+        forged_count = 0
+        for slots in _ERC20_ARTIFACT["immutableReferences"].values():
+            for slot in slots:
+                forged = bytearray(honest)
+                forged[slot["start"] + 31] ^= 0x01
+                faddr = to_checksum_address("0x" + "cc" * 18 + f"{forged_count + 1:04x}")
+                await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(forged).hex()])
+                with pytest.raises(ValidationError, match="does not EXACTLY equal"):
+                    await maker.verify_funded(
+                        dataclasses.replace(loc, contract_address=faddr), expected_amount_wei=_ERC20_AMOUNT
+                    )
+                forged_count += 1
+        # Non-vacuity: every slot of every immutable was forged and refused.
+        assert forged_count == sum(len(s) for s in _ERC20_ARTIFACT["immutableReferences"].values()) >= 12
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("artifact", [_ARTIFACT, _ERC20_ARTIFACT], ids=["EthHtlc", "Erc20Htlc"])
+async def test_immutable_names_match_what_each_getter_RETURNS(anvil_url, artifact):
+    """The id -> name map, checked by EXECUTION rather than by reading bytecode. Each
+    ``immutableReferences`` group gets its own sentinel word in every one of its slots; the runtime
+    is placed with anvil_setCode and each getter the map names is called. The getter must return
+    exactly its group's sentinel. (Sentinels are 12 zero bytes + 20 distinct bytes, so an address
+    getter's masking cannot change them.) The default-suite derivation in
+    ``test_eth_htlc_immutable_names.py`` checks the same map from the bytecode alone."""
+    from eth_utils import keccak, to_checksum_address
+
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        runtime = bytearray(bytes.fromhex(artifact["runtime_bytecode"].removeprefix("0x")))
+        sentinel = {}
+        for n, (ref_id, slots) in enumerate(sorted(artifact["immutableReferences"].items())):
+            sentinel[ref_id] = b"\x00" * 12 + bytes([0xA0 + n]) * 20
+            for slot in slots:
+                runtime[slot["start"] : slot["start"] + 32] = sentinel[ref_id]
+        addr = to_checksum_address("0x" + "5e" * 20)
+        await rpc.w3.provider.make_request("anvil_setCode", [addr, "0x" + bytes(runtime).hex()])
+        returned = {}
+        for ref_id, name in artifact["immutable_names"].items():
+            data = "0x" + keccak(text=name + "()")[:4].hex()
+            out = bytes(await rpc.w3.eth.call({"to": addr, "data": data}))
+            returned[ref_id] = out
+        assert len(returned) == len(artifact["immutableReferences"]) >= 4
+        assert returned == sentinel
+    finally:
+        await rpc.close()
