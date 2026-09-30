@@ -661,6 +661,43 @@ def test_the_freshness_cap_is_a_parameter_defaulting_to_the_pages_value():
         funding_header_ranges(funding_spv.MAINNET_CHAIN, newest + 20_161)
 
 
+def test_C_takes_the_hardest_header_of_the_last_checkpoint_interval():
+    """``max_header_work`` spans the last checkpoint interval as well as the headers served above the
+    newest checkpoint. Here the interval (checkpoints 2 and 4) holds header 3 at eight times the work
+    of every other header, and the served window above checkpoint 4 is all easy headers: ``C`` must be
+    priced on header 3, the smaller cost, not on the easy window alone."""
+    easy, hard = _HARD_BITS, 0x1F0FFFFF  # target 0x0fffff… is 1/8 of 0x7fffff…
+    headers = {0: regtest_genesis_header()}
+    for h, bits in ((1, easy), (2, easy), (3, hard), (4, easy)):
+        root = hashlib.sha256(b"interval" + bytes([h])).digest()
+        headers[h] = mine(radiant_block_hash(headers[h - 1]), root, _NOW - 86400 + 300 * h, bits)
+    pow_limit = (1 << 255) - 1
+    work = {h: radiant_header_work(headers[h], pow_limit=pow_limit) for h in headers}
+    assert work[3] >= 8 * work[4] - 8 and work[4] == work[2]
+    chain = RadiantChain(
+        name="mainnet",
+        checkpoints=tuple((h, radiant_block_hash(headers[h])) for h in (0, 2, 4)),
+        pow_limit=pow_limit,
+        subsidy_halving_interval=210_000,
+        value_bearing=True,
+    )
+    spk = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    c = build_funding_chain(spk=spk, value=1000, confs=6, base=headers, bits=easy, tip_time=_NOW)
+    assert all(radiant_header_work(c.headers[h], pow_limit=pow_limit) == work[4] for h in range(5, c.top + 1))
+    r = verify_maker_funding(
+        c.evidence(),
+        chain=chain,
+        expected_spk=spk,
+        expected_value=1000,
+        value_at_stake_photons=1000,
+        burial_blocks=6,
+        now_unix_s=_NOW,
+        withheld_block_interval_s=_FAST_S,
+    )
+    assert r.max_header_work == work[3]
+    assert r.forged_confirmation_cost_photons == r.subsidy_photons * (work[4] // 16) // work[3]
+
+
 def test_k_past_the_cap_refuses_with_upgrade_or_use_your_own_node(monkeypatch):
     base, chain = _value_bearing_chain(monkeypatch)
     spk = b"\x76\xa9" + bytes(32)
